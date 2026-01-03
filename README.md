@@ -10,8 +10,18 @@ Authority for your infrastructure.
 
 ### Prerequisites
 
+- Go (1.23+)
 - Docker
 - Docker Compose
+
+#### Development Tools
+
+For local development and testing, install the following tools:
+
+```bash
+# MacOS (Homebrew)
+brew install golangci-lint gosec
+```
 
 ### Quick Start
 

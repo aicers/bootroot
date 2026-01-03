@@ -48,6 +48,7 @@ func run() error {
 	fmt.Println("Initializing Bootroot CA...")
 
 	// Create secrets directory
+	// #nosec G301
 	if err := os.MkdirAll(secretsDir, 0755); err != nil {
 		return fmt.Errorf("creating secrets directory: %w", err)
 	}
@@ -126,8 +127,9 @@ func run() error {
 		}
 
 		// Fix permissions for Docker volume mount issues (common in dev envs)
-		//nosec G204
-		if err := exec.Command("chmod", "-R", "777", secretsDir).Run(); err != nil {
+		// #nosec G204
+		cmd := exec.Command("chmod", "-R", "777", secretsDir)
+		if err := cmd.Run(); err != nil {
 			fmt.Printf("Warning: failed to set permissions on secrets dir: %v\n", err)
 		}
 
@@ -200,7 +202,7 @@ func generateEABKey(secretsDir, uid, gid string) (*EABKey, error) {
 	for i := 0; i < 30; i++ {
 		resp, err := http.Get("http://localhost:9000/health")
 		if err == nil && resp.StatusCode == 200 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			fmt.Println(" Ready!")
 			break
 		}
@@ -242,10 +244,13 @@ func generateEABKey(secretsDir, uid, gid string) (*EABKey, error) {
 
 	execArgs := []string{
 		"exec", containerName,
-		"/bin/sh", "-c", cmdStr,
+		"/bin/sh",
+		"-c",
+		cmdStr,
 	}
-
-	out, err := exec.Command("docker", execArgs...).CombinedOutput()
+	// #nosec G204
+	cmd := exec.Command("docker", execArgs...)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		// Fallback: If 'step ca acme eab add' fails (maybe old version?), we are in trouble.
 		// But let's assume it works.
