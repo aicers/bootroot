@@ -29,10 +29,12 @@ services:
     volumes:
       - ./certs:/app/certs
       - ../secrets/certs/root_ca.crt:/app/root_ca.crt
+      - ../secrets:/app/secrets:ro
     command:
       - --server=https://bootroot-ca:9000/acme/acme/directory
       - --root=/app/root_ca.crt
       - --domains=bootroot-agent
       - --out=/app/certs
+      - --eab-file=/app/secrets/eab.json
     expose:
       - "80"
