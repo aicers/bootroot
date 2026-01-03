@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+coverage/
+.git/
+.github/
+.idea/
+.vscode/
+*.min.json
+secrets/
+certs/
+bin/

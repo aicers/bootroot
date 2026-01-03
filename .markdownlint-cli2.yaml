@@ -1,0 +1,9 @@
+globs:
+  - "**/*.md"
+ignores:
+  - "node_modules/**"
+  - "secrets/**"
+  - ".github/**"
+config:
+  MD024:
+    siblings_only: true

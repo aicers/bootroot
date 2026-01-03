@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # 1. Quality & Security Checks (Go, Docs, JSON)
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Check go.mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+          install-mode: "goinstall"
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+      - name: Run Gosec Security Scanner
+        uses: securego/gosec@master
+        with:
+          args: ./...
+
+      - name: Setup Biome
+        uses: biomejs/setup-biome@v2
+        with:
+          version: latest
+
+      - name: Run Biome (JSON Check)
+        run: biome ci --error-on-warnings .
+
+      - name: Run Markdown Lint
+        uses: DavidAnson/markdownlint-cli2-action@v22
+        with:
+          globs: "**/*.md"
+
+  # 2. Functional Verification (Unit + E2E)
+  test:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      # --- Unit Test Phase ---
+      - name: Unit Tests
+        run: go test -race -v ./...
+
+      - name: Build Bootroot Init
+        run: go build -v ./cmd/bootroot
+
+      - name: Build Bootroot Agent
+        run: go build -v ./cmd/agent
+
+      # --- E2E Test Phase ---
+      # This phase implicitly tests 'docker build' via compose
+      - name: Init CA (Generate Secrets)
+        run: go run ./cmd/bootroot
+
+      - name: Fix Permissions (for Docker mount)
+        run: sudo chmod -R 777 secrets
+
+      - name: Start Services (Build & Run)
+        working-directory: deploy
+        run: docker-compose up --build -d
+
+      - name: Wait for services
+        run: sleep 10
+
+      - name: Verify CA Health
+        run: |
+          curl -k --fail https://localhost:9000/health || (docker logs bootroot-ca && exit 1)
+
+      - name: Verify Agent Success
+        run: |
+          # Wait a bit more for acme flow
+          sleep 10
+          if docker logs bootroot-agent 2>&1 | grep -q "Successfully issued certificate"; then
+            echo "PASS: Certificate issued successfully"
+          else
+            echo "FAIL: Certificate issue message not found"
+            docker logs bootroot-agent
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        working-directory: deploy
+        run: docker-compose down
