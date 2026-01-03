@@ -12,7 +12,7 @@ import (
 
 const (
 	CAName          = "BootrootCA"
-	DNSNames        = "localhost,bootroot-ca"
+	DNSNames        = "localhost,bootroot-ca,bootroot-agent"
 	Address         = ":9000"
 	ProvisionerName = "acme"
 )
