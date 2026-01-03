@@ -18,3 +18,21 @@ services:
         "--password-file",
         "/home/step/password.txt",
       ]
+
+  bootroot-agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.agent
+    container_name: bootroot-agent
+    depends_on:
+      - step-ca
+    volumes:
+      - ./certs:/app/certs
+      - ../secrets/certs/root_ca.crt:/app/root_ca.crt
+    command:
+      - --server=https://bootroot-ca:9000/acme/acme/directory
+      - --root=/app/root_ca.crt
+      - --domains=bootroot-agent
+      - --out=/app/certs
+    expose:
+      - "80"
