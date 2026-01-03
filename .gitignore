@@ -1,0 +1,14 @@
+# Secrets and Keys
+secrets/
+*.pem
+*.key
+*.crt
+
+# OS specific
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+/bootroot
+/bin/
