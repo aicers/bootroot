@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -40,16 +41,47 @@ func (u *MyUser) GetPrivateKey() crypto.PrivateKey {
 	return u.key
 }
 
+type EABKey struct {
+	KID string `json:"kid"`
+	Key string `json:"key"`
+}
+
 func main() {
 	server := flag.String("server", "https://localhost:9000/acme/acme/directory", "ACME Directory URL")
 	email := flag.String("email", "admin@example.com", "User Email")
 	domains := flag.String("domains", "localhost", "Comma separated domains")
 	outDir := flag.String("out", "./certs", "Output directory for certificates")
 	rootFile := flag.String("root", "", "Path to Root CA file (PEM)")
+
+	eabKid := flag.String("eab-kid", "", "Key ID for External Account Binding")
+	eabHmac := flag.String("eab-hmac", "", "HMAC Key for External Account Binding")
+	eabFile := flag.String("eab-file", "", "Path to JSON file containing EAB credentials")
+
 	flag.Parse()
 
 	if *domains == "" {
 		log.Fatal("At least one domain is required")
+	}
+
+	// Resolve EAB credentials
+	kid := *eabKid
+	hmac := *eabHmac
+
+	if *eabFile != "" {
+		data, err := os.ReadFile(*eabFile)
+		if err != nil {
+			log.Fatalf("Failed to read EAB file: %v", err)
+		}
+		var eab EABKey
+		if err := json.Unmarshal(data, &eab); err != nil {
+			log.Fatalf("Failed to parse EAB file: %v", err)
+		}
+		if kid == "" {
+			kid = eab.KID
+		}
+		if hmac == "" {
+			hmac = eab.Key
+		}
 	}
 
 	// 1. Create User and Private Key
@@ -100,8 +132,22 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// 3. Register Account
-	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
+	// 3. Register Account (with EAB if provided)
+	regOptions := registration.RegisterOptions{TermsOfServiceAgreed: true}
+	var reg *registration.Resource
+
+	if kid != "" && hmac != "" {
+		// Use RegisterWithExternalAccountBinding when EAB credentials are provided
+		eabOptions := registration.RegisterEABOptions{
+			TermsOfServiceAgreed: true,
+			Kid:                  kid,
+			HmacEncoded:          hmac,
+		}
+		reg, err = client.Registration.RegisterWithExternalAccountBinding(eabOptions)
+	} else {
+		reg, err = client.Registration.Register(regOptions)
+	}
+
 	if err != nil {
 		log.Fatal("Registration failed:", err)
 	}

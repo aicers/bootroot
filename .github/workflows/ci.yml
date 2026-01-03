@@ -85,7 +85,7 @@ jobs:
       # --- E2E Test Phase ---
       # This phase implicitly tests 'docker build' via compose
       - name: Init CA (Generate Secrets)
-        run: go run ./cmd/bootroot
+        run: go run ./cmd/bootroot --no-eab
 
       - name: Fix Permissions (for Docker mount)
         run: sudo chmod -R 777 secrets
