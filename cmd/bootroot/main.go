@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/user"
@@ -54,10 +53,10 @@ func run() error {
 	passwordFile := filepath.Join(secretsDir, "password.txt")
 	provisionerPasswordFile := filepath.Join(secretsDir, "provisioner_password.txt")
 
-	if err := ioutil.WriteFile(passwordFile, []byte("password123\n"), 0600); err != nil {
+	if err := os.WriteFile(passwordFile, []byte("password123\n"), 0600); err != nil {
 		return fmt.Errorf("writing password file: %w", err)
 	}
-	if err := ioutil.WriteFile(provisionerPasswordFile, []byte("sysadmin-password123\n"), 0600); err != nil {
+	if err := os.WriteFile(provisionerPasswordFile, []byte("sysadmin-password123\n"), 0600); err != nil {
 		return fmt.Errorf("writing provisioner password file: %w", err)
 	}
 
