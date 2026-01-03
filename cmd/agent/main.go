@@ -83,7 +83,8 @@ func main() {
 		// Create Transport with Trusted CA
 		tr := &http.Transport{
 			TLSClientConfig: &tls.Config{
-				RootCAs: caCertPool,
+				RootCAs:    caCertPool,
+				MinVersion: tls.VersionTLS12,
 			},
 		}
 
@@ -124,14 +125,14 @@ func main() {
 	}
 
 	// 6. Save to file
-	if err := os.MkdirAll(*outDir, 0755); err != nil {
+	if err := os.MkdirAll(*outDir, 0700); err != nil {
 		log.Fatal(err)
 	}
 
 	certPath := filepath.Join(*outDir, "server.crt")
 	keyPath := filepath.Join(*outDir, "server.key")
 
-	err = os.WriteFile(certPath, certificates.Certificate, 0644)
+	err = os.WriteFile(certPath, certificates.Certificate, 0600)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -45,7 +45,7 @@ func run() error {
 	fmt.Println("Initializing Bootroot CA...")
 
 	// Create secrets directory
-	if err := os.MkdirAll(secretsDir, 0755); err != nil {
+	if err := os.MkdirAll(secretsDir, 0700); err != nil {
 		return fmt.Errorf("creating secrets directory: %w", err)
 	}
 
