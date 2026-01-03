@@ -92,7 +92,7 @@ jobs:
 
       - name: Start Services (Build & Run)
         working-directory: deploy
-        run: docker-compose up --build -d
+        run: docker compose up --build -d
 
       - name: Wait for services
         run: sleep 10
@@ -116,4 +116,4 @@ jobs:
       - name: Cleanup
         if: always()
         working-directory: deploy
-        run: docker-compose down
+        run: docker compose down
