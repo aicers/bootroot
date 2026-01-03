@@ -127,7 +127,9 @@ func run() error {
 
 		// Fix permissions for Docker volume mount issues (common in dev envs)
 		//nosec G204
-		exec.Command("chmod", "-R", "777", secretsDir).Run()
+		if err := exec.Command("chmod", "-R", "777", secretsDir).Run(); err != nil {
+			fmt.Printf("Warning: failed to set permissions on secrets dir: %v\n", err)
+		}
 
 		// 3. Generate EAB Key (Only if EAB is required)
 		fmt.Println("Generating EAB Key for Agent...")
@@ -186,10 +188,11 @@ func generateEABKey(secretsDir, uid, gid string) (*EABKey, error) {
 		return nil, fmt.Errorf("starting temp server: %w", err)
 	}
 
-	// Ensure cleanup
+	// Stop temp server
 	defer func() {
 		fmt.Println("  Stopping temporary CA server...")
-		exec.Command("docker", "kill", containerName).Run()
+		// Use _ to ignore error if container is already stopped/removed
+		_ = exec.Command("docker", "kill", containerName).Run()
 	}()
 
 	// 2. Wait for Health
