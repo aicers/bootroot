@@ -31,6 +31,7 @@ services:
       - ./secrets/certs/root_ca.crt:/app/root_ca.crt
       - ./secrets:/app/secrets:ro
     command:
+      - --oneshot
       - --ca-url=https://bootroot-ca:9000/acme/acme/directory
       - --domain=bootroot-agent.com
       - --cert-path=/app/certs/bootroot-agent.crt

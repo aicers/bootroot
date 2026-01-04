@@ -115,6 +115,10 @@ jobs:
               echo "PASS: Certificate issued successfully"
               exit 0
             fi
+            if docker logs bootroot-agent 2>&1 | grep -q "Certificate issuance succeeded"; then
+              echo "PASS: Certificate issued successfully"
+              exit 0
+            fi
             echo "Waiting for certificate issuance..."
             sleep 5
           done
