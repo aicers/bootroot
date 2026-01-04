@@ -98,7 +98,15 @@ jobs:
 
       - name: Verify CA Health
         run: |
-          curl -k --fail https://localhost:9000/health || (docker logs bootroot-ca && exit 1)
+          for i in {1..10}; do
+            if curl -k --fail https://localhost:9000/health; then
+              exit 0
+            fi
+            echo "Waiting for CA health..."
+            sleep 3
+          done
+          docker logs bootroot-ca
+          exit 1
 
       - name: Verify Agent Success (E2E)
         run: |
