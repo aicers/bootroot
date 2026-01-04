@@ -520,33 +520,36 @@ struct JwsHeader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
     use super::*;
+
+    fn test_settings() -> AcmeSettings {
+        AcmeSettings {
+            http_challenge_port: 80,
+            directory_fetch_attempts: 3,
+            directory_fetch_base_delay_secs: 0,
+            directory_fetch_max_delay_secs: 0,
+            poll_attempts: 15,
+            poll_interval_secs: 2,
+        }
+    }
 
     #[test]
     fn test_client_initialization() {
-        let settings = AcmeSettings {
-            http_challenge_port: 80,
-            directory_fetch_attempts: 10,
-            directory_fetch_base_delay_secs: 1,
-            directory_fetch_max_delay_secs: 10,
-            poll_attempts: 15,
-            poll_interval_secs: 2,
-        };
-        let client = AcmeClient::new("http://example.com".to_string(), &settings);
+        let client = AcmeClient::new("http://example.com".to_string(), &test_settings());
         assert!(client.is_ok());
     }
 
     #[test]
     fn test_compute_key_authorization() {
-        let settings = AcmeSettings {
-            http_challenge_port: 80,
-            directory_fetch_attempts: 10,
-            directory_fetch_base_delay_secs: 1,
-            directory_fetch_max_delay_secs: 10,
-            poll_attempts: 15,
-            poll_interval_secs: 2,
-        };
-        let client = AcmeClient::new("http://example.com".to_string(), &settings).unwrap();
+        let client = AcmeClient::new("http://example.com".to_string(), &test_settings()).unwrap();
         let token = "test_token_123_xyz";
         let ka = client.compute_key_authorization(token).unwrap();
         assert!(ka.starts_with(token));
@@ -565,15 +568,7 @@ mod tests {
 
     #[test]
     fn test_external_account_binding_structure() {
-        let settings = AcmeSettings {
-            http_challenge_port: 80,
-            directory_fetch_attempts: 10,
-            directory_fetch_base_delay_secs: 1,
-            directory_fetch_max_delay_secs: 10,
-            poll_attempts: 15,
-            poll_interval_secs: 2,
-        };
-        let client = AcmeClient::new("http://example.com".to_string(), &settings).unwrap();
+        let client = AcmeClient::new("http://example.com".to_string(), &test_settings()).unwrap();
         let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-secret");
         let creds = EabCredentials {
             kid: "kid-123".to_string(),
@@ -603,5 +598,122 @@ mod tests {
         assert_eq!(protected["url"], "http://example.com/newAccount");
         assert_eq!(payload, jwk_value);
         assert!(binding["signature"].as_str().unwrap().len() > 10);
+    }
+
+    struct DirectoryResponder {
+        calls: Arc<AtomicUsize>,
+        directory_body: serde_json::Value,
+    }
+
+    impl Respond for DirectoryResponder {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            if attempt < 2 {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(&self.directory_body)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_directory_retries_then_succeeds() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let directory_body = serde_json::json!({
+            "newNonce": format!("{}/nonce", server.uri()),
+            "newAccount": format!("{}/account", server.uri()),
+            "newOrder": format!("{}/order", server.uri()),
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/directory"))
+            .respond_with(DirectoryResponder {
+                calls: Arc::clone(&calls),
+                directory_body,
+            })
+            .mount(&server)
+            .await;
+
+        let mut client =
+            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        client.fetch_directory().await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_nonce_reads_replay_nonce_header() {
+        let server = MockServer::start().await;
+        let directory_body = serde_json::json!({
+            "newNonce": format!("{}/nonce", server.uri()),
+            "newAccount": format!("{}/account", server.uri()),
+            "newOrder": format!("{}/order", server.uri()),
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/directory"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&directory_body))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/nonce"))
+            .respond_with(ResponseTemplate::new(200).insert_header("replay-nonce", "nonce-123"))
+            .mount(&server)
+            .await;
+
+        let mut client =
+            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let nonce = client.get_nonce().await.unwrap();
+
+        assert_eq!(nonce, "nonce-123");
+    }
+
+    #[tokio::test]
+    async fn test_post_as_get_sends_empty_payload() {
+        let server = MockServer::start().await;
+        let directory_body = serde_json::json!({
+            "newNonce": format!("{}/nonce", server.uri()),
+            "newAccount": format!("{}/account", server.uri()),
+            "newOrder": format!("{}/order", server.uri()),
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/directory"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&directory_body))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/nonce"))
+            .respond_with(ResponseTemplate::new(200).insert_header("replay-nonce", "nonce-abc"))
+            .mount(&server)
+            .await;
+
+        let order_body = serde_json::json!({
+            "status": "pending",
+            "finalize": format!("{}/finalize", server.uri()),
+            "authorizations": [],
+            "certificate": null
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/order/1"))
+            .and(header("content-type", CONTENT_TYPE_JOSE_JSON))
+            .and(body_string_contains("\"payload\":\"\""))
+            .and(body_string_contains("\"signature\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&order_body))
+            .mount(&server)
+            .await;
+
+        let mut client =
+            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let order = client
+            .poll_order(&format!("{}/order/1", server.uri()))
+            .await
+            .unwrap();
+
+        assert_eq!(order.status, crate::acme::types::OrderStatus::Pending);
     }
 }

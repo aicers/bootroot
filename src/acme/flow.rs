@@ -2,12 +2,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::Result;
+use tokio::fs;
 use tracing::info;
 
 use crate::acme::client::AcmeClient;
 use crate::acme::http01::ChallengeStore;
 use crate::acme::types::{AuthorizationStatus, ChallengeStatus, ChallengeType, OrderStatus};
-use tokio::fs;
 
 const KEY_FILE_MODE: u32 = 0o600;
 const SECRETS_DIR_MODE: u32 = 0o700;
@@ -217,11 +217,11 @@ pub async fn issue_certificate(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::os::unix::fs::PermissionsExt;
 
     use tempfile::tempdir;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_ensure_secrets_dir_permissions() {
