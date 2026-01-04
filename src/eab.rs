@@ -52,3 +52,70 @@ pub async fn load_credentials(
 
     Ok(None)
 }
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+
+    use super::*;
+    #[tokio::test]
+    async fn test_load_credentials_cli_precedence() {
+        let cli_kid = Some("cli-kid".to_string());
+        let cli_hmac = Some("cli-hmac".to_string());
+        // Create a dummy file that has DIFFERENT credentials
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, r#"{{"kid": "file-kid", "key": "file-hmac"}}"#).unwrap();
+        let file_path = Some(file.path().to_path_buf());
+        // Action
+        let result = load_credentials(cli_kid, cli_hmac, file_path).await;
+        // Assert
+        let creds = result.unwrap().unwrap();
+        assert_eq!(creds.kid, "cli-kid");
+        assert_eq!(creds.hmac, "cli-hmac");
+    }
+    #[tokio::test]
+    async fn test_load_credentials_from_file_valid() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, r#"{{"kid": "test-kid", "key": "test-hmac"}}"#).unwrap();
+        let path = file.path().to_path_buf();
+        let result = load_credentials(None, None, Some(path)).await;
+        let creds = result.unwrap().unwrap();
+        assert_eq!(creds.kid, "test-kid");
+        assert_eq!(creds.hmac, "test-hmac");
+    }
+    #[tokio::test]
+    async fn test_load_credentials_file_malformed() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "not json content").unwrap();
+        let path = file.path().to_path_buf();
+        let result = load_credentials(None, None, Some(path)).await;
+        // Should be an error
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to parse EAB JSON")
+        );
+    }
+    #[tokio::test]
+    async fn test_load_credentials_file_not_found() {
+        // Path that definitely doesn't exist
+        let path = PathBuf::from("/non/existent/path/for/bootroot/test.json");
+        let result = load_credentials(None, None, Some(path)).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to read EAB file")
+        );
+    }
+    #[tokio::test]
+    async fn test_load_credentials_none() {
+        let result = load_credentials(None, None, None).await;
+        let creds = result.unwrap();
+        assert!(creds.is_none());
+    }
+}

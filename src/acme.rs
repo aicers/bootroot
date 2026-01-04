@@ -97,8 +97,6 @@ pub struct Challenge {
     pub error: Option<serde_json::Value>,
 }
 
-// --- Client ---
-
 pub struct AcmeClient {
     client: Client,
     directory_url: String,
@@ -361,7 +359,6 @@ impl AcmeClient {
         Ok(cert_pem)
     }
 
-    // Polling helper
     /// Polls the order status.
     ///
     /// # Errors
@@ -376,8 +373,6 @@ impl AcmeClient {
         let order: Order = resp.json().await?;
         Ok(order)
     }
-
-    // --- JWS Helper ---
 
     fn jwk(&self) -> Result<Jwk> {
         let pk = self.key_pair.public_key();
@@ -493,8 +488,6 @@ impl AcmeClient {
     }
 }
 
-// --- JWS Structs ---
-
 #[derive(Debug, Serialize, Clone)]
 struct Jwk {
     kty: String,
@@ -513,8 +506,6 @@ struct JwsHeader {
     #[serde(skip_serializing_if = "Option::is_none")]
     kid: Option<String>,
 }
-
-// --- Entry Point ---
 
 /// Issues a certificate via ACME protocol.
 ///
@@ -727,4 +718,57 @@ pub async fn issue_certificate(
     }
 
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_order_status_deserialization() {
+        let cases = vec![
+            ("\"pending\"", OrderStatus::Pending),
+            ("\"ready\"", OrderStatus::Ready),
+            ("\"processing\"", OrderStatus::Processing),
+            ("\"valid\"", OrderStatus::Valid),
+            ("\"invalid\"", OrderStatus::Invalid),
+        ];
+        for (json, expected) in cases {
+            let status: OrderStatus = serde_json::from_str(json).unwrap();
+            assert_eq!(status, expected);
+        }
+    }
+    #[test]
+    fn test_challenge_type_deserialization() {
+        let json = r#""http-01""#;
+        let c_type: ChallengeType = serde_json::from_str(json).unwrap();
+        assert_eq!(c_type, ChallengeType::Http01);
+        let json = r#""dns-01""#;
+        let c_type: ChallengeType = serde_json::from_str(json).unwrap();
+        assert_eq!(c_type, ChallengeType::Dns01);
+    }
+    #[test]
+    fn test_client_initialization() {
+        let client = AcmeClient::new("http://example.com".to_string());
+        assert!(client.is_ok());
+    }
+    #[test]
+    fn test_compute_key_authorization() {
+        let client = AcmeClient::new("http://example.com".to_string()).unwrap();
+        let token = "test_token_123_xyz";
+        let ka = client.compute_key_authorization(token).unwrap();
+        // KA format: "token.thumbprint"
+        assert!(ka.starts_with(token));
+        let parts: Vec<&str> = ka.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            2,
+            "Key Authorization should have 2 parts separated by ."
+        );
+        // Check thumbprint is valid web-safe base64 (roughly)
+        let thumbprint = parts[1];
+        assert!(!thumbprint.is_empty());
+        // Simple check: no padding characters usually in raw b64url
+        assert!(!thumbprint.contains('='));
+        assert!(!thumbprint.contains('+'));
+        assert!(!thumbprint.contains('/'));
+    }
 }
