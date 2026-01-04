@@ -11,6 +11,8 @@ pub struct Settings {
     pub paths: Paths,
     pub eab: Option<Eab>,
     pub daemon: DaemonSettings,
+    pub acme: AcmeSettings,
+    pub retry: RetrySettings,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -31,6 +33,21 @@ pub struct DaemonSettings {
     pub renew_before: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct AcmeSettings {
+    pub http_challenge_port: u16,
+    pub directory_fetch_attempts: u64,
+    pub directory_fetch_base_delay_secs: u64,
+    pub directory_fetch_max_delay_secs: u64,
+    pub poll_attempts: u64,
+    pub poll_interval_secs: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RetrySettings {
+    pub backoff_secs: Vec<u64>,
+}
+
 const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_EMAIL: &str = "admin@example.com";
 const DEFAULT_CERT_PATH: &str = "certs/cert.pem";
@@ -38,6 +55,13 @@ const DEFAULT_KEY_PATH: &str = "certs/key.pem";
 const DEFAULT_DOMAIN: &str = "bootroot-agent";
 const DEFAULT_CHECK_INTERVAL: &str = "1h";
 const DEFAULT_RENEW_BEFORE: &str = "720h";
+const DEFAULT_HTTP_CHALLENGE_PORT: u16 = 80;
+const DEFAULT_DIRECTORY_FETCH_ATTEMPTS: u64 = 10;
+const DEFAULT_DIRECTORY_FETCH_BASE_DELAY_SECS: u64 = 1;
+const DEFAULT_DIRECTORY_FETCH_MAX_DELAY_SECS: u64 = 10;
+const DEFAULT_POLL_ATTEMPTS: u64 = 15;
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
+const DEFAULT_RETRY_BACKOFF_SECS: [u64; 3] = [5, 10, 30];
 
 impl Settings {
     /// Creates a new `Settings` instance.
@@ -55,7 +79,23 @@ impl Settings {
             .set_default("paths.key", DEFAULT_KEY_PATH)?
             .set_default("domains", vec![DEFAULT_DOMAIN])?
             .set_default("daemon.check_interval", DEFAULT_CHECK_INTERVAL)?
-            .set_default("daemon.renew_before", DEFAULT_RENEW_BEFORE)?;
+            .set_default("daemon.renew_before", DEFAULT_RENEW_BEFORE)?
+            .set_default("acme.http_challenge_port", DEFAULT_HTTP_CHALLENGE_PORT)?
+            .set_default(
+                "acme.directory_fetch_attempts",
+                DEFAULT_DIRECTORY_FETCH_ATTEMPTS,
+            )?
+            .set_default(
+                "acme.directory_fetch_base_delay_secs",
+                DEFAULT_DIRECTORY_FETCH_BASE_DELAY_SECS,
+            )?
+            .set_default(
+                "acme.directory_fetch_max_delay_secs",
+                DEFAULT_DIRECTORY_FETCH_MAX_DELAY_SECS,
+            )?
+            .set_default("acme.poll_attempts", DEFAULT_POLL_ATTEMPTS)?
+            .set_default("acme.poll_interval_secs", DEFAULT_POLL_INTERVAL_SECS)?
+            .set_default("retry.backoff_secs", DEFAULT_RETRY_BACKOFF_SECS.to_vec())?;
 
         // 2. Merge File (optional)
         // If config_path is provided, use it. Otherwise look for "agent.toml"
@@ -108,6 +148,13 @@ mod tests {
         );
         assert_eq!(settings.daemon.check_interval, "1h");
         assert_eq!(settings.daemon.renew_before, "720h");
+        assert_eq!(settings.acme.http_challenge_port, 80);
+        assert_eq!(settings.acme.directory_fetch_attempts, 10);
+        assert_eq!(settings.acme.directory_fetch_base_delay_secs, 1);
+        assert_eq!(settings.acme.directory_fetch_max_delay_secs, 10);
+        assert_eq!(settings.acme.poll_attempts, 15);
+        assert_eq!(settings.acme.poll_interval_secs, 2);
+        assert_eq!(settings.retry.backoff_secs, vec![5, 10, 30]);
     }
 
     #[test]

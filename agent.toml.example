@@ -24,6 +24,22 @@ check_interval = "1h"
 # Start renewal 30 days (720h) before expiry
 renew_before = "720h"
 
+# ACME behavior settings
+[acme]
+# HTTP-01 challenge listen port
+http_challenge_port = 80
+# Directory fetch retries and backoff (seconds)
+directory_fetch_attempts = 10
+directory_fetch_base_delay_secs = 1
+directory_fetch_max_delay_secs = 10
+# Order polling behavior
+poll_attempts = 15
+poll_interval_secs = 2
+
+# Retry settings for issuance attempts
+[retry]
+backoff_secs = [5, 10, 30]
+
 # Optional External Account Binding (EAB) Credentials
 # [eab]
 # kid = "your-key-id"

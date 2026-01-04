@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use tokio::sync::Mutex;
 use tracing::{error, info};
 
 pub mod acme;
 pub mod config;
 pub mod eab;
 
-const DEFAULT_RETRY_BACKOFF_SECS: [u64; 3] = [5, 10, 30];
 const DAEMON_CHECK_INTERVAL_KEY: &str = "daemon.check_interval";
 const DAEMON_RENEW_BEFORE_KEY: &str = "daemon.renew_before";
 
@@ -102,7 +102,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let challenges = Arc::new(Mutex::new(HashMap::new()));
-    let _challenge_server = acme::start_http01_server(challenges.clone());
+    let _challenge_server =
+        acme::start_http01_server(challenges.clone(), settings.acme.http_challenge_port);
 
     // 4. Run ACME Flow
     if args.oneshot {
@@ -178,7 +179,7 @@ async fn issue_with_retry(
     issue_with_retry_inner(
         || acme::issue_certificate(settings, eab.clone(), challenges.clone()),
         |duration| tokio::time::sleep(duration),
-        &DEFAULT_RETRY_BACKOFF_SECS,
+        &settings.retry.backoff_secs,
     )
     .await
 }
@@ -283,6 +284,7 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Mutex;
 
     use rcgen::CertificateParams;
     use tempfile::tempdir;
@@ -310,6 +312,17 @@ mod tests {
             daemon: config::DaemonSettings {
                 check_interval: "1h".to_string(),
                 renew_before: "720h".to_string(),
+            },
+            acme: config::AcmeSettings {
+                http_challenge_port: 80,
+                directory_fetch_attempts: 10,
+                directory_fetch_base_delay_secs: 1,
+                directory_fetch_max_delay_secs: 10,
+                poll_attempts: 15,
+                poll_interval_secs: 2,
+            },
+            retry: config::RetrySettings {
+                backoff_secs: vec![1, 2, 3],
             },
         }
     }
