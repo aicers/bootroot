@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -25,6 +26,37 @@ const DIRECTORY_FETCH_BASE_DELAY_SECS: u64 = 1;
 const DIRECTORY_FETCH_MAX_DELAY_SECS: u64 = 10;
 const POLL_ATTEMPTS: usize = 15;
 const POLL_INTERVAL_SECS: u64 = 2;
+
+pub type ChallengeStore = Arc<Mutex<HashMap<String, String>>>;
+
+#[handler]
+fn http01_challenge(
+    Path(token): Path<String>,
+    Data(state): Data<&ChallengeStore>,
+) -> (StatusCode, String) {
+    let guard = state.lock().expect("challenges mutex poisoned");
+    if let Some(key_auth) = guard.get(&token) {
+        return (StatusCode::OK, key_auth.clone());
+    }
+    (StatusCode::NOT_FOUND, "Not Found".to_string())
+}
+
+pub fn start_http01_server(challenges: ChallengeStore) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let app = Route::new()
+            .at(
+                "/.well-known/acme-challenge/:token",
+                poem::get(http01_challenge),
+            )
+            .data(challenges);
+
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], HTTP_CHALLENGE_PORT));
+        info!("Starting HTTP-01 Challenge Server on {}", addr);
+        if let Err(err) = Server::new(TcpListener::bind(addr)).run(app).await {
+            error!("HTTP server failed: {}", err);
+        }
+    })
+}
 
 #[derive(Debug, Deserialize, Clone)]
 struct Directory {
@@ -553,8 +585,14 @@ struct JwsHeader {
 pub async fn issue_certificate(
     settings: &crate::config::Settings,
     eab_creds: Option<crate::eab::EabCredentials>,
+    challenges: ChallengeStore,
 ) -> Result<()> {
     let mut client = AcmeClient::new(settings.server.clone())?;
+
+    {
+        let mut guard = challenges.lock().expect("challenges mutex poisoned");
+        guard.clear();
+    }
 
     // 1. Get Directory
     client.fetch_directory().await?;
@@ -583,39 +621,6 @@ pub async fn issue_certificate(
     info!("Order created: {:?}", order);
 
     // 5. Handle Authorizations (Challenges)
-    // Shared state for challenges: Token -> KeyAuth
-    let challenges: Arc<Mutex<std::collections::HashMap<String, String>>> =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-    // Start HTTP Server for HTTP-01
-    let server_challenges = challenges.clone();
-    #[handler]
-    fn http01_challenge(
-        Path(token): Path<String>,
-        Data(state): Data<&Arc<Mutex<std::collections::HashMap<String, String>>>>,
-    ) -> (StatusCode, String) {
-        let guard = state.lock().expect("challenges mutex poisoned");
-        if let Some(key_auth) = guard.get(&token) {
-            return (StatusCode::OK, key_auth.clone());
-        }
-        (StatusCode::NOT_FOUND, "Not Found".to_string())
-    }
-
-    tokio::spawn(async move {
-        let app = Route::new()
-            .at(
-                "/.well-known/acme-challenge/:token",
-                poem::get(http01_challenge),
-            )
-            .data(server_challenges);
-
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], HTTP_CHALLENGE_PORT));
-        info!("Starting HTTP-01 Challenge Server on {}", addr);
-        if let Err(err) = Server::new(TcpListener::bind(addr)).run(app).await {
-            error!("HTTP server failed: {}", err);
-        }
-    });
-
     for authz_url in &order.authorizations {
         info!("Fetching authorization: {}", authz_url);
         // Initial fetch
