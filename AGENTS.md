@@ -68,3 +68,20 @@ verify these locally before proposing any code. Breakdown:
     * **Title format**: Use the **imperative mood** (e.g., "Add feature", "Fix bug").
     * **Title limit**: **50 characters**.
     * **Body limit**: Wrap at **72 characters**.
+
+## 7. Code Review Guidelines
+
+* **Constants**:
+  * Use `const` for fixed values instead of "magic strings/numbers".
+  * Define all constants at the **top of the file**, not inside functions.
+* **Types**:
+  * Prefer `enum` over `String` whenever a finite set of values is expected.
+* **Comments**:
+  * Delete redundant or "noisy" comments that just describe code syntax.
+* **Documentation (Rustdoc)**:
+  * Doc comments (`///`) must start with a verb in the **third-person singular**
+    form (e.g., "Creates...", "Returns...", "Calculates...").
+* **Lints (Clippy)**:
+  * Avoid `#[allow(...)]` as much as possible.
+  * If `allow` is necessary, you **MUST** add a comment explaining why.
+  * Exceptions: `clippy::too_many_lines` can be treated loosely.
