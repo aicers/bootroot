@@ -4,42 +4,47 @@ use clap::Parser;
 use tracing::{error, info};
 
 pub mod acme;
+pub mod config;
 pub mod eab;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
+    /// Path to configuration file (default: agent.toml)
+    #[arg(long, short)]
+    config: Option<PathBuf>,
+
     /// Support email address
-    #[arg(long, default_value = "admin@example.com")]
-    email: String,
+    #[arg(long)]
+    email: Option<String>,
 
     /// Domain to request certificate for
-    #[arg(long, default_value = "bootroot-agent")]
-    domain: String,
+    #[arg(long)]
+    domain: Option<String>,
 
     /// ACME Directory URL
-    #[arg(long, default_value = "https://localhost:9000/acme/acme/directory")]
-    ca_url: String,
+    #[arg(long)]
+    ca_url: Option<String>,
 
-    /// EAB Key ID (optional, overrides file)
+    /// EAB Key ID (optional, overrides file/config)
     #[arg(long = "eab-kid")]
     eab_kid: Option<String>,
 
-    /// EAB HMAC Key (optional, overrides file)
+    /// EAB HMAC Key (optional, overrides file/config)
     #[arg(long = "eab-hmac")]
     eab_hmac: Option<String>,
 
-    /// Path to EAB JSON file
+    /// Path to EAB JSON file (optional)
     #[arg(long = "eab-file")]
     eab_file: Option<PathBuf>,
 
     /// Path to save the certificate
-    #[arg(long, default_value = "certs/cert.pem")]
-    cert_path: PathBuf,
+    #[arg(long)]
+    cert_path: Option<PathBuf>,
 
     /// Path to save the private key
-    #[arg(long, default_value = "certs/key.pem")]
-    key_path: PathBuf,
+    #[arg(long)]
+    key_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -49,25 +54,43 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     info!("Starting Bootroot Agent (Rust)");
-    info!("Target Domain: {}", args.domain);
-    info!("CA URL: {}", args.ca_url);
 
-    // 1. Load EAB Credentials
-    let eab_creds = eab::load_credentials(
+    // 1. Load Settings
+    let mut settings = config::Settings::new(args.config.clone())?;
+
+    // 2. Override Config with CLI Args
+    settings.merge_with_args(&args);
+
+    // 3. Resolve EAB Credentials
+    // Priority: CLI Args > Config File
+    let cli_eab = eab::load_credentials(
         args.eab_kid.clone(),
         args.eab_hmac.clone(),
         args.eab_file.clone(),
     )
     .await?;
 
-    if let Some(ref creds) = eab_creds {
-        info!("Loaded EAB Credentials for Key ID: {}", creds.kid);
+    let final_eab = cli_eab.or_else(|| {
+        settings
+            .eab
+            .as_ref()
+            .map(|cfg_eab| crate::eab::EabCredentials {
+                kid: cfg_eab.kid.clone(),
+                hmac: cfg_eab.hmac.clone(),
+            })
+    });
+
+    info!("Target Domains: {:?}", settings.domains);
+    info!("CA URL: {}", settings.server);
+
+    if let Some(ref creds) = final_eab {
+        info!("Using EAB Credentials for Key ID: {}", creds.kid);
     } else {
         info!("No EAB credentials provided. Attempting open enrollment.");
     }
 
-    // 2. Run ACME Flow
-    match acme::issue_certificate(&args, eab_creds).await {
+    // 4. Run ACME Flow
+    match acme::issue_certificate(&settings, final_eab).await {
         Ok(()) => info!("Successfully issued certificate!"),
         Err(e) => {
             error!("Failed to issue certificate: {:?}", e);

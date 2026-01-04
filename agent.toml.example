@@ -1,0 +1,23 @@
+# Bootroot Agent Configuration Example
+# Rename this file to agent.toml to use it.
+
+# Support email address for ACME registration
+email = "admin@example.com"
+
+# Domains to request certificate for
+domains = ["bootroot-agent"]
+
+# ACME Directory URL
+# Default: https://localhost:9000/acme/acme/directory (Step CA)
+server = "https://localhost:9000/acme/acme/directory"
+
+[paths]
+# Path to save the certificate
+cert = "certs/cert.pem"
+# Path to save the private key
+key = "certs/key.pem"
+
+# Optional External Account Binding (EAB) Credentials
+# [eab]
+# kid = "your-key-id"
+# hmac = "your-hmac-key"

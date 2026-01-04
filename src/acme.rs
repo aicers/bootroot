@@ -516,10 +516,10 @@ struct JwsHeader {
 /// Panics if the challenge state mutex is poisoned or TCP listener binding fails (critical errors).
 #[allow(clippy::too_many_lines)]
 pub async fn issue_certificate(
-    args: &crate::Args,
+    settings: &crate::config::Settings,
     eab_creds: Option<crate::eab::EabCredentials>,
 ) -> Result<()> {
-    let mut client = AcmeClient::new(args.ca_url.clone())?;
+    let mut client = AcmeClient::new(settings.server.clone())?;
 
     // 1. Get Directory
     client.fetch_directory().await?;
@@ -544,9 +544,7 @@ pub async fn issue_certificate(
     }
 
     // 4. Create Order
-    let order = client
-        .create_order(std::slice::from_ref(&args.domain))
-        .await?;
+    let order = client.create_order(&settings.domains).await?;
     info!("Order created: {:?}", order);
 
     // 5. Handle Authorizations (Challenges)
@@ -654,12 +652,23 @@ pub async fn issue_certificate(
     }
 
     // 6. Generate CSR
-    info!("Generating CSR for domain: {}", args.domain);
+    let primary_domain = settings
+        .domains
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No domains configured"))?;
+    info!("Generating CSR for domain: {}", primary_domain);
     let mut params = rcgen::CertificateParams::default();
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, args.domain.clone());
-    params.subject_alt_names = vec![rcgen::SanType::DnsName(args.domain.clone().try_into()?)];
+        .push(rcgen::DnType::CommonName, primary_domain.clone());
+
+    let mut sans = Vec::new();
+    for d in &settings.domains {
+        // Rcgen expects Ia5String or String that can be converted
+        let dns_name = d.clone().try_into()?;
+        sans.push(rcgen::SanType::DnsName(dns_name));
+    }
+    params.subject_alt_names = sans;
     // We need a key for the certificate, separate from account key
     let cert_key = rcgen::KeyPair::generate()?;
     let csr_der = params.serialize_request(&cert_key)?;
@@ -700,16 +709,16 @@ pub async fn issue_certificate(
         info!("Certificate received. Saving to files...");
 
         // Save Certificate
-        std::fs::write(&args.cert_path, &cert_pem)
+        std::fs::write(&settings.paths.cert, &cert_pem)
             .map_err(|e| anyhow::anyhow!("Failed to write cert file: {e}"))?;
-        info!("Certificate saved to: {:?}", args.cert_path);
+        info!("Certificate saved to: {:?}", settings.paths.cert);
 
         // Save Private Key
         // key is `cert_key` (rcgen::KeyPair)
         let key_pem = cert_key.serialize_pem();
-        std::fs::write(&args.key_path, &key_pem)
+        std::fs::write(&settings.paths.key, &key_pem)
             .map_err(|e| anyhow::anyhow!("Failed to write key file: {e}"))?;
-        info!("Private key saved to: {:?}", args.key_path);
+        info!("Private key saved to: {:?}", settings.paths.key);
     } else {
         info!(
             "Order finalized, but certificate not yet ready (or failed). Status: {:?}",
