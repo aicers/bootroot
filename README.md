@@ -19,7 +19,7 @@ issuance and renewal from an ACME-compatible Private CA (like `step-ca`).
 
 - **Rust** (latest stable)
 - **Docker** & **Docker Compose**
-- **Biome** (`npm install -g @biomejs/biome`) for development.
+- **Biome** (`brew install biome`) for development.
 
 ### Quick Start (Docker)
 
