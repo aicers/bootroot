@@ -8,49 +8,36 @@ on:
     branches:
       - main
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  # 1. Quality & Security Checks (Go, Docs, JSON)
   check:
+    name: Quality Check
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: "stable"
-          cache: true
+          components: clippy, rustfmt
 
-      - name: Check go.mod tidy
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
 
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
-          args: --timeout=5m
-          install-mode: "goinstall"
+      - name: Check Rust Formatting
+        run: cargo fmt -- --check --config group_imports=StdExternalCrate
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
-      - name: Run govulncheck
-        run: govulncheck ./...
-
-      - name: Run Gosec Security Scanner
-        uses: securego/gosec@master
-        with:
-          args: ./...
+      - name: Check Rust Lints (Clippy)
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Setup Biome
         uses: biomejs/setup-biome@v2
         with:
           version: latest
 
-      - name: Run Biome (JSON Check)
+      - name: Run Biome (Config/JSON Check)
         run: biome ci --error-on-warnings .
 
       - name: Run Markdown Lint
@@ -58,40 +45,52 @@ jobs:
         with:
           globs: "**/*.md"
 
-  # 2. Functional Verification (Unit + E2E)
+      - name: Install cargo-audit
+        run: cargo install cargo-audit || true
+
+      - name: Run Security Audit
+        run: cargo audit
+
   test:
+    name: Test Suite
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "stable"
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      # --- Unit Test Phase ---
-      - name: Unit Tests
-        run: go test -race -v ./...
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
 
-      - name: Build Bootroot Init
-        run: go build -v ./cmd/bootroot
+      # --- Unit Testing ---
+      - name: Run Unit Tests
+        run: cargo test
 
-      - name: Build Bootroot Agent
-        run: go build -v ./cmd/agent
-
-      # --- E2E Test Phase ---
-      # This phase implicitly tests 'docker build' via compose
-      - name: Init CA (Generate Secrets)
-        run: go run ./cmd/bootroot --no-eab
+      # --- E2E Integration Testing (Docker) ---
+      - name: Initialize Test CA
+        run: |
+          mkdir -p secrets
+          echo "password" > secrets/password.txt
+          # Initialize step-ca configuration
+          docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
+            step ca init \
+            --name "Bootroot CI CA" \
+            --provisioner "admin" \
+            --dns "localhost,bootroot-ca" \
+            --address ":9000" \
+            --password-file /home/step/password.txt \
+            --provisioner-password-file /home/step/password.txt \
+            --acme
 
       - name: Fix Permissions (for Docker mount)
-        run: sudo chmod -R 777 secrets
+        run: |
+          mkdir -p secrets certs
+          sudo chmod -R 777 secrets certs
 
-      - name: Start Services (Build & Run)
-        working-directory: deploy
+      - name: Start Services (Docker Compose)
         run: docker compose up --build -d
 
       - name: Wait for services
@@ -101,19 +100,22 @@ jobs:
         run: |
           curl -k --fail https://localhost:9000/health || (docker logs bootroot-ca && exit 1)
 
-      - name: Verify Agent Success
+      - name: Verify Agent Success (E2E)
         run: |
-          # Wait a bit more for acme flow
-          sleep 10
-          if docker logs bootroot-agent 2>&1 | grep -q "Successfully issued certificate"; then
-            echo "PASS: Certificate issued successfully"
-          else
-            echo "FAIL: Certificate issue message not found"
-            docker logs bootroot-agent
-            exit 1
-          fi
+          for i in {1..6}; do
+            if docker logs bootroot-agent 2>&1 | grep -q "Successfully issued certificate"; then
+              echo "PASS: Certificate issued successfully"
+              exit 0
+            fi
+            echo "Waiting for certificate issuance..."
+            sleep 5
+          done
+
+          echo "FAIL: Certificate issue message not found"
+          echo "=== Agent Logs ==="
+          docker logs bootroot-agent
+          exit 1
 
       - name: Cleanup
         if: always()
-        working-directory: deploy
         run: docker compose down

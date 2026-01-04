@@ -3,83 +3,100 @@
 [![CI](https://github.com/aicers/bootroot/actions/workflows/ci.yml/badge.svg)](https://github.com/aicers/bootroot/actions/workflows/ci.yml)
 
 **bootroot** is a product-embedded PKI bootstrap and trust foundation.
-It packages `step-ca` to provide an automated, ACME-based private Certificate
-Authority for your infrastructure.
+It provides a robust **Rust-based ACME Agent** that automates certificate
+issuance and renewal from an ACME-compatible Private CA (like `step-ca`).
+
+## Features
+
+- **ACME Client**: Fully compliant RFC 8555 implementation (Rust).
+- **Supports**: `step-ca` (Internal CA) and `Pebble` (Testing).
+- **Security**: ECSDA P-256 keys, secure storage, and minimal dependencies.
+- **Deployment**: Single static binary or lightweight Docker image.
 
 ## Getting Started
 
 ### Prerequisites
 
-- Go (1.23+)
-- Docker
-- Docker Compose
+- **Rust** (latest stable)
+- **Docker** & **Docker Compose**
+- **Biome** (`npm install -g @biomejs/biome`) for development.
 
-#### Development Tools
+### Quick Start (Docker)
 
-For local development and testing, install the following tools:
+This is the easiest way to verify the agent and CA integration.
 
-```bash
-# MacOS (Homebrew)
-brew install golangci-lint gosec
-```
+1. **Start Services**
 
-### Quick Start
-
-1. **Initialize the CA** (First time only)
-
-   This script generates the Root CA, Intermediate CA, and basic configuration
-   in the `secrets/` directory.
+   The repository comes with pre-generated test secrets in `secrets/`.
 
    ```bash
-   go run ./cmd/bootroot
+   docker compose up --build -d
    ```
 
-2. **Start Services**
+2. **Verify Certificate Issuance**
 
-   This starts both the CA (`bootroot-ca`) and the ACME Agent (`bootroot-agent`).
+   Check the agent logs for success message:
 
    ```bash
-   cd deploy
-   docker-compose up -d
+   docker logs -f bootroot-agent
+   # Expected output: "Successfully issued certificate!"
    ```
 
-3. **Verify**
+3. **Check Artifacts**
 
-   Check if the CA is running:
+   The issued certificate and key are saved to `./certs/`:
 
    ```bash
-   curl -k https://localhost:9000/health
+   ls -l certs/
+   # bootroot-agent.crt
+   # bootroot-agent.key
    ```
 
-   Check if the Agent successfully obtained a certificate:
+### Local Development (Binary)
+
+You can run the agent directly on your host machine.
+
+1. **Start the CA only**
 
    ```bash
-   docker logs bootroot-agent 2>&1 | grep "Successfully issued certificate"
+   docker compose up -d step-ca
    ```
 
-### Cleanup
+2. **Run the Agent**
 
-To stop the services and remove all generated secrets (reset to clean state):
+   ```bash
+   # Make sure you have the root CA trusted or use valid certs
+   # For dev, we point to the local ACME directory
+   cargo run -- \
+     --ca-url https://localhost:9000/acme/acme/directory \
+     --domain my-local-service.com \
+     --cert-path ./certs/my-cert.crt \
+     --key-path ./certs/my-key.key
+   ```
 
-```bash
-# Stop containers
-cd deploy
-docker-compose down
-
-# Remove secrets
-cd ..
-rm -rf secrets/
-```
+   *(Note: You might need to handle TLS trust for `try-ca` manually or ignore
+   cert errors if supported by flags)*
 
 ## Directory Structure
 
-- `deploy/`: Docker Compose and Dockerfile for Agent
-- `cmd/bootroot/`: CA Initialization tool
-- `cmd/agent/`: Universal ACME Agent
-- `scripts/`: Initialization and utility scripts
-- `config/`: Application configurations
-- `secrets/`: Generated CA keys, certs, and password files (Git-ignored)
+- `src/`: Rust source code (ACME client implementation).
+- `secrets/`: Test CA credentials and configuration.
+- `certs/`: Output directory for issued certificates.
+- `docker-compose.yml`: Integration test setup (`step-ca` + `agent`).
+- `Dockerfile`: Production build definition for the agent.
 
-## Documentation
+## Quality Gates
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed architectural contract.
+All contributions must pass the following checks:
+
+```bash
+# Format
+cargo fmt -- --check
+
+# Lint
+cargo clippy --all-targets -- -D warnings
+biome ci --error-on-warnings .
+
+# Test
+cargo test
+```

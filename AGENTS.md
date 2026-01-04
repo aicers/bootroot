@@ -16,8 +16,13 @@ before generating code.
 ## 2. Coding Standards (Rust)
 
 * **Error Handling**: Use `anyhow::Result` for application code and
-  `thiserror` for library code. Never use `unwrap()` or `expect()` in
-  production paths (panic is unacceptable).
+  `thiserror` for library code.
+  * **No `unwrap()`**: Do not use `unwrap()` in production code. Usage in
+    tests is permitted.
+  * **`expect("reason")`**: Use when you are certain a panic will NOT occur.
+    The message must explain *why* the condition is invariant.
+  * **`panic!("reason")`**: Use when you intentionally need to crash the
+    program to alert the user of a critical, unrecoverable state.
 * **Linting**: Code MUST pass `cargo clippy` with no warnings.
 * **Formatting**: Code MUST be formatted with `rustfmt` (default settings).
 * **Async**: Use `tokio` runtime. Avoid blocking operations in async contexts.
@@ -29,6 +34,7 @@ verify these locally before proposing any code. Breakdown:
 
 * **Linting (Rust)**: Must pass `cargo clippy --all-targets -- -D warnings`.
 * **Formatting**: Must pass `cargo fmt -- --check`.
+* **Linting (Biome)**: Must pass `biome ci --error-on-warnings .`.
 * **Security Audit**: Must pass `cargo audit` (check for vulnerable dependencies).
 * **Testing**: `cargo test` must pass all unit and integration tests.
 * **Linting (Docs/Misc)**:
@@ -47,8 +53,18 @@ verify these locally before proposing any code. Breakdown:
 
 ## 5. Domain Context
 
-* **ACME Protocol**: We use `instant-acme` or `rustls-acme`. Be careful with
-  nonce handling and retries.
+* **ACME Protocol**: We implement a custom ACME client (`src/acme.rs`) using
+  `reqwest` and `ring`, adhering strictly to RFC 8555. Be careful with nonce
+  handling, JWK thumbprints, and retries.
 * **Step CA**: Integration targets `smallstep/step-ca`.
 * **Deployment**: The agent runs as a sidecar. Ensure graceful shutdown on
   `SIGTERM`.
+
+## 6. Communication & Workflow Guidelines
+
+* **Commit Messages & Issue/PR Titles**:
+  * **No Prefixes**: Do NOT use prefixes like `feat:`, `chore:`, `fix:`, etc.
+  * **Commits Only**:
+    * **Title format**: Use the **imperative mood** (e.g., "Add feature", "Fix bug").
+    * **Title limit**: **50 characters**.
+    * **Body limit**: Wrap at **72 characters**.
