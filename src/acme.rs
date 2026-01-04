@@ -11,7 +11,7 @@ use ring::digest::{Context as DigestContext, SHA256};
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const ALG_ES256: &str = "ES256";
 const CRV_P256: &str = "P-256";
@@ -20,6 +20,9 @@ const CONTENT_TYPE_JOSE_JSON: &str = "application/jose+json";
 const HEADER_REPLAY_NONCE: &str = "replay-nonce";
 const DEFAULT_CONTACT: &str = "mailto:admin@example.com";
 const HTTP_CHALLENGE_PORT: u16 = 80;
+const DIRECTORY_FETCH_ATTEMPTS: usize = 10;
+const DIRECTORY_FETCH_BASE_DELAY_SECS: u64 = 1;
+const DIRECTORY_FETCH_MAX_DELAY_SECS: u64 = 10;
 const POLL_ATTEMPTS: usize = 15;
 const POLL_INTERVAL_SECS: u64 = 2;
 
@@ -144,10 +147,38 @@ impl AcmeClient {
             return Ok(());
         }
         info!("Fetching ACME directory from {}", self.directory_url);
-        let resp = self.client.get(&self.directory_url).send().await?;
-        let dir: Directory = resp.json().await?;
-        self.directory = Some(dir);
-        Ok(())
+        let mut last_err = None;
+        let mut delay_secs = DIRECTORY_FETCH_BASE_DELAY_SECS;
+        for attempt in 1..=DIRECTORY_FETCH_ATTEMPTS {
+            let resp = self.client.get(&self.directory_url).send().await;
+            match resp {
+                Ok(resp) => match resp.json::<Directory>().await {
+                    Ok(dir) => {
+                        self.directory = Some(dir);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        last_err = Some(err.into());
+                    }
+                },
+                Err(err) => {
+                    last_err = Some(err.into());
+                }
+            }
+
+            if attempt < DIRECTORY_FETCH_ATTEMPTS {
+                warn!(
+                    "ACME directory fetch failed (attempt {}/{}), retrying in {}s...",
+                    attempt, DIRECTORY_FETCH_ATTEMPTS, delay_secs
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                delay_secs = delay_secs
+                    .saturating_mul(2)
+                    .min(DIRECTORY_FETCH_MAX_DELAY_SECS);
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Directory fetch failed")))
     }
 
     async fn get_nonce(&mut self) -> Result<String> {
