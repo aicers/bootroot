@@ -1,14 +1,6 @@
-# Secrets and Keys
+target/
+certs/
 secrets/
-*.pem
-*.key
-*.crt
-
-# OS specific
-.DS_Store
-
-# IDE
-.idea/
+secrets.bak/
+**/*.DS_Store
 .vscode/
-/bootroot
-/bin/

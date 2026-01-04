@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  step-ca:
+    image: smallstep/step-ca:latest
+    container_name: bootroot-ca
+    restart: always
+    ports:
+      - "9000:9000"
+    environment:
+      - STEPUSER=step
+    volumes:
+      - ./secrets:/home/step
+    command:
+      [
+        "/usr/local/bin/step-ca",
+        "/home/step/config/ca.json",
+        "--password-file",
+        "/home/step/password.txt",
+      ]
+
+  bootroot-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bootroot-agent
+    depends_on:
+      - step-ca
+    volumes:
+      - ./certs:/app/certs
+      - ./secrets/certs/root_ca.crt:/app/root_ca.crt
+      - ./secrets:/app/secrets:ro
+    command:
+      - --ca-url=https://bootroot-ca:9000/acme/acme/directory
+      - --domain=bootroot-agent.com
+      - --cert-path=/app/certs/bootroot-agent.crt
+      - --key-path=/app/certs/bootroot-agent.key
+    environment:
+      - RUST_LOG=debug
+    networks:
+      default:
+        aliases:
+          - bootroot-agent.com
