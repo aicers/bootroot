@@ -24,7 +24,7 @@ before generating code.
   * **`panic!("reason")`**: Use when you intentionally need to crash the
     program to alert the user of a critical, unrecoverable state.
 * **Linting**: Code MUST pass `cargo clippy` with no warnings.
-* **Formatting**: Code MUST be formatted with `rustfmt` (default settings).
+* **Formatting**: Code MUST be formatted with `rustfmt` (use `group_imports=StdExternalCrate`).
 * **Async**: Use `tokio` runtime. Avoid blocking operations in async contexts.
 
 ## 3. Quality Gates (Strict)
@@ -33,7 +33,7 @@ before generating code.
 verify these locally before proposing any code. Breakdown:
 
 * **Linting (Rust)**: Must pass `cargo clippy --all-targets -- -D warnings`.
-* **Formatting**: Must pass `cargo fmt -- --check`.
+* **Formatting**: Must pass `cargo fmt -- --check --config group_imports=StdExternalCrate`.
 * **Linting (Biome)**: Must pass `biome ci --error-on-warnings .`.
 * **Security Audit**: Must pass `cargo audit` (check for vulnerable dependencies).
 * **Testing**: `cargo test` must pass all unit and integration tests.

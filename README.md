@@ -119,7 +119,7 @@ All contributions must pass the following checks:
 
 ```bash
 # Format
-cargo fmt -- --check
+cargo fmt -- --check --config group_imports=StdExternalCrate
 
 # Lint
 cargo clippy --all-targets -- -D warnings
