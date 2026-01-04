@@ -8,6 +8,7 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 config = { version = "0.15", default-features = false, features = ["toml"] }
+humantime = "2"
 poem = "3"
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = [
@@ -18,9 +19,11 @@ ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time"] }
+time = "0.3"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x509-parser = "0.16"
 
 [dev-dependencies]
 tempfile = "3"

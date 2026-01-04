@@ -12,6 +12,7 @@ issuance and renewal from an ACME-compatible Private CA (like `step-ca`).
 - **Supports**: `step-ca` (Internal CA) and `Pebble` (Testing).
 - **Security**: ECSDA P-256 keys, secure storage, and minimal dependencies.
 - **Deployment**: Single static binary or lightweight Docker image.
+- **Daemon Mode**: Periodic renewal checks with graceful shutdown.
 
 ## Getting Started
 
@@ -76,6 +77,33 @@ You can run the agent directly on your host machine.
 
    *(Note: You might need to handle TLS trust for `try-ca` manually or ignore
    cert errors if supported by flags)*
+
+### Daemon Mode (Auto-Renewal)
+
+By default, the agent runs as a long-lived process. To run once and exit:
+
+```bash
+cargo run -- --oneshot
+```
+
+Example with custom paths and CA URL:
+
+```bash
+cargo run -- \
+  --oneshot \
+  --ca-url https://localhost:9000/acme/acme/directory \
+  --domain my-local-service.com \
+  --cert-path ./certs/my-cert.crt \
+  --key-path ./certs/my-key.key
+```
+
+Configure the renewal cadence in `agent.toml`:
+
+```toml
+[daemon]
+check_interval = "1h"
+renew_before = "720h"
+```
 
 ## Directory Structure
 

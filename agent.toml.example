@@ -17,6 +17,13 @@ cert = "certs/cert.pem"
 # Path to save the private key
 key = "certs/key.pem"
 
+# Daemon mode settings (auto-renewal)
+[daemon]
+# How often to check certificate validity
+check_interval = "1h"
+# Start renewal 30 days (720h) before expiry
+renew_before = "720h"
+
 # Optional External Account Binding (EAB) Credentials
 # [eab]
 # kid = "your-key-id"

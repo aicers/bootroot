@@ -10,6 +10,7 @@ pub struct Settings {
     pub server: String,
     pub paths: Paths,
     pub eab: Option<Eab>,
+    pub daemon: DaemonSettings,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -24,11 +25,19 @@ pub struct Eab {
     pub hmac: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct DaemonSettings {
+    pub check_interval: String,
+    pub renew_before: String,
+}
+
 const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_EMAIL: &str = "admin@example.com";
 const DEFAULT_CERT_PATH: &str = "certs/cert.pem";
 const DEFAULT_KEY_PATH: &str = "certs/key.pem";
 const DEFAULT_DOMAIN: &str = "bootroot-agent";
+const DEFAULT_CHECK_INTERVAL: &str = "1h";
+const DEFAULT_RENEW_BEFORE: &str = "720h";
 
 impl Settings {
     /// Creates a new `Settings` instance.
@@ -44,7 +53,9 @@ impl Settings {
             .set_default("email", DEFAULT_EMAIL)?
             .set_default("paths.cert", DEFAULT_CERT_PATH)?
             .set_default("paths.key", DEFAULT_KEY_PATH)?
-            .set_default("domains", vec![DEFAULT_DOMAIN])?;
+            .set_default("domains", vec![DEFAULT_DOMAIN])?
+            .set_default("daemon.check_interval", DEFAULT_CHECK_INTERVAL)?
+            .set_default("daemon.renew_before", DEFAULT_RENEW_BEFORE)?;
 
         // 2. Merge File (optional)
         // If config_path is provided, use it. Otherwise look for "agent.toml"
@@ -95,6 +106,8 @@ mod tests {
             settings.server,
             "https://localhost:9000/acme/acme/directory"
         );
+        assert_eq!(settings.daemon.check_interval, "1h");
+        assert_eq!(settings.daemon.renew_before, "720h");
     }
 
     #[test]
@@ -139,6 +152,7 @@ mod tests {
             eab_file: None,
             cert_path: None,
             key_path: None,
+            oneshot: false,
         };
 
         settings.merge_with_args(&args);
