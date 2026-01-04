@@ -2,12 +2,16 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use base64::Engine;
+use poem::http::StatusCode;
+use poem::listener::TcpListener;
+use poem::web::{Data, Path};
+use poem::{EndpointExt, Route, Server, handler};
 use reqwest::Client;
 use ring::digest::{Context as DigestContext, SHA256};
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 const ALG_ES256: &str = "ES256";
 const CRV_P256: &str = "P-256";
@@ -554,34 +558,31 @@ pub async fn issue_certificate(
 
     // Start HTTP Server for HTTP-01
     let server_challenges = challenges.clone();
+    #[handler]
+    fn http01_challenge(
+        Path(token): Path<String>,
+        Data(state): Data<&Arc<Mutex<std::collections::HashMap<String, String>>>>,
+    ) -> (StatusCode, String) {
+        let guard = state.lock().expect("challenges mutex poisoned");
+        if let Some(key_auth) = guard.get(&token) {
+            return (StatusCode::OK, key_auth.clone());
+        }
+        (StatusCode::NOT_FOUND, "Not Found".to_string())
+    }
+
     tokio::spawn(async move {
-        let app = axum::Router::new()
-            .route(
+        let app = Route::new()
+            .at(
                 "/.well-known/acme-challenge/:token",
-                axum::routing::get(
-                    |axum::extract::Path(token): axum::extract::Path<String>,
-                     axum::extract::State(state): axum::extract::State<
-                        Arc<Mutex<std::collections::HashMap<String, String>>>,
-                    >| async move {
-                        let guard = state.lock().expect("challenges mutex poisoned");
-                        if let Some(key_auth) = guard.get(&token) {
-                            return (axum::http::StatusCode::OK, key_auth.clone());
-                        }
-                        (axum::http::StatusCode::NOT_FOUND, "Not Found".to_string())
-                    },
-                ),
+                poem::get(http01_challenge),
             )
-            .with_state(server_challenges);
+            .data(server_challenges);
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], HTTP_CHALLENGE_PORT));
         info!("Starting HTTP-01 Challenge Server on {}", addr);
-        // axum 0.7 uses serve(listener, app)
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .expect("Failed to bind port 80 - ensure sudo/admin privileges");
-        axum::serve(listener, app)
-            .await
-            .expect("HTTP server failed");
+        if let Err(err) = Server::new(TcpListener::bind(addr)).run(app).await {
+            error!("HTTP server failed: {}", err);
+        }
     });
 
     for authz_url in &order.authorizations {
