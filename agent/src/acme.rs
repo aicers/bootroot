@@ -1,66 +1,142 @@
+#![allow(dead_code)]
+#![allow(clippy::struct_field_names)]
+#![allow(clippy::missing_errors_doc)]
+
 use anyhow::{Context, Result};
-use rcgen::KeyPair;
-use tracing::{info, warn};
+use base64::Engine;
+use reqwest::Client;
+use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+use serde::Deserialize;
+use tracing::{debug, info};
 
-use crate::eab::EabCredentials;
+// --- ACME Data Structures ---
 
-// Placeholder for future ACME integration
-// use instant_acme::{Account, ExternalAccountBinding, NewAccount, Identifier};
+#[derive(Debug, Deserialize, Clone)]
+struct Directory {
+    #[serde(rename = "newNonce")]
+    new_nonce: String,
+    #[serde(rename = "newAccount")]
+    new_account: String,
+    #[serde(rename = "newOrder")]
+    new_order: String,
+}
 
-/// Issues a certificate (CSR generation only for now).
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Key generation fails.
-/// - CSR serialization fails.
-/// - File I/O operations fail.
-/// - Domain name is invalid for CSR.
-pub async fn issue_certificate(args: &crate::Args, _eab: Option<EabCredentials>) -> Result<()> {
-    // 1. ACME Account Directory (Placeholder)
-    let directory_url = &args.ca_url;
-    info!("Target ACME Directory: {}", directory_url);
+#[derive(Debug, Deserialize)]
+struct Account {
+    status: String,
+    // orders: String,
+}
 
-    // TODO: Implement instant-acme logic here.
-    // Current compilation fails due to unknown API signature of instant-acme 0.4/0.8.
-    // We need to verify the docs for Account::create and ExternalAccountBinding.
-    warn!(
-        "ACME communication is currently disabled due to API mismatch. Skipping to CSR generation."
-    );
+#[derive(Debug, Deserialize)]
+struct Order {
+    status: String,
+    finalize: String,
+    authorizations: Vec<String>,
+    certificate: Option<String>,
+}
 
-    // 2. Generate Key Pair & CSR (Verified logic)
-    info!("Generating Private Key (P-256) and CSR...");
+// --- Client ---
 
-    // rcgen 0.13+ uses default() and field assignment
-    let mut params = rcgen::CertificateParams::default();
-    params.subject_alt_names = vec![rcgen::SanType::DnsName(args.domain.clone().try_into()?)];
+pub struct AcmeClient {
+    client: Client,
+    directory_url: String,
+    directory: Option<Directory>,
+    key_pair: EcdsaKeyPair,
+    key_id: Option<String>, // Key ID (Account URL) after registration
+    nonce: Option<String>,
+}
 
-    let key_pair = KeyPair::generate()?;
-    let csr = params.serialize_request(&key_pair)?;
+#[allow(dead_code)] // Temporary while implementing
+impl AcmeClient {
+    pub fn new(directory_url: String) -> Result<Self> {
+        // Generate a new ephemeral account key (P-256)
+        let rng = ring::rand::SystemRandom::new();
+        // Fix: Correct argument order (alg, rng)
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+            .map_err(|_| anyhow::anyhow!("Failed to generate account key"))?;
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                .map_err(|_| anyhow::anyhow!("Failed to parse generated key pair"))?;
 
-    info!(
-        "CSR generated successfully. DER size: {} bytes",
-        csr.der().len()
-    );
-
-    // 3. Save Files
-    // Since we don't have a real cert from ACME, we'll skip saving the cert for now.
-    // But we CAN save the private key to test file I/O.
-
-    info!("Saving private key to {:?}", args.key_path);
-    if let Some(parent) = args.key_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .context("Failed to create cert dir")?;
+        Ok(Self {
+            client: Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()?, // TODO: Handle CA properly
+            directory_url,
+            directory: None,
+            key_pair,
+            key_id: None,
+            nonce: None,
+        })
     }
 
-    // key_pair.serialize_pem() returns String
-    tokio::fs::write(&args.key_path, key_pair.serialize_pem())
-        .await
-        .context("Failed to save private key")?;
+    fn b64(data: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+    }
 
-    info!("Private key saved.");
-    warn!("Certificate was NOT issued (ACME flow skipped).");
+    async fn fetch_directory(&mut self) -> Result<()> {
+        if self.directory.is_some() {
+            return Ok(());
+        }
+        info!("Fetching ACME directory from {}", self.directory_url);
+        let resp = self.client.get(&self.directory_url).send().await?;
+        let dir: Directory = resp.json().await?;
+        self.directory = Some(dir);
+        Ok(())
+    }
 
+    async fn get_nonce(&mut self) -> Result<String> {
+        // If we have a cached nonce from previous response, use it (Nonce-replaying not implemented typically, usually one-time)
+        // Actually, Replay-Nonce header is key.
+        // For the first request, get a fresh nonce from newNonce endpoint.
+        if let Some(nonce) = self.nonce.take() {
+            return Ok(nonce);
+        }
+
+        self.fetch_directory().await?;
+        let dir = self.directory.as_ref().unwrap();
+
+        let resp = self.client.head(&dir.new_nonce).send().await?;
+        let nonce = resp
+            .headers()
+            .get("replay-nonce")
+            .context("Missing Replay-Nonce header")?
+            .to_str()?
+            .to_string();
+        Ok(nonce)
+    }
+
+    // JWS Signing Implementation will go here...
+    // async fn post_jose(...)
+}
+
+// --- Entry Point ---
+
+#[allow(clippy::missing_errors_doc)]
+pub async fn issue_certificate(
+    args: &crate::Args,
+    _eab: Option<crate::eab::EabCredentials>,
+) -> Result<()> {
+    let mut client = AcmeClient::new(args.ca_url.clone())?;
+
+    // 1. Get Directory
+    client.fetch_directory().await?;
+    info!("Directory loaded.");
+
+    // 2. Get Nonce (Test)
+    let nonce = client.get_nonce().await?;
+    debug!("Got initial nonce: {}", nonce);
+
+    // TODO: Registration, Ordering, Challenge... implementation needed.
+    // For now, let's confirm the plumbing (reqwest + ring) compiles and works.
+
+    // Placeholder CSR Gen logic (keeping it to verify rcgen still works)
+    info!("Generating CSR locally (Test)...");
+    let mut params = rcgen::CertificateParams::default();
+    params.subject_alt_names = vec![rcgen::SanType::DnsName(args.domain.clone().try_into()?)];
+    let key_pair = rcgen::KeyPair::generate()?;
+    let _csr = params.serialize_request(&key_pair)?;
+
+    info!("Core plumbing ready. Next: JWS implementation.");
     Ok(())
 }

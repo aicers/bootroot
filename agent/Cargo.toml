@@ -18,9 +18,16 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# ACME & Crypto
-instant-acme = "0.8"
-rcgen = "0.14"
+# HTTP & Network
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+
+# Crypto & Encoding
+ring = "0.17"
+base64 = "0.22"
+rcgen = "0.14"  # Still used for CSR generation
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
