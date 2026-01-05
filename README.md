@@ -95,6 +95,7 @@ Configure the renewal cadence in `agent.toml`:
 ```toml
 [[profiles]]
 name = "edge-proxy-a"
+uri_san_enabled = true
 
 [profiles.daemon]
 check_interval = "1h"
@@ -168,6 +169,7 @@ Defaults (if not provided):
 - `profiles[].daemon.check_interval`: `1h`
 - `profiles[].daemon.renew_before`: `720h`
 - `profiles[].daemon.check_jitter`: `0s`
+- `profiles[].uri_san_enabled`: `true`
 - `profiles[].hooks.post_renew.*.timeout_secs`: `30`
 - `profiles[].hooks.post_renew.*.on_failure`: `continue`
 

@@ -23,6 +23,7 @@ name = "bootroot-agent"
 daemon_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
+uri_san_enabled = false
 domains = ["bootroot-agent.com"]
 
 [profiles.paths]

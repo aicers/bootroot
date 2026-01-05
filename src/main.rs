@@ -170,7 +170,11 @@ async fn run_profile_daemon(
         parse_duration_setting(&profile.daemon.renew_before, DAEMON_RENEW_BEFORE_KEY)?;
     let check_jitter =
         parse_duration_setting(&profile.daemon.check_jitter, DAEMON_CHECK_JITTER_KEY)?;
-    let uri_san = build_spiffe_uri(&settings, &profile);
+    let uri_san = if profile.uri_san_enabled {
+        Some(build_spiffe_uri(&settings, &profile))
+    } else {
+        None
+    };
 
     info!(
         "Profile '{}' daemon enabled. check_interval={:?}, renew_before={:?}, check_jitter={:?}",
@@ -211,7 +215,7 @@ async fn run_profile_daemon(
                             &profile,
                             profile_eab,
                             challenges.clone(),
-                            &uri_san,
+                            uri_san.as_deref(),
                         )
                         .await
                         {
@@ -310,10 +314,22 @@ async fn run_profile_oneshot(
     semaphore: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let _permit = semaphore.acquire().await?;
-    let uri_san = build_spiffe_uri(&settings, &profile);
+    let uri_san = if profile.uri_san_enabled {
+        Some(build_spiffe_uri(&settings, &profile))
+    } else {
+        None
+    };
     let profile_eab = resolve_profile_eab(&profile, default_eab);
 
-    match acme::issue_certificate(&settings, &profile, profile_eab, challenges, &uri_san).await {
+    match acme::issue_certificate(
+        &settings,
+        &profile,
+        profile_eab,
+        challenges,
+        uri_san.as_deref(),
+    )
+    .await
+    {
         Ok(()) => {
             if let Err(err) =
                 hooks::run_post_renew_hooks(&settings, &profile, hooks::HookStatus::Success, None)
@@ -350,7 +366,7 @@ async fn issue_with_retry(
     profile: &config::ProfileSettings,
     eab: Option<eab::EabCredentials>,
     challenges: Arc<Mutex<HashMap<String, String>>>,
-    uri_san: &str,
+    uri_san: Option<&str>,
 ) -> anyhow::Result<()> {
     issue_with_retry_inner(
         || acme::issue_certificate(settings, profile, eab.clone(), challenges.clone(), uri_san),
@@ -543,6 +559,7 @@ mod tests {
             daemon_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
+            uri_san_enabled: true,
             domains: vec![TEST_DOMAIN.to_string()],
             paths: config::Paths {
                 cert: cert_path,

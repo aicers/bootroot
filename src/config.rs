@@ -36,6 +36,8 @@ pub struct ProfileSettings {
     pub daemon_name: String,
     pub instance_id: String,
     pub hostname: String,
+    #[serde(default = "default_uri_san_enabled")]
+    pub uri_san_enabled: bool,
     pub domains: Vec<String>,
     pub paths: Paths,
     #[serde(default)]
@@ -141,6 +143,10 @@ fn default_renew_before() -> String {
 
 fn default_check_jitter() -> String {
     DEFAULT_CHECK_JITTER.to_string()
+}
+
+fn default_uri_san_enabled() -> bool {
+    true
 }
 
 impl Default for DaemonSettings {
