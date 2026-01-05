@@ -158,14 +158,23 @@ async fn run_hook_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(working_dir) = &hook.working_dir {
+        command.current_dir(working_dir);
+    }
 
     let mut child = command
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to spawn hook command '{}': {e}", hook.command))?;
 
     let timeout = Duration::from_secs(hook.timeout_secs);
-    let stdout_handle = tokio::spawn(read_stream(child.stdout.take()));
-    let stderr_handle = tokio::spawn(read_stream(child.stderr.take()));
+    let stdout_handle = tokio::spawn(read_stream_limited(
+        child.stdout.take(),
+        hook.max_output_bytes,
+    ));
+    let stderr_handle = tokio::spawn(read_stream_limited(
+        child.stderr.take(),
+        hook.max_output_bytes,
+    ));
 
     let status = tokio::time::timeout(timeout, child.wait()).await;
     if let Ok(result) = status {
@@ -176,12 +185,8 @@ async fn run_hook_command(
         let stderr = stderr_handle
             .await
             .map_err(|e| anyhow::anyhow!("Hook stderr task failed: {e}"))??;
-        if !stdout.trim().is_empty() {
-            debug!("Hook stdout: {}", stdout.trim());
-        }
-        if !stderr.trim().is_empty() {
-            debug!("Hook stderr: {}", stderr.trim());
-        }
+        log_hook_output("stdout", &stdout);
+        log_hook_output("stderr", &stderr);
         if status.success() {
             Ok(())
         } else {
@@ -202,20 +207,73 @@ async fn run_hook_command(
     }
 }
 
-async fn read_stream<R>(stream: Option<R>) -> anyhow::Result<String>
+fn log_hook_output(label: &str, output: &HookOutput) {
+    if !output.text.trim().is_empty() || output.truncated {
+        debug!(
+            "Hook {label} (bytes={}, truncated={}): {}",
+            output.bytes,
+            output.truncated,
+            output.text.trim()
+        );
+    }
+}
+
+struct HookOutput {
+    text: String,
+    bytes: usize,
+    truncated: bool,
+}
+
+async fn read_stream_limited<R>(
+    stream: Option<R>,
+    max_output_bytes: Option<u64>,
+) -> anyhow::Result<HookOutput>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let Some(mut stream) = stream else {
-        return Ok(String::new());
+        return Ok(HookOutput {
+            text: String::new(),
+            bytes: 0,
+            truncated: false,
+        });
     };
 
-    let mut buffer = String::new();
-    stream
-        .read_to_string(&mut buffer)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to read hook output: {e}"))?;
-    Ok(buffer)
+    let max_bytes = max_output_bytes.map_or(usize::MAX, |value| {
+        usize::try_from(value).unwrap_or(usize::MAX)
+    });
+    let mut buf = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read hook output: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read);
+        let remaining = max_bytes.saturating_sub(buf.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let to_copy = read.min(remaining);
+        buf.extend_from_slice(&chunk[..to_copy]);
+        if to_copy < read {
+            truncated = true;
+            break;
+        }
+    }
+
+    Ok(HookOutput {
+        text: String::from_utf8_lossy(&buf).to_string(),
+        bytes: total,
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -224,6 +282,7 @@ mod tests {
     use std::path::PathBuf;
 
     use tempfile::tempdir;
+    use tokio::io::{AsyncWriteExt, duplex};
 
     use super::*;
     use crate::config::{
@@ -252,6 +311,7 @@ mod tests {
                 renew_before: "720h".to_string(),
                 check_jitter: "0s".to_string(),
             },
+            retry: None,
             hooks,
             eab: None,
         };
@@ -296,8 +356,10 @@ mod tests {
                     output_path.display()
                 ),
             ],
+            working_dir: None,
             timeout_secs: 5,
             retry_backoff_secs: Vec::new(),
+            max_output_bytes: None,
             on_failure: HookFailurePolicy::Stop,
         };
 
@@ -325,8 +387,10 @@ mod tests {
         let hook = HookCommand {
             command: "false".to_string(),
             args: Vec::new(),
+            working_dir: None,
             timeout_secs: 5,
             retry_backoff_secs: Vec::new(),
+            max_output_bytes: None,
             on_failure: HookFailurePolicy::Stop,
         };
 
@@ -358,8 +422,10 @@ mod tests {
         let hook = HookCommand {
             command: "false".to_string(),
             args: Vec::new(),
+            working_dir: None,
             timeout_secs: 5,
             retry_backoff_secs: Vec::new(),
+            max_output_bytes: None,
             on_failure: HookFailurePolicy::Continue,
         };
 
@@ -389,8 +455,10 @@ mod tests {
         let hook = HookCommand {
             command: "sleep".to_string(),
             args: vec!["2".to_string()],
+            working_dir: None,
             timeout_secs: 1,
             retry_backoff_secs: Vec::new(),
+            max_output_bytes: None,
             on_failure: HookFailurePolicy::Stop,
         };
 
@@ -407,5 +475,18 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_read_stream_limited_truncates_output() {
+        let (mut writer, reader) = duplex(64);
+        writer.write_all(b"1234567890").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let output = read_stream_limited(Some(reader), Some(5)).await.unwrap();
+
+        assert_eq!(output.text, "12345");
+        assert!(output.truncated);
+        assert_eq!(output.bytes, 10);
     }
 }

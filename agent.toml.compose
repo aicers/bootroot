@@ -34,3 +34,6 @@ key = "/app/certs/bootroot-agent.key"
 check_interval = "1h"
 renew_before = "720h"
 check_jitter = "0s"
+
+[profiles.retry]
+backoff_secs = [5, 10, 30]

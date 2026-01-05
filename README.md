@@ -149,6 +149,8 @@ Hook behavior notes:
 
 - `timeout_secs` defaults to 30 seconds.
 - `retry_backoff_secs` is optional; when set, hooks retry with the given delays.
+- `working_dir` is optional; when set, hooks run from that directory.
+- `max_output_bytes` caps stdout/stderr and logs when truncation happens.
 - `on_failure` controls whether failures stop or continue the hook chain.
 
 ### Configuration Schema
@@ -170,6 +172,7 @@ Defaults (if not provided):
 - `profiles[].daemon.renew_before`: `720h`
 - `profiles[].daemon.check_jitter`: `0s`
 - `profiles[].uri_san_enabled`: `true`
+- `profiles[].retry.backoff_secs`: `retry.backoff_secs` (fallback)
 - `profiles[].hooks.post_renew.*.timeout_secs`: `30`
 - `profiles[].hooks.post_renew.*.on_failure`: `continue`
 
@@ -188,9 +191,12 @@ Validation rules:
 - `profiles[].instance_id` is numeric
 - `profiles[].domains` is non-empty
 - `profiles[].paths.cert` and `profiles[].paths.key` are non-empty
+- `profiles[].retry.backoff_secs` values > 0 (when set)
 - `profiles[].hooks.post_renew.*.command` is non-empty
+- `profiles[].hooks.post_renew.*.working_dir` is non-empty (when set)
 - `profiles[].hooks.post_renew.*.timeout_secs` > 0
 - `profiles[].hooks.post_renew.*.retry_backoff_secs` values > 0
+- `profiles[].hooks.post_renew.*.max_output_bytes` > 0 (when set)
 
 ### Operational Guide
 

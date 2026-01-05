@@ -60,6 +60,10 @@ renew_before = "720h"
 # Randomize check interval by +/- jitter (0s disables)
 check_jitter = "0s"
 
+[profiles.retry]
+# Optional per-profile retry backoff override
+backoff_secs = [5, 10, 30]
+
 # Post-renewal hooks
 [profiles.hooks.post_renew]
 # Commands to run after a successful renewal
@@ -67,8 +71,10 @@ check_jitter = "0s"
 #   {
 #     command = "nginx"
 #     args = ["-s", "reload"]
+#     working_dir = "/etc/nginx"
 #     timeout_secs = 30
 #     retry_backoff_secs = [5, 10, 30]
+#     max_output_bytes = 4096
 #     on_failure = "continue"
 #   }
 # ]

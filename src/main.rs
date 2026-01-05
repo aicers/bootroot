@@ -368,10 +368,16 @@ async fn issue_with_retry(
     challenges: Arc<Mutex<HashMap<String, String>>>,
     uri_san: Option<&str>,
 ) -> anyhow::Result<()> {
+    let backoff = profile
+        .retry
+        .as_ref()
+        .map_or(settings.retry.backoff_secs.as_slice(), |retry| {
+            retry.backoff_secs.as_slice()
+        });
     issue_with_retry_inner(
         || acme::issue_certificate(settings, profile, eab.clone(), challenges.clone(), uri_san),
         |duration| tokio::time::sleep(duration),
-        &settings.retry.backoff_secs,
+        backoff,
     )
     .await
 }
@@ -570,6 +576,7 @@ mod tests {
                 renew_before: "720h".to_string(),
                 check_jitter: "0s".to_string(),
             },
+            retry: None,
             hooks: config::HookSettings::default(),
             eab: None,
         }
