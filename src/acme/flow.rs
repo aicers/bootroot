@@ -69,7 +69,7 @@ async fn write_cert_and_key(
 
 fn build_csr_params(
     profile: &crate::config::ProfileSettings,
-    uri_san: &str,
+    uri_san: Option<&str>,
 ) -> Result<rcgen::CertificateParams> {
     let primary_domain = profile
         .domains
@@ -85,8 +85,10 @@ fn build_csr_params(
         let dns_name = d.clone().try_into()?;
         sans.push(rcgen::SanType::DnsName(dns_name));
     }
-    let uri = uri_san.try_into()?;
-    sans.push(rcgen::SanType::URI(uri));
+    if let Some(uri_san) = uri_san {
+        let uri = uri_san.try_into()?;
+        sans.push(rcgen::SanType::URI(uri));
+    }
     params.subject_alt_names = sans;
     Ok(params)
 }
@@ -102,7 +104,7 @@ pub async fn issue_certificate(
     profile: &crate::config::ProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
     challenges: ChallengeStore,
-    uri_san: &str,
+    uri_san: Option<&str>,
 ) -> Result<()> {
     let mut client = AcmeClient::new(settings.server.clone(), &settings.acme)?;
 
@@ -318,6 +320,7 @@ mod tests {
             daemon_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
+            uri_san_enabled: true,
             domains: vec![TEST_DOMAIN.to_string()],
             paths: crate::config::Paths {
                 cert: PathBuf::from("certs/edge-proxy-a.pem"),
@@ -328,7 +331,7 @@ mod tests {
             eab: None,
         };
 
-        let params = build_csr_params(&profile, TEST_URI_SAN).unwrap();
+        let params = build_csr_params(&profile, Some(TEST_URI_SAN)).unwrap();
         let mut has_uri = false;
         let mut has_dns = false;
         for san in params.subject_alt_names {

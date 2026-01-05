@@ -241,6 +241,7 @@ mod tests {
             daemon_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
+            uri_san_enabled: true,
             domains: vec![TEST_DOMAIN.to_string()],
             paths: Paths {
                 cert: cert_path,

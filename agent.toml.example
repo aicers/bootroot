@@ -42,6 +42,7 @@ name = "edge-proxy-a"
 daemon_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
+uri_san_enabled = true
 domains = ["edge-proxy.internal"]
 
 [profiles.paths]
