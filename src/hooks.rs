@@ -214,3 +214,169 @@ where
         .map_err(|e| anyhow::anyhow!("Failed to read hook output: {e}"))?;
     Ok(buffer)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::config::{
+        AcmeSettings, DaemonSettings, HookCommand, HookSettings, Paths, PostRenewHooks,
+        RetrySettings,
+    };
+
+    const TEST_DOMAIN: &str = "example.com";
+    const TEST_SERVER_URL: &str = "https://example.com/acme/directory";
+    const TEST_KEY_PATH: &str = "unused.key";
+
+    fn build_settings(cert_path: PathBuf, hooks: HookSettings) -> Settings {
+        Settings {
+            email: "test@example.com".to_string(),
+            domains: vec![TEST_DOMAIN.to_string()],
+            server: TEST_SERVER_URL.to_string(),
+            paths: Paths {
+                cert: cert_path,
+                key: PathBuf::from(TEST_KEY_PATH),
+            },
+            eab: None,
+            daemon: DaemonSettings {
+                check_interval: "1h".to_string(),
+                renew_before: "720h".to_string(),
+                check_jitter: "0s".to_string(),
+            },
+            acme: AcmeSettings {
+                http_challenge_port: 80,
+                directory_fetch_attempts: 10,
+                directory_fetch_base_delay_secs: 1,
+                directory_fetch_max_delay_secs: 10,
+                poll_attempts: 15,
+                poll_interval_secs: 2,
+            },
+            retry: RetrySettings {
+                backoff_secs: vec![1, 2, 3],
+            },
+            hooks,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_post_renew_success_hook_writes_status() {
+        let dir = tempdir().unwrap();
+        let output_path = dir.path().join("hook.txt");
+        let cert_path = dir.path().join("cert.pem");
+
+        let hook = HookCommand {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "printf \"%s\" \"$RENEW_STATUS\" > \"{}\"",
+                    output_path.display()
+                ),
+            ],
+            timeout_secs: 5,
+            retry_backoff_secs: Vec::new(),
+            on_failure: HookFailurePolicy::Stop,
+        };
+
+        let hooks = HookSettings {
+            post_renew: PostRenewHooks {
+                success: vec![hook],
+                failure: Vec::new(),
+            },
+        };
+
+        let settings = build_settings(cert_path, hooks);
+        run_post_renew_hooks(&settings, HookStatus::Success, None)
+            .await
+            .unwrap();
+
+        let contents = fs::read_to_string(output_path).unwrap();
+        assert_eq!(contents, "success");
+    }
+
+    #[tokio::test]
+    async fn test_post_renew_failure_hook_stop_propagates_error() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+
+        let hook = HookCommand {
+            command: "false".to_string(),
+            args: Vec::new(),
+            timeout_secs: 5,
+            retry_backoff_secs: Vec::new(),
+            on_failure: HookFailurePolicy::Stop,
+        };
+
+        let hooks = HookSettings {
+            post_renew: PostRenewHooks {
+                success: Vec::new(),
+                failure: vec![hook],
+            },
+        };
+
+        let settings = build_settings(cert_path, hooks);
+        let err = run_post_renew_hooks(&settings, HookStatus::Failure, Some("boom".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Hook exited with status"));
+    }
+
+    #[tokio::test]
+    async fn test_post_renew_failure_hook_continue_ignores_error() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+
+        let hook = HookCommand {
+            command: "false".to_string(),
+            args: Vec::new(),
+            timeout_secs: 5,
+            retry_backoff_secs: Vec::new(),
+            on_failure: HookFailurePolicy::Continue,
+        };
+
+        let hooks = HookSettings {
+            post_renew: PostRenewHooks {
+                success: Vec::new(),
+                failure: vec![hook],
+            },
+        };
+
+        let settings = build_settings(cert_path, hooks);
+        run_post_renew_hooks(&settings, HookStatus::Failure, Some("boom".to_string()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_post_renew_hook_timeout_returns_error() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+
+        let hook = HookCommand {
+            command: "sleep".to_string(),
+            args: vec!["2".to_string()],
+            timeout_secs: 1,
+            retry_backoff_secs: Vec::new(),
+            on_failure: HookFailurePolicy::Stop,
+        };
+
+        let hooks = HookSettings {
+            post_renew: PostRenewHooks {
+                success: vec![hook],
+                failure: Vec::new(),
+            },
+        };
+
+        let settings = build_settings(cert_path, hooks);
+        let err = run_post_renew_hooks(&settings, HookStatus::Success, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
+    }
+}
