@@ -155,6 +155,40 @@ Hook behavior notes:
 - `retry_backoff_secs` is optional; when set, hooks retry with the given delays.
 - `on_failure` controls whether failures stop or continue the hook chain.
 
+### Configuration Schema
+
+Defaults (if not provided):
+
+- `server`: `https://localhost:9000/acme/acme/directory`
+- `email`: `admin@example.com`
+- `domains`: `["bootroot-agent"]`
+- `paths.cert`: `certs/cert.pem`
+- `paths.key`: `certs/key.pem`
+- `daemon.check_interval`: `1h`
+- `daemon.renew_before`: `720h`
+- `daemon.check_jitter`: `0s`
+- `acme.http_challenge_port`: `80`
+- `acme.directory_fetch_attempts`: `10`
+- `acme.directory_fetch_base_delay_secs`: `1`
+- `acme.directory_fetch_max_delay_secs`: `10`
+- `acme.poll_attempts`: `15`
+- `acme.poll_interval_secs`: `2`
+- `retry.backoff_secs`: `[5, 10, 30]`
+- `hooks.post_renew.*.timeout_secs`: `30`
+- `hooks.post_renew.*.on_failure`: `continue`
+
+Validation rules:
+
+- `acme.directory_fetch_attempts` > 0
+- `acme.directory_fetch_base_delay_secs` > 0
+- `acme.directory_fetch_max_delay_secs` > 0 and >= base delay
+- `acme.poll_attempts` > 0
+- `acme.poll_interval_secs` > 0
+- `retry.backoff_secs` is non-empty and all values > 0
+- `hooks.post_renew.*.command` is non-empty
+- `hooks.post_renew.*.timeout_secs` > 0
+- `hooks.post_renew.*.retry_backoff_secs` values > 0
+
 ### Operational Guide
 
 - Renewal is triggered when the cert is missing or expires within
