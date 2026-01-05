@@ -149,6 +149,17 @@ Hook environment variables include:
 `CERT_PATH`, `KEY_PATH`, `DOMAINS`, `PRIMARY_DOMAIN`, `RENEWED_AT`,
 `RENEW_STATUS`, `RENEW_ERROR`, `ACME_SERVER_URL`.
 
+### Operational Guide
+
+- Renewal is triggered when the cert is missing or expires within
+  `daemon.renew_before`.
+- Daemon checks run every `daemon.check_interval`, with optional
+  `daemon.check_jitter` to avoid synchronized polling.
+- Issuance retries use `retry.backoff_secs` delays; the last error is logged.
+- Hook failures respect `on_failure` (`continue` or `stop`), with optional
+  `retry_backoff_secs` and `timeout_secs`.
+- Override order is `agent.toml` < ENV < CLI.
+
 ## Directory Structure
 
 - `src/`: Rust source code (ACME client implementation).
