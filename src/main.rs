@@ -297,6 +297,13 @@ fn parse_duration_setting(value: &str, label: &str) -> anyhow::Result<Duration> 
 }
 
 fn jittered_delay(base: Duration, jitter: Duration) -> Duration {
+    let now_ns = time::OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .max(0);
+    jittered_delay_with_seed(base, jitter, now_ns)
+}
+
+fn jittered_delay_with_seed(base: Duration, jitter: Duration, now_ns: i128) -> Duration {
     let jitter_ns = i128::try_from(jitter.as_nanos()).unwrap_or(i128::MAX);
     if jitter_ns == 0 {
         return base;
@@ -304,9 +311,6 @@ fn jittered_delay(base: Duration, jitter: Duration) -> Duration {
 
     let base_ns = i128::try_from(base.as_nanos()).unwrap_or(i128::MAX);
     let span = jitter_ns.saturating_mul(2).saturating_add(1);
-    let now_ns = time::OffsetDateTime::now_utc()
-        .unix_timestamp_nanos()
-        .max(0);
     let offset = (now_ns % span) - jitter_ns;
     let adjusted = (base_ns + offset).max(MIN_DAEMON_CHECK_DELAY_NANOS);
     let adjusted = adjusted.min(i128::from(u64::MAX));
@@ -387,6 +391,9 @@ mod tests {
     const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;
     const VALID_DURATION_LABEL: &str = "daemon.check_interval";
     const TEST_DELAYS: [u64; 3] = [1, 2, 3];
+    const TEST_JITTER_SECS: u64 = 10;
+    const TEST_BASE_SECS: u64 = 60;
+    const TEST_SEED_NS: i128 = 123_456_789;
 
     fn build_settings(cert_path: PathBuf) -> config::Settings {
         config::Settings {
@@ -441,6 +448,29 @@ mod tests {
             err.to_string()
                 .contains("Invalid daemon.check_interval value")
         );
+    }
+
+    #[test]
+    fn test_jittered_delay_zero_jitter_returns_base() {
+        let base = Duration::from_secs(TEST_BASE_SECS);
+        let jitter = Duration::from_secs(0);
+
+        let delay = jittered_delay_with_seed(base, jitter, TEST_SEED_NS);
+
+        assert_eq!(delay, base);
+    }
+
+    #[test]
+    fn test_jittered_delay_bounds() {
+        let base = Duration::from_secs(TEST_BASE_SECS);
+        let jitter = Duration::from_secs(TEST_JITTER_SECS);
+        let delay = jittered_delay_with_seed(base, jitter, TEST_SEED_NS);
+
+        let min = base.saturating_sub(jitter);
+        let max = base + jitter;
+
+        assert!(delay >= min);
+        assert!(delay <= max);
     }
 
     #[tokio::test]
