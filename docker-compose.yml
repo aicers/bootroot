@@ -30,12 +30,11 @@ services:
       - ./certs:/app/certs
       - ./secrets/certs/root_ca.crt:/app/root_ca.crt
       - ./secrets:/app/secrets:ro
+      - ./agent.toml.compose:/app/agent.toml:ro
     command:
       - --oneshot
       - --ca-url=https://bootroot-ca:9000/acme/acme/directory
-      - --domain=bootroot-agent.com
-      - --cert-path=/app/certs/bootroot-agent.crt
-      - --key-path=/app/certs/bootroot-agent.key
+      - --config=/app/agent.toml
     environment:
       - RUST_LOG=debug
     networks:

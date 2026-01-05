@@ -67,6 +67,30 @@ async fn write_cert_and_key(
     Ok(())
 }
 
+fn build_csr_params(
+    profile: &crate::config::ProfileSettings,
+    uri_san: &str,
+) -> Result<rcgen::CertificateParams> {
+    let primary_domain = profile
+        .domains
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No domains configured"))?;
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, primary_domain.clone());
+
+    let mut sans = Vec::new();
+    for d in &profile.domains {
+        let dns_name = d.clone().try_into()?;
+        sans.push(rcgen::SanType::DnsName(dns_name));
+    }
+    let uri = uri_san.try_into()?;
+    sans.push(rcgen::SanType::URI(uri));
+    params.subject_alt_names = sans;
+    Ok(params)
+}
+
 /// Issues a certificate via ACME protocol.
 ///
 /// # Errors
@@ -172,19 +196,7 @@ pub async fn issue_certificate(
         .first()
         .ok_or_else(|| anyhow::anyhow!("No domains configured"))?;
     info!("Generating CSR for domain: {}", primary_domain);
-    let mut params = rcgen::CertificateParams::default();
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, primary_domain.clone());
-
-    let mut sans = Vec::new();
-    for d in &profile.domains {
-        let dns_name = d.clone().try_into()?;
-        sans.push(rcgen::SanType::DnsName(dns_name));
-    }
-    let uri = uri_san.try_into()?;
-    sans.push(rcgen::SanType::URI(uri));
-    params.subject_alt_names = sans;
+    let params = build_csr_params(profile, uri_san)?;
     let cert_key = rcgen::KeyPair::generate()?;
     let csr_der = params.serialize_request(&cert_key)?;
 
@@ -238,10 +250,14 @@ pub async fn issue_certificate(
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     use tempfile::tempdir;
 
     use super::*;
+
+    const TEST_DOMAIN: &str = "example.com";
+    const TEST_URI_SAN: &str = "spiffe://trusted.domain/edge-node-01/edge-proxy/001";
 
     #[tokio::test]
     async fn test_ensure_secrets_dir_permissions() {
@@ -293,5 +309,45 @@ mod tests {
         let key_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(secrets_mode, SECRETS_DIR_MODE);
         assert_eq!(key_mode, KEY_FILE_MODE);
+    }
+
+    #[test]
+    fn test_build_csr_params_includes_uri_san() {
+        let profile = crate::config::ProfileSettings {
+            name: "edge-proxy-a".to_string(),
+            daemon_name: "edge-proxy".to_string(),
+            instance_id: "001".to_string(),
+            hostname: "edge-node-01".to_string(),
+            domains: vec![TEST_DOMAIN.to_string()],
+            paths: crate::config::Paths {
+                cert: PathBuf::from("certs/edge-proxy-a.pem"),
+                key: PathBuf::from("certs/edge-proxy-a.key"),
+            },
+            daemon: crate::config::DaemonSettings::default(),
+            hooks: crate::config::HookSettings::default(),
+            eab: None,
+        };
+
+        let params = build_csr_params(&profile, TEST_URI_SAN).unwrap();
+        let mut has_uri = false;
+        let mut has_dns = false;
+        for san in params.subject_alt_names {
+            match san {
+                rcgen::SanType::URI(uri) => {
+                    if uri.as_str() == TEST_URI_SAN {
+                        has_uri = true;
+                    }
+                }
+                rcgen::SanType::DnsName(dns) => {
+                    if dns.as_str() == TEST_DOMAIN {
+                        has_dns = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(has_uri);
+        assert!(has_dns);
     }
 }

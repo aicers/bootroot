@@ -529,6 +529,7 @@ mod tests {
 
     const TEST_DOMAIN: &str = "example.com";
     const TEST_KEY_PATH: &str = "unused.key";
+    const TEST_TRUST_DOMAIN: &str = "trusted.domain";
     const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;
     const VALID_DURATION_LABEL: &str = "daemon.check_interval";
     const TEST_DELAYS: [u64; 3] = [1, 2, 3];
@@ -557,6 +558,30 @@ mod tests {
         }
     }
 
+    fn build_settings(profiles: Vec<config::ProfileSettings>) -> config::Settings {
+        config::Settings {
+            email: "test@example.com".to_string(),
+            server: "https://example.com/acme/directory".to_string(),
+            spiffe_trust_domain: TEST_TRUST_DOMAIN.to_string(),
+            eab: None,
+            acme: config::AcmeSettings {
+                http_challenge_port: 80,
+                directory_fetch_attempts: 10,
+                directory_fetch_base_delay_secs: 1,
+                directory_fetch_max_delay_secs: 10,
+                poll_attempts: 15,
+                poll_interval_secs: 2,
+            },
+            retry: config::RetrySettings {
+                backoff_secs: vec![1, 2, 3],
+            },
+            scheduler: config::SchedulerSettings {
+                max_concurrent_issuances: 3,
+            },
+            profiles,
+        }
+    }
+
     fn write_cert(cert_path: &PathBuf, not_after: OffsetDateTime) {
         let mut params = CertificateParams::new(vec![TEST_DOMAIN.to_string()]).unwrap();
         let now = OffsetDateTime::now_utc();
@@ -580,6 +605,61 @@ mod tests {
             err.to_string()
                 .contains("Invalid daemon.check_interval value")
         );
+    }
+
+    #[test]
+    fn test_build_spiffe_uri_formats_path() {
+        let profile = build_profile(PathBuf::from("unused.pem"));
+        let settings = build_settings(vec![profile.clone()]);
+
+        let uri = build_spiffe_uri(&settings, &profile);
+
+        assert_eq!(uri, "spiffe://trusted.domain/edge-node-01/edge-proxy/001");
+    }
+
+    #[test]
+    fn test_resolve_profile_eab_prefers_profile() {
+        let profile_eab = config::Eab {
+            kid: "profile".to_string(),
+            hmac: "profile-hmac".to_string(),
+        };
+        let profile = config::ProfileSettings {
+            eab: Some(profile_eab),
+            ..build_profile(PathBuf::from("unused.pem"))
+        };
+
+        let default_eab = Some(eab::EabCredentials {
+            kid: "default".to_string(),
+            hmac: "default-hmac".to_string(),
+        });
+
+        let resolved = resolve_profile_eab(&profile, default_eab).unwrap();
+
+        assert_eq!(resolved.kid, "profile");
+    }
+
+    #[test]
+    fn test_max_concurrent_issuances_rejects_large_value() {
+        let settings = config::Settings {
+            scheduler: config::SchedulerSettings {
+                max_concurrent_issuances: u64::MAX,
+            },
+            ..build_settings(vec![build_profile(PathBuf::from("unused.pem"))])
+        };
+
+        let result = max_concurrent_issuances(&settings);
+
+        let max_usize_u64 = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+        if max_usize_u64 == u64::MAX {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("max_concurrent_issuances")
+            );
+        }
     }
 
     #[test]

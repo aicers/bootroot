@@ -1,0 +1,35 @@
+# Bootroot Agent Docker Compose Config (Multi-Profile)
+
+email = "admin@example.com"
+server = "https://bootroot-ca:9000/acme/acme/directory"
+spiffe_trust_domain = "trusted.domain"
+
+[scheduler]
+max_concurrent_issuances = 1
+
+[acme]
+http_challenge_port = 80
+directory_fetch_attempts = 10
+directory_fetch_base_delay_secs = 1
+directory_fetch_max_delay_secs = 10
+poll_attempts = 15
+poll_interval_secs = 2
+
+[retry]
+backoff_secs = [5, 10, 30]
+
+[[profiles]]
+name = "bootroot-agent"
+daemon_name = "bootroot-agent"
+instance_id = "001"
+hostname = "bootroot-agent"
+domains = ["bootroot-agent.com"]
+
+[profiles.paths]
+cert = "/app/certs/bootroot-agent.crt"
+key = "/app/certs/bootroot-agent.key"
+
+[profiles.daemon]
+check_interval = "1h"
+renew_before = "720h"
+check_jitter = "0s"
