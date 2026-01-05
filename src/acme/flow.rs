@@ -37,6 +37,36 @@ async fn set_key_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn write_cert_and_key(
+    cert_path: &Path,
+    key_path: &Path,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<()> {
+    let cert_dir = cert_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Cert path has no parent directory"))?;
+    fs::create_dir_all(cert_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create cert dir {}: {e}", cert_dir.display()))?;
+
+    let secrets_dir = key_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Key path has no parent directory"))?;
+    ensure_secrets_dir(secrets_dir).await?;
+
+    fs::write(cert_path, cert_pem)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to write cert file: {e}"))?;
+
+    fs::write(key_path, key_pem)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to write key file: {e}"))?;
+    set_key_permissions(key_path).await?;
+
+    Ok(())
+}
+
 /// Issues a certificate via ACME protocol.
 ///
 /// # Errors
@@ -187,23 +217,15 @@ pub async fn issue_certificate(
         let cert_pem = client.download_certificate(&cert_url).await?;
         info!("Certificate received. Saving to files...");
 
-        let secrets_dir = settings
-            .paths
-            .key
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Key path has no parent directory"))?;
-        ensure_secrets_dir(secrets_dir).await?;
-
-        fs::write(&settings.paths.cert, &cert_pem)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to write cert file: {e}"))?;
-        info!("Certificate saved to: {:?}", settings.paths.cert);
-
         let key_pem = cert_key.serialize_pem();
-        fs::write(&settings.paths.key, &key_pem)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to write key file: {e}"))?;
-        set_key_permissions(&settings.paths.key).await?;
+        write_cert_and_key(
+            &settings.paths.cert,
+            &settings.paths.key,
+            &cert_pem,
+            &key_pem,
+        )
+        .await?;
+        info!("Certificate saved to: {:?}", settings.paths.cert);
         info!("Private key saved to: {:?}", settings.paths.key);
     } else {
         info!(
@@ -248,5 +270,30 @@ mod tests {
 
         let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, KEY_FILE_MODE);
+    }
+
+    #[tokio::test]
+    async fn test_write_cert_and_key_creates_files_with_permissions() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("certs").join("cert.pem");
+        let key_path = dir.path().join("secrets").join("key.pem");
+
+        write_cert_and_key(&cert_path, &key_path, "cert-data", "key-data")
+            .await
+            .unwrap();
+
+        let cert_contents = fs::read_to_string(&cert_path).await.unwrap();
+        let key_contents = fs::read_to_string(&key_path).await.unwrap();
+        assert_eq!(cert_contents, "cert-data");
+        assert_eq!(key_contents, "key-data");
+
+        let secrets_mode = std::fs::metadata(key_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let key_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(secrets_mode, SECRETS_DIR_MODE);
+        assert_eq!(key_mode, KEY_FILE_MODE);
     }
 }
