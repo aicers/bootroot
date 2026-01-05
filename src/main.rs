@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, watch};
 use tracing::{error, info};
 
 pub mod acme;
@@ -29,10 +29,6 @@ pub struct Args {
     #[arg(long)]
     email: Option<String>,
 
-    /// Domain to request certificate for
-    #[arg(long)]
-    domain: Option<String>,
-
     /// ACME Directory URL
     #[arg(long)]
     ca_url: Option<String>,
@@ -48,14 +44,6 @@ pub struct Args {
     /// Path to EAB JSON file (optional)
     #[arg(long = "eab-file")]
     eab_file: Option<PathBuf>,
-
-    /// Path to save the certificate
-    #[arg(long)]
-    cert_path: Option<PathBuf>,
-
-    /// Path to save the private key
-    #[arg(long)]
-    key_path: Option<PathBuf>,
 
     /// Run once and exit (disable daemon loop)
     #[arg(long)]
@@ -86,17 +74,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let final_eab = cli_eab.or_else(|| {
-        settings
-            .eab
-            .as_ref()
-            .map(|cfg_eab| crate::eab::EabCredentials {
-                kid: cfg_eab.kid.clone(),
-                hmac: cfg_eab.hmac.clone(),
-            })
-    });
+    let final_eab = cli_eab.or_else(|| settings.eab.as_ref().map(to_eab_credentials));
 
-    info!("Target Domains: {:?}", settings.domains);
+    info!("Loaded {} profile(s).", settings.profiles.len());
     info!("CA URL: {}", settings.server);
 
     if let Some(ref creds) = final_eab {
@@ -109,9 +89,11 @@ async fn main() -> anyhow::Result<()> {
     let _challenge_server =
         acme::start_http01_server(challenges.clone(), settings.acme.http_challenge_port);
 
+    let settings = Arc::new(settings);
+
     // 4. Run ACME Flow
     if args.oneshot {
-        match run_oneshot(&settings, final_eab, challenges).await {
+        match run_oneshot(Arc::clone(&settings), final_eab, challenges).await {
             Ok(()) => info!("Successfully issued certificate!"),
             Err(e) => {
                 error!("Failed to issue certificate: {:?}", e);
@@ -119,33 +101,92 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        run_daemon(&settings, final_eab, challenges).await?;
+        run_daemon(settings, final_eab, challenges).await?;
     }
 
     Ok(())
 }
 
 async fn run_daemon(
-    settings: &config::Settings,
-    eab: Option<eab::EabCredentials>,
+    settings: Arc<config::Settings>,
+    default_eab: Option<eab::EabCredentials>,
     challenges: Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
+    let max_concurrent = max_concurrent_issuances(&settings)?;
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let shutdown_handle = tokio::spawn(async move {
+        if let Err(err) = wait_for_shutdown().await {
+            error!("Shutdown signal handler error: {err}");
+        }
+        let _ = shutdown_tx.send(true);
+    });
+
+    let mut handles = Vec::new();
+    for profile in settings.profiles.clone() {
+        let settings = Arc::clone(&settings);
+        let semaphore = Arc::clone(&semaphore);
+        let shutdown_rx = shutdown_rx.clone();
+        let challenges = challenges.clone();
+        let default_eab = default_eab.clone();
+
+        handles.push(tokio::spawn(async move {
+            run_profile_daemon(
+                settings,
+                profile,
+                default_eab,
+                challenges,
+                semaphore,
+                shutdown_rx,
+            )
+            .await
+        }));
+    }
+
+    let _ = shutdown_handle.await;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => error!("Profile daemon exited with error: {err}"),
+            Err(err) => error!("Profile daemon task join error: {err}"),
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_profile_daemon(
+    settings: Arc<config::Settings>,
+    profile: config::ProfileSettings,
+    default_eab: Option<eab::EabCredentials>,
+    challenges: Arc<Mutex<HashMap<String, String>>>,
+    semaphore: Arc<Semaphore>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let check_interval =
-        parse_duration_setting(&settings.daemon.check_interval, DAEMON_CHECK_INTERVAL_KEY)?;
+        parse_duration_setting(&profile.daemon.check_interval, DAEMON_CHECK_INTERVAL_KEY)?;
     let renew_before =
-        parse_duration_setting(&settings.daemon.renew_before, DAEMON_RENEW_BEFORE_KEY)?;
+        parse_duration_setting(&profile.daemon.renew_before, DAEMON_RENEW_BEFORE_KEY)?;
     let check_jitter =
-        parse_duration_setting(&settings.daemon.check_jitter, DAEMON_CHECK_JITTER_KEY)?;
+        parse_duration_setting(&profile.daemon.check_jitter, DAEMON_CHECK_JITTER_KEY)?;
+    let uri_san = build_spiffe_uri(&settings, &profile);
 
     info!(
-        "Daemon mode enabled. check_interval={:?}, renew_before={:?}, check_jitter={:?}",
-        check_interval, renew_before, check_jitter
+        "Profile '{}' daemon enabled. check_interval={:?}, renew_before={:?}, check_jitter={:?}",
+        profile.name, check_interval, renew_before, check_jitter
     );
 
-    let mut shutdown = Box::pin(wait_for_shutdown());
     let mut first_tick = true;
-
     loop {
+        if *shutdown.borrow() {
+            info!(
+                "Shutdown signal received. Exiting profile '{}'.",
+                profile.name
+            );
+            break;
+        }
+
         let delay = if first_tick {
             first_tick = false;
             Duration::from_secs(0)
@@ -154,49 +195,58 @@ async fn run_daemon(
         };
 
         tokio::select! {
-            result = &mut shutdown => {
-                if let Err(err) = result {
-                    error!("Shutdown signal handler error: {err}");
-                }
-                info!("Shutdown signal received. Exiting daemon loop.");
+            _ = shutdown.changed() => {
+                info!("Shutdown signal received. Exiting profile '{}'.", profile.name);
                 break;
             }
             () = tokio::time::sleep(delay) => {
-                tracing::debug!("Checking certificate renewal status...");
-                match should_renew(settings, renew_before).await {
+                tracing::debug!("Profile '{}' checking renewal status...", profile.name);
+                match should_renew(&profile, renew_before).await {
                     Ok(true) => {
-                        info!("Renewal required. Starting ACME issuance...");
-                        match issue_with_retry(settings, eab.clone(), challenges.clone()).await {
+                        info!("Profile '{}' renewal required. Starting ACME issuance...", profile.name);
+                        let _permit = semaphore.acquire().await?;
+                        let profile_eab = resolve_profile_eab(&profile, default_eab.clone());
+                        match issue_with_retry(
+                            &settings,
+                            &profile,
+                            profile_eab,
+                            challenges.clone(),
+                            &uri_san,
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 if let Err(err) = hooks::run_post_renew_hooks(
-                                    settings,
+                                    &settings,
+                                    &profile,
                                     hooks::HookStatus::Success,
                                     None,
                                 )
                                 .await
                                 {
-                                    error!("Post-renew success hooks failed: {err}");
+                                    error!("Post-renew success hooks failed for '{}': {err}", profile.name);
                                 }
                             }
                             Err(err) => {
-                                error!("Renewal failed after retries. Will try again on next interval.");
+                                error!("Profile '{}' renewal failed after retries: {err}", profile.name);
                                 if let Err(hook_err) = hooks::run_post_renew_hooks(
-                                    settings,
+                                    &settings,
+                                    &profile,
                                     hooks::HookStatus::Failure,
                                     Some(err.to_string()),
                                 )
                                 .await
                                 {
-                                    error!("Post-renew failure hooks failed: {hook_err}");
+                                    error!("Post-renew failure hooks failed for '{}': {hook_err}", profile.name);
                                 }
                             }
                         }
                     }
                     Ok(false) => {
-                        tracing::debug!("Certificate is still valid. No renewal needed.");
+                        tracing::debug!("Profile '{}' certificate still valid.", profile.name);
                     }
                     Err(err) => {
-                        error!("Failed to evaluate renewal status: {err}");
+                        error!("Profile '{}' renewal check failed: {err}", profile.name);
                     }
                 }
             }
@@ -206,13 +256,104 @@ async fn run_daemon(
     Ok(())
 }
 
-async fn issue_with_retry(
-    settings: &config::Settings,
-    eab: Option<eab::EabCredentials>,
+async fn run_oneshot(
+    settings: Arc<config::Settings>,
+    default_eab: Option<eab::EabCredentials>,
     challenges: Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
+    let max_concurrent = max_concurrent_issuances(&settings)?;
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let mut handles = Vec::new();
+
+    for profile in settings.profiles.clone() {
+        let settings = Arc::clone(&settings);
+        let challenges = challenges.clone();
+        let semaphore = Arc::clone(&semaphore);
+        let default_eab = default_eab.clone();
+
+        handles.push(tokio::spawn(async move {
+            run_profile_oneshot(settings, profile, default_eab, challenges, semaphore).await
+        }));
+    }
+
+    let mut first_error = None;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                error!("Profile oneshot failed: {err}");
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+            Err(err) => {
+                error!("Profile oneshot task join error: {err}");
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!("Profile task join error: {err}"));
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+async fn run_profile_oneshot(
+    settings: Arc<config::Settings>,
+    profile: config::ProfileSettings,
+    default_eab: Option<eab::EabCredentials>,
+    challenges: Arc<Mutex<HashMap<String, String>>>,
+    semaphore: Arc<Semaphore>,
+) -> anyhow::Result<()> {
+    let _permit = semaphore.acquire().await?;
+    let uri_san = build_spiffe_uri(&settings, &profile);
+    let profile_eab = resolve_profile_eab(&profile, default_eab);
+
+    match acme::issue_certificate(&settings, &profile, profile_eab, challenges, &uri_san).await {
+        Ok(()) => {
+            if let Err(err) =
+                hooks::run_post_renew_hooks(&settings, &profile, hooks::HookStatus::Success, None)
+                    .await
+            {
+                error!(
+                    "Post-renew success hooks failed for '{}': {err}",
+                    profile.name
+                );
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(hook_err) = hooks::run_post_renew_hooks(
+                &settings,
+                &profile,
+                hooks::HookStatus::Failure,
+                Some(err.to_string()),
+            )
+            .await
+            {
+                error!(
+                    "Post-renew failure hooks failed for '{}': {hook_err}",
+                    profile.name
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn issue_with_retry(
+    settings: &config::Settings,
+    profile: &config::ProfileSettings,
+    eab: Option<eab::EabCredentials>,
+    challenges: Arc<Mutex<HashMap<String, String>>>,
+    uri_san: &str,
+) -> anyhow::Result<()> {
     issue_with_retry_inner(
-        || acme::issue_certificate(settings, eab.clone(), challenges.clone()),
+        || acme::issue_certificate(settings, profile, eab.clone(), challenges.clone(), uri_san),
         |duration| tokio::time::sleep(duration),
         &settings.retry.backoff_secs,
     )
@@ -257,8 +398,38 @@ where
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Certificate issuance failed")))
 }
 
-async fn should_renew(settings: &config::Settings, renew_before: Duration) -> anyhow::Result<bool> {
-    let cert_bytes = match tokio::fs::read(&settings.paths.cert).await {
+fn build_spiffe_uri(settings: &config::Settings, profile: &config::ProfileSettings) -> String {
+    format!(
+        "spiffe://{}/{}/{}/{}",
+        settings.spiffe_trust_domain, profile.hostname, profile.daemon_name, profile.instance_id
+    )
+}
+
+fn resolve_profile_eab(
+    profile: &config::ProfileSettings,
+    default_eab: Option<eab::EabCredentials>,
+) -> Option<eab::EabCredentials> {
+    profile.eab.as_ref().map(to_eab_credentials).or(default_eab)
+}
+
+fn to_eab_credentials(eab: &config::Eab) -> eab::EabCredentials {
+    eab::EabCredentials {
+        kid: eab.kid.clone(),
+        hmac: eab.hmac.clone(),
+    }
+}
+
+fn max_concurrent_issuances(settings: &config::Settings) -> anyhow::Result<usize> {
+    usize::try_from(settings.scheduler.max_concurrent_issuances).map_err(|_| {
+        anyhow::anyhow!("scheduler.max_concurrent_issuances is too large for this platform")
+    })
+}
+
+async fn should_renew(
+    profile: &config::ProfileSettings,
+    renew_before: Duration,
+) -> anyhow::Result<bool> {
+    let cert_bytes = match tokio::fs::read(&profile.paths.cert).await {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             info!("Certificate file not found. Issuing a new certificate.");
@@ -267,7 +438,7 @@ async fn should_renew(settings: &config::Settings, renew_before: Duration) -> an
         Err(err) => {
             return Err(anyhow::anyhow!(
                 "Failed to read certificate file {}: {err}",
-                settings.paths.cert.display()
+                profile.paths.cert.display()
             ));
         }
     };
@@ -345,35 +516,6 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_oneshot(
-    settings: &config::Settings,
-    eab: Option<eab::EabCredentials>,
-    challenges: Arc<Mutex<HashMap<String, String>>>,
-) -> anyhow::Result<()> {
-    match acme::issue_certificate(settings, eab, challenges).await {
-        Ok(()) => {
-            if let Err(err) =
-                hooks::run_post_renew_hooks(settings, hooks::HookStatus::Success, None).await
-            {
-                error!("Post-renew success hooks failed: {err}");
-            }
-            Ok(())
-        }
-        Err(err) => {
-            if let Err(hook_err) = hooks::run_post_renew_hooks(
-                settings,
-                hooks::HookStatus::Failure,
-                Some(err.to_string()),
-            )
-            .await
-            {
-                error!("Post-renew failure hooks failed: {hook_err}");
-            }
-            Err(err)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -386,7 +528,6 @@ mod tests {
     use super::*;
 
     const TEST_DOMAIN: &str = "example.com";
-    const TEST_SERVER_URL: &str = "https://example.com/acme/directory";
     const TEST_KEY_PATH: &str = "unused.key";
     const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;
     const VALID_DURATION_LABEL: &str = "daemon.check_interval";
@@ -395,33 +536,24 @@ mod tests {
     const TEST_BASE_SECS: u64 = 60;
     const TEST_SEED_NS: i128 = 123_456_789;
 
-    fn build_settings(cert_path: PathBuf) -> config::Settings {
-        config::Settings {
-            email: "test@example.com".to_string(),
+    fn build_profile(cert_path: PathBuf) -> config::ProfileSettings {
+        config::ProfileSettings {
+            name: "edge-proxy-a".to_string(),
+            daemon_name: "edge-proxy".to_string(),
+            instance_id: "001".to_string(),
+            hostname: "edge-node-01".to_string(),
             domains: vec![TEST_DOMAIN.to_string()],
-            server: TEST_SERVER_URL.to_string(),
             paths: config::Paths {
                 cert: cert_path,
                 key: PathBuf::from(TEST_KEY_PATH),
             },
-            eab: None,
             daemon: config::DaemonSettings {
                 check_interval: "1h".to_string(),
                 renew_before: "720h".to_string(),
                 check_jitter: "0s".to_string(),
             },
-            acme: config::AcmeSettings {
-                http_challenge_port: 80,
-                directory_fetch_attempts: 10,
-                directory_fetch_base_delay_secs: 1,
-                directory_fetch_max_delay_secs: 10,
-                poll_attempts: 15,
-                poll_interval_secs: 2,
-            },
-            retry: config::RetrySettings {
-                backoff_secs: vec![1, 2, 3],
-            },
             hooks: config::HookSettings::default(),
+            eab: None,
         }
     }
 
@@ -490,9 +622,9 @@ mod tests {
     async fn test_should_renew_when_missing_cert() {
         let dir = tempdir().unwrap();
         let cert_path = dir.path().join("missing.pem");
-        let settings = build_settings(cert_path);
+        let profile = build_profile(cert_path);
 
-        let renew = should_renew(&settings, Duration::from_secs(60))
+        let renew = should_renew(&profile, Duration::from_secs(60))
             .await
             .unwrap();
 
@@ -503,12 +635,12 @@ mod tests {
     async fn test_should_renew_when_far_from_expiry() {
         let dir = tempdir().unwrap();
         let cert_path = dir.path().join("valid.pem");
-        let settings = build_settings(cert_path.clone());
+        let profile = build_profile(cert_path.clone());
 
         let not_after = OffsetDateTime::now_utc() + time::Duration::days(90);
         write_cert(&cert_path, not_after);
 
-        let renew = should_renew(&settings, Duration::from_secs(THIRTY_DAYS_SECS))
+        let renew = should_renew(&profile, Duration::from_secs(THIRTY_DAYS_SECS))
             .await
             .unwrap();
 
@@ -519,12 +651,12 @@ mod tests {
     async fn test_should_renew_when_near_expiry() {
         let dir = tempdir().unwrap();
         let cert_path = dir.path().join("expiring.pem");
-        let settings = build_settings(cert_path.clone());
+        let profile = build_profile(cert_path.clone());
 
         let not_after = OffsetDateTime::now_utc() + time::Duration::days(1);
         write_cert(&cert_path, not_after);
 
-        let renew = should_renew(&settings, Duration::from_secs(THIRTY_DAYS_SECS))
+        let renew = should_renew(&profile, Duration::from_secs(THIRTY_DAYS_SECS))
             .await
             .unwrap();
 
@@ -536,9 +668,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let cert_path = dir.path().join("invalid.pem");
         fs::write(&cert_path, "not a cert").unwrap();
-        let settings = build_settings(cert_path);
+        let profile = build_profile(cert_path);
 
-        let err = should_renew(&settings, Duration::from_secs(THIRTY_DAYS_SECS))
+        let err = should_renew(&profile, Duration::from_secs(THIRTY_DAYS_SECS))
             .await
             .unwrap_err();
 
@@ -562,12 +694,12 @@ mod tests {
     async fn test_should_renew_rejects_large_duration() {
         let dir = tempdir().unwrap();
         let cert_path = dir.path().join("valid.pem");
-        let settings = build_settings(cert_path.clone());
+        let profile = build_profile(cert_path.clone());
 
         let not_after = OffsetDateTime::now_utc() + time::Duration::days(90);
         write_cert(&cert_path, not_after);
 
-        let err = should_renew(&settings, Duration::MAX).await.unwrap_err();
+        let err = should_renew(&profile, Duration::MAX).await.unwrap_err();
 
         assert!(
             err.to_string()

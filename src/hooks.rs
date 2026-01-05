@@ -5,7 +5,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, error, info};
 
-use crate::config::{HookCommand, HookFailurePolicy, Settings};
+use crate::config::{HookCommand, HookFailurePolicy, ProfileSettings, Settings};
 
 const DEFAULT_RETRY_LOG_LABEL: &str = "post_renew";
 const ENV_CERT_PATH: &str = "CERT_PATH";
@@ -38,12 +38,13 @@ impl HookStatus {
 /// Returns error when a hook fails and its policy is set to stop.
 pub async fn run_post_renew_hooks(
     settings: &Settings,
+    profile: &ProfileSettings,
     status: HookStatus,
     error_message: Option<String>,
 ) -> anyhow::Result<()> {
     let hooks = match status {
-        HookStatus::Success => &settings.hooks.post_renew.success,
-        HookStatus::Failure => &settings.hooks.post_renew.failure,
+        HookStatus::Success => &profile.hooks.post_renew.success,
+        HookStatus::Failure => &profile.hooks.post_renew.failure,
     };
 
     if hooks.is_empty() {
@@ -58,7 +59,7 @@ pub async fn run_post_renew_hooks(
     };
 
     for hook in hooks {
-        match run_hook_with_retry(hook, &context, settings).await {
+        match run_hook_with_retry(hook, &context, settings, profile).await {
             Ok(()) => {}
             Err(err) => {
                 error!("Post-renew hook failed (command='{}'): {err}", hook.command);
@@ -79,18 +80,18 @@ struct HookContext {
 }
 
 impl HookContext {
-    fn envs(&self, settings: &Settings) -> Vec<(String, String)> {
-        let primary_domain = settings.domains.first().map_or("", String::as_str);
+    fn envs(&self, settings: &Settings, profile: &ProfileSettings) -> Vec<(String, String)> {
+        let primary_domain = profile.domains.first().map_or("", String::as_str);
         vec![
             (
                 ENV_CERT_PATH.to_string(),
-                settings.paths.cert.display().to_string(),
+                profile.paths.cert.display().to_string(),
             ),
             (
                 ENV_KEY_PATH.to_string(),
-                settings.paths.key.display().to_string(),
+                profile.paths.key.display().to_string(),
             ),
-            (ENV_DOMAINS.to_string(), settings.domains.join(",")),
+            (ENV_DOMAINS.to_string(), profile.domains.join(",")),
             (ENV_PRIMARY_DOMAIN.to_string(), primary_domain.to_string()),
             (
                 ENV_RENEWED_AT.to_string(),
@@ -115,11 +116,12 @@ async fn run_hook_with_retry(
     hook: &HookCommand,
     context: &HookContext,
     settings: &Settings,
+    profile: &ProfileSettings,
 ) -> anyhow::Result<()> {
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        let result = run_hook_command(hook, context, settings).await;
+        let result = run_hook_command(hook, context, settings, profile).await;
         match result {
             Ok(()) => return Ok(()),
             Err(err) => {
@@ -142,6 +144,7 @@ async fn run_hook_command(
     hook: &HookCommand,
     context: &HookContext,
     settings: &Settings,
+    profile: &ProfileSettings,
 ) -> anyhow::Result<()> {
     info!(
         "Running post-renew hook ({}): {} {:?}",
@@ -151,7 +154,7 @@ async fn run_hook_command(
     let mut command = Command::new(&hook.command);
     command
         .args(&hook.args)
-        .envs(context.envs(settings))
+        .envs(context.envs(settings, profile))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -225,28 +228,38 @@ mod tests {
     use super::*;
     use crate::config::{
         AcmeSettings, DaemonSettings, HookCommand, HookSettings, Paths, PostRenewHooks,
-        RetrySettings,
+        ProfileSettings, RetrySettings, SchedulerSettings, Settings,
     };
 
     const TEST_DOMAIN: &str = "example.com";
     const TEST_SERVER_URL: &str = "https://example.com/acme/directory";
     const TEST_KEY_PATH: &str = "unused.key";
 
-    fn build_settings(cert_path: PathBuf, hooks: HookSettings) -> Settings {
-        Settings {
-            email: "test@example.com".to_string(),
+    fn build_settings(cert_path: PathBuf, hooks: HookSettings) -> (Settings, ProfileSettings) {
+        let profile = ProfileSettings {
+            name: "edge-proxy-a".to_string(),
+            daemon_name: "edge-proxy".to_string(),
+            instance_id: "001".to_string(),
+            hostname: "edge-node-01".to_string(),
             domains: vec![TEST_DOMAIN.to_string()],
-            server: TEST_SERVER_URL.to_string(),
             paths: Paths {
                 cert: cert_path,
                 key: PathBuf::from(TEST_KEY_PATH),
             },
-            eab: None,
             daemon: DaemonSettings {
                 check_interval: "1h".to_string(),
                 renew_before: "720h".to_string(),
                 check_jitter: "0s".to_string(),
             },
+            hooks,
+            eab: None,
+        };
+
+        let settings = Settings {
+            email: "test@example.com".to_string(),
+            server: TEST_SERVER_URL.to_string(),
+            spiffe_trust_domain: "trusted.domain".to_string(),
+            eab: None,
             acme: AcmeSettings {
                 http_challenge_port: 80,
                 directory_fetch_attempts: 10,
@@ -258,8 +271,13 @@ mod tests {
             retry: RetrySettings {
                 backoff_secs: vec![1, 2, 3],
             },
-            hooks,
-        }
+            scheduler: SchedulerSettings {
+                max_concurrent_issuances: 1,
+            },
+            profiles: vec![profile.clone()],
+        };
+
+        (settings, profile)
     }
 
     #[tokio::test]
@@ -289,8 +307,8 @@ mod tests {
             },
         };
 
-        let settings = build_settings(cert_path, hooks);
-        run_post_renew_hooks(&settings, HookStatus::Success, None)
+        let (settings, profile) = build_settings(cert_path, hooks);
+        run_post_renew_hooks(&settings, &profile, HookStatus::Success, None)
             .await
             .unwrap();
 
@@ -318,10 +336,15 @@ mod tests {
             },
         };
 
-        let settings = build_settings(cert_path, hooks);
-        let err = run_post_renew_hooks(&settings, HookStatus::Failure, Some("boom".to_string()))
-            .await
-            .unwrap_err();
+        let (settings, profile) = build_settings(cert_path, hooks);
+        let err = run_post_renew_hooks(
+            &settings,
+            &profile,
+            HookStatus::Failure,
+            Some("boom".to_string()),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.to_string().contains("Hook exited with status"));
     }
@@ -346,10 +369,15 @@ mod tests {
             },
         };
 
-        let settings = build_settings(cert_path, hooks);
-        run_post_renew_hooks(&settings, HookStatus::Failure, Some("boom".to_string()))
-            .await
-            .unwrap();
+        let (settings, profile) = build_settings(cert_path, hooks);
+        run_post_renew_hooks(
+            &settings,
+            &profile,
+            HookStatus::Failure,
+            Some("boom".to_string()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -372,8 +400,8 @@ mod tests {
             },
         };
 
-        let settings = build_settings(cert_path, hooks);
-        let err = run_post_renew_hooks(&settings, HookStatus::Success, None)
+        let (settings, profile) = build_settings(cert_path, hooks);
+        let err = run_post_renew_hooks(&settings, &profile, HookStatus::Success, None)
             .await
             .unwrap_err();
 
