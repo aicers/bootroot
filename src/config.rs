@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use anyhow::Result;
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 
@@ -130,6 +131,40 @@ impl Settings {
             key_path.clone_into(&mut self.paths.key);
         }
     }
+
+    /// Validates configuration values for correctness.
+    ///
+    /// # Errors
+    /// Returns error if any setting is invalid or out of range.
+    pub fn validate(&self) -> Result<()> {
+        if self.acme.directory_fetch_attempts == 0 {
+            anyhow::bail!("acme.directory_fetch_attempts must be greater than 0");
+        }
+        if self.acme.poll_attempts == 0 {
+            anyhow::bail!("acme.poll_attempts must be greater than 0");
+        }
+        if self.acme.poll_interval_secs == 0 {
+            anyhow::bail!("acme.poll_interval_secs must be greater than 0");
+        }
+        if self.acme.directory_fetch_base_delay_secs == 0 {
+            anyhow::bail!("acme.directory_fetch_base_delay_secs must be greater than 0");
+        }
+        if self.acme.directory_fetch_max_delay_secs == 0 {
+            anyhow::bail!("acme.directory_fetch_max_delay_secs must be greater than 0");
+        }
+        if self.acme.directory_fetch_base_delay_secs > self.acme.directory_fetch_max_delay_secs {
+            anyhow::bail!(
+                "acme.directory_fetch_base_delay_secs must be <= acme.directory_fetch_max_delay_secs"
+            );
+        }
+        if self.retry.backoff_secs.is_empty() {
+            anyhow::bail!("retry.backoff_secs must not be empty");
+        }
+        if self.retry.backoff_secs.contains(&0) {
+            anyhow::bail!("retry.backoff_secs values must be greater than 0");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +247,21 @@ mod tests {
             settings.server,
             "https://localhost:9000/acme/acme/directory"
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_acme_settings() {
+        let mut settings = Settings::new(None).unwrap();
+        settings.acme.directory_fetch_attempts = 0;
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("directory_fetch_attempts"));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_retry_backoff() {
+        let mut settings = Settings::new(None).unwrap();
+        settings.retry.backoff_secs = Vec::new();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("retry.backoff_secs"));
     }
 }
