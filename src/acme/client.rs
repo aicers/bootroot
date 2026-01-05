@@ -716,4 +716,91 @@ mod tests {
 
         assert_eq!(order.status, crate::acme::types::OrderStatus::Pending);
     }
+
+    #[tokio::test]
+    async fn test_fetch_directory_fails_after_retries() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("GET"))
+            .and(path("/directory"))
+            .respond_with(DirectoryResponder {
+                calls: Arc::clone(&calls),
+                directory_body: serde_json::json!({"not": "used"}),
+            })
+            .mount(&server)
+            .await;
+
+        let mut client =
+            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let err = client.fetch_directory().await.unwrap_err();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_nonce_missing_header() {
+        let server = MockServer::start().await;
+        let directory_body = serde_json::json!({
+            "newNonce": format!("{}/nonce", server.uri()),
+            "newAccount": format!("{}/account", server.uri()),
+            "newOrder": format!("{}/order", server.uri()),
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/directory"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&directory_body))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/nonce"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut client =
+            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let err = client.get_nonce().await.unwrap_err();
+
+        assert!(err.to_string().contains("Missing Replay-Nonce header"));
+    }
+
+    #[tokio::test]
+    async fn test_post_as_get_non_success_status() {
+        let server = MockServer::start().await;
+        let directory_body = serde_json::json!({
+            "newNonce": format!("{}/nonce", server.uri()),
+            "newAccount": format!("{}/account", server.uri()),
+            "newOrder": format!("{}/order", server.uri()),
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/directory"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&directory_body))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/nonce"))
+            .respond_with(ResponseTemplate::new(200).insert_header("replay-nonce", "nonce-xyz"))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/order/2"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&server)
+            .await;
+
+        let mut client =
+            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let err = client
+            .poll_order(&format!("{}/order/2", server.uri()))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Poll order failed"));
+    }
 }
