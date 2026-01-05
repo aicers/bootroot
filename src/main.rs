@@ -149,7 +149,7 @@ async fn run_daemon(
                 break;
             }
             _ = ticker.tick() => {
-                info!("Checking certificate renewal status...");
+                tracing::debug!("Checking certificate renewal status...");
                 match should_renew(settings, renew_before).await {
                     Ok(true) => {
                         info!("Renewal required. Starting ACME issuance...");
@@ -158,7 +158,7 @@ async fn run_daemon(
                         }
                     }
                     Ok(false) => {
-                        info!("Certificate is still valid. No renewal needed.");
+                        tracing::debug!("Certificate is still valid. No renewal needed.");
                     }
                     Err(err) => {
                         error!("Failed to evaluate renewal status: {err}");

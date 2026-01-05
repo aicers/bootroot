@@ -86,7 +86,7 @@ pub async fn issue_certificate(
     }
 
     client.fetch_directory().await?;
-    info!("Directory loaded.");
+    tracing::debug!("Directory loaded.");
 
     let nonce = client.get_nonce().await?;
     tracing::debug!("Got initial nonce: {}", nonce);
@@ -106,11 +106,11 @@ pub async fn issue_certificate(
     info!("Order created: {:?}", order);
 
     for authz_url in &order.authorizations {
-        info!("Fetching authorization: {}", authz_url);
+        tracing::debug!("Fetching authorization: {}", authz_url);
         let mut authz = client.fetch_authorization(authz_url).await?;
 
         if authz.status == AuthorizationStatus::Valid {
-            info!("Authorization already valid.");
+            tracing::debug!("Authorization already valid.");
             continue;
         }
 
@@ -121,23 +121,23 @@ pub async fn issue_certificate(
         {
             let challenge_token = challenge_ref.token.clone();
             let challenge_url = challenge_ref.url.clone();
-            info!("Found HTTP-01 challenge: token={challenge_token}");
+            tracing::debug!("Found HTTP-01 challenge: token={challenge_token}");
 
             let key_auth = client.compute_key_authorization(&challenge_token)?;
-            info!("Key Authorization computed: {key_auth}");
+            tracing::debug!("Key Authorization computed: {key_auth}");
 
             {
                 let mut guard = challenges.lock().await;
                 guard.insert(challenge_token.clone(), key_auth);
             }
 
-            info!("Triggering challenge validation...");
+            tracing::debug!("Triggering challenge validation...");
             client.trigger_challenge(&challenge_url).await?;
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 authz = client.fetch_authorization(authz_url).await?;
-                info!("Authz status: {:?}", authz.status);
+                tracing::debug!("Authz status: {:?}", authz.status);
                 tracing::debug!("Full Authz: {:?}", authz);
 
                 if authz.status == AuthorizationStatus::Valid {
@@ -194,7 +194,7 @@ pub async fn issue_certificate(
     if finalized_order.status == OrderStatus::Processing {
         if let Some(url) = &order.url {
             for i in 0..settings.acme.poll_attempts {
-                info!("Order processing (attempt {})...", i + 1);
+                tracing::debug!("Order processing (attempt {})...", i + 1);
                 tokio::time::sleep(std::time::Duration::from_secs(
                     settings.acme.poll_interval_secs,
                 ))
