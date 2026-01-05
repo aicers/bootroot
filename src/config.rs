@@ -34,6 +34,7 @@ pub struct Eab {
 pub struct DaemonSettings {
     pub check_interval: String,
     pub renew_before: String,
+    pub check_jitter: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -93,6 +94,7 @@ const DEFAULT_KEY_PATH: &str = "certs/key.pem";
 const DEFAULT_DOMAIN: &str = "bootroot-agent";
 const DEFAULT_CHECK_INTERVAL: &str = "1h";
 const DEFAULT_RENEW_BEFORE: &str = "720h";
+const DEFAULT_CHECK_JITTER: &str = "0s";
 const DEFAULT_HTTP_CHALLENGE_PORT: u16 = 80;
 const DEFAULT_DIRECTORY_FETCH_ATTEMPTS: u64 = 10;
 const DEFAULT_DIRECTORY_FETCH_BASE_DELAY_SECS: u64 = 1;
@@ -123,6 +125,7 @@ impl Settings {
             .set_default("domains", vec![DEFAULT_DOMAIN])?
             .set_default("daemon.check_interval", DEFAULT_CHECK_INTERVAL)?
             .set_default("daemon.renew_before", DEFAULT_RENEW_BEFORE)?
+            .set_default("daemon.check_jitter", DEFAULT_CHECK_JITTER)?
             .set_default("acme.http_challenge_port", DEFAULT_HTTP_CHALLENGE_PORT)?
             .set_default(
                 "acme.directory_fetch_attempts",
@@ -255,6 +258,7 @@ mod tests {
         );
         assert_eq!(settings.daemon.check_interval, "1h");
         assert_eq!(settings.daemon.renew_before, "720h");
+        assert_eq!(settings.daemon.check_jitter, "0s");
         assert_eq!(settings.acme.http_challenge_port, 80);
         assert_eq!(settings.acme.directory_fetch_attempts, 10);
         assert_eq!(settings.acme.directory_fetch_base_delay_secs, 1);

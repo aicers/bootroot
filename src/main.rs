@@ -15,6 +15,8 @@ pub mod hooks;
 
 const DAEMON_CHECK_INTERVAL_KEY: &str = "daemon.check_interval";
 const DAEMON_RENEW_BEFORE_KEY: &str = "daemon.renew_before";
+const DAEMON_CHECK_JITTER_KEY: &str = "daemon.check_jitter";
+const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = 1_000_000_000;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -132,16 +134,25 @@ async fn run_daemon(
         parse_duration_setting(&settings.daemon.check_interval, DAEMON_CHECK_INTERVAL_KEY)?;
     let renew_before =
         parse_duration_setting(&settings.daemon.renew_before, DAEMON_RENEW_BEFORE_KEY)?;
+    let check_jitter =
+        parse_duration_setting(&settings.daemon.check_jitter, DAEMON_CHECK_JITTER_KEY)?;
 
     info!(
-        "Daemon mode enabled. check_interval={:?}, renew_before={:?}",
-        check_interval, renew_before
+        "Daemon mode enabled. check_interval={:?}, renew_before={:?}, check_jitter={:?}",
+        check_interval, renew_before, check_jitter
     );
 
-    let mut ticker = tokio::time::interval(check_interval);
     let mut shutdown = Box::pin(wait_for_shutdown());
+    let mut first_tick = true;
 
     loop {
+        let delay = if first_tick {
+            first_tick = false;
+            Duration::from_secs(0)
+        } else {
+            jittered_delay(check_interval, check_jitter)
+        };
+
         tokio::select! {
             result = &mut shutdown => {
                 if let Err(err) = result {
@@ -150,7 +161,7 @@ async fn run_daemon(
                 info!("Shutdown signal received. Exiting daemon loop.");
                 break;
             }
-            _ = ticker.tick() => {
+            () = tokio::time::sleep(delay) => {
                 tracing::debug!("Checking certificate renewal status...");
                 match should_renew(settings, renew_before).await {
                     Ok(true) => {
@@ -285,6 +296,25 @@ fn parse_duration_setting(value: &str, label: &str) -> anyhow::Result<Duration> 
         .map_err(|e| anyhow::anyhow!("Invalid {label} value '{value}': {e}"))
 }
 
+fn jittered_delay(base: Duration, jitter: Duration) -> Duration {
+    let jitter_ns = i128::try_from(jitter.as_nanos()).unwrap_or(i128::MAX);
+    if jitter_ns == 0 {
+        return base;
+    }
+
+    let base_ns = i128::try_from(base.as_nanos()).unwrap_or(i128::MAX);
+    let span = jitter_ns.saturating_mul(2).saturating_add(1);
+    let now_ns = time::OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .max(0);
+    let offset = (now_ns % span) - jitter_ns;
+    let adjusted = (base_ns + offset).max(MIN_DAEMON_CHECK_DELAY_NANOS);
+    let adjusted = adjusted.min(i128::from(u64::MAX));
+    let adjusted = u64::try_from(adjusted).unwrap_or(u64::MAX);
+
+    Duration::from_nanos(adjusted)
+}
+
 async fn wait_for_shutdown() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -371,6 +401,7 @@ mod tests {
             daemon: config::DaemonSettings {
                 check_interval: "1h".to_string(),
                 renew_before: "720h".to_string(),
+                check_jitter: "0s".to_string(),
             },
             acme: config::AcmeSettings {
                 http_challenge_port: 80,
