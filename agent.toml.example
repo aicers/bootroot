@@ -23,6 +23,8 @@ key = "certs/key.pem"
 check_interval = "1h"
 # Start renewal 30 days (720h) before expiry
 renew_before = "720h"
+# Randomize check interval by +/- jitter (0s disables)
+check_jitter = "0s"
 
 # ACME behavior settings
 [acme]

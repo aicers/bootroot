@@ -75,6 +75,9 @@ verify these locally before proposing any code. Breakdown:
   * Use `const` for fixed values instead of "magic strings/numbers".
   * Define constants at the **top of the file**, not inside functions.
   * **Tests**: Keep test-only constants near the tests for readability.
+* **Type Casting (`as`)**:
+  * Use `as` only when the conversion is 100% safe.
+  * Otherwise use `num_traits` conversions and handle errors explicitly.
 * **Types**:
   * Prefer `enum` over `String` whenever a finite set of values is expected.
 * **Comments**:
