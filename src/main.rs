@@ -473,6 +473,19 @@ mod tests {
         assert!(delay <= max);
     }
 
+    #[test]
+    fn test_jittered_delay_minimum_floor() {
+        let base = Duration::from_secs(2);
+        let jitter = Duration::from_secs(10);
+        let delay = jittered_delay_with_seed(base, jitter, 0);
+
+        let min = Duration::from_nanos(u64::try_from(MIN_DAEMON_CHECK_DELAY_NANOS).unwrap());
+        let max = base + jitter;
+
+        assert!(delay >= min);
+        assert!(delay <= max);
+    }
+
     #[tokio::test]
     async fn test_should_renew_when_missing_cert() {
         let dir = tempdir().unwrap();
