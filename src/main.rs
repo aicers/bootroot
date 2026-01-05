@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. Override Config with CLI Args
     settings.merge_with_args(&args);
+    settings.validate()?;
 
     // 3. Resolve EAB Credentials
     // Priority: CLI Args > Config File
