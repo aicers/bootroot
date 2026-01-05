@@ -46,11 +46,22 @@ backoff_secs = [5, 10, 30]
 [hooks.post_renew]
 # Commands to run after a successful renewal
 # success = [
-#   { command = "nginx", args = ["-s", "reload"], timeout_secs = 30, on_failure = "continue" }
+#   {
+#     command = "nginx"
+#     args = ["-s", "reload"]
+#     timeout_secs = 30
+#     retry_backoff_secs = [5, 10, 30]
+#     on_failure = "continue"
+#   }
 # ]
 # Commands to run after a failed renewal
 # failure = [
-#   { command = "logger", args = ["bootroot renewal failed"], timeout_secs = 30 }
+#   {
+#     command = "logger"
+#     args = ["bootroot renewal failed"]
+#     timeout_secs = 30
+#     on_failure = "stop"
+#   }
 # ]
 
 # Optional External Account Binding (EAB) Credentials
