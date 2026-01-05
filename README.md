@@ -149,6 +149,12 @@ Hook environment variables include:
 `CERT_PATH`, `KEY_PATH`, `DOMAINS`, `PRIMARY_DOMAIN`, `RENEWED_AT`,
 `RENEW_STATUS`, `RENEW_ERROR`, `ACME_SERVER_URL`.
 
+Hook behavior notes:
+
+- `timeout_secs` defaults to 30 seconds.
+- `retry_backoff_secs` is optional; when set, hooks retry with the given delays.
+- `on_failure` controls whether failures stop or continue the hook chain.
+
 ### Operational Guide
 
 - Renewal is triggered when the cert is missing or expires within
