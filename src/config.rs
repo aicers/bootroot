@@ -147,9 +147,17 @@ impl Settings {
         // Add file source (required = false, so it doesn't panic if missing)
         s = s.add_source(File::from(path).required(false));
 
-        // 3. Environment Variables
-        // e.g. BOOTROOT_EMAIL, BOOTROOT_SERVER
-        s = s.add_source(Environment::with_prefix("BOOTROOT").separator("_"));
+        // 3. Environment Variables (double-underscore for nesting)
+        // e.g. BOOTROOT_EMAIL, BOOTROOT_PATHS__CERT, BOOTROOT_DAEMON__RENEW_BEFORE
+        s = s.add_source(
+            Environment::with_prefix("BOOTROOT")
+                .separator("__")
+                .try_parsing(true)
+                .ignore_empty(true)
+                .list_separator(",")
+                .with_list_parse_key("domains")
+                .with_list_parse_key("retry.backoff_secs"),
+        );
 
         // 4. Build
         s.build()?.try_deserialize()

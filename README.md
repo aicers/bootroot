@@ -105,6 +105,21 @@ check_interval = "1h"
 renew_before = "720h"
 ```
 
+### Environment Overrides
+
+Environment variables override `agent.toml`, and CLI flags override
+environment variables.
+
+Nested keys use double underscores. Examples:
+
+```bash
+export BOOTROOT_EMAIL="ops@example.com"
+export BOOTROOT_PATHS__CERT="/etc/bootroot/cert.pem"
+export BOOTROOT_DAEMON__RENEW_BEFORE="720h"
+export BOOTROOT_DOMAINS="example.com,api.example.com"
+export BOOTROOT_RETRY__BACKOFF_SECS="5,10,30"
+```
+
 ### Post-Renewal Hooks
 
 You can run commands after a renewal succeeds or fails:
