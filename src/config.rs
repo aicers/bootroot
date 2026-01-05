@@ -43,6 +43,8 @@ pub struct ProfileSettings {
     #[serde(default)]
     pub daemon: DaemonSettings,
     #[serde(default)]
+    pub retry: Option<RetrySettings>,
+    #[serde(default)]
     pub hooks: HookSettings,
     pub eab: Option<Eab>,
 }
@@ -97,10 +99,14 @@ pub struct HookCommand {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
     #[serde(default = "default_hook_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default)]
     pub retry_backoff_secs: Vec<u64>,
+    #[serde(default)]
+    pub max_output_bytes: Option<u64>,
     #[serde(default)]
     pub on_failure: HookFailurePolicy,
 }
@@ -263,9 +269,7 @@ impl Settings {
         if self.retry.backoff_secs.is_empty() {
             anyhow::bail!("retry.backoff_secs must not be empty");
         }
-        if self.retry.backoff_secs.contains(&0) {
-            anyhow::bail!("retry.backoff_secs values must be greater than 0");
-        }
+        Self::validate_retry_settings(&self.retry.backoff_secs, "retry.backoff_secs")?;
         if self.scheduler.max_concurrent_issuances == 0 {
             anyhow::bail!("scheduler.max_concurrent_issuances must be greater than 0");
         }
@@ -309,6 +313,9 @@ impl Settings {
         if profile.paths.key.as_os_str().is_empty() {
             anyhow::bail!("profiles.paths.key must not be empty");
         }
+        if let Some(retry) = &profile.retry {
+            Self::validate_retry_settings(&retry.backoff_secs, "profiles.retry.backoff_secs")?;
+        }
         Self::validate_hook_commands(
             &profile.hooks.post_renew.success,
             "profiles.hooks.post_renew.success",
@@ -325,12 +332,30 @@ impl Settings {
             if hook.command.trim().is_empty() {
                 anyhow::bail!("{label} hook command must not be empty");
             }
+            if let Some(working_dir) = &hook.working_dir
+                && working_dir.as_os_str().is_empty()
+            {
+                anyhow::bail!("{label} hook working_dir must not be empty");
+            }
             if hook.timeout_secs == 0 {
                 anyhow::bail!("{label} hook timeout_secs must be greater than 0");
             }
-            if hook.retry_backoff_secs.contains(&0) {
-                anyhow::bail!("{label} hook retry_backoff_secs values must be greater than 0");
+            Self::validate_retry_settings(
+                &hook.retry_backoff_secs,
+                &format!("{label} hook retry_backoff_secs"),
+            )?;
+            if let Some(max_output_bytes) = hook.max_output_bytes
+                && max_output_bytes == 0
+            {
+                anyhow::bail!("{label} hook max_output_bytes must be greater than 0");
             }
+        }
+        Ok(())
+    }
+
+    fn validate_retry_settings(backoff_secs: &[u64], label: &str) -> Result<()> {
+        if backoff_secs.contains(&0) {
+            anyhow::bail!("{label} values must be greater than 0");
         }
         Ok(())
     }
@@ -483,8 +508,10 @@ mod tests {
         settings.profiles[0].hooks.post_renew.success = vec![HookCommand {
             command: "   ".to_string(),
             args: Vec::new(),
+            working_dir: None,
             timeout_secs: 30,
             retry_backoff_secs: Vec::new(),
+            max_output_bytes: None,
             on_failure: HookFailurePolicy::Continue,
         }];
 
@@ -503,8 +530,10 @@ mod tests {
         settings.profiles[0].hooks.post_renew.failure = vec![HookCommand {
             command: "true".to_string(),
             args: Vec::new(),
+            working_dir: None,
             timeout_secs: 0,
             retry_backoff_secs: Vec::new(),
+            max_output_bytes: None,
             on_failure: HookFailurePolicy::Continue,
         }];
 
@@ -520,8 +549,10 @@ mod tests {
         settings.profiles[0].hooks.post_renew.success = vec![HookCommand {
             command: "true".to_string(),
             args: Vec::new(),
+            working_dir: None,
             timeout_secs: 30,
             retry_backoff_secs: vec![0],
+            max_output_bytes: None,
             on_failure: HookFailurePolicy::Continue,
         }];
 
@@ -534,5 +565,56 @@ mod tests {
         let settings = Settings::new(None).unwrap();
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("profiles must not be empty"));
+    }
+
+    #[test]
+    fn test_validate_rejects_hook_working_dir_empty() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].hooks.post_renew.success = vec![HookCommand {
+            command: "true".to_string(),
+            args: Vec::new(),
+            working_dir: Some(PathBuf::new()),
+            timeout_secs: 30,
+            retry_backoff_secs: Vec::new(),
+            max_output_bytes: None,
+            on_failure: HookFailurePolicy::Continue,
+        }];
+
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("working_dir"));
+    }
+
+    #[test]
+    fn test_validate_rejects_hook_max_output_zero() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].hooks.post_renew.success = vec![HookCommand {
+            command: "true".to_string(),
+            args: Vec::new(),
+            working_dir: None,
+            timeout_secs: 30,
+            retry_backoff_secs: Vec::new(),
+            max_output_bytes: Some(0),
+            on_failure: HookFailurePolicy::Continue,
+        }];
+
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("max_output_bytes"));
+    }
+
+    #[test]
+    fn test_validate_rejects_profile_retry_backoff_zero() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].retry = Some(RetrySettings {
+            backoff_secs: vec![0],
+        });
+
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles.retry.backoff_secs"));
     }
 }

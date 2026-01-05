@@ -327,6 +327,7 @@ mod tests {
                 key: PathBuf::from("certs/edge-proxy-a.key"),
             },
             daemon: crate::config::DaemonSettings::default(),
+            retry: None,
             hooks: crate::config::HookSettings::default(),
             eab: None,
         };
