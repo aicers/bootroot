@@ -14,6 +14,8 @@ pub struct Settings {
     pub daemon: DaemonSettings,
     pub acme: AcmeSettings,
     pub retry: RetrySettings,
+    #[serde(default)]
+    pub hooks: HookSettings,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -49,6 +51,41 @@ pub struct RetrySettings {
     pub backoff_secs: Vec<u64>,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HookSettings {
+    #[serde(default)]
+    pub post_renew: PostRenewHooks,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PostRenewHooks {
+    #[serde(default)]
+    pub success: Vec<HookCommand>,
+    #[serde(default)]
+    pub failure: Vec<HookCommand>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HookCommand {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_hook_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub retry_backoff_secs: Vec<u64>,
+    #[serde(default)]
+    pub on_failure: HookFailurePolicy,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailurePolicy {
+    #[default]
+    Continue,
+    Stop,
+}
+
 const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_EMAIL: &str = "admin@example.com";
 const DEFAULT_CERT_PATH: &str = "certs/cert.pem";
@@ -63,6 +100,11 @@ const DEFAULT_DIRECTORY_FETCH_MAX_DELAY_SECS: u64 = 10;
 const DEFAULT_POLL_ATTEMPTS: u64 = 15;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
 const DEFAULT_RETRY_BACKOFF_SECS: [u64; 3] = [5, 10, 30];
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
+
+fn default_hook_timeout_secs() -> u64 {
+    DEFAULT_HOOK_TIMEOUT_SECS
+}
 
 impl Settings {
     /// Creates a new `Settings` instance.
@@ -163,6 +205,28 @@ impl Settings {
         if self.retry.backoff_secs.contains(&0) {
             anyhow::bail!("retry.backoff_secs values must be greater than 0");
         }
+        self.validate_hooks()?;
+        Ok(())
+    }
+
+    fn validate_hooks(&self) -> Result<()> {
+        Self::validate_hook_commands(&self.hooks.post_renew.success, "hooks.post_renew.success")?;
+        Self::validate_hook_commands(&self.hooks.post_renew.failure, "hooks.post_renew.failure")?;
+        Ok(())
+    }
+
+    fn validate_hook_commands(hooks: &[HookCommand], label: &str) -> Result<()> {
+        for hook in hooks {
+            if hook.command.trim().is_empty() {
+                anyhow::bail!("{label} hook command must not be empty");
+            }
+            if hook.timeout_secs == 0 {
+                anyhow::bail!("{label} hook timeout_secs must be greater than 0");
+            }
+            if hook.retry_backoff_secs.contains(&0) {
+                anyhow::bail!("{label} hook retry_backoff_secs values must be greater than 0");
+            }
+        }
         Ok(())
     }
 }
@@ -190,6 +254,8 @@ mod tests {
         assert_eq!(settings.acme.poll_attempts, 15);
         assert_eq!(settings.acme.poll_interval_secs, 2);
         assert_eq!(settings.retry.backoff_secs, vec![5, 10, 30]);
+        assert!(settings.hooks.post_renew.success.is_empty());
+        assert!(settings.hooks.post_renew.failure.is_empty());
     }
 
     #[test]
@@ -263,5 +329,50 @@ mod tests {
         settings.retry.backoff_secs = Vec::new();
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("retry.backoff_secs"));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_hook_command() {
+        let mut settings = Settings::new(None).unwrap();
+        settings.hooks.post_renew.success = vec![HookCommand {
+            command: "   ".to_string(),
+            args: Vec::new(),
+            timeout_secs: 30,
+            retry_backoff_secs: Vec::new(),
+            on_failure: HookFailurePolicy::Continue,
+        }];
+
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("hooks.post_renew.success"));
+    }
+
+    #[test]
+    fn test_validate_rejects_hook_timeout_zero() {
+        let mut settings = Settings::new(None).unwrap();
+        settings.hooks.post_renew.failure = vec![HookCommand {
+            command: "true".to_string(),
+            args: Vec::new(),
+            timeout_secs: 0,
+            retry_backoff_secs: Vec::new(),
+            on_failure: HookFailurePolicy::Continue,
+        }];
+
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("timeout_secs"));
+    }
+
+    #[test]
+    fn test_validate_rejects_hook_retry_backoff_zero() {
+        let mut settings = Settings::new(None).unwrap();
+        settings.hooks.post_renew.success = vec![HookCommand {
+            command: "true".to_string(),
+            args: Vec::new(),
+            timeout_secs: 30,
+            retry_backoff_secs: vec![0],
+            on_failure: HookFailurePolicy::Continue,
+        }];
+
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("retry_backoff_secs"));
     }
 }

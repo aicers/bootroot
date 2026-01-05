@@ -73,7 +73,8 @@ verify these locally before proposing any code. Breakdown:
 
 * **Constants**:
   * Use `const` for fixed values instead of "magic strings/numbers".
-  * Define all constants at the **top of the file**, not inside functions.
+  * Define constants at the **top of the file**, not inside functions.
+  * **Tests**: Keep test-only constants near the tests for readability.
 * **Types**:
   * Prefer `enum` over `String` whenever a finite set of values is expected.
 * **Comments**:

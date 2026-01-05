@@ -11,6 +11,7 @@ use tracing::{error, info};
 pub mod acme;
 pub mod config;
 pub mod eab;
+pub mod hooks;
 
 const DAEMON_CHECK_INTERVAL_KEY: &str = "daemon.check_interval";
 const DAEMON_RENEW_BEFORE_KEY: &str = "daemon.renew_before";
@@ -108,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 4. Run ACME Flow
     if args.oneshot {
-        match acme::issue_certificate(&settings, final_eab, challenges).await {
+        match run_oneshot(&settings, final_eab, challenges).await {
             Ok(()) => info!("Successfully issued certificate!"),
             Err(e) => {
                 error!("Failed to issue certificate: {:?}", e);
@@ -154,8 +155,30 @@ async fn run_daemon(
                 match should_renew(settings, renew_before).await {
                     Ok(true) => {
                         info!("Renewal required. Starting ACME issuance...");
-                        if !issue_with_retry(settings, eab.clone(), challenges.clone()).await {
-                            error!("Renewal failed after retries. Will try again on next interval.");
+                        match issue_with_retry(settings, eab.clone(), challenges.clone()).await {
+                            Ok(()) => {
+                                if let Err(err) = hooks::run_post_renew_hooks(
+                                    settings,
+                                    hooks::HookStatus::Success,
+                                    None,
+                                )
+                                .await
+                                {
+                                    error!("Post-renew success hooks failed: {err}");
+                                }
+                            }
+                            Err(err) => {
+                                error!("Renewal failed after retries. Will try again on next interval.");
+                                if let Err(hook_err) = hooks::run_post_renew_hooks(
+                                    settings,
+                                    hooks::HookStatus::Failure,
+                                    Some(err.to_string()),
+                                )
+                                .await
+                                {
+                                    error!("Post-renew failure hooks failed: {hook_err}");
+                                }
+                            }
                         }
                     }
                     Ok(false) => {
@@ -176,7 +199,7 @@ async fn issue_with_retry(
     settings: &config::Settings,
     eab: Option<eab::EabCredentials>,
     challenges: Arc<Mutex<HashMap<String, String>>>,
-) -> bool {
+) -> anyhow::Result<()> {
     issue_with_retry_inner(
         || acme::issue_certificate(settings, eab.clone(), challenges.clone()),
         |duration| tokio::time::sleep(duration),
@@ -189,24 +212,30 @@ async fn issue_with_retry_inner<IssueFn, IssueFut, SleepFn, SleepFut>(
     mut issue_fn: IssueFn,
     mut sleep_fn: SleepFn,
     delays: &[u64],
-) -> bool
+) -> anyhow::Result<()>
 where
     IssueFn: FnMut() -> IssueFut,
     IssueFut: Future<Output = anyhow::Result<()>>,
     SleepFn: FnMut(Duration) -> SleepFut,
     SleepFut: Future<Output = ()>,
 {
+    if delays.is_empty() {
+        return issue_fn().await;
+    }
+
+    let mut last_err = None;
     for (attempt, delay) in delays.iter().enumerate() {
         match issue_fn().await {
             Ok(()) => {
                 info!("Certificate issuance succeeded.");
-                return true;
+                return Ok(());
             }
             Err(err) => {
                 error!(
                     "Certificate issuance failed (attempt {}): {err}",
                     attempt + 1
                 );
+                last_err = Some(err);
                 if attempt + 1 < delays.len() {
                     sleep_fn(Duration::from_secs(*delay)).await;
                 }
@@ -214,7 +243,7 @@ where
         }
     }
 
-    false
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Certificate issuance failed")))
 }
 
 async fn should_renew(settings: &config::Settings, renew_before: Duration) -> anyhow::Result<bool> {
@@ -282,6 +311,35 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_oneshot(
+    settings: &config::Settings,
+    eab: Option<eab::EabCredentials>,
+    challenges: Arc<Mutex<HashMap<String, String>>>,
+) -> anyhow::Result<()> {
+    match acme::issue_certificate(settings, eab, challenges).await {
+        Ok(()) => {
+            if let Err(err) =
+                hooks::run_post_renew_hooks(settings, hooks::HookStatus::Success, None).await
+            {
+                error!("Post-renew success hooks failed: {err}");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(hook_err) = hooks::run_post_renew_hooks(
+                settings,
+                hooks::HookStatus::Failure,
+                Some(err.to_string()),
+            )
+            .await
+            {
+                error!("Post-renew failure hooks failed: {hook_err}");
+            }
+            Err(err)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -325,6 +383,7 @@ mod tests {
             retry: config::RetrySettings {
                 backoff_secs: vec![1, 2, 3],
             },
+            hooks: config::HookSettings::default(),
         }
     }
 
@@ -470,7 +529,7 @@ mod tests {
 
         let ok = issue_with_retry_inner(issue_fn, sleep_fn, &TEST_DELAYS).await;
 
-        assert!(ok);
+        assert!(ok.is_ok());
         assert_eq!(*attempts.lock().unwrap(), 3);
         assert_eq!(
             *sleeps.lock().unwrap(),
@@ -503,7 +562,7 @@ mod tests {
 
         let ok = issue_with_retry_inner(issue_fn, sleep_fn, &TEST_DELAYS).await;
 
-        assert!(!ok);
+        assert!(ok.is_err());
         assert_eq!(*attempts.lock().unwrap(), 3);
         assert_eq!(
             *sleeps.lock().unwrap(),

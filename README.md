@@ -105,6 +105,33 @@ check_interval = "1h"
 renew_before = "720h"
 ```
 
+### Post-Renewal Hooks
+
+You can run commands after a renewal succeeds or fails:
+
+```toml
+[hooks.post_renew]
+success = [
+  {
+    command = "nginx"
+    args = ["-s", "reload"]
+    timeout_secs = 30
+    on_failure = "continue"
+  }
+]
+failure = [
+  {
+    command = "logger"
+    args = ["bootroot renewal failed"]
+    timeout_secs = 30
+  }
+]
+```
+
+Hook environment variables include:
+`CERT_PATH`, `KEY_PATH`, `DOMAINS`, `PRIMARY_DOMAIN`, `RENEWED_AT`,
+`RENEW_STATUS`, `RENEW_ERROR`, `ACME_SERVER_URL`.
+
 ## Directory Structure
 
 - `src/`: Rust source code (ACME client implementation).
