@@ -1,30 +1,19 @@
-# Bootroot Agent Configuration Example
+# Bootroot Agent Configuration Example (Multi-Profile)
 # Rename this file to agent.toml to use it.
 
 # Support email address for ACME registration
 email = "admin@example.com"
 
-# Domains to request certificate for
-domains = ["bootroot-agent"]
-
 # ACME Directory URL
 # Default: https://localhost:9000/acme/acme/directory (Step CA)
 server = "https://localhost:9000/acme/acme/directory"
 
-[paths]
-# Path to save the certificate
-cert = "certs/cert.pem"
-# Path to save the private key
-key = "certs/key.pem"
+# SPIFFE trust domain used for URI SANs
+spiffe_trust_domain = "trusted.domain"
 
-# Daemon mode settings (auto-renewal)
-[daemon]
-# How often to check certificate validity
-check_interval = "1h"
-# Start renewal 30 days (720h) before expiry
-renew_before = "720h"
-# Randomize check interval by +/- jitter (0s disables)
-check_jitter = "0s"
+# Scheduler settings
+[scheduler]
+max_concurrent_issuances = 3
 
 # ACME behavior settings
 [acme]
@@ -42,8 +31,36 @@ poll_interval_secs = 2
 [retry]
 backoff_secs = [5, 10, 30]
 
+# Optional global External Account Binding (EAB) Credentials
+# [eab]
+# kid = "your-key-id"
+# hmac = "your-hmac-key"
+
+# Profiles (one per daemon instance)
+[[profiles]]
+name = "edge-proxy-a"
+daemon_name = "edge-proxy"
+instance_id = "001"
+hostname = "edge-node-01"
+domains = ["edge-proxy.internal"]
+
+[profiles.paths]
+# Path to save the certificate
+cert = "certs/edge-proxy-a.pem"
+# Path to save the private key
+key = "certs/edge-proxy-a.key"
+
+# Daemon mode settings (auto-renewal)
+[profiles.daemon]
+# How often to check certificate validity
+check_interval = "1h"
+# Start renewal 30 days (720h) before expiry
+renew_before = "720h"
+# Randomize check interval by +/- jitter (0s disables)
+check_jitter = "0s"
+
 # Post-renewal hooks
-[hooks.post_renew]
+[profiles.hooks.post_renew]
 # Commands to run after a successful renewal
 # success = [
 #   {
@@ -64,7 +81,7 @@ backoff_secs = [5, 10, 30]
 #   }
 # ]
 
-# Optional External Account Binding (EAB) Credentials
-# [eab]
+# Optional per-profile EAB override
+# [profiles.eab]
 # kid = "your-key-id"
 # hmac = "your-hmac-key"

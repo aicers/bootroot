@@ -75,8 +75,10 @@ async fn write_cert_and_key(
 #[allow(clippy::too_many_lines)]
 pub async fn issue_certificate(
     settings: &crate::config::Settings,
+    profile: &crate::config::ProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
     challenges: ChallengeStore,
+    uri_san: &str,
 ) -> Result<()> {
     let mut client = AcmeClient::new(settings.server.clone(), &settings.acme)?;
 
@@ -102,7 +104,7 @@ pub async fn issue_certificate(
             .await?;
     }
 
-    let order = client.create_order(&settings.domains).await?;
+    let order = client.create_order(&profile.domains).await?;
     info!("Order created: {:?}", order);
 
     for authz_url in &order.authorizations {
@@ -165,7 +167,7 @@ pub async fn issue_certificate(
         }
     }
 
-    let primary_domain = settings
+    let primary_domain = profile
         .domains
         .first()
         .ok_or_else(|| anyhow::anyhow!("No domains configured"))?;
@@ -176,10 +178,12 @@ pub async fn issue_certificate(
         .push(rcgen::DnType::CommonName, primary_domain.clone());
 
     let mut sans = Vec::new();
-    for d in &settings.domains {
+    for d in &profile.domains {
         let dns_name = d.clone().try_into()?;
         sans.push(rcgen::SanType::DnsName(dns_name));
     }
+    let uri = uri_san.try_into()?;
+    sans.push(rcgen::SanType::URI(uri));
     params.subject_alt_names = sans;
     let cert_key = rcgen::KeyPair::generate()?;
     let csr_der = params.serialize_request(&cert_key)?;
@@ -218,15 +222,9 @@ pub async fn issue_certificate(
         info!("Certificate received. Saving to files...");
 
         let key_pem = cert_key.serialize_pem();
-        write_cert_and_key(
-            &settings.paths.cert,
-            &settings.paths.key,
-            &cert_pem,
-            &key_pem,
-        )
-        .await?;
-        info!("Certificate saved to: {:?}", settings.paths.cert);
-        info!("Private key saved to: {:?}", settings.paths.key);
+        write_cert_and_key(&profile.paths.cert, &profile.paths.key, &cert_pem, &key_pem).await?;
+        info!("Certificate saved to: {:?}", profile.paths.cert);
+        info!("Private key saved to: {:?}", profile.paths.key);
     } else {
         info!(
             "Order finalized, but certificate not yet ready (or failed). Status: {:?}",

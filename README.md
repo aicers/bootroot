@@ -66,13 +66,9 @@ You can run the agent directly on your host machine.
 2. **Run the Agent**
 
    ```bash
-   # Make sure you have the root CA trusted or use valid certs
-   # For dev, we point to the local ACME directory
-   cargo run -- \
-     --ca-url https://localhost:9000/acme/acme/directory \
-     --domain my-local-service.com \
-     --cert-path ./certs/my-cert.crt \
-     --key-path ./certs/my-key.key
+   cp agent.toml.example agent.toml
+   # Edit agent.toml to match your daemon profiles and paths
+   cargo run -- --config agent.toml
    ```
 
    *(Note: You might need to handle TLS trust for `try-ca` manually or ignore
@@ -91,16 +87,16 @@ Example with custom paths and CA URL:
 ```bash
 cargo run -- \
   --oneshot \
-  --ca-url https://localhost:9000/acme/acme/directory \
-  --domain my-local-service.com \
-  --cert-path ./certs/my-cert.crt \
-  --key-path ./certs/my-key.key
+  --ca-url https://localhost:9000/acme/acme/directory
 ```
 
 Configure the renewal cadence in `agent.toml`:
 
 ```toml
-[daemon]
+[[profiles]]
+name = "edge-proxy-a"
+
+[profiles.daemon]
 check_interval = "1h"
 renew_before = "720h"
 check_jitter = "0s"
@@ -108,17 +104,16 @@ check_jitter = "0s"
 
 ### Environment Overrides
 
-Environment variables override `agent.toml`, and CLI flags override
-environment variables.
+Environment variables override global `agent.toml` settings, and CLI flags
+override environment variables. Profile definitions should live in
+`agent.toml`.
 
 Nested keys use double underscores. Examples:
 
 ```bash
 export BOOTROOT_EMAIL="ops@example.com"
-export BOOTROOT_PATHS__CERT="/etc/bootroot/cert.pem"
-export BOOTROOT_DAEMON__RENEW_BEFORE="720h"
-export BOOTROOT_DAEMON__CHECK_JITTER="0s"
-export BOOTROOT_DOMAINS="example.com,api.example.com"
+export BOOTROOT_SPIFFE_TRUST_DOMAIN="trusted.domain"
+export BOOTROOT_SCHEDULER__MAX_CONCURRENT_ISSUANCES="3"
 export BOOTROOT_RETRY__BACKOFF_SECS="5,10,30"
 ```
 
@@ -127,7 +122,7 @@ export BOOTROOT_RETRY__BACKOFF_SECS="5,10,30"
 You can run commands after a renewal succeeds or fails:
 
 ```toml
-[hooks.post_renew]
+[profiles.hooks.post_renew]
 success = [
   {
     command = "nginx"
@@ -161,12 +156,7 @@ Defaults (if not provided):
 
 - `server`: `https://localhost:9000/acme/acme/directory`
 - `email`: `admin@example.com`
-- `domains`: `["bootroot-agent"]`
-- `paths.cert`: `certs/cert.pem`
-- `paths.key`: `certs/key.pem`
-- `daemon.check_interval`: `1h`
-- `daemon.renew_before`: `720h`
-- `daemon.check_jitter`: `0s`
+- `spiffe_trust_domain`: `trusted.domain`
 - `acme.http_challenge_port`: `80`
 - `acme.directory_fetch_attempts`: `10`
 - `acme.directory_fetch_base_delay_secs`: `1`
@@ -174,27 +164,39 @@ Defaults (if not provided):
 - `acme.poll_attempts`: `15`
 - `acme.poll_interval_secs`: `2`
 - `retry.backoff_secs`: `[5, 10, 30]`
-- `hooks.post_renew.*.timeout_secs`: `30`
-- `hooks.post_renew.*.on_failure`: `continue`
+- `scheduler.max_concurrent_issuances`: `3`
+- `profiles[].daemon.check_interval`: `1h`
+- `profiles[].daemon.renew_before`: `720h`
+- `profiles[].daemon.check_jitter`: `0s`
+- `profiles[].hooks.post_renew.*.timeout_secs`: `30`
+- `profiles[].hooks.post_renew.*.on_failure`: `continue`
 
 Validation rules:
 
+- `spiffe_trust_domain` is non-empty ASCII
 - `acme.directory_fetch_attempts` > 0
 - `acme.directory_fetch_base_delay_secs` > 0
 - `acme.directory_fetch_max_delay_secs` > 0 and >= base delay
 - `acme.poll_attempts` > 0
 - `acme.poll_interval_secs` > 0
 - `retry.backoff_secs` is non-empty and all values > 0
-- `hooks.post_renew.*.command` is non-empty
-- `hooks.post_renew.*.timeout_secs` > 0
-- `hooks.post_renew.*.retry_backoff_secs` values > 0
+- `scheduler.max_concurrent_issuances` > 0
+- `profiles` is non-empty
+- `profiles[].name`, `profiles[].daemon_name`, `profiles[].hostname` are non-empty
+- `profiles[].instance_id` is numeric
+- `profiles[].domains` is non-empty
+- `profiles[].paths.cert` and `profiles[].paths.key` are non-empty
+- `profiles[].hooks.post_renew.*.command` is non-empty
+- `profiles[].hooks.post_renew.*.timeout_secs` > 0
+- `profiles[].hooks.post_renew.*.retry_backoff_secs` values > 0
 
 ### Operational Guide
 
-- Renewal is triggered when the cert is missing or expires within
-  `daemon.renew_before`.
-- Daemon checks run every `daemon.check_interval`, with optional
-  `daemon.check_jitter` to avoid synchronized polling (minimum 1s delay).
+- Renewal is triggered per profile when the cert is missing or expires within
+  `profiles[].daemon.renew_before`.
+- Daemon checks run per profile with `profiles[].daemon.check_interval`, with
+  optional `profiles[].daemon.check_jitter` to avoid synchronized polling
+  (minimum 1s delay).
 - Issuance retries use `retry.backoff_secs` delays; the last error is logged.
 - Hook failures respect `on_failure` (`continue` or `stop`), with optional
   `retry_backoff_secs` and `timeout_secs`.

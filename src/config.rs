@@ -7,15 +7,15 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub email: String,
-    pub domains: Vec<String>,
     pub server: String,
-    pub paths: Paths,
+    pub spiffe_trust_domain: String,
     pub eab: Option<Eab>,
-    pub daemon: DaemonSettings,
     pub acme: AcmeSettings,
     pub retry: RetrySettings,
     #[serde(default)]
-    pub hooks: HookSettings,
+    pub scheduler: SchedulerSettings,
+    #[serde(default)]
+    pub profiles: Vec<ProfileSettings>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -31,9 +31,27 @@ pub struct Eab {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct ProfileSettings {
+    pub name: String,
+    pub daemon_name: String,
+    pub instance_id: String,
+    pub hostname: String,
+    pub domains: Vec<String>,
+    pub paths: Paths,
+    #[serde(default)]
+    pub daemon: DaemonSettings,
+    #[serde(default)]
+    pub hooks: HookSettings,
+    pub eab: Option<Eab>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct DaemonSettings {
+    #[serde(default = "default_check_interval")]
     pub check_interval: String,
+    #[serde(default = "default_renew_before")]
     pub renew_before: String,
+    #[serde(default = "default_check_jitter")]
     pub check_jitter: String,
 }
 
@@ -50,6 +68,12 @@ pub struct AcmeSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RetrySettings {
     pub backoff_secs: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SchedulerSettings {
+    #[serde(default = "default_max_concurrent_issuances")]
+    pub max_concurrent_issuances: u64,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -89,9 +113,7 @@ pub enum HookFailurePolicy {
 
 const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_EMAIL: &str = "admin@example.com";
-const DEFAULT_CERT_PATH: &str = "certs/cert.pem";
-const DEFAULT_KEY_PATH: &str = "certs/key.pem";
-const DEFAULT_DOMAIN: &str = "bootroot-agent";
+const DEFAULT_SPIFFE_TRUST_DOMAIN: &str = "trusted.domain";
 const DEFAULT_CHECK_INTERVAL: &str = "1h";
 const DEFAULT_RENEW_BEFORE: &str = "720h";
 const DEFAULT_CHECK_JITTER: &str = "0s";
@@ -103,9 +125,36 @@ const DEFAULT_POLL_ATTEMPTS: u64 = 15;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
 const DEFAULT_RETRY_BACKOFF_SECS: [u64; 3] = [5, 10, 30];
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_MAX_CONCURRENT_ISSUANCES: u64 = 3;
 
 fn default_hook_timeout_secs() -> u64 {
     DEFAULT_HOOK_TIMEOUT_SECS
+}
+
+fn default_check_interval() -> String {
+    DEFAULT_CHECK_INTERVAL.to_string()
+}
+
+fn default_renew_before() -> String {
+    DEFAULT_RENEW_BEFORE.to_string()
+}
+
+fn default_check_jitter() -> String {
+    DEFAULT_CHECK_JITTER.to_string()
+}
+
+impl Default for DaemonSettings {
+    fn default() -> Self {
+        Self {
+            check_interval: default_check_interval(),
+            renew_before: default_renew_before(),
+            check_jitter: default_check_jitter(),
+        }
+    }
+}
+
+fn default_max_concurrent_issuances() -> u64 {
+    DEFAULT_MAX_CONCURRENT_ISSUANCES
 }
 
 impl Settings {
@@ -120,12 +169,7 @@ impl Settings {
         s = s
             .set_default("server", DEFAULT_SERVER)?
             .set_default("email", DEFAULT_EMAIL)?
-            .set_default("paths.cert", DEFAULT_CERT_PATH)?
-            .set_default("paths.key", DEFAULT_KEY_PATH)?
-            .set_default("domains", vec![DEFAULT_DOMAIN])?
-            .set_default("daemon.check_interval", DEFAULT_CHECK_INTERVAL)?
-            .set_default("daemon.renew_before", DEFAULT_RENEW_BEFORE)?
-            .set_default("daemon.check_jitter", DEFAULT_CHECK_JITTER)?
+            .set_default("spiffe_trust_domain", DEFAULT_SPIFFE_TRUST_DOMAIN)?
             .set_default("acme.http_challenge_port", DEFAULT_HTTP_CHALLENGE_PORT)?
             .set_default(
                 "acme.directory_fetch_attempts",
@@ -141,7 +185,11 @@ impl Settings {
             )?
             .set_default("acme.poll_attempts", DEFAULT_POLL_ATTEMPTS)?
             .set_default("acme.poll_interval_secs", DEFAULT_POLL_INTERVAL_SECS)?
-            .set_default("retry.backoff_secs", DEFAULT_RETRY_BACKOFF_SECS.to_vec())?;
+            .set_default("retry.backoff_secs", DEFAULT_RETRY_BACKOFF_SECS.to_vec())?
+            .set_default(
+                "scheduler.max_concurrent_issuances",
+                DEFAULT_MAX_CONCURRENT_ISSUANCES,
+            )?;
 
         // 2. Merge File (optional)
         // If config_path is provided, use it. Otherwise look for "agent.toml"
@@ -158,7 +206,6 @@ impl Settings {
                 .try_parsing(true)
                 .ignore_empty(true)
                 .list_separator(",")
-                .with_list_parse_key("domains")
                 .with_list_parse_key("retry.backoff_secs"),
         );
 
@@ -171,17 +218,8 @@ impl Settings {
         if let Some(email) = &args.email {
             email.clone_into(&mut self.email);
         }
-        if let Some(domain) = &args.domain {
-            self.domains = vec![domain.clone()];
-        }
         if let Some(ca_url) = &args.ca_url {
             ca_url.clone_into(&mut self.server);
-        }
-        if let Some(cert_path) = &args.cert_path {
-            cert_path.clone_into(&mut self.paths.cert);
-        }
-        if let Some(key_path) = &args.key_path {
-            key_path.clone_into(&mut self.paths.key);
         }
     }
 
@@ -190,6 +228,12 @@ impl Settings {
     /// # Errors
     /// Returns error if any setting is invalid or out of range.
     pub fn validate(&self) -> Result<()> {
+        if self.spiffe_trust_domain.trim().is_empty() {
+            anyhow::bail!("spiffe_trust_domain must not be empty");
+        }
+        if !self.spiffe_trust_domain.is_ascii() {
+            anyhow::bail!("spiffe_trust_domain must be ASCII");
+        }
         if self.acme.directory_fetch_attempts == 0 {
             anyhow::bail!("acme.directory_fetch_attempts must be greater than 0");
         }
@@ -216,13 +260,57 @@ impl Settings {
         if self.retry.backoff_secs.contains(&0) {
             anyhow::bail!("retry.backoff_secs values must be greater than 0");
         }
-        self.validate_hooks()?;
+        if self.scheduler.max_concurrent_issuances == 0 {
+            anyhow::bail!("scheduler.max_concurrent_issuances must be greater than 0");
+        }
+        if self.profiles.is_empty() {
+            anyhow::bail!("profiles must not be empty");
+        }
+        for profile in &self.profiles {
+            Self::validate_profile(profile)?;
+        }
         Ok(())
     }
 
-    fn validate_hooks(&self) -> Result<()> {
-        Self::validate_hook_commands(&self.hooks.post_renew.success, "hooks.post_renew.success")?;
-        Self::validate_hook_commands(&self.hooks.post_renew.failure, "hooks.post_renew.failure")?;
+    fn validate_profile(profile: &ProfileSettings) -> Result<()> {
+        if profile.name.trim().is_empty() {
+            anyhow::bail!("profiles.name must not be empty");
+        }
+        if profile.daemon_name.trim().is_empty() {
+            anyhow::bail!("profiles.daemon_name must not be empty");
+        }
+        if profile.hostname.trim().is_empty() {
+            anyhow::bail!("profiles.hostname must not be empty");
+        }
+        if !profile.daemon_name.is_ascii() {
+            anyhow::bail!("profiles.daemon_name must be ASCII");
+        }
+        if !profile.hostname.is_ascii() {
+            anyhow::bail!("profiles.hostname must be ASCII");
+        }
+        if profile.instance_id.trim().is_empty() {
+            anyhow::bail!("profiles.instance_id must not be empty");
+        }
+        if !profile.instance_id.chars().all(|ch| ch.is_ascii_digit()) {
+            anyhow::bail!("profiles.instance_id must be numeric");
+        }
+        if profile.domains.is_empty() {
+            anyhow::bail!("profiles.domains must not be empty");
+        }
+        if profile.paths.cert.as_os_str().is_empty() {
+            anyhow::bail!("profiles.paths.cert must not be empty");
+        }
+        if profile.paths.key.as_os_str().is_empty() {
+            anyhow::bail!("profiles.paths.key must not be empty");
+        }
+        Self::validate_hook_commands(
+            &profile.hooks.post_renew.success,
+            "profiles.hooks.post_renew.success",
+        )?;
+        Self::validate_hook_commands(
+            &profile.hooks.post_renew.failure,
+            "profiles.hooks.post_renew.failure",
+        )?;
         Ok(())
     }
 
@@ -248,17 +336,40 @@ mod tests {
 
     use super::*;
 
+    fn write_minimal_profile_config(file: &mut tempfile::NamedTempFile) {
+        writeln!(
+            file,
+            r#"
+            spiffe_trust_domain = "trusted.domain"
+
+            [[profiles]]
+            name = "edge-proxy-a"
+            daemon_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+            domains = ["edge-proxy.internal"]
+
+            [profiles.paths]
+            cert = "certs/edge-proxy-a.pem"
+            key = "certs/edge-proxy-a.key"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+    }
+
     #[test]
     fn test_load_settings_defaults() {
-        let settings = Settings::new(None).unwrap();
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+
         assert_eq!(settings.email, "admin@example.com");
         assert_eq!(
             settings.server,
             "https://localhost:9000/acme/acme/directory"
         );
-        assert_eq!(settings.daemon.check_interval, "1h");
-        assert_eq!(settings.daemon.renew_before, "720h");
-        assert_eq!(settings.daemon.check_jitter, "0s");
+        assert_eq!(settings.spiffe_trust_domain, "trusted.domain");
         assert_eq!(settings.acme.http_challenge_port, 80);
         assert_eq!(settings.acme.directory_fetch_attempts, 10);
         assert_eq!(settings.acme.directory_fetch_base_delay_secs, 1);
@@ -266,8 +377,14 @@ mod tests {
         assert_eq!(settings.acme.poll_attempts, 15);
         assert_eq!(settings.acme.poll_interval_secs, 2);
         assert_eq!(settings.retry.backoff_secs, vec![5, 10, 30]);
-        assert!(settings.hooks.post_renew.success.is_empty());
-        assert!(settings.hooks.post_renew.failure.is_empty());
+        assert_eq!(settings.scheduler.max_concurrent_issuances, 3);
+
+        let profile = &settings.profiles[0];
+        assert_eq!(profile.daemon.check_interval, "1h");
+        assert_eq!(profile.daemon.renew_before, "720h");
+        assert_eq!(profile.daemon.check_jitter, "0s");
+        assert!(profile.hooks.post_renew.success.is_empty());
+        assert!(profile.hooks.post_renew.failure.is_empty());
     }
 
     #[test]
@@ -277,9 +394,17 @@ mod tests {
             file,
             r#"
             email = "file@example.com"
-            domains = ["file-domain"]
             server = "http://file-server"
-            [paths]
+            spiffe_trust_domain = "example.internal"
+
+            [[profiles]]
+            name = "edge-proxy-a"
+            daemon_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+            domains = ["file-domain"]
+
+            [profiles.paths]
             cert = "file/cert.pem"
             key = "file/key.pem"
         "#
@@ -292,26 +417,24 @@ mod tests {
         let settings = Settings::new(Some(path)).unwrap();
 
         assert_eq!(settings.email, "file@example.com");
-        assert_eq!(settings.domains[0], "file-domain");
         assert_eq!(settings.server, "http://file-server");
+        assert_eq!(settings.spiffe_trust_domain, "example.internal");
+        assert_eq!(settings.profiles[0].domains[0], "file-domain");
     }
 
     #[test]
     fn test_merge_with_args() {
-        let mut settings = Settings::new(None).unwrap();
-        // Default check
-        assert_eq!(settings.email, "admin@example.com");
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
 
         let args = crate::Args {
             config: None,
             email: Some("cli@example.com".to_string()),
-            domain: Some("cli-domain".to_string()),
             ca_url: None, // Keep default/config
             eab_kid: None,
             eab_hmac: None,
             eab_file: None,
-            cert_path: None,
-            key_path: None,
             oneshot: false,
         };
 
@@ -319,7 +442,6 @@ mod tests {
 
         // Should be overridden
         assert_eq!(settings.email, "cli@example.com");
-        assert_eq!(settings.domains[0], "cli-domain");
         // Should remain default
         assert_eq!(
             settings.server,
@@ -329,7 +451,9 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_invalid_acme_settings() {
-        let mut settings = Settings::new(None).unwrap();
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
         settings.acme.directory_fetch_attempts = 0;
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("directory_fetch_attempts"));
@@ -337,7 +461,9 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_empty_retry_backoff() {
-        let mut settings = Settings::new(None).unwrap();
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
         settings.retry.backoff_secs = Vec::new();
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("retry.backoff_secs"));
@@ -345,8 +471,10 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_empty_hook_command() {
-        let mut settings = Settings::new(None).unwrap();
-        settings.hooks.post_renew.success = vec![HookCommand {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].hooks.post_renew.success = vec![HookCommand {
             command: "   ".to_string(),
             args: Vec::new(),
             timeout_secs: 30,
@@ -355,13 +483,18 @@ mod tests {
         }];
 
         let err = settings.validate().unwrap_err();
-        assert!(err.to_string().contains("hooks.post_renew.success"));
+        assert!(
+            err.to_string()
+                .contains("profiles.hooks.post_renew.success")
+        );
     }
 
     #[test]
     fn test_validate_rejects_hook_timeout_zero() {
-        let mut settings = Settings::new(None).unwrap();
-        settings.hooks.post_renew.failure = vec![HookCommand {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].hooks.post_renew.failure = vec![HookCommand {
             command: "true".to_string(),
             args: Vec::new(),
             timeout_secs: 0,
@@ -375,8 +508,10 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_hook_retry_backoff_zero() {
-        let mut settings = Settings::new(None).unwrap();
-        settings.hooks.post_renew.success = vec![HookCommand {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].hooks.post_renew.success = vec![HookCommand {
             command: "true".to_string(),
             args: Vec::new(),
             timeout_secs: 30,
@@ -386,5 +521,12 @@ mod tests {
 
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("retry_backoff_secs"));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_profiles() {
+        let settings = Settings::new(None).unwrap();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles must not be empty"));
     }
 }
