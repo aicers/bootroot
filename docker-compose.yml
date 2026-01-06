@@ -1,10 +1,28 @@
 version: "3.8"
 
 services:
+  postgres:
+    image: postgres:16
+    container_name: bootroot-postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=step
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-step-pass}
+      - POSTGRES_DB=stepca
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
   step-ca:
-    image: smallstep/step-ca:latest
+    build:
+      context: .
+      dockerfile: docker/step-ca/Dockerfile
+      args:
+        - STEP_CA_VERSION=v0.29.0
+    image: bootroot-step-ca:0.29.0
     container_name: bootroot-ca
     restart: always
+    depends_on:
+      - postgres
     ports:
       - "9000:9000"
     environment:
@@ -41,3 +59,6 @@ services:
       default:
         aliases:
           - bootroot-agent.com
+
+volumes:
+  postgres-data:
