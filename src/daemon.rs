@@ -274,18 +274,25 @@ async fn issue_with_retry(
     challenges: Arc<Mutex<HashMap<String, String>>>,
     uri_san: Option<&str>,
 ) -> anyhow::Result<()> {
-    let backoff = profile
-        .retry
-        .as_ref()
-        .map_or(settings.retry.backoff_secs.as_slice(), |retry| {
-            retry.backoff_secs.as_slice()
-        });
+    let backoff = select_retry_backoff(settings, profile);
     issue_with_retry_inner(
         || acme::issue_certificate(settings, profile, eab.clone(), challenges.clone(), uri_san),
         |duration| tokio::time::sleep(duration),
         backoff,
     )
     .await
+}
+
+fn select_retry_backoff<'a>(
+    settings: &'a config::Settings,
+    profile: &'a config::ProfileSettings,
+) -> &'a [u64] {
+    profile
+        .retry
+        .as_ref()
+        .map_or(settings.retry.backoff_secs.as_slice(), |retry| {
+            retry.backoff_secs.as_slice()
+        })
 }
 
 pub(crate) async fn issue_with_retry_inner<IssueFn, IssueFut, SleepFn, SleepFut>(
@@ -415,4 +422,82 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::config::{AcmeSettings, DaemonSettings, Paths, RetrySettings, SchedulerSettings};
+
+    fn build_profile() -> config::ProfileSettings {
+        config::ProfileSettings {
+            name: "edge-proxy-a".to_string(),
+            daemon_name: "edge-proxy".to_string(),
+            instance_id: "001".to_string(),
+            hostname: "edge-node-01".to_string(),
+            uri_san_enabled: true,
+            domains: vec!["example.com".to_string()],
+            paths: Paths {
+                cert: PathBuf::from("unused.pem"),
+                key: PathBuf::from("unused.key"),
+            },
+            daemon: DaemonSettings {
+                check_interval: "1h".to_string(),
+                renew_before: "720h".to_string(),
+                check_jitter: "0s".to_string(),
+            },
+            retry: None,
+            hooks: config::HookSettings::default(),
+            eab: None,
+        }
+    }
+
+    fn build_settings(backoff: Vec<u64>) -> config::Settings {
+        config::Settings {
+            email: "test@example.com".to_string(),
+            server: "https://example.com/acme/directory".to_string(),
+            spiffe_trust_domain: "trusted.domain".to_string(),
+            eab: None,
+            acme: AcmeSettings {
+                http_challenge_port: 80,
+                directory_fetch_attempts: 10,
+                directory_fetch_base_delay_secs: 1,
+                directory_fetch_max_delay_secs: 10,
+                poll_attempts: 15,
+                poll_interval_secs: 2,
+            },
+            retry: RetrySettings {
+                backoff_secs: backoff,
+            },
+            scheduler: SchedulerSettings {
+                max_concurrent_issuances: 1,
+            },
+            profiles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_select_retry_backoff_uses_profile_override() {
+        let settings = build_settings(vec![5, 10, 30]);
+        let mut profile = build_profile();
+        profile.retry = Some(RetrySettings {
+            backoff_secs: vec![1, 2],
+        });
+
+        let selected = select_retry_backoff(&settings, &profile);
+
+        assert_eq!(selected, profile.retry.as_ref().unwrap().backoff_secs);
+    }
+
+    #[test]
+    fn test_select_retry_backoff_falls_back_to_global() {
+        let settings = build_settings(vec![5, 10, 30]);
+        let profile = build_profile();
+
+        let selected = select_retry_backoff(&settings, &profile);
+
+        assert_eq!(selected, settings.retry.backoff_secs);
+    }
 }
