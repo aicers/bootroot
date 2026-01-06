@@ -478,6 +478,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_post_renew_hook_respects_working_dir() {
+        let dir = tempdir().unwrap();
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+        let output_path = work_dir.join("pwd.txt");
+        let cert_path = dir.path().join("cert.pem");
+
+        let hook = HookCommand {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "pwd > pwd.txt".to_string()],
+            working_dir: Some(work_dir.clone()),
+            timeout_secs: 5,
+            retry_backoff_secs: Vec::new(),
+            max_output_bytes: None,
+            on_failure: HookFailurePolicy::Stop,
+        };
+
+        let hooks = HookSettings {
+            post_renew: PostRenewHooks {
+                success: vec![hook],
+                failure: Vec::new(),
+            },
+        };
+
+        let (settings, profile) = build_settings(cert_path, hooks);
+        run_post_renew_hooks(&settings, &profile, HookStatus::Success, None)
+            .await
+            .unwrap();
+
+        let contents = fs::read_to_string(output_path).unwrap();
+        let output_dir = PathBuf::from(contents.trim());
+        let output_dir = fs::canonicalize(output_dir).unwrap();
+        let work_dir = fs::canonicalize(work_dir).unwrap();
+        assert_eq!(output_dir, work_dir);
+    }
+
+    #[tokio::test]
     async fn test_read_stream_limited_truncates_output() {
         let (mut writer, reader) = duplex(64);
         writer.write_all(b"1234567890").await.unwrap();
