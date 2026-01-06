@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, watch};
 use tracing::{error, info};
 
-use crate::{acme, config, eab, hooks};
+use crate::{acme, config, eab, hooks, profile};
 
 const DAEMON_CHECK_INTERVAL_KEY: &str = "daemon.check_interval";
 const DAEMON_RENEW_BEFORE_KEY: &str = "daemon.renew_before";
@@ -18,7 +18,7 @@ pub(crate) async fn run_daemon(
     default_eab: Option<eab::EabCredentials>,
     challenges: Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
-    let max_concurrent = max_concurrent_issuances(&settings)?;
+    let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -77,7 +77,7 @@ async fn run_profile_daemon(
     let check_jitter =
         parse_duration_setting(&profile.daemon.check_jitter, DAEMON_CHECK_JITTER_KEY)?;
     let uri_san = if profile.uri_san_enabled {
-        Some(build_spiffe_uri(&settings, &profile))
+        Some(profile::build_spiffe_uri(&settings, &profile))
     } else {
         None
     };
@@ -115,7 +115,7 @@ async fn run_profile_daemon(
                     Ok(true) => {
                         info!("Profile '{}' renewal required. Starting ACME issuance...", profile.name);
                         let _permit = semaphore.acquire().await?;
-                        let profile_eab = resolve_profile_eab(&profile, default_eab.clone());
+                        let profile_eab = profile::resolve_profile_eab(&profile, default_eab.clone());
                         match issue_with_retry(
                             &settings,
                             &profile,
@@ -171,7 +171,7 @@ pub(crate) async fn run_oneshot(
     default_eab: Option<eab::EabCredentials>,
     challenges: Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
-    let max_concurrent = max_concurrent_issuances(&settings)?;
+    let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
     let mut handles = Vec::new();
 
@@ -221,11 +221,11 @@ async fn run_profile_oneshot(
 ) -> anyhow::Result<()> {
     let _permit = semaphore.acquire().await?;
     let uri_san = if profile.uri_san_enabled {
-        Some(build_spiffe_uri(&settings, &profile))
+        Some(profile::build_spiffe_uri(&settings, &profile))
     } else {
         None
     };
-    let profile_eab = resolve_profile_eab(&profile, default_eab);
+    let profile_eab = profile::resolve_profile_eab(&profile, default_eab);
 
     match acme::issue_certificate(
         &settings,
@@ -324,36 +324,6 @@ where
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Certificate issuance failed")))
-}
-
-pub(crate) fn build_spiffe_uri(
-    settings: &config::Settings,
-    profile: &config::ProfileSettings,
-) -> String {
-    format!(
-        "spiffe://{}/{}/{}/{}",
-        settings.spiffe_trust_domain, profile.hostname, profile.daemon_name, profile.instance_id
-    )
-}
-
-pub(crate) fn resolve_profile_eab(
-    profile: &config::ProfileSettings,
-    default_eab: Option<eab::EabCredentials>,
-) -> Option<eab::EabCredentials> {
-    profile.eab.as_ref().map(to_eab_credentials).or(default_eab)
-}
-
-pub(crate) fn to_eab_credentials(eab: &config::Eab) -> eab::EabCredentials {
-    eab::EabCredentials {
-        kid: eab.kid.clone(),
-        hmac: eab.hmac.clone(),
-    }
-}
-
-pub(crate) fn max_concurrent_issuances(settings: &config::Settings) -> anyhow::Result<usize> {
-    usize::try_from(settings.scheduler.max_concurrent_issuances).map_err(|_| {
-        anyhow::anyhow!("scheduler.max_concurrent_issuances is too large for this platform")
-    })
 }
 
 pub(crate) async fn should_renew(
