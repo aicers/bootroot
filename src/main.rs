@@ -11,6 +11,7 @@ pub mod config;
 pub mod daemon;
 pub mod eab;
 pub mod hooks;
+pub mod profile;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -68,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let final_eab = cli_eab.or_else(|| settings.eab.as_ref().map(daemon::to_eab_credentials));
+    let final_eab = cli_eab.or_else(|| settings.eab.as_ref().map(profile::to_eab_credentials));
 
     info!("Loaded {} profile(s).", settings.profiles.len());
     info!("CA URL: {}", settings.server);
@@ -112,7 +113,7 @@ mod tests {
     use tempfile::tempdir;
     use time::OffsetDateTime;
 
-    use super::{config, daemon, eab};
+    use super::{config, daemon, eab, profile};
 
     const TEST_DOMAIN: &str = "example.com";
     const TEST_KEY_PATH: &str = "unused.key";
@@ -201,7 +202,7 @@ mod tests {
         let profile = build_profile(PathBuf::from("unused.pem"));
         let settings = build_settings(vec![profile.clone()]);
 
-        let uri = daemon::build_spiffe_uri(&settings, &profile);
+        let uri = profile::build_spiffe_uri(&settings, &profile);
 
         assert_eq!(uri, "spiffe://trusted.domain/edge-node-01/edge-proxy/001");
     }
@@ -222,7 +223,7 @@ mod tests {
             hmac: "default-hmac".to_string(),
         });
 
-        let resolved = daemon::resolve_profile_eab(&profile, default_eab).unwrap();
+        let resolved = profile::resolve_profile_eab(&profile, default_eab).unwrap();
 
         assert_eq!(resolved.kid, "profile");
     }
@@ -236,7 +237,7 @@ mod tests {
             ..build_settings(vec![build_profile(PathBuf::from("unused.pem"))])
         };
 
-        let result = daemon::max_concurrent_issuances(&settings);
+        let result = profile::max_concurrent_issuances(&settings);
 
         let max_usize_u64 = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
         if max_usize_u64 == u64::MAX {
