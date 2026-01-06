@@ -29,6 +29,13 @@ This is the easiest way to verify the agent and CA integration.
 1. **Start Services**
 
    The repository comes with pre-generated test secrets in `secrets/`.
+   The Compose stack runs `step-ca` with a local PostgreSQL backend
+   (password auth enabled for dev) and builds a custom `step-ca` binary
+   with PostgreSQL support.
+   If you change `POSTGRES_PASSWORD`, update `secrets/config/ca.json`
+   to match the new password in `db.dataSource`.
+   You can also run `scripts/update-ca-db-dsn.sh` to regenerate the DSN
+   from environment variables.
 
    ```bash
    docker compose up --build -d
@@ -63,7 +70,21 @@ You can run the agent directly on your host machine.
    docker compose up -d step-ca
    ```
 
-2. **Run the Agent**
+   This starts the local PostgreSQL backend automatically via `depends_on`.
+
+### Production Notes
+
+- Do not commit production DB credentials. Use secret/env injection.
+- Provide a production `secrets/config/ca.json` with the real DSN and
+  `db.type` set to `postgresql`.
+- Use `sslmode=require` or `verify-full` with proper CA certificates.
+- Use a dedicated DB user with least-privilege access to the step-ca schema.
+- Rotate DB credentials by updating the injected secret and regenerating
+  `secrets/config/ca.json`.
+- Restrict network access so only step-ca can reach the PostgreSQL service.
+- Back up the PostgreSQL database and test restores regularly.
+
+1. **Run the Agent**
 
    ```bash
    cp agent.toml.example agent.toml
