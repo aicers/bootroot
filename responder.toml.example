@@ -1,0 +1,8 @@
+# HTTP-01 Responder Configuration Example
+
+listen_addr = "0.0.0.0:80"
+admin_addr = "0.0.0.0:8080"
+hmac_secret = "change-me"
+token_ttl_secs = 300
+cleanup_interval_secs = 30
+max_skew_secs = 60

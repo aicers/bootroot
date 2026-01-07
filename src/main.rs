@@ -1,9 +1,7 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use tokio::sync::Mutex;
 use tracing::{error, info};
 
 pub mod acme;
@@ -27,6 +25,14 @@ pub struct Args {
     /// ACME Directory URL
     #[arg(long)]
     ca_url: Option<String>,
+
+    /// HTTP-01 responder base URL
+    #[arg(long, env = "BOOTROOT_HTTP_RESPONDER_URL")]
+    http_responder_url: Option<String>,
+
+    /// HTTP-01 responder HMAC secret
+    #[arg(long, env = "BOOTROOT_HTTP_RESPONDER_HMAC")]
+    http_responder_hmac: Option<String>,
 
     /// EAB Key ID (optional, overrides file/config)
     #[arg(long = "eab-kid")]
@@ -80,15 +86,11 @@ async fn main() -> anyhow::Result<()> {
         info!("No EAB credentials provided. Attempting open enrollment.");
     }
 
-    let challenges = Arc::new(Mutex::new(HashMap::new()));
-    let _challenge_server =
-        acme::start_http01_server(challenges.clone(), settings.acme.http_challenge_port);
-
     let settings = Arc::new(settings);
 
     // 4. Run ACME Flow
     if args.oneshot {
-        match daemon::run_oneshot(Arc::clone(&settings), final_eab, challenges).await {
+        match daemon::run_oneshot(Arc::clone(&settings), final_eab).await {
             Ok(()) => info!("Successfully issued certificate!"),
             Err(e) => {
                 error!("Failed to issue certificate: {:?}", e);
@@ -96,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        daemon::run_daemon(settings, final_eab, challenges).await?;
+        daemon::run_daemon(settings, final_eab).await?;
     }
 
     Ok(())
@@ -155,12 +157,15 @@ mod tests {
             spiffe_trust_domain: TEST_TRUST_DOMAIN.to_string(),
             eab: None,
             acme: config::AcmeSettings {
-                http_challenge_port: 80,
                 directory_fetch_attempts: 10,
                 directory_fetch_base_delay_secs: 1,
                 directory_fetch_max_delay_secs: 10,
                 poll_attempts: 15,
                 poll_interval_secs: 2,
+                http_responder_url: "http://localhost:8080".to_string(),
+                http_responder_hmac: "dev-hmac".to_string(),
+                http_responder_timeout_secs: 5,
+                http_responder_token_ttl_secs: 300,
             },
             retry: config::RetrySettings {
                 backoff_secs: vec![1, 2, 3],

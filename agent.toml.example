@@ -17,8 +17,6 @@ max_concurrent_issuances = 3
 
 # ACME behavior settings
 [acme]
-# HTTP-01 challenge listen port
-http_challenge_port = 80
 # Directory fetch retries and backoff (seconds)
 directory_fetch_attempts = 10
 directory_fetch_base_delay_secs = 1
@@ -26,6 +24,10 @@ directory_fetch_max_delay_secs = 10
 # Order polling behavior
 poll_attempts = 15
 poll_interval_secs = 2
+http_responder_url = "http://localhost:8080"
+http_responder_hmac = "change-me"
+http_responder_timeout_secs = 5
+http_responder_token_ttl_secs = 300
 
 # Retry settings for issuance attempts
 [retry]

@@ -1,9 +1,8 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{Semaphore, watch};
 use tracing::{error, info};
 
 use crate::{acme, config, eab, hooks, profile};
@@ -16,7 +15,6 @@ pub(crate) const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = 1_000_000_000;
 pub(crate) async fn run_daemon(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
-    challenges: Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
@@ -34,19 +32,10 @@ pub(crate) async fn run_daemon(
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
         let shutdown_rx = shutdown_rx.clone();
-        let challenges = challenges.clone();
         let default_eab = default_eab.clone();
 
         handles.push(tokio::spawn(async move {
-            run_profile_daemon(
-                settings,
-                profile,
-                default_eab,
-                challenges,
-                semaphore,
-                shutdown_rx,
-            )
-            .await
+            run_profile_daemon(settings, profile, default_eab, semaphore, shutdown_rx).await
         }));
     }
 
@@ -66,7 +55,6 @@ async fn run_profile_daemon(
     settings: Arc<config::Settings>,
     profile: config::ProfileSettings,
     default_eab: Option<eab::EabCredentials>,
-    challenges: Arc<Mutex<HashMap<String, String>>>,
     semaphore: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -120,7 +108,6 @@ async fn run_profile_daemon(
                             &settings,
                             &profile,
                             profile_eab,
-                            challenges.clone(),
                             uri_san.as_deref(),
                         )
                         .await
@@ -169,7 +156,6 @@ async fn run_profile_daemon(
 pub(crate) async fn run_oneshot(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
-    challenges: Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
@@ -177,12 +163,11 @@ pub(crate) async fn run_oneshot(
 
     for profile in settings.profiles.clone() {
         let settings = Arc::clone(&settings);
-        let challenges = challenges.clone();
         let semaphore = Arc::clone(&semaphore);
         let default_eab = default_eab.clone();
 
         handles.push(tokio::spawn(async move {
-            run_profile_oneshot(settings, profile, default_eab, challenges, semaphore).await
+            run_profile_oneshot(settings, profile, default_eab, semaphore).await
         }));
     }
 
@@ -216,7 +201,6 @@ async fn run_profile_oneshot(
     settings: Arc<config::Settings>,
     profile: config::ProfileSettings,
     default_eab: Option<eab::EabCredentials>,
-    challenges: Arc<Mutex<HashMap<String, String>>>,
     semaphore: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let _permit = semaphore.acquire().await?;
@@ -227,15 +211,7 @@ async fn run_profile_oneshot(
     };
     let profile_eab = profile::resolve_profile_eab(&profile, default_eab);
 
-    match acme::issue_certificate(
-        &settings,
-        &profile,
-        profile_eab,
-        challenges,
-        uri_san.as_deref(),
-    )
-    .await
-    {
+    match acme::issue_certificate(&settings, &profile, profile_eab, uri_san.as_deref()).await {
         Ok(()) => {
             if let Err(err) =
                 hooks::run_post_renew_hooks(&settings, &profile, hooks::HookStatus::Success, None)
@@ -271,12 +247,11 @@ async fn issue_with_retry(
     settings: &config::Settings,
     profile: &config::ProfileSettings,
     eab: Option<eab::EabCredentials>,
-    challenges: Arc<Mutex<HashMap<String, String>>>,
     uri_san: Option<&str>,
 ) -> anyhow::Result<()> {
     let backoff = select_retry_backoff(settings, profile);
     issue_with_retry_inner(
-        || acme::issue_certificate(settings, profile, eab.clone(), challenges.clone(), uri_san),
+        || acme::issue_certificate(settings, profile, eab.clone(), uri_san),
         |duration| tokio::time::sleep(duration),
         backoff,
     )
@@ -461,12 +436,15 @@ mod tests {
             spiffe_trust_domain: "trusted.domain".to_string(),
             eab: None,
             acme: AcmeSettings {
-                http_challenge_port: 80,
                 directory_fetch_attempts: 10,
                 directory_fetch_base_delay_secs: 1,
                 directory_fetch_max_delay_secs: 10,
                 poll_attempts: 15,
                 poll_interval_secs: 2,
+                http_responder_url: "http://localhost:8080".to_string(),
+                http_responder_hmac: "dev-hmac".to_string(),
+                http_responder_timeout_secs: 5,
+                http_responder_token_ttl_secs: 300,
             },
             retry: RetrySettings {
                 backoff_secs: backoff,
