@@ -24,19 +24,34 @@ plugins:
           default: true
           nav:
             - Overview: index.md
+            - Concepts: concepts.md
             - Getting Started: getting-started.md
+            - Installation: installation.md
             - Configuration: configuration.md
             - Operations: operations.md
+            - Troubleshooting: troubleshooting.md
+            - FAQ: faq.md
         - locale: ko
           name: 한국어
           build: true
           nav:
             - Overview: index.md
+            - Concepts: concepts.md
             - Getting Started: getting-started.md
+            - Installation: installation.md
             - Configuration: configuration.md
             - Operations: operations.md
+            - Troubleshooting: troubleshooting.md
+            - FAQ: faq.md
           nav_translations:
             Overview: 개요
+            Concepts: 개념
             Getting Started: 시작하기
+            Installation: 설치
             Configuration: 설정
             Operations: 운영
+            Troubleshooting: 문제 해결
+            FAQ: FAQ
+
+extra_css:
+  - styles/pdf.css
