@@ -6,3 +6,4 @@ secrets.bak/
 .vscode/
 .venv/
 site/
+site-pdf-*/

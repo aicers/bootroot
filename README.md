@@ -33,6 +33,24 @@ pip install mkdocs-material mkdocs-static-i18n
 mkdocs serve -a 127.0.0.1:8000
 ```
 
+Command notes:
+
+- `brew install python`: installs Python (one-time per machine).
+- `python3 -m venv .venv`: creates a local virtualenv for this repo.
+- `source .venv/bin/activate`: activates the virtualenv for the current shell.
+- `pip install ...`: installs MkDocs tooling into the virtualenv.
+- Run the `pip install ...` step once after creating the virtualenv (per clone).
+- `mkdocs serve -a 127.0.0.1:8000`: runs a local docs server.
+- `mkdocs build`: builds static files into `site/`.
+- `./scripts/build-docs-pdf.sh en|ko`: builds PDF manuals.
+
+Install scope:
+
+- If you use a per-repo virtualenv (`.venv`), you need to create it and
+  install dependencies each time you clone the repo.
+- If you install MkDocs globally, it is a one-time machine install, but we
+  recommend the per-repo virtualenv to avoid version conflicts.
+
 ## Getting Started
 
 ### Prerequisites
@@ -44,6 +62,11 @@ mkdocs serve -a 127.0.0.1:8000
 ### Quick Start (Docker)
 
 This is the easiest way to verify the agent and CA integration.
+
+Before you start, ensure the domain in `profiles[].domains` resolves from
+step-ca to the HTTP-01 responder. In Compose, `bootroot-http01` provides the
+`bootroot-agent.com` alias. If you change the domain in `agent.toml.compose`,
+update the alias in `docker-compose.yml` or map it in step-ca `/etc/hosts`.
 
 1. **Start Services**
 
@@ -207,12 +230,22 @@ Defaults (if not provided):
 - `server`: `https://localhost:9000/acme/acme/directory`
 - `email`: `admin@example.com`
 - `spiffe_trust_domain`: `trusted.domain`
-- `acme.http_challenge_port`: `80`
 - `acme.directory_fetch_attempts`: `10`
 - `acme.directory_fetch_base_delay_secs`: `1`
 - `acme.directory_fetch_max_delay_secs`: `10`
 - `acme.poll_attempts`: `15`
 - `acme.poll_interval_secs`: `2`
+- `acme.http_responder_url`: `http://localhost:8080`
+- `acme.http_responder_hmac`: (required)
+- `acme.http_responder_timeout_secs`: `5`
+- `acme.http_responder_token_ttl_secs`: `300`
+
+Responder flow notes:
+
+- `acme.http_responder_url` points to the responder **admin API** that
+  bootroot-agent calls to register tokens.
+- The responder listens on port 80 for step-ca’s HTTP-01 requests and replies
+  to `/.well-known/acme-challenge/<token>` with the key authorization.
 - `retry.backoff_secs`: `[5, 10, 30]`
 - `scheduler.max_concurrent_issuances`: `3`
 - `profiles[].daemon.check_interval`: `1h`
@@ -231,6 +264,10 @@ Validation rules:
 - `acme.directory_fetch_max_delay_secs` > 0 and >= base delay
 - `acme.poll_attempts` > 0
 - `acme.poll_interval_secs` > 0
+- `acme.http_responder_url` is non-empty
+- `acme.http_responder_hmac` is non-empty
+- `acme.http_responder_timeout_secs` > 0
+- `acme.http_responder_token_ttl_secs` > 0
 - `retry.backoff_secs` is non-empty and all values > 0
 - `scheduler.max_concurrent_issuances` > 0
 - `profiles` is non-empty

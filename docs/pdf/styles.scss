@@ -1,0 +1,74 @@
+$font-size: 12pt;
+$line-height: 1.6;
+
+@font-face {
+  font-family: "Pretendard";
+  font-style: normal;
+  font-weight: 400;
+  src: url("../fonts/Pretendard-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Pretendard";
+  font-style: normal;
+  font-weight: 700;
+  src: url("../fonts/Pretendard-Bold.woff2") format("woff2");
+}
+
+html,
+body {
+  font-family: "Pretendard", sans-serif !important;
+  font-size: $font-size !important;
+  line-height: $line-height !important;
+}
+
+p,
+li,
+td,
+th {
+  font-family: "Pretendard", sans-serif !important;
+  font-size: $font-size !important;
+  line-height: $line-height !important;
+}
+
+ol,
+ul {
+  margin-left: 1.4em !important;
+  padding-left: 0 !important;
+}
+
+ol {
+  list-style-type: decimal !important;
+  list-style-position: outside !important;
+}
+
+ul {
+  list-style-position: outside !important;
+}
+
+@page {
+  @bottom-center {
+    content: counter(page) !important;
+  }
+}
+
+h1 {
+  font-family: "Pretendard", sans-serif !important;
+  font-size: 23pt;
+}
+
+h2 {
+  font-family: "Pretendard", sans-serif !important;
+  font-size: 17.5pt;
+}
+
+h3 {
+  font-family: "Pretendard", sans-serif !important;
+  font-size: 13.5pt;
+}
+
+code,
+pre {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace !important;
+  font-size: 10pt;
+}
