@@ -61,7 +61,10 @@ pub struct DaemonSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AcmeSettings {
-    pub http_challenge_port: u16,
+    pub http_responder_url: String,
+    pub http_responder_hmac: String,
+    pub http_responder_timeout_secs: u64,
+    pub http_responder_token_ttl_secs: u64,
     pub directory_fetch_attempts: u64,
     pub directory_fetch_base_delay_secs: u64,
     pub directory_fetch_max_delay_secs: u64,
@@ -125,7 +128,10 @@ const DEFAULT_SPIFFE_TRUST_DOMAIN: &str = "trusted.domain";
 const DEFAULT_CHECK_INTERVAL: &str = "1h";
 const DEFAULT_RENEW_BEFORE: &str = "720h";
 const DEFAULT_CHECK_JITTER: &str = "0s";
-const DEFAULT_HTTP_CHALLENGE_PORT: u16 = 80;
+const DEFAULT_HTTP_RESPONDER_URL: &str = "http://localhost:8080";
+const DEFAULT_HTTP_RESPONDER_HMAC: &str = "";
+const DEFAULT_HTTP_RESPONDER_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_HTTP_RESPONDER_TOKEN_TTL_SECS: u64 = 300;
 const DEFAULT_DIRECTORY_FETCH_ATTEMPTS: u64 = 10;
 const DEFAULT_DIRECTORY_FETCH_BASE_DELAY_SECS: u64 = 1;
 const DEFAULT_DIRECTORY_FETCH_MAX_DELAY_SECS: u64 = 10;
@@ -182,7 +188,16 @@ impl Settings {
             .set_default("server", DEFAULT_SERVER)?
             .set_default("email", DEFAULT_EMAIL)?
             .set_default("spiffe_trust_domain", DEFAULT_SPIFFE_TRUST_DOMAIN)?
-            .set_default("acme.http_challenge_port", DEFAULT_HTTP_CHALLENGE_PORT)?
+            .set_default("acme.http_responder_url", DEFAULT_HTTP_RESPONDER_URL)?
+            .set_default("acme.http_responder_hmac", DEFAULT_HTTP_RESPONDER_HMAC)?
+            .set_default(
+                "acme.http_responder_timeout_secs",
+                DEFAULT_HTTP_RESPONDER_TIMEOUT_SECS,
+            )?
+            .set_default(
+                "acme.http_responder_token_ttl_secs",
+                DEFAULT_HTTP_RESPONDER_TOKEN_TTL_SECS,
+            )?
             .set_default(
                 "acme.directory_fetch_attempts",
                 DEFAULT_DIRECTORY_FETCH_ATTEMPTS,
@@ -233,6 +248,12 @@ impl Settings {
         if let Some(ca_url) = &args.ca_url {
             ca_url.clone_into(&mut self.server);
         }
+        if let Some(responder_url) = &args.http_responder_url {
+            responder_url.clone_into(&mut self.acme.http_responder_url);
+        }
+        if let Some(responder_hmac) = &args.http_responder_hmac {
+            responder_hmac.clone_into(&mut self.acme.http_responder_hmac);
+        }
     }
 
     /// Validates configuration values for correctness.
@@ -248,6 +269,18 @@ impl Settings {
         }
         if self.acme.directory_fetch_attempts == 0 {
             anyhow::bail!("acme.directory_fetch_attempts must be greater than 0");
+        }
+        if self.acme.http_responder_url.trim().is_empty() {
+            anyhow::bail!("acme.http_responder_url must not be empty");
+        }
+        if self.acme.http_responder_hmac.trim().is_empty() {
+            anyhow::bail!("acme.http_responder_hmac must not be empty");
+        }
+        if self.acme.http_responder_timeout_secs == 0 {
+            anyhow::bail!("acme.http_responder_timeout_secs must be greater than 0");
+        }
+        if self.acme.http_responder_token_ttl_secs == 0 {
+            anyhow::bail!("acme.http_responder_token_ttl_secs must be greater than 0");
         }
         if self.acme.poll_attempts == 0 {
             anyhow::bail!("acme.poll_attempts must be greater than 0");
@@ -372,6 +405,9 @@ mod tests {
             file,
             r#"
             spiffe_trust_domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
 
             [[profiles]]
             name = "edge-proxy-a"
@@ -401,7 +437,10 @@ mod tests {
             "https://localhost:9000/acme/acme/directory"
         );
         assert_eq!(settings.spiffe_trust_domain, "trusted.domain");
-        assert_eq!(settings.acme.http_challenge_port, 80);
+        assert_eq!(settings.acme.http_responder_url, "http://localhost:8080");
+        assert_eq!(settings.acme.http_responder_hmac, "dev-hmac");
+        assert_eq!(settings.acme.http_responder_timeout_secs, 5);
+        assert_eq!(settings.acme.http_responder_token_ttl_secs, 300);
         assert_eq!(settings.acme.directory_fetch_attempts, 10);
         assert_eq!(settings.acme.directory_fetch_base_delay_secs, 1);
         assert_eq!(settings.acme.directory_fetch_max_delay_secs, 10);
@@ -463,6 +502,8 @@ mod tests {
             config: None,
             email: Some("cli@example.com".to_string()),
             ca_url: None, // Keep default/config
+            http_responder_url: None,
+            http_responder_hmac: None,
             eab_kid: None,
             eab_hmac: None,
             eab_file: None,
@@ -562,7 +603,8 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_empty_profiles() {
-        let settings = Settings::new(None).unwrap();
+        let mut settings = Settings::new(None).unwrap();
+        settings.acme.http_responder_hmac = "test".to_string();
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("profiles must not be empty"));
     }

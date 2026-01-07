@@ -6,7 +6,7 @@ use tokio::fs;
 use tracing::info;
 
 use crate::acme::client::AcmeClient;
-use crate::acme::http01::ChallengeStore;
+use crate::acme::responder_client;
 use crate::acme::types::{AuthorizationStatus, ChallengeStatus, ChallengeType, OrderStatus};
 
 const KEY_FILE_MODE: u32 = 0o600;
@@ -103,15 +103,9 @@ pub async fn issue_certificate(
     settings: &crate::config::Settings,
     profile: &crate::config::ProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
-    challenges: ChallengeStore,
     uri_san: Option<&str>,
 ) -> Result<()> {
     let mut client = AcmeClient::new(settings.server.clone(), &settings.acme)?;
-
-    {
-        let mut guard = challenges.lock().await;
-        guard.clear();
-    }
 
     client.fetch_directory().await?;
     tracing::debug!("Directory loaded.");
@@ -154,10 +148,7 @@ pub async fn issue_certificate(
             let key_auth = client.compute_key_authorization(&challenge_token)?;
             tracing::debug!("Key Authorization computed: {key_auth}");
 
-            {
-                let mut guard = challenges.lock().await;
-                guard.insert(challenge_token.clone(), key_auth);
-            }
+            responder_client::register_http01_token(settings, &challenge_token, &key_auth).await?;
 
             tracing::debug!("Triggering challenge validation...");
             client.trigger_challenge(&challenge_url).await?;

@@ -322,12 +322,15 @@ mod tests {
             spiffe_trust_domain: "trusted.domain".to_string(),
             eab: None,
             acme: AcmeSettings {
-                http_challenge_port: 80,
                 directory_fetch_attempts: 10,
                 directory_fetch_base_delay_secs: 1,
                 directory_fetch_max_delay_secs: 10,
                 poll_attempts: 15,
                 poll_interval_secs: 2,
+                http_responder_url: "http://localhost:8080".to_string(),
+                http_responder_hmac: "dev-hmac".to_string(),
+                http_responder_timeout_secs: 5,
+                http_responder_token_ttl_secs: 300,
             },
             retry: RetrySettings {
                 backoff_secs: vec![1, 2, 3],

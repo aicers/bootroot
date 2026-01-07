@@ -37,6 +37,21 @@ services:
         "/home/step/password.txt",
       ]
 
+  bootroot-http01:
+    build:
+      context: .
+      dockerfile: docker/http01-responder/Dockerfile
+    image: bootroot-http01-responder:latest
+    container_name: bootroot-http01
+    volumes:
+      - ./responder.toml.compose:/app/responder.toml:ro
+    command:
+      - --config=/app/responder.toml
+    networks:
+      default:
+        aliases:
+          - bootroot-agent.com
+
   bootroot-agent:
     build:
       context: .
@@ -55,10 +70,6 @@ services:
       - --config=/app/agent.toml
     environment:
       - RUST_LOG=debug
-    networks:
-      default:
-        aliases:
-          - bootroot-agent.com
 
 volumes:
   postgres-data:
