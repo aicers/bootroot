@@ -13,6 +13,25 @@ issuance and renewal from an ACME-compatible Private CA (like `step-ca`).
 - **Security**: ECSDA P-256 keys, secure storage, and minimal dependencies.
 - **Deployment**: Single static binary or lightweight Docker image.
 - **Daemon Mode**: Periodic renewal checks with graceful shutdown.
+- **Documentation**: Bilingual manual skeleton (EN/KR) via MkDocs.
+
+## Documentation
+
+- Manual entry point: `docs/en/index.md` (English)
+- 매뉴얼 시작점: `docs/ko/index.md` (한국어)
+
+Build locally:
+
+```bash
+brew install python
+python3 -m venv .venv
+# zsh/bash:
+source .venv/bin/activate
+# fish:
+source .venv/bin/activate.fish
+pip install mkdocs-material mkdocs-static-i18n
+mkdocs serve -a 127.0.0.1:8000
+```
 
 ## Getting Started
 
@@ -32,10 +51,10 @@ This is the easiest way to verify the agent and CA integration.
    The Compose stack runs `step-ca` with a local PostgreSQL backend
    (password auth enabled for dev) and builds a custom `step-ca` binary
    with PostgreSQL support.
-   If you change `POSTGRES_PASSWORD`, update `secrets/config/ca.json`
-   to match the new password in `db.dataSource`.
-   You can also run `scripts/update-ca-db-dsn.sh` to regenerate the DSN
-   from environment variables.
+   For now the DB password lives in `.env` for local dev. If you change
+   `POSTGRES_PASSWORD`, update `secrets/config/ca.json` to match the new
+   password in `db.dataSource` (or run `scripts/update-ca-db-dsn.sh`).
+   Secret Manager integration (e.g., OpenBao) will be added later.
 
    ```bash
    docker compose up --build -d
@@ -71,6 +90,13 @@ You can run the agent directly on your host machine.
    ```
 
    This starts the local PostgreSQL backend automatically via `depends_on`.
+
+2. **Initialize step-ca (first-time)**
+
+   If you are not using the pre-generated test secrets, run `step ca init`
+   to create CA keys and config. Store the generated files under `secrets/`
+   and update `secrets/config/ca.json` accordingly. (Detailed operator
+   docs will be provided separately.)
 
 ### Production Notes
 

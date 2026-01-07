@@ -4,3 +4,5 @@ secrets/
 secrets.bak/
 **/*.DS_Store
 .vscode/
+.venv/
+site/

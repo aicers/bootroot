@@ -1,0 +1,42 @@
+site_name: Bootroot Manual
+site_description: Bootroot user manual (EN/KR)
+repo_url: https://github.com/aicers/bootroot
+site_url: https://example.invalid/bootroot
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.tracking
+    - search.highlight
+    - search.suggest
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: folder
+      languages:
+        - locale: en
+          name: English
+          build: true
+          default: true
+          nav:
+            - Overview: index.md
+            - Getting Started: getting-started.md
+            - Configuration: configuration.md
+            - Operations: operations.md
+        - locale: ko
+          name: 한국어
+          build: true
+          nav:
+            - Overview: index.md
+            - Getting Started: getting-started.md
+            - Configuration: configuration.md
+            - Operations: operations.md
+          nav_translations:
+            Overview: 개요
+            Getting Started: 시작하기
+            Configuration: 설정
+            Operations: 운영
