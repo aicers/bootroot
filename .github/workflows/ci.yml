@@ -45,6 +45,12 @@ jobs:
         with:
           globs: "**/*.md"
 
+      - name: Set up MkDocs
+        run: python3 -m pip install --upgrade pip mkdocs-material mkdocs-static-i18n
+
+      - name: Build Docs
+        run: mkdocs build --strict
+
       - name: Install cargo-audit
         run: cargo install cargo-audit || true
 
