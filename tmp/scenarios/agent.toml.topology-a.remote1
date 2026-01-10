@@ -1,0 +1,26 @@
+email = "admin@example.com"
+server = "https://bootroot-ca:9000/acme/acme/directory"
+domain = "trusted.domain"
+
+[scheduler]
+max_concurrent_issuances = 1
+
+[acme]
+poll_attempts = 5
+poll_interval_secs = 1
+http_responder_url = "http://bootroot-http01:8080"
+http_responder_hmac = "dev-hmac"
+http_responder_timeout_secs = 5
+http_responder_token_ttl_secs = 300
+
+[retry]
+backoff_secs = [1, 2, 3]
+
+[[profiles]]
+daemon_name = "edge-proxy"
+instance_id = "102"
+hostname = "edge-node-02"
+
+[profiles.paths]
+cert = "certs/topo-a-102.crt"
+key = "certs/topo-a-102.key"
