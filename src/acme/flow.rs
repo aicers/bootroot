@@ -93,113 +93,110 @@ fn build_csr_params(
     Ok(params)
 }
 
-/// Issues a certificate via ACME protocol.
-///
-/// # Errors
-/// Returns error if ACME protocol fails.
-///
-#[allow(clippy::too_many_lines)]
-pub async fn issue_certificate(
-    settings: &crate::config::Settings,
-    profile: &crate::config::ProfileSettings,
+async fn register_acme_account(
+    client: &mut AcmeClient,
+    email: &str,
     eab_creds: Option<crate::eab::EabCredentials>,
-    uri_san: Option<&str>,
 ) -> Result<()> {
-    let mut client = AcmeClient::new(settings.server.clone(), &settings.acme)?;
-
-    client.fetch_directory().await?;
-    tracing::debug!("Directory loaded.");
-
-    let nonce = client.get_nonce().await?;
-    tracing::debug!("Got initial nonce: {}", nonce);
-
     if let Some(creds) = eab_creds {
         info!("Using existing EAB credentials for Key ID: {}", creds.kid);
         client
-            .register_account(&[contact_from_email(&settings.email)], Some(&creds))
+            .register_account(&[contact_from_email(email)], Some(&creds))
             .await?;
     } else {
         client
-            .register_account(&[contact_from_email(&settings.email)], None)
+            .register_account(&[contact_from_email(email)], None)
             .await?;
     }
+    Ok(())
+}
 
-    let order = client.create_order(&profile.domains).await?;
-    info!("Order created: {:?}", order);
-
+async fn validate_http01_authorizations(
+    settings: &crate::config::Settings,
+    client: &mut AcmeClient,
+    order: &crate::acme::types::Order,
+) -> Result<()> {
     for authz_url in &order.authorizations {
-        tracing::debug!("Fetching authorization: {}", authz_url);
-        let mut authz = client.fetch_authorization(authz_url).await?;
+        validate_authorization_http01(settings, client, authz_url).await?;
+    }
+    Ok(())
+}
 
-        if authz.status == AuthorizationStatus::Valid {
-            tracing::debug!("Authorization already valid.");
-            continue;
-        }
+async fn validate_authorization_http01(
+    settings: &crate::config::Settings,
+    client: &mut AcmeClient,
+    authz_url: &str,
+) -> Result<()> {
+    tracing::debug!("Fetching authorization: {}", authz_url);
+    let authz = client.fetch_authorization(authz_url).await?;
 
-        if let Some(challenge_ref) = authz
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::Http01)
-        {
-            let challenge_token = challenge_ref.token.clone();
-            let challenge_url = challenge_ref.url.clone();
-            tracing::debug!("Found HTTP-01 challenge: token={challenge_token}");
-
-            let key_auth = client.compute_key_authorization(&challenge_token)?;
-            tracing::debug!("Key Authorization computed: {key_auth}");
-
-            responder_client::register_http01_token(settings, &challenge_token, &key_auth).await?;
-
-            tracing::debug!("Triggering challenge validation...");
-            client.trigger_challenge(&challenge_url).await?;
-
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                authz = client.fetch_authorization(authz_url).await?;
-                tracing::debug!("Authz status: {:?}", authz.status);
-                tracing::debug!("Full Authz: {:?}", authz);
-
-                if authz.status == AuthorizationStatus::Valid {
-                    info!("Authorization validated!");
-                    break;
-                }
-                if authz.status == AuthorizationStatus::Invalid {
-                    anyhow::bail!("Authorization failed (invalid)");
-                }
-
-                if let Some(c) = authz.challenges.iter().find(|c| {
-                    c.token == challenge_token
-                        && c.r#type == ChallengeType::Http01
-                        && c.status == ChallengeStatus::Invalid
-                }) {
-                    let error_msg = c
-                        .error
-                        .as_ref()
-                        .map_or_else(|| "Unknown error".to_string(), |e| format!("{e:?}"));
-                    anyhow::bail!("Challenge failed: {error_msg}");
-                }
-            }
-        } else {
-            anyhow::bail!("No HTTP-01 challenge found in authorization");
-        }
+    if authz.status == AuthorizationStatus::Valid {
+        tracing::debug!("Authorization already valid.");
+        return Ok(());
     }
 
-    let primary_domain = profile
-        .domains
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No domains configured"))?;
-    info!("Generating CSR for domain: {}", primary_domain);
-    let params = build_csr_params(profile, uri_san)?;
-    let cert_key = rcgen::KeyPair::generate()?;
-    let csr_der = params.serialize_request(&cert_key)?;
+    let challenge_ref = authz
+        .challenges
+        .iter()
+        .find(|c| c.r#type == ChallengeType::Http01)
+        .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge found in authorization"))?;
 
-    info!("Finalizing order at: {}", order.finalize);
-    let finalized_order = client
-        .finalize_order(&order.finalize, csr_der.der())
-        .await?;
-    info!("Order status after finalize: {:?}", finalized_order.status);
+    let challenge_token = challenge_ref.token.clone();
+    let challenge_url = challenge_ref.url.clone();
+    tracing::debug!("Found HTTP-01 challenge: token={challenge_token}");
 
-    let mut finalized_order = finalized_order;
+    let key_auth = client.compute_key_authorization(&challenge_token)?;
+    tracing::debug!("Key Authorization computed: {key_auth}");
+
+    responder_client::register_http01_token(settings, &challenge_token, &key_auth).await?;
+
+    tracing::debug!("Triggering challenge validation...");
+    client.trigger_challenge(&challenge_url).await?;
+
+    wait_for_http01_validation(client, authz_url, &challenge_token).await?;
+
+    Ok(())
+}
+
+async fn wait_for_http01_validation(
+    client: &mut AcmeClient,
+    authz_url: &str,
+    challenge_token: &str,
+) -> Result<()> {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let authz = client.fetch_authorization(authz_url).await?;
+        tracing::debug!("Authz status: {:?}", authz.status);
+        tracing::debug!("Full Authz: {:?}", authz);
+
+        if authz.status == AuthorizationStatus::Valid {
+            info!("Authorization validated!");
+            return Ok(());
+        }
+        if authz.status == AuthorizationStatus::Invalid {
+            anyhow::bail!("Authorization failed (invalid)");
+        }
+
+        if let Some(c) = authz.challenges.iter().find(|c| {
+            c.token == challenge_token
+                && c.r#type == ChallengeType::Http01
+                && c.status == ChallengeStatus::Invalid
+        }) {
+            let error_msg = c
+                .error
+                .as_ref()
+                .map_or_else(|| "Unknown error".to_string(), |e| format!("{e:?}"));
+            anyhow::bail!("Challenge failed: {error_msg}");
+        }
+    }
+}
+
+async fn wait_for_order_completion(
+    settings: &crate::config::Settings,
+    client: &mut AcmeClient,
+    order: &crate::acme::types::Order,
+    mut finalized_order: crate::acme::types::Order,
+) -> Result<crate::acme::types::Order> {
     if finalized_order.status == OrderStatus::Processing {
         if let Some(url) = &order.url {
             for i in 0..settings.acme.poll_attempts {
@@ -220,6 +217,52 @@ pub async fn issue_certificate(
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     }
+    Ok(finalized_order)
+}
+
+/// Issues a certificate via ACME protocol.
+///
+/// # Errors
+/// Returns error if ACME protocol fails.
+///
+pub async fn issue_certificate(
+    settings: &crate::config::Settings,
+    profile: &crate::config::ProfileSettings,
+    eab_creds: Option<crate::eab::EabCredentials>,
+    uri_san: Option<&str>,
+) -> Result<()> {
+    let mut client = AcmeClient::new(settings.server.clone(), &settings.acme)?;
+
+    client.fetch_directory().await?;
+    tracing::debug!("Directory loaded.");
+
+    let nonce = client.get_nonce().await?;
+    tracing::debug!("Got initial nonce: {}", nonce);
+
+    register_acme_account(&mut client, &settings.email, eab_creds).await?;
+
+    let order = client.create_order(&profile.domains).await?;
+    info!("Order created: {:?}", order);
+
+    validate_http01_authorizations(settings, &mut client, &order).await?;
+
+    let primary_domain = profile
+        .domains
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No domains configured"))?;
+    info!("Generating CSR for domain: {}", primary_domain);
+    let params = build_csr_params(profile, uri_san)?;
+    let cert_key = rcgen::KeyPair::generate()?;
+    let csr_der = params.serialize_request(&cert_key)?;
+
+    info!("Finalizing order at: {}", order.finalize);
+    let finalized_order = client
+        .finalize_order(&order.finalize, csr_der.der())
+        .await?;
+    info!("Order status after finalize: {:?}", finalized_order.status);
+
+    let finalized_order =
+        wait_for_order_completion(settings, &mut client, &order, finalized_order).await?;
 
     if let Some(cert_url) = finalized_order.certificate {
         info!("Downloading certificate from: {}", cert_url);
