@@ -6,10 +6,6 @@ use tokio::sync::{Semaphore, watch};
 use tracing::{error, info};
 
 use crate::{acme, config, eab, hooks, profile};
-
-const DAEMON_CHECK_INTERVAL_KEY: &str = "daemon.check_interval";
-const DAEMON_RENEW_BEFORE_KEY: &str = "daemon.renew_before";
-const DAEMON_CHECK_JITTER_KEY: &str = "daemon.check_jitter";
 pub(crate) const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = 1_000_000_000;
 
 pub(crate) async fn run_daemon(
@@ -58,12 +54,9 @@ async fn run_profile_daemon(
     semaphore: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let check_interval =
-        parse_duration_setting(&profile.daemon.check_interval, DAEMON_CHECK_INTERVAL_KEY)?;
-    let renew_before =
-        parse_duration_setting(&profile.daemon.renew_before, DAEMON_RENEW_BEFORE_KEY)?;
-    let check_jitter =
-        parse_duration_setting(&profile.daemon.check_jitter, DAEMON_CHECK_JITTER_KEY)?;
+    let check_interval = profile.daemon.check_interval;
+    let renew_before = profile.daemon.renew_before;
+    let check_jitter = profile.daemon.check_jitter;
     let uri_san = if profile.uri_san_enabled {
         Some(profile::build_spiffe_uri(&settings, &profile))
     } else {
@@ -345,11 +338,6 @@ pub(crate) fn parse_cert_not_after(cert_bytes: &[u8]) -> anyhow::Result<time::Of
     Ok(cert.validity().not_after.to_datetime())
 }
 
-pub(crate) fn parse_duration_setting(value: &str, label: &str) -> anyhow::Result<Duration> {
-    humantime::parse_duration(value)
-        .map_err(|e| anyhow::anyhow!("Invalid {label} value '{value}': {e}"))
-}
-
 fn jittered_delay(base: Duration, jitter: Duration) -> Duration {
     let now_ns = time::OffsetDateTime::now_utc()
         .unix_timestamp_nanos()
@@ -419,9 +407,9 @@ mod tests {
                 key: PathBuf::from("unused.key"),
             },
             daemon: DaemonSettings {
-                check_interval: "1h".to_string(),
-                renew_before: "720h".to_string(),
-                check_jitter: "0s".to_string(),
+                check_interval: Duration::from_secs(60 * 60),
+                renew_before: Duration::from_secs(720 * 60 * 60),
+                check_jitter: Duration::from_secs(0),
             },
             retry: None,
             hooks: config::HookSettings::default(),

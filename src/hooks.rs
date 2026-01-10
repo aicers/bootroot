@@ -335,9 +335,9 @@ mod tests {
                 key: PathBuf::from(TEST_KEY_PATH),
             },
             daemon: DaemonSettings {
-                check_interval: "1h".to_string(),
-                renew_before: "720h".to_string(),
-                check_jitter: "0s".to_string(),
+                check_interval: Duration::from_secs(60 * 60),
+                renew_before: Duration::from_secs(720 * 60 * 60),
+                check_jitter: Duration::from_secs(0),
             },
             retry: None,
             hooks,

@@ -121,7 +121,6 @@ mod tests {
     const TEST_KEY_PATH: &str = "unused.key";
     const TEST_TRUST_DOMAIN: &str = "trusted.domain";
     const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;
-    const VALID_DURATION_LABEL: &str = "daemon.check_interval";
     const TEST_DELAYS: [u64; 3] = [1, 2, 3];
     const TEST_JITTER_SECS: u64 = 10;
     const TEST_BASE_SECS: u64 = 60;
@@ -140,9 +139,9 @@ mod tests {
                 key: PathBuf::from(TEST_KEY_PATH),
             },
             daemon: config::DaemonSettings {
-                check_interval: "1h".to_string(),
-                renew_before: "720h".to_string(),
-                check_jitter: "0s".to_string(),
+                check_interval: Duration::from_secs(60 * 60),
+                renew_before: Duration::from_secs(720 * 60 * 60),
+                check_jitter: Duration::from_secs(0),
             },
             retry: None,
             hooks: config::HookSettings::default(),
@@ -185,21 +184,6 @@ mod tests {
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
         fs::write(cert_path, cert.pem()).unwrap();
-    }
-
-    #[test]
-    fn test_parse_duration_setting_valid() {
-        let duration = daemon::parse_duration_setting("15m", VALID_DURATION_LABEL).unwrap();
-        assert_eq!(duration, Duration::from_secs(15 * 60));
-    }
-
-    #[test]
-    fn test_parse_duration_setting_invalid() {
-        let err = daemon::parse_duration_setting("nope", VALID_DURATION_LABEL).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Invalid daemon.check_interval value")
-        );
     }
 
     #[test]
