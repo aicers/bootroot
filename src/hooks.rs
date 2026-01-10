@@ -82,18 +82,13 @@ struct HookContext {
 
 impl HookContext {
     fn envs(&self, settings: &Settings, profile: &ProfileSettings) -> Vec<(String, String)> {
-        let primary_domain = profile.domains.first().map_or("", String::as_str);
+        let mut envs = base_envs(settings, profile);
+        envs.extend(self.context_envs());
+        envs
+    }
+
+    fn context_envs(&self) -> Vec<(String, String)> {
         vec![
-            (
-                ENV_CERT_PATH.to_string(),
-                profile.paths.cert.display().to_string(),
-            ),
-            (
-                ENV_KEY_PATH.to_string(),
-                profile.paths.key.display().to_string(),
-            ),
-            (ENV_DOMAINS.to_string(), profile.domains.join(",")),
-            (ENV_PRIMARY_DOMAIN.to_string(), primary_domain.to_string()),
             (
                 ENV_RENEWED_AT.to_string(),
                 self.renewed_at
@@ -108,9 +103,25 @@ impl HookContext {
                 ENV_RENEW_ERROR.to_string(),
                 self.error_message.clone().unwrap_or_default(),
             ),
-            (ENV_SERVER_URL.to_string(), settings.server.clone()),
         ]
     }
+}
+
+fn base_envs(settings: &Settings, profile: &ProfileSettings) -> Vec<(String, String)> {
+    let primary_domain = profile.domains.first().map_or("", String::as_str);
+    vec![
+        (
+            ENV_CERT_PATH.to_string(),
+            profile.paths.cert.display().to_string(),
+        ),
+        (
+            ENV_KEY_PATH.to_string(),
+            profile.paths.key.display().to_string(),
+        ),
+        (ENV_DOMAINS.to_string(), profile.domains.join(",")),
+        (ENV_PRIMARY_DOMAIN.to_string(), primary_domain.to_string()),
+        (ENV_SERVER_URL.to_string(), settings.server.clone()),
+    ]
 }
 
 async fn run_hook_with_retry(
