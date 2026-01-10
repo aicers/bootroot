@@ -64,9 +64,9 @@ There is no implicit trust between environments.
 
 Examples:
 
-- `spiffe://customer-a/giganto`
-- `spiffe://customer-a/aice-web-next`
-- `spiffe://company-prod/aimer-web`
+- `001.giganto.node-01.customer-a.internal`
+- `002.aice-web-next.node-01.customer-a.internal`
+- `001.aimer-web.node-02.company-prod.internal`
 
 ## 5. System Authentication Model
 

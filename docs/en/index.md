@@ -21,7 +21,7 @@ Components:
 
 ## Manual Map
 
-- **Concepts**: PKI, ACME, CSR, SAN, SPIFFE, and mTLS basics
+- **Concepts**: PKI, ACME, CSR, SAN, and mTLS basics
 - **Getting Started**: Quick Docker-based issuance flow
 - **Installation**: step-ca + PostgreSQL + bootroot-agent + responder setup
 - **Configuration**: `agent.toml`, profiles, hooks, retries, and EAB

@@ -3,13 +3,13 @@
 ## Can I run multiple certificates on one machine?
 
 Yes. Define multiple `[[profiles]]` entries. Each profile issues its own
-certificate and can use distinct domains and paths.
+certificate and uses a distinct identity derived from
+`instance_id.daemon_name.hostname.domain`.
 
-## Can I use SPIFFE without DNS names?
+## Can I include URI SANs with ACME?
 
-Not today. ACME HTTP-01 requires `domains`, and those values are always added
-as DNS SANs. `uri_san_enabled = true` only adds a SPIFFE URI; it does not
-remove DNS SANs.
+No. ACME only supports DNS/IP identifiers, so URI SANs are rejected by
+step-ca in the ACME flow.
 
 ## Do I need EAB?
 

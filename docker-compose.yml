@@ -50,7 +50,7 @@ services:
     networks:
       default:
         aliases:
-          - bootroot-agent.com
+          - 001.bootroot-agent.bootroot-agent.trusted.domain
 
   bootroot-agent:
     build:

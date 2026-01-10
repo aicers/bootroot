@@ -108,7 +108,7 @@ impl HookContext {
 }
 
 fn base_envs(settings: &Settings, profile: &ProfileSettings) -> Vec<(String, String)> {
-    let primary_domain = profile.domains.first().map_or("", String::as_str);
+    let primary_domain = crate::config::profile_domain(settings, profile);
     vec![
         (
             ENV_CERT_PATH.to_string(),
@@ -118,8 +118,8 @@ fn base_envs(settings: &Settings, profile: &ProfileSettings) -> Vec<(String, Str
             ENV_KEY_PATH.to_string(),
             profile.paths.key.display().to_string(),
         ),
-        (ENV_DOMAINS.to_string(), profile.domains.join(",")),
-        (ENV_PRIMARY_DOMAIN.to_string(), primary_domain.to_string()),
+        (ENV_DOMAINS.to_string(), primary_domain.clone()),
+        (ENV_PRIMARY_DOMAIN.to_string(), primary_domain),
         (ENV_SERVER_URL.to_string(), settings.server.clone()),
     ]
 }
@@ -318,18 +318,16 @@ mod tests {
         ProfileSettings, RetrySettings, SchedulerSettings, Settings,
     };
 
-    const TEST_DOMAIN: &str = "example.com";
+    const TEST_DOMAIN: &str = "trusted.domain";
     const TEST_SERVER_URL: &str = "https://example.com/acme/directory";
     const TEST_KEY_PATH: &str = "unused.key";
+    const EXPECTED_DOMAIN: &str = "001.edge-proxy.edge-node-01.trusted.domain";
 
     fn build_settings(cert_path: PathBuf, hooks: HookSettings) -> (Settings, ProfileSettings) {
         let profile = ProfileSettings {
-            name: "edge-proxy-a".to_string(),
             daemon_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
-            uri_san_enabled: true,
-            domains: vec![TEST_DOMAIN.to_string()],
             paths: Paths {
                 cert: cert_path,
                 key: PathBuf::from(TEST_KEY_PATH),
@@ -347,7 +345,7 @@ mod tests {
         let settings = Settings {
             email: "test@example.com".to_string(),
             server: TEST_SERVER_URL.to_string(),
-            spiffe_trust_domain: "trusted.domain".to_string(),
+            domain: TEST_DOMAIN.to_string(),
             eab: None,
             acme: AcmeSettings {
                 directory_fetch_attempts: 10,
@@ -370,6 +368,29 @@ mod tests {
         };
 
         (settings, profile)
+    }
+
+    #[test]
+    fn test_hook_envs_include_generated_domains() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let hooks = HookSettings::default();
+        let (settings, profile) = build_settings(cert_path, hooks);
+
+        let envs = super::base_envs(&settings, &profile);
+        let domains = envs
+            .iter()
+            .find(|(key, _)| key == ENV_DOMAINS)
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        let primary_domain = envs
+            .iter()
+            .find(|(key, _)| key == ENV_PRIMARY_DOMAIN)
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+
+        assert_eq!(domains, EXPECTED_DOMAIN);
+        assert_eq!(primary_domain, EXPECTED_DOMAIN);
     }
 
     #[tokio::test]

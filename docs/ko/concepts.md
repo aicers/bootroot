@@ -4,7 +4,7 @@
 
 ## PKI와 인증서
 
-- **CA(인증기관)** 는 공개키와 신원을 묶어 서명합니다.
+- **CA(인증기관)** 는 공개키와 신원을 묶어 서명합니다(호스트명 또는 IP).
 - **인증서**는 신원 정보(SAN), 유효기간, CA 서명을 포함합니다.
 - **개인키**는 반드시 안전하게 보호되어야 합니다.
 
@@ -60,15 +60,7 @@ HTTP-01은 **도메인 소유 확인 절차**입니다. CA가 **토큰**을 발�
 인증서의 실제 신원 목록입니다. 예:
 
 - **DNS**: `example.internal`
-- **URI**: `spiffe://trusted.domain/host/daemon/instance`
-
-## SPIFFE URI
-
-워크로드 식별을 위한 URI 형식입니다. 이 repo의 기본 형식:
-
-```text
-spiffe://<trust-domain>/<hostname>/<daemon-name>/<instance-id>
-```
+- **IP**: `192.0.2.10`
 
 ## mTLS
 

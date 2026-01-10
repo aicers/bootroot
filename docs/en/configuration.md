@@ -10,7 +10,7 @@ The full template lives in `agent.toml.example`.
 ```toml
 email = "admin@example.com"
 server = "https://localhost:9000/acme/acme/directory"
-spiffe_trust_domain = "trusted.domain"
+domain = "trusted.domain"
 ```
 
 - `email`: ACME account contact email. The account is created automatically
@@ -29,9 +29,8 @@ spiffe_trust_domain = "trusted.domain"
     - Docker Compose: `https://bootroot-ca:9000/acme/acme/directory`
     - Host install (same host): `https://localhost:9000/acme/acme/directory`
     - Remote step-ca: `https://<step-ca-host>:9000/acme/<provisioner>/directory`
-- `spiffe_trust_domain`: the **trust domain** portion of the SPIFFE URI SAN.
-  For example, `spiffe_trust_domain = "trusted.domain"` yields
-  `spiffe://trusted.domain/<hostname>/<daemon-name>/<instance-id>`.
+- `domain`: root domain used to auto-generate the DNS SAN as
+  `instance_id.daemon_name.hostname.domain`.
 
 ### Scheduler
 
@@ -96,12 +95,9 @@ Each profile represents one daemon instance (one certificate identity).
 
 ```toml
 [[profiles]]
-name = "edge-proxy-a"
 daemon_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
-uri_san_enabled = true
-domains = ["edge-proxy.internal"]
 
 [profiles.paths]
 cert = "certs/edge-proxy-a.pem"
@@ -113,15 +109,11 @@ renew_before = "720h"
 check_jitter = "0s"
 ```
 
-When `uri_san_enabled = true`, bootroot-agent automatically includes a URI
-like `spiffe://<trust-domain>/<hostname>/<daemon-name>/<instance-id>` in the
-certificate SAN list (no extra user input required). The `<trust-domain>`
-portion comes from the global `spiffe_trust_domain` setting.
-
-`domains` lists the DNS names you want in the certificate (DNS SAN). These
-names are also the targets for HTTP-01 validation, so they must resolve
-from step-ca to the HTTP-01 responder (for Compose, update the network alias;
-for host installs, update `/etc/hosts` or DNS).
+The DNS SAN is auto-generated as
+`<instance-id>.<daemon-name>.<hostname>.<domain>`. This name is also the
+target for HTTP-01 validation, so it must resolve from step-ca to the
+HTTP-01 responder IP (for Compose, update the network alias; for host installs,
+update `/etc/hosts` or DNS).
 
 #### Profile Retry Override
 

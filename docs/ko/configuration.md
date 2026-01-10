@@ -10,7 +10,7 @@ bootroot-agent는 TOML 설정 파일을 읽습니다(기본값: `agent.toml`).
 ```toml
 email = "admin@example.com"
 server = "https://localhost:9000/acme/acme/directory"
-spiffe_trust_domain = "trusted.domain"
+domain = "trusted.domain"
 ```
 
 - `email`: ACME 계정 연락처 이메일입니다. bootroot-agent가 step-ca에
@@ -29,9 +29,8 @@ spiffe_trust_domain = "trusted.domain"
     - Docker Compose: `https://bootroot-ca:9000/acme/acme/directory`
     - 호스트 실행(동일 호스트): `https://localhost:9000/acme/acme/directory`
     - 원격 step-ca: `https://<step-ca-host>:9000/acme/<provisioner>/directory`
-- `spiffe_trust_domain`: SPIFFE URI SAN의 **trust domain** 부분입니다.
-  예를 들어 `spiffe_trust_domain = "trusted.domain"`이면 다음처럼 들어갑니다.
-  `spiffe://trusted.domain/<hostname>/<daemon-name>/<instance-id>`
+- `domain`: `instance_id.daemon_name.hostname.domain` 형식의 DNS SAN을
+  자동 생성할 때 사용하는 루트 도메인입니다.
 
 ### 스케줄러
 
@@ -96,12 +95,9 @@ CLI에서도 지정 가능합니다(`--eab-kid`, `--eab-hmac`, `--eab-file`).
 
 ```toml
 [[profiles]]
-name = "edge-proxy-a"
 daemon_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
-uri_san_enabled = true
-domains = ["edge-proxy.internal"]
 
 [profiles.paths]
 cert = "certs/edge-proxy-a.pem"
@@ -113,14 +109,11 @@ renew_before = "720h"
 check_jitter = "0s"
 ```
 
-`uri_san_enabled = true`이면 bootroot-agent가 인증서 SAN에
-`spiffe://<trust-domain>/<hostname>/<daemon-name>/<instance-id>` 형식의 URI를
-**자동으로 포함**합니다(사용자 추가 입력 없음). 이때 `<trust-domain>`은
-전역 설정의 `spiffe_trust_domain` 값을 사용합니다.
-
-`domains`는 인증서에 포함할 DNS 이름(DNS SAN) 목록입니다. HTTP-01 검증도
-이 도메인으로 진행되므로, step-ca에서 해당 도메인이 HTTP-01 리스폰더로
-해석되어야 합니다(Compose는 네트워크 alias, 베어메탈은 `/etc/hosts`나 DNS).
+DNS SAN은 `<instance-id>.<daemon-name>.<hostname>.<domain>` 형식으로
+자동 생성됩니다. 이 이름은 HTTP-01 검증 대상이므로, step-ca에서
+HTTP-01 리스폰더 IP로 해석되어야 합니다(Compose는 네트워크 alias,
+베어메탈은 `/etc/hosts` 또는 DNS 설정).
+권장 형식: `<instance-id>.<daemon-name>.<hostname>.<domain>`.
 
 #### 프로필 재시도 재정의
 

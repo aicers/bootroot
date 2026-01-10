@@ -1,19 +1,5 @@
 use crate::{config, eab};
 
-pub(crate) const SPIFFE_URI_FORMAT: &str =
-    "spiffe://{trust_domain}/{hostname}/{daemon_name}/{instance_id}";
-
-pub(crate) fn build_spiffe_uri(
-    settings: &config::Settings,
-    profile: &config::ProfileSettings,
-) -> String {
-    SPIFFE_URI_FORMAT
-        .replace("{trust_domain}", &settings.spiffe_trust_domain)
-        .replace("{hostname}", &profile.hostname)
-        .replace("{daemon_name}", &profile.daemon_name)
-        .replace("{instance_id}", &profile.instance_id)
-}
-
 pub(crate) fn resolve_profile_eab(
     profile: &config::ProfileSettings,
     default_eab: Option<eab::EabCredentials>,

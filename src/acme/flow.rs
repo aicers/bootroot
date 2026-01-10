@@ -15,28 +15,17 @@ fn contact_from_email(email: &str) -> String {
 }
 
 fn build_csr_params(
+    settings: &crate::config::Settings,
     profile: &crate::config::ProfileSettings,
-    uri_san: Option<&str>,
 ) -> Result<rcgen::CertificateParams> {
-    let primary_domain = profile
-        .domains
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No domains configured"))?;
+    let primary_domain = crate::config::profile_domain(settings, profile);
     let mut params = rcgen::CertificateParams::default();
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, primary_domain.clone());
 
-    let mut sans = Vec::new();
-    for d in &profile.domains {
-        let dns_name = d.clone().try_into()?;
-        sans.push(rcgen::SanType::DnsName(dns_name));
-    }
-    if let Some(uri_san) = uri_san {
-        let uri = uri_san.try_into()?;
-        sans.push(rcgen::SanType::URI(uri));
-    }
-    params.subject_alt_names = sans;
+    let dns_name = primary_domain.try_into()?;
+    params.subject_alt_names = vec![rcgen::SanType::DnsName(dns_name)];
     Ok(params)
 }
 
@@ -176,7 +165,6 @@ pub async fn issue_certificate(
     settings: &crate::config::Settings,
     profile: &crate::config::ProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
-    uri_san: Option<&str>,
 ) -> Result<()> {
     let mut client = AcmeClient::new(settings.server.clone(), &settings.acme)?;
 
@@ -188,17 +176,16 @@ pub async fn issue_certificate(
 
     register_acme_account(&mut client, &settings.email, eab_creds).await?;
 
-    let order = client.create_order(&profile.domains).await?;
+    let primary_domain = crate::config::profile_domain(settings, profile);
+    let order = client
+        .create_order(std::slice::from_ref(&primary_domain))
+        .await?;
     info!("Order created: {:?}", order);
 
     validate_http01_authorizations(settings, &mut client, &order).await?;
 
-    let primary_domain = profile
-        .domains
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No domains configured"))?;
     info!("Generating CSR for domain: {}", primary_domain);
-    let params = build_csr_params(profile, uri_san)?;
+    let params = build_csr_params(settings, profile)?;
     let cert_key = rcgen::KeyPair::generate()?;
     let csr_der = params.serialize_request(&cert_key)?;
 
@@ -237,18 +224,52 @@ mod tests {
 
     use super::*;
 
-    const TEST_DOMAIN: &str = "example.com";
-    const TEST_URI_SAN: &str = "spiffe://trusted.domain/edge-node-01/edge-proxy/001";
+    const TEST_DOMAIN: &str = "trusted.domain";
 
     #[test]
-    fn test_build_csr_params_includes_uri_san() {
-        let profile = crate::config::ProfileSettings {
-            name: "edge-proxy-a".to_string(),
+    fn test_contact_from_email_adds_mailto_prefix() {
+        let contact = contact_from_email("admin@example.com");
+        assert_eq!(contact, "mailto:admin@example.com");
+    }
+
+    #[test]
+    fn test_contact_from_email_keeps_existing_prefix() {
+        let contact = contact_from_email("mailto:admin@example.com");
+        assert_eq!(contact, "mailto:admin@example.com");
+    }
+
+    fn test_settings() -> crate::config::Settings {
+        crate::config::Settings {
+            email: "test@example.com".to_string(),
+            server: "https://example.com/acme/directory".to_string(),
+            domain: TEST_DOMAIN.to_string(),
+            eab: None,
+            acme: crate::config::AcmeSettings {
+                directory_fetch_attempts: 10,
+                directory_fetch_base_delay_secs: 1,
+                directory_fetch_max_delay_secs: 10,
+                poll_attempts: 15,
+                poll_interval_secs: 2,
+                http_responder_url: "http://localhost:8080".to_string(),
+                http_responder_hmac: "dev-hmac".to_string(),
+                http_responder_timeout_secs: 5,
+                http_responder_token_ttl_secs: 300,
+            },
+            retry: crate::config::RetrySettings {
+                backoff_secs: vec![5, 10, 30],
+            },
+            scheduler: crate::config::SchedulerSettings {
+                max_concurrent_issuances: 3,
+            },
+            profiles: Vec::new(),
+        }
+    }
+
+    fn test_profile() -> crate::config::ProfileSettings {
+        crate::config::ProfileSettings {
             daemon_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
-            uri_san_enabled: true,
-            domains: vec![TEST_DOMAIN.to_string()],
             paths: crate::config::Paths {
                 cert: PathBuf::from("certs/edge-proxy-a.pem"),
                 key: PathBuf::from("certs/edge-proxy-a.key"),
@@ -257,28 +278,41 @@ mod tests {
             retry: None,
             hooks: crate::config::HookSettings::default(),
             eab: None,
-        };
+        }
+    }
 
-        let params = build_csr_params(&profile, Some(TEST_URI_SAN)).unwrap();
-        let mut has_uri = false;
+    fn expected_domain() -> String {
+        "001.edge-proxy.edge-node-01.trusted.domain".to_string()
+    }
+
+    #[test]
+    fn test_build_csr_params_includes_dns_san() {
+        let settings = test_settings();
+        let profile = test_profile();
+        let params = build_csr_params(&settings, &profile).unwrap();
         let mut has_dns = false;
         for san in params.subject_alt_names {
-            match san {
-                rcgen::SanType::URI(uri) => {
-                    if uri.as_str() == TEST_URI_SAN {
-                        has_uri = true;
-                    }
-                }
-                rcgen::SanType::DnsName(dns) => {
-                    if dns.as_str() == TEST_DOMAIN {
-                        has_dns = true;
-                    }
-                }
-                _ => {}
+            if let rcgen::SanType::DnsName(dns) = san
+                && dns.as_str() == expected_domain()
+            {
+                has_dns = true;
             }
         }
 
-        assert!(has_uri);
         assert!(has_dns);
+    }
+
+    #[test]
+    fn test_build_csr_params_sets_common_name_to_primary_domain() {
+        let settings = test_settings();
+        let profile = test_profile();
+        let params = build_csr_params(&settings, &profile).unwrap();
+        let common_name = params.distinguished_name.get(&rcgen::DnType::CommonName);
+        let common_name = match common_name {
+            Some(rcgen::DnValue::Utf8String(value)) => value.as_str(),
+            Some(other) => panic!("Unexpected common name value: {other:?}"),
+            None => panic!("Common name missing"),
+        };
+        assert_eq!(common_name, expected_domain());
     }
 }

@@ -9,7 +9,7 @@ use serde::Deserialize;
 pub struct Settings {
     pub email: String,
     pub server: String,
-    pub spiffe_trust_domain: String,
+    pub domain: String,
     pub eab: Option<Eab>,
     pub acme: AcmeSettings,
     pub retry: RetrySettings,
@@ -17,6 +17,14 @@ pub struct Settings {
     pub scheduler: SchedulerSettings,
     #[serde(default)]
     pub profiles: Vec<ProfileSettings>,
+}
+
+#[must_use]
+pub fn profile_domain(settings: &Settings, profile: &ProfileSettings) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        profile.instance_id, profile.daemon_name, profile.hostname, settings.domain
+    )
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -33,13 +41,9 @@ pub struct Eab {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProfileSettings {
-    pub name: String,
     pub daemon_name: String,
     pub instance_id: String,
     pub hostname: String,
-    #[serde(default = "default_uri_san_enabled")]
-    pub uri_san_enabled: bool,
-    pub domains: Vec<String>,
     pub paths: Paths,
     #[serde(default)]
     pub daemon: DaemonSettings,
@@ -125,7 +129,7 @@ pub enum HookFailurePolicy {
 
 const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_EMAIL: &str = "admin@example.com";
-const DEFAULT_SPIFFE_TRUST_DOMAIN: &str = "trusted.domain";
+const DEFAULT_DOMAIN: &str = "trusted.domain";
 const DEFAULT_CHECK_INTERVAL_SECS: u64 = 60 * 60;
 const DEFAULT_RENEW_BEFORE_SECS: u64 = 720 * 60 * 60;
 const DEFAULT_CHECK_JITTER_SECS: u64 = 0;
@@ -156,10 +160,6 @@ fn default_renew_before() -> Duration {
 
 fn default_check_jitter() -> Duration {
     Duration::from_secs(DEFAULT_CHECK_JITTER_SECS)
-}
-
-fn default_uri_san_enabled() -> bool {
-    true
 }
 
 impl Default for DaemonSettings {
@@ -202,7 +202,7 @@ impl Settings {
         s = s
             .set_default("server", DEFAULT_SERVER)?
             .set_default("email", DEFAULT_EMAIL)?
-            .set_default("spiffe_trust_domain", DEFAULT_SPIFFE_TRUST_DOMAIN)?
+            .set_default("domain", DEFAULT_DOMAIN)?
             .set_default("acme.http_responder_url", DEFAULT_HTTP_RESPONDER_URL)?
             .set_default("acme.http_responder_hmac", DEFAULT_HTTP_RESPONDER_HMAC)?
             .set_default(
@@ -276,11 +276,11 @@ impl Settings {
     /// # Errors
     /// Returns error if any setting is invalid or out of range.
     pub fn validate(&self) -> Result<()> {
-        if self.spiffe_trust_domain.trim().is_empty() {
-            anyhow::bail!("spiffe_trust_domain must not be empty");
+        if self.domain.trim().is_empty() {
+            anyhow::bail!("domain must not be empty");
         }
-        if !self.spiffe_trust_domain.is_ascii() {
-            anyhow::bail!("spiffe_trust_domain must be ASCII");
+        if !self.domain.is_ascii() {
+            anyhow::bail!("domain must be ASCII");
         }
         if self.acme.directory_fetch_attempts == 0 {
             anyhow::bail!("acme.directory_fetch_attempts must be greater than 0");
@@ -331,9 +331,6 @@ impl Settings {
     }
 
     fn validate_profile(profile: &ProfileSettings) -> Result<()> {
-        if profile.name.trim().is_empty() {
-            anyhow::bail!("profiles.name must not be empty");
-        }
         if profile.daemon_name.trim().is_empty() {
             anyhow::bail!("profiles.daemon_name must not be empty");
         }
@@ -351,9 +348,6 @@ impl Settings {
         }
         if !profile.instance_id.chars().all(|ch| ch.is_ascii_digit()) {
             anyhow::bail!("profiles.instance_id must be numeric");
-        }
-        if profile.domains.is_empty() {
-            anyhow::bail!("profiles.domains must not be empty");
         }
         if profile.paths.cert.as_os_str().is_empty() {
             anyhow::bail!("profiles.paths.cert must not be empty");
@@ -420,17 +414,15 @@ mod tests {
         writeln!(
             file,
             r#"
-            spiffe_trust_domain = "trusted.domain"
+            domain = "trusted.domain"
             [acme]
             http_responder_url = "http://localhost:8080"
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
-            name = "edge-proxy-a"
             daemon_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
-            domains = ["edge-proxy.internal"]
 
             [profiles.paths]
             cert = "certs/edge-proxy-a.pem"
@@ -452,7 +444,7 @@ mod tests {
             settings.server,
             "https://localhost:9000/acme/acme/directory"
         );
-        assert_eq!(settings.spiffe_trust_domain, "trusted.domain");
+        assert_eq!(settings.domain, "trusted.domain");
         assert_eq!(settings.acme.http_responder_url, "http://localhost:8080");
         assert_eq!(settings.acme.http_responder_hmac, "dev-hmac");
         assert_eq!(settings.acme.http_responder_timeout_secs, 5);
@@ -484,14 +476,12 @@ mod tests {
             r#"
             email = "file@example.com"
             server = "http://file-server"
-            spiffe_trust_domain = "example.internal"
+            domain = "example.internal"
 
             [[profiles]]
-            name = "edge-proxy-a"
             daemon_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
-            domains = ["file-domain"]
 
             [profiles.paths]
             cert = "file/cert.pem"
@@ -516,14 +506,12 @@ mod tests {
             r#"
             email = "file@example.com"
             server = "http://file-server"
-            spiffe_trust_domain = "example.internal"
+            domain = "example.internal"
 
             [[profiles]]
-            name = "edge-proxy-a"
             daemon_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
-            domains = ["file-domain"]
 
             [profiles.paths]
             cert = "file/cert.pem"
@@ -539,8 +527,7 @@ mod tests {
 
         assert_eq!(settings.email, "file@example.com");
         assert_eq!(settings.server, "http://file-server");
-        assert_eq!(settings.spiffe_trust_domain, "example.internal");
-        assert_eq!(settings.profiles[0].domains[0], "file-domain");
+        assert_eq!(settings.domain, "example.internal");
     }
 
     #[test]
@@ -580,6 +567,37 @@ mod tests {
         settings.acme.directory_fetch_attempts = 0;
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("directory_fetch_attempts"));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_domain() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.domain = "  ".to_string();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("domain must not be empty"));
+    }
+
+    #[test]
+    fn test_validate_rejects_non_ascii_domain() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.domain = "예시.local".to_string();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("domain must be ASCII"));
+    }
+
+    #[test]
+    fn test_profile_domain_uses_settings_domain() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.domain = "example.internal".to_string();
+        let profile = &settings.profiles[0];
+        let domain = profile_domain(&settings, profile);
+        assert_eq!(domain, "001.edge-proxy.edge-node-01.example.internal");
     }
 
     #[test]

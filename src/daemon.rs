@@ -57,15 +57,11 @@ async fn run_profile_daemon(
     let check_interval = profile.daemon.check_interval;
     let renew_before = profile.daemon.renew_before;
     let check_jitter = profile.daemon.check_jitter;
-    let uri_san = if profile.uri_san_enabled {
-        Some(profile::build_spiffe_uri(&settings, &profile))
-    } else {
-        None
-    };
+    let profile_label = config::profile_domain(&settings, &profile);
 
     info!(
         "Profile '{}' daemon enabled. check_interval={:?}, renew_before={:?}, check_jitter={:?}",
-        profile.name, check_interval, renew_before, check_jitter
+        profile_label, check_interval, renew_before, check_jitter
     );
 
     let mut first_tick = true;
@@ -73,7 +69,7 @@ async fn run_profile_daemon(
         if *shutdown.borrow() {
             info!(
                 "Shutdown signal received. Exiting profile '{}'.",
-                profile.name
+                profile_label
             );
             break;
         }
@@ -87,23 +83,20 @@ async fn run_profile_daemon(
 
         tokio::select! {
             _ = shutdown.changed() => {
-                info!("Shutdown signal received. Exiting profile '{}'.", profile.name);
+                info!("Shutdown signal received. Exiting profile '{}'.", profile_label);
                 break;
             }
             () = tokio::time::sleep(delay) => {
-                tracing::debug!("Profile '{}' checking renewal status...", profile.name);
+                tracing::debug!("Profile '{}' checking renewal status...", profile_label);
                 match should_renew(&profile, renew_before).await {
                     Ok(true) => {
-                        info!("Profile '{}' renewal required. Starting ACME issuance...", profile.name);
+                        info!(
+                            "Profile '{}' renewal required. Starting ACME issuance...",
+                            profile_label
+                        );
                         let _permit = semaphore.acquire().await?;
                         let profile_eab = profile::resolve_profile_eab(&profile, default_eab.clone());
-                        match issue_with_retry(
-                            &settings,
-                            &profile,
-                            profile_eab,
-                            uri_san.as_deref(),
-                        )
-                        .await
+                        match issue_with_retry(&settings, &profile, profile_eab).await
                         {
                             Ok(()) => {
                                 if let Err(err) = hooks::run_post_renew_hooks(
@@ -114,11 +107,17 @@ async fn run_profile_daemon(
                                 )
                                 .await
                                 {
-                                    error!("Post-renew success hooks failed for '{}': {err}", profile.name);
+                                    error!(
+                                        "Post-renew success hooks failed for '{}': {err}",
+                                        profile_label
+                                    );
                                 }
                             }
                             Err(err) => {
-                                error!("Profile '{}' renewal failed after retries: {err}", profile.name);
+                                error!(
+                                    "Profile '{}' renewal failed after retries: {err}",
+                                    profile_label
+                                );
                                 if let Err(hook_err) = hooks::run_post_renew_hooks(
                                     &settings,
                                     &profile,
@@ -127,16 +126,19 @@ async fn run_profile_daemon(
                                 )
                                 .await
                                 {
-                                    error!("Post-renew failure hooks failed for '{}': {hook_err}", profile.name);
+                                    error!(
+                                        "Post-renew failure hooks failed for '{}': {hook_err}",
+                                        profile_label
+                                    );
                                 }
                             }
                         }
                     }
                     Ok(false) => {
-                        tracing::debug!("Profile '{}' certificate still valid.", profile.name);
+                        tracing::debug!("Profile '{}' certificate still valid.", profile_label);
                     }
                     Err(err) => {
-                        error!("Profile '{}' renewal check failed: {err}", profile.name);
+                        error!("Profile '{}' renewal check failed: {err}", profile_label);
                     }
                 }
             }
@@ -197,14 +199,10 @@ async fn run_profile_oneshot(
     semaphore: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let _permit = semaphore.acquire().await?;
-    let uri_san = if profile.uri_san_enabled {
-        Some(profile::build_spiffe_uri(&settings, &profile))
-    } else {
-        None
-    };
     let profile_eab = profile::resolve_profile_eab(&profile, default_eab);
+    let profile_label = config::profile_domain(&settings, &profile);
 
-    match acme::issue_certificate(&settings, &profile, profile_eab, uri_san.as_deref()).await {
+    match acme::issue_certificate(&settings, &profile, profile_eab).await {
         Ok(()) => {
             if let Err(err) =
                 hooks::run_post_renew_hooks(&settings, &profile, hooks::HookStatus::Success, None)
@@ -212,7 +210,7 @@ async fn run_profile_oneshot(
             {
                 error!(
                     "Post-renew success hooks failed for '{}': {err}",
-                    profile.name
+                    profile_label
                 );
             }
             Ok(())
@@ -228,7 +226,7 @@ async fn run_profile_oneshot(
             {
                 error!(
                     "Post-renew failure hooks failed for '{}': {hook_err}",
-                    profile.name
+                    profile_label
                 );
             }
             Err(err)
@@ -240,11 +238,10 @@ async fn issue_with_retry(
     settings: &config::Settings,
     profile: &config::ProfileSettings,
     eab: Option<eab::EabCredentials>,
-    uri_san: Option<&str>,
 ) -> anyhow::Result<()> {
     let backoff = select_retry_backoff(settings, profile);
     issue_with_retry_inner(
-        || acme::issue_certificate(settings, profile, eab.clone(), uri_san),
+        || acme::issue_certificate(settings, profile, eab.clone()),
         |duration| tokio::time::sleep(duration),
         backoff,
     )
@@ -396,12 +393,9 @@ mod tests {
 
     fn build_profile() -> config::ProfileSettings {
         config::ProfileSettings {
-            name: "edge-proxy-a".to_string(),
             daemon_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
-            uri_san_enabled: true,
-            domains: vec!["example.com".to_string()],
             paths: Paths {
                 cert: PathBuf::from("unused.pem"),
                 key: PathBuf::from("unused.key"),
@@ -421,7 +415,7 @@ mod tests {
         config::Settings {
             email: "test@example.com".to_string(),
             server: "https://example.com/acme/directory".to_string(),
-            spiffe_trust_domain: "trusted.domain".to_string(),
+            domain: "trusted.domain".to_string(),
             eab: None,
             acme: AcmeSettings {
                 directory_fetch_attempts: 10,

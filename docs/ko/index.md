@@ -20,7 +20,7 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다. step-ca�
 
 ## 매뉴얼 구성
 
-- **개념**: PKI, ACME, CSR, SAN, SPIFFE, mTLS 개요
+- **개념**: PKI, ACME, CSR, SAN, mTLS 개요
 - **빠른 시작**: Docker Compose 기반 첫 발급
 - **설치**: step-ca + PostgreSQL + bootroot-agent + 리스폰더 설치
 - **설정**: `agent.toml`, 프로필, 훅, 재시도, EAB

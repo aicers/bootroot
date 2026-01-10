@@ -5,7 +5,7 @@ This section gives you enough background to understand what you are operating.
 ## PKI and Certificates
 
 - A **Certificate Authority (CA)** signs certificates that bind a public key
-  to an identity (a hostname, service, or SPIFFE URI).
+  to an identity (a hostname or IP address).
 - A **certificate** contains identity fields (Subject, SANs), validity, and
   the CA signature.
 - A **private key** must be protected. It proves possession of the identity.
@@ -58,17 +58,7 @@ and HMAC key. bootroot-agent can load EAB from config or CLI.
 SANs are the identities inside the certificate. Common types:
 
 - **DNS**: `example.internal`
-- **URI**: `spiffe://trusted.domain/host/daemon/instance`
-
-## SPIFFE URI
-
-A SPIFFE URI provides workload identity. In this repo the URI format is:
-
-```text
-spiffe://<trust-domain>/<hostname>/<daemon-name>/<instance-id>
-```
-
-This keeps identities stable across renewals and supports multiple instances.
+- **IP**: `192.0.2.10`
 
 ## mTLS
 

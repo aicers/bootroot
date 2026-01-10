@@ -2,7 +2,8 @@
 
 email = "admin@example.com"
 server = "https://bootroot-ca:9000/acme/acme/directory"
-spiffe_trust_domain = "trusted.domain"
+# Format: <instance_id>.<daemon_name>.<hostname>.<domain>
+domain = "trusted.domain"
 
 [scheduler]
 max_concurrent_issuances = 1
@@ -22,12 +23,9 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [5, 10, 30]
 
 [[profiles]]
-name = "bootroot-agent"
 daemon_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
-uri_san_enabled = false
-domains = ["bootroot-agent.com"]
 
 [profiles.paths]
 cert = "/app/certs/bootroot-agent.crt"
