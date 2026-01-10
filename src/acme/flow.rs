@@ -1,16 +1,10 @@
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-
 use anyhow::Result;
-use tokio::fs;
 use tracing::info;
 
 use crate::acme::client::AcmeClient;
 use crate::acme::responder_client;
 use crate::acme::types::{AuthorizationStatus, ChallengeStatus, ChallengeType, OrderStatus};
-
-const KEY_FILE_MODE: u32 = 0o600;
-const SECRETS_DIR_MODE: u32 = 0o700;
+use crate::fs_util;
 
 fn contact_from_email(email: &str) -> String {
     if email.starts_with("mailto:") {
@@ -18,53 +12,6 @@ fn contact_from_email(email: &str) -> String {
     } else {
         format!("mailto:{email}")
     }
-}
-
-async fn ensure_secrets_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create secrets dir {}: {e}", path.display()))?;
-    fs::set_permissions(path, std::fs::Permissions::from_mode(SECRETS_DIR_MODE))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to set secrets dir permissions: {e}"))?;
-    Ok(())
-}
-
-async fn set_key_permissions(path: &Path) -> Result<()> {
-    fs::set_permissions(path, std::fs::Permissions::from_mode(KEY_FILE_MODE))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to set key file permissions: {e}"))?;
-    Ok(())
-}
-
-async fn write_cert_and_key(
-    cert_path: &Path,
-    key_path: &Path,
-    cert_pem: &str,
-    key_pem: &str,
-) -> Result<()> {
-    let cert_dir = cert_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cert path has no parent directory"))?;
-    fs::create_dir_all(cert_dir)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create cert dir {}: {e}", cert_dir.display()))?;
-
-    let secrets_dir = key_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Key path has no parent directory"))?;
-    ensure_secrets_dir(secrets_dir).await?;
-
-    fs::write(cert_path, cert_pem)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to write cert file: {e}"))?;
-
-    fs::write(key_path, key_pem)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to write key file: {e}"))?;
-    set_key_permissions(key_path).await?;
-
-    Ok(())
 }
 
 fn build_csr_params(
@@ -270,7 +217,8 @@ pub async fn issue_certificate(
         info!("Certificate received. Saving to files...");
 
         let key_pem = cert_key.serialize_pem();
-        write_cert_and_key(&profile.paths.cert, &profile.paths.key, &cert_pem, &key_pem).await?;
+        fs_util::write_cert_and_key(&profile.paths.cert, &profile.paths.key, &cert_pem, &key_pem)
+            .await?;
         info!("Certificate saved to: {:?}", profile.paths.cert);
         info!("Private key saved to: {:?}", profile.paths.key);
     } else {
@@ -285,67 +233,12 @@ pub async fn issue_certificate(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-
-    use tempfile::tempdir;
 
     use super::*;
 
     const TEST_DOMAIN: &str = "example.com";
     const TEST_URI_SAN: &str = "spiffe://trusted.domain/edge-node-01/edge-proxy/001";
-
-    #[tokio::test]
-    async fn test_ensure_secrets_dir_permissions() {
-        let dir = tempdir().unwrap();
-        let secrets_dir = dir.path().join("secrets");
-
-        ensure_secrets_dir(&secrets_dir).await.unwrap();
-
-        let mode = std::fs::metadata(&secrets_dir)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, SECRETS_DIR_MODE);
-    }
-
-    #[tokio::test]
-    async fn test_set_key_permissions() {
-        let dir = tempdir().unwrap();
-        let key_path = dir.path().join("key.pem");
-        fs::write(&key_path, "key-data").await.unwrap();
-
-        set_key_permissions(&key_path).await.unwrap();
-
-        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, KEY_FILE_MODE);
-    }
-
-    #[tokio::test]
-    async fn test_write_cert_and_key_creates_files_with_permissions() {
-        let dir = tempdir().unwrap();
-        let cert_path = dir.path().join("certs").join("cert.pem");
-        let key_path = dir.path().join("secrets").join("key.pem");
-
-        write_cert_and_key(&cert_path, &key_path, "cert-data", "key-data")
-            .await
-            .unwrap();
-
-        let cert_contents = fs::read_to_string(&cert_path).await.unwrap();
-        let key_contents = fs::read_to_string(&key_path).await.unwrap();
-        assert_eq!(cert_contents, "cert-data");
-        assert_eq!(key_contents, "key-data");
-
-        let secrets_mode = std::fs::metadata(key_path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        let key_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(secrets_mode, SECRETS_DIR_MODE);
-        assert_eq!(key_mode, KEY_FILE_MODE);
-    }
 
     #[test]
     fn test_build_csr_params_includes_uri_san() {
