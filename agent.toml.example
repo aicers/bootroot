@@ -8,8 +8,9 @@ email = "admin@example.com"
 # Default: https://localhost:9000/acme/acme/directory (Step CA)
 server = "https://localhost:9000/acme/acme/directory"
 
-# SPIFFE trust domain used for URI SANs
-spiffe_trust_domain = "trusted.domain"
+# Root domain used to auto-generate the DNS SAN
+# Format: <instance_id>.<daemon_name>.<hostname>.<domain>
+domain = "trusted.domain"
 
 # Scheduler settings
 [scheduler]
@@ -40,12 +41,9 @@ backoff_secs = [5, 10, 30]
 
 # Profiles (one per daemon instance)
 [[profiles]]
-name = "edge-proxy-a"
 daemon_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
-uri_san_enabled = true
-domains = ["edge-proxy.internal"]
 
 [profiles.paths]
 # Path to save the certificate

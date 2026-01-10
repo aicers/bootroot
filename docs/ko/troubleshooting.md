@@ -20,7 +20,7 @@
 ## "Finalize failed: badCSR"
 
 CSR에 포함된 SAN이 CA 정책에 맞지 않을 때 발생합니다.
-step-ca 프로비저너 정책과 요청 도메인을 확인하세요.
+step-ca 프로비저너 정책과 요청 DNS SAN을 확인하세요.
 
 ## 인증서 파일이 생성되지 않음
 

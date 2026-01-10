@@ -120,7 +120,6 @@ mod tests {
 
     const TEST_DOMAIN: &str = "example.com";
     const TEST_KEY_PATH: &str = "unused.key";
-    const TEST_TRUST_DOMAIN: &str = "trusted.domain";
     const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;
     const TEST_DELAYS: [u64; 3] = [1, 2, 3];
     const TEST_JITTER_SECS: u64 = 10;
@@ -129,12 +128,9 @@ mod tests {
 
     fn build_profile(cert_path: PathBuf) -> config::ProfileSettings {
         config::ProfileSettings {
-            name: "edge-proxy-a".to_string(),
             daemon_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
-            uri_san_enabled: true,
-            domains: vec![TEST_DOMAIN.to_string()],
             paths: config::Paths {
                 cert: cert_path,
                 key: PathBuf::from(TEST_KEY_PATH),
@@ -154,7 +150,7 @@ mod tests {
         config::Settings {
             email: "test@example.com".to_string(),
             server: "https://example.com/acme/directory".to_string(),
-            spiffe_trust_domain: TEST_TRUST_DOMAIN.to_string(),
+            domain: TEST_DOMAIN.to_string(),
             eab: None,
             acme: config::AcmeSettings {
                 directory_fetch_attempts: 10,
@@ -185,16 +181,6 @@ mod tests {
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
         fs::write(cert_path, cert.pem()).unwrap();
-    }
-
-    #[test]
-    fn test_build_spiffe_uri_formats_path() {
-        let profile = build_profile(PathBuf::from("unused.pem"));
-        let settings = build_settings(vec![profile.clone()]);
-
-        let uri = profile::build_spiffe_uri(&settings, &profile);
-
-        assert_eq!(uri, "spiffe://trusted.domain/edge-node-01/edge-proxy/001");
     }
 
     #[test]

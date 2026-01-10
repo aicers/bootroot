@@ -6,10 +6,12 @@
 
 - Docker 및 Docker Compose
 - Compose 네트워크 내부에서 리스폰더의 포트 80 접근 가능
-- `profiles[].domains` 값이 step-ca에서 **HTTP-01 리스폰더로 해석**되어야 함
+- 자동 생성된 DNS SAN이 step-ca에서 **HTTP-01 리스폰더로 해석**되어야 함
   - Compose에서는 `docker-compose.yml`의 `bootroot-http01`이
-    `bootroot-agent.com` alias를 제공함
-  - 도메인을 바꾸면 alias를 함께 바꾸거나 step-ca의 `/etc/hosts`에 매핑 필요
+    `001.bootroot-agent.bootroot-agent.trusted.domain` alias를 제공함
+  - `domain` 값을 바꾸면 alias를 함께 바꾸거나 step-ca의 `/etc/hosts`에 매핑 필요
+  - 자동 생성 형식:
+    `<instance-id>.<daemon-name>.<hostname>.<domain>`
 
 ## 빠른 실행(Compose)
 
@@ -23,16 +25,17 @@
 
    ```bash
    docker logs -f bootroot-agent
-   # 기대: "Successfully issued certificate!"
    ```
+
+   기대 로그 예시: `Successfully issued certificate!`
 
 3. 발급 파일 확인:
 
    ```bash
    ls -l certs/
-   # bootroot-agent.crt
-   # bootroot-agent.key
    ```
+
+   기대 파일: `bootroot-agent.crt`, `bootroot-agent.key`
 
 ## 내부적으로 일어난 일
 

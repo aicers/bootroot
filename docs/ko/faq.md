@@ -2,13 +2,13 @@
 
 ## 한 머신에서 여러 인증서를 발급할 수 있나요?
 
-가능합니다. `[[profiles]]`를 여러 개 정의하면 됩니다.
+가능합니다. `[[profiles]]`를 여러 개 정의하면 됩니다. 각 프로필은
+`instance_id.daemon_name.hostname.domain` 형식의 고유 신원을 가집니다.
 
-## SPIFFE URI만 사용해도 되나요?
+## ACME에서 URI SAN을 넣을 수 있나요?
 
-현재는 불가능합니다. ACME HTTP-01 발급을 사용하므로 `domains`가 필수이고,
-그 값이 DNS SAN에 항상 포함됩니다. `uri_san_enabled = true`는 SPIFFE URI를
-추가로 넣는 옵션일 뿐, DNS SAN을 제거하지는 않습니다.
+불가능합니다. ACME는 DNS/IP 식별자만 지원하므로, URI SAN이 포함된 CSR은
+step-ca가 거부합니다.
 
 ## EAB는 꼭 필요한가요?
 

@@ -603,6 +603,88 @@ mod tests {
         assert!(binding["signature"].as_str().unwrap().len() > 10);
     }
 
+    #[tokio::test]
+    async fn test_create_order_payload_uses_dns_or_ip_only() {
+        let server = MockServer::start().await;
+        let directory_body = serde_json::json!({
+            "newNonce": format!("{}/nonce", server.uri()),
+            "newAccount": format!("{}/account", server.uri()),
+            "newOrder": format!("{}/order", server.uri()),
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/directory"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&directory_body))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/nonce"))
+            .respond_with(ResponseTemplate::new(200).insert_header("replay-nonce", "nonce-123"))
+            .mount(&server)
+            .await;
+
+        let order_body = serde_json::json!({
+            "status": "pending",
+            "finalize": format!("{}/finalize", server.uri()),
+            "authorizations": [],
+            "certificate": null
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/order"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(&order_body)
+                    .insert_header("Location", format!("{}/order/1", server.uri())),
+            )
+            .mount(&server)
+            .await;
+
+        let mut client =
+            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        client
+            .create_order(&["example.internal".to_string(), "192.0.2.10".to_string()])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let order_request = requests
+            .iter()
+            .find(|request| request.url.path() == "/order")
+            .expect("Expected order request");
+        let body: serde_json::Value = serde_json::from_slice(&order_request.body).unwrap();
+        let payload_b64 = body["payload"].as_str().unwrap();
+        let payload_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&payload_json).unwrap();
+        let identifiers = payload["identifiers"].as_array().unwrap();
+
+        assert_eq!(identifiers.len(), 2);
+
+        let mut found_dns = false;
+        let mut found_ip = false;
+        for identifier in identifiers {
+            let id_type = identifier["type"].as_str().unwrap();
+            let value = identifier["value"].as_str().unwrap();
+            match id_type {
+                "dns" => {
+                    assert_eq!(value, "example.internal");
+                    found_dns = true;
+                }
+                "ip" => {
+                    assert_eq!(value, "192.0.2.10");
+                    found_ip = true;
+                }
+                unexpected => panic!("Unexpected identifier type: {unexpected}"),
+            }
+        }
+
+        assert!(found_dns);
+        assert!(found_ip);
+    }
+
     struct DirectoryResponder {
         calls: Arc<AtomicUsize>,
         directory_body: serde_json::Value,

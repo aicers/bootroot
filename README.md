@@ -63,10 +63,12 @@ Install scope:
 
 This is the easiest way to verify the agent and CA integration.
 
-Before you start, ensure the domain in `profiles[].domains` resolves from
-step-ca to the HTTP-01 responder. In Compose, `bootroot-http01` provides the
-`bootroot-agent.com` alias. If you change the domain in `agent.toml.compose`,
-update the alias in `docker-compose.yml` or map it in step-ca `/etc/hosts`.
+Before you start, ensure the auto-generated DNS SAN resolves from step-ca to
+the HTTP-01 responder. In Compose, `bootroot-http01` provides the
+`001.bootroot-agent.bootroot-agent.trusted.domain` alias. If you change
+`domain` in `agent.toml.compose`, update the alias in `docker-compose.yml` or
+map it in step-ca `/etc/hosts`. The recommended naming scheme is
+`<instance-id>.<daemon-name>.<hostname>.<domain>`.
 
 1. **Start Services**
 
@@ -163,9 +165,12 @@ cargo run -- \
 Configure the renewal cadence in `agent.toml`:
 
 ```toml
+domain = "trusted.domain"
+
 [[profiles]]
-name = "edge-proxy-a"
-uri_san_enabled = true
+daemon_name = "edge-proxy"
+instance_id = "001"
+hostname = "edge-node-01"
 
 [profiles.daemon]
 check_interval = "1h"
@@ -183,7 +188,7 @@ Nested keys use double underscores. Examples:
 
 ```bash
 export BOOTROOT_EMAIL="ops@example.com"
-export BOOTROOT_SPIFFE_TRUST_DOMAIN="trusted.domain"
+export BOOTROOT_DOMAIN="trusted.domain"
 export BOOTROOT_SCHEDULER__MAX_CONCURRENT_ISSUANCES="3"
 export BOOTROOT_RETRY__BACKOFF_SECS="5,10,30"
 ```
@@ -229,7 +234,7 @@ Defaults (if not provided):
 
 - `server`: `https://localhost:9000/acme/acme/directory`
 - `email`: `admin@example.com`
-- `spiffe_trust_domain`: `trusted.domain`
+- `domain`: `trusted.domain`
 - `acme.directory_fetch_attempts`: `10`
 - `acme.directory_fetch_base_delay_secs`: `1`
 - `acme.directory_fetch_max_delay_secs`: `10`
@@ -246,19 +251,21 @@ Responder flow notes:
   bootroot-agent calls to register tokens.
 - The responder listens on port 80 for step-ca’s HTTP-01 requests and replies
   to `/.well-known/acme-challenge/<token>` with the key authorization.
+- ACME issuance accepts only DNS/IP identifiers; URI SANs are ignored.
+- DNS SAN is auto-generated as
+  `instance_id.daemon_name.hostname.domain` and must resolve (from step-ca) to
+  the HTTP-01 responder IP.
 - `retry.backoff_secs`: `[5, 10, 30]`
 - `scheduler.max_concurrent_issuances`: `3`
 - `profiles[].daemon.check_interval`: `1h`
 - `profiles[].daemon.renew_before`: `720h`
 - `profiles[].daemon.check_jitter`: `0s`
-- `profiles[].uri_san_enabled`: `true`
 - `profiles[].retry.backoff_secs`: `retry.backoff_secs` (fallback)
 - `profiles[].hooks.post_renew.*.timeout_secs`: `30`
 - `profiles[].hooks.post_renew.*.on_failure`: `continue`
 
 Validation rules:
 
-- `spiffe_trust_domain` is non-empty ASCII
 - `acme.directory_fetch_attempts` > 0
 - `acme.directory_fetch_base_delay_secs` > 0
 - `acme.directory_fetch_max_delay_secs` > 0 and >= base delay
@@ -271,9 +278,9 @@ Validation rules:
 - `retry.backoff_secs` is non-empty and all values > 0
 - `scheduler.max_concurrent_issuances` > 0
 - `profiles` is non-empty
-- `profiles[].name`, `profiles[].daemon_name`, `profiles[].hostname` are non-empty
+- `domain` is non-empty ASCII
+- `profiles[].daemon_name`, `profiles[].hostname` are non-empty
 - `profiles[].instance_id` is numeric
-- `profiles[].domains` is non-empty
 - `profiles[].paths.cert` and `profiles[].paths.key` are non-empty
 - `profiles[].retry.backoff_secs` values > 0 (when set)
 - `profiles[].hooks.post_renew.*.command` is non-empty

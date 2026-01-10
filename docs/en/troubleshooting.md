@@ -20,7 +20,7 @@ Check your CLI flags. The current CLI supports:
 ## "Finalize failed: badCSR"
 
 This usually means the CSR SANs are not accepted by the CA policy.
-Check the step-ca provisioner policy and the requested domains.
+Check the step-ca provisioner policy and the requested DNS SAN.
 
 ## Certificate files not written
 
