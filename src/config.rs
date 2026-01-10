@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 use config::{Config, ConfigError, Environment, File};
@@ -51,12 +52,12 @@ pub struct ProfileSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct DaemonSettings {
-    #[serde(default = "default_check_interval")]
-    pub check_interval: String,
-    #[serde(default = "default_renew_before")]
-    pub renew_before: String,
-    #[serde(default = "default_check_jitter")]
-    pub check_jitter: String,
+    #[serde(default = "default_check_interval", with = "duration_serde")]
+    pub check_interval: Duration,
+    #[serde(default = "default_renew_before", with = "duration_serde")]
+    pub renew_before: Duration,
+    #[serde(default = "default_check_jitter", with = "duration_serde")]
+    pub check_jitter: Duration,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -125,9 +126,9 @@ pub enum HookFailurePolicy {
 const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_EMAIL: &str = "admin@example.com";
 const DEFAULT_SPIFFE_TRUST_DOMAIN: &str = "trusted.domain";
-const DEFAULT_CHECK_INTERVAL: &str = "1h";
-const DEFAULT_RENEW_BEFORE: &str = "720h";
-const DEFAULT_CHECK_JITTER: &str = "0s";
+const DEFAULT_CHECK_INTERVAL_SECS: u64 = 60 * 60;
+const DEFAULT_RENEW_BEFORE_SECS: u64 = 720 * 60 * 60;
+const DEFAULT_CHECK_JITTER_SECS: u64 = 0;
 const DEFAULT_HTTP_RESPONDER_URL: &str = "http://localhost:8080";
 const DEFAULT_HTTP_RESPONDER_HMAC: &str = "";
 const DEFAULT_HTTP_RESPONDER_TIMEOUT_SECS: u64 = 5;
@@ -145,16 +146,16 @@ fn default_hook_timeout_secs() -> u64 {
     DEFAULT_HOOK_TIMEOUT_SECS
 }
 
-fn default_check_interval() -> String {
-    DEFAULT_CHECK_INTERVAL.to_string()
+fn default_check_interval() -> Duration {
+    Duration::from_secs(DEFAULT_CHECK_INTERVAL_SECS)
 }
 
-fn default_renew_before() -> String {
-    DEFAULT_RENEW_BEFORE.to_string()
+fn default_renew_before() -> Duration {
+    Duration::from_secs(DEFAULT_RENEW_BEFORE_SECS)
 }
 
-fn default_check_jitter() -> String {
-    DEFAULT_CHECK_JITTER.to_string()
+fn default_check_jitter() -> Duration {
+    Duration::from_secs(DEFAULT_CHECK_JITTER_SECS)
 }
 
 fn default_uri_san_enabled() -> bool {
@@ -168,6 +169,20 @@ impl Default for DaemonSettings {
             renew_before: default_renew_before(),
             check_jitter: default_check_jitter(),
         }
+    }
+}
+
+mod duration_serde {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        humantime::parse_duration(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -397,6 +412,7 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::time::Duration;
 
     use super::*;
 
@@ -450,11 +466,46 @@ mod tests {
         assert_eq!(settings.scheduler.max_concurrent_issuances, 3);
 
         let profile = &settings.profiles[0];
-        assert_eq!(profile.daemon.check_interval, "1h");
-        assert_eq!(profile.daemon.renew_before, "720h");
-        assert_eq!(profile.daemon.check_jitter, "0s");
+        assert_eq!(profile.daemon.check_interval, Duration::from_secs(60 * 60));
+        assert_eq!(
+            profile.daemon.renew_before,
+            Duration::from_secs(720 * 60 * 60)
+        );
+        assert_eq!(profile.daemon.check_jitter, Duration::from_secs(0));
         assert!(profile.hooks.post_renew.success.is_empty());
         assert!(profile.hooks.post_renew.failure.is_empty());
+    }
+
+    #[test]
+    fn test_load_settings_rejects_invalid_duration() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+            email = "file@example.com"
+            server = "http://file-server"
+            spiffe_trust_domain = "example.internal"
+
+            [[profiles]]
+            name = "edge-proxy-a"
+            daemon_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+            domains = ["file-domain"]
+
+            [profiles.paths]
+            cert = "file/cert.pem"
+            key = "file/key.pem"
+
+            [profiles.daemon]
+            check_interval = "nope"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let err = Settings::new(Some(file.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("check_interval"));
     }
 
     #[test]
