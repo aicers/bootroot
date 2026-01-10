@@ -29,6 +29,7 @@ plugins:
             - Installation: installation.md
             - Configuration: configuration.md
             - Operations: operations.md
+            - Examples: examples.md
             - Troubleshooting: troubleshooting.md
             - FAQ: faq.md
         - locale: ko
@@ -41,12 +42,14 @@ plugins:
             - Installation: installation.md
             - Configuration: configuration.md
             - Operations: operations.md
+            - Examples: examples.md
             - Troubleshooting: troubleshooting.md
             - FAQ: faq.md
           nav_translations:
             Overview: 개요
             Concepts: 개념
             Getting Started: 시작하기
+            Examples: 예제
             Installation: 설치
             Configuration: 설정
             Operations: 운영

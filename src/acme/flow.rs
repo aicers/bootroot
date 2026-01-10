@@ -89,18 +89,24 @@ async fn validate_authorization_http01(
     tracing::debug!("Triggering challenge validation...");
     client.trigger_challenge(&challenge_url).await?;
 
-    wait_for_http01_validation(client, authz_url, &challenge_token).await?;
+    wait_for_http01_validation(settings, client, authz_url, &challenge_token).await?;
 
     Ok(())
 }
 
 async fn wait_for_http01_validation(
+    settings: &crate::config::Settings,
     client: &mut AcmeClient,
     authz_url: &str,
     challenge_token: &str,
 ) -> Result<()> {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let mut last_error: Option<String> = None;
+
+    for attempt in 0..settings.acme.poll_attempts {
+        tokio::time::sleep(std::time::Duration::from_secs(
+            settings.acme.poll_interval_secs,
+        ))
+        .await;
         let authz = client.fetch_authorization(authz_url).await?;
         tracing::debug!("Authz status: {:?}", authz.status);
         tracing::debug!("Full Authz: {:?}", authz);
@@ -124,7 +130,24 @@ async fn wait_for_http01_validation(
                 .map_or_else(|| "Unknown error".to_string(), |e| format!("{e:?}"));
             anyhow::bail!("Challenge failed: {error_msg}");
         }
+        if let Some(c) = authz.challenges.iter().find(|c| {
+            c.token == challenge_token && c.r#type == ChallengeType::Http01 && c.error.is_some()
+        }) {
+            last_error = c.error.as_ref().map(|e| format!("{e:?}"));
+        }
+
+        tracing::debug!(
+            "HTTP-01 authorization pending (attempt {}/{}).",
+            attempt + 1,
+            settings.acme.poll_attempts
+        );
     }
+
+    let error_msg = last_error.unwrap_or_else(|| "Unknown error".to_string());
+    anyhow::bail!(
+        "Authorization did not validate after {} attempts. Last HTTP-01 error: {error_msg}",
+        settings.acme.poll_attempts
+    );
 }
 
 async fn wait_for_order_completion(

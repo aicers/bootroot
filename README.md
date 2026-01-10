@@ -51,6 +51,24 @@ Install scope:
 - If you install MkDocs globally, it is a one-time machine install, but we
   recommend the per-repo virtualenv to avoid version conflicts.
 
+## Local Scenario Tests
+
+We keep a local end-to-end scenario script that exercises the happy paths and
+failure cases across step-ca, PostgreSQL, the HTTP-01 responder, and the agent.
+
+Run it from the repo root:
+
+```bash
+./scripts/run-local-scenarios.sh happy
+```
+
+Script notes:
+
+- `happy` runs the five happy-path scenarios (this is what CI uses).
+- `all` runs every scenario, including failure cases.
+- `TIMEOUT_SECS=180` and `TMP_DIR=./tmp/scenarios` can be overridden as needed.
+- The script expects Docker + Compose and uses the local Compose stack.
+
 ## Getting Started
 
 ### Prerequisites

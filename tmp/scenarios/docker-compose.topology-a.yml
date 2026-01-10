@@ -1,0 +1,8 @@
+services:
+  bootroot-http01:
+    networks:
+      default:
+        aliases:
+          - 101.edge-proxy.edge-node-01.trusted.domain
+          - 102.edge-proxy.edge-node-02.trusted.domain
+          - 103.edge-proxy.edge-node-03.trusted.domain

@@ -1,0 +1,36 @@
+email = "admin@example.com"
+server = "https://bootroot-ca:9000/acme/acme/directory"
+domain = "trusted.domain"
+
+[scheduler]
+max_concurrent_issuances = 1
+
+[acme]
+poll_attempts = 5
+poll_interval_secs = 1
+http_responder_url = "http://bootroot-http01:8080"
+http_responder_hmac = "dev-hmac"
+http_responder_timeout_secs = 5
+http_responder_token_ttl_secs = 300
+
+[retry]
+backoff_secs = [1, 2, 3]
+
+[[profiles]]
+daemon_name = "bootroot-agent"
+instance_id = "001"
+hostname = "bootroot-agent"
+
+[profiles.paths]
+cert = "/app/certs/renewal-example.crt"
+key = "/app/certs/renewal-example.key"
+
+[profiles.daemon]
+check_interval = "30s"
+renew_before = "2m"
+check_jitter = "0s"
+
+[profiles.hooks.post_renew]
+success = [
+  { command = "sh", args = ["-c", "date > certs/renewed.txt"] }
+]
