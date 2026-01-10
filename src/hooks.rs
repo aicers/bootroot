@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -118,22 +119,38 @@ async fn run_hook_with_retry(
     settings: &Settings,
     profile: &ProfileSettings,
 ) -> anyhow::Result<()> {
-    let mut attempt = 0usize;
-    loop {
-        attempt += 1;
+    run_with_retry(&hook.retry_backoff_secs, |attempt, remaining| async move {
         let result = run_hook_command(hook, context, settings, profile).await;
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => Ok(()),
             Err(err) => {
-                let remaining = hook.retry_backoff_secs.len().saturating_sub(attempt - 1);
                 error!(
                     "Hook attempt {attempt} failed (command='{}', remaining_retries={}): {err}",
                     hook.command, remaining
                 );
-                if attempt > hook.retry_backoff_secs.len() {
+                Err(err)
+            }
+        }
+    })
+    .await
+}
+
+async fn run_with_retry<F, Fut>(backoff: &[u64], mut operation: F) -> anyhow::Result<()>
+where
+    F: FnMut(usize, usize) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let remaining = backoff.len().saturating_sub(attempt - 1);
+        match operation(attempt, remaining).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if attempt > backoff.len() {
                     return Err(err);
                 }
-                let delay = hook.retry_backoff_secs[attempt - 1];
+                let delay = backoff[attempt - 1];
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
         }
