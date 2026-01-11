@@ -172,7 +172,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bootroot-agent"
+name = "bootroot"
 version = "0.1.0"
 dependencies = [
  "anyhow",

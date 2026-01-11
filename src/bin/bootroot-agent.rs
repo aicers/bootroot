@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bootroot_agent::{Args, config, daemon, eab, profile};
+use bootroot::{Args, config, daemon, eab, profile};
 use clap::Parser;
 use tracing::{error, info};
 
@@ -64,7 +64,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use bootroot_agent::{config, daemon, eab, profile};
+    use bootroot::{config, daemon, eab, profile};
     use rcgen::CertificateParams;
     use tempfile::tempdir;
     use time::OffsetDateTime;
