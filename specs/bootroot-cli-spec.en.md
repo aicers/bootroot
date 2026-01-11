@@ -163,6 +163,11 @@ and recovery.
 ### Step 9: Summary
 
 - Show all generated artifacts, Docker services status, and next steps.
+- Next steps guidance:
+  - Deploy OpenBao Agent templates for step-ca and responder
+  - Restart or reload step-ca and responder
+  - Run `bootroot status` to verify services
+  - (Optional) Store EAB kid/hmac at `secret/bootroot/agent/eab`
 
 ## App Onboarding: `bootroot app add`
 

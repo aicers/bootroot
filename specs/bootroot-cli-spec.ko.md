@@ -161,6 +161,11 @@ KV v2는 권장되는 키-값 시크릿 엔진으로, 시크릿 버전 관리와
 ### 9단계: 요약
 
 - 생성물/서비스 상태/다음 단계 출력.
+- Next steps 안내:
+  - step-ca / responder용 OpenBao Agent 템플릿 배포
+  - step-ca / responder 재시작 또는 리로드
+  - `bootroot status`로 상태 확인
+  - (선택) EAB 필요 시 `secret/bootroot/agent/eab`에 kid/hmac 등록
 
 ## 앱 온보딩: `bootroot app add`
 
