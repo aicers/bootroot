@@ -4,6 +4,18 @@ This manual explains how to install, configure, and operate **bootroot-agent**
 with **step-ca**. It is written so that a reader with no PKI background can
 complete a full installation and issue certificates successfully.
 
+## CLI Map (Skeleton)
+
+The CLI sections are placeholders for future updates. The manual content
+below remains the authoritative reference until the CLI is fully documented.
+
+- `bootroot infra up`
+- `bootroot init`
+- `bootroot status`
+- `bootroot app add`
+- `bootroot app info`
+- `bootroot verify`
+
 ## What Bootroot Does
 
 Bootroot is a product-embedded PKI bootstrap layer. A bootstrap prepares the

@@ -2,6 +2,15 @@
 
 This section covers step-ca, PostgreSQL, bootroot-agent, and the HTTP-01 responder.
 
+## CLI Flow (Skeleton)
+
+This section is intentionally a skeleton and will be expanded as the CLI
+implementation matures.
+
+- `bootroot infra up`
+- `bootroot init`
+- `bootroot status`
+
 ## step-ca
 
 ### Docker

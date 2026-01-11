@@ -3,6 +3,16 @@
 bootroot-agent reads a TOML configuration file (default `agent.toml`).
 The full template lives in `agent.toml.example`.
 
+## bootroot CLI (Skeleton)
+
+The CLI configuration section is a placeholder. It will be filled in as the
+CLI subcommands are implemented.
+
+- `bootroot init`
+- `bootroot app add`
+- `bootroot app info`
+- `bootroot verify`
+
 ## bootroot-agent (agent.toml)
 
 ### Global Settings
