@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
-use bootroot_agent::fs_util;
+use bootroot::fs_util;
 use clap::{Args, Parser, Subcommand};
 use openbao::{InitResponse, OpenBaoClient};
 use serde::Serialize;
