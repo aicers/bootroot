@@ -6,9 +6,13 @@ use tokio::sync::{Semaphore, watch};
 use tracing::{error, info};
 
 use crate::{acme, config, eab, hooks, profile};
-pub(crate) const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = 1_000_000_000;
+pub const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = 1_000_000_000;
 
-pub(crate) async fn run_daemon(
+/// Runs the agent daemon loop for all profiles.
+///
+/// # Errors
+/// Returns an error if issuance or shutdown handling fails.
+pub async fn run_daemon(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
 ) -> anyhow::Result<()> {
@@ -148,7 +152,11 @@ async fn run_profile_daemon(
     Ok(())
 }
 
-pub(crate) async fn run_oneshot(
+/// Runs a single issuance pass for all profiles.
+///
+/// # Errors
+/// Returns an error if any profile issuance fails.
+pub async fn run_oneshot(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
 ) -> anyhow::Result<()> {
@@ -260,7 +268,11 @@ fn select_retry_backoff<'a>(
         })
 }
 
-pub(crate) async fn issue_with_retry_inner<IssueFn, IssueFut, SleepFn, SleepFut>(
+/// Issues a certificate with retry and backoff.
+///
+/// # Errors
+/// Returns an error if all retries fail.
+pub async fn issue_with_retry_inner<IssueFn, IssueFut, SleepFn, SleepFut>(
     mut issue_fn: IssueFn,
     mut sleep_fn: SleepFn,
     delays: &[u64],
@@ -298,7 +310,11 @@ where
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Certificate issuance failed")))
 }
 
-pub(crate) async fn should_renew(
+/// Determines whether a certificate should be renewed.
+///
+/// # Errors
+/// Returns an error if the certificate cannot be parsed or read.
+pub async fn should_renew(
     profile: &config::ProfileSettings,
     renew_before: Duration,
 ) -> anyhow::Result<bool> {
@@ -326,7 +342,11 @@ pub(crate) async fn should_renew(
     Ok(not_after <= renew_at)
 }
 
-pub(crate) fn parse_cert_not_after(cert_bytes: &[u8]) -> anyhow::Result<time::OffsetDateTime> {
+/// Parses the certificate expiration timestamp.
+///
+/// # Errors
+/// Returns an error if the certificate cannot be parsed.
+pub fn parse_cert_not_after(cert_bytes: &[u8]) -> anyhow::Result<time::OffsetDateTime> {
     let pem = x509_parser::pem::parse_x509_pem(cert_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to parse PEM certificate: {e}"))?
         .1;
@@ -342,7 +362,8 @@ fn jittered_delay(base: Duration, jitter: Duration) -> Duration {
     jittered_delay_with_seed(base, jitter, now_ns)
 }
 
-pub(crate) fn jittered_delay_with_seed(base: Duration, jitter: Duration, now_ns: i128) -> Duration {
+#[must_use]
+pub fn jittered_delay_with_seed(base: Duration, jitter: Duration, now_ns: i128) -> Duration {
     let jitter_ns = i128::try_from(jitter.as_nanos()).unwrap_or(i128::MAX);
     if jitter_ns == 0 {
         return base;

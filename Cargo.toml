@@ -2,6 +2,7 @@
 name = "bootroot-agent"
 version = "0.1.0"
 edition = "2024"
+autobins = false
 
 [dependencies]
 anyhow = "1"
@@ -32,3 +33,15 @@ wiremock = "0.6"
 [lints.clippy]
 pedantic = "warn"
 unwrap_used = "warn"
+
+[[bin]]
+name = "bootroot"
+path = "src/main.rs"
+
+[[bin]]
+name = "bootroot-agent"
+path = "src/bin/bootroot-agent.rs"
+
+[[bin]]
+name = "bootroot-http01-responder"
+path = "src/bin/bootroot-http01-responder.rs"
