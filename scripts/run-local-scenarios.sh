@@ -21,6 +21,35 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"
 }
 
+load_env_file() {
+  if [ -f "$ROOT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$ROOT_DIR/.env"
+    set +a
+  fi
+}
+
+normalize_stepca_config() {
+  if [ -f "$ROOT_DIR/secrets/config/ca.json" ] && [ -x "$ROOT_DIR/scripts/update-ca-db-dsn.sh" ]; then
+    log "Updating step-ca DB DSN for compose network"
+    "$ROOT_DIR/scripts/update-ca-db-dsn.sh"
+  fi
+
+  if [ -f "$ROOT_DIR/secrets/provisioner_password.txt" ]; then
+    local pw_file="$ROOT_DIR/secrets/password.txt"
+    local prov_file="$ROOT_DIR/secrets/provisioner_password.txt"
+    local key_file="$ROOT_DIR/secrets/secrets/intermediate_ca_key"
+    if [ -f "$pw_file" ] && [ -f "$prov_file" ] && [ -f "$key_file" ]; then
+      if ! cmp -s "$pw_file" "$prov_file"; then
+        log "Aligning password.txt with provisioner_password.txt for local scenario"
+        cp "$prov_file" "$pw_file"
+        chmod 600 "$pw_file" || true
+      fi
+    fi
+  fi
+}
+
 detect_compose() {
   if docker compose version >/dev/null 2>&1; then
     echo "docker compose"
@@ -188,6 +217,8 @@ compose_up() {
 
 scenario_oneshot() {
   log "Scenario: happy-compose-oneshot"
+  load_env_file
+  normalize_stepca_config
   compose_up
 
   if ! wait_for_log "bootroot-agent" "Successfully issued certificate!" "$TIMEOUT_SECS"; then
