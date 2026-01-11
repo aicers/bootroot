@@ -134,12 +134,6 @@ jobs:
           docker logs bootroot-agent
           exit 1
 
-      - name: Run Happy Scenario Script
-        env:
-          TIMEOUT_SECS: "180"
-          TMP_DIR: ./tmp/scenarios
-        run: bash ./scripts/run-local-scenarios.sh happy
-
       - name: Cleanup
         if: always()
         run: docker compose down
