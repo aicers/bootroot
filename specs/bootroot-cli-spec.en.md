@@ -121,6 +121,25 @@ and recovery.
   - `secret/bootroot/responder/hmac`
 - Note: EAB is registered after step-ca is initialized.
 
+### Input precedence matrix
+
+- OpenBao URL: `--openbao-url` → default (`http://localhost:8200`)
+- KV mount: `--kv-mount` → default (`secret`)
+- secrets dir: `--secrets-dir` → default (`secrets`)
+- compose file: `--compose-file` → default (`docker-compose.yml`)
+- root token: `--root-token` → `OPENBAO_ROOT_TOKEN` → prompt (when already
+  initialized)
+- unseal key: `--unseal-key` (repeatable) → `OPENBAO_UNSEAL_KEYS`
+  (comma-separated) → keys generated during init
+- step-ca password: `--stepca-password` → `STEPCA_PASSWORD` →
+  `--auto-generate` → prompt
+- DB DSN: `--db-dsn` → derived from `POSTGRES_*` → prompt
+  - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` (required)
+  - `POSTGRES_HOST` (default `postgres`), `POSTGRES_PORT` (default `5432`)
+- HTTP-01 HMAC: `--http-hmac` → `HTTP01_HMAC` → `--auto-generate` → prompt
+- EAB: requires both `--eab-kid` and `--eab-hmac` (optional)
+  - `EAB_KID`, `EAB_HMAC`
+
 ### Step 5: step-ca OpenBao Agent (pre-init)
 
 - Render `password.txt` and `ca.json` using OpenBao Agent templates.

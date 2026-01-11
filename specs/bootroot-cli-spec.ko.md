@@ -120,6 +120,24 @@ KV v2는 권장되는 키-값 시크릿 엔진으로, 시크릿 버전 관리와
   - `secret/bootroot/responder/hmac`
 - EAB는 step-ca 초기화 이후 등록.
 
+### 입력 우선순위 매트릭스
+
+- OpenBao URL: `--openbao-url` → 기본값(`http://localhost:8200`)
+- KV 마운트: `--kv-mount` → 기본값(`secret`)
+- secrets dir: `--secrets-dir` → 기본값(`secrets`)
+- compose file: `--compose-file` → 기본값(`docker-compose.yml`)
+- root token: `--root-token` → `OPENBAO_ROOT_TOKEN` → 프롬프트(이미
+  초기화된 경우)
+- unseal key: `--unseal-key`(반복) → `OPENBAO_UNSEAL_KEYS`(쉼표 구분) → init 시
+  자동 생성된 키
+- step-ca 키 암호: `--stepca-password` → `STEPCA_PASSWORD` → `--auto-generate` → 프롬프트
+- DB DSN: `--db-dsn` → `POSTGRES_*` 조합 → 프롬프트
+  - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` (필수)
+  - `POSTGRES_HOST`(기본 `postgres`), `POSTGRES_PORT`(기본 `5432`)
+- HTTP-01 HMAC: `--http-hmac` → `HTTP01_HMAC` → `--auto-generate` → 프롬프트
+- EAB: `--eab-kid` + `--eab-hmac` 둘 다 필요(선택)
+  - `EAB_KID`, `EAB_HMAC`
+
 ### 5단계: step-ca용 OpenBao Agent(선행)
 
 - `password.txt`, `ca.json` 템플릿 렌더.

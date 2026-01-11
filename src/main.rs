@@ -118,15 +118,15 @@ struct InitArgs {
     show_secrets: bool,
 
     /// `OpenBao` root token (required if already initialized)
-    #[arg(long)]
+    #[arg(long, env = "OPENBAO_ROOT_TOKEN")]
     root_token: Option<String>,
 
     /// `OpenBao` unseal key (repeatable)
-    #[arg(long)]
+    #[arg(long, env = "OPENBAO_UNSEAL_KEYS", value_delimiter = ',')]
     unseal_key: Vec<String>,
 
     /// step-ca password (password.txt)
-    #[arg(long)]
+    #[arg(long, env = "STEPCA_PASSWORD")]
     stepca_password: Option<String>,
 
     /// `PostgreSQL` DSN for step-ca
@@ -134,15 +134,15 @@ struct InitArgs {
     db_dsn: Option<String>,
 
     /// HTTP-01 responder HMAC secret
-    #[arg(long)]
+    #[arg(long, env = "HTTP01_HMAC")]
     http_hmac: Option<String>,
 
     /// ACME EAB key ID (optional)
-    #[arg(long)]
+    #[arg(long, env = "EAB_KID")]
     eab_kid: Option<String>,
 
     /// ACME EAB HMAC (optional)
-    #[arg(long)]
+    #[arg(long, env = "EAB_HMAC")]
     eab_hmac: Option<String>,
 }
 
