@@ -4,6 +4,18 @@
 전체 과정을 설명합니다. PKI 배경 지식이 없는 사용자도 이 문서만으로
 설치와 인증서 발급을 완료할 수 있도록 구성했습니다.
 
+## CLI 구성(골격)
+
+CLI 섹션은 향후 보강할 골격만 포함합니다. CLI 문서가 완성되기 전까지는
+아래 매뉴얼 내용이 기준입니다.
+
+- `bootroot infra up`
+- `bootroot init`
+- `bootroot status`
+- `bootroot app add`
+- `bootroot app info`
+- `bootroot verify`
+
 ## Bootroot가 하는 일
 
 Bootroot는 제품 내장형 PKI 부트스트랩 계층입니다. 부트스트랩은 시스템이 처음부터

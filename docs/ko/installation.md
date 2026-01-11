@@ -2,6 +2,14 @@
 
 이 섹션은 step-ca, PostgreSQL, bootroot-agent, HTTP-01 리스폰더 설치를 다룹니다.
 
+## CLI 흐름(골격)
+
+이 섹션은 CLI 구현이 완성될 때까지 골격만 유지합니다.
+
+- `bootroot infra up`
+- `bootroot init`
+- `bootroot status`
+
 ## step-ca
 
 ### Docker

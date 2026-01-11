@@ -3,6 +3,15 @@
 bootroot-agent는 TOML 설정 파일을 읽습니다(기본값: `agent.toml`).
 전체 템플릿은 `agent.toml.example`에 있습니다.
 
+## bootroot CLI(골격)
+
+CLI 설정 섹션은 골격만 두고, CLI 구현과 함께 보강할 예정입니다.
+
+- `bootroot init`
+- `bootroot app add`
+- `bootroot app info`
+- `bootroot verify`
+
 ## bootroot-agent (agent.toml)
 
 ### 전역 설정
