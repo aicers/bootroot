@@ -1,8 +1,42 @@
+mod openbao;
+
+use std::collections::BTreeMap;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
+use bootroot_agent::fs_util;
 use clap::{Args, Parser, Subcommand};
+use openbao::{InitResponse, OpenBaoClient};
+use serde::Serialize;
+
+const DEFAULT_OPENBAO_URL: &str = "http://localhost:8200";
+const DEFAULT_KV_MOUNT: &str = "secret";
+const DEFAULT_SECRETS_DIR: &str = "secrets";
+const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
+const DEFAULT_CA_NAME: &str = "Bootroot CA";
+const DEFAULT_CA_PROVISIONER: &str = "admin";
+const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca";
+const DEFAULT_CA_ADDRESS: &str = ":9000";
+const INIT_SECRET_SHARES: u8 = 3;
+const INIT_SECRET_THRESHOLD: u8 = 2;
+const TOKEN_TTL: &str = "1h";
+const SECRET_ID_TTL: &str = "24h";
+const SECRET_BYTES: usize = 32;
+
+const POLICY_BOOTROOT_AGENT: &str = "bootroot-agent";
+const POLICY_BOOTROOT_RESPONDER: &str = "bootroot-responder";
+const POLICY_BOOTROOT_STEPCA: &str = "bootroot-stepca";
+
+const APPROLE_BOOTROOT_AGENT: &str = "bootroot-agent-role";
+const APPROLE_BOOTROOT_RESPONDER: &str = "bootroot-responder-role";
+const APPROLE_BOOTROOT_STEPCA: &str = "bootroot-stepca-role";
+
+const PATH_STEPCA_PASSWORD: &str = "bootroot/stepca/password";
+const PATH_STEPCA_DB: &str = "bootroot/stepca/db";
+const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
+const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -15,7 +49,7 @@ struct Cli {
 enum CliCommand {
     #[command(subcommand)]
     Infra(InfraCommand),
-    Init,
+    Init(InitArgs),
     Status,
     #[command(subcommand)]
     App(AppCommand),
@@ -56,6 +90,61 @@ struct InfraUpArgs {
     restart_policy: String,
 }
 
+#[derive(Args, Debug)]
+struct InitArgs {
+    /// `OpenBao` API URL
+    #[arg(long, default_value = DEFAULT_OPENBAO_URL)]
+    openbao_url: String,
+
+    /// `OpenBao` KV mount path (KV v2)
+    #[arg(long, default_value = DEFAULT_KV_MOUNT)]
+    kv_mount: String,
+
+    /// Secrets directory to render files into
+    #[arg(long, default_value = DEFAULT_SECRETS_DIR)]
+    secrets_dir: PathBuf,
+
+    /// Docker compose file for infra health checks
+    #[arg(long, default_value = DEFAULT_COMPOSE_FILE)]
+    compose_file: PathBuf,
+
+    /// Auto-generate secrets where possible
+    #[arg(long)]
+    auto_generate: bool,
+
+    /// Show secrets in output summaries
+    #[arg(long)]
+    show_secrets: bool,
+
+    /// `OpenBao` root token (required if already initialized)
+    #[arg(long)]
+    root_token: Option<String>,
+
+    /// `OpenBao` unseal key (repeatable)
+    #[arg(long)]
+    unseal_key: Vec<String>,
+
+    /// step-ca password (password.txt)
+    #[arg(long)]
+    stepca_password: Option<String>,
+
+    /// `PostgreSQL` DSN for step-ca
+    #[arg(long)]
+    db_dsn: Option<String>,
+
+    /// HTTP-01 responder HMAC secret
+    #[arg(long)]
+    http_hmac: Option<String>,
+
+    /// ACME EAB key ID (optional)
+    #[arg(long)]
+    eab_kid: Option<String>,
+
+    /// ACME EAB HMAC (optional)
+    #[arg(long)]
+    eab_hmac: Option<String>,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("bootroot error: {err}");
@@ -68,8 +157,10 @@ fn run() -> Result<()> {
 
     match cli.command {
         CliCommand::Infra(InfraCommand::Up(args)) => run_infra_up(&args)?,
-        CliCommand::Init => {
-            println!("bootroot init: not yet implemented");
+        CliCommand::Init(args) => {
+            let runtime = tokio::runtime::Runtime::new()
+                .context("Failed to initialize async runtime for init")?;
+            runtime.block_on(run_init(&args))?;
         }
         CliCommand::Status => {
             println!("bootroot status: not yet implemented");
@@ -120,6 +211,41 @@ fn run_infra_up(args: &InfraUpArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_init(args: &InitArgs) -> Result<()> {
+    ensure_infra_ready(&args.compose_file)?;
+
+    let mut client = OpenBaoClient::new(&args.openbao_url)?;
+    client.health_check().await?;
+
+    let bootstrap = bootstrap_openbao(&mut client, args).await?;
+    let secrets = resolve_init_secrets(args)?;
+    let (role_outputs, _policies, approles) = configure_openbao(&client, args, &secrets).await?;
+
+    let secrets_dir = args.secrets_dir.clone();
+    write_password_file(&secrets_dir, &secrets.stepca_password).await?;
+    update_ca_json(&secrets_dir, &secrets.db_dsn).await?;
+
+    let step_ca_result = ensure_step_ca_initialized(&secrets_dir)?;
+
+    write_state_file(&args.openbao_url, &args.kv_mount, &approles)?;
+
+    let summary = InitSummary {
+        args,
+        init_response: bootstrap.init_response.as_ref(),
+        root_token: &bootstrap.root_token,
+        unseal_keys: &bootstrap.unseal_keys,
+        approles: &role_outputs,
+        stepca_password: &secrets.stepca_password,
+        db_dsn: &secrets.db_dsn,
+        http_hmac: &secrets.http_hmac,
+        eab: secrets.eab.as_ref(),
+        step_ca_result,
+    };
+    print_init_summary(&summary);
+
+    Ok(())
+}
+
 fn compose_up_args(compose_file: &Path, services: &[String]) -> Vec<String> {
     let mut args = vec![
         "compose".to_string(),
@@ -138,9 +264,39 @@ fn compose_pull_args(compose_file: &Path, services: &[String]) -> Vec<String> {
         "-f".to_string(),
         compose_file.to_string_lossy().to_string(),
         "pull".to_string(),
+        "--ignore-pull-failures".to_string(),
     ];
     args.extend(services.iter().cloned());
     args
+}
+
+#[derive(Debug, Clone)]
+struct AppRoleOutput {
+    label: String,
+    role_name: String,
+    role_id: String,
+    secret_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct EabCredentials {
+    kid: String,
+    hmac: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StepCaInitResult {
+    Initialized,
+    Skipped,
+}
+
+#[derive(Debug, Serialize)]
+struct StateFile {
+    openbao_url: String,
+    kv_mount: String,
+    policies: BTreeMap<String, String>,
+    approles: BTreeMap<String, String>,
+    apps: BTreeMap<String, serde_json::Value>,
 }
 
 fn docker_update_args(restart_policy: &str, container_id: &str) -> Vec<String> {
@@ -150,6 +306,600 @@ fn docker_update_args(restart_policy: &str, container_id: &str) -> Vec<String> {
         restart_policy.to_string(),
         container_id.to_string(),
     ]
+}
+
+fn ensure_infra_ready(compose_file: &Path) -> Result<()> {
+    let services = default_infra_services();
+    let readiness = collect_readiness(compose_file, &services)?;
+    ensure_all_healthy(&readiness)?;
+    Ok(())
+}
+
+fn default_infra_services() -> Vec<String> {
+    vec![
+        "openbao".to_string(),
+        "postgres".to_string(),
+        "step-ca".to_string(),
+        "bootroot-http01".to_string(),
+    ]
+}
+
+struct InitBootstrap {
+    init_response: Option<InitResponse>,
+    root_token: String,
+    unseal_keys: Vec<String>,
+}
+
+struct InitSecrets {
+    stepca_password: String,
+    db_dsn: String,
+    http_hmac: String,
+    eab: Option<EabCredentials>,
+}
+
+async fn bootstrap_openbao(client: &mut OpenBaoClient, args: &InitArgs) -> Result<InitBootstrap> {
+    let (init_response, mut root_token, mut unseal_keys) =
+        ensure_openbao_initialized(client, args).await?;
+
+    let seal_status = client.seal_status().await?;
+    if seal_status.sealed {
+        if unseal_keys.is_empty() {
+            unseal_keys = prompt_unseal_keys(seal_status.t)?;
+        }
+        unseal_openbao(client, &unseal_keys).await?;
+    }
+
+    if root_token.is_none() {
+        root_token = Some(prompt_text("OpenBao root token: ")?);
+    }
+    let root_token = root_token.ok_or_else(|| anyhow::anyhow!("OpenBao root token is required"))?;
+
+    client.set_token(root_token.clone());
+
+    Ok(InitBootstrap {
+        init_response,
+        root_token,
+        unseal_keys,
+    })
+}
+
+fn resolve_init_secrets(args: &InitArgs) -> Result<InitSecrets> {
+    let stepca_password = resolve_secret(
+        "step-ca password",
+        args.stepca_password.clone(),
+        args.auto_generate,
+    )?;
+    let db_dsn = resolve_db_dsn(args)?;
+    let http_hmac = resolve_secret(
+        "HTTP-01 responder HMAC",
+        args.http_hmac.clone(),
+        args.auto_generate,
+    )?;
+    let eab = resolve_eab(args)?;
+
+    Ok(InitSecrets {
+        stepca_password,
+        db_dsn,
+        http_hmac,
+        eab,
+    })
+}
+
+async fn configure_openbao(
+    client: &OpenBaoClient,
+    args: &InitArgs,
+    secrets: &InitSecrets,
+) -> Result<(
+    Vec<AppRoleOutput>,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+)> {
+    client.ensure_kv_v2(&args.kv_mount).await?;
+    client.ensure_approle_auth().await?;
+
+    let policies = build_policy_map(&args.kv_mount);
+    for (name, policy) in &policies {
+        client.write_policy(name, policy).await?;
+    }
+
+    let approles = build_approle_map();
+    for (label, role_name) in &approles {
+        let policy_name = match label.as_str() {
+            "bootroot_agent" => POLICY_BOOTROOT_AGENT,
+            "responder" => POLICY_BOOTROOT_RESPONDER,
+            "stepca" => POLICY_BOOTROOT_STEPCA,
+            _ => continue,
+        };
+        client
+            .create_approle(
+                role_name,
+                &[policy_name.to_string()],
+                TOKEN_TTL,
+                SECRET_ID_TTL,
+                true,
+            )
+            .await?;
+    }
+
+    let mut role_outputs = Vec::new();
+    for (label, role_name) in &approles {
+        let role_id = client.read_role_id(role_name).await?;
+        let secret_id = client.create_secret_id(role_name).await?;
+        role_outputs.push(AppRoleOutput {
+            label: label.clone(),
+            role_name: role_name.clone(),
+            role_id,
+            secret_id,
+        });
+    }
+
+    write_openbao_secrets_with_retry(client, &args.kv_mount, secrets).await?;
+
+    Ok((role_outputs, policies, approles))
+}
+
+async fn write_openbao_secrets_with_retry(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    secrets: &InitSecrets,
+) -> Result<()> {
+    let attempt = write_openbao_secrets(
+        client,
+        kv_mount,
+        &secrets.stepca_password,
+        &secrets.db_dsn,
+        &secrets.http_hmac,
+        secrets.eab.as_ref(),
+    )
+    .await;
+    if let Err(err) = attempt {
+        let message = err.to_string();
+        if message.contains("No secret engine mount") {
+            client.ensure_kv_v2(kv_mount).await?;
+            write_openbao_secrets(
+                client,
+                kv_mount,
+                &secrets.stepca_password,
+                &secrets.db_dsn,
+                &secrets.http_hmac,
+                secrets.eab.as_ref(),
+            )
+            .await?;
+        } else {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_openbao_initialized(
+    client: &OpenBaoClient,
+    args: &InitArgs,
+) -> Result<(Option<InitResponse>, Option<String>, Vec<String>)> {
+    let initialized = client.is_initialized().await?;
+    if initialized {
+        return Ok((None, args.root_token.clone(), args.unseal_key.clone()));
+    }
+
+    let response = client
+        .init(INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD)
+        .await?;
+    let root_token = response.root_token.clone();
+    let keys = if response.keys.is_empty() {
+        response.keys_base64.clone()
+    } else {
+        response.keys.clone()
+    };
+    Ok((Some(response), Some(root_token), keys))
+}
+
+async fn unseal_openbao(client: &OpenBaoClient, keys: &[String]) -> Result<()> {
+    for key in keys {
+        let status = client.unseal(key).await?;
+        if !status.sealed {
+            return Ok(());
+        }
+    }
+    let status = client.seal_status().await?;
+    if status.sealed {
+        anyhow::bail!("OpenBao remains sealed after applying unseal keys");
+    }
+    Ok(())
+}
+
+fn prompt_unseal_keys(threshold: Option<u32>) -> Result<Vec<String>> {
+    let count = match threshold {
+        Some(value) if value > 0 => value,
+        _ => {
+            let input = prompt_text("Unseal key threshold (t): ")?;
+            input
+                .parse::<u32>()
+                .context("Invalid unseal threshold value")?
+        }
+    };
+    let mut keys = Vec::with_capacity(count as usize);
+    for index in 1..=count {
+        let key = prompt_text(&format!("Unseal key {index}/{count}: "))?;
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
+fn prompt_text(prompt: &str) -> Result<String> {
+    use std::io::{self, Write};
+    print!("{prompt}");
+    io::stdout().flush().context("Failed to flush stdout")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read input")?;
+    Ok(input.trim().to_string())
+}
+
+fn resolve_secret(label: &str, value: Option<String>, auto_generate: bool) -> Result<String> {
+    if let Some(value) = value {
+        return Ok(value);
+    }
+    if auto_generate {
+        return generate_secret();
+    }
+    prompt_text(&format!("{label}: "))
+}
+
+fn resolve_eab(args: &InitArgs) -> Result<Option<EabCredentials>> {
+    match (&args.eab_kid, &args.eab_hmac) {
+        (Some(kid), Some(hmac)) => Ok(Some(EabCredentials {
+            kid: kid.clone(),
+            hmac: hmac.clone(),
+        })),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("EAB requires both kid and hmac"),
+    }
+}
+
+fn resolve_db_dsn(args: &InitArgs) -> Result<String> {
+    if let Some(dsn) = args.db_dsn.clone() {
+        return Ok(dsn);
+    }
+    if let Some(dsn) = build_dsn_from_env() {
+        return Ok(dsn);
+    }
+    prompt_text("PostgreSQL DSN: ")
+}
+
+fn build_dsn_from_env() -> Option<String> {
+    let Ok(user) = env::var("POSTGRES_USER") else {
+        return None;
+    };
+    let Ok(password) = env::var("POSTGRES_PASSWORD") else {
+        return None;
+    };
+    let Ok(db) = env::var("POSTGRES_DB") else {
+        return None;
+    };
+    let host = env::var("POSTGRES_HOST").unwrap_or_else(|_| "postgres".to_string());
+    let port = env::var("POSTGRES_PORT").unwrap_or_else(|_| "5432".to_string());
+    let dsn = format!("postgresql://{user}:{password}@{host}:{port}/{db}?sslmode=disable");
+    Some(dsn)
+}
+
+fn generate_secret() -> Result<String> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    let mut buffer = vec![0u8; SECRET_BYTES];
+    let rng = SystemRandom::new();
+    rng.fill(&mut buffer)
+        .map_err(|_| anyhow::anyhow!("Failed to generate random secret"))?;
+    Ok(URL_SAFE_NO_PAD.encode(buffer))
+}
+
+fn build_policy_map(kv_mount: &str) -> BTreeMap<String, String> {
+    let mut policies = BTreeMap::new();
+    policies.insert(
+        POLICY_BOOTROOT_AGENT.to_string(),
+        format!(
+            r#"path "{kv_mount}/data/{PATH_AGENT_EAB}" {{
+  capabilities = ["read"]
+}}
+path "{kv_mount}/data/{PATH_RESPONDER_HMAC}" {{
+  capabilities = ["read"]
+}}
+"#
+        ),
+    );
+    policies.insert(
+        POLICY_BOOTROOT_RESPONDER.to_string(),
+        format!(
+            r#"path "{kv_mount}/data/{PATH_RESPONDER_HMAC}" {{
+  capabilities = ["read"]
+}}
+"#
+        ),
+    );
+    policies.insert(
+        POLICY_BOOTROOT_STEPCA.to_string(),
+        format!(
+            r#"path "{kv_mount}/data/{PATH_STEPCA_PASSWORD}" {{
+  capabilities = ["read"]
+}}
+path "{kv_mount}/data/{PATH_STEPCA_DB}" {{
+  capabilities = ["read"]
+}}
+"#
+        ),
+    );
+    policies
+}
+
+fn build_approle_map() -> BTreeMap<String, String> {
+    let mut approles = BTreeMap::new();
+    approles.insert(
+        "bootroot_agent".to_string(),
+        APPROLE_BOOTROOT_AGENT.to_string(),
+    );
+    approles.insert(
+        "responder".to_string(),
+        APPROLE_BOOTROOT_RESPONDER.to_string(),
+    );
+    approles.insert("stepca".to_string(), APPROLE_BOOTROOT_STEPCA.to_string());
+    approles
+}
+
+async fn write_openbao_secrets(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    stepca_password: &str,
+    db_dsn: &str,
+    http_hmac: &str,
+    eab: Option<&EabCredentials>,
+) -> Result<()> {
+    client
+        .write_kv(
+            kv_mount,
+            PATH_STEPCA_PASSWORD,
+            serde_json::json!({ "value": stepca_password }),
+        )
+        .await?;
+    client
+        .write_kv(
+            kv_mount,
+            PATH_STEPCA_DB,
+            serde_json::json!({ "dsn": db_dsn }),
+        )
+        .await?;
+    client
+        .write_kv(
+            kv_mount,
+            PATH_RESPONDER_HMAC,
+            serde_json::json!({ "value": http_hmac }),
+        )
+        .await?;
+    if let Some(eab) = eab {
+        client
+            .write_kv(
+                kv_mount,
+                PATH_AGENT_EAB,
+                serde_json::json!({ "kid": eab.kid, "hmac": eab.hmac }),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn write_password_file(secrets_dir: &Path, password: &str) -> Result<()> {
+    fs_util::ensure_secrets_dir(secrets_dir).await?;
+    let password_path = secrets_dir.join("password.txt");
+    tokio::fs::write(&password_path, password)
+        .await
+        .with_context(|| format!("Failed to write {}", password_path.display()))?;
+    fs_util::set_key_permissions(&password_path).await?;
+    Ok(())
+}
+
+async fn update_ca_json(secrets_dir: &Path, db_dsn: &str) -> Result<()> {
+    let path = secrets_dir.join("config").join("ca.json");
+    let contents = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&contents).context("Failed to parse ca.json")?;
+    value["db"]["type"] = serde_json::Value::String("postgresql".to_string());
+    value["db"]["dataSource"] = serde_json::Value::String(db_dsn.to_string());
+    let updated = serde_json::to_string_pretty(&value).context("Failed to serialize ca.json")?;
+    tokio::fs::write(&path, updated)
+        .await
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn ensure_step_ca_initialized(secrets_dir: &Path) -> Result<StepCaInitResult> {
+    let config_path = secrets_dir.join("config").join("ca.json");
+    let ca_key = secrets_dir.join("secrets").join("root_ca_key");
+    let intermediate_key = secrets_dir.join("secrets").join("intermediate_ca_key");
+    if config_path.exists() && ca_key.exists() && intermediate_key.exists() {
+        return Ok(StepCaInitResult::Skipped);
+    }
+
+    let password_path = secrets_dir.join("password.txt");
+    if !password_path.exists() {
+        anyhow::bail!(
+            "step-ca password file not found at {}",
+            password_path.display()
+        );
+    }
+    let mount_root = std::fs::canonicalize(secrets_dir)
+        .with_context(|| format!("Failed to resolve {}", secrets_dir.display()))?;
+    let mount = format!("{}:/home/step", mount_root.display());
+    let args = vec![
+        "run".to_string(),
+        "--user".to_string(),
+        "root".to_string(),
+        "--rm".to_string(),
+        "-v".to_string(),
+        mount,
+        "smallstep/step-ca".to_string(),
+        "step".to_string(),
+        "ca".to_string(),
+        "init".to_string(),
+        "--name".to_string(),
+        DEFAULT_CA_NAME.to_string(),
+        "--provisioner".to_string(),
+        DEFAULT_CA_PROVISIONER.to_string(),
+        "--dns".to_string(),
+        DEFAULT_CA_DNS.to_string(),
+        "--address".to_string(),
+        DEFAULT_CA_ADDRESS.to_string(),
+        "--password-file".to_string(),
+        "/home/step/password.txt".to_string(),
+        "--provisioner-password-file".to_string(),
+        "/home/step/password.txt".to_string(),
+        "--acme".to_string(),
+    ];
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_docker(&args_ref, "docker step-ca init")?;
+    Ok(StepCaInitResult::Initialized)
+}
+
+fn write_state_file(
+    openbao_url: &str,
+    kv_mount: &str,
+    approles: &BTreeMap<String, String>,
+) -> Result<()> {
+    let policy_map = [
+        (
+            "bootroot_agent".to_string(),
+            POLICY_BOOTROOT_AGENT.to_string(),
+        ),
+        (
+            "responder".to_string(),
+            POLICY_BOOTROOT_RESPONDER.to_string(),
+        ),
+        ("stepca".to_string(), POLICY_BOOTROOT_STEPCA.to_string()),
+    ]
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    let state = StateFile {
+        openbao_url: openbao_url.to_string(),
+        kv_mount: kv_mount.to_string(),
+        policies: policy_map,
+        approles: approles
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        apps: BTreeMap::new(),
+    };
+    let contents =
+        serde_json::to_string_pretty(&state).context("Failed to serialize state.json")?;
+    std::fs::write("state.json", contents).context("Failed to write state.json")?;
+    Ok(())
+}
+
+struct InitSummary<'a> {
+    args: &'a InitArgs,
+    init_response: Option<&'a InitResponse>,
+    root_token: &'a str,
+    unseal_keys: &'a [String],
+    approles: &'a [AppRoleOutput],
+    stepca_password: &'a str,
+    db_dsn: &'a str,
+    http_hmac: &'a str,
+    eab: Option<&'a EabCredentials>,
+    step_ca_result: StepCaInitResult,
+}
+
+fn print_init_summary(summary: &InitSummary<'_>) {
+    let args = summary.args;
+    println!("bootroot init: summary");
+    println!("- OpenBao URL: {}", args.openbao_url);
+    println!("- KV mount: {}", args.kv_mount);
+    println!("- Secrets dir: {}", args.secrets_dir.display());
+    match summary.step_ca_result {
+        StepCaInitResult::Initialized => println!("- step-ca init: completed"),
+        StepCaInitResult::Skipped => println!("- step-ca init: skipped (already initialized)"),
+    }
+
+    if summary.init_response.is_some() {
+        println!(
+            "- OpenBao init: completed (shares={INIT_SECRET_SHARES}, threshold={INIT_SECRET_THRESHOLD})",
+        );
+    } else {
+        println!("- OpenBao init: skipped (already initialized)");
+    }
+
+    println!(
+        "- root token: {}",
+        display_secret(summary.root_token, args.show_secrets)
+    );
+
+    if !summary.unseal_keys.is_empty() {
+        for (idx, key) in summary.unseal_keys.iter().enumerate() {
+            println!(
+                "- unseal key {}: {}",
+                idx + 1,
+                display_secret(key, args.show_secrets)
+            );
+        }
+    }
+
+    println!(
+        "- step-ca password: {}",
+        display_secret(summary.stepca_password, args.show_secrets)
+    );
+    println!(
+        "- db dsn: {}",
+        display_secret(summary.db_dsn, args.show_secrets)
+    );
+    println!(
+        "- responder hmac: {}",
+        display_secret(summary.http_hmac, args.show_secrets)
+    );
+    if let Some(eab) = summary.eab {
+        println!("- eab kid: {}", display_secret(&eab.kid, args.show_secrets));
+        println!(
+            "- eab hmac: {}",
+            display_secret(&eab.hmac, args.show_secrets)
+        );
+    } else {
+        println!("- eab: not configured");
+    }
+
+    println!("- OpenBao KV paths:");
+    println!("  - {PATH_STEPCA_PASSWORD}");
+    println!("  - {PATH_STEPCA_DB}");
+    println!("  - {PATH_RESPONDER_HMAC}");
+    println!("  - {PATH_AGENT_EAB}");
+
+    println!("- AppRoles:");
+    for role in summary.approles {
+        println!("  - {} ({})", role.label, role.role_name);
+        println!(
+            "    role_id: {}",
+            display_secret(&role.role_id, args.show_secrets)
+        );
+        println!(
+            "    secret_id: {}",
+            display_secret(&role.secret_id, args.show_secrets)
+        );
+    }
+}
+
+fn display_secret(value: &str, show_secrets: bool) -> String {
+    if show_secrets {
+        value.to_string()
+    } else {
+        mask_value(value)
+    }
+}
+
+fn mask_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= 4 {
+        "****".to_string()
+    } else {
+        format!("****{}", &trimmed[trimmed.len() - 4..])
+    }
 }
 
 fn load_local_images(dir: &Path) -> Result<usize> {
@@ -364,6 +1114,7 @@ mod tests {
                 "-f",
                 "docker-compose.yml",
                 "pull",
+                "--ignore-pull-failures",
                 "openbao",
                 "postgres"
             ]
@@ -400,5 +1151,23 @@ mod tests {
             }
             _ => panic!("expected infra up"),
         }
+    }
+
+    #[test]
+    fn test_mask_value_short() {
+        assert_eq!(mask_value("abc"), "****");
+    }
+
+    #[test]
+    fn test_mask_value_long() {
+        assert_eq!(mask_value("secretvalue"), "****alue");
+    }
+
+    #[test]
+    fn test_build_policy_map_contains_paths() {
+        let policies = build_policy_map("secret");
+        let agent_policy = policies.get(POLICY_BOOTROOT_AGENT).unwrap();
+        assert!(agent_policy.contains("secret/data/bootroot/agent/eab"));
+        assert!(agent_policy.contains("secret/data/bootroot/responder/hmac"));
     }
 }

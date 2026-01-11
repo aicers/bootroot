@@ -1,6 +1,17 @@
 version: "3.8"
 
 services:
+  openbao:
+    image: openbao/openbao:latest
+    container_name: bootroot-openbao
+    restart: always
+    ports:
+      - "8200:8200"
+    volumes:
+      - openbao-data:/openbao/file
+      - ./openbao:/openbao/config:ro
+    command: ["server", "-config=/openbao/config/openbao.hcl"]
+
   postgres:
     image: postgres:16
     container_name: bootroot-postgres
@@ -72,4 +83,5 @@ services:
       - RUST_LOG=debug
 
 volumes:
+  openbao-data:
   postgres-data:

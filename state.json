@@ -1,0 +1,15 @@
+{
+  "openbao_url": "http://localhost:8200",
+  "kv_mount": "secret",
+  "policies": {
+    "bootroot_agent": "bootroot-agent",
+    "responder": "bootroot-responder",
+    "stepca": "bootroot-stepca"
+  },
+  "approles": {
+    "bootroot_agent": "bootroot-agent-role",
+    "responder": "bootroot-responder-role",
+    "stepca": "bootroot-stepca-role"
+  },
+  "apps": {}
+}
