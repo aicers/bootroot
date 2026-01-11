@@ -15,22 +15,28 @@ mod unix_integration {
     const ROOT_TOKEN: &str = "root-token";
 
     fn write_fake_docker(dir: &Path) -> Result<PathBuf> {
-        let script = r#"#!/bin/sh
+        write_fake_docker_with_status(dir, "running", "healthy")
+    }
+
+    fn write_fake_docker_with_status(dir: &Path, status: &str, health: &str) -> Result<PathBuf> {
+        let script = format!(
+            r#"#!/bin/sh
 set -eu
 
-if [ "${1:-}" = "compose" ] && [ "${2:-}" = "-f" ] && [ "${4:-}" = "ps" ] && [ "${5:-}" = "-q" ]; then
-  service="${6:-}"
+if [ "${{1:-}}" = "compose" ] && [ "${{2:-}}" = "-f" ] && [ "${{4:-}}" = "ps" ] && [ "${{5:-}}" = "-q" ]; then
+  service="${{6:-}}"
   printf "cid-%s" "$service"
   exit 0
 fi
 
-if [ "${1:-}" = "inspect" ]; then
-  printf "running|healthy"
+if [ "${{1:-}}" = "inspect" ]; then
+  printf "{status}|{health}"
   exit 0
 fi
 
 exit 0
-"#;
+"#
+        );
         let path = dir.join("docker");
         fs::write(&path, script).context("Failed to write fake docker script")?;
         fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
@@ -56,6 +62,12 @@ exit 0
         Ok(secrets_dir)
     }
 
+    fn write_password_file(secrets_dir: &Path, contents: &str) -> Result<()> {
+        fs::write(secrets_dir.join("password.txt"), contents)
+            .context("Failed to write password.txt")?;
+        Ok(())
+    }
+
     async fn stub_openbao(server: &MockServer) {
         stub_health(server).await;
         stub_init_status(server).await;
@@ -65,6 +77,40 @@ exit 0
         stub_policies(server).await;
         stub_approles(server).await;
         stub_kv_secrets(server).await;
+    }
+
+    async fn stub_openbao_with_write_failure(server: &MockServer, failing_secret: &str) {
+        stub_health(server).await;
+        stub_init_status(server).await;
+        stub_seal_status(server).await;
+        stub_kv_mount(server).await;
+        stub_auth_backends(server).await;
+        stub_policies(server).await;
+        stub_approles(server).await;
+        stub_kv_secrets_with_failure(server, failing_secret).await;
+    }
+
+    async fn stub_openbao_unseal_failure(server: &MockServer) {
+        stub_health(server).await;
+        stub_init_status_uninitialized(server).await;
+        stub_seal_status_sealed(server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/init"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "keys": ["key1"],
+                "root_token": ROOT_TOKEN
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/unseal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sealed": true
+            })))
+            .mount(server)
+            .await;
     }
 
     async fn stub_health(server: &MockServer) {
@@ -85,11 +131,32 @@ exit 0
             .await;
     }
 
+    async fn stub_init_status_uninitialized(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/init"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "initialized": false
+            })))
+            .mount(server)
+            .await;
+    }
+
     async fn stub_seal_status(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/v1/sys/seal-status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "sealed": false
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn stub_seal_status_sealed(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/seal-status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sealed": true,
+                "t": 1
             })))
             .mount(server)
             .await;
@@ -202,6 +269,66 @@ exit 0
         }
     }
 
+    async fn stub_kv_secrets_with_failure(server: &MockServer, failing_secret: &str) {
+        for secret in [
+            "bootroot/stepca/password",
+            "bootroot/stepca/db",
+            "bootroot/responder/hmac",
+        ] {
+            let response = if secret == failing_secret {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200)
+            };
+            Mock::given(method("POST"))
+                .and(path(format!("/v1/secret/data/{secret}")))
+                .and(header("X-Vault-Token", ROOT_TOKEN))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+    }
+
+    async fn expect_rollback_deletes(server: &MockServer) {
+        for policy in ["bootroot-agent", "bootroot-responder", "bootroot-stepca"] {
+            Mock::given(method("DELETE"))
+                .and(path(format!("/v1/sys/policies/acl/{policy}")))
+                .and(header("X-Vault-Token", ROOT_TOKEN))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        for approle in [
+            "bootroot-agent-role",
+            "bootroot-responder-role",
+            "bootroot-stepca-role",
+        ] {
+            Mock::given(method("DELETE"))
+                .and(path(format!("/v1/auth/approle/role/{approle}")))
+                .and(header("X-Vault-Token", ROOT_TOKEN))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        for secret in [
+            "bootroot/stepca/password",
+            "bootroot/stepca/db",
+            "bootroot/responder/hmac",
+        ] {
+            Mock::given(method("DELETE"))
+                .and(path(format!("/v1/secret/metadata/{secret}")))
+                .and(header("X-Vault-Token", ROOT_TOKEN))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+    }
+
     #[tokio::test]
     async fn init_flow_with_openbao_and_stepca_stubs() -> Result<()> {
         let temp_dir = tempdir().context("Failed to create temp dir")?;
@@ -248,6 +375,142 @@ exit 0
             stdout.contains("bootroot init: summary"),
             "stdout was: {stdout}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_fails_when_infra_unhealthy() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker_with_status(&bin_dir, "exited", "")?;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                "http://127.0.0.1:9999",
+                "--db-dsn",
+                "postgresql://step:step@localhost:5432/step?sslmode=disable",
+                "--auto-generate",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path)
+            .output()
+            .context("Failed to run bootroot init")?;
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Infrastructure not healthy"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_fails_when_unseal_stays_sealed() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao_unseal_failure(&server).await;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--unseal-key",
+                "key1",
+                "--db-dsn",
+                "postgresql://step:step@localhost:5432/step?sslmode=disable",
+                "--auto-generate",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path)
+            .output()
+            .context("Failed to run bootroot init")?;
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("OpenBao remains sealed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_failure_triggers_rollback() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao_with_write_failure(&server, "bootroot/responder/hmac").await;
+        expect_rollback_deletes(&server).await;
+
+        let original_password = "old-password";
+        write_password_file(&secrets_dir, original_password)?;
+        let original_ca_json = fs::read_to_string(secrets_dir.join("config").join("ca.json"))
+            .context("Failed to read ca.json")?;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--root-token",
+                ROOT_TOKEN,
+                "--db-dsn",
+                "postgresql://step:step@localhost:5432/step?sslmode=disable",
+                "--auto-generate",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path)
+            .output()
+            .context("Failed to run bootroot init")?;
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("bootroot init: failed"));
+        let password = fs::read_to_string(secrets_dir.join("password.txt"))
+            .context("Failed to read password.txt")?;
+        assert_eq!(password, original_password);
+        let ca_json = fs::read_to_string(secrets_dir.join("config").join("ca.json"))
+            .context("Failed to read ca.json after rollback")?;
+        assert_eq!(ca_json, original_ca_json);
         Ok(())
     }
 }

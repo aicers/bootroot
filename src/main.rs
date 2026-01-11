@@ -302,7 +302,7 @@ struct EabCredentials {
     hmac: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepCaInitResult {
     Initialized,
     Skipped,
@@ -1182,6 +1182,11 @@ fn docker_output(args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
+
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -1291,5 +1296,113 @@ mod tests {
         let agent_policy = policies.get(POLICY_BOOTROOT_AGENT).unwrap();
         assert!(agent_policy.contains("secret/data/bootroot/agent/eab"));
         assert!(agent_policy.contains("secret/data/bootroot/responder/hmac"));
+    }
+
+    fn default_init_args() -> InitArgs {
+        InitArgs {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: PathBuf::from("secrets"),
+            compose_file: PathBuf::from("docker-compose.yml"),
+            auto_generate: false,
+            show_secrets: false,
+            root_token: None,
+            unseal_key: Vec::new(),
+            stepca_password: None,
+            db_dsn: None,
+            http_hmac: None,
+            eab_kid: None,
+            eab_hmac: None,
+        }
+    }
+
+    #[test]
+    fn test_display_secret_masks_when_hidden() {
+        assert_eq!(display_secret("supersecret", false), "****cret");
+        assert_eq!(display_secret("showme", true), "showme");
+    }
+
+    #[test]
+    fn test_resolve_secret_prefers_value() {
+        let value = resolve_secret("step-ca password", Some("value".to_string()), false).unwrap();
+        assert_eq!(value, "value");
+    }
+
+    #[test]
+    fn test_resolve_secret_auto_generates() {
+        let value = resolve_secret("HTTP-01 HMAC", None, true).unwrap();
+        assert!(!value.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_db_dsn_prefers_cli() {
+        // SAFETY: tests run single-threaded for this scope; vars are restored below.
+        unsafe {
+            env::set_var("POSTGRES_USER", "envuser");
+            env::set_var("POSTGRES_PASSWORD", "envpass");
+            env::set_var("POSTGRES_DB", "envdb");
+        }
+        let mut args = default_init_args();
+        args.db_dsn = Some("postgresql://cliuser:clipass@localhost/db".to_string());
+        let dsn = resolve_db_dsn(&args).unwrap();
+        unsafe {
+            env::remove_var("POSTGRES_USER");
+            env::remove_var("POSTGRES_PASSWORD");
+            env::remove_var("POSTGRES_DB");
+        }
+        assert_eq!(dsn, "postgresql://cliuser:clipass@localhost/db");
+    }
+
+    #[test]
+    fn test_resolve_db_dsn_uses_env() {
+        // SAFETY: tests run single-threaded for this scope; vars are restored below.
+        unsafe {
+            env::set_var("POSTGRES_USER", "step");
+            env::set_var("POSTGRES_PASSWORD", "secret");
+            env::set_var("POSTGRES_DB", "stepca");
+            env::set_var("POSTGRES_HOST", "postgres");
+            env::set_var("POSTGRES_PORT", "5432");
+        }
+        let args = default_init_args();
+        let dsn = resolve_db_dsn(&args).unwrap();
+        unsafe {
+            env::remove_var("POSTGRES_USER");
+            env::remove_var("POSTGRES_PASSWORD");
+            env::remove_var("POSTGRES_DB");
+            env::remove_var("POSTGRES_HOST");
+            env::remove_var("POSTGRES_PORT");
+        }
+        assert_eq!(
+            dsn,
+            "postgresql://step:secret@postgres:5432/stepca?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn test_step_ca_init_skips_when_files_present() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        fs::create_dir_all(secrets_dir.join("config")).unwrap();
+        fs::create_dir_all(secrets_dir.join("secrets")).unwrap();
+        fs::write(
+            secrets_dir.join("config").join("ca.json"),
+            r#"{"db":{"type":"","dataSource":""}}"#,
+        )
+        .unwrap();
+        fs::write(secrets_dir.join("secrets").join("root_ca_key"), "").unwrap();
+        fs::write(secrets_dir.join("secrets").join("intermediate_ca_key"), "").unwrap();
+
+        let result = ensure_step_ca_initialized(&secrets_dir).unwrap();
+        assert_eq!(result, StepCaInitResult::Skipped);
+    }
+
+    #[test]
+    fn test_step_ca_init_requires_password_when_missing_files() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).unwrap();
+
+        let err = ensure_step_ca_initialized(&secrets_dir).unwrap_err();
+        assert!(err.to_string().contains("step-ca password file not found"));
     }
 }
