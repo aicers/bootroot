@@ -16,6 +16,126 @@ CLI 섹션은 향후 보강할 골격만 포함합니다. CLI 문서가 완성�
 - `bootroot app info`
 - `bootroot verify`
 
+### bootroot infra up
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot init
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot status
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot app add
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot app info
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot verify
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
 ## Bootroot가 하는 일
 
 Bootroot는 제품 내장형 PKI 부트스트랩 계층입니다. 부트스트랩은 시스템이 처음부터

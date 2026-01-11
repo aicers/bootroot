@@ -10,6 +10,66 @@
 - `bootroot init`
 - `bootroot status`
 
+### bootroot infra up
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot init
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot status
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
 ## step-ca
 
 ### Docker

@@ -16,6 +16,126 @@ below remains the authoritative reference until the CLI is fully documented.
 - `bootroot app info`
 - `bootroot verify`
 
+### bootroot infra up
+
+TBD (CLI documentation will be added as implementation lands).
+
+#### Inputs
+
+TBD
+
+#### Outputs
+
+TBD
+
+#### Failures
+
+TBD
+
+#### Examples
+
+TBD
+
+### bootroot init
+
+TBD (CLI documentation will be added as implementation lands).
+
+#### Inputs
+
+TBD
+
+#### Outputs
+
+TBD
+
+#### Failures
+
+TBD
+
+#### Examples
+
+TBD
+
+### bootroot status
+
+TBD (CLI documentation will be added as implementation lands).
+
+#### Inputs
+
+TBD
+
+#### Outputs
+
+TBD
+
+#### Failures
+
+TBD
+
+#### Examples
+
+TBD
+
+### bootroot app add
+
+TBD (CLI documentation will be added as implementation lands).
+
+#### Inputs
+
+TBD
+
+#### Outputs
+
+TBD
+
+#### Failures
+
+TBD
+
+#### Examples
+
+TBD
+
+### bootroot app info
+
+TBD (CLI documentation will be added as implementation lands).
+
+#### Inputs
+
+TBD
+
+#### Outputs
+
+TBD
+
+#### Failures
+
+TBD
+
+#### Examples
+
+TBD
+
+### bootroot verify
+
+TBD (CLI documentation will be added as implementation lands).
+
+#### Inputs
+
+TBD
+
+#### Outputs
+
+TBD
+
+#### Failures
+
+TBD
+
+#### Examples
+
+TBD
+
 ## What Bootroot Does
 
 Bootroot is a product-embedded PKI bootstrap layer. A bootstrap prepares the
