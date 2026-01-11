@@ -80,6 +80,10 @@ struct SecretIdData {
 }
 
 impl OpenBaoClient {
+    /// Creates a new `OpenBao` client targeting the provided base URL.
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP client cannot be initialized.
     pub fn new(base_url: &str) -> Result<Self> {
         let client = Client::builder()
             .build()
@@ -95,6 +99,11 @@ impl OpenBaoClient {
         self.token = Some(token);
     }
 
+    /// Checks the `OpenBao` health endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the health endpoint cannot be reached or responds
+    /// with an unexpected status.
     pub async fn health_check(&self) -> Result<()> {
         let url = self.endpoint("sys/health");
         let response = self
@@ -114,11 +123,19 @@ impl OpenBaoClient {
         anyhow::bail!("OpenBao health check failed with status: {status}");
     }
 
+    /// Checks whether the `OpenBao` instance is initialized.
+    ///
+    /// # Errors
+    /// Returns an error if the init status endpoint cannot be queried.
     pub async fn is_initialized(&self) -> Result<bool> {
         let status: InitStatus = self.get_json("sys/init", false).await?;
         Ok(status.initialized)
     }
 
+    /// Initializes `OpenBao` with the provided shares and threshold.
+    ///
+    /// # Errors
+    /// Returns an error if initialization fails or the response is invalid.
     pub async fn init(&self, shares: u8, threshold: u8) -> Result<InitResponse> {
         #[derive(Serialize)]
         struct InitRequest {
@@ -139,10 +156,18 @@ impl OpenBaoClient {
         Self::parse_response(response).await
     }
 
+    /// Fetches the seal status from `OpenBao`.
+    ///
+    /// # Errors
+    /// Returns an error if the seal status endpoint cannot be queried.
     pub async fn seal_status(&self) -> Result<SealStatus> {
         self.get_json("sys/seal-status", false).await
     }
 
+    /// Submits an unseal key to `OpenBao`.
+    ///
+    /// # Errors
+    /// Returns an error if the unseal request fails or the response is invalid.
     pub async fn unseal(&self, key: &str) -> Result<SealStatus> {
         #[derive(Serialize)]
         struct UnsealRequest<'a> {
@@ -159,6 +184,11 @@ impl OpenBaoClient {
         Self::parse_response(response).await
     }
 
+    /// Ensures a KV v2 secrets engine is mounted at the given path.
+    ///
+    /// # Errors
+    /// Returns an error if the mount exists with the wrong type/version or if
+    /// enabling the mount fails.
     pub async fn ensure_kv_v2(&self, mount: &str) -> Result<()> {
         if let Some(data) = self.get_mount(mount).await? {
             if data.mount_type != "kv" {
@@ -192,6 +222,11 @@ impl OpenBaoClient {
         Ok(())
     }
 
+    /// Ensures `AppRole` auth is enabled.
+    ///
+    /// # Errors
+    /// Returns an error if auth backends cannot be queried or enabling `AppRole`
+    /// fails.
     pub async fn ensure_approle_auth(&self) -> Result<()> {
         let auths: AuthListResponse = self.get_json("sys/auth", true).await?;
         let has_approle = auths
@@ -216,6 +251,10 @@ impl OpenBaoClient {
         Ok(())
     }
 
+    /// Writes an ACL policy.
+    ///
+    /// # Errors
+    /// Returns an error if the policy cannot be written.
     pub async fn write_policy(&self, name: &str, policy: &str) -> Result<()> {
         #[derive(Serialize)]
         struct PolicyRequest<'a> {
@@ -230,11 +269,19 @@ impl OpenBaoClient {
         Ok(())
     }
 
+    /// Checks if a policy exists.
+    ///
+    /// # Errors
+    /// Returns an error if the policy lookup fails for unexpected reasons.
     pub async fn policy_exists(&self, name: &str) -> Result<bool> {
         self.resource_exists(&format!("sys/policies/acl/{name}"))
             .await
     }
 
+    /// Deletes an ACL policy.
+    ///
+    /// # Errors
+    /// Returns an error if the delete request fails.
     pub async fn delete_policy(&self, name: &str) -> Result<()> {
         let _: serde_json::Value = self
             .delete_json(&format!("sys/policies/acl/{name}"))
@@ -242,6 +289,10 @@ impl OpenBaoClient {
         Ok(())
     }
 
+    /// Creates or updates an `AppRole` with the given settings.
+    ///
+    /// # Errors
+    /// Returns an error if the `AppRole` cannot be created or updated.
     pub async fn create_approle(
         &self,
         name: &str,
@@ -273,11 +324,19 @@ impl OpenBaoClient {
         Ok(())
     }
 
+    /// Checks if an `AppRole` exists.
+    ///
+    /// # Errors
+    /// Returns an error if the `AppRole` lookup fails for unexpected reasons.
     pub async fn approle_exists(&self, name: &str) -> Result<bool> {
         self.resource_exists(&format!("auth/approle/role/{name}"))
             .await
     }
 
+    /// Deletes an `AppRole`.
+    ///
+    /// # Errors
+    /// Returns an error if the delete request fails.
     pub async fn delete_approle(&self, name: &str) -> Result<()> {
         let _: serde_json::Value = self
             .delete_json(&format!("auth/approle/role/{name}"))
@@ -285,6 +344,10 @@ impl OpenBaoClient {
         Ok(())
     }
 
+    /// Reads the `role_id` for an `AppRole`.
+    ///
+    /// # Errors
+    /// Returns an error if the `role_id` cannot be fetched.
     pub async fn read_role_id(&self, name: &str) -> Result<String> {
         let response: RoleIdResponse = self
             .get_json(&format!("auth/approle/role/{name}/role-id"), true)
@@ -292,6 +355,10 @@ impl OpenBaoClient {
         Ok(response.data.role_id)
     }
 
+    /// Creates a new `secret_id` for an `AppRole`.
+    ///
+    /// # Errors
+    /// Returns an error if the `secret_id` cannot be created.
     pub async fn create_secret_id(&self, name: &str) -> Result<String> {
         let response: SecretIdResponse = self
             .post_json(
@@ -302,6 +369,10 @@ impl OpenBaoClient {
         Ok(response.data.secret_id)
     }
 
+    /// Writes a KV v2 secret.
+    ///
+    /// # Errors
+    /// Returns an error if the write request fails.
     pub async fn write_kv(&self, mount: &str, path: &str, data: serde_json::Value) -> Result<()> {
         #[derive(Serialize)]
         struct KvRequest {
@@ -311,11 +382,19 @@ impl OpenBaoClient {
             .await
     }
 
+    /// Checks if a KV v2 secret exists.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup fails for unexpected reasons.
     pub async fn kv_exists(&self, mount: &str, path: &str) -> Result<bool> {
         self.resource_exists(&format!("{mount}/metadata/{path}"))
             .await
     }
 
+    /// Deletes KV v2 secret metadata and all versions.
+    ///
+    /// # Errors
+    /// Returns an error if the delete request fails.
     pub async fn delete_kv(&self, mount: &str, path: &str) -> Result<()> {
         let _: serde_json::Value = self
             .delete_json(&format!("{mount}/metadata/{path}"))

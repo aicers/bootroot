@@ -1,5 +1,3 @@
-mod openbao;
-
 use std::collections::BTreeMap;
 use std::env;
 use std::io::ErrorKind;
@@ -8,8 +6,8 @@ use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::openbao::{InitResponse, OpenBaoClient};
 use clap::{Args, Parser, Subcommand};
-use openbao::{InitResponse, OpenBaoClient};
 use serde::Serialize;
 
 const DEFAULT_OPENBAO_URL: &str = "http://localhost:8200";
