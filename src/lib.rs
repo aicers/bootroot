@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod eab;
 pub mod fs_util;
 pub mod hooks;
+pub mod openbao;
 pub mod profile;
 
 pub use agent_args::Args;
