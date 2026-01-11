@@ -11,6 +11,66 @@ implementation matures.
 - `bootroot init`
 - `bootroot status`
 
+### bootroot infra up
+
+TBD (CLI documentation will be added as implementation lands).
+
+#### Inputs
+
+TBD
+
+#### Outputs
+
+TBD
+
+#### Failures
+
+TBD
+
+#### Examples
+
+TBD
+
+### bootroot init
+
+TBD (CLI documentation will be added as implementation lands).
+
+#### Inputs
+
+TBD
+
+#### Outputs
+
+TBD
+
+#### Failures
+
+TBD
+
+#### Examples
+
+TBD
+
+### bootroot status
+
+TBD (CLI documentation will be added as implementation lands).
+
+#### Inputs
+
+TBD
+
+#### Outputs
+
+TBD
+
+#### Failures
+
+TBD
+
+#### Examples
+
+TBD
+
 ## step-ca
 
 ### Docker

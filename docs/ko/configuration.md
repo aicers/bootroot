@@ -12,6 +12,86 @@ CLI 설정 섹션은 골격만 두고, CLI 구현과 함께 보강할 예정입�
 - `bootroot app info`
 - `bootroot verify`
 
+### bootroot init
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot app add
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot app info
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
+### bootroot verify
+
+TBD (CLI 문서는 구현 진행에 따라 보강 예정).
+
+#### 입력
+
+TBD
+
+#### 출력
+
+TBD
+
+#### 실패
+
+TBD
+
+#### 예시
+
+TBD
+
 ## bootroot-agent (agent.toml)
 
 ### 전역 설정
