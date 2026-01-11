@@ -2,6 +2,7 @@ mod openbao;
 
 use std::collections::BTreeMap;
 use std::env;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
@@ -217,33 +218,52 @@ async fn run_init(args: &InitArgs) -> Result<()> {
     let mut client = OpenBaoClient::new(&args.openbao_url)?;
     client.health_check().await?;
 
-    let bootstrap = bootstrap_openbao(&mut client, args).await?;
-    let secrets = resolve_init_secrets(args)?;
-    let (role_outputs, _policies, approles) = configure_openbao(&client, args, &secrets).await?;
+    let mut rollback = InitRollback::default();
+    let result: Result<InitSummary> = async {
+        let bootstrap = bootstrap_openbao(&mut client, args).await?;
+        let secrets = resolve_init_secrets(args)?;
+        let (role_outputs, _policies, approles) =
+            configure_openbao(&client, args, &secrets, &mut rollback).await?;
 
-    let secrets_dir = args.secrets_dir.clone();
-    write_password_file(&secrets_dir, &secrets.stepca_password).await?;
-    update_ca_json(&secrets_dir, &secrets.db_dsn).await?;
+        let secrets_dir = args.secrets_dir.clone();
+        rollback.password_backup =
+            Some(write_password_file_with_backup(&secrets_dir, &secrets.stepca_password).await?);
+        rollback.ca_json_backup =
+            Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn).await?);
 
-    let step_ca_result = ensure_step_ca_initialized(&secrets_dir)?;
+        let step_ca_result = ensure_step_ca_initialized(&secrets_dir)?;
 
-    write_state_file(&args.openbao_url, &args.kv_mount, &approles)?;
+        write_state_file(&args.openbao_url, &args.kv_mount, &approles)?;
 
-    let summary = InitSummary {
-        args,
-        init_response: bootstrap.init_response.as_ref(),
-        root_token: &bootstrap.root_token,
-        unseal_keys: &bootstrap.unseal_keys,
-        approles: &role_outputs,
-        stepca_password: &secrets.stepca_password,
-        db_dsn: &secrets.db_dsn,
-        http_hmac: &secrets.http_hmac,
-        eab: secrets.eab.as_ref(),
-        step_ca_result,
-    };
-    print_init_summary(&summary);
+        Ok(InitSummary {
+            openbao_url: args.openbao_url.clone(),
+            kv_mount: args.kv_mount.clone(),
+            secrets_dir: args.secrets_dir.clone(),
+            show_secrets: args.show_secrets,
+            init_response: bootstrap.init_response.is_some(),
+            root_token: bootstrap.root_token,
+            unseal_keys: bootstrap.unseal_keys,
+            approles: role_outputs,
+            stepca_password: secrets.stepca_password,
+            db_dsn: secrets.db_dsn,
+            http_hmac: secrets.http_hmac,
+            eab: secrets.eab,
+            step_ca_result,
+        })
+    }
+    .await;
 
-    Ok(())
+    match result {
+        Ok(summary) => {
+            print_init_summary(&summary);
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("bootroot init: failed, attempting rollback");
+            rollback.rollback(&client, &args.kv_mount).await;
+            Err(err)
+        }
+    }
 }
 
 fn compose_up_args(compose_file: &Path, services: &[String]) -> Vec<String> {
@@ -389,6 +409,7 @@ async fn configure_openbao(
     client: &OpenBaoClient,
     args: &InitArgs,
     secrets: &InitSecrets,
+    rollback: &mut InitRollback,
 ) -> Result<(
     Vec<AppRoleOutput>,
     BTreeMap<String, String>,
@@ -399,6 +420,9 @@ async fn configure_openbao(
 
     let policies = build_policy_map(&args.kv_mount);
     for (name, policy) in &policies {
+        if !client.policy_exists(name).await? {
+            rollback.created_policies.push(name.clone());
+        }
         client.write_policy(name, policy).await?;
     }
 
@@ -410,6 +434,9 @@ async fn configure_openbao(
             "stepca" => POLICY_BOOTROOT_STEPCA,
             _ => continue,
         };
+        if !client.approle_exists(role_name).await? {
+            rollback.created_approles.push(role_name.clone());
+        }
         client
             .create_approle(
                 role_name,
@@ -431,6 +458,16 @@ async fn configure_openbao(
             role_id,
             secret_id,
         });
+    }
+
+    let mut kv_paths = vec![PATH_STEPCA_PASSWORD, PATH_STEPCA_DB, PATH_RESPONDER_HMAC];
+    if secrets.eab.is_some() {
+        kv_paths.push(PATH_AGENT_EAB);
+    }
+    for path in kv_paths {
+        if !client.kv_exists(&args.kv_mount, path).await? {
+            rollback.written_kv_paths.push(path.to_string());
+        }
     }
 
     write_openbao_secrets_with_retry(client, &args.kv_mount, secrets).await?;
@@ -688,17 +725,30 @@ async fn write_openbao_secrets(
     Ok(())
 }
 
-async fn write_password_file(secrets_dir: &Path, password: &str) -> Result<()> {
+async fn write_password_file_with_backup(
+    secrets_dir: &Path,
+    password: &str,
+) -> Result<RollbackFile> {
     fs_util::ensure_secrets_dir(secrets_dir).await?;
     let password_path = secrets_dir.join("password.txt");
+    let original = match tokio::fs::read_to_string(&password_path).await {
+        Ok(contents) => Some(contents),
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to read {}", password_path.display()));
+        }
+    };
     tokio::fs::write(&password_path, password)
         .await
         .with_context(|| format!("Failed to write {}", password_path.display()))?;
     fs_util::set_key_permissions(&password_path).await?;
-    Ok(())
+    Ok(RollbackFile {
+        path: password_path,
+        original,
+    })
 }
 
-async fn update_ca_json(secrets_dir: &Path, db_dsn: &str) -> Result<()> {
+async fn update_ca_json_with_backup(secrets_dir: &Path, db_dsn: &str) -> Result<RollbackFile> {
     let path = secrets_dir.join("config").join("ca.json");
     let contents = tokio::fs::read_to_string(&path)
         .await
@@ -711,7 +761,10 @@ async fn update_ca_json(secrets_dir: &Path, db_dsn: &str) -> Result<()> {
     tokio::fs::write(&path, updated)
         .await
         .with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+    Ok(RollbackFile {
+        path,
+        original: Some(contents),
+    })
 }
 
 fn ensure_step_ca_initialized(secrets_dir: &Path) -> Result<StepCaInitResult> {
@@ -796,31 +849,89 @@ fn write_state_file(
     Ok(())
 }
 
-struct InitSummary<'a> {
-    args: &'a InitArgs,
-    init_response: Option<&'a InitResponse>,
-    root_token: &'a str,
-    unseal_keys: &'a [String],
-    approles: &'a [AppRoleOutput],
-    stepca_password: &'a str,
-    db_dsn: &'a str,
-    http_hmac: &'a str,
-    eab: Option<&'a EabCredentials>,
+#[derive(Debug)]
+struct RollbackFile {
+    path: PathBuf,
+    original: Option<String>,
+}
+
+#[derive(Default)]
+struct InitRollback {
+    created_policies: Vec<String>,
+    created_approles: Vec<String>,
+    written_kv_paths: Vec<String>,
+    password_backup: Option<RollbackFile>,
+    ca_json_backup: Option<RollbackFile>,
+}
+
+impl InitRollback {
+    async fn rollback(&self, client: &OpenBaoClient, kv_mount: &str) {
+        for path in &self.written_kv_paths {
+            if let Err(err) = client.delete_kv(kv_mount, path).await {
+                eprintln!("Rollback: failed to delete KV path {path}: {err}");
+            }
+        }
+        for role in &self.created_approles {
+            if let Err(err) = client.delete_approle(role).await {
+                eprintln!("Rollback: failed to delete AppRole {role}: {err}");
+            }
+        }
+        for policy in &self.created_policies {
+            if let Err(err) = client.delete_policy(policy).await {
+                eprintln!("Rollback: failed to delete policy {policy}: {err}");
+            }
+        }
+        if let Some(file) = &self.password_backup
+            && let Err(err) = rollback_file(file)
+        {
+            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
+        }
+        if let Some(file) = &self.ca_json_backup
+            && let Err(err) = rollback_file(file)
+        {
+            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
+        }
+    }
+}
+
+fn rollback_file(file: &RollbackFile) -> Result<()> {
+    if let Some(contents) = &file.original {
+        std::fs::write(&file.path, contents)
+            .with_context(|| format!("Failed to restore {}", file.path.display()))?;
+    } else if file.path.exists() {
+        std::fs::remove_file(&file.path)
+            .with_context(|| format!("Failed to remove {}", file.path.display()))?;
+    }
+    Ok(())
+}
+
+struct InitSummary {
+    openbao_url: String,
+    kv_mount: String,
+    secrets_dir: PathBuf,
+    show_secrets: bool,
+    init_response: bool,
+    root_token: String,
+    unseal_keys: Vec<String>,
+    approles: Vec<AppRoleOutput>,
+    stepca_password: String,
+    db_dsn: String,
+    http_hmac: String,
+    eab: Option<EabCredentials>,
     step_ca_result: StepCaInitResult,
 }
 
-fn print_init_summary(summary: &InitSummary<'_>) {
-    let args = summary.args;
+fn print_init_summary(summary: &InitSummary) {
     println!("bootroot init: summary");
-    println!("- OpenBao URL: {}", args.openbao_url);
-    println!("- KV mount: {}", args.kv_mount);
-    println!("- Secrets dir: {}", args.secrets_dir.display());
+    println!("- OpenBao URL: {}", summary.openbao_url);
+    println!("- KV mount: {}", summary.kv_mount);
+    println!("- Secrets dir: {}", summary.secrets_dir.display());
     match summary.step_ca_result {
         StepCaInitResult::Initialized => println!("- step-ca init: completed"),
         StepCaInitResult::Skipped => println!("- step-ca init: skipped (already initialized)"),
     }
 
-    if summary.init_response.is_some() {
+    if summary.init_response {
         println!(
             "- OpenBao init: completed (shares={INIT_SECRET_SHARES}, threshold={INIT_SECRET_THRESHOLD})",
         );
@@ -830,7 +941,7 @@ fn print_init_summary(summary: &InitSummary<'_>) {
 
     println!(
         "- root token: {}",
-        display_secret(summary.root_token, args.show_secrets)
+        display_secret(&summary.root_token, summary.show_secrets)
     );
 
     if !summary.unseal_keys.is_empty() {
@@ -838,28 +949,31 @@ fn print_init_summary(summary: &InitSummary<'_>) {
             println!(
                 "- unseal key {}: {}",
                 idx + 1,
-                display_secret(key, args.show_secrets)
+                display_secret(key, summary.show_secrets)
             );
         }
     }
 
     println!(
         "- step-ca password: {}",
-        display_secret(summary.stepca_password, args.show_secrets)
+        display_secret(&summary.stepca_password, summary.show_secrets)
     );
     println!(
         "- db dsn: {}",
-        display_secret(summary.db_dsn, args.show_secrets)
+        display_secret(&summary.db_dsn, summary.show_secrets)
     );
     println!(
         "- responder hmac: {}",
-        display_secret(summary.http_hmac, args.show_secrets)
+        display_secret(&summary.http_hmac, summary.show_secrets)
     );
-    if let Some(eab) = summary.eab {
-        println!("- eab kid: {}", display_secret(&eab.kid, args.show_secrets));
+    if let Some(eab) = summary.eab.as_ref() {
+        println!(
+            "- eab kid: {}",
+            display_secret(&eab.kid, summary.show_secrets)
+        );
         println!(
             "- eab hmac: {}",
-            display_secret(&eab.hmac, args.show_secrets)
+            display_secret(&eab.hmac, summary.show_secrets)
         );
     } else {
         println!("- eab: not configured");
@@ -872,15 +986,25 @@ fn print_init_summary(summary: &InitSummary<'_>) {
     println!("  - {PATH_AGENT_EAB}");
 
     println!("- AppRoles:");
-    for role in summary.approles {
+    for role in &summary.approles {
         println!("  - {} ({})", role.label, role.role_name);
         println!(
             "    role_id: {}",
-            display_secret(&role.role_id, args.show_secrets)
+            display_secret(&role.role_id, summary.show_secrets)
         );
         println!(
             "    secret_id: {}",
-            display_secret(&role.secret_id, args.show_secrets)
+            display_secret(&role.secret_id, summary.show_secrets)
+        );
+    }
+
+    println!("next steps:");
+    println!("  - Configure OpenBao Agent templates for step-ca, responder, and bootroot-agent.");
+    println!("  - Start or reload step-ca and responder to consume rendered secrets.");
+    println!("  - Run `bootroot status` to verify services.");
+    if summary.eab.is_none() {
+        println!(
+            "  - If you need ACME EAB, store kid/hmac at {PATH_AGENT_EAB} or rerun with --eab-kid/--eab-hmac."
         );
     }
 }
