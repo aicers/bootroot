@@ -32,7 +32,6 @@ pub(crate) struct Strings {
     pub(crate) error_state_missing: &'static str,
     pub(crate) error_app_duplicate: &'static str,
     pub(crate) error_app_not_found: &'static str,
-    pub(crate) error_root_token_required: &'static str,
     pub(crate) app_add_summary: &'static str,
     pub(crate) app_info_summary: &'static str,
     pub(crate) app_summary_kind: &'static str,
@@ -258,10 +257,6 @@ impl Messages {
         format_template(self.strings().error_app_not_found, &[("value", app_kind)])
     }
 
-    pub(crate) fn error_root_token_required(&self) -> &'static str {
-        self.strings().error_root_token_required
-    }
-
     pub(crate) fn app_add_summary(&self) -> &'static str {
         self.strings().app_add_summary
     }
@@ -307,7 +302,10 @@ impl Messages {
     }
 
     pub(crate) fn app_next_steps_use_approle(&self, value: &str) -> String {
-        format_template(self.strings().app_next_steps_use_approle, &[("value", value)])
+        format_template(
+            self.strings().app_next_steps_use_approle,
+            &[("value", value)],
+        )
     }
 
     pub(crate) fn status_summary_title(&self) -> &'static str {

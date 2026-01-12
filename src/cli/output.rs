@@ -1,5 +1,6 @@
 use crate::commands::init::InitSummary;
 use crate::i18n::Messages;
+use crate::state::{AppEntry, DeployType};
 
 pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
     print_init_header(summary, messages);
@@ -8,6 +9,57 @@ pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
     print_kv_paths(messages);
     print_approles(summary, messages);
     print_next_steps(summary, messages);
+}
+
+pub(crate) fn print_app_add_summary(
+    entry: &AppEntry,
+    secret_id_path: &std::path::Path,
+    messages: &Messages,
+) {
+    println!("{}", messages.app_add_summary());
+    print_app_fields(entry, messages);
+    println!(
+        "{}",
+        messages.app_summary_policy(&entry.approle.policy_name)
+    );
+    println!("{}", messages.app_summary_approle(&entry.approle.role_name));
+    println!("{}", messages.summary_role_id(&entry.approle.role_id));
+    println!(
+        "{}",
+        messages.app_summary_secret_path(&secret_id_path.display().to_string())
+    );
+    println!("{}", messages.app_summary_next_steps());
+    println!(
+        "{}",
+        messages.app_next_steps_use_approle(&entry.approle.role_name)
+    );
+}
+
+pub(crate) fn print_app_info_summary(entry: &AppEntry, messages: &Messages) {
+    println!("{}", messages.app_info_summary());
+    print_app_fields(entry, messages);
+    println!(
+        "{}",
+        messages.app_summary_policy(&entry.approle.policy_name)
+    );
+    println!("{}", messages.app_summary_approle(&entry.approle.role_name));
+    println!("{}", messages.summary_role_id(&entry.approle.role_id));
+    println!("{}", messages.app_summary_secret_path_hidden());
+}
+
+fn print_app_fields(entry: &AppEntry, messages: &Messages) {
+    println!("{}", messages.app_summary_kind(&entry.app_kind));
+    println!(
+        "{}",
+        messages.app_summary_deploy_type(match entry.deploy_type {
+            DeployType::Daemon => "daemon",
+            DeployType::Docker => "docker",
+        })
+    );
+    println!("{}", messages.app_summary_hostname(&entry.hostname));
+    if let Some(notes) = entry.notes.as_deref() {
+        println!("{}", messages.app_summary_notes(notes));
+    }
 }
 
 fn print_init_header(summary: &InitSummary, messages: &Messages) {
