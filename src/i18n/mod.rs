@@ -97,6 +97,9 @@ pub(crate) struct Strings {
     pub(crate) app_summary_next_steps: &'static str,
     pub(crate) app_next_steps_daemon_profile: &'static str,
     pub(crate) app_next_steps_docker_sidecar: &'static str,
+    pub(crate) app_snippet_daemon_title: &'static str,
+    pub(crate) app_snippet_docker_title: &'static str,
+    pub(crate) app_snippet_domain_hint: &'static str,
     pub(crate) verify_plan_title: &'static str,
     pub(crate) verify_summary_title: &'static str,
     pub(crate) verify_service_name: &'static str,
@@ -523,6 +526,18 @@ impl Messages {
                 ("secret_id_path", data.secret_id_path),
             ],
         )
+    }
+
+    pub(crate) fn app_snippet_daemon_title(&self) -> &'static str {
+        self.strings().app_snippet_daemon_title
+    }
+
+    pub(crate) fn app_snippet_docker_title(&self) -> &'static str {
+        self.strings().app_snippet_docker_title
+    }
+
+    pub(crate) fn app_snippet_domain_hint(&self, value: &str) -> String {
+        format_template(self.strings().app_snippet_domain_hint, &[("value", value)])
     }
 
     pub(crate) fn verify_summary_title(&self) -> &'static str {

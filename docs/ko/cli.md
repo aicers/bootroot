@@ -160,6 +160,7 @@ bootroot status
 - 앱 메타데이터 요약
 - AppRole/정책/secret_id 경로 요약
 - 타입별 온보딩 안내 (daemon 프로필 / docker sidecar)
+- daemon/docker 스니펫(복붙용) 출력
 
 ### 실패
 

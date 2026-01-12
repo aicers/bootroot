@@ -161,6 +161,7 @@ Registers app onboarding info and creates an OpenBao AppRole.
 - App metadata summary
 - AppRole/policy/secret_id path summary
 - Type-specific onboarding guidance (daemon profile / docker sidecar)
+- Copy-paste snippets for daemon profile or docker sidecar
 
 ### Failures
 

@@ -64,6 +64,9 @@ async fn test_app_add_writes_state_and_secret() {
     assert!(stdout.contains("bootroot app add: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- deploy type: daemon"));
+    assert!(stdout.contains("[[profiles]]"));
+    assert!(stdout.contains("service_name = \"edge-proxy\""));
+    assert!(stdout.contains("paths.cert ="));
 
     let state_path = temp_dir.path().join("state.json");
     let contents = fs::read_to_string(&state_path).expect("read state.json");
@@ -178,6 +181,57 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
 
     let output = child.wait_with_output().expect("run app add");
     assert!(output.status.success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_prints_docker_snippet() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("edge-proxy.crt");
+    let key_path = cert_dir.join("edge-proxy.key");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "app",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "docker",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--container-name",
+            "edge-proxy",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run app add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("docker run --rm"));
+    assert!(stdout.contains("--name edge-proxy"));
+    assert!(stdout.contains("/app/agent.toml"));
 }
 
 #[cfg(unix)]
