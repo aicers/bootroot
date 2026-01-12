@@ -4,7 +4,6 @@ pub(crate) mod en;
 pub(crate) mod ko;
 
 pub(crate) struct Strings {
-    pub(crate) not_implemented_status: &'static str,
     pub(crate) not_implemented_app_add: &'static str,
     pub(crate) not_implemented_app_info: &'static str,
     pub(crate) not_implemented_verify: &'static str,
@@ -25,6 +24,27 @@ pub(crate) struct Strings {
     pub(crate) error_invalid_unseal_threshold: &'static str,
     pub(crate) error_eab_requires_both: &'static str,
     pub(crate) error_openbao_sealed: &'static str,
+    pub(crate) status_summary_title: &'static str,
+    pub(crate) status_section_infra: &'static str,
+    pub(crate) status_section_openbao: &'static str,
+    pub(crate) status_section_kv_paths: &'static str,
+    pub(crate) status_section_approles: &'static str,
+    pub(crate) status_infra_entry_with_health: &'static str,
+    pub(crate) status_infra_entry_without_health: &'static str,
+    pub(crate) status_openbao_health: &'static str,
+    pub(crate) status_openbao_sealed: &'static str,
+    pub(crate) status_openbao_kv_mount: &'static str,
+    pub(crate) status_kv_path_entry: &'static str,
+    pub(crate) status_approle_entry: &'static str,
+    pub(crate) status_value_ok: &'static str,
+    pub(crate) status_value_unreachable: &'static str,
+    pub(crate) status_value_present: &'static str,
+    pub(crate) status_value_missing: &'static str,
+    pub(crate) status_value_optional_missing: &'static str,
+    pub(crate) status_value_unknown: &'static str,
+    pub(crate) status_value_invalid: &'static str,
+    pub(crate) status_error_infra_unhealthy: &'static str,
+    pub(crate) status_error_openbao_unreachable: &'static str,
     pub(crate) summary_title: &'static str,
     pub(crate) summary_openbao_url: &'static str,
     pub(crate) summary_kv_mount: &'static str,
@@ -81,10 +101,6 @@ impl Messages {
     pub(crate) fn new(lang: &str) -> Result<Self> {
         let locale = Locale::parse(lang)?;
         Ok(Self { locale })
-    }
-
-    pub(crate) fn not_implemented_status(&self) -> &'static str {
-        self.strings().not_implemented_status
     }
 
     pub(crate) fn not_implemented_app_add(&self) -> &'static str {
@@ -184,6 +200,113 @@ impl Messages {
 
     pub(crate) fn error_openbao_sealed(&self) -> &'static str {
         self.strings().error_openbao_sealed
+    }
+
+    pub(crate) fn status_summary_title(&self) -> &'static str {
+        self.strings().status_summary_title
+    }
+
+    pub(crate) fn status_section_infra(&self) -> &'static str {
+        self.strings().status_section_infra
+    }
+
+    pub(crate) fn status_section_openbao(&self) -> &'static str {
+        self.strings().status_section_openbao
+    }
+
+    pub(crate) fn status_section_kv_paths(&self) -> &'static str {
+        self.strings().status_section_kv_paths
+    }
+
+    pub(crate) fn status_section_approles(&self) -> &'static str {
+        self.strings().status_section_approles
+    }
+
+    pub(crate) fn status_infra_entry_with_health(
+        &self,
+        service: &str,
+        status: &str,
+        health: &str,
+    ) -> String {
+        format_template(
+            self.strings().status_infra_entry_with_health,
+            &[("service", service), ("status", status), ("health", health)],
+        )
+    }
+
+    pub(crate) fn status_infra_entry_without_health(&self, service: &str, status: &str) -> String {
+        format_template(
+            self.strings().status_infra_entry_without_health,
+            &[("service", service), ("status", status)],
+        )
+    }
+
+    pub(crate) fn status_openbao_health(&self, value: &str) -> String {
+        format_template(self.strings().status_openbao_health, &[("value", value)])
+    }
+
+    pub(crate) fn status_openbao_sealed(&self, value: &str) -> String {
+        format_template(self.strings().status_openbao_sealed, &[("value", value)])
+    }
+
+    pub(crate) fn status_openbao_kv_mount(&self, mount: &str, value: &str) -> String {
+        format_template(
+            self.strings().status_openbao_kv_mount,
+            &[("mount", mount), ("value", value)],
+        )
+    }
+
+    pub(crate) fn status_kv_path_entry(&self, path: &str, value: &str) -> String {
+        format_template(
+            self.strings().status_kv_path_entry,
+            &[("path", path), ("value", value)],
+        )
+    }
+
+    pub(crate) fn status_approle_entry(&self, role: &str, value: &str) -> String {
+        format_template(
+            self.strings().status_approle_entry,
+            &[("role", role), ("value", value)],
+        )
+    }
+
+    pub(crate) fn status_value_ok(&self) -> &'static str {
+        self.strings().status_value_ok
+    }
+
+    pub(crate) fn status_value_unreachable(&self) -> &'static str {
+        self.strings().status_value_unreachable
+    }
+
+    pub(crate) fn status_value_present(&self) -> &'static str {
+        self.strings().status_value_present
+    }
+
+    pub(crate) fn status_value_missing(&self) -> &'static str {
+        self.strings().status_value_missing
+    }
+
+    pub(crate) fn status_value_optional_missing(&self) -> &'static str {
+        self.strings().status_value_optional_missing
+    }
+
+    pub(crate) fn status_value_unknown(&self) -> &'static str {
+        self.strings().status_value_unknown
+    }
+
+    pub(crate) fn status_value_invalid(&self) -> &'static str {
+        self.strings().status_value_invalid
+    }
+
+    pub(crate) fn status_error_infra_unhealthy(&self, failures: &str) -> String {
+        format_template(
+            self.strings().status_error_infra_unhealthy,
+            &[("failures", failures)],
+        )
+    }
+
+    pub(crate) fn status_error_openbao_unreachable(&self) -> &'static str {
+        self.strings().status_error_openbao_unreachable
     }
 
     pub(crate) fn summary_title(&self) -> &'static str {

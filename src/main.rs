@@ -28,7 +28,7 @@ enum CliCommand {
     #[command(subcommand)]
     Infra(InfraCommand),
     Init(InitArgs),
-    Status,
+    Status(StatusArgs),
     #[command(subcommand)]
     App(AppCommand),
     Verify,
@@ -123,6 +123,25 @@ struct InitArgs {
     eab_hmac: Option<String>,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct StatusArgs {
+    /// Path to docker-compose.yml
+    #[arg(long, default_value = DEFAULT_COMPOSE_FILE)]
+    compose_file: PathBuf,
+
+    /// `OpenBao` API URL
+    #[arg(long, default_value = DEFAULT_OPENBAO_URL)]
+    openbao_url: String,
+
+    /// `OpenBao` KV mount path (KV v2)
+    #[arg(long, default_value = DEFAULT_KV_MOUNT)]
+    kv_mount: String,
+
+    /// `OpenBao` root token (optional, needed for KV/AppRole checks)
+    #[arg(long, env = "OPENBAO_ROOT_TOKEN")]
+    root_token: Option<String>,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("bootroot error: {err}");
@@ -143,7 +162,11 @@ fn run() -> Result<()> {
                 .context("Failed to initialize async runtime for init")?;
             runtime.block_on(commands::init::run_init(&args, &messages))?;
         }
-        CliCommand::Status => commands::status::run_status(&messages),
+        CliCommand::Status(args) => {
+            let runtime = tokio::runtime::Runtime::new()
+                .context("Failed to initialize async runtime for status")?;
+            runtime.block_on(commands::status::run_status(&args, &messages))?;
+        }
         CliCommand::App(AppCommand::Add) => commands::app::run_app_add(&messages),
         CliCommand::App(AppCommand::Info) => commands::app::run_app_info(&messages),
         CliCommand::Verify => commands::verify::run_verify(&messages),

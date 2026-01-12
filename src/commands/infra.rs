@@ -45,7 +45,7 @@ pub(crate) fn ensure_infra_ready(compose_file: &Path, messages: &Messages) -> Re
     Ok(())
 }
 
-fn default_infra_services() -> Vec<String> {
+pub(crate) fn default_infra_services() -> Vec<String> {
     vec![
         "openbao".to_string(),
         "postgres".to_string(),
@@ -55,14 +55,14 @@ fn default_infra_services() -> Vec<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ContainerReadiness {
-    service: String,
-    container_id: String,
-    status: String,
-    health: Option<String>,
+pub(crate) struct ContainerReadiness {
+    pub(crate) service: String,
+    pub(crate) container_id: String,
+    pub(crate) status: String,
+    pub(crate) health: Option<String>,
 }
 
-fn collect_readiness(
+pub(crate) fn collect_readiness(
     compose_file: &Path,
     services: &[String],
     messages: &Messages,
