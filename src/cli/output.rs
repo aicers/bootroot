@@ -77,6 +77,7 @@ pub(crate) fn print_app_add_summary(
                 config_path: &config_path,
             };
             println!("{}", messages.app_next_steps_daemon_profile(&data));
+            print_daemon_snippet(entry, messages);
         }
         DeployType::Docker => {
             let cert_path = entry.cert_path.display().to_string();
@@ -95,6 +96,7 @@ pub(crate) fn print_app_add_summary(
                 secret_id_path: &secret_id_path_value,
             };
             println!("{}", messages.app_next_steps_docker_sidecar(&data));
+            print_docker_snippet(entry, messages);
         }
     }
 }
@@ -174,6 +176,50 @@ fn print_app_plan_fields(plan: &AppAddPlan<'_>, messages: &Messages) {
     if let Some(notes) = plan.notes {
         println!("{}", messages.app_summary_notes(notes));
     }
+}
+
+fn print_daemon_snippet(entry: &AppEntry, messages: &Messages) {
+    let instance_id = entry.instance_id.as_deref().unwrap_or_default();
+    println!("{}", messages.app_snippet_daemon_title());
+    println!("[[profiles]]");
+    println!(
+        "service_name = \"{service_name}\"",
+        service_name = entry.service_name
+    );
+    println!("instance_id = \"{instance_id}\"");
+    println!("hostname = \"{hostname}\"", hostname = entry.hostname);
+    println!(
+        "paths.cert = \"{cert_path}\"",
+        cert_path = entry.cert_path.display()
+    );
+    println!(
+        "paths.key = \"{key_path}\"",
+        key_path = entry.key_path.display()
+    );
+    println!("[profiles.daemon]");
+    println!("check_interval = \"1h\"");
+    println!("renew_before = \"720h\"");
+    println!("check_jitter = \"0s\"");
+    println!("{}", messages.app_snippet_domain_hint(&entry.domain));
+}
+
+fn print_docker_snippet(entry: &AppEntry, messages: &Messages) {
+    let container = entry.container_name.as_deref().unwrap_or("bootroot-agent");
+    let config_path = entry.agent_config_path.display();
+    let cert_parent = entry
+        .cert_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    println!("{}", messages.app_snippet_docker_title());
+    println!("docker run --rm \\");
+    println!("  --name {container} \\");
+    println!("  -v {config_path}:/app/agent.toml:ro \\");
+    println!(
+        "  -v {cert_dir}:/app/certs \\",
+        cert_dir = cert_parent.display()
+    );
+    println!("  <bootroot-agent-image> \\");
+    println!("  bootroot-agent --config /app/agent.toml --oneshot");
 }
 
 pub(crate) fn print_verify_plan(
