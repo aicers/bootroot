@@ -2,6 +2,7 @@ pub mod acme;
 pub mod agent_args;
 pub mod config;
 pub mod daemon;
+pub mod db;
 pub mod eab;
 pub mod fs_util;
 pub mod hooks;

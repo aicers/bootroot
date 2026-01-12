@@ -140,6 +140,53 @@ fn test_verify_reprompts_on_empty_service_name() {
 }
 
 #[test]
+fn test_verify_db_check_ok() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    fs::write(&cert_path, "cert").expect("write cert");
+    fs::write(&key_path, "key").expect("write key");
+
+    write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let dsn = format!("postgresql://user:pass@127.0.0.1:{port}/stepca?sslmode=disable");
+    write_ca_json_with_dsn(temp_dir.path(), &dsn).expect("write ca.json");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", combined_path)
+        .args([
+            "verify",
+            "--service-name",
+            "edge-proxy",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--db-check",
+        ])
+        .output()
+        .expect("run verify");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("bootroot verify: summary"));
+    assert!(stdout.contains("db check"));
+}
+
+#[test]
 fn test_verify_missing_cert_fails() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");
@@ -255,6 +302,23 @@ fn write_state_with_app(
         serde_json::to_string_pretty(&state)?,
     )
     .context("write state.json")?;
+    Ok(())
+}
+
+fn write_ca_json_with_dsn(root: &std::path::Path, dsn: &str) -> anyhow::Result<()> {
+    let config_dir = root.join("secrets").join("config");
+    fs::create_dir_all(&config_dir).context("create config dir")?;
+    let payload = json!({
+        "db": {
+            "type": "postgresql",
+            "dataSource": dsn
+        }
+    });
+    fs::write(
+        config_dir.join("ca.json"),
+        serde_json::to_string_pretty(&payload)?,
+    )
+    .context("write ca.json")?;
     Ok(())
 }
 

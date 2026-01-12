@@ -19,6 +19,7 @@ pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
     print_init_header(summary, messages);
     print_init_secrets(summary, messages);
     print_responder_check(summary, messages);
+    print_db_check(summary, messages);
     print_kv_paths(messages);
     print_approles(summary, messages);
     print_next_steps(summary, messages);
@@ -316,6 +317,17 @@ fn print_responder_check(summary: &InitSummary, messages: &Messages) {
         }
         crate::commands::init::ResponderCheck::Skipped => {
             println!("{}", messages.summary_responder_check_skipped());
+        }
+    }
+}
+
+fn print_db_check(summary: &InitSummary, messages: &Messages) {
+    match summary.db_check {
+        crate::commands::init::DbCheckStatus::Ok => {
+            println!("{}", messages.summary_db_check_ok());
+        }
+        crate::commands::init::DbCheckStatus::Skipped => {
+            println!("{}", messages.summary_db_check_skipped());
         }
     }
 }

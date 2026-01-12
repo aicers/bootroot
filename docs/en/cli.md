@@ -66,6 +66,8 @@ registers required secrets.
 - `--stepca-password`: step-ca password (`password.txt`)
   - Environment variable: `STEPCA_PASSWORD`
 - `--db-dsn`: PostgreSQL DSN for step-ca
+- `--db-check`: validate DB connectivity
+- `--db-timeout-secs`: DB connectivity timeout (seconds)
 - `--http-hmac`: HTTP-01 responder HMAC
   - Environment variable: `HTTP01_HMAC`
 - `--responder-url`: HTTP-01 responder admin URL (optional)
@@ -88,6 +90,7 @@ registers required secrets.
 - OpenBao init/unseal summary and AppRole outputs
 - `password.txt` and `secrets/config/ca.json` updates
 - step-ca init result and responder check status
+- DB connectivity check status (when enabled)
 - EAB registration summary
 - Next-steps guidance
 
@@ -196,6 +199,8 @@ Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 
 - `--service-name`: service name identifier
 - `--agent-config`: bootroot-agent config path override (optional)
+- `--db-check`: verify DB connectivity using ca.json DSN
+- `--db-timeout-secs`: DB connectivity timeout (seconds)
 
 ### Interactive behavior
 
@@ -207,6 +212,7 @@ Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 
 - cert/key presence
 - verification summary
+- DB connectivity check status (when enabled)
 
 ### Failures
 
