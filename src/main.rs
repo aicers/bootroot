@@ -5,14 +5,20 @@ use clap::{Args, Parser, Subcommand};
 
 mod cli;
 mod commands;
+mod i18n;
 
 use crate::commands::init::{
     DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL, DEFAULT_SECRETS_DIR,
 };
+use crate::i18n::Messages;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    /// Language for CLI output (en or ko)
+    #[arg(long, env = "BOOTROOT_LANG", default_value = "en", global = true)]
+    lang: String,
+
     #[command(subcommand)]
     command: CliCommand,
 }
@@ -126,18 +132,21 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let messages = Messages::new(&cli.lang)?;
 
     match cli.command {
-        CliCommand::Infra(InfraCommand::Up(args)) => commands::infra::run_infra_up(&args)?,
+        CliCommand::Infra(InfraCommand::Up(args)) => {
+            commands::infra::run_infra_up(&args, &messages)?;
+        }
         CliCommand::Init(args) => {
             let runtime = tokio::runtime::Runtime::new()
                 .context("Failed to initialize async runtime for init")?;
-            runtime.block_on(commands::init::run_init(&args))?;
+            runtime.block_on(commands::init::run_init(&args, &messages))?;
         }
-        CliCommand::Status => commands::status::run_status(),
-        CliCommand::App(AppCommand::Add) => commands::app::run_app_add(),
-        CliCommand::App(AppCommand::Info) => commands::app::run_app_info(),
-        CliCommand::Verify => commands::verify::run_verify(),
+        CliCommand::Status => commands::status::run_status(&messages),
+        CliCommand::App(AppCommand::Add) => commands::app::run_app_add(&messages),
+        CliCommand::App(AppCommand::Info) => commands::app::run_app_info(&messages),
+        CliCommand::Verify => commands::verify::run_verify(&messages),
     }
     Ok(())
 }

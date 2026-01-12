@@ -4,8 +4,9 @@ use std::process::Command as ProcessCommand;
 use anyhow::{Context, Result};
 
 use crate::InfraUpArgs;
+use crate::i18n::Messages;
 
-pub(crate) fn run_infra_up(args: &InfraUpArgs) -> Result<()> {
+pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
     let loaded_archives = if let Some(dir) = args.image_archive_dir.as_deref() {
         load_local_images(dir)?
     } else {
@@ -30,17 +31,17 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs) -> Result<()> {
         run_docker(&update_args_ref, "docker update")?;
     }
 
-    print_readiness_summary(&readiness);
-    ensure_all_healthy(&readiness)?;
+    print_readiness_summary(&readiness, messages);
+    ensure_all_healthy(&readiness, messages)?;
 
-    println!("bootroot infra up: completed");
+    println!("{}", messages.infra_up_completed());
     Ok(())
 }
 
-pub(crate) fn ensure_infra_ready(compose_file: &Path) -> Result<()> {
+pub(crate) fn ensure_infra_ready(compose_file: &Path, messages: &Messages) -> Result<()> {
     let services = default_infra_services();
     let readiness = collect_readiness(compose_file, &services)?;
-    ensure_all_healthy(&readiness)?;
+    ensure_all_healthy(&readiness, messages)?;
     Ok(())
 }
 
@@ -107,17 +108,23 @@ fn parse_container_state(raw: &str) -> (String, Option<String>) {
     (status, health)
 }
 
-fn print_readiness_summary(readiness: &[ContainerReadiness]) {
-    println!("bootroot infra up: readiness summary");
+fn print_readiness_summary(readiness: &[ContainerReadiness], messages: &Messages) {
+    println!("{}", messages.infra_readiness_summary());
     for entry in readiness {
         match entry.health.as_deref() {
-            Some(health) => println!("- {}: {} (health: {})", entry.service, entry.status, health),
-            None => println!("- {}: {}", entry.service, entry.status),
+            Some(health) => println!(
+                "{}",
+                messages.infra_entry_with_health(&entry.service, &entry.status, health)
+            ),
+            None => println!(
+                "{}",
+                messages.infra_entry_without_health(&entry.service, &entry.status)
+            ),
         }
     }
 }
 
-fn ensure_all_healthy(readiness: &[ContainerReadiness]) -> Result<()> {
+fn ensure_all_healthy(readiness: &[ContainerReadiness], messages: &Messages) -> Result<()> {
     let mut failures = Vec::new();
     for entry in readiness {
         if entry.status != "running" {
@@ -133,7 +140,7 @@ fn ensure_all_healthy(readiness: &[ContainerReadiness]) -> Result<()> {
     if failures.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("Infrastructure not healthy: {}", failures.join(", "))
+        anyhow::bail!(messages.infra_unhealthy(&failures.join(", ")))
     }
 }
 
