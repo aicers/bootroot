@@ -1,5 +1,8 @@
 # Troubleshooting
 
+If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
+**manual operations** flow.
+
 ## "error: unexpected argument" at startup
 
 Check your CLI flags. The current CLI supports:
@@ -9,6 +12,17 @@ Check your CLI flags. The current CLI supports:
 - `--ca-url`
 - `--eab-kid` / `--eab-hmac` / `--eab-file`
 - `--oneshot`
+
+## OpenBao connection/auth failures
+
+- Check whether OpenBao is sealed
+- Verify the root token or AppRole credentials
+- Confirm the KV v2 mount exists
+
+## OpenBao KV v2 errors
+
+- Ensure KV v2 is enabled (default mount `secret`)
+- If using a different mount, pass it via CLI or env
 
 ## HTTP-01 challenge fails
 

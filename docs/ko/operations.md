@@ -2,6 +2,8 @@
 
 이 섹션은 운영 체크리스트에 집중합니다. 설치/설정은 **설치**와 **설정**
 섹션을 참고하세요.
+CLI를 사용하는 경우 `docs/ko/cli.md`를 참고하세요. 이 문서는 **수동 운영**
+절차를 기준으로 설명합니다.
 
 ## bootroot-agent
 
@@ -22,3 +24,11 @@
 - `acme.http_responder_hmac`와 동일한 시크릿을 사용합니다.
 - systemd로 80 포트를 바인딩하려면 root 권한 또는
   `cap_net_bind_service` 설정이 필요합니다.
+
+## OpenBao
+
+- OpenBao **seal 상태**를 정기적으로 확인합니다.
+- unseal keys와 root token은 안전한 보관소에 분산 보관합니다.
+- AppRole/정책은 최소 권한 원칙으로 구성합니다.
+- KV v2 경로를 백업/스냅샷 정책에 포함합니다.
+- 시크릿 회전 시 bootroot-agent/step-ca 재시작 또는 리로드 정책을 확인합니다.

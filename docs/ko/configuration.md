@@ -3,94 +3,10 @@
 bootroot-agent는 TOML 설정 파일을 읽습니다(기본값: `agent.toml`).
 전체 템플릿은 `agent.toml.example`에 있습니다.
 
-## bootroot CLI(골격)
+## bootroot CLI
 
-CLI 설정 섹션은 골격만 두고, CLI 구현과 함께 보강할 예정입니다.
-
-- `bootroot init`
-- `bootroot app add`
-- `bootroot app info`
-- `bootroot verify`
-
-### bootroot init
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot app add
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot app info
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot verify
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
+CLI 사용법은 `docs/ko/cli.md`에 정리되어 있습니다. 이 문서는 **수동 설정**
+절차를 기준으로 설명합니다.
 
 ## bootroot-agent (agent.toml)
 
@@ -177,6 +93,7 @@ hmac = "your-hmac-key"
 ```
 
 CLI에서도 지정 가능합니다(`--eab-kid`, `--eab-hmac`, `--eab-file`).
+운영 환경에서는 OpenBao에서 EAB 값을 주입하는 구성을 권장합니다.
 
 ### 프로필
 

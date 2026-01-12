@@ -55,6 +55,20 @@ HTTP-01은 **도메인 소유 확인 절차**입니다. CA가 **토큰**을 발�
 등록 제한이 필요한 CA에서 사용하는 방식입니다. `kid`와 `hmac`를
 제공해야 계정 등록이 허용됩니다.
 
+## 시크릿 매니저(OpenBao)
+
+운영 환경에서는 시크릿을 파일이나 환경변수에 하드코딩하지 않고
+OpenBao 같은 시크릿 매니저에 저장해 주입합니다. OpenBao는
+Vault 호환 KV v2 스토리지를 제공하며, 다음 값을 관리합니다.
+
+- step-ca 키 암호(`password.txt`)
+- step-ca DB DSN
+- HTTP-01 responder HMAC
+- EAB `kid`/`hmac`
+
+OpenBao는 **unseal keys**와 **root token**으로 초기화/접속합니다.
+서비스는 AppRole로 인증해 필요한 경로만 읽도록 최소 권한을 적용합니다.
+
 ## SAN (Subject Alternative Name)
 
 인증서의 실제 신원 목록입니다. 예:

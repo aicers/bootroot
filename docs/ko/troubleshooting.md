@@ -1,5 +1,8 @@
 # 문제 해결
 
+CLI를 사용하는 경우 `docs/ko/cli.md`를 참고하세요. 이 문서는 **수동 운영**
+환경에서의 문제 해결을 기준으로 설명합니다.
+
 ## "error: unexpected argument" 발생
 
 현재 CLI는 다음 옵션만 지원합니다.
@@ -9,6 +12,17 @@
 - `--ca-url`
 - `--eab-kid` / `--eab-hmac` / `--eab-file`
 - `--oneshot`
+
+## OpenBao 연결/인증 실패
+
+- OpenBao가 `sealed` 상태인지 확인
+- root token 또는 AppRole 자격증명이 유효한지 확인
+- KV v2 마운트 경로가 존재하는지 확인
+
+## OpenBao KV v2 관련 오류
+
+- KV v2가 enable 되어 있는지 확인(`secret` 기본 경로)
+- 마운트 경로가 다른 경우 CLI 옵션/환경 변수로 지정했는지 확인
 
 ## HTTP-01 챌린지 실패
 

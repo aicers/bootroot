@@ -53,6 +53,20 @@ Flow:
 EAB allows a CA to restrict registrations. The operator supplies a key ID
 and HMAC key. bootroot-agent can load EAB from config or CLI.
 
+## Secret Manager (OpenBao)
+
+In production, avoid hardcoding secrets in files or environment variables.
+Use a secret manager like OpenBao, which provides Vault-compatible KV v2
+storage. Store and inject:
+
+- step-ca password (`password.txt`)
+- step-ca DB DSN
+- HTTP-01 responder HMAC
+- EAB `kid`/`hmac`
+
+OpenBao is initialized with **unseal keys** and a **root token**. Services
+should authenticate with AppRole and read only the required paths.
+
 ## SAN (Subject Alternative Name)
 
 SANs are the identities inside the certificate. Common types:
