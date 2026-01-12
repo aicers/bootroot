@@ -26,9 +26,11 @@ pub(crate) struct Strings {
     pub(crate) error_openbao_sealed: &'static str,
     pub(crate) prompt_eab_register_now: &'static str,
     pub(crate) eab_prompt_instructions: &'static str,
+    pub(crate) prompt_eab_auto_now: &'static str,
     pub(crate) prompt_eab_kid: &'static str,
     pub(crate) prompt_eab_hmac: &'static str,
     pub(crate) error_responder_check_failed: &'static str,
+    pub(crate) error_eab_auto_failed: &'static str,
     pub(crate) status_summary_title: &'static str,
     pub(crate) status_section_infra: &'static str,
     pub(crate) status_section_openbao: &'static str,
@@ -218,6 +220,10 @@ impl Messages {
         self.strings().eab_prompt_instructions
     }
 
+    pub(crate) fn prompt_eab_auto_now(&self) -> &'static str {
+        self.strings().prompt_eab_auto_now
+    }
+
     pub(crate) fn prompt_eab_kid(&self) -> &'static str {
         self.strings().prompt_eab_kid
     }
@@ -228,6 +234,10 @@ impl Messages {
 
     pub(crate) fn error_responder_check_failed(&self) -> &'static str {
         self.strings().error_responder_check_failed
+    }
+
+    pub(crate) fn error_eab_auto_failed(&self) -> &'static str {
+        self.strings().error_eab_auto_failed
     }
 
     pub(crate) fn status_summary_title(&self) -> &'static str {

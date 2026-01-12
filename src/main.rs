@@ -9,6 +9,7 @@ mod i18n;
 
 use crate::commands::init::{
     DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL, DEFAULT_SECRETS_DIR,
+    DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL,
 };
 use crate::i18n::Messages;
 
@@ -121,6 +122,18 @@ struct InitArgs {
     /// HTTP-01 responder request timeout (seconds)
     #[arg(long, default_value_t = 5)]
     responder_timeout_secs: u64,
+
+    /// Auto-issue ACME EAB via step-ca
+    #[arg(long)]
+    eab_auto: bool,
+
+    /// step-ca URL for EAB issuance
+    #[arg(long, default_value = DEFAULT_STEPCA_URL)]
+    stepca_url: String,
+
+    /// step-ca ACME provisioner name
+    #[arg(long, default_value = DEFAULT_STEPCA_PROVISIONER)]
+    stepca_provisioner: String,
 
     /// ACME EAB key ID (optional)
     #[arg(long, env = "EAB_KID")]

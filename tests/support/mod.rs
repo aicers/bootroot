@@ -301,6 +301,7 @@ async fn stub_kv_secrets(server: &MockServer) {
         "bootroot/stepca/password",
         "bootroot/stepca/db",
         "bootroot/responder/hmac",
+        "bootroot/agent/eab",
     ] {
         Mock::given(method("POST"))
             .and(path(format!("/v1/secret/data/{secret}")))
@@ -316,6 +317,7 @@ async fn stub_kv_secrets_with_failure(server: &MockServer, failing_secret: &str)
         "bootroot/stepca/password",
         "bootroot/stepca/db",
         "bootroot/responder/hmac",
+        "bootroot/agent/eab",
     ] {
         let response = if secret == failing_secret {
             ResponseTemplate::new(500)

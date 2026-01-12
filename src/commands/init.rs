@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use bootroot::acme::responder_client;
 use bootroot::fs_util;
 use bootroot::openbao::{InitResponse, OpenBaoClient};
+use reqwest::StatusCode;
 use serde::Serialize;
 
 use crate::InitArgs;
@@ -18,6 +19,8 @@ pub(crate) const DEFAULT_OPENBAO_URL: &str = "http://localhost:8200";
 pub(crate) const DEFAULT_KV_MOUNT: &str = "secret";
 pub(crate) const DEFAULT_SECRETS_DIR: &str = "secrets";
 pub(crate) const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
+pub(crate) const DEFAULT_STEPCA_URL: &str = "https://localhost:9000";
+pub(crate) const DEFAULT_STEPCA_PROVISIONER: &str = "acme";
 
 const DEFAULT_CA_NAME: &str = "Bootroot CA";
 const DEFAULT_CA_PROVISIONER: &str = "admin";
@@ -25,6 +28,7 @@ const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca";
 const DEFAULT_CA_ADDRESS: &str = ":9000";
 const SECRET_BYTES: usize = 32;
 const DEFAULT_RESPONDER_TOKEN_TTL_SECS: u64 = 60;
+const DEFAULT_EAB_ENDPOINT_PATH: &str = "eab";
 
 mod openbao_constants {
     pub(crate) const INIT_SECRET_SHARES: u8 = 3;
@@ -125,6 +129,14 @@ struct InitSecrets {
     db_dsn: String,
     http_hmac: String,
     eab: Option<EabCredentials>,
+}
+
+#[derive(serde::Deserialize)]
+struct EabAutoResponse {
+    #[serde(alias = "keyId", alias = "kid")]
+    kid: String,
+    #[serde(alias = "hmacKey", alias = "hmac")]
+    hmac: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -413,11 +425,25 @@ async fn maybe_register_eab(
     rollback: &mut InitRollback,
     secrets: &InitSecrets,
 ) -> Result<Option<EabCredentials>> {
-    if secrets.eab.is_some() || args.auto_generate {
+    if secrets.eab.is_some() {
         return Ok(None);
+    }
+    if args.eab_auto {
+        let credentials = issue_eab_via_stepca(args)
+            .await
+            .with_context(|| messages.error_eab_auto_failed())?;
+        register_eab_secret(client, &args.kv_mount, rollback, &credentials).await?;
+        return Ok(Some(credentials));
     }
     if !prompt_yes_no(messages.prompt_eab_register_now())? {
         return Ok(None);
+    }
+    if prompt_yes_no(messages.prompt_eab_auto_now())? {
+        let credentials = issue_eab_via_stepca(args)
+            .await
+            .with_context(|| messages.error_eab_auto_failed())?;
+        register_eab_secret(client, &args.kv_mount, rollback, &credentials).await?;
+        return Ok(Some(credentials));
     }
     println!("{}", messages.eab_prompt_instructions());
     let kid = prompt_text(messages.prompt_eab_kid())?;
@@ -444,6 +470,27 @@ async fn register_eab_secret(
         )
         .await?;
     Ok(())
+}
+
+async fn issue_eab_via_stepca(args: &InitArgs) -> Result<EabCredentials> {
+    let base = args.stepca_url.trim_end_matches('/');
+    let provisioner = args.stepca_provisioner.trim();
+    let endpoint = format!("{base}/acme/{provisioner}/{DEFAULT_EAB_ENDPOINT_PATH}");
+    let client = reqwest::Client::new();
+
+    let response = client.post(&endpoint).send().await?;
+    let response = if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+        client.get(&endpoint).send().await?
+    } else {
+        response
+    };
+    let response = response.error_for_status()?;
+
+    let payload: EabAutoResponse = response.json().await?;
+    Ok(EabCredentials {
+        kid: payload.kid,
+        hmac: payload.hmac,
+    })
 }
 
 fn resolve_db_dsn(args: &InitArgs, messages: &Messages) -> Result<String> {
@@ -836,6 +883,9 @@ mod tests {
             http_hmac: None,
             responder_url: None,
             responder_timeout_secs: 5,
+            eab_auto: false,
+            stepca_url: DEFAULT_STEPCA_URL.to_string(),
+            stepca_provisioner: DEFAULT_STEPCA_PROVISIONER.to_string(),
             eab_kid: None,
             eab_hmac: None,
         }
