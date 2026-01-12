@@ -4,137 +4,11 @@
 전체 과정을 설명합니다. PKI 배경 지식이 없는 사용자도 이 문서만으로
 설치와 인증서 발급을 완료할 수 있도록 구성했습니다.
 
-## CLI 구성(골격)
+## CLI
 
-CLI 섹션은 향후 보강할 골격만 포함합니다. CLI 문서가 완성되기 전까지는
-아래 매뉴얼 내용이 기준입니다.
-
-- `bootroot infra up`
-- `bootroot init`
-- `bootroot status`
-- `bootroot app add`
-- `bootroot app info`
-- `bootroot verify`
-
-### bootroot infra up
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot init
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot status
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot app add
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot app info
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot verify
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
+CLI 사용법은 `docs/ko/cli.md`에 정리되어 있습니다.
+이 매뉴얼의 나머지 섹션은 **CLI를 쓰지 않는 수동 절차**를 기준으로
+설명합니다.
 
 ## Bootroot가 하는 일
 
@@ -152,6 +26,7 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다. step-ca�
 
 ## 매뉴얼 구성
 
+- **CLI**: infra 기동/초기화/상태 점검 명령
 - **개념**: PKI, ACME, CSR, SAN, mTLS 개요
 - **빠른 시작**: Docker Compose 기반 첫 발급
 - **설치**: step-ca + PostgreSQL + bootroot-agent + 리스폰더 설치

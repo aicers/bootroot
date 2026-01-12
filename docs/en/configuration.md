@@ -3,95 +3,10 @@
 bootroot-agent reads a TOML configuration file (default `agent.toml`).
 The full template lives in `agent.toml.example`.
 
-## bootroot CLI (Skeleton)
+## bootroot CLI
 
-The CLI configuration section is a placeholder. It will be filled in as the
-CLI subcommands are implemented.
-
-- `bootroot init`
-- `bootroot app add`
-- `bootroot app info`
-- `bootroot verify`
-
-### bootroot init
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot app add
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot app info
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot verify
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
+CLI usage is documented in `docs/en/cli.md`. This document focuses on the
+**manual configuration** flow.
 
 ## bootroot-agent (agent.toml)
 
@@ -178,6 +93,7 @@ hmac = "your-hmac-key"
 ```
 
 EAB can also be passed via CLI (`--eab-kid`, `--eab-hmac`, or `--eab-file`).
+For production, prefer injecting EAB values via OpenBao.
 
 ### Profiles
 

@@ -1,74 +1,8 @@
 # 설치
 
 이 섹션은 step-ca, PostgreSQL, bootroot-agent, HTTP-01 리스폰더 설치를 다룹니다.
-
-## CLI 흐름(골격)
-
-이 섹션은 CLI 구현이 완성될 때까지 골격만 유지합니다.
-
-- `bootroot infra up`
-- `bootroot init`
-- `bootroot status`
-
-### bootroot infra up
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot init
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
-
-### bootroot status
-
-TBD (CLI 문서는 구현 진행에 따라 보강 예정).
-
-#### 입력
-
-TBD
-
-#### 출력
-
-TBD
-
-#### 실패
-
-TBD
-
-#### 예시
-
-TBD
+CLI를 사용하는 경우 `docs/ko/cli.md`를 참고하세요. 이 문서는 **수동 설치**
+절차를 기준으로 설명합니다.
 
 ## step-ca
 
@@ -101,8 +35,8 @@ docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
 
 `<your-password>`는 CA 키를 보호(암호화)하는 비밀번호입니다. 운영에서는
 충분히 강한 비밀번호로 설정하고, 해당 파일은 외부에 노출되지 않도록
-보호하세요. 향후에는 OpenBao 같은 **시크릿 매니저(Secret Manager)** 를
-통해 이 비밀번호를 주입하는 방식을 도입할 계획입니다.
+보호하세요. 운영에서는 OpenBao 같은 **시크릿 매니저(Secret Manager)** 를
+통해 이 비밀번호를 주입하는 방식을 권장합니다.
 
 초기화가 끝나면 다음 파일들이 생성됩니다(대표 예시):
 
@@ -157,9 +91,9 @@ postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=<mode>
 
 `step-pass`는 이 repo의 **개발용 기본 비밀번호**입니다. `.env`의
 `POSTGRES_PASSWORD`와 맞춰져야 하므로, 로컬/Compose 예시에서 동일하게
-사용했습니다. 운영에서는 반드시 강한 비밀번호로 변경하세요. 향후에는
+사용했습니다. 운영에서는 반드시 강한 비밀번호로 변경하세요. 운영에서는
 이 DB 비밀번호도 OpenBao 같은 **시크릿 매니저(Secret Manager)** 를 통해
-주입하는 방식을 도입할 계획입니다.
+주입하는 방식을 권장합니다.
 
 `.env`에는 다음처럼 입력합니다(예시):
 

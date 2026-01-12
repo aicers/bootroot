@@ -4,137 +4,10 @@ This manual explains how to install, configure, and operate **bootroot-agent**
 with **step-ca**. It is written so that a reader with no PKI background can
 complete a full installation and issue certificates successfully.
 
-## CLI Map (Skeleton)
+## CLI
 
-The CLI sections are placeholders for future updates. The manual content
-below remains the authoritative reference until the CLI is fully documented.
-
-- `bootroot infra up`
-- `bootroot init`
-- `bootroot status`
-- `bootroot app add`
-- `bootroot app info`
-- `bootroot verify`
-
-### bootroot infra up
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot init
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot status
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot app add
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot app info
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot verify
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
+CLI usage is documented in `docs/en/cli.md`. The rest of this manual focuses
+on the **manual setup** flow.
 
 ## What Bootroot Does
 
@@ -153,6 +26,7 @@ Components:
 
 ## Manual Map
 
+- **CLI**: infra bring-up, initialization, and status commands
 - **Concepts**: PKI, ACME, CSR, SAN, and mTLS basics
 - **Getting Started**: Quick Docker-based issuance flow
 - **Installation**: step-ca + PostgreSQL + bootroot-agent + responder setup

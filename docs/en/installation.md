@@ -1,75 +1,8 @@
 # Installation
 
 This section covers step-ca, PostgreSQL, bootroot-agent, and the HTTP-01 responder.
-
-## CLI Flow (Skeleton)
-
-This section is intentionally a skeleton and will be expanded as the CLI
-implementation matures.
-
-- `bootroot infra up`
-- `bootroot init`
-- `bootroot status`
-
-### bootroot infra up
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot init
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
-
-### bootroot status
-
-TBD (CLI documentation will be added as implementation lands).
-
-#### Inputs
-
-TBD
-
-#### Outputs
-
-TBD
-
-#### Failures
-
-TBD
-
-#### Examples
-
-TBD
+If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
+**manual setup** flow.
 
 ## step-ca
 
@@ -103,8 +36,8 @@ docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
 ```
 
 `<your-password>` protects (encrypts) the CA keys. In production use a strong
-password and keep this file out of logs and repositories. We plan to inject
-this value via a Secret Manager (for example, OpenBao) later.
+password and keep this file out of logs and repositories. In production we
+recommend injecting this value via a Secret Manager (for example, OpenBao).
 
 After initialization, these files are created (examples):
 
@@ -155,8 +88,8 @@ Examples:
 
 `step-pass` is the development default for this repo. It must match
 `POSTGRES_PASSWORD` in `.env`, which is why the local/Compose examples use the
-same value. In production, replace it with a strong password. We plan to
-inject this DB password via a Secret Manager later.
+same value. In production, replace it with a strong password. In production
+we recommend injecting this DB password via a Secret Manager.
 
 Example `.env`:
 

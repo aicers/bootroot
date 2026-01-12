@@ -1,6 +1,8 @@
 # Getting Started
 
 This section walks through a full end-to-end issuance using Docker Compose.
+If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
+**manual** flow.
 
 ## Prerequisites
 
@@ -48,3 +50,4 @@ This section walks through a full end-to-end issuance using Docker Compose.
 
 - Read **Installation** for production setups
 - Read **Configuration** to add more profiles and hooks
+- For production, inject step-ca passwords/DSN/HMAC/EAB via OpenBao
