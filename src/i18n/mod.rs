@@ -4,7 +4,7 @@ pub(crate) mod en;
 pub(crate) mod ko;
 
 pub(crate) struct AppNextStepsDaemon<'a> {
-    pub(crate) app_kind: &'a str,
+    pub(crate) service_name: &'a str,
     pub(crate) instance_id: &'a str,
     pub(crate) hostname: &'a str,
     pub(crate) domain: &'a str,
@@ -14,7 +14,7 @@ pub(crate) struct AppNextStepsDaemon<'a> {
 }
 
 pub(crate) struct AppNextStepsDocker<'a> {
-    pub(crate) app_kind: &'a str,
+    pub(crate) service_name: &'a str,
     pub(crate) container_name: &'a str,
     pub(crate) hostname: &'a str,
     pub(crate) domain: &'a str,
@@ -76,7 +76,7 @@ pub(crate) struct Strings {
     pub(crate) app_next_steps_daemon_profile: &'static str,
     pub(crate) app_next_steps_docker_sidecar: &'static str,
     pub(crate) verify_summary_title: &'static str,
-    pub(crate) verify_app_kind: &'static str,
+    pub(crate) verify_service_name: &'static str,
     pub(crate) verify_agent_config: &'static str,
     pub(crate) verify_cert_path: &'static str,
     pub(crate) verify_key_path: &'static str,
@@ -285,12 +285,18 @@ impl Messages {
         self.strings().error_state_missing
     }
 
-    pub(crate) fn error_app_duplicate(&self, app_kind: &str) -> String {
-        format_template(self.strings().error_app_duplicate, &[("value", app_kind)])
+    pub(crate) fn error_app_duplicate(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().error_app_duplicate,
+            &[("value", service_name)],
+        )
     }
 
-    pub(crate) fn error_app_not_found(&self, app_kind: &str) -> String {
-        format_template(self.strings().error_app_not_found, &[("value", app_kind)])
+    pub(crate) fn error_app_not_found(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().error_app_not_found,
+            &[("value", service_name)],
+        )
     }
 
     pub(crate) fn error_app_instance_id_required(&self) -> &'static str {
@@ -380,7 +386,7 @@ impl Messages {
         format_template(
             self.strings().app_next_steps_daemon_profile,
             &[
-                ("app_kind", data.app_kind),
+                ("service_name", data.service_name),
                 ("instance_id", data.instance_id),
                 ("hostname", data.hostname),
                 ("domain", data.domain),
@@ -395,7 +401,7 @@ impl Messages {
         format_template(
             self.strings().app_next_steps_docker_sidecar,
             &[
-                ("app_kind", data.app_kind),
+                ("service_name", data.service_name),
                 ("container_name", data.container_name),
                 ("hostname", data.hostname),
                 ("domain", data.domain),
@@ -412,8 +418,8 @@ impl Messages {
         self.strings().verify_summary_title
     }
 
-    pub(crate) fn verify_app_kind(&self, value: &str) -> String {
-        format_template(self.strings().verify_app_kind, &[("value", value)])
+    pub(crate) fn verify_service_name(&self, value: &str) -> String {
+        format_template(self.strings().verify_service_name, &[("value", value)])
     }
 
     pub(crate) fn verify_agent_config(&self, value: &str) -> String {

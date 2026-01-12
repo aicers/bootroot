@@ -13,7 +13,7 @@ If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
     `001.bootroot-agent.bootroot-agent.trusted.domain` network alias
   - If you change `domain`, update the alias or map it in step-ca `/etc/hosts`
   - Auto-generated scheme:
-    `<instance-id>.<daemon-name>.<hostname>.<domain>`
+    `<instance-id>.<service-name>.<hostname>.<domain>`
 
 ## Quick Start (Compose)
 

@@ -34,7 +34,7 @@ fn test_verify_success() {
         .env("PATH", combined_path)
         .args([
             "verify",
-            "--app-kind",
+            "--service-name",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -45,7 +45,7 @@ fn test_verify_success() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     assert!(stdout.contains("bootroot verify: summary"));
-    assert!(stdout.contains("- app kind: edge-proxy"));
+    assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- result: ok"));
 }
 
@@ -75,7 +75,7 @@ fn test_verify_missing_cert_fails() {
         .env("PATH", combined_path)
         .args([
             "verify",
-            "--app-kind",
+            "--service-name",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -115,7 +115,7 @@ fn test_verify_agent_failure_reports_error() {
         .env("PATH", combined_path)
         .args([
             "verify",
-            "--app-kind",
+            "--service-name",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -142,7 +142,7 @@ fn write_state_with_app(
         "approles": {},
         "apps": {
             "edge-proxy": {
-                "app_kind": "edge-proxy",
+                "service_name": "edge-proxy",
                 "deploy_type": "daemon",
                 "hostname": "edge-node-01",
                 "domain": "trusted.domain",

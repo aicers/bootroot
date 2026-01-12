@@ -169,7 +169,7 @@ pub(crate) struct StatusArgs {
 pub(crate) struct AppAddArgs {
     /// App kind identifier
     #[arg(long, required = true)]
-    app_kind: String,
+    service_name: String,
 
     /// Deployment type (daemon or docker)
     #[arg(long, value_enum, required = true)]
@@ -216,14 +216,14 @@ pub(crate) struct AppAddArgs {
 pub(crate) struct AppInfoArgs {
     /// App kind identifier
     #[arg(long, required = true)]
-    app_kind: String,
+    service_name: String,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct VerifyArgs {
     /// App kind identifier
     #[arg(long, required = true)]
-    app_kind: String,
+    service_name: String,
 
     /// bootroot-agent config path override
     #[arg(long)]

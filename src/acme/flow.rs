@@ -290,7 +290,7 @@ mod tests {
 
     fn test_profile() -> crate::config::ProfileSettings {
         crate::config::ProfileSettings {
-            daemon_name: "edge-proxy".to_string(),
+            service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
             paths: crate::config::Paths {

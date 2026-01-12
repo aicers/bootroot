@@ -28,7 +28,7 @@ pub(crate) fn print_app_add_summary(
         "{}",
         messages.app_summary_secret_path(&secret_id_path.display().to_string())
     );
-    println!("{}", messages.app_summary_openbao_path(&entry.app_kind));
+    println!("{}", messages.app_summary_openbao_path(&entry.service_name));
     println!("{}", messages.app_summary_next_steps());
     match entry.deploy_type {
         DeployType::Daemon => {
@@ -36,7 +36,7 @@ pub(crate) fn print_app_add_summary(
             let key_path = entry.key_path.display().to_string();
             let config_path = entry.agent_config_path.display().to_string();
             let data = AppNextStepsDaemon {
-                app_kind: &entry.app_kind,
+                service_name: &entry.service_name,
                 instance_id: entry.instance_id.as_deref().unwrap_or_default(),
                 hostname: &entry.hostname,
                 domain: &entry.domain,
@@ -52,7 +52,7 @@ pub(crate) fn print_app_add_summary(
             let config_path = entry.agent_config_path.display().to_string();
             let secret_id_path_value = secret_id_path.display().to_string();
             let data = AppNextStepsDocker {
-                app_kind: &entry.app_kind,
+                service_name: &entry.service_name,
                 container_name: entry.container_name.as_deref().unwrap_or_default(),
                 hostname: &entry.hostname,
                 domain: &entry.domain,
@@ -82,7 +82,7 @@ pub(crate) fn print_app_info_summary(entry: &AppEntry, messages: &Messages) {
     );
     println!("{}", messages.app_summary_approle(&entry.approle.role_name));
     println!("{}", messages.summary_role_id(&entry.approle.role_id));
-    println!("{}", messages.app_summary_openbao_path(&entry.app_kind));
+    println!("{}", messages.app_summary_openbao_path(&entry.service_name));
     println!(
         "{}",
         messages.app_summary_agent_config(&entry.agent_config_path.display().to_string())
@@ -99,7 +99,7 @@ pub(crate) fn print_app_info_summary(entry: &AppEntry, messages: &Messages) {
 }
 
 fn print_app_fields(entry: &AppEntry, messages: &Messages) {
-    println!("{}", messages.app_summary_kind(&entry.app_kind));
+    println!("{}", messages.app_summary_kind(&entry.service_name));
     println!(
         "{}",
         messages.app_summary_deploy_type(match entry.deploy_type {

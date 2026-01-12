@@ -130,7 +130,7 @@ Registers app onboarding info and creates an OpenBao AppRole.
 
 ### Inputs
 
-- `--app-kind`: app kind identifier
+- `--service-name`: service name identifier
 - `--deploy-type`: deployment type (`daemon` or `docker`)
 - `--hostname`: hostname used for DNS SAN
 - `--domain`: root domain for DNS SAN
@@ -152,7 +152,7 @@ Registers app onboarding info and creates an OpenBao AppRole.
 ### Failures
 
 - Missing `state.json`
-- Duplicate `app-kind`
+- Duplicate `service-name`
 - Missing `instance-id` for daemon
 - Missing `container-name` for docker
 - OpenBao AppRole creation failure
@@ -163,7 +163,7 @@ Shows onboarding information for a registered app.
 
 ### Inputs
 
-- `--app-kind`: app kind identifier
+- `--service-name`: service name identifier
 
 ### Outputs
 
@@ -180,7 +180,7 @@ Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 
 ### Inputs
 
-- `--app-kind`: app kind identifier
+- `--service-name`: service name identifier
 - `--agent-config`: bootroot-agent config path override (optional)
 
 ### Outputs

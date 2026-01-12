@@ -35,7 +35,7 @@ domain = "trusted.domain"
     - Host install (same host): `https://localhost:9000/acme/acme/directory`
     - Remote step-ca: `https://<step-ca-host>:9000/acme/<provisioner>/directory`
 - `domain`: root domain used to auto-generate the DNS SAN as
-  `instance_id.daemon_name.hostname.domain`.
+  `instance_id.service_name.hostname.domain`.
 
 ### Scheduler
 
@@ -101,7 +101,7 @@ Each profile represents one daemon instance (one certificate identity).
 
 ```toml
 [[profiles]]
-daemon_name = "edge-proxy"
+service_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
 
@@ -116,7 +116,7 @@ check_jitter = "0s"
 ```
 
 The DNS SAN is auto-generated as
-`<instance-id>.<daemon-name>.<hostname>.<domain>`. This name is also the
+`<instance-id>.<service-name>.<hostname>.<domain>`. This name is also the
 target for HTTP-01 validation, so it must resolve from step-ca to the
 HTTP-01 responder IP (for Compose, update the network alias; for host installs,
 update `/etc/hosts` or DNS).

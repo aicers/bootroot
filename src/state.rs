@@ -46,7 +46,7 @@ impl StateFile {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct AppEntry {
-    pub(crate) app_kind: String,
+    pub(crate) service_name: String,
     pub(crate) deploy_type: DeployType,
     pub(crate) hostname: String,
     pub(crate) domain: String,

@@ -17,8 +17,8 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
     let state = StateFile::load(state_path)?;
     let entry = state
         .apps
-        .get(&args.app_kind)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&args.app_kind)))?;
+        .get(&args.service_name)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&args.service_name)))?;
 
     let agent_config = args
         .agent_config
@@ -46,7 +46,7 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
     }
 
     println!("{}", messages.verify_summary_title());
-    println!("{}", messages.verify_app_kind(&entry.app_kind));
+    println!("{}", messages.verify_service_name(&entry.service_name));
     println!(
         "{}",
         messages.verify_agent_config(&agent_config.display().to_string())

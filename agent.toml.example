@@ -9,7 +9,7 @@ email = "admin@example.com"
 server = "https://localhost:9000/acme/acme/directory"
 
 # Root domain used to auto-generate the DNS SAN
-# Format: <instance_id>.<daemon_name>.<hostname>.<domain>
+# Format: <instance_id>.<service_name>.<hostname>.<domain>
 domain = "trusted.domain"
 
 # Scheduler settings
@@ -41,7 +41,7 @@ backoff_secs = [5, 10, 30]
 
 # Profiles (one per daemon instance)
 [[profiles]]
-daemon_name = "edge-proxy"
+service_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
 
