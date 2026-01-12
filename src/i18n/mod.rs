@@ -55,7 +55,29 @@ pub(crate) struct Strings {
     pub(crate) error_app_not_found: &'static str,
     pub(crate) error_app_instance_id_required: &'static str,
     pub(crate) error_app_container_name_required: &'static str,
+    pub(crate) error_value_required: &'static str,
+    pub(crate) error_invalid_deploy_type: &'static str,
+    pub(crate) error_path_not_found: &'static str,
+    pub(crate) error_parent_not_found: &'static str,
+    pub(crate) error_operation_cancelled: &'static str,
+    pub(crate) prompt_service_name: &'static str,
+    pub(crate) prompt_deploy_type: &'static str,
+    pub(crate) prompt_hostname: &'static str,
+    pub(crate) prompt_domain: &'static str,
+    pub(crate) prompt_agent_config: &'static str,
+    pub(crate) prompt_cert_path: &'static str,
+    pub(crate) prompt_key_path: &'static str,
+    pub(crate) prompt_instance_id: &'static str,
+    pub(crate) prompt_container_name: &'static str,
+    pub(crate) prompt_confirm_overwrite_password: &'static str,
+    pub(crate) prompt_confirm_overwrite_ca_json: &'static str,
+    pub(crate) prompt_confirm_overwrite_state: &'static str,
+    pub(crate) init_plan_title: &'static str,
+    pub(crate) init_plan_overwrite_password: &'static str,
+    pub(crate) init_plan_overwrite_ca_json: &'static str,
+    pub(crate) init_plan_overwrite_state: &'static str,
     pub(crate) app_add_summary: &'static str,
+    pub(crate) app_add_plan_title: &'static str,
     pub(crate) app_info_summary: &'static str,
     pub(crate) app_summary_kind: &'static str,
     pub(crate) app_summary_deploy_type: &'static str,
@@ -75,6 +97,7 @@ pub(crate) struct Strings {
     pub(crate) app_summary_next_steps: &'static str,
     pub(crate) app_next_steps_daemon_profile: &'static str,
     pub(crate) app_next_steps_docker_sidecar: &'static str,
+    pub(crate) verify_plan_title: &'static str,
     pub(crate) verify_summary_title: &'static str,
     pub(crate) verify_service_name: &'static str,
     pub(crate) verify_agent_config: &'static str,
@@ -307,8 +330,96 @@ impl Messages {
         self.strings().error_app_container_name_required
     }
 
+    pub(crate) fn error_value_required(&self) -> &'static str {
+        self.strings().error_value_required
+    }
+
+    pub(crate) fn error_invalid_deploy_type(&self) -> &'static str {
+        self.strings().error_invalid_deploy_type
+    }
+
+    pub(crate) fn error_path_not_found(&self, value: &str) -> String {
+        format_template(self.strings().error_path_not_found, &[("value", value)])
+    }
+
+    pub(crate) fn error_parent_not_found(&self, value: &str) -> String {
+        format_template(self.strings().error_parent_not_found, &[("value", value)])
+    }
+
+    pub(crate) fn error_operation_cancelled(&self) -> &'static str {
+        self.strings().error_operation_cancelled
+    }
+
+    pub(crate) fn prompt_service_name(&self) -> &'static str {
+        self.strings().prompt_service_name
+    }
+
+    pub(crate) fn prompt_deploy_type(&self) -> &'static str {
+        self.strings().prompt_deploy_type
+    }
+
+    pub(crate) fn prompt_hostname(&self) -> &'static str {
+        self.strings().prompt_hostname
+    }
+
+    pub(crate) fn prompt_domain(&self) -> &'static str {
+        self.strings().prompt_domain
+    }
+
+    pub(crate) fn prompt_agent_config(&self) -> &'static str {
+        self.strings().prompt_agent_config
+    }
+
+    pub(crate) fn prompt_cert_path(&self) -> &'static str {
+        self.strings().prompt_cert_path
+    }
+
+    pub(crate) fn prompt_key_path(&self) -> &'static str {
+        self.strings().prompt_key_path
+    }
+
+    pub(crate) fn prompt_instance_id(&self) -> &'static str {
+        self.strings().prompt_instance_id
+    }
+
+    pub(crate) fn prompt_container_name(&self) -> &'static str {
+        self.strings().prompt_container_name
+    }
+
+    pub(crate) fn prompt_confirm_overwrite_password(&self) -> &'static str {
+        self.strings().prompt_confirm_overwrite_password
+    }
+
+    pub(crate) fn prompt_confirm_overwrite_ca_json(&self) -> &'static str {
+        self.strings().prompt_confirm_overwrite_ca_json
+    }
+
+    pub(crate) fn prompt_confirm_overwrite_state(&self) -> &'static str {
+        self.strings().prompt_confirm_overwrite_state
+    }
+
+    pub(crate) fn init_plan_title(&self) -> &'static str {
+        self.strings().init_plan_title
+    }
+
+    pub(crate) fn init_plan_overwrite_password(&self) -> &'static str {
+        self.strings().init_plan_overwrite_password
+    }
+
+    pub(crate) fn init_plan_overwrite_ca_json(&self) -> &'static str {
+        self.strings().init_plan_overwrite_ca_json
+    }
+
+    pub(crate) fn init_plan_overwrite_state(&self) -> &'static str {
+        self.strings().init_plan_overwrite_state
+    }
+
     pub(crate) fn app_add_summary(&self) -> &'static str {
         self.strings().app_add_summary
+    }
+
+    pub(crate) fn app_add_plan_title(&self) -> &'static str {
+        self.strings().app_add_plan_title
     }
 
     pub(crate) fn app_info_summary(&self) -> &'static str {
@@ -416,6 +527,10 @@ impl Messages {
 
     pub(crate) fn verify_summary_title(&self) -> &'static str {
         self.strings().verify_summary_title
+    }
+
+    pub(crate) fn verify_plan_title(&self) -> &'static str {
+        self.strings().verify_plan_title
     }
 
     pub(crate) fn verify_service_name(&self, value: &str) -> String {

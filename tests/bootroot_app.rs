@@ -1,7 +1,9 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Stdio;
 
 use anyhow::Context;
 use serde_json::json;
@@ -23,6 +25,7 @@ async fn test_app_add_writes_state_and_secret() {
     fs::write(&agent_config, "# config").expect("write agent config");
     let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
@@ -87,6 +90,98 @@ async fn test_app_add_writes_state_and_secret() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_app_add_prompts_for_missing_inputs() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("edge-proxy.crt");
+    let key_path = cert_dir.join("edge-proxy.key");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+
+    let input = format!(
+        "edge-proxy\n\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n{}\n",
+        agent_config.display(),
+        cert_path.display(),
+        key_path.display(),
+        ROOT_TOKEN
+    );
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["app", "add"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn app add");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("run app add");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("bootroot app add: summary"));
+    assert!(stdout.contains("- service name: edge-proxy"));
+    assert!(stdout.contains("- deploy type: daemon"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_reprompts_on_invalid_inputs() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("edge-proxy.crt");
+    let key_path = cert_dir.join("edge-proxy.key");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+
+    let input = format!(
+        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\nmissing.toml\n{}\n{}\n{}\n\n001\n{}\n",
+        agent_config.display(),
+        cert_path.display(),
+        key_path.display(),
+        ROOT_TOKEN
+    );
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["app", "add"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn app add");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("run app add");
+    assert!(output.status.success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_app_add_rejects_duplicate() {
     use support::ROOT_TOKEN;
 
@@ -96,6 +191,7 @@ async fn test_app_add_rejects_duplicate() {
     fs::write(&agent_config, "# config").expect("write agent config");
     let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;

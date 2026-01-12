@@ -1,7 +1,9 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Stdio;
 
 use anyhow::Context;
 use serde_json::json;
@@ -47,6 +49,94 @@ fn test_verify_success() {
     assert!(stdout.contains("bootroot verify: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- result: ok"));
+}
+
+#[test]
+fn test_verify_prompts_for_service_name() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    fs::write(&cert_path, "cert").expect("write cert");
+    fs::write(&key_path, "key").expect("write key");
+
+    write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", combined_path)
+        .args(["verify"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn verify");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"edge-proxy\n")
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("run verify");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("bootroot verify: summary"));
+    assert!(stdout.contains("- service name: edge-proxy"));
+    assert!(stdout.contains("- result: ok"));
+}
+
+#[test]
+fn test_verify_reprompts_on_empty_service_name() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    fs::write(&cert_path, "cert").expect("write cert");
+    fs::write(&key_path, "key").expect("write key");
+
+    write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", combined_path)
+        .args(["verify"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn verify");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"\nedge-proxy\n")
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("run verify");
+    assert!(output.status.success());
 }
 
 #[test]

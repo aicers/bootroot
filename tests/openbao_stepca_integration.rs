@@ -5,7 +5,8 @@ mod support;
 mod unix_integration {
     use std::env;
     use std::fs;
-    use std::process::Command;
+    use std::io::Write;
+    use std::process::{Command, Output, Stdio};
 
     use anyhow::{Context, Result};
     use tempfile::tempdir;
@@ -17,6 +18,25 @@ mod unix_integration {
         stub_openbao_unseal_failure, stub_openbao_with_write_failure, write_fake_docker,
         write_fake_docker_with_status, write_password_file,
     };
+
+    fn run_command_with_input(command: &mut Command, input: &str) -> Result<Output> {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn command")?;
+        child
+            .stdin
+            .as_mut()
+            .context("Missing stdin")?
+            .write_all(input.as_bytes())
+            .context("Failed to write stdin")?;
+        let output = child
+            .wait_with_output()
+            .context("Failed to wait for command")?;
+        Ok(output)
+    }
 
     #[tokio::test]
     async fn init_flow_with_openbao_and_stepca_stubs() -> Result<()> {
@@ -35,7 +55,8 @@ mod unix_integration {
         let path = env::var("PATH").unwrap_or_default();
         let combined_path = format!("{}:{}", bin_dir.display(), path);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
             .current_dir(temp_dir.path())
             .args([
                 "init",
@@ -51,9 +72,9 @@ mod unix_integration {
                 "--compose-file",
                 compose_file.to_string_lossy().as_ref(),
             ])
-            .env("PATH", combined_path)
-            .output()
-            .context("Failed to run bootroot init")?;
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -91,7 +112,8 @@ mod unix_integration {
         let path = env::var("PATH").unwrap_or_default();
         let combined_path = format!("{}:{}", bin_dir.display(), path);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
             .current_dir(temp_dir.path())
             .args([
                 "init",
@@ -109,9 +131,9 @@ mod unix_integration {
                 "--responder-url",
                 &responder.uri(),
             ])
-            .env("PATH", combined_path)
-            .output()
-            .context("Failed to run bootroot init")?;
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -144,7 +166,8 @@ mod unix_integration {
         let path = env::var("PATH").unwrap_or_default();
         let combined_path = format!("{}:{}", bin_dir.display(), path);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
             .current_dir(temp_dir.path())
             .args([
                 "init",
@@ -162,9 +185,9 @@ mod unix_integration {
                 "--responder-url",
                 &responder.uri(),
             ])
-            .env("PATH", combined_path)
-            .output()
-            .context("Failed to run bootroot init")?;
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -199,7 +222,8 @@ mod unix_integration {
         let path = env::var("PATH").unwrap_or_default();
         let combined_path = format!("{}:{}", bin_dir.display(), path);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
             .current_dir(temp_dir.path())
             .args([
                 "init",
@@ -218,9 +242,9 @@ mod unix_integration {
                 "--compose-file",
                 compose_file.to_string_lossy().as_ref(),
             ])
-            .env("PATH", combined_path)
-            .output()
-            .context("Failed to run bootroot init")?;
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !output.status.success() {
@@ -256,7 +280,8 @@ mod unix_integration {
         let path = env::var("PATH").unwrap_or_default();
         let combined_path = format!("{}:{}", bin_dir.display(), path);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
             .current_dir(temp_dir.path())
             .args([
                 "init",
@@ -275,9 +300,9 @@ mod unix_integration {
                 "--compose-file",
                 compose_file.to_string_lossy().as_ref(),
             ])
-            .env("PATH", combined_path)
-            .output()
-            .context("Failed to run bootroot init")?;
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
 
         assert!(!output.status.success());
         Ok(())
@@ -297,7 +322,8 @@ mod unix_integration {
         let path = env::var("PATH").unwrap_or_default();
         let combined_path = format!("{}:{}", bin_dir.display(), path);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
             .current_dir(temp_dir.path())
             .args([
                 "init",
@@ -311,9 +337,9 @@ mod unix_integration {
                 "--compose-file",
                 compose_file.to_string_lossy().as_ref(),
             ])
-            .env("PATH", combined_path)
-            .output()
-            .context("Failed to run bootroot init")?;
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -338,7 +364,8 @@ mod unix_integration {
         let path = env::var("PATH").unwrap_or_default();
         let combined_path = format!("{}:{}", bin_dir.display(), path);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
             .current_dir(temp_dir.path())
             .args([
                 "init",
@@ -354,9 +381,9 @@ mod unix_integration {
                 "--compose-file",
                 compose_file.to_string_lossy().as_ref(),
             ])
-            .env("PATH", combined_path)
-            .output()
-            .context("Failed to run bootroot init")?;
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -387,7 +414,8 @@ mod unix_integration {
         let path = env::var("PATH").unwrap_or_default();
         let combined_path = format!("{}:{}", bin_dir.display(), path);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
             .current_dir(temp_dir.path())
             .args([
                 "init",
@@ -403,8 +431,8 @@ mod unix_integration {
                 "--compose-file",
                 compose_file.to_string_lossy().as_ref(),
             ])
-            .env("PATH", combined_path)
-            .output()
+            .env("PATH", combined_path);
+        let output = run_command_with_input(&mut command, "y\ny\n")
             .context("Failed to run bootroot init")?;
 
         assert!(!output.status.success());
@@ -416,6 +444,52 @@ mod unix_integration {
         let ca_json = fs::read_to_string(secrets_dir.join("config").join("ca.json"))
             .context("Failed to read ca.json after rollback")?;
         assert_eq!(ca_json, original_ca_json);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_cancels_on_overwrite_prompt() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        fs::write(temp_dir.path().join("state.json"), "{}")
+            .context("Failed to write state.json")?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao(&server).await;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--root-token",
+                ROOT_TOKEN,
+                "--db-dsn",
+                "postgresql://step:step@localhost:5432/step?sslmode=disable",
+                "--auto-generate",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path);
+
+        let output =
+            run_command_with_input(&mut command, "n\n").context("Failed to run bootroot init")?;
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Operation cancelled"));
         Ok(())
     }
 }
