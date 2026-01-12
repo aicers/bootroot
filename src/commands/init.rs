@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::acme::responder_client;
+use bootroot::db::{DbDsn, check_tcp, parse_db_dsn};
 use bootroot::fs_util;
 use bootroot::openbao::{InitResponse, OpenBaoClient};
 use reqwest::StatusCode;
@@ -67,6 +68,14 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     let result: Result<InitSummary> = async {
         let bootstrap = bootstrap_openbao(&mut client, args, messages).await?;
         let mut secrets = resolve_init_secrets(args, messages)?;
+        let db_info = parse_db_dsn(&secrets.db_dsn)
+            .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
+        let db_check = if args.db_check {
+            check_db_connectivity(&db_info, args.db_timeout_secs, messages).await?;
+            DbCheckStatus::Ok
+        } else {
+            DbCheckStatus::Skipped
+        };
         let overwrite_password = args.secrets_dir.join("password.txt").exists();
         let overwrite_ca_json = args.secrets_dir.join("config").join("ca.json").exists();
         let overwrite_state = Path::new("state.json").exists();
@@ -128,6 +137,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             eab: secrets.eab,
             step_ca_result,
             responder_check,
+            db_check,
         })
     }
     .await;
@@ -450,6 +460,14 @@ async fn verify_responder(
     .await
     .with_context(|| messages.error_responder_check_failed())?;
     Ok(ResponderCheck::Ok)
+}
+
+async fn check_db_connectivity(db: &DbDsn, timeout_secs: u64, messages: &Messages) -> Result<()> {
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    check_tcp(&db.host, db.port, timeout)
+        .await
+        .with_context(|| messages.error_db_check_failed())?;
+    Ok(())
 }
 
 async fn maybe_register_eab(
@@ -853,6 +871,13 @@ pub(crate) struct InitSummary {
     pub(crate) eab: Option<EabCredentials>,
     pub(crate) step_ca_result: StepCaInitResult,
     pub(crate) responder_check: ResponderCheck,
+    pub(crate) db_check: DbCheckStatus,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DbCheckStatus {
+    Skipped,
+    Ok,
 }
 
 pub(crate) struct InitPlan {
@@ -914,6 +939,8 @@ mod tests {
             unseal_key: Vec::new(),
             stepca_password: None,
             db_dsn: None,
+            db_check: false,
+            db_timeout_secs: 2,
             http_hmac: None,
             responder_url: None,
             responder_timeout_secs: 5,

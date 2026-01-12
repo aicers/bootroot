@@ -43,6 +43,9 @@ pub(crate) struct Strings {
     pub(crate) error_invalid_unseal_threshold: &'static str,
     pub(crate) error_eab_requires_both: &'static str,
     pub(crate) error_openbao_sealed: &'static str,
+    pub(crate) error_invalid_db_dsn: &'static str,
+    pub(crate) error_db_check_failed: &'static str,
+    pub(crate) error_db_type_unsupported: &'static str,
     pub(crate) prompt_eab_register_now: &'static str,
     pub(crate) eab_prompt_instructions: &'static str,
     pub(crate) prompt_eab_auto_now: &'static str,
@@ -149,6 +152,8 @@ pub(crate) struct Strings {
     pub(crate) summary_eab_missing: &'static str,
     pub(crate) summary_responder_check_ok: &'static str,
     pub(crate) summary_responder_check_skipped: &'static str,
+    pub(crate) summary_db_check_ok: &'static str,
+    pub(crate) summary_db_check_skipped: &'static str,
     pub(crate) summary_kv_paths: &'static str,
     pub(crate) summary_approles: &'static str,
     pub(crate) summary_role_id: &'static str,
@@ -277,6 +282,18 @@ impl Messages {
 
     pub(crate) fn error_openbao_sealed(&self) -> &'static str {
         self.strings().error_openbao_sealed
+    }
+
+    pub(crate) fn error_invalid_db_dsn(&self) -> &'static str {
+        self.strings().error_invalid_db_dsn
+    }
+
+    pub(crate) fn error_db_check_failed(&self) -> &'static str {
+        self.strings().error_db_check_failed
+    }
+
+    pub(crate) fn error_db_type_unsupported(&self) -> &'static str {
+        self.strings().error_db_type_unsupported
     }
 
     pub(crate) fn prompt_eab_register_now(&self) -> &'static str {
@@ -766,6 +783,14 @@ impl Messages {
 
     pub(crate) fn summary_responder_check_skipped(&self) -> &'static str {
         self.strings().summary_responder_check_skipped
+    }
+
+    pub(crate) fn summary_db_check_ok(&self) -> &'static str {
+        self.strings().summary_db_check_ok
+    }
+
+    pub(crate) fn summary_db_check_skipped(&self) -> &'static str {
+        self.strings().summary_db_check_skipped
     }
 
     pub(crate) fn summary_kv_paths(&self) -> &'static str {

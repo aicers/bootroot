@@ -72,6 +72,8 @@ struct InfraUpArgs {
 }
 
 #[derive(Args, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+// CLI flags intentionally expose independent toggles for init behavior.
 struct InitArgs {
     /// `OpenBao` API URL
     #[arg(long, default_value = DEFAULT_OPENBAO_URL)]
@@ -112,6 +114,14 @@ struct InitArgs {
     /// `PostgreSQL` DSN for step-ca
     #[arg(long)]
     db_dsn: Option<String>,
+
+    /// Validate DB DSN connectivity
+    #[arg(long)]
+    db_check: bool,
+
+    /// DB connectivity timeout in seconds
+    #[arg(long, default_value_t = 2)]
+    db_timeout_secs: u64,
 
     /// HTTP-01 responder HMAC secret
     #[arg(long, env = "HTTP01_HMAC")]
@@ -228,6 +238,14 @@ pub(crate) struct VerifyArgs {
     /// bootroot-agent config path override
     #[arg(long)]
     agent_config: Option<PathBuf>,
+
+    /// Verify DB connectivity using ca.json DSN
+    #[arg(long)]
+    db_check: bool,
+
+    /// DB connectivity timeout in seconds
+    #[arg(long, default_value_t = 2)]
+    db_timeout_secs: u64,
 }
 
 fn main() {

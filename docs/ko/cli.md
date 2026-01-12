@@ -65,6 +65,8 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--stepca-password`: step-ca 키 암호 (`password.txt`)
   - 환경 변수: `STEPCA_PASSWORD`
 - `--db-dsn`: step-ca용 PostgreSQL DSN
+- `--db-check`: DB 연결 점검
+- `--db-timeout-secs`: DB 연결 타임아웃(초)
 - `--http-hmac`: HTTP-01 responder HMAC
   - 환경 변수: `HTTP01_HMAC`
 - `--responder-url`: HTTP-01 responder 관리자 URL (선택)
@@ -87,6 +89,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - OpenBao 초기화/언실 결과, AppRole 생성 결과 요약
 - `password.txt`, `secrets/config/ca.json` 갱신 결과
 - step-ca 초기화 여부, responder 체크 결과
+- DB 연결 점검 결과(옵션 사용 시)
 - EAB 등록 여부
 - 다음 단계 안내
 
@@ -195,6 +198,8 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다.
 
 - `--service-name`: 서비스 이름 식별자
 - `--agent-config`: bootroot-agent 설정 경로 (선택, 기본은 등록된 값)
+- `--db-check`: ca.json DSN으로 DB 연결 점검
+- `--db-timeout-secs`: DB 연결 타임아웃(초)
 
 ### 대화형 동작
 
@@ -206,6 +211,7 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다.
 
 - cert/key 존재 여부
 - 검증 결과 요약
+- DB 연결 점검 결과(옵션 사용 시)
 
 ### 실패
 
