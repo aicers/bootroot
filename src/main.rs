@@ -6,12 +6,14 @@ use clap::{Args, Parser, Subcommand};
 mod cli;
 mod commands;
 mod i18n;
+mod state;
 
 use crate::commands::init::{
     DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL, DEFAULT_SECRETS_DIR,
     DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL,
 };
 use crate::i18n::Messages;
+use crate::state::DeployType;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -42,8 +44,8 @@ enum InfraCommand {
 
 #[derive(Subcommand, Debug)]
 enum AppCommand {
-    Add,
-    Info,
+    Add(AppAddArgs),
+    Info(AppInfoArgs),
 }
 
 #[derive(Args, Debug)]
@@ -163,6 +165,36 @@ pub(crate) struct StatusArgs {
     root_token: Option<String>,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct AppAddArgs {
+    /// App kind identifier
+    #[arg(long)]
+    app_kind: String,
+
+    /// Deployment type (daemon or docker)
+    #[arg(long, value_enum)]
+    deploy_type: DeployType,
+
+    /// Hostname used for DNS SAN
+    #[arg(long)]
+    hostname: String,
+
+    /// OpenBao root token
+    #[arg(long, env = "OPENBAO_ROOT_TOKEN")]
+    root_token: Option<String>,
+
+    /// Freeform notes (optional)
+    #[arg(long)]
+    notes: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct AppInfoArgs {
+    /// App kind identifier
+    #[arg(long)]
+    app_kind: String,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("bootroot error: {err}");
@@ -188,8 +220,16 @@ fn run() -> Result<()> {
                 .context("Failed to initialize async runtime for status")?;
             runtime.block_on(commands::status::run_status(&args, &messages))?;
         }
-        CliCommand::App(AppCommand::Add) => commands::app::run_app_add(&messages),
-        CliCommand::App(AppCommand::Info) => commands::app::run_app_info(&messages),
+        CliCommand::App(AppCommand::Add(args)) => {
+            let runtime = tokio::runtime::Runtime::new()
+                .context("Failed to initialize async runtime for app add")?;
+            runtime.block_on(commands::app::run_app_add(&args, &messages))?;
+        }
+        CliCommand::App(AppCommand::Info(args)) => {
+            let runtime = tokio::runtime::Runtime::new()
+                .context("Failed to initialize async runtime for app info")?;
+            runtime.block_on(commands::app::run_app_info(&args, &messages))?;
+        }
         CliCommand::Verify => commands::verify::run_verify(&messages),
     }
     Ok(())
