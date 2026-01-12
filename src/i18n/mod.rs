@@ -24,6 +24,11 @@ pub(crate) struct Strings {
     pub(crate) error_invalid_unseal_threshold: &'static str,
     pub(crate) error_eab_requires_both: &'static str,
     pub(crate) error_openbao_sealed: &'static str,
+    pub(crate) prompt_eab_register_now: &'static str,
+    pub(crate) eab_prompt_instructions: &'static str,
+    pub(crate) prompt_eab_kid: &'static str,
+    pub(crate) prompt_eab_hmac: &'static str,
+    pub(crate) error_responder_check_failed: &'static str,
     pub(crate) status_summary_title: &'static str,
     pub(crate) status_section_infra: &'static str,
     pub(crate) status_section_openbao: &'static str,
@@ -61,6 +66,8 @@ pub(crate) struct Strings {
     pub(crate) summary_eab_kid: &'static str,
     pub(crate) summary_eab_hmac: &'static str,
     pub(crate) summary_eab_missing: &'static str,
+    pub(crate) summary_responder_check_ok: &'static str,
+    pub(crate) summary_responder_check_skipped: &'static str,
     pub(crate) summary_kv_paths: &'static str,
     pub(crate) summary_approles: &'static str,
     pub(crate) summary_role_id: &'static str,
@@ -69,6 +76,7 @@ pub(crate) struct Strings {
     pub(crate) next_steps_configure_templates: &'static str,
     pub(crate) next_steps_reload_services: &'static str,
     pub(crate) next_steps_run_status: &'static str,
+    pub(crate) next_steps_eab_issue: &'static str,
     pub(crate) next_steps_eab_hint: &'static str,
 }
 
@@ -200,6 +208,26 @@ impl Messages {
 
     pub(crate) fn error_openbao_sealed(&self) -> &'static str {
         self.strings().error_openbao_sealed
+    }
+
+    pub(crate) fn prompt_eab_register_now(&self) -> &'static str {
+        self.strings().prompt_eab_register_now
+    }
+
+    pub(crate) fn eab_prompt_instructions(&self) -> &'static str {
+        self.strings().eab_prompt_instructions
+    }
+
+    pub(crate) fn prompt_eab_kid(&self) -> &'static str {
+        self.strings().prompt_eab_kid
+    }
+
+    pub(crate) fn prompt_eab_hmac(&self) -> &'static str {
+        self.strings().prompt_eab_hmac
+    }
+
+    pub(crate) fn error_responder_check_failed(&self) -> &'static str {
+        self.strings().error_responder_check_failed
     }
 
     pub(crate) fn status_summary_title(&self) -> &'static str {
@@ -382,6 +410,14 @@ impl Messages {
         self.strings().summary_eab_missing
     }
 
+    pub(crate) fn summary_responder_check_ok(&self) -> &'static str {
+        self.strings().summary_responder_check_ok
+    }
+
+    pub(crate) fn summary_responder_check_skipped(&self) -> &'static str {
+        self.strings().summary_responder_check_skipped
+    }
+
     pub(crate) fn summary_kv_paths(&self) -> &'static str {
         self.strings().summary_kv_paths
     }
@@ -412,6 +448,10 @@ impl Messages {
 
     pub(crate) fn next_steps_run_status(&self) -> &'static str {
         self.strings().next_steps_run_status
+    }
+
+    pub(crate) fn next_steps_eab_issue(&self) -> &'static str {
+        self.strings().next_steps_eab_issue
     }
 
     pub(crate) fn next_steps_eab_hint(&self, path: &str) -> String {

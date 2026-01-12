@@ -27,8 +27,8 @@ struct Cli {
 enum CliCommand {
     #[command(subcommand)]
     Infra(InfraCommand),
-    Init(InitArgs),
-    Status(StatusArgs),
+    Init(Box<InitArgs>),
+    Status(Box<StatusArgs>),
     #[command(subcommand)]
     App(AppCommand),
     Verify,
@@ -113,6 +113,14 @@ struct InitArgs {
     /// HTTP-01 responder HMAC secret
     #[arg(long, env = "HTTP01_HMAC")]
     http_hmac: Option<String>,
+
+    /// HTTP-01 responder admin URL (optional)
+    #[arg(long, env = "HTTP01_RESPONDER_URL")]
+    responder_url: Option<String>,
+
+    /// HTTP-01 responder request timeout (seconds)
+    #[arg(long, default_value_t = 5)]
+    responder_timeout_secs: u64,
 
     /// ACME EAB key ID (optional)
     #[arg(long, env = "EAB_KID")]

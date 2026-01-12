@@ -2,6 +2,15 @@ use crate::commands::init::InitSummary;
 use crate::i18n::Messages;
 
 pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
+    print_init_header(summary, messages);
+    print_init_secrets(summary, messages);
+    print_responder_check(summary, messages);
+    print_kv_paths(messages);
+    print_approles(summary, messages);
+    print_next_steps(summary, messages);
+}
+
+fn print_init_header(summary: &InitSummary, messages: &Messages) {
     println!("{}", messages.summary_title());
     println!("{}", messages.summary_openbao_url(&summary.openbao_url));
     println!("{}", messages.summary_kv_mount(&summary.kv_mount));
@@ -29,7 +38,9 @@ pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
     } else {
         println!("{}", messages.summary_openbao_init_skipped());
     }
+}
 
+fn print_init_secrets(summary: &InitSummary, messages: &Messages) {
     println!(
         "{}",
         messages.summary_root_token(&display_secret(&summary.root_token, summary.show_secrets))
@@ -71,13 +82,28 @@ pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
     } else {
         println!("{}", messages.summary_eab_missing());
     }
+}
 
+fn print_responder_check(summary: &InitSummary, messages: &Messages) {
+    match summary.responder_check {
+        crate::commands::init::ResponderCheck::Ok => {
+            println!("{}", messages.summary_responder_check_ok());
+        }
+        crate::commands::init::ResponderCheck::Skipped => {
+            println!("{}", messages.summary_responder_check_skipped());
+        }
+    }
+}
+
+fn print_kv_paths(messages: &Messages) {
     println!("{}", messages.summary_kv_paths());
     println!("  - {}", crate::commands::init::PATH_STEPCA_PASSWORD);
     println!("  - {}", crate::commands::init::PATH_STEPCA_DB);
     println!("  - {}", crate::commands::init::PATH_RESPONDER_HMAC);
     println!("  - {}", crate::commands::init::PATH_AGENT_EAB);
+}
 
+fn print_approles(summary: &InitSummary, messages: &Messages) {
     println!("{}", messages.summary_approles());
     for role in &summary.approles {
         println!("  - {} ({})", role.label, role.role_name);
@@ -90,12 +116,15 @@ pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
             messages.summary_secret_id(&display_secret(&role.secret_id, summary.show_secrets))
         );
     }
+}
 
+fn print_next_steps(summary: &InitSummary, messages: &Messages) {
     println!("{}", messages.summary_next_steps());
     println!("{}", messages.next_steps_configure_templates());
     println!("{}", messages.next_steps_reload_services());
     println!("{}", messages.next_steps_run_status());
     if summary.eab.is_none() {
+        println!("{}", messages.next_steps_eab_issue());
         println!(
             "{}",
             messages.next_steps_eab_hint(crate::commands::init::PATH_AGENT_EAB)
