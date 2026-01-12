@@ -173,6 +173,117 @@ mod unix_integration {
     }
 
     #[tokio::test]
+    async fn init_auto_eab_registers_credentials() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao(&server).await;
+
+        let stepca = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/acme/acme/eab"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keyId": "eab-kid",
+                "hmacKey": "eab-hmac"
+            })))
+            .mount(&stepca)
+            .await;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--root-token",
+                ROOT_TOKEN,
+                "--db-dsn",
+                "postgresql://step:step@localhost:5432/step?sslmode=disable",
+                "--auto-generate",
+                "--eab-auto",
+                "--stepca-url",
+                &stepca.uri(),
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path)
+            .output()
+            .context("Failed to run bootroot init")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("bootroot init failed: {stderr}");
+        }
+        assert!(stdout.contains("eab kid"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_auto_eab_failure_triggers_rollback() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao(&server).await;
+        expect_rollback_deletes(&server).await;
+
+        let stepca = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/acme/acme/eab"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&stepca)
+            .await;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--root-token",
+                ROOT_TOKEN,
+                "--db-dsn",
+                "postgresql://step:step@localhost:5432/step?sslmode=disable",
+                "--auto-generate",
+                "--eab-auto",
+                "--stepca-url",
+                &stepca.uri(),
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path)
+            .output()
+            .context("Failed to run bootroot init")?;
+
+        assert!(!output.status.success());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn init_fails_when_infra_unhealthy() -> Result<()> {
         let temp_dir = tempdir().context("Failed to create temp dir")?;
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
