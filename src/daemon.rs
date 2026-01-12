@@ -53,7 +53,7 @@ pub async fn run_daemon(
 
 async fn run_profile_daemon(
     settings: Arc<config::Settings>,
-    profile: config::ProfileSettings,
+    profile: config::DaemonProfileSettings,
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
@@ -202,7 +202,7 @@ pub async fn run_oneshot(
 
 async fn run_profile_oneshot(
     settings: Arc<config::Settings>,
-    profile: config::ProfileSettings,
+    profile: config::DaemonProfileSettings,
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
@@ -244,7 +244,7 @@ async fn run_profile_oneshot(
 
 async fn issue_with_retry(
     settings: &config::Settings,
-    profile: &config::ProfileSettings,
+    profile: &config::DaemonProfileSettings,
     eab: Option<eab::EabCredentials>,
 ) -> anyhow::Result<()> {
     let backoff = select_retry_backoff(settings, profile);
@@ -258,7 +258,7 @@ async fn issue_with_retry(
 
 fn select_retry_backoff<'a>(
     settings: &'a config::Settings,
-    profile: &'a config::ProfileSettings,
+    profile: &'a config::DaemonProfileSettings,
 ) -> &'a [u64] {
     profile
         .retry
@@ -315,7 +315,7 @@ where
 /// # Errors
 /// Returns an error if the certificate cannot be parsed or read.
 pub async fn should_renew(
-    profile: &config::ProfileSettings,
+    profile: &config::DaemonProfileSettings,
     renew_before: Duration,
 ) -> anyhow::Result<bool> {
     let cert_bytes = match tokio::fs::read(&profile.paths.cert).await {
@@ -410,10 +410,12 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::{AcmeSettings, DaemonSettings, Paths, RetrySettings, SchedulerSettings};
+    use crate::config::{
+        AcmeSettings, DaemonRuntimeSettings, Paths, RetrySettings, SchedulerSettings,
+    };
 
-    fn build_profile() -> config::ProfileSettings {
-        config::ProfileSettings {
+    fn build_profile() -> config::DaemonProfileSettings {
+        config::DaemonProfileSettings {
             service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
@@ -421,7 +423,7 @@ mod tests {
                 cert: PathBuf::from("unused.pem"),
                 key: PathBuf::from("unused.key"),
             },
-            daemon: DaemonSettings {
+            daemon: DaemonRuntimeSettings {
                 check_interval: Duration::from_secs(60 * 60),
                 renew_before: Duration::from_secs(720 * 60 * 60),
                 check_jitter: Duration::from_secs(0),

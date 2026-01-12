@@ -161,6 +161,9 @@ You can run the agent directly on your host machine.
    cargo run -- --config agent.toml
    ```
 
+   `agent.toml` is for daemon profiles only. Docker sidecars do not use
+   `agent.toml`; configure them via runtime arguments or environment variables.
+
    *(Note: You might need to handle TLS trust for `try-ca` manually or ignore
    cert errors if supported by flags)*
 

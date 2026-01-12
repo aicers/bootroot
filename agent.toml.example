@@ -1,5 +1,6 @@
 # Bootroot Agent Configuration Example (Multi-Profile)
 # Rename this file to agent.toml to use it.
+# This file is for daemon profiles only. Docker sidecars use runtime args/env.
 
 # Support email address for ACME registration
 email = "admin@example.com"

@@ -16,11 +16,11 @@ pub struct Settings {
     #[serde(default)]
     pub scheduler: SchedulerSettings,
     #[serde(default)]
-    pub profiles: Vec<ProfileSettings>,
+    pub profiles: Vec<DaemonProfileSettings>,
 }
 
 #[must_use]
-pub fn profile_domain(settings: &Settings, profile: &ProfileSettings) -> String {
+pub fn profile_domain(settings: &Settings, profile: &DaemonProfileSettings) -> String {
     format!(
         "{}.{}.{}.{}",
         profile.instance_id, profile.service_name, profile.hostname, settings.domain
@@ -40,13 +40,13 @@ pub struct Eab {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ProfileSettings {
+pub struct DaemonProfileSettings {
     pub service_name: String,
     pub instance_id: String,
     pub hostname: String,
     pub paths: Paths,
     #[serde(default)]
-    pub daemon: DaemonSettings,
+    pub daemon: DaemonRuntimeSettings,
     #[serde(default)]
     pub retry: Option<RetrySettings>,
     #[serde(default)]
@@ -55,7 +55,7 @@ pub struct ProfileSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct DaemonSettings {
+pub struct DaemonRuntimeSettings {
     #[serde(default = "default_check_interval", with = "duration_serde")]
     pub check_interval: Duration,
     #[serde(default = "default_renew_before", with = "duration_serde")]
@@ -162,7 +162,7 @@ fn default_check_jitter() -> Duration {
     Duration::from_secs(DEFAULT_CHECK_JITTER_SECS)
 }
 
-impl Default for DaemonSettings {
+impl Default for DaemonRuntimeSettings {
     fn default() -> Self {
         Self {
             check_interval: default_check_interval(),
@@ -330,7 +330,7 @@ impl Settings {
         Ok(())
     }
 
-    fn validate_profile(profile: &ProfileSettings) -> Result<()> {
+    fn validate_profile(profile: &DaemonProfileSettings) -> Result<()> {
         if profile.service_name.trim().is_empty() {
             anyhow::bail!("profiles.service_name must not be empty");
         }

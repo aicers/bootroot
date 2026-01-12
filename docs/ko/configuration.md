@@ -2,6 +2,8 @@
 
 bootroot-agent는 TOML 설정 파일을 읽습니다(기본값: `agent.toml`).
 전체 템플릿은 `agent.toml.example`에 있습니다.
+`agent.toml`은 데몬 프로필 전용입니다. 도커 사이드카는 `agent.toml`을
+사용하지 않고 런타임 인자나 환경변수로 설정합니다.
 
 ## bootroot CLI
 

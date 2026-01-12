@@ -2,6 +2,8 @@
 
 bootroot-agent reads a TOML configuration file (default `agent.toml`).
 The full template lives in `agent.toml.example`.
+`agent.toml` is for daemon profiles only. Docker sidecars do not use
+`agent.toml`; configure them via runtime arguments or environment variables.
 
 ## bootroot CLI
 
