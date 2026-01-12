@@ -11,6 +11,7 @@ use serde::Serialize;
 use crate::InitArgs;
 use crate::cli::output::print_init_summary;
 use crate::commands::infra::{ensure_infra_ready, run_docker};
+use crate::i18n::Messages;
 
 pub(crate) const DEFAULT_OPENBAO_URL: &str = "http://localhost:8200";
 pub(crate) const DEFAULT_KV_MOUNT: &str = "secret";
@@ -50,16 +51,16 @@ pub(crate) use openbao_constants::{
     SECRET_ID_TTL, TOKEN_TTL,
 };
 
-pub(crate) async fn run_init(args: &InitArgs) -> Result<()> {
-    ensure_infra_ready(&args.compose_file)?;
+pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
+    ensure_infra_ready(&args.compose_file, messages)?;
 
     let mut client = OpenBaoClient::new(&args.openbao_url)?;
     client.health_check().await?;
 
     let mut rollback = InitRollback::default();
     let result: Result<InitSummary> = async {
-        let bootstrap = bootstrap_openbao(&mut client, args).await?;
-        let secrets = resolve_init_secrets(args)?;
+        let bootstrap = bootstrap_openbao(&mut client, args, messages).await?;
+        let secrets = resolve_init_secrets(args, messages)?;
         let (role_outputs, _policies, approles) =
             configure_openbao(&client, args, &secrets, &mut rollback).await?;
 
@@ -93,11 +94,11 @@ pub(crate) async fn run_init(args: &InitArgs) -> Result<()> {
 
     match result {
         Ok(summary) => {
-            print_init_summary(&summary);
+            print_init_summary(&summary, messages);
             Ok(())
         }
         Err(err) => {
-            eprintln!("bootroot init: failed, attempting rollback");
+            eprintln!("{}", messages.init_failed_rollback());
             rollback.rollback(&client, &args.kv_mount).await;
             Err(err)
         }
@@ -117,22 +118,27 @@ struct InitSecrets {
     eab: Option<EabCredentials>,
 }
 
-async fn bootstrap_openbao(client: &mut OpenBaoClient, args: &InitArgs) -> Result<InitBootstrap> {
+async fn bootstrap_openbao(
+    client: &mut OpenBaoClient,
+    args: &InitArgs,
+    messages: &Messages,
+) -> Result<InitBootstrap> {
     let (init_response, mut root_token, mut unseal_keys) =
         ensure_openbao_initialized(client, args).await?;
 
     let seal_status = client.seal_status().await?;
     if seal_status.sealed {
         if unseal_keys.is_empty() {
-            unseal_keys = prompt_unseal_keys(seal_status.t)?;
+            unseal_keys = prompt_unseal_keys(seal_status.t, messages)?;
         }
-        unseal_openbao(client, &unseal_keys).await?;
+        unseal_openbao(client, &unseal_keys, messages).await?;
     }
 
     if root_token.is_none() {
-        root_token = Some(prompt_text("OpenBao root token: ")?);
+        root_token = Some(prompt_text(messages.prompt_openbao_root_token())?);
     }
-    let root_token = root_token.ok_or_else(|| anyhow::anyhow!("OpenBao root token is required"))?;
+    let root_token =
+        root_token.ok_or_else(|| anyhow::anyhow!(messages.error_openbao_root_token_required()))?;
 
     client.set_token(root_token.clone());
 
@@ -143,19 +149,19 @@ async fn bootstrap_openbao(client: &mut OpenBaoClient, args: &InitArgs) -> Resul
     })
 }
 
-fn resolve_init_secrets(args: &InitArgs) -> Result<InitSecrets> {
+fn resolve_init_secrets(args: &InitArgs, messages: &Messages) -> Result<InitSecrets> {
     let stepca_password = resolve_secret(
-        "step-ca password",
+        messages.prompt_stepca_password(),
         args.stepca_password.clone(),
         args.auto_generate,
     )?;
-    let db_dsn = resolve_db_dsn(args)?;
+    let db_dsn = resolve_db_dsn(args, messages)?;
     let http_hmac = resolve_secret(
-        "HTTP-01 responder HMAC",
+        messages.prompt_http_hmac(),
         args.http_hmac.clone(),
         args.auto_generate,
     )?;
-    let eab = resolve_eab(args)?;
+    let eab = resolve_eab(args, messages)?;
 
     Ok(InitSecrets {
         stepca_password,
@@ -290,7 +296,11 @@ async fn ensure_openbao_initialized(
     Ok((Some(response), Some(root_token), keys))
 }
 
-async fn unseal_openbao(client: &OpenBaoClient, keys: &[String]) -> Result<()> {
+async fn unseal_openbao(
+    client: &OpenBaoClient,
+    keys: &[String],
+    messages: &Messages,
+) -> Result<()> {
     for key in keys {
         let status = client.unseal(key).await?;
         if !status.sealed {
@@ -299,16 +309,16 @@ async fn unseal_openbao(client: &OpenBaoClient, keys: &[String]) -> Result<()> {
     }
     let status = client.seal_status().await?;
     if status.sealed {
-        anyhow::bail!("OpenBao remains sealed after applying unseal keys");
+        anyhow::bail!(messages.error_openbao_sealed());
     }
     Ok(())
 }
 
-fn prompt_unseal_keys(threshold: Option<u32>) -> Result<Vec<String>> {
+fn prompt_unseal_keys(threshold: Option<u32>, messages: &Messages) -> Result<Vec<String>> {
     let count = match threshold {
         Some(value) if value > 0 => value,
         _ => {
-            let input = prompt_text("Unseal key threshold (t): ")?;
+            let input = prompt_text(messages.prompt_unseal_threshold())?;
             input
                 .parse::<u32>()
                 .context("Invalid unseal threshold value")?
@@ -316,7 +326,7 @@ fn prompt_unseal_keys(threshold: Option<u32>) -> Result<Vec<String>> {
     };
     let mut keys = Vec::with_capacity(count as usize);
     for index in 1..=count {
-        let key = prompt_text(&format!("Unseal key {index}/{count}: "))?;
+        let key = prompt_text(&messages.prompt_unseal_key(index, count))?;
         keys.push(key);
     }
     Ok(keys)
@@ -343,25 +353,25 @@ fn resolve_secret(label: &str, value: Option<String>, auto_generate: bool) -> Re
     prompt_text(&format!("{label}: "))
 }
 
-fn resolve_eab(args: &InitArgs) -> Result<Option<EabCredentials>> {
+fn resolve_eab(args: &InitArgs, messages: &Messages) -> Result<Option<EabCredentials>> {
     match (&args.eab_kid, &args.eab_hmac) {
         (Some(kid), Some(hmac)) => Ok(Some(EabCredentials {
             kid: kid.clone(),
             hmac: hmac.clone(),
         })),
         (None, None) => Ok(None),
-        _ => anyhow::bail!("EAB requires both kid and hmac"),
+        _ => anyhow::bail!(messages.error_eab_requires_both()),
     }
 }
 
-fn resolve_db_dsn(args: &InitArgs) -> Result<String> {
+fn resolve_db_dsn(args: &InitArgs, messages: &Messages) -> Result<String> {
     if let Some(dsn) = args.db_dsn.clone() {
         return Ok(dsn);
     }
     if let Some(dsn) = build_dsn_from_env() {
         return Ok(dsn);
     }
-    prompt_text("PostgreSQL DSN: ")
+    prompt_text(messages.prompt_db_dsn())
 }
 
 fn build_dsn_from_env() -> Option<String> {
@@ -717,6 +727,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::i18n::Messages;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -745,6 +756,10 @@ mod tests {
         }
     }
 
+    fn test_messages() -> Messages {
+        Messages::new("en").expect("valid language")
+    }
+
     #[test]
     fn test_resolve_secret_prefers_value() {
         let value = resolve_secret("step-ca password", Some("value".to_string()), false).unwrap();
@@ -768,7 +783,7 @@ mod tests {
         }
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://cliuser:clipass@localhost/db".to_string());
-        let dsn = resolve_db_dsn(&args).unwrap();
+        let dsn = resolve_db_dsn(&args, &test_messages()).unwrap();
         unsafe {
             env::remove_var("POSTGRES_USER");
             env::remove_var("POSTGRES_PASSWORD");
@@ -789,7 +804,7 @@ mod tests {
             env::set_var("POSTGRES_PORT", "5432");
         }
         let args = default_init_args();
-        let dsn = resolve_db_dsn(&args).unwrap();
+        let dsn = resolve_db_dsn(&args, &test_messages()).unwrap();
         unsafe {
             env::remove_var("POSTGRES_USER");
             env::remove_var("POSTGRES_PASSWORD");

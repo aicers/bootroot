@@ -11,6 +11,18 @@ fn run(args: &[&str]) -> (String, String, i32) {
     (stdout, stderr, code)
 }
 
+fn run_with_env(args: &[&str], key: &str, value: &str) -> (String, String, i32) {
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .args(args)
+        .env(key, value)
+        .output()
+        .expect("bootroot binary runs in tests");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+    (stdout, stderr, code)
+}
+
 #[test]
 fn test_help_lists_subcommands() {
     let (stdout, _stderr, code) = run(&["--help"]);
@@ -27,4 +39,11 @@ fn test_status_command_message() {
     let (stdout, _stderr, code) = run(&["status"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("bootroot status: not yet implemented"));
+}
+
+#[test]
+fn test_status_command_message_korean() {
+    let (stdout, _stderr, code) = run_with_env(&["status"], "BOOTROOT_LANG", "ko");
+    assert_eq!(code, 0);
+    assert!(stdout.contains("bootroot 상태: 아직 구현되지 않았습니다"));
 }

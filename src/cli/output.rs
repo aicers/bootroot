@@ -1,96 +1,104 @@
 use crate::commands::init::InitSummary;
+use crate::i18n::Messages;
 
-pub(crate) fn print_init_summary(summary: &InitSummary) {
-    println!("bootroot init: summary");
-    println!("- OpenBao URL: {}", summary.openbao_url);
-    println!("- KV mount: {}", summary.kv_mount);
-    println!("- Secrets dir: {}", summary.secrets_dir.display());
+pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
+    println!("{}", messages.summary_title());
+    println!("{}", messages.summary_openbao_url(&summary.openbao_url));
+    println!("{}", messages.summary_kv_mount(&summary.kv_mount));
+    println!(
+        "{}",
+        messages.summary_secrets_dir(&summary.secrets_dir.display().to_string())
+    );
     match summary.step_ca_result {
         crate::commands::init::StepCaInitResult::Initialized => {
-            println!("- step-ca init: completed");
+            println!("{}", messages.summary_stepca_completed());
         }
         crate::commands::init::StepCaInitResult::Skipped => {
-            println!("- step-ca init: skipped (already initialized)");
+            println!("{}", messages.summary_stepca_skipped());
         }
     }
 
     if summary.init_response {
         println!(
-            "- OpenBao init: completed (shares={}, threshold={})",
-            crate::commands::init::INIT_SECRET_SHARES,
-            crate::commands::init::INIT_SECRET_THRESHOLD
+            "{}",
+            messages.summary_openbao_init_completed(
+                crate::commands::init::INIT_SECRET_SHARES,
+                crate::commands::init::INIT_SECRET_THRESHOLD
+            )
         );
     } else {
-        println!("- OpenBao init: skipped (already initialized)");
+        println!("{}", messages.summary_openbao_init_skipped());
     }
 
     println!(
-        "- root token: {}",
-        display_secret(&summary.root_token, summary.show_secrets)
+        "{}",
+        messages.summary_root_token(&display_secret(&summary.root_token, summary.show_secrets))
     );
 
     if !summary.unseal_keys.is_empty() {
         for (idx, key) in summary.unseal_keys.iter().enumerate() {
             println!(
-                "- unseal key {}: {}",
-                idx + 1,
-                display_secret(key, summary.show_secrets)
+                "{}",
+                messages.summary_unseal_key(idx + 1, &display_secret(key, summary.show_secrets))
             );
         }
     }
 
     println!(
-        "- step-ca password: {}",
-        display_secret(&summary.stepca_password, summary.show_secrets)
+        "{}",
+        messages.summary_stepca_password(&display_secret(
+            &summary.stepca_password,
+            summary.show_secrets
+        ))
     );
     println!(
-        "- db dsn: {}",
-        display_secret(&summary.db_dsn, summary.show_secrets)
+        "{}",
+        messages.summary_db_dsn(&display_secret(&summary.db_dsn, summary.show_secrets))
     );
     println!(
-        "- responder hmac: {}",
-        display_secret(&summary.http_hmac, summary.show_secrets)
+        "{}",
+        messages.summary_responder_hmac(&display_secret(&summary.http_hmac, summary.show_secrets))
     );
     if let Some(eab) = summary.eab.as_ref() {
         println!(
-            "- eab kid: {}",
-            display_secret(&eab.kid, summary.show_secrets)
+            "{}",
+            messages.summary_eab_kid(&display_secret(&eab.kid, summary.show_secrets))
         );
         println!(
-            "- eab hmac: {}",
-            display_secret(&eab.hmac, summary.show_secrets)
+            "{}",
+            messages.summary_eab_hmac(&display_secret(&eab.hmac, summary.show_secrets))
         );
     } else {
-        println!("- eab: not configured");
+        println!("{}", messages.summary_eab_missing());
     }
 
-    println!("- OpenBao KV paths:");
+    println!("{}", messages.summary_kv_paths());
     println!("  - {}", crate::commands::init::PATH_STEPCA_PASSWORD);
     println!("  - {}", crate::commands::init::PATH_STEPCA_DB);
     println!("  - {}", crate::commands::init::PATH_RESPONDER_HMAC);
     println!("  - {}", crate::commands::init::PATH_AGENT_EAB);
 
-    println!("- AppRoles:");
+    println!("{}", messages.summary_approles());
     for role in &summary.approles {
         println!("  - {} ({})", role.label, role.role_name);
         println!(
-            "    role_id: {}",
-            display_secret(&role.role_id, summary.show_secrets)
+            "{}",
+            messages.summary_role_id(&display_secret(&role.role_id, summary.show_secrets))
         );
         println!(
-            "    secret_id: {}",
-            display_secret(&role.secret_id, summary.show_secrets)
+            "{}",
+            messages.summary_secret_id(&display_secret(&role.secret_id, summary.show_secrets))
         );
     }
 
-    println!("next steps:");
-    println!("  - Configure OpenBao Agent templates for step-ca, responder, and bootroot-agent.");
-    println!("  - Start or reload step-ca and responder to consume rendered secrets.");
-    println!("  - Run `bootroot status` to verify services.");
+    println!("{}", messages.summary_next_steps());
+    println!("{}", messages.next_steps_configure_templates());
+    println!("{}", messages.next_steps_reload_services());
+    println!("{}", messages.next_steps_run_status());
     if summary.eab.is_none() {
         println!(
-            "  - If you need ACME EAB, store kid/hmac at {} or rerun with --eab-kid/--eab-hmac.",
-            crate::commands::init::PATH_AGENT_EAB
+            "{}",
+            messages.next_steps_eab_hint(crate::commands::init::PATH_AGENT_EAB)
         );
     }
 }

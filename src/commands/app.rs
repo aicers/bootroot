@@ -1,7 +1,9 @@
-pub(crate) fn run_app_add() {
-    println!("bootroot app add: not yet implemented");
+use crate::i18n::Messages;
+
+pub(crate) fn run_app_add(messages: &Messages) {
+    println!("{}", messages.not_implemented_app_add());
 }
 
-pub(crate) fn run_app_info() {
-    println!("bootroot app info: not yet implemented");
+pub(crate) fn run_app_info(messages: &Messages) {
+    println!("{}", messages.not_implemented_app_info());
 }
