@@ -23,7 +23,7 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
     let compose_args_ref: Vec<&str> = compose_args.iter().map(String::as_str).collect();
     run_docker(&compose_args_ref, "docker compose up")?;
 
-    let readiness = collect_readiness(&args.compose_file, &args.services)?;
+    let readiness = collect_readiness(&args.compose_file, &args.services, messages)?;
 
     for entry in &readiness {
         let update_args = docker_update_args(&args.restart_policy, &entry.container_id);
@@ -40,7 +40,7 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
 
 pub(crate) fn ensure_infra_ready(compose_file: &Path, messages: &Messages) -> Result<()> {
     let services = default_infra_services();
-    let readiness = collect_readiness(compose_file, &services)?;
+    let readiness = collect_readiness(compose_file, &services, messages)?;
     ensure_all_healthy(&readiness, messages)?;
     Ok(())
 }
@@ -62,7 +62,11 @@ struct ContainerReadiness {
     health: Option<String>,
 }
 
-fn collect_readiness(compose_file: &Path, services: &[String]) -> Result<Vec<ContainerReadiness>> {
+fn collect_readiness(
+    compose_file: &Path,
+    services: &[String],
+    messages: &Messages,
+) -> Result<Vec<ContainerReadiness>> {
     let mut readiness = Vec::with_capacity(services.len());
     for service in services {
         let container_id = docker_compose_output(&[
@@ -74,7 +78,7 @@ fn collect_readiness(compose_file: &Path, services: &[String]) -> Result<Vec<Con
         ])?;
         let container_id = container_id.trim().to_string();
         if container_id.is_empty() {
-            anyhow::bail!("Service has no running container: {service}");
+            anyhow::bail!(messages.error_service_no_container(service));
         }
         let inspect_output = docker_output(&[
             "inspect",

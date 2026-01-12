@@ -13,6 +13,7 @@ pub(crate) struct Strings {
     pub(crate) infra_entry_with_health: &'static str,
     pub(crate) infra_entry_without_health: &'static str,
     pub(crate) infra_unhealthy: &'static str,
+    pub(crate) error_service_no_container: &'static str,
     pub(crate) init_failed_rollback: &'static str,
     pub(crate) prompt_openbao_root_token: &'static str,
     pub(crate) error_openbao_root_token_required: &'static str,
@@ -21,6 +22,7 @@ pub(crate) struct Strings {
     pub(crate) prompt_stepca_password: &'static str,
     pub(crate) prompt_http_hmac: &'static str,
     pub(crate) prompt_db_dsn: &'static str,
+    pub(crate) error_invalid_unseal_threshold: &'static str,
     pub(crate) error_eab_requires_both: &'static str,
     pub(crate) error_openbao_sealed: &'static str,
     pub(crate) summary_title: &'static str,
@@ -128,6 +130,13 @@ impl Messages {
         format_template(self.strings().infra_unhealthy, &[("failures", failures)])
     }
 
+    pub(crate) fn error_service_no_container(&self, service: &str) -> String {
+        format_template(
+            self.strings().error_service_no_container,
+            &[("service", service)],
+        )
+    }
+
     pub(crate) fn init_failed_rollback(&self) -> &'static str {
         self.strings().init_failed_rollback
     }
@@ -163,6 +172,10 @@ impl Messages {
 
     pub(crate) fn prompt_db_dsn(&self) -> &'static str {
         self.strings().prompt_db_dsn
+    }
+
+    pub(crate) fn error_invalid_unseal_threshold(&self) -> &'static str {
+        self.strings().error_invalid_unseal_threshold
     }
 
     pub(crate) fn error_eab_requires_both(&self) -> &'static str {

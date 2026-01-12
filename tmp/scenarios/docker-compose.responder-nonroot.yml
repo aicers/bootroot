@@ -1,3 +1,0 @@
-services:
-  bootroot-http01:
-    user: "65534:65534"
