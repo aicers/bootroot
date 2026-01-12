@@ -6,7 +6,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, error, info};
 
-use crate::config::{HookCommand, HookFailurePolicy, ProfileSettings, Settings};
+use crate::config::{DaemonProfileSettings, HookCommand, HookFailurePolicy, Settings};
 
 const DEFAULT_RETRY_LOG_LABEL: &str = "post_renew";
 const ENV_CERT_PATH: &str = "CERT_PATH";
@@ -39,7 +39,7 @@ impl HookStatus {
 /// Returns error when a hook fails and its policy is set to stop.
 pub async fn run_post_renew_hooks(
     settings: &Settings,
-    profile: &ProfileSettings,
+    profile: &DaemonProfileSettings,
     status: HookStatus,
     error_message: Option<String>,
 ) -> anyhow::Result<()> {
@@ -81,7 +81,7 @@ struct HookContext {
 }
 
 impl HookContext {
-    fn envs(&self, settings: &Settings, profile: &ProfileSettings) -> Vec<(String, String)> {
+    fn envs(&self, settings: &Settings, profile: &DaemonProfileSettings) -> Vec<(String, String)> {
         let mut envs = base_envs(settings, profile);
         envs.extend(self.context_envs());
         envs
@@ -107,7 +107,7 @@ impl HookContext {
     }
 }
 
-fn base_envs(settings: &Settings, profile: &ProfileSettings) -> Vec<(String, String)> {
+fn base_envs(settings: &Settings, profile: &DaemonProfileSettings) -> Vec<(String, String)> {
     let primary_domain = crate::config::profile_domain(settings, profile);
     vec![
         (
@@ -128,7 +128,7 @@ async fn run_hook_with_retry(
     hook: &HookCommand,
     context: &HookContext,
     settings: &Settings,
-    profile: &ProfileSettings,
+    profile: &DaemonProfileSettings,
 ) -> anyhow::Result<()> {
     run_with_retry(&hook.retry_backoff_secs, |attempt, remaining| async move {
         let result = run_hook_command(hook, context, settings, profile).await;
@@ -172,7 +172,7 @@ async fn run_hook_command(
     hook: &HookCommand,
     context: &HookContext,
     settings: &Settings,
-    profile: &ProfileSettings,
+    profile: &DaemonProfileSettings,
 ) -> anyhow::Result<()> {
     info!(
         "Running post-renew hook ({}): {} {:?}",
@@ -314,8 +314,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        AcmeSettings, DaemonSettings, HookCommand, HookSettings, Paths, PostRenewHooks,
-        ProfileSettings, RetrySettings, SchedulerSettings, Settings,
+        AcmeSettings, DaemonProfileSettings, DaemonRuntimeSettings, HookCommand, HookSettings,
+        Paths, PostRenewHooks, RetrySettings, SchedulerSettings, Settings,
     };
 
     const TEST_DOMAIN: &str = "trusted.domain";
@@ -323,8 +323,11 @@ mod tests {
     const TEST_KEY_PATH: &str = "unused.key";
     const EXPECTED_DOMAIN: &str = "001.edge-proxy.edge-node-01.trusted.domain";
 
-    fn build_settings(cert_path: PathBuf, hooks: HookSettings) -> (Settings, ProfileSettings) {
-        let profile = ProfileSettings {
+    fn build_settings(
+        cert_path: PathBuf,
+        hooks: HookSettings,
+    ) -> (Settings, DaemonProfileSettings) {
+        let profile = DaemonProfileSettings {
             service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
@@ -332,7 +335,7 @@ mod tests {
                 cert: cert_path,
                 key: PathBuf::from(TEST_KEY_PATH),
             },
-            daemon: DaemonSettings {
+            daemon: DaemonRuntimeSettings {
                 check_interval: Duration::from_secs(60 * 60),
                 renew_before: Duration::from_secs(720 * 60 * 60),
                 check_jitter: Duration::from_secs(0),

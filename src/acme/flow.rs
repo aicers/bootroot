@@ -16,7 +16,7 @@ fn contact_from_email(email: &str) -> String {
 
 fn build_csr_params(
     settings: &crate::config::Settings,
-    profile: &crate::config::ProfileSettings,
+    profile: &crate::config::DaemonProfileSettings,
 ) -> Result<rcgen::CertificateParams> {
     let primary_domain = crate::config::profile_domain(settings, profile);
     let mut params = rcgen::CertificateParams::default();
@@ -186,7 +186,7 @@ async fn wait_for_order_completion(
 ///
 pub async fn issue_certificate(
     settings: &crate::config::Settings,
-    profile: &crate::config::ProfileSettings,
+    profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
 ) -> Result<()> {
     let mut client = AcmeClient::new(settings.server.clone(), &settings.acme)?;
@@ -288,8 +288,8 @@ mod tests {
         }
     }
 
-    fn test_profile() -> crate::config::ProfileSettings {
-        crate::config::ProfileSettings {
+    fn test_profile() -> crate::config::DaemonProfileSettings {
+        crate::config::DaemonProfileSettings {
             service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
@@ -297,7 +297,7 @@ mod tests {
                 cert: PathBuf::from("certs/edge-proxy-a.pem"),
                 key: PathBuf::from("certs/edge-proxy-a.key"),
             },
-            daemon: crate::config::DaemonSettings::default(),
+            daemon: crate::config::DaemonRuntimeSettings::default(),
             retry: None,
             hooks: crate::config::HookSettings::default(),
             eab: None,

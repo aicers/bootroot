@@ -2,7 +2,7 @@ use crate::{config, eab};
 
 /// Resolves the effective EAB credentials for a profile.
 pub fn resolve_profile_eab(
-    profile: &config::ProfileSettings,
+    profile: &config::DaemonProfileSettings,
     default_eab: Option<eab::EabCredentials>,
 ) -> Option<eab::EabCredentials> {
     profile.eab.as_ref().map(to_eab_credentials).or(default_eab)

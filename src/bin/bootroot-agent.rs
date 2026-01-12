@@ -77,8 +77,8 @@ mod tests {
     const TEST_BASE_SECS: u64 = 60;
     const TEST_SEED_NS: i128 = 123_456_789;
 
-    fn build_profile(cert_path: PathBuf) -> config::ProfileSettings {
-        config::ProfileSettings {
+    fn build_profile(cert_path: PathBuf) -> config::DaemonProfileSettings {
+        config::DaemonProfileSettings {
             service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
@@ -86,7 +86,7 @@ mod tests {
                 cert: cert_path,
                 key: PathBuf::from(TEST_KEY_PATH),
             },
-            daemon: config::DaemonSettings {
+            daemon: config::DaemonRuntimeSettings {
                 check_interval: Duration::from_secs(60 * 60),
                 renew_before: Duration::from_secs(720 * 60 * 60),
                 check_jitter: Duration::from_secs(0),
@@ -97,7 +97,7 @@ mod tests {
         }
     }
 
-    fn build_settings(profiles: Vec<config::ProfileSettings>) -> config::Settings {
+    fn build_settings(profiles: Vec<config::DaemonProfileSettings>) -> config::Settings {
         config::Settings {
             email: "test@example.com".to_string(),
             server: "https://example.com/acme/directory".to_string(),
@@ -140,7 +140,7 @@ mod tests {
             kid: "profile".to_string(),
             hmac: "profile-hmac".to_string(),
         };
-        let profile = config::ProfileSettings {
+        let profile = config::DaemonProfileSettings {
             eab: Some(profile_eab),
             ..build_profile(PathBuf::from("unused.pem"))
         };
