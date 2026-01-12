@@ -46,8 +46,32 @@ pub async fn register_http01_token(
     key_authorization: &str,
 ) -> Result<()> {
     let url = settings.acme.http_responder_url.trim_end_matches('/');
-    let endpoint = format!("{url}{DEFAULT_ADMIN_PATH}");
     let ttl_secs = settings.acme.http_responder_token_ttl_secs;
+    register_http01_token_with(
+        url,
+        &settings.acme.http_responder_hmac,
+        settings.acme.http_responder_timeout_secs,
+        token,
+        key_authorization,
+        ttl_secs,
+    )
+    .await
+}
+
+/// Registers an HTTP-01 token with explicit connection details.
+///
+/// # Errors
+/// Returns an error if the request cannot be sent or the responder rejects it.
+pub async fn register_http01_token_with(
+    base_url: &str,
+    hmac_secret: &str,
+    timeout_secs: u64,
+    token: &str,
+    key_authorization: &str,
+    ttl_secs: u64,
+) -> Result<()> {
+    let url = base_url.trim_end_matches('/');
+    let endpoint = format!("{url}{DEFAULT_ADMIN_PATH}");
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -57,12 +81,10 @@ pub async fn register_http01_token(
         .map_err(|_| anyhow::anyhow!("System time is too large for timestamp"))?;
 
     let payload = signature_payload(timestamp, token, key_authorization, ttl_secs);
-    let signature = sign_request(&settings.acme.http_responder_hmac, &payload);
+    let signature = sign_request(hmac_secret, &payload);
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(
-            settings.acme.http_responder_timeout_secs,
-        ))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build responder client: {e}"))?;
 

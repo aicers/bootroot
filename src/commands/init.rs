@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::acme::responder_client;
 use bootroot::fs_util;
 use bootroot::openbao::{InitResponse, OpenBaoClient};
 use serde::Serialize;
@@ -23,6 +24,7 @@ const DEFAULT_CA_PROVISIONER: &str = "admin";
 const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca";
 const DEFAULT_CA_ADDRESS: &str = ":9000";
 const SECRET_BYTES: usize = 32;
+const DEFAULT_RESPONDER_TOKEN_TTL_SECS: u64 = 60;
 
 mod openbao_constants {
     pub(crate) const INIT_SECRET_SHARES: u8 = 3;
@@ -60,7 +62,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     let mut rollback = InitRollback::default();
     let result: Result<InitSummary> = async {
         let bootstrap = bootstrap_openbao(&mut client, args, messages).await?;
-        let secrets = resolve_init_secrets(args, messages)?;
+        let mut secrets = resolve_init_secrets(args, messages)?;
         let (role_outputs, _policies, approles) =
             configure_openbao(&client, args, &secrets, &mut rollback).await?;
 
@@ -71,6 +73,12 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn).await?);
 
         let step_ca_result = ensure_step_ca_initialized(&secrets_dir)?;
+        let responder_check = verify_responder(args, messages, &secrets).await?;
+        let eab_update =
+            maybe_register_eab(&client, args, messages, &mut rollback, &secrets).await?;
+        if let Some(eab) = eab_update {
+            secrets.eab = Some(eab);
+        }
 
         write_state_file(&args.openbao_url, &args.kv_mount, &approles)?;
 
@@ -88,6 +96,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             http_hmac: secrets.http_hmac,
             eab: secrets.eab,
             step_ca_result,
+            responder_check,
         })
     }
     .await;
@@ -116,6 +125,12 @@ struct InitSecrets {
     db_dsn: String,
     http_hmac: String,
     eab: Option<EabCredentials>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResponderCheck {
+    Skipped,
+    Ok,
 }
 
 async fn bootstrap_openbao(
@@ -343,6 +358,12 @@ fn prompt_text(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    let input = prompt_text(prompt)?;
+    let trimmed = input.trim().to_ascii_lowercase();
+    Ok(trimmed == "y" || trimmed == "yes")
+}
+
 fn resolve_secret(label: &str, value: Option<String>, auto_generate: bool) -> Result<String> {
     if let Some(value) = value {
         return Ok(value);
@@ -362,6 +383,67 @@ fn resolve_eab(args: &InitArgs, messages: &Messages) -> Result<Option<EabCredent
         (None, None) => Ok(None),
         _ => anyhow::bail!(messages.error_eab_requires_both()),
     }
+}
+
+async fn verify_responder(
+    args: &InitArgs,
+    messages: &Messages,
+    secrets: &InitSecrets,
+) -> Result<ResponderCheck> {
+    let Some(responder_url) = args.responder_url.as_deref() else {
+        return Ok(ResponderCheck::Skipped);
+    };
+    responder_client::register_http01_token_with(
+        responder_url,
+        &secrets.http_hmac,
+        args.responder_timeout_secs,
+        "bootroot-init-check",
+        "bootroot-init-check.key",
+        DEFAULT_RESPONDER_TOKEN_TTL_SECS,
+    )
+    .await
+    .with_context(|| messages.error_responder_check_failed())?;
+    Ok(ResponderCheck::Ok)
+}
+
+async fn maybe_register_eab(
+    client: &OpenBaoClient,
+    args: &InitArgs,
+    messages: &Messages,
+    rollback: &mut InitRollback,
+    secrets: &InitSecrets,
+) -> Result<Option<EabCredentials>> {
+    if secrets.eab.is_some() || args.auto_generate {
+        return Ok(None);
+    }
+    if !prompt_yes_no(messages.prompt_eab_register_now())? {
+        return Ok(None);
+    }
+    println!("{}", messages.eab_prompt_instructions());
+    let kid = prompt_text(messages.prompt_eab_kid())?;
+    let hmac = prompt_text(messages.prompt_eab_hmac())?;
+    let credentials = EabCredentials { kid, hmac };
+    register_eab_secret(client, &args.kv_mount, rollback, &credentials).await?;
+    Ok(Some(credentials))
+}
+
+async fn register_eab_secret(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    rollback: &mut InitRollback,
+    credentials: &EabCredentials,
+) -> Result<()> {
+    if !client.kv_exists(kv_mount, PATH_AGENT_EAB).await? {
+        rollback.written_kv_paths.push(PATH_AGENT_EAB.to_string());
+    }
+    client
+        .write_kv(
+            kv_mount,
+            PATH_AGENT_EAB,
+            serde_json::json!({ "kid": credentials.kid, "hmac": credentials.hmac }),
+        )
+        .await?;
+    Ok(())
 }
 
 fn resolve_db_dsn(args: &InitArgs, messages: &Messages) -> Result<String> {
@@ -689,6 +771,7 @@ pub(crate) struct InitSummary {
     pub(crate) http_hmac: String,
     pub(crate) eab: Option<EabCredentials>,
     pub(crate) step_ca_result: StepCaInitResult,
+    pub(crate) responder_check: ResponderCheck,
 }
 
 pub(crate) struct AppRoleOutput {
@@ -751,6 +834,8 @@ mod tests {
             stepca_password: None,
             db_dsn: None,
             http_hmac: None,
+            responder_url: None,
+            responder_timeout_secs: 5,
             eab_kid: None,
             eab_hmac: None,
         }
