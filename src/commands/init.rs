@@ -8,12 +8,12 @@ use bootroot::acme::responder_client;
 use bootroot::fs_util;
 use bootroot::openbao::{InitResponse, OpenBaoClient};
 use reqwest::StatusCode;
-use serde::Serialize;
 
 use crate::InitArgs;
 use crate::cli::output::print_init_summary;
 use crate::commands::infra::{ensure_infra_ready, run_docker};
 use crate::i18n::Messages;
+use crate::state::StateFile;
 
 pub(crate) const DEFAULT_OPENBAO_URL: &str = "http://localhost:8200";
 pub(crate) const DEFAULT_KV_MOUNT: &str = "secret";
@@ -84,7 +84,12 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             secrets.eab = Some(eab);
         }
 
-        write_state_file(&args.openbao_url, &args.kv_mount, &approles)?;
+        write_state_file(
+            &args.openbao_url,
+            &args.kv_mount,
+            &approles,
+            &args.secrets_dir,
+        )?;
 
         Ok(InitSummary {
             openbao_url: args.openbao_url.clone(),
@@ -718,6 +723,7 @@ fn write_state_file(
     openbao_url: &str,
     kv_mount: &str,
     approles: &BTreeMap<String, String>,
+    secrets_dir: &Path,
 ) -> Result<()> {
     let policy_map = [
         (
@@ -735,6 +741,7 @@ fn write_state_file(
     let state = StateFile {
         openbao_url: openbao_url.to_string(),
         kv_mount: kv_mount.to_string(),
+        secrets_dir: Some(secrets_dir.to_path_buf()),
         policies: policy_map,
         approles: approles
             .iter()
@@ -742,9 +749,7 @@ fn write_state_file(
             .collect(),
         apps: BTreeMap::new(),
     };
-    let contents =
-        serde_json::to_string_pretty(&state).context("Failed to serialize state.json")?;
-    std::fs::write("state.json", contents).context("Failed to write state.json")?;
+    state.save(Path::new("state.json"))?;
     Ok(())
 }
 
@@ -838,15 +843,6 @@ pub(crate) struct EabCredentials {
 pub(crate) enum StepCaInitResult {
     Initialized,
     Skipped,
-}
-
-#[derive(Debug, Serialize)]
-struct StateFile {
-    openbao_url: String,
-    kv_mount: String,
-    policies: BTreeMap<String, String>,
-    approles: BTreeMap<String, String>,
-    apps: BTreeMap<String, serde_json::Value>,
 }
 
 #[cfg(test)]

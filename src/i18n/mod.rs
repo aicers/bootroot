@@ -4,8 +4,6 @@ pub(crate) mod en;
 pub(crate) mod ko;
 
 pub(crate) struct Strings {
-    pub(crate) not_implemented_app_add: &'static str,
-    pub(crate) not_implemented_app_info: &'static str,
     pub(crate) not_implemented_verify: &'static str,
     pub(crate) infra_up_completed: &'static str,
     pub(crate) infra_readiness_summary: &'static str,
@@ -31,6 +29,22 @@ pub(crate) struct Strings {
     pub(crate) prompt_eab_hmac: &'static str,
     pub(crate) error_responder_check_failed: &'static str,
     pub(crate) error_eab_auto_failed: &'static str,
+    pub(crate) error_state_missing: &'static str,
+    pub(crate) error_app_duplicate: &'static str,
+    pub(crate) error_app_not_found: &'static str,
+    pub(crate) error_root_token_required: &'static str,
+    pub(crate) app_add_summary: &'static str,
+    pub(crate) app_info_summary: &'static str,
+    pub(crate) app_summary_kind: &'static str,
+    pub(crate) app_summary_deploy_type: &'static str,
+    pub(crate) app_summary_hostname: &'static str,
+    pub(crate) app_summary_notes: &'static str,
+    pub(crate) app_summary_policy: &'static str,
+    pub(crate) app_summary_approle: &'static str,
+    pub(crate) app_summary_secret_path: &'static str,
+    pub(crate) app_summary_secret_path_hidden: &'static str,
+    pub(crate) app_summary_next_steps: &'static str,
+    pub(crate) app_next_steps_use_approle: &'static str,
     pub(crate) status_summary_title: &'static str,
     pub(crate) status_section_infra: &'static str,
     pub(crate) status_section_openbao: &'static str,
@@ -111,14 +125,6 @@ impl Messages {
     pub(crate) fn new(lang: &str) -> Result<Self> {
         let locale = Locale::parse(lang)?;
         Ok(Self { locale })
-    }
-
-    pub(crate) fn not_implemented_app_add(&self) -> &'static str {
-        self.strings().not_implemented_app_add
-    }
-
-    pub(crate) fn not_implemented_app_info(&self) -> &'static str {
-        self.strings().not_implemented_app_info
     }
 
     pub(crate) fn not_implemented_verify(&self) -> &'static str {
@@ -238,6 +244,70 @@ impl Messages {
 
     pub(crate) fn error_eab_auto_failed(&self) -> &'static str {
         self.strings().error_eab_auto_failed
+    }
+
+    pub(crate) fn error_state_missing(&self) -> &'static str {
+        self.strings().error_state_missing
+    }
+
+    pub(crate) fn error_app_duplicate(&self, app_kind: &str) -> String {
+        format_template(self.strings().error_app_duplicate, &[("value", app_kind)])
+    }
+
+    pub(crate) fn error_app_not_found(&self, app_kind: &str) -> String {
+        format_template(self.strings().error_app_not_found, &[("value", app_kind)])
+    }
+
+    pub(crate) fn error_root_token_required(&self) -> &'static str {
+        self.strings().error_root_token_required
+    }
+
+    pub(crate) fn app_add_summary(&self) -> &'static str {
+        self.strings().app_add_summary
+    }
+
+    pub(crate) fn app_info_summary(&self) -> &'static str {
+        self.strings().app_info_summary
+    }
+
+    pub(crate) fn app_summary_kind(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_kind, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_deploy_type(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_deploy_type, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_hostname(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_hostname, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_notes(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_notes, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_policy(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_policy, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_approle(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_approle, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_secret_path(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_secret_path, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_secret_path_hidden(&self) -> &'static str {
+        self.strings().app_summary_secret_path_hidden
+    }
+
+    pub(crate) fn app_summary_next_steps(&self) -> &'static str {
+        self.strings().app_summary_next_steps
+    }
+
+    pub(crate) fn app_next_steps_use_approle(&self, value: &str) -> String {
+        format_template(self.strings().app_next_steps_use_approle, &[("value", value)])
     }
 
     pub(crate) fn status_summary_title(&self) -> &'static str {

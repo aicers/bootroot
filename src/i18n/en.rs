@@ -1,8 +1,6 @@
 use super::Strings;
 
 pub(super) static STRINGS: Strings = Strings {
-    not_implemented_app_add: "bootroot app add: not yet implemented",
-    not_implemented_app_info: "bootroot app info: not yet implemented",
     not_implemented_verify: "bootroot verify: not yet implemented",
     infra_up_completed: "bootroot infra up: completed",
     infra_readiness_summary: "bootroot infra up: readiness summary",
@@ -28,6 +26,23 @@ pub(super) static STRINGS: Strings = Strings {
     prompt_eab_hmac: "EAB hmac: ",
     error_responder_check_failed: "HTTP-01 responder check failed",
     error_eab_auto_failed: "Automatic EAB issuance failed",
+    error_state_missing: "state.json not found (run `bootroot init` first)",
+    error_app_duplicate: "App already exists: {value}",
+    error_app_not_found: "App not found: {value}",
+    error_root_token_required: "OpenBao root token is required for app add",
+    app_add_summary: "bootroot app add: summary",
+    app_info_summary: "bootroot app info: summary",
+    app_summary_kind: "- app kind: {value}",
+    app_summary_deploy_type: "- deploy type: {value}",
+    app_summary_hostname: "- hostname: {value}",
+    app_summary_notes: "- notes: {value}",
+    app_summary_policy: "- policy: {value}",
+    app_summary_approle: "- AppRole: {value}",
+    app_summary_secret_path: "- secret_id path: {value}",
+    app_summary_secret_path_hidden: "- secret_id path: (hidden)",
+    app_summary_next_steps: "next steps:",
+    app_next_steps_use_approle:
+        "  - Configure OpenBao Agent with AppRole {value} and the secret_id file.",
     status_summary_title: "bootroot status: summary",
     status_section_infra: "- infra:",
     status_section_openbao: "- OpenBao:",
