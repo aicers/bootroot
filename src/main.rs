@@ -167,33 +167,33 @@ pub(crate) struct StatusArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct AppAddArgs {
-    /// App kind identifier
-    #[arg(long, required = true)]
-    service_name: String,
+    /// Service name identifier
+    #[arg(long)]
+    service_name: Option<String>,
 
     /// Deployment type (daemon or docker)
-    #[arg(long, value_enum, required = true)]
-    deploy_type: DeployType,
+    #[arg(long, value_enum)]
+    deploy_type: Option<DeployType>,
 
     /// Hostname used for DNS SAN
-    #[arg(long, required = true)]
-    hostname: String,
+    #[arg(long)]
+    hostname: Option<String>,
 
     /// DNS domain for SAN construction
-    #[arg(long, required = true)]
-    domain: String,
+    #[arg(long)]
+    domain: Option<String>,
 
     /// bootroot-agent config path
-    #[arg(long, required = true)]
-    agent_config: PathBuf,
+    #[arg(long)]
+    agent_config: Option<PathBuf>,
 
     /// Certificate output path
-    #[arg(long, required = true)]
-    cert_path: PathBuf,
+    #[arg(long)]
+    cert_path: Option<PathBuf>,
 
     /// Private key output path
-    #[arg(long, required = true)]
-    key_path: PathBuf,
+    #[arg(long)]
+    key_path: Option<PathBuf>,
 
     /// Instance ID (required for daemon)
     #[arg(long)]
@@ -214,16 +214,16 @@ pub(crate) struct AppAddArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct AppInfoArgs {
-    /// App kind identifier
+    /// Service name identifier
     #[arg(long, required = true)]
     service_name: String,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct VerifyArgs {
-    /// App kind identifier
-    #[arg(long, required = true)]
-    service_name: String,
+    /// Service name identifier
+    #[arg(long)]
+    service_name: Option<String>,
 
     /// bootroot-agent config path override
     #[arg(long)]

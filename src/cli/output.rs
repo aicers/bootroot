@@ -1,6 +1,19 @@
-use crate::commands::init::InitSummary;
+use crate::commands::init::{InitPlan, InitSummary};
 use crate::i18n::{AppNextStepsDaemon, AppNextStepsDocker, Messages};
 use crate::state::{AppEntry, DeployType};
+
+pub(crate) struct AppAddPlan<'a> {
+    pub(crate) service_name: &'a str,
+    pub(crate) deploy_type: DeployType,
+    pub(crate) hostname: &'a str,
+    pub(crate) domain: &'a str,
+    pub(crate) agent_config: &'a str,
+    pub(crate) cert_path: &'a str,
+    pub(crate) key_path: &'a str,
+    pub(crate) instance_id: Option<&'a str>,
+    pub(crate) container_name: Option<&'a str>,
+    pub(crate) notes: Option<&'a str>,
+}
 
 pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
     print_init_header(summary, messages);
@@ -9,6 +22,25 @@ pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
     print_kv_paths(messages);
     print_approles(summary, messages);
     print_next_steps(summary, messages);
+}
+
+pub(crate) fn print_init_plan(plan: &InitPlan, messages: &Messages) {
+    println!("{}", messages.init_plan_title());
+    println!("{}", messages.summary_openbao_url(&plan.openbao_url));
+    println!("{}", messages.summary_kv_mount(&plan.kv_mount));
+    println!(
+        "{}",
+        messages.summary_secrets_dir(&plan.secrets_dir.display().to_string())
+    );
+    if plan.overwrite_password {
+        println!("{}", messages.init_plan_overwrite_password());
+    }
+    if plan.overwrite_ca_json {
+        println!("{}", messages.init_plan_overwrite_ca_json());
+    }
+    if plan.overwrite_state {
+        println!("{}", messages.init_plan_overwrite_state());
+    }
 }
 
 pub(crate) fn print_app_add_summary(
@@ -67,6 +99,14 @@ pub(crate) fn print_app_add_summary(
     }
 }
 
+pub(crate) fn print_app_add_plan(plan: &AppAddPlan<'_>, messages: &Messages) {
+    println!("{}", messages.app_add_plan_title());
+    print_app_plan_fields(plan, messages);
+    println!("{}", messages.app_summary_agent_config(plan.agent_config));
+    println!("{}", messages.app_summary_cert_path(plan.cert_path));
+    println!("{}", messages.app_summary_key_path(plan.key_path));
+}
+
 pub(crate) fn print_app_info_summary(entry: &AppEntry, messages: &Messages) {
     println!("{}", messages.app_info_summary());
     print_app_fields(entry, messages);
@@ -112,6 +152,41 @@ fn print_app_fields(entry: &AppEntry, messages: &Messages) {
     if let Some(notes) = entry.notes.as_deref() {
         println!("{}", messages.app_summary_notes(notes));
     }
+}
+
+fn print_app_plan_fields(plan: &AppAddPlan<'_>, messages: &Messages) {
+    println!("{}", messages.app_summary_kind(plan.service_name));
+    println!(
+        "{}",
+        messages.app_summary_deploy_type(match plan.deploy_type {
+            DeployType::Daemon => "daemon",
+            DeployType::Docker => "docker",
+        })
+    );
+    println!("{}", messages.app_summary_hostname(plan.hostname));
+    println!("{}", messages.app_summary_domain(plan.domain));
+    if let Some(instance_id) = plan.instance_id {
+        println!("{}", messages.app_summary_instance_id(instance_id));
+    }
+    if let Some(container_name) = plan.container_name {
+        println!("{}", messages.app_summary_container_name(container_name));
+    }
+    if let Some(notes) = plan.notes {
+        println!("{}", messages.app_summary_notes(notes));
+    }
+}
+
+pub(crate) fn print_verify_plan(
+    service_name: &str,
+    agent_config: &std::path::Path,
+    messages: &Messages,
+) {
+    println!("{}", messages.verify_plan_title());
+    println!("{}", messages.verify_service_name(service_name));
+    println!(
+        "{}",
+        messages.verify_agent_config(&agent_config.display().to_string())
+    );
 }
 
 fn print_init_header(summary: &InitSummary, messages: &Messages) {

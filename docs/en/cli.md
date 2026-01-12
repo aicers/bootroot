@@ -76,6 +76,13 @@ registers required secrets.
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
 - `--eab-kid`, `--eab-hmac`: manual EAB input
 
+### Interactive behavior
+
+- Prompts for missing required inputs.
+- Validates inputs (non-empty, enum values, path existence/parents).
+- Confirms before overwriting `password.txt`, `ca.json`, or `state.json`.
+- Prints a plan summary before execution and the final summary after.
+
 ### Outputs
 
 - OpenBao init/unseal summary and AppRole outputs
@@ -143,6 +150,12 @@ Registers app onboarding info and creates an OpenBao AppRole.
   - Environment variable: `OPENBAO_ROOT_TOKEN`
 - `--notes`: freeform notes (optional)
 
+### Interactive behavior
+
+- Prompts for missing required inputs (deploy type defaults to `daemon`).
+- Validates inputs (non-empty, enum values, path existence/parents).
+- Prints a plan summary before execution and the final summary after.
+
 ### Outputs
 
 - App metadata summary
@@ -182,6 +195,12 @@ Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 
 - `--service-name`: service name identifier
 - `--agent-config`: bootroot-agent config path override (optional)
+
+### Interactive behavior
+
+- Prompts for missing required inputs.
+- Validates inputs (non-empty).
+- Prints a plan summary before execution and the final summary after.
 
 ### Outputs
 

@@ -75,6 +75,13 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--stepca-provisioner`: step-ca ACME provisioner 이름 (기본값 `acme`)
 - `--eab-kid`, `--eab-hmac`: 수동 EAB 입력
 
+### 대화형 동작
+
+- 누락된 필수 입력을 프롬프트로 받습니다.
+- 입력값을 검증합니다(빈 값, enum, 경로/상위 디렉터리).
+- `password.txt`, `ca.json`, `state.json` 덮어쓰기 전 확인합니다.
+- 실행 전 계획 요약, 실행 후 최종 요약을 출력합니다.
+
 ### 출력
 
 - OpenBao 초기화/언실 결과, AppRole 생성 결과 요약
@@ -142,6 +149,12 @@ bootroot status
   - 환경 변수: `OPENBAO_ROOT_TOKEN`
 - `--notes`: 메모(선택)
 
+### 대화형 동작
+
+- 누락된 필수 입력을 프롬프트로 받습니다(배포 타입 기본값: `daemon`).
+- 입력값을 검증합니다(빈 값, enum, 경로/상위 디렉터리).
+- 실행 전 계획 요약, 실행 후 최종 요약을 출력합니다.
+
 ### 출력
 
 - 앱 메타데이터 요약
@@ -181,6 +194,12 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다.
 
 - `--service-name`: 서비스 이름 식별자
 - `--agent-config`: bootroot-agent 설정 경로 (선택, 기본은 등록된 값)
+
+### 대화형 동작
+
+- 누락된 필수 입력을 프롬프트로 받습니다.
+- 입력값을 검증합니다(빈 값).
+- 실행 전 계획 요약, 실행 후 최종 요약을 출력합니다.
 
 ### 출력
 

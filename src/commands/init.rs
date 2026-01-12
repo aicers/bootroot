@@ -10,7 +10,7 @@ use bootroot::openbao::{InitResponse, OpenBaoClient};
 use reqwest::StatusCode;
 
 use crate::InitArgs;
-use crate::cli::output::print_init_summary;
+use crate::cli::output::{print_init_plan, print_init_summary};
 use crate::commands::infra::{ensure_infra_ready, run_docker};
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -67,6 +67,28 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     let result: Result<InitSummary> = async {
         let bootstrap = bootstrap_openbao(&mut client, args, messages).await?;
         let mut secrets = resolve_init_secrets(args, messages)?;
+        let overwrite_password = args.secrets_dir.join("password.txt").exists();
+        let overwrite_ca_json = args.secrets_dir.join("config").join("ca.json").exists();
+        let overwrite_state = Path::new("state.json").exists();
+        let plan = InitPlan {
+            openbao_url: args.openbao_url.clone(),
+            kv_mount: args.kv_mount.clone(),
+            secrets_dir: args.secrets_dir.clone(),
+            overwrite_password,
+            overwrite_ca_json,
+            overwrite_state,
+        };
+        print_init_plan(&plan, messages);
+        if overwrite_password {
+            confirm_overwrite(messages.prompt_confirm_overwrite_password(), messages)?;
+        }
+        if overwrite_ca_json {
+            confirm_overwrite(messages.prompt_confirm_overwrite_ca_json(), messages)?;
+        }
+        if overwrite_state {
+            confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
+        }
+
         let (role_outputs, _policies, approles) =
             configure_openbao(&client, args, &secrets, &mut rollback).await?;
 
@@ -379,6 +401,13 @@ fn prompt_yes_no(prompt: &str) -> Result<bool> {
     let input = prompt_text(prompt)?;
     let trimmed = input.trim().to_ascii_lowercase();
     Ok(trimmed == "y" || trimmed == "yes")
+}
+
+fn confirm_overwrite(prompt: &str, messages: &Messages) -> Result<()> {
+    if prompt_yes_no(prompt)? {
+        return Ok(());
+    }
+    anyhow::bail!(messages.error_operation_cancelled());
 }
 
 fn resolve_secret(label: &str, value: Option<String>, auto_generate: bool) -> Result<String> {
@@ -824,6 +853,15 @@ pub(crate) struct InitSummary {
     pub(crate) eab: Option<EabCredentials>,
     pub(crate) step_ca_result: StepCaInitResult,
     pub(crate) responder_check: ResponderCheck,
+}
+
+pub(crate) struct InitPlan {
+    pub(crate) openbao_url: String,
+    pub(crate) kv_mount: String,
+    pub(crate) secrets_dir: PathBuf,
+    pub(crate) overwrite_password: bool,
+    pub(crate) overwrite_ca_json: bool,
+    pub(crate) overwrite_state: bool,
 }
 
 pub(crate) struct AppRoleOutput {
