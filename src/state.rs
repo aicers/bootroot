@@ -33,7 +33,8 @@ impl StateFile {
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
         let contents =
             serde_json::to_string_pretty(self).context("Failed to serialize state.json")?;
-        std::fs::write(path, contents).with_context(|| format!("Failed to write {}", path.display()))
+        std::fs::write(path, contents)
+            .with_context(|| format!("Failed to write {}", path.display()))
     }
 
     pub(crate) fn secrets_dir(&self) -> PathBuf {

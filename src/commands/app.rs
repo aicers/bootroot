@@ -1,18 +1,22 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
+use bootroot::openbao::OpenBaoClient;
 use tokio::fs;
 
 use crate::AppAddArgs;
 use crate::AppInfoArgs;
+use crate::cli::output::{print_app_add_summary, print_app_info_summary};
 use crate::commands::init::{SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
-use crate::state::{AppEntry, AppRoleEntry, DeployType, StateFile};
-use bootroot::fs_util;
-use bootroot::openbao::OpenBaoClient;
+use crate::state::{AppEntry, AppRoleEntry, StateFile};
 
 const STATE_FILE_NAME: &str = "state.json";
 const APPROLE_PREFIX: &str = "bootroot-app-";
+const APP_KV_BASE: &str = "bootroot/apps";
+const APP_SECRET_DIR: &str = "apps";
+const APP_SECRET_ID_FILENAME: &str = "secret_id";
 
 pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Result<()> {
     let state_path = Path::new(STATE_FILE_NAME);
@@ -28,31 +32,16 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     let root_token = args
         .root_token
         .clone()
-        .ok_or_else(|| anyhow::anyhow!(messages.error_root_token_required()))?;
+        .ok_or_else(|| anyhow::anyhow!(messages.error_openbao_root_token_required()))?;
 
     let mut client = OpenBaoClient::new(&state.openbao_url)?;
     client.set_token(root_token);
     client.ensure_approle_auth().await?;
 
-    let policy_name = format!("{APPROLE_PREFIX}{}", args.app_kind);
-    let policy = build_app_policy(&state.kv_mount, &args.app_kind);
-    client.write_policy(&policy_name, &policy).await?;
-
-    let role_name = format!("{APPROLE_PREFIX}{}", args.app_kind);
-    client
-        .create_approle(
-            &role_name,
-            &[policy_name.clone()],
-            TOKEN_TTL,
-            SECRET_ID_TTL,
-            true,
-        )
-        .await?;
-    let role_id = client.read_role_id(&role_name).await?;
-    let secret_id = client.create_secret_id(&role_name).await?;
-
+    let approle = ensure_app_approle(&client, &state, &args.app_kind).await?;
     let secrets_dir = state.secrets_dir();
-    let secret_id_path = write_secret_id_file(&secrets_dir, &args.app_kind, &secret_id).await?;
+    let secret_id_path =
+        write_secret_id_file(&secrets_dir, &args.app_kind, &approle.secret_id).await?;
 
     let entry = AppEntry {
         app_kind: args.app_kind.clone(),
@@ -60,10 +49,10 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
         hostname: args.hostname.clone(),
         notes: args.notes.clone(),
         approle: AppRoleEntry {
-            role_name,
-            role_id: role_id.clone(),
+            role_name: approle.role_name,
+            role_id: approle.role_id,
             secret_id_path: secret_id_path.clone(),
-            policy_name,
+            policy_name: approle.policy_name,
         },
     };
 
@@ -74,7 +63,7 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     Ok(())
 }
 
-pub(crate) async fn run_app_info(args: &AppInfoArgs, messages: &Messages) -> Result<()> {
+pub(crate) fn run_app_info(args: &AppInfoArgs, messages: &Messages) -> Result<()> {
     let state_path = Path::new(STATE_FILE_NAME);
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
@@ -89,7 +78,7 @@ pub(crate) async fn run_app_info(args: &AppInfoArgs, messages: &Messages) -> Res
 }
 
 fn build_app_policy(kv_mount: &str, app_kind: &str) -> String {
-    let base = format!("bootroot/apps/{app_kind}");
+    let base = format!("{APP_KV_BASE}/{app_kind}");
     format!(
         r#"path "{kv_mount}/data/{base}/*" {{
   capabilities = ["read"]
@@ -106,9 +95,9 @@ async fn write_secret_id_file(
     app_kind: &str,
     secret_id: &str,
 ) -> Result<PathBuf> {
-    let app_dir = secrets_dir.join("apps").join(app_kind);
+    let app_dir = secrets_dir.join(APP_SECRET_DIR).join(app_kind);
     fs_util::ensure_secrets_dir(&app_dir).await?;
-    let secret_path = app_dir.join("secret_id");
+    let secret_path = app_dir.join(APP_SECRET_ID_FILENAME);
     fs::write(&secret_path, secret_id)
         .await
         .with_context(|| format!("Failed to write {}", secret_path.display()))?;
@@ -116,40 +105,46 @@ async fn write_secret_id_file(
     Ok(secret_path)
 }
 
-fn print_app_add_summary(entry: &AppEntry, secret_id_path: &Path, messages: &Messages) {
-    println!("{}", messages.app_add_summary());
-    print_app_fields(entry, messages);
-    println!("{}", messages.app_summary_policy(&entry.approle.policy_name));
-    println!("{}", messages.app_summary_approle(&entry.approle.role_name));
-    println!("{}", messages.summary_role_id(&entry.approle.role_id));
-    println!("{}", messages.app_summary_secret_path(&secret_id_path.display().to_string()));
-    println!("{}", messages.app_summary_next_steps());
-    println!(
-        "{}",
-        messages.app_next_steps_use_approle(&entry.approle.role_name)
-    );
+struct AppRoleMaterialized {
+    role_name: String,
+    role_id: String,
+    secret_id: String,
+    policy_name: String,
 }
 
-fn print_app_info_summary(entry: &AppEntry, messages: &Messages) {
-    println!("{}", messages.app_info_summary());
-    print_app_fields(entry, messages);
-    println!("{}", messages.app_summary_policy(&entry.approle.policy_name));
-    println!("{}", messages.app_summary_approle(&entry.approle.role_name));
-    println!("{}", messages.summary_role_id(&entry.approle.role_id));
-    println!("{}", messages.app_summary_secret_path_hidden());
+async fn ensure_app_approle(
+    client: &OpenBaoClient,
+    state: &StateFile,
+    app_kind: &str,
+) -> Result<AppRoleMaterialized> {
+    let policy_name = app_policy_name(app_kind);
+    let policy = build_app_policy(&state.kv_mount, app_kind);
+    client.write_policy(&policy_name, &policy).await?;
+
+    let role_name = app_role_name(app_kind);
+    client
+        .create_approle(
+            &role_name,
+            std::slice::from_ref(&policy_name),
+            TOKEN_TTL,
+            SECRET_ID_TTL,
+            true,
+        )
+        .await?;
+    let role_id = client.read_role_id(&role_name).await?;
+    let secret_id = client.create_secret_id(&role_name).await?;
+    Ok(AppRoleMaterialized {
+        role_name,
+        role_id,
+        secret_id,
+        policy_name,
+    })
 }
 
-fn print_app_fields(entry: &AppEntry, messages: &Messages) {
-    println!("{}", messages.app_summary_kind(&entry.app_kind));
-    println!(
-        "{}",
-        messages.app_summary_deploy_type(match entry.deploy_type {
-            DeployType::Daemon => "daemon",
-            DeployType::Docker => "docker",
-        })
-    );
-    println!("{}", messages.app_summary_hostname(&entry.hostname));
-    if let Some(notes) = entry.notes.as_deref() {
-        println!("{}", messages.app_summary_notes(notes));
-    }
+fn app_role_name(app_kind: &str) -> String {
+    format!("{APPROLE_PREFIX}{app_kind}")
+}
+
+fn app_policy_name(app_kind: &str) -> String {
+    format!("{APPROLE_PREFIX}{app_kind}")
 }

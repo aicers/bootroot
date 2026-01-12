@@ -164,8 +164,11 @@ fn write_state_file(root: &std::path::Path, openbao_url: &str) -> anyhow::Result
         "approles": {},
         "apps": {}
     });
-    fs::write(root.join("state.json"), serde_json::to_string_pretty(&state)?)
-        .context("write state.json")?;
+    fs::write(
+        root.join("state.json"),
+        serde_json::to_string_pretty(&state)?,
+    )
+    .context("write state.json")?;
     Ok(())
 }
 
@@ -185,8 +188,11 @@ fn write_state_with_app(root: &std::path::Path) {
             "policy_name": "bootroot-app-edge-proxy"
         }
     });
-    fs::write(&state_path, serde_json::to_string_pretty(&value).expect("serialize state"))
-        .expect("write state");
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&value).expect("serialize state"),
+    )
+    .expect("write state");
 }
 
 async fn stub_app_add_openbao(server: &MockServer, app_kind: &str) {

@@ -179,7 +179,7 @@ pub(crate) struct AppAddArgs {
     #[arg(long)]
     hostname: String,
 
-    /// OpenBao root token
+    /// `OpenBao` root token
     #[arg(long, env = "OPENBAO_ROOT_TOKEN")]
     root_token: Option<String>,
 
@@ -226,9 +226,7 @@ fn run() -> Result<()> {
             runtime.block_on(commands::app::run_app_add(&args, &messages))?;
         }
         CliCommand::App(AppCommand::Info(args)) => {
-            let runtime = tokio::runtime::Runtime::new()
-                .context("Failed to initialize async runtime for app info")?;
-            runtime.block_on(commands::app::run_app_info(&args, &messages))?;
+            commands::app::run_app_info(&args, &messages)?;
         }
         CliCommand::Verify => commands::verify::run_verify(&messages),
     }

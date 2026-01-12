@@ -29,7 +29,6 @@ pub(super) static STRINGS: Strings = Strings {
     error_state_missing: "state.json을 찾을 수 없습니다 (`bootroot init`을 먼저 실행하세요)",
     error_app_duplicate: "앱이 이미 존재합니다: {value}",
     error_app_not_found: "앱을 찾을 수 없습니다: {value}",
-    error_root_token_required: "앱 추가를 위해 OpenBao 루트 토큰이 필요합니다",
     app_add_summary: "bootroot 앱 추가: 요약",
     app_info_summary: "bootroot 앱 정보: 요약",
     app_summary_kind: "- 앱 종류: {value}",
