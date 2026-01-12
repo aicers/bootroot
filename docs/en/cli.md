@@ -9,9 +9,9 @@ The CLI provides infra bootstrapping, initialization, and status checks.
 - `bootroot infra up`
 - `bootroot init`
 - `bootroot status`
-- `bootroot app add` (not implemented yet)
-- `bootroot app info` (not implemented yet)
-- `bootroot verify` (not implemented yet)
+- `bootroot app add`
+- `bootroot app info`
+- `bootroot verify`
 
 ## Global Options
 
@@ -126,12 +126,69 @@ bootroot status
 
 ## bootroot app add
 
-Not implemented yet.
+Registers app onboarding info and creates an OpenBao AppRole.
+
+### Inputs
+
+- `--app-kind`: app kind identifier
+- `--deploy-type`: deployment type (`daemon` or `docker`)
+- `--hostname`: hostname used for DNS SAN
+- `--domain`: root domain for DNS SAN
+- `--agent-config`: bootroot-agent config path
+- `--cert-path`: certificate output path
+- `--key-path`: private key output path
+- `--instance-id`: daemon instance_id (required for daemon)
+- `--container-name`: docker container name (required for docker)
+- `--root-token`: OpenBao root token
+  - Environment variable: `OPENBAO_ROOT_TOKEN`
+- `--notes`: freeform notes (optional)
+
+### Outputs
+
+- App metadata summary
+- AppRole/policy/secret_id path summary
+- Type-specific onboarding guidance (daemon profile / docker sidecar)
+
+### Failures
+
+- Missing `state.json`
+- Duplicate `app-kind`
+- Missing `instance-id` for daemon
+- Missing `container-name` for docker
+- OpenBao AppRole creation failure
 
 ## bootroot app info
 
-Not implemented yet.
+Shows onboarding information for a registered app.
+
+### Inputs
+
+- `--app-kind`: app kind identifier
+
+### Outputs
+
+- App type/paths/AppRole/secret paths summary
+
+### Failures
+
+- Missing `state.json`
+- App not found
 
 ## bootroot verify
 
-Not implemented yet.
+Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
+
+### Inputs
+
+- `--app-kind`: app kind identifier
+- `--agent-config`: bootroot-agent config path override (optional)
+
+### Outputs
+
+- cert/key presence
+- verification summary
+
+### Failures
+
+- bootroot-agent execution failure
+- missing cert/key files

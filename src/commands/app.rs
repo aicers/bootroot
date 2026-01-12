@@ -10,7 +10,7 @@ use crate::AppInfoArgs;
 use crate::cli::output::{print_app_add_summary, print_app_info_summary};
 use crate::commands::init::{SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
-use crate::state::{AppEntry, AppRoleEntry, StateFile};
+use crate::state::{AppEntry, AppRoleEntry, DeployType, StateFile};
 
 const STATE_FILE_NAME: &str = "state.json";
 const APPROLE_PREFIX: &str = "bootroot-app-";
@@ -28,6 +28,8 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     if state.apps.contains_key(&args.app_kind) {
         anyhow::bail!(messages.error_app_duplicate(&args.app_kind));
     }
+
+    validate_app_add(args, messages)?;
 
     let root_token = args
         .root_token
@@ -47,6 +49,12 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
         app_kind: args.app_kind.clone(),
         deploy_type: args.deploy_type,
         hostname: args.hostname.clone(),
+        domain: args.domain.clone(),
+        agent_config_path: args.agent_config.clone(),
+        cert_path: args.cert_path.clone(),
+        key_path: args.key_path.clone(),
+        instance_id: args.instance_id.clone(),
+        container_name: args.container_name.clone(),
         notes: args.notes.clone(),
         approle: AppRoleEntry {
             role_name: approle.role_name,
@@ -74,6 +82,27 @@ pub(crate) fn run_app_info(args: &AppInfoArgs, messages: &Messages) -> Result<()
         .get(&args.app_kind)
         .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&args.app_kind)))?;
     print_app_info_summary(entry, messages);
+    Ok(())
+}
+
+fn validate_app_add(args: &AppAddArgs, messages: &Messages) -> Result<()> {
+    match args.deploy_type {
+        DeployType::Daemon => {
+            if args.instance_id.as_deref().unwrap_or_default().is_empty() {
+                anyhow::bail!(messages.error_app_instance_id_required());
+            }
+        }
+        DeployType::Docker => {
+            if args
+                .container_name
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                anyhow::bail!(messages.error_app_container_name_required());
+            }
+        }
+    }
     Ok(())
 }
 

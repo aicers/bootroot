@@ -1,5 +1,5 @@
 use crate::commands::init::InitSummary;
-use crate::i18n::Messages;
+use crate::i18n::{AppNextStepsDaemon, AppNextStepsDocker, Messages};
 use crate::state::{AppEntry, DeployType};
 
 pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
@@ -28,22 +28,73 @@ pub(crate) fn print_app_add_summary(
         "{}",
         messages.app_summary_secret_path(&secret_id_path.display().to_string())
     );
+    println!("{}", messages.app_summary_openbao_path(&entry.app_kind));
     println!("{}", messages.app_summary_next_steps());
-    println!(
-        "{}",
-        messages.app_next_steps_use_approle(&entry.approle.role_name)
-    );
+    match entry.deploy_type {
+        DeployType::Daemon => {
+            let cert_path = entry.cert_path.display().to_string();
+            let key_path = entry.key_path.display().to_string();
+            let config_path = entry.agent_config_path.display().to_string();
+            let data = AppNextStepsDaemon {
+                app_kind: &entry.app_kind,
+                instance_id: entry.instance_id.as_deref().unwrap_or_default(),
+                hostname: &entry.hostname,
+                domain: &entry.domain,
+                cert_path: &cert_path,
+                key_path: &key_path,
+                config_path: &config_path,
+            };
+            println!("{}", messages.app_next_steps_daemon_profile(&data));
+        }
+        DeployType::Docker => {
+            let cert_path = entry.cert_path.display().to_string();
+            let key_path = entry.key_path.display().to_string();
+            let config_path = entry.agent_config_path.display().to_string();
+            let secret_id_path_value = secret_id_path.display().to_string();
+            let data = AppNextStepsDocker {
+                app_kind: &entry.app_kind,
+                container_name: entry.container_name.as_deref().unwrap_or_default(),
+                hostname: &entry.hostname,
+                domain: &entry.domain,
+                cert_path: &cert_path,
+                key_path: &key_path,
+                config_path: &config_path,
+                role_name: &entry.approle.role_name,
+                secret_id_path: &secret_id_path_value,
+            };
+            println!("{}", messages.app_next_steps_docker_sidecar(&data));
+        }
+    }
 }
 
 pub(crate) fn print_app_info_summary(entry: &AppEntry, messages: &Messages) {
     println!("{}", messages.app_info_summary());
     print_app_fields(entry, messages);
+    if let Some(instance_id) = entry.instance_id.as_deref() {
+        println!("{}", messages.app_summary_instance_id(instance_id));
+    }
+    if let Some(container_name) = entry.container_name.as_deref() {
+        println!("{}", messages.app_summary_container_name(container_name));
+    }
     println!(
         "{}",
         messages.app_summary_policy(&entry.approle.policy_name)
     );
     println!("{}", messages.app_summary_approle(&entry.approle.role_name));
     println!("{}", messages.summary_role_id(&entry.approle.role_id));
+    println!("{}", messages.app_summary_openbao_path(&entry.app_kind));
+    println!(
+        "{}",
+        messages.app_summary_agent_config(&entry.agent_config_path.display().to_string())
+    );
+    println!(
+        "{}",
+        messages.app_summary_cert_path(&entry.cert_path.display().to_string())
+    );
+    println!(
+        "{}",
+        messages.app_summary_key_path(&entry.key_path.display().to_string())
+    );
     println!("{}", messages.app_summary_secret_path_hidden());
 }
 
@@ -57,6 +108,7 @@ fn print_app_fields(entry: &AppEntry, messages: &Messages) {
         })
     );
     println!("{}", messages.app_summary_hostname(&entry.hostname));
+    println!("{}", messages.app_summary_domain(&entry.domain));
     if let Some(notes) = entry.notes.as_deref() {
         println!("{}", messages.app_summary_notes(notes));
     }

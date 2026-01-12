@@ -9,9 +9,9 @@ CLI는 infra 기동/초기화/상태 점검을 제공합니다.
 - `bootroot infra up`
 - `bootroot init`
 - `bootroot status`
-- `bootroot app add` (현재 미구현)
-- `bootroot app info` (현재 미구현)
-- `bootroot verify` (현재 미구현)
+- `bootroot app add`
+- `bootroot app info`
+- `bootroot verify`
 
 ## 공통 옵션
 
@@ -125,12 +125,69 @@ bootroot status
 
 ## bootroot app add
 
-현재 미구현입니다.
+앱 온보딩 정보를 등록하고 OpenBao AppRole을 생성합니다.
+
+### 입력
+
+- `--app-kind`: 앱 종류 식별자
+- `--deploy-type`: 배포 타입 (`daemon` 또는 `docker`)
+- `--hostname`: DNS SAN에 사용할 호스트명
+- `--domain`: DNS SAN 루트 도메인
+- `--agent-config`: bootroot-agent 설정 파일 경로
+- `--cert-path`: 인증서 출력 경로
+- `--key-path`: 개인키 출력 경로
+- `--instance-id`: 데몬용 instance_id (daemon 필수)
+- `--container-name`: 도커 앱 컨테이너 이름 (docker 필수)
+- `--root-token`: OpenBao root token
+  - 환경 변수: `OPENBAO_ROOT_TOKEN`
+- `--notes`: 메모(선택)
+
+### 출력
+
+- 앱 메타데이터 요약
+- AppRole/정책/secret_id 경로 요약
+- 타입별 온보딩 안내 (daemon 프로필 / docker sidecar)
+
+### 실패
+
+- `state.json` 누락
+- 중복된 `app-kind`
+- daemon에 `instance-id` 누락
+- docker에 `container-name` 누락
+- OpenBao AppRole 생성 실패
 
 ## bootroot app info
 
-현재 미구현입니다.
+등록된 앱 정보를 조회합니다.
+
+### 입력
+
+- `--app-kind`: 앱 종류 식별자
+
+### 출력
+
+- 앱 타입/경로/AppRole/시크릿 경로 요약
+
+### 실패
+
+- `state.json` 누락
+- 등록되지 않은 앱
 
 ## bootroot verify
 
-현재 미구현입니다.
+bootroot-agent를 one-shot으로 실행해 발급을 검증합니다.
+
+### 입력
+
+- `--app-kind`: 앱 종류 식별자
+- `--agent-config`: bootroot-agent 설정 경로 (선택, 기본은 등록된 값)
+
+### 출력
+
+- cert/key 존재 여부
+- 검증 결과 요약
+
+### 실패
+
+- bootroot-agent 실행 실패
+- cert/key 파일 누락
