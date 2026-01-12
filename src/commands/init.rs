@@ -21,24 +21,34 @@ const DEFAULT_CA_NAME: &str = "Bootroot CA";
 const DEFAULT_CA_PROVISIONER: &str = "admin";
 const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca";
 const DEFAULT_CA_ADDRESS: &str = ":9000";
-pub(crate) const INIT_SECRET_SHARES: u8 = 3;
-pub(crate) const INIT_SECRET_THRESHOLD: u8 = 2;
-const TOKEN_TTL: &str = "1h";
-const SECRET_ID_TTL: &str = "24h";
 const SECRET_BYTES: usize = 32;
 
-const POLICY_BOOTROOT_AGENT: &str = "bootroot-agent";
-const POLICY_BOOTROOT_RESPONDER: &str = "bootroot-responder";
-const POLICY_BOOTROOT_STEPCA: &str = "bootroot-stepca";
+mod openbao_constants {
+    pub(crate) const INIT_SECRET_SHARES: u8 = 3;
+    pub(crate) const INIT_SECRET_THRESHOLD: u8 = 2;
+    pub(crate) const TOKEN_TTL: &str = "1h";
+    pub(crate) const SECRET_ID_TTL: &str = "24h";
 
-const APPROLE_BOOTROOT_AGENT: &str = "bootroot-agent-role";
-const APPROLE_BOOTROOT_RESPONDER: &str = "bootroot-responder-role";
-const APPROLE_BOOTROOT_STEPCA: &str = "bootroot-stepca-role";
+    pub(crate) const POLICY_BOOTROOT_AGENT: &str = "bootroot-agent";
+    pub(crate) const POLICY_BOOTROOT_RESPONDER: &str = "bootroot-responder";
+    pub(crate) const POLICY_BOOTROOT_STEPCA: &str = "bootroot-stepca";
 
-pub(crate) const PATH_STEPCA_PASSWORD: &str = "bootroot/stepca/password";
-pub(crate) const PATH_STEPCA_DB: &str = "bootroot/stepca/db";
-pub(crate) const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
-pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
+    pub(crate) const APPROLE_BOOTROOT_AGENT: &str = "bootroot-agent-role";
+    pub(crate) const APPROLE_BOOTROOT_RESPONDER: &str = "bootroot-responder-role";
+    pub(crate) const APPROLE_BOOTROOT_STEPCA: &str = "bootroot-stepca-role";
+
+    pub(crate) const PATH_STEPCA_PASSWORD: &str = "bootroot/stepca/password";
+    pub(crate) const PATH_STEPCA_DB: &str = "bootroot/stepca/db";
+    pub(crate) const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
+    pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
+}
+
+pub(crate) use openbao_constants::{
+    APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_STEPCA,
+    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
+    PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER, POLICY_BOOTROOT_STEPCA,
+    SECRET_ID_TTL, TOKEN_TTL,
+};
 
 pub(crate) async fn run_init(args: &InitArgs) -> Result<()> {
     ensure_infra_ready(&args.compose_file)?;
