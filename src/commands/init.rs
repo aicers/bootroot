@@ -9,6 +9,7 @@ use bootroot::openbao::{InitResponse, OpenBaoClient};
 use serde::Serialize;
 
 use crate::InitArgs;
+use crate::cli::output::print_init_summary;
 use crate::commands::infra::{ensure_infra_ready, run_docker};
 
 pub(crate) const DEFAULT_OPENBAO_URL: &str = "http://localhost:8200";
@@ -20,8 +21,8 @@ const DEFAULT_CA_NAME: &str = "Bootroot CA";
 const DEFAULT_CA_PROVISIONER: &str = "admin";
 const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca";
 const DEFAULT_CA_ADDRESS: &str = ":9000";
-const INIT_SECRET_SHARES: u8 = 3;
-const INIT_SECRET_THRESHOLD: u8 = 2;
+pub(crate) const INIT_SECRET_SHARES: u8 = 3;
+pub(crate) const INIT_SECRET_THRESHOLD: u8 = 2;
 const TOKEN_TTL: &str = "1h";
 const SECRET_ID_TTL: &str = "24h";
 const SECRET_BYTES: usize = 32;
@@ -34,10 +35,10 @@ const APPROLE_BOOTROOT_AGENT: &str = "bootroot-agent-role";
 const APPROLE_BOOTROOT_RESPONDER: &str = "bootroot-responder-role";
 const APPROLE_BOOTROOT_STEPCA: &str = "bootroot-stepca-role";
 
-const PATH_STEPCA_PASSWORD: &str = "bootroot/stepca/password";
-const PATH_STEPCA_DB: &str = "bootroot/stepca/db";
-const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
-const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
+pub(crate) const PATH_STEPCA_PASSWORD: &str = "bootroot/stepca/password";
+pub(crate) const PATH_STEPCA_DB: &str = "bootroot/stepca/db";
+pub(crate) const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
+pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
 
 pub(crate) async fn run_init(args: &InitArgs) -> Result<()> {
     ensure_infra_ready(&args.compose_file)?;
@@ -654,142 +655,37 @@ fn rollback_file(file: &RollbackFile) -> Result<()> {
     Ok(())
 }
 
-struct InitSummary {
-    openbao_url: String,
-    kv_mount: String,
-    secrets_dir: PathBuf,
-    show_secrets: bool,
-    init_response: bool,
-    root_token: String,
-    unseal_keys: Vec<String>,
-    approles: Vec<AppRoleOutput>,
-    stepca_password: String,
-    db_dsn: String,
-    http_hmac: String,
-    eab: Option<EabCredentials>,
-    step_ca_result: StepCaInitResult,
+pub(crate) struct InitSummary {
+    pub(crate) openbao_url: String,
+    pub(crate) kv_mount: String,
+    pub(crate) secrets_dir: PathBuf,
+    pub(crate) show_secrets: bool,
+    pub(crate) init_response: bool,
+    pub(crate) root_token: String,
+    pub(crate) unseal_keys: Vec<String>,
+    pub(crate) approles: Vec<AppRoleOutput>,
+    pub(crate) stepca_password: String,
+    pub(crate) db_dsn: String,
+    pub(crate) http_hmac: String,
+    pub(crate) eab: Option<EabCredentials>,
+    pub(crate) step_ca_result: StepCaInitResult,
 }
 
-fn print_init_summary(summary: &InitSummary) {
-    println!("bootroot init: summary");
-    println!("- OpenBao URL: {}", summary.openbao_url);
-    println!("- KV mount: {}", summary.kv_mount);
-    println!("- Secrets dir: {}", summary.secrets_dir.display());
-    match summary.step_ca_result {
-        StepCaInitResult::Initialized => println!("- step-ca init: completed"),
-        StepCaInitResult::Skipped => println!("- step-ca init: skipped (already initialized)"),
-    }
-
-    if summary.init_response {
-        println!(
-            "- OpenBao init: completed (shares={INIT_SECRET_SHARES}, threshold={INIT_SECRET_THRESHOLD})",
-        );
-    } else {
-        println!("- OpenBao init: skipped (already initialized)");
-    }
-
-    println!(
-        "- root token: {}",
-        display_secret(&summary.root_token, summary.show_secrets)
-    );
-
-    if !summary.unseal_keys.is_empty() {
-        for (idx, key) in summary.unseal_keys.iter().enumerate() {
-            println!(
-                "- unseal key {}: {}",
-                idx + 1,
-                display_secret(key, summary.show_secrets)
-            );
-        }
-    }
-
-    println!(
-        "- step-ca password: {}",
-        display_secret(&summary.stepca_password, summary.show_secrets)
-    );
-    println!(
-        "- db dsn: {}",
-        display_secret(&summary.db_dsn, summary.show_secrets)
-    );
-    println!(
-        "- responder hmac: {}",
-        display_secret(&summary.http_hmac, summary.show_secrets)
-    );
-    if let Some(eab) = summary.eab.as_ref() {
-        println!(
-            "- eab kid: {}",
-            display_secret(&eab.kid, summary.show_secrets)
-        );
-        println!(
-            "- eab hmac: {}",
-            display_secret(&eab.hmac, summary.show_secrets)
-        );
-    } else {
-        println!("- eab: not configured");
-    }
-
-    println!("- OpenBao KV paths:");
-    println!("  - {PATH_STEPCA_PASSWORD}");
-    println!("  - {PATH_STEPCA_DB}");
-    println!("  - {PATH_RESPONDER_HMAC}");
-    println!("  - {PATH_AGENT_EAB}");
-
-    println!("- AppRoles:");
-    for role in &summary.approles {
-        println!("  - {} ({})", role.label, role.role_name);
-        println!(
-            "    role_id: {}",
-            display_secret(&role.role_id, summary.show_secrets)
-        );
-        println!(
-            "    secret_id: {}",
-            display_secret(&role.secret_id, summary.show_secrets)
-        );
-    }
-
-    println!("next steps:");
-    println!("  - Configure OpenBao Agent templates for step-ca, responder, and bootroot-agent.");
-    println!("  - Start or reload step-ca and responder to consume rendered secrets.");
-    println!("  - Run `bootroot status` to verify services.");
-    if summary.eab.is_none() {
-        println!(
-            "  - If you need ACME EAB, store kid/hmac at {PATH_AGENT_EAB} or rerun with --eab-kid/--eab-hmac."
-        );
-    }
-}
-
-fn display_secret(value: &str, show_secrets: bool) -> String {
-    if show_secrets {
-        value.to_string()
-    } else {
-        mask_value(value)
-    }
-}
-
-fn mask_value(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() <= 4 {
-        "****".to_string()
-    } else {
-        format!("****{}", &trimmed[trimmed.len() - 4..])
-    }
-}
-
-struct AppRoleOutput {
-    label: String,
-    role_name: String,
-    role_id: String,
-    secret_id: String,
+pub(crate) struct AppRoleOutput {
+    pub(crate) label: String,
+    pub(crate) role_name: String,
+    pub(crate) role_id: String,
+    pub(crate) secret_id: String,
 }
 
 #[derive(Debug, Clone)]
-struct EabCredentials {
-    kid: String,
-    hmac: String,
+pub(crate) struct EabCredentials {
+    pub(crate) kid: String,
+    pub(crate) hmac: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StepCaInitResult {
+pub(crate) enum StepCaInitResult {
     Initialized,
     Skipped,
 }
@@ -837,12 +733,6 @@ mod tests {
             eab_kid: None,
             eab_hmac: None,
         }
-    }
-
-    #[test]
-    fn test_display_secret_masks_when_hidden() {
-        assert_eq!(display_secret("supersecret", false), "****cret");
-        assert_eq!(display_secret("showme", true), "showme");
     }
 
     #[test]
