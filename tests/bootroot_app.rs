@@ -19,6 +19,10 @@ async fn test_app_add_writes_state_and_secret() {
 
     let temp_dir = tempdir().expect("create temp dir");
     let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
@@ -34,6 +38,16 @@ async fn test_app_add_writes_state_and_secret() {
             "daemon",
             "--hostname",
             "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
             "--notes",
             "primary",
             "--root-token",
@@ -52,6 +66,8 @@ async fn test_app_add_writes_state_and_secret() {
     let contents = fs::read_to_string(&state_path).expect("read state.json");
     let value: serde_json::Value = serde_json::from_str(&contents).expect("parse state.json");
     assert!(value["apps"]["edge-proxy"].is_object());
+    assert_eq!(value["apps"]["edge-proxy"]["domain"], "trusted.domain");
+    assert_eq!(value["apps"]["edge-proxy"]["instance_id"], "001");
 
     let secret_path = temp_dir
         .path()
@@ -76,6 +92,10 @@ async fn test_app_add_rejects_duplicate() {
 
     let temp_dir = tempdir().expect("create temp dir");
     let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
@@ -91,6 +111,16 @@ async fn test_app_add_rejects_duplicate() {
             "daemon",
             "--hostname",
             "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
             "--root-token",
             ROOT_TOKEN,
         ])
@@ -108,6 +138,16 @@ async fn test_app_add_rejects_duplicate() {
             "daemon",
             "--hostname",
             "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
             "--root-token",
             ROOT_TOKEN,
         ])
@@ -136,6 +176,7 @@ async fn test_app_info_prints_summary() {
     assert!(output.status.success());
     assert!(stdout.contains("bootroot app info: summary"));
     assert!(stdout.contains("- app kind: edge-proxy"));
+    assert!(stdout.contains("- domain: trusted.domain"));
     assert!(stdout.contains("- secret_id path: (hidden)"));
 }
 
@@ -180,6 +221,11 @@ fn write_state_with_app(root: &std::path::Path) {
         "app_kind": "edge-proxy",
         "deploy_type": "daemon",
         "hostname": "edge-node-01",
+        "domain": "trusted.domain",
+        "agent_config_path": "agent.toml",
+        "cert_path": "certs/edge-proxy.crt",
+        "key_path": "certs/edge-proxy.key",
+        "instance_id": "001",
         "notes": "primary",
         "approle": {
             "role_name": "bootroot-app-edge-proxy",

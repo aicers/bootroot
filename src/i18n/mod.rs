@@ -3,8 +3,29 @@ use anyhow::{Context, Result};
 pub(crate) mod en;
 pub(crate) mod ko;
 
+pub(crate) struct AppNextStepsDaemon<'a> {
+    pub(crate) app_kind: &'a str,
+    pub(crate) instance_id: &'a str,
+    pub(crate) hostname: &'a str,
+    pub(crate) domain: &'a str,
+    pub(crate) cert_path: &'a str,
+    pub(crate) key_path: &'a str,
+    pub(crate) config_path: &'a str,
+}
+
+pub(crate) struct AppNextStepsDocker<'a> {
+    pub(crate) app_kind: &'a str,
+    pub(crate) container_name: &'a str,
+    pub(crate) hostname: &'a str,
+    pub(crate) domain: &'a str,
+    pub(crate) cert_path: &'a str,
+    pub(crate) key_path: &'a str,
+    pub(crate) config_path: &'a str,
+    pub(crate) role_name: &'a str,
+    pub(crate) secret_id_path: &'a str,
+}
+
 pub(crate) struct Strings {
-    pub(crate) not_implemented_verify: &'static str,
     pub(crate) infra_up_completed: &'static str,
     pub(crate) infra_readiness_summary: &'static str,
     pub(crate) infra_entry_with_health: &'static str,
@@ -32,18 +53,37 @@ pub(crate) struct Strings {
     pub(crate) error_state_missing: &'static str,
     pub(crate) error_app_duplicate: &'static str,
     pub(crate) error_app_not_found: &'static str,
+    pub(crate) error_app_instance_id_required: &'static str,
+    pub(crate) error_app_container_name_required: &'static str,
     pub(crate) app_add_summary: &'static str,
     pub(crate) app_info_summary: &'static str,
     pub(crate) app_summary_kind: &'static str,
     pub(crate) app_summary_deploy_type: &'static str,
     pub(crate) app_summary_hostname: &'static str,
+    pub(crate) app_summary_domain: &'static str,
+    pub(crate) app_summary_instance_id: &'static str,
+    pub(crate) app_summary_container_name: &'static str,
     pub(crate) app_summary_notes: &'static str,
     pub(crate) app_summary_policy: &'static str,
     pub(crate) app_summary_approle: &'static str,
     pub(crate) app_summary_secret_path: &'static str,
     pub(crate) app_summary_secret_path_hidden: &'static str,
+    pub(crate) app_summary_openbao_path: &'static str,
+    pub(crate) app_summary_agent_config: &'static str,
+    pub(crate) app_summary_cert_path: &'static str,
+    pub(crate) app_summary_key_path: &'static str,
     pub(crate) app_summary_next_steps: &'static str,
-    pub(crate) app_next_steps_use_approle: &'static str,
+    pub(crate) app_next_steps_daemon_profile: &'static str,
+    pub(crate) app_next_steps_docker_sidecar: &'static str,
+    pub(crate) verify_summary_title: &'static str,
+    pub(crate) verify_app_kind: &'static str,
+    pub(crate) verify_agent_config: &'static str,
+    pub(crate) verify_cert_path: &'static str,
+    pub(crate) verify_key_path: &'static str,
+    pub(crate) verify_result_ok: &'static str,
+    pub(crate) verify_agent_failed: &'static str,
+    pub(crate) verify_missing_cert: &'static str,
+    pub(crate) verify_missing_key: &'static str,
     pub(crate) status_summary_title: &'static str,
     pub(crate) status_section_infra: &'static str,
     pub(crate) status_section_openbao: &'static str,
@@ -124,10 +164,6 @@ impl Messages {
     pub(crate) fn new(lang: &str) -> Result<Self> {
         let locale = Locale::parse(lang)?;
         Ok(Self { locale })
-    }
-
-    pub(crate) fn not_implemented_verify(&self) -> &'static str {
-        self.strings().not_implemented_verify
     }
 
     pub(crate) fn infra_up_completed(&self) -> &'static str {
@@ -257,6 +293,14 @@ impl Messages {
         format_template(self.strings().error_app_not_found, &[("value", app_kind)])
     }
 
+    pub(crate) fn error_app_instance_id_required(&self) -> &'static str {
+        self.strings().error_app_instance_id_required
+    }
+
+    pub(crate) fn error_app_container_name_required(&self) -> &'static str {
+        self.strings().error_app_container_name_required
+    }
+
     pub(crate) fn app_add_summary(&self) -> &'static str {
         self.strings().app_add_summary
     }
@@ -275,6 +319,21 @@ impl Messages {
 
     pub(crate) fn app_summary_hostname(&self, value: &str) -> String {
         format_template(self.strings().app_summary_hostname, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_domain(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_domain, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_instance_id(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_instance_id, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_container_name(&self, value: &str) -> String {
+        format_template(
+            self.strings().app_summary_container_name,
+            &[("value", value)],
+        )
     }
 
     pub(crate) fn app_summary_notes(&self, value: &str) -> String {
@@ -297,15 +356,92 @@ impl Messages {
         self.strings().app_summary_secret_path_hidden
     }
 
+    pub(crate) fn app_summary_openbao_path(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_openbao_path, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_agent_config(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_agent_config, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_cert_path(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_cert_path, &[("value", value)])
+    }
+
+    pub(crate) fn app_summary_key_path(&self, value: &str) -> String {
+        format_template(self.strings().app_summary_key_path, &[("value", value)])
+    }
+
     pub(crate) fn app_summary_next_steps(&self) -> &'static str {
         self.strings().app_summary_next_steps
     }
 
-    pub(crate) fn app_next_steps_use_approle(&self, value: &str) -> String {
+    pub(crate) fn app_next_steps_daemon_profile(&self, data: &AppNextStepsDaemon<'_>) -> String {
         format_template(
-            self.strings().app_next_steps_use_approle,
-            &[("value", value)],
+            self.strings().app_next_steps_daemon_profile,
+            &[
+                ("app_kind", data.app_kind),
+                ("instance_id", data.instance_id),
+                ("hostname", data.hostname),
+                ("domain", data.domain),
+                ("cert_path", data.cert_path),
+                ("key_path", data.key_path),
+                ("config_path", data.config_path),
+            ],
         )
+    }
+
+    pub(crate) fn app_next_steps_docker_sidecar(&self, data: &AppNextStepsDocker<'_>) -> String {
+        format_template(
+            self.strings().app_next_steps_docker_sidecar,
+            &[
+                ("app_kind", data.app_kind),
+                ("container_name", data.container_name),
+                ("hostname", data.hostname),
+                ("domain", data.domain),
+                ("cert_path", data.cert_path),
+                ("key_path", data.key_path),
+                ("config_path", data.config_path),
+                ("role_name", data.role_name),
+                ("secret_id_path", data.secret_id_path),
+            ],
+        )
+    }
+
+    pub(crate) fn verify_summary_title(&self) -> &'static str {
+        self.strings().verify_summary_title
+    }
+
+    pub(crate) fn verify_app_kind(&self, value: &str) -> String {
+        format_template(self.strings().verify_app_kind, &[("value", value)])
+    }
+
+    pub(crate) fn verify_agent_config(&self, value: &str) -> String {
+        format_template(self.strings().verify_agent_config, &[("value", value)])
+    }
+
+    pub(crate) fn verify_cert_path(&self, value: &str) -> String {
+        format_template(self.strings().verify_cert_path, &[("value", value)])
+    }
+
+    pub(crate) fn verify_key_path(&self, value: &str) -> String {
+        format_template(self.strings().verify_key_path, &[("value", value)])
+    }
+
+    pub(crate) fn verify_result_ok(&self) -> &'static str {
+        self.strings().verify_result_ok
+    }
+
+    pub(crate) fn verify_agent_failed(&self) -> &'static str {
+        self.strings().verify_agent_failed
+    }
+
+    pub(crate) fn verify_missing_cert(&self, value: &str) -> String {
+        format_template(self.strings().verify_missing_cert, &[("value", value)])
+    }
+
+    pub(crate) fn verify_missing_key(&self, value: &str) -> String {
+        format_template(self.strings().verify_missing_key, &[("value", value)])
     }
 
     pub(crate) fn status_summary_title(&self) -> &'static str {

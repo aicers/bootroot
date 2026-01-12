@@ -34,7 +34,7 @@ enum CliCommand {
     Status(Box<StatusArgs>),
     #[command(subcommand)]
     App(AppCommand),
-    Verify,
+    Verify(VerifyArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -44,7 +44,7 @@ enum InfraCommand {
 
 #[derive(Subcommand, Debug)]
 enum AppCommand {
-    Add(AppAddArgs),
+    Add(Box<AppAddArgs>),
     Info(AppInfoArgs),
 }
 
@@ -168,16 +168,40 @@ pub(crate) struct StatusArgs {
 #[derive(Args, Debug)]
 pub(crate) struct AppAddArgs {
     /// App kind identifier
-    #[arg(long)]
+    #[arg(long, required = true)]
     app_kind: String,
 
     /// Deployment type (daemon or docker)
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, required = true)]
     deploy_type: DeployType,
 
     /// Hostname used for DNS SAN
-    #[arg(long)]
+    #[arg(long, required = true)]
     hostname: String,
+
+    /// DNS domain for SAN construction
+    #[arg(long, required = true)]
+    domain: String,
+
+    /// bootroot-agent config path
+    #[arg(long, required = true)]
+    agent_config: PathBuf,
+
+    /// Certificate output path
+    #[arg(long, required = true)]
+    cert_path: PathBuf,
+
+    /// Private key output path
+    #[arg(long, required = true)]
+    key_path: PathBuf,
+
+    /// Instance ID (required for daemon)
+    #[arg(long)]
+    instance_id: Option<String>,
+
+    /// Container name (required for docker)
+    #[arg(long)]
+    container_name: Option<String>,
 
     /// `OpenBao` root token
     #[arg(long, env = "OPENBAO_ROOT_TOKEN")]
@@ -191,8 +215,19 @@ pub(crate) struct AppAddArgs {
 #[derive(Args, Debug)]
 pub(crate) struct AppInfoArgs {
     /// App kind identifier
-    #[arg(long)]
+    #[arg(long, required = true)]
     app_kind: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct VerifyArgs {
+    /// App kind identifier
+    #[arg(long, required = true)]
+    app_kind: String,
+
+    /// bootroot-agent config path override
+    #[arg(long)]
+    agent_config: Option<PathBuf>,
 }
 
 fn main() {
@@ -228,7 +263,7 @@ fn run() -> Result<()> {
         CliCommand::App(AppCommand::Info(args)) => {
             commands::app::run_app_info(&args, &messages)?;
         }
-        CliCommand::Verify => commands::verify::run_verify(&messages),
+        CliCommand::Verify(args) => commands::verify::run_verify(&args, &messages)?,
     }
     Ok(())
 }

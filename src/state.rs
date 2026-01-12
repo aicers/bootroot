@@ -49,6 +49,14 @@ pub(crate) struct AppEntry {
     pub(crate) app_kind: String,
     pub(crate) deploy_type: DeployType,
     pub(crate) hostname: String,
+    pub(crate) domain: String,
+    pub(crate) agent_config_path: PathBuf,
+    pub(crate) cert_path: PathBuf,
+    pub(crate) key_path: PathBuf,
+    #[serde(default)]
+    pub(crate) instance_id: Option<String>,
+    #[serde(default)]
+    pub(crate) container_name: Option<String>,
     #[serde(default)]
     pub(crate) notes: Option<String>,
     pub(crate) approle: AppRoleEntry,
