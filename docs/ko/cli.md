@@ -129,7 +129,7 @@ bootroot status
 
 ### 입력
 
-- `--app-kind`: 앱 종류 식별자
+- `--service-name`: 서비스 이름 식별자
 - `--deploy-type`: 배포 타입 (`daemon` 또는 `docker`)
 - `--hostname`: DNS SAN에 사용할 호스트명
 - `--domain`: DNS SAN 루트 도메인
@@ -151,7 +151,7 @@ bootroot status
 ### 실패
 
 - `state.json` 누락
-- 중복된 `app-kind`
+- 중복된 `service-name`
 - daemon에 `instance-id` 누락
 - docker에 `container-name` 누락
 - OpenBao AppRole 생성 실패
@@ -162,7 +162,7 @@ bootroot status
 
 ### 입력
 
-- `--app-kind`: 앱 종류 식별자
+- `--service-name`: 서비스 이름 식별자
 
 ### 출력
 
@@ -179,7 +179,7 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다.
 
 ### 입력
 
-- `--app-kind`: 앱 종류 식별자
+- `--service-name`: 서비스 이름 식별자
 - `--agent-config`: bootroot-agent 설정 경로 (선택, 기본은 등록된 값)
 
 ### 출력

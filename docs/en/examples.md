@@ -45,7 +45,7 @@ Below are the full config files used by the Compose example.
    backoff_secs = [5, 10, 30]
 
    [[profiles]]
-   daemon_name = "bootroot-agent"
+   service_name = "bootroot-agent"
    instance_id = "001"
    hostname = "bootroot-agent"
 
@@ -125,7 +125,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "bootroot-agent"
+service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
 
@@ -218,7 +218,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "multi"
+service_name = "multi"
 instance_id = "201"
 hostname = "node-201"
 
@@ -227,7 +227,7 @@ cert = "certs/multi-201.crt"
 key = "certs/multi-201.key"
 
 [[profiles]]
-daemon_name = "multi"
+service_name = "multi"
 instance_id = "202"
 hostname = "node-202"
 
@@ -236,7 +236,7 @@ cert = "certs/multi-202.crt"
 key = "certs/multi-202.key"
 
 [[profiles]]
-daemon_name = "multi"
+service_name = "multi"
 instance_id = "203"
 hostname = "node-203"
 
@@ -292,7 +292,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "edge-proxy"
+service_name = "edge-proxy"
 instance_id = "101"
 hostname = "edge-node-01"
 
@@ -323,7 +323,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "edge-proxy"
+service_name = "edge-proxy"
 instance_id = "102"
 hostname = "edge-node-02"
 
@@ -354,7 +354,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "edge-proxy"
+service_name = "edge-proxy"
 instance_id = "103"
 hostname = "edge-node-03"
 
@@ -435,7 +435,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "split"
+service_name = "split"
 instance_id = "401"
 hostname = "edge-node-01"
 
@@ -466,7 +466,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "split"
+service_name = "split"
 instance_id = "402"
 hostname = "edge-node-02"
 

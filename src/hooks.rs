@@ -325,7 +325,7 @@ mod tests {
 
     fn build_settings(cert_path: PathBuf, hooks: HookSettings) -> (Settings, ProfileSettings) {
         let profile = ProfileSettings {
-            daemon_name: "edge-proxy".to_string(),
+            service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
             paths: Paths {

@@ -3,7 +3,7 @@
 ## 한 머신에서 여러 인증서를 발급할 수 있나요?
 
 가능합니다. `[[profiles]]`를 여러 개 정의하면 됩니다. 각 프로필은
-`instance_id.daemon_name.hostname.domain` 형식의 고유 신원을 가집니다.
+`instance_id.service_name.hostname.domain` 형식의 고유 신원을 가집니다.
 
 ## ACME에서 URI SAN을 넣을 수 있나요?
 

@@ -4,7 +4,7 @@
 
 Yes. Define multiple `[[profiles]]` entries. Each profile issues its own
 certificate and uses a distinct identity derived from
-`instance_id.daemon_name.hostname.domain`.
+`instance_id.service_name.hostname.domain`.
 
 ## Can I include URI SANs with ACME?
 

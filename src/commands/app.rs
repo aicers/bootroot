@@ -25,8 +25,8 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     }
     let mut state = StateFile::load(state_path)?;
 
-    if state.apps.contains_key(&args.app_kind) {
-        anyhow::bail!(messages.error_app_duplicate(&args.app_kind));
+    if state.apps.contains_key(&args.service_name) {
+        anyhow::bail!(messages.error_app_duplicate(&args.service_name));
     }
 
     validate_app_add(args, messages)?;
@@ -40,13 +40,13 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     client.set_token(root_token);
     client.ensure_approle_auth().await?;
 
-    let approle = ensure_app_approle(&client, &state, &args.app_kind).await?;
+    let approle = ensure_app_approle(&client, &state, &args.service_name).await?;
     let secrets_dir = state.secrets_dir();
     let secret_id_path =
-        write_secret_id_file(&secrets_dir, &args.app_kind, &approle.secret_id).await?;
+        write_secret_id_file(&secrets_dir, &args.service_name, &approle.secret_id).await?;
 
     let entry = AppEntry {
-        app_kind: args.app_kind.clone(),
+        service_name: args.service_name.clone(),
         deploy_type: args.deploy_type,
         hostname: args.hostname.clone(),
         domain: args.domain.clone(),
@@ -64,7 +64,7 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
         },
     };
 
-    state.apps.insert(args.app_kind.clone(), entry.clone());
+    state.apps.insert(args.service_name.clone(), entry.clone());
     state.save(state_path)?;
 
     print_app_add_summary(&entry, &secret_id_path, messages);
@@ -79,8 +79,8 @@ pub(crate) fn run_app_info(args: &AppInfoArgs, messages: &Messages) -> Result<()
     let state = StateFile::load(state_path)?;
     let entry = state
         .apps
-        .get(&args.app_kind)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&args.app_kind)))?;
+        .get(&args.service_name)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&args.service_name)))?;
     print_app_info_summary(entry, messages);
     Ok(())
 }
@@ -106,8 +106,8 @@ fn validate_app_add(args: &AppAddArgs, messages: &Messages) -> Result<()> {
     Ok(())
 }
 
-fn build_app_policy(kv_mount: &str, app_kind: &str) -> String {
-    let base = format!("{APP_KV_BASE}/{app_kind}");
+fn build_app_policy(kv_mount: &str, service_name: &str) -> String {
+    let base = format!("{APP_KV_BASE}/{service_name}");
     format!(
         r#"path "{kv_mount}/data/{base}/*" {{
   capabilities = ["read"]
@@ -121,10 +121,10 @@ path "{kv_mount}/metadata/{base}/*" {{
 
 async fn write_secret_id_file(
     secrets_dir: &Path,
-    app_kind: &str,
+    service_name: &str,
     secret_id: &str,
 ) -> Result<PathBuf> {
-    let app_dir = secrets_dir.join(APP_SECRET_DIR).join(app_kind);
+    let app_dir = secrets_dir.join(APP_SECRET_DIR).join(service_name);
     fs_util::ensure_secrets_dir(&app_dir).await?;
     let secret_path = app_dir.join(APP_SECRET_ID_FILENAME);
     fs::write(&secret_path, secret_id)
@@ -144,13 +144,13 @@ struct AppRoleMaterialized {
 async fn ensure_app_approle(
     client: &OpenBaoClient,
     state: &StateFile,
-    app_kind: &str,
+    service_name: &str,
 ) -> Result<AppRoleMaterialized> {
-    let policy_name = app_policy_name(app_kind);
-    let policy = build_app_policy(&state.kv_mount, app_kind);
+    let policy_name = app_policy_name(service_name);
+    let policy = build_app_policy(&state.kv_mount, service_name);
     client.write_policy(&policy_name, &policy).await?;
 
-    let role_name = app_role_name(app_kind);
+    let role_name = app_role_name(service_name);
     client
         .create_approle(
             &role_name,
@@ -170,10 +170,10 @@ async fn ensure_app_approle(
     })
 }
 
-fn app_role_name(app_kind: &str) -> String {
-    format!("{APPROLE_PREFIX}{app_kind}")
+fn app_role_name(service_name: &str) -> String {
+    format!("{APPROLE_PREFIX}{service_name}")
 }
 
-fn app_policy_name(app_kind: &str) -> String {
-    format!("{APPROLE_PREFIX}{app_kind}")
+fn app_policy_name(service_name: &str) -> String {
+    format!("{APPROLE_PREFIX}{service_name}")
 }

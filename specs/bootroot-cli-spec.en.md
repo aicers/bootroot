@@ -173,7 +173,7 @@ and recovery.
 
 ### Binary daemon (host-based)
 
-- Prompt: daemon name, instance_id, hostname, domain, cert/key paths.
+- Prompt: service name, instance_id, hostname, domain, cert/key paths.
 - Update bootroot-agent config `profiles[]` (per-daemon cert, no sharing).
 - Provide instructions to reload bootroot-agent.
 

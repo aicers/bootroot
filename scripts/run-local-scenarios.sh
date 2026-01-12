@@ -114,7 +114,7 @@ run_agent_expect_fail() {
 write_agent_config() {
   local cfg="$1"
   local instance_id="$2"
-  local daemon_name="$3"
+  local service_name="$3"
   local hostname="$4"
   local cert_path="$5"
   local key_path="$6"
@@ -140,7 +140,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "$daemon_name"
+service_name = "$service_name"
 instance_id = "$instance_id"
 hostname = "$hostname"
 
@@ -256,7 +256,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "bootroot-agent"
+service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
 
@@ -336,7 +336,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "multi"
+service_name = "multi"
 instance_id = "201"
 hostname = "node-201"
 
@@ -345,7 +345,7 @@ cert = "certs/multi-201.crt"
 key = "certs/multi-201.key"
 
 [[profiles]]
-daemon_name = "multi"
+service_name = "multi"
 instance_id = "202"
 hostname = "node-202"
 
@@ -354,7 +354,7 @@ cert = "certs/multi-202.crt"
 key = "certs/multi-202.key"
 
 [[profiles]]
-daemon_name = "multi"
+service_name = "multi"
 instance_id = "203"
 hostname = "node-203"
 
@@ -533,7 +533,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "bootroot-agent"
+service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
 
@@ -579,7 +579,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "bootroot-agent"
+service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
 
@@ -627,7 +627,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "bootroot-agent"
+service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
 
@@ -689,7 +689,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
-daemon_name = "bootroot-agent"
+service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
 

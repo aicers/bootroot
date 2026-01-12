@@ -86,7 +86,7 @@ the HTTP-01 responder. In Compose, `bootroot-http01` provides the
 `001.bootroot-agent.bootroot-agent.trusted.domain` alias. If you change
 `domain` in `agent.toml.compose`, update the alias in `docker-compose.yml` or
 map it in step-ca `/etc/hosts`. The recommended naming scheme is
-`<instance-id>.<daemon-name>.<hostname>.<domain>`.
+`<instance-id>.<service-name>.<hostname>.<domain>`.
 
 1. **Start Services**
 
@@ -186,7 +186,7 @@ Configure the renewal cadence in `agent.toml`:
 domain = "trusted.domain"
 
 [[profiles]]
-daemon_name = "edge-proxy"
+service_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
 
@@ -271,7 +271,7 @@ Responder flow notes:
   to `/.well-known/acme-challenge/<token>` with the key authorization.
 - ACME issuance accepts only DNS/IP identifiers; URI SANs are ignored.
 - DNS SAN is auto-generated as
-  `instance_id.daemon_name.hostname.domain` and must resolve (from step-ca) to
+  `instance_id.service_name.hostname.domain` and must resolve (from step-ca) to
   the HTTP-01 responder IP.
 - `retry.backoff_secs`: `[5, 10, 30]`
 - `scheduler.max_concurrent_issuances`: `3`
@@ -297,7 +297,7 @@ Validation rules:
 - `scheduler.max_concurrent_issuances` > 0
 - `profiles` is non-empty
 - `domain` is non-empty ASCII
-- `profiles[].daemon_name`, `profiles[].hostname` are non-empty
+- `profiles[].service_name`, `profiles[].hostname` are non-empty
 - `profiles[].instance_id` is numeric
 - `profiles[].paths.cert` and `profiles[].paths.key` are non-empty
 - `profiles[].retry.backoff_secs` values > 0 (when set)

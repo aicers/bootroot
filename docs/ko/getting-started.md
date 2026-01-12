@@ -13,7 +13,7 @@ CLI를 사용하는 경우 `docs/ko/cli.md`를 참고하세요. 이 문서는 **
     `001.bootroot-agent.bootroot-agent.trusted.domain` alias를 제공함
   - `domain` 값을 바꾸면 alias를 함께 바꾸거나 step-ca의 `/etc/hosts`에 매핑 필요
   - 자동 생성 형식:
-    `<instance-id>.<daemon-name>.<hostname>.<domain>`
+    `<instance-id>.<service-name>.<hostname>.<domain>`
 
 ## 빠른 실행(Compose)
 

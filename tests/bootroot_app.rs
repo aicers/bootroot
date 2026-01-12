@@ -32,7 +32,7 @@ async fn test_app_add_writes_state_and_secret() {
         .args([
             "app",
             "add",
-            "--app-kind",
+            "--service-name",
             "edge-proxy",
             "--deploy-type",
             "daemon",
@@ -59,7 +59,7 @@ async fn test_app_add_writes_state_and_secret() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     assert!(stdout.contains("bootroot app add: summary"));
-    assert!(stdout.contains("- app kind: edge-proxy"));
+    assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- deploy type: daemon"));
 
     let state_path = temp_dir.path().join("state.json");
@@ -105,7 +105,7 @@ async fn test_app_add_rejects_duplicate() {
         .args([
             "app",
             "add",
-            "--app-kind",
+            "--service-name",
             "edge-proxy",
             "--deploy-type",
             "daemon",
@@ -132,7 +132,7 @@ async fn test_app_add_rejects_duplicate() {
         .args([
             "app",
             "add",
-            "--app-kind",
+            "--service-name",
             "edge-proxy",
             "--deploy-type",
             "daemon",
@@ -168,14 +168,14 @@ async fn test_app_info_prints_summary() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["app", "info", "--app-kind", "edge-proxy"])
+        .args(["app", "info", "--service-name", "edge-proxy"])
         .output()
         .expect("run app info");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     assert!(stdout.contains("bootroot app info: summary"));
-    assert!(stdout.contains("- app kind: edge-proxy"));
+    assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- domain: trusted.domain"));
     assert!(stdout.contains("- secret_id path: (hidden)"));
 }
@@ -187,7 +187,7 @@ fn test_app_info_missing_state_file() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["app", "info", "--app-kind", "edge-proxy"])
+        .args(["app", "info", "--service-name", "edge-proxy"])
         .output()
         .expect("run app info");
 
@@ -218,7 +218,7 @@ fn write_state_with_app(root: &std::path::Path) {
     let contents = fs::read_to_string(&state_path).expect("read state");
     let mut value: serde_json::Value = serde_json::from_str(&contents).expect("parse state");
     value["apps"]["edge-proxy"] = json!({
-        "app_kind": "edge-proxy",
+        "service_name": "edge-proxy",
         "deploy_type": "daemon",
         "hostname": "edge-node-01",
         "domain": "trusted.domain",
@@ -241,8 +241,8 @@ fn write_state_with_app(root: &std::path::Path) {
     .expect("write state");
 }
 
-async fn stub_app_add_openbao(server: &MockServer, app_kind: &str) {
-    let role = format!("bootroot-app-{app_kind}");
+async fn stub_app_add_openbao(server: &MockServer, service_name: &str) {
+    let role = format!("bootroot-app-{service_name}");
     Mock::given(method("GET"))
         .and(path("/v1/sys/auth"))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
@@ -272,7 +272,7 @@ async fn stub_app_add_openbao(server: &MockServer, app_kind: &str) {
         .and(path(format!("/v1/auth/approle/role/{role}/role-id")))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "role_id": format!("role-{app_kind}") }
+            "data": { "role_id": format!("role-{service_name}") }
         })))
         .mount(server)
         .await;
@@ -281,7 +281,7 @@ async fn stub_app_add_openbao(server: &MockServer, app_kind: &str) {
         .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "secret_id": format!("secret-{app_kind}") }
+            "data": { "secret_id": format!("secret-{service_name}") }
         })))
         .mount(server)
         .await;

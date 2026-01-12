@@ -23,7 +23,7 @@ pub struct Settings {
 pub fn profile_domain(settings: &Settings, profile: &ProfileSettings) -> String {
     format!(
         "{}.{}.{}.{}",
-        profile.instance_id, profile.daemon_name, profile.hostname, settings.domain
+        profile.instance_id, profile.service_name, profile.hostname, settings.domain
     )
 }
 
@@ -41,7 +41,7 @@ pub struct Eab {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProfileSettings {
-    pub daemon_name: String,
+    pub service_name: String,
     pub instance_id: String,
     pub hostname: String,
     pub paths: Paths,
@@ -331,14 +331,14 @@ impl Settings {
     }
 
     fn validate_profile(profile: &ProfileSettings) -> Result<()> {
-        if profile.daemon_name.trim().is_empty() {
-            anyhow::bail!("profiles.daemon_name must not be empty");
+        if profile.service_name.trim().is_empty() {
+            anyhow::bail!("profiles.service_name must not be empty");
         }
         if profile.hostname.trim().is_empty() {
             anyhow::bail!("profiles.hostname must not be empty");
         }
-        if !profile.daemon_name.is_ascii() {
-            anyhow::bail!("profiles.daemon_name must be ASCII");
+        if !profile.service_name.is_ascii() {
+            anyhow::bail!("profiles.service_name must be ASCII");
         }
         if !profile.hostname.is_ascii() {
             anyhow::bail!("profiles.hostname must be ASCII");
@@ -420,7 +420,7 @@ mod tests {
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
-            daemon_name = "edge-proxy"
+            service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
 
@@ -479,7 +479,7 @@ mod tests {
             domain = "example.internal"
 
             [[profiles]]
-            daemon_name = "edge-proxy"
+            service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
 
@@ -509,7 +509,7 @@ mod tests {
             domain = "example.internal"
 
             [[profiles]]
-            daemon_name = "edge-proxy"
+            service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
 
