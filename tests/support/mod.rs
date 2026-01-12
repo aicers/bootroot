@@ -1,3 +1,7 @@
+// Helper functions are shared across multiple test crates; not every helper is
+// referenced in each test module.
+#![allow(dead_code)]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

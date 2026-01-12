@@ -26,6 +26,14 @@ pub struct SealStatus {
     pub t: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvMountStatus {
+    Missing,
+    NotKv,
+    NotV2,
+    Ok,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct InitResponse {
     #[serde(default)]
@@ -389,6 +397,24 @@ impl OpenBaoClient {
     pub async fn kv_exists(&self, mount: &str, path: &str) -> Result<bool> {
         self.resource_exists(&format!("{mount}/metadata/{path}"))
             .await
+    }
+
+    /// Checks the status of a KV v2 mount.
+    ///
+    /// # Errors
+    /// Returns an error if the mount lookup fails unexpectedly.
+    pub async fn kv_mount_status(&self, mount: &str) -> Result<KvMountStatus> {
+        let Some(data) = self.get_mount(mount).await? else {
+            return Ok(KvMountStatus::Missing);
+        };
+        if data.mount_type != "kv" {
+            return Ok(KvMountStatus::NotKv);
+        }
+        let version = data.options.and_then(|opt| opt.version);
+        if version.as_deref() != Some("2") {
+            return Ok(KvMountStatus::NotV2);
+        }
+        Ok(KvMountStatus::Ok)
     }
 
     /// Deletes KV v2 secret metadata and all versions.

@@ -1,5 +1,225 @@
+use anyhow::Result;
+use bootroot::openbao::{KvMountStatus, OpenBaoClient};
+
+use crate::StatusArgs;
+use crate::commands::infra::{ContainerReadiness, collect_readiness, default_infra_services};
+use crate::commands::init::{
+    PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
+};
 use crate::i18n::Messages;
 
-pub(crate) fn run_status(messages: &Messages) {
-    println!("{}", messages.not_implemented_status());
+pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result<()> {
+    let services = default_infra_services();
+    let readiness = collect_readiness(&args.compose_file, &services, messages)?;
+    let infra_failures = collect_infra_failures(&readiness);
+
+    let mut client = OpenBaoClient::new(&args.openbao_url)?;
+    let openbao_health = client.health_check().await;
+    let openbao_ok = openbao_health.is_ok();
+    let seal_status = if openbao_ok {
+        Some(client.seal_status().await?)
+    } else {
+        None
+    };
+
+    if let Some(token) = args.root_token.clone() {
+        client.set_token(token);
+    }
+
+    let kv_mount_status = if openbao_ok && args.root_token.is_some() {
+        Some(client.kv_mount_status(&args.kv_mount).await?)
+    } else {
+        None
+    };
+
+    let kv_paths = [
+        PATH_STEPCA_PASSWORD,
+        PATH_STEPCA_DB,
+        PATH_RESPONDER_HMAC,
+        PATH_AGENT_EAB,
+    ];
+    let kv_statuses = if openbao_ok && args.root_token.is_some() {
+        Some(fetch_kv_statuses(&client, &args.kv_mount, &kv_paths).await?)
+    } else {
+        None
+    };
+
+    let approles = [
+        "bootroot-agent-role",
+        "bootroot-responder-role",
+        "bootroot-stepca-role",
+    ];
+    let approle_statuses = if openbao_ok && args.root_token.is_some() {
+        Some(fetch_approle_statuses(&client, &approles).await?)
+    } else {
+        None
+    };
+
+    let summary = StatusSummary {
+        readiness: &readiness,
+        openbao_ok,
+        sealed: seal_status.map(|status| status.sealed),
+        kv_mount: &args.kv_mount,
+        kv_mount_status,
+        kv_statuses: kv_statuses.as_deref(),
+        approle_statuses: approle_statuses.as_deref(),
+    };
+    print_status_summary(messages, &summary);
+
+    if !infra_failures.is_empty() {
+        anyhow::bail!(messages.status_error_infra_unhealthy(&infra_failures.join(", ")));
+    }
+    if !openbao_ok {
+        anyhow::bail!(messages.status_error_openbao_unreachable());
+    }
+
+    Ok(())
+}
+
+fn collect_infra_failures(readiness: &[ContainerReadiness]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for entry in readiness {
+        if entry.status != "running" {
+            failures.push(format!("{} status={}", entry.service, entry.status));
+            continue;
+        }
+        if let Some(health) = entry.health.as_deref()
+            && health != "healthy"
+        {
+            failures.push(format!("{} health={}", entry.service, health));
+        }
+    }
+    failures
+}
+
+async fn fetch_kv_statuses(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    paths: &[&str],
+) -> Result<Vec<(String, bool)>> {
+    let mut statuses = Vec::with_capacity(paths.len());
+    for path in paths {
+        let exists = client.kv_exists(kv_mount, path).await?;
+        statuses.push((format!("{kv_mount}/{path}"), exists));
+    }
+    Ok(statuses)
+}
+
+async fn fetch_approle_statuses(
+    client: &OpenBaoClient,
+    roles: &[&str],
+) -> Result<Vec<(String, bool)>> {
+    let mut statuses = Vec::with_capacity(roles.len());
+    for role in roles {
+        let exists = client.approle_exists(role).await?;
+        statuses.push((role.to_string(), exists));
+    }
+    Ok(statuses)
+}
+
+struct StatusSummary<'a> {
+    readiness: &'a [ContainerReadiness],
+    openbao_ok: bool,
+    sealed: Option<bool>,
+    kv_mount: &'a str,
+    kv_mount_status: Option<KvMountStatus>,
+    kv_statuses: Option<&'a [(String, bool)]>,
+    approle_statuses: Option<&'a [(String, bool)]>,
+}
+
+fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
+    println!("{}", messages.status_summary_title());
+    println!("{}", messages.status_section_infra());
+    for entry in summary.readiness {
+        match entry.health.as_deref() {
+            Some(health) => println!(
+                "{}",
+                messages.status_infra_entry_with_health(&entry.service, &entry.status, health)
+            ),
+            None => println!(
+                "{}",
+                messages.status_infra_entry_without_health(&entry.service, &entry.status)
+            ),
+        }
+    }
+
+    println!("{}", messages.status_section_openbao());
+    let health_value = if summary.openbao_ok {
+        messages.status_value_ok()
+    } else {
+        messages.status_value_unreachable()
+    };
+    println!("{}", messages.status_openbao_health(health_value));
+    if let Some(sealed) = summary.sealed {
+        println!("{}", messages.status_openbao_sealed(&sealed.to_string()));
+    } else {
+        println!(
+            "{}",
+            messages.status_openbao_sealed(messages.status_value_unknown())
+        );
+    }
+
+    let kv_mount_value = match summary.kv_mount_status {
+        Some(KvMountStatus::Ok) => messages.status_value_ok(),
+        Some(KvMountStatus::Missing) => messages.status_value_missing(),
+        Some(KvMountStatus::NotKv | KvMountStatus::NotV2) => messages.status_value_invalid(),
+        None => messages.status_value_unknown(),
+    };
+    println!(
+        "{}",
+        messages.status_openbao_kv_mount(summary.kv_mount, kv_mount_value)
+    );
+
+    println!("{}", messages.status_section_kv_paths());
+    if let Some(statuses) = summary.kv_statuses {
+        for (path, present) in statuses {
+            let value = if path.ends_with(PATH_AGENT_EAB) {
+                if *present {
+                    messages.status_value_present()
+                } else {
+                    messages.status_value_optional_missing()
+                }
+            } else if *present {
+                messages.status_value_present()
+            } else {
+                messages.status_value_missing()
+            };
+            println!("{}", messages.status_kv_path_entry(path, value));
+        }
+    } else {
+        for path in [
+            format!("{}/{PATH_STEPCA_PASSWORD}", summary.kv_mount),
+            format!("{}/{PATH_STEPCA_DB}", summary.kv_mount),
+            format!("{}/{PATH_RESPONDER_HMAC}", summary.kv_mount),
+            format!("{}/{PATH_AGENT_EAB}", summary.kv_mount),
+        ] {
+            println!(
+                "{}",
+                messages.status_kv_path_entry(&path, messages.status_value_unknown())
+            );
+        }
+    }
+
+    println!("{}", messages.status_section_approles());
+    if let Some(statuses) = summary.approle_statuses {
+        for (role, present) in statuses {
+            let value = if *present {
+                messages.status_value_present()
+            } else {
+                messages.status_value_missing()
+            };
+            println!("{}", messages.status_approle_entry(role, value));
+        }
+    } else {
+        for role in [
+            "bootroot-agent-role",
+            "bootroot-responder-role",
+            "bootroot-stepca-role",
+        ] {
+            println!(
+                "{}",
+                messages.status_approle_entry(role, messages.status_value_unknown())
+            );
+        }
+    }
 }

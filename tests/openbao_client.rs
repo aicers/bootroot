@@ -1,4 +1,4 @@
-use bootroot::openbao::OpenBaoClient;
+use bootroot::openbao::{KvMountStatus, OpenBaoClient};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -115,6 +115,101 @@ async fn kv_exists_returns_false_on_404() {
         .await
         .expect("kv_exists should succeed");
     assert!(!exists);
+}
+
+#[tokio::test]
+async fn kv_mount_status_returns_missing_on_404() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/mounts/secret"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let status = client
+        .kv_mount_status("secret")
+        .await
+        .expect("kv_mount_status should succeed");
+    assert_eq!(status, KvMountStatus::Missing);
+}
+
+#[tokio::test]
+async fn kv_mount_status_returns_ok_for_kv_v2() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/mounts/secret"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "type": "kv",
+                "options": {
+                    "version": "2"
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let status = client
+        .kv_mount_status("secret")
+        .await
+        .expect("kv_mount_status should succeed");
+    assert_eq!(status, KvMountStatus::Ok);
+}
+
+#[tokio::test]
+async fn kv_mount_status_returns_not_kv() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/mounts/secret"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "type": "transit",
+                "options": {}
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let status = client
+        .kv_mount_status("secret")
+        .await
+        .expect("kv_mount_status should succeed");
+    assert_eq!(status, KvMountStatus::NotKv);
+}
+
+#[tokio::test]
+async fn kv_mount_status_returns_not_v2() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/mounts/secret"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "type": "kv",
+                "options": {
+                    "version": "1"
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let status = client
+        .kv_mount_status("secret")
+        .await
+        .expect("kv_mount_status should succeed");
+    assert_eq!(status, KvMountStatus::NotV2);
 }
 
 #[tokio::test]
