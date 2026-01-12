@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
+mod cli;
 mod commands;
 
 use crate::commands::init::{
