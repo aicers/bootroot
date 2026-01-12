@@ -321,7 +321,7 @@ fn prompt_unseal_keys(threshold: Option<u32>, messages: &Messages) -> Result<Vec
             let input = prompt_text(messages.prompt_unseal_threshold())?;
             input
                 .parse::<u32>()
-                .context("Invalid unseal threshold value")?
+                .context(messages.error_invalid_unseal_threshold())?
         }
     };
     let mut keys = Vec::with_capacity(count as usize);
@@ -371,7 +371,7 @@ fn resolve_db_dsn(args: &InitArgs, messages: &Messages) -> Result<String> {
     if let Some(dsn) = build_dsn_from_env() {
         return Ok(dsn);
     }
-    prompt_text(messages.prompt_db_dsn())
+    prompt_text(&format!("{}: ", messages.prompt_db_dsn()))
 }
 
 fn build_dsn_from_env() -> Option<String> {

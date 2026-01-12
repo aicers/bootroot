@@ -1,4 +1,0 @@
-services:
-  step-ca:
-    volumes:
-      - ./tmp/scenarios/ca.require-eab.json:/home/step/config/ca.json:ro

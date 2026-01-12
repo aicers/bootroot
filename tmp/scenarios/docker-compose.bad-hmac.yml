@@ -1,4 +1,0 @@
-services:
-  bootroot-http01:
-    volumes:
-      - ./tmp/scenarios/responder.toml.bad-hmac:/app/responder.toml:ro

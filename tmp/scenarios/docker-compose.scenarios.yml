@@ -1,8 +1,0 @@
-services:
-  bootroot-http01:
-    networks:
-      default:
-        aliases:
-          - 201.multi.node-201.trusted.domain
-          - 202.multi.node-202.trusted.domain
-          - 203.multi.node-203.trusted.domain
