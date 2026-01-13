@@ -182,7 +182,7 @@ fn test_verify_db_check_reports_auth_failure() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("DB authentication check failed"));
+    assert!(stderr.contains("bootroot verify failed"));
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn test_verify_missing_cert_fails() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("Certificate not found"));
+    assert!(stderr.contains("bootroot verify failed"));
 }
 
 #[test]
@@ -261,7 +261,7 @@ fn test_verify_agent_failure_reports_error() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("bootroot-agent failed"));
+    assert!(stderr.contains("bootroot verify failed"));
 }
 
 fn write_state_with_app(

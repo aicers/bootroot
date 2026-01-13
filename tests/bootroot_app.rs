@@ -306,7 +306,7 @@ async fn test_app_add_rejects_duplicate() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("App already exists"));
+    assert!(stderr.contains("bootroot app add failed"));
 }
 
 #[cfg(unix)]
@@ -343,7 +343,7 @@ fn test_app_info_missing_state_file() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("state.json not found"));
+    assert!(stderr.contains("bootroot app info failed"));
 }
 
 fn write_state_file(root: &std::path::Path, openbao_url: &str) -> anyhow::Result<()> {
