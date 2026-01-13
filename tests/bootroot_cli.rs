@@ -211,7 +211,7 @@ async fn test_status_command_reports_infra_failure() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("Infrastructure not healthy"));
+    assert!(stderr.contains("bootroot status failed"));
 }
 
 #[cfg(unix)]
@@ -254,7 +254,7 @@ async fn test_status_command_reports_openbao_unreachable() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("OpenBao is unreachable"));
+    assert!(stderr.contains("bootroot status failed"));
 }
 
 #[cfg(unix)]

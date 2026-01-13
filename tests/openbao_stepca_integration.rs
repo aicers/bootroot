@@ -191,7 +191,7 @@ mod unix_integration {
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("HTTP-01 responder check failed"));
+        assert!(stderr.contains("bootroot init failed"));
         Ok(())
     }
 
@@ -343,7 +343,7 @@ mod unix_integration {
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("Infrastructure not healthy"));
+        assert!(stderr.contains("bootroot init failed"));
         Ok(())
     }
 
@@ -387,7 +387,7 @@ mod unix_integration {
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("OpenBao remains sealed"));
+        assert!(stderr.contains("bootroot init failed"));
         Ok(())
     }
 
@@ -437,7 +437,7 @@ mod unix_integration {
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("bootroot init: failed"));
+        assert!(stderr.contains("bootroot init failed"));
         let password = fs::read_to_string(secrets_dir.join("password.txt"))
             .context("Failed to read password.txt")?;
         assert_eq!(password, original_password);
@@ -489,7 +489,7 @@ mod unix_integration {
             run_command_with_input(&mut command, "n\n").context("Failed to run bootroot init")?;
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("Operation cancelled"));
+        assert!(stderr.contains("bootroot init failed"));
         Ok(())
     }
 }

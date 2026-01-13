@@ -270,7 +270,11 @@ pub(crate) struct VerifyArgs {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("bootroot error: {err}");
+        let message = err
+            .chain()
+            .next()
+            .map_or_else(|| "bootroot error".to_string(), ToString::to_string);
+        eprintln!("{message}");
         std::process::exit(1);
     }
 }
@@ -281,27 +285,36 @@ fn run() -> Result<()> {
 
     match cli.command {
         CliCommand::Infra(InfraCommand::Up(args)) => {
-            commands::infra::run_infra_up(&args, &messages)?;
+            commands::infra::run_infra_up(&args, &messages)
+                .with_context(|| messages.error_infra_failed())?;
         }
         CliCommand::Init(args) => {
             let runtime = tokio::runtime::Runtime::new()
                 .context("Failed to initialize async runtime for init")?;
-            runtime.block_on(commands::init::run_init(&args, &messages))?;
+            runtime
+                .block_on(commands::init::run_init(&args, &messages))
+                .with_context(|| messages.error_init_failed())?;
         }
         CliCommand::Status(args) => {
             let runtime = tokio::runtime::Runtime::new()
                 .context("Failed to initialize async runtime for status")?;
-            runtime.block_on(commands::status::run_status(&args, &messages))?;
+            runtime
+                .block_on(commands::status::run_status(&args, &messages))
+                .with_context(|| messages.error_status_failed())?;
         }
         CliCommand::App(AppCommand::Add(args)) => {
             let runtime = tokio::runtime::Runtime::new()
                 .context("Failed to initialize async runtime for app add")?;
-            runtime.block_on(commands::app::run_app_add(&args, &messages))?;
+            runtime
+                .block_on(commands::app::run_app_add(&args, &messages))
+                .with_context(|| messages.error_app_add_failed())?;
         }
         CliCommand::App(AppCommand::Info(args)) => {
-            commands::app::run_app_info(&args, &messages)?;
+            commands::app::run_app_info(&args, &messages)
+                .with_context(|| messages.error_app_info_failed())?;
         }
-        CliCommand::Verify(args) => commands::verify::run_verify(&args, &messages)?,
+        CliCommand::Verify(args) => commands::verify::run_verify(&args, &messages)
+            .with_context(|| messages.error_verify_failed())?,
     }
     Ok(())
 }

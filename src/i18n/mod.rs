@@ -71,6 +71,12 @@ pub(crate) struct Strings {
     pub(crate) error_path_not_found: &'static str,
     pub(crate) error_parent_not_found: &'static str,
     pub(crate) error_operation_cancelled: &'static str,
+    pub(crate) error_infra_failed: &'static str,
+    pub(crate) error_init_failed: &'static str,
+    pub(crate) error_status_failed: &'static str,
+    pub(crate) error_app_add_failed: &'static str,
+    pub(crate) error_app_info_failed: &'static str,
+    pub(crate) error_verify_failed: &'static str,
     pub(crate) prompt_service_name: &'static str,
     pub(crate) prompt_deploy_type: &'static str,
     pub(crate) prompt_hostname: &'static str,
@@ -411,6 +417,30 @@ impl Messages {
 
     pub(crate) fn error_operation_cancelled(&self) -> &'static str {
         self.strings().error_operation_cancelled
+    }
+
+    pub(crate) fn error_infra_failed(&self) -> &'static str {
+        self.strings().error_infra_failed
+    }
+
+    pub(crate) fn error_init_failed(&self) -> &'static str {
+        self.strings().error_init_failed
+    }
+
+    pub(crate) fn error_status_failed(&self) -> &'static str {
+        self.strings().error_status_failed
+    }
+
+    pub(crate) fn error_app_add_failed(&self) -> &'static str {
+        self.strings().error_app_add_failed
+    }
+
+    pub(crate) fn error_app_info_failed(&self) -> &'static str {
+        self.strings().error_app_info_failed
+    }
+
+    pub(crate) fn error_verify_failed(&self) -> &'static str {
+        self.strings().error_verify_failed
     }
 
     pub(crate) fn prompt_service_name(&self) -> &'static str {
