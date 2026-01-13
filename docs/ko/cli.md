@@ -65,7 +65,16 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--stepca-password`: step-ca 키 암호 (`password.txt`)
   - 환경 변수: `STEPCA_PASSWORD`
 - `--db-dsn`: step-ca용 PostgreSQL DSN
-- `--db-check`: DB 연결 점검
+- `--db-provision`: step-ca용 PostgreSQL 역할/DB 생성
+- `--db-admin-dsn`: PostgreSQL 관리자 DSN
+  - 환경 변수: `BOOTROOT_DB_ADMIN_DSN`
+- `--db-user`: step-ca용 PostgreSQL 사용자
+  - 환경 변수: `BOOTROOT_DB_USER`
+- `--db-password`: step-ca용 PostgreSQL 비밀번호
+  - 환경 변수: `BOOTROOT_DB_PASSWORD`
+- `--db-name`: step-ca용 PostgreSQL DB 이름
+  - 환경 변수: `BOOTROOT_DB_NAME`
+- `--db-check`: DB 연결/인증 점검
 - `--db-timeout-secs`: DB 연결 타임아웃(초)
 - `--http-hmac`: HTTP-01 responder HMAC
   - 환경 변수: `HTTP01_HMAC`
@@ -198,7 +207,7 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다.
 
 - `--service-name`: 서비스 이름 식별자
 - `--agent-config`: bootroot-agent 설정 경로 (선택, 기본은 등록된 값)
-- `--db-check`: ca.json DSN으로 DB 연결 점검
+- `--db-check`: ca.json DSN으로 DB 연결/인증 점검
 - `--db-timeout-secs`: DB 연결 타임아웃(초)
 
 ### 대화형 동작

@@ -2,6 +2,7 @@ use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use postgres::NoTls;
 
 #[derive(Debug, Clone)]
 pub struct DbDsn {
@@ -11,6 +12,13 @@ pub struct DbDsn {
     pub port: u16,
     pub database: String,
     pub sslmode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbProvisionReport {
+    pub role_created: bool,
+    pub role_updated: bool,
+    pub db_created: bool,
 }
 
 /// Parses a `PostgreSQL` DSN into structured fields.
@@ -58,6 +66,144 @@ pub fn parse_db_dsn(input: &str) -> Result<DbDsn> {
         database: database.to_string(),
         sslmode,
     })
+}
+
+/// Builds a `PostgreSQL` DSN from structured components.
+#[must_use]
+pub fn build_db_dsn(
+    user: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+    database: &str,
+    sslmode: Option<&str>,
+) -> String {
+    let sslmode = sslmode.unwrap_or("disable");
+    format!("postgresql://{user}:{password}@{host}:{port}/{database}?sslmode={sslmode}")
+}
+
+/// Validates that a DB identifier is safe to embed in SQL.
+///
+/// # Errors
+///
+/// Returns an error when the identifier is empty or contains invalid
+/// characters.
+pub fn validate_db_identifier(value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("DB identifier must not be empty");
+    }
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        anyhow::bail!("DB identifier must not be empty");
+    };
+    if !first.is_ascii_alphabetic() {
+        anyhow::bail!("DB identifier must start with a letter");
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        anyhow::bail!("DB identifier must be alphanumeric or underscore");
+    }
+    Ok(())
+}
+
+/// Checks DB auth by connecting and running a lightweight query.
+///
+/// # Errors
+///
+/// Returns an error when the DSN is invalid, authentication fails, or the
+/// query cannot be executed.
+pub fn check_auth_sync(dsn: &str, timeout: Duration) -> Result<()> {
+    let dsn = dsn.to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let mut config = dsn
+                .parse::<postgres::Config>()
+                .context("Failed to parse PostgreSQL DSN")?;
+            config.connect_timeout(timeout);
+            let mut client = config
+                .connect(NoTls)
+                .context("Failed to authenticate to PostgreSQL")?;
+            client
+                .simple_query("SELECT 1")
+                .context("Failed to execute auth check query")?;
+            Ok(())
+        })();
+        let _ = sender.send(result);
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!("Timed out while authenticating to PostgreSQL")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("DB auth check thread disconnected")
+        }
+    }
+}
+
+/// Provisions a DB role and database using the provided admin DSN.
+///
+/// # Errors
+///
+/// Returns an error if the admin DSN is invalid or the provisioning statements
+/// fail to execute.
+pub fn provision_db_sync(
+    admin_dsn: &str,
+    db_user: &str,
+    db_password: &str,
+    db_name: &str,
+    timeout: Duration,
+) -> Result<DbProvisionReport> {
+    let mut config = admin_dsn
+        .parse::<postgres::Config>()
+        .context("Failed to parse PostgreSQL admin DSN")?;
+    config.connect_timeout(timeout);
+    let mut client = config
+        .connect(NoTls)
+        .context("Failed to connect to PostgreSQL as admin")?;
+
+    let mut report = DbProvisionReport::default();
+    let role_exists = client
+        .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&db_user])?
+        .is_some();
+
+    let role_ident = quote_ident(db_user);
+    if role_exists {
+        client.execute(&format!("ALTER ROLE {role_ident} WITH LOGIN"), &[])?;
+        client.execute(
+            &format!("ALTER ROLE {role_ident} WITH PASSWORD $1"),
+            &[&db_password],
+        )?;
+        report.role_updated = true;
+    } else {
+        client.execute(
+            &format!("CREATE ROLE {role_ident} WITH LOGIN PASSWORD $1"),
+            &[&db_password],
+        )?;
+        report.role_created = true;
+    }
+
+    let db_exists = client
+        .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&db_name])?
+        .is_some();
+    let db_ident = quote_ident(db_name);
+    if !db_exists {
+        client.execute(
+            &format!("CREATE DATABASE {db_ident} OWNER {role_ident}"),
+            &[],
+        )?;
+        report.db_created = true;
+    }
+    client.execute(
+        &format!("GRANT ALL PRIVILEGES ON DATABASE {db_ident} TO {role_ident}"),
+        &[],
+    )?;
+    Ok(report)
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 /// Checks TCP connectivity to the database host.
@@ -117,5 +263,35 @@ mod tests {
     fn parse_db_dsn_rejects_missing_password() {
         let err = parse_db_dsn("postgresql://user@localhost/db").unwrap_err();
         assert!(err.to_string().contains("user:password"));
+    }
+
+    #[test]
+    fn build_db_dsn_includes_sslmode() {
+        let dsn = build_db_dsn("user", "pass", "localhost", 5432, "db", Some("require"));
+        assert!(dsn.contains("sslmode=require"));
+    }
+
+    #[test]
+    fn validate_db_identifier_rejects_invalid() {
+        let err = validate_db_identifier("123bad").unwrap_err();
+        assert!(err.to_string().contains("start with a letter"));
+        let err = validate_db_identifier("bad-name").unwrap_err();
+        assert!(err.to_string().contains("underscore"));
+    }
+
+    #[test]
+    fn validate_db_identifier_accepts_valid() {
+        validate_db_identifier("stepca_user").unwrap();
+    }
+
+    #[test]
+    fn check_auth_sync_fails_on_closed_port() {
+        let dsn = "postgresql://user:pass@127.0.0.1:9/db?sslmode=disable";
+        let err = check_auth_sync(dsn, Duration::from_millis(100)).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("authenticate") || message.contains("Timed out"),
+            "{message}"
+        );
     }
 }

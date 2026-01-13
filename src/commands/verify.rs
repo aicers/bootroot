@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use bootroot::db::{check_tcp_sync, parse_db_dsn};
+use bootroot::db::{check_auth_sync, check_tcp_sync, parse_db_dsn};
 
 use crate::VerifyArgs;
 use crate::cli::output::print_verify_plan;
@@ -99,6 +99,7 @@ fn verify_db_connectivity(state: &StateFile, timeout_secs: u64, messages: &Messa
     let timeout = std::time::Duration::from_secs(timeout_secs);
     check_tcp_sync(&parsed.host, parsed.port, timeout)
         .with_context(|| messages.error_db_check_failed())?;
+    check_auth_sync(&dsn, timeout).with_context(|| messages.error_db_auth_failed())?;
     Ok(())
 }
 

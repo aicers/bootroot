@@ -2,10 +2,14 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bootroot::acme::responder_client;
-use bootroot::db::{DbDsn, check_tcp, parse_db_dsn};
+use bootroot::db::{
+    DbDsn, build_db_dsn, check_auth_sync, check_tcp, parse_db_dsn, provision_db_sync,
+    validate_db_identifier,
+};
 use bootroot::fs_util;
 use bootroot::openbao::{InitResponse, OpenBaoClient};
 use reqwest::StatusCode;
@@ -30,6 +34,8 @@ const DEFAULT_CA_ADDRESS: &str = ":9000";
 const SECRET_BYTES: usize = 32;
 const DEFAULT_RESPONDER_TOKEN_TTL_SECS: u64 = 60;
 const DEFAULT_EAB_ENDPOINT_PATH: &str = "eab";
+const DEFAULT_DB_USER: &str = "stepca";
+const DEFAULT_DB_NAME: &str = "stepca";
 
 mod openbao_constants {
     pub(crate) const INIT_SECRET_SHARES: u8 = 3;
@@ -67,15 +73,6 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     let mut rollback = InitRollback::default();
     let result: Result<InitSummary> = async {
         let bootstrap = bootstrap_openbao(&mut client, args, messages).await?;
-        let mut secrets = resolve_init_secrets(args, messages)?;
-        let db_info = parse_db_dsn(&secrets.db_dsn)
-            .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-        let db_check = if args.db_check {
-            check_db_connectivity(&db_info, args.db_timeout_secs, messages).await?;
-            DbCheckStatus::Ok
-        } else {
-            DbCheckStatus::Skipped
-        };
         let overwrite_password = args.secrets_dir.join("password.txt").exists();
         let overwrite_ca_json = args.secrets_dir.join("config").join("ca.json").exists();
         let overwrite_state = Path::new("state.json").exists();
@@ -97,6 +94,21 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
         if overwrite_state {
             confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
         }
+        if args.db_provision {
+            confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
+        }
+
+        let db_dsn = resolve_db_dsn_for_init(args, messages).await?;
+        let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
+        let db_info = parse_db_dsn(&secrets.db_dsn)
+            .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
+        let db_check = if args.db_check {
+            check_db_connectivity(&db_info, &secrets.db_dsn, args.db_timeout_secs, messages)
+                .await?;
+            DbCheckStatus::Ok
+        } else {
+            DbCheckStatus::Skipped
+        };
 
         let (role_outputs, _policies, approles) =
             configure_openbao(&client, args, &secrets, &mut rollback).await?;
@@ -213,13 +225,16 @@ async fn bootstrap_openbao(
     })
 }
 
-fn resolve_init_secrets(args: &InitArgs, messages: &Messages) -> Result<InitSecrets> {
+fn resolve_init_secrets(
+    args: &InitArgs,
+    messages: &Messages,
+    db_dsn: String,
+) -> Result<InitSecrets> {
     let stepca_password = resolve_secret(
         messages.prompt_stepca_password(),
         args.stepca_password.clone(),
         args.auto_generate,
     )?;
-    let db_dsn = resolve_db_dsn(args, messages)?;
     let http_hmac = resolve_secret(
         messages.prompt_http_hmac(),
         args.http_hmac.clone(),
@@ -407,6 +422,15 @@ fn prompt_text(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
+fn prompt_text_with_default(prompt: &str, default: &str) -> Result<String> {
+    let input = prompt_text(prompt)?;
+    if input.trim().is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(input)
+    }
+}
+
 fn prompt_yes_no(prompt: &str) -> Result<bool> {
     let input = prompt_text(prompt)?;
     let trimmed = input.trim().to_ascii_lowercase();
@@ -462,11 +486,21 @@ async fn verify_responder(
     Ok(ResponderCheck::Ok)
 }
 
-async fn check_db_connectivity(db: &DbDsn, timeout_secs: u64, messages: &Messages) -> Result<()> {
-    let timeout = std::time::Duration::from_secs(timeout_secs);
+async fn check_db_connectivity(
+    db: &DbDsn,
+    dsn: &str,
+    timeout_secs: u64,
+    messages: &Messages,
+) -> Result<()> {
+    let timeout = Duration::from_secs(timeout_secs);
     check_tcp(&db.host, db.port, timeout)
         .await
         .with_context(|| messages.error_db_check_failed())?;
+    let dsn_value = dsn.to_string();
+    tokio::task::spawn_blocking(move || check_auth_sync(&dsn_value, timeout))
+        .await
+        .context("DB auth check task failed")?
+        .with_context(|| messages.error_db_auth_failed())?;
     Ok(())
 }
 
@@ -543,6 +577,117 @@ async fn issue_eab_via_stepca(args: &InitArgs) -> Result<EabCredentials> {
         kid: payload.kid,
         hmac: payload.hmac,
     })
+}
+
+async fn resolve_db_dsn_for_init(args: &InitArgs, messages: &Messages) -> Result<String> {
+    if args.db_provision && args.db_dsn.is_some() {
+        anyhow::bail!(messages.error_db_provision_conflict());
+    }
+    if args.db_provision {
+        let inputs = resolve_db_provision_inputs(args, messages)?;
+        let admin = parse_db_dsn(&inputs.admin_dsn)
+            .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
+        let dsn = build_db_dsn(
+            &inputs.db_user,
+            &inputs.db_password,
+            &admin.host,
+            admin.port,
+            &inputs.db_name,
+            admin.sslmode.as_deref(),
+        );
+        let timeout = Duration::from_secs(args.db_timeout_secs);
+        tokio::task::spawn_blocking(move || {
+            provision_db_sync(
+                &inputs.admin_dsn,
+                &inputs.db_user,
+                &inputs.db_password,
+                &inputs.db_name,
+                timeout,
+            )
+        })
+        .await
+        .context("DB provisioning task failed")??;
+        return Ok(dsn);
+    }
+    resolve_db_dsn(args, messages)
+}
+
+#[derive(Debug)]
+struct DbProvisionInputs {
+    admin_dsn: String,
+    db_user: String,
+    db_password: String,
+    db_name: String,
+}
+
+fn resolve_db_provision_inputs(args: &InitArgs, messages: &Messages) -> Result<DbProvisionInputs> {
+    let admin_dsn = if let Some(value) = args.db_admin_dsn.clone() {
+        value
+    } else if let Some(value) = build_admin_dsn_from_env() {
+        value
+    } else {
+        prompt_text(&format!("{}: ", messages.prompt_db_admin_dsn()))?
+    };
+    let default_db_name = args
+        .db_name
+        .clone()
+        .or_else(|| env::var("POSTGRES_DB").ok())
+        .unwrap_or_else(|| DEFAULT_DB_NAME.to_string());
+    let db_user = if let Some(value) = args.db_user.clone() {
+        value
+    } else {
+        let prompt = format!("{} [{}]: ", messages.prompt_db_user(), DEFAULT_DB_USER);
+        prompt_text_with_default(&prompt, DEFAULT_DB_USER)?
+    };
+    let db_name = if let Some(value) = args.db_name.clone() {
+        value
+    } else {
+        let prompt = format!("{} [{}]: ", messages.prompt_db_name(), default_db_name);
+        prompt_text_with_default(&prompt, &default_db_name)?
+    };
+    let db_password = if let Some(value) = args.db_password.clone() {
+        value
+    } else if args.auto_generate {
+        generate_secret()?
+    } else {
+        prompt_text(&format!("{}: ", messages.prompt_db_password()))?
+    };
+
+    validate_db_identifier(&db_user)
+        .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_identifier(&db_user)))?;
+    validate_db_identifier(&db_name)
+        .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_identifier(&db_name)))?;
+
+    Ok(DbProvisionInputs {
+        admin_dsn,
+        db_user,
+        db_password,
+        db_name,
+    })
+}
+
+fn build_admin_dsn_from_env() -> Option<String> {
+    let Ok(user) = env::var("POSTGRES_USER") else {
+        return None;
+    };
+    let Ok(password) = env::var("POSTGRES_PASSWORD") else {
+        return None;
+    };
+    let host = env::var("POSTGRES_HOST").unwrap_or_else(|_| "postgres".to_string());
+    let port = env::var("POSTGRES_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(5432);
+    let db = env::var("POSTGRES_DB").unwrap_or_else(|_| "postgres".to_string());
+    let sslmode = env::var("POSTGRES_SSLMODE").ok();
+    Some(build_db_dsn(
+        &user,
+        &password,
+        &host,
+        port,
+        &db,
+        sslmode.as_deref(),
+    ))
 }
 
 fn resolve_db_dsn(args: &InitArgs, messages: &Messages) -> Result<String> {
@@ -939,6 +1084,11 @@ mod tests {
             unseal_key: Vec::new(),
             stepca_password: None,
             db_dsn: None,
+            db_provision: false,
+            db_admin_dsn: None,
+            db_user: None,
+            db_password: None,
+            db_name: None,
             db_check: false,
             db_timeout_secs: 2,
             http_hmac: None,
@@ -1012,6 +1162,126 @@ mod tests {
             dsn,
             "postgresql://step:secret@postgres:5432/stepca?sslmode=disable"
         );
+    }
+
+    #[test]
+    fn test_resolve_db_provision_inputs_with_args() {
+        let _guard = env_lock();
+        let args = InitArgs {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: PathBuf::from("secrets"),
+            compose_file: PathBuf::from("docker-compose.yml"),
+            auto_generate: false,
+            show_secrets: false,
+            root_token: None,
+            unseal_key: Vec::new(),
+            stepca_password: None,
+            db_dsn: None,
+            db_provision: true,
+            db_admin_dsn: Some(
+                "postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string(),
+            ),
+            db_user: Some("stepuser".to_string()),
+            db_password: Some("step-pass".to_string()),
+            db_name: Some("stepdb".to_string()),
+            db_check: false,
+            db_timeout_secs: 2,
+            http_hmac: None,
+            responder_url: None,
+            responder_timeout_secs: 5,
+            eab_auto: false,
+            stepca_url: DEFAULT_STEPCA_URL.to_string(),
+            stepca_provisioner: DEFAULT_STEPCA_PROVISIONER.to_string(),
+            eab_kid: None,
+            eab_hmac: None,
+        };
+
+        let inputs = resolve_db_provision_inputs(&args, &test_messages()).unwrap();
+        assert_eq!(
+            inputs.admin_dsn,
+            "postgresql://admin:pass@localhost:5432/postgres?sslmode=disable"
+        );
+        assert_eq!(inputs.db_user, "stepuser");
+        assert_eq!(inputs.db_password, "step-pass");
+        assert_eq!(inputs.db_name, "stepdb");
+    }
+
+    #[test]
+    fn test_resolve_db_provision_inputs_rejects_invalid_identifier() {
+        let _guard = env_lock();
+        let args = InitArgs {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: PathBuf::from("secrets"),
+            compose_file: PathBuf::from("docker-compose.yml"),
+            auto_generate: false,
+            show_secrets: false,
+            root_token: None,
+            unseal_key: Vec::new(),
+            stepca_password: None,
+            db_dsn: None,
+            db_provision: true,
+            db_admin_dsn: Some(
+                "postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string(),
+            ),
+            db_user: Some("bad-name".to_string()),
+            db_password: Some("step-pass".to_string()),
+            db_name: Some("stepdb".to_string()),
+            db_check: false,
+            db_timeout_secs: 2,
+            http_hmac: None,
+            responder_url: None,
+            responder_timeout_secs: 5,
+            eab_auto: false,
+            stepca_url: DEFAULT_STEPCA_URL.to_string(),
+            stepca_provisioner: DEFAULT_STEPCA_PROVISIONER.to_string(),
+            eab_kid: None,
+            eab_hmac: None,
+        };
+
+        let err = resolve_db_provision_inputs(&args, &test_messages()).unwrap_err();
+        assert!(err.to_string().contains("Invalid DB identifier"));
+    }
+
+    #[test]
+    fn test_resolve_db_dsn_for_init_rejects_conflict() {
+        let _guard = env_lock();
+        let args = InitArgs {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: PathBuf::from("secrets"),
+            compose_file: PathBuf::from("docker-compose.yml"),
+            auto_generate: false,
+            show_secrets: false,
+            root_token: None,
+            unseal_key: Vec::new(),
+            stepca_password: None,
+            db_dsn: Some("postgresql://user:pass@localhost/db".to_string()),
+            db_provision: true,
+            db_admin_dsn: Some(
+                "postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string(),
+            ),
+            db_user: Some("stepuser".to_string()),
+            db_password: Some("step-pass".to_string()),
+            db_name: Some("stepdb".to_string()),
+            db_check: false,
+            db_timeout_secs: 2,
+            http_hmac: None,
+            responder_url: None,
+            responder_timeout_secs: 5,
+            eab_auto: false,
+            stepca_url: DEFAULT_STEPCA_URL.to_string(),
+            stepca_provisioner: DEFAULT_STEPCA_PROVISIONER.to_string(),
+            eab_kid: None,
+            eab_hmac: None,
+        };
+
+        let err = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(resolve_db_dsn_for_init(&args, &test_messages()))
+            .unwrap_err();
+        assert!(err.to_string().contains("db-provision"));
     }
 
     #[test]

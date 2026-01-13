@@ -140,7 +140,7 @@ fn test_verify_reprompts_on_empty_service_name() {
 }
 
 #[test]
-fn test_verify_db_check_ok() {
+fn test_verify_db_check_reports_auth_failure() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");
     fs::write(&agent_config, "# config").expect("write agent config");
@@ -180,10 +180,9 @@ fn test_verify_db_check_ok() {
         .output()
         .expect("run verify");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success());
-    assert!(stdout.contains("bootroot verify: summary"));
-    assert!(stdout.contains("db check"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("DB authentication check failed"));
 }
 
 #[test]

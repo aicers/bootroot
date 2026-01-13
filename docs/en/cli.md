@@ -66,7 +66,16 @@ registers required secrets.
 - `--stepca-password`: step-ca password (`password.txt`)
   - Environment variable: `STEPCA_PASSWORD`
 - `--db-dsn`: PostgreSQL DSN for step-ca
-- `--db-check`: validate DB connectivity
+- `--db-provision`: provision PostgreSQL role/database for step-ca
+- `--db-admin-dsn`: PostgreSQL admin DSN for provisioning
+  - Environment variable: `BOOTROOT_DB_ADMIN_DSN`
+- `--db-user`: PostgreSQL user for step-ca
+  - Environment variable: `BOOTROOT_DB_USER`
+- `--db-password`: PostgreSQL password for step-ca
+  - Environment variable: `BOOTROOT_DB_PASSWORD`
+- `--db-name`: PostgreSQL database name for step-ca
+  - Environment variable: `BOOTROOT_DB_NAME`
+- `--db-check`: validate DB connectivity and auth
 - `--db-timeout-secs`: DB connectivity timeout (seconds)
 - `--http-hmac`: HTTP-01 responder HMAC
   - Environment variable: `HTTP01_HMAC`
@@ -199,7 +208,7 @@ Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 
 - `--service-name`: service name identifier
 - `--agent-config`: bootroot-agent config path override (optional)
-- `--db-check`: verify DB connectivity using ca.json DSN
+- `--db-check`: verify DB connectivity and auth using ca.json DSN
 - `--db-timeout-secs`: DB connectivity timeout (seconds)
 
 ### Interactive behavior
