@@ -358,6 +358,18 @@ fn print_approles(summary: &InitSummary, messages: &Messages) {
 fn print_next_steps(summary: &InitSummary, messages: &Messages) {
     println!("{}", messages.summary_next_steps());
     println!("{}", messages.next_steps_configure_templates());
+    println!(
+        "{}",
+        messages
+            .next_steps_responder_template(&summary.responder_template_path.display().to_string())
+    );
+    println!(
+        "{}",
+        messages.next_steps_responder_config(&summary.responder_config_path.display().to_string())
+    );
+    if let Some(url) = summary.responder_url.as_deref() {
+        println!("{}", messages.next_steps_responder_url(url));
+    }
     println!("{}", messages.next_steps_reload_services());
     println!("{}", messages.next_steps_run_status());
     if summary.eab.is_none() {
