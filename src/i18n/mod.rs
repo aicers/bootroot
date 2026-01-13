@@ -114,6 +114,7 @@ pub(crate) struct Strings {
     pub(crate) error_openbao_kv_exists_failed: &'static str,
     pub(crate) error_openbao_kv_write_failed: &'static str,
     pub(crate) error_openbao_kv_delete_failed: &'static str,
+    pub(crate) error_openbao_role_output_missing: &'static str,
     pub(crate) error_command_run_failed: &'static str,
     pub(crate) error_command_failed_status: &'static str,
     pub(crate) error_docker_compose_failed: &'static str,
@@ -122,6 +123,7 @@ pub(crate) struct Strings {
     pub(crate) error_secrets_dir_resolve_failed: &'static str,
     pub(crate) error_parse_ca_json_failed: &'static str,
     pub(crate) error_serialize_ca_json_failed: &'static str,
+    pub(crate) error_ca_json_db_missing: &'static str,
     pub(crate) error_parse_state_failed: &'static str,
     pub(crate) error_serialize_state_failed: &'static str,
     pub(crate) prompt_service_name: &'static str,
@@ -224,6 +226,9 @@ pub(crate) struct Strings {
     pub(crate) next_steps_responder_template: &'static str,
     pub(crate) next_steps_responder_config: &'static str,
     pub(crate) next_steps_responder_url: &'static str,
+    pub(crate) next_steps_openbao_agent_stepca_config: &'static str,
+    pub(crate) next_steps_openbao_agent_responder_config: &'static str,
+    pub(crate) next_steps_openbao_agent_override: &'static str,
     pub(crate) next_steps_reload_services: &'static str,
     pub(crate) next_steps_run_status: &'static str,
     pub(crate) next_steps_eab_issue: &'static str,
@@ -653,6 +658,13 @@ impl Messages {
         self.strings().error_openbao_kv_delete_failed
     }
 
+    pub(crate) fn error_openbao_role_output_missing(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_openbao_role_output_missing,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn error_command_run_failed(&self, command: &str) -> String {
         format_template(
             self.strings().error_command_run_failed,
@@ -695,6 +707,10 @@ impl Messages {
 
     pub(crate) fn error_serialize_ca_json_failed(&self) -> &'static str {
         self.strings().error_serialize_ca_json_failed
+    }
+
+    pub(crate) fn error_ca_json_db_missing(&self) -> &'static str {
+        self.strings().error_ca_json_db_missing
     }
 
     pub(crate) fn error_parse_state_failed(&self) -> &'static str {
@@ -1168,6 +1184,27 @@ impl Messages {
 
     pub(crate) fn next_steps_responder_url(&self, value: &str) -> String {
         format_template(self.strings().next_steps_responder_url, &[("value", value)])
+    }
+
+    pub(crate) fn next_steps_openbao_agent_stepca_config(&self, value: &str) -> String {
+        format_template(
+            self.strings().next_steps_openbao_agent_stepca_config,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn next_steps_openbao_agent_responder_config(&self, value: &str) -> String {
+        format_template(
+            self.strings().next_steps_openbao_agent_responder_config,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn next_steps_openbao_agent_override(&self, value: &str) -> String {
+        format_template(
+            self.strings().next_steps_openbao_agent_override,
+            &[("value", value)],
+        )
     }
 
     pub(crate) fn next_steps_reload_services(&self) -> &'static str {
