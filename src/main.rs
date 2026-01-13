@@ -115,7 +115,27 @@ struct InitArgs {
     #[arg(long)]
     db_dsn: Option<String>,
 
-    /// Validate DB DSN connectivity
+    /// Provision `PostgreSQL` role/database for step-ca
+    #[arg(long)]
+    db_provision: bool,
+
+    /// `PostgreSQL` admin DSN for provisioning
+    #[arg(long, env = "BOOTROOT_DB_ADMIN_DSN")]
+    db_admin_dsn: Option<String>,
+
+    /// `PostgreSQL` user for step-ca
+    #[arg(long, env = "BOOTROOT_DB_USER")]
+    db_user: Option<String>,
+
+    /// `PostgreSQL` password for step-ca
+    #[arg(long, env = "BOOTROOT_DB_PASSWORD")]
+    db_password: Option<String>,
+
+    /// `PostgreSQL` database name for step-ca
+    #[arg(long, env = "BOOTROOT_DB_NAME")]
+    db_name: Option<String>,
+
+    /// Validate DB DSN connectivity and auth
     #[arg(long)]
     db_check: bool,
 
@@ -239,7 +259,7 @@ pub(crate) struct VerifyArgs {
     #[arg(long)]
     agent_config: Option<PathBuf>,
 
-    /// Verify DB connectivity using ca.json DSN
+    /// Verify DB connectivity and auth using ca.json DSN
     #[arg(long)]
     db_check: bool,
 

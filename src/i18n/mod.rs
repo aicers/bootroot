@@ -39,18 +39,26 @@ pub(crate) struct Strings {
     pub(crate) prompt_unseal_key: &'static str,
     pub(crate) prompt_stepca_password: &'static str,
     pub(crate) prompt_http_hmac: &'static str,
+    pub(crate) prompt_db_admin_dsn: &'static str,
     pub(crate) prompt_db_dsn: &'static str,
+    pub(crate) prompt_db_user: &'static str,
+    pub(crate) prompt_db_password: &'static str,
+    pub(crate) prompt_db_name: &'static str,
     pub(crate) error_invalid_unseal_threshold: &'static str,
     pub(crate) error_eab_requires_both: &'static str,
     pub(crate) error_openbao_sealed: &'static str,
     pub(crate) error_invalid_db_dsn: &'static str,
     pub(crate) error_db_check_failed: &'static str,
+    pub(crate) error_db_auth_failed: &'static str,
     pub(crate) error_db_type_unsupported: &'static str,
+    pub(crate) error_db_provision_conflict: &'static str,
+    pub(crate) error_invalid_db_identifier: &'static str,
     pub(crate) prompt_eab_register_now: &'static str,
     pub(crate) eab_prompt_instructions: &'static str,
     pub(crate) prompt_eab_auto_now: &'static str,
     pub(crate) prompt_eab_kid: &'static str,
     pub(crate) prompt_eab_hmac: &'static str,
+    pub(crate) prompt_confirm_db_provision: &'static str,
     pub(crate) error_responder_check_failed: &'static str,
     pub(crate) error_eab_auto_failed: &'static str,
     pub(crate) error_state_missing: &'static str,
@@ -268,8 +276,24 @@ impl Messages {
         self.strings().prompt_http_hmac
     }
 
+    pub(crate) fn prompt_db_admin_dsn(&self) -> &'static str {
+        self.strings().prompt_db_admin_dsn
+    }
+
     pub(crate) fn prompt_db_dsn(&self) -> &'static str {
         self.strings().prompt_db_dsn
+    }
+
+    pub(crate) fn prompt_db_user(&self) -> &'static str {
+        self.strings().prompt_db_user
+    }
+
+    pub(crate) fn prompt_db_password(&self) -> &'static str {
+        self.strings().prompt_db_password
+    }
+
+    pub(crate) fn prompt_db_name(&self) -> &'static str {
+        self.strings().prompt_db_name
     }
 
     pub(crate) fn error_invalid_unseal_threshold(&self) -> &'static str {
@@ -292,8 +316,23 @@ impl Messages {
         self.strings().error_db_check_failed
     }
 
+    pub(crate) fn error_db_auth_failed(&self) -> &'static str {
+        self.strings().error_db_auth_failed
+    }
+
     pub(crate) fn error_db_type_unsupported(&self) -> &'static str {
         self.strings().error_db_type_unsupported
+    }
+
+    pub(crate) fn error_db_provision_conflict(&self) -> &'static str {
+        self.strings().error_db_provision_conflict
+    }
+
+    pub(crate) fn error_invalid_db_identifier(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_invalid_db_identifier,
+            &[("value", value)],
+        )
     }
 
     pub(crate) fn prompt_eab_register_now(&self) -> &'static str {
@@ -314,6 +353,10 @@ impl Messages {
 
     pub(crate) fn prompt_eab_hmac(&self) -> &'static str {
         self.strings().prompt_eab_hmac
+    }
+
+    pub(crate) fn prompt_confirm_db_provision(&self) -> &'static str {
+        self.strings().prompt_confirm_db_provision
     }
 
     pub(crate) fn error_responder_check_failed(&self) -> &'static str {
