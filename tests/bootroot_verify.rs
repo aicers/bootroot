@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 use anyhow::Context;
+use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -18,8 +19,12 @@ fn test_verify_success() {
     let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
     fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
-    fs::write(&cert_path, "cert").expect("write cert");
-    fs::write(&key_path, "key").expect("write key");
+    write_cert_with_dns(
+        &cert_path,
+        &key_path,
+        "001.edge-proxy.edge-node-01.trusted.domain",
+    )
+    .expect("write cert");
 
     write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
@@ -45,10 +50,91 @@ fn test_verify_success() {
         .expect("run verify");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
     assert!(stdout.contains("bootroot verify: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- result: ok"));
+}
+
+#[test]
+fn test_verify_docker_success() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("web-app.crt");
+    let key_path = temp_dir.path().join("certs").join("web-app.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    write_cert_with_dns(&cert_path, &key_path, "web-01.trusted.domain").expect("write cert");
+
+    write_state_with_docker_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", combined_path)
+        .args([
+            "verify",
+            "--service-name",
+            "web-app",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run verify");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("bootroot verify: summary"));
+    assert!(stdout.contains("- service name: web-app"));
+    assert!(stdout.contains("- result: ok"));
+}
+
+#[test]
+fn test_verify_san_mismatch_fails() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    write_cert_with_dns(&cert_path, &key_path, "wrong.trusted.domain").expect("write cert");
+
+    write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", combined_path)
+        .args([
+            "verify",
+            "--service-name",
+            "edge-proxy",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run verify");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("bootroot verify failed"));
 }
 
 #[test]
@@ -60,8 +146,12 @@ fn test_verify_prompts_for_service_name() {
     let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
     fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
-    fs::write(&cert_path, "cert").expect("write cert");
-    fs::write(&key_path, "key").expect("write key");
+    write_cert_with_dns(
+        &cert_path,
+        &key_path,
+        "001.edge-proxy.edge-node-01.trusted.domain",
+    )
+    .expect("write cert");
 
     write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
@@ -106,8 +196,12 @@ fn test_verify_reprompts_on_empty_service_name() {
     let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
     fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
-    fs::write(&cert_path, "cert").expect("write cert");
-    fs::write(&key_path, "key").expect("write key");
+    write_cert_with_dns(
+        &cert_path,
+        &key_path,
+        "001.edge-proxy.edge-node-01.trusted.domain",
+    )
+    .expect("write cert");
 
     write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
@@ -148,8 +242,12 @@ fn test_verify_db_check_reports_auth_failure() {
     let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
     fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
-    fs::write(&cert_path, "cert").expect("write cert");
-    fs::write(&key_path, "key").expect("write key");
+    write_cert_with_dns(
+        &cert_path,
+        &key_path,
+        "001.edge-proxy.edge-node-01.trusted.domain",
+    )
+    .expect("write cert");
 
     write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
@@ -191,9 +289,9 @@ fn test_verify_missing_cert_fails() {
     let agent_config = temp_dir.path().join("agent.toml");
     fs::write(&agent_config, "# config").expect("write agent config");
 
-    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let cert_path = temp_dir.path().join("missing").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
-    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    fs::create_dir_all(key_path.parent().unwrap()).expect("create cert dir");
     fs::write(&key_path, "key").expect("write key");
 
     write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
@@ -225,6 +323,86 @@ fn test_verify_missing_cert_fails() {
 }
 
 #[test]
+fn test_verify_empty_cert_fails() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    fs::File::create(&cert_path).expect("create empty cert");
+    fs::write(&key_path, "key").expect("write key");
+
+    write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", combined_path)
+        .args([
+            "verify",
+            "--service-name",
+            "edge-proxy",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run verify");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("Certificate file is empty"));
+}
+
+#[test]
+fn test_verify_empty_key_fails_docker() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("web-app.crt");
+    let key_path = temp_dir.path().join("certs").join("web-app.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    write_cert_with_dns(&cert_path, &key_path, "web-01.trusted.domain").expect("write cert");
+    fs::write(&key_path, "").expect("truncate key");
+
+    write_state_with_docker_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", combined_path)
+        .args([
+            "verify",
+            "--service-name",
+            "web-app",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run verify");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("Key file is empty"));
+}
+
+#[test]
 fn test_verify_agent_failure_reports_error() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");
@@ -233,8 +411,12 @@ fn test_verify_agent_failure_reports_error() {
     let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
     fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
-    fs::write(&cert_path, "cert").expect("write cert");
-    fs::write(&key_path, "key").expect("write key");
+    write_cert_with_dns(
+        &cert_path,
+        &key_path,
+        "001.edge-proxy.edge-node-01.trusted.domain",
+    )
+    .expect("write cert");
 
     write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
@@ -304,6 +486,46 @@ fn write_state_with_app(
     Ok(())
 }
 
+fn write_state_with_docker_app(
+    root: &std::path::Path,
+    agent_config: &std::path::Path,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let state = json!({
+        "openbao_url": "http://localhost:8200",
+        "kv_mount": "secret",
+        "secrets_dir": "secrets",
+        "policies": {},
+        "approles": {},
+        "apps": {
+            "web-app": {
+                "service_name": "web-app",
+                "deploy_type": "docker",
+                "hostname": "web-01",
+                "domain": "trusted.domain",
+                "agent_config_path": agent_config,
+                "cert_path": cert_path,
+                "key_path": key_path,
+                "container_name": "web-app",
+                "approle": {
+                    "role_name": "bootroot-app-web-app",
+                    "role_id": "role-web-app",
+                    "secret_id_path": "secrets/apps/web-app/secret_id",
+                    "policy_name": "bootroot-app-web-app"
+                }
+            }
+        }
+    });
+
+    fs::write(
+        root.join("state.json"),
+        serde_json::to_string_pretty(&state)?,
+    )
+    .context("write state.json")?;
+    Ok(())
+}
+
 fn write_ca_json_with_dsn(root: &std::path::Path, dsn: &str) -> anyhow::Result<()> {
     let config_dir = root.join("secrets").join("config");
     fs::create_dir_all(&config_dir).context("create config dir")?;
@@ -331,5 +553,17 @@ exit {exit_code}
     fs::write(&path, script).context("write fake bootroot-agent")?;
     fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
         .context("set fake bootroot-agent permissions")?;
+    Ok(())
+}
+
+fn write_cert_with_dns(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    dns_name: &str,
+) -> anyhow::Result<()> {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(vec![dns_name.to_string()]).context("generate cert")?;
+    fs::write(cert_path, cert.pem()).context("write cert")?;
+    fs::write(key_path, signing_key.serialize_pem().as_bytes()).context("write key")?;
     Ok(())
 }

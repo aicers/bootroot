@@ -176,6 +176,11 @@ pub(crate) struct Strings {
     pub(crate) verify_agent_failed: &'static str,
     pub(crate) verify_missing_cert: &'static str,
     pub(crate) verify_missing_key: &'static str,
+    pub(crate) verify_empty_cert: &'static str,
+    pub(crate) verify_empty_key: &'static str,
+    pub(crate) verify_cert_parse_failed: &'static str,
+    pub(crate) verify_cert_missing_san: &'static str,
+    pub(crate) verify_cert_san_mismatch: &'static str,
     pub(crate) status_summary_title: &'static str,
     pub(crate) status_section_infra: &'static str,
     pub(crate) status_section_openbao: &'static str,
@@ -946,6 +951,29 @@ impl Messages {
 
     pub(crate) fn verify_missing_key(&self, value: &str) -> String {
         format_template(self.strings().verify_missing_key, &[("value", value)])
+    }
+
+    pub(crate) fn verify_empty_cert(&self, value: &str) -> String {
+        format_template(self.strings().verify_empty_cert, &[("value", value)])
+    }
+
+    pub(crate) fn verify_empty_key(&self, value: &str) -> String {
+        format_template(self.strings().verify_empty_key, &[("value", value)])
+    }
+
+    pub(crate) fn verify_cert_parse_failed(&self) -> &'static str {
+        self.strings().verify_cert_parse_failed
+    }
+
+    pub(crate) fn verify_cert_missing_san(&self) -> &'static str {
+        self.strings().verify_cert_missing_san
+    }
+
+    pub(crate) fn verify_cert_san_mismatch(&self, expected: &str, actual: &str) -> String {
+        format_template(
+            self.strings().verify_cert_san_mismatch,
+            &[("expected", expected), ("actual", actual)],
+        )
     }
 
     pub(crate) fn status_summary_title(&self) -> &'static str {
