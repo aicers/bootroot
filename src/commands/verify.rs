@@ -8,7 +8,7 @@ use crate::VerifyArgs;
 use crate::cli::output::print_verify_plan;
 use crate::cli::prompt::Prompt;
 use crate::i18n::Messages;
-use crate::state::StateFile;
+use crate::state::{AppEntry, DeployType, StateFile};
 
 const STATE_FILE_NAME: &str = "state.json";
 
@@ -50,6 +50,15 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
     if !entry.key_path.exists() {
         anyhow::bail!(messages.verify_missing_key(&entry.key_path.display().to_string()));
     }
+    verify_file_non_empty(
+        &entry.cert_path,
+        &messages.verify_empty_cert(&entry.cert_path.display().to_string()),
+    )?;
+    verify_file_non_empty(
+        &entry.key_path,
+        &messages.verify_empty_key(&entry.key_path.display().to_string()),
+    )?;
+    verify_cert_san(entry, messages)?;
 
     if args.db_check {
         verify_db_connectivity(&state, args.db_timeout_secs, messages)?;
@@ -119,4 +128,67 @@ fn resolve_verify_service_name(args: &VerifyArgs, messages: &Messages) -> Result
         }
         Ok(value.trim().to_string())
     })
+}
+
+fn verify_file_non_empty(path: &Path, message: &str) -> Result<()> {
+    let metadata = std::fs::metadata(path).with_context(|| message.to_string())?;
+    if metadata.len() == 0 {
+        anyhow::bail!(message.to_string());
+    }
+    Ok(())
+}
+
+fn verify_cert_san(entry: &AppEntry, messages: &Messages) -> Result<()> {
+    let expected = expected_dns_name(entry, messages)?;
+    let contents = std::fs::read(&entry.cert_path)
+        .with_context(|| messages.error_read_file_failed(&entry.cert_path.display().to_string()))?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&contents)
+        .map_err(|_| anyhow::anyhow!(messages.verify_cert_parse_failed()))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
+        .map_err(|_| anyhow::anyhow!(messages.verify_cert_parse_failed()))?;
+    let mut dns_names = Vec::new();
+    for extension in cert.extensions() {
+        if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+            extension.parsed_extension()
+        {
+            for name in &san.general_names {
+                if let x509_parser::extensions::GeneralName::DNSName(dns_name) = name {
+                    dns_names.push(dns_name.to_string());
+                }
+            }
+        }
+    }
+    if dns_names.is_empty() {
+        anyhow::bail!(messages.verify_cert_missing_san());
+    }
+    if !dns_names.iter().any(|name| name == &expected) {
+        anyhow::bail!(messages.verify_cert_san_mismatch(&expected, &dns_names.join(", ")));
+    }
+    Ok(())
+}
+
+fn expected_dns_name(entry: &AppEntry, messages: &Messages) -> Result<String> {
+    match entry.deploy_type {
+        DeployType::Daemon => {
+            let instance_id = entry
+                .instance_id
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(messages.error_app_instance_id_required()))?;
+            Ok(format!(
+                "{}.{}.{}.{}",
+                instance_id, entry.service_name, entry.hostname, entry.domain
+            ))
+        }
+        DeployType::Docker => {
+            if entry
+                .container_name
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                anyhow::bail!(messages.error_app_container_name_required());
+            }
+            Ok(format!("{}.{}", entry.hostname, entry.domain))
+        }
+    }
 }
