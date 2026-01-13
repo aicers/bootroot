@@ -39,6 +39,17 @@ const RESPONDER_TEMPLATE_NAME: &str = "responder.toml.ctmpl";
 const RESPONDER_CONFIG_DIR: &str = "responder";
 const RESPONDER_CONFIG_NAME: &str = "responder.toml";
 const RESPONDER_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.responder.override.yml";
+const STEPCA_PASSWORD_TEMPLATE_NAME: &str = "password.txt.ctmpl";
+const STEPCA_CA_JSON_TEMPLATE_NAME: &str = "ca.json.ctmpl";
+const OPENBAO_AGENT_DIR: &str = "openbao";
+const OPENBAO_AGENT_STEPCA_DIR: &str = "stepca";
+const OPENBAO_AGENT_RESPONDER_DIR: &str = "responder";
+const OPENBAO_AGENT_CONFIG_NAME: &str = "agent.hcl";
+const OPENBAO_AGENT_ROLE_ID_NAME: &str = "role_id";
+const OPENBAO_AGENT_SECRET_ID_NAME: &str = "secret_id";
+const OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-agent.override.yml";
+const OPENBAO_AGENT_STEPCA_SERVICE: &str = "openbao-agent-stepca";
+const OPENBAO_AGENT_RESPONDER_SERVICE: &str = "openbao-agent-responder";
 const DEFAULT_EAB_ENDPOINT_PATH: &str = "eab";
 const DEFAULT_DB_USER: &str = "stepca";
 const DEFAULT_DB_NAME: &str = "stepca";
@@ -96,6 +107,8 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     }
 }
 
+#[allow(clippy::too_many_lines)]
+// Keep init flow in one place to preserve ordering across subsystems.
 async fn run_init_inner(
     client: &mut OpenBaoClient,
     args: &InitArgs,
@@ -148,12 +161,23 @@ async fn run_init_inner(
     );
     rollback.ca_json_backup =
         Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn, messages).await?);
+    let stepca_templates = write_stepca_templates(&secrets_dir, &args.kv_mount, messages).await?;
     let responder_paths =
         write_responder_files(&secrets_dir, &args.kv_mount, &secrets.http_hmac, messages).await?;
     let responder_compose_override = write_responder_compose_override(
         &args.compose_file,
         &secrets_dir,
         &responder_paths.config_path,
+        messages,
+    )
+    .await?;
+    let openbao_agent_paths = setup_openbao_agents(
+        &args.compose_file,
+        &secrets_dir,
+        &args.openbao_url,
+        &role_outputs,
+        &stepca_templates,
+        &responder_paths.template_path,
         messages,
     )
     .await?;
@@ -197,6 +221,9 @@ async fn run_init_inner(
         responder_url,
         responder_template_path: responder_paths.template_path,
         responder_config_path: responder_paths.config_path,
+        openbao_agent_stepca_config_path: openbao_agent_paths.stepca_agent_config,
+        openbao_agent_responder_config_path: openbao_agent_paths.responder_agent_config,
+        openbao_agent_override_path: openbao_agent_paths.compose_override_path,
         db_check,
     })
 }
@@ -233,6 +260,17 @@ struct ResponderPaths {
     config_path: PathBuf,
 }
 
+struct StepCaTemplatePaths {
+    password_template_path: PathBuf,
+    ca_json_template_path: PathBuf,
+}
+
+struct OpenBaoAgentPaths {
+    stepca_agent_config: PathBuf,
+    responder_agent_config: PathBuf,
+    compose_override_path: Option<PathBuf>,
+}
+
 async fn write_responder_files(
     secrets_dir: &Path,
     kv_mount: &str,
@@ -264,6 +302,42 @@ async fn write_responder_files(
     })
 }
 
+async fn write_stepca_templates(
+    secrets_dir: &Path,
+    kv_mount: &str,
+    messages: &Messages,
+) -> Result<StepCaTemplatePaths> {
+    let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
+    fs_util::ensure_secrets_dir(&templates_dir).await?;
+
+    let password_template_path = templates_dir.join(STEPCA_PASSWORD_TEMPLATE_NAME);
+    let password_template = build_password_template(kv_mount);
+    tokio::fs::write(&password_template_path, password_template)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&password_template_path.display().to_string())
+        })?;
+    fs_util::set_key_permissions(&password_template_path).await?;
+
+    let ca_json_path = secrets_dir.join("config").join("ca.json");
+    let ca_json_contents = tokio::fs::read_to_string(&ca_json_path)
+        .await
+        .with_context(|| messages.error_read_file_failed(&ca_json_path.display().to_string()))?;
+    let ca_json_template = build_ca_json_template(&ca_json_contents, kv_mount, messages)?;
+    let ca_json_template_path = templates_dir.join(STEPCA_CA_JSON_TEMPLATE_NAME);
+    tokio::fs::write(&ca_json_template_path, ca_json_template)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&ca_json_template_path.display().to_string())
+        })?;
+    fs_util::set_key_permissions(&ca_json_template_path).await?;
+
+    Ok(StepCaTemplatePaths {
+        password_template_path,
+        ca_json_template_path,
+    })
+}
+
 fn build_responder_template(kv_mount: &str) -> String {
     format!(
         r#"# HTTP-01 responder config (OpenBao Agent template)
@@ -278,6 +352,27 @@ max_skew_secs = 60
     )
 }
 
+fn build_password_template(kv_mount: &str) -> String {
+    format!(
+        r#"{{{{ with secret "{kv_mount}/data/{PATH_STEPCA_PASSWORD}" }}}}{{{{ .Data.data.value }}}}{{{{ end }}}}"#
+    )
+}
+
+fn build_ca_json_template(contents: &str, kv_mount: &str, messages: &Messages) -> Result<String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(contents).context(messages.error_parse_ca_json_failed())?;
+    let db = value
+        .get_mut("db")
+        .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
+    let data_source = db
+        .get_mut("dataSource")
+        .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
+    *data_source = serde_json::Value::String(format!(
+        "{{{{ with secret \"{kv_mount}/data/{PATH_STEPCA_DB}\" }}}}{{{{ .Data.data.value }}}}{{{{ end }}}}"
+    ));
+    serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())
+}
+
 fn build_responder_config(hmac: &str) -> String {
     format!(
         r#"# HTTP-01 responder config (rendered)
@@ -290,6 +385,200 @@ cleanup_interval_secs = 30
 max_skew_secs = 60
 "#
     )
+}
+
+async fn write_openbao_agent_files(
+    secrets_dir: &Path,
+    openbao_addr: &str,
+    role_outputs: &[AppRoleOutput],
+    stepca_templates: &StepCaTemplatePaths,
+    responder_template: &Path,
+    messages: &Messages,
+) -> Result<OpenBaoAgentPaths> {
+    let base_dir = secrets_dir.join(OPENBAO_AGENT_DIR);
+    fs_util::ensure_secrets_dir(&base_dir).await?;
+    let stepca_dir = base_dir.join(OPENBAO_AGENT_STEPCA_DIR);
+    let responder_dir = base_dir.join(OPENBAO_AGENT_RESPONDER_DIR);
+    fs_util::ensure_secrets_dir(&stepca_dir).await?;
+    fs_util::ensure_secrets_dir(&responder_dir).await?;
+
+    let stepca_role = find_role_output(role_outputs, "stepca", messages)?;
+    let responder_role = find_role_output(role_outputs, "responder", messages)?;
+
+    let stepca_role_id_path = stepca_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
+    let stepca_secret_id_path = stepca_dir.join(OPENBAO_AGENT_SECRET_ID_NAME);
+    tokio::fs::write(&stepca_role_id_path, &stepca_role.role_id)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&stepca_role_id_path.display().to_string())
+        })?;
+    tokio::fs::write(&stepca_secret_id_path, &stepca_role.secret_id)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&stepca_secret_id_path.display().to_string())
+        })?;
+    fs_util::set_key_permissions(&stepca_role_id_path).await?;
+    fs_util::set_key_permissions(&stepca_secret_id_path).await?;
+
+    let responder_role_id_path = responder_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
+    let responder_secret_id_path = responder_dir.join(OPENBAO_AGENT_SECRET_ID_NAME);
+    tokio::fs::write(&responder_role_id_path, &responder_role.role_id)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&responder_role_id_path.display().to_string())
+        })?;
+    tokio::fs::write(&responder_secret_id_path, &responder_role.secret_id)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&responder_secret_id_path.display().to_string())
+        })?;
+    fs_util::set_key_permissions(&responder_role_id_path).await?;
+    fs_util::set_key_permissions(&responder_secret_id_path).await?;
+
+    let stepca_agent_config = stepca_dir.join(OPENBAO_AGENT_CONFIG_NAME);
+    let responder_agent_config = responder_dir.join(OPENBAO_AGENT_CONFIG_NAME);
+    let password_template = to_container_path(
+        secrets_dir,
+        &stepca_templates.password_template_path,
+        messages,
+    )?;
+    let ca_json_template = to_container_path(
+        secrets_dir,
+        &stepca_templates.ca_json_template_path,
+        messages,
+    )?;
+    let responder_template = to_container_path(secrets_dir, responder_template, messages)?;
+    let password_output =
+        to_container_path(secrets_dir, &secrets_dir.join("password.txt"), messages)?;
+    let ca_json_output = to_container_path(
+        secrets_dir,
+        &secrets_dir.join("config").join("ca.json"),
+        messages,
+    )?;
+    let responder_output = to_container_path(
+        secrets_dir,
+        &secrets_dir.join("responder").join("responder.toml"),
+        messages,
+    )?;
+    let stepca_config = build_openbao_agent_config(
+        openbao_addr,
+        "/openbao/secrets/openbao/stepca/role_id",
+        "/openbao/secrets/openbao/stepca/secret_id",
+        &[
+            (password_template, password_output),
+            (ca_json_template, ca_json_output),
+        ],
+    );
+    let responder_config = build_openbao_agent_config(
+        openbao_addr,
+        "/openbao/secrets/openbao/responder/role_id",
+        "/openbao/secrets/openbao/responder/secret_id",
+        &[(responder_template, responder_output)],
+    );
+    tokio::fs::write(&stepca_agent_config, stepca_config)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&stepca_agent_config.display().to_string())
+        })?;
+    tokio::fs::write(&responder_agent_config, responder_config)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&responder_agent_config.display().to_string())
+        })?;
+    fs_util::set_key_permissions(&stepca_agent_config).await?;
+    fs_util::set_key_permissions(&responder_agent_config).await?;
+
+    Ok(OpenBaoAgentPaths {
+        stepca_agent_config,
+        responder_agent_config,
+        compose_override_path: None,
+    })
+}
+
+async fn setup_openbao_agents(
+    compose_file: &Path,
+    secrets_dir: &Path,
+    openbao_url: &str,
+    role_outputs: &[AppRoleOutput],
+    stepca_templates: &StepCaTemplatePaths,
+    responder_template: &Path,
+    messages: &Messages,
+) -> Result<OpenBaoAgentPaths> {
+    let compose_has_openbao = compose_has_openbao(compose_file, messages)?;
+    let openbao_agent_addr = resolve_openbao_agent_addr(openbao_url, compose_has_openbao);
+    let mut openbao_agent_paths = write_openbao_agent_files(
+        secrets_dir,
+        &openbao_agent_addr,
+        role_outputs,
+        stepca_templates,
+        responder_template,
+        messages,
+    )
+    .await?;
+    let openbao_agent_override = write_openbao_agent_compose_override(
+        compose_file,
+        secrets_dir,
+        &openbao_agent_addr,
+        messages,
+    )
+    .await?;
+    openbao_agent_paths
+        .compose_override_path
+        .clone_from(&openbao_agent_override);
+    if let Some(override_path) = openbao_agent_override.as_ref() {
+        apply_openbao_agent_compose_override(compose_file, override_path, messages)?;
+    }
+    Ok(openbao_agent_paths)
+}
+
+fn build_openbao_agent_config(
+    openbao_addr: &str,
+    role_id_path: &str,
+    secret_id_path: &str,
+    templates: &[(String, String)],
+) -> String {
+    let mut config = format!(
+        r#"vault {{
+  address = "{openbao_addr}"
+}}
+
+auto_auth {{
+  method "approle" {{
+    config = {{
+      role_id_file_path = "{role_id_path}"
+      secret_id_file_path = "{secret_id_path}"
+    }}
+  }}
+  sink "file" {{
+    config = {{
+      path = "/openbao/secrets/openbao/token"
+    }}
+  }}
+}}
+"#
+    );
+    for (source_path, destination_path) in templates {
+        use std::fmt::Write as _;
+        write!(
+            &mut config,
+            r#"
+template {{
+  source = "{source_path}"
+  destination = "{destination_path}"
+  perms = "0600"
+}}
+"#
+        )
+        .expect("write template");
+    }
+    config
+}
+
+fn to_container_path(secrets_dir: &Path, path: &Path, messages: &Messages) -> Result<String> {
+    let relative = path
+        .strip_prefix(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&path.display().to_string()))?;
+    Ok(format!("/openbao/secrets/{}", relative.to_string_lossy()))
 }
 
 async fn write_responder_compose_override(
@@ -321,6 +610,56 @@ services:
     Ok(Some(override_path))
 }
 
+async fn write_openbao_agent_compose_override(
+    compose_file: &Path,
+    secrets_dir: &Path,
+    openbao_addr: &str,
+    messages: &Messages,
+) -> Result<Option<PathBuf>> {
+    let agent_dir = secrets_dir.join(OPENBAO_AGENT_DIR);
+    fs_util::ensure_secrets_dir(&agent_dir).await?;
+    let mount_root = std::fs::canonicalize(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let override_path = agent_dir.join(OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME);
+    let depends_on = if compose_has_openbao(compose_file, messages)? {
+        "    depends_on:\n      - openbao\n"
+    } else {
+        ""
+    };
+    let contents = format!(
+        r#"version: "3.8"
+services:
+  {stepca_service}:
+    image: openbao/openbao:latest
+    container_name: bootroot-openbao-agent-stepca
+    restart: always
+    command: ["agent", "-config=/openbao/secrets/openbao/stepca/agent.hcl"]
+{depends_on}    environment:
+      - VAULT_ADDR={openbao_addr}
+    volumes:
+      - {secrets_path}:/openbao/secrets
+  {responder_service}:
+    image: openbao/openbao:latest
+    container_name: bootroot-openbao-agent-responder
+    restart: always
+    command: ["agent", "-config=/openbao/secrets/openbao/responder/agent.hcl"]
+{depends_on}    environment:
+      - VAULT_ADDR={openbao_addr}
+    volumes:
+      - {secrets_path}:/openbao/secrets
+"#,
+        stepca_service = OPENBAO_AGENT_STEPCA_SERVICE,
+        responder_service = OPENBAO_AGENT_RESPONDER_SERVICE,
+        depends_on = depends_on,
+        openbao_addr = openbao_addr,
+        secrets_path = mount_root.display()
+    );
+    tokio::fs::write(&override_path, contents)
+        .await
+        .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+    Ok(Some(override_path))
+}
+
 fn apply_responder_compose_override(
     compose_file: &Path,
     override_path: &Path,
@@ -338,6 +677,27 @@ fn apply_responder_compose_override(
     ];
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
     run_docker(&args_ref, "docker compose responder override", messages)?;
+    Ok(())
+}
+
+fn apply_openbao_agent_compose_override(
+    compose_file: &Path,
+    override_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let args = [
+        "compose".to_string(),
+        "-f".to_string(),
+        compose_file.to_string_lossy().to_string(),
+        "-f".to_string(),
+        override_path.to_string_lossy().to_string(),
+        "up".to_string(),
+        "-d".to_string(),
+        OPENBAO_AGENT_STEPCA_SERVICE.to_string(),
+        OPENBAO_AGENT_RESPONDER_SERVICE.to_string(),
+    ];
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_docker(&args_ref, "docker compose openbao agent override", messages)?;
     Ok(())
 }
 
@@ -676,6 +1036,12 @@ fn compose_has_responder(compose_file: &Path, messages: &Messages) -> Result<boo
     Ok(compose_contents.contains("bootroot-http01"))
 }
 
+fn compose_has_openbao(compose_file: &Path, messages: &Messages) -> Result<bool> {
+    let compose_contents = std::fs::read_to_string(compose_file)
+        .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
+    Ok(compose_contents.contains("openbao"))
+}
+
 fn resolve_responder_url(args: &InitArgs, compose_has_responder: bool) -> Option<String> {
     if let Some(responder_url) = args.responder_url.as_ref() {
         return Some(responder_url.clone());
@@ -685,6 +1051,15 @@ fn resolve_responder_url(args: &InitArgs, compose_has_responder: bool) -> Option
     } else {
         None
     }
+}
+
+fn resolve_openbao_agent_addr(openbao_url: &str, compose_has_openbao: bool) -> String {
+    if !compose_has_openbao {
+        return openbao_url.to_string();
+    }
+    openbao_url
+        .replace("localhost", "openbao")
+        .replace("127.0.0.1", "openbao")
 }
 
 async fn verify_responder(
@@ -707,6 +1082,17 @@ async fn verify_responder(
     .await
     .with_context(|| messages.error_responder_check_failed())?;
     Ok(ResponderCheck::Ok)
+}
+
+fn find_role_output<'a>(
+    role_outputs: &'a [AppRoleOutput],
+    label: &str,
+    messages: &Messages,
+) -> Result<&'a AppRoleOutput> {
+    role_outputs
+        .iter()
+        .find(|output| output.label == label)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_openbao_role_output_missing(label)))
 }
 
 async fn check_db_connectivity(
@@ -1278,6 +1664,9 @@ pub(crate) struct InitSummary {
     pub(crate) responder_url: Option<String>,
     pub(crate) responder_template_path: PathBuf,
     pub(crate) responder_config_path: PathBuf,
+    pub(crate) openbao_agent_stepca_config_path: PathBuf,
+    pub(crate) openbao_agent_responder_config_path: PathBuf,
+    pub(crate) openbao_agent_override_path: Option<PathBuf>,
     pub(crate) db_check: DbCheckStatus,
 }
 
@@ -1686,6 +2075,124 @@ services:
 
         assert!(contents.contains("bootroot-http01"));
         assert!(contents.contains(&config_path.display().to_string()));
+    }
+
+    #[test]
+    fn test_resolve_openbao_agent_addr_replaces_localhost() {
+        let addr = resolve_openbao_agent_addr("http://localhost:8200", true);
+        assert_eq!(addr, "http://openbao:8200");
+    }
+
+    #[test]
+    fn test_resolve_openbao_agent_addr_keeps_remote() {
+        let addr = resolve_openbao_agent_addr("http://openbao:8200", true);
+        assert_eq!(addr, "http://openbao:8200");
+    }
+
+    #[tokio::test]
+    async fn test_write_stepca_templates_writes_templates() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        fs::create_dir_all(secrets_dir.join("config")).unwrap();
+        fs::write(
+            secrets_dir.join("config").join("ca.json"),
+            r#"{"db":{"type":"postgresql","dataSource":"old"}}"#,
+        )
+        .unwrap();
+
+        let messages = test_messages();
+        let paths = write_stepca_templates(&secrets_dir, "secret", &messages)
+            .await
+            .unwrap();
+        let password_template = fs::read_to_string(&paths.password_template_path).unwrap();
+        let ca_json_template = fs::read_to_string(&paths.ca_json_template_path).unwrap();
+
+        assert!(password_template.contains("secret/data/bootroot/stepca/password"));
+        assert!(ca_json_template.contains("secret/data/bootroot/stepca/db"));
+    }
+
+    #[tokio::test]
+    async fn test_write_openbao_agent_files_writes_configs() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        fs::create_dir_all(secrets_dir.join("config")).unwrap();
+        fs::write(
+            secrets_dir.join("config").join("ca.json"),
+            r#"{"db":{"type":"postgresql","dataSource":"old"}}"#,
+        )
+        .unwrap();
+
+        let messages = test_messages();
+        let stepca_templates = write_stepca_templates(&secrets_dir, "secret", &messages)
+            .await
+            .unwrap();
+        let responder_paths = write_responder_files(&secrets_dir, "secret", "hmac-123", &messages)
+            .await
+            .unwrap();
+
+        let role_outputs = vec![
+            AppRoleOutput {
+                label: "stepca".to_string(),
+                role_name: "bootroot-stepca-role".to_string(),
+                role_id: "stepca-role-id".to_string(),
+                secret_id: "stepca-secret-id".to_string(),
+            },
+            AppRoleOutput {
+                label: "responder".to_string(),
+                role_name: "bootroot-responder-role".to_string(),
+                role_id: "responder-role-id".to_string(),
+                secret_id: "responder-secret-id".to_string(),
+            },
+        ];
+
+        let paths = write_openbao_agent_files(
+            &secrets_dir,
+            "http://openbao:8200",
+            &role_outputs,
+            &stepca_templates,
+            &responder_paths.template_path,
+            &messages,
+        )
+        .await
+        .unwrap();
+        let stepca_config = fs::read_to_string(&paths.stepca_agent_config).unwrap();
+        let responder_config = fs::read_to_string(&paths.responder_agent_config).unwrap();
+
+        assert!(stepca_config.contains("role_id_file_path"));
+        assert!(stepca_config.contains("password.txt.ctmpl"));
+        assert!(responder_config.contains("responder.toml.ctmpl"));
+    }
+
+    #[tokio::test]
+    async fn test_write_openbao_agent_compose_override_writes_services() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).unwrap();
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(
+            &compose_file,
+            r"
+services:
+  openbao:
+    image: openbao/openbao:latest
+",
+        )
+        .unwrap();
+
+        let override_path = write_openbao_agent_compose_override(
+            &compose_file,
+            &secrets_dir,
+            "http://openbao:8200",
+            &test_messages(),
+        )
+        .await
+        .unwrap()
+        .expect("override path");
+        let contents = fs::read_to_string(&override_path).unwrap();
+
+        assert!(contents.contains("openbao-agent-stepca"));
+        assert!(contents.contains("openbao-agent-responder"));
+        assert!(contents.contains(&secrets_dir.display().to_string()));
     }
 
     #[test]

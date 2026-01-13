@@ -367,6 +367,30 @@ fn print_next_steps(summary: &InitSummary, messages: &Messages) {
         "{}",
         messages.next_steps_responder_config(&summary.responder_config_path.display().to_string())
     );
+    println!(
+        "{}",
+        messages.next_steps_openbao_agent_stepca_config(
+            &summary
+                .openbao_agent_stepca_config_path
+                .display()
+                .to_string()
+        )
+    );
+    println!(
+        "{}",
+        messages.next_steps_openbao_agent_responder_config(
+            &summary
+                .openbao_agent_responder_config_path
+                .display()
+                .to_string()
+        )
+    );
+    if let Some(path) = summary.openbao_agent_override_path.as_ref() {
+        println!(
+            "{}",
+            messages.next_steps_openbao_agent_override(&path.display().to_string())
+        );
+    }
     if let Some(url) = summary.responder_url.as_deref() {
         println!("{}", messages.next_steps_responder_url(url));
     }
