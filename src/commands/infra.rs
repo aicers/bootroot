@@ -8,7 +8,7 @@ use crate::i18n::Messages;
 
 pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
     let loaded_archives = if let Some(dir) = args.image_archive_dir.as_deref() {
-        load_local_images(dir)?
+        load_local_images(dir, messages)?
     } else {
         0
     };
@@ -16,19 +16,19 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
     if loaded_archives == 0 {
         let pull_args = compose_pull_args(&args.compose_file, &args.services);
         let pull_args_ref: Vec<&str> = pull_args.iter().map(String::as_str).collect();
-        run_docker(&pull_args_ref, "docker compose pull")?;
+        run_docker(&pull_args_ref, "docker compose pull", messages)?;
     }
 
     let compose_args = compose_up_args(&args.compose_file, &args.services);
     let compose_args_ref: Vec<&str> = compose_args.iter().map(String::as_str).collect();
-    run_docker(&compose_args_ref, "docker compose up")?;
+    run_docker(&compose_args_ref, "docker compose up", messages)?;
 
     let readiness = collect_readiness(&args.compose_file, &args.services, messages)?;
 
     for entry in &readiness {
         let update_args = docker_update_args(&args.restart_policy, &entry.container_id);
         let update_args_ref: Vec<&str> = update_args.iter().map(String::as_str).collect();
-        run_docker(&update_args_ref, "docker update")?;
+        run_docker(&update_args_ref, "docker update", messages)?;
     }
 
     print_readiness_summary(&readiness, messages);
@@ -69,23 +69,29 @@ pub(crate) fn collect_readiness(
 ) -> Result<Vec<ContainerReadiness>> {
     let mut readiness = Vec::with_capacity(services.len());
     for service in services {
-        let container_id = docker_compose_output(&[
-            "-f",
-            compose_file.to_string_lossy().as_ref(),
-            "ps",
-            "-q",
-            service,
-        ])?;
+        let container_id = docker_compose_output(
+            &[
+                "-f",
+                compose_file.to_string_lossy().as_ref(),
+                "ps",
+                "-q",
+                service,
+            ],
+            messages,
+        )?;
         let container_id = container_id.trim().to_string();
         if container_id.is_empty() {
             anyhow::bail!(messages.error_service_no_container(service));
         }
-        let inspect_output = docker_output(&[
-            "inspect",
-            "--format",
-            "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}",
-            &container_id,
-        ])?;
+        let inspect_output = docker_output(
+            &[
+                "inspect",
+                "--format",
+                "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}",
+                &container_id,
+            ],
+            messages,
+        )?;
         let (status, health) = parse_container_state(&inspect_output);
         readiness.push(ContainerReadiness {
             service: service.clone(),
@@ -148,12 +154,12 @@ fn ensure_all_healthy(readiness: &[ContainerReadiness], messages: &Messages) -> 
     }
 }
 
-fn load_local_images(dir: &Path) -> Result<usize> {
+fn load_local_images(dir: &Path, messages: &Messages) -> Result<usize> {
     let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("Failed to read image archive dir: {}", dir.display()))?;
+        .with_context(|| messages.error_read_dir_failed(&dir.display().to_string()))?;
     let mut loaded = 0;
     for entry in entries {
-        let entry = entry.context("Failed to read image archive entry")?;
+        let entry = entry.with_context(|| messages.error_read_dir_entry_failed())?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -164,7 +170,7 @@ fn load_local_images(dir: &Path) -> Result<usize> {
         println!("Loading image archive: {}", path.display());
         let path_str = path.to_string_lossy();
         let args = ["load", "-i", path_str.as_ref()];
-        run_docker(&args, "docker load")?;
+        run_docker(&args, "docker load", messages)?;
         loaded += 1;
     }
     Ok(loaded)
@@ -216,38 +222,38 @@ fn docker_update_args(restart_policy: &str, container_id: &str) -> Vec<String> {
     ]
 }
 
-pub(crate) fn run_docker(args: &[&str], context: &str) -> Result<()> {
+pub(crate) fn run_docker(args: &[&str], context: &str, messages: &Messages) -> Result<()> {
     let status = ProcessCommand::new("docker")
         .args(args)
         .status()
-        .with_context(|| format!("Failed to run {context}"))?;
+        .with_context(|| messages.error_command_run_failed(context))?;
     if !status.success() {
-        anyhow::bail!("{context} failed with status: {status}");
+        anyhow::bail!(messages.error_command_failed_status(context, &status.to_string()));
     }
     Ok(())
 }
 
-fn docker_compose_output(args: &[&str]) -> Result<String> {
+fn docker_compose_output(args: &[&str], messages: &Messages) -> Result<String> {
     let output = ProcessCommand::new("docker")
         .args(["compose"])
         .args(args)
         .output()
-        .context("Failed to run docker compose")?;
+        .with_context(|| messages.error_command_run_failed("docker compose"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("docker compose failed: {stderr}");
+        anyhow::bail!(messages.error_docker_compose_failed(&stderr));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn docker_output(args: &[&str]) -> Result<String> {
+fn docker_output(args: &[&str], messages: &Messages) -> Result<String> {
     let output = ProcessCommand::new("docker")
         .args(args)
         .output()
-        .with_context(|| format!("Failed to run docker {}", args.join(" ")))?;
+        .with_context(|| messages.error_command_run_failed("docker"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("docker command failed: {stderr}");
+        anyhow::bail!(messages.error_docker_command_failed(&stderr));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }

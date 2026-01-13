@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bootroot::openbao::{KvMountStatus, OpenBaoClient};
 
 use crate::StatusArgs;
@@ -13,11 +13,20 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
     let readiness = collect_readiness(&args.compose_file, &services, messages)?;
     let infra_failures = collect_infra_failures(&readiness);
 
-    let mut client = OpenBaoClient::new(&args.openbao_url)?;
-    let openbao_health = client.health_check().await;
+    let mut client = OpenBaoClient::new(&args.openbao_url)
+        .with_context(|| messages.error_openbao_client_create_failed())?;
+    let openbao_health = client
+        .health_check()
+        .await
+        .with_context(|| messages.error_openbao_health_check_failed());
     let openbao_ok = openbao_health.is_ok();
     let seal_status = if openbao_ok {
-        Some(client.seal_status().await?)
+        Some(
+            client
+                .seal_status()
+                .await
+                .with_context(|| messages.error_openbao_seal_status_failed())?,
+        )
     } else {
         None
     };
@@ -27,7 +36,12 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
     }
 
     let kv_mount_status = if openbao_ok && args.root_token.is_some() {
-        Some(client.kv_mount_status(&args.kv_mount).await?)
+        Some(
+            client
+                .kv_mount_status(&args.kv_mount)
+                .await
+                .with_context(|| messages.error_openbao_kv_mount_status_failed())?,
+        )
     } else {
         None
     };
@@ -39,7 +53,7 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         PATH_AGENT_EAB,
     ];
     let kv_statuses = if openbao_ok && args.root_token.is_some() {
-        Some(fetch_kv_statuses(&client, &args.kv_mount, &kv_paths).await?)
+        Some(fetch_kv_statuses(&client, &args.kv_mount, &kv_paths, messages).await?)
     } else {
         None
     };
@@ -50,7 +64,7 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         "bootroot-stepca-role",
     ];
     let approle_statuses = if openbao_ok && args.root_token.is_some() {
-        Some(fetch_approle_statuses(&client, &approles).await?)
+        Some(fetch_approle_statuses(&client, &approles, messages).await?)
     } else {
         None
     };
@@ -96,10 +110,14 @@ async fn fetch_kv_statuses(
     client: &OpenBaoClient,
     kv_mount: &str,
     paths: &[&str],
+    messages: &Messages,
 ) -> Result<Vec<(String, bool)>> {
     let mut statuses = Vec::with_capacity(paths.len());
     for path in paths {
-        let exists = client.kv_exists(kv_mount, path).await?;
+        let exists = client
+            .kv_exists(kv_mount, path)
+            .await
+            .with_context(|| messages.error_openbao_kv_exists_failed())?;
         statuses.push((format!("{kv_mount}/{path}"), exists));
     }
     Ok(statuses)
@@ -108,10 +126,14 @@ async fn fetch_kv_statuses(
 async fn fetch_approle_statuses(
     client: &OpenBaoClient,
     roles: &[&str],
+    messages: &Messages,
 ) -> Result<Vec<(String, bool)>> {
     let mut statuses = Vec::with_capacity(roles.len());
     for role in roles {
-        let exists = client.approle_exists(role).await?;
+        let exists = client
+            .approle_exists(role)
+            .await
+            .with_context(|| messages.error_openbao_approle_exists_failed())?;
         statuses.push((role.to_string(), exists));
     }
     Ok(statuses)

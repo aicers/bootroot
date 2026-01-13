@@ -67,8 +67,12 @@ pub(crate) use openbao_constants::{
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
     ensure_infra_ready(&args.compose_file, messages)?;
 
-    let mut client = OpenBaoClient::new(&args.openbao_url)?;
-    client.health_check().await?;
+    let mut client = OpenBaoClient::new(&args.openbao_url)
+        .with_context(|| messages.error_openbao_client_create_failed())?;
+    client
+        .health_check()
+        .await
+        .with_context(|| messages.error_openbao_health_check_failed())?;
 
     let mut rollback = InitRollback::default();
     let result: Result<InitSummary> = async {
@@ -111,15 +115,17 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
         };
 
         let (role_outputs, _policies, approles) =
-            configure_openbao(&client, args, &secrets, &mut rollback).await?;
+            configure_openbao(&client, args, &secrets, &mut rollback, messages).await?;
 
         let secrets_dir = args.secrets_dir.clone();
-        rollback.password_backup =
-            Some(write_password_file_with_backup(&secrets_dir, &secrets.stepca_password).await?);
+        rollback.password_backup = Some(
+            write_password_file_with_backup(&secrets_dir, &secrets.stepca_password, messages)
+                .await?,
+        );
         rollback.ca_json_backup =
-            Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn).await?);
+            Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn, messages).await?);
 
-        let step_ca_result = ensure_step_ca_initialized(&secrets_dir)?;
+        let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
         let responder_check = verify_responder(args, messages, &secrets).await?;
         let eab_update =
             maybe_register_eab(&client, args, messages, &mut rollback, &secrets).await?;
@@ -132,6 +138,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             &args.kv_mount,
             &approles,
             &args.secrets_dir,
+            messages,
         )?;
 
         Ok(InitSummary {
@@ -161,7 +168,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
         }
         Err(err) => {
             eprintln!("{}", messages.init_failed_rollback());
-            rollback.rollback(&client, &args.kv_mount).await;
+            rollback.rollback(&client, &args.kv_mount, messages).await;
             Err(err)
         }
     }
@@ -200,9 +207,12 @@ async fn bootstrap_openbao(
     messages: &Messages,
 ) -> Result<InitBootstrap> {
     let (init_response, mut root_token, mut unseal_keys) =
-        ensure_openbao_initialized(client, args).await?;
+        ensure_openbao_initialized(client, args, messages).await?;
 
-    let seal_status = client.seal_status().await?;
+    let seal_status = client
+        .seal_status()
+        .await
+        .with_context(|| messages.error_openbao_seal_status_failed())?;
     if seal_status.sealed {
         if unseal_keys.is_empty() {
             unseal_keys = prompt_unseal_keys(seal_status.t, messages)?;
@@ -211,7 +221,7 @@ async fn bootstrap_openbao(
     }
 
     if root_token.is_none() {
-        root_token = Some(prompt_text(messages.prompt_openbao_root_token())?);
+        root_token = Some(prompt_text(messages.prompt_openbao_root_token(), messages)?);
     }
     let root_token =
         root_token.ok_or_else(|| anyhow::anyhow!(messages.error_openbao_root_token_required()))?;
@@ -234,11 +244,13 @@ fn resolve_init_secrets(
         messages.prompt_stepca_password(),
         args.stepca_password.clone(),
         args.auto_generate,
+        messages,
     )?;
     let http_hmac = resolve_secret(
         messages.prompt_http_hmac(),
         args.http_hmac.clone(),
         args.auto_generate,
+        messages,
     )?;
     let eab = resolve_eab(args, messages)?;
 
@@ -255,20 +267,34 @@ async fn configure_openbao(
     args: &InitArgs,
     secrets: &InitSecrets,
     rollback: &mut InitRollback,
+    messages: &Messages,
 ) -> Result<(
     Vec<AppRoleOutput>,
     BTreeMap<String, String>,
     BTreeMap<String, String>,
 )> {
-    client.ensure_kv_v2(&args.kv_mount).await?;
-    client.ensure_approle_auth().await?;
+    client
+        .ensure_kv_v2(&args.kv_mount)
+        .await
+        .with_context(|| messages.error_openbao_kv_mount_failed())?;
+    client
+        .ensure_approle_auth()
+        .await
+        .with_context(|| messages.error_openbao_approle_auth_failed())?;
 
     let policies = build_policy_map(&args.kv_mount);
     for (name, policy) in &policies {
-        if !client.policy_exists(name).await? {
+        if !client
+            .policy_exists(name)
+            .await
+            .with_context(|| messages.error_openbao_policy_exists_failed())?
+        {
             rollback.created_policies.push(name.clone());
         }
-        client.write_policy(name, policy).await?;
+        client
+            .write_policy(name, policy)
+            .await
+            .with_context(|| messages.error_openbao_policy_write_failed())?;
     }
 
     let approles = build_approle_map();
@@ -279,7 +305,11 @@ async fn configure_openbao(
             "stepca" => POLICY_BOOTROOT_STEPCA,
             _ => continue,
         };
-        if !client.approle_exists(role_name).await? {
+        if !client
+            .approle_exists(role_name)
+            .await
+            .with_context(|| messages.error_openbao_approle_exists_failed())?
+        {
             rollback.created_approles.push(role_name.clone());
         }
         client
@@ -290,13 +320,20 @@ async fn configure_openbao(
                 SECRET_ID_TTL,
                 true,
             )
-            .await?;
+            .await
+            .with_context(|| messages.error_openbao_approle_create_failed())?;
     }
 
     let mut role_outputs = Vec::new();
     for (label, role_name) in &approles {
-        let role_id = client.read_role_id(role_name).await?;
-        let secret_id = client.create_secret_id(role_name).await?;
+        let role_id = client
+            .read_role_id(role_name)
+            .await
+            .with_context(|| messages.error_openbao_role_id_failed())?;
+        let secret_id = client
+            .create_secret_id(role_name)
+            .await
+            .with_context(|| messages.error_openbao_secret_id_failed())?;
         role_outputs.push(AppRoleOutput {
             label: label.clone(),
             role_name: role_name.clone(),
@@ -310,12 +347,16 @@ async fn configure_openbao(
         kv_paths.push(PATH_AGENT_EAB);
     }
     for path in kv_paths {
-        if !client.kv_exists(&args.kv_mount, path).await? {
+        if !client
+            .kv_exists(&args.kv_mount, path)
+            .await
+            .with_context(|| messages.error_openbao_kv_exists_failed())?
+        {
             rollback.written_kv_paths.push(path.to_string());
         }
     }
 
-    write_openbao_secrets_with_retry(client, &args.kv_mount, secrets).await?;
+    write_openbao_secrets_with_retry(client, &args.kv_mount, secrets, messages).await?;
 
     Ok((role_outputs, policies, approles))
 }
@@ -324,6 +365,7 @@ async fn write_openbao_secrets_with_retry(
     client: &OpenBaoClient,
     kv_mount: &str,
     secrets: &InitSecrets,
+    messages: &Messages,
 ) -> Result<()> {
     let attempt = write_openbao_secrets(
         client,
@@ -332,12 +374,16 @@ async fn write_openbao_secrets_with_retry(
         &secrets.db_dsn,
         &secrets.http_hmac,
         secrets.eab.as_ref(),
+        messages,
     )
     .await;
     if let Err(err) = attempt {
         let message = err.to_string();
         if message.contains("No secret engine mount") {
-            client.ensure_kv_v2(kv_mount).await?;
+            client
+                .ensure_kv_v2(kv_mount)
+                .await
+                .with_context(|| messages.error_openbao_kv_mount_failed())?;
             write_openbao_secrets(
                 client,
                 kv_mount,
@@ -345,6 +391,7 @@ async fn write_openbao_secrets_with_retry(
                 &secrets.db_dsn,
                 &secrets.http_hmac,
                 secrets.eab.as_ref(),
+                messages,
             )
             .await?;
         } else {
@@ -357,15 +404,20 @@ async fn write_openbao_secrets_with_retry(
 async fn ensure_openbao_initialized(
     client: &OpenBaoClient,
     args: &InitArgs,
+    messages: &Messages,
 ) -> Result<(Option<InitResponse>, Option<String>, Vec<String>)> {
-    let initialized = client.is_initialized().await?;
+    let initialized = client
+        .is_initialized()
+        .await
+        .with_context(|| messages.error_openbao_init_status_failed())?;
     if initialized {
         return Ok((None, args.root_token.clone(), args.unseal_key.clone()));
     }
 
     let response = client
         .init(INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD)
-        .await?;
+        .await
+        .with_context(|| messages.error_openbao_init_failed())?;
     let root_token = response.root_token.clone();
     let keys = if response.keys.is_empty() {
         response.keys_base64.clone()
@@ -381,12 +433,18 @@ async fn unseal_openbao(
     messages: &Messages,
 ) -> Result<()> {
     for key in keys {
-        let status = client.unseal(key).await?;
+        let status = client
+            .unseal(key)
+            .await
+            .with_context(|| messages.error_openbao_unseal_failed())?;
         if !status.sealed {
             return Ok(());
         }
     }
-    let status = client.seal_status().await?;
+    let status = client
+        .seal_status()
+        .await
+        .with_context(|| messages.error_openbao_seal_status_failed())?;
     if status.sealed {
         anyhow::bail!(messages.error_openbao_sealed());
     }
@@ -397,7 +455,7 @@ fn prompt_unseal_keys(threshold: Option<u32>, messages: &Messages) -> Result<Vec
     let count = match threshold {
         Some(value) if value > 0 => value,
         _ => {
-            let input = prompt_text(messages.prompt_unseal_threshold())?;
+            let input = prompt_text(messages.prompt_unseal_threshold(), messages)?;
             input
                 .parse::<u32>()
                 .context(messages.error_invalid_unseal_threshold())?
@@ -405,25 +463,27 @@ fn prompt_unseal_keys(threshold: Option<u32>, messages: &Messages) -> Result<Vec
     };
     let mut keys = Vec::with_capacity(count as usize);
     for index in 1..=count {
-        let key = prompt_text(&messages.prompt_unseal_key(index, count))?;
+        let key = prompt_text(&messages.prompt_unseal_key(index, count), messages)?;
         keys.push(key);
     }
     Ok(keys)
 }
 
-fn prompt_text(prompt: &str) -> Result<String> {
+fn prompt_text(prompt: &str, messages: &Messages) -> Result<String> {
     use std::io::{self, Write};
     print!("{prompt}");
-    io::stdout().flush().context("Failed to flush stdout")?;
+    io::stdout()
+        .flush()
+        .with_context(|| messages.error_prompt_flush_failed())?;
     let mut input = String::new();
     io::stdin()
         .read_line(&mut input)
-        .context("Failed to read input")?;
+        .with_context(|| messages.error_prompt_read_failed())?;
     Ok(input.trim().to_string())
 }
 
-fn prompt_text_with_default(prompt: &str, default: &str) -> Result<String> {
-    let input = prompt_text(prompt)?;
+fn prompt_text_with_default(prompt: &str, default: &str, messages: &Messages) -> Result<String> {
+    let input = prompt_text(prompt, messages)?;
     if input.trim().is_empty() {
         Ok(default.to_string())
     } else {
@@ -431,27 +491,32 @@ fn prompt_text_with_default(prompt: &str, default: &str) -> Result<String> {
     }
 }
 
-fn prompt_yes_no(prompt: &str) -> Result<bool> {
-    let input = prompt_text(prompt)?;
+fn prompt_yes_no(prompt: &str, messages: &Messages) -> Result<bool> {
+    let input = prompt_text(prompt, messages)?;
     let trimmed = input.trim().to_ascii_lowercase();
     Ok(trimmed == "y" || trimmed == "yes")
 }
 
 fn confirm_overwrite(prompt: &str, messages: &Messages) -> Result<()> {
-    if prompt_yes_no(prompt)? {
+    if prompt_yes_no(prompt, messages)? {
         return Ok(());
     }
     anyhow::bail!(messages.error_operation_cancelled());
 }
 
-fn resolve_secret(label: &str, value: Option<String>, auto_generate: bool) -> Result<String> {
+fn resolve_secret(
+    label: &str,
+    value: Option<String>,
+    auto_generate: bool,
+    messages: &Messages,
+) -> Result<String> {
     if let Some(value) = value {
         return Ok(value);
     }
     if auto_generate {
-        return generate_secret();
+        return generate_secret(messages);
     }
-    prompt_text(&format!("{label}: "))
+    prompt_text(&format!("{label}: "), messages)
 }
 
 fn resolve_eab(args: &InitArgs, messages: &Messages) -> Result<Option<EabCredentials>> {
@@ -499,7 +564,7 @@ async fn check_db_connectivity(
     let dsn_value = dsn.to_string();
     tokio::task::spawn_blocking(move || check_auth_sync(&dsn_value, timeout))
         .await
-        .context("DB auth check task failed")?
+        .with_context(|| messages.error_db_auth_task_failed())?
         .with_context(|| messages.error_db_auth_failed())?;
     Ok(())
 }
@@ -515,27 +580,27 @@ async fn maybe_register_eab(
         return Ok(None);
     }
     if args.eab_auto {
-        let credentials = issue_eab_via_stepca(args)
+        let credentials = issue_eab_via_stepca(args, messages)
             .await
             .with_context(|| messages.error_eab_auto_failed())?;
-        register_eab_secret(client, &args.kv_mount, rollback, &credentials).await?;
+        register_eab_secret(client, &args.kv_mount, rollback, &credentials, messages).await?;
         return Ok(Some(credentials));
     }
-    if !prompt_yes_no(messages.prompt_eab_register_now())? {
+    if !prompt_yes_no(messages.prompt_eab_register_now(), messages)? {
         return Ok(None);
     }
-    if prompt_yes_no(messages.prompt_eab_auto_now())? {
-        let credentials = issue_eab_via_stepca(args)
+    if prompt_yes_no(messages.prompt_eab_auto_now(), messages)? {
+        let credentials = issue_eab_via_stepca(args, messages)
             .await
             .with_context(|| messages.error_eab_auto_failed())?;
-        register_eab_secret(client, &args.kv_mount, rollback, &credentials).await?;
+        register_eab_secret(client, &args.kv_mount, rollback, &credentials, messages).await?;
         return Ok(Some(credentials));
     }
     println!("{}", messages.eab_prompt_instructions());
-    let kid = prompt_text(messages.prompt_eab_kid())?;
-    let hmac = prompt_text(messages.prompt_eab_hmac())?;
+    let kid = prompt_text(messages.prompt_eab_kid(), messages)?;
+    let hmac = prompt_text(messages.prompt_eab_hmac(), messages)?;
     let credentials = EabCredentials { kid, hmac };
-    register_eab_secret(client, &args.kv_mount, rollback, &credentials).await?;
+    register_eab_secret(client, &args.kv_mount, rollback, &credentials, messages).await?;
     Ok(Some(credentials))
 }
 
@@ -544,8 +609,13 @@ async fn register_eab_secret(
     kv_mount: &str,
     rollback: &mut InitRollback,
     credentials: &EabCredentials,
+    messages: &Messages,
 ) -> Result<()> {
-    if !client.kv_exists(kv_mount, PATH_AGENT_EAB).await? {
+    if !client
+        .kv_exists(kv_mount, PATH_AGENT_EAB)
+        .await
+        .with_context(|| messages.error_openbao_kv_exists_failed())?
+    {
         rollback.written_kv_paths.push(PATH_AGENT_EAB.to_string());
     }
     client
@@ -554,25 +624,39 @@ async fn register_eab_secret(
             PATH_AGENT_EAB,
             serde_json::json!({ "kid": credentials.kid, "hmac": credentials.hmac }),
         )
-        .await?;
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
     Ok(())
 }
 
-async fn issue_eab_via_stepca(args: &InitArgs) -> Result<EabCredentials> {
+async fn issue_eab_via_stepca(args: &InitArgs, messages: &Messages) -> Result<EabCredentials> {
     let base = args.stepca_url.trim_end_matches('/');
     let provisioner = args.stepca_provisioner.trim();
     let endpoint = format!("{base}/acme/{provisioner}/{DEFAULT_EAB_ENDPOINT_PATH}");
     let client = reqwest::Client::new();
 
-    let response = client.post(&endpoint).send().await?;
+    let response = client
+        .post(&endpoint)
+        .send()
+        .await
+        .with_context(|| messages.error_eab_request_failed())?;
     let response = if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-        client.get(&endpoint).send().await?
+        client
+            .get(&endpoint)
+            .send()
+            .await
+            .with_context(|| messages.error_eab_request_failed())?
     } else {
         response
     };
-    let response = response.error_for_status()?;
+    let response = response
+        .error_for_status()
+        .with_context(|| messages.error_eab_request_failed())?;
 
-    let payload: EabAutoResponse = response.json().await?;
+    let payload: EabAutoResponse = response
+        .json()
+        .await
+        .with_context(|| messages.error_eab_response_parse_failed())?;
     Ok(EabCredentials {
         kid: payload.kid,
         hmac: payload.hmac,
@@ -606,7 +690,7 @@ async fn resolve_db_dsn_for_init(args: &InitArgs, messages: &Messages) -> Result
             )
         })
         .await
-        .context("DB provisioning task failed")??;
+        .with_context(|| messages.error_db_provision_task_failed())??;
         return Ok(dsn);
     }
     resolve_db_dsn(args, messages)
@@ -626,7 +710,7 @@ fn resolve_db_provision_inputs(args: &InitArgs, messages: &Messages) -> Result<D
     } else if let Some(value) = build_admin_dsn_from_env() {
         value
     } else {
-        prompt_text(&format!("{}: ", messages.prompt_db_admin_dsn()))?
+        prompt_text(&format!("{}: ", messages.prompt_db_admin_dsn()), messages)?
     };
     let default_db_name = args
         .db_name
@@ -637,20 +721,20 @@ fn resolve_db_provision_inputs(args: &InitArgs, messages: &Messages) -> Result<D
         value
     } else {
         let prompt = format!("{} [{}]: ", messages.prompt_db_user(), DEFAULT_DB_USER);
-        prompt_text_with_default(&prompt, DEFAULT_DB_USER)?
+        prompt_text_with_default(&prompt, DEFAULT_DB_USER, messages)?
     };
     let db_name = if let Some(value) = args.db_name.clone() {
         value
     } else {
         let prompt = format!("{} [{}]: ", messages.prompt_db_name(), default_db_name);
-        prompt_text_with_default(&prompt, &default_db_name)?
+        prompt_text_with_default(&prompt, &default_db_name, messages)?
     };
     let db_password = if let Some(value) = args.db_password.clone() {
         value
     } else if args.auto_generate {
-        generate_secret()?
+        generate_secret(messages)?
     } else {
-        prompt_text(&format!("{}: ", messages.prompt_db_password()))?
+        prompt_text(&format!("{}: ", messages.prompt_db_password()), messages)?
     };
 
     validate_db_identifier(&db_user)
@@ -697,7 +781,7 @@ fn resolve_db_dsn(args: &InitArgs, messages: &Messages) -> Result<String> {
     if let Some(dsn) = build_dsn_from_env() {
         return Ok(dsn);
     }
-    prompt_text(&format!("{}: ", messages.prompt_db_dsn()))
+    prompt_text(&format!("{}: ", messages.prompt_db_dsn()), messages)
 }
 
 fn build_dsn_from_env() -> Option<String> {
@@ -716,7 +800,7 @@ fn build_dsn_from_env() -> Option<String> {
     Some(dsn)
 }
 
-fn generate_secret() -> Result<String> {
+fn generate_secret(messages: &Messages) -> Result<String> {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ring::rand::{SecureRandom, SystemRandom};
@@ -724,7 +808,7 @@ fn generate_secret() -> Result<String> {
     let mut buffer = vec![0u8; SECRET_BYTES];
     let rng = SystemRandom::new();
     rng.fill(&mut buffer)
-        .map_err(|_| anyhow::anyhow!("Failed to generate random secret"))?;
+        .map_err(|_| anyhow::anyhow!(messages.error_generate_secret_failed()))?;
     Ok(URL_SAFE_NO_PAD.encode(buffer))
 }
 
@@ -787,6 +871,7 @@ async fn write_openbao_secrets(
     db_dsn: &str,
     http_hmac: &str,
     eab: Option<&EabCredentials>,
+    messages: &Messages,
 ) -> Result<()> {
     client
         .write_kv(
@@ -794,21 +879,24 @@ async fn write_openbao_secrets(
             PATH_STEPCA_PASSWORD,
             serde_json::json!({ "value": stepca_password }),
         )
-        .await?;
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
     client
         .write_kv(
             kv_mount,
             PATH_STEPCA_DB,
             serde_json::json!({ "dsn": db_dsn }),
         )
-        .await?;
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
     client
         .write_kv(
             kv_mount,
             PATH_RESPONDER_HMAC,
             serde_json::json!({ "value": http_hmac }),
         )
-        .await?;
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
     if let Some(eab) = eab {
         client
             .write_kv(
@@ -816,7 +904,8 @@ async fn write_openbao_secrets(
                 PATH_AGENT_EAB,
                 serde_json::json!({ "kid": eab.kid, "hmac": eab.hmac }),
             )
-            .await?;
+            .await
+            .with_context(|| messages.error_openbao_kv_write_failed())?;
     }
     Ok(())
 }
@@ -824,6 +913,7 @@ async fn write_openbao_secrets(
 async fn write_password_file_with_backup(
     secrets_dir: &Path,
     password: &str,
+    messages: &Messages,
 ) -> Result<RollbackFile> {
     fs_util::ensure_secrets_dir(secrets_dir).await?;
     let password_path = secrets_dir.join("password.txt");
@@ -831,12 +921,14 @@ async fn write_password_file_with_backup(
         Ok(contents) => Some(contents),
         Err(err) if err.kind() == ErrorKind::NotFound => None,
         Err(err) => {
-            return Err(err).with_context(|| format!("Failed to read {}", password_path.display()));
+            return Err(err).with_context(|| {
+                messages.error_read_file_failed(&password_path.display().to_string())
+            });
         }
     };
     tokio::fs::write(&password_path, password)
         .await
-        .with_context(|| format!("Failed to write {}", password_path.display()))?;
+        .with_context(|| messages.error_write_file_failed(&password_path.display().to_string()))?;
     fs_util::set_key_permissions(&password_path).await?;
     Ok(RollbackFile {
         path: password_path,
@@ -844,26 +936,31 @@ async fn write_password_file_with_backup(
     })
 }
 
-async fn update_ca_json_with_backup(secrets_dir: &Path, db_dsn: &str) -> Result<RollbackFile> {
+async fn update_ca_json_with_backup(
+    secrets_dir: &Path,
+    db_dsn: &str,
+    messages: &Messages,
+) -> Result<RollbackFile> {
     let path = secrets_dir.join("config").join("ca.json");
     let contents = tokio::fs::read_to_string(&path)
         .await
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
     let mut value: serde_json::Value =
-        serde_json::from_str(&contents).context("Failed to parse ca.json")?;
+        serde_json::from_str(&contents).context(messages.error_parse_ca_json_failed())?;
     value["db"]["type"] = serde_json::Value::String("postgresql".to_string());
     value["db"]["dataSource"] = serde_json::Value::String(db_dsn.to_string());
-    let updated = serde_json::to_string_pretty(&value).context("Failed to serialize ca.json")?;
+    let updated =
+        serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
     tokio::fs::write(&path, updated)
         .await
-        .with_context(|| format!("Failed to write {}", path.display()))?;
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(RollbackFile {
         path,
         original: Some(contents),
     })
 }
 
-fn ensure_step_ca_initialized(secrets_dir: &Path) -> Result<StepCaInitResult> {
+fn ensure_step_ca_initialized(secrets_dir: &Path, messages: &Messages) -> Result<StepCaInitResult> {
     let config_path = secrets_dir.join("config").join("ca.json");
     let ca_key = secrets_dir.join("secrets").join("root_ca_key");
     let intermediate_key = secrets_dir.join("secrets").join("intermediate_ca_key");
@@ -873,13 +970,10 @@ fn ensure_step_ca_initialized(secrets_dir: &Path) -> Result<StepCaInitResult> {
 
     let password_path = secrets_dir.join("password.txt");
     if !password_path.exists() {
-        anyhow::bail!(
-            "step-ca password file not found at {}",
-            password_path.display()
-        );
+        anyhow::bail!(messages.error_stepca_password_missing(&password_path.display().to_string()));
     }
     let mount_root = std::fs::canonicalize(secrets_dir)
-        .with_context(|| format!("Failed to resolve {}", secrets_dir.display()))?;
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let mount = format!("{}:/home/step", mount_root.display());
     let args = vec![
         "run".to_string(),
@@ -907,7 +1001,7 @@ fn ensure_step_ca_initialized(secrets_dir: &Path) -> Result<StepCaInitResult> {
         "--acme".to_string(),
     ];
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_docker(&args_ref, "docker step-ca init")?;
+    run_docker(&args_ref, "docker step-ca init", messages)?;
     Ok(StepCaInitResult::Initialized)
 }
 
@@ -916,6 +1010,7 @@ fn write_state_file(
     kv_mount: &str,
     approles: &BTreeMap<String, String>,
     secrets_dir: &Path,
+    messages: &Messages,
 ) -> Result<()> {
     let policy_map = [
         (
@@ -941,7 +1036,9 @@ fn write_state_file(
             .collect(),
         apps: BTreeMap::new(),
     };
-    state.save(Path::new("state.json"))?;
+    state
+        .save(Path::new("state.json"))
+        .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
 }
 
@@ -961,10 +1058,13 @@ struct InitRollback {
 }
 
 impl InitRollback {
-    async fn rollback(&self, client: &OpenBaoClient, kv_mount: &str) {
+    async fn rollback(&self, client: &OpenBaoClient, kv_mount: &str, messages: &Messages) {
         for path in &self.written_kv_paths {
             if let Err(err) = client.delete_kv(kv_mount, path).await {
-                eprintln!("Rollback: failed to delete KV path {path}: {err}");
+                eprintln!(
+                    "{}: {path}: {err}",
+                    messages.error_openbao_kv_delete_failed()
+                );
             }
         }
         for role in &self.created_approles {
@@ -978,25 +1078,26 @@ impl InitRollback {
             }
         }
         if let Some(file) = &self.password_backup
-            && let Err(err) = rollback_file(file)
+            && let Err(err) = rollback_file(file, messages)
         {
             eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
         }
         if let Some(file) = &self.ca_json_backup
-            && let Err(err) = rollback_file(file)
+            && let Err(err) = rollback_file(file, messages)
         {
             eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
         }
     }
 }
 
-fn rollback_file(file: &RollbackFile) -> Result<()> {
+fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
     if let Some(contents) = &file.original {
-        std::fs::write(&file.path, contents)
-            .with_context(|| format!("Failed to restore {}", file.path.display()))?;
+        std::fs::write(&file.path, contents).with_context(|| {
+            messages.error_restore_file_failed(&file.path.display().to_string())
+        })?;
     } else if file.path.exists() {
         std::fs::remove_file(&file.path)
-            .with_context(|| format!("Failed to remove {}", file.path.display()))?;
+            .with_context(|| messages.error_remove_file_failed(&file.path.display().to_string()))?;
     }
     Ok(())
 }
@@ -1108,13 +1209,21 @@ mod tests {
 
     #[test]
     fn test_resolve_secret_prefers_value() {
-        let value = resolve_secret("step-ca password", Some("value".to_string()), false).unwrap();
+        let messages = test_messages();
+        let value = resolve_secret(
+            "step-ca password",
+            Some("value".to_string()),
+            false,
+            &messages,
+        )
+        .unwrap();
         assert_eq!(value, "value");
     }
 
     #[test]
     fn test_resolve_secret_auto_generates() {
-        let value = resolve_secret("HTTP-01 HMAC", None, true).unwrap();
+        let messages = test_messages();
+        let value = resolve_secret("HTTP-01 HMAC", None, true, &messages).unwrap();
         assert!(!value.is_empty());
     }
 
@@ -1298,7 +1407,7 @@ mod tests {
         fs::write(secrets_dir.join("secrets").join("root_ca_key"), "").unwrap();
         fs::write(secrets_dir.join("secrets").join("intermediate_ca_key"), "").unwrap();
 
-        let result = ensure_step_ca_initialized(&secrets_dir).unwrap();
+        let result = ensure_step_ca_initialized(&secrets_dir, &test_messages()).unwrap();
         assert_eq!(result, StepCaInitResult::Skipped);
     }
 
@@ -1308,7 +1417,7 @@ mod tests {
         let secrets_dir = temp_dir.path().join("secrets");
         fs::create_dir_all(&secrets_dir).unwrap();
 
-        let err = ensure_step_ca_initialized(&secrets_dir).unwrap_err();
+        let err = ensure_step_ca_initialized(&secrets_dir, &test_messages()).unwrap_err();
         assert!(err.to_string().contains("step-ca password file not found"));
     }
 
