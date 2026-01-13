@@ -33,6 +33,11 @@ const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca";
 const DEFAULT_CA_ADDRESS: &str = ":9000";
 const SECRET_BYTES: usize = 32;
 const DEFAULT_RESPONDER_TOKEN_TTL_SECS: u64 = 60;
+const DEFAULT_RESPONDER_ADMIN_URL: &str = "http://bootroot-http01:8080";
+const RESPONDER_TEMPLATE_DIR: &str = "templates";
+const RESPONDER_TEMPLATE_NAME: &str = "responder.toml.ctmpl";
+const RESPONDER_CONFIG_DIR: &str = "responder";
+const RESPONDER_CONFIG_NAME: &str = "responder.toml";
 const DEFAULT_EAB_ENDPOINT_PATH: &str = "eab";
 const DEFAULT_DB_USER: &str = "stepca";
 const DEFAULT_DB_NAME: &str = "stepca";
@@ -75,91 +80,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
         .with_context(|| messages.error_openbao_health_check_failed())?;
 
     let mut rollback = InitRollback::default();
-    let result: Result<InitSummary> = async {
-        let bootstrap = bootstrap_openbao(&mut client, args, messages).await?;
-        let overwrite_password = args.secrets_dir.join("password.txt").exists();
-        let overwrite_ca_json = args.secrets_dir.join("config").join("ca.json").exists();
-        let overwrite_state = Path::new("state.json").exists();
-        let plan = InitPlan {
-            openbao_url: args.openbao_url.clone(),
-            kv_mount: args.kv_mount.clone(),
-            secrets_dir: args.secrets_dir.clone(),
-            overwrite_password,
-            overwrite_ca_json,
-            overwrite_state,
-        };
-        print_init_plan(&plan, messages);
-        if overwrite_password {
-            confirm_overwrite(messages.prompt_confirm_overwrite_password(), messages)?;
-        }
-        if overwrite_ca_json {
-            confirm_overwrite(messages.prompt_confirm_overwrite_ca_json(), messages)?;
-        }
-        if overwrite_state {
-            confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
-        }
-        if args.db_provision {
-            confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
-        }
-
-        let db_dsn = resolve_db_dsn_for_init(args, messages).await?;
-        let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
-        let db_info = parse_db_dsn(&secrets.db_dsn)
-            .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-        let db_check = if args.db_check {
-            check_db_connectivity(&db_info, &secrets.db_dsn, args.db_timeout_secs, messages)
-                .await?;
-            DbCheckStatus::Ok
-        } else {
-            DbCheckStatus::Skipped
-        };
-
-        let (role_outputs, _policies, approles) =
-            configure_openbao(&client, args, &secrets, &mut rollback, messages).await?;
-
-        let secrets_dir = args.secrets_dir.clone();
-        rollback.password_backup = Some(
-            write_password_file_with_backup(&secrets_dir, &secrets.stepca_password, messages)
-                .await?,
-        );
-        rollback.ca_json_backup =
-            Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn, messages).await?);
-
-        let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
-        let responder_check = verify_responder(args, messages, &secrets).await?;
-        let eab_update =
-            maybe_register_eab(&client, args, messages, &mut rollback, &secrets).await?;
-        if let Some(eab) = eab_update {
-            secrets.eab = Some(eab);
-        }
-
-        write_state_file(
-            &args.openbao_url,
-            &args.kv_mount,
-            &approles,
-            &args.secrets_dir,
-            messages,
-        )?;
-
-        Ok(InitSummary {
-            openbao_url: args.openbao_url.clone(),
-            kv_mount: args.kv_mount.clone(),
-            secrets_dir: args.secrets_dir.clone(),
-            show_secrets: args.show_secrets,
-            init_response: bootstrap.init_response.is_some(),
-            root_token: bootstrap.root_token,
-            unseal_keys: bootstrap.unseal_keys,
-            approles: role_outputs,
-            stepca_password: secrets.stepca_password,
-            db_dsn: secrets.db_dsn,
-            http_hmac: secrets.http_hmac,
-            eab: secrets.eab,
-            step_ca_result,
-            responder_check,
-            db_check,
-        })
-    }
-    .await;
+    let result = run_init_inner(&mut client, args, messages, &mut rollback).await;
 
     match result {
         Ok(summary) => {
@@ -172,6 +93,100 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             Err(err)
         }
     }
+}
+
+async fn run_init_inner(
+    client: &mut OpenBaoClient,
+    args: &InitArgs,
+    messages: &Messages,
+    rollback: &mut InitRollback,
+) -> Result<InitSummary> {
+    let bootstrap = bootstrap_openbao(client, args, messages).await?;
+    let overwrite_password = args.secrets_dir.join("password.txt").exists();
+    let overwrite_ca_json = args.secrets_dir.join("config").join("ca.json").exists();
+    let overwrite_state = Path::new("state.json").exists();
+    let plan = InitPlan {
+        openbao_url: args.openbao_url.clone(),
+        kv_mount: args.kv_mount.clone(),
+        secrets_dir: args.secrets_dir.clone(),
+        overwrite_password,
+        overwrite_ca_json,
+        overwrite_state,
+    };
+    print_init_plan(&plan, messages);
+    if overwrite_password {
+        confirm_overwrite(messages.prompt_confirm_overwrite_password(), messages)?;
+    }
+    if overwrite_ca_json {
+        confirm_overwrite(messages.prompt_confirm_overwrite_ca_json(), messages)?;
+    }
+    if overwrite_state {
+        confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
+    }
+    if args.db_provision {
+        confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
+    }
+
+    let db_dsn = resolve_db_dsn_for_init(args, messages).await?;
+    let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
+    let db_info = parse_db_dsn(&secrets.db_dsn)
+        .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
+    let db_check = if args.db_check {
+        check_db_connectivity(&db_info, &secrets.db_dsn, args.db_timeout_secs, messages).await?;
+        DbCheckStatus::Ok
+    } else {
+        DbCheckStatus::Skipped
+    };
+
+    let (role_outputs, _policies, approles) =
+        configure_openbao(client, args, &secrets, rollback, messages).await?;
+
+    let secrets_dir = args.secrets_dir.clone();
+    rollback.password_backup = Some(
+        write_password_file_with_backup(&secrets_dir, &secrets.stepca_password, messages).await?,
+    );
+    rollback.ca_json_backup =
+        Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn, messages).await?);
+    let responder_paths =
+        write_responder_files(&secrets_dir, &args.kv_mount, &secrets.http_hmac, messages).await?;
+
+    let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
+    let responder_url = resolve_responder_url(args, messages)?;
+    let responder_check =
+        verify_responder(responder_url.as_deref(), args, messages, &secrets).await?;
+    let eab_update = maybe_register_eab(client, args, messages, rollback, &secrets).await?;
+    if let Some(eab) = eab_update {
+        secrets.eab = Some(eab);
+    }
+
+    write_state_file(
+        &args.openbao_url,
+        &args.kv_mount,
+        &approles,
+        &args.secrets_dir,
+        messages,
+    )?;
+
+    Ok(InitSummary {
+        openbao_url: args.openbao_url.clone(),
+        kv_mount: args.kv_mount.clone(),
+        secrets_dir: args.secrets_dir.clone(),
+        show_secrets: args.show_secrets,
+        init_response: bootstrap.init_response.is_some(),
+        root_token: bootstrap.root_token,
+        unseal_keys: bootstrap.unseal_keys,
+        approles: role_outputs,
+        stepca_password: secrets.stepca_password,
+        db_dsn: secrets.db_dsn,
+        http_hmac: secrets.http_hmac,
+        eab: secrets.eab,
+        step_ca_result,
+        responder_check,
+        responder_url,
+        responder_template_path: responder_paths.template_path,
+        responder_config_path: responder_paths.config_path,
+        db_check,
+    })
 }
 
 struct InitBootstrap {
@@ -199,6 +214,70 @@ struct EabAutoResponse {
 pub(crate) enum ResponderCheck {
     Skipped,
     Ok,
+}
+
+struct ResponderPaths {
+    template_path: PathBuf,
+    config_path: PathBuf,
+}
+
+async fn write_responder_files(
+    secrets_dir: &Path,
+    kv_mount: &str,
+    hmac: &str,
+    messages: &Messages,
+) -> Result<ResponderPaths> {
+    let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
+    fs_util::ensure_secrets_dir(&templates_dir).await?;
+    let responder_dir = secrets_dir.join(RESPONDER_CONFIG_DIR);
+    fs_util::ensure_secrets_dir(&responder_dir).await?;
+
+    let template_path = templates_dir.join(RESPONDER_TEMPLATE_NAME);
+    let template = build_responder_template(kv_mount);
+    tokio::fs::write(&template_path, template)
+        .await
+        .with_context(|| messages.error_write_file_failed(&template_path.display().to_string()))?;
+    fs_util::set_key_permissions(&template_path).await?;
+
+    let config_path = responder_dir.join(RESPONDER_CONFIG_NAME);
+    let config = build_responder_config(hmac);
+    tokio::fs::write(&config_path, config)
+        .await
+        .with_context(|| messages.error_write_file_failed(&config_path.display().to_string()))?;
+    fs_util::set_key_permissions(&config_path).await?;
+
+    Ok(ResponderPaths {
+        template_path,
+        config_path,
+    })
+}
+
+fn build_responder_template(kv_mount: &str) -> String {
+    format!(
+        r#"# HTTP-01 responder config (OpenBao Agent template)
+
+listen_addr = "0.0.0.0:80"
+admin_addr = "0.0.0.0:8080"
+hmac_secret = "{{{{ with secret "{kv_mount}/data/{PATH_RESPONDER_HMAC}" }}}}{{{{ .Data.data.value }}}}{{{{ end }}}}"
+token_ttl_secs = 300
+cleanup_interval_secs = 30
+max_skew_secs = 60
+"#
+    )
+}
+
+fn build_responder_config(hmac: &str) -> String {
+    format!(
+        r#"# HTTP-01 responder config (rendered)
+
+listen_addr = "0.0.0.0:80"
+admin_addr = "0.0.0.0:8080"
+hmac_secret = "{hmac}"
+token_ttl_secs = 300
+cleanup_interval_secs = 30
+max_skew_secs = 60
+"#
+    )
 }
 
 async fn bootstrap_openbao(
@@ -530,12 +609,27 @@ fn resolve_eab(args: &InitArgs, messages: &Messages) -> Result<Option<EabCredent
     }
 }
 
+fn resolve_responder_url(args: &InitArgs, messages: &Messages) -> Result<Option<String>> {
+    if let Some(responder_url) = args.responder_url.as_ref() {
+        return Ok(Some(responder_url.clone()));
+    }
+    let compose_contents = std::fs::read_to_string(&args.compose_file).with_context(|| {
+        messages.error_read_file_failed(&args.compose_file.display().to_string())
+    })?;
+    if compose_contents.contains("bootroot-http01") {
+        Ok(Some(DEFAULT_RESPONDER_ADMIN_URL.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn verify_responder(
+    responder_url: Option<&str>,
     args: &InitArgs,
     messages: &Messages,
     secrets: &InitSecrets,
 ) -> Result<ResponderCheck> {
-    let Some(responder_url) = args.responder_url.as_deref() else {
+    let Some(responder_url) = responder_url else {
         return Ok(ResponderCheck::Skipped);
     };
     responder_client::register_http01_token_with(
@@ -1117,6 +1211,9 @@ pub(crate) struct InitSummary {
     pub(crate) eab: Option<EabCredentials>,
     pub(crate) step_ca_result: StepCaInitResult,
     pub(crate) responder_check: ResponderCheck,
+    pub(crate) responder_url: Option<String>,
+    pub(crate) responder_template_path: PathBuf,
+    pub(crate) responder_config_path: PathBuf,
     pub(crate) db_check: DbCheckStatus,
 }
 
@@ -1394,6 +1491,42 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_responder_url_skips_when_missing() {
+        let temp_dir = tempdir().unwrap();
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").unwrap();
+        let args = InitArgs {
+            compose_file,
+            ..default_init_args()
+        };
+
+        let responder_url = resolve_responder_url(&args, &test_messages()).unwrap();
+        assert!(responder_url.is_none());
+    }
+
+    #[test]
+    fn test_resolve_responder_url_uses_default_when_present() {
+        let temp_dir = tempdir().unwrap();
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(
+            &compose_file,
+            r"
+services:
+  bootroot-http01:
+    image: bootroot-http01-responder:latest
+",
+        )
+        .unwrap();
+        let args = InitArgs {
+            compose_file,
+            ..default_init_args()
+        };
+
+        let responder_url = resolve_responder_url(&args, &test_messages()).unwrap();
+        assert_eq!(responder_url.as_deref(), Some(DEFAULT_RESPONDER_ADMIN_URL));
+    }
+
+    #[test]
     fn test_step_ca_init_skips_when_files_present() {
         let temp_dir = tempdir().unwrap();
         let secrets_dir = temp_dir.path().join("secrets");
@@ -1409,6 +1542,22 @@ mod tests {
 
         let result = ensure_step_ca_initialized(&secrets_dir, &test_messages()).unwrap();
         assert_eq!(result, StepCaInitResult::Skipped);
+    }
+
+    #[tokio::test]
+    async fn test_write_responder_files_writes_template_and_config() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        let messages = test_messages();
+        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", &messages)
+            .await
+            .unwrap();
+        let template = fs::read_to_string(&paths.template_path).unwrap();
+        let config = fs::read_to_string(&paths.config_path).unwrap();
+
+        assert!(template.contains("secret/data/bootroot/responder/hmac"));
+        assert!(config.contains("hmac-123"));
     }
 
     #[test]

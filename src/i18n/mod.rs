@@ -221,6 +221,9 @@ pub(crate) struct Strings {
     pub(crate) summary_secret_id: &'static str,
     pub(crate) summary_next_steps: &'static str,
     pub(crate) next_steps_configure_templates: &'static str,
+    pub(crate) next_steps_responder_template: &'static str,
+    pub(crate) next_steps_responder_config: &'static str,
+    pub(crate) next_steps_responder_url: &'static str,
     pub(crate) next_steps_reload_services: &'static str,
     pub(crate) next_steps_run_status: &'static str,
     pub(crate) next_steps_eab_issue: &'static str,
@@ -1147,6 +1150,24 @@ impl Messages {
 
     pub(crate) fn next_steps_configure_templates(&self) -> &'static str {
         self.strings().next_steps_configure_templates
+    }
+
+    pub(crate) fn next_steps_responder_template(&self, value: &str) -> String {
+        format_template(
+            self.strings().next_steps_responder_template,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn next_steps_responder_config(&self, value: &str) -> String {
+        format_template(
+            self.strings().next_steps_responder_config,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn next_steps_responder_url(&self, value: &str) -> String {
+        format_template(self.strings().next_steps_responder_url, &[("value", value)])
     }
 
     pub(crate) fn next_steps_reload_services(&self) -> &'static str {
