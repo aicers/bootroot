@@ -38,6 +38,7 @@ const RESPONDER_TEMPLATE_DIR: &str = "templates";
 const RESPONDER_TEMPLATE_NAME: &str = "responder.toml.ctmpl";
 const RESPONDER_CONFIG_DIR: &str = "responder";
 const RESPONDER_CONFIG_NAME: &str = "responder.toml";
+const RESPONDER_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.responder.override.yml";
 const DEFAULT_EAB_ENDPOINT_PATH: &str = "eab";
 const DEFAULT_DB_USER: &str = "stepca";
 const DEFAULT_DB_NAME: &str = "stepca";
@@ -149,9 +150,20 @@ async fn run_init_inner(
         Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn, messages).await?);
     let responder_paths =
         write_responder_files(&secrets_dir, &args.kv_mount, &secrets.http_hmac, messages).await?;
+    let responder_compose_override = write_responder_compose_override(
+        &args.compose_file,
+        &secrets_dir,
+        &responder_paths.config_path,
+        messages,
+    )
+    .await?;
+    if let Some(override_path) = responder_compose_override.as_ref() {
+        apply_responder_compose_override(&args.compose_file, override_path, messages)?;
+    }
 
     let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
-    let responder_url = resolve_responder_url(args, messages)?;
+    let compose_has_responder = compose_has_responder(&args.compose_file, messages)?;
+    let responder_url = resolve_responder_url(args, compose_has_responder);
     let responder_check =
         verify_responder(responder_url.as_deref(), args, messages, &secrets).await?;
     let eab_update = maybe_register_eab(client, args, messages, rollback, &secrets).await?;
@@ -278,6 +290,55 @@ cleanup_interval_secs = 30
 max_skew_secs = 60
 "#
     )
+}
+
+async fn write_responder_compose_override(
+    compose_file: &Path,
+    secrets_dir: &Path,
+    config_path: &Path,
+    messages: &Messages,
+) -> Result<Option<PathBuf>> {
+    if !compose_has_responder(compose_file, messages)? {
+        return Ok(None);
+    }
+    let responder_dir = secrets_dir.join(RESPONDER_CONFIG_DIR);
+    fs_util::ensure_secrets_dir(&responder_dir).await?;
+    let override_path = responder_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME);
+    let config_path = std::fs::canonicalize(config_path)
+        .with_context(|| messages.error_resolve_path_failed(&config_path.display().to_string()))?;
+    let contents = format!(
+        r#"version: "3.8"
+services:
+  bootroot-http01:
+    volumes:
+      - {path}:/app/responder.toml:ro
+"#,
+        path = config_path.display()
+    );
+    tokio::fs::write(&override_path, contents)
+        .await
+        .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+    Ok(Some(override_path))
+}
+
+fn apply_responder_compose_override(
+    compose_file: &Path,
+    override_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let args = [
+        "compose".to_string(),
+        "-f".to_string(),
+        compose_file.to_string_lossy().to_string(),
+        "-f".to_string(),
+        override_path.to_string_lossy().to_string(),
+        "up".to_string(),
+        "-d".to_string(),
+        "bootroot-http01".to_string(),
+    ];
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_docker(&args_ref, "docker compose responder override", messages)?;
+    Ok(())
 }
 
 async fn bootstrap_openbao(
@@ -609,17 +670,20 @@ fn resolve_eab(args: &InitArgs, messages: &Messages) -> Result<Option<EabCredent
     }
 }
 
-fn resolve_responder_url(args: &InitArgs, messages: &Messages) -> Result<Option<String>> {
+fn compose_has_responder(compose_file: &Path, messages: &Messages) -> Result<bool> {
+    let compose_contents = std::fs::read_to_string(compose_file)
+        .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
+    Ok(compose_contents.contains("bootroot-http01"))
+}
+
+fn resolve_responder_url(args: &InitArgs, compose_has_responder: bool) -> Option<String> {
     if let Some(responder_url) = args.responder_url.as_ref() {
-        return Ok(Some(responder_url.clone()));
+        return Some(responder_url.clone());
     }
-    let compose_contents = std::fs::read_to_string(&args.compose_file).with_context(|| {
-        messages.error_read_file_failed(&args.compose_file.display().to_string())
-    })?;
-    if compose_contents.contains("bootroot-http01") {
-        Ok(Some(DEFAULT_RESPONDER_ADMIN_URL.to_string()))
+    if compose_has_responder {
+        Some(DEFAULT_RESPONDER_ADMIN_URL.to_string())
     } else {
-        Ok(None)
+        None
     }
 }
 
@@ -1500,7 +1564,9 @@ mod tests {
             ..default_init_args()
         };
 
-        let responder_url = resolve_responder_url(&args, &test_messages()).unwrap();
+        let compose_has_responder =
+            compose_has_responder(&args.compose_file, &test_messages()).expect("compose check");
+        let responder_url = resolve_responder_url(&args, compose_has_responder);
         assert!(responder_url.is_none());
     }
 
@@ -1522,7 +1588,9 @@ services:
             ..default_init_args()
         };
 
-        let responder_url = resolve_responder_url(&args, &test_messages()).unwrap();
+        let compose_has_responder =
+            compose_has_responder(&args.compose_file, &test_messages()).expect("compose check");
+        let responder_url = resolve_responder_url(&args, compose_has_responder);
         assert_eq!(responder_url.as_deref(), Some(DEFAULT_RESPONDER_ADMIN_URL));
     }
 
@@ -1558,6 +1626,66 @@ services:
 
         assert!(template.contains("secret/data/bootroot/responder/hmac"));
         assert!(config.contains("hmac-123"));
+    }
+
+    #[tokio::test]
+    async fn test_write_responder_compose_override_skips_when_missing_service() {
+        let temp_dir = tempdir().unwrap();
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").unwrap();
+
+        let secrets_dir = temp_dir.path().join("secrets");
+        let messages = test_messages();
+        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", &messages)
+            .await
+            .unwrap();
+
+        let override_path = write_responder_compose_override(
+            &compose_file,
+            &secrets_dir,
+            &paths.config_path,
+            &messages,
+        )
+        .await
+        .unwrap();
+
+        assert!(override_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_responder_compose_override_writes_mount() {
+        let temp_dir = tempdir().unwrap();
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(
+            &compose_file,
+            r"
+services:
+  bootroot-http01:
+    image: bootroot-http01-responder:latest
+",
+        )
+        .unwrap();
+
+        let secrets_dir = temp_dir.path().join("secrets");
+        let messages = test_messages();
+        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", &messages)
+            .await
+            .unwrap();
+
+        let override_path = write_responder_compose_override(
+            &compose_file,
+            &secrets_dir,
+            &paths.config_path,
+            &messages,
+        )
+        .await
+        .unwrap()
+        .expect("override path");
+        let contents = fs::read_to_string(&override_path).unwrap();
+        let config_path = std::fs::canonicalize(&paths.config_path).unwrap();
+
+        assert!(contents.contains("bootroot-http01"));
+        assert!(contents.contains(&config_path.display().to_string()));
     }
 
     #[test]
