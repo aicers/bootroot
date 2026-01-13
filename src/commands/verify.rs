@@ -38,7 +38,7 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
             "--oneshot",
         ])
         .status()
-        .context("Failed to run bootroot-agent")?;
+        .with_context(|| messages.error_bootroot_agent_run_failed())?;
 
     if !status.success() {
         anyhow::bail!(messages.verify_agent_failed());
@@ -80,12 +80,12 @@ fn verify_db_connectivity(state: &StateFile, timeout_secs: u64, messages: &Messa
     let secrets_dir = state
         .secrets_dir()
         .canonicalize()
-        .context("Failed to resolve secrets dir")?;
+        .with_context(|| messages.error_secrets_dir_resolve_failed())?;
     let ca_path = secrets_dir.join("config").join("ca.json");
     let contents = std::fs::read_to_string(&ca_path)
-        .with_context(|| format!("Failed to read {}", ca_path.display()))?;
+        .with_context(|| messages.error_read_file_failed(&ca_path.display().to_string()))?;
     let value: serde_json::Value =
-        serde_json::from_str(&contents).context("Failed to parse ca.json")?;
+        serde_json::from_str(&contents).context(messages.error_parse_ca_json_failed())?;
     let db_type = value["db"]["type"].as_str().unwrap_or_default();
     if db_type != "postgresql" {
         anyhow::bail!(messages.error_db_type_unsupported());
@@ -112,7 +112,7 @@ fn resolve_verify_service_name(args: &VerifyArgs, messages: &Messages) -> Result
     }
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
-    let mut prompt = Prompt::new(&mut input, &mut output);
+    let mut prompt = Prompt::new(&mut input, &mut output, messages);
     prompt.prompt_with_validation(messages.prompt_service_name(), None, |value| {
         if value.trim().is_empty() {
             anyhow::bail!(messages.error_value_required());

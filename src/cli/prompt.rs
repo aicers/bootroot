@@ -2,24 +2,38 @@ use std::io::{BufRead, Write};
 
 use anyhow::{Context, Result};
 
+use crate::i18n::Messages;
+
 pub(crate) struct Prompt<'a> {
     input: &'a mut dyn BufRead,
     output: &'a mut dyn Write,
+    messages: &'a Messages,
 }
 
 impl<'a> Prompt<'a> {
-    pub(crate) fn new(input: &'a mut dyn BufRead, output: &'a mut dyn Write) -> Self {
-        Self { input, output }
+    pub(crate) fn new(
+        input: &'a mut dyn BufRead,
+        output: &'a mut dyn Write,
+        messages: &'a Messages,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            messages,
+        }
     }
 
     pub(crate) fn prompt_text(&mut self, label: &str, default: Option<&str>) -> Result<String> {
         let prompt = format_prompt(label, default);
         let mut line = String::new();
-        write!(self.output, "{prompt}").context("Failed to write prompt")?;
-        self.output.flush().context("Failed to flush prompt")?;
+        write!(self.output, "{prompt}")
+            .with_context(|| self.messages.error_prompt_write_failed())?;
+        self.output
+            .flush()
+            .with_context(|| self.messages.error_prompt_flush_failed())?;
         self.input
             .read_line(&mut line)
-            .context("Failed to read prompt input")?;
+            .with_context(|| self.messages.error_prompt_read_failed())?;
         let trimmed = line.trim();
         if trimmed.is_empty()
             && let Some(value) = default
@@ -43,7 +57,8 @@ impl<'a> Prompt<'a> {
             match validate(&value) {
                 Ok(parsed) => return Ok(parsed),
                 Err(err) => {
-                    writeln!(self.output, "{err}").context("Failed to write prompt error")?;
+                    writeln!(self.output, "{err}")
+                        .with_context(|| self.messages.error_prompt_error_write_failed())?;
                 }
             }
         }
@@ -67,7 +82,8 @@ mod tests {
     fn prompt_text_uses_default_on_blank() {
         let mut input = Cursor::new("\n");
         let mut output = Vec::new();
-        let mut prompt = Prompt::new(&mut input, &mut output);
+        let messages = Messages::new("en").unwrap();
+        let mut prompt = Prompt::new(&mut input, &mut output, &messages);
         let value = prompt.prompt_text("Label", Some("default")).unwrap();
         assert_eq!(value, "default");
     }
@@ -76,7 +92,8 @@ mod tests {
     fn prompt_text_reads_value() {
         let mut input = Cursor::new("value\n");
         let mut output = Vec::new();
-        let mut prompt = Prompt::new(&mut input, &mut output);
+        let messages = Messages::new("en").unwrap();
+        let mut prompt = Prompt::new(&mut input, &mut output, &messages);
         let value = prompt.prompt_text("Label", Some("default")).unwrap();
         assert_eq!(value, "value");
     }

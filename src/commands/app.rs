@@ -26,7 +26,8 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
-    let mut state = StateFile::load(state_path)?;
+    let mut state =
+        StateFile::load(state_path).with_context(|| messages.error_parse_state_failed())?;
 
     let resolved = resolve_app_add_args(args, messages)?;
     if state.apps.contains_key(&resolved.service_name) {
@@ -54,14 +55,23 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
 
     let root_token = resolved.root_token.clone();
 
-    let mut client = OpenBaoClient::new(&state.openbao_url)?;
+    let mut client = OpenBaoClient::new(&state.openbao_url)
+        .with_context(|| messages.error_openbao_client_create_failed())?;
     client.set_token(root_token);
-    client.ensure_approle_auth().await?;
+    client
+        .ensure_approle_auth()
+        .await
+        .with_context(|| messages.error_openbao_approle_auth_failed())?;
 
-    let approle = ensure_app_approle(&client, &state, &resolved.service_name).await?;
+    let approle = ensure_app_approle(&client, &state, &resolved.service_name, messages).await?;
     let secrets_dir = state.secrets_dir();
-    let secret_id_path =
-        write_secret_id_file(&secrets_dir, &resolved.service_name, &approle.secret_id).await?;
+    let secret_id_path = write_secret_id_file(
+        &secrets_dir,
+        &resolved.service_name,
+        &approle.secret_id,
+        messages,
+    )
+    .await?;
 
     let entry = AppEntry {
         service_name: resolved.service_name.clone(),
@@ -85,7 +95,9 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     state
         .apps
         .insert(resolved.service_name.clone(), entry.clone());
-    state.save(state_path)?;
+    state
+        .save(state_path)
+        .with_context(|| messages.error_serialize_state_failed())?;
 
     print_app_add_summary(&entry, &secret_id_path, messages);
     Ok(())
@@ -96,7 +108,7 @@ pub(crate) fn run_app_info(args: &AppInfoArgs, messages: &Messages) -> Result<()
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
-    let state = StateFile::load(state_path)?;
+    let state = StateFile::load(state_path).with_context(|| messages.error_parse_state_failed())?;
     let entry = state
         .apps
         .get(&args.service_name)
@@ -152,13 +164,14 @@ async fn write_secret_id_file(
     secrets_dir: &Path,
     service_name: &str,
     secret_id: &str,
+    messages: &Messages,
 ) -> Result<PathBuf> {
     let app_dir = secrets_dir.join(APP_SECRET_DIR).join(service_name);
     fs_util::ensure_secrets_dir(&app_dir).await?;
     let secret_path = app_dir.join(APP_SECRET_ID_FILENAME);
     fs::write(&secret_path, secret_id)
         .await
-        .with_context(|| format!("Failed to write {}", secret_path.display()))?;
+        .with_context(|| messages.error_write_file_failed(&secret_path.display().to_string()))?;
     fs_util::set_key_permissions(&secret_path).await?;
     Ok(secret_path)
 }
@@ -174,10 +187,14 @@ async fn ensure_app_approle(
     client: &OpenBaoClient,
     state: &StateFile,
     service_name: &str,
+    messages: &Messages,
 ) -> Result<AppRoleMaterialized> {
     let policy_name = app_policy_name(service_name);
     let policy = build_app_policy(&state.kv_mount, service_name);
-    client.write_policy(&policy_name, &policy).await?;
+    client
+        .write_policy(&policy_name, &policy)
+        .await
+        .with_context(|| messages.error_openbao_policy_write_failed())?;
 
     let role_name = app_role_name(service_name);
     client
@@ -188,9 +205,16 @@ async fn ensure_app_approle(
             SECRET_ID_TTL,
             true,
         )
-        .await?;
-    let role_id = client.read_role_id(&role_name).await?;
-    let secret_id = client.create_secret_id(&role_name).await?;
+        .await
+        .with_context(|| messages.error_openbao_approle_create_failed())?;
+    let role_id = client
+        .read_role_id(&role_name)
+        .await
+        .with_context(|| messages.error_openbao_role_id_failed())?;
+    let secret_id = client
+        .create_secret_id(&role_name)
+        .await
+        .with_context(|| messages.error_openbao_secret_id_failed())?;
     Ok(AppRoleMaterialized {
         role_name,
         role_id,
@@ -225,7 +249,7 @@ pub(crate) struct ResolvedAppAdd {
 fn resolve_app_add_args(args: &AppAddArgs, messages: &Messages) -> Result<ResolvedAppAdd> {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
-    let mut prompt = Prompt::new(&mut input, &mut output);
+    let mut prompt = Prompt::new(&mut input, &mut output, messages);
 
     let service_name = match args.service_name.clone() {
         Some(value) => value,

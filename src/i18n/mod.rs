@@ -77,6 +77,53 @@ pub(crate) struct Strings {
     pub(crate) error_app_add_failed: &'static str,
     pub(crate) error_app_info_failed: &'static str,
     pub(crate) error_verify_failed: &'static str,
+    pub(crate) error_details: &'static str,
+    pub(crate) error_runtime_init_failed: &'static str,
+    pub(crate) error_prompt_write_failed: &'static str,
+    pub(crate) error_prompt_flush_failed: &'static str,
+    pub(crate) error_prompt_read_failed: &'static str,
+    pub(crate) error_prompt_error_write_failed: &'static str,
+    pub(crate) error_read_file_failed: &'static str,
+    pub(crate) error_write_file_failed: &'static str,
+    pub(crate) error_read_dir_failed: &'static str,
+    pub(crate) error_read_dir_entry_failed: &'static str,
+    pub(crate) error_remove_file_failed: &'static str,
+    pub(crate) error_restore_file_failed: &'static str,
+    pub(crate) error_resolve_path_failed: &'static str,
+    pub(crate) error_generate_secret_failed: &'static str,
+    pub(crate) error_db_auth_task_failed: &'static str,
+    pub(crate) error_db_provision_task_failed: &'static str,
+    pub(crate) error_stepca_password_missing: &'static str,
+    pub(crate) error_eab_request_failed: &'static str,
+    pub(crate) error_eab_response_parse_failed: &'static str,
+    pub(crate) error_openbao_client_create_failed: &'static str,
+    pub(crate) error_openbao_health_check_failed: &'static str,
+    pub(crate) error_openbao_init_status_failed: &'static str,
+    pub(crate) error_openbao_init_failed: &'static str,
+    pub(crate) error_openbao_seal_status_failed: &'static str,
+    pub(crate) error_openbao_unseal_failed: &'static str,
+    pub(crate) error_openbao_kv_mount_failed: &'static str,
+    pub(crate) error_openbao_kv_mount_status_failed: &'static str,
+    pub(crate) error_openbao_approle_auth_failed: &'static str,
+    pub(crate) error_openbao_policy_exists_failed: &'static str,
+    pub(crate) error_openbao_policy_write_failed: &'static str,
+    pub(crate) error_openbao_approle_exists_failed: &'static str,
+    pub(crate) error_openbao_approle_create_failed: &'static str,
+    pub(crate) error_openbao_role_id_failed: &'static str,
+    pub(crate) error_openbao_secret_id_failed: &'static str,
+    pub(crate) error_openbao_kv_exists_failed: &'static str,
+    pub(crate) error_openbao_kv_write_failed: &'static str,
+    pub(crate) error_openbao_kv_delete_failed: &'static str,
+    pub(crate) error_command_run_failed: &'static str,
+    pub(crate) error_command_failed_status: &'static str,
+    pub(crate) error_docker_compose_failed: &'static str,
+    pub(crate) error_docker_command_failed: &'static str,
+    pub(crate) error_bootroot_agent_run_failed: &'static str,
+    pub(crate) error_secrets_dir_resolve_failed: &'static str,
+    pub(crate) error_parse_ca_json_failed: &'static str,
+    pub(crate) error_serialize_ca_json_failed: &'static str,
+    pub(crate) error_parse_state_failed: &'static str,
+    pub(crate) error_serialize_state_failed: &'static str,
     pub(crate) prompt_service_name: &'static str,
     pub(crate) prompt_deploy_type: &'static str,
     pub(crate) prompt_hostname: &'static str,
@@ -441,6 +488,218 @@ impl Messages {
 
     pub(crate) fn error_verify_failed(&self) -> &'static str {
         self.strings().error_verify_failed
+    }
+
+    pub(crate) fn error_details(&self, value: &str) -> String {
+        format_template(self.strings().error_details, &[("value", value)])
+    }
+
+    pub(crate) fn error_runtime_init_failed(&self, command: &str) -> String {
+        format_template(
+            self.strings().error_runtime_init_failed,
+            &[("command", command)],
+        )
+    }
+
+    pub(crate) fn error_prompt_write_failed(&self) -> &'static str {
+        self.strings().error_prompt_write_failed
+    }
+
+    pub(crate) fn error_prompt_flush_failed(&self) -> &'static str {
+        self.strings().error_prompt_flush_failed
+    }
+
+    pub(crate) fn error_prompt_read_failed(&self) -> &'static str {
+        self.strings().error_prompt_read_failed
+    }
+
+    pub(crate) fn error_prompt_error_write_failed(&self) -> &'static str {
+        self.strings().error_prompt_error_write_failed
+    }
+
+    pub(crate) fn error_read_file_failed(&self, value: &str) -> String {
+        format_template(self.strings().error_read_file_failed, &[("value", value)])
+    }
+
+    pub(crate) fn error_write_file_failed(&self, value: &str) -> String {
+        format_template(self.strings().error_write_file_failed, &[("value", value)])
+    }
+
+    pub(crate) fn error_read_dir_failed(&self, value: &str) -> String {
+        format_template(self.strings().error_read_dir_failed, &[("value", value)])
+    }
+
+    pub(crate) fn error_read_dir_entry_failed(&self) -> &'static str {
+        self.strings().error_read_dir_entry_failed
+    }
+
+    pub(crate) fn error_remove_file_failed(&self, value: &str) -> String {
+        format_template(self.strings().error_remove_file_failed, &[("value", value)])
+    }
+
+    pub(crate) fn error_restore_file_failed(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_restore_file_failed,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_resolve_path_failed(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_resolve_path_failed,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_generate_secret_failed(&self) -> &'static str {
+        self.strings().error_generate_secret_failed
+    }
+
+    pub(crate) fn error_db_auth_task_failed(&self) -> &'static str {
+        self.strings().error_db_auth_task_failed
+    }
+
+    pub(crate) fn error_db_provision_task_failed(&self) -> &'static str {
+        self.strings().error_db_provision_task_failed
+    }
+
+    pub(crate) fn error_stepca_password_missing(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_stepca_password_missing,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_eab_request_failed(&self) -> &'static str {
+        self.strings().error_eab_request_failed
+    }
+
+    pub(crate) fn error_eab_response_parse_failed(&self) -> &'static str {
+        self.strings().error_eab_response_parse_failed
+    }
+
+    pub(crate) fn error_openbao_client_create_failed(&self) -> &'static str {
+        self.strings().error_openbao_client_create_failed
+    }
+
+    pub(crate) fn error_openbao_health_check_failed(&self) -> &'static str {
+        self.strings().error_openbao_health_check_failed
+    }
+
+    pub(crate) fn error_openbao_init_status_failed(&self) -> &'static str {
+        self.strings().error_openbao_init_status_failed
+    }
+
+    pub(crate) fn error_openbao_init_failed(&self) -> &'static str {
+        self.strings().error_openbao_init_failed
+    }
+
+    pub(crate) fn error_openbao_seal_status_failed(&self) -> &'static str {
+        self.strings().error_openbao_seal_status_failed
+    }
+
+    pub(crate) fn error_openbao_unseal_failed(&self) -> &'static str {
+        self.strings().error_openbao_unseal_failed
+    }
+
+    pub(crate) fn error_openbao_kv_mount_failed(&self) -> &'static str {
+        self.strings().error_openbao_kv_mount_failed
+    }
+
+    pub(crate) fn error_openbao_kv_mount_status_failed(&self) -> &'static str {
+        self.strings().error_openbao_kv_mount_status_failed
+    }
+
+    pub(crate) fn error_openbao_approle_auth_failed(&self) -> &'static str {
+        self.strings().error_openbao_approle_auth_failed
+    }
+
+    pub(crate) fn error_openbao_policy_exists_failed(&self) -> &'static str {
+        self.strings().error_openbao_policy_exists_failed
+    }
+
+    pub(crate) fn error_openbao_policy_write_failed(&self) -> &'static str {
+        self.strings().error_openbao_policy_write_failed
+    }
+
+    pub(crate) fn error_openbao_approle_exists_failed(&self) -> &'static str {
+        self.strings().error_openbao_approle_exists_failed
+    }
+
+    pub(crate) fn error_openbao_approle_create_failed(&self) -> &'static str {
+        self.strings().error_openbao_approle_create_failed
+    }
+
+    pub(crate) fn error_openbao_role_id_failed(&self) -> &'static str {
+        self.strings().error_openbao_role_id_failed
+    }
+
+    pub(crate) fn error_openbao_secret_id_failed(&self) -> &'static str {
+        self.strings().error_openbao_secret_id_failed
+    }
+
+    pub(crate) fn error_openbao_kv_exists_failed(&self) -> &'static str {
+        self.strings().error_openbao_kv_exists_failed
+    }
+
+    pub(crate) fn error_openbao_kv_write_failed(&self) -> &'static str {
+        self.strings().error_openbao_kv_write_failed
+    }
+
+    pub(crate) fn error_openbao_kv_delete_failed(&self) -> &'static str {
+        self.strings().error_openbao_kv_delete_failed
+    }
+
+    pub(crate) fn error_command_run_failed(&self, command: &str) -> String {
+        format_template(
+            self.strings().error_command_run_failed,
+            &[("value", command)],
+        )
+    }
+
+    pub(crate) fn error_command_failed_status(&self, command: &str, status: &str) -> String {
+        format_template(
+            self.strings().error_command_failed_status,
+            &[("value", command), ("status", status)],
+        )
+    }
+
+    pub(crate) fn error_docker_compose_failed(&self, stderr: &str) -> String {
+        format_template(
+            self.strings().error_docker_compose_failed,
+            &[("value", stderr)],
+        )
+    }
+
+    pub(crate) fn error_docker_command_failed(&self, stderr: &str) -> String {
+        format_template(
+            self.strings().error_docker_command_failed,
+            &[("value", stderr)],
+        )
+    }
+
+    pub(crate) fn error_bootroot_agent_run_failed(&self) -> &'static str {
+        self.strings().error_bootroot_agent_run_failed
+    }
+
+    pub(crate) fn error_secrets_dir_resolve_failed(&self) -> &'static str {
+        self.strings().error_secrets_dir_resolve_failed
+    }
+
+    pub(crate) fn error_parse_ca_json_failed(&self) -> &'static str {
+        self.strings().error_parse_ca_json_failed
+    }
+
+    pub(crate) fn error_serialize_ca_json_failed(&self) -> &'static str {
+        self.strings().error_serialize_ca_json_failed
+    }
+
+    pub(crate) fn error_parse_state_failed(&self) -> &'static str {
+        self.strings().error_parse_state_failed
+    }
+
+    pub(crate) fn error_serialize_state_failed(&self) -> &'static str {
+        self.strings().error_serialize_state_failed
     }
 
     pub(crate) fn prompt_service_name(&self) -> &'static str {
