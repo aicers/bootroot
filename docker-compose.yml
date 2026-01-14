@@ -54,6 +54,8 @@ services:
       dockerfile: docker/http01-responder/Dockerfile
     image: bootroot-http01-responder:latest
     container_name: bootroot-http01
+    ports:
+      - "8080:8080"
     volumes:
       - ./responder.toml.compose:/app/responder.toml:ro
     command:

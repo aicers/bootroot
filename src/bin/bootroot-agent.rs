@@ -2,59 +2,108 @@ use std::sync::Arc;
 
 use bootroot::{Args, config, daemon, eab, profile};
 use clap::Parser;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
     info!("Starting Bootroot Agent (Rust)");
 
-    // 1. Load Settings
-    let mut settings = config::Settings::new(args.config.clone())?;
+    if args.oneshot {
+        let (settings, final_eab) = load_settings(&args).await?;
+        match daemon::run_oneshot(Arc::new(settings), final_eab).await {
+            Ok(()) => info!("Successfully issued certificate!"),
+            Err(err) => {
+                error!("Failed to issue certificate: {err:?}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
 
-    // 2. Override Config with CLI Args
-    settings.merge_with_args(&args);
+    let mut pending = None;
+    #[cfg(unix)]
+    let mut hup = signal(SignalKind::hangup())?;
+    loop {
+        let (settings, final_eab) = match pending.take() {
+            Some(value) => value,
+            None => load_settings(&args).await?,
+        };
+        log_settings(&settings, final_eab.as_ref());
+        let settings = Arc::new(settings);
+        let mut task = tokio::spawn(daemon::run_daemon(Arc::clone(&settings), final_eab));
+        #[cfg(unix)]
+        loop {
+            tokio::select! {
+                result = &mut task => return handle_daemon_result(result),
+                _ = hup.recv() => {
+                    match load_settings(&args).await {
+                        Ok((settings, final_eab)) => {
+                            info!("Reload signal received. Restarting daemon with new config.");
+                            pending = Some((settings, final_eab));
+                            task.abort();
+                            let _ = task.await;
+                            break;
+                        }
+                        Err(err) => {
+                            error!("Reload failed: {err}");
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return handle_daemon_result(task.await);
+        }
+    }
+}
+
+async fn load_settings(
+    args: &Args,
+) -> anyhow::Result<(config::Settings, Option<eab::EabCredentials>)> {
+    let mut settings = config::Settings::new(args.config.clone())?;
+    settings.merge_with_args(args);
     settings.validate()?;
 
-    // 3. Resolve EAB Credentials
-    // Priority: CLI Args > Config File
     let cli_eab = eab::load_credentials(
         args.eab_kid.clone(),
         args.eab_hmac.clone(),
         args.eab_file.clone(),
     )
     .await?;
-
     let final_eab = cli_eab.or_else(|| settings.eab.as_ref().map(profile::to_eab_credentials));
+    Ok((settings, final_eab))
+}
 
+fn log_settings(settings: &config::Settings, final_eab: Option<&eab::EabCredentials>) {
     info!("Loaded {} profile(s).", settings.profiles.len());
     info!("CA URL: {}", settings.server);
 
-    if let Some(ref creds) = final_eab {
+    if let Some(creds) = final_eab {
         info!("Using EAB Credentials for Key ID: {}", creds.kid);
     } else {
         info!("No EAB credentials provided. Attempting open enrollment.");
     }
+}
 
-    let settings = Arc::new(settings);
-
-    // 4. Run ACME Flow
-    if args.oneshot {
-        match daemon::run_oneshot(Arc::clone(&settings), final_eab).await {
-            Ok(()) => info!("Successfully issued certificate!"),
-            Err(e) => {
-                error!("Failed to issue certificate: {:?}", e);
-                std::process::exit(1);
+fn handle_daemon_result(
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(inner) => inner,
+        Err(err) => {
+            if err.is_cancelled() {
+                Ok(())
+            } else {
+                Err(err.into())
             }
         }
-    } else {
-        daemon::run_daemon(settings, final_eab).await?;
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

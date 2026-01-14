@@ -85,12 +85,14 @@ pub(crate) struct Strings {
     pub(crate) error_app_add_failed: &'static str,
     pub(crate) error_app_info_failed: &'static str,
     pub(crate) error_verify_failed: &'static str,
+    pub(crate) error_rotate_failed: &'static str,
     pub(crate) error_details: &'static str,
     pub(crate) error_runtime_init_failed: &'static str,
     pub(crate) error_prompt_write_failed: &'static str,
     pub(crate) error_prompt_flush_failed: &'static str,
     pub(crate) error_prompt_read_failed: &'static str,
     pub(crate) error_prompt_error_write_failed: &'static str,
+    pub(crate) error_file_missing: &'static str,
     pub(crate) error_read_file_failed: &'static str,
     pub(crate) error_write_file_failed: &'static str,
     pub(crate) error_read_dir_failed: &'static str,
@@ -146,6 +148,10 @@ pub(crate) struct Strings {
     pub(crate) prompt_confirm_overwrite_password: &'static str,
     pub(crate) prompt_confirm_overwrite_ca_json: &'static str,
     pub(crate) prompt_confirm_overwrite_state: &'static str,
+    pub(crate) prompt_rotate_stepca_password: &'static str,
+    pub(crate) prompt_rotate_eab: &'static str,
+    pub(crate) prompt_rotate_db: &'static str,
+    pub(crate) prompt_rotate_responder_hmac: &'static str,
     pub(crate) init_plan_title: &'static str,
     pub(crate) init_plan_overwrite_password: &'static str,
     pub(crate) init_plan_overwrite_ca_json: &'static str,
@@ -233,6 +239,15 @@ pub(crate) struct Strings {
     pub(crate) summary_eab_kid: &'static str,
     pub(crate) summary_eab_hmac: &'static str,
     pub(crate) summary_eab_missing: &'static str,
+    pub(crate) rotate_summary_title: &'static str,
+    pub(crate) rotate_summary_stepca_password: &'static str,
+    pub(crate) rotate_summary_restart_stepca: &'static str,
+    pub(crate) rotate_summary_db_dsn: &'static str,
+    pub(crate) rotate_summary_responder_config: &'static str,
+    pub(crate) rotate_summary_agent_configs_updated: &'static str,
+    pub(crate) rotate_summary_agent_configs_skipped: &'static str,
+    pub(crate) rotate_summary_reload_agent: &'static str,
+    pub(crate) rotate_summary_reload_responder: &'static str,
     pub(crate) summary_responder_check_ok: &'static str,
     pub(crate) summary_responder_check_skipped: &'static str,
     pub(crate) summary_db_check_ok: &'static str,
@@ -518,6 +533,10 @@ impl Messages {
         self.strings().error_verify_failed
     }
 
+    pub(crate) fn error_rotate_failed(&self) -> &'static str {
+        self.strings().error_rotate_failed
+    }
+
     pub(crate) fn error_details(&self, value: &str) -> String {
         format_template(self.strings().error_details, &[("value", value)])
     }
@@ -543,6 +562,10 @@ impl Messages {
 
     pub(crate) fn error_prompt_error_write_failed(&self) -> &'static str {
         self.strings().error_prompt_error_write_failed
+    }
+
+    pub(crate) fn error_file_missing(&self, value: &str) -> String {
+        format_template(self.strings().error_file_missing, &[("value", value)])
     }
 
     pub(crate) fn error_read_file_failed(&self, value: &str) -> String {
@@ -787,6 +810,22 @@ impl Messages {
 
     pub(crate) fn prompt_confirm_overwrite_state(&self) -> &'static str {
         self.strings().prompt_confirm_overwrite_state
+    }
+
+    pub(crate) fn prompt_rotate_stepca_password(&self) -> &'static str {
+        self.strings().prompt_rotate_stepca_password
+    }
+
+    pub(crate) fn prompt_rotate_eab(&self) -> &'static str {
+        self.strings().prompt_rotate_eab
+    }
+
+    pub(crate) fn prompt_rotate_db(&self) -> &'static str {
+        self.strings().prompt_rotate_db
+    }
+
+    pub(crate) fn prompt_rotate_responder_hmac(&self) -> &'static str {
+        self.strings().prompt_rotate_responder_hmac
     }
 
     pub(crate) fn init_plan_title(&self) -> &'static str {
@@ -1236,6 +1275,51 @@ impl Messages {
 
     pub(crate) fn summary_eab_missing(&self) -> &'static str {
         self.strings().summary_eab_missing
+    }
+
+    pub(crate) fn rotate_summary_title(&self) -> &'static str {
+        self.strings().rotate_summary_title
+    }
+
+    pub(crate) fn rotate_summary_stepca_password(&self, value: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_stepca_password,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_restart_stepca(&self) -> &'static str {
+        self.strings().rotate_summary_restart_stepca
+    }
+
+    pub(crate) fn rotate_summary_db_dsn(&self, value: &str) -> String {
+        format_template(self.strings().rotate_summary_db_dsn, &[("value", value)])
+    }
+
+    pub(crate) fn rotate_summary_responder_config(&self, value: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_responder_config,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_agent_configs_updated(&self, value: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_agent_configs_updated,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_agent_configs_skipped(&self) -> &'static str {
+        self.strings().rotate_summary_agent_configs_skipped
+    }
+
+    pub(crate) fn rotate_summary_reload_agent(&self) -> &'static str {
+        self.strings().rotate_summary_reload_agent
+    }
+
+    pub(crate) fn rotate_summary_reload_responder(&self) -> &'static str {
+        self.strings().rotate_summary_reload_responder
     }
 
     pub(crate) fn summary_responder_check_ok(&self) -> &'static str {

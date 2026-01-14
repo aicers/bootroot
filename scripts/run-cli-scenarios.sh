@@ -37,11 +37,18 @@ run_init_scenario() {
   reset_openbao
 
   log "Starting infra"
+  if [[ "${BUILD_IMAGES:-0}" == "1" ]]; then
+    log "Building local images"
+    docker compose build step-ca bootroot-http01
+  else
+    log "Skipping local image build (set BUILD_IMAGES=1 to enable)"
+  fi
   cargo run --bin bootroot -- infra up
 
   log "Running bootroot init"
-  cargo run --bin bootroot -- init --auto-generate \
-    --db-dsn "postgres://step:step@127.0.0.1:5432/step"
+  printf "y\ny\ny\nn\n" | cargo run --bin bootroot -- init --auto-generate \
+    --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
+    --responder-url "http://localhost:8080"
 }
 
 require_cmd cargo

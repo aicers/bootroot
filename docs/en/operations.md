@@ -33,3 +33,38 @@ If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
 - Keep AppRole/policies scoped to the minimum required paths.
 - Include KV v2 data in backup/snapshot policies.
 - Confirm reload/restart behavior for bootroot-agent/step-ca after rotations.
+
+## Rotation scheduling
+
+Run `bootroot rotate ...` on a schedule (cron/systemd timer). Keep secrets out
+of command history; use environment files or secure stores.
+
+Example (cron):
+
+```cron
+0 3 * * 0 OPENBAO_ROOT_TOKEN=... bootroot rotate stepca-password --yes
+```
+
+Example (systemd timer):
+
+```ini
+[Unit]
+Description=Rotate step-ca password weekly
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/bootroot/rotate.env
+ExecStart=/usr/local/bin/bootroot rotate stepca-password --yes
+```
+
+```ini
+[Unit]
+Description=Weekly step-ca password rotation
+
+[Timer]
+OnCalendar=Sun 03:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
