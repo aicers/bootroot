@@ -1,5 +1,5 @@
 use crate::commands::init::{InitPlan, InitSummary};
-use crate::i18n::{AppNextStepsDaemon, AppNextStepsDocker, Messages};
+use crate::i18n::{AppNextStepsDaemon, AppNextStepsDocker, AppOpenBaoAgentSteps, Messages};
 use crate::state::{AppEntry, DeployType};
 
 pub(crate) struct AppAddPlan<'a> {
@@ -63,8 +63,47 @@ pub(crate) fn print_app_add_summary(
     );
     println!("{}", messages.app_summary_openbao_path(&entry.service_name));
     println!("{}", messages.app_summary_next_steps());
+    let app_dir = secret_id_path.parent().unwrap_or(std::path::Path::new("."));
+    let role_id_path = app_dir.join("role_id");
+    let secrets_dir = app_dir
+        .parent()
+        .and_then(|parent| parent.parent())
+        .unwrap_or(std::path::Path::new("."));
+    let openbao_agent_config = secrets_dir
+        .join("openbao")
+        .join("apps")
+        .join(&entry.service_name)
+        .join("agent.hcl");
+    let openbao_steps = AppOpenBaoAgentSteps {
+        service_name: &entry.service_name,
+        config_path: &openbao_agent_config.display().to_string(),
+        role_id_path: &role_id_path.display().to_string(),
+        secret_id_path: &secret_id_path.display().to_string(),
+        app_dir: &app_dir.display().to_string(),
+    };
+    println!("{}", messages.app_next_steps_openbao_agent_title());
+    println!(
+        "{}",
+        messages.app_next_steps_openbao_agent_config(&openbao_steps)
+    );
+    println!(
+        "{}",
+        messages.app_next_steps_openbao_agent_role_id_path(&openbao_steps)
+    );
+    println!(
+        "{}",
+        messages.app_next_steps_openbao_agent_secret_id_path(&openbao_steps)
+    );
+    println!(
+        "{}",
+        messages.app_next_steps_openbao_agent_permissions(&openbao_steps)
+    );
     match entry.deploy_type {
         DeployType::Daemon => {
+            println!(
+                "{}",
+                messages.app_next_steps_openbao_agent_daemon_run(&openbao_steps)
+            );
             let cert_path = entry.cert_path.display().to_string();
             let key_path = entry.key_path.display().to_string();
             let config_path = entry.agent_config_path.display().to_string();
@@ -81,6 +120,10 @@ pub(crate) fn print_app_add_summary(
             print_daemon_snippet(entry, messages);
         }
         DeployType::Docker => {
+            println!(
+                "{}",
+                messages.app_next_steps_openbao_agent_docker_run(&openbao_steps)
+            );
             let cert_path = entry.cert_path.display().to_string();
             let key_path = entry.key_path.display().to_string();
             let config_path = entry.agent_config_path.display().to_string();

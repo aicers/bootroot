@@ -25,6 +25,14 @@ pub(crate) struct AppNextStepsDocker<'a> {
     pub(crate) secret_id_path: &'a str,
 }
 
+pub(crate) struct AppOpenBaoAgentSteps<'a> {
+    pub(crate) service_name: &'a str,
+    pub(crate) config_path: &'a str,
+    pub(crate) role_id_path: &'a str,
+    pub(crate) secret_id_path: &'a str,
+    pub(crate) app_dir: &'a str,
+}
+
 pub(crate) struct Strings {
     pub(crate) infra_up_completed: &'static str,
     pub(crate) infra_readiness_summary: &'static str,
@@ -163,6 +171,13 @@ pub(crate) struct Strings {
     pub(crate) app_summary_next_steps: &'static str,
     pub(crate) app_next_steps_daemon_profile: &'static str,
     pub(crate) app_next_steps_docker_sidecar: &'static str,
+    pub(crate) app_next_steps_openbao_agent_title: &'static str,
+    pub(crate) app_next_steps_openbao_agent_config: &'static str,
+    pub(crate) app_next_steps_openbao_agent_role_id_path: &'static str,
+    pub(crate) app_next_steps_openbao_agent_secret_id_path: &'static str,
+    pub(crate) app_next_steps_openbao_agent_permissions: &'static str,
+    pub(crate) app_next_steps_openbao_agent_daemon_run: &'static str,
+    pub(crate) app_next_steps_openbao_agent_docker_run: &'static str,
     pub(crate) app_snippet_daemon_title: &'static str,
     pub(crate) app_snippet_docker_title: &'static str,
     pub(crate) app_snippet_domain_hint: &'static str,
@@ -898,6 +913,73 @@ impl Messages {
                 ("role_name", data.role_name),
                 ("secret_id_path", data.secret_id_path),
             ],
+        )
+    }
+
+    pub(crate) fn app_next_steps_openbao_agent_title(&self) -> &'static str {
+        self.strings().app_next_steps_openbao_agent_title
+    }
+
+    pub(crate) fn app_next_steps_openbao_agent_config(
+        &self,
+        data: &AppOpenBaoAgentSteps<'_>,
+    ) -> String {
+        format_template(
+            self.strings().app_next_steps_openbao_agent_config,
+            &[
+                ("service_name", data.service_name),
+                ("config_path", data.config_path),
+            ],
+        )
+    }
+
+    pub(crate) fn app_next_steps_openbao_agent_role_id_path(
+        &self,
+        data: &AppOpenBaoAgentSteps<'_>,
+    ) -> String {
+        format_template(
+            self.strings().app_next_steps_openbao_agent_role_id_path,
+            &[("role_id_path", data.role_id_path)],
+        )
+    }
+
+    pub(crate) fn app_next_steps_openbao_agent_secret_id_path(
+        &self,
+        data: &AppOpenBaoAgentSteps<'_>,
+    ) -> String {
+        format_template(
+            self.strings().app_next_steps_openbao_agent_secret_id_path,
+            &[("secret_id_path", data.secret_id_path)],
+        )
+    }
+
+    pub(crate) fn app_next_steps_openbao_agent_permissions(
+        &self,
+        data: &AppOpenBaoAgentSteps<'_>,
+    ) -> String {
+        format_template(
+            self.strings().app_next_steps_openbao_agent_permissions,
+            &[("app_dir", data.app_dir)],
+        )
+    }
+
+    pub(crate) fn app_next_steps_openbao_agent_daemon_run(
+        &self,
+        data: &AppOpenBaoAgentSteps<'_>,
+    ) -> String {
+        format_template(
+            self.strings().app_next_steps_openbao_agent_daemon_run,
+            &[("config_path", data.config_path)],
+        )
+    }
+
+    pub(crate) fn app_next_steps_openbao_agent_docker_run(
+        &self,
+        data: &AppOpenBaoAgentSteps<'_>,
+    ) -> String {
+        format_template(
+            self.strings().app_next_steps_openbao_agent_docker_run,
+            &[("config_path", data.config_path)],
         )
     }
 
