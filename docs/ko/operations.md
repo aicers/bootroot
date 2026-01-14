@@ -32,3 +32,38 @@ CLI를 사용하는 경우 `docs/ko/cli.md`를 참고하세요. 이 문서는 **
 - AppRole/정책은 최소 권한 원칙으로 구성합니다.
 - KV v2 경로를 백업/스냅샷 정책에 포함합니다.
 - 시크릿 회전 시 bootroot-agent/step-ca 재시작 또는 리로드 정책을 확인합니다.
+
+## 회전 스케줄링
+
+`bootroot rotate ...`는 크론/systemd 타이머로 주기 실행합니다. 토큰 등
+민감값은 환경 파일이나 안전한 저장소로 관리하세요.
+
+예시(크론):
+
+```cron
+0 3 * * 0 OPENBAO_ROOT_TOKEN=... bootroot rotate stepca-password --yes
+```
+
+예시(systemd 타이머):
+
+```ini
+[Unit]
+Description=step-ca 암호 주간 회전
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/bootroot/rotate.env
+ExecStart=/usr/local/bin/bootroot rotate stepca-password --yes
+```
+
+```ini
+[Unit]
+Description=주간 step-ca 암호 회전
+
+[Timer]
+OnCalendar=Sun 03:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```

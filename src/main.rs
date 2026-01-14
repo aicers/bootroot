@@ -35,6 +35,7 @@ enum CliCommand {
     #[command(subcommand)]
     App(AppCommand),
     Verify(VerifyArgs),
+    Rotate(RotateArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -46,6 +47,88 @@ enum InfraCommand {
 enum AppCommand {
     Add(Box<AppAddArgs>),
     Info(AppInfoArgs),
+}
+
+#[derive(Args, Debug)]
+struct RotateArgs {
+    #[command(subcommand)]
+    command: RotateCommand,
+
+    /// Path to state.json
+    #[arg(long)]
+    state_file: Option<PathBuf>,
+
+    /// Path to docker-compose.yml
+    #[arg(long, default_value = DEFAULT_COMPOSE_FILE)]
+    compose_file: PathBuf,
+
+    /// `OpenBao` API URL override
+    #[arg(long)]
+    openbao_url: Option<String>,
+
+    /// `OpenBao` KV mount path override (KV v2)
+    #[arg(long)]
+    kv_mount: Option<String>,
+
+    /// Secrets directory override
+    #[arg(long)]
+    secrets_dir: Option<PathBuf>,
+
+    /// `OpenBao` root token
+    #[arg(long, env = "OPENBAO_ROOT_TOKEN")]
+    root_token: Option<String>,
+
+    /// Skip confirmation prompts
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum RotateCommand {
+    StepcaPassword(RotateStepcaPasswordArgs),
+    Eab(RotateEabArgs),
+    Db(RotateDbArgs),
+    ResponderHmac(RotateResponderHmacArgs),
+}
+
+#[derive(Args, Debug)]
+struct RotateStepcaPasswordArgs {
+    /// New step-ca key password
+    #[arg(long)]
+    new_password: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct RotateEabArgs {
+    /// step-ca URL for EAB issuance
+    #[arg(long, default_value = DEFAULT_STEPCA_URL)]
+    stepca_url: String,
+
+    /// step-ca ACME provisioner name
+    #[arg(long, default_value = DEFAULT_STEPCA_PROVISIONER)]
+    stepca_provisioner: String,
+}
+
+#[derive(Args, Debug)]
+struct RotateDbArgs {
+    /// `PostgreSQL` admin DSN for rotation
+    #[arg(long = "db-admin-dsn", env = "BOOTROOT_DB_ADMIN_DSN")]
+    admin_dsn: Option<String>,
+
+    /// New database password
+    #[arg(long = "db-password", env = "BOOTROOT_DB_PASSWORD")]
+    password: Option<String>,
+
+    /// DB connectivity timeout in seconds
+    #[arg(long = "db-timeout-secs", default_value_t = 2)]
+    timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct RotateResponderHmacArgs {
+    /// New responder HMAC
+    #[arg(long)]
+    hmac: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -323,6 +406,13 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
         }
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,
+        CliCommand::Rotate(args) => {
+            let runtime = tokio::runtime::Runtime::new()
+                .with_context(|| messages.error_runtime_init_failed("rotate"))?;
+            runtime
+                .block_on(commands::rotate::run_rotate(&args, messages))
+                .with_context(|| messages.error_rotate_failed())?;
+        }
     }
     Ok(())
 }
@@ -340,5 +430,11 @@ mod tests {
             }
             _ => panic!("expected infra up"),
         }
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_stepca() {
+        let cli = Cli::parse_from(["bootroot", "rotate", "stepca-password"]);
+        assert!(matches!(cli.command, CliCommand::Rotate(_)));
     }
 }

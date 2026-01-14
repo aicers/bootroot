@@ -15,6 +15,8 @@ use poem::web::{Data, Json, Path};
 use poem::{EndpointExt, Route, Server, handler};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -98,8 +100,8 @@ struct TokenEntry {
 
 #[derive(Debug)]
 struct ResponderState {
-    settings: ResponderSettings,
-    hmac_key: hmac::Key,
+    settings: RwLock<ResponderSettings>,
+    hmac_key: RwLock<hmac::Key>,
     tokens: RwLock<HashMap<String, TokenEntry>>,
 }
 
@@ -127,9 +129,13 @@ async fn register_token_inner(
     signature: &str,
     request: RegisterRequest,
 ) -> Result<(), String> {
-    let ttl_secs = request.ttl_secs.unwrap_or(state.settings.token_ttl_secs);
+    let ttl_secs = {
+        let settings = state.settings.read().await;
+        request.ttl_secs.unwrap_or(settings.token_ttl_secs)
+    };
     let payload = signature_payload(timestamp, &request, ttl_secs);
-    if !verify_signature(&state.hmac_key, signature, &payload) {
+    let key = { state.hmac_key.read().await.clone() };
+    if !verify_signature(&key, signature, &payload) {
         return Err("Invalid signature".to_string());
     }
 
@@ -160,8 +166,11 @@ mod tests {
         };
 
         Arc::new(ResponderState {
-            hmac_key: hmac::Key::new(hmac::HMAC_SHA256, settings.hmac_secret.as_bytes()),
-            settings,
+            hmac_key: RwLock::new(hmac::Key::new(
+                hmac::HMAC_SHA256,
+                settings.hmac_secret.as_bytes(),
+            )),
+            settings: RwLock::new(settings),
             tokens: RwLock::new(HashMap::new()),
         })
     }
@@ -226,7 +235,8 @@ mod tests {
             ttl_secs: Some(60),
         };
         let payload = signature_payload(timestamp, &request, 60);
-        let signature = STANDARD.encode(hmac::sign(&state.hmac_key, payload.as_bytes()).as_ref());
+        let key = state.hmac_key.read().await;
+        let signature = STANDARD.encode(hmac::sign(&key, payload.as_bytes()).as_ref());
 
         register_token_inner(&state, timestamp, &signature, request)
             .await
@@ -268,7 +278,11 @@ async fn register_token(
         return (StatusCode::BAD_REQUEST, "Invalid timestamp".to_string());
     };
 
-    if !within_skew(timestamp, state.settings.max_skew_secs) {
+    let max_skew = {
+        let settings = state.settings.read().await;
+        settings.max_skew_secs
+    };
+    if !within_skew(timestamp, max_skew) {
         return (
             StatusCode::UNAUTHORIZED,
             "Timestamp out of range".to_string(),
@@ -315,8 +329,11 @@ fn verify_signature(key: &hmac::Key, signature: &str, payload: &str) -> bool {
 }
 
 async fn cleanup_expired_tokens(state: Arc<ResponderState>) {
-    let interval = Duration::from_secs(state.settings.cleanup_interval_secs);
     loop {
+        let interval = {
+            let settings = state.settings.read().await;
+            Duration::from_secs(settings.cleanup_interval_secs)
+        };
         tokio::time::sleep(interval).await;
         let mut tokens = state.tokens.write().await;
         let now = tokio::time::Instant::now();
@@ -334,12 +351,15 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let settings = ResponderSettings::new(args.config)?;
-    settings.validate()?;
+    let config_path = args.config.clone();
+    let settings = load_settings(config_path.clone())?;
 
     let state = Arc::new(ResponderState {
-        hmac_key: hmac::Key::new(hmac::HMAC_SHA256, settings.hmac_secret.as_bytes()),
-        settings: settings.clone(),
+        hmac_key: RwLock::new(hmac::Key::new(
+            hmac::HMAC_SHA256,
+            settings.hmac_secret.as_bytes(),
+        )),
+        settings: RwLock::new(settings.clone()),
         tokens: RwLock::new(HashMap::new()),
     });
 
@@ -367,24 +387,91 @@ async fn main() -> Result<()> {
     info!("Starting HTTP-01 responder on {}", listen_addr);
     info!("Starting HTTP-01 admin API on {}", admin_addr);
 
-    let challenge = Server::new(TcpListener::bind(listen_addr)).run(challenge_app);
-    let admin = Server::new(TcpListener::bind(admin_addr)).run(admin_app);
-
-    tokio::select! {
-        result = challenge => {
-            if let Err(err) = result {
-                error!("Challenge server failed: {err}");
+    let mut challenge =
+        tokio::spawn(Server::new(TcpListener::bind(listen_addr)).run(challenge_app));
+    let mut admin = tokio::spawn(Server::new(TcpListener::bind(admin_addr)).run(admin_app));
+    #[cfg(unix)]
+    {
+        let mut hup = signal(SignalKind::hangup())?;
+        loop {
+            tokio::select! {
+                result = &mut challenge => {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => error!("Challenge server failed: {err}"),
+                        Err(err) => error!("Challenge server task failed: {err}"),
+                    }
+                    break;
+                }
+                result = &mut admin => {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => error!("Admin server failed: {err}"),
+                        Err(err) => error!("Admin server task failed: {err}"),
+                    }
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    warn!("Shutdown signal received");
+                    break;
+                }
+                _ = hup.recv() => {
+                    match reload_settings(&state, config_path.clone()).await {
+                        Ok(()) => info!("Reloaded responder configuration"),
+                        Err(err) => error!("Reload failed: {err}"),
+                    }
+                }
             }
-        }
-        result = admin => {
-            if let Err(err) = result {
-                error!("Admin server failed: {err}");
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            warn!("Shutdown signal received");
         }
     }
 
+    #[cfg(not(unix))]
+    {
+        loop {
+            tokio::select! {
+                result = &mut challenge => {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => error!("Challenge server failed: {err}"),
+                        Err(err) => error!("Challenge server task failed: {err}"),
+                    }
+                    break;
+                }
+                result = &mut admin => {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => error!("Admin server failed: {err}"),
+                        Err(err) => error!("Admin server task failed: {err}"),
+                    }
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    warn!("Shutdown signal received");
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn load_settings(config_path: Option<PathBuf>) -> Result<ResponderSettings> {
+    let settings = ResponderSettings::new(config_path)?;
+    settings.validate()?;
+    Ok(settings)
+}
+
+async fn reload_settings(state: &ResponderState, config_path: Option<PathBuf>) -> Result<()> {
+    let settings = load_settings(config_path)?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, settings.hmac_secret.as_bytes());
+    {
+        let mut settings_lock = state.settings.write().await;
+        *settings_lock = settings;
+    }
+    {
+        let mut key_lock = state.hmac_key.write().await;
+        *key_lock = key;
+    }
     Ok(())
 }

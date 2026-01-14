@@ -1,6 +1,7 @@
 {
   "openbao_url": "http://localhost:8200",
   "kv_mount": "secret",
+  "secrets_dir": "secrets",
   "policies": {
     "bootroot_agent": "bootroot-agent",
     "responder": "bootroot-responder",
