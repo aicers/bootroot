@@ -63,47 +63,9 @@ pub(crate) fn print_app_add_summary(
     );
     println!("{}", messages.app_summary_openbao_path(&entry.service_name));
     println!("{}", messages.app_summary_next_steps());
-    let app_dir = secret_id_path.parent().unwrap_or(std::path::Path::new("."));
-    let role_id_path = app_dir.join("role_id");
-    let secrets_dir = app_dir
-        .parent()
-        .and_then(|parent| parent.parent())
-        .unwrap_or(std::path::Path::new("."));
-    let openbao_agent_config = secrets_dir
-        .join("openbao")
-        .join("apps")
-        .join(&entry.service_name)
-        .join("agent.hcl");
-    let openbao_steps = AppOpenBaoAgentSteps {
-        service_name: &entry.service_name,
-        config_path: &openbao_agent_config.display().to_string(),
-        role_id_path: &role_id_path.display().to_string(),
-        secret_id_path: &secret_id_path.display().to_string(),
-        app_dir: &app_dir.display().to_string(),
-    };
-    println!("{}", messages.app_next_steps_openbao_agent_title());
-    println!(
-        "{}",
-        messages.app_next_steps_openbao_agent_config(&openbao_steps)
-    );
-    println!(
-        "{}",
-        messages.app_next_steps_openbao_agent_role_id_path(&openbao_steps)
-    );
-    println!(
-        "{}",
-        messages.app_next_steps_openbao_agent_secret_id_path(&openbao_steps)
-    );
-    println!(
-        "{}",
-        messages.app_next_steps_openbao_agent_permissions(&openbao_steps)
-    );
+    print_app_openbao_agent_steps(entry, secret_id_path, messages);
     match entry.deploy_type {
         DeployType::Daemon => {
-            println!(
-                "{}",
-                messages.app_next_steps_openbao_agent_daemon_run(&openbao_steps)
-            );
             let cert_path = entry.cert_path.display().to_string();
             let key_path = entry.key_path.display().to_string();
             let config_path = entry.agent_config_path.display().to_string();
@@ -120,10 +82,6 @@ pub(crate) fn print_app_add_summary(
             print_daemon_snippet(entry, messages);
         }
         DeployType::Docker => {
-            println!(
-                "{}",
-                messages.app_next_steps_openbao_agent_docker_run(&openbao_steps)
-            );
             let cert_path = entry.cert_path.display().to_string();
             let key_path = entry.key_path.display().to_string();
             let config_path = entry.agent_config_path.display().to_string();
@@ -181,7 +139,12 @@ pub(crate) fn print_app_info_summary(entry: &AppEntry, messages: &Messages) {
         "{}",
         messages.app_summary_key_path(&entry.key_path.display().to_string())
     );
-    println!("{}", messages.app_summary_secret_path_hidden());
+    println!(
+        "{}",
+        messages.app_summary_secret_path(&entry.approle.secret_id_path.display().to_string())
+    );
+    println!("{}", messages.app_summary_next_steps());
+    print_app_openbao_agent_steps(entry, &entry.approle.secret_id_path, messages);
 }
 
 fn print_app_fields(entry: &AppEntry, messages: &Messages) {
@@ -219,6 +182,62 @@ fn print_app_plan_fields(plan: &AppAddPlan<'_>, messages: &Messages) {
     }
     if let Some(notes) = plan.notes {
         println!("{}", messages.app_summary_notes(notes));
+    }
+}
+
+fn print_app_openbao_agent_steps(
+    entry: &AppEntry,
+    secret_id_path: &std::path::Path,
+    messages: &Messages,
+) {
+    let app_dir = secret_id_path.parent().unwrap_or(std::path::Path::new("."));
+    let role_id_path = app_dir.join("role_id");
+    let secrets_dir = app_dir
+        .parent()
+        .and_then(|parent| parent.parent())
+        .unwrap_or(std::path::Path::new("."));
+    let openbao_agent_config = secrets_dir
+        .join("openbao")
+        .join("apps")
+        .join(&entry.service_name)
+        .join("agent.hcl");
+    let openbao_steps = AppOpenBaoAgentSteps {
+        service_name: &entry.service_name,
+        config_path: &openbao_agent_config.display().to_string(),
+        role_id_path: &role_id_path.display().to_string(),
+        secret_id_path: &secret_id_path.display().to_string(),
+        app_dir: &app_dir.display().to_string(),
+    };
+    println!("{}", messages.app_next_steps_openbao_agent_title());
+    println!(
+        "{}",
+        messages.app_next_steps_openbao_agent_config(&openbao_steps)
+    );
+    println!(
+        "{}",
+        messages.app_next_steps_openbao_agent_role_id_path(&openbao_steps)
+    );
+    println!(
+        "{}",
+        messages.app_next_steps_openbao_agent_secret_id_path(&openbao_steps)
+    );
+    println!(
+        "{}",
+        messages.app_next_steps_openbao_agent_permissions(&openbao_steps)
+    );
+    match entry.deploy_type {
+        DeployType::Daemon => {
+            println!(
+                "{}",
+                messages.app_next_steps_openbao_agent_daemon_run(&openbao_steps)
+            );
+        }
+        DeployType::Docker => {
+            println!(
+                "{}",
+                messages.app_next_steps_openbao_agent_docker_run(&openbao_steps)
+            );
+        }
     }
 }
 

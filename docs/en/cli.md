@@ -101,6 +101,7 @@ registers required secrets.
 - step-ca init result and responder check status
 - DB connectivity check status (when enabled)
 - EAB registration summary
+- OpenBao Agent compose override for step-ca/responder (applied automatically)
 - Next-steps guidance
 
 ### Failures
@@ -172,6 +173,7 @@ Registers app onboarding info and creates an OpenBao AppRole.
 
 - App metadata summary
 - AppRole/policy/secret_id path summary
+- Per-app OpenBao Agent guidance (daemon vs docker)
 - Type-specific onboarding guidance (daemon profile / docker sidecar)
 - Copy-paste snippets for daemon profile or docker sidecar
 
@@ -194,6 +196,7 @@ Shows onboarding information for a registered app.
 ### Outputs
 
 - App type/paths/AppRole/secret paths summary
+- Per-app OpenBao Agent guidance (daemon vs docker)
 
 ### Failures
 

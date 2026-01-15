@@ -171,7 +171,6 @@ pub(crate) struct Strings {
     pub(crate) app_summary_policy: &'static str,
     pub(crate) app_summary_approle: &'static str,
     pub(crate) app_summary_secret_path: &'static str,
-    pub(crate) app_summary_secret_path_hidden: &'static str,
     pub(crate) app_summary_openbao_path: &'static str,
     pub(crate) app_summary_agent_config: &'static str,
     pub(crate) app_summary_cert_path: &'static str,
@@ -913,10 +912,6 @@ impl Messages {
 
     pub(crate) fn app_summary_secret_path(&self, value: &str) -> String {
         format_template(self.strings().app_summary_secret_path, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_secret_path_hidden(&self) -> &'static str {
-        self.strings().app_summary_secret_path_hidden
     }
 
     pub(crate) fn app_summary_openbao_path(&self, value: &str) -> String {

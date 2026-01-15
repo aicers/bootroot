@@ -100,6 +100,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - step-ca 초기화 여부, responder 체크 결과
 - DB 연결 점검 결과(옵션 사용 시)
 - EAB 등록 여부
+- step-ca/responder용 OpenBao Agent compose override 자동 적용
 - 다음 단계 안내
 
 ### 실패
@@ -171,6 +172,7 @@ bootroot status
 
 - 앱 메타데이터 요약
 - AppRole/정책/secret_id 경로 요약
+- 앱별 OpenBao Agent 안내(daemon/docker 분리)
 - 타입별 온보딩 안내 (daemon 프로필 / docker sidecar)
 - daemon/docker 스니펫(복붙용) 출력
 
@@ -193,6 +195,7 @@ bootroot status
 ### 출력
 
 - 앱 타입/경로/AppRole/시크릿 경로 요약
+- 앱별 OpenBao Agent 안내(daemon/docker 분리)
 
 ### 실패
 
