@@ -327,7 +327,7 @@ async fn test_app_info_prints_summary() {
     assert!(stdout.contains("bootroot app info: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- domain: trusted.domain"));
-    assert!(stdout.contains("- secret_id path: (hidden)"));
+    assert!(stdout.contains("- secret_id path: secrets/apps/edge-proxy/secret_id"));
 }
 
 #[cfg(unix)]
