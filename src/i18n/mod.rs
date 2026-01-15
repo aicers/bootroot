@@ -121,6 +121,7 @@ pub(crate) struct Strings {
     pub(crate) error_openbao_approle_create_failed: &'static str,
     pub(crate) error_openbao_role_id_failed: &'static str,
     pub(crate) error_openbao_secret_id_failed: &'static str,
+    pub(crate) error_openbao_approle_login_failed: &'static str,
     pub(crate) error_openbao_kv_exists_failed: &'static str,
     pub(crate) error_openbao_kv_write_failed: &'static str,
     pub(crate) error_openbao_kv_delete_failed: &'static str,
@@ -152,6 +153,7 @@ pub(crate) struct Strings {
     pub(crate) prompt_rotate_eab: &'static str,
     pub(crate) prompt_rotate_db: &'static str,
     pub(crate) prompt_rotate_responder_hmac: &'static str,
+    pub(crate) prompt_rotate_approle_secret_id: &'static str,
     pub(crate) init_plan_title: &'static str,
     pub(crate) init_plan_overwrite_password: &'static str,
     pub(crate) init_plan_overwrite_ca_json: &'static str,
@@ -248,6 +250,9 @@ pub(crate) struct Strings {
     pub(crate) rotate_summary_agent_configs_skipped: &'static str,
     pub(crate) rotate_summary_reload_agent: &'static str,
     pub(crate) rotate_summary_reload_responder: &'static str,
+    pub(crate) rotate_summary_approle_secret_id: &'static str,
+    pub(crate) rotate_summary_reload_openbao_agent: &'static str,
+    pub(crate) rotate_summary_approle_login_ok: &'static str,
     pub(crate) summary_responder_check_ok: &'static str,
     pub(crate) summary_responder_check_skipped: &'static str,
     pub(crate) summary_db_check_ok: &'static str,
@@ -689,6 +694,10 @@ impl Messages {
         self.strings().error_openbao_secret_id_failed
     }
 
+    pub(crate) fn error_openbao_approle_login_failed(&self) -> &'static str {
+        self.strings().error_openbao_approle_login_failed
+    }
+
     pub(crate) fn error_openbao_kv_exists_failed(&self) -> &'static str {
         self.strings().error_openbao_kv_exists_failed
     }
@@ -826,6 +835,13 @@ impl Messages {
 
     pub(crate) fn prompt_rotate_responder_hmac(&self) -> &'static str {
         self.strings().prompt_rotate_responder_hmac
+    }
+
+    pub(crate) fn prompt_rotate_approle_secret_id(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().prompt_rotate_approle_secret_id,
+            &[("service_name", service_name)],
+        )
     }
 
     pub(crate) fn init_plan_title(&self) -> &'static str {
@@ -1320,6 +1336,28 @@ impl Messages {
 
     pub(crate) fn rotate_summary_reload_responder(&self) -> &'static str {
         self.strings().rotate_summary_reload_responder
+    }
+
+    pub(crate) fn rotate_summary_approle_secret_id(
+        &self,
+        service_name: &str,
+        value: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_summary_approle_secret_id,
+            &[("service_name", service_name), ("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_reload_openbao_agent(&self) -> &'static str {
+        self.strings().rotate_summary_reload_openbao_agent
+    }
+
+    pub(crate) fn rotate_summary_approle_login_ok(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_approle_login_ok,
+            &[("service_name", service_name)],
+        )
     }
 
     pub(crate) fn summary_responder_check_ok(&self) -> &'static str {

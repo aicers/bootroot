@@ -87,6 +87,16 @@ struct SecretIdData {
     secret_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AppRoleLoginResponse {
+    auth: AppRoleAuth,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppRoleAuth {
+    client_token: String,
+}
+
 impl OpenBaoClient {
     /// Creates a new `OpenBao` client targeting the provided base URL.
     ///
@@ -375,6 +385,28 @@ impl OpenBaoClient {
             )
             .await?;
         Ok(response.data.secret_id)
+    }
+
+    /// Logs in using an `AppRole` `role_id/secret_id` pair.
+    ///
+    /// # Errors
+    /// Returns an error if the login request fails.
+    pub async fn login_approle(&self, role_id: &str, secret_id: &str) -> Result<String> {
+        let url = self.endpoint("auth/approle/login");
+        let response = self
+            .client
+            .post(url)
+            .json(&serde_json::json!({
+                "role_id": role_id,
+                "secret_id": secret_id
+            }))
+            .send()
+            .await
+            .with_context(|| "OpenBao request failed: auth/approle/login")?;
+        let parsed: AppRoleLoginResponse = Self::parse_response(response)
+            .await
+            .context("OpenBao response parse failed: auth/approle/login")?;
+        Ok(parsed.auth.client_token)
     }
 
     /// Writes a KV v2 secret.
