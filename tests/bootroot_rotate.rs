@@ -74,6 +74,16 @@ async fn test_rotate_approle_secret_id_daemon_updates_secret() {
         & 0o777;
     assert_eq!(mode, 0o600);
 
+    let role_id_path = secret_path.parent().expect("secret parent").join("role_id");
+    let role_id_contents = fs::read_to_string(&role_id_path).expect("read role_id");
+    assert_eq!(role_id_contents, ROLE_ID);
+    let mode = fs::metadata(&role_id_path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+
     let pkill_args = fs::read_to_string(&pkill_log).expect("read pkill log");
     assert!(pkill_args.contains("-HUP"));
     assert!(pkill_args.contains("agent.toml"));
@@ -227,6 +237,15 @@ async fn stub_openbao_for_rotation(server: &MockServer, new_secret_id: &str) {
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "secret_id": new_secret_id }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/role-id")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "role_id": ROLE_ID }
         })))
         .mount(server)
         .await;

@@ -89,6 +89,21 @@ async fn test_app_add_writes_state_and_secret() {
         .mode()
         & 0o777;
     assert_eq!(mode, 0o600);
+
+    let role_id_path = temp_dir
+        .path()
+        .join("secrets")
+        .join("apps")
+        .join("edge-proxy")
+        .join("role_id");
+    let role_id_contents = fs::read_to_string(&role_id_path).expect("read role_id");
+    assert_eq!(role_id_contents, "role-edge-proxy");
+    let mode = fs::metadata(&role_id_path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
 }
 
 #[cfg(unix)]
