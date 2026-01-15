@@ -697,6 +697,9 @@ async fn write_secret_id_atomic(path: &Path, value: &str, messages: &Messages) -
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!(messages.error_parent_not_found(&path.display().to_string()))
     })?;
+    if parent.as_os_str().is_empty() {
+        anyhow::bail!(messages.error_parent_not_found(&path.display().to_string()));
+    }
     fs_util::ensure_secrets_dir(parent).await?;
     let temp_path = temp_secret_path(path);
     tokio::fs::write(&temp_path, value)
@@ -813,7 +816,17 @@ struct EabCredentials {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
     use super::*;
+
+    fn test_messages() -> Messages {
+        Messages::new("en").expect("valid language")
+    }
 
     #[test]
     fn upsert_toml_section_keys_updates_existing() {
@@ -842,5 +855,51 @@ mod tests {
     fn openbao_agent_container_name_uses_prefix() {
         let name = openbao_agent_container_name("api");
         assert_eq!(name, "bootroot-openbao-agent-api");
+    }
+
+    #[tokio::test]
+    async fn write_secret_id_atomic_overwrites_contents() {
+        let dir = tempdir().expect("tempdir");
+        let secret_path = dir.path().join("app").join("secret_id");
+        let messages = test_messages();
+
+        write_secret_id_atomic(&secret_path, "old", &messages)
+            .await
+            .expect("initial write");
+        write_secret_id_atomic(&secret_path, "new", &messages)
+            .await
+            .expect("overwrite");
+
+        let contents = tokio::fs::read_to_string(&secret_path)
+            .await
+            .expect("read secret_id");
+        assert_eq!(contents, "new");
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&secret_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn write_secret_id_atomic_requires_parent_dir() {
+        let messages = test_messages();
+        let err = write_secret_id_atomic(Path::new("secret_id"), "value", &messages)
+            .await
+            .expect_err("expected parent error");
+        let err = err.to_string();
+        assert!(err.contains("Parent directory not found"));
+    }
+
+    #[test]
+    fn temp_secret_path_adds_suffix() {
+        let path = Path::new("/tmp/secret_id");
+        let temp = temp_secret_path(path);
+        let name = temp.file_name().expect("filename").to_string_lossy();
+        assert!(name.starts_with("secret_id.tmp."));
     }
 }
