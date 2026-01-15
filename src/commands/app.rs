@@ -19,6 +19,7 @@ const STATE_FILE_NAME: &str = "state.json";
 const APPROLE_PREFIX: &str = "bootroot-app-";
 const APP_KV_BASE: &str = "bootroot/apps";
 const APP_SECRET_DIR: &str = "apps";
+const APP_ROLE_ID_FILENAME: &str = "role_id";
 const APP_SECRET_ID_FILENAME: &str = "secret_id";
 
 pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Result<()> {
@@ -65,6 +66,13 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
 
     let approle = ensure_app_approle(&client, &state, &resolved.service_name, messages).await?;
     let secrets_dir = state.secrets_dir();
+    write_role_id_file(
+        &secrets_dir,
+        &resolved.service_name,
+        &approle.role_id,
+        messages,
+    )
+    .await?;
     let secret_id_path = write_secret_id_file(
         &secrets_dir,
         &resolved.service_name,
@@ -174,6 +182,22 @@ async fn write_secret_id_file(
         .with_context(|| messages.error_write_file_failed(&secret_path.display().to_string()))?;
     fs_util::set_key_permissions(&secret_path).await?;
     Ok(secret_path)
+}
+
+async fn write_role_id_file(
+    secrets_dir: &Path,
+    service_name: &str,
+    role_id: &str,
+    messages: &Messages,
+) -> Result<PathBuf> {
+    let app_dir = secrets_dir.join(APP_SECRET_DIR).join(service_name);
+    fs_util::ensure_secrets_dir(&app_dir).await?;
+    let role_path = app_dir.join(APP_ROLE_ID_FILENAME);
+    fs::write(&role_path, role_id)
+        .await
+        .with_context(|| messages.error_write_file_failed(&role_path.display().to_string()))?;
+    fs_util::set_key_permissions(&role_path).await?;
+    Ok(role_path)
 }
 
 struct AppRoleMaterialized {

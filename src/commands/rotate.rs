@@ -29,6 +29,7 @@ const RESPONDER_CONFIG_PATH: &str = "responder/responder.toml";
 const CA_JSON_PATH: &str = "config/ca.json";
 const SECRET_BYTES: usize = 32;
 const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
+const ROLE_ID_FILENAME: &str = "role_id";
 
 #[derive(Debug)]
 struct RotateContext {
@@ -355,6 +356,7 @@ async fn rotate_approle_secret_id(
         .apps
         .get(&args.service_name)
         .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&args.service_name)))?;
+    ensure_role_id_file(entry, client, messages).await?;
     let new_secret_id = client
         .create_secret_id(&entry.approle.role_name)
         .await
@@ -379,6 +381,32 @@ async fn rotate_approle_secret_id(
         "{}",
         messages.rotate_summary_approle_login_ok(&args.service_name)
     );
+    Ok(())
+}
+
+async fn ensure_role_id_file(
+    entry: &AppEntry,
+    client: &OpenBaoClient,
+    messages: &Messages,
+) -> Result<()> {
+    let app_dir = entry
+        .approle
+        .secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."));
+    let role_id_path = app_dir.join(ROLE_ID_FILENAME);
+    if role_id_path.exists() {
+        return Ok(());
+    }
+    let role_id = client
+        .read_role_id(&entry.approle.role_name)
+        .await
+        .with_context(|| messages.error_openbao_role_id_failed())?;
+    fs_util::ensure_secrets_dir(app_dir).await?;
+    tokio::fs::write(&role_id_path, role_id)
+        .await
+        .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
+    fs_util::set_key_permissions(&role_id_path).await?;
     Ok(())
 }
 
