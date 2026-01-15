@@ -17,8 +17,8 @@ use crate::commands::init::{
 use crate::i18n::Messages;
 use crate::state::{AppEntry, StateFile};
 use crate::{
-    RotateArgs, RotateCommand, RotateDbArgs, RotateEabArgs, RotateResponderHmacArgs,
-    RotateStepcaPasswordArgs,
+    RotateAppRoleSecretIdArgs, RotateArgs, RotateCommand, RotateDbArgs, RotateEabArgs,
+    RotateResponderHmacArgs, RotateStepcaPasswordArgs,
 };
 
 const STATE_FILE_NAME: &str = "state.json";
@@ -28,6 +28,7 @@ const STEPCA_PASSWORD_FILE: &str = "password.txt";
 const RESPONDER_CONFIG_PATH: &str = "responder/responder.toml";
 const CA_JSON_PATH: &str = "config/ca.json";
 const SECRET_BYTES: usize = 32;
+const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
 
 #[derive(Debug)]
 struct RotateContext {
@@ -92,6 +93,9 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         }
         RotateCommand::ResponderHmac(step_args) => {
             rotate_responder_hmac(&ctx, &client, step_args, args.yes, messages).await?;
+        }
+        RotateCommand::AppRoleSecretId(step_args) => {
+            rotate_approle_secret_id(&ctx, &client, step_args, args.yes, messages).await?;
         }
     }
 
@@ -330,6 +334,51 @@ async fn rotate_responder_hmac(
     if reloaded {
         println!("{}", messages.rotate_summary_reload_responder());
     }
+    Ok(())
+}
+
+async fn rotate_approle_secret_id(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    args: &RotateAppRoleSecretIdArgs,
+    auto_confirm: bool,
+    messages: &Messages,
+) -> Result<()> {
+    confirm_action(
+        &messages.prompt_rotate_approle_secret_id(&args.service_name),
+        auto_confirm,
+        messages,
+    )?;
+
+    let entry = ctx
+        .state
+        .apps
+        .get(&args.service_name)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&args.service_name)))?;
+    let new_secret_id = client
+        .create_secret_id(&entry.approle.role_name)
+        .await
+        .with_context(|| messages.error_openbao_secret_id_failed())?;
+    write_secret_id_atomic(&entry.approle.secret_id_path, &new_secret_id, messages).await?;
+    reload_openbao_agent(entry, messages)?;
+    client
+        .login_approle(&entry.approle.role_id, &new_secret_id)
+        .await
+        .with_context(|| messages.error_openbao_approle_login_failed())?;
+
+    println!("{}", messages.rotate_summary_title());
+    println!(
+        "{}",
+        messages.rotate_summary_approle_secret_id(
+            &args.service_name,
+            &entry.approle.secret_id_path.display().to_string()
+        )
+    );
+    println!("{}", messages.rotate_summary_reload_openbao_agent());
+    println!(
+        "{}",
+        messages.rotate_summary_approle_login_ok(&args.service_name)
+    );
     Ok(())
 }
 
@@ -644,6 +693,72 @@ fn to_container_path(secrets_dir: &Path, path: &Path) -> Result<String> {
     Ok(format!("/home/step/{}", relative.to_string_lossy()))
 }
 
+async fn write_secret_id_atomic(path: &Path, value: &str, messages: &Messages) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!(messages.error_parent_not_found(&path.display().to_string()))
+    })?;
+    fs_util::ensure_secrets_dir(parent).await?;
+    let temp_path = temp_secret_path(path);
+    tokio::fs::write(&temp_path, value)
+        .await
+        .with_context(|| messages.error_write_file_failed(&temp_path.display().to_string()))?;
+    fs_util::set_key_permissions(&temp_path).await?;
+    tokio::fs::rename(&temp_path, path)
+        .await
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    Ok(())
+}
+
+fn temp_secret_path(path: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = path.file_name().map_or_else(
+        || "secret_id".to_string(),
+        |name| name.to_string_lossy().to_string(),
+    );
+    let temp_name = format!("{file_name}.tmp.{pid}.{nanos}");
+    path.with_file_name(temp_name)
+}
+
+fn reload_openbao_agent(entry: &AppEntry, messages: &Messages) -> Result<()> {
+    match entry.deploy_type {
+        crate::state::DeployType::Docker => {
+            let container = openbao_agent_container_name(&entry.service_name);
+            run_docker(
+                &["restart", &container],
+                "docker restart OpenBao Agent",
+                messages,
+            )
+        }
+        crate::state::DeployType::Daemon => reload_openbao_agent_daemon(entry, messages),
+    }
+}
+
+#[cfg(unix)]
+fn reload_openbao_agent_daemon(entry: &AppEntry, messages: &Messages) -> Result<()> {
+    let config_path = entry.agent_config_path.display().to_string();
+    let status = std::process::Command::new("pkill")
+        .args(["-HUP", "-f", &config_path])
+        .status()
+        .with_context(|| messages.error_command_run_failed("pkill -HUP"))?;
+    if !status.success() {
+        anyhow::bail!(messages.error_command_failed_status("pkill -HUP", &status.to_string()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reload_openbao_agent_daemon(_entry: &AppEntry, messages: &Messages) -> Result<()> {
+    anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
+}
+
+fn openbao_agent_container_name(service_name: &str) -> String {
+    format!("{OPENBAO_AGENT_CONTAINER_PREFIX}-{service_name}")
+}
+
 fn compose_has_responder(compose_file: &Path, messages: &Messages) -> Result<bool> {
     let compose_contents = fs::read_to_string(compose_file)
         .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
@@ -721,5 +836,11 @@ mod tests {
         let input = "listen_addr = \"0.0.0.0:80\"\nhmac_secret = \"old\"\n";
         let updated = update_responder_hmac(input, "new");
         assert!(updated.contains("hmac_secret = \"new\""));
+    }
+
+    #[test]
+    fn openbao_agent_container_name_uses_prefix() {
+        let name = openbao_agent_container_name("api");
+        assert_eq!(name, "bootroot-openbao-agent-api");
     }
 }

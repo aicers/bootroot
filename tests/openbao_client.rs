@@ -99,6 +99,32 @@ async fn approle_exists_returns_false_on_404() {
 }
 
 #[tokio::test]
+async fn approle_login_returns_token() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": "role-id",
+            "secret_id": "secret-id"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": {
+                "client_token": "client-token"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = OpenBaoClient::new(&server.uri()).expect("client init should succeed");
+    let token = client
+        .login_approle("role-id", "secret-id")
+        .await
+        .expect("login_approle should succeed");
+    assert_eq!(token, "client-token");
+}
+
+#[tokio::test]
 async fn kv_exists_returns_false_on_404() {
     let server = MockServer::start().await;
 

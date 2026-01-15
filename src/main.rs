@@ -89,6 +89,8 @@ enum RotateCommand {
     Eab(RotateEabArgs),
     Db(RotateDbArgs),
     ResponderHmac(RotateResponderHmacArgs),
+    #[command(name = "approle-secret-id")]
+    AppRoleSecretId(RotateAppRoleSecretIdArgs),
 }
 
 #[derive(Args, Debug)]
@@ -129,6 +131,13 @@ struct RotateResponderHmacArgs {
     /// New responder HMAC
     #[arg(long)]
     hmac: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct RotateAppRoleSecretIdArgs {
+    /// App service name to rotate the `AppRole` `secret_id` for
+    #[arg(long)]
+    service_name: String,
 }
 
 #[derive(Args, Debug)]
@@ -435,6 +444,18 @@ mod tests {
     #[test]
     fn test_cli_parses_rotate_stepca() {
         let cli = Cli::parse_from(["bootroot", "rotate", "stepca-password"]);
+        assert!(matches!(cli.command, CliCommand::Rotate(_)));
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_approle_secret_id() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "approle-secret-id",
+            "--service-name",
+            "api",
+        ]);
         assert!(matches!(cli.command, CliCommand::Rotate(_)));
     }
 }
