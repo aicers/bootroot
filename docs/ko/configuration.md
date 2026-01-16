@@ -7,8 +7,21 @@ bootroot-agent는 TOML 설정 파일을 읽습니다(기본값: `agent.toml`).
 
 ## bootroot CLI
 
-CLI 사용법은 `docs/ko/cli.md`에 정리되어 있습니다. 이 문서는 **수동 설정**
+CLI 사용법은 [CLI 문서](cli.md)에 정리되어 있습니다. 이 문서는 **수동 설정**
 절차를 기준으로 설명합니다.
+
+## OpenBao Agent
+
+OpenBao Agent는 OpenBao에서 시크릿을 읽어 파일로 렌더링합니다.
+`bootroot init`은 step-ca/리스폰더용 `agent.hcl`을
+`secrets/openbao/stepca/agent.hcl`,
+`secrets/openbao/responder/agent.hcl`에 생성합니다.
+`bootroot app add`는 앱별 OpenBao Agent 설정 경로를 출력하며,
+기본 경로는 `secrets/openbao/apps/<service>/agent.hcl`입니다.
+
+OpenBao Agent는 `role_id`/`secret_id` 파일을 사용해 AppRole로 로그인하며,
+해당 파일은 `secrets/apps/<service>/` 아래에 저장됩니다.
+디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
 
 ## bootroot-agent (agent.toml)
 

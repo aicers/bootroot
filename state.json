@@ -12,5 +12,42 @@
     "responder": "bootroot-responder-role",
     "stepca": "bootroot-stepca-role"
   },
-  "apps": {}
+  "apps": {
+    "edge-proxy": {
+      "service_name": "edge-proxy",
+      "deploy_type": "daemon",
+      "hostname": "edge-node-01",
+      "domain": "trusted.domain",
+      "agent_config_path": "/Users/sehkone/projects/bootroot/tmp/agent.toml",
+      "cert_path": "/Users/sehkone/projects/bootroot/certs/edge-proxy.crt",
+      "key_path": "/Users/sehkone/projects/bootroot/certs/edge-proxy.key",
+      "instance_id": "001",
+      "container_name": null,
+      "notes": null,
+      "approle": {
+        "role_name": "bootroot-app-edge-proxy",
+        "role_id": "95f0dff0-67e0-0701-f760-fbe7b6344111",
+        "secret_id_path": "secrets/apps/edge-proxy/secret_id",
+        "policy_name": "bootroot-app-edge-proxy"
+      }
+    },
+    "web-app": {
+      "service_name": "web-app",
+      "deploy_type": "docker",
+      "hostname": "web-01",
+      "domain": "trusted.domain",
+      "agent_config_path": "/Users/sehkone/projects/bootroot/tmp/agent.toml",
+      "cert_path": "/Users/sehkone/projects/bootroot/certs/web-app.crt",
+      "key_path": "/Users/sehkone/projects/bootroot/certs/web-app.key",
+      "instance_id": "001",
+      "container_name": "web-app",
+      "notes": null,
+      "approle": {
+        "role_name": "bootroot-app-web-app",
+        "role_id": "bd3aaf89-56ba-2968-06b9-4177b8087cd6",
+        "secret_id_path": "secrets/apps/web-app/secret_id",
+        "policy_name": "bootroot-app-web-app"
+      }
+    }
+  }
 }

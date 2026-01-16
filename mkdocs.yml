@@ -26,6 +26,7 @@ plugins:
             - Overview: index.md
             - Concepts: concepts.md
             - CLI: cli.md
+            - CLI Examples: cli-examples.md
             - Getting Started: getting-started.md
             - Installation: installation.md
             - Configuration: configuration.md
@@ -40,6 +41,7 @@ plugins:
             - Overview: index.md
             - Concepts: concepts.md
             - CLI: cli.md
+            - CLI Examples: cli-examples.md
             - Getting Started: getting-started.md
             - Installation: installation.md
             - Configuration: configuration.md
@@ -51,6 +53,7 @@ plugins:
             Overview: 개요
             Concepts: 개념
             CLI: CLI
+            CLI Examples: CLI 예제
             Getting Started: 시작하기
             Examples: 예제
             Installation: 설치

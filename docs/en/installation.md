@@ -137,6 +137,59 @@ The important outputs are the CA config and keys. The CA config must use
 A durable CA should use PostgreSQL. See the step-ca sections above for DSN
 examples and how to update `secrets/config/ca.json`.
 
+## OpenBao Agent
+
+OpenBao Agent renders secrets from OpenBao to files. step-ca/responder use
+the `agent.hcl` files produced by `bootroot init`, and apps use the paths
+printed by `bootroot app add`.
+
+### Docker
+
+OpenBao Agent for step-ca (example):
+
+```bash
+docker run --rm \
+  --name openbao-agent-stepca \
+  -v $(pwd)/secrets:/openbao/secrets \
+  -e VAULT_ADDR=http://localhost:8200 \
+  openbao/openbao:latest \
+  agent -config /openbao/secrets/openbao/stepca/agent.hcl
+```
+
+OpenBao Agent for responder (example):
+
+```bash
+docker run --rm \
+  --name openbao-agent-responder \
+  -v $(pwd)/secrets:/openbao/secrets \
+  -e VAULT_ADDR=http://localhost:8200 \
+  openbao/openbao:latest \
+  agent -config /openbao/secrets/openbao/responder/agent.hcl
+```
+
+OpenBao Agent for an app (example):
+
+```bash
+docker run --rm \
+  --name openbao-agent-edge-proxy \
+  -v $(pwd)/secrets:/openbao/secrets \
+  -e VAULT_ADDR=http://localhost:8200 \
+  openbao/openbao:latest \
+  agent -config /openbao/secrets/openbao/apps/edge-proxy/agent.hcl
+```
+
+### Host run
+
+```bash
+openbao agent -config /etc/bootroot/openbao/apps/<service>/agent.hcl
+```
+
+bootroot runs OpenBao Agent **only in Docker** by default. Host execution is
+for reference.
+
+`role_id`/`secret_id` live under `secrets/apps/<service>/`. Keep the
+directory `0700` and the files `0600`.
+
 ## bootroot-agent
 
 ### Binary

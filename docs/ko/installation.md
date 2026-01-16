@@ -1,7 +1,7 @@
 # 설치
 
 이 섹션은 step-ca, PostgreSQL, bootroot-agent, HTTP-01 리스폰더 설치를 다룹니다.
-CLI를 사용하는 경우 `docs/ko/cli.md`를 참고하세요. 이 문서는 **수동 설치**
+CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서는 **수동 설치**
 절차를 기준으로 설명합니다.
 
 ## step-ca
@@ -151,6 +151,59 @@ postgresql://step:step-pass@localhost:5432/stepca?sslmode=disable
 
 운영 환경에서는 PostgreSQL 사용을 권장합니다. 자세한 설정과 DSN 예시는
 `step-ca (Docker)` 및 `step-ca (베어메탈)` 섹션을 참고하세요.
+
+## OpenBao Agent
+
+OpenBao Agent는 OpenBao의 시크릿을 파일로 렌더링합니다. step-ca/리스폰더는
+`bootroot init`가 만든 `agent.hcl`을 사용하고, 앱은 `bootroot app add`
+출력에 나온 경로를 사용합니다.
+
+### Docker
+
+step-ca용 OpenBao Agent(예시):
+
+```bash
+docker run --rm \
+  --name openbao-agent-stepca \
+  -v $(pwd)/secrets:/openbao/secrets \
+  -e VAULT_ADDR=http://localhost:8200 \
+  openbao/openbao:latest \
+  agent -config /openbao/secrets/openbao/stepca/agent.hcl
+```
+
+responder용 OpenBao Agent(예시):
+
+```bash
+docker run --rm \
+  --name openbao-agent-responder \
+  -v $(pwd)/secrets:/openbao/secrets \
+  -e VAULT_ADDR=http://localhost:8200 \
+  openbao/openbao:latest \
+  agent -config /openbao/secrets/openbao/responder/agent.hcl
+```
+
+앱용 OpenBao Agent(예시):
+
+```bash
+docker run --rm \
+  --name openbao-agent-edge-proxy \
+  -v $(pwd)/secrets:/openbao/secrets \
+  -e VAULT_ADDR=http://localhost:8200 \
+  openbao/openbao:latest \
+  agent -config /openbao/secrets/openbao/apps/edge-proxy/agent.hcl
+```
+
+### 호스트 실행
+
+```bash
+openbao agent -config /etc/bootroot/openbao/apps/<service>/agent.hcl
+```
+
+bootroot는 OpenBao Agent를 **호스트 실행하지 않고 Docker로만** 구동하는
+방식을 기본으로 합니다. 호스트 실행은 참고용입니다.
+
+`role_id`/`secret_id` 파일은 `secrets/apps/<service>/` 아래에 있으며,
+해당 디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
 
 ## bootroot-agent
 

@@ -9,8 +9,9 @@ bootroot CLI binary is `bootroot`, and the bootroot-agent binary is
 
 ## CLI
 
-CLI usage is documented in the [CLI manual](cli.md). The rest of this manual focuses
-on the **manual setup** flow.
+CLI usage is documented in the [CLI manual](cli.md). It covers core commands
+like `infra up/init/status`, `app add/verify`, and `rotate`. The rest of this
+manual focuses on the **manual setup** flow.
 
 ## What Bootroot Does
 
@@ -30,8 +31,8 @@ Components:
 
 ## Manual Map
 
-- **CLI**: infra bring-up, initialization, status, app onboarding,
-  verification, and rotation
+- **CLI**: infra bring-up/initialization/status plus app onboarding,
+  issuance verification, secret rotation, and operational guidance
 - **Concepts**: PKI, ACME, CSR, SAN, mTLS, and OpenBao basics
 - **Getting Started**: Quick Docker-based issuance flow
 - **Installation**: OpenBao + step-ca + PostgreSQL + bootroot-agent +

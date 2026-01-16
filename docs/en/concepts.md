@@ -101,6 +101,8 @@ unlock the storage on startup, while the root token grants full administrative
 access. After bootstrap, the OpenBao Agent authenticates using **AppRole**
 (role_id + secret_id) and receives short-lived tokens. Policies should grant
 only the minimum paths required (read-only for runtime services).
+Unseal keys are split using **shares (total)** and **threshold (required)**,
+and you must provide at least the threshold count to unseal.
 OpenBao generates the unseal keys and root token during initialization; an
 operator must capture and store them securely.
 They are needed later to unseal OpenBao after restarts and to perform
