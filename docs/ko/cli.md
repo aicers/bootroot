@@ -158,7 +158,7 @@ bootroot status
 - `--agent-config`: bootroot-agent 설정 파일 경로
 - `--cert-path`: 인증서 출력 경로
 - `--key-path`: 개인키 출력 경로
-- `--instance-id`: 데몬용 instance_id (daemon 필수)
+- `--instance-id`: 앱 instance_id (daemon/docker 필수)
 - `--container-name`: 도커 앱 컨테이너 이름 (docker 필수)
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`)
 - `--notes`: 메모(선택)
@@ -184,7 +184,7 @@ bootroot status
 
 - `state.json` 누락
 - 중복된 `service-name`
-- daemon에 `instance-id` 누락
+- `instance-id` 누락
 - docker에 `container-name` 누락
 - OpenBao AppRole 생성 실패
 

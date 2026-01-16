@@ -317,7 +317,7 @@ pub(crate) struct AppAddArgs {
     #[arg(long)]
     key_path: Option<PathBuf>,
 
-    /// Instance ID (required for daemon)
+    /// Instance ID (required for daemon and docker)
     #[arg(long)]
     instance_id: Option<String>,
 

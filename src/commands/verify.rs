@@ -180,6 +180,10 @@ fn expected_dns_name(entry: &AppEntry, messages: &Messages) -> Result<String> {
             ))
         }
         DeployType::Docker => {
+            let instance_id = entry
+                .instance_id
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(messages.error_app_instance_id_required()))?;
             if entry
                 .container_name
                 .as_deref()
@@ -188,7 +192,10 @@ fn expected_dns_name(entry: &AppEntry, messages: &Messages) -> Result<String> {
             {
                 anyhow::bail!(messages.error_app_container_name_required());
             }
-            Ok(format!("{}.{}", entry.hostname, entry.domain))
+            Ok(format!(
+                "{}.{}.{}.{}",
+                instance_id, entry.service_name, entry.hostname, entry.domain
+            ))
         }
     }
 }

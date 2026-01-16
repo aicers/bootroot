@@ -16,6 +16,7 @@ pub(crate) struct AppNextStepsDaemon<'a> {
 pub(crate) struct AppNextStepsDocker<'a> {
     pub(crate) service_name: &'a str,
     pub(crate) container_name: &'a str,
+    pub(crate) instance_id: &'a str,
     pub(crate) hostname: &'a str,
     pub(crate) domain: &'a str,
     pub(crate) cert_path: &'a str,
@@ -955,6 +956,7 @@ impl Messages {
             &[
                 ("service_name", data.service_name),
                 ("container_name", data.container_name),
+                ("instance_id", data.instance_id),
                 ("hostname", data.hostname),
                 ("domain", data.domain),
                 ("cert_path", data.cert_path),

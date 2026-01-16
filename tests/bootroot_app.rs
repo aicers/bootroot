@@ -234,6 +234,8 @@ async fn test_app_add_prints_docker_snippet() {
             cert_path.to_string_lossy().as_ref(),
             "--key-path",
             key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
             "--container-name",
             "edge-proxy",
             "--root-token",
@@ -247,6 +249,63 @@ async fn test_app_add_prints_docker_snippet() {
     assert!(stdout.contains("docker run --rm"));
     assert!(stdout.contains("--name edge-proxy"));
     assert!(stdout.contains("/app/agent.toml"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_prompts_for_docker_instance_id() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("edge-proxy.crt");
+    let key_path = cert_dir.join("edge-proxy.key");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "app",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "docker",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--container-name",
+            "edge-proxy",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn app add");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"001\n")
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("run app add");
+    assert!(output.status.success());
 }
 
 #[cfg(unix)]

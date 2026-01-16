@@ -37,7 +37,7 @@ domain = "trusted.domain"
     - 호스트 실행(동일 호스트): `https://localhost:9000/acme/acme/directory`
     - 원격 step-ca: `https://<step-ca-host>:9000/acme/<provisioner>/directory`
 - `domain`: `instance_id.service_name.hostname.domain` 형식의 DNS SAN을
-  자동 생성할 때 사용하는 루트 도메인입니다.
+  자동 생성할 때 사용하는 루트 도메인입니다(daemon/docker 공통).
 
 ### 스케줄러
 
@@ -118,7 +118,7 @@ check_jitter = "0s"
 ```
 
 DNS SAN은 `<instance-id>.<service-name>.<hostname>.<domain>` 형식으로
-자동 생성됩니다. 이 이름은 HTTP-01 검증 대상이므로, step-ca에서
+자동 생성됩니다(daemon/docker 공통). 이 이름은 HTTP-01 검증 대상이므로, step-ca에서
 HTTP-01 리스폰더 IP로 해석되어야 합니다(Compose는 네트워크 alias,
 베어메탈은 `/etc/hosts` 또는 DNS 설정).
 권장 형식: `<instance-id>.<service-name>.<hostname>.<domain>`.
