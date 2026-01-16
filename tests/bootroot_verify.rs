@@ -66,7 +66,8 @@ fn test_verify_docker_success() {
     let cert_path = temp_dir.path().join("certs").join("web-app.crt");
     let key_path = temp_dir.path().join("certs").join("web-app.key");
     fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
-    write_cert_with_dns(&cert_path, &key_path, "web-01.trusted.domain").expect("write cert");
+    write_cert_with_dns(&cert_path, &key_path, "001.web-app.web-01.trusted.domain")
+        .expect("write cert");
 
     write_state_with_docker_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
@@ -371,7 +372,8 @@ fn test_verify_empty_key_fails_docker() {
     let cert_path = temp_dir.path().join("certs").join("web-app.crt");
     let key_path = temp_dir.path().join("certs").join("web-app.key");
     fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
-    write_cert_with_dns(&cert_path, &key_path, "web-01.trusted.domain").expect("write cert");
+    write_cert_with_dns(&cert_path, &key_path, "001.web-app.web-01.trusted.domain")
+        .expect("write cert");
     fs::write(&key_path, "").expect("truncate key");
 
     write_state_with_docker_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
@@ -504,6 +506,7 @@ fn write_state_with_docker_app(
                 "deploy_type": "docker",
                 "hostname": "web-01",
                 "domain": "trusted.domain",
+                "instance_id": "001",
                 "agent_config_path": agent_config,
                 "cert_path": cert_path,
                 "key_path": key_path,

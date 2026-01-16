@@ -135,22 +135,17 @@ fn validate_app_add(args: &ResolvedAppAdd, messages: &Messages) -> Result<()> {
     if args.domain.trim().is_empty() {
         anyhow::bail!(messages.error_value_required());
     }
-    match args.deploy_type {
-        DeployType::Daemon => {
-            if args.instance_id.as_deref().unwrap_or_default().is_empty() {
-                anyhow::bail!(messages.error_app_instance_id_required());
-            }
-        }
-        DeployType::Docker => {
-            if args
-                .container_name
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
-                anyhow::bail!(messages.error_app_container_name_required());
-            }
-        }
+    if args.instance_id.as_deref().unwrap_or_default().is_empty() {
+        anyhow::bail!(messages.error_app_instance_id_required());
+    }
+    if matches!(args.deploy_type, DeployType::Docker)
+        && args
+            .container_name
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+    {
+        anyhow::bail!(messages.error_app_container_name_required());
     }
     Ok(())
 }
@@ -329,29 +324,22 @@ fn resolve_app_add_args(args: &AppAddArgs, messages: &Messages) -> Result<Resolv
         messages,
     )?;
 
-    let (instance_id, container_name) = match deploy_type {
-        DeployType::Daemon => {
-            let instance_id = match args.instance_id.clone() {
-                Some(value) => value,
-                None => {
-                    prompt.prompt_with_validation(messages.prompt_instance_id(), None, |value| {
-                        ensure_non_empty(value, messages)
-                    })?
-                }
-            };
-            (Some(instance_id), None)
-        }
-        DeployType::Docker => {
-            let container_name = match args.container_name.clone() {
-                Some(value) => value,
-                None => prompt.prompt_with_validation(
-                    messages.prompt_container_name(),
-                    None,
-                    |value| ensure_non_empty(value, messages),
-                )?,
-            };
-            (None, Some(container_name))
-        }
+    let instance_id = match args.instance_id.clone() {
+        Some(value) => value,
+        None => prompt.prompt_with_validation(messages.prompt_instance_id(), None, |value| {
+            ensure_non_empty(value, messages)
+        })?,
+    };
+    let container_name = match deploy_type {
+        DeployType::Daemon => None,
+        DeployType::Docker => Some(match args.container_name.clone() {
+            Some(value) => value,
+            None => {
+                prompt.prompt_with_validation(messages.prompt_container_name(), None, |value| {
+                    ensure_non_empty(value, messages)
+                })?
+            }
+        }),
     };
 
     let root_token = if let Some(value) = args.root_token.clone() {
@@ -369,7 +357,7 @@ fn resolve_app_add_args(args: &AppAddArgs, messages: &Messages) -> Result<Resolv
         agent_config,
         cert_path,
         key_path,
-        instance_id,
+        instance_id: Some(instance_id),
         container_name,
         root_token,
         notes: args.notes.clone(),

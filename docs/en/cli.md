@@ -160,7 +160,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--agent-config`: bootroot-agent config path
 - `--cert-path`: certificate output path
 - `--key-path`: private key output path
-- `--instance-id`: daemon instance_id (required for daemon)
+- `--instance-id`: app instance_id (required for daemon and docker)
 - `--container-name`: docker container name (required for docker)
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
 - `--notes`: freeform notes (optional)
@@ -186,7 +186,7 @@ The command is considered failed when:
 
 - Missing `state.json`
 - Duplicate `service-name`
-- Missing `instance-id` for daemon
+- Missing `instance-id`
 - Missing `container-name` for docker
 - OpenBao AppRole creation failure
 

@@ -89,6 +89,7 @@ pub(crate) fn print_app_add_summary(
             let data = AppNextStepsDocker {
                 service_name: &entry.service_name,
                 container_name: entry.container_name.as_deref().unwrap_or_default(),
+                instance_id: entry.instance_id.as_deref().unwrap_or_default(),
                 hostname: &entry.hostname,
                 domain: &entry.domain,
                 cert_path: &cert_path,

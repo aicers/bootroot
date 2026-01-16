@@ -37,7 +37,7 @@ domain = "trusted.domain"
     - Host install (same host): `https://localhost:9000/acme/acme/directory`
     - Remote step-ca: `https://<step-ca-host>:9000/acme/<provisioner>/directory`
 - `domain`: root domain used to auto-generate the DNS SAN as
-  `instance_id.service_name.hostname.domain`.
+  `instance_id.service_name.hostname.domain` (daemon and docker).
 
 ### Scheduler
 
@@ -118,10 +118,10 @@ check_jitter = "0s"
 ```
 
 The DNS SAN is auto-generated as
-`<instance-id>.<service-name>.<hostname>.<domain>`. This name is also the
-target for HTTP-01 validation, so it must resolve from step-ca to the
-HTTP-01 responder IP (for Compose, update the network alias; for host installs,
-update `/etc/hosts` or DNS).
+`<instance-id>.<service-name>.<hostname>.<domain>` (daemon and docker). This
+name is also the target for HTTP-01 validation, so it must resolve from step-ca
+to the HTTP-01 responder IP (for Compose, update the network alias; for host
+installs, update `/etc/hosts` or DNS).
 
 #### Profile Retry Override
 
