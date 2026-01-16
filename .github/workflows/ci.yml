@@ -101,12 +101,6 @@ jobs:
           sudo chmod -R 700 "$BOOTROOT_SECRETS_DIR"
           sudo chmod -R 755 certs
 
-      - name: Start Services (Docker Compose)
-        run: docker compose up --build -d
-
-      - name: Wait for services
-        run: sleep 10
-
       - name: CLI Infra Up (Smoke)
         run: |
           docker compose build step-ca bootroot-http01
