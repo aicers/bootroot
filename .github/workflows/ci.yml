@@ -107,7 +107,9 @@ jobs:
         run: sleep 10
 
       - name: CLI Infra Up (Smoke)
-        run: cargo run --bin bootroot -- infra up
+        run: |
+          docker compose build step-ca bootroot-http01
+          cargo run --bin bootroot -- infra up
 
       - name: CLI Init (Smoke)
         run: |
