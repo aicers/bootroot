@@ -62,6 +62,8 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      BOOTROOT_SECRETS_DIR: "${RUNNER_TEMP}/bootroot-secrets"
     steps:
       - uses: actions/checkout@v6
 
@@ -78,10 +80,10 @@ jobs:
       # --- E2E Integration Testing (Docker) ---
       - name: Initialize Test CA
         run: |
-          mkdir -p secrets
-          echo "password" > secrets/password.txt
+          mkdir -p "$BOOTROOT_SECRETS_DIR"
+          echo "password" > "$BOOTROOT_SECRETS_DIR/password.txt"
           # Initialize step-ca configuration
-          docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
+          docker run --user root --rm -v "$BOOTROOT_SECRETS_DIR:/home/step" smallstep/step-ca \
             step ca init \
             --name "Bootroot CI CA" \
             --provisioner "admin" \
@@ -93,8 +95,9 @@ jobs:
 
       - name: Fix Permissions (for Docker mount)
         run: |
-          mkdir -p secrets certs
-          sudo chmod -R 777 secrets certs
+          mkdir -p "$BOOTROOT_SECRETS_DIR" certs
+          sudo chmod -R 700 "$BOOTROOT_SECRETS_DIR"
+          sudo chmod -R 755 certs
 
       - name: Start Services (Docker Compose)
         run: docker compose up --build -d
@@ -112,6 +115,7 @@ jobs:
             --show-secrets \
             --http-hmac "dev-hmac" \
             --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
+            --secrets-dir "$BOOTROOT_SECRETS_DIR" \
             --responder-url "http://localhost:8080" | tee cli-init.log
 
           ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' cli-init.log)"
