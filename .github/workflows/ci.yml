@@ -100,16 +100,21 @@ jobs:
           sudo chown -R "$USER":"$USER" "$BOOTROOT_SECRETS_DIR"
           sudo chmod -R 700 "$BOOTROOT_SECRETS_DIR"
           sudo chmod -R 755 certs
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Start Services (Docker Compose)
-        run: docker compose up --build -d
+        run: docker compose up -d
 
       - name: Wait for services
         run: sleep 10
 
       - name: CLI Infra Up (Smoke)
         run: |
-          docker compose build step-ca bootroot-http01
+          docker buildx bake -f docker-compose.yml \
+            --set "*.cache-from=type=gha" \
+            --set "*.cache-to=type=gha,mode=max" \
+            --set "*.output=type=docker"
           cargo run --bin bootroot -- infra up
 
       - name: CLI Init (Smoke)
