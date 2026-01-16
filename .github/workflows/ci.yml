@@ -62,8 +62,6 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      BOOTROOT_SECRETS_DIR: "${RUNNER_TEMP}/bootroot-secrets"
     steps:
       - uses: actions/checkout@v6
 
@@ -78,6 +76,9 @@ jobs:
         run: cargo test
 
       # --- E2E Integration Testing (Docker) ---
+      - name: Set secrets directory
+        run: echo "BOOTROOT_SECRETS_DIR=$RUNNER_TEMP/bootroot-secrets" >> "$GITHUB_ENV"
+
       - name: Initialize Test CA
         run: |
           mkdir -p "$BOOTROOT_SECRETS_DIR"
