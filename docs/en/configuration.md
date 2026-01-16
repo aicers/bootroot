@@ -7,8 +7,19 @@ The full template lives in `agent.toml.example`.
 
 ## bootroot CLI
 
-CLI usage is documented in `docs/en/cli.md`. This document focuses on the
-**manual configuration** flow.
+CLI usage is documented in the [CLI manual](cli.md). This document focuses on
+the **manual configuration** flow.
+
+## OpenBao Agent
+
+OpenBao Agent reads secrets from OpenBao and renders them to files.
+`bootroot init` generates step-ca/responder agent configs at
+`secrets/openbao/stepca/agent.hcl` and `secrets/openbao/responder/agent.hcl`.
+`bootroot app add` prints the per-app OpenBao Agent config path, which
+defaults to `secrets/openbao/apps/<service>/agent.hcl`.
+
+OpenBao Agent logs in via AppRole using `role_id`/`secret_id` stored under
+`secrets/apps/<service>/`. Keep the directory `0700` and the files `0600`.
 
 ## bootroot-agent (agent.toml)
 

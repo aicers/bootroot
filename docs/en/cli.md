@@ -4,7 +4,8 @@ This document covers the bootroot CLI.
 
 ## Overview
 
-The CLI provides infra bootstrapping, initialization, and status checks.
+The CLI provides infra bootstrapping, initialization, status checks, app
+onboarding, issuance verification, and secret rotation.
 
 - `bootroot infra up`
 - `bootroot init`
@@ -12,6 +13,7 @@ The CLI provides infra bootstrapping, initialization, and status checks.
 - `bootroot app add`
 - `bootroot app info`
 - `bootroot verify`
+- `bootroot rotate`
 
 ## Global Options
 
@@ -22,6 +24,9 @@ The CLI provides infra bootstrapping, initialization, and status checks.
 
 Starts OpenBao/PostgreSQL/step-ca/HTTP-01 responder via Docker Compose and
 checks readiness.
+This command assumes OpenBao/PostgreSQL/HTTP-01 responder run on the **same
+machine as step-ca**. If you deploy them on separate machines, use manual
+setup instead of the CLI.
 
 ### Inputs
 
@@ -147,7 +152,18 @@ bootroot status
 
 ## bootroot app add
 
-Registers app onboarding info and creates an OpenBao AppRole.
+Onboards a new app (daemon/docker) so it can obtain certificates from
+step-ca by registering its metadata and creating an OpenBao AppRole.
+When you run this command, **the bootroot CLI** performs:
+
+- Save app metadata (service name, deploy type, hostname, domain, etc.)
+- Create AppRole/policy and issue `role_id`/`secret_id`
+- Prepare app secret paths and required file locations
+- Print run guidance for bootroot-agent and OpenBao Agent
+
+This is the required step when adding a new app. After it completes, you
+must run bootroot-agent and OpenBao Agent as instructed, and then start
+the app so mTLS certificates are used correctly in app-to-app traffic.
 
 ### Inputs
 
@@ -213,6 +229,9 @@ The command is considered failed when:
 ## bootroot verify
 
 Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
+Use it after app onboarding or config changes to confirm issuance works.
+If you want **continuous renewal**, run bootroot-agent in daemon mode
+(without `--oneshot`) after verification.
 
 ### Inputs
 
@@ -239,3 +258,72 @@ The command is considered failed when:
 
 - bootroot-agent execution failure
 - missing cert/key files
+
+## bootroot rotate
+
+Runs secret rotation workflows. It uses `state.json` to locate paths and
+updates values through OpenBao.
+
+Supported subcommands:
+
+- `rotate stepca-password`
+- `rotate eab`
+- `rotate db`
+- `rotate responder-hmac`
+- `rotate approle-secret-id`
+
+### Inputs
+
+Common:
+
+- `--state-file`: path to `state.json` (optional)
+- `--compose-file`: compose file path (default `docker-compose.yml`)
+- `--openbao-url`: OpenBao API URL (optional)
+- `--kv-mount`: OpenBao KV mount path (optional)
+- `--secrets-dir`: secrets directory (optional)
+- `--root-token`: OpenBao root token (env `OPENBAO_ROOT_TOKEN`)
+- `--yes`: skip confirmation prompts
+
+Per subcommand:
+
+#### `rotate stepca-password`
+
+- `--new-password`: new step-ca key password (optional, auto-generated if omitted)
+
+#### `rotate eab`
+
+- `--stepca-url`: step-ca URL
+- `--stepca-provisioner`: ACME provisioner name
+
+#### `rotate db`
+
+- `--db-admin-dsn`: DB admin DSN (env `BOOTROOT_DB_ADMIN_DSN`)
+- `--db-password`: new DB password (optional, auto-generated if omitted)
+- `--db-timeout-secs`: DB timeout in seconds
+
+#### `rotate responder-hmac`
+
+- `--hmac`: new responder HMAC (optional, auto-generated if omitted)
+
+#### `rotate approle-secret-id`
+
+- `--service-name`: target service name
+
+### Outputs
+
+- Rotation summary (updated files/configs)
+- Restart/reload guidance (step-ca restart, responder reload, etc.)
+- AppRole secret_id rotation includes OpenBao Agent reload and login check
+
+### Failure conditions
+
+The command is considered failed when:
+
+- `state.json` is missing or cannot be parsed
+- OpenBao is unreachable or unhealthy
+- root token is missing or invalid
+- step-ca password rotation cannot find required key/password files
+- DB rotation is missing admin DSN or provisioning fails
+- EAB issuance request fails
+- responder config write fails or reload fails
+- AppRole target is missing or secret_id update fails

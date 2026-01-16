@@ -104,6 +104,8 @@ unseal keys는 기동 시 스토리지를 해제하는 용도이고, root token�
 전체 관리자 권한을 부여합니다. 초기 설정 이후에는 OpenBao Agent가
 **AppRole**(role_id + secret_id)로 로그인해 짧은 TTL 토큰을 받고,
 필요한 경로만 읽도록 최소 권한 정책을 적용합니다.
+unseal keys는 초기화 시 **shares(총 개수)**와 **threshold(필요 개수)**로
+분할되며, 언실 시에는 threshold 개수 이상이 필요합니다.
 unseal keys와 root token은 OpenBao 초기화 시 **OpenBao가 자동 생성**하며,
 운영자가 값을 안전하게 보관해야 합니다.
 이 값들은 재기동 시 언실(unseal)과 운영 중 복구/정책 변경 같은
