@@ -29,7 +29,8 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다. 구성 �
 
 ## 매뉴얼 구성
 
-- **CLI**: infra 기동/초기화/상태 점검, 앱 온보딩, 발급 검증/회전
+- **CLI**: infra 기동/초기화/상태 점검뿐 아니라 앱 온보딩, 발급 검증,
+  시크릿 회전과 운영 안내까지 포함
 - **개념**: PKI, ACME, CSR, SAN, mTLS, 시크릿 관리(OpenBao) 개요
 - **빠른 시작**: Docker Compose 기반 첫 발급
 - **설치**: OpenBao + step-ca + PostgreSQL + bootroot-agent + 리스폰더 설치

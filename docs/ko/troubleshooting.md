@@ -1,6 +1,6 @@
 # 문제 해결
 
-CLI를 사용하는 경우 `docs/ko/cli.md`를 참고하세요. 이 문서는 **수동 운영**
+CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서는 **수동 운영**
 환경에서의 문제 해결을 기준으로 설명합니다.
 
 ## "error: unexpected argument" 발생

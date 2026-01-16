@@ -30,8 +30,8 @@ Components:
 
 ## Manual Map
 
-- **CLI**: infra bring-up, initialization, status, app onboarding,
-  verification, and rotation
+- **CLI**: infra bring-up/initialization/status plus app onboarding,
+  issuance verification, secret rotation, and operational guidance
 - **Concepts**: PKI, ACME, CSR, SAN, mTLS, and OpenBao basics
 - **Getting Started**: Quick Docker-based issuance flow
 - **Installation**: OpenBao + step-ca + PostgreSQL + bootroot-agent +

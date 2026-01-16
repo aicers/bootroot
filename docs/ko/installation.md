@@ -1,7 +1,7 @@
 # 설치
 
 이 섹션은 step-ca, PostgreSQL, bootroot-agent, HTTP-01 리스폰더 설치를 다룹니다.
-CLI를 사용하는 경우 `docs/ko/cli.md`를 참고하세요. 이 문서는 **수동 설치**
+CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서는 **수동 설치**
 절차를 기준으로 설명합니다.
 
 ## step-ca

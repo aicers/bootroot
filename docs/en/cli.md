@@ -22,6 +22,9 @@ The CLI provides infra bootstrapping, initialization, and status checks.
 
 Starts OpenBao/PostgreSQL/step-ca/HTTP-01 responder via Docker Compose and
 checks readiness.
+This command assumes OpenBao/PostgreSQL/HTTP-01 responder run on the **same
+machine as step-ca**. If you deploy them on separate machines, use manual
+setup instead of the CLI.
 
 ### Inputs
 
@@ -147,7 +150,18 @@ bootroot status
 
 ## bootroot app add
 
-Registers app onboarding info and creates an OpenBao AppRole.
+Onboards a new app (daemon/docker) so it can obtain certificates from
+step-ca by registering its metadata and creating an OpenBao AppRole.
+When you run this command, **the bootroot CLI** performs:
+
+- Save app metadata (service name, deploy type, hostname, domain, etc.)
+- Create AppRole/policy and issue `role_id`/`secret_id`
+- Prepare app secret paths and required file locations
+- Print run guidance for bootroot-agent and OpenBao Agent
+
+This is the required step when adding a new app. After it completes, you
+must run bootroot-agent and OpenBao Agent as instructed, and then start
+the app so mTLS certificates are used correctly in app-to-app traffic.
 
 ### Inputs
 
@@ -213,6 +227,9 @@ The command is considered failed when:
 ## bootroot verify
 
 Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
+Use it after app onboarding or config changes to confirm issuance works.
+If you want **continuous renewal**, run bootroot-agent in daemon mode
+(without `--oneshot`) after verification.
 
 ### Inputs
 

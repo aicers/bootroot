@@ -22,6 +22,9 @@ CLI는 infra 기동/초기화/상태 점검을 제공합니다.
 
 Docker Compose로 OpenBao/PostgreSQL/step-ca/HTTP-01 리스폰더를 기동하고
 상태를 점검합니다.
+이 명령은 **step-ca가 실행되는 동일 머신에서** OpenBao/PostgreSQL/
+HTTP-01 리스폰더가 함께 구동된다는 전제를 둡니다. 서로 다른 머신에
+분산해 운영하려면 CLI 대신 수동으로 구성/기동해야 합니다.
 
 ### 입력
 
@@ -145,7 +148,19 @@ bootroot status
 
 ## bootroot app add
 
-앱 온보딩 정보를 등록하고 OpenBao AppRole을 생성합니다.
+새로운 앱(daemon/docker)이 step-ca에서 인증서를 발급받을 수 있도록
+온보딩 정보를 등록하고 OpenBao AppRole을 생성합니다. 이 명령을 실행하면
+**bootroot CLI**가 아래 작업을 수행합니다.
+
+- 앱 메타데이터(서비스 이름, 배포 타입, hostname, domain 등) 저장
+- AppRole/정책 생성 및 `role_id`/`secret_id` 발급
+- 앱별 시크릿 경로 및 필요한 파일 경로 정리
+- bootroot-agent/OpenBao Agent 실행에 필요한 안내 스니펫 출력
+
+이 명령은 새 앱을 추가할 때 **인증서 발급 경로를 준비**하기 위한
+필수 단계입니다. 이후 사용자는 안내된 내용대로 bootroot-agent와
+OpenBao Agent를 구동하고, 앱을 실행해 **앱 간 통신에서 발급된
+mTLS 인증서가 올바르게 사용되도록 구성**해야 합니다.
 
 ### 입력
 
@@ -210,7 +225,10 @@ bootroot status
 
 ## bootroot verify
 
-bootroot-agent를 one-shot으로 실행해 발급을 검증합니다.
+bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 앱 온보딩 직후
+또는 설정 변경 후에 실제 발급이 가능한지 확인할 때 사용합니다.
+검증 이후에도 **주기적 갱신을 원하면 bootroot-agent를 상시 모드로
+실행**해야 합니다(oneshot 없이 실행).
 
 ### 입력
 
