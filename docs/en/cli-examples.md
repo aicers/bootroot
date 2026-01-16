@@ -57,7 +57,7 @@ bootroot infra up: completed
 
 ```bash
 bootroot init --auto-generate \
-  --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
+  --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
   --responder-url "http://localhost:8080"
 ```
 
