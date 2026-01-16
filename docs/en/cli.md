@@ -35,7 +35,9 @@ checks readiness.
 - Container status/health summary
 - Completion message
 
-### Failures
+### Failure conditions
+
+The command is considered failed when:
 
 - docker compose/pull failures
 - Missing or unhealthy containers
@@ -53,34 +55,28 @@ registers required secrets.
 
 ### Inputs
 
+Input priority is **CLI flags > environment variables > prompts/defaults**.
+
 - `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
 - `--kv-mount`: OpenBao KV v2 mount path (default `secret`)
 - `--secrets-dir`: secrets directory (default `secrets`)
 - `--compose-file`: compose file used for infra checks (default `docker-compose.yml`)
 - `--auto-generate`: auto-generate secrets where possible
 - `--show-secrets`: show secrets in the summary
-- `--root-token`: OpenBao root token
-  - Environment variable: `OPENBAO_ROOT_TOKEN`
-- `--unseal-key`: OpenBao unseal key (repeatable)
-  - Environment variable: `OPENBAO_UNSEAL_KEYS` (comma-separated)
-- `--stepca-password`: step-ca password (`password.txt`)
-  - Environment variable: `STEPCA_PASSWORD`
+- `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
+- `--unseal-key`: OpenBao unseal key (repeatable, environment variable: `OPENBAO_UNSEAL_KEYS`)
+- `--stepca-password`: step-ca password (`password.txt`, environment variable: `STEPCA_PASSWORD`)
 - `--db-dsn`: PostgreSQL DSN for step-ca
 - `--db-provision`: provision PostgreSQL role/database for step-ca
-- `--db-admin-dsn`: PostgreSQL admin DSN for provisioning
-  - Environment variable: `BOOTROOT_DB_ADMIN_DSN`
-- `--db-user`: PostgreSQL user for step-ca
-  - Environment variable: `BOOTROOT_DB_USER`
-- `--db-password`: PostgreSQL password for step-ca
-  - Environment variable: `BOOTROOT_DB_PASSWORD`
-- `--db-name`: PostgreSQL database name for step-ca
-  - Environment variable: `BOOTROOT_DB_NAME`
+- `--db-admin-dsn`: PostgreSQL admin DSN (environment variable: `BOOTROOT_DB_ADMIN_DSN`)
+- `--db-user`: PostgreSQL user for step-ca (environment variable: `BOOTROOT_DB_USER`)
+- `--db-password`: PostgreSQL password for step-ca (environment variable: `BOOTROOT_DB_PASSWORD`)
+- `--db-name`: PostgreSQL database name for step-ca (environment variable: `BOOTROOT_DB_NAME`)
 - `--db-check`: validate DB connectivity and auth
 - `--db-timeout-secs`: DB connectivity timeout (seconds)
-- `--http-hmac`: HTTP-01 responder HMAC
-  - Environment variable: `HTTP01_HMAC`
-- `--responder-url`: HTTP-01 responder admin URL (optional)
-  - Environment variable: `HTTP01_RESPONDER_URL`
+- `--http-hmac`: HTTP-01 responder HMAC (environment variable: `HTTP01_HMAC`)
+- `--responder-url`: HTTP-01 responder admin URL (optional, environment
+  variable: `HTTP01_RESPONDER_URL`)
 - `--responder-timeout-secs`: responder timeout (seconds, default `5`)
 - `--eab-auto`: auto-issue EAB via step-ca
 - `--stepca-url`: step-ca URL (default `https://localhost:9000`)
@@ -90,7 +86,8 @@ registers required secrets.
 ### Interactive behavior
 
 - Prompts for missing required inputs.
-- Validates inputs (non-empty, enum values, path existence/parents).
+- Checks that inputs are non-empty, match allowed enum values, and have
+  valid paths/parent directories.
 - Confirms before overwriting `password.txt`, `ca.json`, or `state.json`.
 - Prints a plan summary before execution and the final summary after.
 
@@ -104,7 +101,9 @@ registers required secrets.
 - OpenBao Agent compose override for step-ca/responder (applied automatically)
 - Next-steps guidance
 
-### Failures
+### Failure conditions
+
+The command is considered failed when:
 
 - Unhealthy infra containers
 - OpenBao init/unseal/auth failures
@@ -133,7 +132,9 @@ Checks infra and OpenBao status.
 - Container status summary
 - OpenBao/KV summary
 
-### Failures
+### Failure conditions
+
+The command is considered failed when:
 
 - Missing/unhealthy containers
 - OpenBao API unavailable
@@ -150,6 +151,8 @@ Registers app onboarding info and creates an OpenBao AppRole.
 
 ### Inputs
 
+Input priority is **CLI flags > environment variables > prompts/defaults**.
+
 - `--service-name`: service name identifier
 - `--deploy-type`: deployment type (`daemon` or `docker`)
 - `--hostname`: hostname used for DNS SAN
@@ -159,14 +162,14 @@ Registers app onboarding info and creates an OpenBao AppRole.
 - `--key-path`: private key output path
 - `--instance-id`: daemon instance_id (required for daemon)
 - `--container-name`: docker container name (required for docker)
-- `--root-token`: OpenBao root token
-  - Environment variable: `OPENBAO_ROOT_TOKEN`
+- `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
 - `--notes`: freeform notes (optional)
 
 ### Interactive behavior
 
 - Prompts for missing required inputs (deploy type defaults to `daemon`).
-- Validates inputs (non-empty, enum values, path existence/parents).
+- Checks that inputs are non-empty, match allowed enum values, and have
+  valid paths/parent directories.
 - Prints a plan summary before execution and the final summary after.
 
 ### Outputs
@@ -177,7 +180,9 @@ Registers app onboarding info and creates an OpenBao AppRole.
 - Type-specific onboarding guidance (daemon profile / docker sidecar)
 - Copy-paste snippets for daemon profile or docker sidecar
 
-### Failures
+### Failure conditions
+
+The command is considered failed when:
 
 - Missing `state.json`
 - Duplicate `service-name`
@@ -198,7 +203,9 @@ Shows onboarding information for a registered app.
 - App type/paths/AppRole/secret paths summary
 - Per-app OpenBao Agent guidance (daemon vs docker)
 
-### Failures
+### Failure conditions
+
+The command is considered failed when:
 
 - Missing `state.json`
 - App not found
@@ -217,7 +224,7 @@ Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 ### Interactive behavior
 
 - Prompts for missing required inputs.
-- Validates inputs (non-empty).
+- Checks that inputs are not empty.
 - Prints a plan summary before execution and the final summary after.
 
 ### Outputs
@@ -226,7 +233,9 @@ Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 - verification summary
 - DB connectivity check status (when enabled)
 
-### Failures
+### Failure conditions
+
+The command is considered failed when:
 
 - bootroot-agent execution failure
 - missing cert/key files

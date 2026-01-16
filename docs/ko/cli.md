@@ -35,7 +35,9 @@ Docker Compose로 OpenBao/PostgreSQL/step-ca/HTTP-01 리스폰더를 기동하�
 - 컨테이너 상태/헬스 요약
 - 완료 메시지
 
-### 실패
+### 실패 조건
+
+다음 조건이면 실패로 판정합니다.
 
 - docker compose/pull 실패
 - 컨테이너 미기동 또는 헬스 체크 실패
@@ -52,34 +54,27 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 
 ### 입력
 
+입력 우선순위는 **CLI 옵션 > 환경 변수 > 프롬프트/기본값**입니다.
+
 - `--openbao-url`: OpenBao API URL (기본값 `http://localhost:8200`)
 - `--kv-mount`: OpenBao KV v2 마운트 경로 (기본값 `secret`)
 - `--secrets-dir`: 시크릿 디렉터리 (기본값 `secrets`)
 - `--compose-file`: infra 상태 점검용 compose 파일 (기본값 `docker-compose.yml`)
 - `--auto-generate`: 비밀번호/HMAC 등을 자동 생성
 - `--show-secrets`: 요약 출력에 시크릿 표시
-- `--root-token`: OpenBao root token
-  - 환경 변수: `OPENBAO_ROOT_TOKEN`
-- `--unseal-key`: OpenBao unseal key (반복 가능)
-  - 환경 변수: `OPENBAO_UNSEAL_KEYS` (쉼표 구분)
-- `--stepca-password`: step-ca 키 암호 (`password.txt`)
-  - 환경 변수: `STEPCA_PASSWORD`
+- `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`)
+- `--unseal-key`: OpenBao unseal key (반복 가능, 환경 변수: `OPENBAO_UNSEAL_KEYS`)
+- `--stepca-password`: step-ca 키 암호 (`password.txt`, 환경 변수: `STEPCA_PASSWORD`)
 - `--db-dsn`: step-ca용 PostgreSQL DSN
 - `--db-provision`: step-ca용 PostgreSQL 역할/DB 생성
-- `--db-admin-dsn`: PostgreSQL 관리자 DSN
-  - 환경 변수: `BOOTROOT_DB_ADMIN_DSN`
-- `--db-user`: step-ca용 PostgreSQL 사용자
-  - 환경 변수: `BOOTROOT_DB_USER`
-- `--db-password`: step-ca용 PostgreSQL 비밀번호
-  - 환경 변수: `BOOTROOT_DB_PASSWORD`
-- `--db-name`: step-ca용 PostgreSQL DB 이름
-  - 환경 변수: `BOOTROOT_DB_NAME`
+- `--db-admin-dsn`: PostgreSQL 관리자 DSN (환경 변수: `BOOTROOT_DB_ADMIN_DSN`)
+- `--db-user`: step-ca용 PostgreSQL 사용자 (환경 변수: `BOOTROOT_DB_USER`)
+- `--db-password`: step-ca용 PostgreSQL 비밀번호 (환경 변수: `BOOTROOT_DB_PASSWORD`)
+- `--db-name`: step-ca용 PostgreSQL DB 이름 (환경 변수: `BOOTROOT_DB_NAME`)
 - `--db-check`: DB 연결/인증 점검
 - `--db-timeout-secs`: DB 연결 타임아웃(초)
-- `--http-hmac`: HTTP-01 responder HMAC
-  - 환경 변수: `HTTP01_HMAC`
-- `--responder-url`: HTTP-01 responder 관리자 URL (선택)
-  - 환경 변수: `HTTP01_RESPONDER_URL`
+- `--http-hmac`: HTTP-01 responder HMAC (환경 변수: `HTTP01_HMAC`)
+- `--responder-url`: HTTP-01 responder 관리자 URL (선택, 환경 변수: `HTTP01_RESPONDER_URL`)
 - `--responder-timeout-secs`: responder 요청 타임아웃(초, 기본값 `5`)
 - `--eab-auto`: step-ca에서 EAB 자동 발급
 - `--stepca-url`: step-ca URL (기본값 `https://localhost:9000`)
@@ -89,7 +84,8 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 ### 대화형 동작
 
 - 누락된 필수 입력을 프롬프트로 받습니다.
-- 입력값을 검증합니다(빈 값, enum, 경로/상위 디렉터리).
+- 입력값은 빈 값 여부, 허용된 enum 값인지, 경로/상위 디렉터리가
+  유효한지 확인합니다.
 - `password.txt`, `ca.json`, `state.json` 덮어쓰기 전 확인합니다.
 - 실행 전 계획 요약, 실행 후 최종 요약을 출력합니다.
 
@@ -103,7 +99,9 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - step-ca/responder용 OpenBao Agent compose override 자동 적용
 - 다음 단계 안내
 
-### 실패
+### 실패 조건
+
+다음 조건이면 실패로 판정합니다.
 
 - infra 컨테이너가 비정상인 경우
 - OpenBao 초기화/언실/인증 실패
@@ -132,7 +130,9 @@ infra 및 OpenBao 상태를 점검합니다.
 - 컨테이너 상태 요약
 - OpenBao/ KV 상태 요약
 
-### 실패
+### 실패 조건
+
+다음 조건이면 실패로 판정합니다.
 
 - 컨테이너 미기동/비정상
 - OpenBao 응답 불가
@@ -149,6 +149,8 @@ bootroot status
 
 ### 입력
 
+입력 우선순위는 **CLI 옵션 > 환경 변수 > 프롬프트/기본값**입니다.
+
 - `--service-name`: 서비스 이름 식별자
 - `--deploy-type`: 배포 타입 (`daemon` 또는 `docker`)
 - `--hostname`: DNS SAN에 사용할 호스트명
@@ -158,14 +160,14 @@ bootroot status
 - `--key-path`: 개인키 출력 경로
 - `--instance-id`: 데몬용 instance_id (daemon 필수)
 - `--container-name`: 도커 앱 컨테이너 이름 (docker 필수)
-- `--root-token`: OpenBao root token
-  - 환경 변수: `OPENBAO_ROOT_TOKEN`
+- `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`)
 - `--notes`: 메모(선택)
 
 ### 대화형 동작
 
 - 누락된 필수 입력을 프롬프트로 받습니다(배포 타입 기본값: `daemon`).
-- 입력값을 검증합니다(빈 값, enum, 경로/상위 디렉터리).
+- 입력값은 빈 값 여부, 허용된 enum 값인지, 경로/상위 디렉터리가
+  유효한지 확인합니다.
 - 실행 전 계획 요약, 실행 후 최종 요약을 출력합니다.
 
 ### 출력
@@ -176,7 +178,9 @@ bootroot status
 - 타입별 온보딩 안내 (daemon 프로필 / docker sidecar)
 - daemon/docker 스니펫(복붙용) 출력
 
-### 실패
+### 실패 조건
+
+다음 조건이면 실패로 판정합니다.
 
 - `state.json` 누락
 - 중복된 `service-name`
@@ -197,7 +201,9 @@ bootroot status
 - 앱 타입/경로/AppRole/시크릿 경로 요약
 - 앱별 OpenBao Agent 안내(daemon/docker 분리)
 
-### 실패
+### 실패 조건
+
+다음 조건이면 실패로 판정합니다.
 
 - `state.json` 누락
 - 등록되지 않은 앱
@@ -216,7 +222,7 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다.
 ### 대화형 동작
 
 - 누락된 필수 입력을 프롬프트로 받습니다.
-- 입력값을 검증합니다(빈 값).
+- 입력값은 비어 있지 않은지 확인합니다.
 - 실행 전 계획 요약, 실행 후 최종 요약을 출력합니다.
 
 ### 출력
@@ -225,7 +231,9 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다.
 - 검증 결과 요약
 - DB 연결 점검 결과(옵션 사용 시)
 
-### 실패
+### 실패 조건
+
+다음 조건이면 실패로 판정합니다.
 
 - bootroot-agent 실행 실패
 - cert/key 파일 누락

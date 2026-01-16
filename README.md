@@ -30,7 +30,7 @@ source .venv/bin/activate
 # fish:
 source .venv/bin/activate.fish
 pip install mkdocs-material mkdocs-static-i18n
-mkdocs serve -a 127.0.0.1:8000
+mkdocs serve -a 127.0.0.1:8000 --livereload --dirtyreload
 ```
 
 Command notes:
@@ -40,7 +40,8 @@ Command notes:
 - `source .venv/bin/activate`: activates the virtualenv for the current shell.
 - `pip install ...`: installs MkDocs tooling into the virtualenv.
 - Run the `pip install ...` step once after creating the virtualenv (per clone).
-- `mkdocs serve -a 127.0.0.1:8000`: runs a local docs server.
+- `mkdocs serve -a 127.0.0.1:8000 --livereload --dirtyreload`: runs a local docs
+  server.
 - `mkdocs build`: builds static files into `site/`.
 - `./scripts/build-docs-pdf.sh en|ko`: builds PDF manuals.
 
