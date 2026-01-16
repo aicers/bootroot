@@ -102,6 +102,115 @@ jobs:
       - name: Wait for services
         run: sleep 10
 
+      - name: CLI Infra Up (Smoke)
+        run: cargo run --bin bootroot -- infra up
+
+      - name: CLI Init (Smoke)
+        run: |
+          BOOTROOT_LANG=en printf "y\ny\ny\nn\n" | cargo run --bin bootroot -- init \
+            --auto-generate \
+            --show-secrets \
+            --http-hmac "dev-hmac" \
+            --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
+            --responder-url "http://localhost:8080" | tee cli-init.log
+
+          ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' cli-init.log)"
+          if [ -z "${ROOT_TOKEN:-}" ]; then
+            echo "Failed to read root token from init output"
+            exit 1
+          fi
+          echo "OPENBAO_ROOT_TOKEN=${ROOT_TOKEN}" >> "$GITHUB_ENV"
+
+      - name: CLI App Add + Verify (Smoke)
+        run: |
+          mkdir -p tmp certs
+          cat > tmp/agent.toml <<'EOF'
+          email = "admin@example.com"
+          server = "https://localhost:9000/acme/acme/directory"
+          domain = "trusted.domain"
+
+          [acme]
+          directory_fetch_attempts = 10
+          directory_fetch_base_delay_secs = 1
+          directory_fetch_max_delay_secs = 10
+          poll_attempts = 15
+          poll_interval_secs = 2
+          http_responder_url = "http://localhost:8080"
+          http_responder_hmac = "dev-hmac"
+          http_responder_timeout_secs = 5
+          http_responder_token_ttl_secs = 300
+
+          [[profiles]]
+          service_name = "edge-proxy"
+          instance_id = "001"
+          hostname = "edge-node-01"
+
+          [profiles.paths]
+          cert = "certs/edge-proxy.crt"
+          key = "certs/edge-proxy.key"
+
+          [profiles.daemon]
+          check_interval = "1h"
+          renew_before = "720h"
+          check_jitter = "0s"
+
+          [[profiles]]
+          service_name = "web-app"
+          instance_id = "001"
+          hostname = "web-01"
+
+          [profiles.paths]
+          cert = "certs/web-app.crt"
+          key = "certs/web-app.key"
+
+          [profiles.daemon]
+          check_interval = "1h"
+          renew_before = "720h"
+          check_jitter = "0s"
+          EOF
+
+          cargo run --bin bootroot -- app add \
+            --service-name edge-proxy \
+            --deploy-type daemon \
+            --hostname edge-node-01 \
+            --domain trusted.domain \
+            --agent-config "$(pwd)/tmp/agent.toml" \
+            --cert-path "$(pwd)/certs/edge-proxy.crt" \
+            --key-path "$(pwd)/certs/edge-proxy.key" \
+            --instance-id 001 \
+            --root-token "$OPENBAO_ROOT_TOKEN"
+
+          cargo run --bin bootroot -- app add \
+            --service-name web-app \
+            --deploy-type docker \
+            --hostname web-01 \
+            --domain trusted.domain \
+            --agent-config "$(pwd)/tmp/agent.toml" \
+            --cert-path "$(pwd)/certs/web-app.crt" \
+            --key-path "$(pwd)/certs/web-app.key" \
+            --instance-id 001 \
+            --container-name web-app \
+            --root-token "$OPENBAO_ROOT_TOKEN"
+
+          RESPONDER_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
+          if [ -z "${RESPONDER_IP:-}" ]; then
+            echo "Failed to read responder container IP"
+            exit 1
+          fi
+          docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
+          docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.web-app.web-01.trusted.domain' >> /etc/hosts"
+
+          cargo build --bin bootroot-agent
+          export PATH="$(pwd)/target/debug:$PATH"
+
+          cargo run --bin bootroot -- verify \
+            --service-name edge-proxy \
+            --agent-config "$(pwd)/tmp/agent.toml"
+
+          cargo run --bin bootroot -- verify \
+            --service-name web-app \
+            --agent-config "$(pwd)/tmp/agent.toml"
+
       - name: Verify CA Health
         run: |
           for i in {1..10}; do
