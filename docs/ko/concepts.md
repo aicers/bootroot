@@ -8,6 +8,18 @@
 - **인증서**는 신원 정보(SAN), 유효기간, CA 서명을 포함합니다.
 - **개인키**는 반드시 안전하게 보호되어야 합니다.
 
+## SAN (Subject Alternative Name)
+
+인증서의 실제 신원 목록입니다. 예:
+
+- **DNS**: `example.internal`
+- **IP**: `192.0.2.10`
+
+## mTLS
+
+서버와 클라이언트 모두 인증서를 제시하는 TLS 방식입니다.
+자동 발급/갱신이 가능하면 운영 안정성이 크게 높아집니다.
+
 ## CSR (Certificate Signing Request)
 
 CSR은 클라이언트가 생성하는 요청서입니다. 공개키와 SAN 목록이 포함됩니다.
@@ -55,28 +67,48 @@ HTTP-01은 **도메인 소유 확인 절차**입니다. CA가 **토큰**을 발�
 등록 제한이 필요한 CA에서 사용하는 방식입니다. `kid`와 `hmac`를
 제공해야 계정 등록이 허용됩니다.
 
+- `kid`(key ID): CA가 발급하는 EAB 키의 식별자입니다.
+- `hmac`: 외부 계정 바인딩에 사용하는 공유 HMAC 키입니다.
+- HMAC: 비밀키 기반 해시(Hash-based Message Authentication Code)로,
+  같은 비밀을 공유하는지를 증명합니다.
+
 ## 시크릿 매니저(OpenBao)
 
 운영 환경에서는 시크릿을 파일이나 환경변수에 하드코딩하지 않고
 OpenBao 같은 시크릿 매니저에 저장해 주입합니다. OpenBao는
-Vault 호환 KV v2 스토리지를 제공하며, 다음 값을 관리합니다.
+Vault 호환 KV v2 스토리지를 제공하며(Vault는 널리 쓰이는 시크릿 매니저,
+KV v2는 버전 관리되는 키/값 시크릿 엔진), bootroot에서는 다음 값을
+관리합니다.
 
 - step-ca 키 암호(`password.txt`)
-- step-ca DB DSN
+- step-ca DB DSN(Data Source Name: 호스트/계정/비밀번호를 포함한 접속 문자열)
 - HTTP-01 responder HMAC
 - EAB `kid`/`hmac`
 
+### 시크릿 주입 흐름(OpenBao Agent)
+
+런타임 서비스는 OpenBao에 직접 접속하지 않고, **OpenBao Agent**가
+AppRole로 로그인해 시크릿을 파일로 렌더링합니다. 주요 흐름은 다음과
+같습니다.
+
+- OpenBao Agent가 AppRole(role_id + secret_id)로 로그인
+- 필요한 시크릿을 템플릿 파일로 렌더링(예: `password.txt`,
+  `responder.toml`, `agent.toml`)
+- `bootroot-agent`, HTTP-01 responder, step-ca가 렌더된 파일을 읽어 사용
+
+`bootroot` CLI는 초기화/회전 같은 **관리 작업**에서만 OpenBao API를
+직접 호출합니다.
+
 OpenBao는 **unseal keys**와 **root token**으로 초기화/접속합니다.
-서비스는 AppRole로 인증해 필요한 경로만 읽도록 최소 권한을 적용합니다.
-
-## SAN (Subject Alternative Name)
-
-인증서의 실제 신원 목록입니다. 예:
-
-- **DNS**: `example.internal`
-- **IP**: `192.0.2.10`
-
-## mTLS
-
-서버와 클라이언트 모두 인증서를 제시하는 TLS 방식입니다.
-자동 발급/갱신이 가능하면 운영 안정성이 크게 높아집니다.
+unseal keys는 기동 시 스토리지를 해제하는 용도이고, root token은
+전체 관리자 권한을 부여합니다. 초기 설정 이후에는 OpenBao Agent가
+**AppRole**(role_id + secret_id)로 로그인해 짧은 TTL 토큰을 받고,
+필요한 경로만 읽도록 최소 권한 정책을 적용합니다.
+unseal keys와 root token은 OpenBao 초기화 시 **OpenBao가 자동 생성**하며,
+운영자가 값을 안전하게 보관해야 합니다.
+이 값들은 재기동 시 언실(unseal)과 운영 중 복구/정책 변경 같은
+관리 작업에 필요합니다.
+AppRole의 `role_id`/`secret_id`는 OpenBao가 발급합니다. `role_id`는
+역할 식별자이며 고정값이고, `secret_id`는 로그인에 쓰는 자격증명으로
+재발급/회전이 가능합니다. 초기 값은 운영자가 서비스(OpenBao Agent)에
+전달하고, 이후에는 `secret_id`를 주기적으로 갱신합니다.
