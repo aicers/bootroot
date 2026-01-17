@@ -103,7 +103,7 @@ jobs:
 
       - name: CLI Infra Up (Smoke)
         run: |
-          docker compose build step-ca bootroot-http01
+          docker compose build step-ca bootroot-http01 bootroot-agent
           cargo run --bin bootroot -- infra up
 
       - name: CLI Init (Smoke)
@@ -201,6 +201,53 @@ jobs:
           fi
           docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
           docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.web-app.web-01.trusted.domain' >> /etc/hosts"
+
+          cat > agent.toml.compose <<'EOF'
+          email = "admin@example.com"
+          server = "https://bootroot-ca:9000/acme/acme/directory"
+          domain = "trusted.domain"
+
+          [acme]
+          directory_fetch_attempts = 10
+          directory_fetch_base_delay_secs = 1
+          directory_fetch_max_delay_secs = 10
+          poll_attempts = 15
+          poll_interval_secs = 2
+          http_responder_url = "http://bootroot-http01:8080"
+          http_responder_hmac = "dev-hmac"
+          http_responder_timeout_secs = 5
+          http_responder_token_ttl_secs = 300
+
+          [[profiles]]
+          service_name = "edge-proxy"
+          instance_id = "001"
+          hostname = "edge-node-01"
+
+          [profiles.paths]
+          cert = "certs/edge-proxy.crt"
+          key = "certs/edge-proxy.key"
+
+          [profiles.daemon]
+          check_interval = "1h"
+          renew_before = "720h"
+          check_jitter = "0s"
+
+          [[profiles]]
+          service_name = "web-app"
+          instance_id = "001"
+          hostname = "web-01"
+
+          [profiles.paths]
+          cert = "certs/web-app.crt"
+          key = "certs/web-app.key"
+
+          [profiles.daemon]
+          check_interval = "1h"
+          renew_before = "720h"
+          check_jitter = "0s"
+          EOF
+
+          docker compose up -d bootroot-agent
 
           cargo build --bin bootroot-agent
           export PATH="$(pwd)/target/debug:$PATH"
