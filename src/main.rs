@@ -161,6 +161,14 @@ struct InfraUpArgs {
     /// Docker restart policy to apply after containers start
     #[arg(long, default_value = "unless-stopped")]
     restart_policy: String,
+
+    /// `OpenBao` API URL for auto-unseal (dev/test only)
+    #[arg(long, default_value = DEFAULT_OPENBAO_URL)]
+    openbao_url: String,
+
+    /// Auto-unseal `OpenBao` from file (dev/test only)
+    #[arg(long, env = "OPENBAO_UNSEAL_FILE")]
+    openbao_unseal_from_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -198,6 +206,10 @@ struct InitArgs {
     /// `OpenBao` unseal key (repeatable)
     #[arg(long, env = "OPENBAO_UNSEAL_KEYS", value_delimiter = ',')]
     unseal_key: Vec<String>,
+
+    /// Auto-unseal `OpenBao` from file (dev/test only)
+    #[arg(long, env = "OPENBAO_UNSEAL_FILE")]
+    openbao_unseal_from_file: Option<PathBuf>,
 
     /// step-ca password (password.txt)
     #[arg(long, env = "STEPCA_PASSWORD")]
@@ -242,6 +254,10 @@ struct InitArgs {
     /// HTTP-01 responder admin URL (optional)
     #[arg(long, env = "HTTP01_RESPONDER_URL")]
     responder_url: Option<String>,
+
+    /// Skip HTTP-01 responder check during init
+    #[arg(long)]
+    skip_responder_check: bool,
 
     /// HTTP-01 responder request timeout (seconds)
     #[arg(long, default_value_t = 5)]

@@ -115,6 +115,18 @@ pub(crate) async fn stub_openbao_unseal_failure(server: &MockServer) {
         .await;
 }
 
+pub(crate) async fn stub_openbao_sealed(server: &MockServer) {
+    stub_health(server).await;
+    stub_init_status(server).await;
+    stub_seal_status_sealed(server).await;
+    stub_unseal_success(server).await;
+    stub_kv_mount(server).await;
+    stub_auth_backends(server).await;
+    stub_policies(server).await;
+    stub_approles(server).await;
+    stub_kv_secrets(server).await;
+}
+
 pub(crate) async fn expect_rollback_deletes(server: &MockServer) {
     for policy in ["bootroot-agent", "bootroot-responder", "bootroot-stepca"] {
         Mock::given(method("DELETE"))
@@ -199,6 +211,16 @@ async fn stub_seal_status_sealed(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "sealed": true,
             "t": 1
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_unseal_success(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/unseal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sealed": false
         })))
         .mount(server)
         .await;

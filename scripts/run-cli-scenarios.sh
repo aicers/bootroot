@@ -77,7 +77,8 @@ run_init_scenario() {
     --http-hmac "dev-hmac" \
     --stepca-password "$stepca_password" \
     --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
-    --responder-url "http://localhost:8080" | tee "$ROOT_DIR/tmp/cli-init.log"
+    --responder-url "http://localhost:8080" \
+    --skip-responder-check | tee "$ROOT_DIR/tmp/cli-init.log"
 
   log "Validating full infra"
   cargo run --bin bootroot -- infra up

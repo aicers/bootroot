@@ -159,7 +159,8 @@ jobs:
             --http-hmac "dev-hmac" \
             --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
             --secrets-dir "$BOOTROOT_SECRETS_DIR" \
-            --responder-url "http://localhost:8080" | tee cli-init.log
+            --responder-url "http://localhost:8080" \
+            --skip-responder-check | tee cli-init.log
 
           ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' cli-init.log)"
           if [ -z "${ROOT_TOKEN:-}" ]; then

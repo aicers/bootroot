@@ -17,6 +17,7 @@ use reqwest::StatusCode;
 use crate::InitArgs;
 use crate::cli::output::{print_init_plan, print_init_summary};
 use crate::commands::infra::{ensure_infra_ready, run_docker};
+use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -715,7 +716,15 @@ async fn bootstrap_openbao(
         .with_context(|| messages.error_openbao_seal_status_failed())?;
     if seal_status.sealed {
         if unseal_keys.is_empty() {
-            unseal_keys = prompt_unseal_keys(seal_status.t, messages)?;
+            if let Some(path) = args.openbao_unseal_from_file.as_deref() {
+                println!("{}", messages.warning_openbao_unseal_from_file());
+                let prompt =
+                    messages.prompt_openbao_unseal_from_file_confirm(&path.display().to_string());
+                confirm_overwrite(&prompt, messages)?;
+                unseal_keys = read_unseal_keys_from_file(path, messages)?;
+            } else {
+                unseal_keys = prompt_unseal_keys(seal_status.t, messages)?;
+            }
         }
         unseal_openbao(client, &unseal_keys, messages).await?;
     }
@@ -1068,6 +1077,9 @@ async fn verify_responder(
     messages: &Messages,
     secrets: &InitSecrets,
 ) -> Result<ResponderCheck> {
+    if args.skip_responder_check {
+        return Ok(ResponderCheck::Skipped);
+    }
     let Some(responder_url) = responder_url else {
         return Ok(ResponderCheck::Skipped);
     };
@@ -1733,6 +1745,7 @@ mod tests {
             show_secrets: false,
             root_token: None,
             unseal_key: Vec::new(),
+            openbao_unseal_from_file: None,
             stepca_password: None,
             db_dsn: None,
             db_provision: false,
@@ -1744,6 +1757,7 @@ mod tests {
             db_timeout_secs: 2,
             http_hmac: None,
             responder_url: None,
+            skip_responder_check: false,
             responder_timeout_secs: 5,
             eab_auto: false,
             stepca_url: DEFAULT_STEPCA_URL.to_string(),
@@ -1835,6 +1849,7 @@ mod tests {
             show_secrets: false,
             root_token: None,
             unseal_key: Vec::new(),
+            openbao_unseal_from_file: None,
             stepca_password: None,
             db_dsn: None,
             db_provision: true,
@@ -1848,6 +1863,7 @@ mod tests {
             db_timeout_secs: 2,
             http_hmac: None,
             responder_url: None,
+            skip_responder_check: false,
             responder_timeout_secs: 5,
             eab_auto: false,
             stepca_url: DEFAULT_STEPCA_URL.to_string(),
@@ -1878,6 +1894,7 @@ mod tests {
             show_secrets: false,
             root_token: None,
             unseal_key: Vec::new(),
+            openbao_unseal_from_file: None,
             stepca_password: None,
             db_dsn: None,
             db_provision: true,
@@ -1891,6 +1908,7 @@ mod tests {
             db_timeout_secs: 2,
             http_hmac: None,
             responder_url: None,
+            skip_responder_check: false,
             responder_timeout_secs: 5,
             eab_auto: false,
             stepca_url: DEFAULT_STEPCA_URL.to_string(),
@@ -1915,6 +1933,7 @@ mod tests {
             show_secrets: false,
             root_token: None,
             unseal_key: Vec::new(),
+            openbao_unseal_from_file: None,
             stepca_password: None,
             db_dsn: Some("postgresql://user:pass@localhost/db".to_string()),
             db_provision: true,
@@ -1928,6 +1947,7 @@ mod tests {
             db_timeout_secs: 2,
             http_hmac: None,
             responder_url: None,
+            skip_responder_check: false,
             responder_timeout_secs: 5,
             eab_auto: false,
             stepca_url: DEFAULT_STEPCA_URL.to_string(),

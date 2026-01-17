@@ -34,6 +34,8 @@ HTTP-01 리스폰더가 함께 구동된다는 전제를 둡니다. 서로 다�
 - `--services`: 기동 대상 서비스 목록 (기본값 `openbao,postgres,step-ca,bootroot-http01`)
 - `--image-archive-dir`: 로컬 이미지 아카이브 디렉터리(선택)
 - `--restart-policy`: 컨테이너 재시작 정책 (기본값 `unless-stopped`)
+- `--openbao-url`: OpenBao API URL (기본값 `http://localhost:8200`)
+- `--openbao-unseal-from-file`: 파일에서 OpenBao 언실 키 읽기 (dev/test 전용)
 
 ### 출력
 
@@ -69,6 +71,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--show-secrets`: 요약 출력에 시크릿 표시
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`)
 - `--unseal-key`: OpenBao unseal key (반복 가능, 환경 변수: `OPENBAO_UNSEAL_KEYS`)
+- `--openbao-unseal-from-file`: 파일에서 OpenBao 언실 키 읽기 (dev/test 전용)
 - `--stepca-password`: step-ca 키 암호 (`password.txt`, 환경 변수: `STEPCA_PASSWORD`)
 - `--db-dsn`: step-ca용 PostgreSQL DSN
 - `--db-provision`: step-ca용 PostgreSQL 역할/DB 생성
@@ -80,6 +83,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--db-timeout-secs`: DB 연결 타임아웃(초)
 - `--http-hmac`: HTTP-01 responder HMAC (환경 변수: `HTTP01_HMAC`)
 - `--responder-url`: HTTP-01 responder 관리자 URL (선택, 환경 변수: `HTTP01_RESPONDER_URL`)
+- `--skip-responder-check`: init 시 responder 체크 생략(테스트/제약 환경용)
 - `--responder-timeout-secs`: responder 요청 타임아웃(초, 기본값 `5`)
 - `--eab-auto`: step-ca에서 EAB 자동 발급
 - `--stepca-url`: step-ca URL (기본값 `https://localhost:9000`)
