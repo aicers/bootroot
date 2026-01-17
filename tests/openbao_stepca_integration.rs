@@ -14,7 +14,7 @@ mod unix_integration {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::support::{
-        ROOT_TOKEN, create_secrets_dir, expect_rollback_deletes, stub_openbao,
+        ROOT_TOKEN, create_secrets_dir, expect_rollback_deletes, stub_openbao, stub_openbao_sealed,
         stub_openbao_unseal_failure, stub_openbao_with_write_failure, write_fake_docker,
         write_fake_docker_with_status, write_password_file,
     };
@@ -192,6 +192,61 @@ mod unix_integration {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("bootroot init failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_skips_responder_check_when_flag_set() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao(&server).await;
+
+        let responder = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/http01"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&responder)
+            .await;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--root-token",
+                ROOT_TOKEN,
+                "--db-dsn",
+                "postgresql://step:step@localhost:5432/step?sslmode=disable",
+                "--auto-generate",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+                "--responder-url",
+                &responder.uri(),
+                "--skip-responder-check",
+            ])
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("bootroot init failed: {stderr}");
+        }
         Ok(())
     }
 
@@ -388,6 +443,58 @@ mod unix_integration {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("bootroot init failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_reads_unseal_keys_from_file() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        let unseal_file = temp_dir.path().join("unseal.txt");
+        fs::write(&unseal_file, "key1\n").context("Failed to write unseal file")?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao_sealed(&server).await;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--root-token",
+                ROOT_TOKEN,
+                "--openbao-unseal-from-file",
+                unseal_file.to_string_lossy().as_ref(),
+                "--db-dsn",
+                "postgresql://step:step@localhost:5432/step?sslmode=disable",
+                "--auto-generate",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+                "--skip-responder-check",
+            ])
+            .env("PATH", combined_path);
+        let output = run_command_with_input(&mut command, "y\ny\n")
+            .context("Failed to run bootroot init")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("bootroot init failed: {stderr}");
+        }
+        assert!(stdout.contains("Auto-unseal"), "stdout was: {stdout}");
         Ok(())
     }
 

@@ -34,6 +34,8 @@ setup instead of the CLI.
 - `--services`: services to start (default `openbao,postgres,step-ca,bootroot-http01`)
 - `--image-archive-dir`: local image archive directory (optional)
 - `--restart-policy`: container restart policy (default `unless-stopped`)
+- `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
+- `--openbao-unseal-from-file`: read OpenBao unseal keys from file (dev/test only)
 
 ### Outputs
 
@@ -70,6 +72,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--show-secrets`: show secrets in the summary
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
 - `--unseal-key`: OpenBao unseal key (repeatable, environment variable: `OPENBAO_UNSEAL_KEYS`)
+- `--openbao-unseal-from-file`: read OpenBao unseal keys from file (dev/test only)
 - `--stepca-password`: step-ca password (`password.txt`, environment variable: `STEPCA_PASSWORD`)
 - `--db-dsn`: PostgreSQL DSN for step-ca
 - `--db-provision`: provision PostgreSQL role/database for step-ca
@@ -82,6 +85,8 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--http-hmac`: HTTP-01 responder HMAC (environment variable: `HTTP01_HMAC`)
 - `--responder-url`: HTTP-01 responder admin URL (optional, environment
   variable: `HTTP01_RESPONDER_URL`)
+- `--skip-responder-check`: skip responder check during init (for constrained
+  test environments)
 - `--responder-timeout-secs`: responder timeout (seconds, default `5`)
 - `--eab-auto`: auto-issue EAB via step-ca
 - `--stepca-url`: step-ca URL (default `https://localhost:9000`)

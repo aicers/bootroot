@@ -44,6 +44,9 @@ pub(crate) struct Strings {
     pub(crate) init_failed_rollback: &'static str,
     pub(crate) prompt_openbao_root_token: &'static str,
     pub(crate) error_openbao_root_token_required: &'static str,
+    pub(crate) warning_openbao_unseal_from_file: &'static str,
+    pub(crate) prompt_openbao_unseal_from_file_confirm: &'static str,
+    pub(crate) error_openbao_unseal_file_empty: &'static str,
     pub(crate) prompt_unseal_threshold: &'static str,
     pub(crate) prompt_unseal_key: &'static str,
     pub(crate) prompt_stepca_password: &'static str,
@@ -354,6 +357,24 @@ impl Messages {
 
     pub(crate) fn error_openbao_root_token_required(&self) -> &'static str {
         self.strings().error_openbao_root_token_required
+    }
+
+    pub(crate) fn warning_openbao_unseal_from_file(&self) -> &'static str {
+        self.strings().warning_openbao_unseal_from_file
+    }
+
+    pub(crate) fn prompt_openbao_unseal_from_file_confirm(&self, value: &str) -> String {
+        format_template(
+            self.strings().prompt_openbao_unseal_from_file_confirm,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_openbao_unseal_file_empty(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_openbao_unseal_file_empty,
+            &[("value", value)],
+        )
     }
 
     pub(crate) fn prompt_unseal_threshold(&self) -> &'static str {

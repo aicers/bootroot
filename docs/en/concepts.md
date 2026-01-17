@@ -111,3 +111,10 @@ AppRole `role_id` and `secret_id` are issued by OpenBao. `role_id` identifies
 the role and is stable, while `secret_id` is a credential that can be rotated.
 Operators deliver the initial values to services (or OpenBao Agent), and
 rotate `secret_id` as needed.
+
+### Dev-only auto-unseal (unsafe)
+
+In dev/test environments, you can pass `--openbao-unseal-from-file <path>` to
+`bootroot infra up` or `bootroot init` to **auto-unseal from a local file**.
+This is **unsafe for production**. Storing unseal keys on disk increases the
+blast radius if the host is compromised.

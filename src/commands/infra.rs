@@ -2,8 +2,10 @@ use std::path::Path;
 use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
+use bootroot::openbao::OpenBaoClient;
 
 use crate::InfraUpArgs;
+use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 
 pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
@@ -23,6 +25,10 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
     let compose_args_ref: Vec<&str> = compose_args.iter().map(String::as_str).collect();
     run_docker(&compose_args_ref, "docker compose up", messages)?;
 
+    if let Some(path) = args.openbao_unseal_from_file.as_deref() {
+        auto_unseal_openbao(path, &args.openbao_url, messages)?;
+    }
+
     let readiness = collect_readiness(&args.compose_file, &args.services, messages)?;
 
     for entry in &readiness {
@@ -36,6 +42,53 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
 
     println!("{}", messages.infra_up_completed());
     Ok(())
+}
+
+fn auto_unseal_openbao(path: &Path, openbao_url: &str, messages: &Messages) -> Result<()> {
+    println!("{}", messages.warning_openbao_unseal_from_file());
+    let prompt = messages.prompt_openbao_unseal_from_file_confirm(&path.display().to_string());
+    if !prompt_yes_no(&prompt, messages)? {
+        anyhow::bail!(messages.error_operation_cancelled());
+    }
+
+    let keys = read_unseal_keys_from_file(path, messages)?;
+    let runtime = tokio::runtime::Runtime::new()
+        .with_context(|| messages.error_runtime_init_failed("infra up"))?;
+    runtime.block_on(async {
+        let client = OpenBaoClient::new(openbao_url)
+            .with_context(|| messages.error_openbao_client_create_failed())?;
+        for key in &keys {
+            client
+                .unseal(key)
+                .await
+                .with_context(|| messages.error_openbao_unseal_failed())?;
+        }
+        let status = client
+            .seal_status()
+            .await
+            .with_context(|| messages.error_openbao_seal_status_failed())?;
+        if status.sealed {
+            anyhow::bail!(messages.error_openbao_sealed());
+        }
+        Ok(())
+    })
+}
+
+fn prompt_yes_no(prompt: &str, messages: &Messages) -> Result<bool> {
+    use std::io::{self, Write};
+
+    let mut stdout = io::stdout();
+    let mut input = String::new();
+
+    write!(stdout, "{prompt}").with_context(|| messages.error_prompt_write_failed())?;
+    stdout
+        .flush()
+        .with_context(|| messages.error_prompt_flush_failed())?;
+    io::stdin()
+        .read_line(&mut input)
+        .with_context(|| messages.error_prompt_read_failed())?;
+    let trimmed = input.trim().to_ascii_lowercase();
+    Ok(trimmed == "y" || trimmed == "yes")
 }
 
 pub(crate) fn ensure_infra_ready(compose_file: &Path, messages: &Messages) -> Result<()> {

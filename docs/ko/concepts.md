@@ -114,3 +114,11 @@ AppRole의 `role_id`/`secret_id`는 OpenBao가 발급합니다. `role_id`는
 역할 식별자이며 고정값이고, `secret_id`는 로그인에 쓰는 자격증명으로
 재발급/회전이 가능합니다. 초기 값은 운영자가 서비스(OpenBao Agent)에
 전달하고, 이후에는 `secret_id`를 주기적으로 갱신합니다.
+
+### Dev-only 자동 언실(주의)
+
+개발/테스트 환경에서는 `bootroot infra up` 또는 `bootroot init`에
+`--openbao-unseal-from-file <path>` 옵션을 사용해 **파일에서 unseal keys를
+읽어 자동으로 언실**할 수 있습니다. 이 방식은 **운영 환경에서 사용하면
+안 됩니다**. 키를 디스크에 보관하는 순간 노출 위험이 커지며, 유출 시
+OpenBao 전체가 위험해질 수 있습니다.
