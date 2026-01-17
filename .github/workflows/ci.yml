@@ -247,8 +247,6 @@ jobs:
           check_jitter = "0s"
           EOF
 
-          docker compose up -d bootroot-agent
-
           cargo build --bin bootroot-agent
           export PATH="$(pwd)/target/debug:$PATH"
 
@@ -259,6 +257,9 @@ jobs:
           cargo run --bin bootroot -- verify \
             --service-name web-app \
             --agent-config "$(pwd)/tmp/agent.toml"
+
+      - name: Start bootroot-agent sidecar (Docker)
+        run: docker compose up -d bootroot-agent
 
       - name: Verify CA Health
         run: |
