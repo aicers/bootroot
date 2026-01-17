@@ -12,6 +12,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Change Filter
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.decide.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Filter Paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docs:
+              - "docs/**"
+              - "**/*.md"
+              - "mkdocs.yml"
+              - ".markdownlint*"
+            code:
+              - "src/**"
+              - "tests/**"
+              - "scripts/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "docker-compose.yml"
+              - "Dockerfile*"
+              - "responder.toml.example"
+              - ".github/workflows/**"
+
+      - name: Decide Docs-Only
+        id: decide
+        run: |
+          if [ "${{ steps.filter.outputs.docs }}" = "true" ] && [ "${{ steps.filter.outputs.code }}" != "true" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
   check:
     name: Quality Check
     runs-on: ubuntu-latest
@@ -59,7 +97,8 @@ jobs:
 
   test:
     name: Test Suite
-    needs: check
+    needs: [check, changes]
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
