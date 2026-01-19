@@ -125,7 +125,7 @@ bootroot init --auto-generate --eab-auto --responder-url http://localhost:8080
 
 ## bootroot status
 
-infra 및 OpenBao 상태를 점검합니다.
+infra 상태(컨테이너 포함)와 OpenBao KV/AppRole 상태를 점검합니다.
 
 ### 입력
 
@@ -168,6 +168,12 @@ bootroot status
 OpenBao Agent를 구동하고, 앱을 실행해 **앱 간 통신에서 발급된
 mTLS 인증서가 올바르게 사용되도록 구성**해야 합니다.
 
+앱이 다른 머신에서 실행된다면, 해당 머신에서 bootroot-agent가 같은
+`agent.toml`을 사용하도록 설정해야 합니다. `--cert-path`/`--key-path`
+도 앱이 실행되는 머신 기준으로 맞춰야 합니다. 이 명령은 경로/스니펫을
+안내할 뿐이며, 실제 설정 파일과 실행은 앱이 동작하는 머신에서
+진행해야 합니다.
+
 ### 입력
 
 입력 우선순위는 **CLI 옵션 > 환경 변수 > 프롬프트/기본값**입니다.
@@ -179,7 +185,7 @@ mTLS 인증서가 올바르게 사용되도록 구성**해야 합니다.
 - `--agent-config`: bootroot-agent 설정 파일 경로
 - `--cert-path`: 인증서 출력 경로
 - `--key-path`: 개인키 출력 경로
-- `--instance-id`: 앱 instance_id (daemon/docker 필수)
+- `--instance-id`: 앱 instance_id
 - `--container-name`: 도커 앱 컨테이너 이름 (docker 필수)
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`)
 - `--notes`: 메모(선택)

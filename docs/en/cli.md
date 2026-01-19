@@ -128,7 +128,7 @@ bootroot init --auto-generate --eab-auto --responder-url http://localhost:8080
 
 ## bootroot status
 
-Checks infra and OpenBao status.
+Checks infra status (including containers) and OpenBao KV/AppRole status.
 
 ### Inputs
 
@@ -170,6 +170,12 @@ This is the required step when adding a new app. After it completes, you
 must run bootroot-agent and OpenBao Agent as instructed, and then start
 the app so mTLS certificates are used correctly in app-to-app traffic.
 
+If the app runs on a different machine, the bootroot-agent on that host
+must use the same `agent.toml`. The `--cert-path`/`--key-path` values must
+also be set relative to where the app runs. This command only prints
+paths/snippets; you still configure and run the agent on the machine where
+the app runs.
+
 ### Inputs
 
 Input priority is **CLI flags > environment variables > prompts/defaults**.
@@ -181,7 +187,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--agent-config`: bootroot-agent config path
 - `--cert-path`: certificate output path
 - `--key-path`: private key output path
-- `--instance-id`: app instance_id (required for daemon and docker)
+- `--instance-id`: app instance_id
 - `--container-name`: docker container name (required for docker)
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
 - `--notes`: freeform notes (optional)

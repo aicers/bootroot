@@ -17,6 +17,10 @@ SANs are the identities inside the certificate. Common types:
 - **DNS**: `example.internal`
 - **IP**: `192.0.2.10`
 
+In the bootroot CLI ecosystem, DNS SANs use this format (same for daemon and docker):
+
+`<instance_id>.<service_name>.<hostname>.<domain>`
+
 ## mTLS
 
 Mutual TLS requires both client and server to present certificates.
@@ -46,7 +50,9 @@ Key terms in the ACME flow:
 
 ## HTTP-01 Challenge
 
-HTTP-01 is a domain control check. The CA gives the client a **token**, and
+HTTP-01 is a domain control check. Its purpose is to ensure certificates
+are issued only to the **actual domain owner**. The CA gives the client a
+**token**, and
 then makes an HTTP request to verify that the domain owner can serve it.
 
 Flow:
@@ -62,8 +68,10 @@ Flow:
 
 ## EAB (External Account Binding)
 
-EAB allows a CA to restrict registrations. The operator supplies a key ID
-and HMAC key. bootroot-agent can load EAB from config or CLI.
+EAB lets a CA restrict **account registrations** from clients such as
+bootroot-agent. The **client** must submit the `kid`/`hmac` issued by the
+CA **during account registration**, or the CA will reject the request.
+bootroot-agent can load EAB from config or CLI.
 
 - `kid` (key ID): an identifier for the EAB key pair issued by the CA.
 - `hmac`: the shared HMAC key used to bind the external account.
@@ -73,7 +81,8 @@ and HMAC key. bootroot-agent can load EAB from config or CLI.
 ## Secret Manager (OpenBao)
 
 In production, avoid hardcoding secrets in files or environment variables.
-Use a secret manager like OpenBao, which provides Vault-compatible KV v2
+To reduce security risk, use a secret manager like OpenBao, which provides
+Vault-compatible KV v2
 storage (Vault is a widely used secrets manager; KV v2 is its versioned
 key/value secrets engine). For bootroot, store and inject:
 
@@ -96,19 +105,28 @@ logs in with AppRole and renders secrets to files:
 The `bootroot` CLI calls the OpenBao API only for **administrative actions**
 like init/rotate.
 
+#### OpenBao bootstrap and access
+
 OpenBao is initialized with **unseal keys** and a **root token**. Unseal keys
 unlock the storage on startup, while the root token grants full administrative
-access. After bootstrap, the OpenBao Agent authenticates using **AppRole**
-(role_id + secret_id) and receives short-lived tokens. Policies should grant
-only the minimum paths required (read-only for runtime services).
+access.
+
+#### Unseal keys custody
+
 Unseal keys are split using **shares (total)** and **threshold (required)**,
-and you must provide at least the threshold count to unseal.
-OpenBao generates the unseal keys and root token during initialization; an
-operator must capture and store them securely.
-They are needed later to unseal OpenBao after restarts and to perform
-administrative recovery or policy changes.
-AppRole `role_id` and `secret_id` are issued by OpenBao. `role_id` identifies
-the role and is stable, while `secret_id` is a credential that can be rotated.
+and you must provide at least the threshold count to unseal. OpenBao
+generates the unseal keys and root token during initialization; an operator
+must capture and store them securely. They are needed later to unseal
+OpenBao after restarts and to perform administrative recovery or policy
+changes.
+
+#### AppRole credentials
+
+After bootstrap, the OpenBao Agent authenticates using **AppRole**
+(role_id + secret_id) and receives short-lived tokens. Policies should grant
+only the minimum paths required (read-only for runtime services). AppRole
+`role_id` and `secret_id` are issued by OpenBao. `role_id` identifies the
+role and is stable, while `secret_id` is a credential that can be rotated.
 Operators deliver the initial values to services (or OpenBao Agent), and
 rotate `secret_id` as needed.
 

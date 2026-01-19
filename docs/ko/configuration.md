@@ -13,6 +13,9 @@ CLI 사용법은 [CLI 문서](cli.md)에 정리되어 있습니다. 이 문서�
 ## OpenBao Agent
 
 OpenBao Agent는 OpenBao에서 시크릿을 읽어 파일로 렌더링합니다.
+`agent.hcl`은 **OpenBao Agent 설정 파일**이며, 템플릿/출력 경로와
+AppRole 로그인 정보를 정의합니다. `agent.hcl` 자체가 시크릿 파일은 아니며,
+OpenBao Agent가 이 설정을 사용해 실제 시크릿 파일을 생성합니다.
 `bootroot init`은 step-ca/리스폰더용 `agent.hcl`을
 `secrets/openbao/stepca/agent.hcl`,
 `secrets/openbao/responder/agent.hcl`에 생성합니다.
@@ -22,6 +25,51 @@ OpenBao Agent는 OpenBao에서 시크릿을 읽어 파일로 렌더링합니다.
 OpenBao Agent는 `role_id`/`secret_id` 파일을 사용해 AppRole로 로그인하며,
 해당 파일은 `secrets/apps/<service>/` 아래에 저장됩니다.
 디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
+
+구성 책임은 다음과 같습니다.
+
+- **step-ca/리스폰더**: `bootroot init`이 `agent.hcl`을 자동 생성합니다.
+- **앱별 에이전트**: `bootroot app add`가 경로와 실행 안내를 출력하며,
+  사용자가 해당 경로에 `agent.hcl`을 배치해 실행합니다.
+
+예시 `agent.hcl` 스니펫:
+
+```hcl
+exit_after_auth = false
+pid_file = "/openbao/secrets/openbao/apps/edge-proxy/agent.pid"
+
+auto_auth {
+  method "approle" {
+    mount_path = "auth/approle"
+    config = {
+      role_id_file_path = "/openbao/secrets/apps/edge-proxy/role_id"
+      secret_id_file_path = "/openbao/secrets/apps/edge-proxy/secret_id"
+    }
+  }
+  sink "file" {
+    config = {
+      path = "/openbao/secrets/openbao/apps/edge-proxy/token"
+    }
+  }
+}
+
+template {
+  source = "/openbao/secrets/openbao/apps/edge-proxy/agent.toml.ctmpl"
+  destination = "/openbao/secrets/apps/edge-proxy/agent.toml"
+}
+```
+
+이 스니펫은 **수동 구성 시 참고용**입니다. bootroot CLI 생태계에서는
+`bootroot init`/`bootroot app add`가 생성한 `agent.hcl`을 사용하는 것이
+가장 간편합니다.
+
+구성 설명:
+
+- `exit_after_auth`: `true`면 토큰 발급 후 종료, `false`면 상시 실행합니다.
+- `pid_file`: 에이전트 PID 파일 경로입니다.
+- `auto_auth.method`: AppRole 로그인 설정이며 `role_id`/`secret_id` 파일을 읽습니다.
+- `auto_auth.sink`: 발급된 토큰을 파일로 저장하는 위치입니다.
+- `template`: OpenBao KV 값을 읽어 실제 설정/시크릿 파일을 렌더링합니다.
 
 ## bootroot-agent (agent.toml)
 

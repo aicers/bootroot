@@ -15,6 +15,10 @@
 - **DNS**: `example.internal`
 - **IP**: `192.0.2.10`
 
+bootroot CLI 생태계에서는 다음 형식의 DNS SAN을 사용합니다(데몬/도커 동일):
+
+`<instance_id>.<service_name>.<hostname>.<domain>`
+
 ## mTLS
 
 서버와 클라이언트 모두 인증서를 제시하는 TLS 방식입니다.
@@ -48,7 +52,9 @@ ACME 흐름에서 자주 등장하는 개념은 다음과 같습니다.
 
 ## HTTP-01 챌린지
 
-HTTP-01은 **도메인 소유 확인 절차**입니다. CA가 **토큰**을 발급하고,
+HTTP-01은 **도메인 소유 확인 절차**입니다. 목적은 인증서가
+**실제 도메인 소유자**에게만 발급되도록 보장하는 것입니다. CA가
+**토큰**을 발급하고,
 해당 도메인으로 HTTP 요청을 보내 응답을 검증합니다.
 
 흐름:
@@ -64,8 +70,10 @@ HTTP-01은 **도메인 소유 확인 절차**입니다. CA가 **토큰**을 발�
 
 ## EAB (External Account Binding)
 
-등록 제한이 필요한 CA에서 사용하는 방식입니다. `kid`와 `hmac`를
-제공해야 계정 등록이 허용됩니다.
+CA가 bootroot-agent와 같은 클라이언트의 계정 생성 요청을 제한하고자
+할 때 사용하는 방식입니다. 이때 **클라이언트**가
+CA로부터 발급받은 `kid`/`hmac`를 **계정 등록 요청 시** 제출해야
+등록이 허용됩니다.
 
 - `kid`(key ID): CA가 발급하는 EAB 키의 식별자입니다.
 - `hmac`: 외부 계정 바인딩에 사용하는 공유 HMAC 키입니다.
@@ -74,8 +82,9 @@ HTTP-01은 **도메인 소유 확인 절차**입니다. CA가 **토큰**을 발�
 
 ## 시크릿 매니저(OpenBao)
 
-운영 환경에서는 시크릿을 파일이나 환경변수에 하드코딩하지 않고
-OpenBao 같은 시크릿 매니저에 저장해 주입합니다. OpenBao는
+운영 환경에서는 시크릿을 파일이나 환경변수에 하드코딩하지 않고,
+보안 위험을 줄이기 위해 OpenBao 같은 시크릿 매니저에 저장해
+주입하는 방식을 권장합니다. OpenBao는
 Vault 호환 KV v2 스토리지를 제공하며(Vault는 널리 쓰이는 시크릿 매니저,
 KV v2는 버전 관리되는 키/값 시크릿 엔진), bootroot에서는 다음 값을
 관리합니다.
@@ -99,21 +108,29 @@ AppRole로 로그인해 시크릿을 파일로 렌더링합니다. 주요 흐름
 `bootroot` CLI는 초기화/회전 같은 **관리 작업**에서만 OpenBao API를
 직접 호출합니다.
 
+#### OpenBao 초기화와 접속
+
 OpenBao는 **unseal keys**와 **root token**으로 초기화/접속합니다.
 unseal keys는 기동 시 스토리지를 해제하는 용도이고, root token은
-전체 관리자 권한을 부여합니다. 초기 설정 이후에는 OpenBao Agent가
-**AppRole**(role_id + secret_id)로 로그인해 짧은 TTL 토큰을 받고,
-필요한 경로만 읽도록 최소 권한 정책을 적용합니다.
+전체 관리자 권한을 부여합니다.
+
+#### unseal keys 보관
+
 unseal keys는 초기화 시 **shares(총 개수)**와 **threshold(필요 개수)**로
-분할되며, 언실 시에는 threshold 개수 이상이 필요합니다.
-unseal keys와 root token은 OpenBao 초기화 시 **OpenBao가 자동 생성**하며,
-운영자가 값을 안전하게 보관해야 합니다.
-이 값들은 재기동 시 언실(unseal)과 운영 중 복구/정책 변경 같은
-관리 작업에 필요합니다.
-AppRole의 `role_id`/`secret_id`는 OpenBao가 발급합니다. `role_id`는
-역할 식별자이며 고정값이고, `secret_id`는 로그인에 쓰는 자격증명으로
-재발급/회전이 가능합니다. 초기 값은 운영자가 서비스(OpenBao Agent)에
-전달하고, 이후에는 `secret_id`를 주기적으로 갱신합니다.
+분할되며, 언실 시에는 threshold 개수 이상이 필요합니다. unseal keys와
+root token은 초기화 시 **OpenBao가 자동 생성**하며, 운영자가 값을
+안전하게 보관해야 합니다. 이 값들은 재기동 시 언실(unseal)과 운영 중
+복구/정책 변경 같은 관리 작업에 필요합니다.
+
+#### AppRole 자격증명
+
+초기 설정 이후에는 OpenBao Agent가 **AppRole**(role_id + secret_id)로
+로그인해 짧은 TTL 토큰을 받고, 필요한 경로만 읽도록 최소 권한 정책을
+적용합니다. AppRole의 `role_id`/`secret_id`는 OpenBao가 발급합니다.
+`role_id`는 역할 식별자이며 고정값이고, `secret_id`는 로그인에 쓰는
+자격증명으로 재발급/회전이 가능합니다. 초기 값은 운영자가
+서비스(OpenBao Agent)에 전달하고, 이후에는 `secret_id`를 주기적으로
+갱신합니다.
 
 ### Dev-only 자동 언실(주의)
 
