@@ -4,7 +4,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use bootroot::db::{check_auth_sync, check_tcp_sync, parse_db_dsn};
 
-use crate::VerifyArgs;
+use crate::cli::args::VerifyArgs;
 use crate::cli::output::print_verify_plan;
 use crate::cli::prompt::Prompt;
 use crate::i18n::Messages;
@@ -61,7 +61,7 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
     verify_cert_san(entry, messages)?;
 
     if args.db_check {
-        verify_db_connectivity(&state, args.db_timeout_secs, messages)?;
+        verify_db_connectivity(&state, args.db_timeout.timeout_secs, messages)?;
     }
 
     println!("{}", messages.verify_summary_title());

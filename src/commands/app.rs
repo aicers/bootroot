@@ -5,8 +5,7 @@ use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 use tokio::fs;
 
-use crate::AppAddArgs;
-use crate::AppInfoArgs;
+use crate::cli::args::{AppAddArgs, AppInfoArgs};
 use crate::cli::output::{
     AppAddPlan, print_app_add_plan, print_app_add_summary, print_app_info_summary,
 };
@@ -350,7 +349,7 @@ fn resolve_app_add_args(args: &AppAddArgs, messages: &Messages) -> Result<Resolv
         }),
     };
 
-    let root_token = if let Some(value) = args.root_token.clone() {
+    let root_token = if let Some(value) = args.root_token.root_token.clone() {
         value
     } else {
         let label = messages.prompt_openbao_root_token().trim_end_matches(": ");
