@@ -4,7 +4,7 @@ use std::process::Command as ProcessCommand;
 use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
-use crate::InfraUpArgs;
+use crate::cli::args::InfraUpArgs;
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 

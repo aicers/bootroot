@@ -16,7 +16,7 @@ use reqwest::StatusCode;
 use ring::digest;
 use x509_parser::pem::parse_x509_pem;
 
-use crate::InitArgs;
+use crate::cli::args::InitArgs;
 use crate::cli::output::{print_init_plan, print_init_summary};
 use crate::commands::infra::{ensure_infra_ready, run_docker};
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
@@ -90,9 +90,9 @@ pub(crate) use openbao_constants::{
 };
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
-    ensure_infra_ready(&args.compose_file, messages)?;
+    ensure_infra_ready(&args.compose.compose_file, messages)?;
 
-    let mut client = OpenBaoClient::new(&args.openbao_url)
+    let mut client = OpenBaoClient::new(&args.openbao.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
     client
         .health_check()
@@ -109,7 +109,9 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
         }
         Err(err) => {
             eprintln!("{}", messages.init_failed_rollback());
-            rollback.rollback(&client, &args.kv_mount, messages).await;
+            rollback
+                .rollback(&client, &args.openbao.kv_mount, messages)
+                .await;
             Err(err)
         }
     }
@@ -124,13 +126,18 @@ async fn run_init_inner(
     rollback: &mut InitRollback,
 ) -> Result<InitSummary> {
     let bootstrap = bootstrap_openbao(client, args, messages).await?;
-    let overwrite_password = args.secrets_dir.join("password.txt").exists();
-    let overwrite_ca_json = args.secrets_dir.join("config").join("ca.json").exists();
+    let overwrite_password = args.secrets_dir.secrets_dir.join("password.txt").exists();
+    let overwrite_ca_json = args
+        .secrets_dir
+        .secrets_dir
+        .join("config")
+        .join("ca.json")
+        .exists();
     let overwrite_state = Path::new("state.json").exists();
     let plan = InitPlan {
-        openbao_url: args.openbao_url.clone(),
-        kv_mount: args.kv_mount.clone(),
-        secrets_dir: args.secrets_dir.clone(),
+        openbao_url: args.openbao.openbao_url.clone(),
+        kv_mount: args.openbao.kv_mount.clone(),
+        secrets_dir: args.secrets_dir.secrets_dir.clone(),
         overwrite_password,
         overwrite_ca_json,
         overwrite_state,
@@ -154,7 +161,13 @@ async fn run_init_inner(
     let db_info = parse_db_dsn(&secrets.db_dsn)
         .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
     let db_check = if args.db_check {
-        check_db_connectivity(&db_info, &secrets.db_dsn, args.db_timeout_secs, messages).await?;
+        check_db_connectivity(
+            &db_info,
+            &secrets.db_dsn,
+            args.db_timeout.timeout_secs,
+            messages,
+        )
+        .await?;
         DbCheckStatus::Ok
     } else {
         DbCheckStatus::Skipped
@@ -163,26 +176,32 @@ async fn run_init_inner(
     let (role_outputs, _policies, approles) =
         configure_openbao(client, args, &secrets, rollback, messages).await?;
 
-    let secrets_dir = args.secrets_dir.clone();
+    let secrets_dir = args.secrets_dir.secrets_dir.clone();
     rollback.password_backup = Some(
         write_password_file_with_backup(&secrets_dir, &secrets.stepca_password, messages).await?,
     );
     rollback.ca_json_backup =
         Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn, messages).await?);
-    let stepca_templates = write_stepca_templates(&secrets_dir, &args.kv_mount, messages).await?;
-    let responder_paths =
-        write_responder_files(&secrets_dir, &args.kv_mount, &secrets.http_hmac, messages).await?;
+    let stepca_templates =
+        write_stepca_templates(&secrets_dir, &args.openbao.kv_mount, messages).await?;
+    let responder_paths = write_responder_files(
+        &secrets_dir,
+        &args.openbao.kv_mount,
+        &secrets.http_hmac,
+        messages,
+    )
+    .await?;
     let responder_compose_override = write_responder_compose_override(
-        &args.compose_file,
+        &args.compose.compose_file,
         &secrets_dir,
         &responder_paths.config_path,
         messages,
     )
     .await?;
     let openbao_agent_paths = setup_openbao_agents(
-        &args.compose_file,
+        &args.compose.compose_file,
         &secrets_dir,
-        &args.openbao_url,
+        &args.openbao.openbao_url,
         &role_outputs,
         &stepca_templates,
         &responder_paths.template_path,
@@ -190,19 +209,19 @@ async fn run_init_inner(
     )
     .await?;
     if let Some(override_path) = responder_compose_override.as_ref() {
-        apply_responder_compose_override(&args.compose_file, override_path, messages)?;
+        apply_responder_compose_override(&args.compose.compose_file, override_path, messages)?;
     }
 
     let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
     write_ca_trust_fingerprints_with_retry(
         client,
-        &args.kv_mount,
+        &args.openbao.kv_mount,
         &secrets_dir,
         rollback,
         messages,
     )
     .await?;
-    let compose_has_responder = compose_has_responder(&args.compose_file, messages)?;
+    let compose_has_responder = compose_has_responder(&args.compose.compose_file, messages)?;
     let responder_url = resolve_responder_url(args, compose_has_responder);
     let responder_check =
         verify_responder(responder_url.as_deref(), args, messages, &secrets).await?;
@@ -212,17 +231,17 @@ async fn run_init_inner(
     }
 
     write_state_file(
-        &args.openbao_url,
-        &args.kv_mount,
+        &args.openbao.openbao_url,
+        &args.openbao.kv_mount,
         &approles,
-        &args.secrets_dir,
+        &args.secrets_dir.secrets_dir,
         messages,
     )?;
 
     Ok(InitSummary {
-        openbao_url: args.openbao_url.clone(),
-        kv_mount: args.kv_mount.clone(),
-        secrets_dir: args.secrets_dir.clone(),
+        openbao_url: args.openbao.openbao_url.clone(),
+        kv_mount: args.openbao.kv_mount.clone(),
+        secrets_dir: args.secrets_dir.secrets_dir.clone(),
         show_secrets: args.show_secrets,
         init_response: bootstrap.init_response.is_some(),
         root_token: bootstrap.root_token,
@@ -798,7 +817,7 @@ async fn configure_openbao(
     BTreeMap<String, String>,
 )> {
     client
-        .ensure_kv_v2(&args.kv_mount)
+        .ensure_kv_v2(&args.openbao.kv_mount)
         .await
         .with_context(|| messages.error_openbao_kv_mount_failed())?;
     client
@@ -806,7 +825,7 @@ async fn configure_openbao(
         .await
         .with_context(|| messages.error_openbao_approle_auth_failed())?;
 
-    let policies = build_policy_map(&args.kv_mount);
+    let policies = build_policy_map(&args.openbao.kv_mount);
     for (name, policy) in &policies {
         if !client
             .policy_exists(name)
@@ -872,7 +891,7 @@ async fn configure_openbao(
     }
     for path in kv_paths {
         if !client
-            .kv_exists(&args.kv_mount, path)
+            .kv_exists(&args.openbao.kv_mount, path)
             .await
             .with_context(|| messages.error_openbao_kv_exists_failed())?
         {
@@ -880,7 +899,7 @@ async fn configure_openbao(
         }
     }
 
-    write_openbao_secrets_with_retry(client, &args.kv_mount, secrets, messages).await?;
+    write_openbao_secrets_with_retry(client, &args.openbao.kv_mount, secrets, messages).await?;
 
     Ok((role_outputs, policies, approles))
 }
@@ -1014,7 +1033,11 @@ async fn ensure_openbao_initialized(
         .await
         .with_context(|| messages.error_openbao_init_status_failed())?;
     if initialized {
-        return Ok((None, args.root_token.clone(), args.unseal_key.clone()));
+        return Ok((
+            None,
+            args.root_token.root_token.clone(),
+            args.unseal_key.clone(),
+        ));
     }
 
     let response = client
@@ -1233,7 +1256,14 @@ async fn maybe_register_eab(
         let credentials = issue_eab_via_stepca(args, messages)
             .await
             .with_context(|| messages.error_eab_auto_failed())?;
-        register_eab_secret(client, &args.kv_mount, rollback, &credentials, messages).await?;
+        register_eab_secret(
+            client,
+            &args.openbao.kv_mount,
+            rollback,
+            &credentials,
+            messages,
+        )
+        .await?;
         return Ok(Some(credentials));
     }
     if !prompt_yes_no(messages.prompt_eab_register_now(), messages)? {
@@ -1243,14 +1273,28 @@ async fn maybe_register_eab(
         let credentials = issue_eab_via_stepca(args, messages)
             .await
             .with_context(|| messages.error_eab_auto_failed())?;
-        register_eab_secret(client, &args.kv_mount, rollback, &credentials, messages).await?;
+        register_eab_secret(
+            client,
+            &args.openbao.kv_mount,
+            rollback,
+            &credentials,
+            messages,
+        )
+        .await?;
         return Ok(Some(credentials));
     }
     println!("{}", messages.eab_prompt_instructions());
     let kid = prompt_text(messages.prompt_eab_kid(), messages)?;
     let hmac = prompt_text(messages.prompt_eab_hmac(), messages)?;
     let credentials = EabCredentials { kid, hmac };
-    register_eab_secret(client, &args.kv_mount, rollback, &credentials, messages).await?;
+    register_eab_secret(
+        client,
+        &args.openbao.kv_mount,
+        rollback,
+        &credentials,
+        messages,
+    )
+    .await?;
     Ok(Some(credentials))
 }
 
@@ -1329,7 +1373,7 @@ async fn resolve_db_dsn_for_init(args: &InitArgs, messages: &Messages) -> Result
             &inputs.db_name,
             admin.sslmode.as_deref(),
         );
-        let timeout = Duration::from_secs(args.db_timeout_secs);
+        let timeout = Duration::from_secs(args.db_timeout.timeout_secs);
         tokio::task::spawn_blocking(move || {
             provision_db_sync(
                 &inputs.admin_dsn,
@@ -1355,7 +1399,7 @@ struct DbProvisionInputs {
 }
 
 fn resolve_db_provision_inputs(args: &InitArgs, messages: &Messages) -> Result<DbProvisionInputs> {
-    let admin_dsn = if let Some(value) = args.db_admin_dsn.clone() {
+    let admin_dsn = if let Some(value) = args.db_admin.admin_dsn.clone() {
         value
     } else if let Some(value) = build_admin_dsn_from_env() {
         value
@@ -1831,24 +1875,30 @@ mod tests {
 
     fn default_init_args() -> InitArgs {
         InitArgs {
-            openbao_url: "http://localhost:8200".to_string(),
-            kv_mount: "secret".to_string(),
-            secrets_dir: PathBuf::from("secrets"),
-            compose_file: PathBuf::from("docker-compose.yml"),
+            openbao: crate::cli::args::OpenBaoArgs {
+                openbao_url: "http://localhost:8200".to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: crate::cli::args::SecretsDirArgs {
+                secrets_dir: PathBuf::from("secrets"),
+            },
+            compose: crate::cli::args::ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
             auto_generate: false,
             show_secrets: false,
-            root_token: None,
+            root_token: crate::cli::args::RootTokenArgs { root_token: None },
             unseal_key: Vec::new(),
             openbao_unseal_from_file: None,
             stepca_password: None,
             db_dsn: None,
             db_provision: false,
-            db_admin_dsn: None,
+            db_admin: crate::cli::args::DbAdminDsnArgs { admin_dsn: None },
             db_user: None,
             db_password: None,
             db_name: None,
             db_check: false,
-            db_timeout_secs: 2,
+            db_timeout: crate::cli::args::DbTimeoutArgs { timeout_secs: 2 },
             http_hmac: None,
             responder_url: None,
             skip_responder_check: false,
@@ -1970,37 +2020,13 @@ mod tests {
     #[test]
     fn test_resolve_db_provision_inputs_with_args() {
         let _guard = env_lock();
-        let args = InitArgs {
-            openbao_url: "http://localhost:8200".to_string(),
-            kv_mount: "secret".to_string(),
-            secrets_dir: PathBuf::from("secrets"),
-            compose_file: PathBuf::from("docker-compose.yml"),
-            auto_generate: false,
-            show_secrets: false,
-            root_token: None,
-            unseal_key: Vec::new(),
-            openbao_unseal_from_file: None,
-            stepca_password: None,
-            db_dsn: None,
-            db_provision: true,
-            db_admin_dsn: Some(
-                "postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string(),
-            ),
-            db_user: Some("stepuser".to_string()),
-            db_password: Some("step-pass".to_string()),
-            db_name: Some("stepdb".to_string()),
-            db_check: false,
-            db_timeout_secs: 2,
-            http_hmac: None,
-            responder_url: None,
-            skip_responder_check: false,
-            responder_timeout_secs: 5,
-            eab_auto: false,
-            stepca_url: DEFAULT_STEPCA_URL.to_string(),
-            stepca_provisioner: DEFAULT_STEPCA_PROVISIONER.to_string(),
-            eab_kid: None,
-            eab_hmac: None,
-        };
+        let mut args = default_init_args();
+        args.db_provision = true;
+        args.db_admin.admin_dsn =
+            Some("postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string());
+        args.db_user = Some("stepuser".to_string());
+        args.db_password = Some("step-pass".to_string());
+        args.db_name = Some("stepdb".to_string());
 
         let inputs = resolve_db_provision_inputs(&args, &test_messages()).unwrap();
         assert_eq!(
@@ -2015,37 +2041,13 @@ mod tests {
     #[test]
     fn test_resolve_db_provision_inputs_rejects_invalid_identifier() {
         let _guard = env_lock();
-        let args = InitArgs {
-            openbao_url: "http://localhost:8200".to_string(),
-            kv_mount: "secret".to_string(),
-            secrets_dir: PathBuf::from("secrets"),
-            compose_file: PathBuf::from("docker-compose.yml"),
-            auto_generate: false,
-            show_secrets: false,
-            root_token: None,
-            unseal_key: Vec::new(),
-            openbao_unseal_from_file: None,
-            stepca_password: None,
-            db_dsn: None,
-            db_provision: true,
-            db_admin_dsn: Some(
-                "postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string(),
-            ),
-            db_user: Some("bad-name".to_string()),
-            db_password: Some("step-pass".to_string()),
-            db_name: Some("stepdb".to_string()),
-            db_check: false,
-            db_timeout_secs: 2,
-            http_hmac: None,
-            responder_url: None,
-            skip_responder_check: false,
-            responder_timeout_secs: 5,
-            eab_auto: false,
-            stepca_url: DEFAULT_STEPCA_URL.to_string(),
-            stepca_provisioner: DEFAULT_STEPCA_PROVISIONER.to_string(),
-            eab_kid: None,
-            eab_hmac: None,
-        };
+        let mut args = default_init_args();
+        args.db_provision = true;
+        args.db_admin.admin_dsn =
+            Some("postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string());
+        args.db_user = Some("bad-name".to_string());
+        args.db_password = Some("step-pass".to_string());
+        args.db_name = Some("stepdb".to_string());
 
         let err = resolve_db_provision_inputs(&args, &test_messages()).unwrap_err();
         assert!(err.to_string().contains("Invalid DB identifier"));
@@ -2054,37 +2056,14 @@ mod tests {
     #[test]
     fn test_resolve_db_dsn_for_init_rejects_conflict() {
         let _guard = env_lock();
-        let args = InitArgs {
-            openbao_url: "http://localhost:8200".to_string(),
-            kv_mount: "secret".to_string(),
-            secrets_dir: PathBuf::from("secrets"),
-            compose_file: PathBuf::from("docker-compose.yml"),
-            auto_generate: false,
-            show_secrets: false,
-            root_token: None,
-            unseal_key: Vec::new(),
-            openbao_unseal_from_file: None,
-            stepca_password: None,
-            db_dsn: Some("postgresql://user:pass@localhost/db".to_string()),
-            db_provision: true,
-            db_admin_dsn: Some(
-                "postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string(),
-            ),
-            db_user: Some("stepuser".to_string()),
-            db_password: Some("step-pass".to_string()),
-            db_name: Some("stepdb".to_string()),
-            db_check: false,
-            db_timeout_secs: 2,
-            http_hmac: None,
-            responder_url: None,
-            skip_responder_check: false,
-            responder_timeout_secs: 5,
-            eab_auto: false,
-            stepca_url: DEFAULT_STEPCA_URL.to_string(),
-            stepca_provisioner: DEFAULT_STEPCA_PROVISIONER.to_string(),
-            eab_kid: None,
-            eab_hmac: None,
-        };
+        let mut args = default_init_args();
+        args.db_dsn = Some("postgresql://user:pass@localhost/db".to_string());
+        args.db_provision = true;
+        args.db_admin.admin_dsn =
+            Some("postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string());
+        args.db_user = Some("stepuser".to_string());
+        args.db_password = Some("step-pass".to_string());
+        args.db_name = Some("stepdb".to_string());
 
         let err = tokio::runtime::Runtime::new()
             .expect("runtime")
@@ -2098,13 +2077,12 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").unwrap();
-        let args = InitArgs {
-            compose_file,
-            ..default_init_args()
-        };
+        let mut args = default_init_args();
+        args.compose.compose_file = compose_file;
 
         let compose_has_responder =
-            compose_has_responder(&args.compose_file, &test_messages()).expect("compose check");
+            compose_has_responder(&args.compose.compose_file, &test_messages())
+                .expect("compose check");
         let responder_url = resolve_responder_url(&args, compose_has_responder);
         assert!(responder_url.is_none());
     }
@@ -2122,13 +2100,12 @@ services:
 ",
         )
         .unwrap();
-        let args = InitArgs {
-            compose_file,
-            ..default_init_args()
-        };
+        let mut args = default_init_args();
+        args.compose.compose_file = compose_file;
 
         let compose_has_responder =
-            compose_has_responder(&args.compose_file, &test_messages()).expect("compose check");
+            compose_has_responder(&args.compose.compose_file, &test_messages())
+                .expect("compose check");
         let responder_url = resolve_responder_url(&args, compose_has_responder);
         assert_eq!(responder_url.as_deref(), Some(DEFAULT_RESPONDER_ADMIN_URL));
     }

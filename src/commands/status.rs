@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bootroot::openbao::{KvMountStatus, OpenBaoClient};
 
-use crate::StatusArgs;
+use crate::cli::args::StatusArgs;
 use crate::commands::infra::{ContainerReadiness, collect_readiness, default_infra_services};
 use crate::commands::init::{
     PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
@@ -10,10 +10,10 @@ use crate::i18n::Messages;
 
 pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result<()> {
     let services = default_infra_services();
-    let readiness = collect_readiness(&args.compose_file, &services, messages)?;
+    let readiness = collect_readiness(&args.compose.compose_file, &services, messages)?;
     let infra_failures = collect_infra_failures(&readiness);
 
-    let mut client = OpenBaoClient::new(&args.openbao_url)
+    let mut client = OpenBaoClient::new(&args.openbao.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
     let openbao_health = client
         .health_check()
@@ -31,14 +31,14 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         None
     };
 
-    if let Some(token) = args.root_token.clone() {
+    if let Some(token) = args.root_token.root_token.clone() {
         client.set_token(token);
     }
 
-    let kv_mount_status = if openbao_ok && args.root_token.is_some() {
+    let kv_mount_status = if openbao_ok && args.root_token.root_token.is_some() {
         Some(
             client
-                .kv_mount_status(&args.kv_mount)
+                .kv_mount_status(&args.openbao.kv_mount)
                 .await
                 .with_context(|| messages.error_openbao_kv_mount_status_failed())?,
         )
@@ -53,8 +53,8 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         PATH_CA_TRUST,
         PATH_AGENT_EAB,
     ];
-    let kv_statuses = if openbao_ok && args.root_token.is_some() {
-        Some(fetch_kv_statuses(&client, &args.kv_mount, &kv_paths, messages).await?)
+    let kv_statuses = if openbao_ok && args.root_token.root_token.is_some() {
+        Some(fetch_kv_statuses(&client, &args.openbao.kv_mount, &kv_paths, messages).await?)
     } else {
         None
     };
@@ -64,7 +64,7 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         "bootroot-responder-role",
         "bootroot-stepca-role",
     ];
-    let approle_statuses = if openbao_ok && args.root_token.is_some() {
+    let approle_statuses = if openbao_ok && args.root_token.root_token.is_some() {
         Some(fetch_approle_statuses(&client, &approles, messages).await?)
     } else {
         None
@@ -74,7 +74,7 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         readiness: &readiness,
         openbao_ok,
         sealed: seal_status.map(|status| status.sealed),
-        kv_mount: &args.kv_mount,
+        kv_mount: &args.openbao.kv_mount,
         kv_mount_status,
         kv_statuses: kv_statuses.as_deref(),
         approle_statuses: approle_statuses.as_deref(),

@@ -9,6 +9,10 @@ use bootroot::openbao::OpenBaoClient;
 use bootroot::{db, fs_util};
 use reqwest::StatusCode;
 
+use crate::cli::args::{
+    RotateAppRoleSecretIdArgs, RotateArgs, RotateCommand, RotateDbArgs, RotateEabArgs,
+    RotateResponderHmacArgs, RotateStepcaPasswordArgs,
+};
 use crate::cli::prompt::Prompt;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
@@ -16,10 +20,6 @@ use crate::commands::init::{
 };
 use crate::i18n::Messages;
 use crate::state::{AppEntry, StateFile};
-use crate::{
-    RotateAppRoleSecretIdArgs, RotateArgs, RotateCommand, RotateDbArgs, RotateEabArgs,
-    RotateResponderHmacArgs, RotateStepcaPasswordArgs,
-};
 
 const STATE_FILE_NAME: &str = "state.json";
 const STEPCA_ROOT_KEY: &str = "secrets/root_ca_key";
@@ -53,23 +53,26 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
 
     let openbao_url = args
+        .openbao
         .openbao_url
         .clone()
         .unwrap_or_else(|| state.openbao_url.clone());
     let kv_mount = args
+        .openbao
         .kv_mount
         .clone()
         .unwrap_or_else(|| state.kv_mount.clone());
     let secrets_dir = args
         .secrets_dir
+        .secrets_dir
         .clone()
         .unwrap_or_else(|| state.secrets_dir());
-    let root_token = resolve_root_token(args.root_token.clone(), messages)?;
+    let root_token = resolve_root_token(args.root_token.root_token.clone(), messages)?;
     let ctx = RotateContext {
         openbao_url,
         kv_mount,
         secrets_dir,
-        compose_file: args.compose_file.clone(),
+        compose_file: args.compose.compose_file.clone(),
         root_token,
         state,
     };
@@ -233,7 +236,7 @@ async fn rotate_db(
     let ca_json_path = ctx.secrets_dir.join(CA_JSON_PATH);
     let current_dsn = read_ca_json_dsn(&ca_json_path, messages)?;
     let parsed = db::parse_db_dsn(&current_dsn).with_context(|| messages.error_invalid_db_dsn())?;
-    let timeout = Duration::from_secs(args.timeout_secs);
+    let timeout = Duration::from_secs(args.timeout.timeout_secs);
     db::provision_db_sync(
         &admin_dsn,
         &parsed.user,
@@ -422,7 +425,7 @@ fn resolve_root_token(value: Option<String>, messages: &Messages) -> Result<Stri
 }
 
 fn resolve_db_admin_dsn(args: &RotateDbArgs, messages: &Messages) -> Result<String> {
-    if let Some(value) = args.admin_dsn.clone() {
+    if let Some(value) = args.admin_dsn.admin_dsn.clone() {
         return Ok(value);
     }
     let mut input = std::io::stdin().lock();
