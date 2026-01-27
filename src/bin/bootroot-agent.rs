@@ -166,6 +166,7 @@ mod tests {
             retry: config::RetrySettings {
                 backoff_secs: vec![1, 2, 3],
             },
+            trust: config::TrustSettings::default(),
             scheduler: config::SchedulerSettings {
                 max_concurrent_issuances: 3,
             },

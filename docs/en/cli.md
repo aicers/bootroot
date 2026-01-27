@@ -170,6 +170,16 @@ This is the required step when adding a new app. After it completes, you
 must run bootroot-agent and OpenBao Agent as instructed, and then start
 the app so mTLS certificates are used correctly in app-to-app traffic.
 
+`bootroot app add` does not issue certificates by itself. To actually obtain
+certificates from step-ca, you must **configure and run bootroot-agent**.
+See the bootroot-agent sections in the manuals (Installation/Operations/
+Configuration) for details.
+
+If `bootroot init` stored CA fingerprints in OpenBao (for example,
+`secret/bootroot/ca`), this command includes `trusted_ca_sha256` in the
+agent.toml snippet output. If the value is missing, you must set it manually
+when needed.
+
 If the app runs on a different machine, the bootroot-agent on that host
 must use the same `agent.toml`. The `--cert-path`/`--key-path` values must
 also be set relative to where the app runs. This command only prints

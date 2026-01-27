@@ -136,6 +136,35 @@ Controls HTTP-01 responder settings and retry behavior for ACME operations.
 - `http_responder_timeout_secs`: request timeout to the responder
 - `http_responder_token_ttl_secs`: token TTL in seconds
 
+### Trust
+
+```toml
+[trust]
+ca_bundle_path = "/etc/bootroot/ca-bundle.pem"
+trusted_ca_sha256 = ["<sha256-hex>"]
+```
+
+Controls CA bundle storage and verification for mTLS trust.
+
+- `ca_bundle_path`: path where bootroot-agent writes the CA bundle
+  (intermediate/root only).
+- `trusted_ca_sha256`: list of trusted CA cert fingerprints (SHA-256 hex).
+
+`trusted_ca_sha256` must match **real CA certificate fingerprints** (not
+arbitrary values). `bootroot init` stores CA fingerprints in OpenBao, and
+`bootroot app add` includes the trusted list in the agent.toml snippet.
+In the common workflow, you should use the values printed by app add.
+
+If the snippet does not include `trusted_ca_sha256`, check:
+
+- `secrets/certs/root_ca.crt` and `secrets/certs/intermediate_ca.crt` exist
+- `bootroot init` ran with the same `secrets_dir`
+
+Permissions note: the service consuming the CA bundle must be able to read
+`ca_bundle_path`. The simplest setup is to run bootroot-agent and the service
+as the same user or group; otherwise ensure the file and parent directory
+permissions allow read access.
+
 ### Retry Settings
 
 ```toml

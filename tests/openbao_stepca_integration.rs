@@ -323,7 +323,7 @@ mod unix_integration {
 
         let server = MockServer::start().await;
         stub_openbao(&server).await;
-        expect_rollback_deletes(&server).await;
+        expect_rollback_deletes(&server, true).await;
 
         let stepca = MockServer::start().await;
         Mock::given(method("POST"))
@@ -511,7 +511,7 @@ mod unix_integration {
 
         let server = MockServer::start().await;
         stub_openbao_with_write_failure(&server, "bootroot/responder/hmac").await;
-        expect_rollback_deletes(&server).await;
+        expect_rollback_deletes(&server, false).await;
 
         let original_password = "old-password";
         write_password_file(&secrets_dir, original_password)?;

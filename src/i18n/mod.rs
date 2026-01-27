@@ -128,6 +128,7 @@ pub(crate) struct Strings {
     pub(crate) error_openbao_approle_login_failed: &'static str,
     pub(crate) error_openbao_kv_exists_failed: &'static str,
     pub(crate) error_openbao_kv_write_failed: &'static str,
+    pub(crate) error_openbao_kv_read_failed: &'static str,
     pub(crate) error_openbao_kv_delete_failed: &'static str,
     pub(crate) error_openbao_role_output_missing: &'static str,
     pub(crate) error_command_run_failed: &'static str,
@@ -139,6 +140,11 @@ pub(crate) struct Strings {
     pub(crate) error_parse_ca_json_failed: &'static str,
     pub(crate) error_serialize_ca_json_failed: &'static str,
     pub(crate) error_ca_json_db_missing: &'static str,
+    pub(crate) error_ca_cert_missing: &'static str,
+    pub(crate) error_ca_cert_parse_failed: &'static str,
+    pub(crate) error_ca_trust_missing: &'static str,
+    pub(crate) error_ca_trust_invalid: &'static str,
+    pub(crate) error_ca_trust_empty: &'static str,
     pub(crate) error_parse_state_failed: &'static str,
     pub(crate) error_serialize_state_failed: &'static str,
     pub(crate) prompt_service_name: &'static str,
@@ -191,6 +197,7 @@ pub(crate) struct Strings {
     pub(crate) app_next_steps_openbao_agent_docker_run: &'static str,
     pub(crate) app_snippet_daemon_title: &'static str,
     pub(crate) app_snippet_docker_title: &'static str,
+    pub(crate) app_snippet_trust_title: &'static str,
     pub(crate) app_snippet_domain_hint: &'static str,
     pub(crate) verify_plan_title: &'static str,
     pub(crate) verify_summary_title: &'static str,
@@ -727,6 +734,10 @@ impl Messages {
         self.strings().error_openbao_kv_write_failed
     }
 
+    pub(crate) fn error_openbao_kv_read_failed(&self) -> &'static str {
+        self.strings().error_openbao_kv_read_failed
+    }
+
     pub(crate) fn error_openbao_kv_delete_failed(&self) -> &'static str {
         self.strings().error_openbao_kv_delete_failed
     }
@@ -784,6 +795,29 @@ impl Messages {
 
     pub(crate) fn error_ca_json_db_missing(&self) -> &'static str {
         self.strings().error_ca_json_db_missing
+    }
+
+    pub(crate) fn error_ca_cert_missing(&self, path: &str) -> String {
+        format_template(self.strings().error_ca_cert_missing, &[("value", path)])
+    }
+
+    pub(crate) fn error_ca_cert_parse_failed(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_ca_cert_parse_failed,
+            &[("value", path)],
+        )
+    }
+
+    pub(crate) fn error_ca_trust_missing(&self, key: &str) -> String {
+        format_template(self.strings().error_ca_trust_missing, &[("value", key)])
+    }
+
+    pub(crate) fn error_ca_trust_invalid(&self) -> &'static str {
+        self.strings().error_ca_trust_invalid
+    }
+
+    pub(crate) fn error_ca_trust_empty(&self) -> &'static str {
+        self.strings().error_ca_trust_empty
     }
 
     pub(crate) fn error_parse_state_failed(&self) -> &'static str {
@@ -1062,6 +1096,10 @@ impl Messages {
 
     pub(crate) fn app_snippet_docker_title(&self) -> &'static str {
         self.strings().app_snippet_docker_title
+    }
+
+    pub(crate) fn app_snippet_trust_title(&self) -> &'static str {
+        self.strings().app_snippet_trust_title
     }
 
     pub(crate) fn app_snippet_domain_hint(&self, value: &str) -> String {

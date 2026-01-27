@@ -422,6 +422,24 @@ impl OpenBaoClient {
             .await
     }
 
+    /// Reads a KV v2 secret.
+    ///
+    /// # Errors
+    /// Returns an error if the read request fails.
+    pub async fn read_kv(&self, mount: &str, path: &str) -> Result<serde_json::Value> {
+        #[derive(Deserialize)]
+        struct KvResponse {
+            data: KvResponseData,
+        }
+        #[derive(Deserialize)]
+        struct KvResponseData {
+            data: serde_json::Value,
+        }
+        self.get_json::<KvResponse>(&format!("{mount}/data/{path}"), true)
+            .await
+            .map(|response| response.data.data)
+    }
+
     /// Checks if a KV v2 secret exists.
     ///
     /// # Errors

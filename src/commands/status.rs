@@ -4,7 +4,7 @@ use bootroot::openbao::{KvMountStatus, OpenBaoClient};
 use crate::StatusArgs;
 use crate::commands::infra::{ContainerReadiness, collect_readiness, default_infra_services};
 use crate::commands::init::{
-    PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
+    PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
 };
 use crate::i18n::Messages;
 
@@ -50,6 +50,7 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         PATH_STEPCA_PASSWORD,
         PATH_STEPCA_DB,
         PATH_RESPONDER_HMAC,
+        PATH_CA_TRUST,
         PATH_AGENT_EAB,
     ];
     let kv_statuses = if openbao_ok && args.root_token.is_some() {
@@ -213,6 +214,7 @@ fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
             format!("{}/{PATH_STEPCA_PASSWORD}", summary.kv_mount),
             format!("{}/{PATH_STEPCA_DB}", summary.kv_mount),
             format!("{}/{PATH_RESPONDER_HMAC}", summary.kv_mount),
+            format!("{}/{PATH_CA_TRUST}", summary.kv_mount),
             format!("{}/{PATH_AGENT_EAB}", summary.kv_mount),
         ] {
             println!(

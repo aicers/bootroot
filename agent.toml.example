@@ -31,6 +31,13 @@ http_responder_hmac = "change-me"
 http_responder_timeout_secs = 5
 http_responder_token_ttl_secs = 300
 
+# Trust settings for CA bundle verification/storage
+[trust]
+# Path to save the CA bundle (intermediate/root)
+ca_bundle_path = "certs/ca-bundle.pem"
+# SHA-256 fingerprints of trusted CA certs (hex)
+trusted_ca_sha256 = ["<sha256-hex>"]
+
 # Retry settings for issuance attempts
 [retry]
 backoff_secs = [5, 10, 30]

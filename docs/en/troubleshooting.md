@@ -31,6 +31,15 @@ Check your CLI flags. The current CLI supports:
 - Confirm the domain resolves to the responder host
 - Check the agent can reach the responder admin API (port 8080)
 
+## step-ca PostgreSQL connection failures
+
+If you see errors like `dial tcp 127.0.0.1:5432: connect: connection refused`,
+`db.dataSource` in `secrets/config/ca.json` is likely pointing to localhost
+inside the container. In Compose, use the service name (for example,
+`postgres`) instead of `127.0.0.1` or `localhost`.
+
+Restart step-ca after updating the DSN.
+
 ## "Finalize failed: badCSR"
 
 This usually means the CSR SANs are not accepted by the CA policy.
@@ -41,6 +50,15 @@ Check the step-ca provisioner policy and the requested DNS SAN.
 - Check permissions of `profiles.paths` directories
 - Ensure the parent directory exists
 - Verify the user running bootroot-agent can write
+
+## "CA certificate not found" errors
+
+`bootroot init` stores CA fingerprints in OpenBao and requires
+`secrets/certs/root_ca.crt` and `secrets/certs/intermediate_ca.crt`. If those
+files are missing, init fails.
+
+- Confirm step-ca initialization completed
+- Ensure the files exist under `secrets/certs/`
 
 ## ACME directory fetch retries
 

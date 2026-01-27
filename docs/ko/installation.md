@@ -46,6 +46,10 @@ docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
 - `secrets/ca_key`
 - `secrets/intermediate_ca_key`
 
+`bootroot init`는 CA 지문을 OpenBao에 저장하므로,
+`secrets/certs/root_ca.crt`와 `secrets/certs/intermediate_ca.crt`가
+존재해야 합니다. 이 파일이 없으면 `bootroot init`가 실패합니다.
+
 이 문서의 예시는 `-v $(pwd)/secrets:/home/step`로 마운트하기 때문에,
 생성된 파일이 컨테이너의 `/home/step`에 만들어지고, 호스트에서는
 `./secrets/` 디렉터리로 저장됩니다. 즉, 별도의 위치로 옮기지 말고
@@ -86,6 +90,10 @@ postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=<mode>
   `postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable`
 - 운영(SSL 강제):
   `postgresql://step:<secret>@db.internal:5432/stepca?sslmode=require`
+
+**중요**: step-ca가 컨테이너에서 실행 중이면 `db.dataSource`의 호스트는
+**컨테이너 내부 기준**입니다. 따라서 `127.0.0.1`/`localhost`가 아니라
+Compose 서비스 이름(예: `postgres`)을 사용해야 합니다.
 
 `<secret>` 자리는 실제 운영 비밀번호를 넣어야 합니다.
 
@@ -205,6 +213,59 @@ bootroot는 OpenBao Agent를 **호스트 실행하지 않고 Docker로만** 구�
 `role_id`/`secret_id` 파일은 `secrets/apps/<service>/` 아래에 있으며,
 해당 디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
 
+## 개발/테스트 환경 완전 초기화
+
+로컬 환경이 꼬였거나 시크릿을 완전히 새로 만들고 싶다면 아래 절차로
+깨끗하게 초기화하세요. **모든 기존 키/토큰/인증서가 폐기됩니다.**
+
+1. 컨테이너/볼륨 정리:
+
+   ```bash
+   docker compose down -v --remove-orphans
+   ```
+
+2. 기존 시크릿/산출물 삭제(템플릿은 유지):
+
+   ```bash
+   rm -rf certs tmp state.json \
+     secrets/certs secrets/config secrets/db secrets/openbao \
+     secrets/responder secrets/secrets
+   rm -f secrets/password.txt
+   ```
+
+   `secrets/templates`까지 지웠다면 `git checkout -- secrets/templates`로
+   복원하세요.
+
+3. step-ca 재초기화 및 DB DSN 갱신:
+
+   - `step-ca 초기화(최초 1회)` 절차를 다시 수행합니다.
+   - 로컬 Compose라면 `scripts/update-ca-db-dsn.sh`로
+     `secrets/config/ca.json`을 갱신합니다.
+
+4. OpenBao 초기화/언실:
+
+   - OpenBao를 초기화해 `root token`/`unseal keys`를 확보합니다.
+   - OpenBao를 unseal 합니다.
+
+5. bootroot 초기화:
+
+   ```bash
+   bootroot init --auto-generate \
+     --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable"
+   ```
+
+6. 서비스 기동 및 발급 확인:
+
+   ```bash
+   docker compose up -d
+   docker compose run --rm bootroot-agent
+   ```
+
+   `certs/bootroot-agent.crt`에 PEM이 생성되면 정상입니다.
+
+리스폰더 HMAC 불일치가 발생하면 OpenBao의 HMAC 시크릿과
+리스폰더 설정이 일치하는지 확인하고 리스폰더를 재기동하세요.
+
 ## bootroot-agent
 
 ### 바이너리
@@ -217,6 +278,12 @@ cargo build --release
 `--oneshot`은 인증서를 **한 번만 발급**하고 종료하는 옵션입니다. 데몬
 모드로 주기적 갱신을 하려면 이 옵션을 빼고 실행합니다.
 자세한 설정 방법은 **설정** 섹션을 참고하세요.
+
+#### CA 번들 소비 서비스 권한
+
+mTLS를 사용하는 서비스는 `trust.ca_bundle_path`에 저장되는 CA 번들을 읽을
+수 있어야 합니다. 가장 단순한 구성은 bootroot-agent와 해당 서비스를
+같은 사용자/그룹으로 실행하는 것입니다.
 
 ### Docker
 

@@ -13,6 +13,8 @@ use bootroot::db::{
 use bootroot::fs_util;
 use bootroot::openbao::{InitResponse, OpenBaoClient};
 use reqwest::StatusCode;
+use ring::digest;
+use x509_parser::pem::parse_x509_pem;
 
 use crate::InitArgs;
 use crate::cli::output::{print_init_plan, print_init_summary};
@@ -54,6 +56,10 @@ const OPENBAO_AGENT_RESPONDER_SERVICE: &str = "openbao-agent-responder";
 const DEFAULT_EAB_ENDPOINT_PATH: &str = "eab";
 const DEFAULT_DB_USER: &str = "stepca";
 const DEFAULT_DB_NAME: &str = "stepca";
+const CA_CERTS_DIR: &str = "certs";
+const CA_ROOT_CERT_FILENAME: &str = "root_ca.crt";
+const CA_INTERMEDIATE_CERT_FILENAME: &str = "intermediate_ca.crt";
+const CA_TRUST_KEY: &str = "trusted_ca_sha256";
 
 mod openbao_constants {
     pub(crate) const INIT_SECRET_SHARES: u8 = 3;
@@ -73,13 +79,14 @@ mod openbao_constants {
     pub(crate) const PATH_STEPCA_DB: &str = "bootroot/stepca/db";
     pub(crate) const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
     pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
+    pub(crate) const PATH_CA_TRUST: &str = "bootroot/ca";
 }
 
 pub(crate) use openbao_constants::{
     APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_STEPCA,
-    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
-    PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER, POLICY_BOOTROOT_STEPCA,
-    SECRET_ID_TTL, TOKEN_TTL,
+    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC,
+    PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER,
+    POLICY_BOOTROOT_STEPCA, SECRET_ID_TTL, TOKEN_TTL,
 };
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
@@ -187,6 +194,14 @@ async fn run_init_inner(
     }
 
     let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
+    write_ca_trust_fingerprints_with_retry(
+        client,
+        &args.kv_mount,
+        &secrets_dir,
+        rollback,
+        messages,
+    )
+    .await?;
     let compose_has_responder = compose_has_responder(&args.compose_file, messages)?;
     let responder_url = resolve_responder_url(args, compose_has_responder);
     let responder_check =
@@ -908,6 +923,85 @@ async fn write_openbao_secrets_with_retry(
         }
     }
     Ok(())
+}
+
+async fn write_ca_trust_fingerprints_with_retry(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    secrets_dir: &Path,
+    rollback: &mut InitRollback,
+    messages: &Messages,
+) -> Result<()> {
+    let fingerprints = compute_ca_fingerprints(secrets_dir, messages).await?;
+    if !client
+        .kv_exists(kv_mount, PATH_CA_TRUST)
+        .await
+        .with_context(|| messages.error_openbao_kv_exists_failed())?
+    {
+        rollback.written_kv_paths.push(PATH_CA_TRUST.to_string());
+    }
+    let attempt = client
+        .write_kv(
+            kv_mount,
+            PATH_CA_TRUST,
+            serde_json::json!({ CA_TRUST_KEY: fingerprints }),
+        )
+        .await;
+    if let Err(err) = attempt {
+        let message = err.to_string();
+        if message.contains("No secret engine mount") {
+            client
+                .ensure_kv_v2(kv_mount)
+                .await
+                .with_context(|| messages.error_openbao_kv_mount_failed())?;
+            client
+                .write_kv(
+                    kv_mount,
+                    PATH_CA_TRUST,
+                    serde_json::json!({ CA_TRUST_KEY: fingerprints }),
+                )
+                .await
+                .with_context(|| messages.error_openbao_kv_write_failed())?;
+        } else {
+            return Err(err).with_context(|| messages.error_openbao_kv_write_failed());
+        }
+    }
+    Ok(())
+}
+
+async fn compute_ca_fingerprints(secrets_dir: &Path, messages: &Messages) -> Result<Vec<String>> {
+    let certs_dir = secrets_dir.join(CA_CERTS_DIR);
+    let root_path = certs_dir.join(CA_ROOT_CERT_FILENAME);
+    let intermediate_path = certs_dir.join(CA_INTERMEDIATE_CERT_FILENAME);
+    let root = read_ca_cert_fingerprint(&root_path, messages).await?;
+    let intermediate = read_ca_cert_fingerprint(&intermediate_path, messages).await?;
+    Ok(vec![root, intermediate])
+}
+
+async fn read_ca_cert_fingerprint(path: &Path, messages: &Messages) -> Result<String> {
+    if !path.exists() {
+        anyhow::bail!(messages.error_ca_cert_missing(&path.display().to_string()));
+    }
+    let contents = tokio::fs::read(path)
+        .await
+        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+    let (_, pem) = parse_x509_pem(&contents).map_err(|_| {
+        anyhow::anyhow!(messages.error_ca_cert_parse_failed(&path.display().to_string()))
+    })?;
+    if pem.label != "CERTIFICATE" {
+        anyhow::bail!(messages.error_ca_cert_parse_failed(&path.display().to_string()));
+    }
+    Ok(sha256_hex(&pem.contents))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = digest::digest(&digest::SHA256, bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
 }
 
 async fn ensure_openbao_initialized(
@@ -1782,6 +1876,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value, "value");
+    }
+
+    #[test]
+    fn test_compute_ca_fingerprints_reads_cert_files() {
+        let dir = tempdir().expect("temp dir");
+        let secrets_dir = dir.path().join("secrets");
+        let certs_dir = secrets_dir.join(CA_CERTS_DIR);
+        fs::create_dir_all(&certs_dir).expect("create certs");
+
+        let root = test_cert_pem("root.example");
+        let intermediate = test_cert_pem("intermediate.example");
+        fs::write(certs_dir.join(CA_ROOT_CERT_FILENAME), root).expect("write root cert");
+        fs::write(certs_dir.join(CA_INTERMEDIATE_CERT_FILENAME), intermediate)
+            .expect("write intermediate cert");
+
+        let messages = test_messages();
+        let fingerprints = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(compute_ca_fingerprints(&secrets_dir, &messages))
+            .expect("compute fingerprints");
+        assert_eq!(fingerprints.len(), 2);
+        for fingerprint in fingerprints {
+            assert_eq!(fingerprint.len(), 64);
+            assert!(fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()));
+        }
+    }
+
+    fn test_cert_pem(common_name: &str) -> String {
+        let mut params =
+            rcgen::CertificateParams::new(vec![common_name.to_string()]).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let key = rcgen::KeyPair::generate().expect("key pair");
+        let cert = params.self_signed(&key).expect("self signed");
+        cert.pem()
     }
 
     #[test]

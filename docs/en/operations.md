@@ -11,6 +11,8 @@ If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
 - Ensure key/secret permissions stay `0600`/`0700` on disk.
 - Use hooks to reload dependent services after renewals
   (hook definitions live in **Configuration**).
+- Services that use mTLS must be able to read the CA bundle
+  (for example, `trust.ca_bundle_path`).
 
 ## step-ca + PostgreSQL
 
@@ -68,3 +70,20 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+## CA bundle (trust) operations
+
+When `trust` is enabled, bootroot-agent **splits the leaf and chain** from the
+ACME response, stores the leaf cert/key, and writes the chain (intermediate/root)
+to `ca_bundle_path`. This bundle is used for mTLS peer verification.
+
+- `trust.ca_bundle_path` is the **CA bundle output path**.
+- If `trust.trusted_ca_sha256` is set, the response chain **must pass
+  fingerprint verification** or issuance fails.
+- If no chain is present, the CA bundle is not written (logged).
+
+Permissions/ownership:
+
+- The **service consuming** the CA bundle must be able to read the file.
+- The simplest setup is running bootroot-agent and the service as the **same
+  user or group**.

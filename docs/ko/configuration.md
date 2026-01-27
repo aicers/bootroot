@@ -138,6 +138,35 @@ HTTP-01 리스폰더와 ACME 재시도 동작을 제어합니다.
 - `http_responder_timeout_secs`: 리스폰더 요청 타임아웃(초)
 - `http_responder_token_ttl_secs`: 토큰 TTL(초)
 
+### 신뢰
+
+```toml
+[trust]
+ca_bundle_path = "/etc/bootroot/ca-bundle.pem"
+trusted_ca_sha256 = ["<sha256-hex>"]
+```
+
+mTLS 신뢰를 위해 CA 번들을 저장하고 검증하는 설정입니다.
+
+- `ca_bundle_path`: bootroot-agent가 CA 번들(중간/루트)을 **저장할 경로**입니다.
+- `trusted_ca_sha256`: 신뢰할 CA 인증서 지문 목록(SHA-256 hex)입니다.
+
+`trusted_ca_sha256`는 **임의 값이 아니라 실제 CA 인증서 지문**입니다.
+`bootroot init`이 CA 지문을 OpenBao에 저장하며,
+`bootroot app add` 출력의 agent.toml 스니펫에 **신뢰 지문 목록이 포함**됩니다.
+따라서 일반적인 운영 흐름에서는 app add가 제시한 값을 그대로 사용하면 됩니다.
+
+만약 스니펫에 `trusted_ca_sha256`가 나오지 않는다면 다음을 확인하세요.
+
+- step-ca 초기화로 `secrets/certs/root_ca.crt`,
+  `secrets/certs/intermediate_ca.crt`가 생성되어 있는지
+- `bootroot init`이 같은 `secrets_dir`을 사용해 실행되었는지
+
+권한 참고: CA 번들을 사용하는 서비스가 `ca_bundle_path`를 읽을 수 있어야
+합니다. 가장 간단한 방법은 bootroot-agent와 서비스를 동일 사용자/그룹으로
+실행하는 것이며, 그렇지 않다면 파일과 상위 디렉터리에 읽기 권한을 부여해야
+합니다.
+
 ### 재시도 설정
 
 ```toml

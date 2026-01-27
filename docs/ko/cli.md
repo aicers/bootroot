@@ -168,6 +168,15 @@ bootroot status
 OpenBao Agent를 구동하고, 앱을 실행해 **앱 간 통신에서 발급된
 mTLS 인증서가 올바르게 사용되도록 구성**해야 합니다.
 
+추가로, `bootroot app add`만으로는 인증서가 자동 발급되지 않습니다.
+step-ca로부터 실제 인증서를 받으려면 **bootroot-agent 설정/실행**이
+필수입니다. 자세한 bootroot-agent 설정은 매뉴얼의 해당 섹션을
+참고하세요(설치/운영/설정 문서의 bootroot-agent 항목).
+
+`bootroot init`이 OpenBao에 CA 지문을 저장해 둔 경우(예: `secret/bootroot/ca`),
+이 명령은 `trusted_ca_sha256` 값을 **agent.toml 스니펫에 포함**해 출력합니다.
+해당 값이 없다면 스니펫에는 포함되지 않으므로, 필요 시 수동으로 설정하세요.
+
 앱이 다른 머신에서 실행된다면, 해당 머신에서 bootroot-agent가 같은
 `agent.toml`을 사용하도록 설정해야 합니다. `--cert-path`/`--key-path`
 도 앱이 실행되는 머신 기준으로 맞춰야 합니다. 이 명령은 경로/스니펫을
