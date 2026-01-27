@@ -5,6 +5,9 @@ use anyhow::Result;
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 
+mod defaults;
+mod validation;
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub email: String,
@@ -58,11 +61,11 @@ pub struct DaemonProfileSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct DaemonRuntimeSettings {
-    #[serde(default = "default_check_interval", with = "duration_serde")]
+    #[serde(default = "defaults::default_check_interval", with = "duration_serde")]
     pub check_interval: Duration,
-    #[serde(default = "default_renew_before", with = "duration_serde")]
+    #[serde(default = "defaults::default_renew_before", with = "duration_serde")]
     pub renew_before: Duration,
-    #[serde(default = "default_check_jitter", with = "duration_serde")]
+    #[serde(default = "defaults::default_check_jitter", with = "duration_serde")]
     pub check_jitter: Duration,
 }
 
@@ -94,7 +97,7 @@ pub struct TrustSettings {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct SchedulerSettings {
-    #[serde(default = "default_max_concurrent_issuances")]
+    #[serde(default = "defaults::default_max_concurrent_issuances")]
     pub max_concurrent_issuances: u64,
 }
 
@@ -119,7 +122,7 @@ pub struct HookCommand {
     pub args: Vec<String>,
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
-    #[serde(default = "default_hook_timeout_secs")]
+    #[serde(default = "defaults::default_hook_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default)]
     pub retry_backoff_secs: Vec<u64>,
@@ -137,47 +140,12 @@ pub enum HookFailurePolicy {
     Stop,
 }
 
-const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
-const DEFAULT_EMAIL: &str = "admin@example.com";
-const DEFAULT_DOMAIN: &str = "trusted.domain";
-const DEFAULT_CHECK_INTERVAL_SECS: u64 = 60 * 60;
-const DEFAULT_RENEW_BEFORE_SECS: u64 = 720 * 60 * 60;
-const DEFAULT_CHECK_JITTER_SECS: u64 = 0;
-const DEFAULT_HTTP_RESPONDER_URL: &str = "http://localhost:8080";
-const DEFAULT_HTTP_RESPONDER_HMAC: &str = "";
-const DEFAULT_HTTP_RESPONDER_TIMEOUT_SECS: u64 = 5;
-const DEFAULT_HTTP_RESPONDER_TOKEN_TTL_SECS: u64 = 300;
-const DEFAULT_DIRECTORY_FETCH_ATTEMPTS: u64 = 10;
-const DEFAULT_DIRECTORY_FETCH_BASE_DELAY_SECS: u64 = 1;
-const DEFAULT_DIRECTORY_FETCH_MAX_DELAY_SECS: u64 = 10;
-const DEFAULT_POLL_ATTEMPTS: u64 = 15;
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
-const DEFAULT_RETRY_BACKOFF_SECS: [u64; 3] = [5, 10, 30];
-const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_MAX_CONCURRENT_ISSUANCES: u64 = 3;
-
-fn default_hook_timeout_secs() -> u64 {
-    DEFAULT_HOOK_TIMEOUT_SECS
-}
-
-fn default_check_interval() -> Duration {
-    Duration::from_secs(DEFAULT_CHECK_INTERVAL_SECS)
-}
-
-fn default_renew_before() -> Duration {
-    Duration::from_secs(DEFAULT_RENEW_BEFORE_SECS)
-}
-
-fn default_check_jitter() -> Duration {
-    Duration::from_secs(DEFAULT_CHECK_JITTER_SECS)
-}
-
 impl Default for DaemonRuntimeSettings {
     fn default() -> Self {
         Self {
-            check_interval: default_check_interval(),
-            renew_before: default_renew_before(),
-            check_jitter: default_check_jitter(),
+            check_interval: defaults::default_check_interval(),
+            renew_before: defaults::default_renew_before(),
+            check_jitter: defaults::default_check_jitter(),
         }
     }
 }
@@ -196,10 +164,6 @@ mod duration_serde {
     }
 }
 
-fn default_max_concurrent_issuances() -> u64 {
-    DEFAULT_MAX_CONCURRENT_ISSUANCES
-}
-
 impl Settings {
     /// Creates a new `Settings` instance.
     ///
@@ -209,39 +173,7 @@ impl Settings {
         let mut s = Config::builder();
 
         // 1. Set Defaults
-        s = s
-            .set_default("server", DEFAULT_SERVER)?
-            .set_default("email", DEFAULT_EMAIL)?
-            .set_default("domain", DEFAULT_DOMAIN)?
-            .set_default("acme.http_responder_url", DEFAULT_HTTP_RESPONDER_URL)?
-            .set_default("acme.http_responder_hmac", DEFAULT_HTTP_RESPONDER_HMAC)?
-            .set_default(
-                "acme.http_responder_timeout_secs",
-                DEFAULT_HTTP_RESPONDER_TIMEOUT_SECS,
-            )?
-            .set_default(
-                "acme.http_responder_token_ttl_secs",
-                DEFAULT_HTTP_RESPONDER_TOKEN_TTL_SECS,
-            )?
-            .set_default(
-                "acme.directory_fetch_attempts",
-                DEFAULT_DIRECTORY_FETCH_ATTEMPTS,
-            )?
-            .set_default(
-                "acme.directory_fetch_base_delay_secs",
-                DEFAULT_DIRECTORY_FETCH_BASE_DELAY_SECS,
-            )?
-            .set_default(
-                "acme.directory_fetch_max_delay_secs",
-                DEFAULT_DIRECTORY_FETCH_MAX_DELAY_SECS,
-            )?
-            .set_default("acme.poll_attempts", DEFAULT_POLL_ATTEMPTS)?
-            .set_default("acme.poll_interval_secs", DEFAULT_POLL_INTERVAL_SECS)?
-            .set_default("retry.backoff_secs", DEFAULT_RETRY_BACKOFF_SECS.to_vec())?
-            .set_default(
-                "scheduler.max_concurrent_issuances",
-                DEFAULT_MAX_CONCURRENT_ISSUANCES,
-            )?;
+        s = defaults::apply_defaults(s)?;
 
         // 2. Merge File (optional)
         // If config_path is provided, use it. Otherwise look for "agent.toml"
@@ -287,161 +219,7 @@ impl Settings {
     /// # Errors
     /// Returns error if any setting is invalid or out of range.
     pub fn validate(&self) -> Result<()> {
-        if self.domain.trim().is_empty() {
-            anyhow::bail!("domain must not be empty");
-        }
-        if !self.domain.is_ascii() {
-            anyhow::bail!("domain must be ASCII");
-        }
-        if self.acme.directory_fetch_attempts == 0 {
-            anyhow::bail!("acme.directory_fetch_attempts must be greater than 0");
-        }
-        if self.acme.http_responder_url.trim().is_empty() {
-            anyhow::bail!("acme.http_responder_url must not be empty");
-        }
-        if self.acme.http_responder_hmac.trim().is_empty() {
-            anyhow::bail!("acme.http_responder_hmac must not be empty");
-        }
-        if self.acme.http_responder_timeout_secs == 0 {
-            anyhow::bail!("acme.http_responder_timeout_secs must be greater than 0");
-        }
-        if self.acme.http_responder_token_ttl_secs == 0 {
-            anyhow::bail!("acme.http_responder_token_ttl_secs must be greater than 0");
-        }
-        if self.acme.poll_attempts == 0 {
-            anyhow::bail!("acme.poll_attempts must be greater than 0");
-        }
-        if self.acme.poll_interval_secs == 0 {
-            anyhow::bail!("acme.poll_interval_secs must be greater than 0");
-        }
-        if self.acme.directory_fetch_base_delay_secs == 0 {
-            anyhow::bail!("acme.directory_fetch_base_delay_secs must be greater than 0");
-        }
-        if self.acme.directory_fetch_max_delay_secs == 0 {
-            anyhow::bail!("acme.directory_fetch_max_delay_secs must be greater than 0");
-        }
-        if self.acme.directory_fetch_base_delay_secs > self.acme.directory_fetch_max_delay_secs {
-            anyhow::bail!(
-                "acme.directory_fetch_base_delay_secs must be <= acme.directory_fetch_max_delay_secs"
-            );
-        }
-        if self.retry.backoff_secs.is_empty() {
-            anyhow::bail!("retry.backoff_secs must not be empty");
-        }
-        Self::validate_retry_settings(&self.retry.backoff_secs, "retry.backoff_secs")?;
-        Self::validate_trust_settings(&self.trust)?;
-        if self.scheduler.max_concurrent_issuances == 0 {
-            anyhow::bail!("scheduler.max_concurrent_issuances must be greater than 0");
-        }
-        if self.profiles.is_empty() {
-            anyhow::bail!("profiles must not be empty");
-        }
-        for profile in &self.profiles {
-            Self::validate_profile(profile)?;
-        }
-        Ok(())
-    }
-
-    fn validate_trust_settings(trust: &TrustSettings) -> Result<()> {
-        if trust.ca_bundle_path.is_some() || !trust.trusted_ca_sha256.is_empty() {
-            if trust.ca_bundle_path.is_none() {
-                anyhow::bail!("trust.ca_bundle_path must be set when trust is configured");
-            }
-            if trust.trusted_ca_sha256.is_empty() {
-                anyhow::bail!("trust.trusted_ca_sha256 must not be empty when trust is configured");
-            }
-        }
-        if let Some(path) = &trust.ca_bundle_path
-            && path.as_os_str().is_empty()
-        {
-            anyhow::bail!("trust.ca_bundle_path must not be empty");
-        }
-        for fingerprint in &trust.trusted_ca_sha256 {
-            Self::validate_sha256_fingerprint(fingerprint)?;
-        }
-        Ok(())
-    }
-
-    fn validate_sha256_fingerprint(value: &str) -> Result<()> {
-        if value.len() != 64 {
-            anyhow::bail!("trust.trusted_ca_sha256 must be 64 hex chars");
-        }
-        if !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            anyhow::bail!("trust.trusted_ca_sha256 must be hex");
-        }
-        Ok(())
-    }
-
-    fn validate_profile(profile: &DaemonProfileSettings) -> Result<()> {
-        if profile.service_name.trim().is_empty() {
-            anyhow::bail!("profiles.service_name must not be empty");
-        }
-        if profile.hostname.trim().is_empty() {
-            anyhow::bail!("profiles.hostname must not be empty");
-        }
-        if !profile.service_name.is_ascii() {
-            anyhow::bail!("profiles.service_name must be ASCII");
-        }
-        if !profile.hostname.is_ascii() {
-            anyhow::bail!("profiles.hostname must be ASCII");
-        }
-        if profile.instance_id.trim().is_empty() {
-            anyhow::bail!("profiles.instance_id must not be empty");
-        }
-        if !profile.instance_id.chars().all(|ch| ch.is_ascii_digit()) {
-            anyhow::bail!("profiles.instance_id must be numeric");
-        }
-        if profile.paths.cert.as_os_str().is_empty() {
-            anyhow::bail!("profiles.paths.cert must not be empty");
-        }
-        if profile.paths.key.as_os_str().is_empty() {
-            anyhow::bail!("profiles.paths.key must not be empty");
-        }
-        if let Some(retry) = &profile.retry {
-            Self::validate_retry_settings(&retry.backoff_secs, "profiles.retry.backoff_secs")?;
-        }
-        Self::validate_hook_commands(
-            &profile.hooks.post_renew.success,
-            "profiles.hooks.post_renew.success",
-        )?;
-        Self::validate_hook_commands(
-            &profile.hooks.post_renew.failure,
-            "profiles.hooks.post_renew.failure",
-        )?;
-        Ok(())
-    }
-
-    fn validate_hook_commands(hooks: &[HookCommand], label: &str) -> Result<()> {
-        for hook in hooks {
-            if hook.command.trim().is_empty() {
-                anyhow::bail!("{label} hook command must not be empty");
-            }
-            if let Some(working_dir) = &hook.working_dir
-                && working_dir.as_os_str().is_empty()
-            {
-                anyhow::bail!("{label} hook working_dir must not be empty");
-            }
-            if hook.timeout_secs == 0 {
-                anyhow::bail!("{label} hook timeout_secs must be greater than 0");
-            }
-            Self::validate_retry_settings(
-                &hook.retry_backoff_secs,
-                &format!("{label} hook retry_backoff_secs"),
-            )?;
-            if let Some(max_output_bytes) = hook.max_output_bytes
-                && max_output_bytes == 0
-            {
-                anyhow::bail!("{label} hook max_output_bytes must be greater than 0");
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_retry_settings(backoff_secs: &[u64], label: &str) -> Result<()> {
-        if backoff_secs.contains(&0) {
-            anyhow::bail!("{label} values must be greater than 0");
-        }
-        Ok(())
+        validation::validate_settings(self)
     }
 }
 
