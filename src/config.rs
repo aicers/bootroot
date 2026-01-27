@@ -14,6 +14,8 @@ pub struct Settings {
     pub acme: AcmeSettings,
     pub retry: RetrySettings,
     #[serde(default)]
+    pub trust: TrustSettings,
+    #[serde(default)]
     pub scheduler: SchedulerSettings,
     #[serde(default)]
     pub profiles: Vec<DaemonProfileSettings>,
@@ -80,6 +82,14 @@ pub struct AcmeSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RetrySettings {
     pub backoff_secs: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TrustSettings {
+    #[serde(default)]
+    pub ca_bundle_path: Option<PathBuf>,
+    #[serde(default)]
+    pub trusted_ca_sha256: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -248,7 +258,8 @@ impl Settings {
                 .try_parsing(true)
                 .ignore_empty(true)
                 .list_separator(",")
-                .with_list_parse_key("retry.backoff_secs"),
+                .with_list_parse_key("retry.backoff_secs")
+                .with_list_parse_key("trust.trusted_ca_sha256"),
         );
 
         // 4. Build
@@ -318,6 +329,7 @@ impl Settings {
             anyhow::bail!("retry.backoff_secs must not be empty");
         }
         Self::validate_retry_settings(&self.retry.backoff_secs, "retry.backoff_secs")?;
+        Self::validate_trust_settings(&self.trust)?;
         if self.scheduler.max_concurrent_issuances == 0 {
             anyhow::bail!("scheduler.max_concurrent_issuances must be greater than 0");
         }
@@ -326,6 +338,36 @@ impl Settings {
         }
         for profile in &self.profiles {
             Self::validate_profile(profile)?;
+        }
+        Ok(())
+    }
+
+    fn validate_trust_settings(trust: &TrustSettings) -> Result<()> {
+        if trust.ca_bundle_path.is_some() || !trust.trusted_ca_sha256.is_empty() {
+            if trust.ca_bundle_path.is_none() {
+                anyhow::bail!("trust.ca_bundle_path must be set when trust is configured");
+            }
+            if trust.trusted_ca_sha256.is_empty() {
+                anyhow::bail!("trust.trusted_ca_sha256 must not be empty when trust is configured");
+            }
+        }
+        if let Some(path) = &trust.ca_bundle_path
+            && path.as_os_str().is_empty()
+        {
+            anyhow::bail!("trust.ca_bundle_path must not be empty");
+        }
+        for fingerprint in &trust.trusted_ca_sha256 {
+            Self::validate_sha256_fingerprint(fingerprint)?;
+        }
+        Ok(())
+    }
+
+    fn validate_sha256_fingerprint(value: &str) -> Result<()> {
+        if value.len() != 64 {
+            anyhow::bail!("trust.trusted_ca_sha256 must be 64 hex chars");
+        }
+        if !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            anyhow::bail!("trust.trusted_ca_sha256 must be hex");
         }
         Ok(())
     }

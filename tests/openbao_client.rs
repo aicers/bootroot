@@ -61,6 +61,37 @@ async fn write_kv_uses_v2_path() {
 }
 
 #[tokio::test]
+async fn read_kv_returns_data() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "data": {
+                    "trusted_ca_sha256": ["abc123"]
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+
+    let data = client
+        .read_kv("secret", "bootroot/ca")
+        .await
+        .expect("read_kv should succeed");
+    assert_eq!(
+        data,
+        json!({
+            "trusted_ca_sha256": ["abc123"]
+        })
+    );
+}
+
+#[tokio::test]
 async fn policy_exists_returns_false_on_404() {
     let server = MockServer::start().await;
 

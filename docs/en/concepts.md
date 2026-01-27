@@ -10,6 +10,17 @@ This section gives you enough background to understand what you are operating.
   the CA signature.
 - A **private key** must be protected. It proves possession of the identity.
 
+### step-ca standard CA layout
+
+step-ca uses a **root CA + intermediate CA** layout by default. The
+intermediate issues end-entity certificates, while the root signs the
+intermediate.
+
+bootroot keeps this structure, and the following files are created:
+
+- `root_ca.crt`: root CA certificate
+- `intermediate_ca.crt`: intermediate CA certificate
+
 ## SAN (Subject Alternative Name)
 
 SANs are the identities inside the certificate. Common types:
@@ -25,6 +36,27 @@ In the bootroot CLI ecosystem, DNS SANs use this format (same for daemon and doc
 
 Mutual TLS requires both client and server to present certificates.
 If you control issuance and renewal, you can automate mTLS safely.
+
+In bootroot, the default trust model is **"accept only certificates issued by
+the same step-ca"**. In practice, both peers must validate back to the **same
+CA chain** for the connection to be allowed. The artifact used for that
+validation is the **CA bundle**.
+
+### CA bundle
+
+A CA bundle is a file containing the **root and intermediate certificates**
+that you trust. Services use it as the trust store (the set of trusted CAs)
+for verifying peer certificates.
+
+- bootroot-agent splits the chain from the ACME response and writes it to
+  `ca_bundle_path`.
+- mTLS services load that bundle to **accept only certificates issued by the
+  same step-ca**.
+
+The ACME certificate response is typically a **concatenated PEM** string.
+The first PEM block is the **leaf certificate**, followed by the **chain**
+(intermediate/root). bootroot-agent parses the PEM blocks in order, keeps the
+first block as the leaf, and writes the remaining blocks to `ca_bundle_path`.
 
 ## CSR (Certificate Signing Request)
 

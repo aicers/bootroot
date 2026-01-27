@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rcgen::{CertificateParams, DnType, KeyPair};
 use serde_json::json;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -51,6 +52,7 @@ pub(crate) fn create_secrets_dir(root: &Path) -> Result<PathBuf> {
     let secrets_dir = root.join("secrets");
     fs::create_dir_all(secrets_dir.join("config"))
         .context("Failed to create secrets config dir")?;
+    fs::create_dir_all(secrets_dir.join("certs")).context("Failed to create certs dir")?;
     fs::create_dir_all(secrets_dir.join("secrets")).context("Failed to create secrets key dir")?;
     fs::write(
         secrets_dir.join("config").join("ca.json"),
@@ -61,7 +63,27 @@ pub(crate) fn create_secrets_dir(root: &Path) -> Result<PathBuf> {
         .context("Failed to write root_ca_key")?;
     fs::write(secrets_dir.join("secrets").join("intermediate_ca_key"), "")
         .context("Failed to write intermediate_ca_key")?;
+    fs::write(
+        secrets_dir.join("certs").join("root_ca.crt"),
+        test_cert_pem("root.example"),
+    )
+    .context("Failed to write root_ca.crt")?;
+    fs::write(
+        secrets_dir.join("certs").join("intermediate_ca.crt"),
+        test_cert_pem("intermediate.example"),
+    )
+    .context("Failed to write intermediate_ca.crt")?;
     Ok(secrets_dir)
+}
+
+fn test_cert_pem(common_name: &str) -> String {
+    let mut params = CertificateParams::new(vec![common_name.to_string()]).expect("params");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    let key = KeyPair::generate().expect("key pair");
+    let cert = params.self_signed(&key).expect("self signed");
+    cert.pem()
 }
 
 pub(crate) fn write_password_file(secrets_dir: &Path, contents: &str) -> Result<()> {
@@ -127,7 +149,7 @@ pub(crate) async fn stub_openbao_sealed(server: &MockServer) {
     stub_kv_secrets(server).await;
 }
 
-pub(crate) async fn expect_rollback_deletes(server: &MockServer) {
+pub(crate) async fn expect_rollback_deletes(server: &MockServer, include_ca_trust: bool) {
     for policy in ["bootroot-agent", "bootroot-responder", "bootroot-stepca"] {
         Mock::given(method("DELETE"))
             .and(path(format!("/v1/sys/policies/acl/{policy}")))
@@ -152,11 +174,15 @@ pub(crate) async fn expect_rollback_deletes(server: &MockServer) {
             .await;
     }
 
-    for secret in [
+    let mut secrets = vec![
         "bootroot/stepca/password",
         "bootroot/stepca/db",
         "bootroot/responder/hmac",
-    ] {
+    ];
+    if include_ca_trust {
+        secrets.push("bootroot/ca");
+    }
+    for secret in secrets {
         Mock::given(method("DELETE"))
             .and(path(format!("/v1/secret/metadata/{secret}")))
             .and(header("X-Vault-Token", ROOT_TOKEN))
@@ -324,6 +350,7 @@ async fn stub_kv_secrets(server: &MockServer) {
         "bootroot/stepca/db",
         "bootroot/responder/hmac",
         "bootroot/agent/eab",
+        "bootroot/ca",
     ] {
         Mock::given(method("POST"))
             .and(path(format!("/v1/secret/data/{secret}")))
@@ -340,6 +367,7 @@ async fn stub_kv_secrets_with_failure(server: &MockServer, failing_secret: &str)
         "bootroot/stepca/db",
         "bootroot/responder/hmac",
         "bootroot/agent/eab",
+        "bootroot/ca",
     ] {
         let response = if secret == failing_secret {
             ResponseTemplate::new(500)

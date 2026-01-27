@@ -315,7 +315,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AcmeSettings, DaemonProfileSettings, DaemonRuntimeSettings, HookCommand, HookSettings,
-        Paths, PostRenewHooks, RetrySettings, SchedulerSettings, Settings,
+        Paths, PostRenewHooks, RetrySettings, SchedulerSettings, Settings, TrustSettings,
     };
 
     const TEST_DOMAIN: &str = "trusted.domain";
@@ -364,6 +364,7 @@ mod tests {
             retry: RetrySettings {
                 backoff_secs: vec![1, 2, 3],
             },
+            trust: TrustSettings::default(),
             scheduler: SchedulerSettings {
                 max_concurrent_issuances: 1,
             },

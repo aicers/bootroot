@@ -67,6 +67,26 @@ pub async fn write_cert_and_key(
     Ok(())
 }
 
+/// Writes a CA bundle to disk, creating parent directories as needed.
+///
+/// # Errors
+/// Returns an error if the directory cannot be created or the bundle cannot be written.
+pub async fn write_ca_bundle(bundle_path: &Path, bundle_pem: &str) -> Result<()> {
+    let bundle_dir = bundle_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("CA bundle path has no parent directory"))?;
+    fs::create_dir_all(bundle_dir).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create CA bundle dir {}: {e}",
+            bundle_dir.display()
+        )
+    })?;
+    fs::write(bundle_path, bundle_pem)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to write CA bundle file: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;

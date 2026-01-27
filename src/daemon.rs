@@ -454,6 +454,7 @@ mod tests {
             retry: RetrySettings {
                 backoff_secs: backoff,
             },
+            trust: config::TrustSettings::default(),
             scheduler: SchedulerSettings {
                 max_concurrent_issuances: 1,
             },

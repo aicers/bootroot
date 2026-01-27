@@ -31,6 +31,15 @@ CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서�
 - 도메인이 리스폰더 호스트로 해석되는지 확인
 - 에이전트가 리스폰더 관리자 API(포트 8080)에 접근 가능한지 확인
 
+## step-ca PostgreSQL 연결 실패
+
+`dial tcp 127.0.0.1:5432: connect: connection refused` 같은 오류가 나오면
+`secrets/config/ca.json`의 `db.dataSource`가 컨테이너 내부 기준으로
+잘못 설정된 경우가 많습니다. Compose 환경에서는 `localhost` 대신
+서비스 이름(예: `postgres`)을 사용해야 합니다.
+
+수정 후에는 step-ca를 재시작하세요.
+
 ## "Finalize failed: badCSR"
 
 CSR에 포함된 SAN이 CA 정책에 맞지 않을 때 발생합니다.
@@ -41,6 +50,15 @@ step-ca 프로비저너 정책과 요청 DNS SAN을 확인하세요.
 - `profiles.paths` 경로 권한 확인
 - 상위 디렉터리 존재 여부 확인
 - 실행 사용자 쓰기 권한 확인
+
+## "CA 인증서 파일이 없습니다" 오류
+
+`bootroot init`는 CA 지문을 OpenBao에 저장하기 위해
+`secrets/certs/root_ca.crt`와 `secrets/certs/intermediate_ca.crt`가 필요합니다.
+해당 파일이 없으면 init이 실패합니다.
+
+- step-ca 초기화가 끝났는지 확인
+- `secrets/certs/` 아래에 위 파일이 있는지 확인
 
 ## ACME 디렉터리 재시도 반복
 

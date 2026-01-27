@@ -47,6 +47,9 @@ After initialization, these files are created (examples):
 - `secrets/ca_key`
 - `secrets/intermediate_ca_key`
 
+`bootroot init` stores CA fingerprints in OpenBao, so
+`secrets/certs/root_ca.crt` and `secrets/certs/intermediate_ca.crt` must
+exist. If they are missing, `bootroot init` will fail.
 Because the example mounts `-v $(pwd)/secrets:/home/step`, the files are
 created under `/home/step` in the container and appear under `./secrets/` on
 the host. Keep them in `./secrets/` so `secrets/config/ca.json` stays valid.
@@ -83,6 +86,10 @@ Examples:
   `postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable`
 - Production (TLS enforced):
   `postgresql://step:<secret>@db.internal:5432/stepca?sslmode=require`
+
+**Important**: When step-ca runs in a container, the `db.dataSource` host is
+**inside the container network**. Use the Compose service name (for example,
+`postgres`), not `127.0.0.1` or `localhost`.
 
 `<secret>` is your real database password.
 
@@ -190,6 +197,60 @@ for reference.
 `role_id`/`secret_id` live under `secrets/apps/<service>/`. Keep the
 directory `0700` and the files `0600`.
 
+## Full reset (dev/test)
+
+If your local environment is in a bad state or you want to regenerate all
+secrets from scratch, use this clean reset. **All existing keys/tokens/certs
+will be discarded.**
+
+1. Stop containers and remove volumes:
+
+   ```bash
+   docker compose down -v --remove-orphans
+   ```
+
+2. Remove secrets and outputs (keep templates):
+
+   ```bash
+   rm -rf certs tmp state.json \
+     secrets/certs secrets/config secrets/db secrets/openbao \
+     secrets/responder secrets/secrets
+   rm -f secrets/password.txt
+   ```
+
+   If you removed `secrets/templates`, restore it with
+   `git checkout -- secrets/templates`.
+
+3. Re-initialize step-ca and update the DB DSN:
+
+   - Repeat the `Initialize step-ca (first run)` steps above.
+   - For local Compose, run `scripts/update-ca-db-dsn.sh` to refresh
+     `secrets/config/ca.json`.
+
+4. Initialize and unseal OpenBao:
+
+   - Initialize OpenBao and capture the `root token` and `unseal keys`.
+   - Unseal OpenBao.
+
+5. Initialize bootroot:
+
+   ```bash
+   bootroot init --auto-generate \
+     --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable"
+   ```
+
+6. Start services and verify issuance:
+
+   ```bash
+   docker compose up -d
+   docker compose run --rm bootroot-agent
+   ```
+
+   If `certs/bootroot-agent.crt` is created, issuance is working.
+
+If the responder HMAC mismatches, ensure the OpenBao HMAC secret matches the
+responder config and restart the responder.
+
 ## bootroot-agent
 
 ### Binary
@@ -203,6 +264,12 @@ cargo build --release
 
 `--oneshot` issues once and exits. For daemon mode, omit it. See
 **Configuration** for details.
+
+#### CA bundle consumer permissions
+
+Services using mTLS must be able to read the CA bundle written to
+`trust.ca_bundle_path`. The simplest setup is running bootroot-agent and the
+service under the same user or group.
 
 ### Docker
 

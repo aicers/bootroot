@@ -47,6 +47,7 @@ pub(crate) fn print_init_plan(plan: &InitPlan, messages: &Messages) {
 pub(crate) fn print_app_add_summary(
     entry: &AppEntry,
     secret_id_path: &std::path::Path,
+    trusted_ca_sha256: Option<&[String]>,
     messages: &Messages,
 ) {
     println!("{}", messages.app_add_summary());
@@ -64,6 +65,9 @@ pub(crate) fn print_app_add_summary(
     println!("{}", messages.app_summary_openbao_path(&entry.service_name));
     println!("{}", messages.app_summary_next_steps());
     print_app_openbao_agent_steps(entry, secret_id_path, messages);
+    if let Some(trusted) = trusted_ca_sha256 {
+        print_trust_snippet(entry, trusted, messages);
+    }
     match entry.deploy_type {
         DeployType::Daemon => {
             let cert_path = entry.cert_path.display().to_string();
@@ -286,6 +290,25 @@ fn print_docker_snippet(entry: &AppEntry, messages: &Messages) {
     println!("  bootroot-agent --config /app/agent.toml --oneshot");
 }
 
+fn print_trust_snippet(entry: &AppEntry, trusted: &[String], messages: &Messages) {
+    let cert_dir = entry
+        .cert_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let bundle_path = cert_dir.join("ca-bundle.pem");
+    println!("{}", messages.app_snippet_trust_title());
+    println!("[trust]");
+    println!("ca_bundle_path = \"{}\"", bundle_path.display());
+    println!(
+        "trusted_ca_sha256 = [{}]",
+        trusted
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
 pub(crate) fn print_verify_plan(
     service_name: &str,
     agent_config: &std::path::Path,
@@ -400,6 +423,7 @@ fn print_kv_paths(messages: &Messages) {
     println!("  - {}", crate::commands::init::PATH_STEPCA_PASSWORD);
     println!("  - {}", crate::commands::init::PATH_STEPCA_DB);
     println!("  - {}", crate::commands::init::PATH_RESPONDER_HMAC);
+    println!("  - {}", crate::commands::init::PATH_CA_TRUST);
     println!("  - {}", crate::commands::init::PATH_AGENT_EAB);
 }
 

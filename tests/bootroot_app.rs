@@ -29,6 +29,13 @@ async fn test_app_add_writes_state_and_secret() {
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_trust_missing(&server).await;
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -385,6 +392,107 @@ async fn test_app_add_rejects_duplicate() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_app_add_includes_trust_snippet_when_present() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_present(&server).await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "app",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run app add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("[trust]"));
+    assert!(stdout.contains("trusted_ca_sha256"));
+    assert!(stdout.contains("ca_bundle_path"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_omits_trust_snippet_when_missing() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "app",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run app add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(!stdout.contains("[trust]"));
+    assert!(!stdout.contains("trusted_ca_sha256"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_app_info_prints_summary() {
     let temp_dir = tempdir().expect("create temp dir");
     write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
@@ -507,6 +615,37 @@ async fn stub_app_add_openbao(server: &MockServer, service_name: &str) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "secret_id": format!("secret-{service_name}") }
         })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_app_add_trust_present(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/metadata/bootroot/ca"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "data": {
+                    "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"]
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_app_add_trust_missing(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/metadata/bootroot/ca"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(404))
         .mount(server)
         .await;
 }

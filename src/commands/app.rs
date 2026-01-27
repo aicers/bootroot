@@ -11,7 +11,7 @@ use crate::cli::output::{
     AppAddPlan, print_app_add_plan, print_app_add_summary, print_app_info_summary,
 };
 use crate::cli::prompt::Prompt;
-use crate::commands::init::{SECRET_ID_TTL, TOKEN_TTL};
+use crate::commands::init::{PATH_CA_TRUST, SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
 use crate::state::{AppEntry, AppRoleEntry, DeployType, StateFile};
 
@@ -21,6 +21,7 @@ const APP_KV_BASE: &str = "bootroot/apps";
 const APP_SECRET_DIR: &str = "apps";
 const APP_ROLE_ID_FILENAME: &str = "role_id";
 const APP_SECRET_ID_FILENAME: &str = "secret_id";
+const CA_TRUST_KEY: &str = "trusted_ca_sha256";
 
 pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Result<()> {
     let state_path = Path::new(STATE_FILE_NAME);
@@ -64,6 +65,8 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
         .await
         .with_context(|| messages.error_openbao_approle_auth_failed())?;
 
+    let trusted_ca_sha256 =
+        read_trusted_ca_fingerprints(&client, &state.kv_mount, messages).await?;
     let approle = ensure_app_approle(&client, &state, &resolved.service_name, messages).await?;
     let secrets_dir = state.secrets_dir();
     write_role_id_file(
@@ -107,7 +110,12 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
 
-    print_app_add_summary(&entry, &secret_id_path, messages);
+    print_app_add_summary(
+        &entry,
+        &secret_id_path,
+        trusted_ca_sha256.as_deref(),
+        messages,
+    );
     Ok(())
 }
 
@@ -409,4 +417,87 @@ fn validate_path(path: &Path, must_exist: bool, messages: &Messages) -> Result<(
         anyhow::bail!(messages.error_parent_not_found(&parent.display().to_string()));
     }
     Ok(())
+}
+
+async fn read_trusted_ca_fingerprints(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    messages: &Messages,
+) -> Result<Option<Vec<String>>> {
+    if !client
+        .kv_exists(kv_mount, PATH_CA_TRUST)
+        .await
+        .with_context(|| messages.error_openbao_kv_exists_failed())?
+    {
+        return Ok(None);
+    }
+    let data = client
+        .read_kv(kv_mount, PATH_CA_TRUST)
+        .await
+        .with_context(|| messages.error_openbao_kv_read_failed())?;
+    let value = data
+        .get(CA_TRUST_KEY)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_ca_trust_missing(CA_TRUST_KEY)))?;
+    let fingerprints = parse_trusted_ca_list(value, messages)?;
+    if fingerprints.is_empty() {
+        anyhow::bail!(messages.error_ca_trust_empty());
+    }
+    Ok(Some(fingerprints))
+}
+
+fn parse_trusted_ca_list(value: &serde_json::Value, messages: &Messages) -> Result<Vec<String>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!(messages.error_ca_trust_invalid()))?;
+    let mut fingerprints = Vec::with_capacity(items.len());
+    for item in items {
+        let fingerprint = item
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!(messages.error_ca_trust_invalid()))?;
+        if !is_valid_sha256_fingerprint(fingerprint) {
+            anyhow::bail!(messages.error_ca_trust_invalid());
+        }
+        fingerprints.push(fingerprint.to_string());
+    }
+    Ok(fingerprints)
+}
+
+fn is_valid_sha256_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Messages;
+
+    fn test_messages() -> Messages {
+        Messages::new("en").expect("valid language")
+    }
+
+    #[test]
+    fn test_parse_trusted_ca_list_accepts_valid() {
+        let messages = test_messages();
+        let value = serde_json::json!(["a".repeat(64), "b".repeat(64)]);
+        let parsed = parse_trusted_ca_list(&value, &messages).expect("parse list");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], "a".repeat(64));
+        assert_eq!(parsed[1], "b".repeat(64));
+    }
+
+    #[test]
+    fn test_parse_trusted_ca_list_rejects_non_array() {
+        let messages = test_messages();
+        let value = serde_json::json!("not-array");
+        let err = parse_trusted_ca_list(&value, &messages).unwrap_err();
+        assert!(err.to_string().contains("OpenBao CA trust data"));
+    }
+
+    #[test]
+    fn test_parse_trusted_ca_list_rejects_invalid_fingerprint() {
+        let messages = test_messages();
+        let value = serde_json::json!(["not-hex"]);
+        let err = parse_trusted_ca_list(&value, &messages).unwrap_err();
+        assert!(err.to_string().contains("OpenBao CA trust data"));
+    }
 }
