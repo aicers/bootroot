@@ -5,8 +5,9 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, watch};
 use tracing::{error, info};
 
-use crate::{acme, config, eab, hooks, profile};
-pub const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = 1_000_000_000;
+use crate::{acme, config, eab, hooks, profile, utils};
+
+pub const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = utils::MIN_JITTER_DELAY_NANOS;
 
 /// Runs the agent daemon loop for all profiles.
 ///
@@ -82,7 +83,7 @@ async fn run_profile_daemon(
             first_tick = false;
             Duration::from_secs(0)
         } else {
-            jittered_delay(check_interval, check_jitter)
+            utils::jittered_delay(check_interval, check_jitter)
         };
 
         tokio::select! {
@@ -91,59 +92,17 @@ async fn run_profile_daemon(
                 break;
             }
             () = tokio::time::sleep(delay) => {
-                tracing::debug!("Profile '{}' checking renewal status...", profile_label);
-                match should_renew(&profile, renew_before).await {
-                    Ok(true) => {
-                        info!(
-                            "Profile '{}' renewal required. Starting ACME issuance...",
-                            profile_label
-                        );
-                        let _permit = semaphore.acquire().await?;
-                        let profile_eab = profile::resolve_profile_eab(&profile, default_eab.clone());
-                        match issue_with_retry(&settings, &profile, profile_eab).await
-                        {
-                            Ok(()) => {
-                                if let Err(err) = hooks::run_post_renew_hooks(
-                                    &settings,
-                                    &profile,
-                                    hooks::HookStatus::Success,
-                                    None,
-                                )
-                                .await
-                                {
-                                    error!(
-                                        "Post-renew success hooks failed for '{}': {err}",
-                                        profile_label
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                error!(
-                                    "Profile '{}' renewal failed after retries: {err}",
-                                    profile_label
-                                );
-                                if let Err(hook_err) = hooks::run_post_renew_hooks(
-                                    &settings,
-                                    &profile,
-                                    hooks::HookStatus::Failure,
-                                    Some(err.to_string()),
-                                )
-                                .await
-                                {
-                                    error!(
-                                        "Post-renew failure hooks failed for '{}': {hook_err}",
-                                        profile_label
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Ok(false) => {
-                        tracing::debug!("Profile '{}' certificate still valid.", profile_label);
-                    }
-                    Err(err) => {
-                        error!("Profile '{}' renewal check failed: {err}", profile_label);
-                    }
+                if let Err(err) = check_and_renew_profile(
+                    &settings,
+                    &profile,
+                    default_eab.clone(),
+                    Arc::clone(&semaphore),
+                    renew_before,
+                    &profile_label,
+                )
+                .await
+                {
+                    error!("Profile '{}' renewal loop failed: {err}", profile_label);
                 }
             }
         }
@@ -283,31 +242,19 @@ where
     SleepFn: FnMut(Duration) -> SleepFut,
     SleepFut: Future<Output = ()>,
 {
-    if delays.is_empty() {
-        return issue_fn().await;
+    let result = utils::retry_with_backoff_and_sleep(
+        &mut issue_fn,
+        &mut sleep_fn,
+        |attempt, err| {
+            error!("Certificate issuance failed (attempt {}): {err}", attempt);
+        },
+        delays,
+    )
+    .await;
+    if result.is_ok() {
+        info!("Certificate issuance succeeded.");
     }
-
-    let mut last_err = None;
-    for (attempt, delay) in delays.iter().enumerate() {
-        match issue_fn().await {
-            Ok(()) => {
-                info!("Certificate issuance succeeded.");
-                return Ok(());
-            }
-            Err(err) => {
-                error!(
-                    "Certificate issuance failed (attempt {}): {err}",
-                    attempt + 1
-                );
-                last_err = Some(err);
-                if attempt + 1 < delays.len() {
-                    sleep_fn(Duration::from_secs(*delay)).await;
-                }
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Certificate issuance failed")))
+    result
 }
 
 /// Determines whether a certificate should be renewed.
@@ -355,28 +302,73 @@ pub fn parse_cert_not_after(cert_bytes: &[u8]) -> anyhow::Result<time::OffsetDat
     Ok(cert.validity().not_after.to_datetime())
 }
 
-fn jittered_delay(base: Duration, jitter: Duration) -> Duration {
-    let now_ns = time::OffsetDateTime::now_utc()
-        .unix_timestamp_nanos()
-        .max(0);
-    jittered_delay_with_seed(base, jitter, now_ns)
-}
-
 #[must_use]
 pub fn jittered_delay_with_seed(base: Duration, jitter: Duration, now_ns: i128) -> Duration {
-    let jitter_ns = i128::try_from(jitter.as_nanos()).unwrap_or(i128::MAX);
-    if jitter_ns == 0 {
-        return base;
+    utils::jittered_delay_with_seed(base, jitter, now_ns)
+}
+
+async fn check_and_renew_profile(
+    settings: &config::Settings,
+    profile: &config::DaemonProfileSettings,
+    default_eab: Option<eab::EabCredentials>,
+    semaphore: Arc<Semaphore>,
+    renew_before: Duration,
+    profile_label: &str,
+) -> anyhow::Result<()> {
+    tracing::debug!("Profile '{}' checking renewal status...", profile_label);
+    match should_renew(profile, renew_before).await {
+        Ok(true) => {
+            info!(
+                "Profile '{}' renewal required. Starting ACME issuance...",
+                profile_label
+            );
+            let _permit = semaphore.acquire().await?;
+            let profile_eab = profile::resolve_profile_eab(profile, default_eab);
+            match issue_with_retry(settings, profile, profile_eab).await {
+                Ok(()) => {
+                    if let Err(err) = hooks::run_post_renew_hooks(
+                        settings,
+                        profile,
+                        hooks::HookStatus::Success,
+                        None,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Post-renew success hooks failed for '{}': {err}",
+                            profile_label
+                        );
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        "Profile '{}' renewal failed after retries: {err}",
+                        profile_label
+                    );
+                    if let Err(hook_err) = hooks::run_post_renew_hooks(
+                        settings,
+                        profile,
+                        hooks::HookStatus::Failure,
+                        Some(err.to_string()),
+                    )
+                    .await
+                    {
+                        error!(
+                            "Post-renew failure hooks failed for '{}': {hook_err}",
+                            profile_label
+                        );
+                    }
+                }
+            }
+        }
+        Ok(false) => {
+            tracing::debug!("Profile '{}' certificate still valid.", profile_label);
+        }
+        Err(err) => {
+            error!("Profile '{}' renewal check failed: {err}", profile_label);
+        }
     }
-
-    let base_ns = i128::try_from(base.as_nanos()).unwrap_or(i128::MAX);
-    let span = jitter_ns.saturating_mul(2).saturating_add(1);
-    let offset = (now_ns % span) - jitter_ns;
-    let adjusted = (base_ns + offset).max(MIN_DAEMON_CHECK_DELAY_NANOS);
-    let adjusted = adjusted.min(i128::from(u64::MAX));
-    let adjusted = u64::try_from(adjusted).unwrap_or(u64::MAX);
-
-    Duration::from_nanos(adjusted)
+    Ok(())
 }
 
 async fn wait_for_shutdown() -> anyhow::Result<()> {
