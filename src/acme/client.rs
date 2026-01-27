@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::acme::types::{Authorization, Order};
-use crate::config::AcmeSettings;
+use crate::config::{AcmeSettings, TrustSettings};
 use crate::eab::EabCredentials;
 
 const ALG_ES256: &str = "ES256";
@@ -45,7 +45,11 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if account key generation fails or HTTP client build fails.
-    pub fn new(directory_url: String, settings: &AcmeSettings) -> Result<Self> {
+    pub fn new(
+        directory_url: String,
+        settings: &AcmeSettings,
+        trust: &TrustSettings,
+    ) -> Result<Self> {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
             .map_err(|_| anyhow::anyhow!("Failed to generate account key"))?;
@@ -54,9 +58,7 @@ impl AcmeClient {
                 .map_err(|_| anyhow::anyhow!("Failed to parse generated key pair"))?;
 
         Ok(Self {
-            client: Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?,
+            client: Self::build_http_client(trust)?,
             directory_url,
             directory: None,
             key_pair,
@@ -70,6 +72,17 @@ impl AcmeClient {
 
     fn b64(data: &[u8]) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+    }
+
+    fn build_http_client(trust: &TrustSettings) -> Result<Client> {
+        let mut builder = Client::builder();
+        if let Some(bundle_path) = &trust.ca_bundle_path {
+            let pem = std::fs::read(bundle_path)
+                .with_context(|| format!("Failed to read CA bundle {}", bundle_path.display()))?;
+            let cert = reqwest::Certificate::from_pem(&pem).context("Invalid CA bundle")?;
+            builder = builder.add_root_certificate(cert);
+        }
+        builder.build().context("Failed to build HTTP client")
     }
 
     /// Fetches the ACME directory and caches it.
@@ -529,6 +542,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     use super::*;
+    use crate::config::TrustSettings;
 
     fn test_settings() -> AcmeSettings {
         AcmeSettings {
@@ -544,15 +558,28 @@ mod tests {
         }
     }
 
+    fn test_trust() -> TrustSettings {
+        TrustSettings::default()
+    }
+
     #[test]
     fn test_client_initialization() {
-        let client = AcmeClient::new("http://example.com".to_string(), &test_settings());
+        let client = AcmeClient::new(
+            "http://example.com".to_string(),
+            &test_settings(),
+            &test_trust(),
+        );
         assert!(client.is_ok());
     }
 
     #[test]
     fn test_compute_key_authorization() {
-        let client = AcmeClient::new("http://example.com".to_string(), &test_settings()).unwrap();
+        let client = AcmeClient::new(
+            "http://example.com".to_string(),
+            &test_settings(),
+            &test_trust(),
+        )
+        .unwrap();
         let token = "test_token_123_xyz";
         let ka = client.compute_key_authorization(token).unwrap();
         assert!(ka.starts_with(token));
@@ -571,7 +598,12 @@ mod tests {
 
     #[test]
     fn test_external_account_binding_structure() {
-        let client = AcmeClient::new("http://example.com".to_string(), &test_settings()).unwrap();
+        let client = AcmeClient::new(
+            "http://example.com".to_string(),
+            &test_settings(),
+            &test_trust(),
+        )
+        .unwrap();
         let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-secret");
         let creds = EabCredentials {
             kid: "kid-123".to_string(),
@@ -641,8 +673,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client =
-            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let mut client = AcmeClient::new(
+            format!("{}/directory", server.uri()),
+            &test_settings(),
+            &test_trust(),
+        )
+        .unwrap();
         client
             .create_order(&["example.internal".to_string(), "192.0.2.10".to_string()])
             .await
@@ -720,8 +756,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client =
-            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let mut client = AcmeClient::new(
+            format!("{}/directory", server.uri()),
+            &test_settings(),
+            &test_trust(),
+        )
+        .unwrap();
         client.fetch_directory().await.unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -748,8 +788,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client =
-            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let mut client = AcmeClient::new(
+            format!("{}/directory", server.uri()),
+            &test_settings(),
+            &test_trust(),
+        )
+        .unwrap();
         let nonce = client.get_nonce().await.unwrap();
 
         assert_eq!(nonce, "nonce-123");
@@ -792,8 +836,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client =
-            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let mut client = AcmeClient::new(
+            format!("{}/directory", server.uri()),
+            &test_settings(),
+            &test_trust(),
+        )
+        .unwrap();
         let order = client
             .poll_order(&format!("{}/order/1", server.uri()))
             .await
@@ -816,8 +864,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client =
-            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let mut client = AcmeClient::new(
+            format!("{}/directory", server.uri()),
+            &test_settings(),
+            &test_trust(),
+        )
+        .unwrap();
         let err = client.fetch_directory().await.unwrap_err();
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -845,8 +897,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client =
-            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let mut client = AcmeClient::new(
+            format!("{}/directory", server.uri()),
+            &test_settings(),
+            &test_trust(),
+        )
+        .unwrap();
         let err = client.get_nonce().await.unwrap_err();
 
         assert!(err.to_string().contains("Missing Replay-Nonce header"));
@@ -879,8 +935,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client =
-            AcmeClient::new(format!("{}/directory", server.uri()), &test_settings()).unwrap();
+        let mut client = AcmeClient::new(
+            format!("{}/directory", server.uri()),
+            &test_settings(),
+            &test_trust(),
+        )
+        .unwrap();
         let err = client
             .poll_order(&format!("{}/order/2", server.uri()))
             .await

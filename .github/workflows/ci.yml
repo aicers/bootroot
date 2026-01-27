@@ -172,7 +172,20 @@ jobs:
       - name: CLI App Add + Verify (Smoke)
         run: |
           mkdir -p tmp certs
-          cat > tmp/agent.toml <<'EOF'
+          ROOT_CA_FINGERPRINT="$(openssl x509 -in "$BOOTROOT_SECRETS_DIR/certs/root_ca.crt" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')"
+          INTERMEDIATE_CA_FINGERPRINT=""
+          if [ -f "$BOOTROOT_SECRETS_DIR/certs/intermediate_ca.crt" ]; then
+            INTERMEDIATE_CA_FINGERPRINT="$(openssl x509 -in "$BOOTROOT_SECRETS_DIR/certs/intermediate_ca.crt" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')"
+          fi
+          if [ -z "${ROOT_CA_FINGERPRINT:-}" ]; then
+            echo "Failed to read root CA fingerprint"
+            exit 1
+          fi
+          TRUSTED_CA_FINGERPRINTS="\"${ROOT_CA_FINGERPRINT}\""
+          if [ -n "${INTERMEDIATE_CA_FINGERPRINT:-}" ]; then
+            TRUSTED_CA_FINGERPRINTS="${TRUSTED_CA_FINGERPRINTS}, \"${INTERMEDIATE_CA_FINGERPRINT}\""
+          fi
+          cat > tmp/agent.toml <<EOF
           email = "admin@example.com"
           server = "https://localhost:9000/acme/acme/directory"
           domain = "trusted.domain"
@@ -187,6 +200,10 @@ jobs:
           http_responder_hmac = "dev-hmac"
           http_responder_timeout_secs = 5
           http_responder_token_ttl_secs = 300
+
+          [trust]
+          ca_bundle_path = "${BOOTROOT_SECRETS_DIR}/certs/root_ca.crt"
+          trusted_ca_sha256 = [${TRUSTED_CA_FINGERPRINTS}]
 
           [[profiles]]
           service_name = "edge-proxy"

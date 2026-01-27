@@ -6,6 +6,12 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SECRETS_DIR: &str = "secrets";
+pub(crate) const STATE_FILE_NAME: &str = "state.json";
+const STEPCA_ROOT_KEY: &str = "secrets/root_ca_key";
+const STEPCA_INTERMEDIATE_KEY: &str = "secrets/intermediate_ca_key";
+const STEPCA_PASSWORD_FILE: &str = "password.txt";
+const RESPONDER_CONFIG_PATH: &str = "responder/responder.toml";
+const CA_JSON_PATH: &str = "config/ca.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct StateFile {
@@ -41,6 +47,43 @@ impl StateFile {
         self.secrets_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SECRETS_DIR))
+    }
+
+    pub(crate) fn default_path() -> PathBuf {
+        PathBuf::from(STATE_FILE_NAME)
+    }
+
+    pub(crate) fn paths(&self) -> StatePaths {
+        StatePaths {
+            secrets_dir: self.secrets_dir(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StatePaths {
+    secrets_dir: PathBuf,
+}
+
+impl StatePaths {
+    pub(crate) fn stepca_password_path(&self) -> PathBuf {
+        self.secrets_dir.join(STEPCA_PASSWORD_FILE)
+    }
+
+    pub(crate) fn stepca_root_key_path(&self) -> PathBuf {
+        self.secrets_dir.join(STEPCA_ROOT_KEY)
+    }
+
+    pub(crate) fn stepca_intermediate_key_path(&self) -> PathBuf {
+        self.secrets_dir.join(STEPCA_INTERMEDIATE_KEY)
+    }
+
+    pub(crate) fn responder_config_path(&self) -> PathBuf {
+        self.secrets_dir.join(RESPONDER_CONFIG_PATH)
+    }
+
+    pub(crate) fn ca_json_path(&self) -> PathBuf {
+        self.secrets_dir.join(CA_JSON_PATH)
     }
 }
 
