@@ -6,6 +6,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SECRETS_DIR: &str = "secrets";
+const DEFAULT_STATE_FILE: &str = "state.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct StateFile {
@@ -22,6 +23,10 @@ pub(crate) struct StateFile {
 }
 
 impl StateFile {
+    pub(crate) fn default_path() -> PathBuf {
+        PathBuf::from(DEFAULT_STATE_FILE)
+    }
+
     pub(crate) fn load(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;

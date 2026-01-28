@@ -13,8 +13,6 @@ use crate::cli::prompt::Prompt;
 use crate::commands::init::{PATH_CA_TRUST, SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
 use crate::state::{AppEntry, AppRoleEntry, DeployType, StateFile};
-
-const STATE_FILE_NAME: &str = "state.json";
 const APPROLE_PREFIX: &str = "bootroot-app-";
 const APP_KV_BASE: &str = "bootroot/apps";
 const APP_SECRET_DIR: &str = "apps";
@@ -23,12 +21,12 @@ const APP_SECRET_ID_FILENAME: &str = "secret_id";
 const CA_TRUST_KEY: &str = "trusted_ca_sha256";
 
 pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Result<()> {
-    let state_path = Path::new(STATE_FILE_NAME);
+    let state_path = StateFile::default_path();
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
     let mut state =
-        StateFile::load(state_path).with_context(|| messages.error_parse_state_failed())?;
+        StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
 
     let resolved = resolve_app_add_args(args, messages)?;
     if state.apps.contains_key(&resolved.service_name) {
@@ -106,7 +104,7 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
         .apps
         .insert(resolved.service_name.clone(), entry.clone());
     state
-        .save(state_path)
+        .save(&state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
 
     print_app_add_summary(
@@ -119,11 +117,12 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
 }
 
 pub(crate) fn run_app_info(args: &AppInfoArgs, messages: &Messages) -> Result<()> {
-    let state_path = Path::new(STATE_FILE_NAME);
+    let state_path = StateFile::default_path();
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
-    let state = StateFile::load(state_path).with_context(|| messages.error_parse_state_failed())?;
+    let state =
+        StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
     let entry = state
         .apps
         .get(&args.service_name)
