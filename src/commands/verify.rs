@@ -10,14 +10,12 @@ use crate::cli::prompt::Prompt;
 use crate::i18n::Messages;
 use crate::state::{AppEntry, DeployType, StateFile};
 
-const STATE_FILE_NAME: &str = "state.json";
-
 pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
-    let state_path = Path::new(STATE_FILE_NAME);
+    let state_path = StateFile::default_path();
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
-    let state = StateFile::load(state_path)?;
+    let state = StateFile::load(&state_path)?;
     let service_name = resolve_verify_service_name(args, messages)?;
     let entry = state
         .apps

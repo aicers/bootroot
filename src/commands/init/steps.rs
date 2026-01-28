@@ -16,78 +16,37 @@ use reqwest::StatusCode;
 use ring::digest;
 use x509_parser::pem::parse_x509_pem;
 
+use super::constants::openbao_constants::{
+    APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_STEPCA,
+    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC,
+    PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER,
+    POLICY_BOOTROOT_STEPCA, SECRET_ID_TTL, TOKEN_TTL,
+};
+use super::constants::{
+    CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME, CA_TRUST_KEY,
+    DEFAULT_CA_ADDRESS, DEFAULT_CA_DNS, DEFAULT_CA_NAME, DEFAULT_CA_PROVISIONER, DEFAULT_DB_NAME,
+    DEFAULT_DB_USER, DEFAULT_EAB_ENDPOINT_PATH, DEFAULT_RESPONDER_TOKEN_TTL_SECS,
+    OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME, OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR,
+    OPENBAO_AGENT_RESPONDER_DIR, OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME,
+    OPENBAO_AGENT_SECRET_ID_NAME, OPENBAO_AGENT_STEPCA_DIR, OPENBAO_AGENT_STEPCA_SERVICE,
+    RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
+    RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME, SECRET_BYTES, STEPCA_CA_JSON_TEMPLATE_NAME,
+    STEPCA_PASSWORD_TEMPLATE_NAME,
+};
+use super::paths::{
+    OpenBaoAgentPaths, ResponderPaths, StepCaTemplatePaths, compose_has_openbao,
+    compose_has_responder, resolve_openbao_agent_addr, resolve_responder_url, to_container_path,
+};
+use super::types::{
+    AppRoleOutput, DbCheckStatus, EabCredentials, InitPlan, InitSummary, ResponderCheck,
+    StepCaInitResult,
+};
 use crate::cli::args::InitArgs;
 use crate::cli::output::{print_init_plan, print_init_summary};
 use crate::commands::infra::{ensure_infra_ready, run_docker};
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 use crate::state::StateFile;
-
-pub(crate) const DEFAULT_OPENBAO_URL: &str = "http://localhost:8200";
-pub(crate) const DEFAULT_KV_MOUNT: &str = "secret";
-pub(crate) const DEFAULT_SECRETS_DIR: &str = "secrets";
-pub(crate) const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
-pub(crate) const DEFAULT_STEPCA_URL: &str = "https://localhost:9000";
-pub(crate) const DEFAULT_STEPCA_PROVISIONER: &str = "acme";
-
-const DEFAULT_CA_NAME: &str = "Bootroot CA";
-const DEFAULT_CA_PROVISIONER: &str = "admin";
-const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca";
-const DEFAULT_CA_ADDRESS: &str = ":9000";
-const SECRET_BYTES: usize = 32;
-const DEFAULT_RESPONDER_TOKEN_TTL_SECS: u64 = 60;
-const DEFAULT_RESPONDER_ADMIN_URL: &str = "http://bootroot-http01:8080";
-const RESPONDER_TEMPLATE_DIR: &str = "templates";
-const RESPONDER_TEMPLATE_NAME: &str = "responder.toml.ctmpl";
-const RESPONDER_CONFIG_DIR: &str = "responder";
-const RESPONDER_CONFIG_NAME: &str = "responder.toml";
-const RESPONDER_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.responder.override.yml";
-const STEPCA_PASSWORD_TEMPLATE_NAME: &str = "password.txt.ctmpl";
-const STEPCA_CA_JSON_TEMPLATE_NAME: &str = "ca.json.ctmpl";
-const OPENBAO_AGENT_DIR: &str = "openbao";
-const OPENBAO_AGENT_STEPCA_DIR: &str = "stepca";
-const OPENBAO_AGENT_RESPONDER_DIR: &str = "responder";
-const OPENBAO_AGENT_CONFIG_NAME: &str = "agent.hcl";
-const OPENBAO_AGENT_ROLE_ID_NAME: &str = "role_id";
-const OPENBAO_AGENT_SECRET_ID_NAME: &str = "secret_id";
-const OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-agent.override.yml";
-const OPENBAO_AGENT_STEPCA_SERVICE: &str = "openbao-agent-stepca";
-const OPENBAO_AGENT_RESPONDER_SERVICE: &str = "openbao-agent-responder";
-const DEFAULT_EAB_ENDPOINT_PATH: &str = "eab";
-const DEFAULT_DB_USER: &str = "stepca";
-const DEFAULT_DB_NAME: &str = "stepca";
-const CA_CERTS_DIR: &str = "certs";
-const CA_ROOT_CERT_FILENAME: &str = "root_ca.crt";
-const CA_INTERMEDIATE_CERT_FILENAME: &str = "intermediate_ca.crt";
-const CA_TRUST_KEY: &str = "trusted_ca_sha256";
-
-mod openbao_constants {
-    pub(crate) const INIT_SECRET_SHARES: u8 = 3;
-    pub(crate) const INIT_SECRET_THRESHOLD: u8 = 2;
-    pub(crate) const TOKEN_TTL: &str = "1h";
-    pub(crate) const SECRET_ID_TTL: &str = "24h";
-
-    pub(crate) const POLICY_BOOTROOT_AGENT: &str = "bootroot-agent";
-    pub(crate) const POLICY_BOOTROOT_RESPONDER: &str = "bootroot-responder";
-    pub(crate) const POLICY_BOOTROOT_STEPCA: &str = "bootroot-stepca";
-
-    pub(crate) const APPROLE_BOOTROOT_AGENT: &str = "bootroot-agent-role";
-    pub(crate) const APPROLE_BOOTROOT_RESPONDER: &str = "bootroot-responder-role";
-    pub(crate) const APPROLE_BOOTROOT_STEPCA: &str = "bootroot-stepca-role";
-
-    pub(crate) const PATH_STEPCA_PASSWORD: &str = "bootroot/stepca/password";
-    pub(crate) const PATH_STEPCA_DB: &str = "bootroot/stepca/db";
-    pub(crate) const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
-    pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
-    pub(crate) const PATH_CA_TRUST: &str = "bootroot/ca";
-}
-
-pub(crate) use openbao_constants::{
-    APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_STEPCA,
-    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC,
-    PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER,
-    POLICY_BOOTROOT_STEPCA, SECRET_ID_TTL, TOKEN_TTL,
-};
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
     ensure_infra_ready(&args.compose.compose_file, messages)?;
@@ -133,7 +92,7 @@ async fn run_init_inner(
         .join("config")
         .join("ca.json")
         .exists();
-    let overwrite_state = Path::new("state.json").exists();
+    let overwrite_state = StateFile::default_path().exists();
     let plan = InitPlan {
         openbao_url: args.openbao.openbao_url.clone(),
         kv_mount: args.openbao.kv_mount.clone(),
@@ -282,28 +241,6 @@ struct EabAutoResponse {
     kid: String,
     #[serde(alias = "hmacKey", alias = "hmac")]
     hmac: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ResponderCheck {
-    Skipped,
-    Ok,
-}
-
-struct ResponderPaths {
-    template_path: PathBuf,
-    config_path: PathBuf,
-}
-
-struct StepCaTemplatePaths {
-    password_template_path: PathBuf,
-    ca_json_template_path: PathBuf,
-}
-
-struct OpenBaoAgentPaths {
-    stepca_agent_config: PathBuf,
-    responder_agent_config: PathBuf,
-    compose_override_path: Option<PathBuf>,
 }
 
 async fn write_responder_files(
@@ -607,13 +544,6 @@ template {{
         .expect("write template");
     }
     config
-}
-
-fn to_container_path(secrets_dir: &Path, path: &Path, messages: &Messages) -> Result<String> {
-    let relative = path
-        .strip_prefix(secrets_dir)
-        .with_context(|| messages.error_resolve_path_failed(&path.display().to_string()))?;
-    Ok(format!("/openbao/secrets/{}", relative.to_string_lossy()))
 }
 
 async fn write_responder_compose_override(
@@ -1154,38 +1084,6 @@ fn resolve_eab(args: &InitArgs, messages: &Messages) -> Result<Option<EabCredent
         (None, None) => Ok(None),
         _ => anyhow::bail!(messages.error_eab_requires_both()),
     }
-}
-
-fn compose_has_responder(compose_file: &Path, messages: &Messages) -> Result<bool> {
-    let compose_contents = std::fs::read_to_string(compose_file)
-        .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
-    Ok(compose_contents.contains("bootroot-http01"))
-}
-
-fn compose_has_openbao(compose_file: &Path, messages: &Messages) -> Result<bool> {
-    let compose_contents = std::fs::read_to_string(compose_file)
-        .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
-    Ok(compose_contents.contains("openbao"))
-}
-
-fn resolve_responder_url(args: &InitArgs, compose_has_responder: bool) -> Option<String> {
-    if let Some(responder_url) = args.responder_url.as_ref() {
-        return Some(responder_url.clone());
-    }
-    if compose_has_responder {
-        Some(DEFAULT_RESPONDER_ADMIN_URL.to_string())
-    } else {
-        None
-    }
-}
-
-fn resolve_openbao_agent_addr(openbao_url: &str, compose_has_openbao: bool) -> String {
-    if !compose_has_openbao {
-        return openbao_url.to_string();
-    }
-    openbao_url
-        .replace("localhost", "openbao")
-        .replace("127.0.0.1", "openbao")
 }
 
 async fn verify_responder(
@@ -1730,8 +1628,9 @@ fn write_state_file(
             .collect(),
         apps: BTreeMap::new(),
     };
+    let state_path = StateFile::default_path();
     state
-        .save(Path::new("state.json"))
+        .save(&state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
 }
@@ -1796,64 +1695,6 @@ fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
     Ok(())
 }
 
-pub(crate) struct InitSummary {
-    pub(crate) openbao_url: String,
-    pub(crate) kv_mount: String,
-    pub(crate) secrets_dir: PathBuf,
-    pub(crate) show_secrets: bool,
-    pub(crate) init_response: bool,
-    pub(crate) root_token: String,
-    pub(crate) unseal_keys: Vec<String>,
-    pub(crate) approles: Vec<AppRoleOutput>,
-    pub(crate) stepca_password: String,
-    pub(crate) db_dsn: String,
-    pub(crate) http_hmac: String,
-    pub(crate) eab: Option<EabCredentials>,
-    pub(crate) step_ca_result: StepCaInitResult,
-    pub(crate) responder_check: ResponderCheck,
-    pub(crate) responder_url: Option<String>,
-    pub(crate) responder_template_path: PathBuf,
-    pub(crate) responder_config_path: PathBuf,
-    pub(crate) openbao_agent_stepca_config_path: PathBuf,
-    pub(crate) openbao_agent_responder_config_path: PathBuf,
-    pub(crate) openbao_agent_override_path: Option<PathBuf>,
-    pub(crate) db_check: DbCheckStatus,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum DbCheckStatus {
-    Skipped,
-    Ok,
-}
-
-pub(crate) struct InitPlan {
-    pub(crate) openbao_url: String,
-    pub(crate) kv_mount: String,
-    pub(crate) secrets_dir: PathBuf,
-    pub(crate) overwrite_password: bool,
-    pub(crate) overwrite_ca_json: bool,
-    pub(crate) overwrite_state: bool,
-}
-
-pub(crate) struct AppRoleOutput {
-    pub(crate) label: String,
-    pub(crate) role_name: String,
-    pub(crate) role_id: String,
-    pub(crate) secret_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct EabCredentials {
-    pub(crate) kid: String,
-    pub(crate) hmac: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StepCaInitResult {
-    Initialized,
-    Skipped,
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1861,6 +1702,9 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use super::super::constants::{
+        DEFAULT_RESPONDER_ADMIN_URL, DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL,
+    };
     use super::*;
     use crate::i18n::Messages;
 

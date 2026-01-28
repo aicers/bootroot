@@ -20,32 +20,72 @@ use crate::commands::init::{
 };
 use crate::i18n::Messages;
 use crate::state::{AppEntry, StateFile};
-
-const STATE_FILE_NAME: &str = "state.json";
-const STEPCA_ROOT_KEY: &str = "secrets/root_ca_key";
-const STEPCA_INTERMEDIATE_KEY: &str = "secrets/intermediate_ca_key";
-const STEPCA_PASSWORD_FILE: &str = "password.txt";
-const RESPONDER_CONFIG_PATH: &str = "responder/responder.toml";
-const CA_JSON_PATH: &str = "config/ca.json";
 const SECRET_BYTES: usize = 32;
 const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
 const ROLE_ID_FILENAME: &str = "role_id";
+
+#[derive(Debug, Clone)]
+struct StatePaths {
+    state_file: PathBuf,
+    secrets_dir: PathBuf,
+}
+
+impl StatePaths {
+    fn new(state_file: PathBuf, secrets_dir: PathBuf) -> Self {
+        Self {
+            state_file,
+            secrets_dir,
+        }
+    }
+
+    fn state_file(&self) -> &Path {
+        &self.state_file
+    }
+
+    fn secrets_dir(&self) -> &Path {
+        &self.secrets_dir
+    }
+
+    fn stepca_password(&self) -> PathBuf {
+        self.secrets_dir.join("password.txt")
+    }
+
+    fn stepca_password_new(&self) -> PathBuf {
+        self.secrets_dir.join("password.txt.new")
+    }
+
+    fn stepca_root_key(&self) -> PathBuf {
+        self.secrets_dir.join("secrets").join("root_ca_key")
+    }
+
+    fn stepca_intermediate_key(&self) -> PathBuf {
+        self.secrets_dir.join("secrets").join("intermediate_ca_key")
+    }
+
+    fn responder_config(&self) -> PathBuf {
+        self.secrets_dir.join("responder").join("responder.toml")
+    }
+
+    fn ca_json(&self) -> PathBuf {
+        self.secrets_dir.join("config").join("ca.json")
+    }
+}
 
 #[derive(Debug)]
 struct RotateContext {
     openbao_url: String,
     kv_mount: String,
-    secrets_dir: PathBuf,
     compose_file: PathBuf,
     root_token: String,
     state: StateFile,
+    paths: StatePaths,
 }
 
 pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result<()> {
     let state_path = args
         .state_file
         .clone()
-        .unwrap_or_else(|| PathBuf::from(STATE_FILE_NAME));
+        .unwrap_or_else(StateFile::default_path);
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
@@ -67,15 +107,17 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         .secrets_dir
         .clone()
         .unwrap_or_else(|| state.secrets_dir());
+    let paths = StatePaths::new(state_path, secrets_dir.clone());
     let root_token = resolve_root_token(args.root_token.root_token.clone(), messages)?;
     let ctx = RotateContext {
         openbao_url,
         kv_mount,
-        secrets_dir,
         compose_file: args.compose.compose_file.clone(),
         root_token,
         state,
+        paths,
     };
+    let _state_file = ctx.paths.state_file();
 
     let mut client = OpenBaoClient::new(&ctx.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
@@ -123,11 +165,11 @@ async fn rotate_stepca_password(
         messages,
     )?;
 
-    let secrets_dir = &ctx.secrets_dir;
-    let password_path = secrets_dir.join(STEPCA_PASSWORD_FILE);
-    let new_password_path = secrets_dir.join("password.txt.new");
-    let root_key = secrets_dir.join(STEPCA_ROOT_KEY);
-    let intermediate_key = secrets_dir.join(STEPCA_INTERMEDIATE_KEY);
+    let secrets_dir = ctx.paths.secrets_dir();
+    let password_path = ctx.paths.stepca_password();
+    let new_password_path = ctx.paths.stepca_password_new();
+    let root_key = ctx.paths.stepca_root_key();
+    let intermediate_key = ctx.paths.stepca_intermediate_key();
 
     ensure_file_exists(&password_path, messages)?;
     ensure_file_exists(&root_key, messages)?;
@@ -233,7 +275,7 @@ async fn rotate_db(
         Some(value) => value,
         None => generate_secret(messages)?,
     };
-    let ca_json_path = ctx.secrets_dir.join(CA_JSON_PATH);
+    let ca_json_path = ctx.paths.ca_json();
     let current_dsn = read_ca_json_dsn(&ca_json_path, messages)?;
     let parsed = db::parse_db_dsn(&current_dsn).with_context(|| messages.error_invalid_db_dsn())?;
     let timeout = Duration::from_secs(args.timeout.timeout_secs);
@@ -301,7 +343,7 @@ async fn rotate_responder_hmac(
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
 
-    let responder_path = ctx.secrets_dir.join(RESPONDER_CONFIG_PATH);
+    let responder_path = ctx.paths.responder_config();
     let config = if responder_path.exists() {
         let contents = fs::read_to_string(&responder_path).with_context(|| {
             messages.error_read_file_failed(&responder_path.display().to_string())
