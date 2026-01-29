@@ -298,6 +298,7 @@ fn print_trust_snippet(entry: &AppEntry, trusted: &[String], messages: &Messages
     let bundle_path = cert_dir.join("ca-bundle.pem");
     println!("{}", messages.app_snippet_trust_title());
     println!("[trust]");
+    println!("verify_certificates = true");
     println!("ca_bundle_path = \"{}\"", bundle_path.display());
     println!(
         "trusted_ca_sha256 = [{}]",

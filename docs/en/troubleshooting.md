@@ -63,7 +63,10 @@ files are missing, init fails.
 ## ACME directory fetch retries
 
 - Confirm step-ca is up and reachable
-- Check TLS trust for the CA endpoint
+- Check TLS trust for the CA endpoint:
+  - If using system trust, ensure the CA is installed in the OS store
+  - If using `trust.ca_bundle_path`, ensure the bundle exists and is readable
+  - For temporary diagnosis, use `bootroot-agent --insecure` (not for prod)
 - Verify `server` URL in `agent.toml`
 
 ## Hook execution errors

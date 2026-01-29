@@ -265,6 +265,11 @@ cargo build --release
 `--oneshot` issues once and exits. For daemon mode, omit it. See
 **Configuration** for details.
 
+TLS verification override:
+
+- `--verify-certificates` forces ACME server TLS verification on.
+- `--insecure` disables verification (**insecure**, overrides config).
+
 #### CA bundle consumer permissions
 
 Services using mTLS must be able to read the CA bundle written to
@@ -280,6 +285,13 @@ docker compose up --build -d bootroot-agent
 ```
 
 The agent reads `agent.toml.compose` by default in the container.
+
+The image runs the agent in **daemon mode by default** (no `--oneshot`).
+For a sidecar, use a restart policy such as `restart: unless-stopped` to keep
+the container running (the current compose example does **not** set a restart
+policy for bootroot-agent by default). Also ensure Docker/Compose itself is
+managed by systemd (or an equivalent service manager) so it survives host
+reboots.
 
 ## HTTP-01 responder
 

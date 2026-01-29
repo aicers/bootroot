@@ -87,12 +87,24 @@ pub struct RetrySettings {
     pub backoff_secs: Vec<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TrustSettings {
+    #[serde(default = "defaults::default_verify_certificates")]
+    pub verify_certificates: bool,
     #[serde(default)]
     pub ca_bundle_path: Option<PathBuf>,
     #[serde(default)]
     pub trusted_ca_sha256: Vec<String>,
+}
+
+impl Default for TrustSettings {
+    fn default() -> Self {
+        Self {
+            verify_certificates: defaults::default_verify_certificates(),
+            ca_bundle_path: None,
+            trusted_ca_sha256: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -212,6 +224,12 @@ impl Settings {
         if let Some(responder_hmac) = &args.http_responder_hmac {
             responder_hmac.clone_into(&mut self.acme.http_responder_hmac);
         }
+        if args.verify_certificates {
+            self.trust.verify_certificates = true;
+        }
+        if args.insecure {
+            self.trust.verify_certificates = false;
+        }
     }
 
     /// Validates configuration values for correctness.
@@ -276,6 +294,7 @@ mod tests {
         assert_eq!(settings.acme.poll_interval_secs, 2);
         assert_eq!(settings.retry.backoff_secs, vec![5, 10, 30]);
         assert_eq!(settings.scheduler.max_concurrent_issuances, 3);
+        assert!(!settings.trust.verify_certificates);
 
         let profile = &settings.profiles[0];
         assert_eq!(profile.daemon.check_interval, Duration::from_secs(60 * 60));
@@ -366,6 +385,8 @@ mod tests {
             eab_hmac: None,
             eab_file: None,
             oneshot: false,
+            verify_certificates: false,
+            insecure: false,
         };
 
         settings.merge_with_args(&args);
@@ -377,6 +398,48 @@ mod tests {
             settings.server,
             "https://localhost:9000/acme/acme/directory"
         );
+    }
+
+    #[test]
+    fn test_merge_with_args_trust_override() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.trust.verify_certificates = false;
+
+        let args = crate::Args {
+            config: None,
+            email: None,
+            ca_url: None,
+            http_responder_url: None,
+            http_responder_hmac: None,
+            eab_kid: None,
+            eab_hmac: None,
+            eab_file: None,
+            oneshot: false,
+            verify_certificates: true,
+            insecure: false,
+        };
+
+        settings.merge_with_args(&args);
+        assert!(settings.trust.verify_certificates);
+
+        let args = crate::Args {
+            config: None,
+            email: None,
+            ca_url: None,
+            http_responder_url: None,
+            http_responder_hmac: None,
+            eab_kid: None,
+            eab_hmac: None,
+            eab_file: None,
+            oneshot: false,
+            verify_certificates: false,
+            insecure: true,
+        };
+
+        settings.merge_with_args(&args);
+        assert!(!settings.trust.verify_certificates);
     }
 
     #[test]

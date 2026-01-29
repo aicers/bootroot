@@ -278,6 +278,13 @@ cargo build --release
 `--oneshot`은 인증서를 **한 번만 발급**하고 종료하는 옵션입니다. 데몬
 모드로 주기적 갱신을 하려면 이 옵션을 빼고 실행합니다.
 자세한 설정 방법은 **설정** 섹션을 참고하세요.
+bootroot-agent가 중단 없이 실행되도록 하려면 systemd 등 서비스 관리자에
+등록해 상시 실행되게 구성하세요.
+
+TLS 검증 오버라이드:
+
+- `--verify-certificates`: ACME 서버 TLS 검증 강제
+- `--insecure`: ACME 서버 TLS 검증 비활성화
 
 #### CA 번들 소비 서비스 권한
 
@@ -292,6 +299,12 @@ docker compose up --build -d bootroot-agent
 ```
 
 컨테이너는 기본으로 `agent.toml.compose`를 사용합니다.
+
+이미지는 기본적으로 **데몬 모드**(no `--oneshot`)로 실행됩니다.
+사이드카로 운용할 때는 `restart: unless-stopped` 같은 재시작 정책을
+설정해 컨테이너가 계속 돌도록 하세요(현재 compose 예시는
+bootroot-agent에 restart 정책이 기본으로 들어 있지 않습니다). 또한 호스트 재부팅에도 유지되도록
+Docker/Compose 서비스 자체를 systemd 등으로 관리해야 합니다.
 
 ## HTTP-01 리스폰더
 

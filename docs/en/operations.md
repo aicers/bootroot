@@ -81,6 +81,10 @@ to `ca_bundle_path`. This bundle is used for mTLS peer verification.
 - If `trust.trusted_ca_sha256` is set, the response chain **must pass
   fingerprint verification** or issuance fails.
 - If no chain is present, the CA bundle is not written (logged).
+- With `trust.verify_certificates = true`, bootroot-agent verifies the ACME
+  server TLS certificate. If `ca_bundle_path` is set, it uses that bundle;
+  otherwise it uses the system CA store.
+- CLI override: `bootroot-agent --verify-certificates` or `--insecure`.
 
 Permissions/ownership:
 

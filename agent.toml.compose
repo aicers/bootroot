@@ -6,6 +6,9 @@ server = "https://bootroot-ca:9000/acme/acme/directory"
 # Format: <instance_id>.<service_name>.<hostname>.<domain>
 domain = "trusted.domain"
 
+[trust]
+verify_certificates = false
+
 [scheduler]
 max_concurrent_issuances = 1
 

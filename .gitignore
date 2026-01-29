@@ -8,3 +8,4 @@ secrets.bak/
 site/
 site-pdf-*/
 tmp/
+state.json
