@@ -80,6 +80,10 @@ WantedBy=timers.target
 - `trust.trusted_ca_sha256`를 지정하면 응답의 체인이 **지문 검증을 통과해야**
   저장됩니다. 불일치 시 발급이 실패합니다.
 - 체인이 없는 응답이라면 CA 번들을 저장하지 않습니다(로그에 남습니다).
+- `trust.verify_certificates = true`이면 bootroot-agent가 ACME 서버 TLS
+  인증서를 검증합니다. `ca_bundle_path`가 있으면 그 번들을 사용하고,
+  없으면 시스템 CA 저장소를 사용합니다.
+- CLI 오버라이드: `bootroot-agent --verify-certificates` 또는 `--insecure`.
 
 권한/소유권:
 

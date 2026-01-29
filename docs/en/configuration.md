@@ -140,20 +140,57 @@ Controls HTTP-01 responder settings and retry behavior for ACME operations.
 
 ```toml
 [trust]
+verify_certificates = true
 ca_bundle_path = "/etc/bootroot/ca-bundle.pem"
 trusted_ca_sha256 = ["<sha256-hex>"]
 ```
 
-Controls CA bundle storage and verification for mTLS trust.
+Controls mTLS trust and **ACME server TLS verification**.
 
+Concepts:
+
+- **mTLS trust**: the trust bundle used by services to verify peer
+  certificates. bootroot-agent writes the chain (intermediate/root) to
+  `ca_bundle_path`, and services use that file as their trust store.
+- **ACME server TLS verification**: bootroot-agent verifies the step-ca
+  server certificate when communicating with the ACME endpoint. This is
+  separate from mTLS trust.
+
+Settings:
+
+- `verify_certificates`: enables **ACME server TLS verification**.
+  This is not an mTLS setting; it only affects how bootroot-agent validates
+  the step-ca server certificate.
 - `ca_bundle_path`: path where bootroot-agent writes the CA bundle
-  (intermediate/root only).
+  (intermediate/root only). When `verify_certificates = true`, setting this
+  also makes bootroot-agent trust **this bundle** for the ACME server.
 - `trusted_ca_sha256`: list of trusted CA cert fingerprints (SHA-256 hex).
 
 `trusted_ca_sha256` must match **real CA certificate fingerprints** (not
 arbitrary values). `bootroot init` stores CA fingerprints in OpenBao, and
 `bootroot app add` includes the trusted list in the agent.toml snippet.
 In the common workflow, you should use the values printed by app add.
+
+If `verify_certificates = true` and `ca_bundle_path` is **not** set,
+bootroot-agent uses the **system CA store** to validate the ACME server.
+
+Default: `verify_certificates = false` for backward compatibility. For
+production, enable verification and provide a trusted CA source.
+
+Operational notes:
+
+- On the **first** connection to step-ca, a trusted bundle must already exist
+  at `ca_bundle_path` (manual install). If that is inconvenient, you can
+  **temporarily** use `bootroot-agent --insecure` to obtain the first cert.
+- After issuance succeeds, bootroot-agent writes the chain to `ca_bundle_path`.
+  For **renewals** (cron/daemon), do **not** use `--insecure`; keep
+  verification enabled.
+- This workflow lets you keep `verify_certificates = true` in `agent.toml` and
+  use CLI flags only as a temporary bypass.
+
+Note: in a single step-ca deployment, it is practical to reuse the same
+`ca_bundle_path` for both mTLS trust and ACME server verification. The two
+concepts are still different, so keep them distinct in your mental model.
 
 If the snippet does not include `trusted_ca_sha256`, check:
 
@@ -184,6 +221,34 @@ hmac = "your-hmac-key"
 
 EAB can also be passed via CLI (`--eab-kid`, `--eab-hmac`, or `--eab-file`).
 For production, prefer injecting EAB values via OpenBao.
+
+### Command-line options
+
+`bootroot-agent` can only override a subset of settings.
+Apply order is `agent.toml` → environment variables → CLI options, with CLI
+being applied last.
+
+Example: even if `agent.toml` has `email = "admin@example.com"`,
+running `bootroot-agent --email ops@example.com` uses `ops@example.com`.
+
+Options:
+
+- `--config <PATH>`: config file path (default `agent.toml`)
+- `--email <EMAIL>`: support email address
+- `--ca-url <URL>`: ACME directory URL
+- `--http-responder-url <URL>`: HTTP-01 responder URL
+  (env `BOOTROOT_HTTP_RESPONDER_URL`)
+- `--http-responder-hmac <HMAC>`: HTTP-01 responder HMAC
+  (env `BOOTROOT_HTTP_RESPONDER_HMAC`)
+- `--eab-kid <KID>`: EAB Key ID
+- `--eab-hmac <HMAC>`: EAB HMAC key
+- `--eab-file <PATH>`: EAB JSON file path
+- `--oneshot`: issue once and exit (disable daemon loop)
+- `--verify-certificates`: force ACME server TLS verification
+- `--insecure`: disable ACME server TLS verification
+
+All other settings (profiles, retry, scheduler, hooks, CA bundle paths, etc.)
+must be defined in `agent.toml`.
 
 ### Profiles
 

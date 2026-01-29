@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -40,4 +40,12 @@ pub struct Args {
     /// Run once and exit (disable daemon loop)
     #[arg(long)]
     pub oneshot: bool,
+
+    /// Verify ACME server TLS certificates
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "insecure")]
+    pub verify_certificates: bool,
+
+    /// Disable TLS certificate verification (INSECURE)
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "verify_certificates")]
+    pub insecure: bool,
 }

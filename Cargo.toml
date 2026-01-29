@@ -17,6 +17,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
 ] }
 ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -28,6 +29,7 @@ x509-parser = "0.18"
 
 [dev-dependencies]
 tempfile = "3"
+tokio-rustls = "0.26"
 wiremock = "0.6"
 
 [lints.clippy]

@@ -63,7 +63,10 @@ step-ca 프로비저너 정책과 요청 DNS SAN을 확인하세요.
 ## ACME 디렉터리 재시도 반복
 
 - step-ca 기동 여부 확인
-- TLS 신뢰 설정 확인
+- TLS 신뢰 설정 확인:
+  - 시스템 CA를 쓰는 경우 OS 저장소에 CA가 설치됐는지 확인
+  - `trust.ca_bundle_path`를 쓰는 경우 파일 존재/읽기 권한 확인
+  - 임시 진단 용도로는 `bootroot-agent --insecure` 사용 가능 (운영 비권장)
 - `server` URL 확인
 
 ## 훅 실행 오류

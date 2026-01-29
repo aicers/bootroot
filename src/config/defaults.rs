@@ -20,6 +20,7 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
 const DEFAULT_RETRY_BACKOFF_SECS: [u64; 3] = [5, 10, 30];
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_CONCURRENT_ISSUANCES: u64 = 3;
+const DEFAULT_VERIFY_CERTIFICATES: bool = false;
 
 pub(crate) fn apply_defaults(
     builder: ConfigBuilder<DefaultState>,
@@ -56,7 +57,8 @@ pub(crate) fn apply_defaults(
         .set_default(
             "scheduler.max_concurrent_issuances",
             DEFAULT_MAX_CONCURRENT_ISSUANCES,
-        )
+        )?
+        .set_default("trust.verify_certificates", DEFAULT_VERIFY_CERTIFICATES)
 }
 
 pub(crate) fn default_hook_timeout_secs() -> u64 {
@@ -77,4 +79,8 @@ pub(crate) fn default_check_jitter() -> Duration {
 
 pub(crate) fn default_max_concurrent_issuances() -> u64 {
     DEFAULT_MAX_CONCURRENT_ISSUANCES
+}
+
+pub(crate) fn default_verify_certificates() -> bool {
+    DEFAULT_VERIFY_CERTIFICATES
 }

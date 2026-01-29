@@ -33,6 +33,8 @@ http_responder_token_ttl_secs = 300
 
 # Trust settings for CA bundle verification/storage
 [trust]
+# Toggle TLS certificate verification for ACME server connections
+verify_certificates = true
 # Path to save the CA bundle (intermediate/root)
 ca_bundle_path = "certs/ca-bundle.pem"
 # SHA-256 fingerprints of trusted CA certs (hex)

@@ -276,9 +276,13 @@ Issuing certificate for 001.web-app.web-01.trusted.domain
 Certificate issued successfully.
 ```
 
-## 7) Renewal/rotation (examples)
+## 7) Secret rotation (examples)
 
-bootroot provides rotation commands. Example that rotates all secrets:
+bootroot provides rotation commands for **secrets** (step-ca password, EAB,
+DB credentials, HMAC, AppRole). **Certificate renewal** is handled by
+`bootroot-agent`.
+
+Example that rotates all secrets:
 
 ```bash
 bootroot rotate stepca-password

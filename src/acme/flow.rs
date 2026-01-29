@@ -258,7 +258,7 @@ pub async fn issue_certificate(
     profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
 ) -> Result<()> {
-    let mut client = AcmeClient::new(settings.server.clone(), &settings.acme)?;
+    let mut client = AcmeClient::new(settings.server.clone(), &settings.acme, &settings.trust)?;
 
     client.fetch_directory().await?;
     tracing::debug!("Directory loaded.");

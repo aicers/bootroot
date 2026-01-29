@@ -280,9 +280,12 @@ Issuing certificate for 001.web-app.web-01.trusted.domain
 Certificate issued successfully.
 ```
 
-## 7) 인증서 갱신/회전(예시)
+## 7) 시크릿 회전(예시)
 
-bootroot는 회전 명령을 제공합니다. 모든 시크릿을 갱신하는 예:
+bootroot의 `rotate`는 **시크릿 회전**(step-ca 비밀번호, EAB, DB, HMAC, AppRole)을
+수행합니다. **인증서 갱신**은 `bootroot-agent`가 처리합니다.
+
+모든 시크릿을 갱신하는 예:
 
 ```bash
 bootroot rotate stepca-password
