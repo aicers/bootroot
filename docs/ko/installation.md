@@ -6,7 +6,7 @@ CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서�
 
 ## step-ca
 
-### Docker
+### Docker(기본)
 
 이 repo는 PostgreSQL 지원 step-ca를 빌드하는 compose 구성을 제공합니다.
 
@@ -270,6 +270,9 @@ bootroot는 OpenBao Agent를 **호스트 실행하지 않고 Docker로만** 구�
 
 ### 바이너리
 
+서비스가 **호스트 바이너리/데몬**으로 동작하며, 인증서를 호스트 경로에서
+읽는 경우에 사용합니다.
+
 ```bash
 cargo build --release
 ./target/release/bootroot-agent --config agent.toml --oneshot
@@ -294,6 +297,9 @@ mTLS를 사용하는 서비스는 `trust.ca_bundle_path`에 저장되는 CA 번�
 
 ### Docker
 
+서비스가 **컨테이너로 동작**하고, bootroot-agent 사이드카와 볼륨을
+공유할 수 있는 경우에 사용합니다.
+
 ```bash
 docker compose up --build -d bootroot-agent
 ```
@@ -301,10 +307,11 @@ docker compose up --build -d bootroot-agent
 컨테이너는 기본으로 `agent.toml.compose`를 사용합니다.
 
 이미지는 기본적으로 **데몬 모드**(no `--oneshot`)로 실행됩니다.
-사이드카로 운용할 때는 `restart: unless-stopped` 같은 재시작 정책을
-설정해 컨테이너가 계속 돌도록 하세요(현재 compose 예시는
-bootroot-agent에 restart 정책이 기본으로 들어 있지 않습니다). 또한 호스트 재부팅에도 유지되도록
-Docker/Compose 서비스 자체를 systemd 등으로 관리해야 합니다.
+현재 프로젝트의 기본 `docker-compose.yml`은 bootroot-agent에
+`restart: always`를 설정합니다.
+사용자가 직접 중지한 컨테이너를 유지하려면 `restart: unless-stopped`로
+바꿔 사용하세요. 또한 호스트 재부팅에도 유지되도록 Docker/Compose
+서비스 자체를 systemd 등으로 관리해야 합니다.
 
 ## HTTP-01 리스폰더
 
@@ -317,13 +324,17 @@ HTTP-01 챌린지는 별도 리스폰더 이미지가 처리하며,
 docker compose up --build -d bootroot-http01
 ```
 
+현재 프로젝트의 기본 `docker-compose.yml`은 HTTP-01 리스폰더에
+`restart: always`를 설정합니다.
+
 리스폰더는 `responder.toml.compose`를 읽고 포트 80에서
 `/.well-known/acme-challenge/` 요청에 응답합니다. bootroot-agent는
 포트 8080의 관리자 API로 토큰을 등록하며, 동일한 HMAC 시크릿을 사용합니다.
 
-### systemd(베어메탈)
+### 바이너리(선택)
 
-리스폰더를 호스트에서 systemd로 실행할 수도 있습니다.
+부득이하게 Docker 밖에서 실행해야 한다면 바이너리를 사용하고
+systemd로 관리하세요.
 
 #### 1단계. 리스폰더 바이너리 빌드
 

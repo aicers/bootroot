@@ -255,6 +255,9 @@ responder config and restart the responder.
 
 ### Binary
 
+Use this when the **service itself runs as a host binary/daemon** and reads
+certs/keys from the host filesystem.
+
 Build from source:
 
 ```bash
@@ -278,6 +281,9 @@ service under the same user or group.
 
 ### Docker
 
+Use this when the **service itself runs in a container** and can share
+volumes with the bootroot-agent sidecar.
+
 Use the provided compose service:
 
 ```bash
@@ -287,15 +293,15 @@ docker compose up --build -d bootroot-agent
 The agent reads `agent.toml.compose` by default in the container.
 
 The image runs the agent in **daemon mode by default** (no `--oneshot`).
-For a sidecar, use a restart policy such as `restart: unless-stopped` to keep
-the container running (the current compose example does **not** set a restart
-policy for bootroot-agent by default). Also ensure Docker/Compose itself is
-managed by systemd (or an equivalent service manager) so it survives host
-reboots.
+The default `docker-compose.yml` in this project sets `restart: always` for
+the bootroot-agent sidecar.
+If you prefer manual stop behavior, switch to `restart: unless-stopped`.
+Also ensure Docker/Compose itself is managed by systemd (or an equivalent
+service manager) so it survives host reboots.
 
 ## HTTP-01 responder
 
-### Docker
+### Docker (default)
 
 HTTP-01 challenges are served by a separate responder image built from
 `docker/http01-responder/Dockerfile`.
@@ -304,13 +310,16 @@ HTTP-01 challenges are served by a separate responder image built from
 docker compose up --build -d bootroot-http01
 ```
 
+The default `docker-compose.yml` in this project sets `restart: always` for
+the HTTP-01 responder.
+
 The responder reads `responder.toml.compose` and listens on port 80 for
 `/.well-known/acme-challenge/` requests. bootroot-agent registers tokens via
 an admin API on port 8080 using the shared HMAC secret.
 
-### systemd (bare metal)
+### Binary (optional)
 
-You can also run the responder as a systemd service on a host.
+If you must run it outside Docker, use the binary and manage it with systemd.
 
 #### Step 1. Build the responder binary
 

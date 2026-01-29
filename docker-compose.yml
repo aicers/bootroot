@@ -54,6 +54,7 @@ services:
       dockerfile: docker/http01-responder/Dockerfile
     image: bootroot-http01-responder:latest
     container_name: bootroot-http01
+    restart: always
     ports:
       - "8080:8080"
     volumes:
@@ -70,6 +71,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: bootroot-agent
+    restart: always
     depends_on:
       - step-ca
     volumes:
