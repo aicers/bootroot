@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
 
 use crate::commands::init::{
@@ -23,6 +24,8 @@ pub(crate) struct Cli {
 pub(crate) enum CliCommand {
     #[command(subcommand)]
     Infra(InfraCommand),
+    #[command(subcommand)]
+    Monitoring(MonitoringCommand),
     Init(Box<InitArgs>),
     Status(Box<StatusArgs>),
     #[command(subcommand)]
@@ -34,6 +37,13 @@ pub(crate) enum CliCommand {
 #[derive(Subcommand, Debug)]
 pub(crate) enum InfraCommand {
     Up(InfraUpArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum MonitoringCommand {
+    Up(MonitoringUpArgs),
+    Status(MonitoringStatusArgs),
+    Down(MonitoringDownArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -216,6 +226,54 @@ pub(crate) struct InfraUpArgs {
     /// Auto-unseal `OpenBao` from file (dev/test only)
     #[arg(long, env = "OPENBAO_UNSEAL_FILE")]
     pub(crate) openbao_unseal_from_file: Option<PathBuf>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub(crate) enum MonitoringProfile {
+    Lan,
+    Public,
+}
+
+impl std::fmt::Display for MonitoringProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MonitoringProfile::Lan => write!(f, "lan"),
+            MonitoringProfile::Public => write!(f, "public"),
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct MonitoringUpArgs {
+    /// Path to docker-compose.yml
+    #[arg(long, default_value = "docker-compose.yml")]
+    pub(crate) compose_file: PathBuf,
+
+    /// Monitoring profile to start (lan or public)
+    #[arg(long, value_enum, default_value_t = MonitoringProfile::Lan)]
+    pub(crate) profile: MonitoringProfile,
+
+    /// Grafana admin password override (default: admin)
+    #[arg(long, env = "GRAFANA_ADMIN_PASSWORD")]
+    pub(crate) grafana_admin_password: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct MonitoringStatusArgs {
+    /// Path to docker-compose.yml
+    #[arg(long, default_value = "docker-compose.yml")]
+    pub(crate) compose_file: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct MonitoringDownArgs {
+    /// Path to docker-compose.yml
+    #[arg(long, default_value = "docker-compose.yml")]
+    pub(crate) compose_file: PathBuf,
+
+    /// Reset Grafana admin password on next up
+    #[arg(long)]
+    pub(crate) reset_grafana_admin_password: bool,
 }
 
 #[derive(Args, Debug)]
@@ -435,5 +493,16 @@ mod tests {
             "api",
         ]);
         assert!(matches!(cli.command, CliCommand::Rotate(_)));
+    }
+
+    #[test]
+    fn test_cli_parses_monitoring_profile() {
+        let cli = Cli::parse_from(["bootroot", "monitoring", "up", "--profile", "public"]);
+        match cli.command {
+            CliCommand::Monitoring(MonitoringCommand::Up(args)) => {
+                assert!(matches!(args.profile, MonitoringProfile::Public));
+            }
+            _ => panic!("expected monitoring up"),
+        }
     }
 }

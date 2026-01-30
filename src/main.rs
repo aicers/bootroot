@@ -7,7 +7,7 @@ mod state;
 
 use clap::Parser;
 
-use crate::cli::args::{AppCommand, Cli, CliCommand, InfraCommand};
+use crate::cli::args::{AppCommand, Cli, CliCommand, InfraCommand, MonitoringCommand};
 use crate::i18n::Messages;
 
 fn main() {
@@ -37,6 +37,18 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
         CliCommand::Infra(InfraCommand::Up(args)) => {
             commands::infra::run_infra_up(&args, messages)
                 .with_context(|| messages.error_infra_failed())?;
+        }
+        CliCommand::Monitoring(MonitoringCommand::Up(args)) => {
+            commands::monitoring::run_monitoring_up(&args, messages)
+                .with_context(|| messages.error_monitoring_failed())?;
+        }
+        CliCommand::Monitoring(MonitoringCommand::Status(args)) => {
+            commands::monitoring::run_monitoring_status(&args, messages)
+                .with_context(|| messages.error_monitoring_failed())?;
+        }
+        CliCommand::Monitoring(MonitoringCommand::Down(args)) => {
+            commands::monitoring::run_monitoring_down(&args, messages)
+                .with_context(|| messages.error_monitoring_failed())?;
         }
         CliCommand::Init(args) => {
             let runtime = tokio::runtime::Runtime::new()

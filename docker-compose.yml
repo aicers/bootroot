@@ -7,6 +7,8 @@ services:
     restart: always
     ports:
       - "8200:8200"
+    expose:
+      - "9101"
     volumes:
       - openbao-data:/openbao/file
       - ./openbao:/openbao/config:ro
@@ -36,6 +38,8 @@ services:
       - postgres
     ports:
       - "9000:9000"
+    expose:
+      - "9102"
     environment:
       - STEPUSER=step
     volumes:
@@ -86,6 +90,58 @@ services:
     environment:
       - RUST_LOG=debug
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: bootroot-prometheus
+    restart: always
+    profiles:
+      - lan
+      - public
+    depends_on:
+      - step-ca
+      - openbao
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: bootroot-grafana
+    restart: always
+    profiles:
+      - lan
+    depends_on:
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./monitoring/grafana:/etc/grafana/provisioning:ro
+      - ./monitoring/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_LAN_BIND_ADDR:-127.0.0.1}:3000:3000"
+
+  grafana-public:
+    image: grafana/grafana:latest
+    container_name: bootroot-grafana-public
+    restart: always
+    profiles:
+      - public
+    depends_on:
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./monitoring/grafana:/etc/grafana/provisioning:ro
+      - ./monitoring/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "0.0.0.0:3000:3000"
+
 volumes:
   openbao-data:
   postgres-data:
+  prometheus-data:
+  grafana-data:

@@ -1,8 +1,9 @@
 # Bootroot Manual
 
 This manual explains how to install, configure, and operate **bootroot**
-(bootroot CLI, bootroot-agent, and the HTTP-01 responder) with **step-ca**
-and **OpenBao**. It is written so that a reader with no PKI background can
+(bootroot CLI, bootroot-agent, and the HTTP-01 responder) with **step-ca**,
+**OpenBao**, **Prometheus**, and **Grafana**. It is written so that a reader
+with no PKI background can
 complete a full installation and issue certificates successfully. The
 bootroot CLI binary is `bootroot`, and the bootroot-agent binary is
 `bootroot-agent`.
@@ -15,7 +16,8 @@ for **Certificate Authority**, the service that signs certificates to assert
 identity. ACME (Automated Certificate Management Environment) is the RFC 8555
 protocol used for automated issuance.
 Bootroot's role is to **automatically issue, renew, and rotate certificates**
-so services (daemon apps and docker apps) can communicate over mTLS.
+so services (daemon apps and docker apps) can communicate over mTLS. It also
+uses Prometheus and Grafana to collect and visualize metrics for operations.
 
 Components:
 
@@ -26,6 +28,8 @@ Components:
 - **bootroot CLI**: CLI tool that automates install, init, and operations
 - **bootroot-agent**: A Rust ACME client developed in this project
 - **HTTP-01 responder**: An HTTP-01 daemon developed in this project
+- **Prometheus**: Metrics collector (open source)
+- **Grafana**: Metrics visualization dashboards (open source)
 
 CA is short for **Certificate Authority**, the service that signs certificates
 to assert identity. ACME (Automated Certificate Management Environment) is the
@@ -34,7 +38,7 @@ RFC 8555 protocol used for automated issuance.
 ## Manual Map
 
 - **CLI**: infra bring-up/initialization/status plus app onboarding,
-  issuance verification, secret rotation, and operational guidance
+  issuance verification, secret rotation, and monitoring guidance
 - **Concepts**: PKI, ACME, CSR, SAN, mTLS, and OpenBao basics
 - **Getting Started**: Quick Docker-based issuance flow
 - **Installation**: OpenBao + step-ca + PostgreSQL + bootroot-agent +
@@ -45,7 +49,8 @@ RFC 8555 protocol used for automated issuance.
 
 CLI usage is documented in the [CLI manual](cli.md) and the
 [CLI examples](cli-examples.md). The CLI manual covers
-core commands like `infra up/init/status`, `app add/verify`, and `rotate`.
+core commands like `infra up/init/status`, `app add/verify`, `rotate`, and
+`monitoring`.
 The rest of this manual focuses on the **manual setup** flow.
 
 ## Architecture (High Level)
