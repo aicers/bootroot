@@ -315,3 +315,35 @@ bootroot rotate responder-hmac --yes
 ```
 
 > 실제 운영 정책에 맞춰 주기/대상을 조정하세요.
+
+## 8) 모니터링(예시)
+
+LAN 전용으로 모니터링 기동:
+
+```bash
+bootroot monitoring up --profile lan --grafana-admin-password admin
+```
+
+공개 프로필로 모니터링 기동:
+
+```bash
+bootroot monitoring up --profile public --grafana-admin-password admin
+```
+
+상태 확인:
+
+```bash
+bootroot monitoring status
+```
+
+접속 URL:
+
+- `lan`: `http://<LAN-IP>:3000` (기본값이면 `http://127.0.0.1:3000`)
+- `public`: `http://<공인-IP>:3000`
+
+Grafana 관리자 비밀번호 초기화 후 재기동:
+
+```bash
+bootroot monitoring down --reset-grafana-admin-password
+bootroot monitoring up --profile lan --grafana-admin-password newpass
+```

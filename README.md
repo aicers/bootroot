@@ -11,17 +11,23 @@ bring up a private CA and issue/renew mTLS certificates.
 - **bootroot CLI** (`bootroot`)
 - **bootroot-agent** (`bootroot-agent`)
 - **HTTP-01 responder** (`bootroot-http01`)
+- **Prometheus** (monitoring)
+- **Grafana** (monitoring dashboards)
 
 Open source dependencies:
 
 - **step-ca**: ACME-compatible private CA
 - **OpenBao**: secret manager (Vault-compatible KV v2)
 - **PostgreSQL**: step-ca database
+- **Prometheus**: metrics collection
+- **Grafana**: metrics visualization
 
 ## Architecture Summary
 
 - **Single-machine default**: `bootroot infra up` starts OpenBao, PostgreSQL,
   step-ca, and the HTTP-01 responder with Docker Compose on the step-ca host.
+- **Monitoring**: Prometheus scrapes step-ca/OpenBao metrics and Grafana
+  visualizes them for local ops.
 - **App onboarding**: `bootroot app add` registers app metadata, creates an
   AppRole, and prints the run instructions for bootroot-agent and OpenBao Agent.
 - **Certificate flow**: bootroot-agent issues/renews certs; OpenBao Agent
@@ -41,6 +47,7 @@ bootroot init
 bootroot app add
 bootroot verify
 bootroot rotate ...
+bootroot monitoring up|status|down
 ```
 
 ## Documentation
@@ -100,3 +107,5 @@ Script notes:
 - `all` runs every scenario, including failure cases.
 - `TIMEOUT_SECS=180` and `TMP_DIR=./tmp/scenarios` can be overridden as needed.
 - The script expects Docker + Compose and uses the local Compose stack.
+- Monitoring integration tests (via `cargo test`) require Docker and bind
+  Grafana to `127.0.0.1:3000` during the run.

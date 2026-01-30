@@ -40,6 +40,26 @@ pub(crate) struct Strings {
     pub(crate) infra_entry_with_health: &'static str,
     pub(crate) infra_entry_without_health: &'static str,
     pub(crate) infra_unhealthy: &'static str,
+    pub(crate) monitoring_up_completed: &'static str,
+    pub(crate) monitoring_readiness_summary: &'static str,
+    pub(crate) monitoring_entry_with_health: &'static str,
+    pub(crate) monitoring_entry_without_health: &'static str,
+    pub(crate) monitoring_unhealthy: &'static str,
+    pub(crate) monitoring_status_title: &'static str,
+    pub(crate) monitoring_status_profile: &'static str,
+    pub(crate) monitoring_status_section_services: &'static str,
+    pub(crate) monitoring_status_entry_with_health: &'static str,
+    pub(crate) monitoring_status_entry_without_health: &'static str,
+    pub(crate) monitoring_status_grafana_url: &'static str,
+    pub(crate) monitoring_status_grafana_admin_password: &'static str,
+    pub(crate) monitoring_status_value_set: &'static str,
+    pub(crate) monitoring_status_value_default: &'static str,
+    pub(crate) monitoring_status_value_unknown: &'static str,
+    pub(crate) monitoring_status_no_services: &'static str,
+    pub(crate) monitoring_down_completed: &'static str,
+    pub(crate) monitoring_down_reset_grafana: &'static str,
+    pub(crate) monitoring_down_reset_grafana_skipped: &'static str,
+    pub(crate) monitoring_up_already_running: &'static str,
     pub(crate) error_service_no_container: &'static str,
     pub(crate) init_failed_rollback: &'static str,
     pub(crate) prompt_openbao_root_token: &'static str,
@@ -84,6 +104,7 @@ pub(crate) struct Strings {
     pub(crate) error_parent_not_found: &'static str,
     pub(crate) error_operation_cancelled: &'static str,
     pub(crate) error_infra_failed: &'static str,
+    pub(crate) error_monitoring_failed: &'static str,
     pub(crate) error_init_failed: &'static str,
     pub(crate) error_status_failed: &'static str,
     pub(crate) error_app_add_failed: &'static str,
@@ -131,6 +152,8 @@ pub(crate) struct Strings {
     pub(crate) error_openbao_kv_read_failed: &'static str,
     pub(crate) error_openbao_kv_delete_failed: &'static str,
     pub(crate) error_openbao_role_output_missing: &'static str,
+    pub(crate) error_parse_container_env_failed: &'static str,
+    pub(crate) error_parse_container_mounts_failed: &'static str,
     pub(crate) error_command_run_failed: &'static str,
     pub(crate) error_command_failed_status: &'static str,
     pub(crate) error_docker_compose_failed: &'static str,
@@ -347,6 +370,124 @@ impl Messages {
         format_template(self.strings().infra_unhealthy, &[("failures", failures)])
     }
 
+    pub(crate) fn monitoring_up_completed(&self) -> &'static str {
+        self.strings().monitoring_up_completed
+    }
+
+    pub(crate) fn monitoring_readiness_summary(&self) -> &'static str {
+        self.strings().monitoring_readiness_summary
+    }
+
+    pub(crate) fn monitoring_entry_with_health(
+        &self,
+        service: &str,
+        status: &str,
+        health: &str,
+    ) -> String {
+        format_template(
+            self.strings().monitoring_entry_with_health,
+            &[("service", service), ("status", status), ("health", health)],
+        )
+    }
+
+    pub(crate) fn monitoring_entry_without_health(&self, service: &str, status: &str) -> String {
+        format_template(
+            self.strings().monitoring_entry_without_health,
+            &[("service", service), ("status", status)],
+        )
+    }
+
+    pub(crate) fn monitoring_unhealthy(&self, failures: &str) -> String {
+        format_template(
+            self.strings().monitoring_unhealthy,
+            &[("failures", failures)],
+        )
+    }
+
+    pub(crate) fn monitoring_status_title(&self) -> &'static str {
+        self.strings().monitoring_status_title
+    }
+
+    pub(crate) fn monitoring_status_profile(&self, value: &str) -> String {
+        format_template(
+            self.strings().monitoring_status_profile,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn monitoring_status_section_services(&self) -> &'static str {
+        self.strings().monitoring_status_section_services
+    }
+
+    pub(crate) fn monitoring_status_entry_with_health(
+        &self,
+        service: &str,
+        status: &str,
+        health: &str,
+    ) -> String {
+        format_template(
+            self.strings().monitoring_status_entry_with_health,
+            &[("service", service), ("status", status), ("health", health)],
+        )
+    }
+
+    pub(crate) fn monitoring_status_entry_without_health(
+        &self,
+        service: &str,
+        status: &str,
+    ) -> String {
+        format_template(
+            self.strings().monitoring_status_entry_without_health,
+            &[("service", service), ("status", status)],
+        )
+    }
+
+    pub(crate) fn monitoring_status_grafana_url(&self, value: &str) -> String {
+        format_template(
+            self.strings().monitoring_status_grafana_url,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn monitoring_status_grafana_admin_password(&self, value: &str) -> String {
+        format_template(
+            self.strings().monitoring_status_grafana_admin_password,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn monitoring_status_value_set(&self) -> &'static str {
+        self.strings().monitoring_status_value_set
+    }
+
+    pub(crate) fn monitoring_status_value_default(&self) -> &'static str {
+        self.strings().monitoring_status_value_default
+    }
+
+    pub(crate) fn monitoring_status_value_unknown(&self) -> &'static str {
+        self.strings().monitoring_status_value_unknown
+    }
+
+    pub(crate) fn monitoring_status_no_services(&self) -> &'static str {
+        self.strings().monitoring_status_no_services
+    }
+
+    pub(crate) fn monitoring_down_completed(&self) -> &'static str {
+        self.strings().monitoring_down_completed
+    }
+
+    pub(crate) fn monitoring_down_reset_grafana(&self) -> &'static str {
+        self.strings().monitoring_down_reset_grafana
+    }
+
+    pub(crate) fn monitoring_down_reset_grafana_skipped(&self) -> &'static str {
+        self.strings().monitoring_down_reset_grafana_skipped
+    }
+
+    pub(crate) fn monitoring_up_already_running(&self) -> &'static str {
+        self.strings().monitoring_up_already_running
+    }
+
     pub(crate) fn error_service_no_container(&self, service: &str) -> String {
         format_template(
             self.strings().error_service_no_container,
@@ -544,6 +685,10 @@ impl Messages {
 
     pub(crate) fn error_infra_failed(&self) -> &'static str {
         self.strings().error_infra_failed
+    }
+
+    pub(crate) fn error_monitoring_failed(&self) -> &'static str {
+        self.strings().error_monitoring_failed
     }
 
     pub(crate) fn error_init_failed(&self) -> &'static str {
@@ -747,6 +892,14 @@ impl Messages {
             self.strings().error_openbao_role_output_missing,
             &[("value", value)],
         )
+    }
+
+    pub(crate) fn error_parse_container_env_failed(&self) -> &'static str {
+        self.strings().error_parse_container_env_failed
+    }
+
+    pub(crate) fn error_parse_container_mounts_failed(&self) -> &'static str {
+        self.strings().error_parse_container_mounts_failed
     }
 
     pub(crate) fn error_command_run_failed(&self, command: &str) -> String {

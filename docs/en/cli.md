@@ -6,6 +6,7 @@ This document covers the bootroot CLI.
 
 The CLI provides infra bootstrapping, initialization, status checks, app
 onboarding, issuance verification, and secret rotation.
+It also manages local monitoring with Prometheus and Grafana.
 
 - `bootroot infra up`
 - `bootroot init`
@@ -14,6 +15,7 @@ onboarding, issuance verification, and secret rotation.
 - `bootroot app info`
 - `bootroot verify`
 - `bootroot rotate`
+- `bootroot monitoring`
 
 ## Global Options
 
@@ -348,3 +350,79 @@ The command is considered failed when:
 - EAB issuance request fails
 - responder config write fails or reload fails
 - AppRole target is missing or secret_id update fails
+
+## bootroot monitoring
+
+Manages the local monitoring stack (Prometheus + Grafana) that is defined in
+`docker-compose.yml`. Monitoring uses compose profiles to separate LAN and
+public access modes.
+
+Supported subcommands:
+
+- `monitoring up`
+- `monitoring status`
+- `monitoring down`
+
+### Profiles
+
+- `lan`: Grafana binds to `GRAFANA_LAN_BIND_ADDR` (default `127.0.0.1`)  
+  The default is **localhost-only**, so access is limited to the same machine.  
+  Here, “LAN IP” means the **private-network interface IP** on the same host  
+  (for example, `192.168.x.x` or `10.x.x.x`).  
+  Binding to a LAN IP allows access **only within that private network**  
+  segment and prevents access from the public internet  
+  (assuming no routing or port forwarding).
+- `public`: Grafana binds to `0.0.0.0`  
+  **All interfaces are reachable**, so access is possible from the same LAN  
+  and from outside networks.
+  - Access URL: `http://<public-ip>:3000`
+
+### `monitoring up`
+
+Starts Prometheus and Grafana for the selected profile.
+
+Inputs:
+
+- `--profile`: `lan` or `public` (default `lan`)
+- `--grafana-admin-password`: sets Grafana admin password for **first boot**
+  (can also be passed via `GRAFANA_ADMIN_PASSWORD`)
+
+Behavior:
+
+- If monitoring is already running, it prints a message and exits.
+- Password override is only applied on first boot (Grafana stores it in its DB).
+
+Access URLs:
+
+- `lan`: `http://<lan-ip>:3000` (or `http://127.0.0.1:3000` if using default)
+- `public`: `http://<public-ip>:3000`
+
+### `monitoring status`
+
+Prints monitoring service health plus Grafana access details.
+
+Outputs:
+
+- Service status/health for Prometheus and Grafana
+- Grafana URL (based on profile + `GRAFANA_LAN_BIND_ADDR`)
+- Admin password status:
+  - `default (admin)`, `set`, or `unknown`
+
+Notes:
+
+- This command auto-detects the running profile(s). It does not accept
+  `--profile`.
+
+### `monitoring down`
+
+Stops and removes monitoring containers without affecting infra.
+
+Inputs:
+
+- `--reset-grafana-admin-password`: deletes Grafana data volume so the next
+  `monitoring up` can reapply a new admin password
+
+Notes:
+
+- This command auto-detects the running profile(s). It does not accept
+  `--profile`.

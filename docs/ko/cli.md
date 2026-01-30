@@ -6,6 +6,7 @@
 
 CLI는 infra 기동/초기화/상태 점검과 앱 온보딩, 발급 검증,
 시크릿 회전을 제공합니다.
+또한 Prometheus/Grafana 기반 로컬 모니터링을 관리합니다.
 
 - `bootroot infra up`
 - `bootroot init`
@@ -14,6 +15,7 @@ CLI는 infra 기동/초기화/상태 점검과 앱 온보딩, 발급 검증,
 - `bootroot app info`
 - `bootroot verify`
 - `bootroot rotate`
+- `bootroot monitoring`
 
 ## 공통 옵션
 
@@ -345,3 +347,74 @@ OpenBao와 통신해 값을 갱신합니다.
 - EAB 발급 요청 실패
 - responder 설정 파일 쓰기 실패 또는 리로드 실패
 - AppRole 대상 서비스 미등록 또는 secret_id 갱신 실패
+
+## bootroot monitoring
+
+로컬 모니터링 스택(Prometheus + Grafana)을 관리합니다.
+`docker-compose.yml`의 프로필을 사용해 LAN/공개 모드를 분리합니다.
+
+지원 서브커맨드:
+
+- `monitoring up`
+- `monitoring status`
+- `monitoring down`
+
+### 프로필
+
+- `lan`: Grafana 바인딩 주소는 `GRAFANA_LAN_BIND_ADDR`(기본 `127.0.0.1`)  
+  기본값은 **로컬호스트 전용**이라 같은 머신에서만 접속 가능합니다.  
+  여기서 LAN IP는 **같은 머신이 가진 IP 중 사설망 인터페이스의 주소**를 뜻합니다  
+  (예: `192.168.x.x`, `10.x.x.x`).  
+  `GRAFANA_LAN_BIND_ADDR`를 LAN IP로 지정하면 **해당 사설망 대역에서만 접속**되며  
+  외부 인터넷에서는 접근할 수 없습니다(별도 라우팅/포트포워딩이 없는 전제).
+- `public`: Grafana 바인딩 주소는 `0.0.0.0`  
+  **모든 인터페이스에서 접속 가능**하며, 동일 LAN뿐 아니라 외부에서도 접근됩니다.
+  접속 URL: `http://<공인-IP>:3000`
+
+### `monitoring up`
+
+선택한 프로필로 Prometheus와 Grafana를 기동합니다.
+
+입력:
+
+- `--profile`: `lan` 또는 `public` (기본 `lan`)
+- `--grafana-admin-password`: Grafana 관리자 비밀번호를 **최초 기동 시** 설정
+  (환경 변수 `GRAFANA_ADMIN_PASSWORD`로도 지정 가능)
+
+동작:
+
+- 이미 실행 중이면 메시지를 출력하고 종료합니다.
+- 비밀번호는 Grafana DB에 저장되므로, 최초 기동 이후에는 변경되지 않습니다.
+
+접속 URL:
+
+- `lan`: `http://<LAN-IP>:3000` (기본값이면 `http://127.0.0.1:3000`)
+- `public`: `http://<공인-IP>:3000`
+
+### `monitoring status`
+
+모니터링 서비스 상태와 Grafana 접근 정보를 출력합니다.
+
+출력:
+
+- Prometheus/Grafana 상태/헬스
+- Grafana 접속 URL(프로필 + `GRAFANA_LAN_BIND_ADDR` 기준)
+- 관리자 비밀번호 상태:
+  - `기본값(admin)`, `설정됨`, `알 수 없음`
+
+비고:
+
+- 실행 중인 프로필을 자동 감지합니다. `--profile`은 받지 않습니다.
+
+### `monitoring down`
+
+모니터링 컨테이너를 중지/삭제합니다(infra에는 영향 없음).
+
+입력:
+
+- `--reset-grafana-admin-password`: Grafana 데이터 볼륨을 삭제하여
+  다음 `monitoring up`에서 비밀번호를 다시 적용할 수 있게 합니다.
+
+비고:
+
+- 실행 중인 프로필을 자동 감지합니다. `--profile`은 받지 않습니다.

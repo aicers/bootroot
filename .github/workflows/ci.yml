@@ -140,6 +140,9 @@ jobs:
           sudo chmod -R 700 "$BOOTROOT_SECRETS_DIR"
           sudo chmod -R 755 certs
 
+      - name: Monitoring Integration Test (E2E)
+        run: cargo test --test monitoring_integration
+
       - name: Start Services (Docker Compose)
         run: docker compose up --build -d
 
