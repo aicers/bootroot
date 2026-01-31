@@ -1864,33 +1864,47 @@ mod tests {
     #[test]
     fn test_resolve_db_provision_inputs_with_args() {
         let _guard = env_lock();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let admin_password = format!("admin-{nonce}");
+        let db_password = format!("step-{nonce}");
         let mut args = default_init_args();
         args.db_provision = true;
-        args.db_admin.admin_dsn =
-            Some("postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string());
+        args.db_admin.admin_dsn = Some(format!(
+            "postgresql://admin:{admin_password}@localhost:5432/postgres?sslmode=disable"
+        ));
         args.db_user = Some("stepuser".to_string());
-        args.db_password = Some("step-pass".to_string());
+        args.db_password = Some(db_password.clone());
         args.db_name = Some("stepdb".to_string());
 
         let inputs = resolve_db_provision_inputs(&args, &test_messages()).unwrap();
         assert_eq!(
             inputs.admin_dsn,
-            "postgresql://admin:pass@localhost:5432/postgres?sslmode=disable"
+            format!("postgresql://admin:{admin_password}@localhost:5432/postgres?sslmode=disable")
         );
         assert_eq!(inputs.db_user, "stepuser");
-        assert_eq!(inputs.db_password, "step-pass");
+        assert_eq!(inputs.db_password, db_password);
         assert_eq!(inputs.db_name, "stepdb");
     }
 
     #[test]
     fn test_resolve_db_provision_inputs_rejects_invalid_identifier() {
         let _guard = env_lock();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let admin_password = format!("admin-{nonce}");
+        let db_password = format!("step-{nonce}");
         let mut args = default_init_args();
         args.db_provision = true;
-        args.db_admin.admin_dsn =
-            Some("postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string());
+        args.db_admin.admin_dsn = Some(format!(
+            "postgresql://admin:{admin_password}@localhost:5432/postgres?sslmode=disable"
+        ));
         args.db_user = Some("bad-name".to_string());
-        args.db_password = Some("step-pass".to_string());
+        args.db_password = Some(db_password);
         args.db_name = Some("stepdb".to_string());
 
         let err = resolve_db_provision_inputs(&args, &test_messages()).unwrap_err();
@@ -1900,13 +1914,20 @@ mod tests {
     #[test]
     fn test_resolve_db_dsn_for_init_rejects_conflict() {
         let _guard = env_lock();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let admin_password = format!("admin-{nonce}");
+        let db_password = format!("step-{nonce}");
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://user:pass@localhost/db".to_string());
         args.db_provision = true;
-        args.db_admin.admin_dsn =
-            Some("postgresql://admin:pass@localhost:5432/postgres?sslmode=disable".to_string());
+        args.db_admin.admin_dsn = Some(format!(
+            "postgresql://admin:{admin_password}@localhost:5432/postgres?sslmode=disable"
+        ));
         args.db_user = Some("stepuser".to_string());
-        args.db_password = Some("step-pass".to_string());
+        args.db_password = Some(db_password);
         args.db_name = Some("stepdb".to_string());
 
         let err = tokio::runtime::Runtime::new()
