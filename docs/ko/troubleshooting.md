@@ -68,6 +68,7 @@ step-ca 프로비저너 정책과 요청 DNS SAN을 확인하세요.
   - `trust.ca_bundle_path`를 쓰는 경우 파일 존재/읽기 권한 확인
   - 임시 진단 용도로는 `bootroot-agent --insecure` 사용 가능 (운영 비권장)
 - `server` URL 확인
+- `server` URL이 `https://`인지 확인 (`http://`는 거부됨)
 
 ## 훅 실행 오류
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use ring::digest::{Context as DigestContext, SHA256};
 use ring::hmac;
 use ring::rand::SystemRandom;
@@ -26,6 +26,8 @@ const CRV_P256: &str = "P-256";
 const KTY_EC: &str = "EC";
 const CONTENT_TYPE_JOSE_JSON: &str = "application/jose+json";
 const HEADER_REPLAY_NONCE: &str = "replay-nonce";
+const SCHEME_HTTP: &str = "http";
+const SCHEME_HTTPS: &str = "https";
 #[derive(Debug, Deserialize, Clone)]
 struct Directory {
     #[serde(rename = "newNonce")]
@@ -91,11 +93,12 @@ impl AcmeClient {
         if self.directory.is_some() {
             return Ok(());
         }
-        info!("Fetching ACME directory from {}", self.directory_url);
+        let directory_url = Self::enforce_https(&self.directory_url)?;
+        info!("Fetching ACME directory from {}", directory_url);
         let mut last_err = None;
         let mut delay_secs = self.directory_fetch_base_delay_secs;
         for attempt in 1..=self.directory_fetch_attempts {
-            let resp = self.client.get(&self.directory_url).send().await;
+            let resp = self.client.get(directory_url.clone()).send().await;
             match resp {
                 Ok(resp) => match resp.json::<Directory>().await {
                     Ok(dir) => {
@@ -141,7 +144,8 @@ impl AcmeClient {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Directory not loaded"))?;
 
-        let resp = self.client.head(&dir.nonce).send().await?;
+        let nonce_url = Self::enforce_https(&dir.nonce)?;
+        let resp = self.client.head(nonce_url).send().await?;
         let nonce = resp
             .headers()
             .get(HEADER_REPLAY_NONCE)
@@ -416,16 +420,17 @@ impl AcmeClient {
 
     async fn sign_request<T: Serialize + ?Sized>(
         &mut self,
-        url: &str,
+        url: &Url,
         payload: Option<&T>,
     ) -> Result<serde_json::Value> {
         let nonce = self.get_nonce().await?;
+        let url_value = url.as_str().to_string();
 
         let header = if let Some(kid) = &self.key_id {
             JwsHeader {
                 alg: ALG_ES256.to_string(),
                 nonce,
-                url: url.to_string(),
+                url: url_value.clone(),
                 jwk: None,
                 kid: Some(kid.clone()),
             }
@@ -433,7 +438,7 @@ impl AcmeClient {
             JwsHeader {
                 alg: ALG_ES256.to_string(),
                 nonce,
-                url: url.to_string(),
+                url: url_value,
                 jwk: Some(self.jwk()?),
                 kid: None,
             }
@@ -477,7 +482,8 @@ impl AcmeClient {
         url: &str,
         payload: &T,
     ) -> Result<reqwest::Response> {
-        let body = self.sign_request(url, Some(payload)).await?;
+        let url = Self::enforce_https(url)?;
+        let body = self.sign_request(&url, Some(payload)).await?;
         debug!("POST {} body: {}", url, body);
         let resp = self
             .client
@@ -490,7 +496,8 @@ impl AcmeClient {
     }
 
     async fn post_as_get(&mut self, url: &str) -> Result<reqwest::Response> {
-        let body = self.sign_request::<()>(url, None).await?;
+        let url = Self::enforce_https(url)?;
+        let body = self.sign_request::<()>(&url, None).await?;
         debug!("POST-as-GET {} body: {}", url, body);
         let resp = self
             .client
@@ -500,6 +507,20 @@ impl AcmeClient {
             .send()
             .await?;
         Ok(resp)
+    }
+
+    fn enforce_https(url: &str) -> Result<Url> {
+        let parsed = Url::parse(url).context("Invalid ACME URL")?;
+        if parsed.scheme() == SCHEME_HTTPS {
+            return Ok(parsed);
+        }
+        if parsed.scheme() == SCHEME_HTTP && cfg!(test) {
+            warn!("Allowing non-HTTPS ACME URL in tests: {}", parsed);
+            return Ok(parsed);
+        }
+        Err(anyhow::anyhow!(
+            "Refusing to send ACME request over non-HTTPS URL: {parsed}"
+        ))
     }
 }
 
