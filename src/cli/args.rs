@@ -216,7 +216,7 @@ pub(crate) struct InfraUpArgs {
     pub(crate) image_archive_dir: Option<PathBuf>,
 
     /// Docker restart policy to apply after containers start
-    #[arg(long, default_value = "unless-stopped")]
+    #[arg(long, default_value = "always")]
     pub(crate) restart_policy: String,
 
     /// `OpenBao` API URL for auto-unseal (dev/test only)

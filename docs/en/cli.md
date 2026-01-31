@@ -35,7 +35,7 @@ setup instead of the CLI.
 - `--compose-file`: compose file path (default `docker-compose.yml`)
 - `--services`: services to start (default `openbao,postgres,step-ca,bootroot-http01`)
 - `--image-archive-dir`: local image archive directory (optional)
-- `--restart-policy`: container restart policy (default `unless-stopped`)
+- `--restart-policy`: container restart policy (default `always`)
 - `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
 - `--openbao-unseal-from-file`: read OpenBao unseal keys from file (dev/test only)
 
