@@ -414,6 +414,7 @@ async fn rotate_approle_secret_id(
         .with_context(|| messages.error_openbao_approle_login_failed())?;
 
     println!("{}", messages.rotate_summary_title());
+    // codeql[rust/cleartext-logging]: output is a secret_id file path, not the secret value.
     println!(
         "{}",
         messages.rotate_summary_approle_secret_id(

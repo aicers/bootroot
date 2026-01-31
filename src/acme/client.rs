@@ -527,6 +527,7 @@ impl AcmeClient {
 fn build_http_client(trust: &TrustSettings) -> Result<Client> {
     install_crypto_provider();
     if !trust.verify_certificates {
+        // codeql[rust/disabled-certificate-check]: allowed for bootstrap/diagnostics when TLS trust is not yet configured.
         return Client::builder()
             .danger_accept_invalid_certs(true)
             .build()

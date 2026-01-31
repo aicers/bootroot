@@ -35,6 +35,7 @@ fn build_csr_params(
 }
 
 fn split_leaf_and_chain(cert_pem: &str) -> Result<(String, Vec<Vec<u8>>)> {
+    // codeql[rust/cleartext-logging]: PEM contents are returned for file writes, not logged.
     let mut certs = Vec::new();
     for pem in Pem::iter_from_buffer(cert_pem.as_bytes()) {
         let pem = pem.map_err(|e| anyhow::anyhow!("Failed to parse PEM block: {e:?}"))?;

@@ -1027,6 +1027,7 @@ fn prompt_unseal_keys(threshold: Option<u32>, messages: &Messages) -> Result<Vec
 
 fn prompt_text(prompt: &str, messages: &Messages) -> Result<String> {
     use std::io::{self, Write};
+    // codeql[rust/cleartext-logging]: prompt text is non-secret UI output.
     print!("{prompt}");
     io::stdout()
         .flush()
