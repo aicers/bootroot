@@ -180,6 +180,7 @@ step-ca 컨테이너의 `/etc/hosts`에 매핑을 추가합니다.
 이 매핑은 **검증용 도메인 → responder 컨테이너 IP**로
 강제 연결되도록 만들어, 실제 DNS가 없는 로컬 환경에서도
 HTTP-01 검증이 통과되게 합니다.
+검증 FQDN은 `<instance_id>.<service_name>.<hostname>.<domain>` 형식입니다.
 
 ```bash
 RESPONDER_IP="$(docker inspect -f \
@@ -188,10 +189,9 @@ RESPONDER_IP="$(docker inspect -f \
 docker exec bootroot-ca sh -c \
   "printf '%s %s\n' \"$RESPONDER_IP\" \
   '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
-docker exec bootroot-ca sh -c \
-  "printf '%s %s\n' \"$RESPONDER_IP\" \
-  '001.web-app.web-01.trusted.domain' >> /etc/hosts"
 ```
+
+추가된 앱이 더 있다면, 각 앱의 FQDN에 대해 동일한 명령을 반복하세요.
 
 > 운영 환경에서는 DNS로 동일한 이름 해석이 되도록 구성하세요.
 

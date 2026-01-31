@@ -351,10 +351,7 @@ mod tests {
     #[test]
     fn test_docker_update_args() {
         let args = docker_update_args("always", "container123");
-        assert_eq!(
-            args,
-            vec!["update", "--restart", "always", "container123"]
-        );
+        assert_eq!(args, vec!["update", "--restart", "always", "container123"]);
     }
 
     #[test]

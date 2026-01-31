@@ -178,6 +178,7 @@ responder container. The simplest option is to add /etc/hosts entries inside
 the step-ca container. This forces the **validation FQDNs** to resolve to
 the **responder container IP**, so HTTP-01 validation can succeed without
 real DNS records.
+The validation FQDN follows `<instance_id>.<service_name>.<hostname>.<domain>`.
 
 ```bash
 RESPONDER_IP="$(docker inspect -f \
@@ -186,10 +187,9 @@ RESPONDER_IP="$(docker inspect -f \
 docker exec bootroot-ca sh -c \
   "printf '%s %s\n' \"$RESPONDER_IP\" \
   '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
-docker exec bootroot-ca sh -c \
-  "printf '%s %s\n' \"$RESPONDER_IP\" \
-  '001.web-app.web-01.trusted.domain' >> /etc/hosts"
 ```
+
+If you add more apps, repeat the same command for each app FQDN.
 
 > In production, use proper DNS records instead.
 
