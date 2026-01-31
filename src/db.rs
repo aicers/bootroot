@@ -239,14 +239,25 @@ pub fn check_tcp_sync(host: &str, port: u16, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+
+    fn test_password() -> String {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        format!("pass-{nonce}")
+    }
 
     #[test]
     fn parse_db_dsn_success() {
-        let dsn = "postgresql://user:pass@localhost:5432/db?sslmode=disable";
-        let parsed = parse_db_dsn(dsn).unwrap();
+        let password = test_password();
+        let dsn = format!("postgresql://user:{password}@localhost:5432/db?sslmode=disable");
+        let parsed = parse_db_dsn(&dsn).unwrap();
         assert_eq!(parsed.user, "user");
-        assert_eq!(parsed.password, "pass");
+        assert_eq!(parsed.password, password);
         assert_eq!(parsed.host, "localhost");
         assert_eq!(parsed.port, 5432);
         assert_eq!(parsed.database, "db");
@@ -255,7 +266,8 @@ mod tests {
 
     #[test]
     fn parse_db_dsn_rejects_missing_prefix() {
-        let err = parse_db_dsn("postgres://user:pass@localhost/db").unwrap_err();
+        let password = test_password();
+        let err = parse_db_dsn(&format!("postgres://user:{password}@localhost/db")).unwrap_err();
         assert!(err.to_string().contains("postgresql://"));
     }
 
@@ -267,7 +279,8 @@ mod tests {
 
     #[test]
     fn build_db_dsn_includes_sslmode() {
-        let dsn = build_db_dsn("user", "pass", "localhost", 5432, "db", Some("require"));
+        let password = test_password();
+        let dsn = build_db_dsn("user", &password, "localhost", 5432, "db", Some("require"));
         assert!(dsn.contains("sslmode=require"));
     }
 
@@ -286,8 +299,9 @@ mod tests {
 
     #[test]
     fn check_auth_sync_fails_on_closed_port() {
-        let dsn = "postgresql://user:pass@127.0.0.1:9/db?sslmode=disable";
-        let err = check_auth_sync(dsn, Duration::from_millis(100)).unwrap_err();
+        let password = test_password();
+        let dsn = format!("postgresql://user:{password}@127.0.0.1:9/db?sslmode=disable");
+        let err = check_auth_sync(&dsn, Duration::from_millis(100)).unwrap_err();
         let message = err.to_string();
         assert!(
             message.contains("authenticate") || message.contains("Timed out"),
