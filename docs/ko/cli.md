@@ -35,7 +35,7 @@ HTTP-01 리스폰더가 함께 구동된다는 전제를 둡니다. 서로 다�
 - `--compose-file`: compose 파일 경로 (기본값 `docker-compose.yml`)
 - `--services`: 기동 대상 서비스 목록 (기본값 `openbao,postgres,step-ca,bootroot-http01`)
 - `--image-archive-dir`: 로컬 이미지 아카이브 디렉터리(선택)
-- `--restart-policy`: 컨테이너 재시작 정책 (기본값 `unless-stopped`)
+- `--restart-policy`: 컨테이너 재시작 정책 (기본값 `always`)
 - `--openbao-url`: OpenBao API URL (기본값 `http://localhost:8200`)
 - `--openbao-unseal-from-file`: 파일에서 OpenBao 언실 키 읽기 (dev/test 전용)
 
