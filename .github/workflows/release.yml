@@ -1,0 +1,61 @@
+name: Release
+
+on:
+    push:
+        tags:
+            - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+    contents: write
+
+jobs:
+    release:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v6
+
+            - name: Extract version from tag
+              id: version
+              run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+            - name: Extract release notes from CHANGELOG.md
+              id: release_notes
+              run: |
+                  VERSION="${{ steps.version.outputs.version }}"
+                  SECTION_START=$(grep -nE "^## \[$VERSION\]|^## $VERSION" CHANGELOG.md | head -1 | cut -d: -f1)
+
+                  if [ -z "$SECTION_START" ]; then
+                    echo "Could not find version $VERSION in CHANGELOG.md"
+                    FALLBACK_B64=$(printf 'Release for version %s' "$VERSION" | base64 -w 0)
+                    echo "release_notes_b64=$FALLBACK_B64" >> "$GITHUB_OUTPUT"
+                  else
+                    NEXT_SECTION=$(tail -n +$((SECTION_START + 1)) CHANGELOG.md | grep -n "^## " | head -1 | cut -d: -f1)
+
+                    if [ -z "$NEXT_SECTION" ]; then
+                      tail -n +$((SECTION_START + 1)) CHANGELOG.md > /tmp/release_notes_temp.txt
+                    elif [ "$NEXT_SECTION" -le 1 ]; then
+                      : > /tmp/release_notes_temp.txt
+                    else
+                      tail -n +$((SECTION_START + 1)) CHANGELOG.md | head -n $((NEXT_SECTION - 1)) > /tmp/release_notes_temp.txt
+                    fi
+
+                    # Remove leading blank lines, keep internal spacing
+                    sed -i '/./,$!d' /tmp/release_notes_temp.txt
+                    # Remove trailing blank lines
+                    sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' /tmp/release_notes_temp.txt
+
+                    RELEASE_NOTES_B64=$(base64 -w 0 < /tmp/release_notes_temp.txt)
+                    echo "release_notes_b64=$RELEASE_NOTES_B64" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Create Release
+              run: |
+                  echo "${{ steps.release_notes.outputs.release_notes_b64 }}" | base64 -d > release_notes.txt
+                  gh release create "${{ steps.version.outputs.version }}" \
+                    --title "${{ steps.version.outputs.version }}" \
+                    --notes-file release_notes.txt \
+                    --repo "${{ github.repository }}"
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
