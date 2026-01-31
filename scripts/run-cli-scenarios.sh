@@ -27,7 +27,7 @@ run_cli_tests() {
 
 reset_openbao() {
   log "Resetting OpenBao state"
-  docker compose stop openbao >/dev/null 2>&1 || true
+  docker compose -f docker-compose.yml -f docker-compose.test.yml stop openbao >/dev/null 2>&1 || true
   docker rm bootroot-openbao >/dev/null 2>&1 || true
   docker volume rm bootroot_openbao-data >/dev/null 2>&1 || true
 }
@@ -62,13 +62,13 @@ run_init_scenario() {
 
   log "Starting infra"
   log "Building local images"
-  docker compose build step-ca bootroot-http01
+  docker compose -f docker-compose.yml -f docker-compose.test.yml build step-ca bootroot-http01
   if [ -x "$ROOT_DIR/scripts/update-ca-db-dsn.sh" ]; then
     log "Updating ca.json DB DSN"
     "$ROOT_DIR/scripts/update-ca-db-dsn.sh"
   fi
   log "Starting minimal infra (openbao/postgres/responder)"
-  docker compose up -d openbao postgres bootroot-http01
+  docker compose -f docker-compose.yml -f docker-compose.test.yml up -d openbao postgres bootroot-http01
 
   log "Running bootroot init"
   BOOTROOT_LANG=en printf "y\ny\nn\n" | cargo run --bin bootroot -- init \

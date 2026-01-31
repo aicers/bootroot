@@ -147,14 +147,14 @@ jobs:
         run: cargo test --test monitoring_integration
 
       - name: Start Services (Docker Compose)
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml up --build -d
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d
 
       - name: Wait for services
         run: sleep 10
 
       - name: CLI Infra Up (Smoke)
         run: |
-          docker compose -f docker-compose.yml -f docker-compose.ci.yml build step-ca bootroot-http01
+          docker compose -f docker-compose.yml -f docker-compose.test.yml build step-ca bootroot-http01
           cargo run --bin bootroot -- infra up
 
       - name: CLI Init (Smoke)
@@ -314,4 +314,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml down
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml down

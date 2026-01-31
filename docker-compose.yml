@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   openbao:
     image: openbao/openbao:latest
@@ -67,8 +65,6 @@ services:
       - --config=/app/responder.toml
     networks:
       default:
-        aliases:
-          - 001.bootroot-agent.bootroot-agent.trusted.domain
 
   bootroot-agent:
     build:
