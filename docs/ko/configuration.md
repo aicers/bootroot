@@ -88,6 +88,7 @@ domain = "trusted.domain"
   시스템을 붙일 때 사용할 수 있으므로 실제 수신 가능한 주소를 권장합니다.
 - `server`: ACME 디렉터리 URL입니다. bootroot-agent가 step-ca와 통신할 때
   시작점으로 사용하는 주소입니다.
+  - `https://`만 지원하며 `http://`는 런타임에서 거부됩니다.
   - `localhost`는 **step-ca가 같은 머신에서 동작할 때만** 유효합니다.
     다른 머신이면 해당 호스트/IP로 바꿔야 합니다.
   - 경로 형식은 `/acme/<provisioner-name>/directory`입니다. 개발 설정에서는

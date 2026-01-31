@@ -85,6 +85,7 @@ domain = "trusted.domain"
   address, so use a real inbox in production. In this context, “step-ca
   account” and “ACME account” mean the same registration.
 - `server`: ACME directory URL used as the entry point for step-ca.
+  - Only `https://` URLs are supported. `http://` is refused at runtime.
   - `localhost` only works when step-ca runs on the same host as
     bootroot-agent. Otherwise use the step-ca host/IP.
   - The path is `/acme/<provisioner-name>/directory`. In our dev config the

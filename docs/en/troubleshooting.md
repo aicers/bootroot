@@ -68,6 +68,7 @@ files are missing, init fails.
   - If using `trust.ca_bundle_path`, ensure the bundle exists and is readable
   - For temporary diagnosis, use `bootroot-agent --insecure` (not for prod)
 - Verify `server` URL in `agent.toml`
+- Ensure the `server` URL is `https://` (HTTP is refused)
 
 ## Hook execution errors
 
