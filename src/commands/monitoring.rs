@@ -82,6 +82,7 @@ pub(crate) fn run_monitoring_status(
             .find(|entry| entry.service == grafana_service)
             .and_then(|entry| grafana_admin_password_status(&entry.container_id, messages).ok())
             .unwrap_or(GrafanaAdminPasswordStatus::Unknown);
+        // codeql[rust/cleartext-logging]: output is a status label, not the password value.
         println!(
             "{}",
             messages.monitoring_status_grafana_admin_password(grafana_status.as_str(messages))

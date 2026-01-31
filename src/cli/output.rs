@@ -29,14 +29,17 @@ pub(crate) fn print_init_plan(plan: &InitPlan, messages: &Messages) {
     println!("{}", messages.init_plan_title());
     println!("{}", messages.summary_openbao_url(&plan.openbao_url));
     println!("{}", messages.summary_kv_mount(&plan.kv_mount));
+    // codeql[rust/cleartext-logging]: output is a filesystem path, not a secret value.
     println!(
         "{}",
         messages.summary_secrets_dir(&plan.secrets_dir.display().to_string())
     );
     if plan.overwrite_password {
+        // codeql[rust/cleartext-logging]: output is a non-secret overwrite prompt.
         println!("{}", messages.init_plan_overwrite_password());
     }
     if plan.overwrite_ca_json {
+        // codeql[rust/cleartext-logging]: output is a non-secret overwrite prompt.
         println!("{}", messages.init_plan_overwrite_ca_json());
     }
     if plan.overwrite_state {
@@ -282,6 +285,7 @@ fn print_docker_snippet(entry: &AppEntry, messages: &Messages) {
     println!("docker run --rm \\");
     println!("  --name {container} \\");
     println!("  -v {config_path}:/app/agent.toml:ro \\");
+    // codeql[rust/cleartext-logging]: output is a filesystem path used in a run snippet.
     println!(
         "  -v {cert_dir}:/app/certs \\",
         cert_dir = cert_parent.display()
@@ -327,6 +331,7 @@ fn print_init_header(summary: &InitSummary, messages: &Messages) {
     println!("{}", messages.summary_title());
     println!("{}", messages.summary_openbao_url(&summary.openbao_url));
     println!("{}", messages.summary_kv_mount(&summary.kv_mount));
+    // codeql[rust/cleartext-logging]: output is a filesystem path, not a secret value.
     println!(
         "{}",
         messages.summary_secrets_dir(&summary.secrets_dir.display().to_string())
@@ -368,6 +373,7 @@ fn print_init_secrets(summary: &InitSummary, messages: &Messages) {
         }
     }
 
+    // codeql[rust/cleartext-logging]: secrets can be shown intentionally via --show-secrets.
     println!(
         "{}",
         messages.summary_stepca_password(&display_secret(
@@ -432,6 +438,7 @@ fn print_approles(summary: &InitSummary, messages: &Messages) {
     println!("{}", messages.summary_approles());
     for role in &summary.approles {
         println!("  - {} ({})", role.label, role.role_name);
+        // codeql[rust/cleartext-logging]: secrets can be shown intentionally via --show-secrets.
         println!(
             "{}",
             messages.summary_role_id(&display_secret(&role.role_id, summary.show_secrets))
