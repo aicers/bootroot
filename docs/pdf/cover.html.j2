@@ -1,27 +1,35 @@
 <article id="doc-cover">
-    {% if cover_logo %}
-        <div class="wrapper upper">
-            <div class="logo" style="background-image: url({{ cover_logo | to_url }});"></div>
-        </div>
-    {% else %}
-        <div class="wrapper"></div>
-    {% endif %}
-    <div class="wrapper">
-        <h1>{{ cover_title | e }}</h1>
-        {% if cover_subtitle %}
-            <h2>{{ cover_subtitle | e }}</h2>
-        {% endif %}
+  <div class="cover-wrapper">
+    <div class="cover-header">
+      {% if cover_logo %}
+        <div class="logo" style="background-image: url({{ cover_logo | to_url }});"></div>
+      {% endif %}
     </div>
-    {% if author or copyright %}
-        <div class="properties">
-            <address>
-                {% if author %}
-                    <p id="author">{{ author | e }}</p>
-                {% endif %}
-                {% if copyright %}
-                    <p id="copyright">{{ copyright | e }}</p>
-                {% endif %}
-            </address>
-        </div>
+
+    <div class="cover-title">
+      <h1>{{ cover_title | e }}</h1>
+      {% if cover_subtitle %}
+        <h2>{{ cover_subtitle | e }}</h2>
+      {% endif %}
+      {% if cover_tagline %}
+        <div class="tagline">{{ cover_tagline | e }}</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="cover-footer">
+    <div class="cover-rule"></div>
+
+    {% if author %}
+      {% for line in author.splitlines() %}
+        <p class="meta">{{ line | e }}</p>
+      {% endfor %}
     {% endif %}
+
+    {% if copyright %}
+      {% for line in copyright.splitlines() %}
+        <p class="meta-copyright">{{ line | e }}</p>
+      {% endfor %}
+    {% endif %}
+  </div>
 </article>

@@ -26,12 +26,14 @@ case "$locale" in
     ;;
 esac
 
-trap 'rm -f mkdocs.tmp.yml' EXIT
+trap 'rm -f mkdocs.tmp.yml; if [[ "${BOOTROOT_PDF_DEBUG:-0}" != "1" ]]; then rm -rf .pdf-tmp; fi' EXIT
 
 BOOTROOT_LOCALE="$locale" "$python_bin" - <<'PY'
 import copy
 import os
 import sys
+from datetime import datetime
+import shutil
 import yaml
 
 locale = os.environ.get("BOOTROOT_LOCALE")
@@ -44,6 +46,24 @@ with open("mkdocs.yml", "r", encoding="utf-8") as f:
 
 data = copy.deepcopy(data)
 root = os.getcwd()
+
+tmp_pdf_dir = os.path.join(root, ".pdf-tmp")
+if os.path.exists(tmp_pdf_dir):
+    shutil.rmtree(tmp_pdf_dir)
+shutil.copytree(os.path.join(root, "docs", "pdf"), tmp_pdf_dir)
+
+styles_path = os.path.join(tmp_pdf_dir, "styles.scss")
+fonts_base = f'file://{os.path.join(tmp_pdf_dir, "fonts")}/'
+
+with open(styles_path, "r", encoding="utf-8") as f:
+    styles = f.read()
+
+for prefix in ('../fonts/', 'pdf/fonts/', '/pdf/fonts/', 'fonts/'):
+    styles = styles.replace(f'url("{prefix}', f'url("{fonts_base}')
+
+with open(styles_path, "w", encoding="utf-8") as f:
+    f.write(styles)
+
 data["strict"] = False
 data["site_dir"] = f"site-pdf-{locale}"
 
@@ -56,24 +76,30 @@ for plugin in data.get("plugins", []):
     if isinstance(plugin, dict) and "i18n" in plugin:
         plugin["i18n"]["build_only_locale"] = locale
 
+now = datetime.now()
+
 pdf_plugin = {
     "with-pdf": {
         "enabled_if_env": "BOOTROOT_PDF_EXPORT",
         "output_path": os.path.join(root, "site", "pdf", f"bootroot-manual.{locale}.pdf"),
-        "custom_template_path": "docs/pdf",
-        "author": "",
-        "copyright": "",
+        "custom_template_path": tmp_pdf_dir,
+        "author": f"Version 2.4.0-build.812\n{now.strftime('%B %-d, %Y')}",
+        "copyright": "© 2026 ClumL Inc.",
+        "cover_logo": "docs/pdf/brand.svg",
     }
 }
 
 if locale == "ko":
-    pdf_plugin["with-pdf"]["cover_title"] = "Bootroot 매뉴얼"
+    pdf_plugin["with-pdf"]["cover_title"] = "Bootroot"
     pdf_plugin["with-pdf"]["cover_subtitle"] = "사용자 매뉴얼"
     pdf_plugin["with-pdf"]["toc_title"] = "목차"
+    pdf_plugin["with-pdf"]["author"] = f"버전 2.4.0-build.812\n{now.strftime('%Y년 %-m월 %-d일')}"
+    data.setdefault("extra", {})["cover_tagline"] = "기술 설치 및 운영 매뉴얼"
 else:
-    pdf_plugin["with-pdf"]["cover_title"] = "Bootroot Manual"
+    pdf_plugin["with-pdf"]["cover_title"] = "Bootroot"
     pdf_plugin["with-pdf"]["cover_subtitle"] = "User Manual"
     pdf_plugin["with-pdf"]["toc_title"] = "Table of Contents"
+    data.setdefault("extra", {})["cover_tagline"] = "Technical Installation and Operations Manual"
 
 data.setdefault("plugins", []).append(pdf_plugin)
 
