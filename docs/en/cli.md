@@ -227,6 +227,21 @@ also be set relative to where the app runs. This command only prints
 paths/snippets; you still configure and run the agent on the machine where
 the app runs.
 
+Runtime deployment policy:
+
+### OpenBao Agent
+
+- Docker app: per-app sidecar (**required**)
+- daemon app: per-app host daemon (**required**)
+
+### bootroot-agent
+
+- Docker app: per-app sidecar (recommended)
+- daemon app: one shared host daemon per host (recommended)
+
+Note: Docker apps can use the shared host daemon, but this is supported and
+not recommended (sidecars provide better isolation/lifecycle alignment).
+
 ### Inputs
 
 Input priority is **CLI flags > environment variables > prompts/defaults**.
