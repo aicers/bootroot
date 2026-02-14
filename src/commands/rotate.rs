@@ -536,6 +536,7 @@ fn change_stepca_passphrase(
         to_container_path(secrets_dir, current_password)?,
         "--new-password-file".to_string(),
         to_container_path(secrets_dir, new_password)?,
+        "-f".to_string(),
     ];
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
     run_docker(&args_ref, "docker step-ca change-pass", messages)?;
