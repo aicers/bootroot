@@ -332,6 +332,52 @@ Per subcommand:
 
 - `--service-name`: target service name
 
+### Rotated secret write targets
+
+For the following three subcommands, bootroot updates OpenBao **and** local
+runtime files:
+
+#### `rotate stepca-password`
+
+OpenBao KV: `bootroot/stepca/password`  
+Local file: `secrets/password.txt`
+
+#### `rotate db`
+
+OpenBao KV: `bootroot/stepca/db`  
+Local file: `secrets/config/ca.json` (`db.dataSource`)
+
+#### `rotate responder-hmac`
+
+OpenBao KV: `bootroot/responder/hmac`  
+Local file: `secrets/responder/responder.toml` (`hmac_secret`)
+
+When explicit values are omitted (`--new-password`, `--db-password`, `--hmac`),
+bootroot generates new random values.
+
+### Why local file writes are still required
+
+- `step-ca` key password is consumed via `--password-file` in non-interactive
+  operation, so `password.txt` must be updated.
+- `step-ca` DB connection is read from `ca.json` (`db.dataSource`), so DSN
+  changes must be reflected in that file for runtime use.
+- Responder reads `hmac_secret` from its config file.
+
+OpenBao remains the source of truth for rotated values, but these services
+still consume local files at runtime.
+
+### Security requirements for local secret files
+
+File-based secrets are acceptable in this model when minimum controls are
+enforced:
+
+- secret files: `0600`
+- secret directories: `0700`
+- least-privilege file ownership
+- prevent secret leakage in logs, output, and backups
+
+Risk is not zero: host compromise can still expose local secret files.
+
 ### Outputs
 
 - Rotation summary (updated files/configs)
