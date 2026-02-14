@@ -12,6 +12,9 @@ services:
       - ./openbao:/openbao/config:ro
     command: ["server", "-config=/openbao/config/openbao.hcl"]
 
+  # PostgreSQL for step-ca. The port is exposed to the host so that
+  # `bootroot rotate db` (which runs on the host) can connect directly.
+  # Set POSTGRES_HOST_PORT if the default 5432 conflicts with a local instance.
   postgres:
     image: postgres:16
     container_name: bootroot-postgres
@@ -20,6 +23,8 @@ services:
       - POSTGRES_USER=step
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-step-pass}
       - POSTGRES_DB=stepca
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
