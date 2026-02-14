@@ -329,6 +329,51 @@ OpenBao와 통신해 값을 갱신합니다.
 
 - `--service-name`: 대상 서비스 이름
 
+### 회전 시크릿 쓰기 대상
+
+아래 3개 서브커맨드는 OpenBao만 갱신하지 않고, 로컬 런타임 파일도 함께
+갱신합니다.
+
+#### `rotate stepca-password`
+
+OpenBao KV: `bootroot/stepca/password`  
+로컬 파일: `secrets/password.txt`
+
+#### `rotate db`
+
+OpenBao KV: `bootroot/stepca/db`  
+로컬 파일: `secrets/config/ca.json` (`db.dataSource`)
+
+#### `rotate responder-hmac`
+
+OpenBao KV: `bootroot/responder/hmac`  
+로컬 파일: `secrets/responder/responder.toml` (`hmac_secret`)
+
+값을 명시하지 않으면(`--new-password`, `--db-password`, `--hmac`) bootroot가
+새 랜덤 값을 생성합니다.
+
+### 로컬 파일 갱신이 필요한 이유
+
+- `step-ca` 키 암호는 비대화형 운영에서 `--password-file`로 소비되므로
+  `password.txt` 갱신이 필요합니다.
+- `step-ca` DB 연결 정보는 `ca.json`의 `db.dataSource`를 읽으므로, DSN 변경을
+  해당 파일에 반영해야 런타임에 적용됩니다.
+- responder는 설정 파일의 `hmac_secret` 값을 읽습니다.
+
+즉 회전 값의 소스 오브 트루스는 OpenBao로 유지하되, 현재 런타임 소비 모델상
+로컬 파일 반영이 필요합니다.
+
+### 로컬 시크릿 파일 보안 요건
+
+이 모델에서 파일 기반 시크릿 저장은 아래 최소 요건을 만족할 때 허용됩니다.
+
+- 시크릿 파일 권한: `0600`
+- 시크릿 디렉터리 권한: `0700`
+- 최소 권한 계정 소유권 유지
+- 로그/출력/백업으로 시크릿 유출 방지
+
+리스크가 0은 아닙니다. 호스트 침해 시 로컬 시크릿 파일이 노출될 수 있습니다.
+
 ### 출력
 
 - 회전 요약(수정된 파일 경로/설정 목록)
