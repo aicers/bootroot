@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tracing::warn;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::{db, fs_util};
 use reqwest::StatusCode;
@@ -822,7 +823,13 @@ fn reload_openbao_agent_daemon(entry: &AppEntry, messages: &Messages) -> Result<
         .status()
         .with_context(|| messages.error_command_run_failed("pkill -HUP"))?;
     if !status.success() {
-        anyhow::bail!(messages.error_command_failed_status("pkill -HUP", &status.to_string()));
+        // Exit code 1 means no processes matched (agent not running).
+        // Treat this as a warning since the secret_id rotation itself succeeded.
+        if status.code() == Some(1) {
+            warn!("{}", messages.warning_openbao_agent_not_running());
+        } else {
+            anyhow::bail!(messages.error_command_failed_status("pkill -HUP", &status.to_string()));
+        }
     }
     Ok(())
 }

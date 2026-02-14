@@ -31,6 +31,7 @@ pub(super) static STRINGS: Strings = Strings {
     prompt_openbao_root_token: "OpenBao root token: ",
     error_openbao_root_token_required: "OpenBao root token is required",
     warning_openbao_unseal_from_file: "WARNING: Auto-unseal from file is for dev/test only and unsafe for production.",
+    warning_openbao_agent_not_running: "OpenBao Agent is not running; skipping reload",
     prompt_openbao_unseal_from_file_confirm: "Proceed with auto-unseal from file {value}? [y/N]: ",
     error_openbao_unseal_file_empty: "Unseal key file is empty: {value}",
     prompt_unseal_threshold: "Unseal key threshold (t): ",

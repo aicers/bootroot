@@ -65,6 +65,7 @@ pub(crate) struct Strings {
     pub(crate) prompt_openbao_root_token: &'static str,
     pub(crate) error_openbao_root_token_required: &'static str,
     pub(crate) warning_openbao_unseal_from_file: &'static str,
+    pub(crate) warning_openbao_agent_not_running: &'static str,
     pub(crate) prompt_openbao_unseal_from_file_confirm: &'static str,
     pub(crate) error_openbao_unseal_file_empty: &'static str,
     pub(crate) prompt_unseal_threshold: &'static str,
@@ -509,6 +510,10 @@ impl Messages {
 
     pub(crate) fn warning_openbao_unseal_from_file(&self) -> &'static str {
         self.strings().warning_openbao_unseal_from_file
+    }
+
+    pub(crate) fn warning_openbao_agent_not_running(&self) -> &'static str {
+        self.strings().warning_openbao_agent_not_running
     }
 
     pub(crate) fn prompt_openbao_unseal_from_file_confirm(&self, value: &str) -> String {

@@ -31,6 +31,7 @@ pub(super) static STRINGS: Strings = Strings {
     prompt_openbao_root_token: "OpenBao 루트 토큰: ",
     error_openbao_root_token_required: "OpenBao 루트 토큰이 필요합니다",
     warning_openbao_unseal_from_file: "경고: 파일에서 자동 언실은 dev/test 전용이며 운영에서는 안전하지 않습니다.",
+    warning_openbao_agent_not_running: "OpenBao Agent가 실행 중이 아닙니다; 리로드 생략",
     prompt_openbao_unseal_from_file_confirm: "파일 {value}에서 자동 언실을 진행할까요? [y/N]: ",
     error_openbao_unseal_file_empty: "언실 키 파일이 비어 있습니다: {value}",
     prompt_unseal_threshold: "언실 키 임계치(t): ",
