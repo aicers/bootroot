@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::warn;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::{db, fs_util};
 use reqwest::StatusCode;
+use tracing::warn;
 
 use crate::cli::args::{
     RotateAppRoleSecretIdArgs, RotateArgs, RotateCommand, RotateDbArgs, RotateEabArgs,
