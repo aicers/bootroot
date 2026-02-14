@@ -44,6 +44,39 @@ CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리
 이 매뉴얼의 나머지 섹션은 **CLI를 쓰지 않는 수동 절차**를 기준으로
 설명합니다.
 
+## 설치 토폴로지(요약)
+
+`bootroot` CLI는 `step-ca (with PostgreSQL)`, `OpenBao`, `HTTP-01 responder`
+가 **한 머신에 함께 설치되는 토폴로지**를 전제로 동작합니다. 이 전제는
+보안성(경계 단순화), 편리성(구성 자동화), 운용성(장애 분석/운영 절차 단순화)
+측면에서 가장 유리하고 자연스러운 기본 경로이기 때문입니다.
+`Prometheus`와 `Grafana`도 `OpenBao`/`step-ca`를 모니터링하기 위해
+일반적으로 같은 머신에 함께 배치합니다.
+
+이 전제를 따르면 `step-ca`/`responder` 전용 OpenBao Agent도 같은 머신에서
+각 서비스 전용 인스턴스로 동작해야 합니다.
+
+same-host 전제가 아닌 분산 배치(예: `step-ca`, `OpenBao`, `responder`를 서로
+다른 머신에 배치)도 이론적으로는 가능하지만, 이 경우 `bootroot` CLI 자동화
+대신 수동 설치/설정 절차가 필요합니다. 또한 현재 `bootroot` 구성에서 해당
+토폴로지를 충분히 지원한다고 단정할 수 없습니다.
+
+앱 온보딩 시점인 `bootroot app add`에서 배포 타입(`daemon`/`docker`)별
+실행 가이드와 스니펫이 안내됩니다.
+
+OpenBao Agent 배치 규칙:
+
+- Docker 앱: 앱별 OpenBao Agent 사이드카를 **필수**로 사용
+- daemon 앱: 앱별 OpenBao Agent 호스트 daemon을 **필수**로 사용
+
+bootroot-agent 배치 규칙:
+
+- Docker 앱: 앱별 bootroot-agent 사이드카를 권장
+- daemon 앱: 호스트당 bootroot-agent 통합 daemon 1개를 권장
+
+참고: Docker 앱도 호스트 통합 daemon 사용은 가능하지만, 격리/라이프사이클
+정합성과 장애 영향 범위 측면에서 비권장입니다.
+
 ## 아키텍처(요약)
 
 1. OpenBao가 렌더링한 파일로 시크릿을 주입
