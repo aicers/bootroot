@@ -169,17 +169,18 @@ pub fn provision_db_sync(
         .is_some();
 
     let role_ident = quote_ident(db_user);
+    let password_literal = quote_literal(db_password);
     if role_exists {
         client.execute(&format!("ALTER ROLE {role_ident} WITH LOGIN"), &[])?;
         client.execute(
-            &format!("ALTER ROLE {role_ident} WITH PASSWORD $1"),
-            &[&db_password],
+            &format!("ALTER ROLE {role_ident} WITH PASSWORD {password_literal}"),
+            &[],
         )?;
         report.role_updated = true;
     } else {
         client.execute(
-            &format!("CREATE ROLE {role_ident} WITH LOGIN PASSWORD $1"),
-            &[&db_password],
+            &format!("CREATE ROLE {role_ident} WITH LOGIN PASSWORD {password_literal}"),
+            &[],
         )?;
         report.role_created = true;
     }
@@ -202,8 +203,18 @@ pub fn provision_db_sync(
     Ok(report)
 }
 
+/// Quotes an SQL identifier by wrapping it in double quotes and escaping
+/// any embedded double quotes by doubling them.
 fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Quotes an SQL string literal by wrapping it in single quotes and escaping
+/// any embedded single quotes by doubling them. This is necessary for DDL
+/// statements like `ALTER ROLE ... WITH PASSWORD` and `CREATE ROLE ... WITH
+/// PASSWORD` that do not support parameterized queries.
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Checks TCP connectivity to the database host.
@@ -307,5 +318,35 @@ mod tests {
             message.contains("authenticate") || message.contains("Timed out"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn quote_ident_handles_simple_name() {
+        assert_eq!(quote_ident("my_table"), "\"my_table\"");
+    }
+
+    #[test]
+    fn quote_ident_escapes_double_quotes() {
+        assert_eq!(quote_ident("my\"table"), "\"my\"\"table\"");
+        assert_eq!(quote_ident("a\"b\"c"), "\"a\"\"b\"\"c\"");
+    }
+
+    #[test]
+    fn quote_literal_handles_simple_string() {
+        assert_eq!(quote_literal("password123"), "'password123'");
+    }
+
+    #[test]
+    fn quote_literal_escapes_single_quotes() {
+        assert_eq!(quote_literal("pass'word"), "'pass''word'");
+        assert_eq!(quote_literal("a'b'c"), "'a''b''c'");
+    }
+
+    #[test]
+    fn quote_literal_handles_complex_passwords() {
+        // Password with multiple special characters
+        assert_eq!(quote_literal("p@ss'w0rd!"), "'p@ss''w0rd!'");
+        // Password with consecutive single quotes
+        assert_eq!(quote_literal("test''value"), "'test''''value'");
     }
 }
