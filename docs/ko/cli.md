@@ -110,6 +110,45 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - step-ca/responder용 OpenBao Agent compose override 자동 적용
 - 다음 단계 안내
 
+### step-ca/responder용 OpenBao Agent 초기 bootstrap
+
+현재 기본 토폴로지에서는 OpenBao, step-ca, responder가 같은 호스트에서
+동작하며 로컬 `secrets` 디렉터리를 공유합니다.
+
+이 same-host 모델에서는 `bootroot init`이 step-ca/responder용 OpenBao
+Agent 인증 bootstrap을 자동으로 처리합니다.
+
+- `bootroot-stepca`, `bootroot-responder`용 정책/AppRole 생성
+- `role_id`, `secret_id` 발급
+- OpenBao Agent가 사용할 bootstrap 파일 생성
+- OpenBao Agent 설정(`agent.hcl`)에 `role_id_file_path`,
+  `secret_id_file_path` 경로 반영
+- compose override 적용 후 step-ca/responder용 OpenBao Agent 시작
+
+이는 step-ca/responder 프로세스가 직접 OpenBao Agent를 실행하는 구조가
+아니라, 전용 OpenBao Agent 인스턴스를 별도로 구동하는 방식입니다. 기본
+compose 토폴로지에서는 별도 컨테이너(`openbao-agent-stepca`,
+`openbao-agent-responder`)로 sidecar 성격으로 동작합니다.
+
+생성되는 bootstrap 파일 경로:
+
+- step-ca:
+  `secrets/openbao/stepca/role_id`,
+  `secrets/openbao/stepca/secret_id`
+- responder:
+  `secrets/openbao/responder/role_id`,
+  `secrets/openbao/responder/secret_id`
+
+보안 전제:
+
+- 시크릿 디렉터리 권한: `0700`
+- 시크릿 파일(`role_id`/`secret_id` 및 렌더 결과) 권한: `0600`
+- same-host 로컬 신뢰 경계 전제
+
+멀티호스트 배포에서는 이 로컬 bootstrap 모델만으로는 충분하지 않습니다.
+각 호스트에서 AppRole 자격증명 전달/에이전트 기동을 위한 별도 원격
+bootstrap 절차가 필요합니다.
+
 ### 실패 조건
 
 다음 조건이면 실패로 판정합니다.
