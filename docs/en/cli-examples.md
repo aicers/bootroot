@@ -218,19 +218,14 @@ periodically, rather than a one-shot verification run.
 daemon:
 
 - bootroot-agent: daemon mode
-- OpenBao Agent: per-app Docker container
+- OpenBao Agent: per-app host daemon
 
 bootroot-agent runs **one per machine**, not per app. Update `agent.toml`
 when adding profiles and reload the daemon. Configure systemd so the process
 restarts automatically (set `Restart=always` or `on-failure`).
 
 ```bash
-docker run --rm \
-  --name openbao-agent-edge-proxy \
-  -v /etc/bootroot/openbao/apps/edge-proxy/agent.hcl:/app/agent.hcl:ro \
-  -v /etc/bootroot/secrets:/app/secrets \
-  openbao/bao:latest \
-  agent -config /app/agent.hcl
+openbao agent -config /etc/bootroot/openbao/apps/edge-proxy/agent.hcl
 ```
 
 ```bash
@@ -249,6 +244,10 @@ docker:
 
 - OpenBao Agent: sidecar (per-app Docker container)
 - bootroot-agent: sidecar (per-app Docker container)
+
+Docker apps may also use the shared host bootroot-agent daemon, but this is
+supported and not recommended. The sidecar pattern is preferred for isolation
+and lifecycle alignment.
 
 ```bash
 docker run --rm \

@@ -191,8 +191,15 @@ docker run --rm \
 openbao agent -config /etc/bootroot/openbao/apps/<service>/agent.hcl
 ```
 
-bootroot runs OpenBao Agent **only in Docker** by default. Host execution is
-for reference.
+Recommended deployment policy:
+
+- step-ca/responder: in the same-host topology, run a dedicated OpenBao Agent
+  sidecar per service. Attach `openbao-agent-stepca` to step-ca and
+  `openbao-agent-responder` to responder so each service renders only its own
+  required secrets.
+- app OpenBao Agent (recommended):
+    1. Docker apps: use a per-app sidecar
+    2. daemon apps: run OpenBao Agent as a host daemon **per app**
 
 `role_id`/`secret_id` live under `secrets/apps/<service>/`. Keep the
 directory `0700` and the files `0600`.
@@ -252,6 +259,15 @@ If the responder HMAC mismatches, ensure the OpenBao HMAC secret matches the
 responder config and restart the responder.
 
 ## bootroot-agent
+
+Recommended deployment policy:
+
+- daemon apps: one shared host bootroot-agent daemon per host (recommended)
+- Docker apps: per-app bootroot-agent sidecar (recommended)
+
+Note: Docker apps can use the shared host daemon, but this is supported and
+not recommended. A per-app sidecar gives better isolation, better lifecycle
+alignment, and limits failure impact to a single app more easily.
 
 ### Binary
 

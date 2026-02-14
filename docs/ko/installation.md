@@ -207,8 +207,15 @@ docker run --rm \
 openbao agent -config /etc/bootroot/openbao/apps/<service>/agent.hcl
 ```
 
-bootroot는 OpenBao Agent를 **호스트 실행하지 않고 Docker로만** 구동하는
-방식을 기본으로 합니다. 호스트 실행은 참고용입니다.
+권장 배포 정책:
+
+- step-ca/responder: same-host 토폴로지에서는 서비스별 전용 OpenBao Agent
+  사이드카를 각각 분리해서 사용합니다. 즉 step-ca에는
+  `openbao-agent-stepca`, responder에는 `openbao-agent-responder`를 붙여
+  각 서비스가 필요한 시크릿만 렌더링하도록 운영합니다.
+- 앱 OpenBao Agent(권장):
+    1. Docker 앱: 앱별 사이드카
+    2. daemon 앱: OpenBao Agent를 호스트 daemon으로 **앱마다 1개** 실행
 
 `role_id`/`secret_id` 파일은 `secrets/apps/<service>/` 아래에 있으며,
 해당 디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
@@ -267,6 +274,15 @@ bootroot는 OpenBao Agent를 **호스트 실행하지 않고 Docker로만** 구�
 리스폰더 설정이 일치하는지 확인하고 리스폰더를 재기동하세요.
 
 ## bootroot-agent
+
+권장 배포 정책:
+
+- daemon 앱: 호스트당 bootroot-agent 통합 daemon 1개(권장)
+- Docker 앱: 앱별 bootroot-agent 사이드카(권장)
+
+참고: Docker 앱도 호스트 통합 daemon 사용은 가능하지만, 지원은 하되
+권장하지 않습니다. 앱별 사이드카 구성이 격리와 라이프사이클 정합성에
+유리하고, 장애 영향 범위를 앱 단위로 제한하기 쉽기 때문입니다.
 
 ### 바이너리
 

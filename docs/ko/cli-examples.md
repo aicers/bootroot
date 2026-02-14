@@ -221,7 +221,7 @@ bootroot 검증: 요약
 daemon 앱:
 
 - bootroot-agent: 데몬 모드
-- OpenBao Agent: 앱별 docker 컨테이너
+- OpenBao Agent: 앱별 호스트 daemon
 
 bootroot-agent는 **앱별이 아니라 머신별로 1개**를 데몬으로 실행합니다.
 프로필을 추가할 때마다 `agent.toml`을 갱신하고, 데몬을 리로드하세요.
@@ -229,12 +229,7 @@ bootroot-agent는 **앱별이 아니라 머신별로 1개**를 데몬으로 실�
 `Restart=always`(또는 `on-failure`)를 설정하는 것을 권장합니다.
 
 ```bash
-docker run --rm \
-  --name openbao-agent-edge-proxy \
-  -v /etc/bootroot/openbao/apps/edge-proxy/agent.hcl:/app/agent.hcl:ro \
-  -v /etc/bootroot/secrets:/app/secrets \
-  openbao/bao:latest \
-  agent -config /app/agent.hcl
+openbao agent -config /etc/bootroot/openbao/apps/edge-proxy/agent.hcl
 ```
 
 ```bash
@@ -253,6 +248,10 @@ docker 앱:
 
 - OpenBao Agent: 사이드카(앱별 docker 컨테이너)
 - bootroot-agent: 사이드카(앱별 docker 컨테이너)
+
+Docker 앱도 호스트 통합 bootroot-agent daemon을 사용할 수는 있지만,
+지원은 하되 권장하지 않습니다. 격리와 라이프사이클 정합성을 위해 사이드카
+패턴을 권장합니다.
 
 ```bash
 docker run --rm \
