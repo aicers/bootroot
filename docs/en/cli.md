@@ -113,6 +113,45 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - OpenBao Agent compose override for step-ca/responder (applied automatically)
 - Next-steps guidance
 
+### OpenBao Agent bootstrap for step-ca/responder
+
+Under the current default topology, OpenBao, step-ca, and responder run on
+the same host and share the local `secrets` directory.
+
+In this same-host model, `bootroot init` automatically bootstraps OpenBao
+Agent auth for step-ca/responder:
+
+- Creates policies and AppRoles for `bootroot-stepca` and
+  `bootroot-responder`
+- Issues `role_id` and `secret_id`
+- Writes bootstrap files used by OpenBao Agents
+- Writes OpenBao Agent configs with `role_id_file_path` and
+  `secret_id_file_path`
+- Applies compose override and starts OpenBao Agents for step-ca/responder
+
+These are dedicated OpenBao Agent instances, not step-ca/responder processes
+themselves. In the default compose topology they run as separate containers
+(`openbao-agent-stepca`, `openbao-agent-responder`) with sidecar-like behavior.
+
+Generated bootstrap file paths:
+
+- step-ca:
+  `secrets/openbao/stepca/role_id`,
+  `secrets/openbao/stepca/secret_id`
+- responder:
+  `secrets/openbao/responder/role_id`,
+  `secrets/openbao/responder/secret_id`
+
+Security expectations:
+
+- secrets directories: `0700`
+- secret files (`role_id`/`secret_id` and rendered secrets): `0600`
+- local-host trust boundary for this bootstrap model
+
+For cross-host deployments, this local bootstrap model is not sufficient.
+Use a separate remote bootstrap process for AppRole credentials and agent
+startup on each host.
+
 ### Failure conditions
 
 The command is considered failed when:
