@@ -19,6 +19,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `ALTER ROLE ... WITH PASSWORD` and `CREATE ROLE ... WITH PASSWORD` statements
   do not support parameterized queries (`$1`). The password is now properly
   escaped as a string literal.
+- Fixed `bootroot rotate db` panic with "Cannot start a runtime from within a
+  runtime" error by running the synchronous postgres client on a blocking
+  thread via `tokio::task::spawn_blocking`.
 
 ## [0.1.0] - 2026-02-01
 

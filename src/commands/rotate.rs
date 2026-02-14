@@ -284,13 +284,26 @@ async fn rotate_db(
     let parsed = db::parse_db_dsn(&current_dsn).with_context(|| messages.error_invalid_db_dsn())?;
     ensure_single_host_db_host(&parsed.host, messages)?;
     let timeout = Duration::from_secs(args.timeout.timeout_secs);
-    db::provision_db_sync(
-        &admin_dsn,
-        &parsed.user,
-        &db_password,
-        &parsed.database,
-        timeout,
-    )
+
+    // Run the synchronous postgres client on a blocking thread to avoid
+    // "Cannot start a runtime from within a runtime" panic. The postgres
+    // crate internally calls block_on, which conflicts with the existing
+    // tokio runtime when called from an async context.
+    let admin_dsn_clone = admin_dsn.clone();
+    let user_clone = parsed.user.clone();
+    let password_clone = db_password.clone();
+    let database_clone = parsed.database.clone();
+    tokio::task::spawn_blocking(move || {
+        db::provision_db_sync(
+            &admin_dsn_clone,
+            &user_clone,
+            &password_clone,
+            &database_clone,
+            timeout,
+        )
+    })
+    .await
+    .context("DB provisioning task panicked")?
     .with_context(|| messages.error_db_provision_task_failed())?;
     let new_dsn = db::build_db_dsn(
         &parsed.user,
