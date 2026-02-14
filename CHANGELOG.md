@@ -15,6 +15,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `bootroot rotate db` can connect from the host without exposing the DB
   to external interfaces. Set `POSTGRES_HOST_PORT` if the default port 5432
   conflicts with a local PostgreSQL instance.
+- Fixed `bootroot rotate db` failing with SQL syntax error. PostgreSQL's
+  `ALTER ROLE ... WITH PASSWORD` and `CREATE ROLE ... WITH PASSWORD` statements
+  do not support parameterized queries (`$1`). The password is now properly
+  escaped as a string literal.
 
 ## [0.1.0] - 2026-02-01
 
