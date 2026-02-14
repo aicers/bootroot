@@ -53,6 +53,41 @@ core commands like `infra up/init/status`, `app add/verify`, `rotate`, and
 `monitoring`.
 The rest of this manual focuses on the **manual setup** flow.
 
+## Installation Topology (Summary)
+
+The `bootroot` CLI assumes a topology where `step-ca (with PostgreSQL)`,
+`OpenBao`, and the `HTTP-01 responder` are installed on the **same machine**.
+This is the most natural default path for security (simpler trust boundary),
+convenience (more automation), and operations (simpler troubleshooting and
+runbooks).
+`Prometheus` and `Grafana` are also typically colocated on that machine to
+monitor `OpenBao` and `step-ca`.
+
+With this assumption, dedicated OpenBao Agents for `step-ca` and `responder`
+must also run on that same machine as per-service instances.
+
+A distributed layout (for example, running `step-ca`, `OpenBao`, and responder
+on different machines) is theoretically possible, but it requires manual
+installation/configuration instead of the `bootroot` CLI automation path.
+Also, we cannot guarantee that the current `bootroot` setup fully supports
+every such topology.
+
+During app onboarding, `bootroot app add` prints deployment-type
+(`daemon`/`docker`) specific run guidance and snippets.
+
+OpenBao Agent placement rules:
+
+- Docker app: per-app OpenBao Agent sidecar is **required**
+- daemon app: per-app OpenBao Agent host daemon is **required**
+
+bootroot-agent placement rules:
+
+- Docker app: per-app bootroot-agent sidecar is recommended
+- daemon app: one shared host bootroot-agent daemon per host is recommended
+
+Note: Docker apps can use the shared host daemon, but this is not recommended
+for isolation, lifecycle alignment, and failure blast-radius reasons.
+
 ## Architecture (High Level)
 
 1. OpenBao supplies secrets to bootroot components via rendered files
