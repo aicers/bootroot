@@ -902,6 +902,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::cli::args::{DbAdminDsnArgs, DbTimeoutArgs};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
@@ -1157,5 +1158,91 @@ exit 0
         let temp = temp_secret_path(path);
         let name = temp.file_name().expect("filename").to_string_lossy();
         assert!(name.starts_with("secret_id.tmp."));
+    }
+
+    #[test]
+    fn resolve_db_admin_dsn_uses_cli_arg() {
+        let messages = test_messages();
+        let args = RotateDbArgs {
+            admin_dsn: DbAdminDsnArgs {
+                admin_dsn: Some("postgresql://admin:pass@127.0.0.1:15432/postgres".to_string()),
+            },
+            password: None,
+            timeout: DbTimeoutArgs { timeout_secs: 30 },
+        };
+        let resolved = resolve_db_admin_dsn(&args, &messages).expect("resolve dsn");
+        assert_eq!(resolved, "postgresql://admin:pass@127.0.0.1:15432/postgres");
+    }
+
+    #[test]
+    fn read_ca_json_dsn_reads_data_source() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("ca.json");
+        let messages = test_messages();
+        fs::write(
+            &path,
+            r#"{"db":{"type":"postgresql","dataSource":"postgresql://step:old@postgres:5432/stepca?sslmode=disable"}}"#,
+        )
+        .expect("write ca.json");
+
+        let dsn = read_ca_json_dsn(&path, &messages).expect("read dataSource");
+        assert_eq!(
+            dsn,
+            "postgresql://step:old@postgres:5432/stepca?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn read_ca_json_dsn_rejects_missing_data_source() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("ca.json");
+        let messages = test_messages();
+        fs::write(&path, r#"{"db":{"type":"postgresql"}}"#).expect("write ca.json");
+
+        let err = read_ca_json_dsn(&path, &messages).expect_err("expected missing dataSource");
+        assert!(err.to_string().contains("ca.json"));
+    }
+
+    #[test]
+    fn write_ca_json_dsn_updates_data_source() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("ca.json");
+        let messages = test_messages();
+        fs::write(
+            &path,
+            r#"{"db":{"type":"postgresql","dataSource":"postgresql://step:old@postgres:5432/stepca?sslmode=disable"},"authority":{"provisioners":[]}}"#,
+        )
+        .expect("write ca.json");
+
+        write_ca_json_dsn(
+            &path,
+            "postgresql://step:new@postgres:5432/stepca?sslmode=disable",
+            &messages,
+        )
+        .expect("write dsn");
+
+        let updated = fs::read_to_string(&path).expect("read ca.json");
+        let value: serde_json::Value = serde_json::from_str(&updated).expect("parse updated json");
+        assert_eq!(
+            value["db"]["dataSource"].as_str(),
+            Some("postgresql://step:new@postgres:5432/stepca?sslmode=disable")
+        );
+        assert!(value["authority"].is_object());
+    }
+
+    #[test]
+    fn write_ca_json_dsn_rejects_missing_db_section() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("ca.json");
+        let messages = test_messages();
+        fs::write(&path, r#"{"authority":{"provisioners":[]}}"#).expect("write ca.json");
+
+        let err = write_ca_json_dsn(
+            &path,
+            "postgresql://step:new@postgres:5432/stepca?sslmode=disable",
+            &messages,
+        )
+        .expect_err("expected missing db section");
+        assert!(err.to_string().contains("ca.json"));
     }
 }
