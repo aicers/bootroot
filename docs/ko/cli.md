@@ -363,6 +363,9 @@ OpenBao와 통신해 값을 갱신합니다.
 #### `rotate stepca-password`
 
 - `--new-password`: 새 step-ca 키 비밀번호(선택, 미지정 시 자동 생성)
+- 구현 참고: bootroot는 비대화형 Docker 환경에서 overwrite 확인 프롬프트로
+  인한 실패를 막기 위해 `step crypto change-pass`를 `-f`(`--force`)와 함께
+  실행합니다.
 
 #### `rotate eab`
 
@@ -410,6 +413,9 @@ OpenBao KV: `bootroot/responder/hmac`
 
 - `step-ca` 키 암호는 비대화형 운영에서 `--password-file`로 소비되므로
   `password.txt` 갱신이 필요합니다.
+- `step crypto change-pass`는 기본 동작에서 `/dev/tty`를 통해 overwrite 확인을
+  받으려 하므로, 컨테이너 기반 비대화형 실행에서는 bootroot가 `-f`를 사용해
+  TTY 할당 오류를 방지합니다.
 - `step-ca` DB 연결 정보는 `ca.json`의 `db.dataSource`를 읽으므로, DSN 변경을
   해당 파일에 반영해야 런타임에 적용됩니다.
 - responder는 설정 파일의 `hmac_secret` 값을 읽습니다.
