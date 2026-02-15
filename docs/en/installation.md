@@ -127,6 +127,22 @@ scripts/update-ca-db-dsn.sh
 This script reads `POSTGRES_*` from `.env` and updates `db.type` and
 `db.dataSource` in `secrets/config/ca.json`.
 
+### Single-Host Guardrails
+
+When using the non-TLS local model (`sslmode=disable`), bootroot enforces
+single-host guardrails:
+
+- PostgreSQL host in DSN must be local-only (`postgres`, `localhost`,
+  `127.0.0.1`, or `::1`).
+- PostgreSQL port publishing in Compose must stay localhost-bound (for example,
+  `127.0.0.1:5432:5432`), not `0.0.0.0` or bare `5432:5432`.
+
+If these conditions are violated, `bootroot init`, `bootroot infra up`, and
+`bootroot rotate db` fail fast.
+
+When moving beyond a single-host trust boundary, switch to TLS-based DB
+transport (`sslmode=require` or `sslmode=verify-full`).
+
 ### Bare Metal
 
 Bare metal means installing directly on the host OS (no containers).

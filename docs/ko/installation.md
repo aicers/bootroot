@@ -138,6 +138,23 @@ POSTGRES_PORT=5432
 scripts/update-ca-db-dsn.sh
 ```
 
+### 단일 호스트 가드레일
+
+비TLS 로컬 모델(`sslmode=disable`)을 사용할 때 bootroot는 단일 호스트
+가드레일을 강제합니다.
+
+- DSN의 PostgreSQL 호스트는 로컬 값만 허용됩니다
+  (`postgres`, `localhost`, `127.0.0.1`, `::1`).
+- Compose의 PostgreSQL 포트 publish는 localhost 바인딩만 허용됩니다
+  (예: `127.0.0.1:5432:5432`).
+  `0.0.0.0` 바인딩 또는 `5432:5432` 형태는 허용되지 않습니다.
+
+위 조건을 위반하면 `bootroot init`, `bootroot infra up`,
+`bootroot rotate db`는 즉시 실패합니다.
+
+단일 호스트 신뢰 경계를 벗어나는 경우에는 DB 전송을 TLS 기반으로
+전환하세요(`sslmode=require` 또는 `sslmode=verify-full`).
+
 ### 베어메탈
 
 베어메탈은 컨테이너 없이 **호스트 OS에 직접 설치/운영**하는 방식을 뜻합니다.

@@ -46,6 +46,8 @@ pub(super) static STRINGS: Strings = Strings {
     error_eab_requires_both: "EAB requires both kid and hmac",
     error_openbao_sealed: "OpenBao remains sealed after applying unseal keys",
     error_invalid_db_dsn: "Invalid PostgreSQL DSN",
+    error_db_host_not_single_host: "PostgreSQL host violates single-host guardrail: {host}",
+    error_postgres_port_binding_unsafe: "PostgreSQL port must be bound to localhost only (for example, 127.0.0.1:5432:5432)",
     error_db_check_failed: "DB connectivity check failed",
     error_db_auth_failed: "DB authentication check failed",
     error_db_type_unsupported: "DB check requires postgresql db.type",

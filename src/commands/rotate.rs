@@ -14,6 +14,7 @@ use crate::cli::args::{
     RotateResponderHmacArgs, RotateStepcaPasswordArgs,
 };
 use crate::cli::prompt::Prompt;
+use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
     PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
@@ -269,8 +270,11 @@ async fn rotate_db(
     messages: &Messages,
 ) -> Result<()> {
     confirm_action(messages.prompt_rotate_db(), auto_confirm, messages)?;
+    ensure_postgres_localhost_binding(&ctx.compose_file, messages)?;
 
     let admin_dsn = resolve_db_admin_dsn(args, messages)?;
+    let admin = db::parse_db_dsn(&admin_dsn).with_context(|| messages.error_invalid_db_dsn())?;
+    ensure_single_host_db_host(&admin.host, messages)?;
     let db_password = match args.password.clone() {
         Some(value) => value,
         None => generate_secret(messages)?,
@@ -278,6 +282,7 @@ async fn rotate_db(
     let ca_json_path = ctx.paths.ca_json();
     let current_dsn = read_ca_json_dsn(&ca_json_path, messages)?;
     let parsed = db::parse_db_dsn(&current_dsn).with_context(|| messages.error_invalid_db_dsn())?;
+    ensure_single_host_db_host(&parsed.host, messages)?;
     let timeout = Duration::from_secs(args.timeout.timeout_secs);
     db::provision_db_sync(
         &admin_dsn,
