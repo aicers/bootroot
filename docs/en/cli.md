@@ -366,6 +366,9 @@ Per subcommand:
 #### `rotate stepca-password`
 
 - `--new-password`: new step-ca key password (optional, auto-generated if omitted)
+- implementation note: bootroot runs `step crypto change-pass` with `-f`
+  (`--force`) to avoid interactive overwrite prompts in non-interactive Docker
+  environments.
 
 #### `rotate eab`
 
@@ -413,6 +416,9 @@ bootroot generates new random values.
 
 - `step-ca` key password is consumed via `--password-file` in non-interactive
   operation, so `password.txt` must be updated.
+- `step crypto change-pass` normally asks overwrite confirmation through
+  `/dev/tty`; bootroot passes `-f` to avoid TTY allocation failures in
+  containerized, non-interactive runs.
 - `step-ca` DB connection is read from `ca.json` (`db.dataSource`), so DSN
   changes must be reflected in that file for runtime use.
 - Responder reads `hmac_secret` from its config file.
