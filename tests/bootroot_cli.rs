@@ -102,7 +102,7 @@ fn test_help_lists_subcommands() {
     assert!(stdout.contains("infra"));
     assert!(stdout.contains("init"));
     assert!(stdout.contains("status"));
-    assert!(stdout.contains("app"));
+    assert!(stdout.contains("service"));
     assert!(stdout.contains("verify"));
 }
 

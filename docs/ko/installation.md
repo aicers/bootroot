@@ -180,7 +180,7 @@ postgresql://step:step-pass@localhost:5432/stepca?sslmode=disable
 ## OpenBao Agent
 
 OpenBao Agent는 OpenBao의 시크릿을 파일로 렌더링합니다. step-ca/리스폰더는
-`bootroot init`가 만든 `agent.hcl`을 사용하고, 앱은 `bootroot app add`
+`bootroot init`가 만든 `agent.hcl`을 사용하고, 서비스은 `bootroot service add`
 출력에 나온 경로를 사용합니다.
 
 ### Docker
@@ -207,7 +207,7 @@ docker run --rm \
   agent -config /openbao/secrets/openbao/responder/agent.hcl
 ```
 
-앱용 OpenBao Agent(예시):
+서비스용 OpenBao Agent(예시):
 
 ```bash
 docker run --rm \
@@ -215,13 +215,13 @@ docker run --rm \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://localhost:8200 \
   openbao/openbao:latest \
-  agent -config /openbao/secrets/openbao/apps/edge-proxy/agent.hcl
+  agent -config /openbao/secrets/openbao/services/edge-proxy/agent.hcl
 ```
 
 ### 호스트 실행
 
 ```bash
-openbao agent -config /etc/bootroot/openbao/apps/<service>/agent.hcl
+openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 ```
 
 권장 배포 정책:
@@ -230,11 +230,11 @@ openbao agent -config /etc/bootroot/openbao/apps/<service>/agent.hcl
   사이드카를 각각 분리해서 사용합니다. 즉 step-ca에는
   `openbao-agent-stepca`, responder에는 `openbao-agent-responder`를 붙여
   각 서비스가 필요한 시크릿만 렌더링하도록 운영합니다.
-- 앱 OpenBao Agent(권장):
-    1. Docker 앱: 앱별 사이드카
-    2. daemon 앱: OpenBao Agent를 호스트 daemon으로 **앱마다 1개** 실행
+- 서비스 OpenBao Agent(권장):
+    1. Docker 서비스: 서비스별 사이드카
+    2. daemon 서비스: OpenBao Agent를 daemon으로 **서비스마다 1개** 실행
 
-`role_id`/`secret_id` 파일은 `secrets/apps/<service>/` 아래에 있으며,
+`role_id`/`secret_id` 파일은 `secrets/services/<service>/` 아래에 있으며,
 해당 디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
 
 ## 개발/테스트 환경 완전 초기화
@@ -294,12 +294,12 @@ openbao agent -config /etc/bootroot/openbao/apps/<service>/agent.hcl
 
 권장 배포 정책:
 
-- daemon 앱: 호스트당 bootroot-agent 통합 daemon 1개(권장)
-- Docker 앱: 앱별 bootroot-agent 사이드카(권장)
+- daemon 서비스: 호스트당 bootroot-agent 통합 daemon 1개(권장)
+- Docker 서비스: 서비스별 bootroot-agent 사이드카(권장)
 
-참고: Docker 앱도 호스트 통합 daemon 사용은 가능하지만, 지원은 하되
-권장하지 않습니다. 앱별 사이드카 구성이 격리와 라이프사이클 정합성에
-유리하고, 장애 영향 범위를 앱 단위로 제한하기 쉽기 때문입니다.
+참고: Docker 서비스도 통합 daemon 사용은 가능하지만, 지원은 하되
+권장하지 않습니다. 서비스별 사이드카 구성이 격리와 라이프사이클 정합성에
+유리하고, 장애 영향 범위를 서비스 단위로 제한하기 쉽기 때문입니다.
 
 ### 바이너리
 

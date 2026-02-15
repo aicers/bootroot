@@ -163,8 +163,8 @@ examples and how to update `secrets/config/ca.json`.
 ## OpenBao Agent
 
 OpenBao Agent renders secrets from OpenBao to files. step-ca/responder use
-the `agent.hcl` files produced by `bootroot init`, and apps use the paths
-printed by `bootroot app add`.
+the `agent.hcl` files produced by `bootroot init`, and services use the paths
+printed by `bootroot service add`.
 
 ### Docker
 
@@ -190,7 +190,7 @@ docker run --rm \
   agent -config /openbao/secrets/openbao/responder/agent.hcl
 ```
 
-OpenBao Agent for an app (example):
+OpenBao Agent for a service (example):
 
 ```bash
 docker run --rm \
@@ -198,13 +198,13 @@ docker run --rm \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://localhost:8200 \
   openbao/openbao:latest \
-  agent -config /openbao/secrets/openbao/apps/edge-proxy/agent.hcl
+  agent -config /openbao/secrets/openbao/services/edge-proxy/agent.hcl
 ```
 
 ### Host run
 
 ```bash
-openbao agent -config /etc/bootroot/openbao/apps/<service>/agent.hcl
+openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 ```
 
 Recommended deployment policy:
@@ -213,11 +213,11 @@ Recommended deployment policy:
   sidecar per service. Attach `openbao-agent-stepca` to step-ca and
   `openbao-agent-responder` to responder so each service renders only its own
   required secrets.
-- app OpenBao Agent (recommended):
-    1. Docker apps: use a per-app sidecar
-    2. daemon apps: run OpenBao Agent as a host daemon **per app**
+- service OpenBao Agent (recommended):
+    1. Docker services: use a per-service sidecar
+    2. daemon services: run OpenBao Agent as a daemon **per service**
 
-`role_id`/`secret_id` live under `secrets/apps/<service>/`. Keep the
+`role_id`/`secret_id` live under `secrets/services/<service>/`. Keep the
 directory `0700` and the files `0600`.
 
 ## Full reset (dev/test)
@@ -278,12 +278,12 @@ responder config and restart the responder.
 
 Recommended deployment policy:
 
-- daemon apps: one shared host bootroot-agent daemon per host (recommended)
-- Docker apps: per-app bootroot-agent sidecar (recommended)
+- daemon services: one shared bootroot-agent daemon per host (recommended)
+- Docker services: per-service bootroot-agent sidecar (recommended)
 
-Note: Docker apps can use the shared host daemon, but this is supported and
-not recommended. A per-app sidecar gives better isolation, better lifecycle
-alignment, and limits failure impact to a single app more easily.
+Note: Docker services can use the shared daemon, but this is supported and
+not recommended. A per-service sidecar gives better isolation, better lifecycle
+alignment, and limits failure impact to a single service more easily.
 
 ### Binary
 

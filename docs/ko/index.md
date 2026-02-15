@@ -10,15 +10,17 @@ bootroot-agent 실행 파일은 `bootroot-agent`입니다.
 
 Bootroot는 제품 내장형 PKI 부트스트랩 계층입니다. 부트스트랩은 시스템이 처음부터
 동작할 수 있도록 **초기 환경을 준비하고 구동을 시작하는 과정**을 의미합니다.
-Bootroot의 역할은 서비스(데몬 앱/도커 앱)가 **mTLS 통신을 수행할 수 있도록
-인증서를 자동 발급/갱신/회전**하는 것입니다. 또한 Prometheus/Grafana로
+여기서 Bootroot가 말하는 서비스는 서비스 간 mTLS 통신을 위해 인증서가 필요한
+사용자 애플리케이션(daemon/docker 배포 대상)을 뜻합니다. Bootroot의 역할은
+이 서비스들이 **mTLS 통신을 수행할 수 있도록 인증서를 자동 발급/갱신/회전**하는
+것입니다. 또한 Prometheus/Grafana로
 메트릭을 수집/시각화해 운영 가시성을 확보합니다. 구성 요소는 다음과 같습니다.
 
 - **step-ca**: ACME 호환 사설 CA (오픈 소스)
 - **PostgreSQL**: step-ca가 사용하는 DB 서버 (오픈 소스)
 - **OpenBao**: bootroot 시크릿을 관리/주입하는 시크릿 매니저 (오픈 소스)
 - **OpenBao Agent**: OpenBao 시크릿을 파일로 렌더링하는 에이전트 (오픈 소스)
-- **bootroot CLI**: 전체 설치/초기화/운영을 자동화하는 CLI 도구
+- **bootroot CLI**: 이 프로젝트에서 직접 개발한 전체 설치/초기화/운영 자동화 CLI 도구
 - **bootroot-agent**: 이 프로젝트에서 직접 개발한 Rust ACME 클라이언트
 - **HTTP-01 리스폰더**: 이 프로젝트에서 직접 개발한 HTTP-01 전용 데몬
 - **Prometheus**: 메트릭 수집기 (오픈 소스)
@@ -30,7 +32,7 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다.
 
 ## 매뉴얼 구성
 
-- **CLI**: infra 기동/초기화/상태 점검뿐 아니라 앱 온보딩, 발급 검증,
+- **CLI**: infra 기동/초기화/상태 점검뿐 아니라 서비스 온보딩, 발급 검증,
   시크릿 회전과 모니터링 운영 안내까지 포함
 - **개념**: PKI, ACME, CSR, SAN, mTLS, 시크릿 관리(OpenBao) 개요
 - **빠른 시작**: Docker Compose 기반 첫 발급
@@ -40,7 +42,7 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다.
 - **문제 해결 / FAQ**: 자주 발생하는 오류와 답변
 
 CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리되어 있습니다. CLI 문서에서는
-`infra up/init/status`, `app add/verify`, `rotate`, `monitoring` 등 주요 명령을 다룹니다.
+`infra up/init/status`, `service add/verify`, `rotate`, `monitoring` 등 주요 명령을 다룹니다.
 이 매뉴얼의 나머지 섹션은 **CLI를 쓰지 않는 수동 절차**를 기준으로
 설명합니다.
 
@@ -54,27 +56,27 @@ CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리
 일반적으로 같은 머신에 함께 배치합니다.
 
 이 전제를 따르면 `step-ca`/`responder` 전용 OpenBao Agent도 같은 머신에서
-각 서비스 전용 인스턴스로 동작해야 합니다.
+각각 전용 인스턴스로 동작해야 합니다.
 
 same-host 전제가 아닌 분산 배치(예: `step-ca`, `OpenBao`, `responder`를 서로
 다른 머신에 배치)도 이론적으로는 가능하지만, 이 경우 `bootroot` CLI 자동화
 대신 수동 설치/설정 절차가 필요합니다. 또한 현재 `bootroot` 구성에서 해당
 토폴로지를 충분히 지원한다고 단정할 수 없습니다.
 
-앱 온보딩 시점인 `bootroot app add`에서 배포 타입(`daemon`/`docker`)별
+서비스 온보딩 시점인 `bootroot service add`에서 배포 타입(`daemon`/`docker`)별
 실행 가이드와 스니펫이 안내됩니다.
 
 OpenBao Agent 배치 규칙:
 
-- Docker 앱: 앱별 OpenBao Agent 사이드카를 **필수**로 사용
-- daemon 앱: 앱별 OpenBao Agent 호스트 daemon을 **필수**로 사용
+- Docker 서비스: 서비스별 **OpenBao Agent 사이드카**를 **필수**로 사용
+- 데몬 서비스: 서비스별 **OpenBao Agent 데몬**을 **필수**로 사용
 
 bootroot-agent 배치 규칙:
 
-- Docker 앱: 앱별 bootroot-agent 사이드카를 권장
-- daemon 앱: 호스트당 bootroot-agent 통합 daemon 1개를 권장
+- Docker 서비스: 서비스별 **bootroot-agent 사이드카**를 권장
+- 데몬 서비스: 호스트당 **bootroot-agent 통합 데몬** 1개를 권장
 
-참고: Docker 앱도 호스트 통합 daemon 사용은 가능하지만, 격리/라이프사이클
+참고: Docker 서비스도 통합 데몬 사용은 가능하지만, 격리/라이프사이클
 정합성과 장애 영향 범위 측면에서 비권장입니다.
 
 ## 아키텍처(요약)
@@ -91,6 +93,8 @@ bootroot-agent 배치 규칙:
 ## 안전 수칙
 
 - 운영 시크릿은 git에 커밋하지 마세요.
-- 시크릿은 `0600`, 시크릿 디렉터리는 `0700` 권한을 권장합니다.
+- 시크릿 파일은 반드시 `0600`, 시크릿 디렉터리는 반드시 `0700` 권한으로
+  설정하세요.
 - OpenBao 토큰/unseal 키는 별도 안전 저장소에 보관하세요.
-- CA와 DB 간 네트워크 접근을 제한하세요.
+- Bootroot가 기본으로 설정하는 방식대로 CA와 DB는 같은 머신에 설치하고,
+  DB는 외부에 오픈하지 마세요.

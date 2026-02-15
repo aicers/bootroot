@@ -19,7 +19,7 @@ pub(crate) struct StateFile {
     #[serde(default)]
     pub(crate) approles: BTreeMap<String, String>,
     #[serde(default)]
-    pub(crate) apps: BTreeMap<String, AppEntry>,
+    pub(crate) services: BTreeMap<String, ServiceEntry>,
 }
 
 impl StateFile {
@@ -50,7 +50,7 @@ impl StateFile {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct AppEntry {
+pub(crate) struct ServiceEntry {
     pub(crate) service_name: String,
     pub(crate) deploy_type: DeployType,
     pub(crate) hostname: String,
@@ -64,11 +64,11 @@ pub(crate) struct AppEntry {
     pub(crate) container_name: Option<String>,
     #[serde(default)]
     pub(crate) notes: Option<String>,
-    pub(crate) approle: AppRoleEntry,
+    pub(crate) approle: ServiceRoleEntry,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct AppRoleEntry {
+pub(crate) struct ServiceRoleEntry {
     pub(crate) role_name: String,
     pub(crate) role_id: String,
     pub(crate) secret_id_path: PathBuf,

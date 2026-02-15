@@ -5,22 +5,22 @@ use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 use tokio::fs;
 
-use crate::cli::args::{AppAddArgs, AppInfoArgs};
+use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs};
 use crate::cli::output::{
-    AppAddPlan, print_app_add_plan, print_app_add_summary, print_app_info_summary,
+    ServiceAddPlan, print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
 use crate::cli::prompt::Prompt;
 use crate::commands::init::{PATH_CA_TRUST, SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
-use crate::state::{AppEntry, AppRoleEntry, DeployType, StateFile};
-const APPROLE_PREFIX: &str = "bootroot-app-";
-const APP_KV_BASE: &str = "bootroot/apps";
-const APP_SECRET_DIR: &str = "apps";
-const APP_ROLE_ID_FILENAME: &str = "role_id";
-const APP_SECRET_ID_FILENAME: &str = "secret_id";
+use crate::state::{DeployType, ServiceEntry, ServiceRoleEntry, StateFile};
+const SERVICE_ROLE_PREFIX: &str = "bootroot-service-";
+const SERVICE_KV_BASE: &str = "bootroot/services";
+const SERVICE_SECRET_DIR: &str = "services";
+const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
+const SERVICE_SECRET_ID_FILENAME: &str = "secret_id";
 const CA_TRUST_KEY: &str = "trusted_ca_sha256";
 
-pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Result<()> {
+pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) -> Result<()> {
     let state_path = StateFile::default_path();
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
@@ -28,17 +28,17 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     let mut state =
         StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
 
-    let resolved = resolve_app_add_args(args, messages)?;
-    if state.apps.contains_key(&resolved.service_name) {
-        anyhow::bail!(messages.error_app_duplicate(&resolved.service_name));
+    let resolved = resolve_service_add_args(args, messages)?;
+    if state.services.contains_key(&resolved.service_name) {
+        anyhow::bail!(messages.error_service_duplicate(&resolved.service_name));
     }
 
-    validate_app_add(&resolved, messages)?;
+    validate_service_add(&resolved, messages)?;
 
     let agent_config = resolved.agent_config.display().to_string();
     let cert_path = resolved.cert_path.display().to_string();
     let key_path = resolved.key_path.display().to_string();
-    let plan = AppAddPlan {
+    let plan = ServiceAddPlan {
         service_name: &resolved.service_name,
         deploy_type: resolved.deploy_type,
         hostname: &resolved.hostname,
@@ -50,7 +50,7 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
         container_name: resolved.container_name.as_deref(),
         notes: resolved.notes.as_deref(),
     };
-    print_app_add_plan(&plan, messages);
+    print_service_add_plan(&plan, messages);
 
     let root_token = resolved.root_token.clone();
 
@@ -64,7 +64,7 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
 
     let trusted_ca_sha256 =
         read_trusted_ca_fingerprints(&client, &state.kv_mount, messages).await?;
-    let approle = ensure_app_approle(&client, &state, &resolved.service_name, messages).await?;
+    let approle = ensure_service_approle(&client, &state, &resolved.service_name, messages).await?;
     let secrets_dir = state.secrets_dir();
     write_role_id_file(
         &secrets_dir,
@@ -81,7 +81,7 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     )
     .await?;
 
-    let entry = AppEntry {
+    let entry = ServiceEntry {
         service_name: resolved.service_name.clone(),
         deploy_type: resolved.deploy_type,
         hostname: resolved.hostname.clone(),
@@ -92,7 +92,7 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
         instance_id: resolved.instance_id.clone(),
         container_name: resolved.container_name.clone(),
         notes: resolved.notes.clone(),
-        approle: AppRoleEntry {
+        approle: ServiceRoleEntry {
             role_name: approle.role_name,
             role_id: approle.role_id,
             secret_id_path: secret_id_path.clone(),
@@ -101,13 +101,13 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     };
 
     state
-        .apps
+        .services
         .insert(resolved.service_name.clone(), entry.clone());
     state
         .save(&state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
 
-    print_app_add_summary(
+    print_service_add_summary(
         &entry,
         &secret_id_path,
         trusted_ca_sha256.as_deref(),
@@ -116,7 +116,7 @@ pub(crate) async fn run_app_add(args: &AppAddArgs, messages: &Messages) -> Resul
     Ok(())
 }
 
-pub(crate) fn run_app_info(args: &AppInfoArgs, messages: &Messages) -> Result<()> {
+pub(crate) fn run_service_info(args: &ServiceInfoArgs, messages: &Messages) -> Result<()> {
     let state_path = StateFile::default_path();
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
@@ -124,14 +124,14 @@ pub(crate) fn run_app_info(args: &AppInfoArgs, messages: &Messages) -> Result<()
     let state =
         StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
     let entry = state
-        .apps
+        .services
         .get(&args.service_name)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&args.service_name)))?;
-    print_app_info_summary(entry, messages);
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
+    print_service_info_summary(entry, messages);
     Ok(())
 }
 
-fn validate_app_add(args: &ResolvedAppAdd, messages: &Messages) -> Result<()> {
+fn validate_service_add(args: &ResolvedServiceAdd, messages: &Messages) -> Result<()> {
     if args.service_name.trim().is_empty() {
         anyhow::bail!(messages.error_value_required());
     }
@@ -142,7 +142,7 @@ fn validate_app_add(args: &ResolvedAppAdd, messages: &Messages) -> Result<()> {
         anyhow::bail!(messages.error_value_required());
     }
     if args.instance_id.as_deref().unwrap_or_default().is_empty() {
-        anyhow::bail!(messages.error_app_instance_id_required());
+        anyhow::bail!(messages.error_service_instance_id_required());
     }
     if matches!(args.deploy_type, DeployType::Docker)
         && args
@@ -151,13 +151,13 @@ fn validate_app_add(args: &ResolvedAppAdd, messages: &Messages) -> Result<()> {
             .unwrap_or_default()
             .is_empty()
     {
-        anyhow::bail!(messages.error_app_container_name_required());
+        anyhow::bail!(messages.error_service_container_name_required());
     }
     Ok(())
 }
 
-fn build_app_policy(kv_mount: &str, service_name: &str) -> String {
-    let base = format!("{APP_KV_BASE}/{service_name}");
+fn build_service_policy(kv_mount: &str, service_name: &str) -> String {
+    let base = format!("{SERVICE_KV_BASE}/{service_name}");
     format!(
         r#"path "{kv_mount}/data/{base}/*" {{
   capabilities = ["read"]
@@ -175,9 +175,9 @@ async fn write_secret_id_file(
     secret_id: &str,
     messages: &Messages,
 ) -> Result<PathBuf> {
-    let app_dir = secrets_dir.join(APP_SECRET_DIR).join(service_name);
-    fs_util::ensure_secrets_dir(&app_dir).await?;
-    let secret_path = app_dir.join(APP_SECRET_ID_FILENAME);
+    let service_dir = secrets_dir.join(SERVICE_SECRET_DIR).join(service_name);
+    fs_util::ensure_secrets_dir(&service_dir).await?;
+    let secret_path = service_dir.join(SERVICE_SECRET_ID_FILENAME);
     fs::write(&secret_path, secret_id)
         .await
         .with_context(|| messages.error_write_file_failed(&secret_path.display().to_string()))?;
@@ -191,9 +191,9 @@ async fn write_role_id_file(
     role_id: &str,
     messages: &Messages,
 ) -> Result<PathBuf> {
-    let app_dir = secrets_dir.join(APP_SECRET_DIR).join(service_name);
-    fs_util::ensure_secrets_dir(&app_dir).await?;
-    let role_path = app_dir.join(APP_ROLE_ID_FILENAME);
+    let service_dir = secrets_dir.join(SERVICE_SECRET_DIR).join(service_name);
+    fs_util::ensure_secrets_dir(&service_dir).await?;
+    let role_path = service_dir.join(SERVICE_ROLE_ID_FILENAME);
     fs::write(&role_path, role_id)
         .await
         .with_context(|| messages.error_write_file_failed(&role_path.display().to_string()))?;
@@ -201,27 +201,27 @@ async fn write_role_id_file(
     Ok(role_path)
 }
 
-struct AppRoleMaterialized {
+struct ServiceAppRoleMaterialized {
     role_name: String,
     role_id: String,
     secret_id: String,
     policy_name: String,
 }
 
-async fn ensure_app_approle(
+async fn ensure_service_approle(
     client: &OpenBaoClient,
     state: &StateFile,
     service_name: &str,
     messages: &Messages,
-) -> Result<AppRoleMaterialized> {
-    let policy_name = app_policy_name(service_name);
-    let policy = build_app_policy(&state.kv_mount, service_name);
+) -> Result<ServiceAppRoleMaterialized> {
+    let policy_name = service_policy_name(service_name);
+    let policy = build_service_policy(&state.kv_mount, service_name);
     client
         .write_policy(&policy_name, &policy)
         .await
         .with_context(|| messages.error_openbao_policy_write_failed())?;
 
-    let role_name = app_role_name(service_name);
+    let role_name = service_role_name(service_name);
     client
         .create_approle(
             &role_name,
@@ -240,7 +240,7 @@ async fn ensure_app_approle(
         .create_secret_id(&role_name)
         .await
         .with_context(|| messages.error_openbao_secret_id_failed())?;
-    Ok(AppRoleMaterialized {
+    Ok(ServiceAppRoleMaterialized {
         role_name,
         role_id,
         secret_id,
@@ -248,16 +248,16 @@ async fn ensure_app_approle(
     })
 }
 
-fn app_role_name(service_name: &str) -> String {
-    format!("{APPROLE_PREFIX}{service_name}")
+fn service_role_name(service_name: &str) -> String {
+    format!("{SERVICE_ROLE_PREFIX}{service_name}")
 }
 
-fn app_policy_name(service_name: &str) -> String {
-    format!("{APPROLE_PREFIX}{service_name}")
+fn service_policy_name(service_name: &str) -> String {
+    format!("{SERVICE_ROLE_PREFIX}{service_name}")
 }
 
 #[derive(Debug)]
-pub(crate) struct ResolvedAppAdd {
+pub(crate) struct ResolvedServiceAdd {
     pub(crate) service_name: String,
     pub(crate) deploy_type: DeployType,
     pub(crate) hostname: String,
@@ -271,7 +271,10 @@ pub(crate) struct ResolvedAppAdd {
     pub(crate) notes: Option<String>,
 }
 
-fn resolve_app_add_args(args: &AppAddArgs, messages: &Messages) -> Result<ResolvedAppAdd> {
+fn resolve_service_add_args(
+    args: &ServiceAddArgs,
+    messages: &Messages,
+) -> Result<ResolvedServiceAdd> {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let mut prompt = Prompt::new(&mut input, &mut output, messages);
@@ -355,7 +358,7 @@ fn resolve_app_add_args(args: &AppAddArgs, messages: &Messages) -> Result<Resolv
         prompt.prompt_with_validation(label, None, |value| ensure_non_empty(value, messages))?
     };
 
-    Ok(ResolvedAppAdd {
+    Ok(ResolvedServiceAdd {
         service_name,
         deploy_type,
         hostname,

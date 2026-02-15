@@ -175,7 +175,7 @@ jobs:
           fi
           echo "OPENBAO_ROOT_TOKEN=${ROOT_TOKEN}" >> "$GITHUB_ENV"
 
-      - name: CLI App Add + Verify (Smoke)
+      - name: CLI Service Add + Verify (Smoke)
         run: |
           mkdir -p tmp certs
           cat > tmp/agent.toml <<'EOF'
@@ -223,7 +223,7 @@ jobs:
           check_jitter = "0s"
           EOF
 
-          cargo run --bin bootroot -- app add \
+          cargo run --bin bootroot -- service add \
             --service-name edge-proxy \
             --deploy-type daemon \
             --hostname edge-node-01 \
@@ -234,7 +234,7 @@ jobs:
             --instance-id 001 \
             --root-token "$OPENBAO_ROOT_TOKEN"
 
-          cargo run --bin bootroot -- app add \
+          cargo run --bin bootroot -- service add \
             --service-name web-app \
             --deploy-type docker \
             --hostname web-01 \

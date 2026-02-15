@@ -172,8 +172,8 @@ check_jitter = "0s"
 EOF
 }
 
-run_app_scenarios() {
-  log "Running app add + verify scenarios"
+run_service_scenarios() {
+  log "Running service add + verify scenarios"
   log "Building bootroot-agent for verify"
   cargo build --bin bootroot-agent
   export PATH="$ROOT_DIR/target/debug:$PATH"
@@ -187,7 +187,7 @@ run_app_scenarios() {
     fail "Failed to read root token from init output"
   fi
 
-  cargo run --bin bootroot -- app add \
+  cargo run --bin bootroot -- service add \
     --service-name edge-proxy \
     --deploy-type daemon \
     --hostname edge-node-01 \
@@ -198,7 +198,7 @@ run_app_scenarios() {
     --instance-id 001 \
     --root-token "$root_token"
 
-  cargo run --bin bootroot -- app add \
+  cargo run --bin bootroot -- service add \
     --service-name web-app \
     --deploy-type docker \
     --hostname web-01 \
@@ -239,4 +239,4 @@ require_cmd docker
 require_cmd curl
 run_cli_tests
 run_init_scenario
-run_app_scenarios
+run_service_scenarios
