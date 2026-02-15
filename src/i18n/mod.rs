@@ -80,6 +80,8 @@ pub(crate) struct Strings {
     pub(crate) error_eab_requires_both: &'static str,
     pub(crate) error_openbao_sealed: &'static str,
     pub(crate) error_invalid_db_dsn: &'static str,
+    pub(crate) error_db_host_not_single_host: &'static str,
+    pub(crate) error_postgres_port_binding_unsafe: &'static str,
     pub(crate) error_db_check_failed: &'static str,
     pub(crate) error_db_auth_failed: &'static str,
     pub(crate) error_db_type_unsupported: &'static str,
@@ -580,6 +582,17 @@ impl Messages {
 
     pub(crate) fn error_invalid_db_dsn(&self) -> &'static str {
         self.strings().error_invalid_db_dsn
+    }
+
+    pub(crate) fn error_db_host_not_single_host(&self, host: &str) -> String {
+        format_template(
+            self.strings().error_db_host_not_single_host,
+            &[("host", host)],
+        )
+    }
+
+    pub(crate) fn error_postgres_port_binding_unsafe(&self) -> &'static str {
+        self.strings().error_postgres_port_binding_unsafe
     }
 
     pub(crate) fn error_db_check_failed(&self) -> &'static str {

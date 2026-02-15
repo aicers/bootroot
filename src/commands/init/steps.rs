@@ -43,12 +43,14 @@ use super::types::{
 };
 use crate::cli::args::InitArgs;
 use crate::cli::output::{print_init_plan, print_init_summary};
+use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
 use crate::commands::infra::{ensure_infra_ready, run_docker};
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
+    ensure_postgres_localhost_binding(&args.compose.compose_file, messages)?;
     ensure_infra_ready(&args.compose.compose_file, messages)?;
 
     let mut client = OpenBaoClient::new(&args.openbao.openbao_url)
@@ -1264,6 +1266,7 @@ async fn resolve_db_dsn_for_init(args: &InitArgs, messages: &Messages) -> Result
         let inputs = resolve_db_provision_inputs(args, messages)?;
         let admin = parse_db_dsn(&inputs.admin_dsn)
             .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
+        ensure_single_host_db_host(&admin.host, messages)?;
         let dsn = build_db_dsn(
             &inputs.db_user,
             &inputs.db_password,
@@ -1284,9 +1287,16 @@ async fn resolve_db_dsn_for_init(args: &InitArgs, messages: &Messages) -> Result
         })
         .await
         .with_context(|| messages.error_db_provision_task_failed())??;
+        let parsed =
+            parse_db_dsn(&dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
+        ensure_single_host_db_host(&parsed.host, messages)?;
         return Ok(dsn);
     }
-    resolve_db_dsn(args, messages)
+    let dsn = resolve_db_dsn(args, messages)?;
+    let parsed =
+        parse_db_dsn(&dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
+    ensure_single_host_db_host(&parsed.host, messages)?;
+    Ok(dsn)
 }
 
 #[derive(Debug)]
@@ -1834,6 +1844,20 @@ mod tests {
             env::remove_var("POSTGRES_DB");
         }
         assert_eq!(dsn, "postgresql://cliuser:clipass@localhost/db");
+    }
+
+    #[test]
+    fn test_resolve_db_dsn_for_init_rejects_remote_host() {
+        let _guard = env_lock();
+        let mut args = default_init_args();
+        args.db_dsn =
+            Some("postgresql://user:pass@db.internal:5432/stepca?sslmode=disable".to_string());
+
+        let err = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(resolve_db_dsn_for_init(&args, &test_messages()))
+            .expect_err("remote db host should fail single-host guardrail");
+        assert!(err.to_string().contains("single-host guardrail"));
     }
 
     #[test]

@@ -5,10 +5,13 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::InfraUpArgs;
+use crate::commands::guardrails::ensure_postgres_localhost_binding;
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 
 pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
+    ensure_postgres_localhost_binding(&args.compose_file, messages)?;
+
     let loaded_archives = if let Some(dir) = args.image_archive_dir.as_deref() {
         load_local_images(dir, messages)?
     } else {

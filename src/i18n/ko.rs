@@ -46,6 +46,8 @@ pub(super) static STRINGS: Strings = Strings {
     error_eab_requires_both: "EAB에는 kid와 hmac이 모두 필요합니다",
     error_openbao_sealed: "OpenBao가 언실 키 적용 후에도 봉인 상태입니다",
     error_invalid_db_dsn: "PostgreSQL DSN이 올바르지 않습니다",
+    error_db_host_not_single_host: "PostgreSQL 호스트가 단일 호스트 가드레일을 위반합니다: {host}",
+    error_postgres_port_binding_unsafe: "PostgreSQL 포트는 localhost로만 바인딩되어야 합니다 (예: 127.0.0.1:5432:5432)",
     error_db_check_failed: "DB 연결 점검에 실패했습니다",
     error_db_auth_failed: "DB 인증 점검에 실패했습니다",
     error_db_type_unsupported: "DB 점검은 postgresql db.type에서만 지원합니다",

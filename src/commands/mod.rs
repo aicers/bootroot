@@ -1,4 +1,5 @@
 pub(crate) mod app;
+pub(crate) mod guardrails;
 pub(crate) mod infra;
 pub(crate) mod init;
 pub(crate) mod monitoring;
