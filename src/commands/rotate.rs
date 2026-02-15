@@ -891,16 +891,197 @@ struct EabCredentials {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::ffi::{OsStr, OsString};
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use tempfile::tempdir;
 
     use super::*;
 
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
+    const TEST_DOCKER_EXIT_ENV: &str = "BOOTROOT_TEST_DOCKER_EXIT";
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = env::var_os(key);
+            // SAFETY: Tests hold ENV_LOCK while mutating process environment.
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            // SAFETY: Tests hold ENV_LOCK while mutating process environment.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    env::set_var(self.key, previous);
+                } else {
+                    env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .expect("environment lock must not be poisoned")
+    }
+
+    fn write_fake_docker_script(path: &Path) {
+        let script = r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "${BOOTROOT_TEST_DOCKER_ARGS:?missing log path}"
+if [ -n "${BOOTROOT_TEST_DOCKER_EXIT:-}" ]; then
+  exit "${BOOTROOT_TEST_DOCKER_EXIT}"
+fi
+exit 0
+"#;
+        fs::write(path, script).expect("fake docker script should be written");
+        #[cfg(unix)]
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("fake docker script should be executable");
+    }
+
+    fn path_with_prepend(bin_dir: &Path) -> OsString {
+        let mut paths = vec![bin_dir.to_path_buf()];
+        if let Some(existing) = env::var_os("PATH") {
+            paths.extend(env::split_paths(&existing));
+        }
+        env::join_paths(paths).expect("PATH components should be valid")
+    }
+
     fn test_messages() -> Messages {
         Messages::new("en").expect("valid language")
+    }
+
+    #[test]
+    fn change_stepca_passphrase_invokes_docker_with_force_and_expected_paths() {
+        let _lock = env_lock();
+        let temp = tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let docker_path = bin_dir.join("docker");
+        write_fake_docker_script(&docker_path);
+
+        let args_log_path = temp.path().join("docker-args.log");
+        let _path_guard = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args_guard = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log_path.as_os_str());
+        let _exit_guard = ScopedEnvVar::set(TEST_DOCKER_EXIT_ENV, "0");
+
+        let secrets_dir = temp.path().join("secrets");
+        fs::create_dir_all(secrets_dir.join("secrets")).expect("create secrets key dir");
+        let current_password = secrets_dir.join("password.txt");
+        let new_password = secrets_dir.join("password.txt.new");
+        let key_path = secrets_dir.join("secrets").join("root_ca_key");
+        fs::write(&current_password, "old").expect("write current password");
+        fs::write(&new_password, "new").expect("write new password");
+        fs::write(&key_path, "key").expect("write key");
+
+        change_stepca_passphrase(
+            &secrets_dir,
+            &current_password,
+            &new_password,
+            &key_path,
+            &test_messages(),
+        )
+        .expect("change passphrase should succeed");
+
+        let logged_args = fs::read_to_string(&args_log_path).expect("read logged args");
+        let args: Vec<&str> = logged_args.lines().collect();
+        let mount_root = fs::canonicalize(&secrets_dir).expect("canonicalize secrets dir");
+        let expected_mount = format!("{}:/home/step", mount_root.display());
+        let expected = vec![
+            "run",
+            "--user",
+            "root",
+            "--rm",
+            "-v",
+            expected_mount.as_str(),
+            "smallstep/step-ca",
+            "step",
+            "crypto",
+            "change-pass",
+            "/home/step/secrets/root_ca_key",
+            "--password-file",
+            "/home/step/password.txt",
+            "--new-password-file",
+            "/home/step/password.txt.new",
+            "-f",
+        ];
+        assert_eq!(args, expected);
+    }
+
+    #[test]
+    fn change_stepca_passphrase_fails_when_key_is_outside_secrets_dir() {
+        let temp = tempdir().expect("tempdir");
+        let secrets_dir = temp.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let current_password = secrets_dir.join("password.txt");
+        let new_password = secrets_dir.join("password.txt.new");
+        fs::write(&current_password, "old").expect("write current password");
+        fs::write(&new_password, "new").expect("write new password");
+        let external_key = temp.path().join("external.key");
+        fs::write(&external_key, "key").expect("write key");
+
+        let err = change_stepca_passphrase(
+            &secrets_dir,
+            &current_password,
+            &new_password,
+            &external_key,
+            &test_messages(),
+        )
+        .expect_err("key outside secrets dir must fail");
+        assert!(err.to_string().contains("is not under secrets dir"));
+    }
+
+    #[test]
+    fn change_stepca_passphrase_surfaces_docker_failure_status() {
+        let _lock = env_lock();
+        let temp = tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let docker_path = bin_dir.join("docker");
+        write_fake_docker_script(&docker_path);
+
+        let args_log_path = temp.path().join("docker-args.log");
+        let _path_guard = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args_guard = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log_path.as_os_str());
+        let _exit_guard = ScopedEnvVar::set(TEST_DOCKER_EXIT_ENV, "7");
+
+        let secrets_dir = temp.path().join("secrets");
+        fs::create_dir_all(secrets_dir.join("secrets")).expect("create secrets key dir");
+        let current_password = secrets_dir.join("password.txt");
+        let new_password = secrets_dir.join("password.txt.new");
+        let key_path = secrets_dir.join("secrets").join("root_ca_key");
+        fs::write(&current_password, "old").expect("write current password");
+        fs::write(&new_password, "new").expect("write new password");
+        fs::write(&key_path, "key").expect("write key");
+
+        let err = change_stepca_passphrase(
+            &secrets_dir,
+            &current_password,
+            &new_password,
+            &key_path,
+            &test_messages(),
+        )
+        .expect_err("docker failure should bubble up");
+        let message = err.to_string();
+        assert!(message.contains("docker step-ca change-pass"));
     }
 
     #[test]

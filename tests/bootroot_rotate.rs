@@ -21,6 +21,95 @@ const ROLE_ID: &str = "role-edge-proxy";
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+    let secrets_dir = temp_dir.path().join("secrets");
+    fs::create_dir_all(secrets_dir.join("secrets")).expect("create secrets key dir");
+    fs::write(secrets_dir.join("password.txt"), "old-password").expect("write password");
+    fs::write(secrets_dir.join("secrets").join("root_ca_key"), "root-key").expect("write root key");
+    fs::write(
+        secrets_dir.join("secrets").join("intermediate_ca_key"),
+        "intermediate-key",
+    )
+    .expect("write intermediate key");
+
+    let compose_file = temp_dir.path().join("docker-compose.yml");
+    fs::write(&compose_file, "services: {}\n").expect("write compose file");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+
+    stub_openbao_for_stepca_password_rotation(&openbao, "new-pass-123").await;
+
+    let path = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--compose-file",
+            compose_file.to_string_lossy().as_ref(),
+            "--yes",
+            "stepca-password",
+            "--new-password",
+            "new-pass-123",
+        ])
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
+        .output()
+        .expect("run rotate stepca-password");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("bootroot rotate: summary"));
+
+    let docker_args_log = fs::read_to_string(&docker_log).expect("read docker log");
+    let lines: Vec<&str> = docker_args_log.lines().collect();
+
+    let change_pass_lines = lines
+        .iter()
+        .filter(|line| line.contains("crypto change-pass"))
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(change_pass_lines.len(), 2, "docker log:\n{docker_args_log}");
+    for line in change_pass_lines {
+        assert!(line.contains(" -f"), "docker log line missing -f: {line}");
+        assert!(
+            line.contains("--password-file") && line.contains("--new-password-file"),
+            "docker log line missing password file args: {line}"
+        );
+    }
+
+    let restart_line = lines
+        .iter()
+        .find(|line| {
+            line.contains("compose") && line.contains("restart") && line.contains("step-ca")
+        })
+        .copied()
+        .unwrap_or_else(|| {
+            panic!("restart step-ca command should be invoked\nlog:\n{docker_args_log}")
+        });
+    assert!(
+        restart_line.contains(" -f "),
+        "compose command should include -f: {restart_line}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_rotate_approle_secret_id_daemon_updates_secret() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
@@ -263,6 +352,26 @@ async fn stub_openbao_for_rotation(server: &MockServer, new_secret_id: &str) {
         .await;
 }
 
+async fn stub_openbao_for_stepca_password_rotation(server: &MockServer, expected_password: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/stepca/password"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "data": {
+                "value": expected_password
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+}
+
 fn write_fake_pkill(bin_dir: &Path, output_path: &Path) -> anyhow::Result<()> {
     let script = r#"#!/bin/sh
 set -eu
@@ -286,7 +395,7 @@ fn write_fake_docker(bin_dir: &Path, output_path: &Path) -> anyhow::Result<()> {
 set -eu
 
 if [ -n "${DOCKER_OUTPUT:-}" ]; then
-  printf "%s" "$*" > "$DOCKER_OUTPUT"
+  printf "%s\n" "$*" >> "$DOCKER_OUTPUT"
 fi
 
 exit 0
