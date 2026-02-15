@@ -173,13 +173,13 @@ pub fn provision_db_sync(
     if role_exists {
         client.execute(&format!("ALTER ROLE {role_ident} WITH LOGIN"), &[])?;
         client.execute(
-            &format!("ALTER ROLE {role_ident} WITH PASSWORD {password_literal}"),
+            &alter_role_password_sql(&role_ident, &password_literal),
             &[],
         )?;
         report.role_updated = true;
     } else {
         client.execute(
-            &format!("CREATE ROLE {role_ident} WITH LOGIN PASSWORD {password_literal}"),
+            &create_role_with_password_sql(&role_ident, &password_literal),
             &[],
         )?;
         report.role_created = true;
@@ -215,6 +215,17 @@ fn quote_ident(value: &str) -> String {
 /// PASSWORD` that do not support parameterized queries.
 fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Builds SQL that sets a role password using a pre-quoted literal.
+fn alter_role_password_sql(role_ident: &str, password_literal: &str) -> String {
+    format!("ALTER ROLE {role_ident} WITH PASSWORD {password_literal}")
+}
+
+/// Builds SQL that creates a role with login and password using a pre-quoted
+/// literal.
+fn create_role_with_password_sql(role_ident: &str, password_literal: &str) -> String {
+    format!("CREATE ROLE {role_ident} WITH LOGIN PASSWORD {password_literal}")
 }
 
 /// Checks TCP connectivity to the database host.
@@ -348,5 +359,33 @@ mod tests {
         assert_eq!(quote_literal("p@ss'w0rd!"), "'p@ss''w0rd!'");
         // Password with consecutive single quotes
         assert_eq!(quote_literal("test''value"), "'test''''value'");
+    }
+
+    #[test]
+    fn quote_literal_handles_empty_string() {
+        assert_eq!(quote_literal(""), "''");
+    }
+
+    #[test]
+    fn quote_literal_preserves_newlines_and_backslashes() {
+        assert_eq!(quote_literal("line1\nline2\\path"), "'line1\nline2\\path'");
+    }
+
+    #[test]
+    fn alter_role_password_sql_uses_escaped_literal_without_placeholder() {
+        let sql =
+            alter_role_password_sql(&quote_ident("step"), &quote_literal("x';DROP ROLE step;--"));
+        assert_eq!(
+            sql,
+            "ALTER ROLE \"step\" WITH PASSWORD 'x'';DROP ROLE step;--'"
+        );
+        assert!(!sql.contains("$1"));
+    }
+
+    #[test]
+    fn create_role_with_password_sql_uses_escaped_literal_without_placeholder() {
+        let sql = create_role_with_password_sql(&quote_ident("step"), &quote_literal("pass'word"));
+        assert_eq!(sql, "CREATE ROLE \"step\" WITH LOGIN PASSWORD 'pass''word'");
+        assert!(!sql.contains("$1"));
     }
 }
