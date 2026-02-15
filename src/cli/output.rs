@@ -1,8 +1,10 @@
 use crate::commands::init::{InitPlan, InitSummary};
-use crate::i18n::{AppNextStepsDaemon, AppNextStepsDocker, AppOpenBaoAgentSteps, Messages};
-use crate::state::{AppEntry, DeployType};
+use crate::i18n::{
+    Messages, ServiceNextStepsDaemon, ServiceNextStepsDocker, ServiceOpenBaoAgentSteps,
+};
+use crate::state::{DeployType, ServiceEntry};
 
-pub(crate) struct AppAddPlan<'a> {
+pub(crate) struct ServiceAddPlan<'a> {
     pub(crate) service_name: &'a str,
     pub(crate) deploy_type: DeployType,
     pub(crate) hostname: &'a str,
@@ -47,27 +49,33 @@ pub(crate) fn print_init_plan(plan: &InitPlan, messages: &Messages) {
     }
 }
 
-pub(crate) fn print_app_add_summary(
-    entry: &AppEntry,
+pub(crate) fn print_service_add_summary(
+    entry: &ServiceEntry,
     secret_id_path: &std::path::Path,
     trusted_ca_sha256: Option<&[String]>,
     messages: &Messages,
 ) {
-    println!("{}", messages.app_add_summary());
-    print_app_fields(entry, messages);
+    println!("{}", messages.service_add_summary());
+    print_service_fields(entry, messages);
     println!(
         "{}",
-        messages.app_summary_policy(&entry.approle.policy_name)
+        messages.service_summary_policy(&entry.approle.policy_name)
     );
-    println!("{}", messages.app_summary_approle(&entry.approle.role_name));
+    println!(
+        "{}",
+        messages.service_summary_approle(&entry.approle.role_name)
+    );
     println!("{}", messages.summary_role_id(&entry.approle.role_id));
     println!(
         "{}",
-        messages.app_summary_secret_path(&secret_id_path.display().to_string())
+        messages.service_summary_secret_path(&secret_id_path.display().to_string())
     );
-    println!("{}", messages.app_summary_openbao_path(&entry.service_name));
-    println!("{}", messages.app_summary_next_steps());
-    print_app_openbao_agent_steps(entry, secret_id_path, messages);
+    println!(
+        "{}",
+        messages.service_summary_openbao_path(&entry.service_name)
+    );
+    println!("{}", messages.service_summary_next_steps());
+    print_service_openbao_agent_steps(entry, secret_id_path, messages);
     if let Some(trusted) = trusted_ca_sha256 {
         print_trust_snippet(entry, trusted, messages);
     }
@@ -76,7 +84,7 @@ pub(crate) fn print_app_add_summary(
             let cert_path = entry.cert_path.display().to_string();
             let key_path = entry.key_path.display().to_string();
             let config_path = entry.agent_config_path.display().to_string();
-            let data = AppNextStepsDaemon {
+            let data = ServiceNextStepsDaemon {
                 service_name: &entry.service_name,
                 instance_id: entry.instance_id.as_deref().unwrap_or_default(),
                 hostname: &entry.hostname,
@@ -85,7 +93,7 @@ pub(crate) fn print_app_add_summary(
                 key_path: &key_path,
                 config_path: &config_path,
             };
-            println!("{}", messages.app_next_steps_daemon_profile(&data));
+            println!("{}", messages.service_next_steps_daemon_profile(&data));
             print_daemon_snippet(entry, messages);
         }
         DeployType::Docker => {
@@ -93,7 +101,7 @@ pub(crate) fn print_app_add_summary(
             let key_path = entry.key_path.display().to_string();
             let config_path = entry.agent_config_path.display().to_string();
             let secret_id_path_value = secret_id_path.display().to_string();
-            let data = AppNextStepsDocker {
+            let data = ServiceNextStepsDocker {
                 service_name: &entry.service_name,
                 container_name: entry.container_name.as_deref().unwrap_or_default(),
                 instance_id: entry.instance_id.as_deref().unwrap_or_default(),
@@ -105,153 +113,168 @@ pub(crate) fn print_app_add_summary(
                 role_name: &entry.approle.role_name,
                 secret_id_path: &secret_id_path_value,
             };
-            println!("{}", messages.app_next_steps_docker_sidecar(&data));
+            println!("{}", messages.service_next_steps_docker_sidecar(&data));
             print_docker_snippet(entry, messages);
         }
     }
 }
 
-pub(crate) fn print_app_add_plan(plan: &AppAddPlan<'_>, messages: &Messages) {
-    println!("{}", messages.app_add_plan_title());
-    print_app_plan_fields(plan, messages);
-    println!("{}", messages.app_summary_agent_config(plan.agent_config));
-    println!("{}", messages.app_summary_cert_path(plan.cert_path));
-    println!("{}", messages.app_summary_key_path(plan.key_path));
+pub(crate) fn print_service_add_plan(plan: &ServiceAddPlan<'_>, messages: &Messages) {
+    println!("{}", messages.service_add_plan_title());
+    print_service_plan_fields(plan, messages);
+    println!(
+        "{}",
+        messages.service_summary_agent_config(plan.agent_config)
+    );
+    println!("{}", messages.service_summary_cert_path(plan.cert_path));
+    println!("{}", messages.service_summary_key_path(plan.key_path));
 }
 
-pub(crate) fn print_app_info_summary(entry: &AppEntry, messages: &Messages) {
-    println!("{}", messages.app_info_summary());
-    print_app_fields(entry, messages);
+pub(crate) fn print_service_info_summary(entry: &ServiceEntry, messages: &Messages) {
+    println!("{}", messages.service_info_summary());
+    print_service_fields(entry, messages);
     if let Some(instance_id) = entry.instance_id.as_deref() {
-        println!("{}", messages.app_summary_instance_id(instance_id));
+        println!("{}", messages.service_summary_instance_id(instance_id));
     }
     if let Some(container_name) = entry.container_name.as_deref() {
-        println!("{}", messages.app_summary_container_name(container_name));
+        println!(
+            "{}",
+            messages.service_summary_container_name(container_name)
+        );
     }
     println!(
         "{}",
-        messages.app_summary_policy(&entry.approle.policy_name)
+        messages.service_summary_policy(&entry.approle.policy_name)
     );
-    println!("{}", messages.app_summary_approle(&entry.approle.role_name));
+    println!(
+        "{}",
+        messages.service_summary_approle(&entry.approle.role_name)
+    );
     println!("{}", messages.summary_role_id(&entry.approle.role_id));
-    println!("{}", messages.app_summary_openbao_path(&entry.service_name));
     println!(
         "{}",
-        messages.app_summary_agent_config(&entry.agent_config_path.display().to_string())
+        messages.service_summary_openbao_path(&entry.service_name)
     );
     println!(
         "{}",
-        messages.app_summary_cert_path(&entry.cert_path.display().to_string())
+        messages.service_summary_agent_config(&entry.agent_config_path.display().to_string())
     );
     println!(
         "{}",
-        messages.app_summary_key_path(&entry.key_path.display().to_string())
+        messages.service_summary_cert_path(&entry.cert_path.display().to_string())
     );
     println!(
         "{}",
-        messages.app_summary_secret_path(&entry.approle.secret_id_path.display().to_string())
+        messages.service_summary_key_path(&entry.key_path.display().to_string())
     );
-    println!("{}", messages.app_summary_next_steps());
-    print_app_openbao_agent_steps(entry, &entry.approle.secret_id_path, messages);
+    println!(
+        "{}",
+        messages.service_summary_secret_path(&entry.approle.secret_id_path.display().to_string())
+    );
+    println!("{}", messages.service_summary_next_steps());
+    print_service_openbao_agent_steps(entry, &entry.approle.secret_id_path, messages);
 }
 
-fn print_app_fields(entry: &AppEntry, messages: &Messages) {
-    println!("{}", messages.app_summary_kind(&entry.service_name));
+fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
+    println!("{}", messages.service_summary_kind(&entry.service_name));
     println!(
         "{}",
-        messages.app_summary_deploy_type(match entry.deploy_type {
+        messages.service_summary_deploy_type(match entry.deploy_type {
             DeployType::Daemon => "daemon",
             DeployType::Docker => "docker",
         })
     );
-    println!("{}", messages.app_summary_hostname(&entry.hostname));
-    println!("{}", messages.app_summary_domain(&entry.domain));
+    println!("{}", messages.service_summary_hostname(&entry.hostname));
+    println!("{}", messages.service_summary_domain(&entry.domain));
     if let Some(notes) = entry.notes.as_deref() {
-        println!("{}", messages.app_summary_notes(notes));
+        println!("{}", messages.service_summary_notes(notes));
     }
 }
 
-fn print_app_plan_fields(plan: &AppAddPlan<'_>, messages: &Messages) {
-    println!("{}", messages.app_summary_kind(plan.service_name));
+fn print_service_plan_fields(plan: &ServiceAddPlan<'_>, messages: &Messages) {
+    println!("{}", messages.service_summary_kind(plan.service_name));
     println!(
         "{}",
-        messages.app_summary_deploy_type(match plan.deploy_type {
+        messages.service_summary_deploy_type(match plan.deploy_type {
             DeployType::Daemon => "daemon",
             DeployType::Docker => "docker",
         })
     );
-    println!("{}", messages.app_summary_hostname(plan.hostname));
-    println!("{}", messages.app_summary_domain(plan.domain));
+    println!("{}", messages.service_summary_hostname(plan.hostname));
+    println!("{}", messages.service_summary_domain(plan.domain));
     if let Some(instance_id) = plan.instance_id {
-        println!("{}", messages.app_summary_instance_id(instance_id));
+        println!("{}", messages.service_summary_instance_id(instance_id));
     }
     if let Some(container_name) = plan.container_name {
-        println!("{}", messages.app_summary_container_name(container_name));
+        println!(
+            "{}",
+            messages.service_summary_container_name(container_name)
+        );
     }
     if let Some(notes) = plan.notes {
-        println!("{}", messages.app_summary_notes(notes));
+        println!("{}", messages.service_summary_notes(notes));
     }
 }
 
-fn print_app_openbao_agent_steps(
-    entry: &AppEntry,
+fn print_service_openbao_agent_steps(
+    entry: &ServiceEntry,
     secret_id_path: &std::path::Path,
     messages: &Messages,
 ) {
-    let app_dir = secret_id_path.parent().unwrap_or(std::path::Path::new("."));
-    let role_id_path = app_dir.join("role_id");
-    let secrets_dir = app_dir
+    let service_dir = secret_id_path.parent().unwrap_or(std::path::Path::new("."));
+    let role_id_path = service_dir.join("role_id");
+    let secrets_dir = service_dir
         .parent()
         .and_then(|parent| parent.parent())
         .unwrap_or(std::path::Path::new("."));
     let openbao_agent_config = secrets_dir
         .join("openbao")
-        .join("apps")
+        .join("services")
         .join(&entry.service_name)
         .join("agent.hcl");
-    let openbao_steps = AppOpenBaoAgentSteps {
+    let openbao_steps = ServiceOpenBaoAgentSteps {
         service_name: &entry.service_name,
         config_path: &openbao_agent_config.display().to_string(),
         role_id_path: &role_id_path.display().to_string(),
         secret_id_path: &secret_id_path.display().to_string(),
-        app_dir: &app_dir.display().to_string(),
+        service_dir: &service_dir.display().to_string(),
     };
-    println!("{}", messages.app_next_steps_openbao_agent_title());
+    println!("{}", messages.service_next_steps_openbao_agent_title());
     println!(
         "{}",
-        messages.app_next_steps_openbao_agent_config(&openbao_steps)
+        messages.service_next_steps_openbao_agent_config(&openbao_steps)
     );
     println!(
         "{}",
-        messages.app_next_steps_openbao_agent_role_id_path(&openbao_steps)
+        messages.service_next_steps_openbao_agent_role_id_path(&openbao_steps)
     );
     println!(
         "{}",
-        messages.app_next_steps_openbao_agent_secret_id_path(&openbao_steps)
+        messages.service_next_steps_openbao_agent_secret_id_path(&openbao_steps)
     );
     println!(
         "{}",
-        messages.app_next_steps_openbao_agent_permissions(&openbao_steps)
+        messages.service_next_steps_openbao_agent_permissions(&openbao_steps)
     );
     match entry.deploy_type {
         DeployType::Daemon => {
             println!(
                 "{}",
-                messages.app_next_steps_openbao_agent_daemon_run(&openbao_steps)
+                messages.service_next_steps_openbao_agent_daemon_run(&openbao_steps)
             );
         }
         DeployType::Docker => {
             println!(
                 "{}",
-                messages.app_next_steps_openbao_agent_docker_run(&openbao_steps)
+                messages.service_next_steps_openbao_agent_docker_run(&openbao_steps)
             );
         }
     }
 }
 
-fn print_daemon_snippet(entry: &AppEntry, messages: &Messages) {
+fn print_daemon_snippet(entry: &ServiceEntry, messages: &Messages) {
     let instance_id = entry.instance_id.as_deref().unwrap_or_default();
-    println!("{}", messages.app_snippet_daemon_title());
+    println!("{}", messages.service_snippet_daemon_title());
     println!("[[profiles]]");
     println!(
         "service_name = \"{service_name}\"",
@@ -271,17 +294,17 @@ fn print_daemon_snippet(entry: &AppEntry, messages: &Messages) {
     println!("check_interval = \"1h\"");
     println!("renew_before = \"720h\"");
     println!("check_jitter = \"0s\"");
-    println!("{}", messages.app_snippet_domain_hint(&entry.domain));
+    println!("{}", messages.service_snippet_domain_hint(&entry.domain));
 }
 
-fn print_docker_snippet(entry: &AppEntry, messages: &Messages) {
+fn print_docker_snippet(entry: &ServiceEntry, messages: &Messages) {
     let container = entry.container_name.as_deref().unwrap_or("bootroot-agent");
     let config_path = entry.agent_config_path.display();
     let cert_parent = entry
         .cert_path
         .parent()
         .unwrap_or(std::path::Path::new("."));
-    println!("{}", messages.app_snippet_docker_title());
+    println!("{}", messages.service_snippet_docker_title());
     println!("docker run --rm \\");
     println!("  --name {container} \\");
     println!("  -v {config_path}:/app/agent.toml:ro \\");
@@ -294,13 +317,13 @@ fn print_docker_snippet(entry: &AppEntry, messages: &Messages) {
     println!("  bootroot-agent --config /app/agent.toml --oneshot");
 }
 
-fn print_trust_snippet(entry: &AppEntry, trusted: &[String], messages: &Messages) {
+fn print_trust_snippet(entry: &ServiceEntry, trusted: &[String], messages: &Messages) {
     let cert_dir = entry
         .cert_path
         .parent()
         .unwrap_or(std::path::Path::new("."));
     let bundle_path = cert_dir.join("ca-bundle.pem");
-    println!("{}", messages.app_snippet_trust_title());
+    println!("{}", messages.service_snippet_trust_title());
     println!("[trust]");
     println!("verify_certificates = true");
     println!("ca_bundle_path = \"{}\"", bundle_path.display());

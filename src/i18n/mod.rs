@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 pub(crate) mod en;
 pub(crate) mod ko;
 
-pub(crate) struct AppNextStepsDaemon<'a> {
+pub(crate) struct ServiceNextStepsDaemon<'a> {
     pub(crate) service_name: &'a str,
     pub(crate) instance_id: &'a str,
     pub(crate) hostname: &'a str,
@@ -13,7 +13,7 @@ pub(crate) struct AppNextStepsDaemon<'a> {
     pub(crate) config_path: &'a str,
 }
 
-pub(crate) struct AppNextStepsDocker<'a> {
+pub(crate) struct ServiceNextStepsDocker<'a> {
     pub(crate) service_name: &'a str,
     pub(crate) container_name: &'a str,
     pub(crate) instance_id: &'a str,
@@ -26,12 +26,12 @@ pub(crate) struct AppNextStepsDocker<'a> {
     pub(crate) secret_id_path: &'a str,
 }
 
-pub(crate) struct AppOpenBaoAgentSteps<'a> {
+pub(crate) struct ServiceOpenBaoAgentSteps<'a> {
     pub(crate) service_name: &'a str,
     pub(crate) config_path: &'a str,
     pub(crate) role_id_path: &'a str,
     pub(crate) secret_id_path: &'a str,
-    pub(crate) app_dir: &'a str,
+    pub(crate) service_dir: &'a str,
 }
 
 pub(crate) struct Strings {
@@ -96,10 +96,10 @@ pub(crate) struct Strings {
     pub(crate) error_responder_check_failed: &'static str,
     pub(crate) error_eab_auto_failed: &'static str,
     pub(crate) error_state_missing: &'static str,
-    pub(crate) error_app_duplicate: &'static str,
-    pub(crate) error_app_not_found: &'static str,
-    pub(crate) error_app_instance_id_required: &'static str,
-    pub(crate) error_app_container_name_required: &'static str,
+    pub(crate) error_service_duplicate: &'static str,
+    pub(crate) error_service_not_found: &'static str,
+    pub(crate) error_service_instance_id_required: &'static str,
+    pub(crate) error_service_container_name_required: &'static str,
     pub(crate) error_value_required: &'static str,
     pub(crate) error_invalid_deploy_type: &'static str,
     pub(crate) error_path_not_found: &'static str,
@@ -109,8 +109,8 @@ pub(crate) struct Strings {
     pub(crate) error_monitoring_failed: &'static str,
     pub(crate) error_init_failed: &'static str,
     pub(crate) error_status_failed: &'static str,
-    pub(crate) error_app_add_failed: &'static str,
-    pub(crate) error_app_info_failed: &'static str,
+    pub(crate) error_service_add_failed: &'static str,
+    pub(crate) error_service_info_failed: &'static str,
     pub(crate) error_verify_failed: &'static str,
     pub(crate) error_rotate_failed: &'static str,
     pub(crate) error_details: &'static str,
@@ -193,37 +193,37 @@ pub(crate) struct Strings {
     pub(crate) init_plan_overwrite_password: &'static str,
     pub(crate) init_plan_overwrite_ca_json: &'static str,
     pub(crate) init_plan_overwrite_state: &'static str,
-    pub(crate) app_add_summary: &'static str,
-    pub(crate) app_add_plan_title: &'static str,
-    pub(crate) app_info_summary: &'static str,
-    pub(crate) app_summary_kind: &'static str,
-    pub(crate) app_summary_deploy_type: &'static str,
-    pub(crate) app_summary_hostname: &'static str,
-    pub(crate) app_summary_domain: &'static str,
-    pub(crate) app_summary_instance_id: &'static str,
-    pub(crate) app_summary_container_name: &'static str,
-    pub(crate) app_summary_notes: &'static str,
-    pub(crate) app_summary_policy: &'static str,
-    pub(crate) app_summary_approle: &'static str,
-    pub(crate) app_summary_secret_path: &'static str,
-    pub(crate) app_summary_openbao_path: &'static str,
-    pub(crate) app_summary_agent_config: &'static str,
-    pub(crate) app_summary_cert_path: &'static str,
-    pub(crate) app_summary_key_path: &'static str,
-    pub(crate) app_summary_next_steps: &'static str,
-    pub(crate) app_next_steps_daemon_profile: &'static str,
-    pub(crate) app_next_steps_docker_sidecar: &'static str,
-    pub(crate) app_next_steps_openbao_agent_title: &'static str,
-    pub(crate) app_next_steps_openbao_agent_config: &'static str,
-    pub(crate) app_next_steps_openbao_agent_role_id_path: &'static str,
-    pub(crate) app_next_steps_openbao_agent_secret_id_path: &'static str,
-    pub(crate) app_next_steps_openbao_agent_permissions: &'static str,
-    pub(crate) app_next_steps_openbao_agent_daemon_run: &'static str,
-    pub(crate) app_next_steps_openbao_agent_docker_run: &'static str,
-    pub(crate) app_snippet_daemon_title: &'static str,
-    pub(crate) app_snippet_docker_title: &'static str,
-    pub(crate) app_snippet_trust_title: &'static str,
-    pub(crate) app_snippet_domain_hint: &'static str,
+    pub(crate) service_add_summary: &'static str,
+    pub(crate) service_add_plan_title: &'static str,
+    pub(crate) service_info_summary: &'static str,
+    pub(crate) service_summary_kind: &'static str,
+    pub(crate) service_summary_deploy_type: &'static str,
+    pub(crate) service_summary_hostname: &'static str,
+    pub(crate) service_summary_domain: &'static str,
+    pub(crate) service_summary_instance_id: &'static str,
+    pub(crate) service_summary_container_name: &'static str,
+    pub(crate) service_summary_notes: &'static str,
+    pub(crate) service_summary_policy: &'static str,
+    pub(crate) service_summary_approle: &'static str,
+    pub(crate) service_summary_secret_path: &'static str,
+    pub(crate) service_summary_openbao_path: &'static str,
+    pub(crate) service_summary_agent_config: &'static str,
+    pub(crate) service_summary_cert_path: &'static str,
+    pub(crate) service_summary_key_path: &'static str,
+    pub(crate) service_summary_next_steps: &'static str,
+    pub(crate) service_next_steps_daemon_profile: &'static str,
+    pub(crate) service_next_steps_docker_sidecar: &'static str,
+    pub(crate) service_next_steps_openbao_agent_title: &'static str,
+    pub(crate) service_next_steps_openbao_agent_config: &'static str,
+    pub(crate) service_next_steps_openbao_agent_role_id_path: &'static str,
+    pub(crate) service_next_steps_openbao_agent_secret_id_path: &'static str,
+    pub(crate) service_next_steps_openbao_agent_permissions: &'static str,
+    pub(crate) service_next_steps_openbao_agent_daemon_run: &'static str,
+    pub(crate) service_next_steps_openbao_agent_docker_run: &'static str,
+    pub(crate) service_snippet_daemon_title: &'static str,
+    pub(crate) service_snippet_docker_title: &'static str,
+    pub(crate) service_snippet_trust_title: &'static str,
+    pub(crate) service_snippet_domain_hint: &'static str,
     pub(crate) verify_plan_title: &'static str,
     pub(crate) verify_summary_title: &'static str,
     pub(crate) verify_service_name: &'static str,
@@ -654,26 +654,26 @@ impl Messages {
         self.strings().error_state_missing
     }
 
-    pub(crate) fn error_app_duplicate(&self, service_name: &str) -> String {
+    pub(crate) fn error_service_duplicate(&self, service_name: &str) -> String {
         format_template(
-            self.strings().error_app_duplicate,
+            self.strings().error_service_duplicate,
             &[("value", service_name)],
         )
     }
 
-    pub(crate) fn error_app_not_found(&self, service_name: &str) -> String {
+    pub(crate) fn error_service_not_found(&self, service_name: &str) -> String {
         format_template(
-            self.strings().error_app_not_found,
+            self.strings().error_service_not_found,
             &[("value", service_name)],
         )
     }
 
-    pub(crate) fn error_app_instance_id_required(&self) -> &'static str {
-        self.strings().error_app_instance_id_required
+    pub(crate) fn error_service_instance_id_required(&self) -> &'static str {
+        self.strings().error_service_instance_id_required
     }
 
-    pub(crate) fn error_app_container_name_required(&self) -> &'static str {
-        self.strings().error_app_container_name_required
+    pub(crate) fn error_service_container_name_required(&self) -> &'static str {
+        self.strings().error_service_container_name_required
     }
 
     pub(crate) fn error_value_required(&self) -> &'static str {
@@ -712,12 +712,12 @@ impl Messages {
         self.strings().error_status_failed
     }
 
-    pub(crate) fn error_app_add_failed(&self) -> &'static str {
-        self.strings().error_app_add_failed
+    pub(crate) fn error_service_add_failed(&self) -> &'static str {
+        self.strings().error_service_add_failed
     }
 
-    pub(crate) fn error_app_info_failed(&self) -> &'static str {
-        self.strings().error_app_info_failed
+    pub(crate) fn error_service_info_failed(&self) -> &'static str {
+        self.strings().error_service_info_failed
     }
 
     pub(crate) fn error_verify_failed(&self) -> &'static str {
@@ -1081,84 +1081,105 @@ impl Messages {
         self.strings().init_plan_overwrite_state
     }
 
-    pub(crate) fn app_add_summary(&self) -> &'static str {
-        self.strings().app_add_summary
+    pub(crate) fn service_add_summary(&self) -> &'static str {
+        self.strings().service_add_summary
     }
 
-    pub(crate) fn app_add_plan_title(&self) -> &'static str {
-        self.strings().app_add_plan_title
+    pub(crate) fn service_add_plan_title(&self) -> &'static str {
+        self.strings().service_add_plan_title
     }
 
-    pub(crate) fn app_info_summary(&self) -> &'static str {
-        self.strings().app_info_summary
+    pub(crate) fn service_info_summary(&self) -> &'static str {
+        self.strings().service_info_summary
     }
 
-    pub(crate) fn app_summary_kind(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_kind, &[("value", value)])
+    pub(crate) fn service_summary_kind(&self, value: &str) -> String {
+        format_template(self.strings().service_summary_kind, &[("value", value)])
     }
 
-    pub(crate) fn app_summary_deploy_type(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_deploy_type, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_hostname(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_hostname, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_domain(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_domain, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_instance_id(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_instance_id, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_container_name(&self, value: &str) -> String {
+    pub(crate) fn service_summary_deploy_type(&self, value: &str) -> String {
         format_template(
-            self.strings().app_summary_container_name,
+            self.strings().service_summary_deploy_type,
             &[("value", value)],
         )
     }
 
-    pub(crate) fn app_summary_notes(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_notes, &[("value", value)])
+    pub(crate) fn service_summary_hostname(&self, value: &str) -> String {
+        format_template(self.strings().service_summary_hostname, &[("value", value)])
     }
 
-    pub(crate) fn app_summary_policy(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_policy, &[("value", value)])
+    pub(crate) fn service_summary_domain(&self, value: &str) -> String {
+        format_template(self.strings().service_summary_domain, &[("value", value)])
     }
 
-    pub(crate) fn app_summary_approle(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_approle, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_secret_path(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_secret_path, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_openbao_path(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_openbao_path, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_agent_config(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_agent_config, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_cert_path(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_cert_path, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_key_path(&self, value: &str) -> String {
-        format_template(self.strings().app_summary_key_path, &[("value", value)])
-    }
-
-    pub(crate) fn app_summary_next_steps(&self) -> &'static str {
-        self.strings().app_summary_next_steps
-    }
-
-    pub(crate) fn app_next_steps_daemon_profile(&self, data: &AppNextStepsDaemon<'_>) -> String {
+    pub(crate) fn service_summary_instance_id(&self, value: &str) -> String {
         format_template(
-            self.strings().app_next_steps_daemon_profile,
+            self.strings().service_summary_instance_id,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_container_name(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_container_name,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_notes(&self, value: &str) -> String {
+        format_template(self.strings().service_summary_notes, &[("value", value)])
+    }
+
+    pub(crate) fn service_summary_policy(&self, value: &str) -> String {
+        format_template(self.strings().service_summary_policy, &[("value", value)])
+    }
+
+    pub(crate) fn service_summary_approle(&self, value: &str) -> String {
+        format_template(self.strings().service_summary_approle, &[("value", value)])
+    }
+
+    pub(crate) fn service_summary_secret_path(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_secret_path,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_openbao_path(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_openbao_path,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_agent_config(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_agent_config,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_cert_path(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_cert_path,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_key_path(&self, value: &str) -> String {
+        format_template(self.strings().service_summary_key_path, &[("value", value)])
+    }
+
+    pub(crate) fn service_summary_next_steps(&self) -> &'static str {
+        self.strings().service_summary_next_steps
+    }
+
+    pub(crate) fn service_next_steps_daemon_profile(
+        &self,
+        data: &ServiceNextStepsDaemon<'_>,
+    ) -> String {
+        format_template(
+            self.strings().service_next_steps_daemon_profile,
             &[
                 ("service_name", data.service_name),
                 ("instance_id", data.instance_id),
@@ -1171,9 +1192,12 @@ impl Messages {
         )
     }
 
-    pub(crate) fn app_next_steps_docker_sidecar(&self, data: &AppNextStepsDocker<'_>) -> String {
+    pub(crate) fn service_next_steps_docker_sidecar(
+        &self,
+        data: &ServiceNextStepsDocker<'_>,
+    ) -> String {
         format_template(
-            self.strings().app_next_steps_docker_sidecar,
+            self.strings().service_next_steps_docker_sidecar,
             &[
                 ("service_name", data.service_name),
                 ("container_name", data.container_name),
@@ -1189,16 +1213,16 @@ impl Messages {
         )
     }
 
-    pub(crate) fn app_next_steps_openbao_agent_title(&self) -> &'static str {
-        self.strings().app_next_steps_openbao_agent_title
+    pub(crate) fn service_next_steps_openbao_agent_title(&self) -> &'static str {
+        self.strings().service_next_steps_openbao_agent_title
     }
 
-    pub(crate) fn app_next_steps_openbao_agent_config(
+    pub(crate) fn service_next_steps_openbao_agent_config(
         &self,
-        data: &AppOpenBaoAgentSteps<'_>,
+        data: &ServiceOpenBaoAgentSteps<'_>,
     ) -> String {
         format_template(
-            self.strings().app_next_steps_openbao_agent_config,
+            self.strings().service_next_steps_openbao_agent_config,
             &[
                 ("service_name", data.service_name),
                 ("config_path", data.config_path),
@@ -1206,70 +1230,74 @@ impl Messages {
         )
     }
 
-    pub(crate) fn app_next_steps_openbao_agent_role_id_path(
+    pub(crate) fn service_next_steps_openbao_agent_role_id_path(
         &self,
-        data: &AppOpenBaoAgentSteps<'_>,
+        data: &ServiceOpenBaoAgentSteps<'_>,
     ) -> String {
         format_template(
-            self.strings().app_next_steps_openbao_agent_role_id_path,
+            self.strings().service_next_steps_openbao_agent_role_id_path,
             &[("role_id_path", data.role_id_path)],
         )
     }
 
-    pub(crate) fn app_next_steps_openbao_agent_secret_id_path(
+    pub(crate) fn service_next_steps_openbao_agent_secret_id_path(
         &self,
-        data: &AppOpenBaoAgentSteps<'_>,
+        data: &ServiceOpenBaoAgentSteps<'_>,
     ) -> String {
         format_template(
-            self.strings().app_next_steps_openbao_agent_secret_id_path,
+            self.strings()
+                .service_next_steps_openbao_agent_secret_id_path,
             &[("secret_id_path", data.secret_id_path)],
         )
     }
 
-    pub(crate) fn app_next_steps_openbao_agent_permissions(
+    pub(crate) fn service_next_steps_openbao_agent_permissions(
         &self,
-        data: &AppOpenBaoAgentSteps<'_>,
+        data: &ServiceOpenBaoAgentSteps<'_>,
     ) -> String {
         format_template(
-            self.strings().app_next_steps_openbao_agent_permissions,
-            &[("app_dir", data.app_dir)],
+            self.strings().service_next_steps_openbao_agent_permissions,
+            &[("service_dir", data.service_dir)],
         )
     }
 
-    pub(crate) fn app_next_steps_openbao_agent_daemon_run(
+    pub(crate) fn service_next_steps_openbao_agent_daemon_run(
         &self,
-        data: &AppOpenBaoAgentSteps<'_>,
+        data: &ServiceOpenBaoAgentSteps<'_>,
     ) -> String {
         format_template(
-            self.strings().app_next_steps_openbao_agent_daemon_run,
+            self.strings().service_next_steps_openbao_agent_daemon_run,
             &[("config_path", data.config_path)],
         )
     }
 
-    pub(crate) fn app_next_steps_openbao_agent_docker_run(
+    pub(crate) fn service_next_steps_openbao_agent_docker_run(
         &self,
-        data: &AppOpenBaoAgentSteps<'_>,
+        data: &ServiceOpenBaoAgentSteps<'_>,
     ) -> String {
         format_template(
-            self.strings().app_next_steps_openbao_agent_docker_run,
+            self.strings().service_next_steps_openbao_agent_docker_run,
             &[("config_path", data.config_path)],
         )
     }
 
-    pub(crate) fn app_snippet_daemon_title(&self) -> &'static str {
-        self.strings().app_snippet_daemon_title
+    pub(crate) fn service_snippet_daemon_title(&self) -> &'static str {
+        self.strings().service_snippet_daemon_title
     }
 
-    pub(crate) fn app_snippet_docker_title(&self) -> &'static str {
-        self.strings().app_snippet_docker_title
+    pub(crate) fn service_snippet_docker_title(&self) -> &'static str {
+        self.strings().service_snippet_docker_title
     }
 
-    pub(crate) fn app_snippet_trust_title(&self) -> &'static str {
-        self.strings().app_snippet_trust_title
+    pub(crate) fn service_snippet_trust_title(&self) -> &'static str {
+        self.strings().service_snippet_trust_title
     }
 
-    pub(crate) fn app_snippet_domain_hint(&self, value: &str) -> String {
-        format_template(self.strings().app_snippet_domain_hint, &[("value", value)])
+    pub(crate) fn service_snippet_domain_hint(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_snippet_domain_hint,
+            &[("value", value)],
+        )
     }
 
     pub(crate) fn verify_summary_title(&self) -> &'static str {

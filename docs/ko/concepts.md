@@ -4,7 +4,7 @@
 
 ## PKI와 인증서
 
-- **CA(인증기관)** 는 공개키와 신원을 묶어 서명합니다(호스트명 또는 IP).
+- **CA(인증기관)** 는 공개키와 신원을 묶어 서명합니다.
 - **인증서**는 신원 정보(SAN), 유효기간, CA 서명을 포함합니다.
 - **개인키**는 반드시 안전하게 보호되어야 합니다.
 
@@ -25,7 +25,10 @@ bootroot의 기본 설정에서도 이 구조를 그대로 따르며, 아래 파
 - **DNS**: `example.internal`
 - **IP**: `192.0.2.10`
 
-bootroot CLI 생태계에서는 다음 형식의 DNS SAN을 사용합니다(데몬/도커 동일):
+bootroot에서는 인증서를 서비스 단위로 발급하므로, DNS SAN에도
+`service_name`이 포함됩니다. 또한 같은 머신에서 동일 서비스가 여러
+인스턴스로 구동될 수 있으므로, 인스턴스를 구분하기 위해 `instance_id`를
+앞에 포함합니다. 데몬/도커 배포 모두 같은 형식을 사용합니다.
 
 `<instance_id>.<service_name>.<hostname>.<domain>`
 
@@ -42,6 +45,8 @@ bootroot의 기본 전제는 **같은 step-ca가 발급한 인증서만 신뢰**
 
 CA 번들은 신뢰할 **루트/중간 인증서 체인**을 묶은 파일입니다. 서비스는 이
 번들을 trust store(신뢰 저장소)로 사용해 상대방 인증서를 검증합니다.
+Bootroot는 외부 CA를 사용하지 않으므로, 루트 CA는 step-ca가 생성한
+자체 서명(self-signed) 루트이고, 중간 CA는 이 루트 CA로 서명된 인증서입니다.
 
 - bootroot-agent가 ACME 응답에서 체인(중간/루트)을 분리해
   `ca_bundle_path`에 저장합니다.
@@ -55,7 +60,8 @@ bootroot-agent는 PEM 블록을 순서대로 파싱해 **첫 블록을 리프**,
 
 ## CSR (Certificate Signing Request)
 
-CSR은 클라이언트가 생성하는 요청서입니다. 공개키와 SAN 목록이 포함됩니다.
+CSR은 CA로부터 인증서를 발급받으려는 주체가 생성하는 요청서입니다.
+공개키와 SAN 목록이 포함됩니다.
 CA가 이를 검증한 뒤 인증서를 발급합니다.
 
 ## ACME
@@ -74,7 +80,7 @@ ACME 흐름에서 자주 등장하는 개념은 다음과 같습니다.
 - **Authorization**: 특정 식별자(도메인 등)에 대한 소유 증명 단계입니다.
   하나의 Order는 여러 Authorization을 포함할 수 있습니다.
 - **Challenge**: Authorization을 통과하기 위한 실제 검증 방법입니다.
-  HTTP-01, DNS-01, TLS-ALPN-01 등이 있으며, 이 프로젝트는 HTTP-01을 사용합니다.
+  HTTP-01, DNS-01, TLS-ALPN-01 등이 있으며, Bootroot는 HTTP-01을 사용합니다.
 - **Finalize**: 모든 Authorization이 통과되면 CSR을 제출하고
   인증서를 발급받는 단계입니다.
 - **Certificate**: 최종 발급된 인증서입니다. ACME 서버에서 다운로드합니다.

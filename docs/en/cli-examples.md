@@ -87,19 +87,19 @@ bootroot init: summary
 - responder check: ok
 - db check: skipped
 - OpenBao KV paths:
-    role_id: secrets/apps/<service>/role_id
-    secret_id: secrets/apps/<service>/secret_id
+    role_id: secrets/services/<service>/role_id
+    secret_id: secrets/services/<service>/secret_id
 next steps:
-  - Attach AppRole/secret_id to the app.
+  - Attach AppRole/secret_id to the service.
   - Prepare OpenBao Agent/bootroot-agent execution.
 ```
 
-## 3) app add
+## 3) service add
 
-### 3-1) daemon app
+### 3-1) daemon service
 
 ```bash
-bootroot app add \
+bootroot service add \
   --service-name edge-proxy \
   --deploy-type daemon \
   --hostname edge-node-01 \
@@ -116,7 +116,7 @@ Sample dialog/output (full):
 ```text
 OpenBao root token: ********
 
-bootroot app add: plan
+bootroot service add: plan
 - service name: edge-proxy
 - deploy type: daemon
 - hostname: edge-node-01
@@ -126,27 +126,27 @@ bootroot app add: plan
 - cert path: /etc/bootroot/certs/edge-proxy.crt
 - key path: /etc/bootroot/certs/edge-proxy.key
 next steps:
-  - AppRole: bootroot-app-edge-proxy
-  - secret_id path: secrets/apps/edge-proxy/secret_id
-  - OpenBao path: bootroot/apps/edge-proxy
-  - OpenBao Agent (per-app instance):
-    - config: secrets/openbao-agent/apps/edge-proxy.hcl
-    - role_id file: secrets/apps/edge-proxy/role_id
-    - secret_id file: secrets/apps/edge-proxy/secret_id
-    - ensure secrets/apps/edge-proxy is 0700 and
+  - AppRole: bootroot-service-edge-proxy
+  - secret_id path: secrets/services/edge-proxy/secret_id
+  - OpenBao path: bootroot/services/edge-proxy
+  - OpenBao Agent (per-service instance):
+    - config: secrets/openbao-agent/services/edge-proxy.hcl
+    - role_id file: secrets/services/edge-proxy/role_id
+    - secret_id file: secrets/services/edge-proxy/secret_id
+    - ensure secrets/services/edge-proxy is 0700 and
       role_id/secret_id files are 0600
-    - run the app-specific OpenBao Agent on the host with
-      secrets/openbao-agent/apps/edge-proxy.hcl
+    - run the service-specific OpenBao Agent on the host with
+      secrets/openbao-agent/services/edge-proxy.hcl
   - Add profile for edge-proxy (instance_id=001, hostname=edge-node-01,
     domain=trusted.domain, cert=/etc/bootroot/certs/edge-proxy.crt,
     key=/etc/bootroot/certs/edge-proxy.key) to /etc/bootroot/agent.toml
     and reload bootroot-agent.
 ```
 
-### 3-2) docker app
+### 3-2) docker service
 
 ```bash
-bootroot app add \
+bootroot service add \
   --service-name web-app \
   --deploy-type docker \
   --hostname web-01 \
@@ -167,8 +167,8 @@ OpenBao root token: ********
 next steps:
   - Run sidecar for web-app (container=web-app, instance_id=001,
     hostname=web-01, domain=trusted.domain) with config
-    /srv/bootroot/agent.toml, AppRole bootroot-app-web-app, and
-    secret_id file secrets/apps/web-app/secret_id.
+    /srv/bootroot/agent.toml, AppRole bootroot-service-web-app, and
+    secret_id file secrets/services/web-app/secret_id.
 ```
 
 ## 4) Local DNS/hosts setup for validation
@@ -189,11 +189,11 @@ docker exec bootroot-ca sh -c \
   '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
 ```
 
-If you add more apps, repeat the same command for each app FQDN.
+If you add more services, repeat the same command for each service FQDN.
 
 > In production, use proper DNS records instead.
 
-## 5) app verify
+## 5) service verify
 
 ```bash
 bootroot verify --service-name edge-proxy
@@ -210,7 +210,7 @@ bootroot verify: summary
 `bootroot verify` performs a one-shot issuance check. For **continuous
 renewal**, run bootroot-agent in daemon mode (without `--oneshot`).
 
-## 6) Run apps (continuous mode)
+## 6) Run services (continuous mode)
 
 “Continuous mode” means the daemon keeps running to renew certificates
 periodically, rather than a one-shot verification run.
@@ -218,14 +218,14 @@ periodically, rather than a one-shot verification run.
 daemon:
 
 - bootroot-agent: daemon mode
-- OpenBao Agent: per-app host daemon
+- OpenBao Agent: per-service daemon
 
-bootroot-agent runs **one per machine**, not per app. Update `agent.toml`
+bootroot-agent runs **one per machine**, not per service. Update `agent.toml`
 when adding profiles and reload the daemon. Configure systemd so the process
 restarts automatically (set `Restart=always` or `on-failure`).
 
 ```bash
-openbao agent -config /etc/bootroot/openbao/apps/edge-proxy/agent.hcl
+openbao agent -config /etc/bootroot/openbao/services/edge-proxy/agent.hcl
 ```
 
 ```bash
@@ -242,17 +242,17 @@ Certificate issued successfully.
 
 docker:
 
-- OpenBao Agent: sidecar (per-app Docker container)
-- bootroot-agent: sidecar (per-app Docker container)
+- OpenBao Agent: sidecar (per-service Docker container)
+- bootroot-agent: sidecar (per-service Docker container)
 
-Docker apps may also use the shared host bootroot-agent daemon, but this is
+Docker services may also use the shared bootroot-agent daemon, but this is
 supported and not recommended. The sidecar pattern is preferred for isolation
 and lifecycle alignment.
 
 ```bash
 docker run --rm \
   --name openbao-agent-web-app \
-  -v /srv/bootroot/openbao/apps/web-app/agent.hcl:/app/agent.hcl:ro \
+  -v /srv/bootroot/openbao/services/web-app/agent.hcl:/app/agent.hcl:ro \
   -v /srv/bootroot/secrets:/app/secrets \
   openbao/bao:latest \
   agent -config /app/agent.hcl

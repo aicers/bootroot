@@ -40,7 +40,7 @@ async fn test_app_add_writes_state_and_secret() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
-            "app",
+            "service",
             "add",
             "--service-name",
             "edge-proxy",
@@ -64,11 +64,11 @@ async fn test_app_add_writes_state_and_secret() {
             ROOT_TOKEN,
         ])
         .output()
-        .expect("run app add");
+        .expect("run service add");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(stdout.contains("bootroot app add: summary"));
+    assert!(stdout.contains("bootroot service add: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- deploy type: daemon"));
     assert!(stdout.contains("[[profiles]]"));
@@ -78,14 +78,14 @@ async fn test_app_add_writes_state_and_secret() {
     let state_path = temp_dir.path().join("state.json");
     let contents = fs::read_to_string(&state_path).expect("read state.json");
     let value: serde_json::Value = serde_json::from_str(&contents).expect("parse state.json");
-    assert!(value["apps"]["edge-proxy"].is_object());
-    assert_eq!(value["apps"]["edge-proxy"]["domain"], "trusted.domain");
-    assert_eq!(value["apps"]["edge-proxy"]["instance_id"], "001");
+    assert!(value["services"]["edge-proxy"].is_object());
+    assert_eq!(value["services"]["edge-proxy"]["domain"], "trusted.domain");
+    assert_eq!(value["services"]["edge-proxy"]["instance_id"], "001");
 
     let secret_path = temp_dir
         .path()
         .join("secrets")
-        .join("apps")
+        .join("services")
         .join("edge-proxy")
         .join("secret_id");
     let secret_contents = fs::read_to_string(&secret_path).expect("read secret_id");
@@ -100,7 +100,7 @@ async fn test_app_add_writes_state_and_secret() {
     let role_id_path = temp_dir
         .path()
         .join("secrets")
-        .join("apps")
+        .join("services")
         .join("edge-proxy")
         .join("role_id");
     let role_id_contents = fs::read_to_string(&role_id_path).expect("read role_id");
@@ -140,11 +140,11 @@ async fn test_app_add_prompts_for_missing_inputs() {
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["app", "add"])
+        .args(["service", "add"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn app add");
+        .expect("spawn service add");
 
     child
         .stdin
@@ -153,10 +153,10 @@ async fn test_app_add_prompts_for_missing_inputs() {
         .write_all(input.as_bytes())
         .expect("write stdin");
 
-    let output = child.wait_with_output().expect("run app add");
+    let output = child.wait_with_output().expect("run service add");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(stdout.contains("bootroot app add: summary"));
+    assert!(stdout.contains("bootroot service add: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- deploy type: daemon"));
 }
@@ -188,11 +188,11 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["app", "add"])
+        .args(["service", "add"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn app add");
+        .expect("spawn service add");
 
     child
         .stdin
@@ -201,7 +201,7 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
         .write_all(input.as_bytes())
         .expect("write stdin");
 
-    let output = child.wait_with_output().expect("run app add");
+    let output = child.wait_with_output().expect("run service add");
     assert!(output.status.success());
 }
 
@@ -225,7 +225,7 @@ async fn test_app_add_prints_docker_snippet() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
-            "app",
+            "service",
             "add",
             "--service-name",
             "edge-proxy",
@@ -249,7 +249,7 @@ async fn test_app_add_prints_docker_snippet() {
             ROOT_TOKEN,
         ])
         .output()
-        .expect("run app add");
+        .expect("run service add");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
@@ -278,7 +278,7 @@ async fn test_app_add_prompts_for_docker_instance_id() {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
-            "app",
+            "service",
             "add",
             "--service-name",
             "edge-proxy",
@@ -302,7 +302,7 @@ async fn test_app_add_prompts_for_docker_instance_id() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn app add");
+        .expect("spawn service add");
 
     child
         .stdin
@@ -311,7 +311,7 @@ async fn test_app_add_prompts_for_docker_instance_id() {
         .write_all(b"001\n")
         .expect("write stdin");
 
-    let output = child.wait_with_output().expect("run app add");
+    let output = child.wait_with_output().expect("run service add");
     assert!(output.status.success());
 }
 
@@ -334,7 +334,7 @@ async fn test_app_add_rejects_duplicate() {
     let _ = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
-            "app",
+            "service",
             "add",
             "--service-name",
             "edge-proxy",
@@ -356,12 +356,12 @@ async fn test_app_add_rejects_duplicate() {
             ROOT_TOKEN,
         ])
         .output()
-        .expect("run app add");
+        .expect("run service add");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
-            "app",
+            "service",
             "add",
             "--service-name",
             "edge-proxy",
@@ -383,11 +383,11 @@ async fn test_app_add_rejects_duplicate() {
             ROOT_TOKEN,
         ])
         .output()
-        .expect("run app add");
+        .expect("run service add");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("bootroot app add failed"));
+    assert!(stderr.contains("bootroot service add failed"));
 }
 
 #[cfg(unix)]
@@ -410,7 +410,7 @@ async fn test_app_add_includes_trust_snippet_when_present() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
-            "app",
+            "service",
             "add",
             "--service-name",
             "edge-proxy",
@@ -432,7 +432,7 @@ async fn test_app_add_includes_trust_snippet_when_present() {
             ROOT_TOKEN,
         ])
         .output()
-        .expect("run app add");
+        .expect("run service add");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
@@ -461,7 +461,7 @@ async fn test_app_add_omits_trust_snippet_when_missing() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
-            "app",
+            "service",
             "add",
             "--service-name",
             "edge-proxy",
@@ -483,7 +483,7 @@ async fn test_app_add_omits_trust_snippet_when_missing() {
             ROOT_TOKEN,
         ])
         .output()
-        .expect("run app add");
+        .expect("run service add");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
@@ -500,16 +500,16 @@ async fn test_app_info_prints_summary() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["app", "info", "--service-name", "edge-proxy"])
+        .args(["service", "info", "--service-name", "edge-proxy"])
         .output()
-        .expect("run app info");
+        .expect("run service info");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(stdout.contains("bootroot app info: summary"));
+    assert!(stdout.contains("bootroot service info: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- domain: trusted.domain"));
-    assert!(stdout.contains("- secret_id path: secrets/apps/edge-proxy/secret_id"));
+    assert!(stdout.contains("- secret_id path: secrets/services/edge-proxy/secret_id"));
 }
 
 #[cfg(unix)]
@@ -519,13 +519,13 @@ fn test_app_info_missing_state_file() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["app", "info", "--service-name", "edge-proxy"])
+        .args(["service", "info", "--service-name", "edge-proxy"])
         .output()
-        .expect("run app info");
+        .expect("run service info");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("bootroot app info failed"));
+    assert!(stderr.contains("bootroot service info failed"));
 }
 
 fn write_state_file(root: &std::path::Path, openbao_url: &str) -> anyhow::Result<()> {
@@ -535,7 +535,7 @@ fn write_state_file(root: &std::path::Path, openbao_url: &str) -> anyhow::Result
         "secrets_dir": "secrets",
         "policies": {},
         "approles": {},
-        "apps": {}
+        "services": {}
     });
     fs::write(
         root.join("state.json"),
@@ -549,7 +549,7 @@ fn write_state_with_app(root: &std::path::Path) {
     let state_path = root.join("state.json");
     let contents = fs::read_to_string(&state_path).expect("read state");
     let mut value: serde_json::Value = serde_json::from_str(&contents).expect("parse state");
-    value["apps"]["edge-proxy"] = json!({
+    value["services"]["edge-proxy"] = json!({
         "service_name": "edge-proxy",
         "deploy_type": "daemon",
         "hostname": "edge-node-01",
@@ -560,10 +560,10 @@ fn write_state_with_app(root: &std::path::Path) {
         "instance_id": "001",
         "notes": "primary",
         "approle": {
-            "role_name": "bootroot-app-edge-proxy",
+            "role_name": "bootroot-service-edge-proxy",
             "role_id": "role-edge-proxy",
-            "secret_id_path": "secrets/apps/edge-proxy/secret_id",
-            "policy_name": "bootroot-app-edge-proxy"
+            "secret_id_path": "secrets/services/edge-proxy/secret_id",
+            "policy_name": "bootroot-service-edge-proxy"
         }
     });
     fs::write(
@@ -574,7 +574,7 @@ fn write_state_with_app(root: &std::path::Path) {
 }
 
 async fn stub_app_add_openbao(server: &MockServer, service_name: &str) {
-    let role = format!("bootroot-app-{service_name}");
+    let role = format!("bootroot-service-{service_name}");
     Mock::given(method("GET"))
         .and(path("/v1/sys/auth"))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))

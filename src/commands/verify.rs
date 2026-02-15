@@ -8,7 +8,7 @@ use crate::cli::args::VerifyArgs;
 use crate::cli::output::print_verify_plan;
 use crate::cli::prompt::Prompt;
 use crate::i18n::Messages;
-use crate::state::{AppEntry, DeployType, StateFile};
+use crate::state::{DeployType, ServiceEntry, StateFile};
 
 pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
     let state_path = StateFile::default_path();
@@ -18,9 +18,9 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
     let state = StateFile::load(&state_path)?;
     let service_name = resolve_verify_service_name(args, messages)?;
     let entry = state
-        .apps
+        .services
         .get(&service_name)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&service_name)))?;
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&service_name)))?;
 
     let agent_config = args
         .agent_config
@@ -136,7 +136,7 @@ fn verify_file_non_empty(path: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-fn verify_cert_san(entry: &AppEntry, messages: &Messages) -> Result<()> {
+fn verify_cert_san(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     let expected = expected_dns_name(entry, messages)?;
     let contents = std::fs::read(&entry.cert_path)
         .with_context(|| messages.error_read_file_failed(&entry.cert_path.display().to_string()))?;
@@ -165,13 +165,13 @@ fn verify_cert_san(entry: &AppEntry, messages: &Messages) -> Result<()> {
     Ok(())
 }
 
-fn expected_dns_name(entry: &AppEntry, messages: &Messages) -> Result<String> {
+fn expected_dns_name(entry: &ServiceEntry, messages: &Messages) -> Result<String> {
     match entry.deploy_type {
         DeployType::Daemon => {
             let instance_id = entry
                 .instance_id
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!(messages.error_app_instance_id_required()))?;
+                .ok_or_else(|| anyhow::anyhow!(messages.error_service_instance_id_required()))?;
             Ok(format!(
                 "{}.{}.{}.{}",
                 instance_id, entry.service_name, entry.hostname, entry.domain
@@ -181,14 +181,14 @@ fn expected_dns_name(entry: &AppEntry, messages: &Messages) -> Result<String> {
             let instance_id = entry
                 .instance_id
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!(messages.error_app_instance_id_required()))?;
+                .ok_or_else(|| anyhow::anyhow!(messages.error_service_instance_id_required()))?;
             if entry
                 .container_name
                 .as_deref()
                 .unwrap_or_default()
                 .is_empty()
             {
-                anyhow::bail!(messages.error_app_container_name_required());
+                anyhow::bail!(messages.error_service_container_name_required());
             }
             Ok(format!(
                 "{}.{}.{}.{}",

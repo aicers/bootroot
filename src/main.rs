@@ -7,7 +7,7 @@ mod state;
 
 use clap::Parser;
 
-use crate::cli::args::{AppCommand, Cli, CliCommand, InfraCommand, MonitoringCommand};
+use crate::cli::args::{Cli, CliCommand, InfraCommand, MonitoringCommand, ServiceCommand};
 use crate::i18n::Messages;
 
 fn main() {
@@ -64,16 +64,16 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
                 .block_on(commands::status::run_status(&args, messages))
                 .with_context(|| messages.error_status_failed())?;
         }
-        CliCommand::App(AppCommand::Add(args)) => {
+        CliCommand::Service(ServiceCommand::Add(args)) => {
             let runtime = tokio::runtime::Runtime::new()
-                .with_context(|| messages.error_runtime_init_failed("app add"))?;
+                .with_context(|| messages.error_runtime_init_failed("service add"))?;
             runtime
-                .block_on(commands::app::run_app_add(&args, messages))
-                .with_context(|| messages.error_app_add_failed())?;
+                .block_on(commands::service::run_service_add(&args, messages))
+                .with_context(|| messages.error_service_add_failed())?;
         }
-        CliCommand::App(AppCommand::Info(args)) => {
-            commands::app::run_app_info(&args, messages)
-                .with_context(|| messages.error_app_info_failed())?;
+        CliCommand::Service(ServiceCommand::Info(args)) => {
+            commands::service::run_service_info(&args, messages)
+                .with_context(|| messages.error_service_info_failed())?;
         }
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,

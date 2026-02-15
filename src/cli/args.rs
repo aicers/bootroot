@@ -29,7 +29,7 @@ pub(crate) enum CliCommand {
     Init(Box<InitArgs>),
     Status(Box<StatusArgs>),
     #[command(subcommand)]
-    App(AppCommand),
+    Service(ServiceCommand),
     Verify(VerifyArgs),
     Rotate(RotateArgs),
 }
@@ -47,9 +47,9 @@ pub(crate) enum MonitoringCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum AppCommand {
-    Add(Box<AppAddArgs>),
-    Info(AppInfoArgs),
+pub(crate) enum ServiceCommand {
+    Add(Box<ServiceAddArgs>),
+    Info(ServiceInfoArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -392,7 +392,7 @@ pub(crate) struct StatusArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct AppAddArgs {
+pub(crate) struct ServiceAddArgs {
     /// Service name identifier
     #[arg(long)]
     pub(crate) service_name: Option<String>,
@@ -438,7 +438,7 @@ pub(crate) struct AppAddArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct AppInfoArgs {
+pub(crate) struct ServiceInfoArgs {
     /// Service name identifier
     #[arg(long, required = true)]
     pub(crate) service_name: String,

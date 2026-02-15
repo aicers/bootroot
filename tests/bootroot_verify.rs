@@ -460,7 +460,7 @@ fn write_state_with_app(
         "secrets_dir": "secrets",
         "policies": {},
         "approles": {},
-        "apps": {
+        "services": {
             "edge-proxy": {
                 "service_name": "edge-proxy",
                 "deploy_type": "daemon",
@@ -471,10 +471,10 @@ fn write_state_with_app(
                 "key_path": key_path,
                 "instance_id": "001",
                 "approle": {
-                    "role_name": "bootroot-app-edge-proxy",
+                    "role_name": "bootroot-service-edge-proxy",
                     "role_id": "role-edge-proxy",
-                    "secret_id_path": "secrets/apps/edge-proxy/secret_id",
-                    "policy_name": "bootroot-app-edge-proxy"
+                    "secret_id_path": "secrets/services/edge-proxy/secret_id",
+                    "policy_name": "bootroot-service-edge-proxy"
                 }
             }
         }
@@ -500,7 +500,7 @@ fn write_state_with_docker_app(
         "secrets_dir": "secrets",
         "policies": {},
         "approles": {},
-        "apps": {
+        "services": {
             "web-app": {
                 "service_name": "web-app",
                 "deploy_type": "docker",
@@ -512,10 +512,10 @@ fn write_state_with_docker_app(
                 "key_path": key_path,
                 "container_name": "web-app",
                 "approle": {
-                    "role_name": "bootroot-app-web-app",
+                    "role_name": "bootroot-service-web-app",
                     "role_id": "role-web-app",
-                    "secret_id_path": "secrets/apps/web-app/secret_id",
-                    "policy_name": "bootroot-app-web-app"
+                    "secret_id_path": "secrets/services/web-app/secret_id",
+                    "policy_name": "bootroot-service-web-app"
                 }
             }
         }

@@ -4,15 +4,15 @@ This document covers the bootroot CLI.
 
 ## Overview
 
-The CLI provides infra bootstrapping, initialization, status checks, app
+The CLI provides infra bootstrapping, initialization, status checks, service
 onboarding, issuance verification, and secret rotation.
 It also manages local monitoring with Prometheus and Grafana.
 
 - `bootroot infra up`
 - `bootroot init`
 - `bootroot status`
-- `bootroot app add`
-- `bootroot app info`
+- `bootroot service add`
+- `bootroot service info`
 - `bootroot verify`
 - `bootroot rotate`
 - `bootroot monitoring`
@@ -196,22 +196,23 @@ The command is considered failed when:
 bootroot status
 ```
 
-## bootroot app add
+## bootroot service add
 
-Onboards a new app (daemon/docker) so it can obtain certificates from
+Onboards a new service (daemon/docker) so it can obtain certificates from
 step-ca by registering its metadata and creating an OpenBao AppRole.
 When you run this command, **the bootroot CLI** performs:
 
-- Save app metadata (service name, deploy type, hostname, domain, etc.)
+- Save service metadata (service name, deploy type, hostname, domain, etc.)
 - Create AppRole/policy and issue `role_id`/`secret_id`
-- Prepare app secret paths and required file locations
+- Prepare service secret paths and required file locations
 - Print run guidance for bootroot-agent and OpenBao Agent
 
-This is the required step when adding a new app. After it completes, you
+This is the required step when adding a new service. After it completes, you
 must run bootroot-agent and OpenBao Agent as instructed, and then start
-the app so mTLS certificates are used correctly in app-to-app traffic.
+the service so mTLS certificates are used correctly in service-to-service
+traffic.
 
-`bootroot app add` does not issue certificates by itself. To actually obtain
+`bootroot service add` does not issue certificates by itself. To actually obtain
 certificates from step-ca, you must **configure and run bootroot-agent**.
 See the bootroot-agent sections in the manuals (Installation/Operations/
 Configuration) for details.
@@ -221,25 +222,25 @@ If `bootroot init` stored CA fingerprints in OpenBao (for example,
 agent.toml snippet output. If the value is missing, you must set it manually
 when needed.
 
-If the app runs on a different machine, the bootroot-agent on that host
+If the service runs on a different machine, the bootroot-agent on that host
 must use the same `agent.toml`. The `--cert-path`/`--key-path` values must
-also be set relative to where the app runs. This command only prints
+also be set relative to where the service runs. This command only prints
 paths/snippets; you still configure and run the agent on the machine where
-the app runs.
+the service runs.
 
 Runtime deployment policy:
 
 ### OpenBao Agent
 
-- Docker app: per-app sidecar (**required**)
-- daemon app: per-app host daemon (**required**)
+- Docker service: per-service sidecar (**required**)
+- daemon service: per-service daemon (**required**)
 
 ### bootroot-agent
 
-- Docker app: per-app sidecar (recommended)
-- daemon app: one shared host daemon per host (recommended)
+- Docker service: per-service sidecar (recommended)
+- daemon service: one shared daemon per host (recommended)
 
-Note: Docker apps can use the shared host daemon, but this is supported and
+Note: Docker services can use the shared daemon, but this is supported and
 not recommended (sidecars provide better isolation/lifecycle alignment).
 
 ### Inputs
@@ -253,7 +254,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--agent-config`: bootroot-agent config path
 - `--cert-path`: certificate output path
 - `--key-path`: private key output path
-- `--instance-id`: app instance_id
+- `--instance-id`: service instance_id
 - `--container-name`: docker container name (required for docker)
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
 - `--notes`: freeform notes (optional)
@@ -269,7 +270,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 
 - App metadata summary
 - AppRole/policy/secret_id path summary
-- Per-app OpenBao Agent guidance (daemon vs docker)
+- Per-service OpenBao Agent guidance (daemon vs docker)
 - Type-specific onboarding guidance (daemon profile / docker sidecar)
 - Copy-paste snippets for daemon profile or docker sidecar
 
@@ -283,9 +284,9 @@ The command is considered failed when:
 - Missing `container-name` for docker
 - OpenBao AppRole creation failure
 
-## bootroot app info
+## bootroot service info
 
-Shows onboarding information for a registered app.
+Shows onboarding information for a registered service.
 
 ### Inputs
 
@@ -294,7 +295,7 @@ Shows onboarding information for a registered app.
 ### Outputs
 
 - App type/paths/AppRole/secret paths summary
-- Per-app OpenBao Agent guidance (daemon vs docker)
+- Per-service OpenBao Agent guidance (daemon vs docker)
 
 ### Failure conditions
 
@@ -306,7 +307,7 @@ The command is considered failed when:
 ## bootroot verify
 
 Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
-Use it after app onboarding or config changes to confirm issuance works.
+Use it after service onboarding or config changes to confirm issuance works.
 If you want **continuous renewal**, run bootroot-agent in daemon mode
 (without `--oneshot`) after verification.
 

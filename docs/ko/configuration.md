@@ -19,48 +19,48 @@ OpenBao Agent가 이 설정을 사용해 실제 시크릿 파일을 생성합니
 `bootroot init`은 step-ca/리스폰더용 `agent.hcl`을
 `secrets/openbao/stepca/agent.hcl`,
 `secrets/openbao/responder/agent.hcl`에 생성합니다.
-`bootroot app add`는 앱별 OpenBao Agent 설정 경로를 출력하며,
-기본 경로는 `secrets/openbao/apps/<service>/agent.hcl`입니다.
+`bootroot service add`는 서비스별 OpenBao Agent 설정 경로를 출력하며,
+기본 경로는 `secrets/openbao/services/<service>/agent.hcl`입니다.
 
 OpenBao Agent는 `role_id`/`secret_id` 파일을 사용해 AppRole로 로그인하며,
-해당 파일은 `secrets/apps/<service>/` 아래에 저장됩니다.
+해당 파일은 `secrets/services/<service>/` 아래에 저장됩니다.
 디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
 
 구성 책임은 다음과 같습니다.
 
 - **step-ca/리스폰더**: `bootroot init`이 `agent.hcl`을 자동 생성합니다.
-- **앱별 에이전트**: `bootroot app add`가 경로와 실행 안내를 출력하며,
+- **서비스별 에이전트**: `bootroot service add`가 경로와 실행 안내를 출력하며,
   사용자가 해당 경로에 `agent.hcl`을 배치해 실행합니다.
 
 예시 `agent.hcl` 스니펫:
 
 ```hcl
 exit_after_auth = false
-pid_file = "/openbao/secrets/openbao/apps/edge-proxy/agent.pid"
+pid_file = "/openbao/secrets/openbao/services/edge-proxy/agent.pid"
 
 auto_auth {
   method "approle" {
     mount_path = "auth/approle"
     config = {
-      role_id_file_path = "/openbao/secrets/apps/edge-proxy/role_id"
-      secret_id_file_path = "/openbao/secrets/apps/edge-proxy/secret_id"
+      role_id_file_path = "/openbao/secrets/services/edge-proxy/role_id"
+      secret_id_file_path = "/openbao/secrets/services/edge-proxy/secret_id"
     }
   }
   sink "file" {
     config = {
-      path = "/openbao/secrets/openbao/apps/edge-proxy/token"
+      path = "/openbao/secrets/openbao/services/edge-proxy/token"
     }
   }
 }
 
 template {
-  source = "/openbao/secrets/openbao/apps/edge-proxy/agent.toml.ctmpl"
-  destination = "/openbao/secrets/apps/edge-proxy/agent.toml"
+  source = "/openbao/secrets/openbao/services/edge-proxy/agent.toml.ctmpl"
+  destination = "/openbao/secrets/services/edge-proxy/agent.toml"
 }
 ```
 
 이 스니펫은 **수동 구성 시 참고용**입니다. bootroot CLI 생태계에서는
-`bootroot init`/`bootroot app add`가 생성한 `agent.hcl`을 사용하는 것이
+`bootroot init`/`bootroot service add`가 생성한 `agent.hcl`을 사용하는 것이
 가장 간편합니다.
 
 구성 설명:
@@ -170,8 +170,8 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 제어하는 설정입니다.
 
 `trusted_ca_sha256`는 **임의 값이 아니라 실제 CA 인증서 지문**입니다.
 `bootroot init`이 CA 지문을 OpenBao에 저장하며,
-`bootroot app add` 출력의 agent.toml 스니펫에 **신뢰 지문 목록이 포함**됩니다.
-따라서 일반적인 운영 흐름에서는 app add가 제시한 값을 그대로 사용하면 됩니다.
+`bootroot service add` 출력의 agent.toml 스니펫에 **신뢰 지문 목록이 포함**됩니다.
+따라서 일반적인 운영 흐름에서는 service add가 제시한 값을 그대로 사용하면 됩니다.
 
 `verify_certificates = true`인데 `ca_bundle_path`가 없으면,
 bootroot-agent는 **시스템 CA 저장소**로 ACME 서버를 검증합니다.

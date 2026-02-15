@@ -87,19 +87,19 @@ bootroot init: 요약
 - responder 점검: ok
 - DB 점검: 생략
 - OpenBao KV 경로:
-    role_id: secrets/apps/<service>/role_id
-    secret_id: secrets/apps/<service>/secret_id
+    role_id: secrets/services/<service>/role_id
+    secret_id: secrets/services/<service>/secret_id
 다음 단계:
-  - AppRole/secret_id를 앱에 연결하세요.
+  - AppRole/secret_id를 서비스에 연결하세요.
   - OpenBao Agent/bootroot-agent 실행을 준비하세요.
 ```
 
-## 3) app add
+## 3) service add
 
-### 3-1) daemon 앱 추가
+### 3-1) daemon 서비스 추가
 
 ```bash
-bootroot app add \
+bootroot service add \
   --service-name edge-proxy \
   --deploy-type daemon \
   --hostname edge-node-01 \
@@ -116,7 +116,7 @@ bootroot app add \
 ```text
 OpenBao root token: ********
 
-bootroot 앱 추가: 계획
+bootroot 서비스 추가: 계획
 - 서비스 이름: edge-proxy
 - 배포 타입: daemon
 - 호스트명: edge-node-01
@@ -126,14 +126,14 @@ bootroot 앱 추가: 계획
 - cert 경로: /etc/bootroot/certs/edge-proxy.crt
 - key 경로: /etc/bootroot/certs/edge-proxy.key
 다음 단계:
-  - AppRole: bootroot-app-edge-proxy
-  - secret_id 경로: secrets/apps/edge-proxy/secret_id
-  - OpenBao 경로: bootroot/apps/edge-proxy
-  - OpenBao Agent (앱별 인스턴스):
+  - AppRole: bootroot-service-edge-proxy
+  - secret_id 경로: secrets/services/edge-proxy/secret_id
+  - OpenBao 경로: bootroot/services/edge-proxy
+  - OpenBao Agent (서비스별 인스턴스):
     - config: secrets/openbao-agent/apps/edge-proxy.hcl
-    - role_id file: secrets/apps/edge-proxy/role_id
-    - secret_id file: secrets/apps/edge-proxy/secret_id
-    - ensure secrets/apps/edge-proxy is 0700 and
+    - role_id file: secrets/services/edge-proxy/role_id
+    - secret_id file: secrets/services/edge-proxy/secret_id
+    - ensure secrets/services/edge-proxy is 0700 and
       role_id/secret_id files are 0600
     - run the app-specific OpenBao Agent on the host with
       secrets/openbao-agent/apps/edge-proxy.hcl
@@ -144,10 +144,10 @@ bootroot 앱 추가: 계획
     bootroot-agent를 리로드하세요.
 ```
 
-### 3-2) docker 앱 추가
+### 3-2) docker 서비스 추가
 
 ```bash
-bootroot app add \
+bootroot service add \
   --service-name web-app \
   --deploy-type docker \
   --hostname web-01 \
@@ -168,8 +168,8 @@ OpenBao root token: ********
 다음 단계:
   - web-app 사이드카(container=web-app, instance_id=001,
     hostname=web-01, domain=trusted.domain)를
-    /srv/bootroot/agent.toml로 실행하고 AppRole bootroot-app-web-app,
-    secret_id 파일 secrets/apps/web-app/secret_id를 사용하세요.
+    /srv/bootroot/agent.toml로 실행하고 AppRole bootroot-service-web-app,
+    secret_id 파일 secrets/services/web-app/secret_id를 사용하세요.
 ```
 
 ## 4) 로컬 검증을 위한 DNS/hosts 준비
@@ -191,7 +191,7 @@ docker exec bootroot-ca sh -c \
   '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
 ```
 
-추가된 앱이 더 있다면, 각 앱의 FQDN에 대해 동일한 명령을 반복하세요.
+추가된 서비스이 더 있다면, 각 서비스의 FQDN에 대해 동일한 명령을 반복하세요.
 
 > 운영 환경에서는 DNS로 동일한 이름 해석이 되도록 구성하세요.
 
@@ -213,23 +213,23 @@ bootroot 검증: 요약
 검증 이후에도 주기적 갱신을 원하면 bootroot-agent를 **상시 모드**
 로 실행해야 합니다(oneshot 없이 실행).
 
-## 6) 앱 구동(상시 모드)
+## 6) 서비스 구동(상시 모드)
 
 여기서 “상시 모드”는 one-shot 검증이 아니라 **지속 실행**으로
 인증서를 주기적으로 갱신하는 운용 모드를 뜻합니다.
 
-daemon 앱:
+daemon 서비스:
 
 - bootroot-agent: 데몬 모드
-- OpenBao Agent: 앱별 호스트 daemon
+- OpenBao Agent: 서비스별 daemon
 
-bootroot-agent는 **앱별이 아니라 머신별로 1개**를 데몬으로 실행합니다.
+bootroot-agent는 **서비스별이 아니라 머신별로 1개**를 데몬으로 실행합니다.
 프로필을 추가할 때마다 `agent.toml`을 갱신하고, 데몬을 리로드하세요.
 프로세스 종료 시 자동 재기동되도록 systemd에서
 `Restart=always`(또는 `on-failure`)를 설정하는 것을 권장합니다.
 
 ```bash
-openbao agent -config /etc/bootroot/openbao/apps/edge-proxy/agent.hcl
+openbao agent -config /etc/bootroot/openbao/services/edge-proxy/agent.hcl
 ```
 
 ```bash
@@ -244,19 +244,19 @@ Issuing certificate for 001.edge-proxy.edge-node-01.trusted.domain
 Certificate issued successfully.
 ```
 
-docker 앱:
+docker 서비스:
 
-- OpenBao Agent: 사이드카(앱별 docker 컨테이너)
-- bootroot-agent: 사이드카(앱별 docker 컨테이너)
+- OpenBao Agent: 사이드카(서비스별 docker 컨테이너)
+- bootroot-agent: 사이드카(서비스별 docker 컨테이너)
 
-Docker 앱도 호스트 통합 bootroot-agent daemon을 사용할 수는 있지만,
+Docker 서비스도 호스트 통합 bootroot-agent daemon을 사용할 수는 있지만,
 지원은 하되 권장하지 않습니다. 격리와 라이프사이클 정합성을 위해 사이드카
 패턴을 권장합니다.
 
 ```bash
 docker run --rm \
   --name openbao-agent-web-app \
-  -v /srv/bootroot/openbao/apps/web-app/agent.hcl:/app/agent.hcl:ro \
+  -v /srv/bootroot/openbao/services/web-app/agent.hcl:/app/agent.hcl:ro \
   -v /srv/bootroot/secrets:/app/secrets \
   openbao/bao:latest \
   agent -config /app/agent.hcl

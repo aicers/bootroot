@@ -20,7 +20,7 @@ use crate::commands::init::{
     PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
 };
 use crate::i18n::Messages;
-use crate::state::{AppEntry, StateFile};
+use crate::state::{ServiceEntry, StateFile};
 const SECRET_BYTES: usize = 32;
 const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
 const ROLE_ID_FILENAME: &str = "role_id";
@@ -234,7 +234,7 @@ async fn rotate_eab(
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
 
-    let updated = update_agent_configs(&ctx.state.apps, messages, |contents| {
+    let updated = update_agent_configs(&ctx.state.services, messages, |contents| {
         let updated = upsert_toml_section_keys(
             contents,
             "eab",
@@ -372,7 +372,7 @@ async fn rotate_responder_hmac(
     };
     write_secret_file(&responder_path, &config, messages).await?;
 
-    let updated = update_agent_configs(&ctx.state.apps, messages, |contents| {
+    let updated = update_agent_configs(&ctx.state.services, messages, |contents| {
         upsert_toml_section_keys(contents, "acme", &[("http_responder_hmac", &hmac)])
     })?;
 
@@ -416,9 +416,9 @@ async fn rotate_approle_secret_id(
 
     let entry = ctx
         .state
-        .apps
+        .services
         .get(&args.service_name)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_app_not_found(&args.service_name)))?;
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
     ensure_role_id_file(entry, client, messages).await?;
     let new_secret_id = client
         .create_secret_id(&entry.approle.role_name)
@@ -449,16 +449,16 @@ async fn rotate_approle_secret_id(
 }
 
 async fn ensure_role_id_file(
-    entry: &AppEntry,
+    entry: &ServiceEntry,
     client: &OpenBaoClient,
     messages: &Messages,
 ) -> Result<()> {
-    let app_dir = entry
+    let service_dir = entry
         .approle
         .secret_id_path
         .parent()
         .unwrap_or(Path::new("."));
-    let role_id_path = app_dir.join(ROLE_ID_FILENAME);
+    let role_id_path = service_dir.join(ROLE_ID_FILENAME);
     if role_id_path.exists() {
         return Ok(());
     }
@@ -466,7 +466,7 @@ async fn ensure_role_id_file(
         .read_role_id(&entry.approle.role_name)
         .await
         .with_context(|| messages.error_openbao_role_id_failed())?;
-    fs_util::ensure_secrets_dir(app_dir).await?;
+    fs_util::ensure_secrets_dir(service_dir).await?;
     tokio::fs::write(&role_id_path, role_id)
         .await
         .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
@@ -675,7 +675,7 @@ fn update_responder_hmac(contents: &str, hmac: &str) -> String {
 }
 
 fn update_agent_configs<F>(
-    apps: &std::collections::BTreeMap<String, AppEntry>,
+    services: &std::collections::BTreeMap<String, ServiceEntry>,
     messages: &Messages,
     mut update: F,
 ) -> Result<Vec<String>>
@@ -684,7 +684,7 @@ where
 {
     let mut updated = Vec::new();
     let mut seen = HashSet::new();
-    for entry in apps.values() {
+    for entry in services.values() {
         if !seen.insert(entry.agent_config_path.clone()) {
             continue;
         }
@@ -819,7 +819,7 @@ fn temp_secret_path(path: &Path) -> PathBuf {
     path.with_file_name(temp_name)
 }
 
-fn reload_openbao_agent(entry: &AppEntry, messages: &Messages) -> Result<()> {
+fn reload_openbao_agent(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     match entry.deploy_type {
         crate::state::DeployType::Docker => {
             let container = openbao_agent_container_name(&entry.service_name);
@@ -834,7 +834,7 @@ fn reload_openbao_agent(entry: &AppEntry, messages: &Messages) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn reload_openbao_agent_daemon(entry: &AppEntry, messages: &Messages) -> Result<()> {
+fn reload_openbao_agent_daemon(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     let config_path = entry.agent_config_path.display().to_string();
     let status = std::process::Command::new("pkill")
         .args(["-HUP", "-f", &config_path])
@@ -847,7 +847,7 @@ fn reload_openbao_agent_daemon(entry: &AppEntry, messages: &Messages) -> Result<
 }
 
 #[cfg(not(unix))]
-fn reload_openbao_agent_daemon(_entry: &AppEntry, messages: &Messages) -> Result<()> {
+fn reload_openbao_agent_daemon(_entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
 }
 

@@ -16,7 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod support;
 
 const SERVICE_NAME: &str = "edge-proxy";
-const ROLE_NAME: &str = "bootroot-app-edge-proxy";
+const ROLE_NAME: &str = "bootroot-service-edge-proxy";
 const ROLE_ID: &str = "role-edge-proxy";
 
 #[cfg(unix)]
@@ -251,7 +251,7 @@ async fn test_rotate_approle_secret_id_missing_app_fails() {
             "--yes",
             "approle-secret-id",
             "--service-name",
-            "missing-app",
+            "missing-service",
         ])
         .output()
         .expect("run rotate approle-secret-id");
@@ -263,7 +263,7 @@ async fn test_rotate_approle_secret_id_missing_app_fails() {
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stderr.contains("bootroot rotate failed"));
-    assert!(stderr.contains("App not found"));
+    assert!(stderr.contains("Service not found"));
 }
 
 fn prepare_app_state(root: &Path, openbao_url: &str, deploy_type: &str) -> anyhow::Result<PathBuf> {
@@ -271,8 +271,8 @@ fn prepare_app_state(root: &Path, openbao_url: &str, deploy_type: &str) -> anyho
     let state_path = root.join("state.json");
     let contents = fs::read_to_string(&state_path).context("read state")?;
     let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
-    let secret_id_path = PathBuf::from("secrets/apps/edge-proxy/secret_id");
-    state["apps"][SERVICE_NAME] = json!({
+    let secret_id_path = PathBuf::from("secrets/services/edge-proxy/secret_id");
+    state["services"][SERVICE_NAME] = json!({
         "service_name": SERVICE_NAME,
         "deploy_type": deploy_type,
         "hostname": "edge-node-01",
@@ -291,7 +291,7 @@ fn prepare_app_state(root: &Path, openbao_url: &str, deploy_type: &str) -> anyho
     });
     fs::write(&state_path, serde_json::to_string_pretty(&state)?).context("write state")?;
 
-    let secret_dir = root.join("secrets").join("apps").join(SERVICE_NAME);
+    let secret_dir = root.join("secrets").join("services").join(SERVICE_NAME);
     fs::create_dir_all(&secret_dir).context("create secrets dir")?;
     fs::write(root.join("agent.toml"), "# agent").context("write agent config")?;
     Ok(root.join(secret_id_path))
@@ -304,7 +304,7 @@ fn write_state_file(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
         "secrets_dir": "secrets",
         "policies": {},
         "approles": {},
-        "apps": {}
+        "services": {}
     });
     fs::write(
         root.join("state.json"),

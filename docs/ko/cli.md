@@ -4,15 +4,15 @@
 
 ## 개요
 
-CLI는 infra 기동/초기화/상태 점검과 앱 온보딩, 발급 검증,
+CLI는 infra 기동/초기화/상태 점검과 서비스 온보딩, 발급 검증,
 시크릿 회전을 제공합니다.
 또한 Prometheus/Grafana 기반 로컬 모니터링을 관리합니다.
 
 - `bootroot infra up`
 - `bootroot init`
 - `bootroot status`
-- `bootroot app add`
-- `bootroot app info`
+- `bootroot service add`
+- `bootroot service info`
 - `bootroot verify`
 - `bootroot rotate`
 - `bootroot monitoring`
@@ -193,23 +193,23 @@ infra 상태(컨테이너 포함)와 OpenBao KV/AppRole 상태를 점검합니�
 bootroot status
 ```
 
-## bootroot app add
+## bootroot service add
 
-새로운 앱(daemon/docker)이 step-ca에서 인증서를 발급받을 수 있도록
+새로운 서비스(daemon/docker)이 step-ca에서 인증서를 발급받을 수 있도록
 온보딩 정보를 등록하고 OpenBao AppRole을 생성합니다. 이 명령을 실행하면
 **bootroot CLI**가 아래 작업을 수행합니다.
 
-- 앱 메타데이터(서비스 이름, 배포 타입, hostname, domain 등) 저장
+- 서비스 메타데이터(서비스 이름, 배포 타입, hostname, domain 등) 저장
 - AppRole/정책 생성 및 `role_id`/`secret_id` 발급
-- 앱별 시크릿 경로 및 필요한 파일 경로 정리
+- 서비스별 시크릿 경로 및 필요한 파일 경로 정리
 - bootroot-agent/OpenBao Agent 실행에 필요한 안내 스니펫 출력
 
-이 명령은 새 앱을 추가할 때 **인증서 발급 경로를 준비**하기 위한
+이 명령은 새 서비스을 추가할 때 **인증서 발급 경로를 준비**하기 위한
 필수 단계입니다. 이후 사용자는 안내된 내용대로 bootroot-agent와
-OpenBao Agent를 구동하고, 앱을 실행해 **앱 간 통신에서 발급된
+OpenBao Agent를 구동하고, 서비스을 실행해 **서비스 간 통신에서 발급된
 mTLS 인증서가 올바르게 사용되도록 구성**해야 합니다.
 
-추가로, `bootroot app add`만으로는 인증서가 자동 발급되지 않습니다.
+추가로, `bootroot service add`만으로는 인증서가 자동 발급되지 않습니다.
 step-ca로부터 실제 인증서를 받으려면 **bootroot-agent 설정/실행**이
 필수입니다. 자세한 bootroot-agent 설정은 매뉴얼의 해당 섹션을
 참고하세요(설치/운영/설정 문서의 bootroot-agent 항목).
@@ -218,25 +218,25 @@ step-ca로부터 실제 인증서를 받으려면 **bootroot-agent 설정/실행
 이 명령은 `trusted_ca_sha256` 값을 **agent.toml 스니펫에 포함**해 출력합니다.
 해당 값이 없다면 스니펫에는 포함되지 않으므로, 필요 시 수동으로 설정하세요.
 
-앱이 다른 머신에서 실행된다면, 해당 머신에서 bootroot-agent가 같은
+서비스이 다른 머신에서 실행된다면, 해당 머신에서 bootroot-agent가 같은
 `agent.toml`을 사용하도록 설정해야 합니다. `--cert-path`/`--key-path`
-도 앱이 실행되는 머신 기준으로 맞춰야 합니다. 이 명령은 경로/스니펫을
-안내할 뿐이며, 실제 설정 파일과 실행은 앱이 동작하는 머신에서
+도 서비스이 실행되는 머신 기준으로 맞춰야 합니다. 이 명령은 경로/스니펫을
+안내할 뿐이며, 실제 설정 파일과 실행은 서비스이 동작하는 머신에서
 진행해야 합니다.
 
 런타임 배포 정책:
 
 ### OpenBao Agent
 
-- Docker 앱: 앱별 사이드카(**필수**)
-- daemon 앱: 앱별 호스트 daemon(**필수**)
+- Docker 서비스: 서비스별 사이드카(**필수**)
+- daemon 서비스: 서비스별 daemon(**필수**)
 
 ### bootroot-agent
 
-- Docker 앱: 앱별 사이드카(권장)
-- daemon 앱: 호스트당 통합 daemon 1개(권장)
+- Docker 서비스: 서비스별 사이드카(권장)
+- daemon 서비스: 호스트당 통합 daemon 1개(권장)
 
-참고: Docker 앱도 호스트 통합 daemon 사용은 가능하지만 비권장입니다
+참고: Docker 서비스도 통합 daemon 사용은 가능하지만 비권장입니다
 (격리/라이프사이클 정합성 측면).
 
 ### 입력
@@ -250,8 +250,8 @@ step-ca로부터 실제 인증서를 받으려면 **bootroot-agent 설정/실행
 - `--agent-config`: bootroot-agent 설정 파일 경로
 - `--cert-path`: 인증서 출력 경로
 - `--key-path`: 개인키 출력 경로
-- `--instance-id`: 앱 instance_id
-- `--container-name`: 도커 앱 컨테이너 이름 (docker 필수)
+- `--instance-id`: 서비스 instance_id
+- `--container-name`: 도커 서비스 컨테이너 이름 (docker 필수)
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`)
 - `--notes`: 메모(선택)
 
@@ -264,9 +264,9 @@ step-ca로부터 실제 인증서를 받으려면 **bootroot-agent 설정/실행
 
 ### 출력
 
-- 앱 메타데이터 요약
+- 서비스 메타데이터 요약
 - AppRole/정책/secret_id 경로 요약
-- 앱별 OpenBao Agent 안내(daemon/docker 분리)
+- 서비스별 OpenBao Agent 안내(daemon/docker 분리)
 - 타입별 온보딩 안내 (daemon 프로필 / docker sidecar)
 - daemon/docker 스니펫(복붙용) 출력
 
@@ -280,9 +280,9 @@ step-ca로부터 실제 인증서를 받으려면 **bootroot-agent 설정/실행
 - docker에 `container-name` 누락
 - OpenBao AppRole 생성 실패
 
-## bootroot app info
+## bootroot service info
 
-등록된 앱 정보를 조회합니다.
+등록된 서비스 정보를 조회합니다.
 
 ### 입력
 
@@ -290,19 +290,19 @@ step-ca로부터 실제 인증서를 받으려면 **bootroot-agent 설정/실행
 
 ### 출력
 
-- 앱 타입/경로/AppRole/시크릿 경로 요약
-- 앱별 OpenBao Agent 안내(daemon/docker 분리)
+- 서비스 타입/경로/AppRole/시크릿 경로 요약
+- 서비스별 OpenBao Agent 안내(daemon/docker 분리)
 
 ### 실패 조건
 
 다음 조건이면 실패로 판정합니다.
 
 - `state.json` 누락
-- 등록되지 않은 앱
+- 등록되지 않은 서비스
 
 ## bootroot verify
 
-bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 앱 온보딩 직후
+bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 서비스 온보딩 직후
 또는 설정 변경 후에 실제 발급이 가능한지 확인할 때 사용합니다.
 검증 이후에도 **주기적 갱신을 원하면 bootroot-agent를 상시 모드로
 실행**해야 합니다(oneshot 없이 실행).

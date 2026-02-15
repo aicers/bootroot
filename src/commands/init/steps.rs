@@ -1637,7 +1637,7 @@ fn write_state_file(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        apps: BTreeMap::new(),
+        services: BTreeMap::new(),
     };
     let state_path = StateFile::default_path();
     state
