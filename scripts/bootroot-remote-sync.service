@@ -1,0 +1,25 @@
+[Unit]
+Description=bootroot remote secret sync (pull + ack)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/bootroot/remote-sync.env
+ExecStart=/usr/local/bin/bootroot-remote sync \
+  --openbao-url ${OPENBAO_URL} \
+  --kv-mount ${OPENBAO_KV_MOUNT} \
+  --service-name ${SERVICE_NAME} \
+  --role-id-path ${ROLE_ID_PATH} \
+  --secret-id-path ${SECRET_ID_PATH} \
+  --eab-file-path ${EAB_FILE_PATH} \
+  --agent-config-path ${AGENT_CONFIG_PATH} \
+  --ca-bundle-path ${CA_BUNDLE_PATH} \
+  --summary-json ${SUMMARY_JSON_PATH} \
+  --bootroot-bin ${BOOTROOT_BIN} \
+  --retry-attempts ${RETRY_ATTEMPTS} \
+  --retry-backoff-secs ${RETRY_BACKOFF_SECS} \
+  --retry-jitter-secs ${RETRY_JITTER_SECS}
+
