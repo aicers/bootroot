@@ -1,0 +1,32 @@
+{
+  "id": "scenario-a-single-node-mixed",
+  "nodes": [
+    {
+      "id": "node-a",
+      "services": [
+        {
+          "service_name": "daemon-a1",
+          "deploy_type": "daemon",
+          "instance_id": "001"
+        },
+        {
+          "service_name": "daemon-a2",
+          "deploy_type": "daemon",
+          "instance_id": "002"
+        },
+        {
+          "service_name": "docker-a1",
+          "deploy_type": "docker",
+          "instance_id": "003",
+          "container_name": "docker-a1-container"
+        },
+        {
+          "service_name": "docker-a2",
+          "deploy_type": "docker",
+          "instance_id": "004",
+          "container_name": "docker-a2-container"
+        }
+      ]
+    }
+  ]
+}

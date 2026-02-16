@@ -1,0 +1,42 @@
+{
+  "id": "scenario-b-multi-node-distributed",
+  "nodes": [
+    {
+      "id": "node-a",
+      "services": [
+        {
+          "service_name": "daemon-b1",
+          "deploy_type": "daemon",
+          "instance_id": "001"
+        }
+      ]
+    },
+    {
+      "id": "node-b",
+      "services": [
+        {
+          "service_name": "docker-b1",
+          "deploy_type": "docker",
+          "instance_id": "001",
+          "container_name": "docker-b1-container"
+        }
+      ]
+    },
+    {
+      "id": "node-c",
+      "services": [
+        {
+          "service_name": "daemon-b2",
+          "deploy_type": "daemon",
+          "instance_id": "001"
+        },
+        {
+          "service_name": "docker-b2",
+          "deploy_type": "docker",
+          "instance_id": "002",
+          "container_name": "docker-b2-container"
+        }
+      ]
+    }
+  ]
+}
