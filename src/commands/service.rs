@@ -5,7 +5,7 @@ use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 use tokio::fs;
 
-use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs};
+use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs, ServiceSyncStatusArgs};
 use crate::cli::output::{
     ServiceAddAppliedPaths, ServiceAddPlan, print_service_add_plan, print_service_add_summary,
     print_service_info_summary,
@@ -15,6 +15,7 @@ use crate::commands::init::{PATH_CA_TRUST, SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
 use crate::state::{
     DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, ServiceSyncStatus, StateFile,
+    SyncApplyStatus,
 };
 const SERVICE_ROLE_PREFIX: &str = "bootroot-service-";
 const SERVICE_KV_BASE: &str = "bootroot/services";
@@ -186,6 +187,87 @@ pub(crate) fn run_service_info(args: &ServiceInfoArgs, messages: &Messages) -> R
         .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
     print_service_info_summary(entry, messages);
     Ok(())
+}
+
+pub(crate) fn run_service_sync_status(
+    args: &ServiceSyncStatusArgs,
+    messages: &Messages,
+) -> Result<()> {
+    let state_path = StateFile::default_path();
+    if !state_path.exists() {
+        anyhow::bail!(messages.error_state_missing());
+    }
+    let mut state =
+        StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
+    let service_name = args.service_name.clone();
+    let summary_contents = std::fs::read_to_string(&args.summary_json).with_context(|| {
+        messages.error_read_file_failed(&args.summary_json.display().to_string())
+    })?;
+    let summary: RemoteApplySummary = serde_json::from_str(&summary_contents)
+        .context("Failed to parse remote sync summary JSON")?;
+    let secret_id_status = map_remote_status(&summary.secret_id.status)?;
+    let eab_status = map_remote_status(&summary.eab.status)?;
+    let responder_hmac_status = map_remote_status(&summary.responder_hmac.status)?;
+    let trust_sync_status = map_remote_status(&summary.trust_sync.status)?;
+
+    {
+        let entry = state
+            .services
+            .get_mut(&service_name)
+            .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&service_name)))?;
+        entry.sync_status.secret_id = secret_id_status;
+        entry.sync_status.eab = eab_status;
+        entry.sync_status.responder_hmac = responder_hmac_status;
+        entry.sync_status.trust_sync = trust_sync_status;
+    }
+
+    state
+        .save(&state_path)
+        .with_context(|| messages.error_serialize_state_failed())?;
+
+    println!("{}", messages.service_sync_status_summary_title());
+    println!("{}", messages.service_sync_status_service(&service_name));
+    println!(
+        "{}",
+        messages.service_sync_status_item("secret_id", secret_id_status.as_str())
+    );
+    println!(
+        "{}",
+        messages.service_sync_status_item("eab", eab_status.as_str())
+    );
+    println!(
+        "{}",
+        messages.service_sync_status_item("responder_hmac", responder_hmac_status.as_str())
+    );
+    println!(
+        "{}",
+        messages.service_sync_status_item("trust_sync", trust_sync_status.as_str())
+    );
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RemoteApplySummary {
+    secret_id: RemoteApplyItem,
+    eab: RemoteApplyItem,
+    responder_hmac: RemoteApplyItem,
+    trust_sync: RemoteApplyItem,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RemoteApplyItem {
+    status: String,
+}
+
+fn map_remote_status(value: &str) -> Result<SyncApplyStatus> {
+    match value {
+        "applied" | "unchanged" => Ok(SyncApplyStatus::Applied),
+        "failed" => Ok(SyncApplyStatus::Failed),
+        "none" => Ok(SyncApplyStatus::None),
+        "pending" => Ok(SyncApplyStatus::Pending),
+        "expired" => Ok(SyncApplyStatus::Expired),
+        _ => anyhow::bail!("Unsupported remote sync status: {value}"),
+    }
 }
 
 fn validate_service_add(args: &ResolvedServiceAdd, messages: &Messages) -> Result<()> {
@@ -771,5 +853,11 @@ mod tests {
         let once = upsert_managed_profile("", "edge-proxy", &block);
         let twice = upsert_managed_profile(&once, "edge-proxy", &block);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn test_map_remote_status_treats_unchanged_as_applied() {
+        let status = map_remote_status("unchanged").expect("map status");
+        assert_eq!(status, SyncApplyStatus::Applied);
     }
 }
