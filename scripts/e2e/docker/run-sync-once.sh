@@ -21,7 +21,7 @@ cd "$WORK_DIR"
   --ca-bundle-path "$WORK_DIR/certs/ca-bundle.pem" \
   --summary-json "$WORK_DIR/remote-summary.json" \
   --bootroot-bin "$BOOTROOT_BIN" \
-  --retry-attempts 1 \
+  --retry-attempts 3 \
   --retry-backoff-secs 1 \
   --retry-jitter-secs 0 \
   >/dev/null
