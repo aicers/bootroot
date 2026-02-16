@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
+import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 PORT = int(os.environ.get("MOCK_OPENBAO_PORT", "18200"))
-SERVICE = os.environ.get("SERVICE_NAME", "edge-proxy")
 TOKEN = "mock-client-token"
+SERVICE_PATH_PATTERN = re.compile(r"^/v1/secret/data/bootroot/services/([^/]+)/([^/]+)$")
 
 
 def write_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -29,41 +31,60 @@ class Handler(BaseHTTPRequestHandler):
         write_json(self, 404, {"errors": ["not found"]})
 
     def do_GET(self) -> None:  # noqa: N802
-        base = f"/v1/secret/data/bootroot/services/{SERVICE}"
         if self.path == "/v1/sys/health":
             write_json(self, 200, {"initialized": True, "sealed": False})
             return
-        if self.path == f"{base}/secret_id":
-            write_json(self, 200, {"data": {"data": {"secret_id": "synced-secret-id"}}})
-            return
-        if self.path == f"{base}/eab":
-            write_json(
-                self,
-                200,
-                {"data": {"data": {"kid": "synced-kid", "hmac": "synced-hmac"}}},
-            )
-            return
-        if self.path == f"{base}/http_responder_hmac":
-            write_json(
-                self,
-                200,
-                {"data": {"data": {"hmac": "synced-responder-hmac"}}},
-            )
-            return
-        if self.path == f"{base}/trust":
-            write_json(
-                self,
-                200,
-                {
-                    "data": {
+        match = SERVICE_PATH_PATTERN.match(self.path)
+        if match:
+            service = match.group(1)
+            secret_kind = match.group(2)
+            if secret_kind == "secret_id":
+                write_json(
+                    self,
+                    200,
+                    {"data": {"data": {"secret_id": f"synced-secret-id-{service}"}}},
+                )
+                return
+            if secret_kind == "eab":
+                write_json(
+                    self,
+                    200,
+                    {
                         "data": {
-                            "trusted_ca_sha256": ["33" * 32],
-                            "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nSMOKE\n-----END CERTIFICATE-----",
+                            "data": {
+                                "kid": f"synced-kid-{service}",
+                                "hmac": f"synced-hmac-{service}",
+                            }
                         }
-                    }
-                },
-            )
-            return
+                    },
+                )
+                return
+            if secret_kind == "http_responder_hmac":
+                write_json(
+                    self,
+                    200,
+                    {"data": {"data": {"hmac": f"synced-responder-hmac-{service}"}}},
+                )
+                return
+            if secret_kind == "trust":
+                fingerprint = hashlib.sha256(service.encode("utf-8")).hexdigest()
+                write_json(
+                    self,
+                    200,
+                    {
+                        "data": {
+                            "data": {
+                                "trusted_ca_sha256": [fingerprint],
+                                "ca_bundle_pem": (
+                                    "-----BEGIN CERTIFICATE-----\n"
+                                    f"SMOKE-{service}\n"
+                                    "-----END CERTIFICATE-----"
+                                ),
+                            }
+                        }
+                    },
+                )
+                return
         write_json(self, 404, {"errors": ["not found"]})
 
 

@@ -1,0 +1,64 @@
+{
+  "id": "scenario-c-multi-node-uneven",
+  "nodes": [
+    {
+      "id": "node-a",
+      "services": [
+        {
+          "service_name": "daemon-c1",
+          "deploy_type": "daemon",
+          "instance_id": "001"
+        },
+        {
+          "service_name": "daemon-c2",
+          "deploy_type": "daemon",
+          "instance_id": "002"
+        },
+        {
+          "service_name": "docker-c1",
+          "deploy_type": "docker",
+          "instance_id": "003",
+          "container_name": "docker-c1-container"
+        }
+      ]
+    },
+    {
+      "id": "node-b",
+      "services": [
+        {
+          "service_name": "daemon-c3",
+          "deploy_type": "daemon",
+          "instance_id": "001"
+        },
+        {
+          "service_name": "docker-c2",
+          "deploy_type": "docker",
+          "instance_id": "002",
+          "container_name": "docker-c2-container"
+        },
+        {
+          "service_name": "docker-c3",
+          "deploy_type": "docker",
+          "instance_id": "003",
+          "container_name": "docker-c3-container"
+        }
+      ]
+    },
+    {
+      "id": "node-c",
+      "services": [
+        {
+          "service_name": "daemon-c4",
+          "deploy_type": "daemon",
+          "instance_id": "001"
+        },
+        {
+          "service_name": "docker-c4",
+          "deploy_type": "docker",
+          "instance_id": "002",
+          "container_name": "docker-c4-container"
+        }
+      ]
+    }
+  ]
+}
