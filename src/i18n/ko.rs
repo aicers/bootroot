@@ -182,6 +182,8 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_cert_path: "- cert 경로: {value}",
     service_summary_key_path: "- key 경로: {value}",
     service_summary_next_steps: "다음 단계:",
+    service_summary_print_only_hint: "- 수동 스니펫은 기본 출력에서 숨겨집니다. 필요하면 --print-only(또는 --dry-run)로 출력하세요",
+    service_summary_preview_mode: "- 프리뷰 모드: 파일이나 state 변경이 적용되지 않았습니다",
     service_next_steps_daemon_profile: "  - {config_path}에 {service_name} 프로필(instance_id={instance_id}, hostname={hostname}, domain={domain}, cert={cert_path}, key={key_path})을 추가하고 bootroot-agent를 리로드하세요.",
     service_next_steps_docker_sidecar: "  - {service_name} 사이드카(container={container_name}, instance_id={instance_id}, hostname={hostname}, domain={domain})를 {config_path}로 실행하고 AppRole {role_name}, secret_id 파일 {secret_id_path}를 사용하세요.",
     service_next_steps_openbao_agent_title: "  - OpenBao Agent(서비스별 인스턴스):",

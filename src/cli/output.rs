@@ -61,6 +61,8 @@ pub(crate) fn print_service_add_summary(
     secret_id_path: &std::path::Path,
     applied: Option<ServiceAddAppliedPaths<'_>>,
     trusted_ca_sha256: Option<&[String]>,
+    show_snippets: bool,
+    note: Option<&str>,
     messages: &Messages,
 ) {
     println!("{}", messages.service_add_summary());
@@ -95,6 +97,12 @@ pub(crate) fn print_service_add_summary(
             "{}",
             messages.service_summary_auto_applied_openbao_template(paths.openbao_agent_template)
         );
+    }
+    if let Some(note) = note {
+        println!("{note}");
+    }
+    if !show_snippets {
+        return;
     }
     println!("{}", messages.service_summary_next_steps());
     print_service_openbao_agent_steps(entry, secret_id_path, messages);

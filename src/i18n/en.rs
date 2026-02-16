@@ -182,6 +182,8 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_cert_path: "- cert path: {value}",
     service_summary_key_path: "- key path: {value}",
     service_summary_next_steps: "next steps:",
+    service_summary_print_only_hint: "- manual snippets are hidden by default; run with --print-only (or --dry-run) to print them",
+    service_summary_preview_mode: "- preview mode: no files or state were changed",
     service_next_steps_daemon_profile: "  - Add profile for {service_name} (instance_id={instance_id}, hostname={hostname}, domain={domain}, cert={cert_path}, key={key_path}) to {config_path} and reload bootroot-agent.",
     service_next_steps_docker_sidecar: "  - Run sidecar for {service_name} (container={container_name}, instance_id={instance_id}, hostname={hostname}, domain={domain}) with config {config_path}, AppRole {role_name}, and secret_id file {secret_id_path}.",
     service_next_steps_openbao_agent_title: "  - OpenBao Agent (per-service instance):",

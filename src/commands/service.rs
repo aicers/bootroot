@@ -37,7 +37,8 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let mut state =
         StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
 
-    let resolved = resolve_service_add_args(args, messages)?;
+    let preview = args.dry_run || args.print_only;
+    let resolved = resolve_service_add_args(args, messages, preview)?;
     if state.services.contains_key(&resolved.service_name) {
         anyhow::bail!(messages.error_service_duplicate(&resolved.service_name));
     }
@@ -62,6 +63,38 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     };
     print_service_add_plan(&plan, messages);
 
+    if preview {
+        run_service_add_preview(&state, &resolved, messages);
+        return Ok(());
+    }
+
+    run_service_add_apply(&mut state, &state_path, &resolved, messages).await
+}
+
+fn run_service_add_preview(state: &StateFile, resolved: &ResolvedServiceAdd, messages: &Messages) {
+    let preview_entry = build_preview_service_entry(resolved, state);
+    let preview_secret_id_path = state
+        .secrets_dir()
+        .join(SERVICE_SECRET_DIR)
+        .join(&resolved.service_name)
+        .join(SERVICE_SECRET_ID_FILENAME);
+    print_service_add_summary(
+        &preview_entry,
+        &preview_secret_id_path,
+        None,
+        None,
+        true,
+        Some(messages.service_summary_preview_mode()),
+        messages,
+    );
+}
+
+async fn run_service_add_apply(
+    state: &mut StateFile,
+    state_path: &Path,
+    resolved: &ResolvedServiceAdd,
+    messages: &Messages,
+) -> Result<()> {
     let root_token = resolved.root_token.clone();
 
     let mut client = OpenBaoClient::new(&state.openbao_url)
@@ -74,7 +107,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
 
     let trusted_ca_sha256 =
         read_trusted_ca_fingerprints(&client, &state.kv_mount, messages).await?;
-    let approle = ensure_service_approle(&client, &state, &resolved.service_name, messages).await?;
+    let approle = ensure_service_approle(&client, state, &resolved.service_name, messages).await?;
     let secrets_dir = state.secrets_dir();
     write_role_id_file(
         &secrets_dir,
@@ -91,7 +124,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     )
     .await?;
     let applied = if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
-        Some(apply_local_service_configs(&secrets_dir, &resolved, &secret_id_path, messages).await?)
+        Some(apply_local_service_configs(&secrets_dir, resolved, &secret_id_path, messages).await?)
     } else {
         None
     };
@@ -121,7 +154,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
         .services
         .insert(resolved.service_name.clone(), entry.clone());
     state
-        .save(&state_path)
+        .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
 
     print_service_add_summary(
@@ -133,6 +166,8 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
             openbao_agent_template: &result.openbao_agent_template,
         }),
         trusted_ca_sha256.as_deref(),
+        false,
+        Some(messages.service_summary_print_only_hint()),
         messages,
     );
     Ok(())
@@ -436,6 +471,34 @@ fn service_policy_name(service_name: &str) -> String {
     format!("{SERVICE_ROLE_PREFIX}{service_name}")
 }
 
+fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile) -> ServiceEntry {
+    let preview_secret_id_path = state
+        .secrets_dir()
+        .join(SERVICE_SECRET_DIR)
+        .join(&resolved.service_name)
+        .join(SERVICE_SECRET_ID_FILENAME);
+    ServiceEntry {
+        service_name: resolved.service_name.clone(),
+        deploy_type: resolved.deploy_type,
+        delivery_mode: resolved.delivery_mode,
+        sync_status: ServiceSyncStatus::default(),
+        hostname: resolved.hostname.clone(),
+        domain: resolved.domain.clone(),
+        agent_config_path: resolved.agent_config.clone(),
+        cert_path: resolved.cert_path.clone(),
+        key_path: resolved.key_path.clone(),
+        instance_id: resolved.instance_id.clone(),
+        container_name: resolved.container_name.clone(),
+        notes: resolved.notes.clone(),
+        approle: ServiceRoleEntry {
+            role_name: service_role_name(&resolved.service_name),
+            role_id: "dry-run".to_string(),
+            secret_id_path: preview_secret_id_path,
+            policy_name: service_policy_name(&resolved.service_name),
+        },
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ResolvedServiceAdd {
     pub(crate) service_name: String,
@@ -455,6 +518,7 @@ pub(crate) struct ResolvedServiceAdd {
 fn resolve_service_add_args(
     args: &ServiceAddArgs,
     messages: &Messages,
+    preview: bool,
 ) -> Result<ResolvedServiceAdd> {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
@@ -533,7 +597,9 @@ fn resolve_service_add_args(
         }),
     };
 
-    let root_token = if let Some(value) = args.root_token.root_token.clone() {
+    let root_token = if preview {
+        String::new()
+    } else if let Some(value) = args.root_token.root_token.clone() {
         value
     } else {
         let label = messages.prompt_openbao_root_token().trim_end_matches(": ");
