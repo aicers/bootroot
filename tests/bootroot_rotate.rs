@@ -113,8 +113,8 @@ async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
 async fn test_rotate_approle_secret_id_daemon_updates_secret() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let secret_path =
-        prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon").expect("prepare state");
+    let secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
+        .expect("prepare state");
     fs::write(&secret_path, "old-secret").expect("seed secret_id");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -183,8 +183,8 @@ async fn test_rotate_approle_secret_id_daemon_updates_secret() {
 async fn test_rotate_approle_secret_id_docker_restarts_agent() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let secret_path =
-        prepare_app_state(temp_dir.path(), &openbao.uri(), "docker").expect("prepare state");
+    let secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "docker", "local-file")
+        .expect("prepare state");
     fs::write(&secret_path, "old-secret").expect("seed secret_id");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -266,7 +266,168 @@ async fn test_rotate_approle_secret_id_missing_app_fails() {
     assert!(stderr.contains("Service not found"));
 }
 
-fn prepare_app_state(root: &Path, openbao_url: &str, deploy_type: &str) -> anyhow::Result<PathBuf> {
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_approle_secret_id_remote_sets_pending_status() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let _secret_path = prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
+
+    stub_openbao_for_rotation(&openbao, "secret-remote").await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "approle-secret-id",
+            "--service-name",
+            SERVICE_NAME,
+        ])
+        .output()
+        .expect("run rotate approle-secret-id");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["services"][SERVICE_NAME]["sync_status"]["secret_id"],
+        "pending"
+    );
+    assert!(
+        state["services"][SERVICE_NAME]["sync_metadata"]["secret_id"]["started_at_unix"].is_i64()
+    );
+    assert!(
+        state["services"][SERVICE_NAME]["sync_metadata"]["secret_id"]["expires_at_unix"].is_i64()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_remote_sets_pending_status() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let _secret_path = prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
+
+    stub_openbao_for_eab_rotation(&openbao).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "eab",
+            "--stepca-url",
+            &openbao.uri(),
+            "--stepca-provisioner",
+            "acme",
+        ])
+        .output()
+        .expect("run rotate eab");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["services"][SERVICE_NAME]["sync_status"]["eab"],
+        "pending"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_remote_sets_pending_status() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let _secret_path = prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
+
+    let compose_file = temp_dir.path().join("docker-compose.yml");
+    fs::write(&compose_file, "services: {}\n").expect("write compose");
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-remote").await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--compose-file",
+            compose_file.to_string_lossy().as_ref(),
+            "--yes",
+            "responder-hmac",
+            "--hmac",
+            "hmac-remote",
+        ])
+        .output()
+        .expect("run rotate responder-hmac");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["services"][SERVICE_NAME]["sync_status"]["responder_hmac"],
+        "pending"
+    );
+}
+
+fn prepare_app_state(
+    root: &Path,
+    openbao_url: &str,
+    deploy_type: &str,
+    delivery_mode: &str,
+) -> anyhow::Result<PathBuf> {
     write_state_file(root, openbao_url)?;
     let state_path = root.join("state.json");
     let contents = fs::read_to_string(&state_path).context("read state")?;
@@ -275,6 +436,7 @@ fn prepare_app_state(root: &Path, openbao_url: &str, deploy_type: &str) -> anyho
     state["services"][SERVICE_NAME] = json!({
         "service_name": SERVICE_NAME,
         "deploy_type": deploy_type,
+        "delivery_mode": delivery_mode,
         "hostname": "edge-node-01",
         "domain": "trusted.domain",
         "agent_config_path": "agent.toml",
@@ -365,6 +527,56 @@ async fn stub_openbao_for_stepca_password_rotation(server: &MockServer, expected
         .and(body_json(json!({
             "data": {
                 "value": expected_password
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+}
+
+async fn stub_openbao_for_eab_rotation(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/acme/acme/eab"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kid": "new-kid",
+            "hmac": "new-hmac"
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/agent/eab"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "data": {
+                "kid": "new-kid",
+                "hmac": "new-hmac"
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+}
+
+async fn stub_openbao_for_responder_hmac_rotation(server: &MockServer, hmac: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/responder/hmac"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "data": {
+                "value": hmac
             }
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))

@@ -14,8 +14,8 @@ use crate::cli::prompt::Prompt;
 use crate::commands::init::{PATH_CA_TRUST, SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
 use crate::state::{
-    DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, ServiceSyncStatus, StateFile,
-    SyncApplyStatus,
+    DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, ServiceSyncMetadata,
+    ServiceSyncStatus, StateFile, SyncApplyStatus, SyncTiming,
 };
 const SERVICE_ROLE_PREFIX: &str = "bootroot-service-";
 const SERVICE_KV_BASE: &str = "bootroot/services";
@@ -158,6 +158,7 @@ async fn run_service_add_apply(
         deploy_type: resolved.deploy_type,
         delivery_mode: resolved.delivery_mode,
         sync_status: initial_sync_status(resolved.delivery_mode),
+        sync_metadata: ServiceSyncMetadata::default(),
         hostname: resolved.hostname.clone(),
         domain: resolved.domain.clone(),
         agent_config_path: resolved.agent_config.clone(),
@@ -274,9 +275,21 @@ pub(crate) fn run_service_sync_status(
             .services
             .get_mut(&service_name)
             .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&service_name)))?;
-        entry.sync_status.secret_id = secret_id_status;
-        entry.sync_status.eab = eab_status;
-        entry.sync_status.responder_hmac = responder_hmac_status;
+        apply_sync_status_with_metadata(
+            &mut entry.sync_status.secret_id,
+            &mut entry.sync_metadata.secret_id,
+            secret_id_status,
+        );
+        apply_sync_status_with_metadata(
+            &mut entry.sync_status.eab,
+            &mut entry.sync_metadata.eab,
+            eab_status,
+        );
+        apply_sync_status_with_metadata(
+            &mut entry.sync_status.responder_hmac,
+            &mut entry.sync_metadata.responder_hmac,
+            responder_hmac_status,
+        );
         entry.sync_status.trust_sync = trust_sync_status;
     }
 
@@ -326,6 +339,18 @@ fn map_remote_status(value: &str) -> Result<SyncApplyStatus> {
         "pending" => Ok(SyncApplyStatus::Pending),
         "expired" => Ok(SyncApplyStatus::Expired),
         _ => anyhow::bail!("Unsupported remote sync status: {value}"),
+    }
+}
+
+fn apply_sync_status_with_metadata(
+    status: &mut SyncApplyStatus,
+    metadata: &mut SyncTiming,
+    next: SyncApplyStatus,
+) {
+    *status = next;
+    if !matches!(next, SyncApplyStatus::Pending) {
+        metadata.started_at_unix = None;
+        metadata.expires_at_unix = None;
     }
 }
 
@@ -812,6 +837,7 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
         deploy_type: resolved.deploy_type,
         delivery_mode: resolved.delivery_mode,
         sync_status: ServiceSyncStatus::default(),
+        sync_metadata: ServiceSyncMetadata::default(),
         hostname: resolved.hostname.clone(),
         domain: resolved.domain.clone(),
         agent_config_path: resolved.agent_config.clone(),
@@ -1107,5 +1133,18 @@ mod tests {
     fn test_map_remote_status_treats_unchanged_as_applied() {
         let status = map_remote_status("unchanged").expect("map status");
         assert_eq!(status, SyncApplyStatus::Applied);
+    }
+
+    #[test]
+    fn test_apply_sync_status_with_metadata_clears_window_for_terminal_status() {
+        let mut status = SyncApplyStatus::Pending;
+        let mut timing = SyncTiming {
+            started_at_unix: Some(10),
+            expires_at_unix: Some(20),
+        };
+        apply_sync_status_with_metadata(&mut status, &mut timing, SyncApplyStatus::Applied);
+        assert_eq!(status, SyncApplyStatus::Applied);
+        assert_eq!(timing.started_at_unix, None);
+        assert_eq!(timing.expires_at_unix, None);
     }
 }
