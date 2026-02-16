@@ -24,6 +24,20 @@ pub(crate) struct ServiceAddAppliedPaths<'a> {
     pub(crate) openbao_agent_template: &'a str,
 }
 
+pub(crate) struct ServiceAddRemoteBootstrap<'a> {
+    pub(crate) bootstrap_file: &'a str,
+    pub(crate) remote_run_command: &'a str,
+    pub(crate) control_sync_command: &'a str,
+}
+
+pub(crate) struct ServiceAddSummaryOptions<'a> {
+    pub(crate) applied: Option<ServiceAddAppliedPaths<'a>>,
+    pub(crate) remote: Option<ServiceAddRemoteBootstrap<'a>>,
+    pub(crate) trusted_ca_sha256: Option<&'a [String]>,
+    pub(crate) show_snippets: bool,
+    pub(crate) note: Option<&'a str>,
+}
+
 pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
     print_init_header(summary, messages);
     print_init_secrets(summary, messages);
@@ -59,10 +73,7 @@ pub(crate) fn print_init_plan(plan: &InitPlan, messages: &Messages) {
 pub(crate) fn print_service_add_summary(
     entry: &ServiceEntry,
     secret_id_path: &std::path::Path,
-    applied: Option<ServiceAddAppliedPaths<'_>>,
-    trusted_ca_sha256: Option<&[String]>,
-    show_snippets: bool,
-    note: Option<&str>,
+    options: ServiceAddSummaryOptions<'_>,
     messages: &Messages,
 ) {
     println!("{}", messages.service_add_summary());
@@ -84,7 +95,7 @@ pub(crate) fn print_service_add_summary(
         "{}",
         messages.service_summary_openbao_path(&entry.service_name)
     );
-    if let Some(paths) = applied {
+    if let Some(paths) = options.applied {
         println!(
             "{}",
             messages.service_summary_auto_applied_agent_config(paths.agent_config)
@@ -98,15 +109,29 @@ pub(crate) fn print_service_add_summary(
             messages.service_summary_auto_applied_openbao_template(paths.openbao_agent_template)
         );
     }
-    if let Some(note) = note {
+    if let Some(remote) = options.remote {
+        println!(
+            "{}",
+            messages.service_summary_remote_bootstrap_file(remote.bootstrap_file)
+        );
+        println!(
+            "{}",
+            messages.service_summary_remote_run_command(remote.remote_run_command)
+        );
+        println!(
+            "{}",
+            messages.service_summary_remote_sync_command(remote.control_sync_command)
+        );
+    }
+    if let Some(note) = options.note {
         println!("{note}");
     }
-    if !show_snippets {
+    if !options.show_snippets {
         return;
     }
     println!("{}", messages.service_summary_next_steps());
     print_service_openbao_agent_steps(entry, secret_id_path, messages);
-    if let Some(trusted) = trusted_ca_sha256 {
+    if let Some(trusted) = options.trusted_ca_sha256 {
         print_trust_snippet(entry, trusted, messages);
     }
     match entry.deploy_type {
