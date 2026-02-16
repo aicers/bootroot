@@ -359,6 +359,17 @@ jobs:
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           ./scripts/e2e/docker/run-baseline.sh
 
+      - name: Run Docker rotation smoke (Scenario A, secret_id only)
+        run: |
+          SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-a-single-node-mixed.json" \
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/docker-rotation-smoke-${GITHUB_RUN_ID}" \
+          PROJECT_NAME="bootroot-e2e-rotation-${GITHUB_RUN_ID}" \
+          ROTATION_ITEMS="secret_id" \
+          TIMEOUT_SECS=60 \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
+          ./scripts/e2e/docker/run-rotation-recovery.sh
+
       - name: Upload Harness Artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -373,4 +384,12 @@ jobs:
         with:
           name: docker-baseline-smoke-${{ github.run_id }}
           path: tmp/e2e/docker-baseline-smoke-${{ github.run_id }}
+          if-no-files-found: warn
+
+      - name: Upload Rotation Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-rotation-smoke-${{ github.run_id }}
+          path: tmp/e2e/docker-rotation-smoke-${{ github.run_id }}
           if-no-files-found: warn

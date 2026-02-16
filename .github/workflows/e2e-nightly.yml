@@ -1,0 +1,65 @@
+name: E2E Nightly
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  docker-rotation-recovery-full:
+    name: Docker Rotation Recovery Full Matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build bootroot binaries
+        run: cargo build --bin bootroot --bin bootroot-remote
+
+      - name: Run Docker baseline full matrix
+        run: |
+          SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json" \
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/nightly-baseline-${GITHUB_RUN_ID}" \
+          PROJECT_NAME="bootroot-e2e-nightly-baseline-${GITHUB_RUN_ID}" \
+          MAX_CYCLES=2 \
+          INTERVAL_SECS=1 \
+          TIMEOUT_SECS=60 \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
+          ./scripts/e2e/docker/run-baseline.sh
+
+      - name: Run Docker rotation/recovery full matrix
+        run: |
+          SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json" \
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/nightly-rotation-${GITHUB_RUN_ID}" \
+          PROJECT_NAME="bootroot-e2e-nightly-rotation-${GITHUB_RUN_ID}" \
+          ROTATION_ITEMS="secret_id,eab,responder_hmac,trust_sync" \
+          TIMEOUT_SECS=90 \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
+          ./scripts/e2e/docker/run-rotation-recovery.sh
+
+      - name: Upload Baseline Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-baseline-${{ github.run_id }}
+          path: tmp/e2e/nightly-baseline-${{ github.run_id }}
+          if-no-files-found: warn
+
+      - name: Upload Rotation Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-rotation-${{ github.run_id }}
+          path: tmp/e2e/nightly-rotation-${{ github.run_id }}
+          if-no-files-found: warn

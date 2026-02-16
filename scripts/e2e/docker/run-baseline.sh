@@ -236,23 +236,23 @@ for item in services:
         raise SystemExit(f"delivery_mode mismatch for {service}: {entry['delivery_mode']}")
 
     secret_value = item["secret_id_path"].read_text(encoding='utf-8').strip()
-    if secret_value != f"synced-secret-id-{service}":
+    if secret_value != f"synced-secret-id-{service}-v1":
         raise SystemExit(f"secret_id mismatch for {service}: {secret_value}")
 
     eab = json.loads(item["eab_file_path"].read_text(encoding='utf-8'))
-    if eab.get("kid") != f"synced-kid-{service}" or eab.get("hmac") != f"synced-hmac-{service}":
+    if eab.get("kid") != f"synced-kid-{service}-v1" or eab.get("hmac") != f"synced-hmac-{service}-v1":
         raise SystemExit(f"eab mismatch for {service}")
 
     agent_config = item["agent_config_path"].read_text(encoding='utf-8')
-    expected_hmac = f"synced-responder-hmac-{service}"
+    expected_hmac = f"synced-responder-hmac-{service}-v1"
     if expected_hmac not in agent_config:
         raise SystemExit(f"responder hmac missing in agent config for {service}")
-    expected_fp = hashlib.sha256(service.encode('utf-8')).hexdigest()
+    expected_fp = hashlib.sha256(f"{service}-v1".encode('utf-8')).hexdigest()
     if expected_fp not in agent_config:
         raise SystemExit(f"trusted_ca_sha256 missing in agent config for {service}")
 
     ca_bundle_contents = item["ca_bundle_path"].read_text(encoding='utf-8')
-    if f"SMOKE-{service}" not in ca_bundle_contents:
+    if f"SMOKE-{service}-v1" not in ca_bundle_contents:
         raise SystemExit(f"ca_bundle mismatch for {service}")
 
     summary = json.loads(item["summary_json_path"].read_text(encoding='utf-8'))
