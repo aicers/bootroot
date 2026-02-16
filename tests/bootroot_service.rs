@@ -949,6 +949,65 @@ fn test_service_sync_status_clears_sync_metadata_after_terminal_update() {
 
 #[cfg(unix)]
 #[test]
+fn test_service_sync_status_updates_only_target_service() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+    let state_path = temp_dir.path().join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    state["services"]["edge-proxy"]["delivery_mode"] = json!("remote-bootstrap");
+    state["services"]["edge-proxy"]["sync_status"] = json!({
+        "secret_id": "pending",
+        "eab": "pending",
+        "responder_hmac": "pending",
+        "trust_sync": "pending"
+    });
+    state["services"]["edge-alt"] = secondary_service_state();
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state).expect("serialize state"),
+    )
+    .expect("write state");
+
+    let summary_path = temp_dir.path().join("remote-summary.json");
+    fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&json!({
+            "secret_id": {"status": "applied"},
+            "eab": {"status": "unchanged"},
+            "responder_hmac": {"status": "failed", "error": "simulated"},
+            "trust_sync": {"status": "pending"}
+        }))
+        .expect("serialize summary"),
+    )
+    .expect("write summary json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "sync-status",
+            "--service-name",
+            "edge-proxy",
+            "--summary-json",
+            summary_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run service sync-status");
+    assert!(output.status.success());
+
+    let updated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read updated state"))
+            .expect("parse updated state");
+
+    assert_primary_service_synced(&updated);
+    assert_secondary_service_unchanged(&updated);
+}
+
+#[cfg(unix)]
+#[test]
 fn test_app_info_missing_state_file() {
     let temp_dir = tempdir().expect("create temp dir");
 
@@ -1067,6 +1126,79 @@ fn write_state_with_app(root: &std::path::Path) {
         serde_json::to_string_pretty(&value).expect("serialize state"),
     )
     .expect("write state");
+}
+
+fn secondary_service_state() -> serde_json::Value {
+    json!({
+        "service_name": "edge-alt",
+        "deploy_type": "daemon",
+        "delivery_mode": "local-file",
+        "hostname": "edge-node-02",
+        "domain": "trusted.domain",
+        "agent_config_path": "agent-alt.toml",
+        "cert_path": "certs/edge-alt.crt",
+        "key_path": "certs/edge-alt.key",
+        "instance_id": "002",
+        "notes": "secondary",
+        "sync_status": {
+            "secret_id": "none",
+            "eab": "none",
+            "responder_hmac": "none",
+            "trust_sync": "none"
+        },
+        "approle": {
+            "role_name": "bootroot-service-edge-alt",
+            "role_id": "role-edge-alt",
+            "secret_id_path": "secrets/services/edge-alt/secret_id",
+            "policy_name": "bootroot-service-edge-alt"
+        }
+    })
+}
+
+fn assert_primary_service_synced(updated: &serde_json::Value) {
+    assert_eq!(
+        updated["services"]["edge-proxy"]["delivery_mode"],
+        "remote-bootstrap"
+    );
+    assert_eq!(
+        updated["services"]["edge-proxy"]["sync_status"]["secret_id"],
+        "applied"
+    );
+    assert_eq!(
+        updated["services"]["edge-proxy"]["sync_status"]["eab"],
+        "applied"
+    );
+    assert_eq!(
+        updated["services"]["edge-proxy"]["sync_status"]["responder_hmac"],
+        "failed"
+    );
+    assert_eq!(
+        updated["services"]["edge-proxy"]["sync_status"]["trust_sync"],
+        "pending"
+    );
+}
+
+fn assert_secondary_service_unchanged(updated: &serde_json::Value) {
+    assert_eq!(
+        updated["services"]["edge-alt"]["delivery_mode"],
+        "local-file"
+    );
+    assert_eq!(
+        updated["services"]["edge-alt"]["sync_status"]["secret_id"],
+        "none"
+    );
+    assert_eq!(
+        updated["services"]["edge-alt"]["sync_status"]["eab"],
+        "none"
+    );
+    assert_eq!(
+        updated["services"]["edge-alt"]["sync_status"]["responder_hmac"],
+        "none"
+    );
+    assert_eq!(
+        updated["services"]["edge-alt"]["sync_status"]["trust_sync"],
+        "none"
+    );
 }
 
 async fn stub_app_add_openbao(server: &MockServer, service_name: &str) {
