@@ -666,7 +666,7 @@ async fn write_remote_bootstrap_artifact(
 
     let remote_summary_path = format!("{}-remote-summary.json", resolved.service_name);
     let remote_run_command = format!(
-        "bootroot-remote pull --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --ca-bundle-path '{}' --summary-json '{}' --output json",
+        "bootroot-remote sync --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --ca-bundle-path '{}' --summary-json '{}' --output json",
         artifact.openbao_url,
         artifact.kv_mount,
         artifact.service_name,
@@ -744,7 +744,7 @@ async fn write_remote_bootstrap_artifact_file(
     fs_util::set_key_permissions(&artifact_path).await?;
     let remote_summary_path = format!("{service_name}-remote-summary.json");
     let remote_run_command = format!(
-        "bootroot-remote pull --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --ca-bundle-path '{}' --summary-json '{}' --output json",
+        "bootroot-remote sync --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --ca-bundle-path '{}' --summary-json '{}' --output json",
         artifact.openbao_url,
         artifact.kv_mount,
         artifact.service_name,

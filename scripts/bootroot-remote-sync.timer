@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic bootroot remote secret sync
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+Unit=bootroot-remote-sync.service
+
+[Install]
+WantedBy=timers.target
+

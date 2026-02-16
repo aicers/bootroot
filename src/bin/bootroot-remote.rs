@@ -32,6 +32,8 @@ enum Command {
     Pull(PullArgs),
     /// Acknowledge pull summary into control-plane sync-status
     Ack(AckArgs),
+    /// Run pull + ack with retry/backoff for scheduled sync
+    Sync(SyncArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -94,6 +96,69 @@ struct AckArgs {
     /// Optional state file path to pass through
     #[arg(long)]
     state_file: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct SyncArgs {
+    /// `OpenBao` base URL
+    #[arg(long, env = "OPENBAO_URL")]
+    openbao_url: String,
+
+    /// `OpenBao` KV mount (v2)
+    #[arg(long, default_value = "secret", env = "OPENBAO_KV_MOUNT")]
+    kv_mount: String,
+
+    /// Service name
+    #[arg(long)]
+    service_name: String,
+
+    /// `AppRole` `role_id` file path used for `OpenBao` login
+    #[arg(long)]
+    role_id_path: PathBuf,
+
+    /// Destination path for rotated `secret_id`
+    #[arg(long)]
+    secret_id_path: PathBuf,
+
+    /// Destination path for EAB JSON (kid/hmac)
+    #[arg(long)]
+    eab_file_path: PathBuf,
+
+    /// bootroot-agent config path to update
+    #[arg(long)]
+    agent_config_path: PathBuf,
+
+    /// CA bundle output path (required when trust data includes `ca_bundle_pem`)
+    #[arg(long)]
+    ca_bundle_path: Option<PathBuf>,
+
+    /// Summary JSON path shared between pull and ack
+    #[arg(long)]
+    summary_json: PathBuf,
+
+    /// bootroot CLI binary path for ack
+    #[arg(long, default_value = "bootroot")]
+    bootroot_bin: PathBuf,
+
+    /// Optional state file path to pass through ack
+    #[arg(long)]
+    state_file: Option<PathBuf>,
+
+    /// Output format for pull stage
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
+
+    /// Maximum sync attempts before failure (must be >= 1)
+    #[arg(long, default_value_t = 3)]
+    retry_attempts: u32,
+
+    /// Base backoff between retries in seconds
+    #[arg(long, default_value_t = 5)]
+    retry_backoff_secs: u64,
+
+    /// Extra randomized delay upper bound in seconds (0 disables jitter)
+    #[arg(long, default_value_t = 0)]
+    retry_jitter_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -187,6 +252,7 @@ async fn run(args: Args) -> Result<i32> {
     match args.command {
         Command::Pull(args) => run_pull(args).await,
         Command::Ack(args) => run_ack(&args),
+        Command::Sync(args) => run_sync(args).await,
     }
 }
 
@@ -387,6 +453,50 @@ fn run_ack(args: &AckArgs) -> Result<i32> {
     Ok(0)
 }
 
+async fn run_sync(args: SyncArgs) -> Result<i32> {
+    validate_sync_args(&args)?;
+    for attempt in 1..=args.retry_attempts {
+        let pull_args = PullArgs {
+            openbao_url: args.openbao_url.clone(),
+            kv_mount: args.kv_mount.clone(),
+            service_name: args.service_name.clone(),
+            role_id_path: args.role_id_path.clone(),
+            secret_id_path: args.secret_id_path.clone(),
+            eab_file_path: args.eab_file_path.clone(),
+            agent_config_path: args.agent_config_path.clone(),
+            ca_bundle_path: args.ca_bundle_path.clone(),
+            output: args.output,
+            summary_json: Some(args.summary_json.clone()),
+        };
+        match run_pull(pull_args).await {
+            Ok(0) => {
+                let ack_args = AckArgs {
+                    service_name: args.service_name.clone(),
+                    summary_json: args.summary_json.clone(),
+                    bootroot_bin: args.bootroot_bin.clone(),
+                    state_file: args.state_file.clone(),
+                };
+                return run_ack(&ack_args);
+            }
+            Ok(_pull_code) => {}
+            Err(err) => {
+                eprintln!("bootroot-remote sync pull attempt {attempt} failed: {err}");
+            }
+        }
+
+        if attempt < args.retry_attempts {
+            let delay_secs =
+                compute_retry_delay_secs(args.retry_backoff_secs, args.retry_jitter_secs);
+            eprintln!(
+                "bootroot-remote sync retry {attempt}/{} in {}s",
+                args.retry_attempts, delay_secs
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        }
+    }
+    Ok(1)
+}
+
 fn validate_pull_args(args: &PullArgs) -> Result<()> {
     if args.service_name.trim().is_empty() {
         anyhow::bail!("--service-name must not be empty");
@@ -430,6 +540,52 @@ fn validate_ack_args(args: &AckArgs) -> Result<()> {
         anyhow::bail!("summary JSON not found: {}", args.summary_json.display());
     }
     Ok(())
+}
+
+fn validate_sync_args(args: &SyncArgs) -> Result<()> {
+    if args.retry_attempts == 0 {
+        anyhow::bail!("--retry-attempts must be >= 1");
+    }
+    let pull_args = PullArgs {
+        openbao_url: args.openbao_url.clone(),
+        kv_mount: args.kv_mount.clone(),
+        service_name: args.service_name.clone(),
+        role_id_path: args.role_id_path.clone(),
+        secret_id_path: args.secret_id_path.clone(),
+        eab_file_path: args.eab_file_path.clone(),
+        agent_config_path: args.agent_config_path.clone(),
+        ca_bundle_path: args.ca_bundle_path.clone(),
+        output: args.output,
+        summary_json: Some(args.summary_json.clone()),
+    };
+    validate_pull_args(&pull_args)?;
+    let ack_args = AckArgs {
+        service_name: args.service_name.clone(),
+        summary_json: args.summary_json.clone(),
+        bootroot_bin: args.bootroot_bin.clone(),
+        state_file: args.state_file.clone(),
+    };
+    validate_ack_args_for_sync(&ack_args)
+}
+
+fn validate_ack_args_for_sync(args: &AckArgs) -> Result<()> {
+    if args.service_name.trim().is_empty() {
+        anyhow::bail!("--service-name must not be empty");
+    }
+    Ok(())
+}
+
+fn compute_retry_delay_secs(base: u64, jitter: u64) -> u64 {
+    if jitter == 0 {
+        return base;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let nanos_u64 = u64::try_from(nanos).unwrap_or(u64::MAX);
+    let extra = nanos_u64 % jitter.saturating_add(1);
+    base.saturating_add(extra)
 }
 
 async fn read_secret_file(path: &Path) -> Result<String> {
@@ -753,5 +909,16 @@ mod tests {
         let current = ApplyItemSummary::failed("failed".to_string());
         let merged = merge_apply_status(current, ApplyStatus::Applied, None);
         assert!(matches!(merged.status, ApplyStatus::Failed));
+    }
+
+    #[test]
+    fn test_compute_retry_delay_without_jitter_returns_base() {
+        assert_eq!(compute_retry_delay_secs(7, 0), 7);
+    }
+
+    #[test]
+    fn test_compute_retry_delay_with_jitter_is_bounded() {
+        let value = compute_retry_delay_secs(5, 3);
+        assert!((5..=8).contains(&value));
     }
 }
