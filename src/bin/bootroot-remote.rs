@@ -70,18 +70,55 @@ enum OutputFormat {
 enum ApplyStatus {
     Applied,
     Unchanged,
+    Failed,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplyItemSummary {
+    status: ApplyStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ApplyItemSummary {
+    fn applied(status: ApplyStatus) -> Self {
+        Self {
+            status,
+            error: None,
+        }
+    }
+
+    fn failed(error: String) -> Self {
+        Self {
+            status: ApplyStatus::Failed,
+            error: Some(error),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct ApplySummary {
-    secret_id: ApplyStatus,
-    eab: ApplyStatus,
-    responder_hmac: ApplyStatus,
-    trust_sync: ApplyStatus,
+    secret_id: ApplyItemSummary,
+    eab: ApplyItemSummary,
+    responder_hmac: ApplyItemSummary,
+    trust_sync: ApplyItemSummary,
     agent_config_path: String,
     secret_id_path: String,
     eab_file_path: String,
     ca_bundle_path: Option<String>,
+}
+
+impl ApplySummary {
+    fn has_failures(&self) -> bool {
+        [
+            self.secret_id.status,
+            self.eab.status,
+            self.responder_hmac.status,
+            self.trust_sync.status,
+        ]
+        .into_iter()
+        .any(|status| matches!(status, ApplyStatus::Failed))
+    }
 }
 
 #[derive(Debug)]
@@ -98,6 +135,18 @@ struct PulledSecrets {
 async fn main() {
     let args = Args::parse();
     match run(args).await {
+        Ok(summary) if summary.summary.has_failures() => {
+            match summary.output {
+                OutputFormat::Text => print_text_summary(&summary.summary),
+                OutputFormat::Json => match serde_json::to_string_pretty(&summary.summary) {
+                    Ok(payload) => println!("{payload}"),
+                    Err(err) => {
+                        eprintln!("Failed to serialize summary: {err}");
+                    }
+                },
+            }
+            std::process::exit(1);
+        }
         Ok(summary) => match summary.output {
             OutputFormat::Text => print_text_summary(&summary.summary),
             OutputFormat::Json => match serde_json::to_string_pretty(&summary.summary) {
@@ -152,54 +201,37 @@ async fn run(args: Args) -> Result<RunResult> {
     client.set_token(token);
 
     let pulled = pull_secrets(&client, &args.kv_mount, &args.service_name).await?;
-    let secret_id_status = write_secret_file(&args.secret_id_path, &pulled.secret_id).await?;
-    let eab_status = write_eab_file(&args.eab_file_path, &pulled.eab_kid, &pulled.eab_hmac).await?;
-
-    let agent_config = fs::read_to_string(&args.agent_config_path)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to read agent config {}",
-                args.agent_config_path.display()
-            )
-        })?;
-    let acme_pairs = vec![("http_responder_hmac", pulled.responder_hmac.clone())];
-    let hmac_updated = upsert_toml_section_keys(&agent_config, "acme", &acme_pairs);
-    let trust_pairs =
-        build_trust_updates(&pulled.trusted_ca_sha256, args.ca_bundle_path.as_deref());
-    let trust_updated = upsert_toml_section_keys(&hmac_updated, "trust", &trust_pairs);
-
-    let responder_hmac_status = if hmac_updated == agent_config {
-        ApplyStatus::Unchanged
-    } else {
-        ApplyStatus::Applied
+    let secret_id_status = match write_secret_file(&args.secret_id_path, &pulled.secret_id).await {
+        Ok(status) => ApplyItemSummary::applied(status),
+        Err(err) => ApplyItemSummary::failed(format!("secret_id apply failed: {err}")),
     };
-    let mut trust_sync_status = if trust_updated == hmac_updated {
-        ApplyStatus::Unchanged
-    } else {
-        ApplyStatus::Applied
-    };
-    if trust_updated != agent_config {
-        fs::write(&args.agent_config_path, &trust_updated)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to write agent config {}",
-                    args.agent_config_path.display()
-                )
-            })?;
-        fs_util::set_key_permissions(&args.agent_config_path).await?;
-    }
+    let eab_status =
+        match write_eab_file(&args.eab_file_path, &pulled.eab_kid, &pulled.eab_hmac).await {
+            Ok(status) => ApplyItemSummary::applied(status),
+            Err(err) => ApplyItemSummary::failed(format!("eab apply failed: {err}")),
+        };
+
+    let (responder_hmac_status, mut trust_sync_status) =
+        apply_agent_config_updates(&args, &pulled).await;
 
     if let Some(bundle_path) = args.ca_bundle_path.as_deref() {
-        let pem = pulled.ca_bundle_pem.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "trust data missing {CA_BUNDLE_PEM_KEY} while --ca-bundle-path was provided"
-            )
-        })?;
-        let bundle_status = write_secret_file(bundle_path, pem).await?;
-        if matches!(bundle_status, ApplyStatus::Applied) {
-            trust_sync_status = ApplyStatus::Applied;
+        match pulled.ca_bundle_pem.as_deref() {
+            Some(pem) => match write_secret_file(bundle_path, pem).await {
+                Ok(bundle_status) => {
+                    trust_sync_status = merge_apply_status(trust_sync_status, bundle_status, None);
+                }
+                Err(err) => {
+                    trust_sync_status = ApplyItemSummary::failed(format!(
+                        "ca bundle apply failed ({}): {err}",
+                        bundle_path.display()
+                    ));
+                }
+            },
+            None => {
+                trust_sync_status = ApplyItemSummary::failed(format!(
+                    "trust data missing {CA_BUNDLE_PEM_KEY} while --ca-bundle-path was provided"
+                ));
+            }
         }
     }
 
@@ -218,6 +250,95 @@ async fn run(args: Args) -> Result<RunResult> {
         summary,
         output: args.output,
     })
+}
+
+async fn apply_agent_config_updates(
+    args: &Args,
+    pulled: &PulledSecrets,
+) -> (ApplyItemSummary, ApplyItemSummary) {
+    let agent_config = match fs::read_to_string(&args.agent_config_path).await {
+        Ok(contents) => contents,
+        Err(err) => {
+            let message = format!(
+                "agent config read failed ({}): {err}",
+                args.agent_config_path.display()
+            );
+            return (
+                ApplyItemSummary::failed(message.clone()),
+                ApplyItemSummary::failed(message),
+            );
+        }
+    };
+
+    let acme_pairs = vec![("http_responder_hmac", pulled.responder_hmac.clone())];
+    let hmac_updated = upsert_toml_section_keys(&agent_config, "acme", &acme_pairs);
+    let trust_pairs =
+        build_trust_updates(&pulled.trusted_ca_sha256, args.ca_bundle_path.as_deref());
+    let trust_updated = upsert_toml_section_keys(&hmac_updated, "trust", &trust_pairs);
+
+    let responder_changed = hmac_updated != agent_config;
+    let trust_changed = trust_updated != hmac_updated;
+
+    let mut responder_hmac_status = ApplyItemSummary::applied(if responder_changed {
+        ApplyStatus::Applied
+    } else {
+        ApplyStatus::Unchanged
+    });
+    let mut trust_sync_status = ApplyItemSummary::applied(if trust_changed {
+        ApplyStatus::Applied
+    } else {
+        ApplyStatus::Unchanged
+    });
+
+    if trust_updated != agent_config {
+        if let Err(err) = fs::write(&args.agent_config_path, &trust_updated).await {
+            let message = format!(
+                "agent config write failed ({}): {err}",
+                args.agent_config_path.display()
+            );
+            if responder_changed {
+                responder_hmac_status = ApplyItemSummary::failed(message.clone());
+            }
+            if trust_changed {
+                trust_sync_status = ApplyItemSummary::failed(message);
+            }
+            return (responder_hmac_status, trust_sync_status);
+        }
+        if let Err(err) = fs_util::set_key_permissions(&args.agent_config_path).await {
+            let message = format!(
+                "agent config chmod failed ({}): {err}",
+                args.agent_config_path.display()
+            );
+            if responder_changed {
+                responder_hmac_status = ApplyItemSummary::failed(message.clone());
+            }
+            if trust_changed {
+                trust_sync_status = ApplyItemSummary::failed(message);
+            }
+        }
+    }
+
+    (responder_hmac_status, trust_sync_status)
+}
+
+fn merge_apply_status(
+    current: ApplyItemSummary,
+    next: ApplyStatus,
+    next_error: Option<String>,
+) -> ApplyItemSummary {
+    if matches!(current.status, ApplyStatus::Failed) {
+        return current;
+    }
+    if matches!(next, ApplyStatus::Failed) {
+        return ApplyItemSummary {
+            status: next,
+            error: next_error,
+        };
+    }
+    if matches!(current.status, ApplyStatus::Applied) || matches!(next, ApplyStatus::Applied) {
+        return ApplyItemSummary::applied(ApplyStatus::Applied);
+    }
+    ApplyItemSummary::applied(ApplyStatus::Unchanged)
 }
 
 fn validate_args(args: &Args) -> Result<()> {
@@ -487,13 +608,17 @@ fn is_section_header(value: &str) -> bool {
 
 fn print_text_summary(summary: &ApplySummary) {
     println!("bootroot-remote sync summary");
-    println!("- secret_id: {}", status_to_str(summary.secret_id));
-    println!("- eab: {}", status_to_str(summary.eab));
+    println!("- secret_id: {}", status_to_str(summary.secret_id.status));
+    print_optional_error("secret_id", summary.secret_id.error.as_deref());
+    println!("- eab: {}", status_to_str(summary.eab.status));
+    print_optional_error("eab", summary.eab.error.as_deref());
     println!(
         "- responder_hmac: {}",
-        status_to_str(summary.responder_hmac)
+        status_to_str(summary.responder_hmac.status)
     );
-    println!("- trust_sync: {}", status_to_str(summary.trust_sync));
+    print_optional_error("responder_hmac", summary.responder_hmac.error.as_deref());
+    println!("- trust_sync: {}", status_to_str(summary.trust_sync.status));
+    print_optional_error("trust_sync", summary.trust_sync.error.as_deref());
     println!("- agent_config_path: {}", summary.agent_config_path);
     println!("- secret_id_path: {}", summary.secret_id_path);
     println!("- eab_file_path: {}", summary.eab_file_path);
@@ -506,6 +631,13 @@ fn status_to_str(status: ApplyStatus) -> &'static str {
     match status {
         ApplyStatus::Applied => "applied",
         ApplyStatus::Unchanged => "unchanged",
+        ApplyStatus::Failed => "failed",
+    }
+}
+
+fn print_optional_error(name: &str, error: Option<&str>) {
+    if let Some(value) = error {
+        println!("  error({name}): {value}");
     }
 }
 
@@ -540,5 +672,12 @@ mod tests {
         );
         assert!(output.contains("[trust]"));
         assert!(output.contains("ca_bundle_path = \"certs/ca.pem\""));
+    }
+
+    #[test]
+    fn test_merge_apply_status_prefers_failed_state() {
+        let current = ApplyItemSummary::failed("failed".to_string());
+        let merged = merge_apply_status(current, ApplyStatus::Applied, None);
+        assert!(matches!(merged.status, ApplyStatus::Failed));
     }
 }

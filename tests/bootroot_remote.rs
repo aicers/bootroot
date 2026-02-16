@@ -183,6 +183,54 @@ async fn test_bootroot_remote_fails_when_trust_fingerprints_missing() {
     assert!(stderr.contains("trusted_ca_sha256"));
 }
 
+#[tokio::test]
+async fn test_bootroot_remote_reports_partial_failure_with_json_output() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let role_id_path = temp_dir.path().join("secrets").join("role_id");
+    let secret_id_path = temp_dir.path().join("secrets").join("secret_id");
+    let eab_file_path = temp_dir.path().join("secrets").join("eab.json");
+    let agent_config_path = temp_dir.path().join("agent.toml");
+
+    fs::create_dir_all(role_id_path.parent().expect("role_id parent")).expect("create secrets dir");
+    fs::write(&role_id_path, "role-edge-proxy\n").expect("write role_id");
+    fs::write(&secret_id_path, "old-secret\n").expect("write secret_id");
+    fs::create_dir_all(&agent_config_path)
+        .expect("create agent config directory to force read failure");
+
+    let server = MockServer::start().await;
+    stub_openbao_remote_sync(&server).await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .args([
+            "--openbao-url",
+            &server.uri(),
+            "--service-name",
+            "edge-proxy",
+            "--role-id-path",
+            role_id_path.to_string_lossy().as_ref(),
+            "--secret-id-path",
+            secret_id_path.to_string_lossy().as_ref(),
+            "--eab-file-path",
+            eab_file_path.to_string_lossy().as_ref(),
+            "--agent-config-path",
+            agent_config_path.to_string_lossy().as_ref(),
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("run bootroot-remote");
+
+    assert!(!output.status.success());
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse json summary");
+
+    assert_eq!(summary["secret_id"]["status"], "applied");
+    assert_eq!(summary["eab"]["status"], "applied");
+    assert_eq!(summary["responder_hmac"]["status"], "failed");
+    assert_eq!(summary["trust_sync"]["status"], "failed");
+    assert!(summary["responder_hmac"]["error"].is_string());
+}
+
 async fn stub_openbao_remote_sync(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/auth/approle/login"))
