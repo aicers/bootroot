@@ -138,11 +138,14 @@ assert_state_applied() {
 }
 
 run_verify() {
-  PATH="$WORK_DIR/bin:$PATH" \
-    "$BOOTROOT_BIN" verify \
-      --service-name "$SERVICE_NAME" \
-      --agent-config "$WORK_DIR/agent.toml" \
-      >/dev/null
+  (
+    cd "$WORK_DIR"
+    PATH="$WORK_DIR/bin:$PATH" \
+      "$BOOTROOT_BIN" verify \
+        --service-name "$SERVICE_NAME" \
+        --agent-config "agent.toml" \
+        >/dev/null
+  )
 }
 
 main() {
