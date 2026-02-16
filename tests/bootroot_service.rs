@@ -424,6 +424,72 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_app_add_remote_bootstrap_rerun_is_idempotent() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+
+    let agent_config_value = agent_config.to_string_lossy().to_string();
+    let cert_path_value = cert_path.to_string_lossy().to_string();
+    let key_path_value = key_path.to_string_lossy().to_string();
+    let args = [
+        "service",
+        "add",
+        "--service-name",
+        "edge-proxy",
+        "--deploy-type",
+        "daemon",
+        "--delivery-mode",
+        "remote-bootstrap",
+        "--hostname",
+        "edge-node-01",
+        "--domain",
+        "trusted.domain",
+        "--agent-config",
+        &agent_config_value,
+        "--cert-path",
+        &cert_path_value,
+        "--key-path",
+        &key_path_value,
+        "--instance-id",
+        "001",
+        "--root-token",
+        ROOT_TOKEN,
+    ];
+
+    let first = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(args)
+        .output()
+        .expect("run service add first");
+    assert!(first.status.success());
+
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(args)
+        .output()
+        .expect("run service add second");
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(second.status.success());
+    assert!(stdout.contains("existing remote-bootstrap service matched input"));
+
+    let state_contents =
+        fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
+    let state: serde_json::Value = serde_json::from_str(&state_contents).expect("parse state");
+    assert!(state["services"]["edge-proxy"].is_object());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_app_add_local_file_sets_verify_prerequisites() {
     use support::ROOT_TOKEN;
 
