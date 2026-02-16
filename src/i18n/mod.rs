@@ -246,6 +246,8 @@ pub(crate) struct Strings {
     pub(crate) status_section_openbao: &'static str,
     pub(crate) status_section_kv_paths: &'static str,
     pub(crate) status_section_approles: &'static str,
+    pub(crate) status_section_services: &'static str,
+    pub(crate) status_services_none: &'static str,
     pub(crate) status_infra_entry_with_health: &'static str,
     pub(crate) status_infra_entry_without_health: &'static str,
     pub(crate) status_openbao_health: &'static str,
@@ -253,6 +255,8 @@ pub(crate) struct Strings {
     pub(crate) status_openbao_kv_mount: &'static str,
     pub(crate) status_kv_path_entry: &'static str,
     pub(crate) status_approle_entry: &'static str,
+    pub(crate) status_service_delivery_mode: &'static str,
+    pub(crate) status_service_sync_status: &'static str,
     pub(crate) status_value_ok: &'static str,
     pub(crate) status_value_unreachable: &'static str,
     pub(crate) status_value_present: &'static str,
@@ -1399,6 +1403,14 @@ impl Messages {
         self.strings().status_section_approles
     }
 
+    pub(crate) fn status_section_services(&self) -> &'static str {
+        self.strings().status_section_services
+    }
+
+    pub(crate) fn status_services_none(&self) -> &'static str {
+        self.strings().status_services_none
+    }
+
     pub(crate) fn status_infra_entry_with_health(
         &self,
         service: &str,
@@ -1444,6 +1456,25 @@ impl Messages {
         format_template(
             self.strings().status_approle_entry,
             &[("role", role), ("value", value)],
+        )
+    }
+
+    pub(crate) fn status_service_delivery_mode(&self, service: &str, value: &str) -> String {
+        format_template(
+            self.strings().status_service_delivery_mode,
+            &[("service", service), ("value", value)],
+        )
+    }
+
+    pub(crate) fn status_service_sync_status(
+        &self,
+        service: &str,
+        name: &str,
+        value: &str,
+    ) -> String {
+        format_template(
+            self.strings().status_service_sync_status,
+            &[("service", service), ("name", name), ("value", value)],
         )
     }
 

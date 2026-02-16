@@ -7,6 +7,7 @@ use crate::commands::init::{
     PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
 };
 use crate::i18n::Messages;
+use crate::state::StateFile;
 
 pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result<()> {
     let services = default_infra_services();
@@ -69,6 +70,7 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
     } else {
         None
     };
+    let service_statuses = load_service_statuses(messages)?;
 
     let summary = StatusSummary {
         readiness: &readiness,
@@ -78,6 +80,7 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         kv_mount_status,
         kv_statuses: kv_statuses.as_deref(),
         approle_statuses: approle_statuses.as_deref(),
+        service_statuses: &service_statuses,
     };
     print_status_summary(messages, &summary);
 
@@ -89,6 +92,27 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
     }
 
     Ok(())
+}
+
+fn load_service_statuses(messages: &Messages) -> Result<Vec<ServiceStatusEntry>> {
+    let state_path = StateFile::default_path();
+    if !state_path.exists() {
+        return Ok(Vec::new());
+    }
+    let state =
+        StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
+    let mut service_statuses = Vec::with_capacity(state.services.len());
+    for entry in state.services.values() {
+        service_statuses.push(ServiceStatusEntry {
+            service_name: entry.service_name.clone(),
+            delivery_mode: entry.delivery_mode.as_str().to_string(),
+            secret_id: entry.sync_status.secret_id.as_str().to_string(),
+            eab: entry.sync_status.eab.as_str().to_string(),
+            responder_hmac: entry.sync_status.responder_hmac.as_str().to_string(),
+            trust_sync: entry.sync_status.trust_sync.as_str().to_string(),
+        });
+    }
+    Ok(service_statuses)
 }
 
 fn collect_infra_failures(readiness: &[ContainerReadiness]) -> Vec<String> {
@@ -148,6 +172,16 @@ struct StatusSummary<'a> {
     kv_mount_status: Option<KvMountStatus>,
     kv_statuses: Option<&'a [(String, bool)]>,
     approle_statuses: Option<&'a [(String, bool)]>,
+    service_statuses: &'a [ServiceStatusEntry],
+}
+
+struct ServiceStatusEntry {
+    service_name: String,
+    delivery_mode: String,
+    secret_id: String,
+    eab: String,
+    responder_hmac: String,
+    trust_sync: String,
 }
 
 fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
@@ -165,7 +199,13 @@ fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
             ),
         }
     }
+    print_openbao_section(messages, summary);
+    print_kv_paths_section(messages, summary);
+    print_approles_section(messages, summary);
+    print_services_section(messages, summary);
+}
 
+fn print_openbao_section(messages: &Messages, summary: &StatusSummary<'_>) {
     println!("{}", messages.status_section_openbao());
     let health_value = if summary.openbao_ok {
         messages.status_value_ok()
@@ -192,7 +232,9 @@ fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
         "{}",
         messages.status_openbao_kv_mount(summary.kv_mount, kv_mount_value)
     );
+}
 
+fn print_kv_paths_section(messages: &Messages, summary: &StatusSummary<'_>) {
     println!("{}", messages.status_section_kv_paths());
     if let Some(statuses) = summary.kv_statuses {
         for (path, present) in statuses {
@@ -223,7 +265,9 @@ fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
             );
         }
     }
+}
 
+fn print_approles_section(messages: &Messages, summary: &StatusSummary<'_>) {
     println!("{}", messages.status_section_approles());
     if let Some(statuses) = summary.approle_statuses {
         for (role, present) in statuses {
@@ -243,6 +287,49 @@ fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
             println!(
                 "{}",
                 messages.status_approle_entry(role, messages.status_value_unknown())
+            );
+        }
+    }
+}
+
+fn print_services_section(messages: &Messages, summary: &StatusSummary<'_>) {
+    println!("{}", messages.status_section_services());
+    if summary.service_statuses.is_empty() {
+        println!("{}", messages.status_services_none());
+    } else {
+        for service in summary.service_statuses {
+            println!(
+                "{}",
+                messages
+                    .status_service_delivery_mode(&service.service_name, &service.delivery_mode)
+            );
+            println!(
+                "{}",
+                messages.status_service_sync_status(
+                    &service.service_name,
+                    "secret_id",
+                    &service.secret_id
+                )
+            );
+            println!(
+                "{}",
+                messages.status_service_sync_status(&service.service_name, "eab", &service.eab)
+            );
+            println!(
+                "{}",
+                messages.status_service_sync_status(
+                    &service.service_name,
+                    "responder_hmac",
+                    &service.responder_hmac,
+                )
+            );
+            println!(
+                "{}",
+                messages.status_service_sync_status(
+                    &service.service_name,
+                    "trust_sync",
+                    &service.trust_sync
+                )
             );
         }
     }
