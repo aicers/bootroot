@@ -42,9 +42,6 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
 
     let preview = args.dry_run || args.print_only;
     let resolved = resolve_service_add_args(args, messages, preview)?;
-    if state.services.contains_key(&resolved.service_name) {
-        anyhow::bail!(messages.error_service_duplicate(&resolved.service_name));
-    }
 
     validate_service_add(&resolved, messages)?;
 
@@ -65,6 +62,13 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
         notes: resolved.notes.as_deref(),
     };
     print_service_add_plan(&plan, messages);
+
+    if let Some(existing) = state.services.get(&resolved.service_name).cloned() {
+        if is_idempotent_remote_rerun(&existing, &resolved) {
+            return run_service_add_remote_idempotent(&state, &existing, messages).await;
+        }
+        anyhow::bail!(messages.error_service_duplicate(&resolved.service_name));
+    }
 
     if preview {
         run_service_add_preview(&state, &resolved, messages);
@@ -196,6 +200,33 @@ async fn run_service_add_apply(
             trusted_ca_sha256: trusted_ca_sha256.as_deref(),
             show_snippets: false,
             note: Some(messages.service_summary_print_only_hint()),
+        },
+        messages,
+    );
+    Ok(())
+}
+
+async fn run_service_add_remote_idempotent(
+    state: &StateFile,
+    entry: &ServiceEntry,
+    messages: &Messages,
+) -> Result<()> {
+    let secrets_dir = state.secrets_dir();
+    let remote_bootstrap =
+        write_remote_bootstrap_artifact_from_entry(state, &secrets_dir, entry, messages).await?;
+    print_service_add_summary(
+        entry,
+        &entry.approle.secret_id_path,
+        ServiceAddSummaryOptions {
+            applied: None,
+            remote: Some(ServiceAddRemoteBootstrap {
+                bootstrap_file: &remote_bootstrap.bootstrap_file,
+                remote_run_command: &remote_bootstrap.remote_run_command,
+                control_sync_command: &remote_bootstrap.control_sync_command,
+            }),
+            trusted_ca_sha256: None,
+            show_snippets: false,
+            note: Some(messages.service_summary_remote_idempotent_hint()),
         },
         messages,
     );
@@ -551,6 +582,20 @@ template {{
     )
 }
 
+fn is_idempotent_remote_rerun(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
+    matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap)
+        && matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap)
+        && entry.deploy_type == resolved.deploy_type
+        && entry.hostname == resolved.hostname
+        && entry.domain == resolved.domain
+        && entry.agent_config_path == resolved.agent_config
+        && entry.cert_path == resolved.cert_path
+        && entry.key_path == resolved.key_path
+        && entry.instance_id == resolved.instance_id
+        && entry.container_name == resolved.container_name
+        && entry.notes == resolved.notes
+}
+
 async fn write_remote_bootstrap_artifact(
     state: &StateFile,
     secrets_dir: &Path,
@@ -610,6 +655,84 @@ async fn write_remote_bootstrap_artifact(
     let control_sync_command = format!(
         "bootroot service sync-status --service-name '{}' --summary-json '{}'",
         resolved.service_name, remote_summary_path
+    );
+    Ok(RemoteBootstrapResult {
+        bootstrap_file: artifact_path.display().to_string(),
+        remote_run_command,
+        control_sync_command,
+    })
+}
+
+async fn write_remote_bootstrap_artifact_from_entry(
+    state: &StateFile,
+    secrets_dir: &Path,
+    entry: &ServiceEntry,
+    messages: &Messages,
+) -> Result<RemoteBootstrapResult> {
+    let secret_id_path = entry.approle.secret_id_path.clone();
+    let role_id_path = secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(SERVICE_ROLE_ID_FILENAME);
+    let eab_path = secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("eab.json");
+    let ca_bundle_path = entry
+        .cert_path
+        .parent()
+        .unwrap_or(Path::new("certs"))
+        .join("ca-bundle.pem");
+    let artifact = RemoteBootstrapArtifact {
+        openbao_url: state.openbao_url.clone(),
+        kv_mount: state.kv_mount.clone(),
+        service_name: entry.service_name.clone(),
+        role_id_path: role_id_path.display().to_string(),
+        secret_id_path: secret_id_path.display().to_string(),
+        eab_file_path: eab_path.display().to_string(),
+        agent_config_path: entry.agent_config_path.display().to_string(),
+        ca_bundle_path: ca_bundle_path.display().to_string(),
+    };
+    write_remote_bootstrap_artifact_file(
+        secrets_dir,
+        entry.service_name.as_str(),
+        &artifact,
+        messages,
+    )
+    .await
+}
+
+async fn write_remote_bootstrap_artifact_file(
+    secrets_dir: &Path,
+    service_name: &str,
+    artifact: &RemoteBootstrapArtifact,
+    messages: &Messages,
+) -> Result<RemoteBootstrapResult> {
+    let artifact_dir = secrets_dir.join(REMOTE_BOOTSTRAP_DIR).join(service_name);
+    fs_util::ensure_secrets_dir(&artifact_dir).await?;
+    let artifact_path = artifact_dir.join(REMOTE_BOOTSTRAP_FILENAME);
+    let payload = serde_json::to_string_pretty(artifact)
+        .with_context(|| "Failed to serialize remote bootstrap artifact".to_string())?;
+    fs::write(&artifact_path, payload)
+        .await
+        .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
+    fs_util::set_key_permissions(&artifact_path).await?;
+    let remote_summary_path = format!("{service_name}-remote-summary.json");
+    let remote_run_command = format!(
+        "bootroot-remote --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --ca-bundle-path '{}' --output json > {}",
+        artifact.openbao_url,
+        artifact.kv_mount,
+        artifact.service_name,
+        artifact.role_id_path,
+        artifact.secret_id_path,
+        artifact.eab_file_path,
+        artifact.agent_config_path,
+        artifact.ca_bundle_path,
+        remote_summary_path
+    );
+    let control_sync_command = format!(
+        "bootroot service sync-status --service-name '{}' --summary-json '{}'",
+        artifact.service_name, remote_summary_path
     );
     Ok(RemoteBootstrapResult {
         bootstrap_file: artifact_path.display().to_string(),

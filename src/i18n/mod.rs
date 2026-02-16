@@ -224,6 +224,7 @@ pub(crate) struct Strings {
     pub(crate) service_summary_next_steps: &'static str,
     pub(crate) service_summary_print_only_hint: &'static str,
     pub(crate) service_summary_preview_mode: &'static str,
+    pub(crate) service_summary_remote_idempotent_hint: &'static str,
     pub(crate) service_next_steps_daemon_profile: &'static str,
     pub(crate) service_next_steps_docker_sidecar: &'static str,
     pub(crate) service_next_steps_openbao_agent_title: &'static str,
@@ -1271,6 +1272,10 @@ impl Messages {
 
     pub(crate) fn service_summary_preview_mode(&self) -> &'static str {
         self.strings().service_summary_preview_mode
+    }
+
+    pub(crate) fn service_summary_remote_idempotent_hint(&self) -> &'static str {
+        self.strings().service_summary_remote_idempotent_hint
     }
 
     pub(crate) fn service_next_steps_daemon_profile(
