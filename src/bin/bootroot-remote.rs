@@ -22,6 +22,20 @@ const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
     about = "Pull/apply remote service secrets from OpenBao"
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Pull and apply service secrets from `OpenBao`
+    Pull(PullArgs),
+    /// Acknowledge pull summary into control-plane sync-status
+    Ack(AckArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct PullArgs {
     /// `OpenBao` base URL
     #[arg(long, env = "OPENBAO_URL")]
     openbao_url: String,
@@ -57,6 +71,29 @@ struct Args {
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     output: OutputFormat,
+
+    /// Optional path to write summary JSON for later ack ingest
+    #[arg(long)]
+    summary_json: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct AckArgs {
+    /// Service name
+    #[arg(long)]
+    service_name: String,
+
+    /// Path to summary JSON produced by `pull`
+    #[arg(long)]
+    summary_json: PathBuf,
+
+    /// bootroot CLI binary path
+    #[arg(long, default_value = "bootroot")]
+    bootroot_bin: PathBuf,
+
+    /// Optional state file path to pass through
+    #[arg(long)]
+    state_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -102,10 +139,6 @@ struct ApplySummary {
     eab: ApplyItemSummary,
     responder_hmac: ApplyItemSummary,
     trust_sync: ApplyItemSummary,
-    agent_config_path: String,
-    secret_id_path: String,
-    eab_file_path: String,
-    ca_bundle_path: Option<String>,
 }
 
 impl ApplySummary {
@@ -135,28 +168,11 @@ struct PulledSecrets {
 async fn main() {
     let args = Args::parse();
     match run(args).await {
-        Ok(summary) if summary.summary.has_failures() => {
-            match summary.output {
-                OutputFormat::Text => print_text_summary(&summary.summary),
-                OutputFormat::Json => match serde_json::to_string_pretty(&summary.summary) {
-                    Ok(payload) => println!("{payload}"),
-                    Err(err) => {
-                        eprintln!("Failed to serialize summary: {err}");
-                    }
-                },
+        Ok(exit_code) => {
+            if exit_code != 0 {
+                std::process::exit(exit_code);
             }
-            std::process::exit(1);
         }
-        Ok(summary) => match summary.output {
-            OutputFormat::Text => print_text_summary(&summary.summary),
-            OutputFormat::Json => match serde_json::to_string_pretty(&summary.summary) {
-                Ok(payload) => println!("{payload}"),
-                Err(err) => {
-                    eprintln!("Failed to serialize summary: {err}");
-                    std::process::exit(1);
-                }
-            },
-        },
         Err(err) => {
             eprintln!("bootroot-remote failed: {err}");
             if let Some(detail) = err.chain().nth(1) {
@@ -167,13 +183,15 @@ async fn main() {
     }
 }
 
-struct RunResult {
-    summary: ApplySummary,
-    output: OutputFormat,
+async fn run(args: Args) -> Result<i32> {
+    match args.command {
+        Command::Pull(args) => run_pull(args).await,
+        Command::Ack(args) => run_ack(&args),
+    }
 }
 
-async fn run(args: Args) -> Result<RunResult> {
-    validate_args(&args)?;
+async fn run_pull(args: PullArgs) -> Result<i32> {
+    validate_pull_args(&args)?;
 
     let role_id = read_secret_file(&args.role_id_path)
         .await
@@ -240,20 +258,19 @@ async fn run(args: Args) -> Result<RunResult> {
         eab: eab_status,
         responder_hmac: responder_hmac_status,
         trust_sync: trust_sync_status,
-        agent_config_path: args.agent_config_path.display().to_string(),
-        secret_id_path: args.secret_id_path.display().to_string(),
-        eab_file_path: args.eab_file_path.display().to_string(),
-        ca_bundle_path: args.ca_bundle_path.map(|path| path.display().to_string()),
     };
-
-    Ok(RunResult {
-        summary,
-        output: args.output,
-    })
+    if let Some(summary_json) = args.summary_json.as_deref() {
+        write_summary_json(summary_json, &summary).await?;
+    }
+    print_summary(&summary, args.output)?;
+    if summary.has_failures() {
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 async fn apply_agent_config_updates(
-    args: &Args,
+    args: &PullArgs,
     pulled: &PulledSecrets,
 ) -> (ApplyItemSummary, ApplyItemSummary) {
     let agent_config = match fs::read_to_string(&args.agent_config_path).await {
@@ -341,7 +358,36 @@ fn merge_apply_status(
     ApplyItemSummary::applied(ApplyStatus::Unchanged)
 }
 
-fn validate_args(args: &Args) -> Result<()> {
+fn run_ack(args: &AckArgs) -> Result<i32> {
+    validate_ack_args(args)?;
+    let status = std::process::Command::new(&args.bootroot_bin)
+        .arg("service")
+        .arg("sync-status")
+        .arg("--service-name")
+        .arg(&args.service_name)
+        .arg("--summary-json")
+        .arg(&args.summary_json)
+        .args(
+            args.state_file
+                .as_ref()
+                .map(|path| ["--state-file".to_string(), path.display().to_string()])
+                .into_iter()
+                .flatten(),
+        )
+        .status()
+        .with_context(|| {
+            format!(
+                "Failed to execute bootroot sync-status via {}",
+                args.bootroot_bin.display()
+            )
+        })?;
+    if !status.success() {
+        anyhow::bail!("bootroot service sync-status failed with status {status}");
+    }
+    Ok(0)
+}
+
+fn validate_pull_args(args: &PullArgs) -> Result<()> {
     if args.service_name.trim().is_empty() {
         anyhow::bail!("--service-name must not be empty");
     }
@@ -372,6 +418,16 @@ fn validate_args(args: &Args) -> Result<()> {
             "agent config file not found: {}",
             args.agent_config_path.display()
         );
+    }
+    Ok(())
+}
+
+fn validate_ack_args(args: &AckArgs) -> Result<()> {
+    if args.service_name.trim().is_empty() {
+        anyhow::bail!("--service-name must not be empty");
+    }
+    if !args.summary_json.exists() {
+        anyhow::bail!("summary JSON not found: {}", args.summary_json.display());
     }
     Ok(())
 }
@@ -619,26 +675,6 @@ fn print_text_summary(summary: &ApplySummary) {
     print_optional_error("responder_hmac", summary.responder_hmac.error.as_deref());
     println!("- trust_sync: {}", status_to_str(summary.trust_sync.status));
     print_optional_error("trust_sync", summary.trust_sync.error.as_deref());
-    println!(
-        "- agent_config_path: {}",
-        redacted_path_state(&summary.agent_config_path)
-    );
-    println!(
-        "- secret_id_path: {}",
-        redacted_path_state(&summary.secret_id_path)
-    );
-    println!(
-        "- eab_file_path: {}",
-        redacted_path_state(&summary.eab_file_path)
-    );
-    println!(
-        "- ca_bundle_path: {}",
-        if summary.ca_bundle_path.is_some() {
-            "<configured>"
-        } else {
-            "<not configured>"
-        }
-    );
 }
 
 fn status_to_str(status: ApplyStatus) -> &'static str {
@@ -655,12 +691,28 @@ fn print_optional_error(name: &str, error: Option<&str>) {
     }
 }
 
-fn redacted_path_state(value: &str) -> &'static str {
-    if value.is_empty() {
-        "<not set>"
-    } else {
-        "<redacted>"
+fn print_summary(summary: &ApplySummary, output: OutputFormat) -> Result<()> {
+    match output {
+        OutputFormat::Text => {
+            print_text_summary(summary);
+            Ok(())
+        }
+        OutputFormat::Json => {
+            let payload = serde_json::to_string_pretty(summary)?;
+            println!("{payload}");
+            Ok(())
+        }
     }
+}
+
+async fn write_summary_json(path: &Path, summary: &ApplySummary) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs_util::ensure_secrets_dir(parent).await?;
+    }
+    let payload = serde_json::to_string_pretty(summary)?;
+    fs::write(path, payload).await?;
+    fs_util::set_key_permissions(path).await?;
+    Ok(())
 }
 
 #[cfg(test)]
