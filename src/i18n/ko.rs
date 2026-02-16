@@ -166,6 +166,8 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_deploy_type: "- 배포 타입: {value}",
     service_summary_hostname: "- 호스트명: {value}",
     service_summary_domain: "- 도메인: {value}",
+    service_summary_delivery_mode: "- 전달 모드: {value}",
+    service_summary_sync_status: "- 동기화 {name}: {value}",
     service_summary_instance_id: "- instance_id: {value}",
     service_summary_container_name: "- 컨테이너 이름: {value}",
     service_summary_notes: "- 메모: {value}",
