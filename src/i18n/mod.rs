@@ -209,6 +209,9 @@ pub(crate) struct Strings {
     pub(crate) service_summary_approle: &'static str,
     pub(crate) service_summary_secret_path: &'static str,
     pub(crate) service_summary_openbao_path: &'static str,
+    pub(crate) service_summary_auto_applied_agent_config: &'static str,
+    pub(crate) service_summary_auto_applied_openbao_config: &'static str,
+    pub(crate) service_summary_auto_applied_openbao_template: &'static str,
     pub(crate) service_summary_agent_config: &'static str,
     pub(crate) service_summary_cert_path: &'static str,
     pub(crate) service_summary_key_path: &'static str,
@@ -1168,6 +1171,27 @@ impl Messages {
     pub(crate) fn service_summary_openbao_path(&self, value: &str) -> String {
         format_template(
             self.strings().service_summary_openbao_path,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_auto_applied_agent_config(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_auto_applied_agent_config,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_auto_applied_openbao_config(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_auto_applied_openbao_config,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_auto_applied_openbao_template(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_auto_applied_openbao_template,
             &[("value", value)],
         )
     }

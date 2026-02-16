@@ -7,7 +7,8 @@ use tokio::fs;
 
 use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs};
 use crate::cli::output::{
-    ServiceAddPlan, print_service_add_plan, print_service_add_summary, print_service_info_summary,
+    ServiceAddAppliedPaths, ServiceAddPlan, print_service_add_plan, print_service_add_summary,
+    print_service_info_summary,
 };
 use crate::cli::prompt::Prompt;
 use crate::commands::init::{PATH_CA_TRUST, SECRET_ID_TTL, TOKEN_TTL};
@@ -20,7 +21,13 @@ const SERVICE_KV_BASE: &str = "bootroot/services";
 const SERVICE_SECRET_DIR: &str = "services";
 const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
 const SERVICE_SECRET_ID_FILENAME: &str = "secret_id";
+const OPENBAO_SERVICE_CONFIG_DIR: &str = "openbao/services";
+const OPENBAO_AGENT_CONFIG_FILENAME: &str = "agent.hcl";
+const OPENBAO_AGENT_TEMPLATE_FILENAME: &str = "agent.toml.ctmpl";
+const OPENBAO_AGENT_TOKEN_FILENAME: &str = "token";
 const CA_TRUST_KEY: &str = "trusted_ca_sha256";
+const MANAGED_PROFILE_BEGIN_PREFIX: &str = "# BEGIN bootroot managed profile:";
+const MANAGED_PROFILE_END_PREFIX: &str = "# END bootroot managed profile:";
 
 pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) -> Result<()> {
     let state_path = StateFile::default_path();
@@ -83,6 +90,11 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
         messages,
     )
     .await?;
+    let applied = if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
+        Some(apply_local_service_configs(&secrets_dir, &resolved, &secret_id_path, messages).await?)
+    } else {
+        None
+    };
 
     let entry = ServiceEntry {
         service_name: resolved.service_name.clone(),
@@ -115,6 +127,11 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     print_service_add_summary(
         &entry,
         &secret_id_path,
+        applied.as_ref().map(|result| ServiceAddAppliedPaths {
+            agent_config: &result.agent_config,
+            openbao_agent_config: &result.openbao_agent_config,
+            openbao_agent_template: &result.openbao_agent_template,
+        }),
         trusted_ca_sha256.as_deref(),
         messages,
     );
@@ -211,6 +228,164 @@ struct ServiceAppRoleMaterialized {
     role_id: String,
     secret_id: String,
     policy_name: String,
+}
+
+struct LocalApplyResult {
+    agent_config: String,
+    openbao_agent_config: String,
+    openbao_agent_template: String,
+}
+
+async fn apply_local_service_configs(
+    secrets_dir: &Path,
+    resolved: &ResolvedServiceAdd,
+    secret_id_path: &Path,
+    messages: &Messages,
+) -> Result<LocalApplyResult> {
+    let profile = render_managed_profile_block(resolved);
+    let current = if resolved.agent_config.exists() {
+        fs::read_to_string(&resolved.agent_config)
+            .await
+            .with_context(|| {
+                messages.error_read_file_failed(&resolved.agent_config.display().to_string())
+            })?
+    } else {
+        String::new()
+    };
+    let next = upsert_managed_profile(&current, &resolved.service_name, &profile);
+    fs::write(&resolved.agent_config, &next)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&resolved.agent_config.display().to_string())
+        })?;
+    fs_util::set_key_permissions(&resolved.agent_config).await?;
+
+    let openbao_service_dir = secrets_dir
+        .join(OPENBAO_SERVICE_CONFIG_DIR)
+        .join(&resolved.service_name);
+    fs_util::ensure_secrets_dir(&openbao_service_dir).await?;
+
+    let template_path = openbao_service_dir.join(OPENBAO_AGENT_TEMPLATE_FILENAME);
+    fs::write(&template_path, next)
+        .await
+        .with_context(|| messages.error_write_file_failed(&template_path.display().to_string()))?;
+    fs_util::set_key_permissions(&template_path).await?;
+
+    let role_id_path = secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(SERVICE_ROLE_ID_FILENAME);
+    let token_path = openbao_service_dir.join(OPENBAO_AGENT_TOKEN_FILENAME);
+    let agent_config_path = openbao_service_dir.join(OPENBAO_AGENT_CONFIG_FILENAME);
+    let agent_hcl = render_openbao_agent_config(
+        &role_id_path,
+        secret_id_path,
+        &token_path,
+        &template_path,
+        &resolved.agent_config,
+    );
+    fs::write(&agent_config_path, agent_hcl)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&agent_config_path.display().to_string())
+        })?;
+    fs_util::set_key_permissions(&agent_config_path).await?;
+
+    Ok(LocalApplyResult {
+        agent_config: resolved.agent_config.display().to_string(),
+        openbao_agent_config: agent_config_path.display().to_string(),
+        openbao_agent_template: template_path.display().to_string(),
+    })
+}
+
+fn render_managed_profile_block(args: &ResolvedServiceAdd) -> String {
+    let instance_id = args.instance_id.as_deref().unwrap_or_default();
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{MANAGED_PROFILE_BEGIN_PREFIX} {}",
+        args.service_name
+    ));
+    lines.push("[[profiles]]".to_string());
+    lines.push(format!("service_name = \"{}\"", args.service_name));
+    lines.push(format!("instance_id = \"{instance_id}\""));
+    lines.push(format!("hostname = \"{}\"", args.hostname));
+    lines.push(String::new());
+    lines.push("[profiles.paths]".to_string());
+    lines.push(format!("cert = \"{}\"", args.cert_path.display()));
+    lines.push(format!("key = \"{}\"", args.key_path.display()));
+    lines.push(format!(
+        "{MANAGED_PROFILE_END_PREFIX} {}",
+        args.service_name
+    ));
+    format!("{}\n", lines.join("\n"))
+}
+
+fn upsert_managed_profile(contents: &str, service_name: &str, replacement: &str) -> String {
+    let begin_marker = format!("{MANAGED_PROFILE_BEGIN_PREFIX} {service_name}");
+    let end_marker = format!("{MANAGED_PROFILE_END_PREFIX} {service_name}");
+    if let Some(begin) = contents.find(&begin_marker)
+        && let Some(end_relative) = contents[begin..].find(&end_marker)
+    {
+        let end = begin + end_relative + end_marker.len();
+        let suffix = contents[end..]
+            .strip_prefix('\n')
+            .unwrap_or(&contents[end..]);
+        let mut updated = String::new();
+        updated.push_str(&contents[..begin]);
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(replacement);
+        if !suffix.is_empty() && !replacement.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(suffix);
+        return updated;
+    }
+
+    let mut updated = contents.trim_end().to_string();
+    if !updated.is_empty() {
+        updated.push_str("\n\n");
+    }
+    updated.push_str(replacement);
+    updated
+}
+
+fn render_openbao_agent_config(
+    role_id_path: &Path,
+    secret_id_path: &Path,
+    token_path: &Path,
+    template_path: &Path,
+    destination_path: &Path,
+) -> String {
+    format!(
+        r#"auto_auth {{
+  method "approle" {{
+    mount_path = "auth/approle"
+    config = {{
+      role_id_file_path = "{role_id_path}"
+      secret_id_file_path = "{secret_id_path}"
+    }}
+  }}
+  sink "file" {{
+    config = {{
+      path = "{token_path}"
+    }}
+  }}
+}}
+
+template {{
+  source = "{template_path}"
+  destination = "{destination_path}"
+  perms = "0600"
+}}
+"#,
+        role_id_path = role_id_path.display(),
+        secret_id_path = secret_id_path.display(),
+        token_path = token_path.display(),
+        template_path = template_path.display(),
+        destination_path = destination_path.display(),
+    )
 }
 
 async fn ensure_service_approle(
@@ -320,7 +495,7 @@ fn resolve_service_add_args(
         args.agent_config.clone(),
         messages.prompt_agent_config(),
         &mut prompt,
-        true,
+        matches!(delivery_mode, DeliveryMode::RemoteBootstrap),
         messages,
     )?;
 
@@ -508,5 +683,27 @@ mod tests {
         let value = serde_json::json!(["not-hex"]);
         let err = parse_trusted_ca_list(&value, &messages).unwrap_err();
         assert!(err.to_string().contains("OpenBao CA trust data"));
+    }
+
+    #[test]
+    fn test_upsert_managed_profile_is_idempotent() {
+        let args = ResolvedServiceAdd {
+            service_name: "edge-proxy".to_string(),
+            deploy_type: DeployType::Daemon,
+            delivery_mode: DeliveryMode::LocalFile,
+            hostname: "edge-node-01".to_string(),
+            domain: "trusted.domain".to_string(),
+            agent_config: PathBuf::from("agent.toml"),
+            cert_path: PathBuf::from("certs/edge-proxy.crt"),
+            key_path: PathBuf::from("certs/edge-proxy.key"),
+            instance_id: Some("001".to_string()),
+            container_name: None,
+            root_token: "root".to_string(),
+            notes: None,
+        };
+        let block = render_managed_profile_block(&args);
+        let once = upsert_managed_profile("", "edge-proxy", &block);
+        let twice = upsert_managed_profile(&once, "edge-proxy", &block);
+        assert_eq!(once, twice);
     }
 }

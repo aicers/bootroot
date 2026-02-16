@@ -76,8 +76,17 @@ async fn test_app_add_writes_state_and_secret() {
     assert!(stdout.contains("[[profiles]]"));
     assert!(stdout.contains("service_name = \"edge-proxy\""));
     assert!(stdout.contains("paths.cert ="));
+    assert!(stdout.contains("- auto-applied bootroot-agent config:"));
+    assert!(stdout.contains("- auto-applied OpenBao Agent config:"));
 
     assert_state_contains_default_delivery_mode(temp_dir.path());
+
+    let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
+    assert!(agent_contents.contains("# BEGIN bootroot managed profile: edge-proxy"));
+    assert!(agent_contents.contains("service_name = \"edge-proxy\""));
+    assert!(agent_contents.contains("instance_id = \"001\""));
+    assert!(agent_contents.contains("hostname = \"edge-node-01\""));
+    assert!(agent_contents.contains("[profiles.paths]"));
 
     let secret_path = temp_dir
         .path()
@@ -108,6 +117,8 @@ async fn test_app_add_writes_state_and_secret() {
         .mode()
         & 0o777;
     assert_eq!(mode, 0o600);
+
+    assert_openbao_service_agent_files(temp_dir.path(), "edge-proxy");
 }
 
 #[cfg(unix)]
@@ -176,7 +187,7 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
     stub_app_add_openbao(&server, "edge-proxy").await;
 
     let input = format!(
-        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\nmissing.toml\n{}\n{}\n{}\n\n001\n{}\n",
+        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\n{}\nmissing/edge-proxy.crt\n{}\n{}\n\n001\n{}\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
@@ -300,6 +311,8 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         .output()
         .expect("run service add");
     assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("auto-applied"));
 
     let state_contents =
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
@@ -308,6 +321,15 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         state["services"]["edge-proxy"]["delivery_mode"],
         "remote-bootstrap"
     );
+
+    let openbao_hcl = temp_dir
+        .path()
+        .join("secrets")
+        .join("openbao")
+        .join("services")
+        .join("edge-proxy")
+        .join("agent.hcl");
+    assert!(!openbao_hcl.exists());
 }
 
 #[cfg(unix)]
@@ -626,6 +648,18 @@ fn assert_state_contains_default_delivery_mode(root: &std::path::Path) {
         value["services"]["edge-proxy"]["sync_status"]["trust_sync"],
         "none"
     );
+}
+
+fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str) {
+    let openbao_service_dir = root
+        .join("secrets")
+        .join("openbao")
+        .join("services")
+        .join(service_name);
+    let openbao_hcl = openbao_service_dir.join("agent.hcl");
+    let openbao_ctmpl = openbao_service_dir.join("agent.toml.ctmpl");
+    assert!(openbao_hcl.exists());
+    assert!(openbao_ctmpl.exists());
 }
 
 fn write_state_with_app(root: &std::path::Path) {
