@@ -53,6 +53,10 @@ impl StateFile {
 pub(crate) struct ServiceEntry {
     pub(crate) service_name: String,
     pub(crate) deploy_type: DeployType,
+    #[serde(default)]
+    pub(crate) delivery_mode: DeliveryMode,
+    #[serde(default)]
+    pub(crate) sync_status: ServiceSyncStatus,
     pub(crate) hostname: String,
     pub(crate) domain: String,
     pub(crate) agent_config_path: PathBuf,
@@ -65,6 +69,60 @@ pub(crate) struct ServiceEntry {
     #[serde(default)]
     pub(crate) notes: Option<String>,
     pub(crate) approle: ServiceRoleEntry,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum DeliveryMode {
+    #[default]
+    LocalFile,
+    RemoteBootstrap,
+}
+
+impl DeliveryMode {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFile => "local-file",
+            Self::RemoteBootstrap => "remote-bootstrap",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SyncApplyStatus {
+    #[default]
+    None,
+    Pending,
+    Applied,
+    Failed,
+    Expired,
+}
+
+impl SyncApplyStatus {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pending => "pending",
+            Self::Applied => "applied",
+            Self::Failed => "failed",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ServiceSyncStatus {
+    #[serde(default)]
+    pub(crate) secret_id: SyncApplyStatus,
+    #[serde(default)]
+    pub(crate) eab: SyncApplyStatus,
+    #[serde(default)]
+    pub(crate) responder_hmac: SyncApplyStatus,
+    #[serde(default)]
+    pub(crate) trust_sync: SyncApplyStatus,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -80,4 +138,25 @@ pub(crate) struct ServiceRoleEntry {
 pub(crate) enum DeployType {
     Daemon,
     Docker,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_mode_defaults_to_local_file() {
+        let mode = DeliveryMode::default();
+        assert_eq!(mode, DeliveryMode::LocalFile);
+        assert_eq!(mode.as_str(), "local-file");
+    }
+
+    #[test]
+    fn sync_status_defaults_to_none() {
+        let status = ServiceSyncStatus::default();
+        assert_eq!(status.secret_id, SyncApplyStatus::None);
+        assert_eq!(status.eab, SyncApplyStatus::None);
+        assert_eq!(status.responder_hmac, SyncApplyStatus::None);
+        assert_eq!(status.trust_sync, SyncApplyStatus::None);
+    }
 }

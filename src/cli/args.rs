@@ -7,7 +7,7 @@ use crate::commands::init::{
     DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL, DEFAULT_SECRETS_DIR,
     DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL,
 };
-use crate::state::DeployType;
+use crate::state::{DeliveryMode, DeployType};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -401,6 +401,10 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long, value_enum)]
     pub(crate) deploy_type: Option<DeployType>,
 
+    /// Secret delivery mode (local-file or remote-bootstrap)
+    #[arg(long, value_enum)]
+    pub(crate) delivery_mode: Option<DeliveryMode>,
+
     /// Hostname used for DNS SAN
     #[arg(long)]
     pub(crate) hostname: Option<String>,
@@ -503,6 +507,26 @@ mod tests {
                 assert!(matches!(args.profile, MonitoringProfile::Public));
             }
             _ => panic!("expected monitoring up"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_delivery_mode() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--delivery-mode",
+            "remote-bootstrap",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert!(matches!(
+                    args.delivery_mode,
+                    Some(DeliveryMode::RemoteBootstrap)
+                ));
+            }
+            _ => panic!("expected service add"),
         }
     }
 }

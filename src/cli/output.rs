@@ -7,6 +7,7 @@ use crate::state::{DeployType, ServiceEntry};
 pub(crate) struct ServiceAddPlan<'a> {
     pub(crate) service_name: &'a str,
     pub(crate) deploy_type: DeployType,
+    pub(crate) delivery_mode: crate::state::DeliveryMode,
     pub(crate) hostname: &'a str,
     pub(crate) domain: &'a str,
     pub(crate) agent_config: &'a str,
@@ -186,6 +187,29 @@ fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
     );
     println!("{}", messages.service_summary_hostname(&entry.hostname));
     println!("{}", messages.service_summary_domain(&entry.domain));
+    println!(
+        "{}",
+        messages.service_summary_delivery_mode(entry.delivery_mode.as_str())
+    );
+    println!(
+        "{}",
+        messages.service_summary_sync_status("secret_id", entry.sync_status.secret_id.as_str())
+    );
+    println!(
+        "{}",
+        messages.service_summary_sync_status("eab", entry.sync_status.eab.as_str())
+    );
+    println!(
+        "{}",
+        messages.service_summary_sync_status(
+            "responder_hmac",
+            entry.sync_status.responder_hmac.as_str(),
+        )
+    );
+    println!(
+        "{}",
+        messages.service_summary_sync_status("trust_sync", entry.sync_status.trust_sync.as_str())
+    );
     if let Some(notes) = entry.notes.as_deref() {
         println!("{}", messages.service_summary_notes(notes));
     }
@@ -202,6 +226,10 @@ fn print_service_plan_fields(plan: &ServiceAddPlan<'_>, messages: &Messages) {
     );
     println!("{}", messages.service_summary_hostname(plan.hostname));
     println!("{}", messages.service_summary_domain(plan.domain));
+    println!(
+        "{}",
+        messages.service_summary_delivery_mode(plan.delivery_mode.as_str())
+    );
     if let Some(instance_id) = plan.instance_id {
         println!("{}", messages.service_summary_instance_id(instance_id));
     }

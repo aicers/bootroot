@@ -12,7 +12,9 @@ use crate::cli::output::{
 use crate::cli::prompt::Prompt;
 use crate::commands::init::{PATH_CA_TRUST, SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
-use crate::state::{DeployType, ServiceEntry, ServiceRoleEntry, StateFile};
+use crate::state::{
+    DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, ServiceSyncStatus, StateFile,
+};
 const SERVICE_ROLE_PREFIX: &str = "bootroot-service-";
 const SERVICE_KV_BASE: &str = "bootroot/services";
 const SERVICE_SECRET_DIR: &str = "services";
@@ -41,6 +43,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let plan = ServiceAddPlan {
         service_name: &resolved.service_name,
         deploy_type: resolved.deploy_type,
+        delivery_mode: resolved.delivery_mode,
         hostname: &resolved.hostname,
         domain: &resolved.domain,
         agent_config: &agent_config,
@@ -84,6 +87,8 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let entry = ServiceEntry {
         service_name: resolved.service_name.clone(),
         deploy_type: resolved.deploy_type,
+        delivery_mode: resolved.delivery_mode,
+        sync_status: ServiceSyncStatus::default(),
         hostname: resolved.hostname.clone(),
         domain: resolved.domain.clone(),
         agent_config_path: resolved.agent_config.clone(),
@@ -260,6 +265,7 @@ fn service_policy_name(service_name: &str) -> String {
 pub(crate) struct ResolvedServiceAdd {
     pub(crate) service_name: String,
     pub(crate) deploy_type: DeployType,
+    pub(crate) delivery_mode: DeliveryMode,
     pub(crate) hostname: String,
     pub(crate) domain: String,
     pub(crate) agent_config: PathBuf,
@@ -294,6 +300,7 @@ fn resolve_service_add_args(
             |value| parse_deploy_type(value, messages),
         )?,
     };
+    let delivery_mode = args.delivery_mode.unwrap_or_default();
 
     let hostname = match args.hostname.clone() {
         Some(value) => value,
@@ -361,6 +368,7 @@ fn resolve_service_add_args(
     Ok(ResolvedServiceAdd {
         service_name,
         deploy_type,
+        delivery_mode,
         hostname,
         domain,
         agent_config,

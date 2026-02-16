@@ -71,16 +71,13 @@ async fn test_app_add_writes_state_and_secret() {
     assert!(stdout.contains("bootroot service add: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- deploy type: daemon"));
+    assert!(stdout.contains("- delivery mode: local-file"));
+    assert!(stdout.contains("- sync secret_id: none"));
     assert!(stdout.contains("[[profiles]]"));
     assert!(stdout.contains("service_name = \"edge-proxy\""));
     assert!(stdout.contains("paths.cert ="));
 
-    let state_path = temp_dir.path().join("state.json");
-    let contents = fs::read_to_string(&state_path).expect("read state.json");
-    let value: serde_json::Value = serde_json::from_str(&contents).expect("parse state.json");
-    assert!(value["services"]["edge-proxy"].is_object());
-    assert_eq!(value["services"]["edge-proxy"]["domain"], "trusted.domain");
-    assert_eq!(value["services"]["edge-proxy"]["instance_id"], "001");
+    assert_state_contains_default_delivery_mode(temp_dir.path());
 
     let secret_path = temp_dir
         .path()
@@ -256,6 +253,61 @@ async fn test_app_add_prints_docker_snippet() {
     assert!(stdout.contains("docker run --rm"));
     assert!(stdout.contains("--name edge-proxy"));
     assert!(stdout.contains("/app/agent.toml"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--delivery-mode",
+            "remote-bootstrap",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+    assert!(output.status.success());
+
+    let state_contents =
+        fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
+    let state: serde_json::Value = serde_json::from_str(&state_contents).expect("parse state");
+    assert_eq!(
+        state["services"]["edge-proxy"]["delivery_mode"],
+        "remote-bootstrap"
+    );
 }
 
 #[cfg(unix)]
@@ -509,6 +561,8 @@ async fn test_app_info_prints_summary() {
     assert!(stdout.contains("bootroot service info: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- domain: trusted.domain"));
+    assert!(stdout.contains("- delivery mode: local-file"));
+    assert!(stdout.contains("- sync secret_id: none"));
     assert!(stdout.contains("- secret_id path: secrets/services/edge-proxy/secret_id"));
 }
 
@@ -543,6 +597,35 @@ fn write_state_file(root: &std::path::Path, openbao_url: &str) -> anyhow::Result
     )
     .context("write state.json")?;
     Ok(())
+}
+
+fn assert_state_contains_default_delivery_mode(root: &std::path::Path) {
+    let state_path = root.join("state.json");
+    let contents = fs::read_to_string(&state_path).expect("read state.json");
+    let value: serde_json::Value = serde_json::from_str(&contents).expect("parse state.json");
+    assert!(value["services"]["edge-proxy"].is_object());
+    assert_eq!(value["services"]["edge-proxy"]["domain"], "trusted.domain");
+    assert_eq!(value["services"]["edge-proxy"]["instance_id"], "001");
+    assert_eq!(
+        value["services"]["edge-proxy"]["delivery_mode"],
+        "local-file"
+    );
+    assert_eq!(
+        value["services"]["edge-proxy"]["sync_status"]["secret_id"],
+        "none"
+    );
+    assert_eq!(
+        value["services"]["edge-proxy"]["sync_status"]["eab"],
+        "none"
+    );
+    assert_eq!(
+        value["services"]["edge-proxy"]["sync_status"]["responder_hmac"],
+        "none"
+    );
+    assert_eq!(
+        value["services"]["edge-proxy"]["sync_status"]["trust_sync"],
+        "none"
+    );
 }
 
 fn write_state_with_app(root: &std::path::Path) {

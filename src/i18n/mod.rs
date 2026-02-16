@@ -200,6 +200,8 @@ pub(crate) struct Strings {
     pub(crate) service_summary_deploy_type: &'static str,
     pub(crate) service_summary_hostname: &'static str,
     pub(crate) service_summary_domain: &'static str,
+    pub(crate) service_summary_delivery_mode: &'static str,
+    pub(crate) service_summary_sync_status: &'static str,
     pub(crate) service_summary_instance_id: &'static str,
     pub(crate) service_summary_container_name: &'static str,
     pub(crate) service_summary_notes: &'static str,
@@ -1110,6 +1112,20 @@ impl Messages {
 
     pub(crate) fn service_summary_domain(&self, value: &str) -> String {
         format_template(self.strings().service_summary_domain, &[("value", value)])
+    }
+
+    pub(crate) fn service_summary_delivery_mode(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_delivery_mode,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_sync_status(&self, name: &str, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_sync_status,
+            &[("name", name), ("value", value)],
+        )
     }
 
     pub(crate) fn service_summary_instance_id(&self, value: &str) -> String {
