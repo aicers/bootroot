@@ -17,13 +17,21 @@ use crate::cli::prompt::Prompt;
 use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
-    PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
+    PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, SECRET_ID_TTL,
 };
 use crate::i18n::Messages;
-use crate::state::{ServiceEntry, StateFile};
+use crate::state::{DeliveryMode, ServiceEntry, StateFile, SyncApplyStatus, SyncTiming};
 const SECRET_BYTES: usize = 32;
 const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
 const ROLE_ID_FILENAME: &str = "role_id";
+const DEFAULT_REMOTE_ROTATION_OVERLAP_SECS: i64 = 86_400;
+
+#[derive(Clone, Copy)]
+enum RotationSyncItem {
+    SecretId,
+    Eab,
+    ResponderHmac,
+}
 
 #[derive(Debug, Clone)]
 struct StatePaths {
@@ -110,7 +118,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         .unwrap_or_else(|| state.secrets_dir());
     let paths = StatePaths::new(state_path, secrets_dir.clone());
     let root_token = resolve_root_token(args.root_token.root_token.clone(), messages)?;
-    let ctx = RotateContext {
+    let mut ctx = RotateContext {
         openbao_url,
         kv_mount,
         compose_file: args.compose.compose_file.clone(),
@@ -119,6 +127,10 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         paths,
     };
     let _state_file = ctx.paths.state_file();
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    if expire_overdue_remote_sync_items(&mut ctx.state, now_unix) {
+        save_state(&ctx, messages)?;
+    }
 
     let mut client = OpenBaoClient::new(&ctx.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
@@ -130,19 +142,19 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
 
     match &args.command {
         RotateCommand::StepcaPassword(step_args) => {
-            rotate_stepca_password(&ctx, &client, step_args, args.yes, messages).await?;
+            rotate_stepca_password(&mut ctx, &client, step_args, args.yes, messages).await?;
         }
         RotateCommand::Eab(step_args) => {
-            rotate_eab(&ctx, &client, step_args, args.yes, messages).await?;
+            rotate_eab(&mut ctx, &client, step_args, args.yes, messages).await?;
         }
         RotateCommand::Db(step_args) => {
-            rotate_db(&ctx, &client, step_args, args.yes, messages).await?;
+            rotate_db(&mut ctx, &client, step_args, args.yes, messages).await?;
         }
         RotateCommand::ResponderHmac(step_args) => {
-            rotate_responder_hmac(&ctx, &client, step_args, args.yes, messages).await?;
+            rotate_responder_hmac(&mut ctx, &client, step_args, args.yes, messages).await?;
         }
         RotateCommand::AppRoleSecretId(step_args) => {
-            rotate_approle_secret_id(&ctx, &client, step_args, args.yes, messages).await?;
+            rotate_approle_secret_id(&mut ctx, &client, step_args, args.yes, messages).await?;
         }
     }
 
@@ -150,7 +162,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
 }
 
 async fn rotate_stepca_password(
-    ctx: &RotateContext,
+    ctx: &mut RotateContext,
     client: &OpenBaoClient,
     args: &RotateStepcaPasswordArgs,
     auto_confirm: bool,
@@ -216,7 +228,7 @@ async fn rotate_stepca_password(
 }
 
 async fn rotate_eab(
-    ctx: &RotateContext,
+    ctx: &mut RotateContext,
     client: &OpenBaoClient,
     args: &RotateEabArgs,
     auto_confirm: bool,
@@ -234,18 +246,37 @@ async fn rotate_eab(
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
 
-    let updated = update_agent_configs(&ctx.state.services, messages, |contents| {
-        let updated = upsert_toml_section_keys(
-            contents,
-            "eab",
-            &[("kid", &credentials.kid), ("hmac", &credentials.hmac)],
-        );
-        upsert_toml_section_keys(
-            &updated,
-            "profiles.eab",
-            &[("kid", &credentials.kid), ("hmac", &credentials.hmac)],
-        )
-    })?;
+    let updated = update_agent_configs(
+        ctx.state
+            .services
+            .values()
+            .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::LocalFile)),
+        messages,
+        |contents| {
+            let updated = upsert_toml_section_keys(
+                contents,
+                "eab",
+                &[("kid", &credentials.kid), ("hmac", &credentials.hmac)],
+            );
+            upsert_toml_section_keys(
+                &updated,
+                "profiles.eab",
+                &[("kid", &credentials.kid), ("hmac", &credentials.hmac)],
+            )
+        },
+    )?;
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let overlap_secs = remote_rotation_overlap_secs();
+    let expires_at_unix = now_unix + overlap_secs;
+    let pending_updated = mark_pending_for_remote_services(
+        &mut ctx.state,
+        RotationSyncItem::Eab,
+        now_unix,
+        expires_at_unix,
+    );
+    if pending_updated {
+        save_state(ctx, messages)?;
+    }
 
     println!("{}", messages.rotate_summary_title());
     println!("{}", messages.summary_eab_kid(&credentials.kid));
@@ -263,7 +294,7 @@ async fn rotate_eab(
 }
 
 async fn rotate_db(
-    ctx: &RotateContext,
+    ctx: &mut RotateContext,
     client: &OpenBaoClient,
     args: &RotateDbArgs,
     auto_confirm: bool,
@@ -336,7 +367,7 @@ async fn rotate_db(
 }
 
 async fn rotate_responder_hmac(
-    ctx: &RotateContext,
+    ctx: &mut RotateContext,
     client: &OpenBaoClient,
     args: &RotateResponderHmacArgs,
     auto_confirm: bool,
@@ -372,9 +403,26 @@ async fn rotate_responder_hmac(
     };
     write_secret_file(&responder_path, &config, messages).await?;
 
-    let updated = update_agent_configs(&ctx.state.services, messages, |contents| {
-        upsert_toml_section_keys(contents, "acme", &[("http_responder_hmac", &hmac)])
-    })?;
+    let updated = update_agent_configs(
+        ctx.state
+            .services
+            .values()
+            .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::LocalFile)),
+        messages,
+        |contents| upsert_toml_section_keys(contents, "acme", &[("http_responder_hmac", &hmac)]),
+    )?;
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let overlap_secs = remote_rotation_overlap_secs();
+    let expires_at_unix = now_unix + overlap_secs;
+    let pending_updated = mark_pending_for_remote_services(
+        &mut ctx.state,
+        RotationSyncItem::ResponderHmac,
+        now_unix,
+        expires_at_unix,
+    );
+    if pending_updated {
+        save_state(ctx, messages)?;
+    }
 
     let mut reloaded = false;
     if compose_has_responder(&ctx.compose_file, messages)? {
@@ -402,7 +450,7 @@ async fn rotate_responder_hmac(
 }
 
 async fn rotate_approle_secret_id(
-    ctx: &RotateContext,
+    ctx: &mut RotateContext,
     client: &OpenBaoClient,
     args: &RotateAppRoleSecretIdArgs,
     auto_confirm: bool,
@@ -418,18 +466,39 @@ async fn rotate_approle_secret_id(
         .state
         .services
         .get(&args.service_name)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
-    ensure_role_id_file(entry, client, messages).await?;
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?
+        .clone();
+    let is_remote = matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap);
+    if !is_remote {
+        ensure_role_id_file(&entry, client, messages).await?;
+    }
     let new_secret_id = client
         .create_secret_id(&entry.approle.role_name)
         .await
         .with_context(|| messages.error_openbao_secret_id_failed())?;
     write_secret_id_atomic(&entry.approle.secret_id_path, &new_secret_id, messages).await?;
-    reload_openbao_agent(entry, messages)?;
+    if !is_remote {
+        reload_openbao_agent(&entry, messages)?;
+    }
     client
         .login_approle(&entry.approle.role_id, &new_secret_id)
         .await
         .with_context(|| messages.error_openbao_approle_login_failed())?;
+    if is_remote {
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        let overlap_secs = remote_rotation_overlap_secs();
+        let expires_at_unix = now_unix + overlap_secs;
+        let changed = mark_pending_for_service(
+            &mut ctx.state,
+            &args.service_name,
+            RotationSyncItem::SecretId,
+            now_unix,
+            expires_at_unix,
+        )?;
+        if changed {
+            save_state(ctx, messages)?;
+        }
+    }
 
     println!("{}", messages.rotate_summary_title());
     // codeql[rust/cleartext-logging]: output is a secret_id file path, not the secret value.
@@ -440,7 +509,9 @@ async fn rotate_approle_secret_id(
             &entry.approle.secret_id_path.display().to_string()
         )
     );
-    println!("{}", messages.rotate_summary_reload_openbao_agent());
+    if !is_remote {
+        println!("{}", messages.rotate_summary_reload_openbao_agent());
+    }
     println!(
         "{}",
         messages.rotate_summary_approle_login_ok(&args.service_name)
@@ -472,6 +543,153 @@ async fn ensure_role_id_file(
         .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
     fs_util::set_key_permissions(&role_id_path).await?;
     Ok(())
+}
+
+fn save_state(ctx: &RotateContext, messages: &Messages) -> Result<()> {
+    ctx.state
+        .save(ctx.paths.state_file())
+        .with_context(|| messages.error_serialize_state_failed())
+}
+
+fn remote_rotation_overlap_secs() -> i64 {
+    let parsed = humantime::parse_duration(SECRET_ID_TTL);
+    if let Ok(duration) = parsed
+        && let Ok(seconds) = i64::try_from(duration.as_secs())
+    {
+        return seconds.max(1);
+    }
+    DEFAULT_REMOTE_ROTATION_OVERLAP_SECS
+}
+
+fn mark_pending_for_remote_services(
+    state: &mut StateFile,
+    item: RotationSyncItem,
+    started_at_unix: i64,
+    expires_at_unix: i64,
+) -> bool {
+    let mut changed = false;
+    for entry in state
+        .services
+        .values_mut()
+        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
+    {
+        if mark_pending_for_entry(entry, item, started_at_unix, expires_at_unix) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn mark_pending_for_service(
+    state: &mut StateFile,
+    service_name: &str,
+    item: RotationSyncItem,
+    started_at_unix: i64,
+    expires_at_unix: i64,
+) -> Result<bool> {
+    let entry = state
+        .services
+        .get_mut(service_name)
+        .ok_or_else(|| anyhow::anyhow!("Service not found: {service_name}"))?;
+    Ok(mark_pending_for_entry(
+        entry,
+        item,
+        started_at_unix,
+        expires_at_unix,
+    ))
+}
+
+fn mark_pending_for_entry(
+    entry: &mut ServiceEntry,
+    item: RotationSyncItem,
+    started_at_unix: i64,
+    expires_at_unix: i64,
+) -> bool {
+    match item {
+        RotationSyncItem::SecretId => set_pending(
+            &mut entry.sync_status.secret_id,
+            &mut entry.sync_metadata.secret_id,
+            started_at_unix,
+            expires_at_unix,
+        ),
+        RotationSyncItem::Eab => set_pending(
+            &mut entry.sync_status.eab,
+            &mut entry.sync_metadata.eab,
+            started_at_unix,
+            expires_at_unix,
+        ),
+        RotationSyncItem::ResponderHmac => set_pending(
+            &mut entry.sync_status.responder_hmac,
+            &mut entry.sync_metadata.responder_hmac,
+            started_at_unix,
+            expires_at_unix,
+        ),
+    }
+}
+
+fn expire_overdue_remote_sync_items(state: &mut StateFile, now_unix: i64) -> bool {
+    let mut changed = false;
+    for entry in state
+        .services
+        .values_mut()
+        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
+    {
+        changed |= expire_item_if_needed(entry, RotationSyncItem::SecretId, now_unix);
+        changed |= expire_item_if_needed(entry, RotationSyncItem::Eab, now_unix);
+        changed |= expire_item_if_needed(entry, RotationSyncItem::ResponderHmac, now_unix);
+    }
+    changed
+}
+
+fn expire_item_if_needed(entry: &mut ServiceEntry, item: RotationSyncItem, now_unix: i64) -> bool {
+    match item {
+        RotationSyncItem::SecretId => expire_if_due(
+            &mut entry.sync_status.secret_id,
+            &mut entry.sync_metadata.secret_id,
+            now_unix,
+        ),
+        RotationSyncItem::Eab => expire_if_due(
+            &mut entry.sync_status.eab,
+            &mut entry.sync_metadata.eab,
+            now_unix,
+        ),
+        RotationSyncItem::ResponderHmac => expire_if_due(
+            &mut entry.sync_status.responder_hmac,
+            &mut entry.sync_metadata.responder_hmac,
+            now_unix,
+        ),
+    }
+}
+
+fn set_pending(
+    status: &mut SyncApplyStatus,
+    metadata: &mut SyncTiming,
+    started_at_unix: i64,
+    expires_at_unix: i64,
+) -> bool {
+    let changed = *status != SyncApplyStatus::Pending
+        || metadata.started_at_unix != Some(started_at_unix)
+        || metadata.expires_at_unix != Some(expires_at_unix);
+    *status = SyncApplyStatus::Pending;
+    metadata.started_at_unix = Some(started_at_unix);
+    metadata.expires_at_unix = Some(expires_at_unix);
+    changed
+}
+
+fn expire_if_due(status: &mut SyncApplyStatus, metadata: &mut SyncTiming, now_unix: i64) -> bool {
+    if *status != SyncApplyStatus::Pending {
+        return false;
+    }
+    if metadata
+        .expires_at_unix
+        .is_some_and(|deadline| now_unix >= deadline)
+    {
+        *status = SyncApplyStatus::Expired;
+        metadata.started_at_unix = None;
+        metadata.expires_at_unix = None;
+        return true;
+    }
+    false
 }
 
 fn resolve_root_token(value: Option<String>, messages: &Messages) -> Result<String> {
@@ -674,17 +892,18 @@ fn update_responder_hmac(contents: &str, hmac: &str) -> String {
     output
 }
 
-fn update_agent_configs<F>(
-    services: &std::collections::BTreeMap<String, ServiceEntry>,
+fn update_agent_configs<'a, I, F>(
+    services: I,
     messages: &Messages,
     mut update: F,
 ) -> Result<Vec<String>>
 where
+    I: IntoIterator<Item = &'a ServiceEntry>,
     F: FnMut(&str) -> String,
 {
     let mut updated = Vec::new();
     let mut seen = HashSet::new();
-    for entry in services.values() {
+    for entry in services {
         if !seen.insert(entry.agent_config_path.clone()) {
             continue;
         }
@@ -909,6 +1128,7 @@ struct EabCredentials {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::env;
     use std::ffi::{OsStr, OsString};
     use std::fs;
@@ -921,6 +1141,7 @@ mod tests {
 
     use super::*;
     use crate::cli::args::{DbAdminDsnArgs, DbTimeoutArgs};
+    use crate::state::{DeployType, ServiceRoleEntry, ServiceSyncMetadata, ServiceSyncStatus};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
@@ -1262,5 +1483,105 @@ exit 0
         )
         .expect_err("expected missing db section");
         assert!(err.to_string().contains("ca.json"));
+    }
+
+    #[test]
+    fn mark_pending_for_remote_services_updates_only_remote_entries() {
+        let mut services = BTreeMap::new();
+        services.insert(
+            "remote".to_string(),
+            test_service_entry("remote", DeliveryMode::RemoteBootstrap),
+        );
+        services.insert(
+            "local".to_string(),
+            test_service_entry("local", DeliveryMode::LocalFile),
+        );
+        let mut state = StateFile {
+            openbao_url: "http://127.0.0.1:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services,
+        };
+
+        let changed = mark_pending_for_remote_services(&mut state, RotationSyncItem::Eab, 100, 200);
+        assert!(changed);
+        assert_eq!(
+            state
+                .services
+                .get("remote")
+                .expect("remote service")
+                .sync_status
+                .eab,
+            SyncApplyStatus::Pending
+        );
+        let remote_meta = &state
+            .services
+            .get("remote")
+            .expect("remote service")
+            .sync_metadata
+            .eab;
+        assert_eq!(remote_meta.started_at_unix, Some(100));
+        assert_eq!(remote_meta.expires_at_unix, Some(200));
+        assert_eq!(
+            state
+                .services
+                .get("local")
+                .expect("local service")
+                .sync_status
+                .eab,
+            SyncApplyStatus::None
+        );
+    }
+
+    #[test]
+    fn expire_overdue_remote_sync_items_marks_expired() {
+        let mut service = test_service_entry("remote", DeliveryMode::RemoteBootstrap);
+        service.sync_status.secret_id = SyncApplyStatus::Pending;
+        service.sync_metadata.secret_id.started_at_unix = Some(1);
+        service.sync_metadata.secret_id.expires_at_unix = Some(5);
+
+        let mut services = BTreeMap::new();
+        services.insert("remote".to_string(), service);
+        let mut state = StateFile {
+            openbao_url: "http://127.0.0.1:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services,
+        };
+
+        let changed = expire_overdue_remote_sync_items(&mut state, 5);
+        assert!(changed);
+        let remote = state.services.get("remote").expect("remote service");
+        assert_eq!(remote.sync_status.secret_id, SyncApplyStatus::Expired);
+        assert_eq!(remote.sync_metadata.secret_id.started_at_unix, None);
+        assert_eq!(remote.sync_metadata.secret_id.expires_at_unix, None);
+    }
+
+    fn test_service_entry(service_name: &str, delivery_mode: DeliveryMode) -> ServiceEntry {
+        ServiceEntry {
+            service_name: service_name.to_string(),
+            deploy_type: DeployType::Daemon,
+            delivery_mode,
+            sync_status: ServiceSyncStatus::default(),
+            sync_metadata: ServiceSyncMetadata::default(),
+            hostname: "node".to_string(),
+            domain: "example.com".to_string(),
+            agent_config_path: PathBuf::from("agent.toml"),
+            cert_path: PathBuf::from("certs/service.crt"),
+            key_path: PathBuf::from("certs/service.key"),
+            instance_id: Some("001".to_string()),
+            container_name: None,
+            notes: None,
+            approle: ServiceRoleEntry {
+                role_name: format!("role-{service_name}"),
+                role_id: format!("role-id-{service_name}"),
+                secret_id_path: PathBuf::from(format!("secrets/services/{service_name}/secret_id")),
+                policy_name: format!("policy-{service_name}"),
+            },
+        }
     }
 }
