@@ -215,6 +215,9 @@ pub(crate) struct Strings {
     pub(crate) service_summary_auto_applied_agent_config: &'static str,
     pub(crate) service_summary_auto_applied_openbao_config: &'static str,
     pub(crate) service_summary_auto_applied_openbao_template: &'static str,
+    pub(crate) service_summary_remote_bootstrap_file: &'static str,
+    pub(crate) service_summary_remote_run_command: &'static str,
+    pub(crate) service_summary_remote_sync_command: &'static str,
     pub(crate) service_summary_agent_config: &'static str,
     pub(crate) service_summary_cert_path: &'static str,
     pub(crate) service_summary_key_path: &'static str,
@@ -1215,6 +1218,27 @@ impl Messages {
     pub(crate) fn service_summary_auto_applied_openbao_template(&self, value: &str) -> String {
         format_template(
             self.strings().service_summary_auto_applied_openbao_template,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_remote_bootstrap_file(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_remote_bootstrap_file,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_remote_run_command(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_remote_run_command,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_remote_sync_command(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_remote_sync_command,
             &[("value", value)],
         )
     }

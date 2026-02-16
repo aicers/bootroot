@@ -365,6 +365,9 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("auto-applied"));
+    assert!(stdout.contains("- remote bootstrap file:"));
+    assert!(stdout.contains("- remote run command:"));
+    assert!(stdout.contains("- control sync-status command:"));
 
     let state_contents =
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
@@ -372,6 +375,22 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
     assert_eq!(
         state["services"]["edge-proxy"]["delivery_mode"],
         "remote-bootstrap"
+    );
+    assert_eq!(
+        state["services"]["edge-proxy"]["sync_status"]["secret_id"],
+        "pending"
+    );
+    assert_eq!(
+        state["services"]["edge-proxy"]["sync_status"]["eab"],
+        "pending"
+    );
+    assert_eq!(
+        state["services"]["edge-proxy"]["sync_status"]["responder_hmac"],
+        "pending"
+    );
+    assert_eq!(
+        state["services"]["edge-proxy"]["sync_status"]["trust_sync"],
+        "pending"
     );
 
     let openbao_hcl = temp_dir
@@ -382,6 +401,25 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         .join("edge-proxy")
         .join("agent.hcl");
     assert!(!openbao_hcl.exists());
+
+    let remote_bootstrap = temp_dir
+        .path()
+        .join("secrets")
+        .join("remote-bootstrap")
+        .join("services")
+        .join("edge-proxy")
+        .join("bootstrap.json");
+    assert!(remote_bootstrap.exists());
+    let bootstrap_contents = fs::read_to_string(&remote_bootstrap).expect("read bootstrap file");
+    let bootstrap: serde_json::Value =
+        serde_json::from_str(&bootstrap_contents).expect("parse bootstrap json");
+    assert_eq!(bootstrap["service_name"], "edge-proxy");
+    assert_eq!(bootstrap["kv_mount"], "secret");
+    assert!(bootstrap["role_id_path"].is_string());
+    assert!(bootstrap["secret_id_path"].is_string());
+    assert!(bootstrap["eab_file_path"].is_string());
+    assert!(bootstrap["agent_config_path"].is_string());
+    assert!(bootstrap["ca_bundle_path"].is_string());
 }
 
 #[cfg(unix)]

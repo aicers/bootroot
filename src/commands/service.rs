@@ -7,8 +7,8 @@ use tokio::fs;
 
 use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs, ServiceSyncStatusArgs};
 use crate::cli::output::{
-    ServiceAddAppliedPaths, ServiceAddPlan, print_service_add_plan, print_service_add_summary,
-    print_service_info_summary,
+    ServiceAddAppliedPaths, ServiceAddPlan, ServiceAddRemoteBootstrap, ServiceAddSummaryOptions,
+    print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
 use crate::cli::prompt::Prompt;
 use crate::commands::init::{PATH_CA_TRUST, SECRET_ID_TTL, TOKEN_TTL};
@@ -26,6 +26,8 @@ const OPENBAO_SERVICE_CONFIG_DIR: &str = "openbao/services";
 const OPENBAO_AGENT_CONFIG_FILENAME: &str = "agent.hcl";
 const OPENBAO_AGENT_TEMPLATE_FILENAME: &str = "agent.toml.ctmpl";
 const OPENBAO_AGENT_TOKEN_FILENAME: &str = "token";
+const REMOTE_BOOTSTRAP_DIR: &str = "remote-bootstrap/services";
+const REMOTE_BOOTSTRAP_FILENAME: &str = "bootstrap.json";
 const CA_TRUST_KEY: &str = "trusted_ca_sha256";
 const MANAGED_PROFILE_BEGIN_PREFIX: &str = "# BEGIN bootroot managed profile:";
 const MANAGED_PROFILE_END_PREFIX: &str = "# END bootroot managed profile:";
@@ -82,10 +84,13 @@ fn run_service_add_preview(state: &StateFile, resolved: &ResolvedServiceAdd, mes
     print_service_add_summary(
         &preview_entry,
         &preview_secret_id_path,
-        None,
-        None,
-        true,
-        Some(messages.service_summary_preview_mode()),
+        ServiceAddSummaryOptions {
+            applied: None,
+            remote: None,
+            trusted_ca_sha256: None,
+            show_snippets: true,
+            note: Some(messages.service_summary_preview_mode()),
+        },
         messages,
     );
 }
@@ -129,12 +134,26 @@ async fn run_service_add_apply(
     } else {
         None
     };
+    let remote_bootstrap = if matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap) {
+        Some(
+            write_remote_bootstrap_artifact(
+                state,
+                &secrets_dir,
+                resolved,
+                &secret_id_path,
+                messages,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     let entry = ServiceEntry {
         service_name: resolved.service_name.clone(),
         deploy_type: resolved.deploy_type,
         delivery_mode: resolved.delivery_mode,
-        sync_status: ServiceSyncStatus::default(),
+        sync_status: initial_sync_status(resolved.delivery_mode),
         hostname: resolved.hostname.clone(),
         domain: resolved.domain.clone(),
         agent_config_path: resolved.agent_config.clone(),
@@ -161,14 +180,23 @@ async fn run_service_add_apply(
     print_service_add_summary(
         &entry,
         &secret_id_path,
-        applied.as_ref().map(|result| ServiceAddAppliedPaths {
-            agent_config: &result.agent_config,
-            openbao_agent_config: &result.openbao_agent_config,
-            openbao_agent_template: &result.openbao_agent_template,
-        }),
-        trusted_ca_sha256.as_deref(),
-        false,
-        Some(messages.service_summary_print_only_hint()),
+        ServiceAddSummaryOptions {
+            applied: applied.as_ref().map(|result| ServiceAddAppliedPaths {
+                agent_config: &result.agent_config,
+                openbao_agent_config: &result.openbao_agent_config,
+                openbao_agent_template: &result.openbao_agent_template,
+            }),
+            remote: remote_bootstrap
+                .as_ref()
+                .map(|result| ServiceAddRemoteBootstrap {
+                    bootstrap_file: &result.bootstrap_file,
+                    remote_run_command: &result.remote_run_command,
+                    control_sync_command: &result.control_sync_command,
+                }),
+            trusted_ca_sha256: trusted_ca_sha256.as_deref(),
+            show_snippets: false,
+            note: Some(messages.service_summary_print_only_hint()),
+        },
         messages,
     );
     Ok(())
@@ -353,6 +381,24 @@ struct LocalApplyResult {
     openbao_agent_template: String,
 }
 
+struct RemoteBootstrapResult {
+    bootstrap_file: String,
+    remote_run_command: String,
+    control_sync_command: String,
+}
+
+#[derive(serde::Serialize)]
+struct RemoteBootstrapArtifact {
+    openbao_url: String,
+    kv_mount: String,
+    service_name: String,
+    role_id_path: String,
+    secret_id_path: String,
+    eab_file_path: String,
+    agent_config_path: String,
+    ca_bundle_path: String,
+}
+
 async fn apply_local_service_configs(
     secrets_dir: &Path,
     resolved: &ResolvedServiceAdd,
@@ -503,6 +549,85 @@ template {{
         template_path = template_path.display(),
         destination_path = destination_path.display(),
     )
+}
+
+async fn write_remote_bootstrap_artifact(
+    state: &StateFile,
+    secrets_dir: &Path,
+    resolved: &ResolvedServiceAdd,
+    secret_id_path: &Path,
+    messages: &Messages,
+) -> Result<RemoteBootstrapResult> {
+    let role_id_path = secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(SERVICE_ROLE_ID_FILENAME);
+    let eab_path = secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("eab.json");
+    let ca_bundle_path = resolved
+        .cert_path
+        .parent()
+        .unwrap_or(Path::new("certs"))
+        .join("ca-bundle.pem");
+
+    let artifact = RemoteBootstrapArtifact {
+        openbao_url: state.openbao_url.clone(),
+        kv_mount: state.kv_mount.clone(),
+        service_name: resolved.service_name.clone(),
+        role_id_path: role_id_path.display().to_string(),
+        secret_id_path: secret_id_path.display().to_string(),
+        eab_file_path: eab_path.display().to_string(),
+        agent_config_path: resolved.agent_config.display().to_string(),
+        ca_bundle_path: ca_bundle_path.display().to_string(),
+    };
+    let artifact_dir = secrets_dir
+        .join(REMOTE_BOOTSTRAP_DIR)
+        .join(&resolved.service_name);
+    fs_util::ensure_secrets_dir(&artifact_dir).await?;
+    let artifact_path = artifact_dir.join(REMOTE_BOOTSTRAP_FILENAME);
+    let payload = serde_json::to_string_pretty(&artifact)
+        .with_context(|| "Failed to serialize remote bootstrap artifact".to_string())?;
+    fs::write(&artifact_path, payload)
+        .await
+        .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
+    fs_util::set_key_permissions(&artifact_path).await?;
+
+    let remote_summary_path = format!("{}-remote-summary.json", resolved.service_name);
+    let remote_run_command = format!(
+        "bootroot-remote --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --ca-bundle-path '{}' --output json > {}",
+        artifact.openbao_url,
+        artifact.kv_mount,
+        artifact.service_name,
+        artifact.role_id_path,
+        artifact.secret_id_path,
+        artifact.eab_file_path,
+        artifact.agent_config_path,
+        artifact.ca_bundle_path,
+        remote_summary_path
+    );
+    let control_sync_command = format!(
+        "bootroot service sync-status --service-name '{}' --summary-json '{}'",
+        resolved.service_name, remote_summary_path
+    );
+    Ok(RemoteBootstrapResult {
+        bootstrap_file: artifact_path.display().to_string(),
+        remote_run_command,
+        control_sync_command,
+    })
+}
+
+fn initial_sync_status(delivery_mode: DeliveryMode) -> ServiceSyncStatus {
+    match delivery_mode {
+        DeliveryMode::LocalFile => ServiceSyncStatus::default(),
+        DeliveryMode::RemoteBootstrap => ServiceSyncStatus {
+            secret_id: SyncApplyStatus::Pending,
+            eab: SyncApplyStatus::Pending,
+            responder_hmac: SyncApplyStatus::Pending,
+            trust_sync: SyncApplyStatus::Pending,
+        },
+    }
 }
 
 async fn ensure_service_approle(
