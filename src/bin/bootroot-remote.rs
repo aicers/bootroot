@@ -619,12 +619,26 @@ fn print_text_summary(summary: &ApplySummary) {
     print_optional_error("responder_hmac", summary.responder_hmac.error.as_deref());
     println!("- trust_sync: {}", status_to_str(summary.trust_sync.status));
     print_optional_error("trust_sync", summary.trust_sync.error.as_deref());
-    println!("- agent_config_path: {}", summary.agent_config_path);
-    println!("- secret_id_path: {}", summary.secret_id_path);
-    println!("- eab_file_path: {}", summary.eab_file_path);
-    if let Some(path) = summary.ca_bundle_path.as_deref() {
-        println!("- ca_bundle_path: {path}");
-    }
+    println!(
+        "- agent_config_path: {}",
+        redacted_path_state(&summary.agent_config_path)
+    );
+    println!(
+        "- secret_id_path: {}",
+        redacted_path_state(&summary.secret_id_path)
+    );
+    println!(
+        "- eab_file_path: {}",
+        redacted_path_state(&summary.eab_file_path)
+    );
+    println!(
+        "- ca_bundle_path: {}",
+        if summary.ca_bundle_path.is_some() {
+            "<configured>"
+        } else {
+            "<not configured>"
+        }
+    );
 }
 
 fn status_to_str(status: ApplyStatus) -> &'static str {
@@ -636,8 +650,16 @@ fn status_to_str(status: ApplyStatus) -> &'static str {
 }
 
 fn print_optional_error(name: &str, error: Option<&str>) {
-    if let Some(value) = error {
-        println!("  error({name}): {value}");
+    if let Some(_value) = error {
+        println!("  error({name}): <redacted>");
+    }
+}
+
+fn redacted_path_state(value: &str) -> &'static str {
+    if value.is_empty() {
+        "<not set>"
+    } else {
+        "<redacted>"
     }
 }
 
