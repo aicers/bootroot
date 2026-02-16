@@ -47,7 +47,7 @@ use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_sing
 use crate::commands::infra::{ensure_infra_ready, run_docker};
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
-use crate::state::StateFile;
+use crate::state::{DeliveryMode, StateFile, SyncApplyStatus};
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
     ensure_postgres_localhost_binding(&args.compose.compose_file, messages)?;
@@ -174,7 +174,7 @@ async fn run_init_inner(
     }
 
     let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
-    write_ca_trust_fingerprints_with_retry(
+    let trust_changed = write_ca_trust_fingerprints_with_retry(
         client,
         &args.openbao.kv_mount,
         &secrets_dir,
@@ -198,6 +198,9 @@ async fn run_init_inner(
         &args.secrets_dir.secrets_dir,
         messages,
     )?;
+    if trust_changed {
+        mark_remote_trust_sync_pending(messages)?;
+    }
 
     Ok(InitSummary {
         openbao_url: args.openbao.openbao_url.clone(),
@@ -882,20 +885,32 @@ async fn write_ca_trust_fingerprints_with_retry(
     secrets_dir: &Path,
     rollback: &mut InitRollback,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<bool> {
     let fingerprints = compute_ca_fingerprints(secrets_dir, messages).await?;
-    if !client
+    let ca_bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
+    let kv_exists = client
         .kv_exists(kv_mount, PATH_CA_TRUST)
         .await
-        .with_context(|| messages.error_openbao_kv_exists_failed())?
-    {
+        .with_context(|| messages.error_openbao_kv_exists_failed())?;
+    if !kv_exists {
         rollback.written_kv_paths.push(PATH_CA_TRUST.to_string());
     }
+    let current_trust = if kv_exists {
+        Some(
+            client
+                .read_kv(kv_mount, PATH_CA_TRUST)
+                .await
+                .with_context(|| messages.error_openbao_kv_read_failed())?,
+        )
+    } else {
+        None
+    };
+    let changed = trust_payload_changed(current_trust.as_ref(), &fingerprints, &ca_bundle_pem);
     let attempt = client
         .write_kv(
             kv_mount,
             PATH_CA_TRUST,
-            serde_json::json!({ CA_TRUST_KEY: fingerprints }),
+            serde_json::json!({ CA_TRUST_KEY: fingerprints, "ca_bundle_pem": ca_bundle_pem }),
         )
         .await;
     if let Err(err) = attempt {
@@ -909,7 +924,7 @@ async fn write_ca_trust_fingerprints_with_retry(
                 .write_kv(
                     kv_mount,
                     PATH_CA_TRUST,
-                    serde_json::json!({ CA_TRUST_KEY: fingerprints }),
+                    serde_json::json!({ CA_TRUST_KEY: fingerprints, "ca_bundle_pem": ca_bundle_pem }),
                 )
                 .await
                 .with_context(|| messages.error_openbao_kv_write_failed())?;
@@ -917,7 +932,7 @@ async fn write_ca_trust_fingerprints_with_retry(
             return Err(err).with_context(|| messages.error_openbao_kv_write_failed());
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 async fn compute_ca_fingerprints(secrets_dir: &Path, messages: &Messages) -> Result<Vec<String>> {
@@ -927,6 +942,45 @@ async fn compute_ca_fingerprints(secrets_dir: &Path, messages: &Messages) -> Res
     let root = read_ca_cert_fingerprint(&root_path, messages).await?;
     let intermediate = read_ca_cert_fingerprint(&intermediate_path, messages).await?;
     Ok(vec![root, intermediate])
+}
+
+async fn compute_ca_bundle_pem(secrets_dir: &Path, messages: &Messages) -> Result<String> {
+    let certs_dir = secrets_dir.join(CA_CERTS_DIR);
+    let root_path = certs_dir.join(CA_ROOT_CERT_FILENAME);
+    let intermediate_path = certs_dir.join(CA_INTERMEDIATE_CERT_FILENAME);
+    let root = tokio::fs::read_to_string(&root_path)
+        .await
+        .with_context(|| messages.error_read_file_failed(&root_path.display().to_string()))?;
+    let intermediate = tokio::fs::read_to_string(&intermediate_path)
+        .await
+        .with_context(|| {
+            messages.error_read_file_failed(&intermediate_path.display().to_string())
+        })?;
+    Ok(format!("{root}{intermediate}"))
+}
+
+fn trust_payload_changed(
+    current: Option<&serde_json::Value>,
+    fingerprints: &[String],
+    ca_bundle_pem: &str,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    let current_fingerprints = current
+        .get(CA_TRUST_KEY)
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        });
+    let current_bundle = current
+        .get("ca_bundle_pem")
+        .and_then(serde_json::Value::as_str);
+    current_fingerprints.as_deref() != Some(fingerprints) || current_bundle != Some(ca_bundle_pem)
 }
 
 async fn read_ca_cert_fingerprint(path: &Path, messages: &Messages) -> Result<String> {
@@ -1615,6 +1669,14 @@ fn write_state_file(
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    let state_path = StateFile::default_path();
+    let existing_services = if state_path.exists() {
+        StateFile::load(&state_path)
+            .map(|state| state.services)
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
     let policy_map = [
         (
             "bootroot_agent".to_string(),
@@ -1637,13 +1699,43 @@ fn write_state_file(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        services: BTreeMap::new(),
+        services: existing_services,
     };
-    let state_path = StateFile::default_path();
     state
         .save(&state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
+}
+
+fn mark_remote_trust_sync_pending(messages: &Messages) -> Result<()> {
+    let state_path = StateFile::default_path();
+    if !state_path.exists() {
+        return Ok(());
+    }
+    mark_remote_trust_sync_pending_at_path(&state_path, messages)?;
+    Ok(())
+}
+
+fn mark_remote_trust_sync_pending_at_path(state_path: &Path, messages: &Messages) -> Result<bool> {
+    let mut state =
+        StateFile::load(state_path).with_context(|| messages.error_parse_state_failed())?;
+    let mut changed = false;
+    for entry in state
+        .services
+        .values_mut()
+        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
+    {
+        if entry.sync_status.trust_sync != SyncApplyStatus::Pending {
+            entry.sync_status.trust_sync = SyncApplyStatus::Pending;
+            changed = true;
+        }
+    }
+    if changed {
+        state
+            .save(state_path)
+            .with_context(|| messages.error_serialize_state_failed())?;
+    }
+    Ok(changed)
 }
 
 #[derive(Debug)]
@@ -2228,5 +2320,118 @@ services:
         let agent_policy = policies.get(POLICY_BOOTROOT_AGENT).unwrap();
         assert!(agent_policy.contains("secret/data/bootroot/agent/eab"));
         assert!(agent_policy.contains("secret/data/bootroot/responder/hmac"));
+    }
+
+    #[test]
+    fn test_trust_payload_changed_detects_changes() {
+        let fingerprints = vec!["a".repeat(64), "b".repeat(64)];
+        let bundle = "bundle-pem";
+        assert!(trust_payload_changed(None, &fingerprints, bundle));
+
+        let current = serde_json::json!({
+            CA_TRUST_KEY: fingerprints,
+            "ca_bundle_pem": bundle,
+        });
+        assert!(!trust_payload_changed(
+            Some(&current),
+            &["a".repeat(64), "b".repeat(64)],
+            "bundle-pem"
+        ));
+        assert!(trust_payload_changed(
+            Some(&current),
+            &["c".repeat(64), "d".repeat(64)],
+            "bundle-pem"
+        ));
+        assert!(trust_payload_changed(
+            Some(&current),
+            &["a".repeat(64), "b".repeat(64)],
+            "bundle-pem-updated"
+        ));
+    }
+
+    #[test]
+    fn test_mark_remote_trust_sync_pending_at_path_updates_remote_only() {
+        let temp_dir = tempdir().expect("tempdir");
+        let state_path = temp_dir.path().join("state.json");
+        let state = serde_json::json!({
+            "openbao_url": "http://localhost:8200",
+            "kv_mount": "secret",
+            "secrets_dir": "secrets",
+            "policies": {},
+            "approles": {},
+            "services": {
+                "remote-service": {
+                    "service_name": "remote-service",
+                    "deploy_type": "daemon",
+                    "delivery_mode": "remote-bootstrap",
+                    "sync_status": {
+                        "secret_id": "none",
+                        "eab": "none",
+                        "responder_hmac": "none",
+                        "trust_sync": "applied"
+                    },
+                    "hostname": "edge-node-01",
+                    "domain": "trusted.domain",
+                    "agent_config_path": "agent.toml",
+                    "cert_path": "certs/remote.crt",
+                    "key_path": "certs/remote.key",
+                    "instance_id": "001",
+                    "container_name": null,
+                    "notes": null,
+                    "approle": {
+                        "role_name": "bootroot-service-remote-service",
+                        "role_id": "role-id-remote",
+                        "secret_id_path": "secrets/services/remote-service/secret_id",
+                        "policy_name": "bootroot-service-remote-service"
+                    }
+                },
+                "local-service": {
+                    "service_name": "local-service",
+                    "deploy_type": "daemon",
+                    "delivery_mode": "local-file",
+                    "sync_status": {
+                        "secret_id": "none",
+                        "eab": "none",
+                        "responder_hmac": "none",
+                        "trust_sync": "applied"
+                    },
+                    "hostname": "edge-node-02",
+                    "domain": "trusted.domain",
+                    "agent_config_path": "agent-local.toml",
+                    "cert_path": "certs/local.crt",
+                    "key_path": "certs/local.key",
+                    "instance_id": "002",
+                    "container_name": null,
+                    "notes": null,
+                    "approle": {
+                        "role_name": "bootroot-service-local-service",
+                        "role_id": "role-id-local",
+                        "secret_id_path": "secrets/services/local-service/secret_id",
+                        "policy_name": "bootroot-service-local-service"
+                    }
+                }
+            }
+        });
+        fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+
+        let changed = mark_remote_trust_sync_pending_at_path(&state_path, &test_messages())
+            .expect("mark remote pending");
+        assert!(changed);
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+                .expect("parse state");
+        assert_eq!(
+            updated["services"]["remote-service"]["sync_status"]["trust_sync"],
+            "pending"
+        );
+        assert_eq!(
+            updated["services"]["local-service"]["sync_status"]["trust_sync"],
+            "applied"
+        );
     }
 }
