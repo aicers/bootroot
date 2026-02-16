@@ -40,6 +40,8 @@ mod unix_integration {
             .env("MAX_CYCLES", "2")
             .env("INTERVAL_SECS", "1")
             .env("TIMEOUT_SECS", "20")
+            .env("BOOTROOT_BIN", env!("CARGO_BIN_EXE_bootroot"))
+            .env("BOOTROOT_REMOTE_BIN", env!("CARGO_BIN_EXE_bootroot-remote"))
             .output()
             .with_context(|| "Failed to run docker harness smoke script")?;
 
@@ -51,16 +53,27 @@ mod unix_integration {
         let phase_log = artifact_dir.join("phases.log");
         let runner_log = artifact_dir.join("runner.log");
         let manifest = artifact_dir.join("manifest.json");
+        let state_snapshot = artifact_dir.join("state-final.json");
         assert!(phase_log.exists());
         assert!(runner_log.exists());
         assert!(manifest.exists());
+        assert!(state_snapshot.exists());
 
         let phase_contents =
             std::fs::read_to_string(&phase_log).with_context(|| "Failed to read phase log")?;
         assert!(phase_contents.contains("\"phase\":\"bootstrap\""));
         assert!(phase_contents.contains("\"phase\":\"runner-start\""));
         assert!(phase_contents.contains("\"phase\":\"sync-loop\""));
+        assert!(phase_contents.contains("\"phase\":\"ack\""));
+        assert!(phase_contents.contains("\"phase\":\"verify\""));
         assert!(phase_contents.contains("\"phase\":\"cleanup\""));
+
+        let state_contents =
+            std::fs::read_to_string(state_snapshot).with_context(|| "Failed to read state")?;
+        assert!(state_contents.contains("\"secret_id\": \"applied\""));
+        assert!(state_contents.contains("\"eab\": \"applied\""));
+        assert!(state_contents.contains("\"responder_hmac\": \"applied\""));
+        assert!(state_contents.contains("\"trust_sync\": \"applied\""));
 
         Ok(())
     }
