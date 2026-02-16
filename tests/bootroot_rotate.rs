@@ -16,6 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod support;
 
 const SERVICE_NAME: &str = "edge-proxy";
+const SECONDARY_SERVICE_NAME: &str = "edge-alt";
 const ROLE_NAME: &str = "bootroot-service-edge-proxy";
 const ROLE_ID: &str = "role-edge-proxy";
 
@@ -368,6 +369,8 @@ async fn test_rotate_eab_remote_sets_pending_status() {
         state["services"][SERVICE_NAME]["sync_status"]["eab"],
         "pending"
     );
+    assert!(state["services"][SERVICE_NAME]["sync_metadata"]["eab"]["started_at_unix"].is_i64());
+    assert!(state["services"][SERVICE_NAME]["sync_metadata"]["eab"]["expires_at_unix"].is_i64());
 }
 
 #[cfg(unix)]
@@ -420,6 +423,76 @@ async fn test_rotate_responder_hmac_remote_sets_pending_status() {
         state["services"][SERVICE_NAME]["sync_status"]["responder_hmac"],
         "pending"
     );
+    assert!(
+        state["services"][SERVICE_NAME]["sync_metadata"]["responder_hmac"]["started_at_unix"]
+            .is_i64()
+    );
+    assert!(
+        state["services"][SERVICE_NAME]["sync_metadata"]["responder_hmac"]["expires_at_unix"]
+            .is_i64()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_marks_remote_pending_and_updates_local_service() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_mixed_service_state(temp_dir.path(), &openbao.uri()).expect("prepare mixed state");
+    stub_openbao_for_eab_rotation(&openbao).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "eab",
+            "--stepca-url",
+            &openbao.uri(),
+            "--stepca-provisioner",
+            "acme",
+        ])
+        .output()
+        .expect("run rotate eab");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["services"][SERVICE_NAME]["sync_status"]["eab"],
+        "pending"
+    );
+    assert_eq!(
+        state["services"][SECONDARY_SERVICE_NAME]["sync_status"]["eab"],
+        "none"
+    );
+
+    let local_agent = fs::read_to_string(temp_dir.path().join("agent-local.toml"))
+        .expect("read local agent config");
+    assert!(local_agent.contains("[eab]"));
+    assert!(local_agent.contains("kid = \"new-kid\""));
+    assert!(local_agent.contains("hmac = \"new-hmac\""));
+    assert!(local_agent.contains("[profiles.eab]"));
+    assert_eq!(
+        state["services"][SECONDARY_SERVICE_NAME]["sync_status"]["secret_id"],
+        "none"
+    );
+    assert_eq!(
+        state["services"][SECONDARY_SERVICE_NAME]["sync_status"]["responder_hmac"],
+        "none"
+    );
 }
 
 fn prepare_app_state(
@@ -457,6 +530,69 @@ fn prepare_app_state(
     fs::create_dir_all(&secret_dir).context("create secrets dir")?;
     fs::write(root.join("agent.toml"), "# agent").context("write agent config")?;
     Ok(root.join(secret_id_path))
+}
+
+fn prepare_mixed_service_state(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
+    write_state_file(root, openbao_url)?;
+    let state_path = root.join("state.json");
+    let contents = fs::read_to_string(&state_path).context("read state")?;
+    let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
+    state["services"][SERVICE_NAME] = json!({
+        "service_name": SERVICE_NAME,
+        "deploy_type": "daemon",
+        "delivery_mode": "remote-bootstrap",
+        "hostname": "edge-node-01",
+        "domain": "trusted.domain",
+        "agent_config_path": "agent.toml",
+        "cert_path": "certs/edge-proxy.crt",
+        "key_path": "certs/edge-proxy.key",
+        "instance_id": "001",
+        "container_name": "edge-proxy",
+        "sync_status": {
+            "secret_id": "none",
+            "eab": "none",
+            "responder_hmac": "none",
+            "trust_sync": "none"
+        },
+        "approle": {
+            "role_name": ROLE_NAME,
+            "role_id": ROLE_ID,
+            "secret_id_path": "secrets/services/edge-proxy/secret_id",
+            "policy_name": ROLE_NAME
+        }
+    });
+    state["services"][SECONDARY_SERVICE_NAME] = json!({
+        "service_name": SECONDARY_SERVICE_NAME,
+        "deploy_type": "daemon",
+        "delivery_mode": "local-file",
+        "hostname": "edge-node-02",
+        "domain": "trusted.domain",
+        "agent_config_path": "agent-local.toml",
+        "cert_path": "certs/edge-alt.crt",
+        "key_path": "certs/edge-alt.key",
+        "instance_id": "002",
+        "container_name": "edge-alt",
+        "sync_status": {
+            "secret_id": "none",
+            "eab": "none",
+            "responder_hmac": "none",
+            "trust_sync": "none"
+        },
+        "approle": {
+            "role_name": "bootroot-service-edge-alt",
+            "role_id": "role-edge-alt",
+            "secret_id_path": "secrets/services/edge-alt/secret_id",
+            "policy_name": "bootroot-service-edge-alt"
+        }
+    });
+    fs::write(&state_path, serde_json::to_string_pretty(&state)?).context("write state")?;
+    fs::write(root.join("agent.toml"), "# remote agent").context("write remote agent config")?;
+    fs::write(
+        root.join("agent-local.toml"),
+        "[profiles]\nservice_name = \"edge-alt\"\n",
+    )
+    .context("write local agent config")?;
+    Ok(())
 }
 
 fn write_state_file(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
