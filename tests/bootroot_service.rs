@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 use anyhow::Context;
+use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
 use wiremock::matchers::{header, method, path};
@@ -73,9 +74,7 @@ async fn test_app_add_writes_state_and_secret() {
     assert!(stdout.contains("- deploy type: daemon"));
     assert!(stdout.contains("- delivery mode: local-file"));
     assert!(stdout.contains("- sync secret_id: none"));
-    assert!(stdout.contains("[[profiles]]"));
-    assert!(stdout.contains("service_name = \"edge-proxy\""));
-    assert!(stdout.contains("paths.cert ="));
+    assert!(stdout.contains("manual snippets are hidden by default"));
     assert!(stdout.contains("- auto-applied bootroot-agent config:"));
     assert!(stdout.contains("- auto-applied OpenBao Agent config:"));
 
@@ -119,6 +118,65 @@ async fn test_app_add_writes_state_and_secret() {
     assert_eq!(mode, 0o600);
 
     assert_openbao_service_agent_files(temp_dir.path(), "edge-proxy");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_print_only_shows_snippets_without_writes() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("bootroot service add: summary"));
+    assert!(stdout.contains("daemon profile snippet:"));
+    assert!(stdout.contains("preview mode: no files or state were changed"));
+    assert!(!stdout.contains("auto-applied"));
+
+    let state_contents =
+        fs::read_to_string(temp_dir.path().join("state.json")).expect("read state.json");
+    let state: serde_json::Value = serde_json::from_str(&state_contents).expect("parse state");
+    assert!(state["services"]["edge-proxy"].is_null());
+    assert!(
+        !temp_dir
+            .path()
+            .join("secrets")
+            .join("services")
+            .join("edge-proxy")
+            .join("secret_id")
+            .exists()
+    );
 }
 
 #[cfg(unix)]
@@ -216,25 +274,21 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_prints_docker_snippet() {
-    use support::ROOT_TOKEN;
-
     let temp_dir = tempdir().expect("create temp dir");
-    let server = MockServer::start().await;
     let agent_config = temp_dir.path().join("agent.toml");
-    fs::write(&agent_config, "# config").expect("write agent config");
     let cert_dir = temp_dir.path().join("certs");
     fs::create_dir_all(&cert_dir).expect("create cert dir");
     let cert_path = cert_dir.join("edge-proxy.crt");
     let key_path = cert_dir.join("edge-proxy.key");
 
-    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
-    stub_app_add_openbao(&server, "edge-proxy").await;
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
             "service",
             "add",
+            "--print-only",
             "--service-name",
             "edge-proxy",
             "--deploy-type",
@@ -253,8 +307,6 @@ async fn test_app_add_prints_docker_snippet() {
             "001",
             "--container-name",
             "edge-proxy",
-            "--root-token",
-            ROOT_TOKEN,
         ])
         .output()
         .expect("run service add");
@@ -330,6 +382,76 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         .join("edge-proxy")
         .join("agent.hcl");
     assert!(!openbao_hcl.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_local_file_sets_verify_prerequisites() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# existing").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+
+    let add_output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+    assert!(add_output.status.success());
+
+    write_cert_with_dns(
+        &cert_path,
+        &key_path,
+        "001.edge-proxy.edge-node-01.trusted.domain",
+    )
+    .expect("write cert");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_fake_bootroot_agent(&bin_dir, 0).expect("write fake bootroot-agent");
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{current_path}", bin_dir.display());
+
+    let verify_output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", path)
+        .args(["verify", "--service-name", "edge-proxy"])
+        .output()
+        .expect("run verify");
+    let stdout = String::from_utf8_lossy(&verify_output.stdout);
+    assert!(verify_output.status.success());
+    assert!(stdout.contains("bootroot verify: summary"));
+    assert!(stdout.contains("- result: ok"));
 }
 
 #[cfg(unix)]
@@ -510,9 +632,10 @@ async fn test_app_add_includes_trust_snippet_when_present() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(stdout.contains("[trust]"));
-    assert!(stdout.contains("trusted_ca_sha256"));
-    assert!(stdout.contains("ca_bundle_path"));
+    assert!(!stdout.contains("[trust]"));
+    assert!(!stdout.contains("trusted_ca_sha256"));
+    assert!(!stdout.contains("ca_bundle_path"));
+    assert!(stdout.contains("manual snippets are hidden by default"));
 }
 
 #[cfg(unix)]
@@ -660,6 +783,26 @@ fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str
     let openbao_ctmpl = openbao_service_dir.join("agent.toml.ctmpl");
     assert!(openbao_hcl.exists());
     assert!(openbao_ctmpl.exists());
+}
+
+fn write_cert_with_dns(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    dns_name: &str,
+) -> anyhow::Result<()> {
+    let cert = generate_simple_self_signed(vec![dns_name.to_string()])?;
+    fs::write(cert_path, cert.cert.pem()).context("write cert pem")?;
+    fs::write(key_path, cert.signing_key.serialize_pem()).context("write key pem")?;
+    Ok(())
+}
+
+fn write_fake_bootroot_agent(dir: &std::path::Path, exit_code: i32) -> anyhow::Result<()> {
+    let script_path = dir.join("bootroot-agent");
+    let script = format!("#!/bin/sh\nexit {exit_code}\n");
+    fs::write(&script_path, script).context("write fake bootroot-agent")?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .context("set fake bootroot-agent perms")?;
+    Ok(())
 }
 
 fn write_state_with_app(root: &std::path::Path) {

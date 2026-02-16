@@ -405,6 +405,14 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long, value_enum)]
     pub(crate) delivery_mode: Option<DeliveryMode>,
 
+    /// Preview changes without writing files or state
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+
+    /// Print manual snippets only without writing files or state
+    #[arg(long)]
+    pub(crate) print_only: bool,
+
     /// Hostname used for DNS SAN
     #[arg(long)]
     pub(crate) hostname: Option<String>,
@@ -525,6 +533,42 @@ mod tests {
                     args.delivery_mode,
                     Some(DeliveryMode::RemoteBootstrap)
                 ));
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_print_only_flags() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--print-only",
+            "--dry-run",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            "agent.toml",
+            "--cert-path",
+            "certs/edge-proxy.crt",
+            "--key-path",
+            "certs/edge-proxy.key",
+            "--instance-id",
+            "001",
+            "--root-token",
+            "root-token",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert!(args.print_only);
+                assert!(args.dry_run);
             }
             _ => panic!("expected service add"),
         }
