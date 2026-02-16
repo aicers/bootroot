@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 use serde_json::json;
 use tempfile::tempdir;
@@ -31,6 +32,7 @@ async fn test_bootroot_remote_applies_service_secrets() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
         .args([
+            "pull",
             "--openbao-url",
             &server.uri(),
             "--kv-mount",
@@ -107,6 +109,7 @@ async fn test_bootroot_remote_is_idempotent_on_second_run() {
     let command = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
             .args([
+                "pull",
                 "--openbao-url",
                 &server.uri(),
                 "--kv-mount",
@@ -161,6 +164,7 @@ async fn test_bootroot_remote_fails_when_trust_fingerprints_missing() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
         .args([
+            "pull",
             "--openbao-url",
             &server.uri(),
             "--service-name",
@@ -202,6 +206,7 @@ async fn test_bootroot_remote_reports_partial_failure_with_json_output() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
         .args([
+            "pull",
             "--openbao-url",
             &server.uri(),
             "--service-name",
@@ -229,6 +234,49 @@ async fn test_bootroot_remote_reports_partial_failure_with_json_output() {
     assert_eq!(summary["responder_hmac"]["status"], "failed");
     assert_eq!(summary["trust_sync"]["status"], "failed");
     assert!(summary["responder_hmac"]["error"].is_string());
+}
+
+#[tokio::test]
+async fn test_bootroot_remote_ack_invokes_bootroot_sync_status() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let summary_path = temp_dir.path().join("summary.json");
+    fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&json!({
+            "secret_id": {"status": "applied"},
+            "eab": {"status": "applied"},
+            "responder_hmac": {"status": "failed"},
+            "trust_sync": {"status": "pending"}
+        }))
+        .expect("serialize summary"),
+    )
+    .expect("write summary");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let bootroot_log = temp_dir.path().join("bootroot.log");
+    write_fake_bootroot(&bin_dir, &bootroot_log);
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .env("PATH", combined_path)
+        .args([
+            "ack",
+            "--service-name",
+            "edge-proxy",
+            "--summary-json",
+            summary_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run bootroot-remote ack");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    let invoked = fs::read_to_string(&bootroot_log).expect("read bootroot invocation");
+    assert!(invoked.contains("service sync-status"));
+    assert!(invoked.contains("--service-name edge-proxy"));
+    assert!(invoked.contains("--summary-json"));
 }
 
 async fn stub_openbao_remote_sync(server: &MockServer) {
@@ -305,4 +353,20 @@ async fn stub_shared_service_payloads(server: &MockServer, trust_payload: serde_
 fn assert_mode(path: &std::path::Path, expected: u32) {
     let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
     assert_eq!(mode, expected, "path {}", path.display());
+}
+
+fn write_fake_bootroot(bin_dir: &Path, output_path: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf "%s " "$@" > "{}"
+exit 0
+"#,
+        output_path.display()
+    );
+    let path = bin_dir.join("bootroot");
+    fs::write(&path, script).expect("write fake bootroot");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .expect("set fake bootroot permissions");
+    fs::write(output_path, "").expect("seed bootroot output");
 }
