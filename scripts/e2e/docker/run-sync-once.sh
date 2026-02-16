@@ -14,6 +14,9 @@ AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-$WORK_DIR/agent.toml}"
 CA_BUNDLE_PATH="${CA_BUNDLE_PATH:-$WORK_DIR/certs/ca-bundle.pem}"
 SUMMARY_JSON_PATH="${SUMMARY_JSON_PATH:-$WORK_DIR/remote-summary-$SERVICE_NAME.json}"
 STATE_LOCK_DIR="${STATE_LOCK_DIR:-$WORK_DIR/.sync-status-lock}"
+RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-3}"
+RETRY_BACKOFF_SECS="${RETRY_BACKOFF_SECS:-1}"
+RETRY_JITTER_SECS="${RETRY_JITTER_SECS:-0}"
 
 acquire_lock() {
   local start
@@ -46,9 +49,9 @@ trap release_lock EXIT
   --ca-bundle-path "$CA_BUNDLE_PATH" \
   --summary-json "$SUMMARY_JSON_PATH" \
   --bootroot-bin "$BOOTROOT_BIN" \
-  --retry-attempts 3 \
-  --retry-backoff-secs 1 \
-  --retry-jitter-secs 0 \
+  --retry-attempts "$RETRY_ATTEMPTS" \
+  --retry-backoff-secs "$RETRY_BACKOFF_SECS" \
+  --retry-jitter-secs "$RETRY_JITTER_SECS" \
   >/dev/null
 
 printf '{"tick":%s}\n' "$(date +%s)" >>"$TICK_FILE"
