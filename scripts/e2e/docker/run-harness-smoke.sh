@@ -17,11 +17,13 @@ RUNNER_LOG="$ARTIFACT_DIR/runner.log"
 PHASE_LOG="$ARTIFACT_DIR/phases.log"
 MANIFEST_FILE="$ARTIFACT_DIR/manifest.json"
 RUNNER_PID_FILE="$ARTIFACT_DIR/runner.pid"
+MOCK_OPENBAO_PID_FILE="$ARTIFACT_DIR/mock-openbao.pid"
 COMPOSE_FILE="$ROOT_DIR/docker-compose.yml"
 COMPOSE_TEST_FILE="$ROOT_DIR/docker-compose.test.yml"
 COMPOSE_SERVICES="openbao postgres step-ca bootroot-http01"
 BOOTROOT_BIN="${BOOTROOT_BIN:-$ROOT_DIR/target/debug/bootroot}"
 BOOTROOT_REMOTE_BIN="${BOOTROOT_REMOTE_BIN:-$ROOT_DIR/target/debug/bootroot-remote}"
+MOCK_OPENBAO_PORT="${MOCK_OPENBAO_PORT:-18200}"
 
 log_phase() {
   local phase="$1"
@@ -49,6 +51,10 @@ ensure_bins() {
   fi
   if [ ! -x "$BOOTROOT_REMOTE_BIN" ]; then
     printf "bootroot-remote binary not executable: %s\n" "$BOOTROOT_REMOTE_BIN" >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf "python3 is required for mock OpenBao server\n" >&2
     exit 1
   fi
 }
@@ -113,6 +119,12 @@ cleanup() {
     kill "$pid" >/dev/null 2>&1 || true
     wait "$pid" 2>/dev/null || true
   fi
+  if [ -f "$MOCK_OPENBAO_PID_FILE" ]; then
+    local mock_pid
+    mock_pid="$(cat "$MOCK_OPENBAO_PID_FILE")"
+    kill "$mock_pid" >/dev/null 2>&1 || true
+    wait "$mock_pid" 2>/dev/null || true
+  fi
   capture_artifacts
   compose_down
 }
@@ -148,9 +160,13 @@ main() {
 
   "$ROOT_DIR/scripts/e2e/docker/bootstrap-smoke-node.sh" "$WORK_DIR"
 
+  SERVICE_NAME="$SERVICE_NAME" MOCK_OPENBAO_PORT="$MOCK_OPENBAO_PORT" \
+    python3 "$ROOT_DIR/scripts/e2e/docker/mock-openbao-server.py" >/dev/null 2>&1 &
+  printf "%s" "$!" >"$MOCK_OPENBAO_PID_FILE"
+
   log_phase "runner-start" "service-node-01" "$SERVICE_NAME"
   local sync_command
-  sync_command="cd '$WORK_DIR' && '$BOOTROOT_REMOTE_BIN' ack --service-name '$SERVICE_NAME' --summary-json '$WORK_DIR/remote-summary.json' --bootroot-bin '$BOOTROOT_BIN' >/dev/null && printf '{\"tick\":%s}\n' \"\$(date +%s)\" >> '$RUNNER_TICKS_FILE'"
+  sync_command="WORK_DIR='$WORK_DIR' SERVICE_NAME='$SERVICE_NAME' BOOTROOT_REMOTE_BIN='$BOOTROOT_REMOTE_BIN' BOOTROOT_BIN='$BOOTROOT_BIN' OPENBAO_URL='http://127.0.0.1:$MOCK_OPENBAO_PORT' TICK_FILE='$RUNNER_TICKS_FILE' '$ROOT_DIR/scripts/e2e/docker/run-sync-once.sh'"
   SCENARIO_ID="$SCENARIO_ID" \
   NODE_ID="service-node-01" \
   SERVICE_ID="$SERVICE_NAME" \
