@@ -2,6 +2,8 @@
 // referenced in each test module.
 #![allow(dead_code)]
 
+pub(crate) mod docker_harness;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

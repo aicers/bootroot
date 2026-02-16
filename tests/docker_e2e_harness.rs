@@ -1,39 +1,24 @@
 #[cfg(unix)]
+mod support;
+
+#[cfg(unix)]
 mod unix_integration {
-    use std::path::PathBuf;
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context, Result};
-
-    fn unique_id() -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        format!("harness-{now}")
-    }
-
-    fn smoke_script_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts")
-            .join("e2e")
-            .join("docker")
-            .join("run-harness-smoke.sh")
-    }
 
     #[test]
     #[ignore = "Requires local Docker for E2E harness validation"]
     fn docker_harness_smoke_generates_artifacts() -> Result<()> {
-        let scenario_id = unique_id();
-        let artifact_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let scenario_id = super::support::docker_harness::unique_scenario_id("harness");
+        let artifact_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tmp")
             .join("e2e")
             .join(format!("docker-smoke-{scenario_id}"));
 
         let output = Command::new("bash")
             .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .arg(smoke_script_path())
+            .arg(super::support::docker_harness::smoke_script_path())
             .env("SCENARIO_ID", &scenario_id)
             .env("PROJECT_NAME", format!("bootroot-e2e-{scenario_id}"))
             .env("ARTIFACT_DIR", &artifact_dir)
