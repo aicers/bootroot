@@ -713,6 +713,67 @@ async fn test_app_info_prints_summary() {
 
 #[cfg(unix)]
 #[test]
+fn test_service_sync_status_updates_state_from_remote_summary() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+    let summary_path = temp_dir.path().join("remote-summary.json");
+    fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&json!({
+            "secret_id": {"status": "applied"},
+            "eab": {"status": "unchanged"},
+            "responder_hmac": {"status": "failed", "error": "simulated"},
+            "trust_sync": {"status": "pending"}
+        }))
+        .expect("serialize summary"),
+    )
+    .expect("write summary json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "sync-status",
+            "--service-name",
+            "edge-proxy",
+            "--summary-json",
+            summary_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run service sync-status");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("bootroot service sync-status: summary"));
+    assert!(stdout.contains("- sync secret_id: applied"));
+    assert!(stdout.contains("- sync eab: applied"));
+    assert!(stdout.contains("- sync responder_hmac: failed"));
+    assert!(stdout.contains("- sync trust_sync: pending"));
+
+    let state_contents =
+        fs::read_to_string(temp_dir.path().join("state.json")).expect("read updated state");
+    let state: serde_json::Value = serde_json::from_str(&state_contents).expect("parse state");
+    assert_eq!(
+        state["services"]["edge-proxy"]["sync_status"]["secret_id"],
+        "applied"
+    );
+    assert_eq!(
+        state["services"]["edge-proxy"]["sync_status"]["eab"],
+        "applied"
+    );
+    assert_eq!(
+        state["services"]["edge-proxy"]["sync_status"]["responder_hmac"],
+        "failed"
+    );
+    assert_eq!(
+        state["services"]["edge-proxy"]["sync_status"]["trust_sync"],
+        "pending"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_app_info_missing_state_file() {
     let temp_dir = tempdir().expect("create temp dir");
 
