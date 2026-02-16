@@ -10,6 +10,8 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-smoke-$PROJECT_NAME}"
 INTERVAL_SECS="${INTERVAL_SECS:-1}"
 MAX_CYCLES="${MAX_CYCLES:-3}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-30}"
+SERVICE_NAME="${SERVICE_NAME:-edge-proxy}"
+WORK_DIR="$ARTIFACT_DIR/service-node"
 RUNNER_TICKS_FILE="$ARTIFACT_DIR/runner-ticks.log"
 RUNNER_LOG="$ARTIFACT_DIR/runner.log"
 PHASE_LOG="$ARTIFACT_DIR/phases.log"
@@ -18,6 +20,8 @@ RUNNER_PID_FILE="$ARTIFACT_DIR/runner.pid"
 COMPOSE_FILE="$ROOT_DIR/docker-compose.yml"
 COMPOSE_TEST_FILE="$ROOT_DIR/docker-compose.test.yml"
 COMPOSE_SERVICES="openbao postgres step-ca bootroot-http01"
+BOOTROOT_BIN="${BOOTROOT_BIN:-$ROOT_DIR/target/debug/bootroot}"
+BOOTROOT_REMOTE_BIN="${BOOTROOT_REMOTE_BIN:-$ROOT_DIR/target/debug/bootroot-remote}"
 
 log_phase() {
   local phase="$1"
@@ -36,6 +40,17 @@ ensure_compose() {
   fi
   printf "docker compose is required\n" >&2
   exit 1
+}
+
+ensure_bins() {
+  if [ ! -x "$BOOTROOT_BIN" ]; then
+    printf "bootroot binary not executable: %s\n" "$BOOTROOT_BIN" >&2
+    exit 1
+  fi
+  if [ ! -x "$BOOTROOT_REMOTE_BIN" ]; then
+    printf "bootroot-remote binary not executable: %s\n" "$BOOTROOT_REMOTE_BIN" >&2
+    exit 1
+  fi
 }
 
 compose_up() {
@@ -66,6 +81,9 @@ capture_artifacts() {
     -f "$COMPOSE_FILE" \
     -f "$COMPOSE_TEST_FILE" \
     logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+
+  cp -f "$WORK_DIR/state.json" "$ARTIFACT_DIR/state-final.json" 2>/dev/null || true
+  cp -f "$WORK_DIR/remote-summary.json" "$ARTIFACT_DIR/summary-final.json" 2>/dev/null || true
 }
 
 wait_for_runner_cycles() {
@@ -99,8 +117,25 @@ cleanup() {
   compose_down
 }
 
+assert_state_applied() {
+  local state_file="$1"
+  grep -q '"secret_id": "applied"' "$state_file"
+  grep -q '"eab": "applied"' "$state_file"
+  grep -q '"responder_hmac": "applied"' "$state_file"
+  grep -q '"trust_sync": "applied"' "$state_file"
+}
+
+run_verify() {
+  PATH="$WORK_DIR/bin:$PATH" \
+    "$BOOTROOT_BIN" verify \
+      --service-name "$SERVICE_NAME" \
+      --agent-config "$WORK_DIR/agent.toml" \
+      >/dev/null
+}
+
 main() {
   ensure_compose
+  ensure_bins
   mkdir -p "$ARTIFACT_DIR"
   : >"$RUNNER_TICKS_FILE"
   : >"$RUNNER_LOG"
@@ -111,12 +146,14 @@ main() {
   log_phase "bootstrap" "control-plane" "all"
   compose_up
 
-  log_phase "runner-start" "service-node-01" "edge-proxy"
+  "$ROOT_DIR/scripts/e2e/docker/bootstrap-smoke-node.sh" "$WORK_DIR"
+
+  log_phase "runner-start" "service-node-01" "$SERVICE_NAME"
   local sync_command
-  sync_command="printf '{\"tick\":%s}\n' \"\$(date +%s)\" >> '$RUNNER_TICKS_FILE'"
+  sync_command="cd '$WORK_DIR' && '$BOOTROOT_REMOTE_BIN' ack --service-name '$SERVICE_NAME' --summary-json '$WORK_DIR/remote-summary.json' --bootroot-bin '$BOOTROOT_BIN' >/dev/null && printf '{\"tick\":%s}\n' \"\$(date +%s)\" >> '$RUNNER_TICKS_FILE'"
   SCENARIO_ID="$SCENARIO_ID" \
   NODE_ID="service-node-01" \
-  SERVICE_ID="edge-proxy" \
+  SERVICE_ID="$SERVICE_NAME" \
   INTERVAL_SECS="$INTERVAL_SECS" \
   MAX_CYCLES="$MAX_CYCLES" \
   RUNNER_LOG="$RUNNER_LOG" \
@@ -125,16 +162,22 @@ main() {
   local runner_pid="$!"
   printf "%s" "$runner_pid" >"$RUNNER_PID_FILE"
 
-  log_phase "sync-loop" "service-node-01" "edge-proxy"
+  log_phase "sync-loop" "service-node-01" "$SERVICE_NAME"
   if ! wait_for_runner_cycles; then
     printf "runner did not complete expected cycles\n" >&2
     exit 1
   fi
 
-  log_phase "ack" "control-plane" "edge-proxy"
-  log_phase "verify" "service-node-01" "edge-proxy"
+  log_phase "ack" "control-plane" "$SERVICE_NAME"
+  if ! assert_state_applied "$WORK_DIR/state.json"; then
+    printf "state did not converge to applied\n" >&2
+    exit 1
+  fi
 
-  cat >"$MANIFEST_FILE" <<EOF
+  log_phase "verify" "service-node-01" "$SERVICE_NAME"
+  run_verify
+
+  cat >"$MANIFEST_FILE" <<JSON
 {
   "scenario": "$SCENARIO_ID",
   "project": "$PROJECT_NAME",
@@ -152,7 +195,7 @@ main() {
     "max_cycles": $MAX_CYCLES
   }
 }
-EOF
+JSON
 }
 
 main "$@"
