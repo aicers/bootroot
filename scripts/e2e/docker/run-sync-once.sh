@@ -8,6 +8,8 @@ BOOTROOT_BIN="${BOOTROOT_BIN:?BOOTROOT_BIN is required}"
 OPENBAO_URL="${OPENBAO_URL:?OPENBAO_URL is required}"
 TICK_FILE="${TICK_FILE:?TICK_FILE is required}"
 
+cd "$WORK_DIR"
+
 "$BOOTROOT_REMOTE_BIN" sync \
   --openbao-url "$OPENBAO_URL" \
   --kv-mount "secret" \
