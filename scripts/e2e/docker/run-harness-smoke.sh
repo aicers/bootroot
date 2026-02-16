@@ -57,6 +57,10 @@ ensure_bins() {
     printf "python3 is required for mock OpenBao server\n" >&2
     exit 1
   fi
+  if ! command -v curl >/dev/null 2>&1; then
+    printf "curl is required for mock OpenBao health checks\n" >&2
+    exit 1
+  fi
 }
 
 compose_up() {
@@ -102,6 +106,22 @@ wait_for_runner_cycles() {
       line_count="$(wc -l <"$RUNNER_TICKS_FILE" | tr -d ' ')"
     fi
     if [ "$line_count" -ge "$MAX_CYCLES" ]; then
+      return 0
+    fi
+    if [ $(( $(date +%s) - start )) -ge "$TIMEOUT_SECS" ]; then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+wait_for_mock_openbao() {
+  local health_url
+  health_url="http://127.0.0.1:$MOCK_OPENBAO_PORT/v1/sys/health"
+  local start
+  start="$(date +%s)"
+  while true; do
+    if curl -fsS "$health_url" >/dev/null 2>&1; then
       return 0
     fi
     if [ $(( $(date +%s) - start )) -ge "$TIMEOUT_SECS" ]; then
@@ -166,6 +186,10 @@ main() {
   SERVICE_NAME="$SERVICE_NAME" MOCK_OPENBAO_PORT="$MOCK_OPENBAO_PORT" \
     python3 "$ROOT_DIR/scripts/e2e/docker/mock-openbao-server.py" >/dev/null 2>&1 &
   printf "%s" "$!" >"$MOCK_OPENBAO_PID_FILE"
+  if ! wait_for_mock_openbao; then
+    printf "mock OpenBao did not become healthy\n" >&2
+    exit 1
+  fi
 
   log_phase "runner-start" "service-node-01" "$SERVICE_NAME"
   local sync_command
