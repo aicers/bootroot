@@ -86,6 +86,7 @@ bootroot init: 요약
 - step-ca 초기화: 완료
 - responder 점검: ok
 - DB 점검: 생략
+- DB 호스트 해석: localhost -> postgres
 - OpenBao KV 경로:
     role_id: secrets/services/<service>/role_id
     secret_id: secrets/services/<service>/secret_id

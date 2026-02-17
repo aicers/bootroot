@@ -86,6 +86,7 @@ bootroot init: summary
 - step-ca init: completed
 - responder check: ok
 - db check: skipped
+- db host resolution: localhost -> postgres
 - OpenBao KV paths:
     role_id: secrets/services/<service>/role_id
     secret_id: secrets/services/<service>/secret_id

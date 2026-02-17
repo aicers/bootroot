@@ -92,6 +92,13 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--stepca-provisioner`: step-ca ACME provisioner 이름 (기본값 `acme`)
 - `--eab-kid`, `--eab-hmac`: 수동 EAB 입력
 
+DB DSN host 처리 규칙:
+
+- `localhost`, `127.0.0.1`, `::1` 입력은 init 시 내부적으로
+  `postgres`로 정규화됩니다.
+- `db.internal` 같은 원격 호스트는 step-ca 컨테이너 런타임에서 접근할 수
+  없어 init이 실패합니다.
+
 ### 대화형 동작
 
 - 누락된 필수 입력을 프롬프트로 받습니다.
@@ -106,6 +113,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `password.txt`, `secrets/config/ca.json` 갱신 결과
 - step-ca 초기화 여부, responder 체크 결과
 - DB 연결 점검 결과(옵션 사용 시)
+- DB host 해석 결과(`from -> to`)
 - EAB 등록 여부
 - step-ca/responder용 OpenBao Agent compose override 자동 적용
 - 다음 단계 안내

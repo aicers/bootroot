@@ -35,8 +35,12 @@ CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서�
 
 `dial tcp 127.0.0.1:5432: connect: connection refused` 같은 오류가 나오면
 `secrets/config/ca.json`의 `db.dataSource`가 컨테이너 내부 기준으로
-잘못 설정된 경우가 많습니다. Compose 환경에서는 `localhost` 대신
-서비스 이름(예: `postgres`)을 사용해야 합니다.
+잘못 설정된 경우가 많습니다.
+
+- `bootroot init`에 `localhost`/`127.0.0.1`/`::1`을 넣었다면, 정상적으로
+  `postgres`로 정규화되어야 합니다.
+- `db.internal` 같은 원격 호스트를 넣으면 init이 실패합니다(설계된 동작).
+- init summary의 `DB 호스트 해석: from -> to` 라인을 확인하세요.
 
 수정 후에는 step-ca를 재시작하세요.
 

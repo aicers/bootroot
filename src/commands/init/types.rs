@@ -29,6 +29,8 @@ pub(crate) struct InitSummary {
     pub(crate) approles: Vec<AppRoleOutput>,
     pub(crate) stepca_password: String,
     pub(crate) db_dsn: String,
+    pub(crate) db_dsn_host_original: String,
+    pub(crate) db_dsn_host_effective: String,
     pub(crate) http_hmac: String,
     pub(crate) eab: Option<EabCredentials>,
     pub(crate) step_ca_result: StepCaInitResult,

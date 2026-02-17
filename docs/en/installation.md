@@ -88,8 +88,12 @@ Examples:
   `postgresql://step:<secret>@db.internal:5432/stepca?sslmode=require`
 
 **Important**: When step-ca runs in a container, the `db.dataSource` host is
-**inside the container network**. Use the Compose service name (for example,
-`postgres`), not `127.0.0.1` or `localhost`.
+**inside the container network**. The effective host must be the Compose
+service name (for example, `postgres`).
+
+In `bootroot init`, `--db-dsn`/`--db-admin-dsn` inputs can use
+`localhost`/`127.0.0.1`/`::1`; init normalizes them to `postgres`.
+Remote hosts like `db.internal` fail during init.
 
 `<secret>` is your real database password.
 
@@ -97,6 +101,10 @@ Examples:
 `POSTGRES_PASSWORD` in `.env`, which is why the local/Compose examples use the
 same value. In production, replace it with a strong password. In production
 we recommend injecting this DB password via a Secret Manager.
+
+Note: automatic DB password generation applies only when `bootroot init` runs
+with both `--db-provision` and `--auto-generate`. In the `--db-dsn` path, the
+password embedded in the DSN is used as-is.
 
 Example `.env`:
 
@@ -134,6 +142,8 @@ single-host guardrails:
 
 - PostgreSQL host in DSN must be local-only (`postgres`, `localhost`,
   `127.0.0.1`, or `::1`).
+- init summary prints DB host resolution (for example,
+  `localhost -> postgres`).
 - PostgreSQL port publishing in Compose must stay localhost-bound (for example,
   `127.0.0.1:5432:5432`), not `0.0.0.0` or bare `5432:5432`.
 

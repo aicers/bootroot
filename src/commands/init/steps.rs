@@ -43,7 +43,7 @@ use super::types::{
 };
 use crate::cli::args::InitArgs;
 use crate::cli::output::{print_init_plan, print_init_summary};
-use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
+use crate::commands::guardrails::{ensure_postgres_localhost_binding, is_single_host_db_host};
 use crate::commands::infra::{ensure_infra_ready, run_docker};
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
@@ -117,7 +117,7 @@ async fn run_init_inner(
         confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
     }
 
-    let db_dsn = resolve_db_dsn_for_init(args, messages).await?;
+    let (db_dsn, db_dsn_normalization) = resolve_db_dsn_for_init(args, messages).await?;
     let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
     let db_info = parse_db_dsn(&secrets.db_dsn)
         .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
@@ -213,6 +213,8 @@ async fn run_init_inner(
         approles: role_outputs,
         stepca_password: secrets.stepca_password,
         db_dsn: secrets.db_dsn,
+        db_dsn_host_original: db_dsn_normalization.original_host,
+        db_dsn_host_effective: db_dsn_normalization.effective_host,
         http_hmac: secrets.http_hmac,
         eab: secrets.eab,
         step_ca_result,
@@ -239,6 +241,14 @@ struct InitSecrets {
     http_hmac: String,
     eab: Option<EabCredentials>,
 }
+
+#[derive(Debug, Clone)]
+struct DbDsnNormalization {
+    original_host: String,
+    effective_host: String,
+}
+
+const DB_COMPOSE_HOST: &str = "postgres";
 
 #[derive(serde::Deserialize)]
 struct EabAutoResponse {
@@ -1312,7 +1322,23 @@ async fn issue_eab_via_stepca(args: &InitArgs, messages: &Messages) -> Result<Ea
     })
 }
 
-async fn resolve_db_dsn_for_init(args: &InitArgs, messages: &Messages) -> Result<String> {
+fn normalize_db_host_for_compose_runtime(host: &str, messages: &Messages) -> Result<String> {
+    if host.eq_ignore_ascii_case(DB_COMPOSE_HOST) {
+        return Ok(DB_COMPOSE_HOST.to_string());
+    }
+    if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
+        return Ok(DB_COMPOSE_HOST.to_string());
+    }
+    if is_single_host_db_host(host) {
+        return Ok(host.to_string());
+    }
+    anyhow::bail!(messages.error_db_host_compose_runtime(host, DB_COMPOSE_HOST));
+}
+
+async fn resolve_db_dsn_for_init(
+    args: &InitArgs,
+    messages: &Messages,
+) -> Result<(String, DbDsnNormalization)> {
     if args.db_provision && args.db_dsn.is_some() {
         anyhow::bail!(messages.error_db_provision_conflict());
     }
@@ -1320,11 +1346,11 @@ async fn resolve_db_dsn_for_init(args: &InitArgs, messages: &Messages) -> Result
         let inputs = resolve_db_provision_inputs(args, messages)?;
         let admin = parse_db_dsn(&inputs.admin_dsn)
             .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-        ensure_single_host_db_host(&admin.host, messages)?;
+        let effective_host = normalize_db_host_for_compose_runtime(&admin.host, messages)?;
         let dsn = build_db_dsn(
             &inputs.db_user,
             &inputs.db_password,
-            &admin.host,
+            &effective_host,
             admin.port,
             &inputs.db_name,
             admin.sslmode.as_deref(),
@@ -1341,16 +1367,37 @@ async fn resolve_db_dsn_for_init(args: &InitArgs, messages: &Messages) -> Result
         })
         .await
         .with_context(|| messages.error_db_provision_task_failed())??;
-        let parsed =
-            parse_db_dsn(&dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-        ensure_single_host_db_host(&parsed.host, messages)?;
-        return Ok(dsn);
+        return Ok((
+            dsn,
+            DbDsnNormalization {
+                original_host: admin.host,
+                effective_host,
+            },
+        ));
     }
     let dsn = resolve_db_dsn(args, messages)?;
     let parsed =
         parse_db_dsn(&dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-    ensure_single_host_db_host(&parsed.host, messages)?;
-    Ok(dsn)
+    let effective_host = normalize_db_host_for_compose_runtime(&parsed.host, messages)?;
+    let effective_dsn = if parsed.host == effective_host {
+        dsn
+    } else {
+        build_db_dsn(
+            &parsed.user,
+            &parsed.password,
+            &effective_host,
+            parsed.port,
+            &parsed.database,
+            parsed.sslmode.as_deref(),
+        )
+    };
+    Ok((
+        effective_dsn,
+        DbDsnNormalization {
+            original_host: parsed.host,
+            effective_host,
+        },
+    ))
 }
 
 #[derive(Debug)]
@@ -1949,7 +1996,50 @@ mod tests {
             .expect("runtime")
             .block_on(resolve_db_dsn_for_init(&args, &test_messages()))
             .expect_err("remote db host should fail single-host guardrail");
-        assert!(err.to_string().contains("single-host guardrail"));
+        assert!(
+            err.to_string()
+                .contains("not reachable from step-ca container")
+        );
+    }
+
+    #[test]
+    fn test_resolve_db_dsn_for_init_normalizes_localhost_to_postgres() {
+        let _guard = env_lock();
+        let mut args = default_init_args();
+        args.db_dsn = Some("postgresql://user:pass@localhost:5432/stepca".to_string());
+
+        let (dsn, normalization) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(resolve_db_dsn_for_init(&args, &test_messages()))
+            .expect("dsn should resolve");
+        assert_eq!(
+            dsn,
+            "postgresql://user:pass@postgres:5432/stepca?sslmode=disable"
+        );
+        assert_eq!(normalization.original_host, "localhost");
+        assert_eq!(normalization.effective_host, "postgres");
+    }
+
+    #[test]
+    fn test_resolve_db_dsn_for_init_keeps_postgres_host() {
+        let _guard = env_lock();
+        let mut args = default_init_args();
+        args.db_dsn = Some("postgresql://user:pass@postgres:5432/stepca".to_string());
+
+        let (dsn, normalization) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(resolve_db_dsn_for_init(&args, &test_messages()))
+            .expect("dsn should resolve");
+        assert_eq!(dsn, "postgresql://user:pass@postgres:5432/stepca");
+        assert_eq!(normalization.original_host, "postgres");
+        assert_eq!(normalization.effective_host, "postgres");
+    }
+
+    #[test]
+    fn test_normalize_db_host_for_compose_runtime_localhost() {
+        let normalized =
+            normalize_db_host_for_compose_runtime("127.0.0.1", &test_messages()).unwrap();
+        assert_eq!(normalized, "postgres");
     }
 
     #[test]

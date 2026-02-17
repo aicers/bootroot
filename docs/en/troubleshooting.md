@@ -34,9 +34,13 @@ Check your CLI flags. The current CLI supports:
 ## step-ca PostgreSQL connection failures
 
 If you see errors like `dial tcp 127.0.0.1:5432: connect: connection refused`,
-`db.dataSource` in `secrets/config/ca.json` is likely pointing to localhost
-inside the container. In Compose, use the service name (for example,
-`postgres`) instead of `127.0.0.1` or `localhost`.
+`db.dataSource` in `secrets/config/ca.json` is likely wrong for container
+runtime.
+
+- If you used `localhost`/`127.0.0.1`/`::1` in `bootroot init`, it should be
+  normalized to `postgres`.
+- Remote hosts like `db.internal` are expected to fail during init.
+- Check the init summary line `db host resolution: from -> to`.
 
 Restart step-ca after updating the DSN.
 

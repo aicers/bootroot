@@ -92,8 +92,12 @@ postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=<mode>
   `postgresql://step:<secret>@db.internal:5432/stepca?sslmode=require`
 
 **중요**: step-ca가 컨테이너에서 실행 중이면 `db.dataSource`의 호스트는
-**컨테이너 내부 기준**입니다. 따라서 `127.0.0.1`/`localhost`가 아니라
-Compose 서비스 이름(예: `postgres`)을 사용해야 합니다.
+**컨테이너 내부 기준**입니다. 최종적으로는 Compose 서비스 이름(예:
+`postgres`)을 사용해야 합니다.
+
+`bootroot init`의 `--db-dsn`/`--db-admin-dsn` 입력에서는
+`localhost`/`127.0.0.1`/`::1`도 허용되며, 내부적으로 `postgres`로
+정규화됩니다. 반면 `db.internal` 같은 원격 호스트는 init에서 실패합니다.
 
 `<secret>` 자리는 실제 운영 비밀번호를 넣어야 합니다.
 
@@ -102,6 +106,10 @@ Compose 서비스 이름(예: `postgres`)을 사용해야 합니다.
 사용했습니다. 운영에서는 반드시 강한 비밀번호로 변경하세요. 운영에서는
 이 DB 비밀번호도 OpenBao 같은 **시크릿 매니저(Secret Manager)** 를 통해
 주입하는 방식을 권장합니다.
+
+참고: DB 비밀번호 자동 생성은 `bootroot init`에서
+`--db-provision`과 `--auto-generate`를 함께 사용할 때만 적용됩니다.
+`--db-dsn` 경로에서는 DSN에 포함된 비밀번호를 그대로 사용합니다.
 
 `.env`에는 다음처럼 입력합니다(예시):
 
@@ -145,6 +153,8 @@ scripts/update-ca-db-dsn.sh
 
 - DSN의 PostgreSQL 호스트는 로컬 값만 허용됩니다
   (`postgres`, `localhost`, `127.0.0.1`, `::1`).
+- init summary에는 DB host 해석 결과가 함께 출력됩니다
+  (예: `localhost -> postgres`).
 - Compose의 PostgreSQL 포트 publish는 localhost 바인딩만 허용됩니다
   (예: `127.0.0.1:5432:5432`).
   `0.0.0.0` 바인딩 또는 `5432:5432` 형태는 허용되지 않습니다.
