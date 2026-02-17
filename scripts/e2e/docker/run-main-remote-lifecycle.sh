@@ -49,6 +49,7 @@ RESPONDER_URL=""
 OPENBAO_ROOT_TOKEN=""
 CURRENT_PHASE="init"
 BOOTROOT_CONTROL_PROXY="${REMOTE_DIR}/bin/bootroot-control"
+SERVICE_KV_PATH_BASE="bootroot/services/${SERVICE_NAME}"
 
 log_phase() {
   local phase="$1"
@@ -428,6 +429,17 @@ run_verify_pair() {
   snapshot_cert_meta "$label"
 }
 
+openbao_write_service_kv() {
+  local item="$1"
+  local payload="$2"
+  curl -fsS \
+    -X POST \
+    -H "X-Vault-Token: ${OPENBAO_ROOT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    "http://${STEPCA_HOST_IP}:8200/v1/secret/data/${SERVICE_KV_PATH_BASE}/${item}" \
+    -d "$payload" >/dev/null
+}
+
 force_reissue_remote_service() {
   rm -f "$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt" "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key"
 }
@@ -441,6 +453,37 @@ run_rotation_secret_id() {
     --yes \
     approle-secret-id \
     --service-name "$SERVICE_NAME" >>"$RUN_LOG" 2>&1
+}
+
+run_rotation_eab() {
+  log_phase "rotate-eab"
+  local kid hmac payload
+  kid="remote-kid-$(date +%s)"
+  hmac="remote-hmac-$(date +%s)"
+  payload="$(jq -n --arg kid "$kid" --arg hmac "$hmac" '{data:{kid:$kid,hmac:$hmac}}')"
+  openbao_write_service_kv "eab" "$payload"
+}
+
+run_rotation_trust_sync() {
+  log_phase "rotate-trust-sync"
+  local current_trust_json extra_fingerprint ca_bundle_pem payload
+  current_trust_json="$(python3 - "$REMOTE_AGENT_CONFIG_PATH" <<'PY'
+import json
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as fh:
+    data = tomllib.load(fh)
+trusted = data.get("trust", {}).get("trusted_ca_sha256", [])
+if not trusted:
+    raise SystemExit("missing trust.trusted_ca_sha256")
+print(json.dumps(trusted))
+PY
+)"
+  extra_fingerprint="$(openssl rand -hex 32)"
+  ca_bundle_pem="$(cat "$REMOTE_CERTS_DIR/ca-bundle.pem")"
+  payload="$(jq -n --argjson current "$current_trust_json" --arg extra "$extra_fingerprint" --arg pem "$ca_bundle_pem" '{data:{trusted_ca_sha256:($current + [$extra]),ca_bundle_pem:$pem}}')"
+  openbao_write_service_kv "trust" "$payload"
 }
 
 run_rotation_responder_hmac() {
@@ -488,6 +531,22 @@ main() {
   run_verify_pair "after-secret-id"
   assert_fingerprint_changed "initial" "after-secret-id"
 
+  run_rotation_eab
+  log_phase "sync-after-eab"
+  run_remote_sync
+  assert_control_sync_applied
+  force_reissue_remote_service
+  run_verify_pair "after-eab"
+  assert_fingerprint_changed "after-secret-id" "after-eab"
+
+  run_rotation_trust_sync
+  log_phase "sync-after-trust-sync"
+  run_remote_sync
+  assert_control_sync_applied
+  force_reissue_remote_service
+  run_verify_pair "after-trust-sync"
+  assert_fingerprint_changed "after-eab" "after-trust-sync"
+
   run_rotation_responder_hmac
   log_phase "sync-after-responder-hmac"
   run_remote_sync
@@ -495,7 +554,7 @@ main() {
 
   force_reissue_remote_service
   run_verify_pair "after-responder-hmac"
-  assert_fingerprint_changed "after-secret-id" "after-responder-hmac"
+  assert_fingerprint_changed "after-trust-sync" "after-responder-hmac"
 }
 
 main "$@"
