@@ -16,10 +16,12 @@ Usage: scripts/ci-local-e2e.sh [--skip-hosts-all] [--fresh-secrets]
 Runs the same Docker E2E matrix steps used in CI:
 1) main lifecycle (fqdn-only-hosts)
 2) main lifecycle (hosts-all)
-3) rotation/recovery full matrix
+3) main remote lifecycle (fqdn-only-hosts)
+4) main remote lifecycle (hosts-all)
+5) rotation/recovery full matrix
 
 Options:
-  --skip-hosts-all  Skip hosts-all lifecycle step (useful when sudo -n is unavailable locally)
+  --skip-hosts-all  Skip hosts-all steps (useful when sudo -n is unavailable locally)
   --fresh-secrets   Temporarily replace ./secrets with a clean directory and restore it on exit
 EOF
 }
@@ -99,6 +101,40 @@ else
   echo "[ci-local-e2e] skip main lifecycle (hosts-all)"
 fi
 
+echo "[ci-local-e2e] run main remote lifecycle (fqdn-only-hosts)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-main-remote-fqdn-${RUN_ID}" \
+PROJECT_NAME="bootroot-e2e-ci-main-remote-fqdn-${RUN_ID}" \
+RESOLUTION_MODE="fqdn-only-hosts" \
+SECRETS_DIR="$ROOT_DIR/secrets" \
+TIMEOUT_SECS=120 \
+INFRA_UP_ATTEMPTS=12 \
+INFRA_UP_DELAY_SECS=10 \
+VERIFY_ATTEMPTS=5 \
+VERIFY_DELAY_SECS=5 \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
+BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
+"$ROOT_DIR/scripts/e2e/docker/run-main-remote-lifecycle.sh"
+
+if [ "$SKIP_HOSTS_ALL" -eq 0 ]; then
+  echo "[ci-local-e2e] run main remote lifecycle (hosts-all)"
+  ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-main-remote-hosts-${RUN_ID}" \
+  PROJECT_NAME="bootroot-e2e-ci-main-remote-hosts-${RUN_ID}" \
+  RESOLUTION_MODE="hosts-all" \
+  SECRETS_DIR="$ROOT_DIR/secrets" \
+  TIMEOUT_SECS=120 \
+  INFRA_UP_ATTEMPTS=12 \
+  INFRA_UP_DELAY_SECS=10 \
+  VERIFY_ATTEMPTS=5 \
+  VERIFY_DELAY_SECS=5 \
+  BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+  BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
+  BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
+  "$ROOT_DIR/scripts/e2e/docker/run-main-remote-lifecycle.sh"
+else
+  echo "[ci-local-e2e] skip main remote lifecycle (hosts-all)"
+fi
+
 echo "[ci-local-e2e] run rotation/recovery full matrix"
 SCENARIO_FILE="$ROOT_DIR/tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json" \
 ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-rotation-${RUN_ID}" \
@@ -113,4 +149,6 @@ echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
 echo "  - $ROOT_DIR/tmp/e2e/ci-main-fqdn-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-main-hosts-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-main-remote-fqdn-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-main-remote-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-rotation-${RUN_ID}"

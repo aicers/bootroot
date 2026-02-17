@@ -104,6 +104,32 @@ ruff format .
 ruff check --fix .
 ```
 
+## Local E2E Preflight (required before push)
+
+To reduce avoidable CI failures, run the local E2E preflight below in addition
+to `cargo test`:
+
+```bash
+./scripts/ci-local-e2e.sh
+./scripts/e2e/docker/run-extended-suite.sh
+```
+
+Why both:
+
+- `./scripts/ci-local-e2e.sh` mirrors the core Docker E2E matrix used by CI
+  (main lifecycle, main remote lifecycle, and rotation/recovery).
+- `./scripts/e2e/docker/run-extended-suite.sh` covers the extended scenarios
+  used by the separate Extended workflow.
+
+If these do not pass locally, CI/Extended workflow failures are likely after
+push.
+
+Notes:
+
+- If your machine cannot run non-interactive sudo (`sudo -n`) for `hosts-all`,
+  use `./scripts/ci-local-e2e.sh --skip-hosts-all`.
+- Artifacts are written under `tmp/e2e/` for triage.
+
 Install scope:
 
 - If you use a per-repo virtualenv (`.venv`), you need to create it and
