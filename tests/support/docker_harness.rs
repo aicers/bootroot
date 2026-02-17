@@ -25,6 +25,14 @@ pub(crate) fn baseline_script_path() -> PathBuf {
         .join("run-baseline.sh")
 }
 
+pub(crate) fn main_lifecycle_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("e2e")
+        .join("docker")
+        .join("run-main-lifecycle.sh")
+}
+
 pub(crate) fn baseline_scenario_path(file_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
