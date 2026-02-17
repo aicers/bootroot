@@ -85,6 +85,7 @@ PROFILE_KEY_PATH="${PROFILE_KEY_PATH:-$(read_state_field key_path)}"
   --ca-bundle-path "$CA_BUNDLE_PATH" \
   --summary-json "$SUMMARY_JSON_PATH" \
   --bootroot-bin "$BOOTROOT_BIN" \
+  --state-file "$STATE_FILE" \
   --retry-attempts "$RETRY_ATTEMPTS" \
   --retry-backoff-secs "$RETRY_BACKOFF_SECS" \
   --retry-jitter-secs "$RETRY_JITTER_SECS" \

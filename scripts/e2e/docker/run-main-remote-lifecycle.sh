@@ -48,7 +48,6 @@ STEPCA_EAB_URL=""
 RESPONDER_URL=""
 OPENBAO_ROOT_TOKEN=""
 CURRENT_PHASE="init"
-BOOTROOT_CONTROL_PROXY="${REMOTE_DIR}/bin/bootroot-control"
 SERVICE_KV_PATH_BASE="bootroot/services/${SERVICE_NAME}"
 
 log_phase() {
@@ -216,17 +215,6 @@ wait_for_openbao_api() {
   fail "openbao API did not become reachable before init"
 }
 
-write_bootroot_control_proxy() {
-  mkdir -p "$(dirname "$BOOTROOT_CONTROL_PROXY")"
-  cat >"$BOOTROOT_CONTROL_PROXY" <<EOF_PROXY
-#!/usr/bin/env sh
-set -eu
-cd "$CONTROL_DIR"
-exec "$BOOTROOT_BIN" "\$@"
-EOF_PROXY
-  chmod 700 "$BOOTROOT_CONTROL_PROXY"
-}
-
 run_bootstrap_chain() {
   log_phase "infra-up"
   local attempt
@@ -341,7 +329,8 @@ run_remote_sync() {
       --profile-key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key" \
       --ca-bundle-path "$ca_bundle_path" \
       --summary-json "$summary_path" \
-      --bootroot-bin "$BOOTROOT_CONTROL_PROXY" \
+      --bootroot-bin "$BOOTROOT_BIN" \
+      --state-file "$CONTROL_DIR/state.json" \
       --output json >>"$RUN_LOG" 2>&1
   )
 }
@@ -488,7 +477,6 @@ main() {
   compose_down
   reset_stepca_materials_for_e2e
   prepare_test_ca_materials
-  write_bootroot_control_proxy
 
   run_bootstrap_chain
   copy_remote_bootstrap_materials
