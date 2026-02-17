@@ -19,6 +19,8 @@ VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-5}"
 VERIFY_DELAY_SECS="${VERIFY_DELAY_SECS:-5}"
 HTTP01_TARGET_ATTEMPTS="${HTTP01_TARGET_ATTEMPTS:-40}"
 HTTP01_TARGET_DELAY_SECS="${HTTP01_TARGET_DELAY_SECS:-2}"
+RESPONDER_READY_ATTEMPTS="${RESPONDER_READY_ATTEMPTS:-30}"
+RESPONDER_READY_DELAY_SECS="${RESPONDER_READY_DELAY_SECS:-1}"
 BOOTROOT_BIN="${BOOTROOT_BIN:-$ROOT_DIR/target/debug/bootroot}"
 BOOTROOT_REMOTE_BIN="${BOOTROOT_REMOTE_BIN:-$ROOT_DIR/target/debug/bootroot-remote}"
 BOOTROOT_AGENT_BIN="${BOOTROOT_AGENT_BIN:-$ROOT_DIR/target/debug/bootroot-agent}"
@@ -215,6 +217,21 @@ wait_for_openbao_api() {
   fail "openbao API did not become reachable before init"
 }
 
+wait_for_responder_admin() {
+  local admin_url="${RESPONDER_URL%/}/admin/http01"
+  local attempt
+  for attempt in $(seq 1 "$RESPONDER_READY_ATTEMPTS"); do
+    local code
+    code="$(curl -sS -m 2 -o /dev/null -w '%{http_code}' "$admin_url" || true)"
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+      return 0
+    fi
+    sleep "$RESPONDER_READY_DELAY_SECS"
+  done
+  docker logs bootroot-http01 >>"$RUN_LOG" 2>&1 || true
+  fail "responder admin endpoint did not become reachable before init: $admin_url"
+}
+
 run_bootstrap_chain() {
   log_phase "infra-up"
   local attempt
@@ -229,6 +246,7 @@ run_bootstrap_chain() {
   done
 
   wait_for_openbao_api
+  wait_for_responder_admin
 
   log_phase "init"
   rm -f "$CONTROL_DIR/state.json"
@@ -244,8 +262,7 @@ run_bootstrap_chain() {
     --eab-hmac "$INIT_EAB_HMAC" \
     --http-hmac "dev-hmac" \
     --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
-    --responder-url "$RESPONDER_URL" \
-    --skip-responder-check >"$INIT_RAW_LOG" 2>&1; then
+    --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"
       tail -n 160 "$INIT_RAW_LOG" || true
