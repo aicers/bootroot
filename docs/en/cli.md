@@ -95,6 +95,13 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
 - `--eab-kid`, `--eab-hmac`: manual EAB input
 
+DB DSN host handling:
+
+- `localhost`, `127.0.0.1`, and `::1` are normalized to `postgres` during
+  init.
+- Remote hosts like `db.internal` fail during init because they are not
+  reachable from the step-ca container runtime.
+
 ### Interactive behavior
 
 - Prompts for missing required inputs.
@@ -109,6 +116,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `password.txt` and `secrets/config/ca.json` updates
 - step-ca init result and responder check status
 - DB connectivity check status (when enabled)
+- DB host resolution summary (`from -> to`)
 - EAB registration summary
 - OpenBao Agent compose override for step-ca/responder (applied automatically)
 - Next-steps guidance

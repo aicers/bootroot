@@ -274,7 +274,6 @@ prepare_test_ca_materials() {
       --acme >>"$RUN_LOG" 2>&1
   fi
 
-  normalize_stepca_db_host_for_compose
   [ -r "$SECRETS_DIR/config/ca.json" ] || fail "secrets/config/ca.json is not readable"
 }
 
@@ -287,53 +286,6 @@ reset_stepca_materials_for_e2e() {
     "$SECRETS_DIR/certs" \
     "$SECRETS_DIR/db" \
     "$SECRETS_DIR/secrets"
-}
-
-normalize_stepca_db_host_for_compose() {
-  local ca_json="$SECRETS_DIR/config/ca.json"
-  [ -f "$ca_json" ] || return 0
-  python3 - "$ca_json" >>"$RUN_LOG" 2>&1 <<'PY'
-import json
-import sys
-from urllib.parse import urlsplit, urlunsplit
-
-path = sys.argv[1]
-with open(path, "r", encoding="utf-8") as fh:
-    data = json.load(fh)
-
-db = data.get("db")
-if not isinstance(db, dict):
-    raise SystemExit(0)
-
-dsn = db.get("dataSource")
-if not isinstance(dsn, str):
-    raise SystemExit(0)
-
-parts = urlsplit(dsn)
-if parts.scheme not in ("postgres", "postgresql"):
-    raise SystemExit(0)
-if parts.hostname not in ("127.0.0.1", "localhost"):
-    raise SystemExit(0)
-
-netloc = parts.netloc
-userinfo = ""
-hostport = netloc
-if "@" in netloc:
-    userinfo, hostport = netloc.rsplit("@", 1)
-
-port = ""
-if ":" in hostport:
-    _host, tail = hostport.rsplit(":", 1)
-    if tail:
-        port = ":" + tail
-
-new_netloc = f"{userinfo + '@' if userinfo else ''}postgres{port}"
-db["dataSource"] = urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
-
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-PY
 }
 
 run_bootstrap_chain() {

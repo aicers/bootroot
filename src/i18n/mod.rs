@@ -81,6 +81,7 @@ pub(crate) struct Strings {
     pub(crate) error_openbao_sealed: &'static str,
     pub(crate) error_invalid_db_dsn: &'static str,
     pub(crate) error_db_host_not_single_host: &'static str,
+    pub(crate) error_db_host_compose_runtime: &'static str,
     pub(crate) error_postgres_port_binding_unsafe: &'static str,
     pub(crate) error_db_check_failed: &'static str,
     pub(crate) error_db_auth_failed: &'static str,
@@ -310,6 +311,7 @@ pub(crate) struct Strings {
     pub(crate) summary_responder_check_skipped: &'static str,
     pub(crate) summary_db_check_ok: &'static str,
     pub(crate) summary_db_check_skipped: &'static str,
+    pub(crate) summary_db_host_resolution: &'static str,
     pub(crate) summary_kv_paths: &'static str,
     pub(crate) summary_approles: &'static str,
     pub(crate) summary_role_id: &'static str,
@@ -606,6 +608,13 @@ impl Messages {
         format_template(
             self.strings().error_db_host_not_single_host,
             &[("host", host)],
+        )
+    }
+
+    pub(crate) fn error_db_host_compose_runtime(&self, host: &str, expected: &str) -> String {
+        format_template(
+            self.strings().error_db_host_compose_runtime,
+            &[("host", host), ("expected", expected)],
         )
     }
 
@@ -1755,6 +1764,13 @@ impl Messages {
 
     pub(crate) fn summary_db_check_skipped(&self) -> &'static str {
         self.strings().summary_db_check_skipped
+    }
+
+    pub(crate) fn summary_db_host_resolution(&self, from: &str, to: &str) -> String {
+        format_template(
+            self.strings().summary_db_host_resolution,
+            &[("from", from), ("to", to)],
+        )
     }
 
     pub(crate) fn summary_kv_paths(&self) -> &'static str {

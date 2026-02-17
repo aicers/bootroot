@@ -528,6 +528,13 @@ fn print_db_check(summary: &InitSummary, messages: &Messages) {
             println!("{}", messages.summary_db_check_skipped());
         }
     }
+    println!(
+        "{}",
+        messages.summary_db_host_resolution(
+            &summary.db_dsn_host_original,
+            &summary.db_dsn_host_effective
+        )
+    );
 }
 
 fn print_kv_paths(messages: &Messages) {
