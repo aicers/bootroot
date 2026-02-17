@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import re
-import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
 
 PORT = int(os.environ.get("MOCK_OPENBAO_PORT", "18200"))
 TOKEN = "mock-client-token"
@@ -105,14 +104,14 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             if secret_kind == "trust":
-                fingerprint = hashlib.sha256(f"{service}-v{version}".encode("utf-8")).hexdigest()
+                fingerprint = hashlib.sha256(f"{service}-v{version}".encode()).hexdigest()
                 write_json(
                     self,
                     200,
                     {
                         "data": {
                             "data": {
-                            "trusted_ca_sha256": [fingerprint],
+                                "trusted_ca_sha256": [fingerprint],
                                 "ca_bundle_pem": (
                                     "-----BEGIN CERTIFICATE-----\n"
                                     f"SMOKE-{service}-v{version}\n"

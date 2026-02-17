@@ -82,6 +82,28 @@ Command notes:
 - `mkdocs build`: builds static files into `site/`.
 - `./scripts/build-docs-pdf.sh en|ko`: builds PDF manuals.
 
+## Quality Checks
+
+Run quality gates locally before pushing:
+
+```bash
+cargo fmt -- --check --config group_imports=StdExternalCrate
+cargo clippy --all-targets -- -D warnings
+biome ci --error-on-warnings .
+markdownlint-cli2 "**/*.md" "#node_modules" "#target"
+ruff format --check .
+ruff check .
+cargo audit
+cargo test
+```
+
+If Python formatting/linting fails, auto-fix first:
+
+```bash
+ruff format .
+ruff check --fix .
+```
+
 Install scope:
 
 - If you use a per-repo virtualenv (`.venv`), you need to create it and

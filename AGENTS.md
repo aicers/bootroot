@@ -35,6 +35,8 @@ verify these locally before proposing any code. Breakdown:
 * **Linting (Rust)**: Must pass `cargo clippy --all-targets -- -D warnings`.
 * **Formatting**: Must pass `cargo fmt -- --check --config group_imports=StdExternalCrate`.
 * **Linting (Biome)**: Must pass `biome ci --error-on-warnings .`.
+* **Formatting (Python)**: Must pass `ruff format --check .`.
+* **Linting (Python)**: Must pass `ruff check .`.
 * **Security Audit**: Must pass `cargo audit` (check for vulnerable dependencies).
 * **Testing**: `cargo test` must pass all unit and integration tests.
 * **Linting (Docs/Misc)**:
