@@ -8,12 +8,14 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-main-lifecycle-$(date +%s
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
-SECRETS_DIR="${SECRETS_DIR:-$WORKSPACE_DIR/secrets}"
+SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
 AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-$WORKSPACE_DIR/agent.toml}"
 CERTS_DIR="${CERTS_DIR:-$WORKSPACE_DIR/certs}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-120}"
 INFRA_UP_ATTEMPTS="${INFRA_UP_ATTEMPTS:-6}"
 INFRA_UP_DELAY_SECS="${INFRA_UP_DELAY_SECS:-5}"
+INFRA_READY_ATTEMPTS="${INFRA_READY_ATTEMPTS:-30}"
+INFRA_READY_DELAY_SECS="${INFRA_READY_DELAY_SECS:-4}"
 BOOTROOT_BIN="${BOOTROOT_BIN:-$ROOT_DIR/target/debug/bootroot}"
 BOOTROOT_REMOTE_BIN="${BOOTROOT_REMOTE_BIN:-$ROOT_DIR/target/debug/bootroot-remote}"
 BOOTROOT_AGENT_BIN="${BOOTROOT_AGENT_BIN:-$ROOT_DIR/target/debug/bootroot-agent}"
@@ -24,6 +26,10 @@ INIT_LOG="$ARTIFACT_DIR/init.log"
 INIT_RAW_LOG="$ARTIFACT_DIR/init.raw.log"
 CERT_META_DIR="$ARTIFACT_DIR/cert-meta"
 HOSTS_MARKER="# bootroot-e2e-main-lifecycle"
+VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-3}"
+VERIFY_DELAY_SECS="${VERIFY_DELAY_SECS:-3}"
+HTTP01_TARGET_ATTEMPTS="${HTTP01_TARGET_ATTEMPTS:-40}"
+HTTP01_TARGET_DELAY_SECS="${HTTP01_TARGET_DELAY_SECS:-2}"
 
 EDGE_SERVICE="edge-proxy"
 EDGE_HOSTNAME="edge-node-01"
@@ -41,9 +47,11 @@ STEPCA_SERVER_URL=""
 STEPCA_EAB_URL=""
 RESPONDER_URL=""
 OPENBAO_ROOT_TOKEN=""
+CURRENT_PHASE="init"
 
 log_phase() {
   local phase="$1"
+  CURRENT_PHASE="$phase"
   local now
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '{"ts":"%s","phase":"%s","mode":"%s"}\n' \
@@ -52,8 +60,19 @@ log_phase() {
 
 fail() {
   local message="$1"
+  if [ -n "${RUN_LOG:-}" ]; then
+    printf '[fatal][%s] %s\n' "$CURRENT_PHASE" "$message" >>"$RUN_LOG" || true
+  fi
   echo "$message" >&2
   exit 1
+}
+
+run_sudo() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return
+  fi
+  sudo -n "$@"
 }
 
 ensure_prerequisites() {
@@ -65,11 +84,70 @@ ensure_prerequisites() {
   [ -x "$BOOTROOT_REMOTE_BIN" ] || fail "bootroot-remote binary not executable: $BOOTROOT_REMOTE_BIN"
 }
 
+ensure_compose_images() {
+  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" build step-ca bootroot-http01 >>"$RUN_LOG" 2>&1
+}
+
 run_bootroot() {
   (
     cd "$WORKSPACE_DIR"
     "$BOOTROOT_BIN" "$@"
   )
+}
+
+infra_services() {
+  printf '%s\n' "openbao" "postgres" "step-ca" "bootroot-http01"
+}
+
+service_container_id() {
+  local service="$1"
+  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -q "$service" | tr -d '\n'
+}
+
+is_service_ready() {
+  local service="$1"
+  local container_id
+  container_id="$(service_container_id "$service")"
+  if [ -z "$container_id" ]; then
+    return 1
+  fi
+
+  local state
+  state="$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+  if [ -z "$state" ]; then
+    return 1
+  fi
+
+  local status health
+  status="${state%%|*}"
+  health="${state#*|}"
+  if [ "$status" != "running" ]; then
+    return 1
+  fi
+  if [ -n "$health" ] && [ "$health" != "healthy" ]; then
+    return 1
+  fi
+  return 0
+}
+
+wait_for_infra_ready() {
+  local attempt
+  for attempt in $(seq 1 "$INFRA_READY_ATTEMPTS"); do
+    local all_ready=1
+    local service
+    while IFS= read -r service; do
+      if ! is_service_ready "$service"; then
+        all_ready=0
+        break
+      fi
+    done < <(infra_services)
+
+    if [ "$all_ready" -eq 1 ]; then
+      return 0
+    fi
+    sleep "$INFRA_READY_DELAY_SECS"
+  done
+  return 1
 }
 
 compose_down() {
@@ -85,13 +163,13 @@ cleanup_hosts() {
   if [ "$RESOLUTION_MODE" != "hosts-all" ]; then
     return 0
   fi
-  if ! command -v sudo >/dev/null 2>&1; then
+  if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
     return 0
   fi
   local tmp_file
   tmp_file="$(mktemp)"
-  sudo awk -v marker="$HOSTS_MARKER" 'index($0, marker) == 0 { print }' /etc/hosts >"$tmp_file"
-  sudo cp "$tmp_file" /etc/hosts
+  run_sudo awk -v marker="$HOSTS_MARKER" 'index($0, marker) == 0 { print }' /etc/hosts >"$tmp_file"
+  run_sudo cp "$tmp_file" /etc/hosts
   rm -f "$tmp_file"
 }
 
@@ -102,19 +180,40 @@ cleanup() {
   compose_down
 }
 
+on_error() {
+  local line="$1"
+  echo "run-main-lifecycle failed at phase=${CURRENT_PHASE} line=${line}" >&2
+  echo "artifact dir: ${ARTIFACT_DIR}" >&2
+  if [ -f "$RUN_LOG" ]; then
+    echo "--- run.log (tail) ---" >&2
+    tail -n 80 "$RUN_LOG" >&2 || true
+  fi
+  if [ -f "$INIT_RAW_LOG" ]; then
+    echo "--- init.raw.log (tail) ---" >&2
+    tail -n 120 "$INIT_RAW_LOG" >&2 || true
+  fi
+  if [ -f "$INIT_LOG" ]; then
+    echo "--- init.log (tail) ---" >&2
+    tail -n 80 "$INIT_LOG" >&2 || true
+  fi
+}
+
 add_hosts_entry() {
   local ip="$1"
   local host="$2"
   if grep -qE "[[:space:]]${host}([[:space:]]|\$)" /etc/hosts; then
     return 0
   fi
-  echo "${ip} ${host} ${HOSTS_MARKER}" | sudo tee -a /etc/hosts >/dev/null
+  echo "${ip} ${host} ${HOSTS_MARKER}" | run_sudo tee -a /etc/hosts >/dev/null
 }
 
 configure_resolution_mode() {
   case "$RESOLUTION_MODE" in
     hosts-all)
-      command -v sudo >/dev/null 2>&1 || fail "hosts-all mode requires sudo"
+      if [ "$(id -u)" -ne 0 ]; then
+        command -v sudo >/dev/null 2>&1 || fail "hosts-all mode requires sudo"
+        run_sudo true || fail "hosts-all mode requires non-interactive sudo (sudo -n)"
+      fi
       add_hosts_entry "$STEPCA_HOST_IP" "$STEPCA_HOST_NAME"
       add_hosts_entry "$RESPONDER_HOST_IP" "$RESPONDER_HOST_NAME"
       STEPCA_SERVER_URL="https://${STEPCA_HOST_NAME}:9000/acme/acme/directory"
@@ -164,7 +263,7 @@ prepare_test_ca_materials() {
     docker run --user root --rm -v "$SECRETS_DIR:/home/step" smallstep/step-ca \
       step ca init \
       --name "Bootroot E2E CA" \
-      --provisioner "acme" \
+      --provisioner "admin" \
       --dns "localhost,bootroot-ca,stepca.internal" \
       --address ":9000" \
       --password-file /home/step/password.txt \
@@ -175,30 +274,45 @@ prepare_test_ca_materials() {
 
 run_bootstrap_chain() {
   log_phase "infra-up"
-  local attempt
-  for attempt in $(seq 1 "$INFRA_UP_ATTEMPTS"); do
-    if run_bootroot infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1; then
-      break
+  if ! run_bootroot infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1; then
+    if ! wait_for_infra_ready; then
+      local attempt
+      for attempt in $(seq 1 "$INFRA_UP_ATTEMPTS"); do
+        if run_bootroot infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1; then
+          break
+        fi
+        if [ "$attempt" -eq "$INFRA_UP_ATTEMPTS" ]; then
+          fail "bootroot infra up failed after ${INFRA_UP_ATTEMPTS} attempts"
+        fi
+        sleep "$INFRA_UP_DELAY_SECS"
+      done
     fi
-    if [ "$attempt" -eq "$INFRA_UP_ATTEMPTS" ]; then
-      fail "bootroot infra up failed after ${INFRA_UP_ATTEMPTS} attempts"
-    fi
-    sleep "$INFRA_UP_DELAY_SECS"
-  done
+  fi
+
+  wait_for_openbao_api
 
   log_phase "init"
-  BOOTROOT_LANG=en printf "y\ny\nn\n" | run_bootroot init \
+  rm -f "$WORKSPACE_DIR/state.json"
+  if ! BOOTROOT_LANG=en printf "y\ny\nn\n" | run_bootroot init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --auto-generate \
     --show-secrets \
     --stepca-url "$STEPCA_EAB_URL" \
-    --stepca-provisioner "acme" \
+    --stepca-provisioner "admin" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \
     --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
     --responder-url "$RESPONDER_URL" \
-    --skip-responder-check >"$INIT_RAW_LOG" 2>&1
+    --skip-responder-check >"$INIT_RAW_LOG" 2>&1; then
+    {
+      echo "bootroot init failed (raw tail):"
+      tail -n 160 "$INIT_RAW_LOG" || true
+    } >>"$RUN_LOG"
+    docker logs bootroot-openbao >>"$RUN_LOG" 2>&1 || true
+    docker logs bootroot-postgres >>"$RUN_LOG" 2>&1 || true
+    fail "bootroot init failed"
+  fi
 
   OPENBAO_ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' "$INIT_RAW_LOG")"
   [ -n "${OPENBAO_ROOT_TOKEN:-}" ] || fail "Failed to parse root token from init output"
@@ -231,6 +345,20 @@ run_bootstrap_chain() {
     --root-token "$OPENBAO_ROOT_TOKEN" >>"$RUN_LOG" 2>&1
 }
 
+wait_for_openbao_api() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    local code
+    code="$(curl -sS -o /dev/null -w '%{http_code}' "http://${STEPCA_HOST_IP}:8200/v1/sys/health" || true)"
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs bootroot-openbao >>"$RUN_LOG" 2>&1 || true
+  fail "openbao API did not become reachable before init"
+}
+
 wire_stepca_hosts() {
   local responder_ip
   responder_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
@@ -239,6 +367,41 @@ wire_stepca_hosts() {
     "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${EDGE_SERVICE}.${EDGE_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
   docker exec bootroot-ca sh -c \
     "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${WEB_SERVICE}.${WEB_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
+}
+
+wait_for_stepca_http01_targets() {
+  local hosts
+  hosts=(
+    "${INSTANCE_ID}.${EDGE_SERVICE}.${EDGE_HOSTNAME}.${DOMAIN}"
+    "${INSTANCE_ID}.${WEB_SERVICE}.${WEB_HOSTNAME}.${DOMAIN}"
+  )
+
+  local host
+  for host in "${hosts[@]}"; do
+    local attempt
+    for attempt in $(seq 1 "$HTTP01_TARGET_ATTEMPTS"); do
+      if docker exec bootroot-ca bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${host}/80'" >/dev/null 2>&1; then
+        break
+      fi
+      if [ "$attempt" -eq "$HTTP01_TARGET_ATTEMPTS" ]; then
+        docker exec bootroot-ca sh -c "cat /etc/hosts | tail -n 20" >>"$RUN_LOG" 2>&1 || true
+        docker logs bootroot-http01 >>"$RUN_LOG" 2>&1 || true
+        fail "step-ca cannot reach HTTP-01 target: ${host}:80"
+      fi
+      sleep "$HTTP01_TARGET_DELAY_SECS"
+    done
+  done
+}
+
+wait_for_stepca_health() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if curl -kfsS https://127.0.0.1:9000/health >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  fail "step-ca health endpoint did not become ready"
 }
 
 snapshot_cert_meta() {
@@ -260,10 +423,24 @@ fingerprint_of() {
 run_verify_pair() {
   local label="$1"
   log_phase "verify-${label}"
-  run_bootroot verify --service-name "$EDGE_SERVICE" --agent-config "$AGENT_CONFIG_PATH" >>"$RUN_LOG" 2>&1
-  run_bootroot verify --service-name "$WEB_SERVICE" --agent-config "$AGENT_CONFIG_PATH" >>"$RUN_LOG" 2>&1
+  verify_service_with_retry "$EDGE_SERVICE"
+  verify_service_with_retry "$WEB_SERVICE"
   snapshot_cert_meta "$EDGE_SERVICE" "$label"
   snapshot_cert_meta "$WEB_SERVICE" "$label"
+}
+
+verify_service_with_retry() {
+  local service="$1"
+  local attempt
+  for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
+    if run_bootroot verify --service-name "$service" --agent-config "$AGENT_CONFIG_PATH" >>"$RUN_LOG" 2>&1; then
+      return 0
+    fi
+    if [ "$attempt" -eq "$VERIFY_ATTEMPTS" ]; then
+      fail "verify failed for ${service} after ${VERIFY_ATTEMPTS} attempts"
+    fi
+    sleep "$VERIFY_DELAY_SECS"
+  done
 }
 
 assert_fingerprint_changed() {
@@ -310,14 +487,18 @@ main() {
   : >"$PHASE_LOG"
   : >"$RUN_LOG"
   trap cleanup EXIT
+  trap 'on_error $LINENO' ERR
 
   ensure_prerequisites
+  ensure_compose_images
   configure_resolution_mode
   compose_down
   prepare_test_ca_materials
   write_agent_config
   run_bootstrap_chain
   wire_stepca_hosts
+  wait_for_stepca_http01_targets
+  wait_for_stepca_health
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"
