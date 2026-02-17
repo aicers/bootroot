@@ -648,6 +648,15 @@ async fn stub_openbao_for_rotation(server: &MockServer, new_secret_id: &str) {
         })))
         .mount(server)
         .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/secret_id"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
 }
 
 async fn stub_openbao_for_stepca_password_rotation(server: &MockServer, expected_password: &str) {
@@ -698,6 +707,15 @@ async fn stub_openbao_for_eab_rotation(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)
         .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/eab"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
 }
 
 async fn stub_openbao_for_responder_hmac_rotation(server: &MockServer, hmac: &str) {
@@ -715,6 +733,15 @@ async fn stub_openbao_for_responder_hmac_rotation(server: &MockServer, hmac: &st
                 "value": hmac
             }
         })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/http_responder_hmac"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)
         .await;

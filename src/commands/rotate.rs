@@ -25,6 +25,11 @@ const SECRET_BYTES: usize = 32;
 const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
 const ROLE_ID_FILENAME: &str = "role_id";
 const DEFAULT_REMOTE_ROTATION_OVERLAP_SECS: i64 = 86_400;
+const SERVICE_KV_BASE: &str = "bootroot/services";
+const SERVICE_SECRET_ID_KEY: &str = "secret_id";
+const SERVICE_EAB_KID_KEY: &str = "kid";
+const SERVICE_EAB_HMAC_KEY: &str = "hmac";
+const SERVICE_RESPONDER_HMAC_KEY: &str = "hmac";
 
 #[derive(Clone, Copy)]
 enum RotationSyncItem {
@@ -245,6 +250,7 @@ async fn rotate_eab(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
+    sync_remote_eab_payloads(ctx, client, &credentials.kid, &credentials.hmac, messages).await?;
 
     let updated = update_agent_configs(
         ctx.state
@@ -391,6 +397,7 @@ async fn rotate_responder_hmac(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
+    sync_remote_responder_hmac_payloads(ctx, client, &hmac, messages).await?;
 
     let responder_path = ctx.paths.responder_config();
     let config = if responder_path.exists() {
@@ -485,6 +492,14 @@ async fn rotate_approle_secret_id(
         .await
         .with_context(|| messages.error_openbao_approle_login_failed())?;
     if is_remote {
+        write_remote_service_secret_id(
+            client,
+            &ctx.kv_mount,
+            &args.service_name,
+            &new_secret_id,
+            messages,
+        )
+        .await?;
         let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
         let overlap_secs = remote_rotation_overlap_secs();
         let expires_at_unix = now_unix + overlap_secs;
@@ -549,6 +564,74 @@ fn save_state(ctx: &RotateContext, messages: &Messages) -> Result<()> {
     ctx.state
         .save(ctx.paths.state_file())
         .with_context(|| messages.error_serialize_state_failed())
+}
+
+async fn write_remote_service_secret_id(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    service_name: &str,
+    secret_id: &str,
+    messages: &Messages,
+) -> Result<()> {
+    client
+        .write_kv(
+            kv_mount,
+            &format!("{SERVICE_KV_BASE}/{service_name}/secret_id"),
+            serde_json::json!({ SERVICE_SECRET_ID_KEY: secret_id }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())
+}
+
+async fn sync_remote_eab_payloads(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    kid: &str,
+    hmac: &str,
+    messages: &Messages,
+) -> Result<()> {
+    for service_name in ctx
+        .state
+        .services
+        .values()
+        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
+        .map(|entry| entry.service_name.as_str())
+    {
+        client
+            .write_kv(
+                &ctx.kv_mount,
+                &format!("{SERVICE_KV_BASE}/{service_name}/eab"),
+                serde_json::json!({ SERVICE_EAB_KID_KEY: kid, SERVICE_EAB_HMAC_KEY: hmac }),
+            )
+            .await
+            .with_context(|| messages.error_openbao_kv_write_failed())?;
+    }
+    Ok(())
+}
+
+async fn sync_remote_responder_hmac_payloads(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    hmac: &str,
+    messages: &Messages,
+) -> Result<()> {
+    for service_name in ctx
+        .state
+        .services
+        .values()
+        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
+        .map(|entry| entry.service_name.as_str())
+    {
+        client
+            .write_kv(
+                &ctx.kv_mount,
+                &format!("{SERVICE_KV_BASE}/{service_name}/http_responder_hmac"),
+                serde_json::json!({ SERVICE_RESPONDER_HMAC_KEY: hmac }),
+            )
+            .await
+            .with_context(|| messages.error_openbao_kv_write_failed())?;
+    }
+    Ok(())
 }
 
 fn remote_rotation_overlap_secs() -> i64 {

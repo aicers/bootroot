@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "$ROOT_DIR"
+
+ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-main-remote-lifecycle-$(date +%s)}"
+COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
+COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
+SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
+CONTROL_DIR="${CONTROL_DIR:-$ARTIFACT_DIR/control-node}"
+REMOTE_DIR="${REMOTE_DIR:-$ARTIFACT_DIR/remote-node}"
+REMOTE_AGENT_CONFIG_PATH="${REMOTE_AGENT_CONFIG_PATH:-$REMOTE_DIR/agent.toml}"
+REMOTE_CERTS_DIR="${REMOTE_CERTS_DIR:-$REMOTE_DIR/certs}"
+TIMEOUT_SECS="${TIMEOUT_SECS:-120}"
+INFRA_UP_ATTEMPTS="${INFRA_UP_ATTEMPTS:-12}"
+INFRA_UP_DELAY_SECS="${INFRA_UP_DELAY_SECS:-10}"
+VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-5}"
+VERIFY_DELAY_SECS="${VERIFY_DELAY_SECS:-5}"
+HTTP01_TARGET_ATTEMPTS="${HTTP01_TARGET_ATTEMPTS:-40}"
+HTTP01_TARGET_DELAY_SECS="${HTTP01_TARGET_DELAY_SECS:-2}"
+BOOTROOT_BIN="${BOOTROOT_BIN:-$ROOT_DIR/target/debug/bootroot}"
+BOOTROOT_REMOTE_BIN="${BOOTROOT_REMOTE_BIN:-$ROOT_DIR/target/debug/bootroot-remote}"
+BOOTROOT_AGENT_BIN="${BOOTROOT_AGENT_BIN:-$ROOT_DIR/target/debug/bootroot-agent}"
+RESOLUTION_MODE="${RESOLUTION_MODE:-fqdn-only-hosts}"
+
+PHASE_LOG="$ARTIFACT_DIR/phases.log"
+RUN_LOG="$ARTIFACT_DIR/run.log"
+INIT_RAW_LOG="$ARTIFACT_DIR/init.raw.log"
+INIT_LOG="$ARTIFACT_DIR/init.log"
+CERT_META_DIR="$ARTIFACT_DIR/cert-meta"
+HOSTS_MARKER="# bootroot-e2e-main-remote-lifecycle"
+
+SERVICE_NAME="edge-proxy"
+HOSTNAME="edge-node-02"
+DOMAIN="trusted.domain"
+INSTANCE_ID="101"
+INIT_EAB_KID="${INIT_EAB_KID:-dev-kid}"
+INIT_EAB_HMAC="${INIT_EAB_HMAC:-dev-hmac}"
+
+STEPCA_HOST_IP="127.0.0.1"
+RESPONDER_HOST_IP="127.0.0.1"
+STEPCA_HOST_NAME="stepca.internal"
+RESPONDER_HOST_NAME="responder.internal"
+
+STEPCA_SERVER_URL=""
+STEPCA_EAB_URL=""
+RESPONDER_URL=""
+OPENBAO_ROOT_TOKEN=""
+CURRENT_PHASE="init"
+BOOTROOT_CONTROL_PROXY="${REMOTE_DIR}/bin/bootroot-control"
+
+log_phase() {
+  local phase="$1"
+  CURRENT_PHASE="$phase"
+  local now
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{"ts":"%s","phase":"%s","mode":"%s"}\n' "$now" "$phase" "$RESOLUTION_MODE" >>"$PHASE_LOG"
+}
+
+fail() {
+  local message="$1"
+  printf '[fatal][%s] %s\n' "$CURRENT_PHASE" "$message" >>"$RUN_LOG" || true
+  echo "$message" >&2
+  exit 1
+}
+
+run_sudo() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return
+  fi
+  sudo -n "$@"
+}
+
+run_bootroot_control() {
+  (
+    cd "$CONTROL_DIR"
+    "$BOOTROOT_BIN" "$@"
+  )
+}
+
+ensure_prerequisites() {
+  command -v docker >/dev/null 2>&1 || fail "docker is required"
+  docker compose version >/dev/null 2>&1 || fail "docker compose is required"
+  command -v jq >/dev/null 2>&1 || fail "jq is required"
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+  command -v openssl >/dev/null 2>&1 || fail "openssl is required"
+  [ -x "$BOOTROOT_BIN" ] || fail "bootroot binary not executable: $BOOTROOT_BIN"
+  [ -x "$BOOTROOT_REMOTE_BIN" ] || fail "bootroot-remote binary not executable: $BOOTROOT_REMOTE_BIN"
+  [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent binary not executable: $BOOTROOT_AGENT_BIN"
+}
+
+ensure_compose_images() {
+  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" build step-ca bootroot-http01 >>"$RUN_LOG" 2>&1
+}
+
+compose_down() {
+  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
+}
+
+capture_artifacts() {
+  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
+  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+}
+
+cleanup_hosts() {
+  if [ "$RESOLUTION_MODE" != "hosts-all" ]; then
+    return 0
+  fi
+  if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
+    return 0
+  fi
+  local tmp_file
+  tmp_file="$(mktemp)"
+  run_sudo awk -v marker="$HOSTS_MARKER" 'index($0, marker) == 0 { print }' /etc/hosts >"$tmp_file"
+  run_sudo cp "$tmp_file" /etc/hosts
+  rm -f "$tmp_file"
+}
+
+cleanup() {
+  log_phase "cleanup"
+  cleanup_hosts
+  capture_artifacts
+  compose_down
+}
+
+on_error() {
+  local line="$1"
+  echo "run-main-remote-lifecycle failed at phase=${CURRENT_PHASE} line=${line}" >&2
+  echo "artifact dir: ${ARTIFACT_DIR}" >&2
+  [ -f "$RUN_LOG" ] && tail -n 120 "$RUN_LOG" >&2 || true
+  [ -f "$INIT_RAW_LOG" ] && tail -n 120 "$INIT_RAW_LOG" >&2 || true
+  [ -f "$INIT_LOG" ] && tail -n 120 "$INIT_LOG" >&2 || true
+}
+
+add_hosts_entry() {
+  local ip="$1"
+  local host="$2"
+  if grep -qE "[[:space:]]${host}([[:space:]]|$)" /etc/hosts; then
+    return 0
+  fi
+  echo "${ip} ${host} ${HOSTS_MARKER}" | run_sudo tee -a /etc/hosts >/dev/null
+}
+
+configure_resolution_mode() {
+  case "$RESOLUTION_MODE" in
+    hosts-all)
+      if [ "$(id -u)" -ne 0 ]; then
+        command -v sudo >/dev/null 2>&1 || fail "hosts-all mode requires sudo"
+        run_sudo true || fail "hosts-all mode requires non-interactive sudo (sudo -n)"
+      fi
+      add_hosts_entry "$STEPCA_HOST_IP" "$STEPCA_HOST_NAME"
+      add_hosts_entry "$RESPONDER_HOST_IP" "$RESPONDER_HOST_NAME"
+      STEPCA_SERVER_URL="https://${STEPCA_HOST_NAME}:9000/acme/acme/directory"
+      STEPCA_EAB_URL="https://${STEPCA_HOST_NAME}:9000"
+      RESPONDER_URL="http://${RESPONDER_HOST_NAME}:8080"
+      ;;
+    fqdn-only-hosts)
+      STEPCA_SERVER_URL="https://localhost:9000/acme/acme/directory"
+      STEPCA_EAB_URL="https://localhost:9000"
+      RESPONDER_URL="http://${RESPONDER_HOST_IP}:8080"
+      ;;
+    *)
+      fail "Unsupported RESOLUTION_MODE: $RESOLUTION_MODE"
+      ;;
+  esac
+}
+
+reset_stepca_materials_for_e2e() {
+  if [ "${RESET_STEPCA_MATERIALS:-1}" != "1" ]; then
+    return 0
+  fi
+  rm -rf "$SECRETS_DIR/config" "$SECRETS_DIR/certs" "$SECRETS_DIR/db" "$SECRETS_DIR/secrets"
+}
+
+prepare_test_ca_materials() {
+  mkdir -p "$SECRETS_DIR" "$REMOTE_CERTS_DIR"
+  chmod 700 "$SECRETS_DIR" "$REMOTE_CERTS_DIR"
+  local uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+
+  if [ ! -f "$SECRETS_DIR/password.txt" ]; then
+    printf '%s\n' "password" >"$SECRETS_DIR/password.txt"
+    chmod 600 "$SECRETS_DIR/password.txt"
+  fi
+
+  if [ ! -f "$SECRETS_DIR/config/ca.json" ]; then
+    docker run --user "${uid}:${gid}" --rm -v "$SECRETS_DIR:/home/step" smallstep/step-ca \
+      step ca init \
+      --name "Bootroot E2E CA" \
+      --provisioner "admin" \
+      --dns "localhost,bootroot-ca,stepca.internal" \
+      --address ":9000" \
+      --password-file /home/step/password.txt \
+      --provisioner-password-file /home/step/password.txt \
+      --acme >>"$RUN_LOG" 2>&1
+  fi
+
+  [ -r "$SECRETS_DIR/config/ca.json" ] || fail "secrets/config/ca.json is not readable"
+}
+
+wait_for_openbao_api() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    local code
+    code="$(curl -sS -o /dev/null -w '%{http_code}' "http://${STEPCA_HOST_IP}:8200/v1/sys/health" || true)"
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs bootroot-openbao >>"$RUN_LOG" 2>&1 || true
+  fail "openbao API did not become reachable before init"
+}
+
+write_remote_agent_config() {
+  mkdir -p "$(dirname "$REMOTE_AGENT_CONFIG_PATH")" "$REMOTE_CERTS_DIR"
+  cat >"$REMOTE_AGENT_CONFIG_PATH" <<EOF_CONF
+email = "admin@example.com"
+server = "${STEPCA_SERVER_URL}"
+domain = "${DOMAIN}"
+
+[acme]
+directory_fetch_attempts = 10
+directory_fetch_base_delay_secs = 1
+directory_fetch_max_delay_secs = 10
+poll_attempts = 15
+poll_interval_secs = 2
+http_responder_url = "${RESPONDER_URL}"
+http_responder_hmac = "dev-hmac"
+http_responder_timeout_secs = 5
+http_responder_token_ttl_secs = 300
+
+[[profiles]]
+service_name = "${SERVICE_NAME}"
+instance_id = "${INSTANCE_ID}"
+hostname = "${HOSTNAME}"
+
+[profiles.paths]
+cert = "${REMOTE_CERTS_DIR}/${SERVICE_NAME}.crt"
+key = "${REMOTE_CERTS_DIR}/${SERVICE_NAME}.key"
+EOF_CONF
+}
+
+write_bootroot_control_proxy() {
+  mkdir -p "$(dirname "$BOOTROOT_CONTROL_PROXY")"
+  cat >"$BOOTROOT_CONTROL_PROXY" <<EOF_PROXY
+#!/usr/bin/env sh
+set -eu
+cd "$CONTROL_DIR"
+exec "$BOOTROOT_BIN" "\$@"
+EOF_PROXY
+  chmod 700 "$BOOTROOT_CONTROL_PROXY"
+}
+
+run_bootstrap_chain() {
+  log_phase "infra-up"
+  local attempt
+  for attempt in $(seq 1 "$INFRA_UP_ATTEMPTS"); do
+    if run_bootroot_control infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1; then
+      break
+    fi
+    if [ "$attempt" -eq "$INFRA_UP_ATTEMPTS" ]; then
+      fail "bootroot infra up failed after ${INFRA_UP_ATTEMPTS} attempts"
+    fi
+    sleep "$INFRA_UP_DELAY_SECS"
+  done
+
+  wait_for_openbao_api
+
+  log_phase "init"
+  rm -f "$CONTROL_DIR/state.json"
+  if ! BOOTROOT_LANG=en printf "y\ny\nn\n" | run_bootroot_control init \
+    --compose-file "$COMPOSE_FILE" \
+    --secrets-dir "$SECRETS_DIR" \
+    --auto-generate \
+    --show-secrets \
+    --stepca-url "$STEPCA_EAB_URL" \
+    --stepca-provisioner "acme" \
+    --stepca-password "password" \
+    --eab-kid "$INIT_EAB_KID" \
+    --eab-hmac "$INIT_EAB_HMAC" \
+    --http-hmac "dev-hmac" \
+    --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
+    --responder-url "$RESPONDER_URL" \
+    --skip-responder-check >"$INIT_RAW_LOG" 2>&1; then
+    {
+      echo "bootroot init failed (raw tail):"
+      tail -n 160 "$INIT_RAW_LOG" || true
+    } >>"$RUN_LOG"
+    fail "bootroot init failed"
+  fi
+
+  OPENBAO_ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' "$INIT_RAW_LOG")"
+  [ -n "${OPENBAO_ROOT_TOKEN:-}" ] || fail "Failed to parse root token from init output"
+  sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
+
+  log_phase "service-add"
+  run_bootroot_control service add \
+    --service-name "$SERVICE_NAME" \
+    --deploy-type daemon \
+    --delivery-mode remote-bootstrap \
+    --hostname "$HOSTNAME" \
+    --domain "$DOMAIN" \
+    --agent-config "$REMOTE_AGENT_CONFIG_PATH" \
+    --cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt" \
+    --key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key" \
+    --instance-id "$INSTANCE_ID" \
+    --root-token "$OPENBAO_ROOT_TOKEN" >>"$RUN_LOG" 2>&1
+}
+
+copy_remote_bootstrap_materials() {
+  local control_service_dir="$SECRETS_DIR/services/$SERVICE_NAME"
+  local remote_service_dir="$REMOTE_DIR/secrets/services/$SERVICE_NAME"
+  mkdir -p "$remote_service_dir"
+  cp "$control_service_dir/role_id" "$remote_service_dir/role_id"
+  cp "$control_service_dir/secret_id" "$remote_service_dir/secret_id"
+  chmod 600 "$remote_service_dir/role_id" "$remote_service_dir/secret_id"
+}
+
+wire_stepca_hosts() {
+  local responder_ip
+  responder_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
+  [ -n "${responder_ip:-}" ] || fail "Failed to resolve responder container IP"
+  docker exec bootroot-ca sh -c \
+    "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${SERVICE_NAME}.${HOSTNAME}.${DOMAIN}' >> /etc/hosts"
+}
+
+wait_for_stepca_http01_target() {
+  local host="${INSTANCE_ID}.${SERVICE_NAME}.${HOSTNAME}.${DOMAIN}"
+  local attempt
+  for attempt in $(seq 1 "$HTTP01_TARGET_ATTEMPTS"); do
+    if docker exec bootroot-ca bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${host}/80'" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [ "$attempt" -eq "$HTTP01_TARGET_ATTEMPTS" ]; then
+      fail "step-ca cannot reach HTTP-01 target: ${host}:80"
+    fi
+    sleep "$HTTP01_TARGET_DELAY_SECS"
+  done
+}
+
+run_remote_sync() {
+  local summary_path="$REMOTE_DIR/${SERVICE_NAME}-remote-summary.json"
+  local role_id_path="$REMOTE_DIR/secrets/services/$SERVICE_NAME/role_id"
+  local secret_id_path="$REMOTE_DIR/secrets/services/$SERVICE_NAME/secret_id"
+  local eab_path="$REMOTE_DIR/secrets/services/$SERVICE_NAME/eab.json"
+  local ca_bundle_path="$REMOTE_CERTS_DIR/ca-bundle.pem"
+
+  (
+    cd "$REMOTE_DIR"
+    "$BOOTROOT_REMOTE_BIN" sync \
+      --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+      --kv-mount "secret" \
+      --service-name "$SERVICE_NAME" \
+      --role-id-path "$role_id_path" \
+      --secret-id-path "$secret_id_path" \
+      --eab-file-path "$eab_path" \
+      --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
+      --ca-bundle-path "$ca_bundle_path" \
+      --summary-json "$summary_path" \
+      --bootroot-bin "$BOOTROOT_CONTROL_PROXY" \
+      --output json >>"$RUN_LOG" 2>&1
+  )
+}
+
+assert_control_sync_applied() {
+  python3 - "$CONTROL_DIR/state.json" "$SERVICE_NAME" <<'PY'
+import json
+import sys
+
+state_path = sys.argv[1]
+service = sys.argv[2]
+state = json.load(open(state_path, encoding='utf-8'))
+status = state['services'][service]['sync_status']
+for key in ('secret_id', 'eab', 'responder_hmac', 'trust_sync'):
+    if status.get(key) != 'applied':
+        raise SystemExit(f"sync status mismatch: {service}:{key} => {status.get(key)}")
+PY
+}
+
+verify_with_retry() {
+  local attempt
+  local agent_bin_dir
+  agent_bin_dir="$(dirname "$BOOTROOT_AGENT_BIN")"
+  for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
+    if PATH="${agent_bin_dir}:$PATH" run_bootroot_control verify --service-name "$SERVICE_NAME" --agent-config "$REMOTE_AGENT_CONFIG_PATH" >>"$RUN_LOG" 2>&1; then
+      return 0
+    fi
+    if [ "$attempt" -eq "$VERIFY_ATTEMPTS" ]; then
+      fail "verify failed for ${SERVICE_NAME} after ${VERIFY_ATTEMPTS} attempts"
+    fi
+    sleep "$VERIFY_DELAY_SECS"
+  done
+}
+
+snapshot_cert_meta() {
+  local label="$1"
+  local cert_path="$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt"
+  local meta_file="$CERT_META_DIR/${SERVICE_NAME}-${label}.txt"
+  [ -f "$cert_path" ] || fail "Missing certificate: $cert_path"
+  openssl x509 -in "$cert_path" -noout -serial -startdate -enddate -fingerprint -sha256 >"$meta_file"
+}
+
+fingerprint_of() {
+  local label="$1"
+  local meta_file="$CERT_META_DIR/${SERVICE_NAME}-${label}.txt"
+  awk -F= '/^sha256 Fingerprint=/{print $2}' "$meta_file"
+}
+
+assert_fingerprint_changed() {
+  local before_label="$1"
+  local after_label="$2"
+  local before_fp after_fp
+  before_fp="$(fingerprint_of "$before_label")"
+  after_fp="$(fingerprint_of "$after_label")"
+  [ -n "$before_fp" ] || fail "Missing fingerprint for ${SERVICE_NAME}/${before_label}"
+  [ -n "$after_fp" ] || fail "Missing fingerprint for ${SERVICE_NAME}/${after_label}"
+  [ "$before_fp" != "$after_fp" ] || fail "Fingerprint did not change for ${SERVICE_NAME} (${before_label} -> ${after_label})"
+}
+
+run_verify_pair() {
+  local label="$1"
+  log_phase "verify-${label}"
+  verify_with_retry
+  snapshot_cert_meta "$label"
+}
+
+run_rotation_responder_hmac() {
+  log_phase "rotate-responder-hmac"
+  run_bootroot_control rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --root-token "$OPENBAO_ROOT_TOKEN" \
+    --yes \
+    responder-hmac >>"$RUN_LOG" 2>&1
+}
+
+main() {
+  mkdir -p "$ARTIFACT_DIR" "$CONTROL_DIR" "$REMOTE_DIR" "$REMOTE_CERTS_DIR" "$CERT_META_DIR"
+  : >"$PHASE_LOG"
+  : >"$RUN_LOG"
+  trap cleanup EXIT
+  trap 'on_error $LINENO' ERR
+
+  ensure_prerequisites
+  ensure_compose_images
+  configure_resolution_mode
+  compose_down
+  reset_stepca_materials_for_e2e
+  prepare_test_ca_materials
+  write_remote_agent_config
+  write_bootroot_control_proxy
+
+  run_bootstrap_chain
+  copy_remote_bootstrap_materials
+  wire_stepca_hosts
+  wait_for_stepca_http01_target
+
+  log_phase "sync-initial"
+  run_remote_sync
+  assert_control_sync_applied
+
+  run_verify_pair "initial"
+
+  run_rotation_responder_hmac
+  log_phase "sync-after-rotate"
+  run_remote_sync
+  assert_control_sync_applied
+
+  run_verify_pair "after-responder-hmac"
+  assert_fingerprint_changed "initial" "after-responder-hmac"
+}
+
+main "$@"

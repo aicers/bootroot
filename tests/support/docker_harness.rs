@@ -33,6 +33,14 @@ pub(crate) fn main_lifecycle_script_path() -> PathBuf {
         .join("run-main-lifecycle.sh")
 }
 
+pub(crate) fn main_remote_lifecycle_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("e2e")
+        .join("docker")
+        .join("run-main-remote-lifecycle.sh")
+}
+
 pub(crate) fn baseline_scenario_path(file_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

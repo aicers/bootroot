@@ -422,10 +422,58 @@ async fn stub_control_plane_openbao(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "data": {
-                    "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"]
+                    "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
+                    "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nCONTROL\n-----END CERTIFICATE-----"
                 }
             }
         })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/agent/eab"))
+        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "kid": "control-kid", "hmac": "control-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/responder/hmac"))
+        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "value": "control-responder-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/secret/data/bootroot/services/edge-proxy/secret_id",
+        ))
+        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/eab"))
+        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/secret/data/bootroot/services/edge-proxy/http_responder_hmac",
+        ))
+        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/trust"))
+        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 }
