@@ -316,12 +316,12 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.test.yml down
 
-  test-docker-harness-smoke:
-    name: Docker Harness Smoke
+  test-docker-e2e-matrix:
+    name: Docker E2E Matrix
     needs: [check, changes]
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
 
@@ -334,62 +334,41 @@ jobs:
       - name: Build bootroot binaries
         run: cargo build --bin bootroot --bin bootroot-remote
 
-      - name: Run Docker harness smoke script
+      - name: Run Docker baseline full matrix
         run: |
-          mkdir -p tmp/e2e
-          SCENARIO_ID="ci-harness-smoke-${GITHUB_RUN_ID}" \
-          PROJECT_NAME="bootroot-e2e-${GITHUB_RUN_ID}" \
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/docker-harness-${GITHUB_RUN_ID}" \
+          SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json" \
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-baseline-${GITHUB_RUN_ID}" \
+          PROJECT_NAME="bootroot-e2e-ci-baseline-${GITHUB_RUN_ID}" \
           MAX_CYCLES=2 \
           INTERVAL_SECS=1 \
-          TIMEOUT_SECS=30 \
-          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
-          BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
-          ./scripts/e2e/docker/run-harness-smoke.sh
-
-      - name: Run Docker baseline smoke (Scenario A)
-        run: |
-          SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-a-single-node-mixed.json" \
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/docker-baseline-smoke-${GITHUB_RUN_ID}" \
-          PROJECT_NAME="bootroot-e2e-baseline-${GITHUB_RUN_ID}" \
-          MAX_CYCLES=2 \
-          INTERVAL_SECS=1 \
-          TIMEOUT_SECS=45 \
+          TIMEOUT_SECS=60 \
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           ./scripts/e2e/docker/run-baseline.sh
 
-      - name: Run Docker rotation smoke (Scenario A, secret_id only)
+      - name: Run Docker rotation/recovery full matrix
         run: |
-          SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-a-single-node-mixed.json" \
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/docker-rotation-smoke-${GITHUB_RUN_ID}" \
-          PROJECT_NAME="bootroot-e2e-rotation-${GITHUB_RUN_ID}" \
-          ROTATION_ITEMS="secret_id" \
-          TIMEOUT_SECS=60 \
+          SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json" \
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-rotation-${GITHUB_RUN_ID}" \
+          PROJECT_NAME="bootroot-e2e-ci-rotation-${GITHUB_RUN_ID}" \
+          ROTATION_ITEMS="secret_id,eab,responder_hmac,trust_sync" \
+          TIMEOUT_SECS=90 \
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           ./scripts/e2e/docker/run-rotation-recovery.sh
-
-      - name: Upload Harness Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-harness-smoke-${{ github.run_id }}
-          path: tmp/e2e/docker-harness-${{ github.run_id }}
-          if-no-files-found: warn
 
       - name: Upload Baseline Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: docker-baseline-smoke-${{ github.run_id }}
-          path: tmp/e2e/docker-baseline-smoke-${{ github.run_id }}
+          name: ci-baseline-${{ github.run_id }}
+          path: tmp/e2e/ci-baseline-${{ github.run_id }}
           if-no-files-found: warn
 
       - name: Upload Rotation Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: docker-rotation-smoke-${{ github.run_id }}
-          path: tmp/e2e/docker-rotation-smoke-${{ github.run_id }}
+          name: ci-rotation-${{ github.run_id }}
+          path: tmp/e2e/ci-rotation-${{ github.run_id }}
           if-no-files-found: warn
