@@ -1,23 +1,26 @@
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, Serialize)]
 pub(crate) enum ResponderCheck {
     Skipped,
     Ok,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub(crate) enum DbCheckStatus {
     Skipped,
     Ok,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct EabCredentials {
     pub(crate) kid: String,
     pub(crate) hmac: String,
 }
 
+#[derive(Debug, Serialize)]
 pub(crate) struct InitSummary {
     pub(crate) openbao_url: String,
     pub(crate) kv_mount: String,
@@ -53,6 +56,7 @@ pub(crate) struct InitPlan {
     pub(crate) overwrite_state: bool,
 }
 
+#[derive(Debug, Serialize)]
 pub(crate) struct AppRoleOutput {
     pub(crate) label: String,
     pub(crate) role_name: String,
@@ -60,7 +64,7 @@ pub(crate) struct AppRoleOutput {
     pub(crate) secret_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) enum StepCaInitResult {
     Initialized,
     Skipped,
