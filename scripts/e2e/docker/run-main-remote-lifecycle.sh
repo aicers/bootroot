@@ -216,35 +216,6 @@ wait_for_openbao_api() {
   fail "openbao API did not become reachable before init"
 }
 
-write_remote_agent_config() {
-  mkdir -p "$(dirname "$REMOTE_AGENT_CONFIG_PATH")" "$REMOTE_CERTS_DIR"
-  cat >"$REMOTE_AGENT_CONFIG_PATH" <<EOF_CONF
-email = "admin@example.com"
-server = "${STEPCA_SERVER_URL}"
-domain = "${DOMAIN}"
-
-[acme]
-directory_fetch_attempts = 10
-directory_fetch_base_delay_secs = 1
-directory_fetch_max_delay_secs = 10
-poll_attempts = 15
-poll_interval_secs = 2
-http_responder_url = "${RESPONDER_URL}"
-http_responder_hmac = "dev-hmac"
-http_responder_timeout_secs = 5
-http_responder_token_ttl_secs = 300
-
-[[profiles]]
-service_name = "${SERVICE_NAME}"
-instance_id = "${INSTANCE_ID}"
-hostname = "${HOSTNAME}"
-
-[profiles.paths]
-cert = "${REMOTE_CERTS_DIR}/${SERVICE_NAME}.crt"
-key = "${REMOTE_CERTS_DIR}/${SERVICE_NAME}.key"
-EOF_CONF
-}
-
 write_bootroot_control_proxy() {
   mkdir -p "$(dirname "$BOOTROOT_CONTROL_PROXY")"
   cat >"$BOOTROOT_CONTROL_PROXY" <<EOF_PROXY
@@ -360,6 +331,14 @@ run_remote_sync() {
       --secret-id-path "$secret_id_path" \
       --eab-file-path "$eab_path" \
       --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
+      --agent-email "admin@example.com" \
+      --agent-server "$STEPCA_SERVER_URL" \
+      --agent-domain "$DOMAIN" \
+      --agent-responder-url "$RESPONDER_URL" \
+      --profile-hostname "$HOSTNAME" \
+      --profile-instance-id "$INSTANCE_ID" \
+      --profile-cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt" \
+      --profile-key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key" \
       --ca-bundle-path "$ca_bundle_path" \
       --summary-json "$summary_path" \
       --bootroot-bin "$BOOTROOT_CONTROL_PROXY" \
@@ -509,7 +488,6 @@ main() {
   compose_down
   reset_stepca_materials_for_e2e
   prepare_test_ca_materials
-  write_remote_agent_config
   write_bootroot_control_proxy
 
   run_bootstrap_chain

@@ -23,7 +23,6 @@ async fn test_app_add_writes_state_and_secret() {
     let temp_dir = tempdir().expect("create temp dir");
     let server = MockServer::start().await;
     let agent_config = temp_dir.path().join("agent.toml");
-    fs::write(&agent_config, "# config").expect("write agent config");
     let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
     fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
@@ -418,6 +417,10 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
     let bootstrap_contents = fs::read_to_string(&remote_bootstrap).expect("read bootstrap file");
     let bootstrap: serde_json::Value =
         serde_json::from_str(&bootstrap_contents).expect("parse bootstrap json");
+    assert_remote_bootstrap_artifact_shape(&bootstrap);
+}
+
+fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
     assert_eq!(bootstrap["service_name"], "edge-proxy");
     assert_eq!(bootstrap["kv_mount"], "secret");
     assert!(bootstrap["role_id_path"].is_string());
@@ -425,6 +428,20 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
     assert!(bootstrap["eab_file_path"].is_string());
     assert!(bootstrap["agent_config_path"].is_string());
     assert!(bootstrap["ca_bundle_path"].is_string());
+    assert!(bootstrap["openbao_agent_config_path"].is_string());
+    assert!(bootstrap["openbao_agent_template_path"].is_string());
+    assert!(bootstrap["openbao_agent_token_path"].is_string());
+    assert_eq!(bootstrap["agent_email"], "admin@example.com");
+    assert_eq!(
+        bootstrap["agent_server"],
+        "https://localhost:9000/acme/acme/directory"
+    );
+    assert_eq!(bootstrap["agent_domain"], "trusted.domain");
+    assert_eq!(bootstrap["agent_responder_url"], "http://127.0.0.1:8080");
+    assert_eq!(bootstrap["profile_hostname"], "edge-node-01");
+    assert_eq!(bootstrap["profile_instance_id"], "001");
+    assert!(bootstrap["profile_cert_path"].is_string());
+    assert!(bootstrap["profile_key_path"].is_string());
 }
 
 #[cfg(unix)]
@@ -1172,8 +1189,29 @@ fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str
         .join(service_name);
     let openbao_hcl = openbao_service_dir.join("agent.hcl");
     let openbao_ctmpl = openbao_service_dir.join("agent.toml.ctmpl");
+    let openbao_token = openbao_service_dir.join("token");
     assert!(openbao_hcl.exists());
     assert!(openbao_ctmpl.exists());
+    assert!(openbao_token.exists());
+
+    let hcl_mode = fs::metadata(&openbao_hcl)
+        .expect("openbao hcl metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let ctmpl_mode = fs::metadata(&openbao_ctmpl)
+        .expect("openbao ctmpl metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let token_mode = fs::metadata(&openbao_token)
+        .expect("openbao token metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(hcl_mode, 0o600);
+    assert_eq!(ctmpl_mode, 0o600);
+    assert_eq!(token_mode, 0o600);
 }
 
 fn write_cert_with_dns(

@@ -205,34 +205,6 @@ jobs:
           http_responder_hmac = "dev-hmac"
           http_responder_timeout_secs = 5
           http_responder_token_ttl_secs = 300
-
-          [[profiles]]
-          service_name = "edge-proxy"
-          instance_id = "001"
-          hostname = "edge-node-01"
-
-          [profiles.paths]
-          cert = "certs/edge-proxy.crt"
-          key = "certs/edge-proxy.key"
-
-          [profiles.daemon]
-          check_interval = "1h"
-          renew_before = "720h"
-          check_jitter = "0s"
-
-          [[profiles]]
-          service_name = "web-app"
-          instance_id = "001"
-          hostname = "web-01"
-
-          [profiles.paths]
-          cert = "certs/web-app.crt"
-          key = "certs/web-app.key"
-
-          [profiles.daemon]
-          check_interval = "1h"
-          renew_before = "720h"
-          check_jitter = "0s"
           EOF
 
           cargo run --bin bootroot -- service add \
