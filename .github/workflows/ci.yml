@@ -332,19 +332,29 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build bootroot binaries
-        run: cargo build --bin bootroot --bin bootroot-remote
+        run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
-      - name: Run Docker baseline full matrix
+      - name: Run Docker main lifecycle (fqdn-only-hosts)
         run: |
-          SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json" \
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-baseline-${GITHUB_RUN_ID}" \
-          PROJECT_NAME="bootroot-e2e-ci-baseline-${GITHUB_RUN_ID}" \
-          MAX_CYCLES=2 \
-          INTERVAL_SECS=1 \
-          TIMEOUT_SECS=60 \
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-fqdn-${GITHUB_RUN_ID}" \
+          PROJECT_NAME="bootroot-e2e-ci-main-fqdn-${GITHUB_RUN_ID}" \
+          RESOLUTION_MODE="fqdn-only-hosts" \
+          TIMEOUT_SECS=120 \
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
-          ./scripts/e2e/docker/run-baseline.sh
+          BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
+          ./scripts/e2e/docker/run-main-lifecycle.sh
+
+      - name: Run Docker main lifecycle (hosts-all)
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-hosts-${GITHUB_RUN_ID}" \
+          PROJECT_NAME="bootroot-e2e-ci-main-hosts-${GITHUB_RUN_ID}" \
+          RESOLUTION_MODE="hosts-all" \
+          TIMEOUT_SECS=120 \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
+          BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
+          ./scripts/e2e/docker/run-main-lifecycle.sh
 
       - name: Run Docker rotation/recovery full matrix
         run: |
@@ -361,8 +371,16 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ci-baseline-${{ github.run_id }}
-          path: tmp/e2e/ci-baseline-${{ github.run_id }}
+          name: ci-main-fqdn-${{ github.run_id }}
+          path: tmp/e2e/ci-main-fqdn-${{ github.run_id }}
+          if-no-files-found: warn
+
+      - name: Upload Hosts-All Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-main-hosts-${{ github.run_id }}
+          path: tmp/e2e/ci-main-hosts-${{ github.run_id }}
           if-no-files-found: warn
 
       - name: Upload Rotation Artifacts
