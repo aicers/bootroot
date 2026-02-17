@@ -65,6 +65,9 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
 
     match result {
         Ok(summary) => {
+            if let Some(summary_json) = args.summary_json.as_deref() {
+                write_init_summary_json(summary_json, &summary).await?;
+            }
             print_init_summary(&summary, messages);
             Ok(())
         }
@@ -76,6 +79,16 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             Err(err)
         }
     }
+}
+
+async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let payload = serde_json::to_string_pretty(summary)?;
+    tokio::fs::write(path, payload).await?;
+    fs_util::set_key_permissions(path).await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1881,6 +1894,7 @@ mod tests {
             },
             auto_generate: false,
             show_secrets: false,
+            summary_json: None,
             root_token: crate::cli::args::RootTokenArgs { root_token: None },
             unseal_key: Vec::new(),
             openbao_unseal_from_file: None,

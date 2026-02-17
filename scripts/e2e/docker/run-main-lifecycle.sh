@@ -24,6 +24,7 @@ PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUN_LOG="$ARTIFACT_DIR/run.log"
 INIT_LOG="$ARTIFACT_DIR/init.log"
 INIT_RAW_LOG="$ARTIFACT_DIR/init.raw.log"
+INIT_SUMMARY_JSON="$ARTIFACT_DIR/init-summary.json"
 CERT_META_DIR="$ARTIFACT_DIR/cert-meta"
 HOSTS_MARKER="# bootroot-e2e-main-lifecycle"
 VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-3}"
@@ -315,6 +316,7 @@ run_bootstrap_chain() {
   if ! BOOTROOT_LANG=en printf "y\ny\nn\n" | run_bootroot init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
+    --summary-json "$INIT_SUMMARY_JSON" \
     --auto-generate \
     --show-secrets \
     --stepca-url "$STEPCA_EAB_URL" \
@@ -332,7 +334,7 @@ run_bootstrap_chain() {
     fail "bootroot init failed"
   fi
 
-  OPENBAO_ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' "$INIT_RAW_LOG")"
+  OPENBAO_ROOT_TOKEN="$(jq -r '.root_token // empty' "$INIT_SUMMARY_JSON")"
   [ -n "${OPENBAO_ROOT_TOKEN:-}" ] || fail "Failed to parse root token from init output"
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 

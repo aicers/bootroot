@@ -299,6 +299,10 @@ pub(crate) struct InitArgs {
     #[arg(long)]
     pub(crate) show_secrets: bool,
 
+    /// Path to init summary JSON file
+    #[arg(long = "summary-json")]
+    pub(crate) summary_json: Option<PathBuf>,
+
     #[command(flatten)]
     pub(crate) root_token: RootTokenArgs,
 
@@ -632,6 +636,17 @@ mod tests {
                 assert_eq!(args.state_file, Some(PathBuf::from("state.custom.json")));
             }
             _ => panic!("expected service sync-status"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_init_summary_json() {
+        let cli = Cli::parse_from(["bootroot", "init", "--summary-json", "init-summary.json"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert_eq!(args.summary_json, Some(PathBuf::from("init-summary.json")));
+            }
+            _ => panic!("expected init"),
         }
     }
 }
