@@ -428,6 +428,21 @@ run_verify_pair() {
   snapshot_cert_meta "$label"
 }
 
+force_reissue_remote_service() {
+  rm -f "$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt" "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key"
+}
+
+run_rotation_secret_id() {
+  log_phase "rotate-secret-id"
+  run_bootroot_control rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --root-token "$OPENBAO_ROOT_TOKEN" \
+    --yes \
+    approle-secret-id \
+    --service-name "$SERVICE_NAME" >>"$RUN_LOG" 2>&1
+}
+
 run_rotation_responder_hmac() {
   log_phase "rotate-responder-hmac"
   run_bootroot_control rotate \
@@ -465,13 +480,22 @@ main() {
 
   run_verify_pair "initial"
 
+  run_rotation_secret_id
+  log_phase "sync-after-secret-id"
+  run_remote_sync
+  assert_control_sync_applied
+  force_reissue_remote_service
+  run_verify_pair "after-secret-id"
+  assert_fingerprint_changed "initial" "after-secret-id"
+
   run_rotation_responder_hmac
-  log_phase "sync-after-rotate"
+  log_phase "sync-after-responder-hmac"
   run_remote_sync
   assert_control_sync_applied
 
+  force_reissue_remote_service
   run_verify_pair "after-responder-hmac"
-  assert_fingerprint_changed "initial" "after-responder-hmac"
+  assert_fingerprint_changed "after-secret-id" "after-responder-hmac"
 }
 
 main "$@"
