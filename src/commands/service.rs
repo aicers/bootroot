@@ -288,7 +288,10 @@ pub(crate) fn run_service_sync_status(
     args: &ServiceSyncStatusArgs,
     messages: &Messages,
 ) -> Result<()> {
-    let state_path = StateFile::default_path();
+    let state_path = args
+        .state_file
+        .clone()
+        .unwrap_or_else(StateFile::default_path);
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
