@@ -39,6 +39,7 @@ jobs:
               - "scripts/**"
               - "Cargo.toml"
               - "Cargo.lock"
+              - "pyproject.toml"
               - "docker-compose.yml"
               - "Dockerfile*"
               - "responder.toml.example"
@@ -67,11 +68,25 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Python Tools
+        run: python -m pip install --upgrade pip ruff mkdocs-material mkdocs-static-i18n
+
       - name: Check Rust Formatting
         run: cargo fmt -- --check --config group_imports=StdExternalCrate
 
       - name: Check Rust Lints (Clippy)
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Check Python Formatting
+        run: ruff format --check .
+
+      - name: Check Python Lints
+        run: ruff check .
 
       - name: Setup Biome
         uses: biomejs/setup-biome@v2
@@ -85,9 +100,6 @@ jobs:
         uses: DavidAnson/markdownlint-cli2-action@v22
         with:
           globs: "**/*.md"
-
-      - name: Set up MkDocs
-        run: python3 -m pip install --upgrade pip mkdocs-material mkdocs-static-i18n
 
       - name: Build Docs
         run: mkdocs build --strict

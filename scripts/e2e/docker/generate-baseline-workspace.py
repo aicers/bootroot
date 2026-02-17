@@ -20,16 +20,16 @@ def parse_args() -> argparse.Namespace:
 def build_agent_toml(service_name: str, hostname: str, instance_id: str) -> str:
     return (
         "[acme]\n"
-        "http_responder_hmac = \"seed-responder-hmac\"\n\n"
+        'http_responder_hmac = "seed-responder-hmac"\n\n'
         "[trust]\n"
-        "trusted_ca_sha256 = [\"" + ("0" * 64) + "\"]\n\n"
+        'trusted_ca_sha256 = ["' + ("0" * 64) + '"]\n\n'
         "[[profiles]]\n"
-        f"service_name = \"{service_name}\"\n"
-        f"instance_id = \"{instance_id}\"\n"
-        f"hostname = \"{hostname}\"\n\n"
+        f'service_name = "{service_name}"\n'
+        f'instance_id = "{instance_id}"\n'
+        f'hostname = "{hostname}"\n\n'
         "[profiles.paths]\n"
-        f"cert = \"certs/{service_name}.crt\"\n"
-        f"key = \"certs/{service_name}.key\"\n"
+        f'cert = "certs/{service_name}.crt"\n'
+        f'key = "certs/{service_name}.key"\n'
     )
 
 
@@ -114,7 +114,9 @@ def main() -> None:
             role_id_path.write_text(f"role-{service_name}\n", encoding="utf-8")
             secret_id_path.write_text(f"seed-secret-{service_name}\n", encoding="utf-8")
             eab_file_path.write_text(
-                json.dumps({"kid": f"seed-kid-{service_name}", "hmac": f"seed-hmac-{service_name}"}),
+                json.dumps(
+                    {"kid": f"seed-kid-{service_name}", "hmac": f"seed-hmac-{service_name}"}
+                ),
                 encoding="utf-8",
             )
             os.chmod(role_id_path, 0o600)
