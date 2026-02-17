@@ -493,6 +493,16 @@ run_verify_pair() {
   snapshot_cert_meta "$WEB_SERVICE" "$label"
 }
 
+force_reissue_for_service() {
+  local service="$1"
+  rm -f "$CERTS_DIR/${service}.crt" "$CERTS_DIR/${service}.key"
+}
+
+force_reissue_all_services() {
+  force_reissue_for_service "$EDGE_SERVICE"
+  force_reissue_for_service "$WEB_SERVICE"
+}
+
 verify_service_with_retry() {
   local service="$1"
   local attempt
@@ -529,6 +539,7 @@ run_rotations_with_verification() {
     --root-token "$OPENBAO_ROOT_TOKEN" \
     --yes \
     responder-hmac >>"$RUN_LOG" 2>&1
+  force_reissue_all_services
   run_verify_pair "after-responder-hmac"
   assert_fingerprint_changed "$EDGE_SERVICE" "initial" "after-responder-hmac"
   assert_fingerprint_changed "$WEB_SERVICE" "initial" "after-responder-hmac"
