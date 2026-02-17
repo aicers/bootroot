@@ -367,6 +367,12 @@ fn assert_mode(path: &Path, expected: u32) {
 
 async fn stub_control_plane_openbao(server: &MockServer) {
     let role_name = format!("bootroot-service-{SERVICE_NAME}");
+    stub_control_plane_approle(server, &role_name).await;
+    stub_control_plane_global_materials(server).await;
+    stub_control_plane_service_material_writes(server).await;
+}
+
+async fn stub_control_plane_approle(server: &MockServer, role_name: &str) {
     Mock::given(method("GET"))
         .and(path("/v1/sys/auth"))
         .and(header("X-Vault-Token", ROOT_TOKEN))
@@ -409,7 +415,9 @@ async fn stub_control_plane_openbao(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
 
+async fn stub_control_plane_global_materials(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/v1/secret/metadata/bootroot/ca"))
         .and(header("X-Vault-Token", ROOT_TOKEN))
@@ -447,7 +455,9 @@ async fn stub_control_plane_openbao(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
 
+async fn stub_control_plane_service_material_writes(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path(
             "/v1/secret/data/bootroot/services/edge-proxy/secret_id",
