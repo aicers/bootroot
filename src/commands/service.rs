@@ -38,6 +38,9 @@ const SERVICE_EAB_KID_KEY: &str = "kid";
 const SERVICE_EAB_HMAC_KEY: &str = "hmac";
 const SERVICE_RESPONDER_HMAC_KEY: &str = "hmac";
 const SERVICE_CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
+const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
+const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
+const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
 
 pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) -> Result<()> {
     let state_path = StateFile::default_path();
@@ -485,6 +488,17 @@ struct RemoteBootstrapArtifact {
     eab_file_path: String,
     agent_config_path: String,
     ca_bundle_path: String,
+    openbao_agent_config_path: String,
+    openbao_agent_template_path: String,
+    openbao_agent_token_path: String,
+    agent_email: String,
+    agent_server: String,
+    agent_domain: String,
+    agent_responder_url: String,
+    profile_hostname: String,
+    profile_instance_id: String,
+    profile_cert_path: String,
+    profile_key_path: String,
 }
 
 struct RemoteSyncMaterial {
@@ -535,6 +549,12 @@ async fn apply_local_service_configs(
         .unwrap_or(Path::new("."))
         .join(SERVICE_ROLE_ID_FILENAME);
     let token_path = openbao_service_dir.join(OPENBAO_AGENT_TOKEN_FILENAME);
+    if !token_path.exists() {
+        fs::write(&token_path, "")
+            .await
+            .with_context(|| messages.error_write_file_failed(&token_path.display().to_string()))?;
+    }
+    fs_util::set_key_permissions(&token_path).await?;
     let agent_config_path = openbao_service_dir.join(OPENBAO_AGENT_CONFIG_FILENAME);
     let agent_hcl = render_openbao_agent_config(
         &role_id_path,
@@ -681,6 +701,8 @@ async fn write_remote_bootstrap_artifact(
         .parent()
         .unwrap_or(Path::new("certs"))
         .join("ca-bundle.pem");
+    let (openbao_agent_config_path, openbao_agent_template_path, openbao_agent_token_path) =
+        remote_openbao_agent_paths(secret_id_path, &resolved.service_name);
 
     let artifact = RemoteBootstrapArtifact {
         openbao_url: state.openbao_url.clone(),
@@ -691,6 +713,17 @@ async fn write_remote_bootstrap_artifact(
         eab_file_path: eab_path.display().to_string(),
         agent_config_path: resolved.agent_config.display().to_string(),
         ca_bundle_path: ca_bundle_path.display().to_string(),
+        openbao_agent_config_path: openbao_agent_config_path.display().to_string(),
+        openbao_agent_template_path: openbao_agent_template_path.display().to_string(),
+        openbao_agent_token_path: openbao_agent_token_path.display().to_string(),
+        agent_email: DEFAULT_AGENT_EMAIL.to_string(),
+        agent_server: DEFAULT_AGENT_SERVER.to_string(),
+        agent_domain: resolved.domain.clone(),
+        agent_responder_url: DEFAULT_AGENT_RESPONDER_URL.to_string(),
+        profile_hostname: resolved.hostname.clone(),
+        profile_instance_id: resolved.instance_id.clone().unwrap_or_default(),
+        profile_cert_path: resolved.cert_path.display().to_string(),
+        profile_key_path: resolved.key_path.display().to_string(),
     };
     let artifact_dir = secrets_dir
         .join(REMOTE_BOOTSTRAP_DIR)
@@ -705,18 +738,7 @@ async fn write_remote_bootstrap_artifact(
     fs_util::set_key_permissions(&artifact_path).await?;
 
     let remote_summary_path = format!("{}-remote-summary.json", resolved.service_name);
-    let remote_run_command = format!(
-        "bootroot-remote sync --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --ca-bundle-path '{}' --summary-json '{}' --output json",
-        artifact.openbao_url,
-        artifact.kv_mount,
-        artifact.service_name,
-        artifact.role_id_path,
-        artifact.secret_id_path,
-        artifact.eab_file_path,
-        artifact.agent_config_path,
-        artifact.ca_bundle_path,
-        remote_summary_path
-    );
+    let remote_run_command = render_remote_run_command(&artifact, &remote_summary_path);
     let control_sync_command = format!(
         "bootroot-remote ack --service-name '{}' --summary-json '{}'",
         resolved.service_name, remote_summary_path
@@ -748,6 +770,8 @@ async fn write_remote_bootstrap_artifact_from_entry(
         .parent()
         .unwrap_or(Path::new("certs"))
         .join("ca-bundle.pem");
+    let (openbao_agent_config_path, openbao_agent_template_path, openbao_agent_token_path) =
+        remote_openbao_agent_paths(&secret_id_path, &entry.service_name);
     let artifact = RemoteBootstrapArtifact {
         openbao_url: state.openbao_url.clone(),
         kv_mount: state.kv_mount.clone(),
@@ -757,6 +781,17 @@ async fn write_remote_bootstrap_artifact_from_entry(
         eab_file_path: eab_path.display().to_string(),
         agent_config_path: entry.agent_config_path.display().to_string(),
         ca_bundle_path: ca_bundle_path.display().to_string(),
+        openbao_agent_config_path: openbao_agent_config_path.display().to_string(),
+        openbao_agent_template_path: openbao_agent_template_path.display().to_string(),
+        openbao_agent_token_path: openbao_agent_token_path.display().to_string(),
+        agent_email: DEFAULT_AGENT_EMAIL.to_string(),
+        agent_server: DEFAULT_AGENT_SERVER.to_string(),
+        agent_domain: entry.domain.clone(),
+        agent_responder_url: DEFAULT_AGENT_RESPONDER_URL.to_string(),
+        profile_hostname: entry.hostname.clone(),
+        profile_instance_id: entry.instance_id.clone().unwrap_or_default(),
+        profile_cert_path: entry.cert_path.display().to_string(),
+        profile_key_path: entry.key_path.display().to_string(),
     };
     write_remote_bootstrap_artifact_file(
         secrets_dir,
@@ -783,18 +818,7 @@ async fn write_remote_bootstrap_artifact_file(
         .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
     fs_util::set_key_permissions(&artifact_path).await?;
     let remote_summary_path = format!("{service_name}-remote-summary.json");
-    let remote_run_command = format!(
-        "bootroot-remote sync --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --ca-bundle-path '{}' --summary-json '{}' --output json",
-        artifact.openbao_url,
-        artifact.kv_mount,
-        artifact.service_name,
-        artifact.role_id_path,
-        artifact.secret_id_path,
-        artifact.eab_file_path,
-        artifact.agent_config_path,
-        artifact.ca_bundle_path,
-        remote_summary_path
-    );
+    let remote_run_command = render_remote_run_command(artifact, &remote_summary_path);
     let control_sync_command = format!(
         "bootroot-remote ack --service-name '{}' --summary-json '{}'",
         artifact.service_name, remote_summary_path
@@ -804,6 +828,48 @@ async fn write_remote_bootstrap_artifact_file(
         remote_run_command,
         control_sync_command,
     })
+}
+
+fn render_remote_run_command(artifact: &RemoteBootstrapArtifact, summary_path: &str) -> String {
+    format!(
+        "bootroot-remote sync --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --agent-email '{}' --agent-server '{}' --agent-domain '{}' --agent-responder-url '{}' --profile-hostname '{}' --profile-instance-id '{}' --profile-cert-path '{}' --profile-key-path '{}' --ca-bundle-path '{}' --summary-json '{}' --output json",
+        artifact.openbao_url,
+        artifact.kv_mount,
+        artifact.service_name,
+        artifact.role_id_path,
+        artifact.secret_id_path,
+        artifact.eab_file_path,
+        artifact.agent_config_path,
+        artifact.agent_email,
+        artifact.agent_server,
+        artifact.agent_domain,
+        artifact.agent_responder_url,
+        artifact.profile_hostname,
+        artifact.profile_instance_id,
+        artifact.profile_cert_path,
+        artifact.profile_key_path,
+        artifact.ca_bundle_path,
+        summary_path
+    )
+}
+
+fn remote_openbao_agent_paths(
+    secret_id_path: &Path,
+    service_name: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let secret_service_dir = secret_id_path.parent().unwrap_or_else(|| Path::new("."));
+    let services_dir = secret_service_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let secrets_dir = services_dir.parent().unwrap_or_else(|| Path::new("."));
+    let openbao_service_dir = secrets_dir
+        .join(OPENBAO_SERVICE_CONFIG_DIR)
+        .join(service_name);
+    (
+        openbao_service_dir.join(OPENBAO_AGENT_CONFIG_FILENAME),
+        openbao_service_dir.join(OPENBAO_AGENT_TEMPLATE_FILENAME),
+        openbao_service_dir.join(OPENBAO_AGENT_TOKEN_FILENAME),
+    )
 }
 
 fn initial_sync_status(delivery_mode: DeliveryMode) -> ServiceSyncStatus {
@@ -1081,7 +1147,7 @@ fn resolve_service_add_args(
         args.agent_config.clone(),
         messages.prompt_agent_config(),
         &mut prompt,
-        matches!(delivery_mode, DeliveryMode::RemoteBootstrap),
+        false,
         messages,
     )?;
 

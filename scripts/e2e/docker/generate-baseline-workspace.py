@@ -17,22 +17,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_agent_toml(service_name: str, hostname: str, instance_id: str) -> str:
-    return (
-        "[acme]\n"
-        'http_responder_hmac = "seed-responder-hmac"\n\n'
-        "[trust]\n"
-        'trusted_ca_sha256 = ["' + ("0" * 64) + '"]\n\n'
-        "[[profiles]]\n"
-        f'service_name = "{service_name}"\n'
-        f'instance_id = "{instance_id}"\n'
-        f'hostname = "{hostname}"\n\n'
-        "[profiles.paths]\n"
-        f'cert = "certs/{service_name}.crt"\n'
-        f'key = "certs/{service_name}.key"\n'
-    )
-
-
 def ensure_cert_pair(work_dir: Path, service_name: str, hostname: str, instance_id: str) -> None:
     cert_path = work_dir / "certs" / f"{service_name}.crt"
     key_path = work_dir / "certs" / f"{service_name}.key"
@@ -122,12 +106,6 @@ def main() -> None:
             os.chmod(role_id_path, 0o600)
             os.chmod(secret_id_path, 0o600)
             os.chmod(eab_file_path, 0o600)
-
-            agent_config_path.write_text(
-                build_agent_toml(service_name, hostname, instance_id),
-                encoding="utf-8",
-            )
-            os.chmod(agent_config_path, 0o600)
 
             ensure_cert_pair(work_dir, service_name, hostname, instance_id)
 

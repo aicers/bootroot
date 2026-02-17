@@ -14,6 +14,12 @@ const EAB_KID_KEY: &str = "kid";
 const EAB_HMAC_KEY: &str = "hmac";
 const TRUSTED_CA_KEY: &str = "trusted_ca_sha256";
 const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
+const MANAGED_PROFILE_BEGIN_PREFIX: &str = "# BEGIN BOOTROOT REMOTE PROFILE";
+const MANAGED_PROFILE_END_PREFIX: &str = "# END BOOTROOT REMOTE PROFILE";
+const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
+const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
+const DEFAULT_AGENT_DOMAIN: &str = "trusted.domain";
+const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,6 +71,38 @@ struct PullArgs {
     /// bootroot-agent config path to update
     #[arg(long)]
     agent_config_path: PathBuf,
+
+    /// bootroot-agent email for baseline config generation
+    #[arg(long, default_value = DEFAULT_AGENT_EMAIL)]
+    agent_email: String,
+
+    /// bootroot-agent ACME server URL for baseline config generation
+    #[arg(long, default_value = DEFAULT_AGENT_SERVER)]
+    agent_server: String,
+
+    /// bootroot-agent domain for baseline config generation
+    #[arg(long, default_value = DEFAULT_AGENT_DOMAIN)]
+    agent_domain: String,
+
+    /// HTTP-01 responder admin URL for baseline config generation
+    #[arg(long, default_value = DEFAULT_AGENT_RESPONDER_URL)]
+    agent_responder_url: String,
+
+    /// Service profile hostname for baseline generation
+    #[arg(long, default_value = "localhost")]
+    profile_hostname: String,
+
+    /// Service profile `instance_id` for baseline generation
+    #[arg(long, default_value = "")]
+    profile_instance_id: String,
+
+    /// Service profile cert path for baseline generation
+    #[arg(long)]
+    profile_cert_path: Option<PathBuf>,
+
+    /// Service profile key path for baseline generation
+    #[arg(long)]
+    profile_key_path: Option<PathBuf>,
 
     /// CA bundle output path (required when trust data includes `ca_bundle_pem`)
     #[arg(long)]
@@ -127,6 +165,38 @@ struct SyncArgs {
     /// bootroot-agent config path to update
     #[arg(long)]
     agent_config_path: PathBuf,
+
+    /// bootroot-agent email for baseline config generation
+    #[arg(long, default_value = DEFAULT_AGENT_EMAIL)]
+    agent_email: String,
+
+    /// bootroot-agent ACME server URL for baseline config generation
+    #[arg(long, default_value = DEFAULT_AGENT_SERVER)]
+    agent_server: String,
+
+    /// bootroot-agent domain for baseline config generation
+    #[arg(long, default_value = DEFAULT_AGENT_DOMAIN)]
+    agent_domain: String,
+
+    /// HTTP-01 responder admin URL for baseline config generation
+    #[arg(long, default_value = DEFAULT_AGENT_RESPONDER_URL)]
+    agent_responder_url: String,
+
+    /// Service profile hostname for baseline generation
+    #[arg(long, default_value = "localhost")]
+    profile_hostname: String,
+
+    /// Service profile `instance_id` for baseline generation
+    #[arg(long, default_value = "")]
+    profile_instance_id: String,
+
+    /// Service profile cert path for baseline generation
+    #[arg(long)]
+    profile_cert_path: Option<PathBuf>,
+
+    /// Service profile key path for baseline generation
+    #[arg(long)]
+    profile_key_path: Option<PathBuf>,
 
     /// CA bundle output path (required when trust data includes `ca_bundle_pem`)
     #[arg(long)]
@@ -339,8 +409,12 @@ async fn apply_agent_config_updates(
     args: &PullArgs,
     pulled: &PulledSecrets,
 ) -> (ApplyItemSummary, ApplyItemSummary) {
+    let profile_paths = resolve_profile_paths(args);
     let agent_config = match fs::read_to_string(&args.agent_config_path).await {
         Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            render_agent_config_baseline(args, &profile_paths.cert_path, &profile_paths.key_path)
+        }
         Err(err) => {
             let message = format!(
                 "agent config read failed ({}): {err}",
@@ -352,15 +426,27 @@ async fn apply_agent_config_updates(
             );
         }
     };
+    let with_profile = upsert_managed_profile_block(
+        &agent_config,
+        &args.service_name,
+        &render_managed_profile_block(
+            &args.service_name,
+            &args.profile_instance_id,
+            &args.profile_hostname,
+            &profile_paths.cert_path,
+            &profile_paths.key_path,
+        ),
+    );
 
     let acme_pairs = vec![("http_responder_hmac", pulled.responder_hmac.clone())];
-    let hmac_updated = upsert_toml_section_keys(&agent_config, "acme", &acme_pairs);
+    let hmac_updated = upsert_toml_section_keys(&with_profile, "acme", &acme_pairs);
     let trust_pairs =
         build_trust_updates(&pulled.trusted_ca_sha256, args.ca_bundle_path.as_deref());
     let trust_updated = upsert_toml_section_keys(&hmac_updated, "trust", &trust_pairs);
 
-    let responder_changed = hmac_updated != agent_config;
+    let responder_changed = hmac_updated != with_profile;
     let trust_changed = trust_updated != hmac_updated;
+    let profile_changed = with_profile != agent_config;
 
     let mut responder_hmac_status = ApplyItemSummary::applied(if responder_changed {
         ApplyStatus::Applied
@@ -374,6 +460,18 @@ async fn apply_agent_config_updates(
     });
 
     if trust_updated != agent_config {
+        if let Some(parent) = args.agent_config_path.parent()
+            && let Err(err) = fs_util::ensure_secrets_dir(parent).await
+        {
+            let message = format!(
+                "agent config parent mkdir failed ({}): {err}",
+                parent.display()
+            );
+            return (
+                ApplyItemSummary::failed(message.clone()),
+                ApplyItemSummary::failed(message),
+            );
+        }
         if let Err(err) = fs::write(&args.agent_config_path, &trust_updated).await {
             let message = format!(
                 "agent config write failed ({}): {err}",
@@ -398,6 +496,16 @@ async fn apply_agent_config_updates(
             if trust_changed {
                 trust_sync_status = ApplyItemSummary::failed(message);
             }
+            return (responder_hmac_status, trust_sync_status);
+        }
+    }
+    if let Err(err) = write_openbao_agent_artifacts(args, &trust_updated).await {
+        let message = format!("openbao agent setup failed: {err}");
+        if responder_changed || profile_changed {
+            responder_hmac_status = ApplyItemSummary::failed(message.clone());
+        }
+        if trust_changed || profile_changed {
+            trust_sync_status = ApplyItemSummary::failed(message);
         }
     }
 
@@ -464,6 +572,14 @@ async fn run_sync(args: SyncArgs) -> Result<i32> {
             secret_id_path: args.secret_id_path.clone(),
             eab_file_path: args.eab_file_path.clone(),
             agent_config_path: args.agent_config_path.clone(),
+            agent_email: args.agent_email.clone(),
+            agent_server: args.agent_server.clone(),
+            agent_domain: args.agent_domain.clone(),
+            agent_responder_url: args.agent_responder_url.clone(),
+            profile_hostname: args.profile_hostname.clone(),
+            profile_instance_id: args.profile_instance_id.clone(),
+            profile_cert_path: args.profile_cert_path.clone(),
+            profile_key_path: args.profile_key_path.clone(),
             ca_bundle_path: args.ca_bundle_path.clone(),
             output: args.output,
             summary_json: Some(args.summary_json.clone()),
@@ -505,7 +621,6 @@ fn validate_pull_args(args: &PullArgs) -> Result<()> {
         &args.role_id_path,
         &args.secret_id_path,
         &args.eab_file_path,
-        &args.agent_config_path,
     ] {
         let parent = path
             .parent()
@@ -521,12 +636,6 @@ fn validate_pull_args(args: &PullArgs) -> Result<()> {
         anyhow::bail!(
             "secret_id file not found: {}",
             args.secret_id_path.display()
-        );
-    }
-    if !args.agent_config_path.exists() {
-        anyhow::bail!(
-            "agent config file not found: {}",
-            args.agent_config_path.display()
         );
     }
     Ok(())
@@ -554,6 +663,14 @@ fn validate_sync_args(args: &SyncArgs) -> Result<()> {
         secret_id_path: args.secret_id_path.clone(),
         eab_file_path: args.eab_file_path.clone(),
         agent_config_path: args.agent_config_path.clone(),
+        agent_email: args.agent_email.clone(),
+        agent_server: args.agent_server.clone(),
+        agent_domain: args.agent_domain.clone(),
+        agent_responder_url: args.agent_responder_url.clone(),
+        profile_hostname: args.profile_hostname.clone(),
+        profile_instance_id: args.profile_instance_id.clone(),
+        profile_cert_path: args.profile_cert_path.clone(),
+        profile_key_path: args.profile_key_path.clone(),
         ca_bundle_path: args.ca_bundle_path.clone(),
         output: args.output,
         summary_json: Some(args.summary_json.clone()),
@@ -777,6 +894,189 @@ fn upsert_toml_section_keys(contents: &str, section: &str, pairs: &[(&str, Strin
     }
 
     output
+}
+
+struct ProfilePaths {
+    cert_path: PathBuf,
+    key_path: PathBuf,
+}
+
+fn resolve_profile_paths(args: &PullArgs) -> ProfilePaths {
+    let fallback_dir = args
+        .agent_config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("certs");
+    let cert_path = args
+        .profile_cert_path
+        .clone()
+        .unwrap_or_else(|| fallback_dir.join(format!("{}.crt", args.service_name)));
+    let key_path = args
+        .profile_key_path
+        .clone()
+        .unwrap_or_else(|| fallback_dir.join(format!("{}.key", args.service_name)));
+    ProfilePaths {
+        cert_path,
+        key_path,
+    }
+}
+
+fn render_agent_config_baseline(args: &PullArgs, cert_path: &Path, key_path: &Path) -> String {
+    let profile_block = render_managed_profile_block(
+        &args.service_name,
+        &args.profile_instance_id,
+        &args.profile_hostname,
+        cert_path,
+        key_path,
+    );
+    format!(
+        "email = \"{email}\"\n\
+server = \"{server}\"\n\
+domain = \"{domain}\"\n\n\
+[acme]\n\
+directory_fetch_attempts = 10\n\
+directory_fetch_base_delay_secs = 1\n\
+directory_fetch_max_delay_secs = 10\n\
+poll_attempts = 15\n\
+poll_interval_secs = 2\n\
+http_responder_url = \"{responder_url}\"\n\
+http_responder_hmac = \"\"\n\
+http_responder_timeout_secs = 5\n\
+http_responder_token_ttl_secs = 300\n\n\
+{profile_block}",
+        email = args.agent_email,
+        server = args.agent_server,
+        domain = args.agent_domain,
+        responder_url = args.agent_responder_url,
+    )
+}
+
+fn render_managed_profile_block(
+    service_name: &str,
+    instance_id: &str,
+    hostname: &str,
+    cert_path: &Path,
+    key_path: &Path,
+) -> String {
+    format!(
+        "{MANAGED_PROFILE_BEGIN_PREFIX} {service_name}\n\
+[[profiles]]\n\
+service_name = \"{service_name}\"\n\
+instance_id = \"{instance_id}\"\n\
+hostname = \"{hostname}\"\n\n\
+[profiles.paths]\n\
+cert = \"{cert}\"\n\
+key = \"{key}\"\n\
+{MANAGED_PROFILE_END_PREFIX} {service_name}\n",
+        cert = cert_path.display(),
+        key = key_path.display(),
+    )
+}
+
+fn upsert_managed_profile_block(contents: &str, service_name: &str, replacement: &str) -> String {
+    let begin_marker = format!("{MANAGED_PROFILE_BEGIN_PREFIX} {service_name}");
+    let end_marker = format!("{MANAGED_PROFILE_END_PREFIX} {service_name}");
+    if let Some(begin) = contents.find(&begin_marker)
+        && let Some(end_relative) = contents[begin..].find(&end_marker)
+    {
+        let end = begin + end_relative + end_marker.len();
+        let suffix = contents[end..]
+            .strip_prefix('\n')
+            .unwrap_or(&contents[end..]);
+        let mut updated = String::new();
+        updated.push_str(&contents[..begin]);
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(replacement);
+        if !suffix.is_empty() && !replacement.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(suffix);
+        return updated;
+    }
+    let mut updated = contents.trim_end().to_string();
+    if !updated.is_empty() {
+        updated.push_str("\n\n");
+    }
+    updated.push_str(replacement);
+    updated
+}
+
+async fn write_openbao_agent_artifacts(args: &PullArgs, agent_template: &str) -> Result<()> {
+    let secret_service_dir = args
+        .secret_id_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("secret_id path has no parent"))?;
+    let secrets_services_dir = secret_service_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("secret_id path missing services directory"))?;
+    let secrets_dir = secrets_services_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("secret_id path missing secrets root"))?;
+    let openbao_service_dir = secrets_dir
+        .join("openbao")
+        .join("services")
+        .join(&args.service_name);
+    fs_util::ensure_secrets_dir(&openbao_service_dir).await?;
+
+    let template_path = openbao_service_dir.join("agent.toml.ctmpl");
+    let token_path = openbao_service_dir.join("token");
+    let config_path = openbao_service_dir.join("agent.hcl");
+
+    fs::write(&template_path, agent_template).await?;
+    fs_util::set_key_permissions(&template_path).await?;
+    if !token_path.exists() {
+        fs::write(&token_path, "").await?;
+    }
+    fs_util::set_key_permissions(&token_path).await?;
+    let config = render_openbao_agent_config(
+        &args.role_id_path,
+        &args.secret_id_path,
+        &token_path,
+        &template_path,
+        &args.agent_config_path,
+    );
+    fs::write(&config_path, config).await?;
+    fs_util::set_key_permissions(&config_path).await?;
+    Ok(())
+}
+
+fn render_openbao_agent_config(
+    role_id_path: &Path,
+    secret_id_path: &Path,
+    token_path: &Path,
+    template_path: &Path,
+    destination_path: &Path,
+) -> String {
+    format!(
+        r#"auto_auth {{
+  method "approle" {{
+    mount_path = "auth/approle"
+    config = {{
+      role_id_file_path = "{role_id_path}"
+      secret_id_file_path = "{secret_id_path}"
+    }}
+  }}
+  sink "file" {{
+    config = {{
+      path = "{token_path}"
+    }}
+  }}
+}}
+
+template {{
+  source = "{template_path}"
+  destination = "{destination_path}"
+  perms = "0600"
+}}
+"#,
+        role_id_path = role_id_path.display(),
+        secret_id_path = secret_id_path.display(),
+        token_path = token_path.display(),
+        template_path = template_path.display(),
+        destination_path = destination_path.display(),
+    )
 }
 
 fn parse_key_line<'a>(line: &'a str, pairs: &[(&'a str, String)]) -> Option<(&'a str, String)> {

@@ -14,17 +14,6 @@ fi
 
 mkdir -p "$WORK_DIR/certs" "$WORK_DIR/secrets/services/$SERVICE_NAME" "$WORK_DIR/bin"
 
-cat >"$WORK_DIR/agent.toml" <<TOML
-[[profiles]]
-service_name = "$SERVICE_NAME"
-instance_id = "$INSTANCE_ID"
-hostname = "$HOSTNAME"
-
-[profiles.paths]
-cert = "certs/$SERVICE_NAME.crt"
-key = "certs/$SERVICE_NAME.key"
-TOML
-
 cat >"$WORK_DIR/state.json" <<JSON
 {
   "openbao_url": "http://127.0.0.1:8200",

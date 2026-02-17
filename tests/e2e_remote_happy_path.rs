@@ -77,11 +77,27 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     let eab_contents = fs::read_to_string(&eab_path).expect("read eab");
     assert!(eab_contents.contains("\"kid\": \"remote-kid\""));
     let agent_contents = fs::read_to_string(&agent_config_path).expect("read agent config");
+    let openbao_agent_dir = service_dir
+        .join("secrets")
+        .join("openbao")
+        .join("services")
+        .join(SERVICE_NAME);
+    let openbao_agent_hcl = openbao_agent_dir.join("agent.hcl");
+    let openbao_agent_template = openbao_agent_dir.join("agent.toml.ctmpl");
+    let openbao_agent_token = openbao_agent_dir.join("token");
+    assert!(openbao_agent_hcl.exists());
+    assert!(openbao_agent_template.exists());
+    assert!(openbao_agent_token.exists());
     assert!(agent_contents.contains("http_responder_hmac = \"remote-responder-hmac\""));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
+    assert!(agent_contents.contains("[[profiles]]"));
+    assert!(agent_contents.contains("service_name = \"edge-proxy\""));
     assert_mode(&secret_id_path, 0o600);
     assert_mode(&eab_path, 0o600);
     assert_mode(&agent_config_path, 0o600);
+    assert_mode(&openbao_agent_hcl, 0o600);
+    assert_mode(&openbao_agent_template, 0o600);
+    assert_mode(&openbao_agent_token, 0o600);
 
     write_verify_state(&service_dir).expect("write verify state");
     write_cert_for_service(&service_dir).expect("write cert/key");
@@ -182,6 +198,30 @@ fn run_remote_sync(
             eab_file_path.to_string_lossy().as_ref(),
             "--agent-config-path",
             agent_config_path.to_string_lossy().as_ref(),
+            "--agent-email",
+            "admin@example.com",
+            "--agent-server",
+            "https://localhost:9000/acme/acme/directory",
+            "--agent-domain",
+            DOMAIN,
+            "--agent-responder-url",
+            "http://127.0.0.1:8080",
+            "--profile-hostname",
+            HOSTNAME,
+            "--profile-instance-id",
+            INSTANCE_ID,
+            "--profile-cert-path",
+            service_dir
+                .join("certs")
+                .join("edge-proxy.crt")
+                .to_string_lossy()
+                .as_ref(),
+            "--profile-key-path",
+            service_dir
+                .join("certs")
+                .join("edge-proxy.key")
+                .to_string_lossy()
+                .as_ref(),
             "--ca-bundle-path",
             ca_bundle_path.to_string_lossy().as_ref(),
             "--summary-json",
@@ -243,11 +283,6 @@ fn prepare_service_node_files(root: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(root.join("secrets").join("services").join(SERVICE_NAME))
         .context("create service secret dir")?;
     fs::create_dir_all(root.join("certs")).context("create cert dir")?;
-    fs::write(
-        root.join("agent.toml"),
-        "[acme]\nhttp_responder_hmac = \"old\"\n[trust]\ntrusted_ca_sha256 = [\"0\"]\n",
-    )
-    .context("write agent config")?;
     Ok(())
 }
 
