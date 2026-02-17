@@ -30,6 +30,8 @@ VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-3}"
 VERIFY_DELAY_SECS="${VERIFY_DELAY_SECS:-3}"
 HTTP01_TARGET_ATTEMPTS="${HTTP01_TARGET_ATTEMPTS:-40}"
 HTTP01_TARGET_DELAY_SECS="${HTTP01_TARGET_DELAY_SECS:-2}"
+RESPONDER_READY_ATTEMPTS="${RESPONDER_READY_ATTEMPTS:-30}"
+RESPONDER_READY_DELAY_SECS="${RESPONDER_READY_DELAY_SECS:-1}"
 
 EDGE_SERVICE="edge-proxy"
 EDGE_HOSTNAME="edge-node-01"
@@ -306,6 +308,7 @@ run_bootstrap_chain() {
   fi
 
   wait_for_openbao_api
+  wait_for_responder_admin
 
   log_phase "init"
   rm -f "$WORKSPACE_DIR/state.json"
@@ -319,8 +322,7 @@ run_bootstrap_chain() {
     --stepca-password "password" \
     --http-hmac "dev-hmac" \
     --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
-    --responder-url "$RESPONDER_URL" \
-    --skip-responder-check >"$INIT_RAW_LOG" 2>&1; then
+    --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"
       tail -n 160 "$INIT_RAW_LOG" || true
@@ -373,6 +375,21 @@ wait_for_openbao_api() {
   done
   docker logs bootroot-openbao >>"$RUN_LOG" 2>&1 || true
   fail "openbao API did not become reachable before init"
+}
+
+wait_for_responder_admin() {
+  local admin_url="${RESPONDER_URL%/}/admin/http01"
+  local attempt
+  for attempt in $(seq 1 "$RESPONDER_READY_ATTEMPTS"); do
+    local code
+    code="$(curl -sS -m 2 -o /dev/null -w '%{http_code}' "$admin_url" || true)"
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+      return 0
+    fi
+    sleep "$RESPONDER_READY_DELAY_SECS"
+  done
+  docker logs bootroot-http01 >>"$RUN_LOG" 2>&1 || true
+  fail "responder admin endpoint did not become reachable before init: $admin_url"
 }
 
 wire_stepca_hosts() {
