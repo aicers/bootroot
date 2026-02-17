@@ -11,7 +11,9 @@ use crate::cli::output::{
     print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
 use crate::cli::prompt::Prompt;
-use crate::commands::init::{PATH_CA_TRUST, SECRET_ID_TTL, TOKEN_TTL};
+use crate::commands::init::{
+    PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, SECRET_ID_TTL, TOKEN_TTL,
+};
 use crate::i18n::Messages;
 use crate::state::{
     DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, ServiceSyncMetadata,
@@ -31,6 +33,11 @@ const REMOTE_BOOTSTRAP_FILENAME: &str = "bootstrap.json";
 const CA_TRUST_KEY: &str = "trusted_ca_sha256";
 const MANAGED_PROFILE_BEGIN_PREFIX: &str = "# BEGIN bootroot managed profile:";
 const MANAGED_PROFILE_END_PREFIX: &str = "# END bootroot managed profile:";
+const SERVICE_SECRET_ID_KEY: &str = "secret_id";
+const SERVICE_EAB_KID_KEY: &str = "kid";
+const SERVICE_EAB_HMAC_KEY: &str = "hmac";
+const SERVICE_RESPONDER_HMAC_KEY: &str = "hmac";
+const SERVICE_CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
 
 pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) -> Result<()> {
     let state_path = StateFile::default_path();
@@ -133,6 +140,9 @@ async fn run_service_add_apply(
         messages,
     )
     .await?;
+    sync_remote_service_bundle_if_needed(&client, state, resolved, &approle.secret_id, messages)
+        .await?;
+
     let applied = if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
         Some(apply_local_service_configs(&secrets_dir, resolved, &secret_id_path, messages).await?)
     } else {
@@ -205,6 +215,28 @@ async fn run_service_add_apply(
         messages,
     );
     Ok(())
+}
+
+async fn sync_remote_service_bundle_if_needed(
+    client: &OpenBaoClient,
+    state: &StateFile,
+    resolved: &ResolvedServiceAdd,
+    secret_id: &str,
+    messages: &Messages,
+) -> Result<()> {
+    if !matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap) {
+        return Ok(());
+    }
+    let material = read_remote_sync_material(client, &state.kv_mount, messages).await?;
+    write_remote_service_sync_bundle(
+        client,
+        &state.kv_mount,
+        &resolved.service_name,
+        secret_id,
+        &material,
+        messages,
+    )
+    .await
 }
 
 async fn run_service_add_remote_idempotent(
@@ -453,6 +485,14 @@ struct RemoteBootstrapArtifact {
     eab_file_path: String,
     agent_config_path: String,
     ca_bundle_path: String,
+}
+
+struct RemoteSyncMaterial {
+    eab_kid: String,
+    eab_hmac: String,
+    responder_hmac: String,
+    trusted_ca_sha256: Vec<String>,
+    ca_bundle_pem: Option<String>,
 }
 
 async fn apply_local_service_configs(
@@ -824,6 +864,132 @@ fn service_role_name(service_name: &str) -> String {
 
 fn service_policy_name(service_name: &str) -> String {
     format!("{SERVICE_ROLE_PREFIX}{service_name}")
+}
+
+fn read_required_string(
+    value: &serde_json::Value,
+    key: &str,
+    missing_message: &str,
+) -> Result<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!(missing_message.to_string()))
+}
+
+async fn read_remote_sync_material(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    messages: &Messages,
+) -> Result<RemoteSyncMaterial> {
+    let eab = client
+        .read_kv(kv_mount, PATH_AGENT_EAB)
+        .await
+        .with_context(|| {
+            format!(
+                "{} ({PATH_AGENT_EAB})",
+                messages.error_openbao_kv_read_failed()
+            )
+        })?;
+    let responder_hmac = client
+        .read_kv(kv_mount, PATH_RESPONDER_HMAC)
+        .await
+        .with_context(|| {
+            format!(
+                "{} ({PATH_RESPONDER_HMAC})",
+                messages.error_openbao_kv_read_failed()
+            )
+        })?;
+    let trust = client
+        .read_kv(kv_mount, PATH_CA_TRUST)
+        .await
+        .with_context(|| {
+            format!(
+                "{} ({PATH_CA_TRUST})",
+                messages.error_openbao_kv_read_failed()
+            )
+        })?;
+    let trusted_ca_sha256 = parse_trusted_ca_list(
+        trust
+            .get(CA_TRUST_KEY)
+            .ok_or_else(|| anyhow::anyhow!(messages.error_ca_trust_missing(CA_TRUST_KEY)))?,
+        messages,
+    )?;
+    if trusted_ca_sha256.is_empty() {
+        anyhow::bail!(messages.error_ca_trust_empty());
+    }
+    Ok(RemoteSyncMaterial {
+        eab_kid: read_required_string(
+            &eab,
+            SERVICE_EAB_KID_KEY,
+            "OpenBao EAB data missing key: kid",
+        )?,
+        eab_hmac: read_required_string(
+            &eab,
+            SERVICE_EAB_HMAC_KEY,
+            "OpenBao EAB data missing key: hmac",
+        )?,
+        responder_hmac: read_required_string(
+            &responder_hmac,
+            "value",
+            "OpenBao responder HMAC data missing key: value",
+        )?,
+        trusted_ca_sha256,
+        ca_bundle_pem: trust
+            .get(SERVICE_CA_BUNDLE_PEM_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+async fn write_remote_service_sync_bundle(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    service_name: &str,
+    secret_id: &str,
+    material: &RemoteSyncMaterial,
+    messages: &Messages,
+) -> Result<()> {
+    let base = format!("{SERVICE_KV_BASE}/{service_name}");
+    client
+        .write_kv(
+            kv_mount,
+            &format!("{base}/secret_id"),
+            serde_json::json!({ SERVICE_SECRET_ID_KEY: secret_id }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
+    client
+        .write_kv(
+            kv_mount,
+            &format!("{base}/eab"),
+            serde_json::json!({
+                SERVICE_EAB_KID_KEY: &material.eab_kid,
+                SERVICE_EAB_HMAC_KEY: &material.eab_hmac,
+            }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
+    client
+        .write_kv(
+            kv_mount,
+            &format!("{base}/http_responder_hmac"),
+            serde_json::json!({ SERVICE_RESPONDER_HMAC_KEY: &material.responder_hmac }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
+    let mut trust_payload = serde_json::json!({
+        CA_TRUST_KEY: &material.trusted_ca_sha256,
+    });
+    if let Some(bundle) = material.ca_bundle_pem.as_deref() {
+        trust_payload[SERVICE_CA_BUNDLE_PEM_KEY] = serde_json::Value::String(bundle.to_string());
+    }
+    client
+        .write_kv(kv_mount, &format!("{base}/trust"), trust_payload)
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
+    Ok(())
 }
 
 fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile) -> ServiceEntry {

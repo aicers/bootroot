@@ -333,6 +333,7 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_remote_sync_material(&server, "edge-proxy").await;
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -362,8 +363,12 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         ])
         .output()
         .expect("run service add");
-    assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(!stdout.contains("auto-applied"));
     assert!(stdout.contains("- remote bootstrap file:"));
     assert!(stdout.contains("- remote run command:"));
@@ -437,6 +442,7 @@ async fn test_app_add_remote_bootstrap_rerun_is_idempotent() {
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_remote_sync_material(&server, "edge-proxy").await;
 
     let agent_config_value = agent_config.to_string_lossy().to_string();
     let cert_path_value = cert_path.to_string_lossy().to_string();
@@ -471,7 +477,12 @@ async fn test_app_add_remote_bootstrap_rerun_is_idempotent() {
         .args(args)
         .output()
         .expect("run service add first");
-    assert!(first.status.success());
+    assert!(
+        first.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
 
     let second = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -1364,6 +1375,83 @@ async fn stub_app_add_trust_missing(server: &MockServer) {
         .and(path("/v1/secret/metadata/bootroot/ca"))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(404))
+        .mount(server)
+        .await;
+}
+
+async fn stub_app_add_remote_sync_material(server: &MockServer, service_name: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/metadata/bootroot/agent/eab"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/agent/eab"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "kid": "test-kid", "hmac": "test-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/metadata/bootroot/responder/hmac"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/responder/hmac"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "value": "test-responder-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/metadata/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": {
+                "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
+                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+            } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/secret_id"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/eab"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/http_responder_hmac"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/trust"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 }
