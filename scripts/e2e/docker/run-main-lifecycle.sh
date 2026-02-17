@@ -254,13 +254,16 @@ EOF
 prepare_test_ca_materials() {
   mkdir -p "$SECRETS_DIR" "$CERTS_DIR"
   chmod 700 "$SECRETS_DIR" "$CERTS_DIR"
+  local uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
   if [ ! -f "$SECRETS_DIR/password.txt" ]; then
     printf '%s\n' "password" >"$SECRETS_DIR/password.txt"
     chmod 600 "$SECRETS_DIR/password.txt"
   fi
 
   if [ ! -f "$SECRETS_DIR/config/ca.json" ]; then
-    docker run --user root --rm -v "$SECRETS_DIR:/home/step" smallstep/step-ca \
+    docker run --user "${uid}:${gid}" --rm -v "$SECRETS_DIR:/home/step" smallstep/step-ca \
       step ca init \
       --name "Bootroot E2E CA" \
       --provisioner "admin" \
@@ -270,6 +273,67 @@ prepare_test_ca_materials() {
       --provisioner-password-file /home/step/password.txt \
       --acme >>"$RUN_LOG" 2>&1
   fi
+
+  normalize_stepca_db_host_for_compose
+  [ -r "$SECRETS_DIR/config/ca.json" ] || fail "secrets/config/ca.json is not readable"
+}
+
+reset_stepca_materials_for_e2e() {
+  if [ "${RESET_STEPCA_MATERIALS:-1}" != "1" ]; then
+    return 0
+  fi
+  rm -rf \
+    "$SECRETS_DIR/config" \
+    "$SECRETS_DIR/certs" \
+    "$SECRETS_DIR/db" \
+    "$SECRETS_DIR/secrets"
+}
+
+normalize_stepca_db_host_for_compose() {
+  local ca_json="$SECRETS_DIR/config/ca.json"
+  [ -f "$ca_json" ] || return 0
+  python3 - "$ca_json" >>"$RUN_LOG" 2>&1 <<'PY'
+import json
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+db = data.get("db")
+if not isinstance(db, dict):
+    raise SystemExit(0)
+
+dsn = db.get("dataSource")
+if not isinstance(dsn, str):
+    raise SystemExit(0)
+
+parts = urlsplit(dsn)
+if parts.scheme not in ("postgres", "postgresql"):
+    raise SystemExit(0)
+if parts.hostname not in ("127.0.0.1", "localhost"):
+    raise SystemExit(0)
+
+netloc = parts.netloc
+userinfo = ""
+hostport = netloc
+if "@" in netloc:
+    userinfo, hostport = netloc.rsplit("@", 1)
+
+port = ""
+if ":" in hostport:
+    _host, tail = hostport.rsplit(":", 1)
+    if tail:
+        port = ":" + tail
+
+new_netloc = f"{userinfo + '@' if userinfo else ''}postgres{port}"
+db["dataSource"] = urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
+
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+PY
 }
 
 run_bootstrap_chain() {
@@ -302,7 +366,7 @@ run_bootstrap_chain() {
     --stepca-provisioner "admin" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \
-    --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
+    --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
     --responder-url "$RESPONDER_URL" \
     --skip-responder-check >"$INIT_RAW_LOG" 2>&1; then
     {
@@ -493,6 +557,7 @@ main() {
   ensure_compose_images
   configure_resolution_mode
   compose_down
+  reset_stepca_materials_for_e2e
   prepare_test_ca_materials
   write_agent_config
   run_bootstrap_chain
