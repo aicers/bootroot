@@ -336,25 +336,53 @@ jobs:
 
       - name: Run Docker main lifecycle (fqdn-only-hosts)
         run: |
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-fqdn-${GITHUB_RUN_ID}" \
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-fqdn-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
           PROJECT_NAME="bootroot-e2e-ci-main-fqdn-${GITHUB_RUN_ID}" \
           RESOLUTION_MODE="fqdn-only-hosts" \
+          SECRETS_DIR="$(pwd)/secrets" \
           TIMEOUT_SECS=120 \
+          INFRA_UP_ATTEMPTS=12 \
+          INFRA_UP_DELAY_SECS=10 \
+          VERIFY_ATTEMPTS=5 \
+          VERIFY_DELAY_SECS=5 \
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/e2e/docker/run-main-lifecycle.sh
+          ./scripts/e2e/docker/run-main-lifecycle.sh || {
+            echo "main lifecycle (fqdn-only-hosts) failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
+            [ -f "$ARTIFACT_DIR/init.raw.log" ] && tail -n 200 "$ARTIFACT_DIR/init.raw.log" || true
+            [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
+            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
+            exit 1
+          }
 
       - name: Run Docker main lifecycle (hosts-all)
         run: |
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-hosts-${GITHUB_RUN_ID}" \
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-hosts-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
           PROJECT_NAME="bootroot-e2e-ci-main-hosts-${GITHUB_RUN_ID}" \
           RESOLUTION_MODE="hosts-all" \
+          SECRETS_DIR="$(pwd)/secrets" \
           TIMEOUT_SECS=120 \
+          INFRA_UP_ATTEMPTS=12 \
+          INFRA_UP_DELAY_SECS=10 \
+          VERIFY_ATTEMPTS=5 \
+          VERIFY_DELAY_SECS=5 \
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/e2e/docker/run-main-lifecycle.sh
+          ./scripts/e2e/docker/run-main-lifecycle.sh || {
+            echo "main lifecycle (hosts-all) failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
+            [ -f "$ARTIFACT_DIR/init.raw.log" ] && tail -n 200 "$ARTIFACT_DIR/init.raw.log" || true
+            [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
+            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
+            exit 1
+          }
 
       - name: Run Docker rotation/recovery full matrix
         run: |
