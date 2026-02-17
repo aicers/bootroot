@@ -1,0 +1,99 @@
+name: E2E Extended
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 23:30 KST daily (UTC-based scheduler)
+    - cron: "30 14 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  decide-run:
+    name: Decide Extended Run
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Decide by event and main activity
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "reason=manual dispatch" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch origin main --depth=200
+
+          TODAY_KST="$(TZ=Asia/Seoul date +%Y-%m-%d)"
+          COUNT="$(git log origin/main --since="${TODAY_KST} 00:00:00 +0900" --until="${TODAY_KST} 23:59:59 +0900" --pretty=oneline | wc -l | tr -d ' ')"
+
+          if [ "${COUNT}" -gt 0 ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "reason=main commits detected on ${TODAY_KST} (KST): ${COUNT}" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no main commits on ${TODAY_KST} (KST)" >> "$GITHUB_OUTPUT"
+          fi
+
+  run-extended:
+    name: Run Extended Docker E2E
+    needs: [decide-run]
+    if: needs.decide-run.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build bootroot binaries
+        run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
+
+      - name: Run extended Docker E2E suite
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/extended-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          PROJECT_PREFIX="bootroot-e2e-extended-${GITHUB_RUN_ID}" \
+          SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json" \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
+          ./scripts/e2e/docker/run-extended-suite.sh || {
+            echo "extended suite failed"
+            [ -f "$ARTIFACT_DIR/extended-summary.json" ] && cat "$ARTIFACT_DIR/extended-summary.json" || true
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            find "$ARTIFACT_DIR" -name run.log -maxdepth 3 -print -exec tail -n 120 {} \; || true
+            exit 1
+          }
+
+      - name: Upload Extended E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extended-e2e-${{ github.run_id }}
+          path: tmp/e2e/extended-${{ github.run_id }}
+          if-no-files-found: warn
+
+  skip-note:
+    name: Skip Note
+    needs: [decide-run]
+    if: needs.decide-run.outputs.should_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print skip reason
+        run: |
+          echo "Skipped extended E2E: ${{ needs.decide-run.outputs.reason }}"

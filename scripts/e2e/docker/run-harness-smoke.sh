@@ -11,6 +11,7 @@ INTERVAL_SECS="${INTERVAL_SECS:-1}"
 MAX_CYCLES="${MAX_CYCLES:-3}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-30}"
 SERVICE_NAME="${SERVICE_NAME:-edge-proxy}"
+RUNNER_MODE="${RUNNER_MODE:-systemd-timer}"
 WORK_DIR="$ARTIFACT_DIR/service-node"
 RUNNER_TICKS_FILE="$ARTIFACT_DIR/runner-ticks.log"
 RUNNER_LOG="$ARTIFACT_DIR/runner.log"
@@ -225,6 +226,7 @@ main() {
   "scenario": "$SCENARIO_ID",
   "project": "$PROJECT_NAME",
   "artifact_dir": "$ARTIFACT_DIR",
+  "runner_mode": "$RUNNER_MODE",
   "topology": {
     "control_plane": 1,
     "service_nodes": 1,
