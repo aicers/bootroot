@@ -189,8 +189,10 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 제어하는 설정입니다.
 
 - `--delivery-mode remote-bootstrap`: 지문이 서비스별 원격 sync trust 경로에 자동 기록되고,
   `bootroot-remote sync` 단계에서 서비스 머신의 `agent.toml`에 반영됩니다.
-- `--delivery-mode local-file`: `agent.toml`의 trust 항목은 자동 삽입되지 않으므로 필요 시
-  수동으로 설정해야 합니다.
+- `--delivery-mode local-file`: trust 설정(`trusted_ca_sha256`,
+  `ca_bundle_path`)이 `agent.toml`에 자동 병합됩니다. OpenBao trust 데이터에
+  `ca_bundle_pem`도 있으면 bootroot가 해당 PEM을 `ca_bundle_path` 파일에
+  제한 권한으로 자동 반영합니다.
 
 `verify_certificates = true`인데 `ca_bundle_path`가 없으면,
 bootroot-agent는 **시스템 CA 저장소**로 ACME 서버를 검증합니다.

@@ -73,7 +73,8 @@ async fn test_app_add_writes_state_and_secret() {
     assert!(stdout.contains("- deploy type: daemon"));
     assert!(stdout.contains("- delivery mode: local-file"));
     assert!(stdout.contains("- sync secret_id: none"));
-    assert!(stdout.contains("manual snippets are hidden by default"));
+    assert!(stdout.contains("next steps:"));
+    assert!(stdout.contains("daemon profile snippet:"));
     assert!(stdout.contains("- auto-applied bootroot-agent config:"));
     assert!(stdout.contains("- auto-applied OpenBao Agent config:"));
 
@@ -161,6 +162,7 @@ async fn test_app_add_print_only_shows_snippets_without_writes() {
     assert!(stdout.contains("bootroot service add: summary"));
     assert!(stdout.contains("daemon profile snippet:"));
     assert!(stdout.contains("preview mode: no files or state were changed"));
+    assert!(stdout.contains("trust preview unavailable"));
     assert!(!stdout.contains("auto-applied"));
 
     let state_contents =
@@ -176,6 +178,57 @@ async fn test_app_add_print_only_shows_snippets_without_writes() {
             .join("secret_id")
             .exists()
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_print_only_with_root_token_shows_trust_snippet() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_present(&server).await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("[trust]"));
+    assert!(stdout.contains("trusted_ca_sha256"));
+    assert!(stdout.contains("ca_bundle_path"));
+    assert!(!stdout.contains("trust preview unavailable"));
 }
 
 #[cfg(unix)]
@@ -370,8 +423,10 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
     );
     assert!(!stdout.contains("auto-applied"));
     assert!(stdout.contains("- remote bootstrap file:"));
-    assert!(stdout.contains("- remote run command:"));
-    assert!(stdout.contains("- control sync-status command:"));
+    assert!(stdout.contains("- remote handoff order:"));
+    assert!(stdout.contains("1. Run on the service host:"));
+    assert!(stdout.contains("2. Run on the step-ca host:"));
+    assert!(stdout.contains("3. Check status on the step-ca host:"));
 
     let state_contents =
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
@@ -764,10 +819,22 @@ async fn test_app_add_includes_trust_snippet_when_present() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(!stdout.contains("[trust]"));
-    assert!(!stdout.contains("trusted_ca_sha256"));
-    assert!(!stdout.contains("ca_bundle_path"));
-    assert!(stdout.contains("manual snippets are hidden by default"));
+    assert!(stdout.contains("[trust]"));
+    assert!(stdout.contains("trusted_ca_sha256"));
+    assert!(stdout.contains("ca_bundle_path"));
+    let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
+    assert!(agent_contents.contains("[trust]"));
+    assert!(agent_contents.contains("trusted_ca_sha256"));
+    assert!(agent_contents.contains("ca_bundle_path = \""));
+    let bundle_path = temp_dir.path().join("certs").join("ca-bundle.pem");
+    let bundle_contents = fs::read_to_string(&bundle_path).expect("read ca bundle");
+    assert!(bundle_contents.contains("BEGIN CERTIFICATE"));
+    let mode = fs::metadata(&bundle_path)
+        .expect("bundle metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
 }
 
 #[cfg(unix)]
@@ -1400,7 +1467,8 @@ async fn stub_app_add_trust_present(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "data": {
-                    "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"]
+                    "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
+                    "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nTRUST\n-----END CERTIFICATE-----"
                 }
             }
         })))

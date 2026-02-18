@@ -192,9 +192,10 @@ arbitrary values). `bootroot init` stores CA fingerprints in OpenBao, and
   to the
   per-service remote sync trust path and then applied to `agent.toml` on the
   service machine by `bootroot-remote sync`.
-- `--delivery-mode local-file`: trust fields are not auto-inserted into
-  `agent.toml`, so set
-  them manually when needed.
+- `--delivery-mode local-file`: trust settings are automatically merged into
+  `agent.toml` (`trusted_ca_sha256`, `ca_bundle_path`). When OpenBao trust
+  data also includes `ca_bundle_pem`, bootroot writes that PEM to
+  `ca_bundle_path` with restricted file permissions.
 
 If `verify_certificates = true` and `ca_bundle_path` is **not** set,
 bootroot-agent uses the **system CA store** to validate the ACME server.

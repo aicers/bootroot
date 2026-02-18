@@ -81,29 +81,91 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     }
 
     if preview {
-        run_service_add_preview(&state, &resolved, messages);
+        run_service_add_preview(&state, &resolved, messages).await;
         return Ok(());
     }
 
     run_service_add_apply(&mut state, &state_path, &resolved, messages).await
 }
 
-fn run_service_add_preview(state: &StateFile, resolved: &ResolvedServiceAdd, messages: &Messages) {
+async fn run_service_add_preview(
+    state: &StateFile,
+    resolved: &ResolvedServiceAdd,
+    messages: &Messages,
+) {
     let preview_entry = build_preview_service_entry(resolved, state);
     let preview_secret_id_path = state
         .secrets_dir()
         .join(SERVICE_SECRET_DIR)
         .join(&resolved.service_name)
         .join(SERVICE_SECRET_ID_FILENAME);
+    let mut note = messages.service_summary_preview_mode().to_string();
+    let mut trusted_ca_sha256: Option<Vec<String>> = None;
+    if resolved.root_token.trim().is_empty() {
+        note.push('\n');
+        note.push_str(messages.service_summary_preview_trust_skipped_no_token());
+    } else {
+        let mut client = match OpenBaoClient::new(&state.openbao_url)
+            .with_context(|| messages.error_openbao_client_create_failed())
+        {
+            Ok(client) => client,
+            Err(err) => {
+                note.push('\n');
+                note.push_str(
+                    &messages.service_summary_preview_trust_lookup_failed(err.to_string().as_str()),
+                );
+                print_service_add_summary(
+                    &preview_entry,
+                    &preview_secret_id_path,
+                    ServiceAddSummaryOptions {
+                        applied: None,
+                        remote: None,
+                        trusted_ca_sha256: None,
+                        show_snippets: true,
+                        note: Some(note),
+                    },
+                    messages,
+                );
+                return;
+            }
+        };
+        client.set_token(resolved.root_token.clone());
+        match client
+            .ensure_approle_auth()
+            .await
+            .with_context(|| messages.error_openbao_approle_auth_failed())
+        {
+            Ok(()) => match read_ca_trust_material(&client, &state.kv_mount, messages).await {
+                Ok(Some(material)) => trusted_ca_sha256 = Some(material.trusted_ca_sha256),
+                Ok(None) => {
+                    note.push('\n');
+                    note.push_str(messages.service_summary_preview_trust_not_found());
+                }
+                Err(err) => {
+                    note.push('\n');
+                    note.push_str(
+                        &messages
+                            .service_summary_preview_trust_lookup_failed(err.to_string().as_str()),
+                    );
+                }
+            },
+            Err(err) => {
+                note.push('\n');
+                note.push_str(
+                    &messages.service_summary_preview_trust_lookup_failed(err.to_string().as_str()),
+                );
+            }
+        }
+    }
     print_service_add_summary(
         &preview_entry,
         &preview_secret_id_path,
         ServiceAddSummaryOptions {
             applied: None,
             remote: None,
-            trusted_ca_sha256: None,
+            trusted_ca_sha256: trusted_ca_sha256.as_deref(),
             show_snippets: true,
-            note: Some(messages.service_summary_preview_mode()),
+            note: Some(note),
         },
         messages,
     );
@@ -125,8 +187,10 @@ async fn run_service_add_apply(
         .await
         .with_context(|| messages.error_openbao_approle_auth_failed())?;
 
-    let trusted_ca_sha256 =
-        read_trusted_ca_fingerprints(&client, &state.kv_mount, messages).await?;
+    let ca_trust_material = read_ca_trust_material(&client, &state.kv_mount, messages).await?;
+    let trusted_ca_sha256 = ca_trust_material
+        .as_ref()
+        .map(|material| material.trusted_ca_sha256.as_slice());
     let approle = ensure_service_approle(&client, state, &resolved.service_name, messages).await?;
     let secrets_dir = state.secrets_dir();
     write_role_id_file(
@@ -147,7 +211,16 @@ async fn run_service_add_apply(
         .await?;
 
     let applied = if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
-        Some(apply_local_service_configs(&secrets_dir, resolved, &secret_id_path, messages).await?)
+        Some(
+            apply_local_service_configs(
+                &secrets_dir,
+                resolved,
+                &secret_id_path,
+                ca_trust_material.as_ref(),
+                messages,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -166,7 +239,32 @@ async fn run_service_add_apply(
         None
     };
 
-    let entry = ServiceEntry {
+    let entry = build_service_entry(resolved, approle, &secret_id_path);
+
+    state
+        .services
+        .insert(resolved.service_name.clone(), entry.clone());
+    state
+        .save(state_path)
+        .with_context(|| messages.error_serialize_state_failed())?;
+
+    print_service_add_apply_summary(
+        &entry,
+        &secret_id_path,
+        applied.as_ref(),
+        remote_bootstrap.as_ref(),
+        trusted_ca_sha256,
+        messages,
+    );
+    Ok(())
+}
+
+fn build_service_entry(
+    resolved: &ResolvedServiceAdd,
+    approle: ServiceAppRoleMaterialized,
+    secret_id_path: &Path,
+) -> ServiceEntry {
+    ServiceEntry {
         service_name: resolved.service_name.clone(),
         deploy_type: resolved.deploy_type,
         delivery_mode: resolved.delivery_mode,
@@ -183,41 +281,40 @@ async fn run_service_add_apply(
         approle: ServiceRoleEntry {
             role_name: approle.role_name,
             role_id: approle.role_id,
-            secret_id_path: secret_id_path.clone(),
+            secret_id_path: secret_id_path.to_path_buf(),
             policy_name: approle.policy_name,
         },
-    };
+    }
+}
 
-    state
-        .services
-        .insert(resolved.service_name.clone(), entry.clone());
-    state
-        .save(state_path)
-        .with_context(|| messages.error_serialize_state_failed())?;
-
+fn print_service_add_apply_summary(
+    entry: &ServiceEntry,
+    secret_id_path: &Path,
+    applied: Option<&LocalApplyResult>,
+    remote_bootstrap: Option<&RemoteBootstrapResult>,
+    trusted_ca_sha256: Option<&[String]>,
+    messages: &Messages,
+) {
     print_service_add_summary(
-        &entry,
-        &secret_id_path,
+        entry,
+        secret_id_path,
         ServiceAddSummaryOptions {
-            applied: applied.as_ref().map(|result| ServiceAddAppliedPaths {
+            applied: applied.map(|result| ServiceAddAppliedPaths {
                 agent_config: &result.agent_config,
                 openbao_agent_config: &result.openbao_agent_config,
                 openbao_agent_template: &result.openbao_agent_template,
             }),
-            remote: remote_bootstrap
-                .as_ref()
-                .map(|result| ServiceAddRemoteBootstrap {
-                    bootstrap_file: &result.bootstrap_file,
-                    remote_run_command: &result.remote_run_command,
-                    control_sync_command: &result.control_sync_command,
-                }),
-            trusted_ca_sha256: trusted_ca_sha256.as_deref(),
-            show_snippets: false,
-            note: Some(messages.service_summary_print_only_hint()),
+            remote: remote_bootstrap.map(|result| ServiceAddRemoteBootstrap {
+                bootstrap_file: &result.bootstrap_file,
+                remote_run_command: &result.remote_run_command,
+                control_sync_command: &result.control_sync_command,
+            }),
+            trusted_ca_sha256,
+            show_snippets: true,
+            note: None,
         },
         messages,
     );
-    Ok(())
 }
 
 async fn sync_remote_service_bundle_if_needed(
@@ -261,8 +358,12 @@ async fn run_service_add_remote_idempotent(
                 control_sync_command: &remote_bootstrap.control_sync_command,
             }),
             trusted_ca_sha256: None,
-            show_snippets: false,
-            note: Some(messages.service_summary_remote_idempotent_hint()),
+            show_snippets: true,
+            note: Some(
+                messages
+                    .service_summary_remote_idempotent_hint()
+                    .to_string(),
+            ),
         },
         messages,
     );
@@ -512,10 +613,16 @@ struct RemoteSyncMaterial {
     ca_bundle_pem: Option<String>,
 }
 
+struct CaTrustMaterial {
+    trusted_ca_sha256: Vec<String>,
+    ca_bundle_pem: Option<String>,
+}
+
 async fn apply_local_service_configs(
     secrets_dir: &Path,
     resolved: &ResolvedServiceAdd,
     secret_id_path: &Path,
+    ca_trust_material: Option<&CaTrustMaterial>,
     messages: &Messages,
 ) -> Result<LocalApplyResult> {
     let profile = render_managed_profile_block(resolved);
@@ -528,7 +635,20 @@ async fn apply_local_service_configs(
     } else {
         String::new()
     };
-    let next = upsert_managed_profile(&current, &resolved.service_name, &profile);
+    let with_profile = upsert_managed_profile(&current, &resolved.service_name, &profile);
+    let mut next = with_profile;
+    if let Some(material) = ca_trust_material {
+        let ca_bundle_path = resolved
+            .cert_path
+            .parent()
+            .unwrap_or(Path::new("certs"))
+            .join("ca-bundle.pem");
+        let trust_updates = build_trust_updates(&material.trusted_ca_sha256, &ca_bundle_path);
+        next = upsert_toml_section_keys(&next, "trust", &trust_updates);
+        if let Some(bundle_pem) = material.ca_bundle_pem.as_deref() {
+            write_local_ca_bundle(&ca_bundle_path, bundle_pem, messages).await?;
+        }
+    }
     fs::write(&resolved.agent_config, &next)
         .await
         .with_context(|| {
@@ -542,7 +662,7 @@ async fn apply_local_service_configs(
     fs_util::ensure_secrets_dir(&openbao_service_dir).await?;
 
     let template_path = openbao_service_dir.join(OPENBAO_AGENT_TEMPLATE_FILENAME);
-    fs::write(&template_path, next)
+    fs::write(&template_path, &next)
         .await
         .with_context(|| messages.error_write_file_failed(&template_path.display().to_string()))?;
     fs_util::set_key_permissions(&template_path).await?;
@@ -578,6 +698,22 @@ async fn apply_local_service_configs(
         openbao_agent_config: agent_config_path.display().to_string(),
         openbao_agent_template: template_path.display().to_string(),
     })
+}
+
+async fn write_local_ca_bundle(path: &Path, bundle_pem: &str, messages: &Messages) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs_util::ensure_secrets_dir(parent).await?;
+    }
+    let contents = if bundle_pem.ends_with('\n') {
+        bundle_pem.to_string()
+    } else {
+        format!("{bundle_pem}\n")
+    };
+    fs::write(path, contents)
+        .await
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::set_key_permissions(path).await?;
+    Ok(())
 }
 
 fn render_managed_profile_block(args: &ResolvedServiceAdd) -> String {
@@ -631,6 +767,123 @@ fn upsert_managed_profile(contents: &str, service_name: &str, replacement: &str)
     }
     updated.push_str(replacement);
     updated
+}
+
+fn build_trust_updates(
+    fingerprints: &[String],
+    ca_bundle_path: &Path,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("ca_bundle_path", ca_bundle_path.display().to_string()),
+        (
+            CA_TRUST_KEY,
+            format!(
+                "[{}]",
+                fingerprints
+                    .iter()
+                    .map(|value| format!("\"{value}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
+    ]
+}
+
+fn upsert_toml_section_keys(contents: &str, section: &str, pairs: &[(&str, String)]) -> String {
+    let mut output = String::new();
+    let mut section_found = false;
+    let mut in_section = false;
+    let mut seen_keys = std::collections::BTreeSet::new();
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed) {
+            if in_section {
+                output.push_str(&render_missing_keys(pairs, &seen_keys));
+            }
+            in_section = trimmed == format!("[{section}]");
+            if in_section {
+                section_found = true;
+                seen_keys.clear();
+            }
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+
+        if in_section
+            && let Some((key, indent)) = parse_key_line(line, pairs)
+            && let Some(value) = pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.as_str())
+        {
+            output.push_str(&format_key_line(&indent, key, value));
+            seen_keys.insert(key.to_string());
+            continue;
+        }
+
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    if in_section {
+        output.push_str(&render_missing_keys(pairs, &seen_keys));
+    }
+
+    if !section_found {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push('[');
+        output.push_str(section);
+        output.push_str("]\n");
+        for (key, value) in pairs {
+            output.push_str(&format_key_line("", key, value));
+        }
+    }
+
+    output
+}
+
+fn is_section_header(line: &str) -> bool {
+    line.starts_with('[') && line.ends_with(']')
+}
+
+fn parse_key_line<'a>(line: &'a str, pairs: &[(&'a str, String)]) -> Option<(&'a str, String)> {
+    for (key, _) in pairs {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")) {
+            let indent = line
+                .chars()
+                .take_while(|ch| ch.is_whitespace())
+                .collect::<String>();
+            return Some((key, indent));
+        }
+    }
+    None
+}
+
+fn format_key_line(indent: &str, key: &str, value: &str) -> String {
+    let rendered = if value.starts_with('[') {
+        value.to_string()
+    } else {
+        format!("\"{value}\"")
+    };
+    format!("{indent}{key} = {rendered}\n")
+}
+
+fn render_missing_keys(
+    pairs: &[(&str, String)],
+    seen_keys: &std::collections::BTreeSet<String>,
+) -> String {
+    let mut extra = String::new();
+    for (key, value) in pairs {
+        if !seen_keys.contains(*key) {
+            extra.push_str(&format_key_line("", key, value));
+        }
+    }
+    extra
 }
 
 fn render_openbao_agent_config(
@@ -1189,7 +1442,7 @@ fn resolve_service_add_args(
     };
 
     let root_token = if preview {
-        String::new()
+        args.root_token.root_token.clone().unwrap_or_default()
     } else if let Some(value) = args.root_token.root_token.clone() {
         value
     } else {
@@ -1260,11 +1513,11 @@ fn validate_path(path: &Path, must_exist: bool, messages: &Messages) -> Result<(
     Ok(())
 }
 
-async fn read_trusted_ca_fingerprints(
+async fn read_ca_trust_material(
     client: &OpenBaoClient,
     kv_mount: &str,
     messages: &Messages,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<CaTrustMaterial>> {
     if !client
         .kv_exists(kv_mount, PATH_CA_TRUST)
         .await
@@ -1283,7 +1536,14 @@ async fn read_trusted_ca_fingerprints(
     if fingerprints.is_empty() {
         anyhow::bail!(messages.error_ca_trust_empty());
     }
-    Ok(Some(fingerprints))
+    let ca_bundle_pem = data
+        .get(SERVICE_CA_BUNDLE_PEM_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    Ok(Some(CaTrustMaterial {
+        trusted_ca_sha256: fingerprints,
+        ca_bundle_pem,
+    }))
 }
 
 fn parse_trusted_ca_list(value: &serde_json::Value, messages: &Messages) -> Result<Vec<String>> {
@@ -1362,6 +1622,32 @@ mod tests {
         let once = upsert_managed_profile("", "edge-proxy", &block);
         let twice = upsert_managed_profile(&once, "edge-proxy", &block);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn test_upsert_toml_section_keys_adds_and_updates_trust_section_idempotently() {
+        let updates = build_trust_updates(
+            &["a".repeat(64), "b".repeat(64)],
+            Path::new("certs/ca-bundle.pem"),
+        );
+        let original = "[acme]\nhttp_responder_hmac = \"old\"\n";
+        let once = upsert_toml_section_keys(original, "trust", &updates);
+        let twice = upsert_toml_section_keys(&once, "trust", &updates);
+
+        assert_eq!(once, twice);
+        assert!(once.contains("[trust]"));
+        assert!(once.contains("ca_bundle_path = \"certs/ca-bundle.pem\""));
+        assert!(once.contains("trusted_ca_sha256 = ["));
+    }
+
+    #[test]
+    fn test_upsert_toml_section_keys_preserves_existing_unmanaged_lines() {
+        let updates = vec![("ca_bundle_path", "certs/ca.pem".to_string())];
+        let original = "[trust]\nextra = true\n";
+        let output = upsert_toml_section_keys(original, "trust", &updates);
+
+        assert!(output.contains("extra = true"));
+        assert!(output.contains("ca_bundle_path = \"certs/ca.pem\""));
     }
 
     #[test]

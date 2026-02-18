@@ -283,7 +283,7 @@ When you run this command, **the `bootroot` CLI** automates:
 - Register service metadata in `state.json`
 - Create service-scoped OpenBao policy/AppRole and issue `role_id`/`secret_id`
 - Write `secrets/services/<service>/role_id` and `secret_id`
-- Print execution summary (manual snippets are hidden in default mode)
+- Print execution summary and operator snippets
 
 Automation by `--delivery-mode` choice:
 
@@ -323,21 +323,23 @@ automatically as part of onboarding.
   `trusted_ca_sha256` into the per-service remote sync bundle
   (`secret/.../services/<service>/trust`), and `bootroot-remote sync`
   applies it to trust settings in `agent.toml` on the service machine.
-- `local-file` path: trust fields (`trusted_ca_sha256`) are not
-  auto-inserted into `agent.toml`. If you use trust verification, set those
-  trust fields manually in `agent.toml`.
+- `local-file` path: trust settings are auto-merged into `agent.toml`
+  (`trusted_ca_sha256` and `ca_bundle_path`), and CA bundle PEM is written
+  to the local `ca_bundle_path` when OpenBao trust data includes
+  `ca_bundle_pem`.
 
 Preview mode note (`--print-only`/`--dry-run`):
 
-- it does not query OpenBao, so trust values are not auto-included in snippets.
+- If `--root-token` is provided, preview also queries OpenBao trust data and
+  prints trust snippets.
+- Without `--root-token`, preview prints why trust snippets are unavailable.
 
 Common cases where manual setup is still needed:
 
 - you want to pin trust fields directly in `agent.toml` for `local-file`
 - you apply configuration only from preview output
 
-`--print-only`/`--dry-run` is preview mode: it does not write files/state and
-prints manual snippets only.
+`--print-only`/`--dry-run` is preview mode: it does not write files/state.
 
 ### Runtime deployment policy
 
@@ -388,11 +390,11 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - AppRole/policy/secret_id path summary
 - Delivery mode + per-item sync-status summary (`local-file` provides
   auto-applied `agent.toml`/OpenBao Agent config/template paths, and
-  `remote-bootstrap` provides a generated bootstrap artifact + remote run command)
+  `remote-bootstrap` provides a generated bootstrap artifact + ordered remote
+  handoff commands)
 - Per-service OpenBao Agent guidance (daemon vs docker)
 - Type-specific onboarding guidance (daemon profile / docker sidecar)
-- Copy-paste snippets for daemon profile or docker sidecar
-  (only with `--print-only`/`--dry-run`)
+- Copy-paste snippets for daemon profile or docker sidecar (default + preview)
 
 ### Failure conditions
 
