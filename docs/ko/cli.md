@@ -276,7 +276,7 @@ bootroot status
 - 서비스 메타데이터를 `state.json`에 등록
 - 서비스 전용 OpenBao 정책/AppRole 생성, `role_id`/`secret_id` 발급
 - `secrets/services/<service>/role_id`, `secret_id` 파일 생성
-- 결과 요약 출력(기본 모드에서는 수동 스니펫 숨김)
+- 결과 요약과 운영자용 스니펫 출력
 
 전달 모드(`--delivery-mode`) 선택값별 자동 반영:
 
@@ -311,21 +311,22 @@ bootroot status
 - `remote-bootstrap` 경로: `trusted_ca_sha256`를 서비스별 원격 sync
   번들(`secret/.../services/<service>/trust`)에 자동 기록하고, 원격 서비스
   머신의 `bootroot-remote sync`가 이를 `agent.toml` trust 항목에 반영합니다.
-- `local-file` 경로: trust 항목(`trusted_ca_sha256`)은 `agent.toml`에 자동
-  삽입되지 않습니다. 따라서 trust 검증을 사용할 경우 `agent.toml`에 해당
-  항목을 수동으로 설정해야 합니다.
+- `local-file` 경로: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)이
+  `agent.toml`에 자동 병합되며, OpenBao trust 데이터에 `ca_bundle_pem`이
+  있으면 로컬 `ca_bundle_path` 파일에도 자동 반영됩니다.
 
 preview 모드(`--print-only`/`--dry-run`) 주의:
 
-- OpenBao를 조회하지 않으므로 trust 값이 스니펫에 자동 포함되지 않습니다.
+- `--root-token`을 주면 preview에서도 OpenBao trust 데이터를 조회해 trust
+  스니펫을 출력합니다.
+- `--root-token`이 없으면 trust 스니펫을 출력하지 못하는 이유를 함께 출력합니다.
 
 사용자가 수동으로 설정해야 하는 대표 상황:
 
 - `local-file` 경로에서 `agent.toml`에 trust 항목을 직접 고정해 관리하려는 경우
 - preview 출력만 보고 설정을 적용하는 경우
 
-`--print-only`/`--dry-run`은 파일/상태를 쓰지 않고 수동 스니펫만 출력하는
-미리보기 모드입니다.
+`--print-only`/`--dry-run`은 파일/상태를 쓰지 않는 미리보기 모드입니다.
 
 ### 런타임 배포 정책
 
@@ -376,10 +377,10 @@ preview 모드(`--print-only`/`--dry-run`) 주의:
 - AppRole/정책/secret_id 경로 요약
 - 전달 모드 및 항목별 sync-status 요약(`local-file`은
   `agent.toml`/OpenBao Agent 설정/템플릿 자동 반영 경로, `remote-bootstrap`은
-  부트스트랩 아티팩트 + 원격 실행 명령 출력)
+  부트스트랩 아티팩트 + 순서형 원격 handoff 명령 출력)
 - 서비스별 OpenBao Agent 안내(daemon/docker 분리)
 - 타입별 온보딩 안내 (daemon 프로필 / docker sidecar)
-- daemon/docker 스니펫(복붙용) 출력(`--print-only`/`--dry-run`에서만)
+- daemon/docker 스니펫(복붙용) 출력(기본 모드 + preview 모드)
 
 ### 실패 조건
 

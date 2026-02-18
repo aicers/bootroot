@@ -219,12 +219,18 @@ pub(crate) struct Strings {
     pub(crate) service_summary_remote_bootstrap_file: &'static str,
     pub(crate) service_summary_remote_run_command: &'static str,
     pub(crate) service_summary_remote_sync_command: &'static str,
+    pub(crate) service_summary_remote_handoff_title: &'static str,
+    pub(crate) service_summary_remote_handoff_service_host: &'static str,
+    pub(crate) service_summary_remote_handoff_control_host: &'static str,
+    pub(crate) service_summary_remote_handoff_status_check: &'static str,
     pub(crate) service_summary_agent_config: &'static str,
     pub(crate) service_summary_cert_path: &'static str,
     pub(crate) service_summary_key_path: &'static str,
     pub(crate) service_summary_next_steps: &'static str,
-    pub(crate) service_summary_print_only_hint: &'static str,
     pub(crate) service_summary_preview_mode: &'static str,
+    pub(crate) service_summary_preview_trust_skipped_no_token: &'static str,
+    pub(crate) service_summary_preview_trust_not_found: &'static str,
+    pub(crate) service_summary_preview_trust_lookup_failed: &'static str,
     pub(crate) service_summary_remote_idempotent_hint: &'static str,
     pub(crate) service_next_steps_daemon_profile: &'static str,
     pub(crate) service_next_steps_docker_sidecar: &'static str,
@@ -1253,6 +1259,31 @@ impl Messages {
         )
     }
 
+    pub(crate) fn service_summary_remote_handoff_title(&self) -> &'static str {
+        self.strings().service_summary_remote_handoff_title
+    }
+
+    pub(crate) fn service_summary_remote_handoff_service_host(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_remote_handoff_service_host,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_remote_handoff_control_host(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_remote_handoff_control_host,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_summary_remote_handoff_status_check(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_remote_handoff_status_check,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn service_summary_agent_config(&self, value: &str) -> String {
         format_template(
             self.strings().service_summary_agent_config,
@@ -1275,12 +1306,24 @@ impl Messages {
         self.strings().service_summary_next_steps
     }
 
-    pub(crate) fn service_summary_print_only_hint(&self) -> &'static str {
-        self.strings().service_summary_print_only_hint
-    }
-
     pub(crate) fn service_summary_preview_mode(&self) -> &'static str {
         self.strings().service_summary_preview_mode
+    }
+
+    pub(crate) fn service_summary_preview_trust_skipped_no_token(&self) -> &'static str {
+        self.strings()
+            .service_summary_preview_trust_skipped_no_token
+    }
+
+    pub(crate) fn service_summary_preview_trust_not_found(&self) -> &'static str {
+        self.strings().service_summary_preview_trust_not_found
+    }
+
+    pub(crate) fn service_summary_preview_trust_lookup_failed(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_preview_trust_lookup_failed,
+            &[("value", value)],
+        )
     }
 
     pub(crate) fn service_summary_remote_idempotent_hint(&self) -> &'static str {

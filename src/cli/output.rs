@@ -35,7 +35,7 @@ pub(crate) struct ServiceAddSummaryOptions<'a> {
     pub(crate) remote: Option<ServiceAddRemoteBootstrap<'a>>,
     pub(crate) trusted_ca_sha256: Option<&'a [String]>,
     pub(crate) show_snippets: bool,
-    pub(crate) note: Option<&'a str>,
+    pub(crate) note: Option<String>,
 }
 
 pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
@@ -96,42 +96,77 @@ pub(crate) fn print_service_add_summary(
         messages.service_summary_openbao_path(&entry.service_name)
     );
     if let Some(paths) = options.applied {
-        println!(
-            "{}",
-            messages.service_summary_auto_applied_agent_config(paths.agent_config)
-        );
-        println!(
-            "{}",
-            messages.service_summary_auto_applied_openbao_config(paths.openbao_agent_config)
-        );
-        println!(
-            "{}",
-            messages.service_summary_auto_applied_openbao_template(paths.openbao_agent_template)
-        );
+        print_local_apply_summary(&paths, messages);
     }
     if let Some(remote) = options.remote {
-        println!(
-            "{}",
-            messages.service_summary_remote_bootstrap_file(remote.bootstrap_file)
-        );
-        println!(
-            "{}",
-            messages.service_summary_remote_run_command(remote.remote_run_command)
-        );
-        println!(
-            "{}",
-            messages.service_summary_remote_sync_command(remote.control_sync_command)
-        );
+        print_remote_handoff_summary(&remote, &entry.service_name, messages);
     }
-    if let Some(note) = options.note {
+    if let Some(note) = options.note.as_deref() {
         println!("{note}");
     }
     if !options.show_snippets {
         return;
     }
+    print_service_add_snippets(entry, secret_id_path, options.trusted_ca_sha256, messages);
+}
+
+fn print_local_apply_summary(paths: &ServiceAddAppliedPaths<'_>, messages: &Messages) {
+    println!(
+        "{}",
+        messages.service_summary_auto_applied_agent_config(paths.agent_config)
+    );
+    println!(
+        "{}",
+        messages.service_summary_auto_applied_openbao_config(paths.openbao_agent_config)
+    );
+    println!(
+        "{}",
+        messages.service_summary_auto_applied_openbao_template(paths.openbao_agent_template)
+    );
+}
+
+fn print_remote_handoff_summary(
+    remote: &ServiceAddRemoteBootstrap<'_>,
+    service_name: &str,
+    messages: &Messages,
+) {
+    println!(
+        "{}",
+        messages.service_summary_remote_bootstrap_file(remote.bootstrap_file)
+    );
+    println!(
+        "{}",
+        messages.service_summary_remote_run_command(remote.remote_run_command)
+    );
+    println!(
+        "{}",
+        messages.service_summary_remote_sync_command(remote.control_sync_command)
+    );
+    println!("{}", messages.service_summary_remote_handoff_title());
+    println!(
+        "{}",
+        messages.service_summary_remote_handoff_service_host(remote.remote_run_command)
+    );
+    println!(
+        "{}",
+        messages.service_summary_remote_handoff_control_host(remote.control_sync_command)
+    );
+    let status_check_command = format!("bootroot service info --service-name '{service_name}'");
+    println!(
+        "{}",
+        messages.service_summary_remote_handoff_status_check(&status_check_command)
+    );
+}
+
+fn print_service_add_snippets(
+    entry: &ServiceEntry,
+    secret_id_path: &std::path::Path,
+    trusted_ca_sha256: Option<&[String]>,
+    messages: &Messages,
+) {
     println!("{}", messages.service_summary_next_steps());
     print_service_openbao_agent_steps(entry, secret_id_path, messages);
-    if let Some(trusted) = options.trusted_ca_sha256 {
+    if let Some(trusted) = trusted_ca_sha256 {
         print_trust_snippet(entry, trusted, messages);
     }
     match entry.deploy_type {
