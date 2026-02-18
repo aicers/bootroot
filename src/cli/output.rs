@@ -111,6 +111,7 @@ pub(crate) fn print_service_add_summary(
 }
 
 fn print_local_apply_summary(paths: &ServiceAddAppliedPaths<'_>, messages: &Messages) {
+    println!("{}", messages.service_scope_bootroot_managed());
     println!(
         "{}",
         messages.service_summary_auto_applied_agent_config(paths.agent_config)
@@ -130,10 +131,12 @@ fn print_remote_handoff_summary(
     service_name: &str,
     messages: &Messages,
 ) {
+    println!("{}", messages.service_scope_bootroot_managed());
     println!(
         "{}",
         messages.service_summary_remote_bootstrap_file(remote.bootstrap_file)
     );
+    println!("{}", messages.service_scope_operator_required());
     println!(
         "{}",
         messages.service_summary_remote_run_command(remote.remote_run_command)
@@ -151,6 +154,7 @@ fn print_remote_handoff_summary(
         "{}",
         messages.service_summary_remote_handoff_control_host(remote.control_sync_command)
     );
+    println!("{}", messages.service_scope_operator_recommended());
     let status_check_command = format!("bootroot service info --service-name '{service_name}'");
     println!(
         "{}",
@@ -165,10 +169,8 @@ fn print_service_add_snippets(
     messages: &Messages,
 ) {
     println!("{}", messages.service_summary_next_steps());
+    println!("{}", messages.service_scope_operator_required());
     print_service_openbao_agent_steps(entry, secret_id_path, messages);
-    if let Some(trusted) = trusted_ca_sha256 {
-        print_trust_snippet(entry, trusted, messages);
-    }
     match entry.deploy_type {
         DeployType::Daemon => {
             let cert_path = entry.cert_path.display().to_string();
@@ -206,6 +208,10 @@ fn print_service_add_snippets(
             println!("{}", messages.service_next_steps_docker_sidecar(&data));
             print_docker_snippet(entry, messages);
         }
+    }
+    if let Some(trusted) = trusted_ca_sha256 {
+        println!("{}", messages.service_scope_operator_optional());
+        print_trust_snippet(entry, trusted, messages);
     }
 }
 

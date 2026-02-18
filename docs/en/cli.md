@@ -392,6 +392,10 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   auto-applied `agent.toml`/OpenBao Agent config/template paths, and
   `remote-bootstrap` provides a generated bootstrap artifact + ordered remote
   handoff commands)
+- Explicit ownership/scope labels in output:
+  `Bootroot-managed`, `Operator-managed (required)`,
+  `Operator-managed (recommended)`, and
+  `Operator-managed (optional)`
 - Per-service OpenBao Agent guidance (daemon vs docker)
 - Type-specific onboarding guidance (daemon profile / docker sidecar)
 - Copy-paste snippets for daemon profile or docker sidecar (default + preview)

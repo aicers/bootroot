@@ -216,6 +216,10 @@ pub(crate) struct Strings {
     pub(crate) service_summary_auto_applied_agent_config: &'static str,
     pub(crate) service_summary_auto_applied_openbao_config: &'static str,
     pub(crate) service_summary_auto_applied_openbao_template: &'static str,
+    pub(crate) service_scope_bootroot_managed: &'static str,
+    pub(crate) service_scope_operator_required: &'static str,
+    pub(crate) service_scope_operator_recommended: &'static str,
+    pub(crate) service_scope_operator_optional: &'static str,
     pub(crate) service_summary_remote_bootstrap_file: &'static str,
     pub(crate) service_summary_remote_run_command: &'static str,
     pub(crate) service_summary_remote_sync_command: &'static str,
@@ -1236,6 +1240,22 @@ impl Messages {
             self.strings().service_summary_auto_applied_openbao_template,
             &[("value", value)],
         )
+    }
+
+    pub(crate) fn service_scope_bootroot_managed(&self) -> &'static str {
+        self.strings().service_scope_bootroot_managed
+    }
+
+    pub(crate) fn service_scope_operator_required(&self) -> &'static str {
+        self.strings().service_scope_operator_required
+    }
+
+    pub(crate) fn service_scope_operator_recommended(&self) -> &'static str {
+        self.strings().service_scope_operator_recommended
+    }
+
+    pub(crate) fn service_scope_operator_optional(&self) -> &'static str {
+        self.strings().service_scope_operator_optional
     }
 
     pub(crate) fn service_summary_remote_bootstrap_file(&self, value: &str) -> String {

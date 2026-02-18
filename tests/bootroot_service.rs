@@ -73,6 +73,8 @@ async fn test_app_add_writes_state_and_secret() {
     assert!(stdout.contains("- deploy type: daemon"));
     assert!(stdout.contains("- delivery mode: local-file"));
     assert!(stdout.contains("- sync secret_id: none"));
+    assert!(stdout.contains("Bootroot-managed:"));
+    assert!(stdout.contains("Operator-managed (required):"));
     assert!(stdout.contains("next steps:"));
     assert!(stdout.contains("daemon profile snippet:"));
     assert!(stdout.contains("- auto-applied bootroot-agent config:"));
@@ -160,6 +162,7 @@ async fn test_app_add_print_only_shows_snippets_without_writes() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     assert!(stdout.contains("bootroot service add: summary"));
+    assert!(stdout.contains("Operator-managed (required):"));
     assert!(stdout.contains("daemon profile snippet:"));
     assert!(stdout.contains("preview mode: no files or state were changed"));
     assert!(stdout.contains("trust preview unavailable"));
@@ -422,6 +425,9 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(!stdout.contains("auto-applied"));
+    assert!(stdout.contains("Bootroot-managed:"));
+    assert!(stdout.contains("Operator-managed (required):"));
+    assert!(stdout.contains("Operator-managed (recommended):"));
     assert!(stdout.contains("- remote bootstrap file:"));
     assert!(stdout.contains("- remote handoff order:"));
     assert!(stdout.contains("1. Run on the service host:"));
