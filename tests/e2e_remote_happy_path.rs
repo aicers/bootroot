@@ -77,6 +77,7 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     let eab_contents = fs::read_to_string(&eab_path).expect("read eab");
     assert!(eab_contents.contains("\"kid\": \"remote-kid\""));
     let agent_contents = fs::read_to_string(&agent_config_path).expect("read agent config");
+    let ca_bundle_path = service_dir.join("certs").join("ca-bundle.pem");
     let openbao_agent_dir = service_dir
         .join("secrets")
         .join("openbao")
@@ -90,11 +91,16 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     assert!(openbao_agent_token.exists());
     assert!(agent_contents.contains("http_responder_hmac = \"remote-responder-hmac\""));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
+    assert!(agent_contents.contains("ca_bundle_path = \""));
     assert!(agent_contents.contains("[[profiles]]"));
     assert!(agent_contents.contains("service_name = \"edge-proxy\""));
+    let bundle_contents = fs::read_to_string(&ca_bundle_path).expect("read ca-bundle");
+    assert!(bundle_contents.contains("BEGIN CERTIFICATE"));
+    assert!(bundle_contents.contains("REMOTE"));
     assert_mode(&secret_id_path, 0o600);
     assert_mode(&eab_path, 0o600);
     assert_mode(&agent_config_path, 0o600);
+    assert_mode(&ca_bundle_path, 0o600);
     assert_mode(&openbao_agent_hcl, 0o600);
     assert_mode(&openbao_agent_template, 0o600);
     assert_mode(&openbao_agent_token, 0o600);

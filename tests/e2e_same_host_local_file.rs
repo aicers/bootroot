@@ -58,6 +58,14 @@ async fn test_same_host_local_file_happy_path() {
     assert!(agent_contents.contains("[profiles.paths]"));
     assert!(agent_contents.contains("cert = \""));
     assert!(agent_contents.contains("key = \""));
+    assert!(agent_contents.contains("[trust]"));
+    assert!(agent_contents.contains("trusted_ca_sha256 = ["));
+    assert!(agent_contents.contains("ca_bundle_path = \""));
+
+    let bundle_contents = fs::read_to_string(&files.ca_bundle_path).expect("read ca-bundle");
+    assert!(bundle_contents.contains("BEGIN CERTIFICATE"));
+    assert!(bundle_contents.contains("LOCAL-TRUST"));
+    assert_mode(&files.ca_bundle_path, 0o600);
 
     assert!(
         temp.path()
@@ -503,7 +511,8 @@ async fn stub_service_add_openbao(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "data": {
-                    "trusted_ca_sha256": ["11".repeat(32)]
+                    "trusted_ca_sha256": ["11".repeat(32)],
+                    "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nLOCAL-TRUST\n-----END CERTIFICATE-----"
                 }
             }
         })))
@@ -628,4 +637,9 @@ async fn stub_remote_pull_openbao(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
+
+fn assert_mode(path: &Path, expected: u32) {
+    let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode, expected, "path {}", path.display());
 }
