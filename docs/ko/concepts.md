@@ -174,3 +174,29 @@ root token은 초기화 시 **OpenBao가 자동 생성**하며, 운영자가 값
 읽어 자동으로 언실**할 수 있습니다. 이 방식은 **운영 환경에서 사용하면
 안 됩니다**. 키를 디스크에 보관하는 순간 노출 위험이 커지며, 유출 시
 OpenBao 전체가 위험해질 수 있습니다.
+
+## 서비스 추가의 두 가지 방식
+
+Bootroot의 중요한 목표인 서비스의 인증서 발급/갱신 자동화를 위해서,
+Bootroot는 서비스 추가를 두 가지 방식으로 지원합니다. 인증서 발급/갱신을
+위해서는 서비스별 OpenBao Agent와 bootroot-agent가 올바르게 설정되어야
+하며, 이 두 에이전트 설정을 `bootroot service add`가 어떤 경로로 반영할지는
+서비스가 step-ca 설치 머신에 함께 있는지 또는 다른 머신에 있는지에 따라
+달라집니다.
+
+- 같은 머신: `bootroot` CLI가 OpenBao Agent/bootroot-agent 관련 로컬 설정 파일
+  반영을 직접 처리할 수 있습니다.
+- 다른 머신: `bootroot` CLI가 원격 머신 파일을 직접 수정할 수 없으므로,
+  서비스 머신의 `bootroot-remote`를 통한 원격 동기화 절차가 필요합니다.
+
+`bootroot service add`의 `--delivery-mode`가 이 방식을 선택하는 옵션입니다.
+`local-file`과 `remote-bootstrap`은 이 옵션에서 고르는 두 가지 선택지입니다.
+
+- `local-file`: 서비스가 step-ca 설치 머신에 함께 있을 때 사용합니다.
+- `remote-bootstrap`: 서비스가 다른 머신에 있을 때 사용하며, 서비스 머신의
+  `bootroot-remote`가 `pull/sync/ack` 흐름으로 반영합니다.
+  이 흐름에서는 step-ca 설치 머신의 `bootroot` CLI가 서비스의 목표 상태를
+  기록하고, 서비스 머신의 `bootroot-remote`가 이를 읽어 반영합니다.
+  `pull`은 step-ca 설치 머신에 기록된 목표 상태를 읽고, `sync`는 읽은 상태를
+  서비스 머신의 로컬 파일/설정에 적용하며, `ack`는 적용 결과를 step-ca 설치
+  머신의 상태 파일(`state.json`)에 기록합니다.

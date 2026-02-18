@@ -2,8 +2,6 @@
 
 bootroot-agent는 TOML 설정 파일을 읽습니다(기본값: `agent.toml`).
 전체 템플릿은 `agent.toml.example`에 있습니다.
-`agent.toml`은 데몬 프로필 전용입니다. 도커 사이드카는 `agent.toml`을
-사용하지 않고 런타임 인자나 환경변수로 설정합니다.
 
 ## bootroot CLI
 
@@ -29,8 +27,12 @@ OpenBao Agent는 `role_id`/`secret_id` 파일을 사용해 AppRole로 로그인�
 구성 책임은 다음과 같습니다.
 
 - **step-ca/리스폰더**: `bootroot init`이 `agent.hcl`을 자동 생성합니다.
-- **서비스별 에이전트**: `bootroot service add`가 경로와 실행 안내를 출력하며,
-  사용자가 해당 경로에 `agent.hcl`을 배치해 실행합니다.
+- **`--delivery-mode local-file`로 추가한 서비스**:
+  `bootroot service add`가 서비스별 OpenBao Agent
+  설정/템플릿과 managed `agent.toml` 프로필을 자동 반영합니다.
+- **`--delivery-mode remote-bootstrap`로 추가한 서비스**: `bootroot service add`가 부트스트랩
+  아티팩트를 만들고, `bootroot-remote sync`가 원격 호스트에서
+  `agent.hcl`/템플릿/토큰과 managed `agent.toml` 프로필을 반영합니다.
 
 예시 `agent.hcl` 스니펫:
 
@@ -62,6 +64,19 @@ template {
 이 스니펫은 **수동 구성 시 참고용**입니다. bootroot CLI 생태계에서는
 `bootroot init`/`bootroot service add`가 생성한 `agent.hcl`을 사용하는 것이
 가장 간편합니다.
+
+`--delivery-mode remote-bootstrap` 경로에서는 원격에 `agent.toml`이 아직 없을 때
+`bootroot-remote sync`가 baseline을 생성할 수 있습니다. baseline 생성에는
+다음 입력이 사용됩니다.
+
+- `--agent-email`
+- `--agent-server`
+- `--agent-domain`
+- `--agent-responder-url`
+- `--profile-hostname`
+- `--profile-instance-id`
+- `--profile-cert-path`
+- `--profile-key-path`
 
 구성 설명:
 
@@ -169,9 +184,13 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 제어하는 설정입니다.
 - `trusted_ca_sha256`: 신뢰할 CA 인증서 지문 목록(SHA-256 hex)입니다.
 
 `trusted_ca_sha256`는 **임의 값이 아니라 실제 CA 인증서 지문**입니다.
-`bootroot init`이 CA 지문을 OpenBao에 저장하며,
-`bootroot service add` 출력의 agent.toml 스니펫에 **신뢰 지문 목록이 포함**됩니다.
-따라서 일반적인 운영 흐름에서는 service add가 제시한 값을 그대로 사용하면 됩니다.
+`bootroot init`이 CA 지문을 OpenBao에 저장하고, 이후 `bootroot service add`는
+`--delivery-mode`에 따라 이를 다르게 반영합니다.
+
+- `--delivery-mode remote-bootstrap`: 지문이 서비스별 원격 sync trust 경로에 자동 기록되고,
+  `bootroot-remote sync` 단계에서 서비스 머신의 `agent.toml`에 반영됩니다.
+- `--delivery-mode local-file`: `agent.toml`의 trust 항목은 자동 삽입되지 않으므로 필요 시
+  수동으로 설정해야 합니다.
 
 `verify_certificates = true`인데 `ca_bundle_path`가 없으면,
 bootroot-agent는 **시스템 CA 저장소**로 ACME 서버를 검증합니다.
@@ -195,11 +214,13 @@ bootroot-agent는 **시스템 CA 저장소**로 ACME 서버를 검증합니다.
 ACME 서버 검증에 **같은 `ca_bundle_path`를 재사용하는 운영**이 가능합니다.
 다만 두 개념은 목적이 다르므로 필요 시 분리할 수 있다는 점은 기억하세요.
 
-만약 스니펫에 `trusted_ca_sha256`가 나오지 않는다면 다음을 확인하세요.
+`--delivery-mode remote-bootstrap` 경로에서 trust 반영이 되지 않거나 값이 비어 있으면 다음을
+확인하세요.
 
 - step-ca 초기화로 `secrets/certs/root_ca.crt`,
   `secrets/certs/intermediate_ca.crt`가 생성되어 있는지
 - `bootroot init`이 같은 `secrets_dir`을 사용해 실행되었는지
+- OpenBao의 `secret/bootroot/ca` 경로에 `trusted_ca_sha256`가 있는지
 
 권한 참고: CA 번들을 사용하는 서비스가 `ca_bundle_path`를 읽을 수 있어야
 합니다. 가장 간단한 방법은 bootroot-agent와 서비스를 동일 사용자/그룹으로

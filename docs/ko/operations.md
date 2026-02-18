@@ -5,6 +5,8 @@
 CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서는 **수동 운영**
 절차를 기준으로 설명합니다.
 
+CI/테스트 운영 기준은 [CI/E2E](e2e-ci.md)를 참고하세요.
+
 ## bootroot-agent
 
 - 발급/검증/훅 결과 로그를 모니터링합니다.
@@ -69,6 +71,41 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+## 원격 sync 러너 운영
+
+remote-bootstrap 서비스는 `bootroot-remote sync`를 주기 실행해야 합니다.
+다음 템플릿 파일을 제공합니다.
+
+- `scripts/bootroot-remote-sync.service`
+- `scripts/bootroot-remote-sync.timer`
+- `scripts/bootroot-remote-sync.cron`
+
+권장 패턴:
+
+- 서비스별 러너 1개
+- 서비스별 `--summary-json` 경로 분리
+- role/secret/token/config 경로를 서비스 단위로 분리
+
+최소 환경/설정 체크리스트:
+
+- OpenBao 엔드포인트, KV 마운트
+- 서비스 이름, AppRole 파일 경로(`role_id`, `secret_id`)
+- EAB 파일 경로, `agent.toml` 경로
+- 프로필 식별/경로 입력(hostname, instance_id, cert/key 경로)
+- trust sync 사용 시 CA 번들 경로
+
+장애 처리 가이드:
+
+- `bootroot-remote sync`의 retry/backoff/jitter 사용
+- `failed`/`expired` 상태가 반복되면 알림 연계
+- pull summary JSON과 `bootroot service sync-status`를 함께 확인
+
+보안 참고:
+
+- 시크릿 디렉터리 `0700`, 파일 `0600`
+- 원문 시크릿이 포함된 summary JSON을 공용 로그에 출력하지 않기
+- 서비스 계정 권한을 서비스별 경로로 최소화
 
 ## CA 번들(trust) 운영
 

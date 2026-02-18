@@ -236,7 +236,8 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 
 권장 배포 정책:
 
-- step-ca/responder: same-host 토폴로지에서는 서비스별 전용 OpenBao Agent
+- step-ca/responder: step-ca/OpenBao/responder가 한 머신에서 동작하는 bootroot
+  기본 토폴로지에서는 서비스별 전용 OpenBao Agent
   사이드카를 각각 분리해서 사용합니다. 즉 step-ca에는
   `openbao-agent-stepca`, responder에는 `openbao-agent-responder`를 붙여
   각 서비스가 필요한 시크릿만 렌더링하도록 운영합니다.

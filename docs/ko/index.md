@@ -1,10 +1,11 @@
 # Bootroot 매뉴얼
 
-이 매뉴얼은 **bootroot**(bootroot CLI, bootroot-agent, HTTP-01 리스폰더)와
-**step-ca**, **OpenBao**, **Prometheus**, **Grafana**를 설치, 구성, 운영하는 전체 과정을 설명합니다.
-PKI 배경 지식이 없는 사용자도 이 문서만으로 설치와 인증서 발급을
-완료할 수 있도록 구성했습니다. bootroot CLI 실행 파일은 `bootroot`,
-bootroot-agent 실행 파일은 `bootroot-agent`입니다.
+이 매뉴얼은 **bootroot**(bootroot CLI, bootroot-agent, bootroot-remote,
+HTTP-01 리스폰더)와 **step-ca**, **OpenBao**, **Prometheus**, **Grafana**를
+설치, 구성, 운영하는 전체 과정을 설명합니다. PKI 배경 지식이 없는 사용자도
+이 문서만으로 설치와 인증서 발급을 완료할 수 있도록 구성했습니다.
+bootroot CLI 실행 파일은 `bootroot`, bootroot-agent 실행 파일은
+`bootroot-agent`, 원격 서비스 설정 CLI 실행 파일은 `bootroot-agent`입니다.
 
 ## Bootroot가 하는 일
 
@@ -21,7 +22,9 @@ Bootroot는 제품 내장형 PKI 부트스트랩 계층입니다. 부트스트�
 - **OpenBao**: bootroot 시크릿을 관리/주입하는 시크릿 매니저 (오픈 소스)
 - **OpenBao Agent**: OpenBao 시크릿을 파일로 렌더링하는 에이전트 (오픈 소스)
 - **bootroot CLI**: 이 프로젝트에서 직접 개발한 전체 설치/초기화/운영 자동화 CLI 도구
-- **bootroot-agent**: 이 프로젝트에서 직접 개발한 Rust ACME 클라이언트
+- **bootroot-agent**: 이 프로젝트에서 직접 개발한 Rust ACME 클라이언트 데몬
+- **bootroot-remote**: 이 프로젝트에서 직접 개발한 원격 서비스의 설정을
+  위한 동기화 CLI 도구
 - **HTTP-01 리스폰더**: 이 프로젝트에서 직접 개발한 HTTP-01 전용 데몬
 - **Prometheus**: 메트릭 수집기 (오픈 소스)
 - **Grafana**: 메트릭 시각화 대시보드 (오픈 소스)
@@ -33,16 +36,18 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다.
 ## 매뉴얼 구성
 
 - **CLI**: infra 기동/초기화/상태 점검뿐 아니라 서비스 온보딩, 발급 검증,
-  시크릿 회전과 모니터링 운영 안내까지 포함
+  시크릿 회전, 모니터링, 원격 동기화 운영 안내까지 포함
 - **개념**: PKI, ACME, CSR, SAN, mTLS, 시크릿 관리(OpenBao) 개요
 - **빠른 시작**: Docker Compose 기반 첫 발급
 - **설치**: OpenBao + step-ca + PostgreSQL + bootroot-agent + 리스폰더 설치
 - **설정**: `agent.toml`, 프로필, 훅, 재시도, EAB
 - **운영**: 갱신, 로그, 백업, 보안(OpenBao 포함)
+- **CI/E2E**: PR 필수 매트릭스, 확장 워크플로, 아티팩트, 로컬 재현
 - **문제 해결 / FAQ**: 자주 발생하는 오류와 답변
 
 CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리되어 있습니다. CLI 문서에서는
-`infra up/init/status`, `service add/verify`, `rotate`, `monitoring` 등 주요 명령을 다룹니다.
+`infra up/init/status`, `service add/verify`, `rotate`, `monitoring`과
+`bootroot-remote pull/ack/sync` 등 주요 명령을 다룹니다.
 이 매뉴얼의 나머지 섹션은 **CLI를 쓰지 않는 수동 절차**를 기준으로
 설명합니다.
 
@@ -58,13 +63,17 @@ CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리
 이 전제를 따르면 `step-ca`/`responder` 전용 OpenBao Agent도 같은 머신에서
 각각 전용 인스턴스로 동작해야 합니다.
 
-same-host 전제가 아닌 분산 배치(예: `step-ca`, `OpenBao`, `responder`를 서로
-다른 머신에 배치)도 이론적으로는 가능하지만, 이 경우 `bootroot` CLI 자동화
-대신 수동 설치/설정 절차가 필요합니다. 또한 현재 `bootroot` 구성에서 해당
-토폴로지를 충분히 지원한다고 단정할 수 없습니다.
+`step-ca`/`PostgreSQL`/`OpenBao`/`HTTP-01 responder`를 한 머신에 함께 두는
+기본 전제를 벗어난 분산 배치도 이론적으로는 가능합니다. 다만 이 경우에는
+`bootroot` CLI 자동화 대신 수동 설치/설정 절차가 필요합니다. 예를 들어
+`step-ca+PostgreSQL`은 CA 머신에, `OpenBao`는 별도 시크릿 머신에,
+`HTTP-01 responder`는 서비스 엣지 머신에 두는 구성입니다. 또한 현재
+`bootroot` 구성에서 이러한 토폴로지를 충분히 지원한다고 단정할 수는
+없습니다.
 
-서비스 온보딩 시점인 `bootroot service add`에서 배포 타입(`daemon`/`docker`)별
-실행 가이드와 스니펫이 안내됩니다.
+`bootroot service add`로 등록한 서비스는 step-ca가 설치된 머신에서
+동작할 수도 있고, 다른 머신에서 동작할 수도 있습니다. 어떤 배치이든
+서비스 런타임에는 OpenBao Agent와 bootroot-agent를 함께 구성해야 합니다.
 
 OpenBao Agent 배치 규칙:
 
@@ -79,16 +88,31 @@ bootroot-agent 배치 규칙:
 참고: Docker 서비스도 통합 데몬 사용은 가능하지만, 격리/라이프사이클
 정합성과 장애 영향 범위 측면에서 비권장입니다.
 
+bootroot-remote 배치 규칙:
+
+- 서비스별로 개별 인스턴스가 주기적으로 실행되도록 해야 합니다.
+- 여러 서비스가 동시에 sync할 때에는 서비스별 `--summary-json` 경로를
+  분리해 파일 충돌을 피해야 합니다.
+
+참고:
+step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-remote가
+필요하지 않습니다.
+서비스가 다른 머신에 추가되는 경우에는 해당 서비스 머신에 bootroot-remote를
+배치해야 합니다.
+
 ## 아키텍처(요약)
 
-1. OpenBao가 렌더링한 파일로 시크릿을 주입
-2. bootroot-agent가 step-ca의 ACME 디렉터리를 읽음
-3. ACME 계정을 등록(EAB 선택)
-4. 인증서 발급 주문 생성
-5. HTTP-01 토큰을 리스폰더에 등록
-6. 리스폰더가 포트 80에서 HTTP-01 응답
-7. 인증서 발급 및 파일 저장
-8. 훅 실행 및 주기적 갱신(데몬 모드)
+1. CA 인프라 구동 및 초기화
+2. 서비스 추가 및 서비스별 OpenBao Agent, bootroot-agent 설정
+3. OpenBao Agent가 렌더링한 파일로 시크릿을 주입
+4. bootroot-agent가 step-ca의 ACME 디렉터리를 읽음
+5. ACME 계정을 등록(EAB 선택)
+6. 인증서 발급 주문 생성
+7. HTTP-01 토큰을 리스폰더에 등록
+8. 리스폰더가 포트 80에서 HTTP-01 응답
+9. 인증서 발급 및 파일 저장
+10. bootroot-agent가 서비스 훅 실행
+11. 인증서 주기적 갱신
 
 ## 안전 수칙
 

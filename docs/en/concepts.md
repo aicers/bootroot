@@ -175,3 +175,30 @@ In dev/test environments, you can pass `--openbao-unseal-from-file <path>` to
 `bootroot infra up` or `bootroot init` to **auto-unseal from a local file**.
 This is **unsafe for production**. Storing unseal keys on disk increases the
 blast radius if the host is compromised.
+
+## Two service-add modes
+
+To support one of Bootroot's key goals, automated certificate
+issuance/renewal for services, Bootroot provides two service-add modes.
+For issuance/renewal to work, OpenBao Agent and bootroot-agent must be
+configured correctly per service. How `bootroot service add` applies those
+agent settings differs depending on
+whether the service is on the step-ca machine or on a different machine.
+
+- Same machine: the `bootroot` CLI can directly apply local OpenBao Agent/bootroot-agent
+  related configuration files.
+- Different machine: the `bootroot` CLI cannot directly modify remote files, so
+  remote synchronization via `bootroot-remote` on the service machine is
+  required.
+
+In `bootroot service add`, `--delivery-mode` is the selector option.
+`local-file` and `remote-bootstrap` are the two choices for that option.
+
+- `local-file`: used when the service runs on the step-ca machine.
+- `remote-bootstrap`: used when the service runs on a different machine; the
+  service machine converges updates via `bootroot-remote` (`pull/sync/ack`).
+  In this flow, the `bootroot` CLI on the step-ca machine writes desired
+  service state, and `bootroot-remote` on the service machine reads and applies
+  it. `pull` reads desired state recorded on the step-ca machine, `sync`
+  applies it to local files/config on the service machine, and `ack` writes
+  apply results to the state file (`state.json`) on the step-ca machine.

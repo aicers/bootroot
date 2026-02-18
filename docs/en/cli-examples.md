@@ -57,6 +57,7 @@ bootroot infra up: completed
 
 ```bash
 bootroot init --auto-generate \
+  --summary-json ./tmp/init-summary.json \
   --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
   --responder-url "http://localhost:8080"
 ```
@@ -90,10 +91,14 @@ bootroot init: summary
 - OpenBao KV paths:
     role_id: secrets/services/<service>/role_id
     secret_id: secrets/services/<service>/secret_id
+- summary json: ./tmp/init-summary.json
 next steps:
   - Attach AppRole/secret_id to the service.
   - Prepare OpenBao Agent/bootroot-agent execution.
 ```
+
+For automation, read sensitive fields (for example root token) from
+`./tmp/init-summary.json` instead of parsing human-readable text output.
 
 ## 3) service add
 
@@ -171,6 +176,52 @@ next steps:
     /srv/bootroot/agent.toml, AppRole bootroot-service-web-app, and
     secret_id file secrets/services/web-app/secret_id.
 ```
+
+### 3-3) remote-bootstrap delivery mode + remote sync
+
+Control node onboarding (artifact generation):
+
+```bash
+bootroot service add \
+  --service-name edge-remote \
+  --deploy-type daemon \
+  --delivery-mode remote-bootstrap \
+  --hostname edge-node-02 \
+  --domain trusted.domain \
+  --agent-config /srv/bootroot/agent.toml \
+  --cert-path /srv/bootroot/certs/edge-remote.crt \
+  --key-path /srv/bootroot/certs/edge-remote.key \
+  --instance-id 101 \
+  --root-token <OPENBAO_ROOT_TOKEN>
+```
+
+Remote node convergence:
+
+```bash
+bootroot-remote sync \
+  --openbao-url http://127.0.0.1:8200 \
+  --kv-mount secret \
+  --service-name edge-remote \
+  --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
+  --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id \
+  --eab-file-path /srv/bootroot/secrets/services/edge-remote/eab.json \
+  --agent-config-path /srv/bootroot/agent.toml \
+  --agent-email admin@example.com \
+  --agent-server https://stepca.internal:9000/acme/acme/directory \
+  --agent-domain trusted.domain \
+  --agent-responder-url http://responder.internal:8080 \
+  --profile-hostname edge-node-02 \
+  --profile-instance-id 101 \
+  --profile-cert-path /srv/bootroot/certs/edge-remote.crt \
+  --profile-key-path /srv/bootroot/certs/edge-remote.key \
+  --ca-bundle-path /srv/bootroot/certs/ca-bundle.pem \
+  --summary-json /srv/bootroot/tmp/edge-remote-summary.json \
+  --state-file /srv/bootroot/state.json \
+  --output json
+```
+
+The sync summary drives `bootroot service sync-status` updates for:
+`secret_id`, `eab`, `responder_hmac`, and `trust_sync`.
 
 ## 4) Local DNS/hosts setup for validation
 
