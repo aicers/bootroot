@@ -378,6 +378,9 @@ preview 모드(`--print-only`/`--dry-run`) 주의:
 - 전달 모드 및 항목별 sync-status 요약(`local-file`은
   `agent.toml`/OpenBao Agent 설정/템플릿 자동 반영 경로, `remote-bootstrap`은
   부트스트랩 아티팩트 + 순서형 원격 handoff 명령 출력)
+- 출력에 소유/책임 범위를 명시하는 라벨을 함께 표시:
+  `Bootroot 자동 반영 항목`, `운영자 실행 항목 (필수)`,
+  `운영자 실행 항목 (권장)`, `운영자 실행 항목 (선택)`
 - 서비스별 OpenBao Agent 안내(daemon/docker 분리)
 - 타입별 온보딩 안내 (daemon 프로필 / docker sidecar)
 - daemon/docker 스니펫(복붙용) 출력(기본 모드 + preview 모드)
