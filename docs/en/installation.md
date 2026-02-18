@@ -219,7 +219,8 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 
 Recommended deployment policy:
 
-- step-ca/responder: in the same-host topology, run a dedicated OpenBao Agent
+- step-ca/responder: in the bootroot default topology where
+  step-ca/OpenBao/responder run on one machine, run a dedicated OpenBao Agent
   sidecar per service. Attach `openbao-agent-stepca` to step-ca and
   `openbao-agent-responder` to responder so each service renders only its own
   required secrets.

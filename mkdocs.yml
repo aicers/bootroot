@@ -31,6 +31,7 @@ plugins:
             - Installation: installation.md
             - Configuration: configuration.md
             - Operations: operations.md
+            - CI & E2E: e2e-ci.md
             - Examples: examples.md
             - Troubleshooting: troubleshooting.md
             - FAQ: faq.md
@@ -46,6 +47,7 @@ plugins:
             - Installation: installation.md
             - Configuration: configuration.md
             - Operations: operations.md
+            - CI & E2E: e2e-ci.md
             - Examples: examples.md
             - Troubleshooting: troubleshooting.md
             - FAQ: faq.md
@@ -59,6 +61,7 @@ plugins:
             Installation: 설치
             Configuration: 설정
             Operations: 운영
+            CI & E2E: CI/E2E
             Troubleshooting: 문제 해결
             FAQ: FAQ
 

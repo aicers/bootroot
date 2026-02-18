@@ -1,12 +1,12 @@
 # Bootroot Manual
 
 This manual explains how to install, configure, and operate **bootroot**
-(bootroot CLI, bootroot-agent, and the HTTP-01 responder) with **step-ca**,
-**OpenBao**, **Prometheus**, and **Grafana**. It is written so that a reader
-with no PKI background can
-complete a full installation and issue certificates successfully. The
-bootroot CLI binary is `bootroot`, and the bootroot-agent binary is
-`bootroot-agent`.
+(bootroot CLI, bootroot-agent, bootroot-remote, and the HTTP-01 responder)
+with **step-ca**, **OpenBao**, **Prometheus**, and **Grafana**. It is written
+so that a reader with no PKI background can complete a full installation and
+issue certificates successfully. The bootroot CLI binary is `bootroot`, the
+bootroot-agent binary is `bootroot-agent`, and the remote-service
+configuration CLI binary is `bootroot-agent`.
 
 ## What Bootroot Does
 
@@ -29,7 +29,9 @@ Components:
 - **OpenBao Agent**: Agent that renders OpenBao secrets to files (open source)
 - **bootroot CLI**: A CLI tool developed in this project that automates
   install, init, and operations
-- **bootroot-agent**: A Rust ACME client developed in this project
+- **bootroot-agent**: A Rust ACME client daemon developed in this project
+- **bootroot-remote**: A synchronization CLI tool developed in this
+  project for configuring remote services
 - **HTTP-01 responder**: An HTTP-01 daemon developed in this project
 - **Prometheus**: Metrics collector (open source)
 - **Grafana**: Metrics visualization dashboards (open source)
@@ -41,19 +43,21 @@ RFC 8555 protocol used for automated issuance.
 ## Manual Map
 
 - **CLI**: infra bring-up/initialization/status plus service onboarding,
-  issuance verification, secret rotation, and monitoring guidance
+  issuance verification, secret rotation, monitoring, and remote sync guidance
 - **Concepts**: PKI, ACME, CSR, SAN, mTLS, and OpenBao basics
 - **Getting Started**: Quick Docker-based issuance flow
 - **Installation**: OpenBao + step-ca + PostgreSQL + bootroot-agent +
   responder setup
 - **Configuration**: `agent.toml`, profiles, hooks, retries, and EAB
 - **Operations**: Renewal, logs, backup, and security (including OpenBao)
+- **CI & E2E**: PR-critical matrix, extended workflow, artifacts, and local
+  reproduction
 - **Troubleshooting / FAQ**: Common issues and answers
 
 CLI usage is documented in the [CLI manual](cli.md) and the
 [CLI examples](cli-examples.md). The CLI manual covers
 core commands like `infra up/init/status`, `service add/verify`, `rotate`, and
-`monitoring`.
+`monitoring`, plus `bootroot-remote pull/ack/sync`.
 The rest of this manual focuses on the **manual setup** flow.
 
 ## Installation Topology (Summary)
@@ -69,14 +73,16 @@ monitor `OpenBao` and `step-ca`.
 With this assumption, dedicated OpenBao Agents for `step-ca` and `responder`
 must also run on that same machine as dedicated instances for each of them.
 
-A distributed layout (for example, running `step-ca`, `OpenBao`, and responder
-on different machines) is theoretically possible, but it requires manual
-installation/configuration instead of the `bootroot` CLI automation path.
-Also, we cannot guarantee that the current `bootroot` setup fully supports
-every such topology.
+A distributed layout that breaks this baseline is theoretically possible, but
+it requires manual installation/configuration instead of the `bootroot` CLI
+automation path. For example, place `step-ca+PostgreSQL` on a CA machine,
+`OpenBao` on a separate secrets machine, and the `HTTP-01 responder` on an
+edge service machine. Also, we cannot guarantee that the current `bootroot`
+setup fully supports this topology class.
 
-During service onboarding, `bootroot service add` prints deployment-type
-(`daemon`/`docker`) specific run guidance and snippets.
+Services added by `bootroot service add` may run either on the same machine as
+step-ca or on different machines. Regardless of placement, each service runtime
+must include both OpenBao Agent and bootroot-agent.
 
 OpenBao Agent placement rules:
 
@@ -91,16 +97,31 @@ bootroot-agent placement rules:
 Note: Docker services can use the shared daemon, but this is not recommended
 for isolation, lifecycle alignment, and failure blast-radius reasons.
 
+bootroot-remote placement rules:
+
+- Each service should have its own periodic `bootroot-remote` instance.
+- When multiple services sync at the same time, use a separate
+  `--summary-json` path per service to avoid file collisions.
+
+Note:
+If a service is added on the machine where step-ca is installed,
+bootroot-remote is not required.
+If a service is added on a different machine, bootroot-remote must be
+deployed on that service machine.
+
 ## Architecture (High Level)
 
-1. OpenBao supplies secrets to bootroot components via rendered files
-2. bootroot-agent fetches the ACME directory from step-ca
-3. It registers an ACME account (optionally with EAB)
-4. It requests an order for a domain/SAN set
-5. It registers HTTP-01 tokens with the responder
-6. The responder serves HTTP-01 on port 80
-7. It finalizes the order and writes cert/key to disk
-8. It runs hooks and schedules renewals (daemon mode)
+1. Bring up and initialize CA infrastructure
+2. Add services and configure per-service OpenBao Agent and bootroot-agent
+3. OpenBao Agent supplies secrets to bootroot components via rendered files
+4. bootroot-agent fetches the ACME directory from step-ca
+5. It registers an ACME account (optionally with EAB)
+6. It requests an order for a domain/SAN set
+7. It registers HTTP-01 tokens with the responder
+8. The responder serves HTTP-01 on port 80
+9. It finalizes the order and writes cert/key to disk
+10. bootroot-agent runs service hooks
+11. Certificates are renewed periodically
 
 ## Safety Notes
 

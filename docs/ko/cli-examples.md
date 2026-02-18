@@ -57,6 +57,7 @@ bootroot 인프라 기동: 완료
 
 ```bash
 bootroot init --auto-generate \
+  --summary-json ./tmp/init-summary.json \
   --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
   --responder-url "http://localhost:8080"
 ```
@@ -90,10 +91,14 @@ bootroot init: 요약
 - OpenBao KV 경로:
     role_id: secrets/services/<service>/role_id
     secret_id: secrets/services/<service>/secret_id
+- summary json: ./tmp/init-summary.json
 다음 단계:
   - AppRole/secret_id를 서비스에 연결하세요.
   - OpenBao Agent/bootroot-agent 실행을 준비하세요.
 ```
+
+자동화에서는 사람용 요약 텍스트를 파싱하지 말고
+`./tmp/init-summary.json`에서 root token 같은 민감 필드를 읽으세요.
 
 ## 3) service add
 
@@ -172,6 +177,52 @@ OpenBao root token: ********
     /srv/bootroot/agent.toml로 실행하고 AppRole bootroot-service-web-app,
     secret_id 파일 secrets/services/web-app/secret_id를 사용하세요.
 ```
+
+### 3-3) remote-bootstrap 전달 모드 + 원격 sync
+
+제어 노드 온보딩(아티팩트 생성):
+
+```bash
+bootroot service add \
+  --service-name edge-remote \
+  --deploy-type daemon \
+  --delivery-mode remote-bootstrap \
+  --hostname edge-node-02 \
+  --domain trusted.domain \
+  --agent-config /srv/bootroot/agent.toml \
+  --cert-path /srv/bootroot/certs/edge-remote.crt \
+  --key-path /srv/bootroot/certs/edge-remote.key \
+  --instance-id 101 \
+  --root-token <OPENBAO_ROOT_TOKEN>
+```
+
+원격 노드 수렴:
+
+```bash
+bootroot-remote sync \
+  --openbao-url http://127.0.0.1:8200 \
+  --kv-mount secret \
+  --service-name edge-remote \
+  --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
+  --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id \
+  --eab-file-path /srv/bootroot/secrets/services/edge-remote/eab.json \
+  --agent-config-path /srv/bootroot/agent.toml \
+  --agent-email admin@example.com \
+  --agent-server https://stepca.internal:9000/acme/acme/directory \
+  --agent-domain trusted.domain \
+  --agent-responder-url http://responder.internal:8080 \
+  --profile-hostname edge-node-02 \
+  --profile-instance-id 101 \
+  --profile-cert-path /srv/bootroot/certs/edge-remote.crt \
+  --profile-key-path /srv/bootroot/certs/edge-remote.key \
+  --ca-bundle-path /srv/bootroot/certs/ca-bundle.pem \
+  --summary-json /srv/bootroot/tmp/edge-remote-summary.json \
+  --state-file /srv/bootroot/state.json \
+  --output json
+```
+
+sync summary는 `bootroot service sync-status`에서
+`secret_id`, `eab`, `responder_hmac`, `trust_sync` 상태 갱신에 사용됩니다.
 
 ## 4) 로컬 검증을 위한 DNS/hosts 준비
 

@@ -5,6 +5,8 @@ See **Installation** and **Configuration** for full setup steps and options.
 If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
 **manual operations** flow.
 
+For CI/test operations, see [CI & E2E](e2e-ci.md).
+
 ## bootroot-agent
 
 - Monitor logs for issuance, authorization, and hook results.
@@ -70,6 +72,41 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+## Remote sync runner operations
+
+For remote-bootstrap services, run a periodic `bootroot-remote sync` runner.
+Template files are provided:
+
+- `scripts/bootroot-remote-sync.service`
+- `scripts/bootroot-remote-sync.timer`
+- `scripts/bootroot-remote-sync.cron`
+
+Recommended pattern:
+
+- one runner per service
+- one `--summary-json` file per service
+- keep role/secret/token/config paths service-scoped
+
+Minimum environment/config checklist:
+
+- OpenBao endpoint and KV mount
+- service name and AppRole file paths (`role_id`, `secret_id`)
+- EAB file path and `agent.toml` path
+- profile identity/path fields (hostname, instance_id, cert/key paths)
+- CA bundle path when trust sync is enabled
+
+Failure handling guidance:
+
+- use retry/backoff/jitter controls in `bootroot-remote sync`
+- alert on repeated `failed`/`expired` sync-status values
+- inspect pull summary JSON + `bootroot service sync-status` output together
+
+Security notes:
+
+- secret directories `0700`, secret files `0600`
+- avoid printing raw summary JSON with secrets to shared logs
+- limit service account access to service-specific paths only
 
 ## CA bundle (trust) operations
 

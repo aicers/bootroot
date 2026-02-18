@@ -1,26 +1,87 @@
 # CLI
 
-This document covers the bootroot CLI.
+This document covers the Bootroot automation CLIs (`bootroot` and
+`bootroot-remote`).
 
 ## Overview
 
 The CLI provides infra bootstrapping, initialization, status checks, service
 onboarding, issuance verification, and secret rotation.
 It also manages local monitoring with Prometheus and Grafana.
+Roles:
+
+- `bootroot`: automates infra/init/service/rotate/monitoring on the
+  machine hosting step-ca
+- `bootroot-remote`: performs pull/sync/ack convergence on machines
+  hosting remote services
+
+Primary commands:
 
 - `bootroot infra up`
 - `bootroot init`
 - `bootroot status`
 - `bootroot service add`
 - `bootroot service info`
+- `bootroot service sync-status`
 - `bootroot verify`
 - `bootroot rotate`
 - `bootroot monitoring`
+- `bootroot-remote pull/ack/sync`
 
 ## Global Options
 
 - `--lang`: output language (`en` or `ko`, default `en`)
   - Environment variable: `BOOTROOT_LANG`
+
+## bootroot CLI automation scope vs operator responsibilities
+
+What bootroot CLI installs/starts automatically (Docker path):
+
+- for `bootroot infra up`: image pull/build plus container create/start for
+  OpenBao/PostgreSQL/step-ca/HTTP-01 responder
+- in the bootroot default topology where step-ca/OpenBao/responder run on one
+  machine, `bootroot init` generates step-ca/responder OpenBao Agent configs
+  and enables `openbao-agent-stepca`/`openbao-agent-responder` via compose
+  override
+
+It does not install host binaries/services (for example, systemd units).
+
+What bootroot CLI prepares automatically:
+
+- service/secret config and state artifacts (`state.json`, per-service
+  AppRole/secret files, etc.)
+- local config file updates produced by `service add`/`init`/`rotate` flows
+
+What operators must install and manage directly:
+
+- `bootroot` CLI
+- `bootroot-agent`
+- `bootroot-remote` (CLI that runs on the service machine when an added
+  service runs on a different machine from the step-ca host)
+- OpenBao Agent
+
+Runtime supervision is also operator-owned:
+
+- systemd mode: configure restart policy (`Restart=always` or `on-failure`)
+- container mode: ensure container restart policy and Docker daemon startup on
+  reboot
+
+When an added service runs on a different machine from the step-ca host,
+schedule `bootroot-remote sync` periodically on that service machine
+(systemd timer or cron).
+
+## Name resolution responsibilities
+
+For HTTP-01, step-ca must resolve each validation FQDN
+(`<instance>.<service>.<hostname>.<domain>`) to the responder target.
+
+If you use hostnames (instead of direct IPs) for step-ca/responder endpoints,
+configure DNS/hosts consistently on every participating host:
+
+- control/step-ca host
+- each remote service host
+
+In local Docker E2E, this mapping is injected automatically by test scripts.
 
 ## bootroot infra up
 
@@ -72,6 +133,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--compose-file`: compose file used for infra checks (default `docker-compose.yml`)
 - `--auto-generate`: auto-generate secrets where possible
 - `--show-secrets`: show secrets in the summary
+- `--summary-json`: write init summary as machine-readable JSON
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
 - `--unseal-key`: OpenBao unseal key (repeatable, environment variable: `OPENBAO_UNSEAL_KEYS`)
 - `--openbao-unseal-from-file`: read OpenBao unseal keys from file (dev/test only)
@@ -120,28 +182,34 @@ DB DSN host handling:
 - EAB registration summary
 - OpenBao Agent compose override for step-ca/responder (applied automatically)
 - Next-steps guidance
+- Optional summary JSON file (`--summary-json`) for automation
 
-### OpenBao Agent bootstrap for step-ca/responder
+### Initial OpenBao Agent auth setup for step-ca/responder
 
 Under the current default topology, OpenBao, step-ca, and responder run on
-the same host and share the local `secrets` directory.
+the machine hosting step-ca and share the local `secrets` directory.
 
-In this same-host model, `bootroot init` automatically bootstraps OpenBao
-Agent auth for step-ca/responder:
+In this default topology, `bootroot init` automatically prepares the initial
+OpenBao Agent auth setup for step-ca/responder. The core steps are:
 
-- Creates policies and AppRoles for `bootroot-stepca` and
-  `bootroot-responder`
-- Issues `role_id` and `secret_id`
-- Writes bootstrap files used by OpenBao Agents
-- Writes OpenBao Agent configs with `role_id_file_path` and
-  `secret_id_file_path`
-- Applies compose override and starts OpenBao Agents for step-ca/responder
+- `bootroot-stepca` and `bootroot-responder` are OpenBao AppRole names, and
+  `role_id` is a separate identifier issued by OpenBao for each AppRole
+- OpenBao issues `role_id`/`secret_id` for each AppRole
+- The issued `role_id`/`secret_id` are written to files read by OpenBao Agent
+- OpenBao Agent config (`agent.hcl`) is wired to those files via
+  `role_id_file_path`/`secret_id_file_path`
+- Applies an additional compose settings file as a compose override on top of
+  the base `docker-compose.yml` to enable step-ca/responder OpenBao Agent
+  services/config, then starts those agents
 
-These are dedicated OpenBao Agent instances, not step-ca/responder processes
-themselves. In the default compose topology they run as separate containers
-(`openbao-agent-stepca`, `openbao-agent-responder`) with sidecar-like behavior.
+This model runs dedicated OpenBao Agent instances instead of running OpenBao
+Agent directly inside step-ca/responder processes, and in the default compose
+topology those dedicated instances are implemented as separate containers
+(`openbao-agent-stepca`, `openbao-agent-responder`). In other words, they are
+dedicated agent containers with sidecar-like behavior that run alongside
+step-ca/responder in the same compose stack.
 
-Generated bootstrap file paths:
+Generated auth credential file paths (`role_id`/`secret_id`):
 
 - step-ca:
   `secrets/openbao/stepca/role_id`,
@@ -154,11 +222,13 @@ Security expectations:
 
 - secrets directories: `0700`
 - secret files (`role_id`/`secret_id` and rendered secrets): `0600`
-- local-host trust boundary for this bootstrap model
+- local trust boundary on the machine hosting step-ca for this bootstrap model
 
-For cross-host deployments, this local bootstrap model is not sufficient.
-Use a separate remote bootstrap process for AppRole credentials and agent
-startup on each host.
+If OpenBao and step-ca/responder are placed on different machines, the local
+`secrets` directory sharing model assumed in this section (file-based secret
+delivery) no longer applies. In that case, a separate remote auth-setup process
+is required for AppRole credential delivery and agent startup, and this
+topology is outside the `bootroot` CLI automation scope.
 
 ### Failure conditions
 
@@ -208,42 +278,75 @@ bootroot status
 
 Onboards a new service (daemon/docker) so it can obtain certificates from
 step-ca by registering its metadata and creating an OpenBao AppRole.
-When you run this command, **the bootroot CLI** performs:
+When you run this command, **the `bootroot` CLI** automates:
 
-- Save service metadata (service name, deploy type, hostname, domain, etc.)
-- Create AppRole/policy and issue `role_id`/`secret_id`
-- Prepare service secret paths and required file locations
-- Print run guidance for bootroot-agent and OpenBao Agent
+- Register service metadata in `state.json`
+- Create service-scoped OpenBao policy/AppRole and issue `role_id`/`secret_id`
+- Write `secrets/services/<service>/role_id` and `secret_id`
+- Print execution summary (manual snippets are hidden in default mode)
 
-This is the required step when adding a new service. After it completes, you
-must run bootroot-agent and OpenBao Agent as instructed, and then start
-the service so mTLS certificates are used correctly in service-to-service
-traffic.
+Automation by `--delivery-mode` choice:
 
-`bootroot service add` does not issue certificates by itself. To actually obtain
-certificates from step-ca, you must **configure and run bootroot-agent**.
-See the bootroot-agent sections in the manuals (Installation/Operations/
-Configuration) for details.
+1. `local-file`:
+   use this when the service is added on the same machine where
+   step-ca/OpenBao/responder are installed. The CLI applies local
+   updates (or creates) the managed profile block in `agent.toml` and
+   auto-generates OpenBao Agent
+   template/config/token files.
+2. `remote-bootstrap`:
+   use this when the service is added on a different machine from where
+   step-ca/OpenBao/responder are installed. The CLI writes a remote sync
+   bundle (`secret_id`/`eab`/`responder_hmac`/`trust`) to OpenBao KV and
+   generates a remote bootstrap artifact. Here, "remote sync" means
+   `bootroot` on the step-ca machine writes the desired config/secret bundle,
+   and `bootroot-remote` on the service machine pulls and applies it. The
+   "remote bootstrap artifact" is the generated output that contains the
+   initial inputs/run information needed to start that remote sync flow.
 
-If `bootroot init` stored CA fingerprints in OpenBao (for example,
-`secret/bootroot/ca`), this command includes `trusted_ca_sha256` in the
-agent.toml snippet output. If the value is missing, you must set it manually
-when needed.
+This is the required step when adding a new service to prepare certificate
+issuance/renewal paths. However, `bootroot service add` itself does not issue
+certificates.
 
-If the service runs on a different machine, the bootroot-agent on that host
-must use the same `agent.toml`. The `--cert-path`/`--key-path` values must
-also be set relative to where the service runs. This command only prints
-paths/snippets; you still configure and run the agent on the machine where
-the service runs.
+You still need to perform:
 
-Runtime deployment policy:
+- Start and keep OpenBao Agent/bootroot-agent running on the service machine
+- For `remote-bootstrap`, configure periodic `bootroot-remote` runs on the
+  service machine
+- Validate issuance path via `bootroot verify` or real service startup
 
-### OpenBao Agent
+In the default flow, a successful `bootroot init` automatically prepares
+`secret/bootroot/ca` in OpenBao. Then, in default apply mode (without
+`--print-only`/`--dry-run`), `bootroot service add` also handles trust values
+automatically as part of onboarding.
+
+- `remote-bootstrap` path: it writes
+  `trusted_ca_sha256` into the per-service remote sync bundle
+  (`secret/.../services/<service>/trust`), and `bootroot-remote sync`
+  applies it to trust settings in `agent.toml` on the service machine.
+- `local-file` path: trust fields (`trusted_ca_sha256`) are not
+  auto-inserted into `agent.toml`. If you use trust verification, set those
+  trust fields manually in `agent.toml`.
+
+Preview mode note (`--print-only`/`--dry-run`):
+
+- it does not query OpenBao, so trust values are not auto-included in snippets.
+
+Common cases where manual setup is still needed:
+
+- you want to pin trust fields directly in `agent.toml` for `local-file`
+- you apply configuration only from preview output
+
+`--print-only`/`--dry-run` is preview mode: it does not write files/state and
+prints manual snippets only.
+
+### Runtime deployment policy
+
+#### OpenBao Agent
 
 - Docker service: per-service sidecar (**required**)
 - daemon service: per-service daemon (**required**)
 
-### bootroot-agent
+#### bootroot-agent
 
 - Docker service: per-service sidecar (recommended)
 - daemon service: one shared daemon per host (recommended)
@@ -257,6 +360,9 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 
 - `--service-name`: service name identifier
 - `--deploy-type`: deployment type (`daemon` or `docker`)
+- `--delivery-mode`: delivery mode (`local-file` or `remote-bootstrap`).
+  Note: `remote-bootstrap` is a mode value, not an executable binary, and the
+  executable used for this mode is `bootroot-remote`.
 - `--hostname`: hostname used for DNS SAN
 - `--domain`: root domain for DNS SAN
 - `--agent-config`: bootroot-agent config path
@@ -266,6 +372,8 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--container-name`: docker container name (required for docker)
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
 - `--notes`: freeform notes (optional)
+- `--print-only`: print snippets/next steps without writing state/files
+- `--dry-run`: alias of preview mode (same effect as `--print-only`)
 
 ### Interactive behavior
 
@@ -278,9 +386,13 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 
 - App metadata summary
 - AppRole/policy/secret_id path summary
+- Delivery mode + per-item sync-status summary (`local-file` provides
+  auto-applied `agent.toml`/OpenBao Agent config/template paths, and
+  `remote-bootstrap` provides a generated bootstrap artifact + remote run command)
 - Per-service OpenBao Agent guidance (daemon vs docker)
 - Type-specific onboarding guidance (daemon profile / docker sidecar)
 - Copy-paste snippets for daemon profile or docker sidecar
+  (only with `--print-only`/`--dry-run`)
 
 ### Failure conditions
 
@@ -311,6 +423,45 @@ The command is considered failed when:
 
 - Missing `state.json`
 - App not found
+
+## bootroot service sync-status
+
+Updates `state.json` sync-status from a `bootroot-remote` summary JSON.
+This command is usually called by `bootroot-remote ack`.
+
+### Inputs
+
+- `--service-name`: service name identifier
+- `--summary-json`: summary JSON path from `bootroot-remote pull/sync`
+- `--state-file`: optional `state.json` path override
+
+### Tracked items
+
+- `secret_id`
+- `eab`
+- `responder_hmac`
+- `trust_sync`
+
+### Status values
+
+- `none`: not tracked yet
+- `pending`: waiting for remote apply
+- `applied`: remote apply acknowledged
+- `failed`: apply failed
+- `expired`: pending window exceeded and timed out
+
+### Outputs
+
+- Per-item sync-status summary for the target service
+- Updated `state.json` (or `--state-file`) metadata/timestamps
+
+### Failure conditions
+
+The command is considered failed when:
+
+- `state.json` is missing or cannot be parsed
+- summary JSON is missing or invalid
+- target service is not registered
 
 ## bootroot verify
 
@@ -541,3 +692,68 @@ Notes:
 
 - This command auto-detects the running profile(s). It does not accept
   `--profile`.
+
+## bootroot-remote (remote sync binary)
+
+`bootroot-remote` is a separate binary used for services registered with
+`bootroot service add --delivery-mode remote-bootstrap`. It applies the desired
+service state (`secret_id`/`eab`/`responder_hmac`/`trust`) stored in OpenBao on
+the step-ca machine to files on remote service machines via `pull/sync/ack`,
+updates local files such as `agent.toml`, and records results in `state.json`
+sync-status.
+
+### `bootroot-remote pull`
+
+Pulls and applies service secrets/config to remote file paths.
+
+Key inputs:
+
+- `--openbao-url`, `--kv-mount`, `--service-name`
+- `--role-id-path`, `--secret-id-path`, `--eab-file-path`
+- `--agent-config-path`
+- baseline/profile inputs:
+  `--agent-email`, `--agent-server`, `--agent-domain`,
+  `--agent-responder-url`, `--profile-hostname`,
+  `--profile-instance-id`, `--profile-cert-path`, `--profile-key-path`
+- `--ca-bundle-path`
+- `--summary-json` (optional) and `--output text|json`
+
+If `agent.toml` does not exist yet, pull creates a baseline config and then
+updates (or creates) a managed profile block for the service.
+
+### `bootroot-remote ack`
+
+Acknowledges a summary file back into `state.json` sync-status.
+
+Key inputs:
+
+- `--service-name`
+- `--summary-json`
+- `--bootroot-bin` (default `bootroot`)
+- `--state-file` (optional)
+
+### `bootroot-remote sync`
+
+Runs `pull + ack` with retry/backoff/jitter for scheduled execution.
+In production, run this command periodically via systemd timer or cron.
+
+Key retry controls:
+
+- `--retry-attempts`
+- `--retry-backoff-secs`
+- `--retry-jitter-secs`
+
+Summary JSON contract items:
+
+- `secret_id`
+- `eab`
+- `responder_hmac`
+- `trust_sync`
+
+Each item returns `applied|unchanged|failed` in the pull summary. `ack` maps
+that result into `state.json` sync-status values.
+
+Output safety semantics:
+
+- text output redacts per-item error details
+- JSON output is machine-readable and should be treated as sensitive artifact
