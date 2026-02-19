@@ -254,8 +254,11 @@ bootroot rotate --yes responder-hmac
 실행 단계:
 
 1. `stepca.internal`, `responder.internal` host entry 추가
+    - `stepca.internal` entry 추가
+    - `responder.internal` entry 추가
 2. 원격 전달 E2E 시나리오의 phase 전체 실행
 3. cleanup에서 임시 host entry 제거
+    - `HOSTS_MARKER`가 붙은 행만 삭제
 
 실제 실행 명령(스크립트 발췌):
 
@@ -373,12 +376,12 @@ RUNNER_MODE=cron ./scripts/e2e/docker/run-harness-smoke.sh
 ./scripts/e2e/docker/run-extended-suite.sh
 ```
 
-로컬에서 `sudo -n`이 불가능하면 다음을 사용합니다.
+로컬에서 `sudo -n`이 불가능하면:
 
-이유: `hosts-all` 케이스는 실행 중 호스트 머신의 `/etc/hosts`를
-추가/복원해야 하며, 이 작업은 비대화식 관리자 권한(`sudo -n`)이 필요합니다.
-
-- `./scripts/ci-local-e2e.sh --skip-hosts-all`
+- `./scripts/ci-local-e2e.sh --skip-hosts-all`을 실행합니다.
+- 이유: `hosts-all` 케이스는 실행 중 호스트 머신의 `/etc/hosts`를
+  추가/복원해야 하며, 이 작업은 비대화식 관리자 권한(`sudo -n`)이
+  필요합니다.
 
 이는 로컬 제약 우회용입니다. CI에서는 `hosts-all` 케이스도 실행됩니다.
 
@@ -419,9 +422,10 @@ E2E에서 OpenBao 언실/토큰 사용 방식:
    목표 상태를 기록합니다.
 2. remote node의 `bootroot-remote sync`가 해당 상태를 읽어 로컬 파일/설정에
    반영합니다. (`sync` 내부에서 `pull`/`ack` 단계가 함께 수행됨)
-3. E2E는 다음 두 출력이 같은 결과를 가리키는지 비교합니다.  
-   (1) `bootroot-remote sync --summary-json ...` 결과 JSON  
-   (2) control node의 `bootroot service sync-status` 조회 결과
+3. E2E는 다음 두 출력이 같은 결과를 가리키는지 비교합니다:
+
+    - `bootroot-remote sync --summary-json ...` 결과 JSON
+    - control node의 `bootroot service sync-status` 조회 결과
 
 비교 항목(서비스별):
 
