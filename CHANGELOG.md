@@ -6,6 +6,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Added core Bootroot CLI lifecycle foundations, including infra readiness,
+  init/status, service onboarding, verify/rotate flows, and related guardrails.
+- Added remote-bootstrap operations via `bootroot-remote` with pull/ack/sync,
+  summary JSON handling, retry controls, and schedule templates.
+- Added extended E2E workflow separation for heavier scenarios.
+- Added Python quality gates with Ruff (format/lint) in CI and docs workflows.
+
+### Changed
+
+- Changed DB DSN runtime handling to normalize local hosts for compose runtime
+  compatibility.
+- Changed service onboarding output to clarify Bootroot-managed vs
+  operator-managed boundaries and trust-related behavior.
+- Expanded Docker E2E coverage (baseline, rotation recovery, main lifecycle,
+  remote lifecycle) and aligned local preflight paths with CI expectations.
+
 ### Fixed
 
 - Fix `bootroot rotate stepca-password` failing with TTY allocation error
@@ -22,6 +40,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Fixed `bootroot rotate db` panic with "Cannot start a runtime from within a
   runtime" error by running the synchronous postgres client on a blocking
   thread via `tokio::task::spawn_blocking`.
+- Fixed hosts-all lifecycle instability and related CI reproducibility issues.
+- Fixed and strengthened trust sync and trust verification behavior with
+  stronger E2E assertions.
 
 ## [0.1.0] - 2026-02-01
 
