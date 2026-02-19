@@ -13,9 +13,14 @@ For automated command flow, also see [CLI](cli.md) and
 
 Operations policy summary:
 
-- Compose is the recommended path.
-- systemd is also supported, but always-on/restart/dependency guarantees are
-  operator responsibilities.
+- recommended runtime differs by deployment target:
+  step-ca/OpenBao/HTTP-01 responder run as independent services
+  (Compose or systemd).
+  For services added via `bootroot service add`, Docker services are best
+  operated with per-service agent sidecars, while daemon services are best
+  operated as host daemons (systemd).
+- in all paths, always-on/restart/dependency guarantees are operator
+  responsibilities.
 - bootroot automates config/material generation, but binary installation and
   process lifecycle management remain operator-owned.
 
@@ -234,10 +239,11 @@ inside a container, `localhost` points to the agent container itself, not the
 OpenBao container. On Docker networks, use the OpenBao container name
 (`bootroot-openbao`).
 
-Note: in the bootroot default topology where step-ca/OpenBao/responder run on
-one machine, `bootroot init` generates step-ca/responder OpenBao Agent configs
-and a compose override, then starts `openbao-agent-stepca` and
-`openbao-agent-responder`.
+Note: in the bootroot default topology where
+OpenBao/PostgreSQL/step-ca/HTTP-01 responder are deployed on one machine,
+`bootroot init` generates step-ca/responder OpenBao Agent configs and enables
+dedicated OpenBao Agent containers (`openbao-agent-stepca`,
+`openbao-agent-responder`) via compose override.
 
 ### Host run
 
@@ -248,8 +254,9 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 Recommended deployment policy:
 
 - step-ca/responder: in the bootroot default topology where
-  step-ca/OpenBao/responder run on one machine, run a dedicated OpenBao Agent
-  sidecar per service. Attach `openbao-agent-stepca` to step-ca and
+  OpenBao/PostgreSQL/step-ca/HTTP-01 responder run on one machine, run a
+  dedicated OpenBao Agent sidecar per service. Attach `openbao-agent-stepca`
+  to step-ca and
   `openbao-agent-responder` to responder so each service renders only its own
   required secrets.
 - service OpenBao Agent (recommended):

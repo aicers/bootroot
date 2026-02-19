@@ -42,11 +42,12 @@ RFC 8555 protocol used for automated issuance.
 
 ## Manual Map
 
+- **Concepts**: PKI, ACME, CSR, SAN, mTLS, and OpenBao basics
 - **CLI**: infra bring-up/initialization/status plus service onboarding,
   issuance verification, secret rotation, monitoring, and remote sync guidance
-- **Concepts**: PKI, ACME, CSR, SAN, mTLS, and OpenBao basics
+- **CLI Examples**: scenario-oriented command examples and option patterns
 - **Installation**: OpenBao + step-ca + PostgreSQL + bootroot-agent +
-  responder setup
+  bootroot-remote + responder setup
 - **Configuration**: `agent.toml`, profiles, hooks, retries, and EAB
 - **Operations**: Renewal, logs, backup, and security (including OpenBao)
 - **CI & E2E**: PR-critical matrix, extended workflow, artifacts, and local
@@ -57,16 +58,24 @@ CLI usage is documented in the [CLI manual](cli.md) and the
 [CLI examples](cli-examples.md). The CLI manual covers
 core commands like `infra up/init/status`, `service add/verify`, `rotate`, and
 `monitoring`, plus `bootroot-remote pull/ack/sync`.
-The rest of this manual focuses on the **manual setup** flow.
+In this manual, the **Installation/Configuration** pages focus on a
+non-CLI manual flow; other pages keep an operations/concepts/validation focus.
 
 ## Automation Boundary (Summary)
 
 - Bootroot-managed: config/material generation and updates, state recording,
   sync input preparation
 - Operator-managed: binary installation/update, process always-on ownership,
-  runtime integration (Compose/systemd)
-- Policy: Compose is recommended, systemd is supported. In both paths,
-  operators must satisfy reliability requirements directly.
+  runtime setup (for example, Compose service definitions or systemd
+  units/timers) and boot-time start/restart policies
+
+Runtime selection guidance:
+Operate step-ca/OpenBao/HTTP-01 responder as independent services
+(Compose or systemd). For services added via `bootroot service add`,
+recommended operation differs by deployment type: Docker services are best run
+with per-service agent sidecars, while daemon services are best run as host
+daemons (systemd). In all paths, operators must satisfy reliability
+requirements directly.
 
 ## Installation Topology (Summary)
 
@@ -128,8 +137,6 @@ in practice many deployments configure `/etc/hosts` mappings directly.
    (`<instance_id>.<service_name>.<hostname>.<domain>`) to the responder IP.
    Configure mappings in the environment where step-ca runs
    (container/host `/etc/hosts`) or in DNS.
-   If step-ca accesses services by IP literal instead of service FQDN, this
-   specific name mapping is not required.
 
 2. Remote service machine -> step-ca/responder name -> IP  
    If a service runs on a different machine from step-ca/OpenBao and that

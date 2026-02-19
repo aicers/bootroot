@@ -20,13 +20,19 @@ Operator-managed scope:
 - binary installation/update (`bootroot`, `bootroot-agent`, `bootroot-remote`,
   OpenBao Agent)
 - process supervision for always-on behavior (start/restart/boot startup)
-- runtime integration (`docker compose` or `systemd`)
+- runtime setup (for example, `docker compose` service definitions or
+  `systemd` units/timers) and boot-time start/restart policies
 
 Policy summary:
 
-- Compose is the recommended runtime path.
-- systemd is supported, but operators must satisfy the same reliability
-  requirements directly (always-on, restart, dependency ordering).
+- recommended runtime differs by deployment target:
+  step-ca/OpenBao/HTTP-01 responder run as independent services
+  (Compose or systemd).
+  For services added via `bootroot service add`, Docker services are best
+  operated with per-service agent sidecars, while daemon services are best
+  operated as host daemons (systemd).
+- in all paths, operators must satisfy reliability requirements directly
+  (always-on, restart, dependency ordering).
 - In both paths, bootroot does not fully manage the entire process lifecycle.
 
 ## Core operational checks

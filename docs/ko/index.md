@@ -35,10 +35,12 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다.
 
 ## 매뉴얼 구성
 
+- **개념**: PKI, ACME, CSR, SAN, mTLS, 시크릿 관리(OpenBao) 개요
 - **CLI**: infra 기동/초기화/상태 점검뿐 아니라 서비스 온보딩, 발급 검증,
   시크릿 회전, 모니터링, 원격 동기화 운영 안내까지 포함
-- **개념**: PKI, ACME, CSR, SAN, mTLS, 시크릿 관리(OpenBao) 개요
-- **설치**: OpenBao + step-ca + PostgreSQL + bootroot-agent + 리스폰더 설치
+- **CLI 예제**: 주요 CLI 시나리오별 실행 예시와 옵션 사용 패턴
+- **설치**: OpenBao + step-ca + PostgreSQL + bootroot-agent +
+  bootroot-remote + 리스폰더 설치
 - **설정**: `agent.toml`, 프로필, 훅, 재시도, EAB
 - **운영**: 갱신, 로그, 백업, 보안(OpenBao 포함)
 - **CI/E2E**: PR 필수 매트릭스, 확장 워크플로, 아티팩트, 로컬 재현
@@ -47,16 +49,16 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다.
 CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리되어 있습니다. CLI 문서에서는
 `infra up/init/status`, `service add/verify`, `rotate`, `monitoring`과
 `bootroot-remote pull/ack/sync` 등 주요 명령을 다룹니다.
-이 매뉴얼의 나머지 섹션은 **CLI를 쓰지 않는 수동 절차**를 기준으로
-설명합니다.
+이 매뉴얼에서 **설치/설정 섹션은 CLI를 쓰지 않는 수동 절차**를 기준으로
+설명하고, 나머지 섹션은 목적에 맞는 운영/개념/검증 관점으로 설명합니다.
 
 ## 자동화 경계(요약)
 
-- bootroot가 자동화하는 것: 설정/산출물 생성과 갱신, 상태 기록, 동기화 입력 준비
-- 운영자가 책임지는 것: 바이너리 설치/업데이트, 프로세스 상시 실행 보장,
-  런타임 통합(Compose/systemd)
-- 정책: Compose는 권장 경로이고, systemd는 지원 경로입니다.
-  두 경로 모두 운영자가 신뢰성 요건을 직접 충족해야 합니다.
+- bootroot가 자동화하는 것: 설정/산출물 생성과 갱신, 상태 기록,
+  동기화 입력 준비, `bootroot infra up` 기반 인프라 Compose 구성/기동
+- 운영자가 책임지는 것: 실행 구성요소 설치/업데이트(bootroot 관련 실행 파일과
+  OpenBao Agent 포함), 프로세스 상시 실행 보장, 실행 환경 구성(예: Compose
+  서비스 정의, systemd 유닛/타이머 등록)과 부팅 후 자동 시작/재시작 정책 적용
 
 ## 설치 토폴로지(요약)
 
@@ -113,22 +115,23 @@ step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-r
 조건을 반드시 만족해야 합니다. DNS로 구성해도 되지만, 실무에서는 보통
 `/etc/hosts` 매핑을 직접 구성하는 경우가 많습니다.
 
-1. step-ca -> 서비스 FQDN(HTTP-01 검증 대상) -> 리스폰더 IP 경로  
-   step-ca는 각 서비스의 검증 FQDN
-   (`<instance_id>.<service_name>.<hostname>.<domain>`)을 리스폰더 IP로
-   해석할 수 있어야 합니다. 이를 위해 step-ca가 동작하는 환경(컨테이너/호스트)의
-   hosts 설정(`/etc/hosts`) 또는 DNS에 매핑을 넣어야 합니다.
-   step-ca가 서비스 FQDN 대신 IP literal로 직접 접근하는 구성이라면
-   해당 이름 매핑은 필요하지 않습니다.
+### 1) step-ca -> 서비스 FQDN(HTTP-01 검증 대상) -> 리스폰더 IP
 
-2. 원격 서비스 머신 -> step-ca/responder 이름 -> IP 경로  
-   서비스가 step-ca/OpenBao와 다른 머신에 추가되는 경우, 해당 서비스 머신에서
-   step-ca/responder를 IP 대신 이름으로 접근한다면 그 이름이 올바른 IP로
-   해석되어야 합니다. 예: `stepca.internal`, `responder.internal`을
-   사용하는 경우 서비스 머신의 hosts 설정(`/etc/hosts`) 또는 DNS에 동일 매핑을
-   구성해야 합니다.
-   반대로 step-ca/responder를 IP literal로 직접 접근하면 이 이름 매핑은
-   필요하지 않습니다.
+- 접속 주체: step-ca
+- 필수 조건: step-ca가 각 서비스의 검증 FQDN
+  (`<instance_id>.<service_name>.<hostname>.<domain>`)을 리스폰더 IP로
+  찾을 수 있어야 합니다.
+- 설정 위치: step-ca가 동작하는 환경(컨테이너/호스트)의 `/etc/hosts` 또는 DNS
+
+### 2) 원격 서비스 머신 -> step-ca/responder 이름 -> IP
+
+- 접속 주체: step-ca/OpenBao와 다른 머신에 배치된 서비스
+- 필수 조건: 해당 서비스 머신이 step-ca/responder를 이름으로 접근할 때
+  올바른 IP로 찾을 수 있어야 합니다.
+- 설정 위치: 해당 서비스 머신의 `/etc/hosts` 또는 DNS
+- 예시 이름: `stepca.internal`, `responder.internal`
+- 예외: step-ca/responder를 IP literal로 직접 접근하면 이 매핑은
+  필요하지 않습니다.
 
 ## 아키텍처(요약)
 

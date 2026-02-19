@@ -196,7 +196,7 @@ Configuration:
 
 Purpose:
 
-- Validate remote-bootstrap onboarding and remote sync-apply path
+- Validate remote-bootstrap onboarding and remote sync-apply mode
 - Validate sync/ack-driven `sync_status` updates for
   `secret_id`, `eab`, `responder_hmac`, `trust_sync`
 - Validate remote rotation/recovery sequence across all sync items

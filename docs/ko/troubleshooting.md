@@ -59,7 +59,7 @@
 ### 전달 모드(`--delivery-mode`)를 확인
 
 - `local-file`: step-ca/OpenBao/responder가 동작하는 같은 머신에 서비스 추가
-- `remote-bootstrap`: 서비스가 다른 머신에 추가되며 `bootroot-remote` 경로로 반영
+- `remote-bootstrap`: 서비스가 다른 머신에 추가되며 `bootroot-remote` 방식으로 반영
 
 모드와 실제 배치가 맞지 않으면 설정 반영 경로가 어긋납니다.
 

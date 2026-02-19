@@ -192,7 +192,7 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 목적:
 
-- remote-bootstrap 온보딩과 동기화 반영 경로 검증
+- remote-bootstrap 온보딩과 동기화 반영 방식 검증
 - `secret_id`, `eab`, `responder_hmac`, `trust_sync` 항목의
   sync/ack 기반 상태 반영 검증
 - 원격 회전/복구 시퀀스를 항목별로 검증
