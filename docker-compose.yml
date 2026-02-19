@@ -85,9 +85,14 @@ services:
       - ./secrets:/app/secrets:ro
       - ./agent.toml.compose:/app/agent.toml:ro
     command:
-      - --oneshot
-      - --ca-url=https://bootroot-ca:9000/acme/acme/directory
-      - --config=/app/agent.toml
+      - /bin/sh
+      - -lc
+      - |
+        cp /app/agent.toml /app/certs/agent.runtime.toml
+        exec /app/bootroot-agent \
+          --oneshot \
+          --ca-url=https://bootroot-ca:9000/acme/acme/directory \
+          --config=/app/certs/agent.runtime.toml
     environment:
       - RUST_LOG=debug
 

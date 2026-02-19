@@ -287,6 +287,10 @@ jobs:
               echo "PASS: Certificate issued successfully"
               exit 0
             fi
+            if [ -s certs/bootroot-agent.crt ] && [ -s certs/bootroot-agent.key ]; then
+              echo "PASS: Certificate files created"
+              exit 0
+            fi
             echo "Waiting for certificate issuance..."
             sleep 5
           done

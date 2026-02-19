@@ -81,8 +81,11 @@ run_agent_oneshot() {
   compose_cmd="$(detect_compose)"
 
   $compose_cmd "${COMPOSE_FILES[@]}" run --rm --no-deps \
+    --entrypoint /bin/sh \
     -v "$cfg:/app/agent.toml:ro" \
-    bootroot-agent --oneshot --config=/app/agent.toml
+    bootroot-agent -lc \
+    "cp /app/agent.toml /app/certs/agent.runtime.toml && \
+     exec /app/bootroot-agent --oneshot --config=/app/certs/agent.runtime.toml"
 }
 
 run_agent_oneshot_network() {
@@ -92,12 +95,15 @@ run_agent_oneshot_network() {
   image="$(resolve_agent_image)"
 
   docker run --rm \
+    --entrypoint /bin/sh \
     --network "$network" \
     -v "$ROOT_DIR/certs:/app/certs" \
     -v "$ROOT_DIR/secrets/certs/root_ca.crt:/app/root_ca.crt" \
     -v "$ROOT_DIR/secrets:/app/secrets:ro" \
     -v "$cfg:/app/agent.toml:ro" \
-    "$image" --oneshot --config=/app/agent.toml
+    "$image" -lc \
+    "cp /app/agent.toml /app/certs/agent.runtime.toml && \
+     exec /app/bootroot-agent --oneshot --config=/app/certs/agent.runtime.toml"
 }
 
 run_agent_expect_fail() {
@@ -223,8 +229,11 @@ scenario_oneshot() {
   normalize_stepca_config
   compose_up
 
-  if ! wait_for_log "bootroot-agent" "Successfully issued certificate!" "$TIMEOUT_SECS"; then
-    fail "Timeout waiting for successful issuance log"
+  if ! wait_for_file "$ROOT_DIR/certs/bootroot-agent.crt" "$TIMEOUT_SECS"; then
+    fail "Timeout waiting for certs/bootroot-agent.crt"
+  fi
+  if ! wait_for_file "$ROOT_DIR/certs/bootroot-agent.key" "$TIMEOUT_SECS"; then
+    fail "Timeout waiting for certs/bootroot-agent.key"
   fi
 
   [ -f "$ROOT_DIR/certs/bootroot-agent.crt" ] || fail "Missing certs/bootroot-agent.crt"
@@ -280,8 +289,11 @@ TOML
   local compose_cmd
   compose_cmd="$(detect_compose)"
   $compose_cmd "${COMPOSE_FILES[@]}" run -d --name bootroot-agent-renewal --no-deps \
+    --entrypoint /bin/sh \
     -v "$cfg:/app/agent.toml:ro" \
-    bootroot-agent --config=/app/agent.toml
+    bootroot-agent -lc \
+    "cp /app/agent.toml /app/certs/agent.runtime.toml && \
+     exec /app/bootroot-agent --config=/app/certs/agent.runtime.toml"
 
   if ! wait_for_file "$ROOT_DIR/certs/renewal-example.crt" "$TIMEOUT_SECS"; then
     docker rm -f bootroot-agent-renewal >/dev/null 2>&1 || true
@@ -366,8 +378,11 @@ key = "certs/multi-203.key"
 TOML
 
   $compose_cmd "${COMPOSE_FILES[@]}" run --rm --no-deps \
+    --entrypoint /bin/sh \
     -v "$cfg:/app/agent.toml:ro" \
-    bootroot-agent --oneshot --config=/app/agent.toml
+    bootroot-agent -lc \
+    "cp /app/agent.toml /app/certs/agent.runtime.toml && \
+     exec /app/bootroot-agent --oneshot --config=/app/certs/agent.runtime.toml"
 
   [ -f "$ROOT_DIR/certs/multi-201.crt" ] || fail "Missing certs/multi-201.crt"
   [ -f "$ROOT_DIR/certs/multi-202.crt" ] || fail "Missing certs/multi-202.crt"
