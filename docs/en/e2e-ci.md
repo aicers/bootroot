@@ -256,8 +256,11 @@ Purpose:
 Execution steps:
 
 1. Add host entries for `stepca.internal` / `responder.internal`
+    - Add `stepca.internal` entry
+    - Add `responder.internal` entry
 2. Run all remote-delivery E2E scenario phases
 3. Remove temporary host entries in cleanup
+    - Remove only lines tagged with `HOSTS_MARKER`
 
 Actual commands (script excerpt):
 
@@ -378,12 +381,12 @@ Execution guide:
 ./scripts/e2e/docker/run-extended-suite.sh
 ```
 
-When local `sudo -n` is unavailable, run:
+When local `sudo -n` is unavailable:
 
-Reason: `hosts-all` cases add and restore host-machine `/etc/hosts` during the
-run, and that operation requires non-interactive admin privileges (`sudo -n`).
-
-- `./scripts/ci-local-e2e.sh --skip-hosts-all`
+- Run `./scripts/ci-local-e2e.sh --skip-hosts-all`.
+- Reason: `hosts-all` cases add and restore host-machine `/etc/hosts` during
+  the run, and that operation requires non-interactive admin privileges
+  (`sudo -n`).
 
 Use this only as a local constraint workaround. CI still executes
 `hosts-all` variants.
@@ -428,9 +431,10 @@ Verification flow:
    records desired state.
 2. `bootroot-remote sync` on the remote node reads that state and applies it to
    local files/config. (`sync` includes `pull`/`ack` behavior internally)
-3. E2E compares the following two outputs and requires the same result.  
-   (1) JSON from `bootroot-remote sync --summary-json ...`  
-   (2) state view from `bootroot service sync-status` on the control node
+3. E2E compares two outputs and requires the same result:
+
+    - JSON from `bootroot-remote sync --summary-json ...`
+    - State view from `bootroot service sync-status` on the control node
 
 Per-service comparison items:
 

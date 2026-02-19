@@ -82,6 +82,24 @@ Command notes:
 - `mkdocs build`: builds static files into `site/`.
 - `./scripts/build-docs-pdf.sh en|ko`: builds PDF manuals.
 
+## Docs Authoring Rules (list hierarchy)
+
+To avoid rendered list hierarchy regressions in MkDocs Material:
+
+- Prefer heading/label + single-level list over deep nested lists.
+- If nesting is required, use 4-space indentation consistently.
+- Keep a blank line before and after nested lists.
+- Avoid mixing long free-form paragraphs between list markers where possible.
+- For complex comparisons, prefer short table or separate subsection blocks.
+
+Docs PR quick checklist:
+
+- Run local preview for changed docs pages:
+  `mkdocs serve -a 127.0.0.1:8000 --livereload --dirtyreload`
+- Run markdown lint:
+  `markdownlint-cli2 "**/*.md" "#node_modules" "#target"`
+- If both KR/EN pages were changed, verify wording/structure parity.
+
 ## Quality Checks
 
 Run quality gates locally before pushing:

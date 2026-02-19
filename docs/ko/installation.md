@@ -351,7 +351,7 @@ bootroot-agent가 중단 없이 실행되도록 하려면 systemd 등 서비스 
 
 TLS 검증 오버라이드:
 
-자세한 동작 원리와 권장 운용 순서는 [설정 > 신뢰](configuration.md#신뢰)를
+자세한 동작 원리와 권장 운용 순서는 [설정 > 신뢰](configuration.md)를
 참고하세요.
 
 - `--verify-certificates`: ACME 서버 TLS 검증 강제
