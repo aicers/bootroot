@@ -14,6 +14,14 @@ For automated command flow, also see [CLI](cli.md) and
 bootroot-agent reads a TOML configuration file (default `agent.toml`).
 The full template lives in `agent.toml.example`.
 
+CLI (`bootroot`, `bootroot-remote`) option notation rules:
+
+- If an option includes `(environment variable: ...)`, that option supports
+  environment-variable input.
+- If an option includes `(default ...)`, that default is defined in code.
+- If those markers are absent, that option has no built-in default (required
+  or optional input) and/or no environment-variable support.
+
 ## OpenBao Agent
 
 OpenBao Agent reads secrets from OpenBao and renders them to files.
@@ -279,9 +287,10 @@ Options:
 - `--eab-kid <KID>`: EAB Key ID
 - `--eab-hmac <HMAC>`: EAB HMAC key
 - `--eab-file <PATH>`: EAB JSON file path
-- `--oneshot`: issue once and exit (disable daemon loop)
+- `--oneshot`: issue once and exit (disable daemon loop, default `false`)
 - `--verify-certificates`: force ACME server TLS verification
-- `--insecure`: disable ACME server TLS verification
+  (default `false`)
+- `--insecure`: disable ACME server TLS verification (default `false`)
 
 All other settings (profiles, retry, scheduler, hooks, CA bundle paths, etc.)
 must be defined in `agent.toml`.
@@ -378,6 +387,15 @@ uses `ops@example.com`.
 ## HTTP-01 responder (responder.toml)
 
 The responder reads `responder.toml` (or `BOOTROOT_RESPONDER__*` env vars).
+You can override the config file path with
+`bootroot-http01-responder --config <PATH>`. If omitted, the default is
+`responder.toml`.
+
+Environment variable mapping rule:
+
+- Use `BOOTROOT_RESPONDER__<KEY>`.
+- Example: `listen_addr` -> `BOOTROOT_RESPONDER__LISTEN_ADDR`
+- Example: `token_ttl_secs` -> `BOOTROOT_RESPONDER__TOKEN_TTL_SECS`
 
 ```toml
 listen_addr = "0.0.0.0:80"
@@ -390,10 +408,18 @@ max_skew_secs = 60
 
 - `listen_addr`: address where step-ca sends **HTTP-01 validation requests**.
   The responder replies to `/.well-known/acme-challenge/<token>` with the key
-  authorization.
+  authorization. (default `0.0.0.0:80`, environment variable:
+  `BOOTROOT_RESPONDER__LISTEN_ADDR`)
 - `admin_addr`: **admin API** where bootroot-agent registers tokens so the
-  responder can answer on `listen_addr`.
-- `hmac_secret`: shared secret (must match `acme.http_responder_hmac`)
-- `token_ttl_secs`: how long tokens stay valid
-- `cleanup_interval_secs`: how often expired tokens are removed
-- `max_skew_secs`: allowed clock skew for admin requests
+  responder can answer on `listen_addr`. (default `0.0.0.0:8080`,
+  environment variable: `BOOTROOT_RESPONDER__ADMIN_ADDR`)
+- `hmac_secret`: shared secret (must match `acme.http_responder_hmac`).
+  **No default (required)**. Empty values are rejected. (environment variable:
+  `BOOTROOT_RESPONDER__HMAC_SECRET`)
+- `token_ttl_secs`: how long tokens stay valid (default `300`, environment
+  variable: `BOOTROOT_RESPONDER__TOKEN_TTL_SECS`, value must be > 0)
+- `cleanup_interval_secs`: how often expired tokens are removed (default `30`,
+  environment variable: `BOOTROOT_RESPONDER__CLEANUP_INTERVAL_SECS`, value
+  must be > 0)
+- `max_skew_secs`: allowed clock skew for admin requests (default `60`,
+  environment variable: `BOOTROOT_RESPONDER__MAX_SKEW_SECS`, value must be > 0)

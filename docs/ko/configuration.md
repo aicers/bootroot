@@ -14,6 +14,13 @@
 bootroot-agent는 TOML 설정 파일을 읽습니다(기본값: `agent.toml`).
 전체 템플릿은 `agent.toml.example`에 있습니다.
 
+CLI(`bootroot`, `bootroot-remote`) 옵션 표기 원칙:
+
+- 옵션 설명에 `(환경 변수: ...)`가 있으면 해당 옵션이 환경 변수 입력을 지원합니다.
+- 옵션 설명에 `(기본값 ...)`이 있으면 코드에 기본값이 정의되어 있습니다.
+- 위 표기가 없으면 해당 항목은 기본값이 없거나(필수/선택 입력) 환경 변수
+  입력을 지원하지 않습니다.
+
 ## OpenBao Agent
 
 OpenBao Agent는 OpenBao에서 시크릿을 읽어 파일로 렌더링합니다.
@@ -73,7 +80,7 @@ template {
 `bootroot init`/`bootroot service add`가 생성한 `agent.hcl`을 사용하는 것이
 가장 간편합니다.
 
-`--delivery-mode remote-bootstrap` 경로에서는 원격에 `agent.toml`이 아직 없을 때
+`--delivery-mode remote-bootstrap` 방식에서는 원격에 `agent.toml`이 아직 없을 때
 `bootroot-remote sync`가 baseline을 생성할 수 있습니다. baseline 생성에는
 다음 입력이 사용됩니다.
 
@@ -339,9 +346,9 @@ backoff_secs = [5, 10, 30]
 - `--eab-kid <KID>`: EAB Key ID
 - `--eab-hmac <HMAC>`: EAB HMAC Key
 - `--eab-file <PATH>`: EAB JSON 파일 경로
-- `--oneshot`: 1회 발급 후 종료(데몬 루프 비활성화)
-- `--verify-certificates`: ACME 서버 TLS 검증 강제
-- `--insecure`: ACME 서버 TLS 검증 비활성화
+- `--oneshot`: 1회 발급 후 종료(데몬 루프 비활성화, 기본값 `false`)
+- `--verify-certificates`: ACME 서버 TLS 검증 강제(기본값 `false`)
+- `--insecure`: ACME 서버 TLS 검증 비활성화(기본값 `false`)
 
 그 외 설정(프로필, 재시도, 스케줄러, 훅, CA 번들 경로 등)은
 `agent.toml`에 정의해야 합니다.
@@ -349,6 +356,14 @@ backoff_secs = [5, 10, 30]
 ## HTTP-01 리스폰더 (responder.toml)
 
 리스폰더는 `responder.toml`(또는 `BOOTROOT_RESPONDER__*` 환경변수)을 읽습니다.
+설정 파일 경로는 `bootroot-http01-responder --config <PATH>`로 바꿀 수 있으며,
+미지정 시 기본값은 `responder.toml`입니다.
+
+환경 변수 매핑 규칙:
+
+- `BOOTROOT_RESPONDER__<KEY>` 형식으로 주입합니다.
+- 예: `listen_addr` -> `BOOTROOT_RESPONDER__LISTEN_ADDR`
+- 예: `token_ttl_secs` -> `BOOTROOT_RESPONDER__TOKEN_TTL_SECS`
 
 ```toml
 listen_addr = "0.0.0.0:80"
@@ -361,11 +376,18 @@ max_skew_secs = 60
 
 - `listen_addr`: step-ca가 HTTP-01 검증을 위해 **HTTP 요청을 보내는 주소**입니다.
   리스폰더는 `/.well-known/acme-challenge/<token>` 요청에 key authorization을
-  응답합니다.
+  응답합니다. (기본값 `0.0.0.0:80`, 환경 변수:
+  `BOOTROOT_RESPONDER__LISTEN_ADDR`)
 - `admin_addr`: bootroot-agent가 **토큰을 등록하기 위해 호출하는 관리자 API**
   주소입니다. 이 요청을 통해 리스폰더가 `listen_addr`에서 응답할 토큰을
-  저장합니다.
-- `hmac_secret`: 공유 비밀키(`acme.http_responder_hmac`와 동일해야 함)
-- `token_ttl_secs`: 토큰 유효 시간(초)
-- `cleanup_interval_secs`: 만료 토큰 정리 주기(초)
-- `max_skew_secs`: 관리자 요청 허용 시계 오차(초)
+  저장합니다. (기본값 `0.0.0.0:8080`, 환경 변수:
+  `BOOTROOT_RESPONDER__ADMIN_ADDR`)
+- `hmac_secret`: 공유 비밀키(`acme.http_responder_hmac`와 동일해야 함).
+  **기본값 없음(필수)**, 빈 값은 거부됩니다. (환경 변수:
+  `BOOTROOT_RESPONDER__HMAC_SECRET`)
+- `token_ttl_secs`: 토큰 유효 시간(초, 기본값 `300`, 환경 변수:
+  `BOOTROOT_RESPONDER__TOKEN_TTL_SECS`, 0은 허용되지 않음)
+- `cleanup_interval_secs`: 만료 토큰 정리 주기(초, 기본값 `30`, 환경 변수:
+  `BOOTROOT_RESPONDER__CLEANUP_INTERVAL_SECS`, 0은 허용되지 않음)
+- `max_skew_secs`: 관리자 요청 허용 시계 오차(초, 기본값 `60`, 환경 변수:
+  `BOOTROOT_RESPONDER__MAX_SKEW_SECS`, 0은 허용되지 않음)

@@ -11,10 +11,9 @@
 실제 명령/자동화 흐름은 [CLI](cli.md), [CLI 예제](cli-examples.md)를
 함께 참고하세요.
 
-운영 정책(요약):
+운영자 책임(요약):
 
-- Compose 경로를 권장합니다.
-- systemd 경로도 지원하지만, 상시 실행/재시작/의존성 보장은 운영자 책임입니다.
+- 상시 실행/재시작/의존성 보장은 운영자 책임입니다.
 - bootroot는 설정/산출물 생성을 자동화하지만, 바이너리 설치와 프로세스
   생명주기 관리는 운영자가 수행해야 합니다.
 
@@ -250,7 +249,8 @@ docker run --rm \
 가리키기 때문입니다. Docker 네트워크에서는 OpenBao 컨테이너 이름
 (`bootroot-openbao`)으로 접근해야 합니다.
 
-참고: step-ca/OpenBao/responder가 한 머신에서 동작하는 bootroot 기본
+참고: OpenBao/PostgreSQL/step-ca/HTTP-01 responder가 한 머신에서 동작하는
+bootroot 기본
 토폴로지에서는 `bootroot init`가 step-ca/responder용 OpenBao Agent 설정 파일과
 compose override를 생성하고, `openbao-agent-stepca`,
 `openbao-agent-responder` 컨테이너를 기동합니다.
@@ -263,7 +263,8 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 
 권장 배포 정책:
 
-- step-ca/responder: step-ca/OpenBao/responder가 한 머신에서 동작하는 bootroot
+- step-ca/responder:
+  OpenBao/PostgreSQL/step-ca/HTTP-01 responder가 한 머신에서 동작하는 bootroot
   기본 토폴로지에서는 서비스별 전용 OpenBao Agent
   사이드카를 각각 분리해서 사용합니다. 즉 step-ca에는
   `openbao-agent-stepca`, responder에는 `openbao-agent-responder`를 붙여
@@ -400,7 +401,7 @@ docker compose up --build -d bootroot-agent
 - 실행: `bootroot-remote sync ...`
 - 운영: systemd timer 또는 cron으로 주기 실행
 
-`remote-bootstrap` 경로의 상세 인자/예시는 [CLI](cli.md)의
+`remote-bootstrap` 방식의 상세 인자/예시는 [CLI](cli.md)의
 `bootroot-remote pull/ack/sync` 섹션을 참고하세요.
 
 ## HTTP-01 리스폰더

@@ -30,19 +30,20 @@ CLI는 infra 기동/초기화/상태 점검과 서비스 온보딩, 발급 검�
 - `--lang`: 출력 언어 (`en` 또는 `ko`, 기본값 `en`)
   - 환경 변수: `BOOTROOT_LANG`
 
+표기 규칙: 옵션 설명에 `(환경 변수: ...)`가 있으면 해당 옵션이 환경 변수 입력을
+지원한다는 뜻입니다. 이 표기가 없으면 환경 변수 입력을 지원하지 않습니다.
+
 ## bootroot CLI 자동 준비 범위와 운영자 책임
 
-bootroot CLI가 자동으로 설치/기동해 주는 항목(Docker 경로):
+bootroot CLI가 자동으로 설치/기동해 주는 항목(Docker 방식):
 
 - `bootroot infra up` 기준 OpenBao/PostgreSQL/step-ca/HTTP-01 responder
   컨테이너의 이미지 pull, 생성, 기동
   (서비스 이미지 build가 필요한 경우 별도 `docker compose build` 수행 필요)
-- step-ca/OpenBao/responder가 한 머신에서 동작하는 bootroot 기본 토폴로지에서
-  `bootroot init` 기준 step-ca/responder용 OpenBao Agent 설정 생성 및
-  compose override를 통한 `openbao-agent-stepca`/`openbao-agent-responder`
-  컨테이너 활성화
-
-단, 호스트 바이너리/서비스(systemd 유닛 등) 설치는 자동으로 수행하지 않습니다.
+- 기본 토폴로지(OpenBao/PostgreSQL/step-ca/HTTP-01 responder를 한 머신에 배치)에서는
+  `bootroot init`이 step-ca/responder용 OpenBao Agent 설정을 생성하고,
+  compose override로 전용 OpenBao Agent 컨테이너(`openbao-agent-stepca`,
+  `openbao-agent-responder`)를 활성화
 
 bootroot CLI가 자동으로 준비하는 항목:
 
@@ -55,7 +56,7 @@ bootroot CLI가 자동으로 준비하는 항목:
 - `bootroot-agent`
 - `bootroot-remote`(추가 서비스가 step-ca 운영 머신이 아닌 다른 머신에서 동작할 때,
   해당 서비스 머신에서 실행하는 CLI)
-- OpenBao Agent
+- OpenBao Agent(추가 서비스용; step-ca/responder용은 `bootroot init`에서 자동 준비)
 
 프로세스 상시 운영도 운영자 책임입니다.
 
@@ -68,17 +69,15 @@ bootroot CLI가 자동으로 준비하는 항목:
 
 ## 이름 해석(DNS/hosts) 운영 책임
 
-HTTP-01 검증에서 step-ca는 각 검증 FQDN
-(`<instance>.<service>.<hostname>.<domain>`)을 responder 대상으로 해석할 수
-있어야 합니다.
+핵심 원칙:
 
-step-ca/responder 엔드포인트를 IP가 아닌 이름으로 사용한다면, 참여하는 모든
-호스트에서 DNS/hosts를 일관되게 설정해야 합니다.
+- HTTP-01 검증이 동작하려면 step-ca가 서비스 검증 FQDN을 responder IP로
+  찾을 수 있어야 합니다.
+- step-ca/responder를 IP가 아닌 이름으로 접근하면, 관련 호스트들에서
+  DNS/hosts 매핑을 일관되게 맞춰야 합니다.
 
-- control/step-ca 호스트
-- 각 remote 서비스 호스트
-
-로컬 Docker E2E에서는 이 매핑을 테스트 스크립트가 자동 주입합니다.
+상세 기준과 조건별 설명은 개요의 [/etc/hosts 매핑 설정](index.md#etchosts)을
+참고하세요.
 
 ## bootroot infra up
 
@@ -95,7 +94,8 @@ HTTP-01 리스폰더가 함께 구동된다는 전제를 둡니다. 서로 다�
 - `--image-archive-dir`: 로컬 이미지 아카이브 디렉터리(선택)
 - `--restart-policy`: 컨테이너 재시작 정책 (기본값 `always`)
 - `--openbao-url`: OpenBao API URL (기본값 `http://localhost:8200`)
-- `--openbao-unseal-from-file`: 파일에서 OpenBao 언실 키 읽기 (dev/test 전용)
+- `--openbao-unseal-from-file`: 파일에서 OpenBao 언실 키 읽기
+  (dev/test 전용, 환경 변수: `OPENBAO_UNSEAL_FILE`)
 
 ### 출력
 
@@ -130,13 +130,18 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--auto-generate`: 비밀번호/HMAC 등을 자동 생성
 - `--show-secrets`: 요약 출력에 시크릿 표시
 - `--summary-json`: init 요약을 머신 파싱용 JSON 파일로 저장
-- `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`)
-  - 기본 실행에서는 필수입니다.
-  - preview 모드(`--print-only`/`--dry-run`)에서는 선택이며, trust 프리뷰를
-    보려면 지정해야 합니다.
+- `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`).
+  기본 실행에서는 필수입니다. preview 모드(`--print-only`/`--dry-run`)에서는
+  선택이며, trust 프리뷰를 보려면 지정해야 합니다.
 - `--unseal-key`: OpenBao unseal key (반복 가능, 환경 변수: `OPENBAO_UNSEAL_KEYS`)
-- `--openbao-unseal-from-file`: 파일에서 OpenBao 언실 키 읽기 (dev/test 전용)
-- `--stepca-password`: step-ca 키 암호 (`password.txt`, 환경 변수: `STEPCA_PASSWORD`)
+  같은 옵션을 여러 번 전달할 수 있습니다
+  (예: `--unseal-key k1 --unseal-key k2 --unseal-key k3`).
+  환경 변수는 쉼표 구분 목록으로 전달합니다
+  (예: `OPENBAO_UNSEAL_KEYS="k1,k2,k3"`).
+- `--openbao-unseal-from-file`: 파일에서 OpenBao 언실 키 읽기
+  (dev/test 전용, 환경 변수: `OPENBAO_UNSEAL_FILE`)
+- `--stepca-password`: step-ca 키 암호 값 (저장 위치: `secrets/password.txt`,
+  환경 변수: `STEPCA_PASSWORD`)
 - `--db-dsn`: step-ca용 PostgreSQL DSN
 - `--db-provision`: step-ca용 PostgreSQL 역할/DB 생성
 - `--db-admin-dsn`: PostgreSQL 관리자 DSN (환경 변수: `BOOTROOT_DB_ADMIN_DSN`)
@@ -144,7 +149,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--db-password`: step-ca용 PostgreSQL 비밀번호 (환경 변수: `BOOTROOT_DB_PASSWORD`)
 - `--db-name`: step-ca용 PostgreSQL DB 이름 (환경 변수: `BOOTROOT_DB_NAME`)
 - `--db-check`: DB 연결/인증 점검
-- `--db-timeout-secs`: DB 연결 타임아웃(초)
+- `--db-timeout-secs`: DB 연결 타임아웃(초, 기본값 `2`)
 - `--http-hmac`: HTTP-01 responder HMAC (환경 변수: `HTTP01_HMAC`)
 - `--responder-url`: HTTP-01 responder 관리자 URL (선택, 환경 변수: `HTTP01_RESPONDER_URL`)
 - `--skip-responder-check`: init 시 responder 체크 생략(테스트/제약 환경용)
@@ -153,6 +158,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--stepca-url`: step-ca URL (기본값 `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner 이름 (기본값 `acme`)
 - `--eab-kid`, `--eab-hmac`: 수동 EAB 입력
+  (환경 변수: `EAB_KID`, `EAB_HMAC`)
 
 DB DSN host 처리 규칙:
 
@@ -183,8 +189,8 @@ DB DSN host 처리 규칙:
 
 ### step-ca/responder용 OpenBao Agent 초기 인증 준비
 
-현재 기본 토폴로지에서는 OpenBao, step-ca, responder가 step-ca가 설치된
-머신에서 함께 동작하며 로컬 `secrets` 디렉터리를 공유합니다.
+현재 기본 토폴로지에서는 step-ca가 설치된 머신에서 OpenBao, step-ca,
+responder가 함께 동작하며 로컬 `secrets` 디렉터리를 공유합니다.
 
 이 기본 토폴로지에서는 `bootroot init`이 step-ca/responder용 OpenBao Agent의
 초기 인증 준비를 자동으로 처리합니다. 핵심 작업은 다음과 같습니다.
@@ -248,10 +254,11 @@ infra 상태(컨테이너 포함)와 OpenBao KV/AppRole 상태를 점검합니�
 
 ### 입력
 
-- `--compose-file`: compose 파일 경로
-- `--openbao-url`: OpenBao URL
-- `--kv-mount`: OpenBao KV v2 마운트 경로
-- `--root-token`: KV/AppRole 체크용 토큰(선택)
+- `--compose-file`: compose 파일 경로 (기본값 `docker-compose.yml`)
+- `--openbao-url`: OpenBao URL (기본값 `http://localhost:8200`)
+- `--kv-mount`: OpenBao KV v2 마운트 경로 (기본값 `secret`)
+- `--root-token`: KV/AppRole 체크용 토큰
+  (선택, 환경 변수: `OPENBAO_ROOT_TOKEN`)
 
 ### 출력
 
@@ -275,67 +282,81 @@ bootroot status
 
 새로운 서비스(daemon/docker)이 step-ca에서 인증서를 발급받을 수 있도록
 온보딩 정보를 등록하고 OpenBao AppRole을 생성합니다. 이 명령을 실행하면
-**`bootroot` CLI**가 아래 자동화를 수행합니다.
+**`bootroot` CLI**가 아래 순서로 온보딩 자동화를 수행합니다.
+
+### 1) 기본 자동 반영
 
 - 서비스 메타데이터를 `state.json`에 등록
 - 서비스 전용 OpenBao 정책/AppRole 생성, `role_id`/`secret_id` 발급
 - `secrets/services/<service>/role_id`, `secret_id` 파일 생성
 - 결과 요약과 운영자용 스니펫 출력
 
-전달 모드(`--delivery-mode`) 선택값별 자동 반영:
+### 2) 전달 모드(`--delivery-mode`)별 자동 반영
 
-1. `local-file`:
-   서비스가 step-ca/OpenBao/responder가 설치된 동일 머신에 추가될 때
-   사용합니다. `agent.toml`의 관리 대상 프로필 블록 갱신(없으면 추가)과 OpenBao Agent
-   템플릿/설정/토큰 파일 생성을 로컬에서 바로 처리합니다.
-2. `remote-bootstrap`:
-   서비스가 step-ca/OpenBao/responder가 설치된 머신이 아닌 다른 머신에
-   추가될 때 사용합니다. 원격 반영용 OpenBao KV 번들
-   (`secret_id`/`eab`/`responder_hmac`/`trust`)을 기록하고 원격 bootstrap
-   아티팩트를 생성합니다. 여기서 "원격 반영용"은 step-ca가 동작하는 머신의
-   `bootroot`가 기록한 목표 설정/시크릿 묶음을 원격 서비스 머신의
-   `bootroot-remote`가 pull해서 반영한다는 의미입니다. "원격 bootstrap
-   아티팩트"는 이 원격 동기화를 시작할 때 필요한 초기 입력/실행 정보를 담은
-   산출물입니다.
+#### 2-1) `local-file`
 
-이 명령은 새 서비스 추가 시 **인증서 발급/갱신 경로를 준비**하는 필수 단계입니다.
-다만 `bootroot service add` 자체가 인증서를 발급하지는 않습니다.
+- 사용 시점: 서비스가 OpenBao/PostgreSQL/step-ca/HTTP-01 responder가 설치된
+  동일 머신에 추가될 때
+- 자동 반영: `agent.toml`의 관리 대상 프로필 블록 갱신(없으면 추가), OpenBao
+  Agent 템플릿/설정/토큰 파일 로컬 생성
 
-사용자가 직접 해야 할 작업:
+#### 2-2) `remote-bootstrap`
+
+- 사용 시점: 서비스가 OpenBao/PostgreSQL/step-ca/HTTP-01 responder가 설치된
+  머신이 아닌 다른 머신에 추가될 때
+- 자동 반영: 원격 반영용 OpenBao KV 번들
+  (`secret_id`/`eab`/`responder_hmac`/`trust`) 기록, 원격 bootstrap
+  아티팩트 생성
+- 동작 의미: step-ca가 동작하는 머신의 `bootroot`가 기록한 설정/시크릿 묶음을
+  원격 서비스 머신의 `bootroot-remote`가 pull해서 반영
+- 아티팩트 의미: 원격 동기화 시작에 필요한 초기 입력/실행 정보를 담은 산출물
+
+### 3) 명령 범위와 운영자 작업
+
+- 이 명령은 새 서비스의 **인증서 발급/갱신 경로를 준비**하는 필수 단계입니다.
+- `bootroot service add` 자체가 인증서를 발급하지는 않습니다.
+
+운영자가 직접 해야 할 작업:
 
 - 서비스 머신에서 OpenBao Agent/bootroot-agent를 실제로 기동/상시 운영
 - `remote-bootstrap`인 경우 서비스 머신에서 `bootroot-remote` 주기 실행 구성
 - `bootroot verify` 또는 실제 서비스 실행으로 발급 경로 검증
+
+### 4) trust 자동 처리와 preview
 
 기본 흐름에서 `bootroot init`를 정상 완료하면 OpenBao의
 `secret/bootroot/ca`가 자동으로 준비되며, 기본 실행
 (`--print-only`/`--dry-run` 없이 실행)의 `bootroot service add`가 trust
 관련 값도 자동으로 처리합니다.
 
-- `remote-bootstrap` 경로: `trusted_ca_sha256`를 서비스별 원격 sync
+#### 4-1) 전달 모드별 trust 자동 처리
+
+- `remote-bootstrap` 방식: `trusted_ca_sha256`를 서비스별 원격 sync
   번들(`secret/.../services/<service>/trust`)에 자동 기록하고, 원격 서비스
   머신의 `bootroot-remote sync`가 이를 `agent.toml` trust 항목에 반영합니다.
-- `local-file` 경로: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)이
+- `local-file` 방식: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)이
   `agent.toml`에 자동 병합되며, OpenBao trust 데이터에 `ca_bundle_pem`이
   있으면 로컬 `ca_bundle_path` 파일에도 자동 반영됩니다.
-- bootroot-agent 런타임 자동 강화(요약): 일반 실행에서 첫 발급이 성공하면
+
+#### 4-2) bootroot-agent 런타임 자동 강화(요약)
+
+- 일반 실행에서 첫 발급이 성공하면
   `trust.verify_certificates = true`를 `agent.toml`에 자동 기록해 이후 실행부터
   ACME 서버 TLS 검증을 사용합니다. `--insecure` 실행은 해당 실행에서만
-  검증을 우회하고 자동 강화를 건너뜁니다. 자세한 규칙/운영 흐름은 **설정 > 신뢰**
-  섹션을 참고하세요.
+  검증을 우회하고 자동 강화를 건너뜁니다. 자세한 규칙/운영 흐름은
+  [설정 > 신뢰](configuration.md#_4) 섹션을 참고하세요.
 
-preview 모드(`--print-only`/`--dry-run`) 주의:
+#### 4-3) preview 모드(`--print-only`/`--dry-run`)
 
 - `--root-token`을 주면 preview에서도 OpenBao trust 데이터를 조회해 trust
   스니펫을 출력합니다.
 - `--root-token`이 없으면 trust 스니펫을 출력하지 못하는 이유를 함께 출력합니다.
+- `--print-only`/`--dry-run`은 파일/상태를 쓰지 않는 미리보기 모드입니다.
 
-사용자가 수동으로 설정해야 하는 대표 상황:
+#### 4-4) 수동 설정이 필요한 대표 상황
 
-- `local-file` 경로에서 `agent.toml`에 trust 항목을 직접 고정해 관리하려는 경우
+- `local-file` 방식에서 `agent.toml`에 trust 항목을 직접 고정해 관리하려는 경우
 - preview 출력만 보고 설정을 적용하는 경우
-
-`--print-only`/`--dry-run`은 파일/상태를 쓰지 않는 미리보기 모드입니다.
 
 ### 런타임 배포 정책
 
@@ -475,7 +496,7 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 서비스 
 - `--service-name`: 서비스 이름 식별자
 - `--agent-config`: bootroot-agent 설정 경로 (선택, 기본은 등록된 값)
 - `--db-check`: ca.json DSN으로 DB 연결/인증 점검
-- `--db-timeout-secs`: DB 연결 타임아웃(초)
+- `--db-timeout-secs`: DB 연결 타임아웃(초, 기본값 `2`)
 
 ### 대화형 동작
 
@@ -532,14 +553,15 @@ OpenBao와 통신해 값을 갱신합니다.
 
 #### `rotate eab`
 
-- `--stepca-url`: step-ca URL
-- `--stepca-provisioner`: ACME 프로비저너 이름
+- `--stepca-url`: step-ca URL (기본값 `https://localhost:9000`)
+- `--stepca-provisioner`: ACME 프로비저너 이름 (기본값 `acme`)
 
 #### `rotate db`
 
 - `--db-admin-dsn`: DB 관리자 DSN (환경 변수 `BOOTROOT_DB_ADMIN_DSN`)
-- `--db-password`: 새 DB 비밀번호(선택, 미지정 시 자동 생성)
-- `--db-timeout-secs`: DB 점검 타임아웃(초)
+- `--db-password`: 새 DB 비밀번호
+  (선택, 미지정 시 자동 생성, 환경 변수: `BOOTROOT_DB_PASSWORD`)
+- `--db-timeout-secs`: DB 점검 타임아웃(초, 기본값 `2`)
 
 #### `rotate responder-hmac`
 
@@ -645,9 +667,10 @@ OpenBao KV: `bootroot/responder/hmac`
 
 입력:
 
+- `--compose-file`: compose 파일 경로 (기본값 `docker-compose.yml`)
 - `--profile`: `lan` 또는 `public` (기본 `lan`)
 - `--grafana-admin-password`: Grafana 관리자 비밀번호를 **최초 기동 시** 설정
-  (환경 변수 `GRAFANA_ADMIN_PASSWORD`로도 지정 가능)
+  (환경 변수: `GRAFANA_ADMIN_PASSWORD`)
 
 동작:
 
@@ -673,6 +696,8 @@ OpenBao KV: `bootroot/responder/hmac`
 비고:
 
 - 실행 중인 프로필을 자동 감지합니다. `--profile`은 받지 않습니다.
+- `--compose-file`로 대상 compose 파일 경로를 지정할 수 있습니다
+  (기본값 `docker-compose.yml`).
 
 ### `monitoring down`
 
@@ -680,6 +705,7 @@ OpenBao KV: `bootroot/responder/hmac`
 
 입력:
 
+- `--compose-file`: compose 파일 경로 (기본값 `docker-compose.yml`)
 - `--reset-grafana-admin-password`: Grafana 데이터 볼륨을 삭제하여
   다음 `monitoring up`에서 비밀번호를 다시 적용할 수 있게 합니다.
 
@@ -701,8 +727,10 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 
 주요 입력:
 
-- `--openbao-url`, `--kv-mount`, `--service-name`
-  - 환경 변수: `OPENBAO_URL`, `OPENBAO_KV_MOUNT`
+- `--openbao-url`: OpenBao API URL (환경 변수: `OPENBAO_URL`)
+- `--kv-mount`: OpenBao KV v2 마운트 경로 (환경 변수: `OPENBAO_KV_MOUNT`)
+  (기본값 `secret`)
+- `--service-name`
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`
 - `--agent-config-path`
 - baseline/profile 입력:
@@ -722,7 +750,7 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 - `--ca-bundle-path`
   - trust 데이터에 `ca_bundle_pem`이 포함된 경우 번들을 파일로 반영하려면
     지정이 필요합니다.
-- `--summary-json`(선택), `--output text|json`
+- `--summary-json`(선택), `--output text|json` (기본값 `text`)
 
 `agent.toml`이 아직 없으면 pull 단계에서 baseline을 생성한 뒤, 서비스용
 관리 대상 프로필 블록을 갱신(없으면 추가)합니다.
@@ -745,9 +773,9 @@ summary 파일을 `state.json`의 sync-status로 반영합니다.
 
 주요 재시도 입력:
 
-- `--retry-attempts`
-- `--retry-backoff-secs`
-- `--retry-jitter-secs`
+- `--retry-attempts` (기본값 `3`)
+- `--retry-backoff-secs` (기본값 `5`)
+- `--retry-jitter-secs` (기본값 `0`)
 
 그 외 입력:
 
@@ -758,7 +786,8 @@ summary 파일을 `state.json`의 sync-status로 반영합니다.
 - `--summary-json`은 sync에서 필수입니다.
 - ack 연동용으로 `--bootroot-bin`(기본 `bootroot`), `--state-file`(선택)을
   받을 수 있습니다.
-- pull 단계 출력 형식 제어용 `--output text|json`을 받을 수 있습니다.
+- pull 단계 출력 형식 제어용 `--output text|json`을 받을 수 있습니다
+  (기본값 `text`).
 
 summary JSON 계약 항목:
 

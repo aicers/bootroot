@@ -33,19 +33,22 @@ Primary commands:
 - `--lang`: output language (`en` or `ko`, default `en`)
   - Environment variable: `BOOTROOT_LANG`
 
+Notation rule: when an option includes `(environment variable: ...)`, that
+option supports environment-variable input. If that marker is absent, the
+option does not support environment-variable input.
+
 ## bootroot CLI automation scope vs operator responsibilities
 
-What bootroot CLI installs/starts automatically (Docker path):
+What bootroot CLI installs/starts automatically (Docker workflow):
 
 - for `bootroot infra up`: image pull plus container create/start for
   OpenBao/PostgreSQL/step-ca/HTTP-01 responder
   (if service images require build, run `docker compose build` separately)
-- in the bootroot default topology where step-ca/OpenBao/responder run on one
-  machine, `bootroot init` generates step-ca/responder OpenBao Agent configs
-  and enables `openbao-agent-stepca`/`openbao-agent-responder` via compose
-  override
-
-It does not install host binaries/services (for example, systemd units).
+- in the default topology (OpenBao/PostgreSQL/step-ca/HTTP-01 responder
+  deployed on one machine),
+  `bootroot init` generates step-ca/responder OpenBao Agent configs and enables
+  dedicated OpenBao Agent containers
+  (`openbao-agent-stepca`, `openbao-agent-responder`) via compose override
 
 What bootroot CLI prepares automatically:
 
@@ -59,7 +62,8 @@ What operators must install and manage directly:
 - `bootroot-agent`
 - `bootroot-remote` (CLI that runs on the service machine when an added
   service runs on a different machine from the step-ca host)
-- OpenBao Agent
+- OpenBao Agent (for added services; step-ca/responder agents are auto-prepared
+  by `bootroot init`)
 
 Runtime supervision is also operator-owned:
 
@@ -73,16 +77,15 @@ schedule `bootroot-remote sync` periodically on that service machine
 
 ## Name resolution responsibilities
 
-For HTTP-01, step-ca must resolve each validation FQDN
-(`<instance>.<service>.<hostname>.<domain>`) to the responder target.
+Key points:
 
-If you use hostnames (instead of direct IPs) for step-ca/responder endpoints,
-configure DNS/hosts consistently on every participating host:
+- For HTTP-01 validation, step-ca must resolve each service validation FQDN to
+  the responder IP.
+- If step-ca/responder are accessed by hostname (not direct IP), keep DNS/hosts
+  mappings consistent across participating hosts.
 
-- control/step-ca host
-- each remote service host
-
-In local Docker E2E, this mapping is injected automatically by test scripts.
+For detailed rules and condition-specific behavior, see the Overview section
+[/etc/hosts Mapping](index.md#etchosts-mapping).
 
 ## bootroot infra up
 
@@ -99,7 +102,8 @@ setup instead of the CLI.
 - `--image-archive-dir`: local image archive directory (optional)
 - `--restart-policy`: container restart policy (default `always`)
 - `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
-- `--openbao-unseal-from-file`: read OpenBao unseal keys from file (dev/test only)
+- `--openbao-unseal-from-file`: read OpenBao unseal keys from file
+  (dev/test only, environment variable: `OPENBAO_UNSEAL_FILE`)
 
 ### Outputs
 
@@ -135,13 +139,19 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--auto-generate`: auto-generate secrets where possible
 - `--show-secrets`: show secrets in the summary
 - `--summary-json`: write init summary as machine-readable JSON
-- `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
-  - required for normal apply mode.
-  - optional in preview mode (`--print-only`/`--dry-run`), but required if you
-    want trust preview output.
+- `--root-token`: OpenBao root token (environment variable:
+  `OPENBAO_ROOT_TOKEN`). Required for normal apply mode. Optional in preview
+  mode (`--print-only`/`--dry-run`), but required if you want trust preview
+  output.
 - `--unseal-key`: OpenBao unseal key (repeatable, environment variable: `OPENBAO_UNSEAL_KEYS`)
-- `--openbao-unseal-from-file`: read OpenBao unseal keys from file (dev/test only)
-- `--stepca-password`: step-ca password (`password.txt`, environment variable: `STEPCA_PASSWORD`)
+  You can pass the same option multiple times
+  (for example: `--unseal-key k1 --unseal-key k2 --unseal-key k3`).
+  For env input, pass a comma-separated list
+  (for example: `OPENBAO_UNSEAL_KEYS="k1,k2,k3"`).
+- `--openbao-unseal-from-file`: read OpenBao unseal keys from file
+  (dev/test only, environment variable: `OPENBAO_UNSEAL_FILE`)
+- `--stepca-password`: step-ca password value (stored at `secrets/password.txt`,
+  environment variable: `STEPCA_PASSWORD`)
 - `--db-dsn`: PostgreSQL DSN for step-ca
 - `--db-provision`: provision PostgreSQL role/database for step-ca
 - `--db-admin-dsn`: PostgreSQL admin DSN (environment variable: `BOOTROOT_DB_ADMIN_DSN`)
@@ -149,7 +159,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--db-password`: PostgreSQL password for step-ca (environment variable: `BOOTROOT_DB_PASSWORD`)
 - `--db-name`: PostgreSQL database name for step-ca (environment variable: `BOOTROOT_DB_NAME`)
 - `--db-check`: validate DB connectivity and auth
-- `--db-timeout-secs`: DB connectivity timeout (seconds)
+- `--db-timeout-secs`: DB connectivity timeout (seconds, default `2`)
 - `--http-hmac`: HTTP-01 responder HMAC (environment variable: `HTTP01_HMAC`)
 - `--responder-url`: HTTP-01 responder admin URL (optional, environment
   variable: `HTTP01_RESPONDER_URL`)
@@ -160,6 +170,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--stepca-url`: step-ca URL (default `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
 - `--eab-kid`, `--eab-hmac`: manual EAB input
+  (environment variables: `EAB_KID`, `EAB_HMAC`)
 
 DB DSN host handling:
 
@@ -255,10 +266,11 @@ Checks infra status (including containers) and OpenBao KV/AppRole status.
 
 ### Inputs
 
-- `--compose-file`: compose file path
-- `--openbao-url`: OpenBao URL
-- `--kv-mount`: OpenBao KV v2 mount path
-- `--root-token`: token for KV/AppRole checks (optional)
+- `--compose-file`: compose file path (default `docker-compose.yml`)
+- `--openbao-url`: OpenBao URL (default `http://localhost:8200`)
+- `--kv-mount`: OpenBao KV v2 mount path (default `secret`)
+- `--root-token`: token for KV/AppRole checks
+  (optional, environment variable: `OPENBAO_ROOT_TOKEN`)
 
 ### Outputs
 
@@ -282,34 +294,42 @@ bootroot status
 
 Onboards a new service (daemon/docker) so it can obtain certificates from
 step-ca by registering its metadata and creating an OpenBao AppRole.
-When you run this command, **the `bootroot` CLI** automates:
+When you run this command, **the `bootroot` CLI** performs onboarding
+automation in the following structure.
+
+### 1) Base automation
 
 - Register service metadata in `state.json`
 - Create service-scoped OpenBao policy/AppRole and issue `role_id`/`secret_id`
 - Write `secrets/services/<service>/role_id` and `secret_id`
 - Print execution summary and operator snippets
 
-Automation by `--delivery-mode` choice:
+### 2) Automation by `--delivery-mode`
 
-1. `local-file`:
-   use this when the service is added on the same machine where
-   step-ca/OpenBao/responder are installed. The CLI applies local
-   updates (or creates) the managed profile block in `agent.toml` and
-   auto-generates OpenBao Agent
-   template/config/token files.
-2. `remote-bootstrap`:
-   use this when the service is added on a different machine from where
-   step-ca/OpenBao/responder are installed. The CLI writes a remote sync
-   bundle (`secret_id`/`eab`/`responder_hmac`/`trust`) to OpenBao KV and
-   generates a remote bootstrap artifact. Here, "remote sync" means
-   `bootroot` on the step-ca machine writes the desired config/secret bundle,
-   and `bootroot-remote` on the service machine pulls and applies it. The
-   "remote bootstrap artifact" is the generated output that contains the
-   initial inputs/run information needed to start that remote sync flow.
+#### 2-1) `local-file`
 
-This is the required step when adding a new service to prepare certificate
-issuance/renewal paths. However, `bootroot service add` itself does not issue
-certificates.
+- When to use: when the service is added on the same machine where
+  OpenBao/PostgreSQL/step-ca/HTTP-01 responder are installed
+- Auto-applied: managed profile block update (or create) in `agent.toml`,
+  plus local OpenBao Agent template/config/token file generation
+
+#### 2-2) `remote-bootstrap`
+
+- When to use: when the service is added on a different machine from where
+  OpenBao/PostgreSQL/step-ca/HTTP-01 responder are installed
+- Auto-applied: write remote OpenBao KV sync bundle
+  (`secret_id`/`eab`/`responder_hmac`/`trust`), generate remote bootstrap
+  artifact
+- Behavior meaning: `bootroot` on the step-ca machine writes the config/secret
+  bundle, and `bootroot-remote` on the service machine pulls and applies it
+- Artifact meaning: generated output that contains initial inputs/run
+  information required to start remote synchronization
+
+### 3) Command scope and operator actions
+
+- This is the required step to prepare certificate issuance/renewal paths for
+  a newly added service.
+- `bootroot service add` itself does not issue certificates.
 
 You still need to perform:
 
@@ -318,38 +338,44 @@ You still need to perform:
   service machine
 - Validate issuance path via `bootroot verify` or real service startup
 
+### 4) Trust automation and preview
+
 In the default flow, a successful `bootroot init` automatically prepares
 `secret/bootroot/ca` in OpenBao. Then, in default apply mode (without
 `--print-only`/`--dry-run`), `bootroot service add` also handles trust values
 automatically as part of onboarding.
 
-- `remote-bootstrap` path: it writes
+#### 4-1) Trust automation by delivery mode
+
+- `remote-bootstrap` mode: it writes
   `trusted_ca_sha256` into the per-service remote sync bundle
   (`secret/.../services/<service>/trust`), and `bootroot-remote sync`
   applies it to trust settings in `agent.toml` on the service machine.
-- `local-file` path: trust settings are auto-merged into `agent.toml`
+- `local-file` mode: trust settings are auto-merged into `agent.toml`
   (`trusted_ca_sha256` and `ca_bundle_path`), and CA bundle PEM is written
   to the local `ca_bundle_path` when OpenBao trust data includes
   `ca_bundle_pem`.
-- bootroot-agent runtime hardening (summary): after first successful issuance
+
+#### 4-2) bootroot-agent runtime hardening (summary)
+
+- After first successful issuance
   in normal execution, bootroot-agent auto-writes
   `trust.verify_certificates = true` to `agent.toml` and uses ACME server TLS
   verification from subsequent runs. A run with `--insecure` bypasses
   verification only for that run and skips hardening. For full rules and
-  operating flow, see **Configuration > Trust**.
+  operating flow, see [Configuration > Trust](configuration.md#trust).
 
-Preview mode note (`--print-only`/`--dry-run`):
+#### 4-3) Preview mode (`--print-only`/`--dry-run`)
 
 - If `--root-token` is provided, preview also queries OpenBao trust data and
   prints trust snippets.
 - Without `--root-token`, preview prints why trust snippets are unavailable.
+- `--print-only`/`--dry-run` is preview mode: it does not write files/state.
 
-Common cases where manual setup is still needed:
+#### 4-4) Common manual setup cases
 
-- you want to pin trust fields directly in `agent.toml` for `local-file`
-- you apply configuration only from preview output
-
-`--print-only`/`--dry-run` is preview mode: it does not write files/state.
+- You want to pin trust fields directly in `agent.toml` for `local-file`.
+- You apply configuration only from preview output.
 
 ### Runtime deployment policy
 
@@ -491,7 +517,7 @@ If you want **continuous renewal**, run bootroot-agent in daemon mode
 - `--service-name`: service name identifier
 - `--agent-config`: bootroot-agent config path override (optional)
 - `--db-check`: verify DB connectivity and auth using ca.json DSN
-- `--db-timeout-secs`: DB connectivity timeout (seconds)
+- `--db-timeout-secs`: DB connectivity timeout (seconds, default `2`)
 
 ### Interactive behavior
 
@@ -548,14 +574,15 @@ Per subcommand:
 
 #### `rotate eab`
 
-- `--stepca-url`: step-ca URL
-- `--stepca-provisioner`: ACME provisioner name
+- `--stepca-url`: step-ca URL (default `https://localhost:9000`)
+- `--stepca-provisioner`: ACME provisioner name (default `acme`)
 
 #### `rotate db`
 
 - `--db-admin-dsn`: DB admin DSN (env `BOOTROOT_DB_ADMIN_DSN`)
-- `--db-password`: new DB password (optional, auto-generated if omitted)
-- `--db-timeout-secs`: DB timeout in seconds
+- `--db-password`: new DB password
+  (optional, auto-generated if omitted, env `BOOTROOT_DB_PASSWORD`)
+- `--db-timeout-secs`: DB timeout in seconds (default `2`)
 
 #### `rotate responder-hmac`
 
@@ -665,9 +692,10 @@ Starts Prometheus and Grafana for the selected profile.
 
 Inputs:
 
+- `--compose-file`: compose file path (default `docker-compose.yml`)
 - `--profile`: `lan` or `public` (default `lan`)
 - `--grafana-admin-password`: sets Grafana admin password for **first boot**
-  (can also be passed via `GRAFANA_ADMIN_PASSWORD`)
+  (environment variable: `GRAFANA_ADMIN_PASSWORD`)
 
 Behavior:
 
@@ -694,6 +722,8 @@ Notes:
 
 - This command auto-detects the running profile(s). It does not accept
   `--profile`.
+- You can pass `--compose-file` to target another compose file
+  (default `docker-compose.yml`).
 
 ### `monitoring down`
 
@@ -701,6 +731,7 @@ Stops and removes monitoring containers without affecting infra.
 
 Inputs:
 
+- `--compose-file`: compose file path (default `docker-compose.yml`)
 - `--reset-grafana-admin-password`: deletes Grafana data volume so the next
   `monitoring up` can reapply a new admin password
 
@@ -724,8 +755,11 @@ Pulls and applies service secrets/config to remote file paths.
 
 Key inputs:
 
-- `--openbao-url`, `--kv-mount`, `--service-name`
-  - environment variables: `OPENBAO_URL`, `OPENBAO_KV_MOUNT`
+- `--openbao-url`: OpenBao API URL (environment variable: `OPENBAO_URL`)
+- `--kv-mount`: OpenBao KV v2 mount path
+  (environment variable: `OPENBAO_KV_MOUNT`)
+  (default `secret`)
+- `--service-name`
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`
 - `--agent-config-path`
 - baseline/profile inputs:
@@ -744,7 +778,7 @@ Key inputs:
     - `--profile-instance-id`: empty string (`""`)
 - `--ca-bundle-path`
   - required to write bundle files when trust data includes `ca_bundle_pem`.
-- `--summary-json` (optional) and `--output text|json`
+- `--summary-json` (optional) and `--output text|json` (default `text`)
 
 If `agent.toml` does not exist yet, pull creates a baseline config and then
 updates (or creates) a managed profile block for the service.
@@ -767,9 +801,9 @@ In production, run this command periodically via systemd timer or cron.
 
 Key retry controls:
 
-- `--retry-attempts`
-- `--retry-backoff-secs`
-- `--retry-jitter-secs`
+- `--retry-attempts` (default `3`)
+- `--retry-backoff-secs` (default `5`)
+- `--retry-jitter-secs` (default `0`)
 
 Other inputs:
 
@@ -780,6 +814,7 @@ Other inputs:
 - For ack passthrough, it also accepts `--bootroot-bin` (default `bootroot`)
   and optional `--state-file`.
 - It also accepts `--output text|json` for pull-stage output format.
+  (default `text`)
 
 Summary JSON contract items:
 
