@@ -333,8 +333,13 @@ cargo build --release
 
 TLS verification override:
 
+For detailed behavior and the recommended operating flow, see
+[Configuration > Trust](configuration.md#trust).
+
 - `--verify-certificates` forces ACME server TLS verification on.
-- `--insecure` disables verification (**insecure**, overrides config).
+- `--insecure` disables verification for that run (**insecure**, overrides
+  config). In normal mode runs (without `--insecure`), successful issuance
+  auto-hardens `trust.verify_certificates = true`.
 
 #### CA bundle consumer permissions
 

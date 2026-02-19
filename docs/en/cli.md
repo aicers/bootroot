@@ -331,6 +331,12 @@ automatically as part of onboarding.
   (`trusted_ca_sha256` and `ca_bundle_path`), and CA bundle PEM is written
   to the local `ca_bundle_path` when OpenBao trust data includes
   `ca_bundle_pem`.
+- bootroot-agent runtime hardening (summary): after first successful issuance
+  in normal execution, bootroot-agent auto-writes
+  `trust.verify_certificates = true` to `agent.toml` and uses ACME server TLS
+  verification from subsequent runs. A run with `--insecure` bypasses
+  verification only for that run and skips hardening. For full rules and
+  operating flow, see **Configuration > Trust**.
 
 Preview mode note (`--print-only`/`--dry-run`):
 

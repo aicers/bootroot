@@ -150,18 +150,27 @@ bootroot service sync-status \
 
 ## CA 번들(trust) 운영
 
-`trust` 설정을 켜면 bootroot-agent는 ACME 응답에서 **리프와 체인을 분리**해
-리프 인증서/키를 저장하고, 체인(중간/루트)을 `ca_bundle_path`에 저장합니다.
-이 번들은 mTLS에서 상대 인증서 검증에 사용됩니다.
+이 섹션은 `trust.ca_bundle_path`, `trust.trusted_ca_sha256`,
+`trust.verify_certificates` 3개 값의 운영 기준을 설명합니다.
 
-- `trust.ca_bundle_path`는 **CA 번들 파일 경로**입니다.
-- `trust.trusted_ca_sha256`를 지정하면 응답의 체인이 **지문 검증을 통과해야**
-  저장됩니다. 불일치 시 발급이 실패합니다.
-- 체인이 없는 응답이라면 CA 번들을 저장하지 않습니다(로그에 남습니다).
-- `trust.verify_certificates = true`이면 bootroot-agent가 ACME 서버 TLS
-  인증서를 검증합니다. `ca_bundle_path`가 있으면 그 번들을 사용하고,
+- `trust.ca_bundle_path`와 `trust.trusted_ca_sha256`를 구성하면
+  bootroot-agent는 발급 응답에서 리프 인증서와 체인을 분리합니다.
+  리프 인증서/키는 서비스 경로에 저장하고, 체인(중간/루트)은
+  `trust.ca_bundle_path`에 저장합니다.
+- `trust.trusted_ca_sha256`가 설정되어 있으면 체인 지문 검증을 통과한 경우에만
+  번들을 저장합니다. 지문이 불일치하면 발급이 실패합니다.
+- 응답에 체인이 없으면 CA 번들은 갱신하지 않으며 로그에 경고를 남깁니다.
+- `trust.verify_certificates = true`이면 bootroot-agent가 ACME 서버(step-ca)의
+  TLS 인증서를 검증합니다. `ca_bundle_path`가 있으면 그 번들을 사용하고,
   없으면 시스템 CA 저장소를 사용합니다.
-- CLI 오버라이드: `bootroot-agent --verify-certificates` 또는 `--insecure`.
+- CLI 오버라이드:
+  `bootroot-agent --verify-certificates`(해당 실행에서 검증 강제) 또는
+  `bootroot-agent --insecure`(해당 실행에서만 검증 비활성화).
+- 일반 모드(`--insecure` 없이)에서 첫 발급이 성공하면, bootroot-agent는
+  `agent.toml`의 `trust.verify_certificates` 값을 `true`로 자동 기록해
+  이후 실행부터 검증 모드로 전환합니다.
+- 이 자동 전환 과정에서 파일 쓰기 또는 재로드 검증이 실패하면
+  bootroot-agent는 non-zero로 종료합니다.
 
 권한/소유권:
 

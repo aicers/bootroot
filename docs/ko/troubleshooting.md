@@ -91,6 +91,12 @@
 - 시스템 trust 또는 `trust.ca_bundle_path`가 올바른지 확인
 - 임시 진단 용도로만 `bootroot-agent --insecure` 사용 (운영 비권장)
 
+### 발급 직후 자동 강화 실패
+
+- 증상: 발급은 성공했지만 직후 bootroot-agent가 non-zero로 종료됨
+- 원인: `trust.verify_certificates = true` 자동 기록/재로드 검증 실패
+- 확인: `--config` 경로, 파일 권한, `agent.toml` 문법
+
 ## 파일/훅 관련 오류
 
 - `profiles.paths`의 상위 디렉터리 존재 여부와 쓰기 권한 확인

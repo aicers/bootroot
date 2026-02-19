@@ -172,73 +172,65 @@ ca_bundle_path = "/etc/bootroot/ca-bundle.pem"
 trusted_ca_sha256 = ["<sha256-hex>"]
 ```
 
-mTLS 신뢰와 **ACME 서버 TLS 검증**을 제어하는 설정입니다.
+mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 
-개념 정리:
+#### 1) 개념 구분
 
-- **mTLS 신뢰**: 서비스가 서로의 인증서를 검증할 때 사용할 **신뢰 번들**입니다.
-  bootroot-agent가 발급 응답의 체인(중간/루트)을 `ca_bundle_path`에 저장하면,
-  이 파일을 서비스의 trust store로 사용합니다.
-- **ACME 서버 TLS 검증**: bootroot-agent가 step-ca(ACME 서버)와 통신할 때
-  **서버 인증서를 검증하는 동작**입니다. 이는 mTLS와 별개의 개념입니다.
+1. **mTLS 신뢰**: 서비스가 상대 인증서를 검증할 때 사용할 신뢰 번들입니다.
+   bootroot-agent는 발급 응답의 체인(중간/루트)을 `ca_bundle_path`에 저장합니다.
+2. **ACME 서버 TLS 검증**: bootroot-agent가 step-ca(ACME 서버)와 통신할 때
+   서버 인증서를 검증하는 동작입니다. mTLS 신뢰와는 별도입니다.
 
-설정 항목:
+#### 2) 핵심 설정
 
-- `verify_certificates`: **ACME 서버 TLS 검증** 여부입니다.
-  mTLS 신뢰 설정이 아니라, step-ca와 통신할 때 bootroot-agent가
-  서버 인증서를 검증할지 결정합니다.
-- `ca_bundle_path`: bootroot-agent가 **CA 번들(중간/루트)을 저장할 경로**입니다.
-  `verify_certificates = true`일 때 이 값을 설정하면 **이 번들을 ACME 서버
-  신뢰 번들로도 사용**합니다.
-- `trusted_ca_sha256`: 신뢰할 CA 인증서 지문 목록(SHA-256 hex)입니다.
-- trust를 구성하면 `ca_bundle_path`와 `trusted_ca_sha256`를 함께 설정해야
-  합니다(둘 중 하나만 설정하면 검증에서 실패).
+- `verify_certificates`: ACME 서버 TLS 검증 사용 여부
+- `ca_bundle_path`: CA 번들(중간/루트) 저장 경로
+- `trusted_ca_sha256`: 신뢰할 CA 인증서 지문 목록(SHA-256 hex)
+- `verify_certificates = true`인데 `ca_bundle_path`가 없으면 시스템 CA 저장소를 사용
+- 기본값은 `verify_certificates = false` (호환성 목적)
 
-`trusted_ca_sha256`는 **임의 값이 아니라 실제 CA 인증서 지문**입니다.
-`bootroot init`이 CA 지문을 OpenBao에 저장하고, 이후 `bootroot service add`는
-`--delivery-mode`에 따라 이를 다르게 반영합니다.
+`trusted_ca_sha256`는 임의 값이 아니라 실제 CA 인증서 지문이어야 합니다.
 
-- `--delivery-mode remote-bootstrap`: 지문이 서비스별 원격 sync trust 경로에 자동 기록되고,
-  `bootroot-remote sync` 단계에서 서비스 머신의 `agent.toml`에 반영됩니다.
-- `--delivery-mode local-file`: trust 설정(`trusted_ca_sha256`,
-  `ca_bundle_path`)이 `agent.toml`에 자동 병합됩니다. OpenBao trust 데이터에
-  `ca_bundle_pem`도 있으면 bootroot가 해당 PEM을 `ca_bundle_path` 파일에
-  제한 권한으로 자동 반영합니다.
+#### 3) `--delivery-mode` 연동
 
-`verify_certificates = true`인데 `ca_bundle_path`가 없으면,
-bootroot-agent는 **시스템 CA 저장소**로 ACME 서버를 검증합니다.
+- `remote-bootstrap`: 서비스별 원격 sync trust 경로에 지문이 기록되고,
+  `bootroot-remote sync`가 서비스 머신 `agent.toml`에 반영
+- `local-file`: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)을
+  `agent.toml`에 자동 병합, OpenBao trust 데이터에 `ca_bundle_pem`이 있으면
+  `ca_bundle_path` 파일도 자동 반영
 
-기본값: `verify_certificates = false` (호환성 유지 목적). 운영 환경에서는
-검증을 활성화하고 신뢰할 CA 소스를 제공하는 것을 권장합니다.
+#### 4) 실행 플래그 동작
 
-운영 팁:
+- `--insecure`: 해당 실행에서 `verify_certificates=false` 강제
+- `--verify-certificates`: 해당 실행에서 `verify_certificates=true` 강제
+- 둘 다 없으면 기존 설정값 그대로 사용
 
-- bootroot-agent가 **처음** step-ca와 통신할 때는 `ca_bundle_path`에
-  신뢰할 CA 번들이 **미리 존재해야** 합니다(수동 설치 필요).
-  이 과정이 번거롭다면, **일시적으로** `bootroot-agent --insecure`로
-  발급을 진행할 수 있습니다.
-- 한 번 발급이 성공하면 bootroot-agent가 체인을 `ca_bundle_path`에
-  저장합니다. 이후 **정기 갱신(cron/daemon)** 단계에서는
-  `--insecure`를 사용하지 말고 **검증을 유지**하는 것이 안전합니다.
-- 위 흐름을 사용하면 `agent.toml`의 `verify_certificates = true`는
-  그대로 두고, 필요 시에만 CLI로 임시 우회할 수 있습니다.
+#### 5) 권장 운영 절차
 
-참고: 단일 step-ca를 사용하는 환경에서는 mTLS 신뢰 번들과
-ACME 서버 검증에 **같은 `ca_bundle_path`를 재사용하는 운영**이 가능합니다.
-다만 두 개념은 목적이 다르므로 필요 시 분리할 수 있다는 점은 기억하세요.
+목표: "첫 발급은 미검증, 이후는 검증" 흐름
 
-`--delivery-mode remote-bootstrap` 경로에서 trust 반영이 되지 않거나 값이 비어 있으면 다음을
-확인하세요.
+1. 초기 `agent.toml`을 `trust.verify_certificates = false`로 둡니다.
+2. 첫 발급을 `--insecure` 없이 실행합니다.
+3. 첫 발급 성공 시 bootroot-agent가 `trust.verify_certificates = true`를 자동 기록합니다.
+4. 이후 정기 갱신(cron/daemon)을 `--insecure` 없이 실행해 검증 모드를 유지합니다.
 
-- step-ca 초기화로 `secrets/certs/root_ca.crt`,
-  `secrets/certs/intermediate_ca.crt`가 생성되어 있는지
-- `bootroot init`이 같은 `secrets_dir`을 사용해 실행되었는지
-- OpenBao의 `secret/bootroot/ca` 경로에 `trusted_ca_sha256`가 있는지
+#### 6) 실패/주의 사항
 
-권한 참고: CA 번들을 사용하는 서비스가 `ca_bundle_path`를 읽을 수 있어야
-합니다. 가장 간단한 방법은 bootroot-agent와 서비스를 동일 사용자/그룹으로
-실행하는 것이며, 그렇지 않다면 파일과 상위 디렉터리에 읽기 권한을 부여해야
-합니다.
+- 자동 전환의 파일 쓰기/재로드 검증이 실패하면 bootroot-agent는 non-zero로 종료
+- `--insecure` 실행은 해당 실행에서만 우회하며 자동 강화를 건너뜀
+- 다음 일반 실행에서 자동 강화 조건을 다시 검사
+- 단일 step-ca 환경에서는 mTLS 번들과 ACME 검증에 같은 `ca_bundle_path` 재사용 가능
+
+#### 7) 점검 체크리스트
+
+- `--delivery-mode remote-bootstrap`에서 trust가 비면 아래를 확인
+- `secrets/certs/root_ca.crt`, `secrets/certs/intermediate_ca.crt` 존재 여부
+- `bootroot init` 실행 시 동일 `secrets_dir` 사용 여부
+- OpenBao `secret/bootroot/ca` 경로의 `trusted_ca_sha256` 존재 여부
+
+권한 참고: `ca_bundle_path`는 이를 읽는 서비스가 접근 가능해야 합니다.
+가장 단순한 방법은 bootroot-agent와 서비스를 같은 사용자/그룹으로 실행하는
+것입니다.
 
 ### 재시도 설정
 

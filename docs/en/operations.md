@@ -151,18 +151,29 @@ Security notes:
 
 ## CA bundle (trust) operations
 
-When `trust` is enabled, bootroot-agent **splits the leaf and chain** from the
-ACME response, stores the leaf cert/key, and writes the chain (intermediate/root)
-to `ca_bundle_path`. This bundle is used for mTLS peer verification.
+This section covers how to operate three trust settings together:
+`trust.ca_bundle_path`, `trust.trusted_ca_sha256`, and
+`trust.verify_certificates`.
 
-- `trust.ca_bundle_path` is the **CA bundle output path**.
-- If `trust.trusted_ca_sha256` is set, the response chain **must pass
-  fingerprint verification** or issuance fails.
-- If no chain is present, the CA bundle is not written (logged).
+- When `trust.ca_bundle_path` and `trust.trusted_ca_sha256` are configured,
+  bootroot-agent splits the ACME issuance response into leaf + chain.
+  The leaf cert/key are stored in service paths, and the chain
+  (intermediate/root) is written to `trust.ca_bundle_path`.
+- If `trust.trusted_ca_sha256` is set, bundle write is allowed only when the
+  chain fingerprint check passes. A mismatch fails issuance.
+- If the response has no chain, the CA bundle is not updated and a warning
+  is logged.
 - With `trust.verify_certificates = true`, bootroot-agent verifies the ACME
-  server TLS certificate. If `ca_bundle_path` is set, it uses that bundle;
-  otherwise it uses the system CA store.
-- CLI override: `bootroot-agent --verify-certificates` or `--insecure`.
+  server (step-ca) TLS certificate. If `ca_bundle_path` is set, it uses that
+  bundle; otherwise it uses the system CA store.
+- CLI overrides:
+  `bootroot-agent --verify-certificates` (force verify for that run) or
+  `bootroot-agent --insecure` (disable verify only for that run).
+- In normal mode (without `--insecure`), after the first successful issuance,
+  bootroot-agent auto-writes `trust.verify_certificates = true` in
+  `agent.toml`, so subsequent runs switch to verification mode.
+- If file write or reload validation fails during this hardening step,
+  bootroot-agent exits non-zero.
 
 Permissions/ownership:
 

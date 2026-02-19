@@ -318,6 +318,11 @@ bootroot status
 - `local-file` 경로: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)이
   `agent.toml`에 자동 병합되며, OpenBao trust 데이터에 `ca_bundle_pem`이
   있으면 로컬 `ca_bundle_path` 파일에도 자동 반영됩니다.
+- bootroot-agent 런타임 자동 강화(요약): 일반 실행에서 첫 발급이 성공하면
+  `trust.verify_certificates = true`를 `agent.toml`에 자동 기록해 이후 실행부터
+  ACME 서버 TLS 검증을 사용합니다. `--insecure` 실행은 해당 실행에서만
+  검증을 우회하고 자동 강화를 건너뜁니다. 자세한 규칙/운영 흐름은 **설정 > 신뢰**
+  섹션을 참고하세요.
 
 preview 모드(`--print-only`/`--dry-run`) 주의:
 

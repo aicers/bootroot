@@ -15,7 +15,14 @@ async fn main() -> anyhow::Result<()> {
 
     if args.oneshot {
         let (settings, final_eab) = load_settings(&args).await?;
-        match daemon::run_oneshot(Arc::new(settings), final_eab).await {
+        match daemon::run_oneshot(
+            Arc::new(settings),
+            final_eab,
+            args.config.clone(),
+            args.insecure,
+        )
+        .await
+        {
             Ok(()) => info!("Successfully issued certificate!"),
             Err(err) => {
                 error!("Failed to issue certificate: {err:?}");
@@ -35,7 +42,12 @@ async fn main() -> anyhow::Result<()> {
         };
         log_settings(&settings, final_eab.as_ref());
         let settings = Arc::new(settings);
-        let mut task = tokio::spawn(daemon::run_daemon(Arc::clone(&settings), final_eab));
+        let mut task = tokio::spawn(daemon::run_daemon(
+            Arc::clone(&settings),
+            final_eab,
+            args.config.clone(),
+            args.insecure,
+        ));
         #[cfg(unix)]
         loop {
             tokio::select! {

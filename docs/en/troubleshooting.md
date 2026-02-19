@@ -92,6 +92,13 @@ If only one side changes, the flow is usually broken in `pull/sync/ack`.
 - Validate system trust or `trust.ca_bundle_path`
 - Use `bootroot-agent --insecure` only for temporary diagnosis
 
+### Auto-hardening failed after issuance
+
+- Symptom: issuance succeeded, but bootroot-agent exits non-zero right after.
+- Cause: writing/reloading `agent.toml` for
+  `trust.verify_certificates = true` failed.
+- Check `--config` path, file permissions, and config syntax.
+
 ## File and hook errors
 
 - Check parent directory existence and write permission for `profiles.paths`
