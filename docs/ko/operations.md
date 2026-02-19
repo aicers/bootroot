@@ -1,10 +1,33 @@
 # 운영
 
-이 섹션은 운영 체크리스트와 장애 대응(runbook)에 집중합니다. 설치/설정은
+이 섹션은 운영 체크리스트와 장애 대응 절차에 집중합니다. 설치/설정은
 **설치**와 **설정** 섹션을 참고하세요.
 CLI 명령 자체는 [CLI 문서](cli.md)를 참고하세요.
 
 CI/테스트 운영 기준은 [CI/E2E](e2e-ci.md)를 참고하세요.
+
+## 자동화 경계(필독)
+
+bootroot 자동화 범위:
+
+- 설정/산출물 생성 및 갱신(`agent.toml`, `agent.hcl`, `agent.toml.ctmpl`,
+  `token`, sync 관련 파일)
+- 서비스 추가 시 전달 모드별 상태 기록과 동기화 데이터 준비
+- rotate/verify/status 등 운영 명령 실행 흐름 제공
+
+운영자 책임 범위:
+
+- 바이너리 설치/업데이트(`bootroot`, `bootroot-agent`, `bootroot-remote`,
+  OpenBao Agent)
+- 프로세스 상시 실행 보장(시작/재시작/부팅 시 자동 시작)
+- 런타임 통합(`docker compose` 또는 `systemd`)
+
+정책 요약:
+
+- Compose 경로는 권장 운영 경로입니다.
+- systemd 경로도 지원하지만, 동일 신뢰성 요건(상시 실행/재시작/의존성)을
+  운영자가 직접 충족해야 합니다.
+- 어느 경로든 bootroot가 전체 런타임 생명주기를 완전 관리하지는 않습니다.
 
 ## 운영 기본 점검 루틴
 
@@ -62,6 +85,28 @@ bootroot monitoring status
 - Grafana 관리자 비밀번호를 초기 상태로 되돌리려면
   `bootroot monitoring down --reset-grafana-admin-password`를 사용합니다.
 
+## Compose 운영 절차(권장)
+
+- 서비스 본체와 필요한 에이전트/사이드카가 모두 상시 실행 상태인지 확인합니다.
+- `restart: always` 또는 `restart: unless-stopped` 정책을 명시합니다.
+- 호스트 재부팅 후 자동 기동되도록 Docker/Compose 서비스 자체를
+  systemd 등으로 관리합니다.
+- 기본 점검 순서:
+  `docker compose ps` -> `docker compose logs --tail=200 <service>`
+  -> `bootroot verify --service-name <service>`.
+
+## systemd 운영 절차(지원)
+
+- `bootroot-agent`를 long-running 서비스로 등록하고 `Restart=on-failure`,
+  `WantedBy=multi-user.target`를 적용합니다.
+- OpenBao Agent를 systemd로 운영한다면 서비스별로 분리하고
+  `After=network-online.target` 같은 의존성 순서를 명시합니다.
+- `bootroot-remote`는 서비스별 timer/cron으로 주기 실행하고, 중복 실행 방지
+  잠금(`flock`)을 적용합니다.
+- 점검 순서:
+  `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
+  -> `bootroot verify --service-name <service>`.
+
 ## 회전 스케줄링
 
 `bootroot rotate ...`는 크론/systemd 타이머로 주기 실행합니다. 토큰 등
@@ -115,6 +160,7 @@ WantedBy=timers.target
 - 서비스별 주기 실행 작업 1개
 - 서비스별 `--summary-json` 경로 분리
 - role/secret/token/config 경로를 서비스 단위로 분리
+- 중복 실행 방지 잠금 적용(`flock` 등)
 
 최소 환경/설정 체크리스트:
 
@@ -129,6 +175,15 @@ WantedBy=timers.target
 - `bootroot-remote sync`의 retry/backoff/jitter 사용
 - `failed`/`expired` 상태가 반복되면 알림 연계
 - pull summary JSON과 `bootroot service sync-status`를 함께 확인
+
+systemd timer 권장 예시(중복 실행 방지):
+
+```ini
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n /var/lock/bootroot-remote-<service>.lock \
+  /usr/local/bin/bootroot-remote sync ...
+```
 
 수동 반영(예외 상황):
 

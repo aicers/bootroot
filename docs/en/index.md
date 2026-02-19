@@ -59,13 +59,22 @@ core commands like `infra up/init/status`, `service add/verify`, `rotate`, and
 `monitoring`, plus `bootroot-remote pull/ack/sync`.
 The rest of this manual focuses on the **manual setup** flow.
 
+## Automation Boundary (Summary)
+
+- Bootroot-managed: config/material generation and updates, state recording,
+  sync input preparation
+- Operator-managed: binary installation/update, process always-on ownership,
+  runtime integration (Compose/systemd)
+- Policy: Compose is recommended, systemd is supported. In both paths,
+  operators must satisfy reliability requirements directly.
+
 ## Installation Topology (Summary)
 
 The `bootroot` CLI assumes a topology where `step-ca (with PostgreSQL)`,
 `OpenBao`, and the `HTTP-01 responder` are installed on the **same machine**.
 This is the most natural default path for security (simpler trust boundary),
 convenience (more automation), and operations (simpler troubleshooting and
-runbooks).
+operational procedures).
 `Prometheus` and `Grafana` are also typically colocated on that machine to
 monitor `OpenBao` and `step-ca`.
 
@@ -119,6 +128,8 @@ in practice many deployments configure `/etc/hosts` mappings directly.
    (`<instance_id>.<service_name>.<hostname>.<domain>`) to the responder IP.
    Configure mappings in the environment where step-ca runs
    (container/host `/etc/hosts`) or in DNS.
+   If step-ca accesses services by IP literal instead of service FQDN, this
+   specific name mapping is not required.
 
 2. Remote service machine -> step-ca/responder name -> IP  
    If a service runs on a different machine from step-ca/OpenBao and that
@@ -126,6 +137,8 @@ in practice many deployments configure `/etc/hosts` mappings directly.
    resolve to the correct IPs on that service machine. Example: when using
    `stepca.internal` and `responder.internal`, configure the same mappings in
    that machine's `/etc/hosts` or DNS.
+   If the remote service machine accesses step-ca/responder by IP literal,
+   this specific hostname mapping is not required.
 
 ## Architecture (High Level)
 

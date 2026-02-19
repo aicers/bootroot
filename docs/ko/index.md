@@ -50,6 +50,14 @@ CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리
 이 매뉴얼의 나머지 섹션은 **CLI를 쓰지 않는 수동 절차**를 기준으로
 설명합니다.
 
+## 자동화 경계(요약)
+
+- bootroot가 자동화하는 것: 설정/산출물 생성과 갱신, 상태 기록, 동기화 입력 준비
+- 운영자가 책임지는 것: 바이너리 설치/업데이트, 프로세스 상시 실행 보장,
+  런타임 통합(Compose/systemd)
+- 정책: Compose는 권장 경로이고, systemd는 지원 경로입니다.
+  두 경로 모두 운영자가 신뢰성 요건을 직접 충족해야 합니다.
+
 ## 설치 토폴로지(요약)
 
 `bootroot` CLI는 `step-ca (with PostgreSQL)`, `OpenBao`, `HTTP-01 responder`
@@ -110,6 +118,8 @@ step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-r
    (`<instance_id>.<service_name>.<hostname>.<domain>`)을 리스폰더 IP로
    해석할 수 있어야 합니다. 이를 위해 step-ca가 동작하는 환경(컨테이너/호스트)의
    hosts 설정(`/etc/hosts`) 또는 DNS에 매핑을 넣어야 합니다.
+   step-ca가 서비스 FQDN 대신 IP literal로 직접 접근하는 구성이라면
+   해당 이름 매핑은 필요하지 않습니다.
 
 2. 원격 서비스 머신 -> step-ca/responder 이름 -> IP 경로  
    서비스가 step-ca/OpenBao와 다른 머신에 추가되는 경우, 해당 서비스 머신에서
@@ -117,6 +127,8 @@ step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-r
    해석되어야 합니다. 예: `stepca.internal`, `responder.internal`을
    사용하는 경우 서비스 머신의 hosts 설정(`/etc/hosts`) 또는 DNS에 동일 매핑을
    구성해야 합니다.
+   반대로 step-ca/responder를 IP literal로 직접 접근하면 이 이름 매핑은
+   필요하지 않습니다.
 
 ## 아키텍처(요약)
 
