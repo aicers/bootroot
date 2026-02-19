@@ -159,6 +159,12 @@ must capture and store them securely. They are needed later to unseal
 OpenBao after restarts and to perform administrative recovery or policy
 changes.
 
+#### When unseal is required again
+
+Once OpenBao is unsealed, it does not require unsealing again until it returns
+to a sealed state. Common cases are process/container restart, node reboot,
+manual seal, or recovery procedures that transition the node back to sealed.
+
 #### AppRole credentials
 
 After bootstrap, the OpenBao Agent authenticates using **AppRole**

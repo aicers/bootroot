@@ -89,8 +89,11 @@ bootroot init: summary
 - db check: skipped
 - db host resolution: localhost -> postgres
 - OpenBao KV paths:
-    role_id: secrets/services/<service>/role_id
-    secret_id: secrets/services/<service>/secret_id
+  - bootroot/stepca/password
+  - bootroot/stepca/db
+  - bootroot/http01/hmac
+  - bootroot/ca
+  - bootroot/agent/eab
 - summary json: ./tmp/init-summary.json
 next steps:
   - Attach AppRole/secret_id to the service.
@@ -102,7 +105,29 @@ For automation, read sensitive fields (for example root token) from
 
 ## 3) service add
 
-### 3-1) daemon service
+`--delivery-mode` in `bootroot service add` selects how service configuration is
+applied.
+
+- default: `local-file`
+- `local-file`: use when the service is added on the **same machine** as
+  step-ca/OpenBao/responder
+- `remote-bootstrap`: use when the service is added on a **different machine**
+  from step-ca/OpenBao/responder
+- `--dry-run`, `--print-only`: both run in preview mode and do not write files
+  or state.
+- To show trust snippets in preview, also provide `--root-token`.
+- If preview runs without `--root-token`, the CLI prints why trust snippets are
+  unavailable.
+
+Sections 3-1 and 3-2 below are default (`local-file`) examples, and 3-3 is a
+`remote-bootstrap` example.
+
+> Note: `secrets/...` paths in sample outputs assume the default
+> `--secrets-dir secrets`. If you use another secrets root in production
+> (for example `/etc/bootroot/secrets`), read them with the same relative
+> structure.
+
+### 3-1) local-file (default): daemon service
 
 ```bash
 bootroot service add \
@@ -136,20 +161,39 @@ next steps:
   - secret_id path: secrets/services/edge-proxy/secret_id
   - OpenBao path: bootroot/services/edge-proxy
   - OpenBao Agent (per-service instance):
-    - config: secrets/openbao-agent/services/edge-proxy.hcl
+    - config: secrets/openbao/services/edge-proxy/agent.hcl
     - role_id file: secrets/services/edge-proxy/role_id
     - secret_id file: secrets/services/edge-proxy/secret_id
     - ensure secrets/services/edge-proxy is 0700 and
       role_id/secret_id files are 0600
     - run the service-specific OpenBao Agent on the host with
-      secrets/openbao-agent/services/edge-proxy.hcl
+      secrets/openbao/services/edge-proxy/agent.hcl
   - Add profile for edge-proxy (instance_id=001, hostname=edge-node-01,
     domain=trusted.domain, cert=/etc/bootroot/certs/edge-proxy.crt,
     key=/etc/bootroot/certs/edge-proxy.key) to /etc/bootroot/agent.toml
     and reload bootroot-agent.
 ```
 
-### 3-2) docker service
+In current CLI output, the same information is also grouped under
+`Bootroot-managed` and `Operator-managed (required/recommended/optional)` labels
+to make ownership boundaries explicit.
+
+Example (label-focused):
+
+```text
+Bootroot-managed:
+- auto-applied bootroot-agent config: ...
+- auto-applied OpenBao Agent config: ...
+
+Operator-managed (required):
+- run OpenBao Agent
+- run/reload bootroot-agent
+
+Operator-managed (optional):
+- apply manual trust pin/override instead of auto-applied trust values
+```
+
+### 3-2) local-file (default): docker service
 
 ```bash
 bootroot service add \
@@ -216,20 +260,32 @@ bootroot-remote sync \
   --profile-key-path /srv/bootroot/certs/edge-remote.key \
   --ca-bundle-path /srv/bootroot/certs/ca-bundle.pem \
   --summary-json /srv/bootroot/tmp/edge-remote-summary.json \
-  --state-file /srv/bootroot/state.json \
   --output json
 ```
 
-The sync summary drives `bootroot service sync-status` updates for:
-`secret_id`, `eab`, `responder_hmac`, and `trust_sync`.
+`bootroot-remote sync` runs pull and ack together, then applies the summary to
+`bootroot service sync-status` for `secret_id`, `eab`, `responder_hmac`, and
+`trust_sync`.
+Add `--state-file <path>` only when state.json is not in the default location.
+In operations, prefer the exact `remote run command` printed by
+`bootroot service add`.
 
-## 4) Local DNS/hosts setup for validation
+Additional input notes:
 
-In local setups, step-ca must resolve the HTTP-01 validation FQDNs to the
-responder container. The simplest option is to add /etc/hosts entries inside
-the step-ca container. This forces the **validation FQDNs** to resolve to
-the **responder container IP**, so HTTP-01 validation can succeed without
-real DNS records.
+- sync accepts the same pull inputs (`--openbao-url`, `--kv-mount`,
+  `--service-name`, `--role-id-path`, `--secret-id-path`, `--eab-file-path`,
+  `--agent-config-path`, baseline/profile inputs, `--ca-bundle-path`).
+- `--summary-json` is required for sync.
+- For ack passthrough, it also accepts `--bootroot-bin` (default `bootroot`)
+  and optional `--state-file`.
+- It also accepts `--output text|json` for pull-stage output format.
+
+## 4) DNS/hosts setup for CLI examples
+
+To run these CLI examples, step-ca must resolve HTTP-01 validation FQDNs to
+the responder container. In environments where DNS is not ready yet, add
+/etc/hosts entries inside the step-ca container to map
+**validation FQDNs -> responder container IP**.
 The validation FQDN follows `<instance_id>.<service_name>.<hostname>.<domain>`.
 
 ```bash
@@ -243,12 +299,16 @@ docker exec bootroot-ca sh -c \
 
 If you add more services, repeat the same command for each service FQDN.
 
-> In production, use proper DNS records instead.
-
 ## 5) service verify
 
 ```bash
 bootroot verify --service-name edge-proxy
+```
+
+To verify DB connectivity/auth as well:
+
+```bash
+bootroot verify --service-name edge-proxy --db-check
 ```
 
 Sample dialog/output (full):
@@ -277,7 +337,7 @@ when adding profiles and reload the daemon. Configure systemd so the process
 restarts automatically (set `Restart=always` or `on-failure`).
 
 ```bash
-openbao agent -config /etc/bootroot/openbao/services/edge-proxy/agent.hcl
+openbao agent -config /etc/bootroot/secrets/openbao/services/edge-proxy/agent.hcl
 ```
 
 ```bash
@@ -302,9 +362,10 @@ supported and not recommended. The sidecar pattern is preferred for isolation
 and lifecycle alignment.
 
 ```bash
+AGENT_HCL=/srv/bootroot/secrets/openbao/services/web-app/agent.hcl
 docker run --rm \
   --name openbao-agent-web-app \
-  -v /srv/bootroot/openbao/services/web-app/agent.hcl:/app/agent.hcl:ro \
+  -v "$AGENT_HCL":/app/agent.hcl:ro \
   -v /srv/bootroot/secrets:/app/secrets \
   openbao/bao:latest \
   agent -config /app/agent.hcl
@@ -353,7 +414,8 @@ set -euo pipefail
 
 bootroot rotate stepca-password --yes
 bootroot rotate eab --yes
-bootroot rotate db --yes
+bootroot rotate db --yes \
+  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
 bootroot rotate responder-hmac --yes
 ```
 

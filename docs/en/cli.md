@@ -37,8 +37,9 @@ Primary commands:
 
 What bootroot CLI installs/starts automatically (Docker path):
 
-- for `bootroot infra up`: image pull/build plus container create/start for
+- for `bootroot infra up`: image pull plus container create/start for
   OpenBao/PostgreSQL/step-ca/HTTP-01 responder
+  (if service images require build, run `docker compose build` separately)
 - in the bootroot default topology where step-ca/OpenBao/responder run on one
   machine, `bootroot init` generates step-ca/responder OpenBao Agent configs
   and enables `openbao-agent-stepca`/`openbao-agent-responder` via compose
@@ -135,6 +136,9 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--show-secrets`: show secrets in the summary
 - `--summary-json`: write init summary as machine-readable JSON
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
+  - required for normal apply mode.
+  - optional in preview mode (`--print-only`/`--dry-run`), but required if you
+    want trust preview output.
 - `--unseal-key`: OpenBao unseal key (repeatable, environment variable: `OPENBAO_UNSEAL_KEYS`)
 - `--openbao-unseal-from-file`: read OpenBao unseal keys from file (dev/test only)
 - `--stepca-password`: step-ca password (`password.txt`, environment variable: `STEPCA_PASSWORD`)
@@ -715,13 +719,25 @@ Pulls and applies service secrets/config to remote file paths.
 Key inputs:
 
 - `--openbao-url`, `--kv-mount`, `--service-name`
+  - environment variables: `OPENBAO_URL`, `OPENBAO_KV_MOUNT`
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`
 - `--agent-config-path`
 - baseline/profile inputs:
   `--agent-email`, `--agent-server`, `--agent-domain`,
   `--agent-responder-url`, `--profile-hostname`,
   `--profile-instance-id`, `--profile-cert-path`, `--profile-key-path`
+  - `--profile-cert-path` and `--profile-key-path` are optional.
+    If omitted, defaults are derived from `--agent-config-path` as
+    `certs/<service>.crt` and `certs/<service>.key`.
+  - defaults:
+    - `--agent-email`: `admin@example.com`
+    - `--agent-server`: `https://localhost:9000/acme/acme/directory`
+    - `--agent-domain`: `trusted.domain`
+    - `--agent-responder-url`: `http://127.0.0.1:8080`
+    - `--profile-hostname`: `localhost`
+    - `--profile-instance-id`: empty string (`""`)
 - `--ca-bundle-path`
+  - required to write bundle files when trust data includes `ca_bundle_pem`.
 - `--summary-json` (optional) and `--output text|json`
 
 If `agent.toml` does not exist yet, pull creates a baseline config and then
@@ -748,6 +764,16 @@ Key retry controls:
 - `--retry-attempts`
 - `--retry-backoff-secs`
 - `--retry-jitter-secs`
+
+Other inputs:
+
+- sync accepts the same pull inputs (`--openbao-url`, `--kv-mount`,
+  `--service-name`, `--role-id-path`, `--secret-id-path`, `--eab-file-path`,
+  `--agent-config-path`, baseline/profile inputs, `--ca-bundle-path`).
+- `--summary-json` is required for sync.
+- For ack passthrough, it also accepts `--bootroot-bin` (default `bootroot`)
+  and optional `--state-file`.
+- It also accepts `--output text|json` for pull-stage output format.
 
 Summary JSON contract items:
 

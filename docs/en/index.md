@@ -6,7 +6,7 @@ with **step-ca**, **OpenBao**, **Prometheus**, and **Grafana**. It is written
 so that a reader with no PKI background can complete a full installation and
 issue certificates successfully. The bootroot CLI binary is `bootroot`, the
 bootroot-agent binary is `bootroot-agent`, and the remote-service
-configuration CLI binary is `bootroot-agent`.
+configuration CLI binary is `bootroot-remote`.
 
 ## What Bootroot Does
 
@@ -45,14 +45,13 @@ RFC 8555 protocol used for automated issuance.
 - **CLI**: infra bring-up/initialization/status plus service onboarding,
   issuance verification, secret rotation, monitoring, and remote sync guidance
 - **Concepts**: PKI, ACME, CSR, SAN, mTLS, and OpenBao basics
-- **Getting Started**: Quick Docker-based issuance flow
 - **Installation**: OpenBao + step-ca + PostgreSQL + bootroot-agent +
   responder setup
 - **Configuration**: `agent.toml`, profiles, hooks, retries, and EAB
 - **Operations**: Renewal, logs, backup, and security (including OpenBao)
 - **CI & E2E**: PR-critical matrix, extended workflow, artifacts, and local
   reproduction
-- **Troubleshooting / FAQ**: Common issues and answers
+- **Troubleshooting**: Common issues and recovery steps
 
 CLI usage is documented in the [CLI manual](cli.md) and the
 [CLI examples](cli-examples.md). The CLI manual covers
@@ -108,6 +107,25 @@ If a service is added on the machine where step-ca is installed,
 bootroot-remote is not required.
 If a service is added on a different machine, bootroot-remote must be
 deployed on that service machine.
+
+## /etc/hosts Mapping
+
+For certificate issuance/renewal to work reliably, name-to-IP mapping
+(`/etc/hosts` or DNS) must satisfy both conditions below. DNS also works, but
+in practice many deployments configure `/etc/hosts` mappings directly.
+
+1. step-ca -> service FQDN (HTTP-01 target) -> responder IP  
+   step-ca must resolve each service validation FQDN
+   (`<instance_id>.<service_name>.<hostname>.<domain>`) to the responder IP.
+   Configure mappings in the environment where step-ca runs
+   (container/host `/etc/hosts`) or in DNS.
+
+2. Remote service machine -> step-ca/responder name -> IP  
+   If a service runs on a different machine from step-ca/OpenBao and that
+   machine accesses step-ca/responder by name (not direct IP), those names must
+   resolve to the correct IPs on that service machine. Example: when using
+   `stepca.internal` and `responder.internal`, configure the same mappings in
+   that machine's `/etc/hosts` or DNS.
 
 ## Architecture (High Level)
 

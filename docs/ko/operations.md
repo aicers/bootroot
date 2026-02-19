@@ -1,11 +1,28 @@
 # 운영
 
-이 섹션은 운영 체크리스트에 집중합니다. 설치/설정은 **설치**와 **설정**
-섹션을 참고하세요.
-CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서는 **수동 운영**
-절차를 기준으로 설명합니다.
+이 섹션은 운영 체크리스트와 장애 대응(runbook)에 집중합니다. 설치/설정은
+**설치**와 **설정** 섹션을 참고하세요.
+CLI 명령 자체는 [CLI 문서](cli.md)를 참고하세요.
 
 CI/테스트 운영 기준은 [CI/E2E](e2e-ci.md)를 참고하세요.
+
+## 운영 기본 점검 루틴
+
+운영자는 아래 명령을 주기적으로 실행해 상태를 빠르게 점검할 수 있습니다.
+
+```bash
+bootroot status
+bootroot verify --service-name <service> --db-check
+bootroot service info --service-name <service>
+bootroot monitoring status
+```
+
+- `bootroot status`: OpenBao/step-ca/상태 파일 기준의 전체 상태 확인
+- `bootroot verify --service-name <service> --db-check`:
+  비대화형으로 발급/검증/DB/리스폰더 연동 점검
+- `bootroot service info --service-name <service>`:
+  서비스별 전달 모드/항목별 sync-status 등 현재 상태 확인
+- `bootroot monitoring status`: Prometheus/Grafana 컨테이너 상태 확인
 
 ## bootroot-agent
 
@@ -37,10 +54,21 @@ CI/테스트 운영 기준은 [CI/E2E](e2e-ci.md)를 참고하세요.
 - KV v2 경로를 백업/스냅샷 정책에 포함합니다.
 - 시크릿 회전 시 bootroot-agent/step-ca 재시작 또는 리로드 정책을 확인합니다.
 
+## 모니터링 운영
+
+- `bootroot monitoring up --profile lan|public`으로 모니터링 컨테이너를 기동합니다.
+- `bootroot monitoring status`는 실행 중 프로필의 컨테이너 상태와 Grafana URL/관리자 비밀번호 상태를 출력합니다.
+- `bootroot monitoring down`으로 모니터링 컨테이너를 중지/삭제합니다.
+- Grafana 관리자 비밀번호를 초기 상태로 되돌리려면
+  `bootroot monitoring down --reset-grafana-admin-password`를 사용합니다.
+
 ## 회전 스케줄링
 
 `bootroot rotate ...`는 크론/systemd 타이머로 주기 실행합니다. 토큰 등
 민감값은 환경 파일이나 안전한 저장소로 관리하세요.
+`bootroot rotate` 계열 명령은 OpenBao root token이 필요하며,
+`--root-token` 또는 `OPENBAO_ROOT_TOKEN`으로 전달할 수 있습니다
+(없으면 프롬프트 입력).
 
 예시(크론):
 
@@ -72,9 +100,10 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-## 원격 sync 러너 운영
+## 원격 sync 주기 실행 운영
 
-remote-bootstrap 서비스는 `bootroot-remote sync`를 주기 실행해야 합니다.
+`--delivery-mode remote-bootstrap`으로 추가한 대상은
+`bootroot-remote sync`를 주기 실행해야 합니다.
 다음 템플릿 파일을 제공합니다.
 
 - `scripts/bootroot-remote-sync.service`
@@ -83,7 +112,7 @@ remote-bootstrap 서비스는 `bootroot-remote sync`를 주기 실행해야 합�
 
 권장 패턴:
 
-- 서비스별 러너 1개
+- 서비스별 주기 실행 작업 1개
 - 서비스별 `--summary-json` 경로 분리
 - role/secret/token/config 경로를 서비스 단위로 분리
 
@@ -101,10 +130,22 @@ remote-bootstrap 서비스는 `bootroot-remote sync`를 주기 실행해야 합�
 - `failed`/`expired` 상태가 반복되면 알림 연계
 - pull summary JSON과 `bootroot service sync-status`를 함께 확인
 
+수동 반영(예외 상황):
+
+- `bootroot-remote sync`가 만든 summary JSON을 수동 반영해야 할 때만
+  아래 명령을 사용합니다.
+
+```bash
+bootroot service sync-status \
+  --service-name <service> \
+  --summary-json <service>-remote-summary.json
+```
+
 보안 참고:
 
 - 시크릿 디렉터리 `0700`, 파일 `0600`
-- 원문 시크릿이 포함된 summary JSON을 공용 로그에 출력하지 않기
+- summary JSON은 상태/오류 요약 중심이지만, 운영 로그에는 필요한 범위만 남기고
+  장기 보관 정책을 분리하기
 - 서비스 계정 권한을 서비스별 경로로 최소화
 
 ## CA 번들(trust) 운영
