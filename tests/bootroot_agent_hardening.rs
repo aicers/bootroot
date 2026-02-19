@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use bootroot::config;
 use rcgen::generate_simple_self_signed;
+use reqwest::Certificate;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -22,12 +23,17 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 struct AcmeTlsFixture {
     addr: SocketAddr,
+    ca_pem: String,
     handle: JoinHandle<()>,
 }
 
 impl AcmeTlsFixture {
     fn directory_url(&self) -> String {
-        format!("https://127.0.0.1:{}/directory", self.addr.port())
+        format!("https://localhost:{}/directory", self.addr.port())
+    }
+
+    fn ca_pem(&self) -> &str {
+        &self.ca_pem
     }
 }
 
@@ -103,9 +109,10 @@ fn acme_fixture_response(
     }
 }
 
-async fn assert_fixture_reachable(directory_url: &str) {
+async fn assert_fixture_reachable(directory_url: &str, ca_pem: &str) {
+    let ca_cert = Certificate::from_pem(ca_pem.as_bytes()).expect("parse fixture CA certificate");
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .add_root_certificate(ca_cert)
         .timeout(Duration::from_secs(2))
         .build()
         .expect("build fixture probe client");
@@ -136,12 +143,12 @@ async fn start_acme_tls_fixture() -> Result<AcmeTlsFixture> {
         )
         .context("build tls config")?;
 
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind("localhost:0")
         .await
         .context("bind fixture listener")?;
     let addr = listener.local_addr().context("fixture local addr")?;
     let acceptor = TlsAcceptor::from(Arc::new(config));
-    let base = format!("https://127.0.0.1:{}", addr.port());
+    let base = format!("https://localhost:{}", addr.port());
     let nonce_value = "fixture-nonce";
     let cert_response = format!("{cert_pem}\n");
 
@@ -187,7 +194,11 @@ async fn start_acme_tls_fixture() -> Result<AcmeTlsFixture> {
         }
     });
 
-    Ok(AcmeTlsFixture { addr, handle })
+    Ok(AcmeTlsFixture {
+        addr,
+        ca_pem: cert_pem,
+        handle,
+    })
 }
 
 async fn mount_responder_admin_mock(server: &MockServer) {
@@ -303,7 +314,7 @@ async fn run_agent_oneshot(config_path: &Path, ca_url: &str, insecure: bool) -> 
 #[tokio::test]
 async fn oneshot_normal_run_auto_hardens_verify_flag() -> Result<()> {
     let fixture = start_acme_tls_fixture().await?;
-    assert_fixture_reachable(&fixture.directory_url()).await;
+    assert_fixture_reachable(&fixture.directory_url(), fixture.ca_pem()).await;
     let tmp = tempdir().context("create tempdir")?;
     let responder = MockServer::start().await;
     mount_responder_admin_mock(&responder).await;
@@ -329,7 +340,7 @@ async fn oneshot_normal_run_auto_hardens_verify_flag() -> Result<()> {
 #[tokio::test]
 async fn oneshot_insecure_then_normal_enforces_hardening() -> Result<()> {
     let fixture = start_acme_tls_fixture().await?;
-    assert_fixture_reachable(&fixture.directory_url()).await;
+    assert_fixture_reachable(&fixture.directory_url(), fixture.ca_pem()).await;
     let tmp = tempdir().context("create tempdir")?;
     let responder = MockServer::start().await;
     mount_responder_admin_mock(&responder).await;
@@ -363,7 +374,7 @@ async fn oneshot_insecure_then_normal_enforces_hardening() -> Result<()> {
 #[tokio::test]
 async fn oneshot_hardening_write_failure_exits_non_zero() -> Result<()> {
     let fixture = start_acme_tls_fixture().await?;
-    assert_fixture_reachable(&fixture.directory_url()).await;
+    assert_fixture_reachable(&fixture.directory_url(), fixture.ca_pem()).await;
     let tmp = tempdir().context("create tempdir")?;
     let responder = MockServer::start().await;
     mount_responder_admin_mock(&responder).await;
