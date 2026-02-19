@@ -392,6 +392,8 @@ Use this only as a local constraint workaround. CI still executes
 
 Lifecycle scripts consume `bootroot init --summary-json` output for automation.
 Do not parse human-readable summary lines for tokens/secrets.
+Local CLI scenario runs use the same rule and read `.root_token` from
+`--summary-json`.
 
 Minimum machine field used by E2E:
 

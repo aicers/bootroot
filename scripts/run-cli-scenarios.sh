@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+INIT_SUMMARY_JSON="$ROOT_DIR/tmp/cli-init-summary.json"
 
 log() {
   printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"
@@ -74,11 +75,16 @@ run_init_scenario() {
   BOOTROOT_LANG=en printf "y\ny\nn\n" | cargo run --bin bootroot -- init \
     --auto-generate \
     --show-secrets \
+    --summary-json "$INIT_SUMMARY_JSON" \
     --http-hmac "dev-hmac" \
     --stepca-password "$stepca_password" \
     --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
     --responder-url "http://localhost:8080" \
     --skip-responder-check | tee "$ROOT_DIR/tmp/cli-init.log"
+
+  if [ ! -f "$INIT_SUMMARY_JSON" ]; then
+    fail "Init summary JSON not found: $INIT_SUMMARY_JSON"
+  fi
 
   log "Validating full infra"
   cargo run --bin bootroot -- infra up
@@ -182,9 +188,9 @@ run_service_scenarios() {
   write_agent_config "$ROOT_DIR/tmp/agent.toml"
 
   local root_token
-  root_token="$(awk -F': ' '/root token:/ {print $2; exit}' "$ROOT_DIR/tmp/cli-init.log")"
+  root_token="$(jq -r '.root_token // empty' "$INIT_SUMMARY_JSON")"
   if [[ -z "${root_token:-}" ]]; then
-    fail "Failed to read root token from init output"
+    fail "Missing root_token in init summary JSON: $INIT_SUMMARY_JSON"
   fi
 
   cargo run --bin bootroot -- service add \
@@ -237,6 +243,7 @@ run_verify() {
 require_cmd cargo
 require_cmd docker
 require_cmd curl
+require_cmd jq
 run_cli_tests
 run_init_scenario
 run_service_scenarios

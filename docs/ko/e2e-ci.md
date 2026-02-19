@@ -386,6 +386,7 @@ RUNNER_MODE=cron ./scripts/e2e/docker/run-harness-smoke.sh
 
 라이프사이클 스크립트는 `bootroot init --summary-json` 출력으로 자동화를
 수행합니다. 사람용 요약 텍스트를 파싱해 토큰/시크릿을 추출하지 않습니다.
+로컬 CLI 시나리오 실행도 같은 방식으로 `--summary-json`의 `.root_token`을 사용합니다.
 
 E2E가 사용하는 최소 머신 필드:
 
