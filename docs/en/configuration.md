@@ -173,74 +173,70 @@ ca_bundle_path = "/etc/bootroot/ca-bundle.pem"
 trusted_ca_sha256 = ["<sha256-hex>"]
 ```
 
-Controls mTLS trust and **ACME server TLS verification**.
+This section covers both mTLS trust and **ACME server TLS verification**.
 
-Concepts:
+#### 1) Concept split
 
-- **mTLS trust**: the trust bundle used by services to verify peer
-  certificates. bootroot-agent writes the chain (intermediate/root) to
-  `ca_bundle_path`, and services use that file as their trust store.
-- **ACME server TLS verification**: bootroot-agent verifies the step-ca
-  server certificate when communicating with the ACME endpoint. This is
-  separate from mTLS trust.
+1. **mTLS trust**: bundle used by services to verify peer certificates.
+   bootroot-agent writes the chain (intermediate/root) to `ca_bundle_path`.
+2. **ACME server TLS verification**: bootroot-agent validates the step-ca
+   server certificate during ACME communication. This is separate from mTLS.
 
-Settings:
+#### 2) Core settings
 
-- `verify_certificates`: enables **ACME server TLS verification**.
-  This is not an mTLS setting; it only affects how bootroot-agent validates
-  the step-ca server certificate.
-- `ca_bundle_path`: path where bootroot-agent writes the CA bundle
-  (intermediate/root only). When `verify_certificates = true`, setting this
-  also makes bootroot-agent trust **this bundle** for the ACME server.
-- `trusted_ca_sha256`: list of trusted CA cert fingerprints (SHA-256 hex).
-- When trust is configured, `ca_bundle_path` and `trusted_ca_sha256` must be
-  set together (setting only one fails validation).
+- `verify_certificates`: enable/disable ACME server TLS verification
+- `ca_bundle_path`: output path for CA bundle (intermediate/root)
+- `trusted_ca_sha256`: trusted CA fingerprint list (SHA-256 hex)
+- if `verify_certificates = true` and `ca_bundle_path` is missing,
+  system CA store is used
+- default is `verify_certificates = false` (backward compatibility)
 
-`trusted_ca_sha256` must match **real CA certificate fingerprints** (not
-arbitrary values). `bootroot init` stores CA fingerprints in OpenBao, and
-`bootroot service add` applies them differently by `--delivery-mode`:
+`trusted_ca_sha256` must match real CA certificate fingerprints (not
+arbitrary values).
 
-- `--delivery-mode remote-bootstrap`: fingerprints are automatically written
-  to the
-  per-service remote sync trust path and then applied to `agent.toml` on the
-  service machine by `bootroot-remote sync`.
-- `--delivery-mode local-file`: trust settings are automatically merged into
-  `agent.toml` (`trusted_ca_sha256`, `ca_bundle_path`). When OpenBao trust
-  data also includes `ca_bundle_pem`, bootroot writes that PEM to
-  `ca_bundle_path` with restricted file permissions.
+#### 3) `--delivery-mode` integration
 
-If `verify_certificates = true` and `ca_bundle_path` is **not** set,
-bootroot-agent uses the **system CA store** to validate the ACME server.
+- `remote-bootstrap`: fingerprints are written to per-service remote sync
+  trust path, then applied to service-machine `agent.toml` by
+  `bootroot-remote sync`
+- `local-file`: trust settings (`trusted_ca_sha256`, `ca_bundle_path`) are
+  auto-merged into `agent.toml`; if OpenBao trust includes `ca_bundle_pem`,
+  bootroot also writes `ca_bundle_path` automatically
 
-Default: `verify_certificates = false` for backward compatibility. For
-production, enable verification and provide a trusted CA source.
+#### 4) Runtime flag behavior
 
-Operational notes:
+- `--insecure`: force `verify_certificates=false` for that run
+- `--verify-certificates`: force `verify_certificates=true` for that run
+- neither flag: use current config value as-is
 
-- On the **first** connection to step-ca, a trusted bundle must already exist
-  at `ca_bundle_path` (manual install). If that is inconvenient, you can
-  **temporarily** use `bootroot-agent --insecure` to obtain the first cert.
-- After issuance succeeds, bootroot-agent writes the chain to `ca_bundle_path`.
-  For **renewals** (cron/daemon), do **not** use `--insecure`; keep
-  verification enabled.
-- This workflow lets you keep `verify_certificates = true` in `agent.toml` and
-  use CLI flags only as a temporary bypass.
+#### 5) Recommended operating flow
 
-Note: in a single step-ca deployment, it is practical to reuse the same
-`ca_bundle_path` for both mTLS trust and ACME server verification. The two
-concepts are still different, so keep them distinct in your mental model.
+Goal: "first issuance without verification, then verification enabled"
 
-If trust is missing or empty in services using
-`--delivery-mode remote-bootstrap`, check:
+1. Start with `trust.verify_certificates = false` in `agent.toml`.
+2. Run first issuance without `--insecure`.
+3. On first successful issuance, bootroot-agent auto-writes
+   `trust.verify_certificates = true`.
+4. Run renewals (cron/daemon) without `--insecure` to keep verification on.
 
+#### 6) Failure/caution notes
+
+- if hardening write/reload verification fails, bootroot-agent exits non-zero
+- `--insecure` bypasses verification only for that run and skips hardening
+- next normal run checks hardening conditions again
+- in single-step-ca setups, reusing one `ca_bundle_path` for both mTLS and
+  ACME verification is acceptable
+
+#### 7) Validation checklist
+
+- if trust is missing/empty in `--delivery-mode remote-bootstrap`, check:
 - `secrets/certs/root_ca.crt` and `secrets/certs/intermediate_ca.crt` exist
 - `bootroot init` ran with the same `secrets_dir`
-- `secret/bootroot/ca` in OpenBao contains `trusted_ca_sha256`
+- OpenBao `secret/bootroot/ca` contains `trusted_ca_sha256`
 
 Permissions note: the service consuming the CA bundle must be able to read
-`ca_bundle_path`. The simplest setup is to run bootroot-agent and the service
-as the same user or group; otherwise ensure the file and parent directory
-permissions allow read access.
+`ca_bundle_path`. The simplest setup is running bootroot-agent and service as
+the same user/group.
 
 ### Retry Settings
 

@@ -1,13 +1,25 @@
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use tokio::sync::{Semaphore, watch};
 use tracing::{error, info};
 
 use crate::{acme, config, eab, hooks, profile, utils};
 
 pub const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = utils::MIN_JITTER_DELAY_NANOS;
+const DEFAULT_AGENT_CONFIG_PATH: &str = "agent.toml";
+const TRUST_SECTION: &str = "trust";
+const VERIFY_CERTIFICATES_KEY: &str = "verify_certificates";
+const VERIFY_CERTIFICATES_TRUE: &str = "true";
+
+#[derive(Clone)]
+struct HardeningPolicy {
+    config_path: PathBuf,
+    insecure_mode: bool,
+}
 
 /// Runs the agent daemon loop for all profiles.
 ///
@@ -16,10 +28,16 @@ pub const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = utils::MIN_JITTER_DELAY_NANOS;
 pub async fn run_daemon(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
+    config_path: Option<PathBuf>,
+    insecure_mode: bool,
 ) -> anyhow::Result<()> {
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let hardening = HardeningPolicy {
+        config_path: resolve_config_path(config_path.as_deref()),
+        insecure_mode,
+    };
 
     let shutdown_handle = tokio::spawn(async move {
         if let Err(err) = wait_for_shutdown().await {
@@ -34,22 +52,42 @@ pub async fn run_daemon(
         let semaphore = Arc::clone(&semaphore);
         let shutdown_rx = shutdown_rx.clone();
         let default_eab = default_eab.clone();
+        let hardening = hardening.clone();
 
         handles.push(tokio::spawn(async move {
-            run_profile_daemon(settings, profile, default_eab, semaphore, shutdown_rx).await
+            run_profile_daemon(
+                settings,
+                profile,
+                default_eab,
+                semaphore,
+                shutdown_rx,
+                hardening,
+            )
+            .await
         }));
     }
 
     let _ = shutdown_handle.await;
+    let mut first_error = None;
     for handle in handles {
         match handle.await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => error!("Profile daemon exited with error: {err}"),
-            Err(err) => error!("Profile daemon task join error: {err}"),
+            Ok(Err(err)) => {
+                error!("Profile daemon exited with error: {err}");
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+            Err(err) => {
+                error!("Profile daemon task join error: {err}");
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!("Profile daemon task join error: {err}"));
+                }
+            }
         }
     }
 
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 async fn run_profile_daemon(
@@ -58,6 +96,7 @@ async fn run_profile_daemon(
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
+    hardening: HardeningPolicy,
 ) -> anyhow::Result<()> {
     let check_interval = profile.daemon.check_interval;
     let renew_before = profile.daemon.renew_before;
@@ -92,18 +131,16 @@ async fn run_profile_daemon(
                 break;
             }
             () = tokio::time::sleep(delay) => {
-                if let Err(err) = check_and_renew_profile(
+                check_and_renew_profile(
                     &settings,
                     &profile,
                     default_eab.clone(),
                     Arc::clone(&semaphore),
                     renew_before,
                     &profile_label,
+                    &hardening,
                 )
-                .await
-                {
-                    error!("Profile '{}' renewal loop failed: {err}", profile_label);
-                }
+                .await?;
             }
         }
     }
@@ -118,18 +155,25 @@ async fn run_profile_daemon(
 pub async fn run_oneshot(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
+    config_path: Option<PathBuf>,
+    insecure_mode: bool,
 ) -> anyhow::Result<()> {
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let hardening = HardeningPolicy {
+        config_path: resolve_config_path(config_path.as_deref()),
+        insecure_mode,
+    };
     let mut handles = Vec::new();
 
     for profile in settings.profiles.clone() {
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
         let default_eab = default_eab.clone();
+        let hardening = hardening.clone();
 
         handles.push(tokio::spawn(async move {
-            run_profile_oneshot(settings, profile, default_eab, semaphore).await
+            run_profile_oneshot(settings, profile, default_eab, semaphore, hardening).await
         }));
     }
 
@@ -164,6 +208,7 @@ async fn run_profile_oneshot(
     profile: config::DaemonProfileSettings,
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
+    hardening: HardeningPolicy,
 ) -> anyhow::Result<()> {
     let _permit = semaphore.acquire().await?;
     let profile_eab = profile::resolve_profile_eab(&profile, default_eab);
@@ -171,6 +216,13 @@ async fn run_profile_oneshot(
 
     match acme::issue_certificate(&settings, &profile, profile_eab).await {
         Ok(()) => {
+            maybe_harden_tls_verify(
+                &settings,
+                &hardening.config_path,
+                &profile_label,
+                hardening.insecure_mode,
+            )
+            .await?;
             if let Err(err) =
                 hooks::run_post_renew_hooks(&settings, &profile, hooks::HookStatus::Success, None)
                     .await
@@ -314,6 +366,7 @@ async fn check_and_renew_profile(
     semaphore: Arc<Semaphore>,
     renew_before: Duration,
     profile_label: &str,
+    hardening: &HardeningPolicy,
 ) -> anyhow::Result<()> {
     tracing::debug!("Profile '{}' checking renewal status...", profile_label);
     match should_renew(profile, renew_before).await {
@@ -326,6 +379,13 @@ async fn check_and_renew_profile(
             let profile_eab = profile::resolve_profile_eab(profile, default_eab);
             match issue_with_retry(settings, profile, profile_eab).await {
                 Ok(()) => {
+                    maybe_harden_tls_verify(
+                        settings,
+                        &hardening.config_path,
+                        profile_label,
+                        hardening.insecure_mode,
+                    )
+                    .await?;
                     if let Err(err) = hooks::run_post_renew_hooks(
                         settings,
                         profile,
@@ -371,6 +431,188 @@ async fn check_and_renew_profile(
     Ok(())
 }
 
+fn resolve_config_path(config_path: Option<&Path>) -> PathBuf {
+    config_path.map_or_else(
+        || PathBuf::from(DEFAULT_AGENT_CONFIG_PATH),
+        Path::to_path_buf,
+    )
+}
+
+async fn maybe_harden_tls_verify(
+    settings: &config::Settings,
+    config_path: &Path,
+    profile_label: &str,
+    insecure_mode: bool,
+) -> anyhow::Result<()> {
+    if settings.trust.verify_certificates {
+        return Ok(());
+    }
+
+    if insecure_mode {
+        info!(
+            "Profile '{}' issued in --insecure mode. \
+verify_certificates stays false for this run.",
+            profile_label
+        );
+        return Ok(());
+    }
+
+    set_verify_certificates_true(config_path, profile_label).await
+}
+
+async fn set_verify_certificates_true(
+    config_path: &Path,
+    profile_label: &str,
+) -> anyhow::Result<()> {
+    let current = tokio::fs::read_to_string(config_path)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Profile '{}' failed to read config {} for TLS hardening: {err}",
+                profile_label,
+                config_path.display()
+            )
+        })?;
+
+    let updated = upsert_toml_section_keys(
+        &current,
+        TRUST_SECTION,
+        &[(
+            VERIFY_CERTIFICATES_KEY,
+            VERIFY_CERTIFICATES_TRUE.to_string(),
+        )],
+    );
+    if updated != current {
+        tokio::fs::write(config_path, updated)
+            .await
+            .with_context(|| {
+                format!(
+                    "Profile '{}' failed to write TLS hardening config: {}",
+                    profile_label,
+                    config_path.display()
+                )
+            })?;
+    }
+
+    let reloaded = config::Settings::new(Some(config_path.to_path_buf())).with_context(|| {
+        format!(
+            "Profile '{}' failed to reload hardening config: {}",
+            profile_label,
+            config_path.display()
+        )
+    })?;
+    if !reloaded.trust.verify_certificates {
+        anyhow::bail!(
+            "Profile '{}' TLS hardening check failed: trust.verify_certificates is still false ({})",
+            profile_label,
+            config_path.display()
+        );
+    }
+
+    info!(
+        "Profile '{}' hardened TLS verify to true in {}",
+        profile_label,
+        config_path.display()
+    );
+    Ok(())
+}
+
+fn upsert_toml_section_keys(contents: &str, section: &str, pairs: &[(&str, String)]) -> String {
+    let mut output = String::new();
+    let mut section_found = false;
+    let mut in_section = false;
+    let mut seen_keys = std::collections::BTreeSet::new();
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed) {
+            if in_section {
+                output.push_str(&render_missing_keys(pairs, &seen_keys));
+            }
+            in_section = trimmed == format!("[{section}]");
+            if in_section {
+                section_found = true;
+                seen_keys.clear();
+            }
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+
+        if in_section
+            && let Some((key, indent)) = parse_key_line(line, pairs)
+            && let Some(value) = pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.as_str())
+        {
+            output.push_str(&format_key_line(&indent, key, value));
+            seen_keys.insert(key.to_string());
+            continue;
+        }
+
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    if in_section {
+        output.push_str(&render_missing_keys(pairs, &seen_keys));
+    }
+
+    if !section_found {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push('[');
+        output.push_str(section);
+        output.push_str("]\n");
+        for (key, value) in pairs {
+            output.push_str(&format_key_line("", key, value));
+        }
+    }
+
+    output
+}
+
+fn parse_key_line<'a>(line: &'a str, pairs: &[(&'a str, String)]) -> Option<(&'a str, String)> {
+    for (key, _) in pairs {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")) {
+            let indent = line
+                .chars()
+                .take_while(|ch| ch.is_whitespace())
+                .collect::<String>();
+            return Some((key, indent));
+        }
+    }
+    None
+}
+
+fn render_missing_keys(
+    pairs: &[(&str, String)],
+    seen_keys: &std::collections::BTreeSet<String>,
+) -> String {
+    let mut output = String::new();
+    for (key, value) in pairs {
+        if !seen_keys.contains(*key) {
+            output.push_str(&format_key_line("", key, value));
+        }
+    }
+    output
+}
+
+fn format_key_line(indent: &str, key: &str, value: &str) -> String {
+    if value.starts_with('[') || value == VERIFY_CERTIFICATES_TRUE {
+        format!("{indent}{key} = {value}\n")
+    } else {
+        format!("{indent}{key} = \"{value}\"\n")
+    }
+}
+
+fn is_section_header(value: &str) -> bool {
+    value.starts_with('[') && value.ends_with(']')
+}
+
 async fn wait_for_shutdown() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -399,6 +641,7 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use super::*;
@@ -475,5 +718,223 @@ mod tests {
         let selected = select_retry_backoff(&settings, &profile);
 
         assert_eq!(selected, settings.retry.backoff_secs);
+    }
+
+    #[test]
+    fn test_upsert_toml_section_keys_updates_existing_trust_flag() {
+        let input = "[trust]\nverify_certificates = false\n";
+        let output = upsert_toml_section_keys(
+            input,
+            TRUST_SECTION,
+            &[(
+                VERIFY_CERTIFICATES_KEY,
+                VERIFY_CERTIFICATES_TRUE.to_string(),
+            )],
+        );
+        assert!(output.contains("verify_certificates = true"));
+    }
+
+    #[test]
+    fn test_upsert_toml_section_keys_adds_trust_section() {
+        let input = "email = \"admin@example.com\"\n";
+        let output = upsert_toml_section_keys(
+            input,
+            TRUST_SECTION,
+            &[(
+                VERIFY_CERTIFICATES_KEY,
+                VERIFY_CERTIFICATES_TRUE.to_string(),
+            )],
+        );
+        assert!(output.contains("[trust]"));
+        assert!(output.contains("verify_certificates = true"));
+    }
+
+    #[tokio::test]
+    async fn test_set_verify_certificates_true_updates_config_file() {
+        let dir = tempfile::tempdir().expect("creates temp dir");
+        let config_path = dir.path().join("agent.toml");
+        fs::write(
+            &config_path,
+            r#"
+email = "admin@example.com"
+server = "https://localhost:9000/acme/acme/directory"
+domain = "example.internal"
+
+[acme]
+http_responder_url = "http://localhost:8080"
+http_responder_hmac = "dev-hmac"
+"#,
+        )
+        .expect("writes config fixture");
+
+        set_verify_certificates_true(&config_path, "test-profile")
+            .await
+            .expect("hardens config");
+
+        let updated = fs::read_to_string(&config_path).expect("reads updated config");
+        assert!(updated.contains("[trust]"));
+        assert!(updated.contains("verify_certificates = true"));
+    }
+
+    #[tokio::test]
+    async fn test_set_verify_certificates_true_fails_on_unwritable_path() {
+        let dir = tempfile::tempdir().expect("creates temp dir");
+        let config_path = dir.path().join("agent.toml");
+        fs::create_dir(&config_path).expect("creates directory path");
+
+        let err = set_verify_certificates_true(&config_path, "test-profile")
+            .await
+            .expect_err("must fail");
+        assert!(err.to_string().contains("failed to read config"));
+    }
+
+    #[tokio::test]
+    async fn test_set_verify_certificates_true_fails_when_config_missing() {
+        let dir = tempfile::tempdir().expect("creates temp dir");
+        let config_path = dir.path().join("missing-agent.toml");
+
+        let err = set_verify_certificates_true(&config_path, "test-profile")
+            .await
+            .expect_err("must fail when config file does not exist");
+        assert!(err.to_string().contains("failed to read config"));
+    }
+
+    #[tokio::test]
+    async fn test_maybe_harden_tls_verify_skips_when_insecure() {
+        let dir = tempfile::tempdir().expect("creates temp dir");
+        let config_path = dir.path().join("agent.toml");
+        fs::write(&config_path, "[trust]\nverify_certificates = false\n")
+            .expect("writes config fixture");
+        let settings = build_settings(vec![5, 10, 30]);
+
+        maybe_harden_tls_verify(&settings, &config_path, "test-profile", true)
+            .await
+            .expect("must skip hardening in insecure mode");
+
+        let updated = fs::read_to_string(&config_path).expect("reads config after skip");
+        assert!(updated.contains("verify_certificates = false"));
+    }
+
+    #[tokio::test]
+    async fn test_maybe_harden_tls_verify_retries_after_insecure_run() {
+        let dir = tempfile::tempdir().expect("creates temp dir");
+        let config_path = dir.path().join("agent.toml");
+        fs::write(
+            &config_path,
+            r#"
+email = "admin@example.com"
+server = "https://localhost:9000/acme/acme/directory"
+domain = "example.internal"
+
+[acme]
+http_responder_url = "http://localhost:8080"
+http_responder_hmac = "dev-hmac"
+[trust]
+verify_certificates = false
+"#,
+        )
+        .expect("writes config fixture");
+        let settings = build_settings(vec![5, 10, 30]);
+
+        maybe_harden_tls_verify(&settings, &config_path, "test-profile", true)
+            .await
+            .expect("insecure run skips hardening");
+        let skipped = fs::read_to_string(&config_path).expect("reads skipped config");
+        assert!(skipped.contains("verify_certificates = false"));
+
+        maybe_harden_tls_verify(&settings, &config_path, "test-profile", false)
+            .await
+            .expect("normal run hardens");
+        let hardened = fs::read_to_string(&config_path).expect("reads hardened config");
+        assert!(hardened.contains("verify_certificates = true"));
+    }
+
+    #[tokio::test]
+    async fn test_set_verify_certificates_true_fails_on_malformed_toml() {
+        let dir = tempfile::tempdir().expect("creates temp dir");
+        let config_path = dir.path().join("agent.toml");
+        fs::write(
+            &config_path,
+            r#"
+email = "admin@example.com"
+server = "https://localhost:9000/acme/acme/directory"
+domain = "example.internal"
+[acme
+http_responder_url = "http://localhost:8080"
+http_responder_hmac = "dev-hmac"
+"#,
+        )
+        .expect("writes malformed config fixture");
+
+        let err = set_verify_certificates_true(&config_path, "test-profile")
+            .await
+            .expect_err("must fail when config remains invalid");
+        assert!(
+            err.to_string()
+                .contains("failed to reload hardening config")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_maybe_harden_tls_verify_noop_when_already_true() {
+        let dir = tempfile::tempdir().expect("creates temp dir");
+        let config_path = dir.path().join("agent.toml");
+        fs::write(&config_path, "[trust]\nverify_certificates = false\n")
+            .expect("writes config fixture");
+        let mut settings = build_settings(vec![5, 10, 30]);
+        settings.trust.verify_certificates = true;
+
+        maybe_harden_tls_verify(&settings, &config_path, "test-profile", false)
+            .await
+            .expect("already true should be no-op");
+
+        let updated = fs::read_to_string(&config_path).expect("reads config");
+        assert!(updated.contains("verify_certificates = false"));
+    }
+
+    #[tokio::test]
+    async fn test_set_verify_certificates_true_preserves_other_trust_fields() {
+        let dir = tempfile::tempdir().expect("creates temp dir");
+        let config_path = dir.path().join("agent.toml");
+        fs::write(
+            &config_path,
+            r#"
+email = "admin@example.com"
+server = "https://localhost:9000/acme/acme/directory"
+domain = "example.internal"
+
+[acme]
+http_responder_url = "http://localhost:8080"
+http_responder_hmac = "dev-hmac"
+
+[trust]
+verify_certificates = false
+ca_bundle_path = "certs/ca-bundle.pem"
+trusted_ca_sha256 = ["aa11"]
+"#,
+        )
+        .expect("writes config fixture");
+
+        set_verify_certificates_true(&config_path, "test-profile")
+            .await
+            .expect("hardens config");
+
+        let updated = fs::read_to_string(&config_path).expect("reads updated config");
+        assert!(updated.contains("verify_certificates = true"));
+        assert!(updated.contains("ca_bundle_path = \"certs/ca-bundle.pem\""));
+        assert!(updated.contains("trusted_ca_sha256 = [\"aa11\"]"));
+    }
+
+    #[test]
+    fn test_resolve_config_path_uses_default_when_none() {
+        let resolved = resolve_config_path(None);
+        assert_eq!(resolved, PathBuf::from(DEFAULT_AGENT_CONFIG_PATH));
+    }
+
+    #[test]
+    fn test_resolve_config_path_prefers_provided_path() {
+        let provided = PathBuf::from("/tmp/custom-agent.toml");
+        let resolved = resolve_config_path(Some(&provided));
+        assert_eq!(resolved, provided);
     }
 }
