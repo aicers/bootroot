@@ -53,6 +53,10 @@ Host name mapping mode (E2E run mode):
 Common behavior: both mapping modes add service FQDN -> responder IP mappings
 in the step-ca container `/etc/hosts` so SAN targets are reachable.
 
+Operational note: host-entry add/remove behavior in E2E is for test
+convenience. In production, maintain DNS/hosts mappings and always-on runtime
+state for services/agents continuously.
+
 ## Docker E2E test scope
 
 PR-critical Docker test set validates:
@@ -82,7 +86,8 @@ Primary script:
 ## Scenario details and execution steps
 
 This section repeats key context from other manual pages on purpose.
-Use this page alone as a runbook for CI/E2E understanding and reproduction.
+Use this page alone as an operational guide for CI/E2E understanding and
+reproduction.
 
 ### 1) local-delivery E2E scenario (`fqdn-only-hosts`)
 

@@ -11,6 +11,14 @@ the hood.
 For automated command flow, also see [CLI](cli.md) and
 [CLI Examples](cli-examples.md).
 
+Operations policy summary:
+
+- Compose is the recommended path.
+- systemd is also supported, but always-on/restart/dependency guarantees are
+  operator responsibilities.
+- bootroot automates config/material generation, but binary installation and
+  process lifecycle management remain operator-owned.
+
 ## step-ca
 
 ### Docker

@@ -1,10 +1,33 @@
 # Operations
 
-This section focuses on operational checks and incident response runbooks.
+This section focuses on operational checks and incident response procedures.
 See **Installation** and **Configuration** for full setup steps and options.
 For CLI command syntax, see [CLI](cli.md).
 
 For CI/test operations, see [CI & E2E](e2e-ci.md).
+
+## Automation boundary (must read)
+
+Bootroot-managed scope:
+
+- generation and updates of config/material files (`agent.toml`, `agent.hcl`,
+  `agent.toml.ctmpl`, `token`, and sync-related files)
+- per-delivery-mode state recording and sync input preparation during service add
+- operational command flow entry points (`rotate`, `verify`, `status`)
+
+Operator-managed scope:
+
+- binary installation/update (`bootroot`, `bootroot-agent`, `bootroot-remote`,
+  OpenBao Agent)
+- process supervision for always-on behavior (start/restart/boot startup)
+- runtime integration (`docker compose` or `systemd`)
+
+Policy summary:
+
+- Compose is the recommended runtime path.
+- systemd is supported, but operators must satisfy the same reliability
+  requirements directly (always-on, restart, dependency ordering).
+- In both paths, bootroot does not fully manage the entire process lifecycle.
 
 ## Core operational checks
 
@@ -64,6 +87,28 @@ bootroot monitoring status
 - To reset Grafana admin password to the initial state, run
   `bootroot monitoring down --reset-grafana-admin-password`.
 
+## Compose operations procedure (recommended)
+
+- Keep workload containers and required sidecars/agents running continuously.
+- Set explicit restart policy (`restart: always` or `restart: unless-stopped`).
+- Ensure Docker/Compose itself is managed by systemd (or equivalent) so
+  services recover after host reboot.
+- Basic triage flow:
+  `docker compose ps` -> `docker compose logs --tail=200 <service>`
+  -> `bootroot verify --service-name <service>`.
+
+## systemd operations procedure (supported)
+
+- Register `bootroot-agent` as a long-running service with
+  `Restart=on-failure` and `WantedBy=multi-user.target`.
+- If OpenBao Agent is systemd-managed, split it per service and define
+  dependency ordering such as `After=network-online.target`.
+- Run `bootroot-remote` periodically per service (timer/cron) and apply overlap
+  prevention lock (`flock`).
+- Triage flow:
+  `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
+  -> `bootroot verify --service-name <service>`.
+
 ## Rotation scheduling
 
 Run `bootroot rotate ...` on a schedule (cron/systemd timer). Keep secrets out
@@ -116,6 +161,7 @@ Recommended pattern:
 - one periodic sync job per service
 - one `--summary-json` file per service
 - keep role/secret/token/config paths service-scoped
+- apply overlap prevention lock (`flock` or equivalent)
 
 Minimum environment/config checklist:
 
@@ -130,6 +176,15 @@ Failure handling guidance:
 - use retry/backoff/jitter controls in `bootroot-remote sync`
 - alert on repeated `failed`/`expired` sync-status values
 - inspect pull summary JSON + `bootroot service sync-status` output together
+
+systemd timer example (overlap prevention):
+
+```ini
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n /var/lock/bootroot-remote-<service>.lock \
+  /usr/local/bin/bootroot-remote sync ...
+```
 
 Manual ingest (exception path):
 
