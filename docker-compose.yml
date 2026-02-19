@@ -84,9 +84,10 @@ services:
       - ./secrets/certs/root_ca.crt:/app/root_ca.crt
       - ./secrets:/app/secrets:ro
       - ./agent.toml.compose:/app/agent.toml:ro
-    command:
+    entrypoint:
       - /bin/sh
       - -lc
+    command:
       - |
         cp /app/agent.toml /app/certs/agent.runtime.toml
         exec /app/bootroot-agent \
