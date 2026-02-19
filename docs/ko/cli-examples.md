@@ -89,8 +89,11 @@ bootroot init: 요약
 - DB 점검: 생략
 - DB 호스트 해석: localhost -> postgres
 - OpenBao KV 경로:
-    role_id: secrets/services/<service>/role_id
-    secret_id: secrets/services/<service>/secret_id
+  - bootroot/stepca/password
+  - bootroot/stepca/db
+  - bootroot/http01/hmac
+  - bootroot/ca
+  - bootroot/agent/eab
 - summary json: ./tmp/init-summary.json
 다음 단계:
   - AppRole/secret_id를 서비스에 연결하세요.
@@ -102,7 +105,27 @@ bootroot init: 요약
 
 ## 3) service add
 
-### 3-1) daemon 서비스 추가
+`bootroot service add`의 `--delivery-mode`는 서비스 설정 반영 경로를 고르는
+옵션입니다.
+
+- 기본값: `local-file`
+- `local-file`: 서비스가 step-ca/OpenBao/responder와 **같은 머신**에 추가될 때 사용
+- `remote-bootstrap`: 서비스가 step-ca/OpenBao/responder와 **다른 머신**에
+  추가될 때 사용
+- `--dry-run`, `--print-only`: 둘 다 프리뷰 모드로 동작하며 파일/state를
+  변경하지 않습니다.
+- 프리뷰에서 trust 스니펫을 보려면 `--root-token`을 함께 지정해야 합니다.
+- `--root-token` 없이 프리뷰를 실행하면 trust 스니펫을 출력하지 못한 이유가
+  함께 출력됩니다.
+
+아래 3-1/3-2는 기본값(`local-file`) 예제이고, 3-3은
+`remote-bootstrap` 예제입니다.
+
+> 참고: 아래 출력의 `secrets/...` 경로는 기본 `--secrets-dir secrets` 기준입니다.
+> 운영 환경에서 시크릿 루트가 다르면(예: `/etc/bootroot/secrets`) 같은 상대
+> 구조로 치환해서 읽으면 됩니다.
+
+### 3-1) local-file (기본값): daemon 서비스 추가
 
 ```bash
 bootroot service add \
@@ -136,13 +159,13 @@ bootroot 서비스 추가: 계획
   - secret_id 경로: secrets/services/edge-proxy/secret_id
   - OpenBao 경로: bootroot/services/edge-proxy
   - OpenBao Agent (서비스별 인스턴스):
-    - config: secrets/openbao-agent/apps/edge-proxy.hcl
+    - config: secrets/openbao/services/edge-proxy/agent.hcl
     - role_id file: secrets/services/edge-proxy/role_id
     - secret_id file: secrets/services/edge-proxy/secret_id
     - ensure secrets/services/edge-proxy is 0700 and
       role_id/secret_id files are 0600
     - run the app-specific OpenBao Agent on the host with
-      secrets/openbao-agent/apps/edge-proxy.hcl
+      secrets/openbao/services/edge-proxy/agent.hcl
   - /etc/bootroot/agent.toml에 프로필(instance_id=001,
     hostname=edge-node-01, domain=trusted.domain,
     cert=/etc/bootroot/certs/edge-proxy.crt,
@@ -150,7 +173,26 @@ bootroot 서비스 추가: 계획
     bootroot-agent를 리로드하세요.
 ```
 
-### 3-2) docker 서비스 추가
+최신 CLI 출력에는 위 정보와 함께
+`Bootroot 자동 반영 항목`/`운영자 실행 항목 (필수/권장/선택)` 라벨이 표시되어
+자동 처리 범위와 운영자 작업 범위를 명확히 구분해 줍니다.
+
+예시(라벨 중심):
+
+```text
+Bootroot 자동 반영 항목:
+- 자동 반영 bootroot-agent 설정: ...
+- 자동 반영 OpenBao Agent 설정: ...
+
+운영자 실행 항목 (필수):
+- OpenBao Agent 실행
+- bootroot-agent 실행/리로드
+
+운영자 실행 항목 (선택):
+- trust 자동 반영값 대신 수동 trust 고정/오버라이드 적용
+```
+
+### 3-2) local-file (기본값): docker 서비스 추가
 
 ```bash
 bootroot service add \
@@ -217,21 +259,33 @@ bootroot-remote sync \
   --profile-key-path /srv/bootroot/certs/edge-remote.key \
   --ca-bundle-path /srv/bootroot/certs/ca-bundle.pem \
   --summary-json /srv/bootroot/tmp/edge-remote-summary.json \
-  --state-file /srv/bootroot/state.json \
   --output json
 ```
 
-sync summary는 `bootroot service sync-status`에서
-`secret_id`, `eab`, `responder_hmac`, `trust_sync` 상태 갱신에 사용됩니다.
+`bootroot-remote sync`는 pull과 ack를 함께 수행하며, summary를
+`bootroot service sync-status`에 반영해 `secret_id`, `eab`,
+`responder_hmac`, `trust_sync` 상태를 갱신합니다.
+`state.json` 경로가 기본값이 아닌 경우에만 `--state-file <path>`를 추가하세요.
+또한 실제 운영에서는 `bootroot service add` 요약 출력의
+`원격 실행 명령`을 그대로 사용하는 것을 권장합니다.
 
-## 4) 로컬 검증을 위한 DNS/hosts 준비
+추가 입력 정리:
 
-로컬 환경에서는 step-ca가 `HTTP-01` 검증 대상 FQDN을
-리스폰더 컨테이너로 해석할 수 있어야 합니다. 간단히는
-step-ca 컨테이너의 `/etc/hosts`에 매핑을 추가합니다.
-이 매핑은 **검증용 도메인 → responder 컨테이너 IP**로
-강제 연결되도록 만들어, 실제 DNS가 없는 로컬 환경에서도
-HTTP-01 검증이 통과되게 합니다.
+- sync는 pull 입력(`--openbao-url`, `--kv-mount`, `--service-name`,
+  `--role-id-path`, `--secret-id-path`, `--eab-file-path`,
+  `--agent-config-path`, baseline/profile 입력, `--ca-bundle-path`)을
+  그대로 받습니다.
+- `--summary-json`은 sync에서 필수입니다.
+- ack 연동용으로 `--bootroot-bin`(기본 `bootroot`), `--state-file`(선택)을
+  받을 수 있습니다.
+- pull 단계 출력 형식 제어용 `--output text|json`을 받을 수 있습니다.
+
+## 4) DNS/hosts 준비 (CLI 예제 실행용)
+
+이 CLI 예제를 실행하려면 step-ca가 `HTTP-01` 검증 대상 FQDN을
+리스폰더 컨테이너로 해석할 수 있어야 합니다. DNS가 아직 준비되지 않은
+환경에서는 step-ca 컨테이너의 `/etc/hosts`에 매핑을 추가해
+**검증용 도메인 -> responder 컨테이너 IP**로 연결할 수 있습니다.
 검증 FQDN은 `<instance_id>.<service_name>.<hostname>.<domain>` 형식입니다.
 
 ```bash
@@ -243,14 +297,18 @@ docker exec bootroot-ca sh -c \
   '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
 ```
 
-추가된 서비스이 더 있다면, 각 서비스의 FQDN에 대해 동일한 명령을 반복하세요.
+추가된 서비스가 더 있다면, 각 서비스의 FQDN에 대해 동일한 명령을 반복하세요.
 
-> 운영 환경에서는 DNS로 동일한 이름 해석이 되도록 구성하세요.
-
-## 5) app verify
+## 5) service verify
 
 ```bash
 bootroot verify --service-name edge-proxy
+```
+
+DB 연결/인증까지 함께 검증하려면:
+
+```bash
+bootroot verify --service-name edge-proxy --db-check
 ```
 
 예시 대화/출력(전체):
@@ -281,7 +339,7 @@ bootroot-agent는 **서비스별이 아니라 머신별로 1개**를 데몬으�
 `Restart=always`(또는 `on-failure`)를 설정하는 것을 권장합니다.
 
 ```bash
-openbao agent -config /etc/bootroot/openbao/services/edge-proxy/agent.hcl
+openbao agent -config /etc/bootroot/secrets/openbao/services/edge-proxy/agent.hcl
 ```
 
 ```bash
@@ -306,9 +364,10 @@ Docker 서비스도 호스트 통합 bootroot-agent daemon을 사용할 수는 �
 패턴을 권장합니다.
 
 ```bash
+AGENT_HCL=/srv/bootroot/secrets/openbao/services/web-app/agent.hcl
 docker run --rm \
   --name openbao-agent-web-app \
-  -v /srv/bootroot/openbao/services/web-app/agent.hcl:/app/agent.hcl:ro \
+  -v "$AGENT_HCL":/app/agent.hcl:ro \
   -v /srv/bootroot/secrets:/app/secrets \
   openbao/bao:latest \
   agent -config /app/agent.hcl
@@ -356,7 +415,8 @@ set -euo pipefail
 
 bootroot rotate stepca-password --yes
 bootroot rotate eab --yes
-bootroot rotate db --yes
+bootroot rotate db --yes \
+  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
 bootroot rotate responder-hmac --yes
 ```
 

@@ -1,12 +1,18 @@
 # Configuration
 
+This section explains configuration principles for bootroot-agent, OpenBao
+Agent, and hook/retry/trust settings.
+In real operations you will typically use `bootroot` CLI automation, but this
+page is intentionally written from a **manual (non-CLI) perspective** to improve
+understanding.
+In other words, it helps you understand which configuration files the CLI
+creates and updates under the hood.
+
+For automated command flow, also see [CLI](cli.md) and
+[CLI Examples](cli-examples.md).
+
 bootroot-agent reads a TOML configuration file (default `agent.toml`).
 The full template lives in `agent.toml.example`.
-
-## bootroot CLI
-
-CLI usage is documented in the [CLI manual](cli.md). This document focuses on
-the **manual configuration** flow.
 
 ## OpenBao Agent
 
@@ -19,8 +25,11 @@ itself; OpenBao Agent uses it to render the actual secret files.
 `bootroot service add` prints the per-service OpenBao Agent config path, which
 defaults to `secrets/openbao/services/<service>/agent.hcl`.
 
-OpenBao Agent logs in via AppRole using `role_id`/`secret_id` stored under
-`secrets/services/<service>/`. Keep the directory `0700` and the files `0600`.
+OpenBao Agent logs in via AppRole using `role_id`/`secret_id` files.
+For per-service flow (`bootroot service add`) the default path is
+`secrets/services/<service>/`, while step-ca/responder bootstrap
+(`bootroot init`) uses `secrets/openbao/stepca/` and
+`secrets/openbao/responder/`. Keep directories `0700` and files `0600`.
 
 Ownership is split as follows:
 
@@ -151,6 +160,7 @@ Controls HTTP-01 responder settings and retry behavior for ACME operations.
   - Remote responder: `http://<responder-host>:8080`
 - `http_responder_hmac`: shared HMAC secret for registering tokens. This must
   match the responder's `hmac_secret`.
+  If empty, validation fails and the agent does not start.
 - `http_responder_timeout_secs`: request timeout to the responder
 - `http_responder_token_ttl_secs`: token TTL in seconds
 
@@ -183,6 +193,8 @@ Settings:
   (intermediate/root only). When `verify_certificates = true`, setting this
   also makes bootroot-agent trust **this bundle** for the ACME server.
 - `trusted_ca_sha256`: list of trusted CA cert fingerprints (SHA-256 hex).
+- When trust is configured, `ca_bundle_path` and `trusted_ca_sha256` must be
+  set together (setting only one fails validation).
 
 `trusted_ca_sha256` must match **real CA certificate fingerprints** (not
 arbitrary values). `bootroot init` stores CA fingerprints in OpenBao, and
@@ -281,6 +293,8 @@ must be defined in `agent.toml`.
 ### Profiles
 
 Each profile represents one daemon instance (one certificate identity).
+At least one `[[profiles]]` entry is required, and `instance_id` must be a
+numeric string.
 
 ```toml
 [[profiles]]

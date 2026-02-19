@@ -35,7 +35,8 @@ CLI는 infra 기동/초기화/상태 점검과 서비스 온보딩, 발급 검�
 bootroot CLI가 자동으로 설치/기동해 주는 항목(Docker 경로):
 
 - `bootroot infra up` 기준 OpenBao/PostgreSQL/step-ca/HTTP-01 responder
-  컨테이너의 이미지 pull/build, 생성, 기동
+  컨테이너의 이미지 pull, 생성, 기동
+  (서비스 이미지 build가 필요한 경우 별도 `docker compose build` 수행 필요)
 - step-ca/OpenBao/responder가 한 머신에서 동작하는 bootroot 기본 토폴로지에서
   `bootroot init` 기준 step-ca/responder용 OpenBao Agent 설정 생성 및
   compose override를 통한 `openbao-agent-stepca`/`openbao-agent-responder`
@@ -130,6 +131,9 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--show-secrets`: 요약 출력에 시크릿 표시
 - `--summary-json`: init 요약을 머신 파싱용 JSON 파일로 저장
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`)
+  - 기본 실행에서는 필수입니다.
+  - preview 모드(`--print-only`/`--dry-run`)에서는 선택이며, trust 프리뷰를
+    보려면 지정해야 합니다.
 - `--unseal-key`: OpenBao unseal key (반복 가능, 환경 변수: `OPENBAO_UNSEAL_KEYS`)
 - `--openbao-unseal-from-file`: 파일에서 OpenBao 언실 키 읽기 (dev/test 전용)
 - `--stepca-password`: step-ca 키 암호 (`password.txt`, 환경 변수: `STEPCA_PASSWORD`)
@@ -693,13 +697,26 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 주요 입력:
 
 - `--openbao-url`, `--kv-mount`, `--service-name`
+  - 환경 변수: `OPENBAO_URL`, `OPENBAO_KV_MOUNT`
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`
 - `--agent-config-path`
 - baseline/profile 입력:
   `--agent-email`, `--agent-server`, `--agent-domain`,
   `--agent-responder-url`, `--profile-hostname`,
   `--profile-instance-id`, `--profile-cert-path`, `--profile-key-path`
+  - `--profile-cert-path`, `--profile-key-path`는 선택입니다.
+    미지정 시 `--agent-config-path` 기준 `certs/<service>.crt`,
+    `certs/<service>.key`를 기본 경로로 사용합니다.
+  - 기본값:
+    - `--agent-email`: `admin@example.com`
+    - `--agent-server`: `https://localhost:9000/acme/acme/directory`
+    - `--agent-domain`: `trusted.domain`
+    - `--agent-responder-url`: `http://127.0.0.1:8080`
+    - `--profile-hostname`: `localhost`
+    - `--profile-instance-id`: 빈 문자열(`""`)
 - `--ca-bundle-path`
+  - trust 데이터에 `ca_bundle_pem`이 포함된 경우 번들을 파일로 반영하려면
+    지정이 필요합니다.
 - `--summary-json`(선택), `--output text|json`
 
 `agent.toml`이 아직 없으면 pull 단계에서 baseline을 생성한 뒤, 서비스용
@@ -726,6 +743,17 @@ summary 파일을 `state.json`의 sync-status로 반영합니다.
 - `--retry-attempts`
 - `--retry-backoff-secs`
 - `--retry-jitter-secs`
+
+그 외 입력:
+
+- sync는 pull 입력(`--openbao-url`, `--kv-mount`, `--service-name`,
+  `--role-id-path`, `--secret-id-path`, `--eab-file-path`,
+  `--agent-config-path`, baseline/profile 입력, `--ca-bundle-path`)을
+  그대로 받습니다.
+- `--summary-json`은 sync에서 필수입니다.
+- ack 연동용으로 `--bootroot-bin`(기본 `bootroot`), `--state-file`(선택)을
+  받을 수 있습니다.
+- pull 단계 출력 형식 제어용 `--output text|json`을 받을 수 있습니다.
 
 summary JSON 계약 항목:
 

@@ -1,8 +1,15 @@
 # 설치
 
-이 섹션은 step-ca, PostgreSQL, bootroot-agent, HTTP-01 리스폰더 설치를 다룹니다.
-CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서는 **수동 설치**
-절차를 기준으로 설명합니다.
+이 섹션은 step-ca, PostgreSQL, OpenBao Agent, bootroot-agent, HTTP-01
+리스폰더의 설치/배치 원리를 설명합니다.
+실제 운영에서는 보통 `bootroot` CLI 자동화를 사용하지만, 이 문서는
+**사용자 이해도를 높이기 위해 CLI 자동화를 배제한 수동 관점**으로
+구성되어 있습니다.
+즉, "CLI가 내부에서 어떤 구성을 만들어 주는지"를 사람이 직접 따라가며
+이해할 수 있게 설명합니다.
+
+실제 명령/자동화 흐름은 [CLI](cli.md), [CLI 예제](cli-examples.md)를
+함께 참고하세요.
 
 ## step-ca
 
@@ -40,11 +47,11 @@ docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
 
 초기화가 끝나면 다음 파일들이 생성됩니다(대표 예시):
 
-- `ca.json`
-- `root_ca.crt`
-- `intermediate_ca.crt`
-- `secrets/ca_key`
-- `secrets/intermediate_ca_key`
+- `secrets/config/ca.json`
+- `secrets/certs/root_ca.crt`
+- `secrets/certs/intermediate_ca.crt`
+- `secrets/secrets/root_ca_key`
+- `secrets/secrets/intermediate_ca_key`
 
 `bootroot init`는 CA 지문을 OpenBao에 저장하므로,
 `secrets/certs/root_ca.crt`와 `secrets/certs/intermediate_ca.crt`가
@@ -190,7 +197,7 @@ postgresql://step:step-pass@localhost:5432/stepca?sslmode=disable
 ## OpenBao Agent
 
 OpenBao Agent는 OpenBao의 시크릿을 파일로 렌더링합니다. step-ca/리스폰더는
-`bootroot init`가 만든 `agent.hcl`을 사용하고, 서비스은 `bootroot service add`
+`bootroot init`가 만든 `agent.hcl`을 사용하고, 서비스는 `bootroot service add`
 출력에 나온 경로를 사용합니다.
 
 ### Docker
@@ -200,8 +207,9 @@ step-ca용 OpenBao Agent(예시):
 ```bash
 docker run --rm \
   --name openbao-agent-stepca \
+  --network bootroot_default \
   -v $(pwd)/secrets:/openbao/secrets \
-  -e VAULT_ADDR=http://localhost:8200 \
+  -e VAULT_ADDR=http://bootroot-openbao:8200 \
   openbao/openbao:latest \
   agent -config /openbao/secrets/openbao/stepca/agent.hcl
 ```
@@ -211,8 +219,9 @@ responder용 OpenBao Agent(예시):
 ```bash
 docker run --rm \
   --name openbao-agent-responder \
+  --network bootroot_default \
   -v $(pwd)/secrets:/openbao/secrets \
-  -e VAULT_ADDR=http://localhost:8200 \
+  -e VAULT_ADDR=http://bootroot-openbao:8200 \
   openbao/openbao:latest \
   agent -config /openbao/secrets/openbao/responder/agent.hcl
 ```
@@ -222,11 +231,22 @@ docker run --rm \
 ```bash
 docker run --rm \
   --name openbao-agent-edge-proxy \
+  --network bootroot_default \
   -v $(pwd)/secrets:/openbao/secrets \
-  -e VAULT_ADDR=http://localhost:8200 \
+  -e VAULT_ADDR=http://bootroot-openbao:8200 \
   openbao/openbao:latest \
   agent -config /openbao/secrets/openbao/services/edge-proxy/agent.hcl
 ```
+
+위 예시에서 `VAULT_ADDR=http://localhost:8200`를 쓰지 않는 이유:
+컨테이너 내부 `localhost`는 OpenBao가 아니라 **해당 Agent 컨테이너 자신**을
+가리키기 때문입니다. Docker 네트워크에서는 OpenBao 컨테이너 이름
+(`bootroot-openbao`)으로 접근해야 합니다.
+
+참고: step-ca/OpenBao/responder가 한 머신에서 동작하는 bootroot 기본
+토폴로지에서는 `bootroot init`가 step-ca/responder용 OpenBao Agent 설정 파일과
+compose override를 생성하고, `openbao-agent-stepca`,
+`openbao-agent-responder` 컨테이너를 기동합니다.
 
 ### 호스트 실행
 
@@ -245,8 +265,9 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
     1. Docker 서비스: 서비스별 사이드카
     2. daemon 서비스: OpenBao Agent를 daemon으로 **서비스마다 1개** 실행
 
-`role_id`/`secret_id` 파일은 `secrets/services/<service>/` 아래에 있으며,
-해당 디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
+서비스용 OpenBao Agent의 `role_id`/`secret_id` 파일은
+`secrets/services/<service>/` 아래에 있으며, 해당 디렉터리는 `0700`, 파일은
+`0600` 권한을 유지해야 합니다.
 
 ## 개발/테스트 환경 완전 초기화
 
@@ -350,12 +371,25 @@ docker compose up --build -d bootroot-agent
 
 컨테이너는 기본으로 `agent.toml.compose`를 사용합니다.
 
-이미지는 기본적으로 **데몬 모드**(no `--oneshot`)로 실행됩니다.
-현재 프로젝트의 기본 `docker-compose.yml`은 bootroot-agent에
-`restart: always`를 설정합니다.
+현재 프로젝트 기본 `docker-compose.yml`의 bootroot-agent는
+`--oneshot`으로 실행됩니다(1회 발급 후 종료).
+지속 갱신이 필요한 운영 구성에서는 `--oneshot` 없이 데몬 모드로 실행하고
+재시작 정책(`restart: always` 또는 `unless-stopped`)을 함께 설정하세요.
 사용자가 직접 중지한 컨테이너를 유지하려면 `restart: unless-stopped`로
 바꿔 사용하세요. 또한 호스트 재부팅에도 유지되도록 Docker/Compose
 서비스 자체를 systemd 등으로 관리해야 합니다.
+
+## bootroot-remote (원격 서비스 머신용)
+
+서비스가 step-ca/OpenBao가 동작하는 머신이 아닌 다른 머신에 추가될 때는
+해당 서비스 머신에 `bootroot-remote`를 설치해야 합니다.
+
+- 설치: `cargo build --release --bin bootroot-remote`
+- 실행: `bootroot-remote sync ...`
+- 운영: systemd timer 또는 cron으로 주기 실행
+
+`remote-bootstrap` 경로의 상세 인자/예시는 [CLI](cli.md)의
+`bootroot-remote pull/ack/sync` 섹션을 참고하세요.
 
 ## HTTP-01 리스폰더
 

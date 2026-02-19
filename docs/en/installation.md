@@ -1,8 +1,15 @@
 # Installation
 
-This section covers step-ca, PostgreSQL, bootroot-agent, and the HTTP-01 responder.
-If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
-**manual setup** flow.
+This section explains installation and placement principles for step-ca,
+PostgreSQL, OpenBao Agent, bootroot-agent, and the HTTP-01 responder.
+In real operations you will typically use `bootroot` CLI automation, but this
+page is intentionally written from a **manual (non-CLI) perspective** to improve
+understanding.
+In other words, it helps you understand what the CLI automation is doing under
+the hood.
+
+For automated command flow, also see [CLI](cli.md) and
+[CLI Examples](cli-examples.md).
 
 ## step-ca
 
@@ -41,11 +48,11 @@ recommend injecting this value via a Secret Manager (for example, OpenBao).
 
 After initialization, these files are created (examples):
 
-- `ca.json`
-- `root_ca.crt`
-- `intermediate_ca.crt`
-- `secrets/ca_key`
-- `secrets/intermediate_ca_key`
+- `secrets/config/ca.json`
+- `secrets/certs/root_ca.crt`
+- `secrets/certs/intermediate_ca.crt`
+- `secrets/secrets/root_ca_key`
+- `secrets/secrets/intermediate_ca_key`
 
 `bootroot init` stores CA fingerprints in OpenBao, so
 `secrets/certs/root_ca.crt` and `secrets/certs/intermediate_ca.crt` must
@@ -183,8 +190,9 @@ OpenBao Agent for step-ca (example):
 ```bash
 docker run --rm \
   --name openbao-agent-stepca \
+  --network bootroot_default \
   -v $(pwd)/secrets:/openbao/secrets \
-  -e VAULT_ADDR=http://localhost:8200 \
+  -e VAULT_ADDR=http://bootroot-openbao:8200 \
   openbao/openbao:latest \
   agent -config /openbao/secrets/openbao/stepca/agent.hcl
 ```
@@ -194,8 +202,9 @@ OpenBao Agent for responder (example):
 ```bash
 docker run --rm \
   --name openbao-agent-responder \
+  --network bootroot_default \
   -v $(pwd)/secrets:/openbao/secrets \
-  -e VAULT_ADDR=http://localhost:8200 \
+  -e VAULT_ADDR=http://bootroot-openbao:8200 \
   openbao/openbao:latest \
   agent -config /openbao/secrets/openbao/responder/agent.hcl
 ```
@@ -205,11 +214,22 @@ OpenBao Agent for a service (example):
 ```bash
 docker run --rm \
   --name openbao-agent-edge-proxy \
+  --network bootroot_default \
   -v $(pwd)/secrets:/openbao/secrets \
-  -e VAULT_ADDR=http://localhost:8200 \
+  -e VAULT_ADDR=http://bootroot-openbao:8200 \
   openbao/openbao:latest \
   agent -config /openbao/secrets/openbao/services/edge-proxy/agent.hcl
 ```
+
+Why not `VAULT_ADDR=http://localhost:8200` here:
+inside a container, `localhost` points to the agent container itself, not the
+OpenBao container. On Docker networks, use the OpenBao container name
+(`bootroot-openbao`).
+
+Note: in the bootroot default topology where step-ca/OpenBao/responder run on
+one machine, `bootroot init` generates step-ca/responder OpenBao Agent configs
+and a compose override, then starts `openbao-agent-stepca` and
+`openbao-agent-responder`.
 
 ### Host run
 
@@ -228,8 +248,8 @@ Recommended deployment policy:
     1. Docker services: use a per-service sidecar
     2. daemon services: run OpenBao Agent as a daemon **per service**
 
-`role_id`/`secret_id` live under `secrets/services/<service>/`. Keep the
-directory `0700` and the files `0600`.
+For service OpenBao Agent flow, `role_id`/`secret_id` live under
+`secrets/services/<service>/`. Keep the directory `0700` and the files `0600`.
 
 ## Full reset (dev/test)
 
@@ -335,12 +355,26 @@ docker compose up --build -d bootroot-agent
 
 The agent reads `agent.toml.compose` by default in the container.
 
-The image runs the agent in **daemon mode by default** (no `--oneshot`).
-The default `docker-compose.yml` in this project sets `restart: always` for
-the bootroot-agent sidecar.
+In this project's default `docker-compose.yml`, bootroot-agent is launched with
+`--oneshot` (issue once, then exit).
+For production-style continuous renewal, run without `--oneshot` (daemon mode)
+and configure an explicit restart policy (`restart: always` or
+`restart: unless-stopped`).
 If you prefer manual stop behavior, switch to `restart: unless-stopped`.
 Also ensure Docker/Compose itself is managed by systemd (or an equivalent
 service manager) so it survives host reboots.
+
+## bootroot-remote (for remote service machines)
+
+When a service is added on a machine different from where step-ca/OpenBao run,
+install `bootroot-remote` on that service machine.
+
+- Build/install: `cargo build --release --bin bootroot-remote`
+- Runtime: `bootroot-remote sync ...`
+- Operations: periodic execution via systemd timer or cron
+
+For detailed arguments/examples in `remote-bootstrap` mode, see
+`bootroot-remote pull/ack/sync` in [CLI](cli.md).
 
 ## HTTP-01 responder
 

@@ -27,14 +27,11 @@ plugins:
             - Concepts: concepts.md
             - CLI: cli.md
             - CLI Examples: cli-examples.md
-            - Getting Started: getting-started.md
             - Installation: installation.md
             - Configuration: configuration.md
             - Operations: operations.md
             - CI & E2E: e2e-ci.md
-            - Examples: examples.md
             - Troubleshooting: troubleshooting.md
-            - FAQ: faq.md
         - locale: ko
           name: 한국어
           build: true
@@ -43,27 +40,21 @@ plugins:
             - Concepts: concepts.md
             - CLI: cli.md
             - CLI Examples: cli-examples.md
-            - Getting Started: getting-started.md
             - Installation: installation.md
             - Configuration: configuration.md
             - Operations: operations.md
             - CI & E2E: e2e-ci.md
-            - Examples: examples.md
             - Troubleshooting: troubleshooting.md
-            - FAQ: faq.md
           nav_translations:
             Overview: 개요
             Concepts: 개념
             CLI: CLI
             CLI Examples: CLI 예제
-            Getting Started: 시작하기
-            Examples: 예제
             Installation: 설치
             Configuration: 설정
             Operations: 운영
             CI & E2E: CI/E2E
             Troubleshooting: 문제 해결
-            FAQ: FAQ
 
 extra_css:
   - styles/pdf.css

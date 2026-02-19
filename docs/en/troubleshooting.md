@@ -1,82 +1,106 @@
 # Troubleshooting
 
-If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
-**manual operations** flow.
+This page lists high-frequency failures.
+Use [CLI](cli.md) for command/option definitions, [CLI Examples](cli-examples.md)
+for concrete runs, and [CI & E2E](e2e-ci.md) for validation scenarios.
 
-## "error: unexpected argument" at startup
+## Common first checks
 
-Check your CLI flags. The current CLI supports:
+- Verify which binary you are running (`bootroot`, `bootroot-agent`, `bootroot-remote`)
+- Use `--help` on the exact binary/version you are invoking
+- Verify OpenBao/step-ca/PostgreSQL/responder processes are actually running
+- Verify name-to-IP mapping (`/etc/hosts` or DNS) matches your topology
 
-- `--config`
-- `--email`
-- `--ca-url`
-- `--eab-kid` / `--eab-hmac` / `--eab-file`
-- `--oneshot`
+## "error: unexpected argument"
 
-## OpenBao connection/auth failures
+The most common cause is mixing flags across binaries.
 
-- Check whether OpenBao is sealed
-- Verify the root token or AppRole credentials
-- Confirm the KV v2 mount exists
+- `bootroot` flags are different from `bootroot-agent` flags.
+- `bootroot-remote` has its own flag set.
+- Check `--help` on the specific binary before retrying.
 
-## OpenBao KV v2 errors
+## `bootroot infra up` / `bootroot init` failures
 
-- Ensure KV v2 is enabled (default mount `secret`)
-- If using a different mount, pass it via CLI or env
+### OpenBao failures
 
-## HTTP-01 challenge fails
+- Check whether OpenBao is still `sealed` and unseal if needed
+- Verify root token/AppRole credentials
+- Confirm KV v2 mount exists (default `secret`)
 
-- Ensure port 80 is reachable from step-ca to the responder
-- Verify the responder is running and bound to port 80
-- Confirm the domain resolves to the responder host
-- Check the agent can reach the responder admin API (port 8080)
+### step-ca init / CA file failures
 
-## step-ca PostgreSQL connection failures
+Missing files below can fail init:
 
-If you see errors like `dial tcp 127.0.0.1:5432: connect: connection refused`,
-`db.dataSource` in `secrets/config/ca.json` is likely wrong for container
-runtime.
+- `secrets/certs/root_ca.crt`
+- `secrets/certs/intermediate_ca.crt`
 
-- If you used `localhost`/`127.0.0.1`/`::1` in `bootroot init`, it should be
-  normalized to `postgres`.
-- Remote hosts like `db.internal` are expected to fail during init.
-- Check the init summary line `db host resolution: from -> to`.
+### PostgreSQL DSN failures
 
-Restart step-ca after updating the DSN.
+If you see `dial tcp 127.0.0.1:5432: connect: connection refused`, DSN host in
+`secrets/config/ca.json` is often wrong for container runtime.
 
-## "Finalize failed: badCSR"
+- `localhost`/`127.0.0.1`/`::1` input should be normalized to `postgres`
+- Remote hosts like `db.internal` fail by design under single-host guardrails
+- Check init summary DB host conversion line (`from -> to`)
 
-This usually means the CSR SANs are not accepted by the CA policy.
-Check the step-ca provisioner policy and the requested DNS SAN.
+### responder check failures
 
-## Certificate files not written
+- step-ca must reach responder `:80`
+- responder admin API (`:8080`) path must be correct
 
-- Check permissions of `profiles.paths` directories
-- Ensure the parent directory exists
-- Verify the user running bootroot-agent can write
+## `bootroot service add` result differs from expectation
 
-## "CA certificate not found" errors
+### Distinguish preview and apply modes
 
-`bootroot init` stores CA fingerprints in OpenBao and requires
-`secrets/certs/root_ca.crt` and `secrets/certs/intermediate_ca.crt`. If those
-files are missing, init fails.
+- `--print-only` / `--dry-run` is preview mode
+- Preview mode does not write files/state
+- Trust preview may require `--root-token` even in preview mode
 
-- Confirm step-ca initialization completed
-- Ensure the files exist under `secrets/certs/`
+### Verify delivery mode (`--delivery-mode`)
 
-## ACME directory fetch retries
+- `local-file`: service is added on the same machine as step-ca/OpenBao/responder
+- `remote-bootstrap`: service is added on another machine and applied through
+  `bootroot-remote`
 
-- Confirm step-ca is up and reachable
-- Check TLS trust for the CA endpoint:
-  - If using system trust, ensure the CA is installed in the OS store
-  - If using `trust.ca_bundle_path`, ensure the bundle exists and is readable
-  - For temporary diagnosis, use `bootroot-agent --insecure` (not for prod)
-- Verify `server` URL in `agent.toml`
-- Ensure the `server` URL is `https://` (HTTP is refused)
+If mode and placement do not match, file/state updates go to the wrong path.
 
-## Hook execution errors
+## `remote-bootstrap` sync failures
 
-- Confirm `command` path and permissions
-- Check `working_dir` exists
-- Look for log messages about stdout/stderr truncation
-- Review logs for output truncation messages
+- Ensure `bootroot-remote sync` is configured as a periodic run on service hosts
+- Use a unique `--summary-json` path per service for concurrent syncs
+- Compare these two outputs
+  - `bootroot-remote sync --summary-json ...`
+  - `bootroot service sync-status` on the control machine
+
+If only one side changes, the flow is usually broken in `pull/sync/ack`.
+
+## Issuance and renewal failures
+
+### HTTP-01 failures
+
+- step-ca must map service FQDN to responder IP
+- service hosts (remote mode) must also map step-ca/responder names correctly
+
+### `Finalize failed: badCSR`
+
+- Requested SANs do not match step-ca provisioner policy
+- Validate both SAN generation and CA policy together
+
+### Repeated ACME directory retries
+
+- Ensure `server` URL is `https://` (`http://` is rejected)
+- Validate system trust or `trust.ca_bundle_path`
+- Use `bootroot-agent --insecure` only for temporary diagnosis
+
+## File and hook errors
+
+- Check parent directory existence and write permission for `profiles.paths`
+- Verify runtime user permissions
+- For hook failures, verify `command` path/permissions and `working_dir`
+- Check logs for truncation warnings on process output
+
+## Local E2E-only failures
+
+- `hosts-all` needs host `/etc/hosts` mutation, so `sudo -n` is required
+- If `sudo -n` is unavailable locally, use `--skip-hosts-all`
+- This is a local workaround; CI still validates `hosts-all`

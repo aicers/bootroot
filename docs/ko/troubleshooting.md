@@ -1,81 +1,105 @@
 # 문제 해결
 
-CLI를 사용하는 경우 [CLI 문서](cli.md)를 참고하세요. 이 문서는 **수동 운영**
-환경에서의 문제 해결을 기준으로 설명합니다.
+자주 발생하는 장애를 증상별로 정리합니다.
+명령/옵션의 전체 정의는 [CLI](cli.md), 실제 실행 흐름은 [CLI 예제](cli-examples.md),
+검증 시나리오는 [CI/E2E](e2e-ci.md)를 함께 참고하세요.
 
-## "error: unexpected argument" 발생
+## 먼저 확인할 공통 사항
 
-현재 CLI는 다음 옵션만 지원합니다.
+- 실행 바이너리가 맞는지 확인 (`bootroot`, `bootroot-agent`, `bootroot-remote`)
+- `bootroot` 실행 시 `--help`로 현재 버전의 옵션을 확인
+- OpenBao/step-ca/PostgreSQL/responder 컨테이너(또는 데몬)가 실제로 기동 중인지 확인
+- 이름 매핑(`/etc/hosts` 또는 DNS)이 설치 토폴로지와 일치하는지 확인
 
-- `--config`
-- `--email`
-- `--ca-url`
-- `--eab-kid` / `--eab-hmac` / `--eab-file`
-- `--oneshot`
+## "error: unexpected argument"가 발생할 때
 
-## OpenBao 연결/인증 실패
+가장 흔한 원인은 **다른 바이너리의 옵션을 섞어 쓴 경우**입니다.
 
-- OpenBao가 `sealed` 상태인지 확인
-- root token 또는 AppRole 자격증명이 유효한지 확인
-- KV v2 마운트 경로가 존재하는지 확인
+- `bootroot` 옵션과 `bootroot-agent` 옵션은 다릅니다.
+- `bootroot-remote`도 별도 옵션 집합을 사용합니다.
+- 각 바이너리에서 `--help` 출력으로 실제 지원 옵션을 먼저 확인하세요.
 
-## OpenBao KV v2 관련 오류
+## `bootroot infra up`/`bootroot init` 단계가 실패할 때
 
-- KV v2가 enable 되어 있는지 확인(`secret` 기본 경로)
-- 마운트 경로가 다른 경우 CLI 옵션/환경 변수로 지정했는지 확인
+### OpenBao 관련
 
-## HTTP-01 챌린지 실패
+- OpenBao가 `sealed` 상태인지 확인하고, 필요 시 unseal 후 재시도
+- root token/AppRole 자격증명이 유효한지 확인
+- KV v2 마운트(`secret` 기본값)가 실제로 존재하는지 확인
 
-- step-ca에서 리스폰더의 80 포트에 접속 가능해야 함
-- 리스폰더가 80 포트에 바인딩되어 있는지 확인
-- 도메인이 리스폰더 호스트로 해석되는지 확인
-- 에이전트가 리스폰더 관리자 API(포트 8080)에 접근 가능한지 확인
+### step-ca 초기화/CA 파일 관련
 
-## step-ca PostgreSQL 연결 실패
+- `secrets/certs/root_ca.crt`
+- `secrets/certs/intermediate_ca.crt`
 
-`dial tcp 127.0.0.1:5432: connect: connection refused` 같은 오류가 나오면
-`secrets/config/ca.json`의 `db.dataSource`가 컨테이너 내부 기준으로
-잘못 설정된 경우가 많습니다.
+위 파일이 없으면 `bootroot init`이 실패할 수 있습니다.
 
-- `bootroot init`에 `localhost`/`127.0.0.1`/`::1`을 넣었다면, 정상적으로
-  `postgres`로 정규화되어야 합니다.
-- `db.internal` 같은 원격 호스트를 넣으면 init이 실패합니다(설계된 동작).
-- init summary의 `DB 호스트 해석: from -> to` 라인을 확인하세요.
+### PostgreSQL DSN 관련
 
-수정 후에는 step-ca를 재시작하세요.
+`dial tcp 127.0.0.1:5432: connect: connection refused`가 보이면
+`secrets/config/ca.json`의 `db.dataSource` 호스트가 런타임 기준으로 잘못된 경우가 많습니다.
 
-## "Finalize failed: badCSR"
+- `localhost`/`127.0.0.1`/`::1` 입력은 init 과정에서 `postgres`로 정규화되는지 확인
+- `db.internal` 같은 원격 호스트는 단일 호스트 가드레일에서 실패(설계된 동작)
+- init summary의 DB 호스트 변환 라인(`from -> to`) 확인
 
-CSR에 포함된 SAN이 CA 정책에 맞지 않을 때 발생합니다.
-step-ca 프로비저너 정책과 요청 DNS SAN을 확인하세요.
+### responder 체크 관련
 
-## 인증서 파일이 생성되지 않음
+- step-ca에서 responder의 `:80`에 접근 가능한지 확인
+- responder 관리자 API(`:8080`) 경로가 올바른지 확인
 
-- `profiles.paths` 경로 권한 확인
-- 상위 디렉터리 존재 여부 확인
-- 실행 사용자 쓰기 권한 확인
+## `bootroot service add` 결과가 기대와 다를 때
 
-## "CA 인증서 파일이 없습니다" 오류
+### preview 모드와 기본 실행 모드를 구분
 
-`bootroot init`는 CA 지문을 OpenBao에 저장하기 위해
-`secrets/certs/root_ca.crt`와 `secrets/certs/intermediate_ca.crt`가 필요합니다.
-해당 파일이 없으면 init이 실패합니다.
+- `--print-only`/`--dry-run`은 preview 모드입니다.
+- preview 모드는 파일/상태를 실제로 쓰지 않습니다.
+- trust 프리뷰까지 보려면 preview에서도 `--root-token`이 필요할 수 있습니다.
 
-- step-ca 초기화가 끝났는지 확인
-- `secrets/certs/` 아래에 위 파일이 있는지 확인
+### 전달 모드(`--delivery-mode`)를 확인
 
-## ACME 디렉터리 재시도 반복
+- `local-file`: step-ca/OpenBao/responder가 동작하는 같은 머신에 서비스 추가
+- `remote-bootstrap`: 서비스가 다른 머신에 추가되며 `bootroot-remote` 경로로 반영
 
-- step-ca 기동 여부 확인
-- TLS 신뢰 설정 확인:
-  - 시스템 CA를 쓰는 경우 OS 저장소에 CA가 설치됐는지 확인
-  - `trust.ca_bundle_path`를 쓰는 경우 파일 존재/읽기 권한 확인
-  - 임시 진단 용도로는 `bootroot-agent --insecure` 사용 가능 (운영 비권장)
-- `server` URL 확인
-- `server` URL이 `https://`인지 확인 (`http://`는 거부됨)
+모드와 실제 배치가 맞지 않으면 설정 반영 경로가 어긋납니다.
 
-## 훅 실행 오류
+## `remote-bootstrap` 동기화가 실패할 때
 
-- `command` 경로 및 권한 확인
-- `working_dir` 존재 여부 확인
-- 로그에서 출력 잘림 메시지 확인
+- 서비스 머신에서 `bootroot-remote sync`가 **주기 실행**되도록 구성했는지 확인
+- 여러 서비스를 동시에 돌릴 때 서비스별 `--summary-json` 경로를 분리했는지 확인
+- 아래 두 결과가 일치하는지 확인
+  - `bootroot-remote sync --summary-json ...` 출력
+  - control 머신의 `bootroot service sync-status` 출력
+
+어느 한쪽만 갱신되면 `pull/sync/ack` 흐름 중간에서 끊긴 상태일 수 있습니다.
+
+## 인증서 발급/갱신이 실패할 때
+
+### HTTP-01 실패
+
+- step-ca가 서비스 FQDN을 responder IP로 찾을 수 있어야 합니다.
+- 서비스 머신(원격 추가 시)도 step-ca/responder 이름을 올바른 IP로 찾을 수 있어야 합니다.
+
+### `Finalize failed: badCSR`
+
+- 요청 SAN이 step-ca 프로비저너 정책과 맞지 않을 때 발생합니다.
+- 서비스 SAN 생성 규칙과 CA 정책을 함께 점검하세요.
+
+### ACME 디렉터리 재시도 반복
+
+- `server` URL이 `https://`인지 확인 (`http://` 거부)
+- 시스템 trust 또는 `trust.ca_bundle_path`가 올바른지 확인
+- 임시 진단 용도로만 `bootroot-agent --insecure` 사용 (운영 비권장)
+
+## 파일/훅 관련 오류
+
+- `profiles.paths`의 상위 디렉터리 존재 여부와 쓰기 권한 확인
+- 실행 사용자 권한 확인
+- 훅 실패 시 `command` 경로/권한, `working_dir` 존재 여부 확인
+- 로그의 출력 잘림(트렁케이션) 경고 메시지 확인
+
+## 로컬 E2E 실행에서만 주로 발생하는 이슈
+
+- `hosts-all` 모드는 호스트 `/etc/hosts` 수정이 필요해 `sudo -n` 권한이 필요합니다.
+- 로컬에서 `sudo -n`이 불가능하면 `--skip-hosts-all` 경로를 사용하세요.
+- 이는 로컬 제약 우회이며, CI는 `hosts-all`도 검증합니다.

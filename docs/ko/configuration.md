@@ -1,12 +1,18 @@
 # 설정
 
+이 섹션은 bootroot-agent, OpenBao Agent, 훅/재시도/신뢰 설정의 구성 원리를
+설명합니다.
+실제 운영에서는 보통 `bootroot` CLI 자동화를 사용하지만, 이 문서는
+**사용자 이해도를 높이기 위해 CLI 자동화를 배제한 수동 관점**으로
+구성되어 있습니다.
+즉, "CLI가 내부에서 어떤 설정을 만들고 갱신하는지"를 사람이 직접 따라가며
+이해할 수 있게 설명합니다.
+
+실제 명령/자동화 흐름은 [CLI](cli.md), [CLI 예제](cli-examples.md)를
+함께 참고하세요.
+
 bootroot-agent는 TOML 설정 파일을 읽습니다(기본값: `agent.toml`).
 전체 템플릿은 `agent.toml.example`에 있습니다.
-
-## bootroot CLI
-
-CLI 사용법은 [CLI 문서](cli.md)에 정리되어 있습니다. 이 문서는 **수동 설정**
-절차를 기준으로 설명합니다.
 
 ## OpenBao Agent
 
@@ -20,8 +26,10 @@ OpenBao Agent가 이 설정을 사용해 실제 시크릿 파일을 생성합니
 `bootroot service add`는 서비스별 OpenBao Agent 설정 경로를 출력하며,
 기본 경로는 `secrets/openbao/services/<service>/agent.hcl`입니다.
 
-OpenBao Agent는 `role_id`/`secret_id` 파일을 사용해 AppRole로 로그인하며,
-해당 파일은 `secrets/services/<service>/` 아래에 저장됩니다.
+OpenBao Agent는 `role_id`/`secret_id` 파일을 사용해 AppRole로 로그인합니다.
+서비스별(`bootroot service add`) 기본 경로는
+`secrets/services/<service>/`이며, step-ca/리스폰더(`bootroot init`)는
+`secrets/openbao/stepca/`, `secrets/openbao/responder/`를 사용합니다.
 디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
 
 구성 책임은 다음과 같습니다.
@@ -151,6 +159,7 @@ HTTP-01 리스폰더와 ACME 재시도 동작을 제어합니다.
   - 원격 리스폰더: `http://<responder-host>:8080`
 - `http_responder_hmac`: 토큰 등록용 HMAC 공유 비밀키입니다. HTTP-01 리스폰더의
   `hmac_secret`과 동일해야 합니다.
+  비어 있으면 검증 단계에서 실행이 실패합니다.
 - `http_responder_timeout_secs`: 리스폰더 요청 타임아웃(초)
 - `http_responder_token_ttl_secs`: 토큰 TTL(초)
 
@@ -182,6 +191,8 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 제어하는 설정입니다.
   `verify_certificates = true`일 때 이 값을 설정하면 **이 번들을 ACME 서버
   신뢰 번들로도 사용**합니다.
 - `trusted_ca_sha256`: 신뢰할 CA 인증서 지문 목록(SHA-256 hex)입니다.
+- trust를 구성하면 `ca_bundle_path`와 `trusted_ca_sha256`를 함께 설정해야
+  합니다(둘 중 하나만 설정하면 검증에서 실패).
 
 `trusted_ca_sha256`는 **임의 값이 아니라 실제 CA 인증서 지문**입니다.
 `bootroot init`이 CA 지문을 OpenBao에 저장하고, 이후 `bootroot service add`는
@@ -252,6 +263,8 @@ CLI에서도 지정 가능합니다(`--eab-kid`, `--eab-hmac`, `--eab-file`).
 ### 프로필
 
 프로필 하나가 인증서 하나를 의미합니다.
+최소 1개 이상의 `[[profiles]]`가 필요하며, `instance_id`는 숫자 문자열이어야
+합니다.
 
 ```toml
 [[profiles]]

@@ -5,7 +5,7 @@ HTTP-01 리스폰더)와 **step-ca**, **OpenBao**, **Prometheus**, **Grafana**�
 설치, 구성, 운영하는 전체 과정을 설명합니다. PKI 배경 지식이 없는 사용자도
 이 문서만으로 설치와 인증서 발급을 완료할 수 있도록 구성했습니다.
 bootroot CLI 실행 파일은 `bootroot`, bootroot-agent 실행 파일은
-`bootroot-agent`, 원격 서비스 설정 CLI 실행 파일은 `bootroot-agent`입니다.
+`bootroot-agent`, 원격 서비스 설정 CLI 실행 파일은 `bootroot-remote`입니다.
 
 ## Bootroot가 하는 일
 
@@ -38,12 +38,11 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다.
 - **CLI**: infra 기동/초기화/상태 점검뿐 아니라 서비스 온보딩, 발급 검증,
   시크릿 회전, 모니터링, 원격 동기화 운영 안내까지 포함
 - **개념**: PKI, ACME, CSR, SAN, mTLS, 시크릿 관리(OpenBao) 개요
-- **빠른 시작**: Docker Compose 기반 첫 발급
 - **설치**: OpenBao + step-ca + PostgreSQL + bootroot-agent + 리스폰더 설치
 - **설정**: `agent.toml`, 프로필, 훅, 재시도, EAB
 - **운영**: 갱신, 로그, 백업, 보안(OpenBao 포함)
 - **CI/E2E**: PR 필수 매트릭스, 확장 워크플로, 아티팩트, 로컬 재현
-- **문제 해결 / FAQ**: 자주 발생하는 오류와 답변
+- **문제 해결**: 자주 발생하는 오류와 대응 방법
 
 CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리되어 있습니다. CLI 문서에서는
 `infra up/init/status`, `service add/verify`, `rotate`, `monitoring`과
@@ -99,6 +98,25 @@ step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-r
 필요하지 않습니다.
 서비스가 다른 머신에 추가되는 경우에는 해당 서비스 머신에 bootroot-remote를
 배치해야 합니다.
+
+## /etc/hosts 매핑 설정
+
+인증서 발급/갱신이 정상 동작하려면, 이름 매핑(/etc/hosts 또는 DNS)이 아래 두
+조건을 반드시 만족해야 합니다. DNS로 구성해도 되지만, 실무에서는 보통
+`/etc/hosts` 매핑을 직접 구성하는 경우가 많습니다.
+
+1. step-ca -> 서비스 FQDN(HTTP-01 검증 대상) -> 리스폰더 IP 경로  
+   step-ca는 각 서비스의 검증 FQDN
+   (`<instance_id>.<service_name>.<hostname>.<domain>`)을 리스폰더 IP로
+   해석할 수 있어야 합니다. 이를 위해 step-ca가 동작하는 환경(컨테이너/호스트)의
+   hosts 설정(`/etc/hosts`) 또는 DNS에 매핑을 넣어야 합니다.
+
+2. 원격 서비스 머신 -> step-ca/responder 이름 -> IP 경로  
+   서비스가 step-ca/OpenBao와 다른 머신에 추가되는 경우, 해당 서비스 머신에서
+   step-ca/responder를 IP 대신 이름으로 접근한다면 그 이름이 올바른 IP로
+   해석되어야 합니다. 예: `stepca.internal`, `responder.internal`을
+   사용하는 경우 서비스 머신의 hosts 설정(`/etc/hosts`) 또는 DNS에 동일 매핑을
+   구성해야 합니다.
 
 ## 아키텍처(요약)
 

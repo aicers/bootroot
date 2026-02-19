@@ -1,11 +1,28 @@
 # Operations
 
-This section focuses on runbook checks and avoids repeating setup details.
+This section focuses on operational checks and incident response runbooks.
 See **Installation** and **Configuration** for full setup steps and options.
-If you are using the CLI, see `docs/en/cli.md`. This document focuses on the
-**manual operations** flow.
+For CLI command syntax, see [CLI](cli.md).
 
 For CI/test operations, see [CI & E2E](e2e-ci.md).
+
+## Core operational checks
+
+Run these regularly for fast health checks:
+
+```bash
+bootroot status
+bootroot verify --service-name <service> --db-check
+bootroot service info --service-name <service>
+bootroot monitoring status
+```
+
+- `bootroot status`: overall state from OpenBao/step-ca/state file perspective
+- `bootroot verify --service-name <service> --db-check`:
+  non-interactive issuance/verification/DB/responder checks
+- `bootroot service info --service-name <service>`:
+  current per-service state including delivery mode and per-item sync-status
+- `bootroot monitoring status`: Prometheus/Grafana container status
 
 ## bootroot-agent
 
@@ -38,10 +55,21 @@ For CI/test operations, see [CI & E2E](e2e-ci.md).
 - Include KV v2 data in backup/snapshot policies.
 - Confirm reload/restart behavior for bootroot-agent/step-ca after rotations.
 
+## Monitoring operations
+
+- Use `bootroot monitoring up --profile lan|public` to start monitoring.
+- `bootroot monitoring status` prints running profile status plus
+  Grafana URL/admin-password status.
+- Use `bootroot monitoring down` to stop/remove monitoring containers.
+- To reset Grafana admin password to the initial state, run
+  `bootroot monitoring down --reset-grafana-admin-password`.
+
 ## Rotation scheduling
 
 Run `bootroot rotate ...` on a schedule (cron/systemd timer). Keep secrets out
 of command history; use environment files or secure stores.
+`bootroot rotate` commands require an OpenBao root token. Provide it via
+`--root-token` or `OPENBAO_ROOT_TOKEN` (otherwise you will be prompted).
 
 Example (cron):
 
@@ -73,9 +101,10 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-## Remote sync runner operations
+## Remote sync periodic operations
 
-For remote-bootstrap services, run a periodic `bootroot-remote sync` runner.
+For targets added with `--delivery-mode remote-bootstrap`, run a periodic
+`bootroot-remote sync` job.
 Template files are provided:
 
 - `scripts/bootroot-remote-sync.service`
@@ -84,7 +113,7 @@ Template files are provided:
 
 Recommended pattern:
 
-- one runner per service
+- one periodic sync job per service
 - one `--summary-json` file per service
 - keep role/secret/token/config paths service-scoped
 
@@ -102,10 +131,22 @@ Failure handling guidance:
 - alert on repeated `failed`/`expired` sync-status values
 - inspect pull summary JSON + `bootroot service sync-status` output together
 
+Manual ingest (exception path):
+
+- Use the command below only when you need to ingest a previously generated
+  summary JSON manually.
+
+```bash
+bootroot service sync-status \
+  --service-name <service> \
+  --summary-json <service>-remote-summary.json
+```
+
 Security notes:
 
 - secret directories `0700`, secret files `0600`
-- avoid printing raw summary JSON with secrets to shared logs
+- summary JSON is primarily status/error metadata; still keep it out of broad
+  shared logs and apply retention controls
 - limit service account access to service-specific paths only
 
 ## CA bundle (trust) operations
