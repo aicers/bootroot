@@ -17,10 +17,12 @@ use ring::digest;
 use x509_parser::pem::parse_x509_pem;
 
 use super::constants::openbao_constants::{
-    APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_STEPCA,
-    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC,
-    PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER,
-    POLICY_BOOTROOT_STEPCA, SECRET_ID_TTL, TOKEN_TTL,
+    APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_RUNTIME_ROTATE,
+    APPROLE_BOOTROOT_RUNTIME_SERVICE_ADD, APPROLE_BOOTROOT_STEPCA, INIT_SECRET_SHARES,
+    INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
+    PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER,
+    POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD, POLICY_BOOTROOT_STEPCA,
+    SECRET_ID_TTL, TOKEN_TTL,
 };
 use super::constants::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME, CA_TRUST_KEY,
@@ -804,6 +806,8 @@ async fn configure_openbao(
             "bootroot_agent" => POLICY_BOOTROOT_AGENT,
             "responder" => POLICY_BOOTROOT_RESPONDER,
             "stepca" => POLICY_BOOTROOT_STEPCA,
+            "runtime_service_add" => POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
+            "runtime_rotate" => POLICY_BOOTROOT_RUNTIME_ROTATE,
             _ => continue,
         };
         if !client
@@ -1564,6 +1568,69 @@ path "{kv_mount}/data/{PATH_STEPCA_DB}" {{
 "#
         ),
     );
+    policies.insert(
+        POLICY_BOOTROOT_RUNTIME_SERVICE_ADD.to_string(),
+        format!(
+            r#"path "sys/policies/acl/bootroot-service-*" {{
+  capabilities = ["create", "update", "read"]
+}}
+path "auth/approle/role/bootroot-service-*" {{
+  capabilities = ["create", "update", "read"]
+}}
+path "auth/approle/role/bootroot-service-*/role-id" {{
+  capabilities = ["read"]
+}}
+path "auth/approle/role/bootroot-service-*/secret-id" {{
+  capabilities = ["create", "update"]
+}}
+path "{kv_mount}/data/{PATH_AGENT_EAB}" {{
+  capabilities = ["read"]
+}}
+path "{kv_mount}/data/{PATH_RESPONDER_HMAC}" {{
+  capabilities = ["read"]
+}}
+path "{kv_mount}/data/{PATH_CA_TRUST}" {{
+  capabilities = ["read"]
+}}
+path "{kv_mount}/metadata/{PATH_CA_TRUST}" {{
+  capabilities = ["read"]
+}}
+path "{kv_mount}/data/bootroot/services/*" {{
+  capabilities = ["create", "update", "read"]
+}}
+"#
+        ),
+    );
+    policies.insert(
+        POLICY_BOOTROOT_RUNTIME_ROTATE.to_string(),
+        format!(
+            r#"path "{kv_mount}/data/{PATH_STEPCA_PASSWORD}" {{
+  capabilities = ["create", "update", "read"]
+}}
+path "{kv_mount}/data/{PATH_STEPCA_DB}" {{
+  capabilities = ["create", "update", "read"]
+}}
+path "{kv_mount}/data/{PATH_AGENT_EAB}" {{
+  capabilities = ["create", "update", "read"]
+}}
+path "{kv_mount}/data/{PATH_RESPONDER_HMAC}" {{
+  capabilities = ["create", "update", "read"]
+}}
+path "{kv_mount}/data/bootroot/services/*" {{
+  capabilities = ["create", "update", "read"]
+}}
+path "auth/approle/role/bootroot-service-*" {{
+  capabilities = ["create", "update", "read"]
+}}
+path "auth/approle/role/bootroot-service-*/role-id" {{
+  capabilities = ["read"]
+}}
+path "auth/approle/role/bootroot-service-*/secret-id" {{
+  capabilities = ["create", "update"]
+}}
+"#
+        ),
+    );
     policies
 }
 
@@ -1578,6 +1645,14 @@ fn build_approle_map() -> BTreeMap<String, String> {
         APPROLE_BOOTROOT_RESPONDER.to_string(),
     );
     approles.insert("stepca".to_string(), APPROLE_BOOTROOT_STEPCA.to_string());
+    approles.insert(
+        "runtime_service_add".to_string(),
+        APPROLE_BOOTROOT_RUNTIME_SERVICE_ADD.to_string(),
+    );
+    approles.insert(
+        "runtime_rotate".to_string(),
+        APPROLE_BOOTROOT_RUNTIME_ROTATE.to_string(),
+    );
     approles
 }
 
@@ -1747,6 +1822,14 @@ fn write_state_file(
             POLICY_BOOTROOT_RESPONDER.to_string(),
         ),
         ("stepca".to_string(), POLICY_BOOTROOT_STEPCA.to_string()),
+        (
+            "runtime_service_add".to_string(),
+            POLICY_BOOTROOT_RUNTIME_SERVICE_ADD.to_string(),
+        ),
+        (
+            "runtime_rotate".to_string(),
+            POLICY_BOOTROOT_RUNTIME_ROTATE.to_string(),
+        ),
     ]
     .into_iter()
     .collect::<BTreeMap<_, _>>();
@@ -2422,8 +2505,17 @@ services:
     fn test_build_policy_map_contains_paths() {
         let policies = build_policy_map("secret");
         let agent_policy = policies.get(POLICY_BOOTROOT_AGENT).unwrap();
+        let service_add_policy = policies.get(POLICY_BOOTROOT_RUNTIME_SERVICE_ADD).unwrap();
+        let rotate_policy = policies.get(POLICY_BOOTROOT_RUNTIME_ROTATE).unwrap();
         assert!(agent_policy.contains("secret/data/bootroot/agent/eab"));
         assert!(agent_policy.contains("secret/data/bootroot/responder/hmac"));
+        assert!(service_add_policy.contains("sys/policies/acl/bootroot-service-*"));
+        assert!(service_add_policy.contains("auth/approle/role/bootroot-service-*/secret-id"));
+        assert!(service_add_policy.contains("secret/metadata/bootroot/ca"));
+        assert!(rotate_policy.contains("secret/data/bootroot/stepca/password"));
+        assert!(rotate_policy.contains("secret/data/bootroot/services/*"));
+        assert!(rotate_policy.contains("auth/approle/role/bootroot-service-*"));
+        assert!(rotate_policy.contains("auth/approle/role/bootroot-service-*/secret-id"));
     }
 
     #[test]

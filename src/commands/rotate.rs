@@ -19,6 +19,7 @@ use crate::commands::infra::run_docker;
 use crate::commands::init::{
     PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, SECRET_ID_TTL,
 };
+use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry, StateFile, SyncApplyStatus, SyncTiming};
 const SECRET_BYTES: usize = 32;
@@ -90,7 +91,6 @@ struct RotateContext {
     openbao_url: String,
     kv_mount: String,
     compose_file: PathBuf,
-    root_token: String,
     state: StateFile,
     paths: StatePaths,
 }
@@ -122,12 +122,11 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         .clone()
         .unwrap_or_else(|| state.secrets_dir());
     let paths = StatePaths::new(state_path, secrets_dir.clone());
-    let root_token = resolve_root_token(args.root_token.root_token.clone(), messages)?;
+    let runtime_auth = resolve_runtime_auth(&args.runtime_auth, true, messages)?;
     let mut ctx = RotateContext {
         openbao_url,
         kv_mount,
         compose_file: args.compose.compose_file.clone(),
-        root_token,
         state,
         paths,
     };
@@ -139,7 +138,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
 
     let mut client = OpenBaoClient::new(&ctx.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
-    client.set_token(ctx.root_token.clone());
+    authenticate_openbao_client(&mut client, &runtime_auth, messages).await?;
     client
         .health_check()
         .await
@@ -773,17 +772,6 @@ fn expire_if_due(status: &mut SyncApplyStatus, metadata: &mut SyncTiming, now_un
         return true;
     }
     false
-}
-
-fn resolve_root_token(value: Option<String>, messages: &Messages) -> Result<String> {
-    if let Some(value) = value {
-        return Ok(value);
-    }
-    let mut input = std::io::stdin().lock();
-    let mut output = std::io::stdout();
-    let mut prompt = Prompt::new(&mut input, &mut output, messages);
-    let label = messages.prompt_openbao_root_token().trim_end_matches(": ");
-    prompt.prompt_with_validation(label, None, |value| ensure_non_empty(value, messages))
 }
 
 fn resolve_db_admin_dsn(args: &RotateDbArgs, messages: &Messages) -> Result<String> {

@@ -9,7 +9,7 @@ use anyhow::Context;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[cfg(unix)]
@@ -120,6 +120,135 @@ async fn test_app_add_writes_state_and_secret() {
     assert_eq!(mode, 0o600);
 
     assert_openbao_service_agent_files(temp_dir.path(), "edge-proxy");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_supports_approle_runtime_auth() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_approle_login(
+        &server,
+        "runtime-role-id",
+        "runtime-secret-id",
+        "runtime-client",
+    )
+    .await;
+    stub_app_add_openbao_with_token(&server, "edge-proxy", "runtime-client").await;
+    stub_app_add_trust_missing_with_token(&server, "runtime-client").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            "runtime-role-id",
+            "--approle-secret-id",
+            "runtime-secret-id",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("bootroot service add: summary"));
+    assert!(stdout.contains("- service name: edge-proxy"));
+    assert!(
+        temp_dir
+            .path()
+            .join("secrets")
+            .join("services")
+            .join("edge-proxy")
+            .join("secret_id")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_approle_permission_denied_fails() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_approle_login(
+        &server,
+        "runtime-role-id",
+        "runtime-secret-id",
+        "runtime-client",
+    )
+    .await;
+    stub_app_add_trust_missing_with_token(&server, "runtime-client").await;
+    stub_app_add_policy_write_forbidden_with_token(&server, "edge-proxy", "runtime-client").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            "runtime-role-id",
+            "--approle-secret-id",
+            "runtime-secret-id",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("bootroot service add failed"));
+    assert!(stderr.contains("OpenBao policy write failed"));
 }
 
 #[cfg(unix)]
@@ -252,27 +381,23 @@ async fn test_app_add_prompts_for_missing_inputs() {
     stub_app_add_openbao(&server, "edge-proxy").await;
 
     let input = format!(
-        "edge-proxy\n\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n{}\n",
+        "edge-proxy\n\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
-        ROOT_TOKEN
     );
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "add"])
+        .args(["service", "add", "--root-token", ROOT_TOKEN])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn service add");
 
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(input.as_bytes()).expect("write stdin");
+    drop(stdin);
 
     let output = child.wait_with_output().expect("run service add");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -300,27 +425,23 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
     stub_app_add_openbao(&server, "edge-proxy").await;
 
     let input = format!(
-        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\n{}\nmissing/edge-proxy.crt\n{}\n{}\n\n001\n{}\n",
+        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\n{}\nmissing/edge-proxy.crt\n{}\n{}\n\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
-        ROOT_TOKEN
     );
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "add"])
+        .args(["service", "add", "--root-token", ROOT_TOKEN])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn service add");
 
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(input.as_bytes()).expect("write stdin");
+    drop(stdin);
 
     let output = child.wait_with_output().expect("run service add");
     assert!(output.status.success());
@@ -693,12 +814,9 @@ async fn test_app_add_prompts_for_docker_instance_id() {
         .spawn()
         .expect("spawn service add");
 
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(b"001\n")
-        .expect("write stdin");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(b"001\n").expect("write stdin");
+    drop(stdin);
 
     let output = child.wait_with_output().expect("run service add");
     assert!(output.status.success());
@@ -1414,35 +1532,29 @@ fn assert_terminal_sync_metadata_cleared(metadata: &serde_json::Value, key: &str
 }
 
 async fn stub_app_add_openbao(server: &MockServer, service_name: &str) {
+    stub_app_add_openbao_with_token(server, service_name, support::ROOT_TOKEN).await;
+}
+
+async fn stub_app_add_openbao_with_token(server: &MockServer, service_name: &str, token: &str) {
     let role = format!("bootroot-service-{service_name}");
-    Mock::given(method("GET"))
-        .and(path("/v1/sys/auth"))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": {
-                "approle/": {}
-            }
-        })))
-        .mount(server)
-        .await;
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/sys/policies/acl/{role}")))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{role}")))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 
     Mock::given(method("GET"))
         .and(path(format!("/v1/auth/approle/role/{role}/role-id")))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "role_id": format!("role-{service_name}") }
         })))
@@ -1451,7 +1563,7 @@ async fn stub_app_add_openbao(server: &MockServer, service_name: &str) {
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "secret_id": format!("secret-{service_name}") }
         })))
@@ -1460,16 +1572,20 @@ async fn stub_app_add_openbao(server: &MockServer, service_name: &str) {
 }
 
 async fn stub_app_add_trust_present(server: &MockServer) {
+    stub_app_add_trust_present_with_token(server, support::ROOT_TOKEN).await;
+}
+
+async fn stub_app_add_trust_present_with_token(server: &MockServer, token: &str) {
     Mock::given(method("GET"))
         .and(path("/v1/secret/metadata/bootroot/ca"))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/ca"))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "data": {
@@ -1483,10 +1599,49 @@ async fn stub_app_add_trust_present(server: &MockServer) {
 }
 
 async fn stub_app_add_trust_missing(server: &MockServer) {
+    stub_app_add_trust_missing_with_token(server, support::ROOT_TOKEN).await;
+}
+
+async fn stub_app_add_trust_missing_with_token(server: &MockServer, token: &str) {
     Mock::given(method("GET"))
         .and(path("/v1/secret/metadata/bootroot/ca"))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(404))
+        .mount(server)
+        .await;
+}
+
+async fn stub_app_add_policy_write_forbidden_with_token(
+    server: &MockServer,
+    service_name: &str,
+    token: &str,
+) {
+    let role = format!("bootroot-service-{service_name}");
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/sys/policies/acl/{role}")))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "errors": ["permission denied"]
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_approle_login(
+    server: &MockServer,
+    role_id: &str,
+    secret_id: &str,
+    client_token: &str,
+) {
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": role_id,
+            "secret_id": secret_id
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": client_token }
+        })))
         .mount(server)
         .await;
 }

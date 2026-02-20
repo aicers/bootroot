@@ -14,6 +14,10 @@ use crate::cli::prompt::Prompt;
 use crate::commands::init::{
     PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, SECRET_ID_TTL, TOKEN_TTL,
 };
+use crate::commands::openbao_auth::{
+    RuntimeAuthResolved, authenticate_openbao_client, resolve_runtime_auth,
+    resolve_runtime_auth_optional,
+};
 use crate::i18n::Messages;
 use crate::state::{
     DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, ServiceSyncMetadata,
@@ -101,10 +105,24 @@ async fn run_service_add_preview(
         .join(SERVICE_SECRET_ID_FILENAME);
     let mut note = messages.service_summary_preview_mode().to_string();
     let mut trusted_ca_sha256: Option<Vec<String>> = None;
-    if resolved.root_token.trim().is_empty() {
+    let Some(auth) = resolved.runtime_auth.as_ref() else {
         note.push('\n');
         note.push_str(messages.service_summary_preview_trust_skipped_no_token());
-    } else {
+        print_service_add_summary(
+            &preview_entry,
+            &preview_secret_id_path,
+            ServiceAddSummaryOptions {
+                applied: None,
+                remote: None,
+                trusted_ca_sha256: None,
+                show_snippets: true,
+                note: Some(note),
+            },
+            messages,
+        );
+        return;
+    };
+    {
         let mut client = match OpenBaoClient::new(&state.openbao_url)
             .with_context(|| messages.error_openbao_client_create_failed())
         {
@@ -129,12 +147,7 @@ async fn run_service_add_preview(
                 return;
             }
         };
-        client.set_token(resolved.root_token.clone());
-        match client
-            .ensure_approle_auth()
-            .await
-            .with_context(|| messages.error_openbao_approle_auth_failed())
-        {
+        match authenticate_openbao_client(&mut client, auth, messages).await {
             Ok(()) => match read_ca_trust_material(&client, &state.kv_mount, messages).await {
                 Ok(Some(material)) => trusted_ca_sha256 = Some(material.trusted_ca_sha256),
                 Ok(None) => {
@@ -177,15 +190,14 @@ async fn run_service_add_apply(
     resolved: &ResolvedServiceAdd,
     messages: &Messages,
 ) -> Result<()> {
-    let root_token = resolved.root_token.clone();
+    let auth = resolved
+        .runtime_auth
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("OpenBao auth is required"))?;
 
     let mut client = OpenBaoClient::new(&state.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
-    client.set_token(root_token);
-    client
-        .ensure_approle_auth()
-        .await
-        .with_context(|| messages.error_openbao_approle_auth_failed())?;
+    authenticate_openbao_client(&mut client, auth, messages).await?;
 
     let ca_trust_material = read_ca_trust_material(&client, &state.kv_mount, messages).await?;
     let trusted_ca_sha256 = ca_trust_material
@@ -1355,7 +1367,7 @@ pub(crate) struct ResolvedServiceAdd {
     pub(crate) key_path: PathBuf,
     pub(crate) instance_id: Option<String>,
     pub(crate) container_name: Option<String>,
-    pub(crate) root_token: String,
+    pub(crate) runtime_auth: Option<RuntimeAuthResolved>,
     pub(crate) notes: Option<String>,
 }
 
@@ -1441,13 +1453,10 @@ fn resolve_service_add_args(
         }),
     };
 
-    let root_token = if preview {
-        args.root_token.root_token.clone().unwrap_or_default()
-    } else if let Some(value) = args.root_token.root_token.clone() {
-        value
+    let runtime_auth = if preview {
+        resolve_runtime_auth_optional(&args.runtime_auth)?
     } else {
-        let label = messages.prompt_openbao_root_token().trim_end_matches(": ");
-        prompt.prompt_with_validation(label, None, |value| ensure_non_empty(value, messages))?
+        Some(resolve_runtime_auth(&args.runtime_auth, true, messages)?)
     };
 
     Ok(ResolvedServiceAdd {
@@ -1461,7 +1470,7 @@ fn resolve_service_add_args(
         key_path,
         instance_id: Some(instance_id),
         container_name,
-        root_token,
+        runtime_auth,
         notes: args.notes.clone(),
     })
 }
@@ -1615,7 +1624,7 @@ mod tests {
             key_path: PathBuf::from("certs/edge-proxy.key"),
             instance_id: Some("001".to_string()),
             container_name: None,
-            root_token: "root".to_string(),
+            runtime_auth: None,
             notes: None,
         };
         let block = render_managed_profile_block(&args);

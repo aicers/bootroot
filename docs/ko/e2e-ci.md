@@ -105,7 +105,8 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 실행 단계:
 
 1. `infra-up`: Compose 서비스 기동 및 readiness 대기
-2. `init`: `bootroot init --summary-json` 실행 후 JSON에서 `root_token` 파싱
+2. `init`: `bootroot init --summary-json` 실행 후 JSON에서 런타임 AppRole
+   자격증명 파싱
 3. `service-add`: daemon + docker 서비스를 `local-file` 모드로 추가
 4. `verify-initial`: 초기 인증서 발급/검증 후 fingerprint 스냅샷 저장
 5. `rotate-responder-hmac`: 회전 실행 후 재발급 강제
@@ -139,8 +140,14 @@ bootroot verify --service-name edge-proxy --agent-config "$AGENT_CONFIG_PATH"
 bootroot verify --service-name web-app --agent-config "$AGENT_CONFIG_PATH"
 
 # 5) rotate-responder-hmac
+# init summary에서
+#   runtime_service_add: role_id/secret_id
+#   runtime_rotate: role_id/secret_id
 bootroot rotate --compose-file "$COMPOSE_FILE" \
-  --openbao-url "http://127.0.0.1:8200" --root-token "$OPENBAO_ROOT_TOKEN" \
+  --openbao-url "http://127.0.0.1:8200" \
+  --auth-mode approle \
+  --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+  --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
   --yes responder-hmac
 ```
 
@@ -199,7 +206,8 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 실행 단계:
 
-1. control node에서 `infra-up`, `init` 실행 후 summary JSON에서 `root_token` 파싱
+1. control node에서 `infra-up`, `init` 실행 후 summary JSON에서 런타임
+   AppRole 자격증명 파싱
 2. control node에서 `remote-bootstrap` 모드로 `service-add` 실행
 3. bootstrap 재료(`role_id`, `secret_id`)를 remote node로 복사
 4. `sync-initial`: remote node에서 `bootroot-remote sync` 실행
@@ -392,25 +400,27 @@ RUNNER_MODE=cron ./scripts/e2e/docker/run-harness-smoke.sh
 
 라이프사이클 스크립트는 `bootroot init --summary-json` 출력으로 자동화를
 수행합니다. 사람용 요약 텍스트를 파싱해 토큰/시크릿을 추출하지 않습니다.
-로컬 CLI 시나리오 실행도 같은 방식으로 `--summary-json`의 `.root_token`을 사용합니다.
+로컬 CLI 시나리오 실행도 같은 방식으로 `--summary-json`의 `.approles[]`에서
+런타임 AppRole 자격증명을 사용합니다.
 이 절차는 **테스트/자동화 편의용 규칙**이며, 운영 환경의 토큰 보관 정책을
 대체하지 않습니다.
 
 E2E가 사용하는 최소 머신 필드:
 
-- `root_token`
+- `.approles[]` 항목 중:
+  - `runtime_service_add` (`role_id`, `secret_id`)
+  - `runtime_rotate` (`role_id`, `secret_id`)
 
-E2E에서 OpenBao 언실/토큰 사용 방식:
+E2E에서 OpenBao 언실/런타임 인증 사용 방식:
 
 - E2E는 보통 `init` 단계에서 한 번 언실한 뒤 같은 실행 동안 재언실하지 않음
 - 다시 언실이 필요한 경우는 OpenBao가 다시 `sealed` 상태가 되었을 때뿐임
   (예: 프로세스/컨테이너 재시작, 수동 seal, 복구 절차)
-- `root_token`은 `init-summary.json`에서 읽어 셸 변수(`OPENBAO_ROOT_TOKEN`)로
-  보관하고, 같은 실행 내 `service add`/`rotate` 등에 `--root-token`으로 전달
-- 테스트 스크립트도 root token을 장기 저장하지 않으며, 실행 컨텍스트 변수로만
-  전달해 사용
-- 요약 JSON 파일 자체에 토큰이 포함되므로 아티팩트 보관 시 민감정보로 취급
-  해야 함
+- 런타임 AppRole 자격증명은 `init-summary.json`의 `approles`에서 읽어
+  `--auth-mode approle`로 `service add`/`rotate`에 전달
+- 테스트 스크립트는 자격증명을 장기 저장하지 않고 실행 컨텍스트 변수로만 전달
+- 요약 JSON 파일에는 root token/AppRole secret_id 등 민감 필드가 포함되므로
+  아티팩트 보관 시 민감정보로 취급해야 함
 
 운영 가이드:
 

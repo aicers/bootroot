@@ -187,10 +187,20 @@ run_service_scenarios() {
   mkdir -p "$ROOT_DIR/tmp" "$ROOT_DIR/certs"
   write_agent_config "$ROOT_DIR/tmp/agent.toml"
 
-  local root_token
-  root_token="$(jq -r '.root_token // empty' "$INIT_SUMMARY_JSON")"
-  if [[ -z "${root_token:-}" ]]; then
-    fail "Missing root_token in init summary JSON: $INIT_SUMMARY_JSON"
+  local runtime_service_add_role_id runtime_service_add_secret_id
+  runtime_service_add_role_id="$(
+    jq -r '.approles[] | select(.label == "runtime_service_add") | .role_id // empty' \
+      "$INIT_SUMMARY_JSON"
+  )"
+  runtime_service_add_secret_id="$(
+    jq -r '.approles[] | select(.label == "runtime_service_add") | .secret_id // empty' \
+      "$INIT_SUMMARY_JSON"
+  )"
+  if [[ -z "${runtime_service_add_role_id:-}" ]]; then
+    fail "Missing runtime_service_add role_id in init summary JSON: $INIT_SUMMARY_JSON"
+  fi
+  if [[ -z "${runtime_service_add_secret_id:-}" ]]; then
+    fail "Missing runtime_service_add secret_id in init summary JSON: $INIT_SUMMARY_JSON"
   fi
 
   cargo run --bin bootroot -- service add \
@@ -202,7 +212,9 @@ run_service_scenarios() {
     --cert-path "$ROOT_DIR/certs/edge-proxy.crt" \
     --key-path "$ROOT_DIR/certs/edge-proxy.key" \
     --instance-id 001 \
-    --root-token "$root_token"
+    --auth-mode approle \
+    --approle-role-id "$runtime_service_add_role_id" \
+    --approle-secret-id "$runtime_service_add_secret_id"
 
   cargo run --bin bootroot -- service add \
     --service-name web-app \
@@ -214,7 +226,9 @@ run_service_scenarios() {
     --key-path "$ROOT_DIR/certs/web-app.key" \
     --instance-id 001 \
     --container-name web-app \
-    --root-token "$root_token"
+    --auth-mode approle \
+    --approle-role-id "$runtime_service_add_role_id" \
+    --approle-secret-id "$runtime_service_add_secret_id"
 
   add_stepca_host_aliases
   wait_for_responder_http01

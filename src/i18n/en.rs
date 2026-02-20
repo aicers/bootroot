@@ -198,7 +198,7 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_key_path: "- key path: {value}",
     service_summary_next_steps: "next steps:",
     service_summary_preview_mode: "- preview mode: no files or state were changed",
-    service_summary_preview_trust_skipped_no_token: "- trust preview unavailable: provide --root-token to query OpenBao trust data in preview mode",
+    service_summary_preview_trust_skipped_no_token: "- trust preview unavailable: provide OpenBao runtime auth (--root-token or --auth-mode approle with AppRole credentials) in preview mode",
     service_summary_preview_trust_not_found: "- trust preview unavailable: OpenBao CA trust data (secret/bootroot/ca) was not found",
     service_summary_preview_trust_lookup_failed: "- trust preview lookup failed: {value}",
     service_summary_remote_idempotent_hint: "- existing remote-bootstrap service matched input; bootstrap artifact was refreshed",
