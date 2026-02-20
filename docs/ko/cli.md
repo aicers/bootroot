@@ -31,7 +31,9 @@ CLI는 infra 기동/초기화/상태 점검과 서비스 온보딩, 발급 검�
   - 환경 변수: `BOOTROOT_LANG`
 
 표기 규칙: 옵션 설명에 `(환경 변수: ...)`가 있으면 해당 옵션이 환경 변수 입력을
-지원한다는 뜻입니다. 이 표기가 없으면 환경 변수 입력을 지원하지 않습니다.
+지원한다는 뜻입니다. 옵션 설명에 `(기본값 ...)`가 있으면 코드에 기본값이
+정의되어 있다는 뜻입니다. 위 표기가 없으면 해당 항목은 기본값이 없거나
+(필수/선택 입력) 환경 변수 입력을 지원하지 않습니다.
 
 ## bootroot CLI 자동 준비 범위와 운영자 책임
 
@@ -720,6 +722,7 @@ OpenBao KV: `bootroot/responder/hmac`
 OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/`trust`)를
 원격 서비스 머신에서 `pull/sync/ack` 순서로 반영해 `agent.toml` 같은 로컬
 파일을 갱신하고, 결과를 `state.json`의 sync-status에 기록합니다.
+`bootroot-remote`도 공통 옵션 `--lang`(환경 변수 `BOOTROOT_LANG`)을 지원합니다.
 
 ### `bootroot-remote pull`
 
