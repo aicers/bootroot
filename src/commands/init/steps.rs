@@ -1619,6 +1619,9 @@ path "{kv_mount}/data/{PATH_RESPONDER_HMAC}" {{
 path "{kv_mount}/data/bootroot/services/*" {{
   capabilities = ["create", "update", "read"]
 }}
+path "auth/approle/role/bootroot-service-*" {{
+  capabilities = ["create", "update", "read"]
+}}
 path "auth/approle/role/bootroot-service-*/role-id" {{
   capabilities = ["read"]
 }}
@@ -2511,6 +2514,8 @@ services:
         assert!(service_add_policy.contains("secret/metadata/bootroot/ca"));
         assert!(rotate_policy.contains("secret/data/bootroot/stepca/password"));
         assert!(rotate_policy.contains("secret/data/bootroot/services/*"));
+        assert!(rotate_policy.contains("auth/approle/role/bootroot-service-*"));
+        assert!(rotate_policy.contains("auth/approle/role/bootroot-service-*/secret-id"));
     }
 
     #[test]
