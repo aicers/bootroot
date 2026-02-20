@@ -10,7 +10,7 @@ use anyhow::Context;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const RUNTIME_SERVICE_ADD_ROLE_ID: &str = "runtime-service-add-role-id";
@@ -479,6 +479,10 @@ fn write_fake_pkill(root: &Path, exit_code: i32) -> anyhow::Result<()> {
 async fn stub_service_add_openbao(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": RUNTIME_SERVICE_ADD_ROLE_ID,
+            "secret_id": RUNTIME_SERVICE_ADD_SECRET_ID
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "auth": { "client_token": RUNTIME_CLIENT_TOKEN }
         })))
@@ -617,6 +621,10 @@ async fn stub_secret_id_rotation_openbao(server: &MockServer, secret_id: &str) {
 async fn stub_remote_pull_openbao(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": ROLE_ID,
+            "secret_id": "secret-initial"
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "auth": { "client_token": "remote-token" }
         })))

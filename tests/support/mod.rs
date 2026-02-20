@@ -15,6 +15,20 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub(crate) const ROOT_TOKEN: &str = "root-token";
+const POLICY_NAMES: &[&str] = &[
+    "bootroot-agent",
+    "bootroot-responder",
+    "bootroot-stepca",
+    "bootroot-runtime-service-add",
+    "bootroot-runtime-rotate",
+];
+const APPROLE_NAMES: &[&str] = &[
+    "bootroot-agent-role",
+    "bootroot-responder-role",
+    "bootroot-stepca-role",
+    "bootroot-runtime-service-add-role",
+    "bootroot-runtime-rotate-role",
+];
 
 pub(crate) fn write_fake_docker(dir: &Path) -> Result<PathBuf> {
     write_fake_docker_with_status(dir, "running", "healthy")
@@ -152,7 +166,7 @@ pub(crate) async fn stub_openbao_sealed(server: &MockServer) {
 }
 
 pub(crate) async fn expect_rollback_deletes(server: &MockServer, include_ca_trust: bool) {
-    for policy in ["bootroot-agent", "bootroot-responder", "bootroot-stepca"] {
+    for policy in POLICY_NAMES {
         Mock::given(method("DELETE"))
             .and(path(format!("/v1/sys/policies/acl/{policy}")))
             .and(header("X-Vault-Token", ROOT_TOKEN))
@@ -162,11 +176,7 @@ pub(crate) async fn expect_rollback_deletes(server: &MockServer, include_ca_trus
             .await;
     }
 
-    for approle in [
-        "bootroot-agent-role",
-        "bootroot-responder-role",
-        "bootroot-stepca-role",
-    ] {
+    for approle in APPROLE_NAMES {
         Mock::given(method("DELETE"))
             .and(path(format!("/v1/auth/approle/role/{approle}")))
             .and(header("X-Vault-Token", ROOT_TOKEN))
@@ -289,7 +299,7 @@ async fn stub_auth_backends(server: &MockServer) {
 }
 
 async fn stub_policies(server: &MockServer) {
-    for policy in ["bootroot-agent", "bootroot-responder", "bootroot-stepca"] {
+    for policy in POLICY_NAMES {
         Mock::given(method("GET"))
             .and(path(format!("/v1/sys/policies/acl/{policy}")))
             .and(header("X-Vault-Token", ROOT_TOKEN))
@@ -307,11 +317,7 @@ async fn stub_policies(server: &MockServer) {
 }
 
 async fn stub_approles(server: &MockServer) {
-    for approle in [
-        "bootroot-agent-role",
-        "bootroot-responder-role",
-        "bootroot-stepca-role",
-    ] {
+    for approle in APPROLE_NAMES {
         Mock::given(method("GET"))
             .and(path(format!("/v1/auth/approle/role/{approle}")))
             .and(header("X-Vault-Token", ROOT_TOKEN))
