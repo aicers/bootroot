@@ -393,6 +393,8 @@ RUNNER_MODE=cron ./scripts/e2e/docker/run-harness-smoke.sh
 라이프사이클 스크립트는 `bootroot init --summary-json` 출력으로 자동화를
 수행합니다. 사람용 요약 텍스트를 파싱해 토큰/시크릿을 추출하지 않습니다.
 로컬 CLI 시나리오 실행도 같은 방식으로 `--summary-json`의 `.root_token`을 사용합니다.
+이 절차는 **테스트/자동화 편의용 규칙**이며, 운영 환경의 토큰 보관 정책을
+대체하지 않습니다.
 
 E2E가 사용하는 최소 머신 필드:
 
@@ -405,6 +407,8 @@ E2E에서 OpenBao 언실/토큰 사용 방식:
   (예: 프로세스/컨테이너 재시작, 수동 seal, 복구 절차)
 - `root_token`은 `init-summary.json`에서 읽어 셸 변수(`OPENBAO_ROOT_TOKEN`)로
   보관하고, 같은 실행 내 `service add`/`rotate` 등에 `--root-token`으로 전달
+- 테스트 스크립트도 root token을 장기 저장하지 않으며, 실행 컨텍스트 변수로만
+  전달해 사용
 - 요약 JSON 파일 자체에 토큰이 포함되므로 아티팩트 보관 시 민감정보로 취급
   해야 함
 

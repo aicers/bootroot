@@ -113,6 +113,9 @@ bootroot monitoring status
 `bootroot rotate` 계열 명령은 OpenBao root token이 필요하며,
 `--root-token` 또는 `OPENBAO_ROOT_TOKEN`으로 전달할 수 있습니다
 (없으면 프롬프트 입력).
+`bootroot`는 root token 영구 저장소를 기본 제공하지 않으므로,
+운영 환경에서는 비밀관리 시스템 또는 보호된 환경 파일에서 매 실행 시
+토큰을 주입하는 방식을 사용하세요.
 
 예시(크론):
 
@@ -201,6 +204,16 @@ bootroot service sync-status \
 - summary JSON은 상태/오류 요약 중심이지만, 운영 로그에는 필요한 범위만 남기고
   장기 보관 정책을 분리하기
 - 서비스 계정 권한을 서비스별 경로로 최소화
+- `bootroot init --summary-json` 산출물은 `root_token`을 포함할 수 있으므로
+  민감 아티팩트로 취급하고 접근/보관 기간을 제한하기
+
+## OpenBao 재기동/복구 체크리스트
+
+- OpenBao가 `sealed` 상태면 먼저 unseal keys로 언실을 완료합니다.
+- 언실 완료 후, root token이 필요한 관리자 명령(`service add`, `rotate`,
+  필요 시 `status` 상세 체크)에 토큰을 주입합니다.
+- 언실(unseal)과 root token 주입은 별도 단계입니다. 언실이 끝났다고
+  root token 요구가 사라지지는 않습니다.
 
 ## CA 번들(trust) 운영
 

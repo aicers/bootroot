@@ -148,6 +148,10 @@ AppRole로 로그인해 시크릿을 파일로 렌더링합니다. 주요 흐름
 OpenBao는 **unseal keys**와 **root token**으로 초기화/접속합니다.
 unseal keys는 기동 시 스토리지를 해제하는 용도이고, root token은
 전체 관리자 권한을 부여합니다.
+이 둘은 용도가 다릅니다. 언실은 저장소 잠금 해제 동작이고, root token은
+정책/AppRole/시크릿 경로 관리 같은 관리자 작업 권한입니다.
+Bootroot는 root token 영구 저장소를 기본 제공하지 않으므로, 운영 중
+관리자 명령 실행 시에는 안전한 보관소/환경 파일에서 주입해야 합니다.
 
 #### unseal keys 보관
 

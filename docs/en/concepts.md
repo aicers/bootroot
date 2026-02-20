@@ -149,6 +149,11 @@ like init/rotate.
 OpenBao is initialized with **unseal keys** and a **root token**. Unseal keys
 unlock the storage on startup, while the root token grants full administrative
 access.
+These serve different purposes: unseal is for storage unlock state transitions,
+while the root token is for privileged management actions (policy/AppRole/secret
+path administration). Bootroot does not provide a built-in persistent
+root-token store, so day-2 admin commands should inject the token from a
+secure store or environment file.
 
 #### Unseal keys custody
 
