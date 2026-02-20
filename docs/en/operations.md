@@ -121,6 +121,9 @@ Run `bootroot rotate ...` on a schedule (cron/systemd timer). Keep secrets out
 of command history; use environment files or secure stores.
 `bootroot rotate` commands require an OpenBao root token. Provide it via
 `--root-token` or `OPENBAO_ROOT_TOKEN` (otherwise you will be prompted).
+`bootroot` does not include a built-in persistent root-token store, so
+production setups should inject the token per run from a secure store or
+protected environment file.
 
 Example (cron):
 
@@ -209,6 +212,16 @@ Security notes:
 - summary JSON is primarily status/error metadata; still keep it out of broad
   shared logs and apply retention controls
 - limit service account access to service-specific paths only
+- treat `bootroot init --summary-json` output as sensitive because it may
+  include `root_token`
+
+## OpenBao restart/recovery checklist
+
+- If OpenBao is `sealed`, unseal it first with unseal keys.
+- After unseal, inject root token for token-required admin commands
+  (`service add`, `rotate`, and detailed `status` checks when needed).
+- Keep unseal and root-token steps separate in runbooks: unseal completion does
+  not remove root-token requirements for privileged operations.
 
 ## CA bundle (trust) operations
 

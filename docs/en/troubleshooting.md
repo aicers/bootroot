@@ -26,6 +26,28 @@ The most common cause is mixing flags across binaries.
 - Check whether OpenBao is still `sealed` and unseal if needed
 - Verify root token/AppRole credentials
 - Confirm KV v2 mount exists (default `secret`)
+- Unseal keys and root token have different roles:
+  - unseal keys: clear `sealed` state
+  - root token: privileged commands (`service add`, `rotate`, detailed status)
+
+### root token missing/invalid
+
+Symptoms:
+
+- `root token missing` or permission-related errors
+
+Checks:
+
+- Confirm the current command requires root token
+- Verify `--root-token`/`OPENBAO_ROOT_TOKEN` value and expiry
+- If this is a detailed status/trust preview flow, confirm mode-specific token
+  requirements
+
+Actions:
+
+- Re-inject token from a secure store or protected env file
+- Keep runbooks explicit that `bootroot` does not provide a built-in persistent
+  root-token store
 
 ### step-ca init / CA file failures
 

@@ -141,10 +141,16 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--auto-generate`: auto-generate secrets where possible
 - `--show-secrets`: show secrets in the summary
 - `--summary-json`: write init summary as machine-readable JSON
+  (it may include sensitive fields such as `root_token`)
 - `--root-token`: OpenBao root token (environment variable:
   `OPENBAO_ROOT_TOKEN`). Required for normal apply mode. Optional in preview
   mode (`--print-only`/`--dry-run`), but required if you want trust preview
   output.
+  When OpenBao is newly initialized in the current run, init can use the
+  generated token in its internal flow without manual token entry. For an
+  already-initialized OpenBao, you must provide a token via
+  `--root-token`/env/prompt. `bootroot` does not maintain a built-in
+  persistent root-token store.
 - `--unseal-key`: OpenBao unseal key (repeatable, environment variable: `OPENBAO_UNSEAL_KEYS`)
   You can pass the same option multiple times
   (for example: `--unseal-key k1 --unseal-key k2 --unseal-key k3`).
@@ -273,6 +279,8 @@ Checks infra status (including containers) and OpenBao KV/AppRole status.
 - `--kv-mount`: OpenBao KV v2 mount path (default `secret`)
 - `--root-token`: token for KV/AppRole checks
   (optional, environment variable: `OPENBAO_ROOT_TOKEN`)
+  Without a token, checks are limited to infra/container-level status and do
+  not include full KV/AppRole verification.
 
 ### Outputs
 

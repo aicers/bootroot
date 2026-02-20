@@ -402,6 +402,8 @@ Lifecycle scripts consume `bootroot init --summary-json` output for automation.
 Do not parse human-readable summary lines for tokens/secrets.
 Local CLI scenario runs use the same rule and read `.root_token` from
 `--summary-json`.
+This is a **test/automation convenience rule**, not a production token custody
+policy.
 
 Minimum machine field used by E2E:
 
@@ -416,6 +418,8 @@ How E2E handles OpenBao unseal and token usage:
 - `root_token` is read from `init-summary.json`, stored in a shell variable
   (`OPENBAO_ROOT_TOKEN`), and passed to `service add`/`rotate` in the same run
   via `--root-token`
+- test scripts also avoid long-term token persistence; token use stays in
+  per-run shell context
 - Because summary JSON contains the token, treat the artifact as sensitive
   output in storage/retention workflows
 

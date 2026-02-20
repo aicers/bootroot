@@ -26,6 +26,27 @@
 - OpenBao가 `sealed` 상태인지 확인하고, 필요 시 unseal 후 재시도
 - root token/AppRole 자격증명이 유효한지 확인
 - KV v2 마운트(`secret` 기본값)가 실제로 존재하는지 확인
+- 언실 키와 root token은 역할이 다릅니다.
+  - 언실 키: `sealed` 해제
+  - root token: `service add`/`rotate`/상세 상태 점검 같은 관리자 명령 권한
+
+### root token 누락/인증 실패
+
+증상:
+
+- `root token 누락` 또는 `permission denied` 류 오류
+
+확인:
+
+- 현재 명령이 root token 필요 명령인지 확인
+- `--root-token`/`OPENBAO_ROOT_TOKEN` 전달값과 만료 여부 확인
+- 토큰이 필요한 상세 체크라면 preview/기본 실행 모드 조건을 함께 확인
+
+조치:
+
+- 안전한 저장소/환경 파일에서 토큰을 다시 주입
+- `bootroot`가 root token 영구 저장소를 기본 제공하지 않는다는 전제로
+  운영 절차를 구성
 
 ### step-ca 초기화/CA 파일 관련
 

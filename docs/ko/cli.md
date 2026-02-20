@@ -132,9 +132,14 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--auto-generate`: 비밀번호/HMAC 등을 자동 생성
 - `--show-secrets`: 요약 출력에 시크릿 표시
 - `--summary-json`: init 요약을 머신 파싱용 JSON 파일로 저장
+  (민감 필드 포함 가능: 예 `root_token`)
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`).
   기본 실행에서는 필수입니다. preview 모드(`--print-only`/`--dry-run`)에서는
   선택이며, trust 프리뷰를 보려면 지정해야 합니다.
+  현재 실행에서 OpenBao를 신규 초기화하는 경우에는 별도 수동 입력 없이
+  생성된 토큰을 내부 흐름에서 사용합니다. 반대로 이미 초기화된 OpenBao에
+  대해 재실행할 때는 `--root-token`/환경 변수/프롬프트로 토큰을 제공해야
+  합니다. `bootroot`는 root token 영구 저장소를 별도로 관리하지 않습니다.
 - `--unseal-key`: OpenBao unseal key (반복 가능, 환경 변수: `OPENBAO_UNSEAL_KEYS`)
   같은 옵션을 여러 번 전달할 수 있습니다
   (예: `--unseal-key k1 --unseal-key k2 --unseal-key k3`).
@@ -261,6 +266,8 @@ infra 상태(컨테이너 포함)와 OpenBao KV/AppRole 상태를 점검합니�
 - `--kv-mount`: OpenBao KV v2 마운트 경로 (기본값 `secret`)
 - `--root-token`: KV/AppRole 체크용 토큰
   (선택, 환경 변수: `OPENBAO_ROOT_TOKEN`)
+  토큰을 주지 않으면 infra/컨테이너 상태 중심으로 점검하고, KV/AppRole
+  상세 체크는 제한됩니다.
 
 ### 출력
 
