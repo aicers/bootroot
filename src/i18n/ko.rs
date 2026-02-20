@@ -198,7 +198,7 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_key_path: "- key 경로: {value}",
     service_summary_next_steps: "다음 단계:",
     service_summary_preview_mode: "- 프리뷰 모드: 파일이나 state 변경이 적용되지 않았습니다",
-    service_summary_preview_trust_skipped_no_token: "- trust 프리뷰를 조회하지 못했습니다: 프리뷰 모드에서 OpenBao trust 데이터를 조회하려면 --root-token을 지정하세요",
+    service_summary_preview_trust_skipped_no_token: "- trust 프리뷰를 조회하지 못했습니다: 프리뷰 모드에서는 OpenBao 런타임 인증(--root-token 또는 --auth-mode approle + AppRole 자격정보)을 제공해야 합니다",
     service_summary_preview_trust_not_found: "- trust 프리뷰를 조회하지 못했습니다: OpenBao CA trust 데이터(secret/bootroot/ca)를 찾지 못했습니다",
     service_summary_preview_trust_lookup_failed: "- trust 프리뷰 조회 실패: {value}",
     service_summary_remote_idempotent_hint: "- 기존 remote-bootstrap 서비스와 입력이 일치하여 부트스트랩 아티팩트를 갱신했습니다",

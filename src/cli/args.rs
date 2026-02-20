@@ -104,6 +104,40 @@ pub(crate) struct RootTokenArgs {
     pub(crate) root_token: Option<String>,
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthMode {
+    Auto,
+    Root,
+    Approle,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct RuntimeAuthArgs {
+    /// Runtime authentication mode (`auto`, `root`, `approle`)
+    #[arg(long, value_enum, default_value = "auto")]
+    pub(crate) auth_mode: AuthMode,
+
+    /// `OpenBao` root token
+    #[arg(long, env = "OPENBAO_ROOT_TOKEN")]
+    pub(crate) root_token: Option<String>,
+
+    /// `OpenBao` `AppRole` `role_id`
+    #[arg(long, env = "OPENBAO_APPROLE_ROLE_ID")]
+    pub(crate) approle_role_id: Option<String>,
+
+    /// `OpenBao` `AppRole` `secret_id`
+    #[arg(long, env = "OPENBAO_APPROLE_SECRET_ID")]
+    pub(crate) approle_secret_id: Option<String>,
+
+    /// Path to file containing `OpenBao` `AppRole` `role_id`
+    #[arg(long, env = "OPENBAO_APPROLE_ROLE_ID_FILE")]
+    pub(crate) approle_role_id_file: Option<PathBuf>,
+
+    /// Path to file containing `OpenBao` `AppRole` `secret_id`
+    #[arg(long, env = "OPENBAO_APPROLE_SECRET_ID_FILE")]
+    pub(crate) approle_secret_id_file: Option<PathBuf>,
+}
+
 #[derive(Args, Debug, Clone)]
 pub(crate) struct DbAdminDsnArgs {
     /// `PostgreSQL` admin DSN for provisioning
@@ -137,7 +171,7 @@ pub(crate) struct RotateArgs {
     pub(crate) secrets_dir: SecretsDirOverrideArgs,
 
     #[command(flatten)]
-    pub(crate) root_token: RootTokenArgs,
+    pub(crate) runtime_auth: RuntimeAuthArgs,
 
     /// Skip confirmation prompts
     #[arg(long)]
@@ -448,7 +482,7 @@ pub(crate) struct ServiceAddArgs {
     pub(crate) container_name: Option<String>,
 
     #[command(flatten)]
-    pub(crate) root_token: RootTokenArgs,
+    pub(crate) runtime_auth: RuntimeAuthArgs,
 
     /// Freeform notes (optional)
     #[arg(long)]

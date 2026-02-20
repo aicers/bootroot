@@ -151,9 +151,10 @@ unlock the storage on startup, while the root token grants full administrative
 access.
 These serve different purposes: unseal is for storage unlock state transitions,
 while the root token is for privileged management actions (policy/AppRole/secret
-path administration). Bootroot does not provide a built-in persistent
-root-token store, so day-2 admin commands should inject the token from a
-secure store or environment file.
+path administration). For day-2 automation (`bootroot service add`,
+`bootroot rotate`), use runtime AppRole auth and reserve root token for
+bootstrap/break-glass actions. Bootroot does not provide a built-in persistent
+root-token store.
 
 #### Unseal keys custody
 

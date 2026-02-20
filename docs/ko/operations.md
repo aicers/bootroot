@@ -110,17 +110,16 @@ bootroot monitoring status
 
 `bootroot rotate ...`는 크론/systemd 타이머로 주기 실행합니다. 토큰 등
 민감값은 환경 파일이나 안전한 저장소로 관리하세요.
-`bootroot rotate` 계열 명령은 OpenBao root token이 필요하며,
-`--root-token` 또는 `OPENBAO_ROOT_TOKEN`으로 전달할 수 있습니다
-(없으면 프롬프트 입력).
-`bootroot`는 root token 영구 저장소를 기본 제공하지 않으므로,
-운영 환경에서는 비밀관리 시스템 또는 보호된 환경 파일에서 매 실행 시
-토큰을 주입하는 방식을 사용하세요.
+day-2 자동화에서는 root token 대신 AppRole 런타임 인증
+(`--auth-mode approle`)을 사용하세요. root token은 부트스트랩/비상
+절차용으로만 유지하는 것을 권장합니다.
+`bootroot`는 root token 영구 저장소를 기본 제공하지 않습니다.
 
 예시(크론):
 
 ```cron
-0 3 * * 0 OPENBAO_ROOT_TOKEN=... bootroot rotate stepca-password --yes
+0 3 * * 0 OPENBAO_APPROLE_ROLE_ID=... OPENBAO_APPROLE_SECRET_ID=... \
+  bootroot rotate --auth-mode approle stepca-password --yes
 ```
 
 예시(systemd 타이머):
@@ -210,10 +209,11 @@ bootroot service sync-status \
 ## OpenBao 재기동/복구 체크리스트
 
 - OpenBao가 `sealed` 상태면 먼저 unseal keys로 언실을 완료합니다.
-- 언실 완료 후, root token이 필요한 관리자 명령(`service add`, `rotate`,
-  필요 시 `status` 상세 체크)에 토큰을 주입합니다.
-- 언실(unseal)과 root token 주입은 별도 단계입니다. 언실이 끝났다고
-  root token 요구가 사라지지는 않습니다.
+- 언실 완료 후 운영 명령에 맞는 런타임 인증을 주입합니다.
+  - day-2 `service add`/`rotate`: AppRole 우선(`--auth-mode approle`)
+  - 부트스트랩/비상 관리자 작업: root token(`--auth-mode root`)
+- 언실(unseal)과 런타임 인증 주입은 별도 단계입니다. 언실이 끝났다고
+  OpenBao 인증 요구가 사라지지는 않습니다.
 
 ## CA 번들(trust) 운영
 

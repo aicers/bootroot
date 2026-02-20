@@ -28,26 +28,31 @@ The most common cause is mixing flags across binaries.
 - Confirm KV v2 mount exists (default `secret`)
 - Unseal keys and root token have different roles:
   - unseal keys: clear `sealed` state
-  - root token: privileged commands (`service add`, `rotate`, detailed status)
+  - root token: bootstrap/break-glass administration
 
-### root token missing/invalid
+### Runtime auth missing/invalid (`service add` / `rotate`)
 
 Symptoms:
 
-- `root token missing` or permission-related errors
+- auth input missing/invalid (`root token missing`, `permission denied`,
+  AppRole login failure)
 
 Checks:
 
-- Confirm the current command requires root token
-- Verify `--root-token`/`OPENBAO_ROOT_TOKEN` value and expiry
-- If this is a detailed status/trust preview flow, confirm mode-specific token
-  requirements
+- Confirm which auth path you are using:
+  - root path: `--auth-mode root` + `--root-token`/`OPENBAO_ROOT_TOKEN`
+  - AppRole path: `--auth-mode approle` + role_id/secret_id (value or file)
+- For AppRole, verify role_id/secret_id match and secret_id is not expired/revoked.
+- For permission errors, compare required path capabilities vs current policy scope.
+- In preview/trust checks, verify runtime auth is supplied when the command needs
+  OpenBao reads.
 
 Actions:
 
-- Re-inject token from a secure store or protected env file
-- Keep runbooks explicit that `bootroot` does not provide a built-in persistent
-  root-token store
+- Re-inject valid runtime auth from a protected source (env file, runtime secret
+  injection, or AppRole credential files).
+- If AppRole secret_id expired, rotate/re-issue it and update the runtime input.
+- Reserve root token for bootstrap/break-glass flows only.
 
 ### step-ca init / CA file failures
 
@@ -76,7 +81,7 @@ If you see `dial tcp 127.0.0.1:5432: connect: connection refused`, DSN host in
 
 - `--print-only` / `--dry-run` is preview mode
 - Preview mode does not write files/state
-- Trust preview may require `--root-token` even in preview mode
+- Trust preview may require runtime auth even in preview mode
 
 ### Verify delivery mode (`--delivery-mode`)
 

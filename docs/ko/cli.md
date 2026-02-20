@@ -357,9 +357,9 @@ bootroot status
 
 #### 4-3) preview 모드(`--print-only`/`--dry-run`)
 
-- `--root-token`을 주면 preview에서도 OpenBao trust 데이터를 조회해 trust
-  스니펫을 출력합니다.
-- `--root-token`이 없으면 trust 스니펫을 출력하지 못하는 이유를 함께 출력합니다.
+- 런타임 인증(root token 또는 AppRole)을 주면 preview에서도 OpenBao trust
+  데이터를 조회해 trust 스니펫을 출력합니다.
+- 런타임 인증이 없으면 trust 스니펫을 출력하지 못하는 이유를 함께 출력합니다.
 - `--print-only`/`--dry-run`은 파일/상태를 쓰지 않는 미리보기 모드입니다.
 
 #### 4-4) 수동 설정이 필요한 대표 상황
@@ -398,7 +398,17 @@ bootroot status
 - `--key-path`: 개인키 출력 경로
 - `--instance-id`: 서비스 instance_id
 - `--container-name`: 도커 서비스 컨테이너 이름 (docker 필수)
-- `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`)
+- `--auth-mode`: 런타임 인증 모드 (`auto`, `root`, `approle`, 기본값 `auto`)
+- `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`,
+  전환/비상 경로)
+- `--approle-role-id`: OpenBao AppRole role_id
+  (환경 변수: `OPENBAO_APPROLE_ROLE_ID`)
+- `--approle-secret-id`: OpenBao AppRole secret_id
+  (환경 변수: `OPENBAO_APPROLE_SECRET_ID`)
+- `--approle-role-id-file`: AppRole role_id 파일 경로
+  (환경 변수: `OPENBAO_APPROLE_ROLE_ID_FILE`)
+- `--approle-secret-id-file`: AppRole secret_id 파일 경로
+  (환경 변수: `OPENBAO_APPROLE_SECRET_ID_FILE`)
 - `--notes`: 메모(선택)
 - `--print-only`: 파일/state 변경 없이 안내/스니펫만 출력
 - `--dry-run`: preview 모드 별칭(`--print-only`와 동일)
@@ -548,7 +558,17 @@ OpenBao와 통신해 값을 갱신합니다.
 - `--openbao-url`: OpenBao API URL (선택)
 - `--kv-mount`: OpenBao KV 마운트 경로 (선택)
 - `--secrets-dir`: 시크릿 디렉터리 (선택)
-- `--root-token`: OpenBao root token (환경 변수 `OPENBAO_ROOT_TOKEN`)
+- `--auth-mode`: 런타임 인증 모드 (`auto`, `root`, `approle`, 기본값 `auto`)
+- `--root-token`: OpenBao root token (환경 변수 `OPENBAO_ROOT_TOKEN`,
+  전환/비상 경로)
+- `--approle-role-id`: OpenBao AppRole role_id
+  (환경 변수: `OPENBAO_APPROLE_ROLE_ID`)
+- `--approle-secret-id`: OpenBao AppRole secret_id
+  (환경 변수: `OPENBAO_APPROLE_SECRET_ID`)
+- `--approle-role-id-file`: AppRole role_id 파일 경로
+  (환경 변수: `OPENBAO_APPROLE_ROLE_ID_FILE`)
+- `--approle-secret-id-file`: AppRole secret_id 파일 경로
+  (환경 변수: `OPENBAO_APPROLE_SECRET_ID_FILE`)
 - `--yes`: 확인 프롬프트 생략
 
 서브커맨드별:
@@ -640,7 +660,7 @@ OpenBao KV: `bootroot/responder/hmac`
 
 - `state.json` 누락 또는 파싱 실패
 - OpenBao 연결/헬스 체크 실패
-- root token 누락 또는 인증 실패
+- 런타임 인증 누락 또는 인증 실패(root token 또는 AppRole)
 - step-ca 비밀번호 회전 시 키/비밀번호 파일 누락
 - DB 회전 시 관리자 DSN 누락 또는 DB 프로비저닝 실패
 - EAB 발급 요청 실패

@@ -150,8 +150,10 @@ unseal keys는 기동 시 스토리지를 해제하는 용도이고, root token�
 전체 관리자 권한을 부여합니다.
 이 둘은 용도가 다릅니다. 언실은 저장소 잠금 해제 동작이고, root token은
 정책/AppRole/시크릿 경로 관리 같은 관리자 작업 권한입니다.
-Bootroot는 root token 영구 저장소를 기본 제공하지 않으므로, 운영 중
-관리자 명령 실행 시에는 안전한 보관소/환경 파일에서 주입해야 합니다.
+day-2 자동화(`bootroot service add`, `bootroot rotate`)에서는 root token 대신
+런타임 AppRole 인증 사용을 권장하고, root token은 부트스트랩/비상 작업용으로
+유지하는 것이 좋습니다. Bootroot는 root token 영구 저장소를 기본 제공하지
+않습니다.
 
 #### unseal keys 보관
 

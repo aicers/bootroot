@@ -46,10 +46,15 @@ pub(crate) mod openbao_constants {
     pub(crate) const POLICY_BOOTROOT_AGENT: &str = "bootroot-agent";
     pub(crate) const POLICY_BOOTROOT_RESPONDER: &str = "bootroot-responder";
     pub(crate) const POLICY_BOOTROOT_STEPCA: &str = "bootroot-stepca";
+    pub(crate) const POLICY_BOOTROOT_RUNTIME_SERVICE_ADD: &str = "bootroot-runtime-service-add";
+    pub(crate) const POLICY_BOOTROOT_RUNTIME_ROTATE: &str = "bootroot-runtime-rotate";
 
     pub(crate) const APPROLE_BOOTROOT_AGENT: &str = "bootroot-agent-role";
     pub(crate) const APPROLE_BOOTROOT_RESPONDER: &str = "bootroot-responder-role";
     pub(crate) const APPROLE_BOOTROOT_STEPCA: &str = "bootroot-stepca-role";
+    pub(crate) const APPROLE_BOOTROOT_RUNTIME_SERVICE_ADD: &str =
+        "bootroot-runtime-service-add-role";
+    pub(crate) const APPROLE_BOOTROOT_RUNTIME_ROTATE: &str = "bootroot-runtime-rotate-role";
 
     pub(crate) const PATH_STEPCA_PASSWORD: &str = "bootroot/stepca/password";
     pub(crate) const PATH_STEPCA_DB: &str = "bootroot/stepca/db";

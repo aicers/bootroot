@@ -377,9 +377,9 @@ automatically as part of onboarding.
 
 #### 4-3) Preview mode (`--print-only`/`--dry-run`)
 
-- If `--root-token` is provided, preview also queries OpenBao trust data and
-  prints trust snippets.
-- Without `--root-token`, preview prints why trust snippets are unavailable.
+- If runtime auth is provided (root token or AppRole), preview also queries
+  OpenBao trust data and prints trust snippets.
+- Without runtime auth, preview prints why trust snippets are unavailable.
 - `--print-only`/`--dry-run` is preview mode: it does not write files/state.
 
 #### 4-4) Common manual setup cases
@@ -418,7 +418,17 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--key-path`: private key output path
 - `--instance-id`: service instance_id
 - `--container-name`: docker container name (required for docker)
-- `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`)
+- `--auth-mode`: runtime auth mode (`auto`, `root`, `approle`, default `auto`)
+- `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`,
+  transition/break-glass path)
+- `--approle-role-id`: OpenBao AppRole role_id
+  (environment variable: `OPENBAO_APPROLE_ROLE_ID`)
+- `--approle-secret-id`: OpenBao AppRole secret_id
+  (environment variable: `OPENBAO_APPROLE_SECRET_ID`)
+- `--approle-role-id-file`: file path containing AppRole role_id
+  (environment variable: `OPENBAO_APPROLE_ROLE_ID_FILE`)
+- `--approle-secret-id-file`: file path containing AppRole secret_id
+  (environment variable: `OPENBAO_APPROLE_SECRET_ID_FILE`)
 - `--notes`: freeform notes (optional)
 - `--print-only`: print snippets/next steps without writing state/files
 - `--dry-run`: alias of preview mode (same effect as `--print-only`)
@@ -570,7 +580,17 @@ Common:
 - `--openbao-url`: OpenBao API URL (optional)
 - `--kv-mount`: OpenBao KV mount path (optional)
 - `--secrets-dir`: secrets directory (optional)
-- `--root-token`: OpenBao root token (env `OPENBAO_ROOT_TOKEN`)
+- `--auth-mode`: runtime auth mode (`auto`, `root`, `approle`, default `auto`)
+- `--root-token`: OpenBao root token (env `OPENBAO_ROOT_TOKEN`,
+  transition/break-glass path)
+- `--approle-role-id`: OpenBao AppRole role_id
+  (env `OPENBAO_APPROLE_ROLE_ID`)
+- `--approle-secret-id`: OpenBao AppRole secret_id
+  (env `OPENBAO_APPROLE_SECRET_ID`)
+- `--approle-role-id-file`: file path containing AppRole role_id
+  (env `OPENBAO_APPROLE_ROLE_ID_FILE`)
+- `--approle-secret-id-file`: file path containing AppRole secret_id
+  (env `OPENBAO_APPROLE_SECRET_ID_FILE`)
 - `--yes`: skip confirmation prompts
 
 Per subcommand:
@@ -663,7 +683,7 @@ The command is considered failed when:
 
 - `state.json` is missing or cannot be parsed
 - OpenBao is unreachable or unhealthy
-- root token is missing or invalid
+- runtime auth is missing or invalid (root token or AppRole)
 - step-ca password rotation cannot find required key/password files
 - DB rotation is missing admin DSN or provisioning fails
 - EAB issuance request fails

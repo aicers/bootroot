@@ -28,25 +28,30 @@
 - KV v2 마운트(`secret` 기본값)가 실제로 존재하는지 확인
 - 언실 키와 root token은 역할이 다릅니다.
   - 언실 키: `sealed` 해제
-  - root token: `service add`/`rotate`/상세 상태 점검 같은 관리자 명령 권한
+  - root token: 부트스트랩/비상 관리자 작업 권한
 
-### root token 누락/인증 실패
+### 런타임 인증 누락/인증 실패(`service add`/`rotate`)
 
 증상:
 
-- `root token 누락` 또는 `permission denied` 류 오류
+- 인증 입력 누락/불일치(`root token 누락`, `permission denied`,
+  AppRole 로그인 실패 등)
 
 확인:
 
-- 현재 명령이 root token 필요 명령인지 확인
-- `--root-token`/`OPENBAO_ROOT_TOKEN` 전달값과 만료 여부 확인
-- 토큰이 필요한 상세 체크라면 preview/기본 실행 모드 조건을 함께 확인
+- 현재 인증 경로를 확인:
+  - root 경로: `--auth-mode root` + `--root-token`/`OPENBAO_ROOT_TOKEN`
+  - AppRole 경로: `--auth-mode approle` + role_id/secret_id(직접 전달 또는 파일)
+- AppRole이면 role_id/secret_id 짝이 맞는지, secret_id 만료/폐기 여부 확인
+- `permission denied`면 필요한 OpenBao 경로 권한과 현재 정책 범위를 비교
+- preview/trust 확인 흐름이면 OpenBao 조회에 필요한 런타임 인증이 전달됐는지 확인
 
 조치:
 
-- 안전한 저장소/환경 파일에서 토큰을 다시 주입
-- `bootroot`가 root token 영구 저장소를 기본 제공하지 않는다는 전제로
-  운영 절차를 구성
+- 보호된 입력 경로(환경 파일/런타임 시크릿 주입/AppRole 파일)에서
+  유효한 런타임 인증을 다시 주입
+- AppRole secret_id가 만료됐다면 재발급/회전 후 런타임 입력 갱신
+- root token은 부트스트랩/비상 작업 용도로만 제한
 
 ### step-ca 초기화/CA 파일 관련
 
@@ -75,7 +80,7 @@
 
 - `--print-only`/`--dry-run`은 preview 모드입니다.
 - preview 모드는 파일/상태를 실제로 쓰지 않습니다.
-- trust 프리뷰까지 보려면 preview에서도 `--root-token`이 필요할 수 있습니다.
+- trust 프리뷰까지 보려면 preview에서도 런타임 인증이 필요할 수 있습니다.
 
 ### 전달 모드(`--delivery-mode`)를 확인
 

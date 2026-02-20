@@ -2,6 +2,7 @@ pub(crate) mod guardrails;
 pub(crate) mod infra;
 pub(crate) mod init;
 pub(crate) mod monitoring;
+pub(crate) mod openbao_auth;
 pub(crate) mod openbao_unseal;
 pub(crate) mod rotate;
 pub(crate) mod service;
