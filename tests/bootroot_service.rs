@@ -381,27 +381,23 @@ async fn test_app_add_prompts_for_missing_inputs() {
     stub_app_add_openbao(&server, "edge-proxy").await;
 
     let input = format!(
-        "edge-proxy\n\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n{}\n",
+        "edge-proxy\n\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
-        ROOT_TOKEN
     );
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "add"])
+        .args(["service", "add", "--root-token", ROOT_TOKEN])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn service add");
 
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(input.as_bytes()).expect("write stdin");
+    drop(stdin);
 
     let output = child.wait_with_output().expect("run service add");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -429,27 +425,23 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
     stub_app_add_openbao(&server, "edge-proxy").await;
 
     let input = format!(
-        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\n{}\nmissing/edge-proxy.crt\n{}\n{}\n\n001\n{}\n",
+        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\n{}\nmissing/edge-proxy.crt\n{}\n{}\n\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
-        ROOT_TOKEN
     );
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "add"])
+        .args(["service", "add", "--root-token", ROOT_TOKEN])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn service add");
 
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(input.as_bytes()).expect("write stdin");
+    drop(stdin);
 
     let output = child.wait_with_output().expect("run service add");
     assert!(output.status.success());
@@ -822,12 +814,9 @@ async fn test_app_add_prompts_for_docker_instance_id() {
         .spawn()
         .expect("spawn service add");
 
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(b"001\n")
-        .expect("write stdin");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(b"001\n").expect("write stdin");
+    drop(stdin);
 
     let output = child.wait_with_output().expect("run service add");
     assert!(output.status.success());
