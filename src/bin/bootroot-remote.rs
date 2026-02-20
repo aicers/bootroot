@@ -28,8 +28,49 @@ const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
     about = "Pull/apply remote service secrets from OpenBao"
 )]
 struct Args {
+    /// Language for CLI output (en or ko)
+    #[arg(long, env = "BOOTROOT_LANG", default_value = "en", global = true)]
+    lang: String,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliLang {
+    En,
+    Ko,
+}
+
+impl CliLang {
+    fn parse(input: &str) -> Result<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "en" => Ok(Self::En),
+            "ko" => Ok(Self::Ko),
+            _ => anyhow::bail!("Unsupported language code '{input}'. Supported values: en, ko"),
+        }
+    }
+}
+
+fn localized(lang: CliLang, en: &str, ko: &str) -> String {
+    match lang {
+        CliLang::En => en.to_string(),
+        CliLang::Ko => ko.to_string(),
+    }
+}
+
+fn summary_header(lang: CliLang) -> &'static str {
+    match lang {
+        CliLang::En => "bootroot-remote sync summary",
+        CliLang::Ko => "bootroot-remote 동기화 요약",
+    }
+}
+
+fn redacted_error_label(lang: CliLang) -> &'static str {
+    match lang {
+        CliLang::En => "error",
+        CliLang::Ko => "오류",
+    }
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -302,71 +343,117 @@ struct PulledSecrets {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    match run(args).await {
+    let lang = match CliLang::parse(&args.lang) {
+        Ok(lang) => lang,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(2);
+        }
+    };
+    match run(args, lang).await {
         Ok(exit_code) => {
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
         }
         Err(err) => {
-            eprintln!("bootroot-remote failed: {err}");
+            eprintln!(
+                "{}: {err}",
+                localized(lang, "bootroot-remote failed", "bootroot-remote 실행 실패")
+            );
             if let Some(detail) = err.chain().nth(1) {
-                eprintln!("details: {detail}");
+                eprintln!("{}: {detail}", localized(lang, "details", "상세 정보"));
             }
             std::process::exit(1);
         }
     }
 }
 
-async fn run(args: Args) -> Result<i32> {
+async fn run(args: Args, lang: CliLang) -> Result<i32> {
     match args.command {
-        Command::Pull(args) => run_pull(args).await,
-        Command::Ack(args) => run_ack(&args),
-        Command::Sync(args) => run_sync(args).await,
+        Command::Pull(args) => run_pull(args, lang).await,
+        Command::Ack(args) => run_ack(&args, lang),
+        Command::Sync(args) => run_sync(args, lang).await,
     }
 }
 
-async fn run_pull(args: PullArgs) -> Result<i32> {
-    validate_pull_args(&args)?;
+// This function intentionally keeps end-to-end pull orchestration in one place
+// so status aggregation and exit-code semantics stay easy to audit.
+#[allow(clippy::too_many_lines)]
+async fn run_pull(args: PullArgs, lang: CliLang) -> Result<i32> {
+    validate_pull_args(&args, lang)?;
 
-    let role_id = read_secret_file(&args.role_id_path)
+    let role_id = read_secret_file(&args.role_id_path, lang)
         .await
         .with_context(|| {
-            format!(
-                "Failed to read role_id from {}",
-                args.role_id_path.display()
+            localized(
+                lang,
+                &format!(
+                    "Failed to read role_id from {}",
+                    args.role_id_path.display()
+                ),
+                &format!(
+                    "role_id 파일을 읽지 못했습니다: {}",
+                    args.role_id_path.display()
+                ),
             )
         })?;
-    let current_secret_id = read_secret_file(&args.secret_id_path)
+    let current_secret_id = read_secret_file(&args.secret_id_path, lang)
         .await
         .with_context(|| {
-            format!(
-                "Failed to read current secret_id from {}",
-                args.secret_id_path.display()
+            localized(
+                lang,
+                &format!(
+                    "Failed to read current secret_id from {}",
+                    args.secret_id_path.display()
+                ),
+                &format!(
+                    "현재 secret_id 파일을 읽지 못했습니다: {}",
+                    args.secret_id_path.display()
+                ),
             )
         })?;
 
-    let mut client = OpenBaoClient::new(&args.openbao_url)
-        .with_context(|| "Failed to create OpenBao client".to_string())?;
+    let mut client = OpenBaoClient::new(&args.openbao_url).with_context(|| {
+        localized(
+            lang,
+            "Failed to create OpenBao client",
+            "OpenBao 클라이언트를 생성하지 못했습니다",
+        )
+    })?;
     let token = client
         .login_approle(&role_id, &current_secret_id)
         .await
-        .with_context(|| "OpenBao AppRole login failed".to_string())?;
+        .with_context(|| {
+            localized(
+                lang,
+                "OpenBao AppRole login failed",
+                "OpenBao AppRole 로그인에 실패했습니다",
+            )
+        })?;
     client.set_token(token);
 
-    let pulled = pull_secrets(&client, &args.kv_mount, &args.service_name).await?;
+    let pulled = pull_secrets(&client, &args.kv_mount, &args.service_name, lang).await?;
     let secret_id_status = match write_secret_file(&args.secret_id_path, &pulled.secret_id).await {
         Ok(status) => ApplyItemSummary::applied(status),
-        Err(err) => ApplyItemSummary::failed(format!("secret_id apply failed: {err}")),
+        Err(err) => ApplyItemSummary::failed(localized(
+            lang,
+            &format!("secret_id apply failed: {err}"),
+            &format!("secret_id 반영 실패: {err}"),
+        )),
     };
     let eab_status =
         match write_eab_file(&args.eab_file_path, &pulled.eab_kid, &pulled.eab_hmac).await {
             Ok(status) => ApplyItemSummary::applied(status),
-            Err(err) => ApplyItemSummary::failed(format!("eab apply failed: {err}")),
+            Err(err) => ApplyItemSummary::failed(localized(
+                lang,
+                &format!("eab apply failed: {err}"),
+                &format!("eab 반영 실패: {err}"),
+            )),
         };
 
     let (responder_hmac_status, mut trust_sync_status) =
-        apply_agent_config_updates(&args, &pulled).await;
+        apply_agent_config_updates(&args, &pulled, lang).await;
 
     if let Some(bundle_path) = args.ca_bundle_path.as_deref() {
         match pulled.ca_bundle_pem.as_deref() {
@@ -375,15 +462,22 @@ async fn run_pull(args: PullArgs) -> Result<i32> {
                     trust_sync_status = merge_apply_status(trust_sync_status, bundle_status, None);
                 }
                 Err(err) => {
-                    trust_sync_status = ApplyItemSummary::failed(format!(
-                        "ca bundle apply failed ({}): {err}",
-                        bundle_path.display()
+                    trust_sync_status = ApplyItemSummary::failed(localized(
+                        lang,
+                        &format!("ca bundle apply failed ({}): {err}", bundle_path.display()),
+                        &format!("ca bundle 반영 실패 ({}): {err}", bundle_path.display()),
                     ));
                 }
             },
             None => {
-                trust_sync_status = ApplyItemSummary::failed(format!(
-                    "trust data missing {CA_BUNDLE_PEM_KEY} while --ca-bundle-path was provided"
+                trust_sync_status = ApplyItemSummary::failed(localized(
+                    lang,
+                    &format!(
+                        "trust data missing {CA_BUNDLE_PEM_KEY} while --ca-bundle-path was provided"
+                    ),
+                    &format!(
+                        "--ca-bundle-path가 지정되었지만 trust 데이터에 {CA_BUNDLE_PEM_KEY}가 없습니다"
+                    ),
                 ));
             }
         }
@@ -398,16 +492,20 @@ async fn run_pull(args: PullArgs) -> Result<i32> {
     if let Some(summary_json) = args.summary_json.as_deref() {
         write_summary_json(summary_json, &summary).await?;
     }
-    print_summary(&summary, args.output)?;
+    print_summary(&summary, args.output, lang)?;
     if summary.has_failures() {
         return Ok(1);
     }
     Ok(0)
 }
 
+// This function intentionally centralizes agent config mutation flow so
+// per-item status/error mapping remains consistent for summary JSON contracts.
+#[allow(clippy::too_many_lines)]
 async fn apply_agent_config_updates(
     args: &PullArgs,
     pulled: &PulledSecrets,
+    lang: CliLang,
 ) -> (ApplyItemSummary, ApplyItemSummary) {
     let profile_paths = resolve_profile_paths(args);
     let agent_config = match fs::read_to_string(&args.agent_config_path).await {
@@ -416,9 +514,16 @@ async fn apply_agent_config_updates(
             render_agent_config_baseline(args, &profile_paths.cert_path, &profile_paths.key_path)
         }
         Err(err) => {
-            let message = format!(
-                "agent config read failed ({}): {err}",
-                args.agent_config_path.display()
+            let message = localized(
+                lang,
+                &format!(
+                    "agent config read failed ({}): {err}",
+                    args.agent_config_path.display()
+                ),
+                &format!(
+                    "agent.toml 읽기 실패 ({}): {err}",
+                    args.agent_config_path.display()
+                ),
             );
             return (
                 ApplyItemSummary::failed(message.clone()),
@@ -463,9 +568,16 @@ async fn apply_agent_config_updates(
         if let Some(parent) = args.agent_config_path.parent()
             && let Err(err) = fs_util::ensure_secrets_dir(parent).await
         {
-            let message = format!(
-                "agent config parent mkdir failed ({}): {err}",
-                parent.display()
+            let message = localized(
+                lang,
+                &format!(
+                    "agent config parent mkdir failed ({}): {err}",
+                    parent.display()
+                ),
+                &format!(
+                    "agent.toml 상위 디렉터리 생성 실패 ({}): {err}",
+                    parent.display()
+                ),
             );
             return (
                 ApplyItemSummary::failed(message.clone()),
@@ -473,9 +585,16 @@ async fn apply_agent_config_updates(
             );
         }
         if let Err(err) = fs::write(&args.agent_config_path, &trust_updated).await {
-            let message = format!(
-                "agent config write failed ({}): {err}",
-                args.agent_config_path.display()
+            let message = localized(
+                lang,
+                &format!(
+                    "agent config write failed ({}): {err}",
+                    args.agent_config_path.display()
+                ),
+                &format!(
+                    "agent.toml 쓰기 실패 ({}): {err}",
+                    args.agent_config_path.display()
+                ),
             );
             if responder_changed {
                 responder_hmac_status = ApplyItemSummary::failed(message.clone());
@@ -486,9 +605,16 @@ async fn apply_agent_config_updates(
             return (responder_hmac_status, trust_sync_status);
         }
         if let Err(err) = fs_util::set_key_permissions(&args.agent_config_path).await {
-            let message = format!(
-                "agent config chmod failed ({}): {err}",
-                args.agent_config_path.display()
+            let message = localized(
+                lang,
+                &format!(
+                    "agent config chmod failed ({}): {err}",
+                    args.agent_config_path.display()
+                ),
+                &format!(
+                    "agent.toml 권한 설정 실패 ({}): {err}",
+                    args.agent_config_path.display()
+                ),
             );
             if responder_changed {
                 responder_hmac_status = ApplyItemSummary::failed(message.clone());
@@ -499,8 +625,12 @@ async fn apply_agent_config_updates(
             return (responder_hmac_status, trust_sync_status);
         }
     }
-    if let Err(err) = write_openbao_agent_artifacts(args, &trust_updated).await {
-        let message = format!("openbao agent setup failed: {err}");
+    if let Err(err) = write_openbao_agent_artifacts(args, &trust_updated, lang).await {
+        let message = localized(
+            lang,
+            &format!("openbao agent setup failed: {err}"),
+            &format!("OpenBao Agent 설정 준비 실패: {err}"),
+        );
         if responder_changed || profile_changed {
             responder_hmac_status = ApplyItemSummary::failed(message.clone());
         }
@@ -532,8 +662,8 @@ fn merge_apply_status(
     ApplyItemSummary::applied(ApplyStatus::Unchanged)
 }
 
-fn run_ack(args: &AckArgs) -> Result<i32> {
-    validate_ack_args(args)?;
+fn run_ack(args: &AckArgs, lang: CliLang) -> Result<i32> {
+    validate_ack_args(args, lang)?;
     let status = std::process::Command::new(&args.bootroot_bin)
         .arg("service")
         .arg("sync-status")
@@ -550,19 +680,33 @@ fn run_ack(args: &AckArgs) -> Result<i32> {
         )
         .status()
         .with_context(|| {
-            format!(
-                "Failed to execute bootroot sync-status via {}",
-                args.bootroot_bin.display()
+            localized(
+                lang,
+                &format!(
+                    "Failed to execute bootroot sync-status via {}",
+                    args.bootroot_bin.display()
+                ),
+                &format!(
+                    "bootroot sync-status 실행 실패 ({})",
+                    args.bootroot_bin.display()
+                ),
             )
         })?;
     if !status.success() {
-        anyhow::bail!("bootroot service sync-status failed with status {status}");
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                &format!("bootroot service sync-status failed with status {status}"),
+                &format!("bootroot service sync-status 실행 실패: {status}"),
+            )
+        );
     }
     Ok(0)
 }
 
-async fn run_sync(args: SyncArgs) -> Result<i32> {
-    validate_sync_args(&args)?;
+async fn run_sync(args: SyncArgs, lang: CliLang) -> Result<i32> {
+    validate_sync_args(&args, lang)?;
     for attempt in 1..=args.retry_attempts {
         let pull_args = PullArgs {
             openbao_url: args.openbao_url.clone(),
@@ -584,7 +728,7 @@ async fn run_sync(args: SyncArgs) -> Result<i32> {
             output: args.output,
             summary_json: Some(args.summary_json.clone()),
         };
-        match run_pull(pull_args).await {
+        match run_pull(pull_args, lang).await {
             Ok(0) => {
                 let ack_args = AckArgs {
                     service_name: args.service_name.clone(),
@@ -592,11 +736,18 @@ async fn run_sync(args: SyncArgs) -> Result<i32> {
                     bootroot_bin: args.bootroot_bin.clone(),
                     state_file: args.state_file.clone(),
                 };
-                return run_ack(&ack_args);
+                return run_ack(&ack_args, lang);
             }
             Ok(_pull_code) => {}
             Err(err) => {
-                eprintln!("bootroot-remote sync pull attempt {attempt} failed: {err}");
+                eprintln!(
+                    "{}",
+                    localized(
+                        lang,
+                        &format!("bootroot-remote sync pull attempt {attempt} failed: {err}"),
+                        &format!("bootroot-remote sync pull {attempt}회차 실패: {err}"),
+                    )
+                );
             }
         }
 
@@ -604,8 +755,18 @@ async fn run_sync(args: SyncArgs) -> Result<i32> {
             let delay_secs =
                 compute_retry_delay_secs(args.retry_backoff_secs, args.retry_jitter_secs);
             eprintln!(
-                "bootroot-remote sync retry {attempt}/{} in {}s",
-                args.retry_attempts, delay_secs
+                "{}",
+                localized(
+                    lang,
+                    &format!(
+                        "bootroot-remote sync retry {attempt}/{} in {}s",
+                        args.retry_attempts, delay_secs
+                    ),
+                    &format!(
+                        "bootroot-remote sync 재시도 {attempt}/{} ({}초 후)",
+                        args.retry_attempts, delay_secs
+                    ),
+                )
             );
             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
         }
@@ -613,47 +774,112 @@ async fn run_sync(args: SyncArgs) -> Result<i32> {
     Ok(1)
 }
 
-fn validate_pull_args(args: &PullArgs) -> Result<()> {
+fn validate_pull_args(args: &PullArgs, lang: CliLang) -> Result<()> {
     if args.service_name.trim().is_empty() {
-        anyhow::bail!("--service-name must not be empty");
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                "--service-name must not be empty",
+                "--service-name 값은 비어 있으면 안 됩니다",
+            )
+        );
     }
     for path in [
         &args.role_id_path,
         &args.secret_id_path,
         &args.eab_file_path,
     ] {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Path {} has no parent directory", path.display()))?;
+        let parent = path.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                localized(
+                    lang,
+                    &format!("Path {} has no parent directory", path.display()),
+                    &format!("경로의 상위 디렉터리가 없습니다: {}", path.display()),
+                )
+            )
+        })?;
         if !parent.exists() {
-            anyhow::bail!("Parent directory not found: {}", parent.display());
+            anyhow::bail!(
+                "{}",
+                localized(
+                    lang,
+                    &format!("Parent directory not found: {}", parent.display()),
+                    &format!("상위 디렉터리를 찾을 수 없습니다: {}", parent.display()),
+                )
+            );
         }
     }
     if !args.role_id_path.exists() {
-        anyhow::bail!("role_id file not found: {}", args.role_id_path.display());
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                &format!("role_id file not found: {}", args.role_id_path.display()),
+                &format!(
+                    "role_id 파일을 찾을 수 없습니다: {}",
+                    args.role_id_path.display()
+                ),
+            )
+        );
     }
     if !args.secret_id_path.exists() {
         anyhow::bail!(
-            "secret_id file not found: {}",
-            args.secret_id_path.display()
+            "{}",
+            localized(
+                lang,
+                &format!(
+                    "secret_id file not found: {}",
+                    args.secret_id_path.display()
+                ),
+                &format!(
+                    "secret_id 파일을 찾을 수 없습니다: {}",
+                    args.secret_id_path.display()
+                ),
+            )
         );
     }
     Ok(())
 }
 
-fn validate_ack_args(args: &AckArgs) -> Result<()> {
+fn validate_ack_args(args: &AckArgs, lang: CliLang) -> Result<()> {
     if args.service_name.trim().is_empty() {
-        anyhow::bail!("--service-name must not be empty");
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                "--service-name must not be empty",
+                "--service-name 값은 비어 있으면 안 됩니다",
+            )
+        );
     }
     if !args.summary_json.exists() {
-        anyhow::bail!("summary JSON not found: {}", args.summary_json.display());
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                &format!("summary JSON not found: {}", args.summary_json.display()),
+                &format!(
+                    "summary JSON 파일을 찾을 수 없습니다: {}",
+                    args.summary_json.display()
+                ),
+            )
+        );
     }
     Ok(())
 }
 
-fn validate_sync_args(args: &SyncArgs) -> Result<()> {
+fn validate_sync_args(args: &SyncArgs, lang: CliLang) -> Result<()> {
     if args.retry_attempts == 0 {
-        anyhow::bail!("--retry-attempts must be >= 1");
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                "--retry-attempts must be >= 1",
+                "--retry-attempts는 1 이상이어야 합니다",
+            )
+        );
     }
     let pull_args = PullArgs {
         openbao_url: args.openbao_url.clone(),
@@ -675,19 +901,26 @@ fn validate_sync_args(args: &SyncArgs) -> Result<()> {
         output: args.output,
         summary_json: Some(args.summary_json.clone()),
     };
-    validate_pull_args(&pull_args)?;
+    validate_pull_args(&pull_args, lang)?;
     let ack_args = AckArgs {
         service_name: args.service_name.clone(),
         summary_json: args.summary_json.clone(),
         bootroot_bin: args.bootroot_bin.clone(),
         state_file: args.state_file.clone(),
     };
-    validate_ack_args_for_sync(&ack_args)
+    validate_ack_args_for_sync(&ack_args, lang)
 }
 
-fn validate_ack_args_for_sync(args: &AckArgs) -> Result<()> {
+fn validate_ack_args_for_sync(args: &AckArgs, lang: CliLang) -> Result<()> {
     if args.service_name.trim().is_empty() {
-        anyhow::bail!("--service-name must not be empty");
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                "--service-name must not be empty",
+                "--service-name 값은 비어 있으면 안 됩니다",
+            )
+        );
     }
     Ok(())
 }
@@ -705,39 +938,76 @@ fn compute_retry_delay_secs(base: u64, jitter: u64) -> u64 {
     base.saturating_add(extra)
 }
 
-async fn read_secret_file(path: &Path) -> Result<String> {
+async fn read_secret_file(path: &Path, lang: CliLang) -> Result<String> {
     let value = fs::read_to_string(path).await?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        anyhow::bail!("Secret file is empty: {}", path.display());
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                &format!("Secret file is empty: {}", path.display()),
+                &format!("시크릿 파일이 비어 있습니다: {}", path.display()),
+            )
+        );
     }
     Ok(trimmed.to_string())
 }
 
-async fn pull_secrets(client: &OpenBaoClient, mount: &str, service: &str) -> Result<PulledSecrets> {
+async fn pull_secrets(
+    client: &OpenBaoClient,
+    mount: &str,
+    service: &str,
+    lang: CliLang,
+) -> Result<PulledSecrets> {
     let base = format!("{SERVICE_KV_BASE}/{service}");
     let secret_id_data = client
         .read_kv(mount, &format!("{base}/secret_id"))
         .await
-        .with_context(|| "Failed to read service secret_id from OpenBao".to_string())?;
+        .with_context(|| {
+            localized(
+                lang,
+                "Failed to read service secret_id from OpenBao",
+                "OpenBao에서 서비스 secret_id를 읽지 못했습니다",
+            )
+        })?;
     let eab_data = client
         .read_kv(mount, &format!("{base}/eab"))
         .await
-        .with_context(|| "Failed to read service eab from OpenBao".to_string())?;
+        .with_context(|| {
+            localized(
+                lang,
+                "Failed to read service eab from OpenBao",
+                "OpenBao에서 서비스 eab를 읽지 못했습니다",
+            )
+        })?;
     let hmac_data = client
         .read_kv(mount, &format!("{base}/http_responder_hmac"))
         .await
-        .with_context(|| "Failed to read service responder hmac from OpenBao".to_string())?;
+        .with_context(|| {
+            localized(
+                lang,
+                "Failed to read service responder hmac from OpenBao",
+                "OpenBao에서 서비스 responder hmac를 읽지 못했습니다",
+            )
+        })?;
     let trust_data = client
         .read_kv(mount, &format!("{base}/trust"))
         .await
-        .with_context(|| "Failed to read service trust data from OpenBao".to_string())?;
+        .with_context(|| {
+            localized(
+                lang,
+                "Failed to read service trust data from OpenBao",
+                "OpenBao에서 서비스 trust 데이터를 읽지 못했습니다",
+            )
+        })?;
 
-    let secret_id = read_required_string(&secret_id_data, &[SECRET_ID_KEY, "value"])?;
-    let eab_kid = read_required_string(&eab_data, &[EAB_KID_KEY])?;
-    let eab_hmac = read_required_string(&eab_data, &[EAB_HMAC_KEY])?;
-    let responder_hmac = read_required_string(&hmac_data, &[HMAC_KEY, "http_responder_hmac"])?;
-    let trusted_ca_sha256 = read_required_fingerprints(&trust_data)?;
+    let secret_id = read_required_string(&secret_id_data, &[SECRET_ID_KEY, "value"], lang)?;
+    let eab_kid = read_required_string(&eab_data, &[EAB_KID_KEY], lang)?;
+    let eab_hmac = read_required_string(&eab_data, &[EAB_HMAC_KEY], lang)?;
+    let responder_hmac =
+        read_required_string(&hmac_data, &[HMAC_KEY, "http_responder_hmac"], lang)?;
+    let trusted_ca_sha256 = read_required_fingerprints(&trust_data, lang)?;
     let ca_bundle_pem = trust_data
         .get(CA_BUNDLE_PEM_KEY)
         .and_then(serde_json::Value::as_str)
@@ -753,7 +1023,7 @@ async fn pull_secrets(client: &OpenBaoClient, mount: &str, service: &str) -> Res
     })
 }
 
-fn read_required_string(data: &serde_json::Value, keys: &[&str]) -> Result<String> {
+fn read_required_string(data: &serde_json::Value, keys: &[&str], lang: CliLang) -> Result<String> {
     for key in keys {
         if let Some(value) = data.get(key).and_then(serde_json::Value::as_str) {
             let trimmed = value.trim();
@@ -762,24 +1032,61 @@ fn read_required_string(data: &serde_json::Value, keys: &[&str]) -> Result<Strin
             }
         }
     }
-    anyhow::bail!("Missing required string key: {}", keys.join("|"))
+    anyhow::bail!(
+        "{}",
+        localized(
+            lang,
+            &format!("Missing required string key: {}", keys.join("|")),
+            &format!("필수 문자열 키가 없습니다: {}", keys.join("|")),
+        )
+    )
 }
 
-fn read_required_fingerprints(data: &serde_json::Value) -> Result<Vec<String>> {
+fn read_required_fingerprints(data: &serde_json::Value, lang: CliLang) -> Result<Vec<String>> {
     let values = data
         .get(TRUSTED_CA_KEY)
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("Missing required array key: {TRUSTED_CA_KEY}"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                localized(
+                    lang,
+                    &format!("Missing required array key: {TRUSTED_CA_KEY}"),
+                    &format!("필수 배열 키가 없습니다: {TRUSTED_CA_KEY}"),
+                )
+            )
+        })?;
     if values.is_empty() {
-        anyhow::bail!("{TRUSTED_CA_KEY} must not be empty");
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                &format!("{TRUSTED_CA_KEY} must not be empty"),
+                &format!("{TRUSTED_CA_KEY} 값은 비어 있으면 안 됩니다"),
+            )
+        );
     }
     let mut fingerprints = Vec::with_capacity(values.len());
     for value in values {
-        let fingerprint = value
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("{TRUSTED_CA_KEY} must contain strings"))?;
+        let fingerprint = value.as_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                localized(
+                    lang,
+                    &format!("{TRUSTED_CA_KEY} must contain strings"),
+                    &format!("{TRUSTED_CA_KEY} 배열은 문자열만 포함해야 합니다"),
+                )
+            )
+        })?;
         if fingerprint.len() != 64 || !fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            anyhow::bail!("{TRUSTED_CA_KEY} must be 64 hex chars");
+            anyhow::bail!(
+                "{}",
+                localized(
+                    lang,
+                    &format!("{TRUSTED_CA_KEY} must be 64 hex chars"),
+                    &format!("{TRUSTED_CA_KEY} 값은 64자리 hex여야 합니다"),
+                )
+            );
         }
         fingerprints.push(fingerprint.to_string());
     }
@@ -1003,17 +1310,41 @@ fn upsert_managed_profile_block(contents: &str, service_name: &str, replacement:
     updated
 }
 
-async fn write_openbao_agent_artifacts(args: &PullArgs, agent_template: &str) -> Result<()> {
-    let secret_service_dir = args
-        .secret_id_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("secret_id path has no parent"))?;
-    let secrets_services_dir = secret_service_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("secret_id path missing services directory"))?;
-    let secrets_dir = secrets_services_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("secret_id path missing secrets root"))?;
+async fn write_openbao_agent_artifacts(
+    args: &PullArgs,
+    agent_template: &str,
+    lang: CliLang,
+) -> Result<()> {
+    let secret_service_dir = args.secret_id_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}",
+            localized(
+                lang,
+                "secret_id path has no parent",
+                "secret_id 경로에 상위 디렉터리가 없습니다",
+            )
+        )
+    })?;
+    let secrets_services_dir = secret_service_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}",
+            localized(
+                lang,
+                "secret_id path missing services directory",
+                "secret_id 경로에 services 디렉터리가 없습니다",
+            )
+        )
+    })?;
+    let secrets_dir = secrets_services_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}",
+            localized(
+                lang,
+                "secret_id path missing secrets root",
+                "secret_id 경로에 secrets 루트가 없습니다",
+            )
+        )
+    })?;
     let openbao_service_dir = secrets_dir
         .join("openbao")
         .join("services")
@@ -1118,19 +1449,23 @@ fn is_section_header(value: &str) -> bool {
     value.starts_with('[') && value.ends_with(']')
 }
 
-fn print_text_summary(summary: &ApplySummary) {
-    println!("bootroot-remote sync summary");
+fn print_text_summary(summary: &ApplySummary, lang: CliLang) {
+    println!("{}", summary_header(lang));
     println!("- secret_id: {}", status_to_str(summary.secret_id.status));
-    print_optional_error("secret_id", summary.secret_id.error.as_deref());
+    print_optional_error("secret_id", summary.secret_id.error.as_deref(), lang);
     println!("- eab: {}", status_to_str(summary.eab.status));
-    print_optional_error("eab", summary.eab.error.as_deref());
+    print_optional_error("eab", summary.eab.error.as_deref(), lang);
     println!(
         "- responder_hmac: {}",
         status_to_str(summary.responder_hmac.status)
     );
-    print_optional_error("responder_hmac", summary.responder_hmac.error.as_deref());
+    print_optional_error(
+        "responder_hmac",
+        summary.responder_hmac.error.as_deref(),
+        lang,
+    );
     println!("- trust_sync: {}", status_to_str(summary.trust_sync.status));
-    print_optional_error("trust_sync", summary.trust_sync.error.as_deref());
+    print_optional_error("trust_sync", summary.trust_sync.error.as_deref(), lang);
 }
 
 fn status_to_str(status: ApplyStatus) -> &'static str {
@@ -1141,16 +1476,16 @@ fn status_to_str(status: ApplyStatus) -> &'static str {
     }
 }
 
-fn print_optional_error(name: &str, error: Option<&str>) {
+fn print_optional_error(name: &str, error: Option<&str>, lang: CliLang) {
     if let Some(_value) = error {
-        println!("  error({name}): <redacted>");
+        println!("  {}({name}): <redacted>", redacted_error_label(lang));
     }
 }
 
-fn print_summary(summary: &ApplySummary, output: OutputFormat) -> Result<()> {
+fn print_summary(summary: &ApplySummary, output: OutputFormat, lang: CliLang) -> Result<()> {
     match output {
         OutputFormat::Text => {
-            print_text_summary(summary);
+            print_text_summary(summary, lang);
             Ok(())
         }
         OutputFormat::Json => {
@@ -1180,8 +1515,31 @@ mod tests {
         let data = serde_json::json!({
             "trusted_ca_sha256": ["a".repeat(64), "b".repeat(64)]
         });
-        let parsed = read_required_fingerprints(&data).expect("parse trust fingerprints");
+        let parsed =
+            read_required_fingerprints(&data, CliLang::En).expect("parse trust fingerprints");
         assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn test_cli_lang_parse_en_and_ko() {
+        assert_eq!(CliLang::parse("en").expect("parse en"), CliLang::En);
+        assert_eq!(CliLang::parse("ko").expect("parse ko"), CliLang::Ko);
+        assert_eq!(CliLang::parse("EN").expect("parse EN"), CliLang::En);
+    }
+
+    #[test]
+    fn test_cli_lang_parse_invalid_fails() {
+        let err = CliLang::parse("jp").expect_err("invalid lang should fail");
+        assert!(
+            err.to_string().contains("Unsupported language code"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_summary_header_localization() {
+        assert_eq!(summary_header(CliLang::En), "bootroot-remote sync summary");
+        assert_eq!(summary_header(CliLang::Ko), "bootroot-remote 동기화 요약");
     }
 
     #[test]

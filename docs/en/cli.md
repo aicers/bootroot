@@ -34,8 +34,10 @@ Primary commands:
   - Environment variable: `BOOTROOT_LANG`
 
 Notation rule: when an option includes `(environment variable: ...)`, that
-option supports environment-variable input. If that marker is absent, the
-option does not support environment-variable input.
+option supports environment-variable input. When an option includes
+`(default ...)`, a code-level default value is defined. If those markers are
+absent, the item either has no default (required/optional input) or does not
+support environment-variable input.
 
 ## bootroot CLI automation scope vs operator responsibilities
 
@@ -748,6 +750,8 @@ service state (`secret_id`/`eab`/`responder_hmac`/`trust`) stored in OpenBao on
 the step-ca machine to files on remote service machines via `pull/sync/ack`,
 updates local files such as `agent.toml`, and records results in `state.json`
 sync-status.
+`bootroot-remote` also supports the global `--lang` option
+(environment variable: `BOOTROOT_LANG`).
 
 ### `bootroot-remote pull`
 
