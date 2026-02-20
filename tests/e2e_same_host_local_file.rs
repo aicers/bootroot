@@ -13,7 +13,11 @@ use tempfile::tempdir;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const ROOT_TOKEN: &str = "root-token";
+const RUNTIME_SERVICE_ADD_ROLE_ID: &str = "runtime-service-add-role-id";
+const RUNTIME_SERVICE_ADD_SECRET_ID: &str = "runtime-service-add-secret-id";
+const RUNTIME_ROTATE_ROLE_ID: &str = "runtime-rotate-role-id";
+const RUNTIME_ROTATE_SECRET_ID: &str = "runtime-rotate-secret-id";
+const RUNTIME_CLIENT_TOKEN: &str = "runtime-client-token";
 const SERVICE_NAME: &str = "edge-proxy";
 const HOSTNAME: &str = "edge-node-01";
 const DOMAIN: &str = "trusted.domain";
@@ -298,8 +302,12 @@ fn run_service_add_local(
             files.key_path.to_string_lossy().as_ref(),
             "--instance-id",
             INSTANCE_ID,
-            "--root-token",
-            ROOT_TOKEN,
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            RUNTIME_SERVICE_ADD_ROLE_ID,
+            "--approle-secret-id",
+            RUNTIME_SERVICE_ADD_SECRET_ID,
         ])
         .output()
         .context("run service add")?;
@@ -319,8 +327,12 @@ fn run_rotate_eab(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
             "rotate",
             "--openbao-url",
             openbao_url,
-            "--root-token",
-            ROOT_TOKEN,
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            RUNTIME_ROTATE_ROLE_ID,
+            "--approle-secret-id",
+            RUNTIME_ROTATE_SECRET_ID,
             "--yes",
             "eab",
             "--stepca-url",
@@ -346,8 +358,12 @@ fn run_rotate_responder_hmac(root: &Path, openbao_url: &str, hmac: &str) -> anyh
             "rotate",
             "--openbao-url",
             openbao_url,
-            "--root-token",
-            ROOT_TOKEN,
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            RUNTIME_ROTATE_ROLE_ID,
+            "--approle-secret-id",
+            RUNTIME_ROTATE_SECRET_ID,
             "--compose-file",
             "docker-compose.yml",
             "--yes",
@@ -376,8 +392,12 @@ fn run_rotate_secret_id_with_output(root: &Path, openbao_url: &str) -> std::proc
             "rotate",
             "--openbao-url",
             openbao_url,
-            "--root-token",
-            ROOT_TOKEN,
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            RUNTIME_ROTATE_ROLE_ID,
+            "--approle-secret-id",
+            RUNTIME_ROTATE_SECRET_ID,
             "--yes",
             "approle-secret-id",
             "--service-name",
@@ -457,9 +477,17 @@ fn write_fake_pkill(root: &Path, exit_code: i32) -> anyhow::Result<()> {
 }
 
 async fn stub_service_add_openbao(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": RUNTIME_CLIENT_TOKEN }
+        })))
+        .mount(server)
+        .await;
+
     Mock::given(method("GET"))
         .and(path("/v1/sys/auth"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "approle/": {} }
         })))
@@ -468,21 +496,21 @@ async fn stub_service_add_openbao(server: &MockServer) {
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/sys/policies/acl/{ROLE_NAME}")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 
     Mock::given(method("GET"))
         .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/role-id")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "role_id": ROLE_ID }
         })))
@@ -491,7 +519,7 @@ async fn stub_service_add_openbao(server: &MockServer) {
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "secret_id": "secret-initial" }
         })))
@@ -500,14 +528,14 @@ async fn stub_service_add_openbao(server: &MockServer) {
 
     Mock::given(method("GET"))
         .and(path("/v1/secret/metadata/bootroot/ca"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/ca"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "data": {
@@ -539,14 +567,14 @@ async fn stub_rotate_sequence_openbao(
 
     Mock::given(method("POST"))
         .and(path("/v1/secret/data/bootroot/agent/eab"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)
         .await;
 
     Mock::given(method("POST"))
         .and(path("/v1/secret/data/bootroot/responder/hmac"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)
         .await;
@@ -561,7 +589,7 @@ async fn stub_secret_id_rotation_openbao(server: &MockServer, secret_id: &str) {
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "secret_id": secret_id }
         })))
@@ -570,7 +598,7 @@ async fn stub_secret_id_rotation_openbao(server: &MockServer, secret_id: &str) {
 
     Mock::given(method("GET"))
         .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/role-id")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "role_id": ROLE_ID }
         })))
@@ -580,7 +608,7 @@ async fn stub_secret_id_rotation_openbao(server: &MockServer, secret_id: &str) {
     Mock::given(method("POST"))
         .and(path("/v1/auth/approle/login"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "auth": { "client_token": "client-token" }
+            "auth": { "client_token": RUNTIME_CLIENT_TOKEN }
         })))
         .mount(server)
         .await;

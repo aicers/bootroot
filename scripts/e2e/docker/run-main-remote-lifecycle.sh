@@ -49,7 +49,10 @@ RESPONDER_HOST_NAME="responder.internal"
 STEPCA_SERVER_URL=""
 STEPCA_EAB_URL=""
 RESPONDER_URL=""
-OPENBAO_ROOT_TOKEN=""
+RUNTIME_SERVICE_ADD_ROLE_ID=""
+RUNTIME_SERVICE_ADD_SECRET_ID=""
+RUNTIME_ROTATE_ROLE_ID=""
+RUNTIME_ROTATE_SECRET_ID=""
 CURRENT_PHASE="init"
 SERVICE_KV_PATH_BASE="bootroot/services/${SERVICE_NAME}"
 
@@ -272,8 +275,26 @@ run_bootstrap_chain() {
     fail "bootroot init failed"
   fi
 
-  OPENBAO_ROOT_TOKEN="$(jq -r '.root_token // empty' "$INIT_SUMMARY_JSON")"
-  [ -n "${OPENBAO_ROOT_TOKEN:-}" ] || fail "Failed to parse root token from init output"
+  RUNTIME_SERVICE_ADD_ROLE_ID="$(
+    jq -r '.approles[] | select(.label == "runtime_service_add") | .role_id // empty' \
+      "$INIT_SUMMARY_JSON"
+  )"
+  RUNTIME_SERVICE_ADD_SECRET_ID="$(
+    jq -r '.approles[] | select(.label == "runtime_service_add") | .secret_id // empty' \
+      "$INIT_SUMMARY_JSON"
+  )"
+  RUNTIME_ROTATE_ROLE_ID="$(
+    jq -r '.approles[] | select(.label == "runtime_rotate") | .role_id // empty' \
+      "$INIT_SUMMARY_JSON"
+  )"
+  RUNTIME_ROTATE_SECRET_ID="$(
+    jq -r '.approles[] | select(.label == "runtime_rotate") | .secret_id // empty' \
+      "$INIT_SUMMARY_JSON"
+  )"
+  [ -n "${RUNTIME_SERVICE_ADD_ROLE_ID:-}" ] || fail "Failed to parse runtime_service_add role_id"
+  [ -n "${RUNTIME_SERVICE_ADD_SECRET_ID:-}" ] || fail "Failed to parse runtime_service_add secret_id"
+  [ -n "${RUNTIME_ROTATE_ROLE_ID:-}" ] || fail "Failed to parse runtime_rotate role_id"
+  [ -n "${RUNTIME_ROTATE_SECRET_ID:-}" ] || fail "Failed to parse runtime_rotate secret_id"
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 
   log_phase "service-add"
@@ -287,7 +308,9 @@ run_bootstrap_chain() {
     --cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt" \
     --key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key" \
     --instance-id "$INSTANCE_ID" \
-    --root-token "$OPENBAO_ROOT_TOKEN" >>"$RUN_LOG" 2>&1
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 }
 
 copy_remote_bootstrap_materials() {
@@ -419,9 +442,22 @@ run_verify_pair() {
 openbao_write_service_kv() {
   local item="$1"
   local payload="$2"
+  local runtime_token
+  runtime_token="$(
+    curl -fsS \
+      -X POST \
+      -H "Content-Type: application/json" \
+      "http://${STEPCA_HOST_IP}:8200/v1/auth/approle/login" \
+      -d "$(jq -n \
+        --arg role_id "$RUNTIME_ROTATE_ROLE_ID" \
+        --arg secret_id "$RUNTIME_ROTATE_SECRET_ID" \
+        '{role_id:$role_id,secret_id:$secret_id}')" \
+      | jq -r '.auth.client_token // empty'
+  )"
+  [ -n "${runtime_token:-}" ] || fail "Failed to obtain runtime AppRole client token"
   curl -fsS \
     -X POST \
-    -H "X-Vault-Token: ${OPENBAO_ROOT_TOKEN}" \
+    -H "X-Vault-Token: ${runtime_token}" \
     -H "Content-Type: application/json" \
     "http://${STEPCA_HOST_IP}:8200/v1/secret/data/${SERVICE_KV_PATH_BASE}/${item}" \
     -d "$payload" >/dev/null
@@ -436,7 +472,9 @@ run_rotation_secret_id() {
   run_bootroot_control rotate \
     --compose-file "$COMPOSE_FILE" \
     --openbao-url "http://${STEPCA_HOST_IP}:8200" \
-    --root-token "$OPENBAO_ROOT_TOKEN" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     approle-secret-id \
     --service-name "$SERVICE_NAME" >>"$RUN_LOG" 2>&1
@@ -478,7 +516,9 @@ run_rotation_responder_hmac() {
   run_bootroot_control rotate \
     --compose-file "$COMPOSE_FILE" \
     --openbao-url "http://${STEPCA_HOST_IP}:8200" \
-    --root-token "$OPENBAO_ROOT_TOKEN" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     responder-hmac >>"$RUN_LOG" 2>&1
 }

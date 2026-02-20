@@ -491,6 +491,58 @@ async fn test_rotate_responder_hmac_supports_approle_runtime_auth() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_rotate_responder_hmac_approle_permission_denied_fails() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let _secret_path = prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
+
+    let compose_file = temp_dir.path().join("docker-compose.yml");
+    fs::write(&compose_file, "services: {}\n").expect("write compose");
+    stub_openbao_for_runtime_approle_login(
+        &openbao,
+        "runtime-role-id",
+        "runtime-secret-id",
+        "runtime-client",
+    )
+    .await;
+    stub_openbao_for_responder_hmac_rotation_forbidden(&openbao, "runtime-client").await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            "runtime-role-id",
+            "--approle-secret-id",
+            "runtime-secret-id",
+            "--compose-file",
+            compose_file.to_string_lossy().as_ref(),
+            "--yes",
+            "responder-hmac",
+            "--hmac",
+            "hmac-runtime",
+        ])
+        .output()
+        .expect("run rotate responder-hmac");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("bootroot rotate failed"));
+    assert!(stderr.contains("OpenBao KV secret write failed"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_rotate_eab_marks_remote_pending_and_updates_local_service() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
@@ -807,6 +859,23 @@ async fn stub_openbao_for_responder_hmac_rotation_with_token(
         )))
         .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+}
+
+async fn stub_openbao_for_responder_hmac_rotation_forbidden(server: &MockServer, token: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/responder/hmac"))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "errors": ["permission denied"]
+        })))
         .mount(server)
         .await;
 }

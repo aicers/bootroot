@@ -195,6 +195,64 @@ async fn test_app_add_supports_approle_runtime_auth() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_app_add_approle_permission_denied_fails() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_approle_login(
+        &server,
+        "runtime-role-id",
+        "runtime-secret-id",
+        "runtime-client",
+    )
+    .await;
+    stub_app_add_trust_missing_with_token(&server, "runtime-client").await;
+    stub_app_add_policy_write_forbidden_with_token(&server, "edge-proxy", "runtime-client").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            "runtime-role-id",
+            "--approle-secret-id",
+            "runtime-secret-id",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("bootroot service add failed"));
+    assert!(stderr.contains("OpenBao policy write failed"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_app_add_print_only_shows_snippets_without_writes() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");
@@ -1560,6 +1618,22 @@ async fn stub_app_add_trust_missing_with_token(server: &MockServer, token: &str)
         .and(path("/v1/secret/metadata/bootroot/ca"))
         .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(404))
+        .mount(server)
+        .await;
+}
+
+async fn stub_app_add_policy_write_forbidden_with_token(
+    server: &MockServer,
+    service_name: &str,
+    token: &str,
+) {
+    let role = format!("bootroot-service-{service_name}");
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/sys/policies/acl/{role}")))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "errors": ["permission denied"]
+        })))
         .mount(server)
         .await;
 }

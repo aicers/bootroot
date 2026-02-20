@@ -109,7 +109,8 @@ Purpose:
 Execution steps:
 
 1. `infra-up`: bring up Compose services and wait for readiness
-2. `init`: run `bootroot init --summary-json` and read `root_token` from JSON
+2. `init`: run `bootroot init --summary-json` and read runtime AppRole
+   credentials from JSON
 3. `service-add`: add daemon + docker services in `local-file` mode
 4. `verify-initial`: issue/verify initial certs and snapshot fingerprints
 5. `rotate-responder-hmac`: run rotation and force reissue
@@ -143,8 +144,14 @@ bootroot verify --service-name edge-proxy --agent-config "$AGENT_CONFIG_PATH"
 bootroot verify --service-name web-app --agent-config "$AGENT_CONFIG_PATH"
 
 # 5) rotate-responder-hmac
+# from init summary
+#   runtime_service_add: role_id/secret_id
+#   runtime_rotate: role_id/secret_id
 bootroot rotate --compose-file "$COMPOSE_FILE" \
-  --openbao-url "http://127.0.0.1:8200" --root-token "$OPENBAO_ROOT_TOKEN" \
+  --openbao-url "http://127.0.0.1:8200" \
+  --auth-mode approle \
+  --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+  --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
   --yes responder-hmac
 ```
 
@@ -203,7 +210,8 @@ Purpose:
 
 Execution steps:
 
-1. `infra-up`, `init` on control node, then parse `root_token` from summary JSON
+1. `infra-up`, `init` on control node, then parse runtime AppRole credentials
+   from summary JSON
 2. `service-add` in `remote-bootstrap` mode (control node writes desired state)
 3. Copy bootstrap materials (`role_id`, `secret_id`) to remote node
 4. `sync-initial`: run `bootroot-remote sync` on remote node
@@ -400,28 +408,29 @@ Use this only as a local constraint workaround. CI still executes
 
 Lifecycle scripts consume `bootroot init --summary-json` output for automation.
 Do not parse human-readable summary lines for tokens/secrets.
-Local CLI scenario runs use the same rule and read `.root_token` from
-`--summary-json`.
+Local CLI scenario runs use the same rule and read runtime AppRole credentials
+from `.approles[]` in `--summary-json`.
 This is a **test/automation convenience rule**, not a production token custody
 policy.
 
-Minimum machine field used by E2E:
+Minimum machine fields used by E2E:
 
-- `root_token`
+- `.approles[]` entries for:
+  - `runtime_service_add` (`role_id`, `secret_id`)
+  - `runtime_rotate` (`role_id`, `secret_id`)
 
-How E2E handles OpenBao unseal and token usage:
+How E2E handles OpenBao unseal and runtime auth:
 
 - E2E typically unseals once during `init` and does not unseal again in the
   same run
 - Unseal is required again only after OpenBao returns to `sealed` state
   (for example: process/container restart, manual seal, recovery flow)
-- `root_token` is read from `init-summary.json`, stored in a shell variable
-  (`OPENBAO_ROOT_TOKEN`), and passed to `service add`/`rotate` in the same run
-  via `--root-token`
-- test scripts also avoid long-term token persistence; token use stays in
-  per-run shell context
-- Because summary JSON contains the token, treat the artifact as sensitive
-  output in storage/retention workflows
+- runtime AppRole credentials are read from `init-summary.json` (`approles`)
+  and passed to `service add`/`rotate` via `--auth-mode approle`
+- scripts avoid long-term credential persistence; values stay in per-run shell
+  context
+- summary JSON contains sensitive fields (including root token and AppRole
+  secret_id), so treat the artifact as sensitive in retention workflows
 
 Operational guidance:
 

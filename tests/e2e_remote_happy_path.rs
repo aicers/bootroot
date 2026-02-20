@@ -8,10 +8,12 @@ use anyhow::Context;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const ROOT_TOKEN: &str = "root-token";
+const RUNTIME_SERVICE_ADD_ROLE_ID: &str = "runtime-service-add-role-id";
+const RUNTIME_SERVICE_ADD_SECRET_ID: &str = "runtime-service-add-secret-id";
+const RUNTIME_CLIENT_TOKEN: &str = "runtime-client-token";
 const SERVICE_NAME: &str = "edge-proxy";
 const HOSTNAME: &str = "edge-node-02";
 const DOMAIN: &str = "trusted.domain";
@@ -143,8 +145,12 @@ fn run_service_add_remote(control_dir: &Path, service_dir: &Path) -> anyhow::Res
                 .as_ref(),
             "--instance-id",
             INSTANCE_ID,
-            "--root-token",
-            ROOT_TOKEN,
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            RUNTIME_SERVICE_ADD_ROLE_ID,
+            "--approle-secret-id",
+            RUNTIME_SERVICE_ADD_SECRET_ID,
         ])
         .output()
         .context("run bootroot service add")?;
@@ -414,9 +420,23 @@ async fn stub_control_plane_openbao(server: &MockServer) {
 }
 
 async fn stub_control_plane_approle(server: &MockServer, role_name: &str) {
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": RUNTIME_SERVICE_ADD_ROLE_ID,
+            "secret_id": RUNTIME_SERVICE_ADD_SECRET_ID
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": {
+                "client_token": RUNTIME_CLIENT_TOKEN
+            }
+        })))
+        .mount(server)
+        .await;
+
     Mock::given(method("GET"))
         .and(path("/v1/sys/auth"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "approle/": {}
@@ -427,21 +447,21 @@ async fn stub_control_plane_approle(server: &MockServer, role_name: &str) {
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/sys/policies/acl/{role_name}")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{role_name}")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 
     Mock::given(method("GET"))
         .and(path(format!("/v1/auth/approle/role/{role_name}/role-id")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "role_id": "role-edge-proxy" }
         })))
@@ -450,7 +470,7 @@ async fn stub_control_plane_approle(server: &MockServer, role_name: &str) {
 
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{role_name}/secret-id")))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "secret_id": "secret-edge-proxy" }
         })))
@@ -461,13 +481,13 @@ async fn stub_control_plane_approle(server: &MockServer, role_name: &str) {
 async fn stub_control_plane_global_materials(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/v1/secret/metadata/bootroot/ca"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/ca"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "data": {
@@ -481,7 +501,7 @@ async fn stub_control_plane_global_materials(server: &MockServer) {
 
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/agent/eab"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "data": { "kid": "control-kid", "hmac": "control-hmac" } }
         })))
@@ -490,7 +510,7 @@ async fn stub_control_plane_global_materials(server: &MockServer) {
 
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/responder/hmac"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "data": { "value": "control-responder-hmac" } }
         })))
@@ -503,13 +523,13 @@ async fn stub_control_plane_service_material_writes(server: &MockServer) {
         .and(path(
             "/v1/secret/data/bootroot/services/edge-proxy/secret_id",
         ))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/secret/data/bootroot/services/edge-proxy/eab"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
@@ -517,13 +537,13 @@ async fn stub_control_plane_service_material_writes(server: &MockServer) {
         .and(path(
             "/v1/secret/data/bootroot/services/edge-proxy/http_responder_hmac",
         ))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/secret/data/bootroot/services/edge-proxy/trust"))
-        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
