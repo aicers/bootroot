@@ -64,7 +64,7 @@ automatically.
    `role_id` (safe to store on disk) with a rotatable `secret_id` (sensitive).
    Rotating `secret_id` invalidates the running OpenBao Agent's credential, so
    the agent cannot rotate its own secret. The operator triggers rotation with
-   `bootroot rotate secret-id` and delivers the new value to the service
+   `bootroot rotate approle-secret-id` and delivers the new value to the service
    machine (Bootroot provides the delivery mechanism via `bootroot-remote
    apply-secret-id`).
 

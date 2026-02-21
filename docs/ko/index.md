@@ -56,7 +56,7 @@ step-ca 프로비저너 비밀번호, 데이터베이스 비밀번호 등)은 Op
    가능)와 회전 가능한 `secret_id`(민감)를 쌍으로 사용합니다. `secret_id`를
    회전하면 실행 중인 OpenBao Agent의 인증 정보가 무효화되므로, 에이전트가
    스스로 자신의 시크릿을 회전할 수 없습니다. 운영자가
-   `bootroot rotate secret-id`로 회전을 실행하고 `bootroot-remote
+   `bootroot rotate approle-secret-id`로 회전을 실행하고 `bootroot-remote
    apply-secret-id`로 서비스 머신에 새 값을 전달합니다.
 
 **AppRole 모델.**
