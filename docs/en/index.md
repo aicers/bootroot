@@ -40,6 +40,52 @@ CA is short for **Certificate Authority**, the service that signs certificates
 to assert identity. ACME (Automated Certificate Management Environment) is the
 RFC 8555 protocol used for automated issuance.
 
+## Design Philosophy
+
+Bootroot automates the mTLS certificate lifecycle while leaving exactly two
+operations to the human operator — the two that *cannot* be safely automated.
+
+**CA key scope.**
+CA keys are generated once during `bootroot infra init`. The project does not
+support CA key rotation; replacing a CA requires a full re-init.
+
+**Secret management.**
+Every secret needed for certificate issuance and renewal (EAB credentials,
+responder HMAC, step-ca provisioner password, database password, etc.) is
+stored in OpenBao. Bootroot generates, rotates, and delivers these secrets
+automatically.
+
+**Two manual operations.**
+
+1. **OpenBao unseal** — The unseal key must be entered by an operator each time
+   OpenBao starts. (`--openbao-unseal-from-file` exists as a development
+   convenience; it is not intended for production use.)
+2. **secret_id rotation and delivery** — AppRole authentication pairs a static
+   `role_id` (safe to store on disk) with a rotatable `secret_id` (sensitive).
+   Rotating `secret_id` invalidates the running OpenBao Agent's credential, so
+   the agent cannot rotate its own secret. The operator triggers rotation with
+   `bootroot rotate secret-id` and delivers the new value to the service
+   machine (Bootroot provides the delivery mechanism via `bootroot-remote
+   apply-secret-id`).
+
+**AppRole model.**
+After `bootroot infra init`, the root token is no longer required for
+day-to-day operations. Each service authenticates to OpenBao through AppRole:
+`role_id` (static, written to a file) plus `secret_id` (rotated periodically
+by the operator).
+
+**Initial trust.**
+On the very first certificate issuance, the CA's own certificate is not yet
+available to the agent, so CA identity verification is skipped. This is safe
+because the operator controls both the CA and the agent during bootstrap.
+On every subsequent renewal, the already-obtained CA certificate is used to
+verify the CA's identity.
+
+**Everything else is automated.**
+EAB credentials, responder HMAC keys, step-ca provisioner passwords, database
+passwords, and trust-bundle synchronization are all rotated automatically by
+Bootroot without operator intervention.
+
 ## Manual Map
 
 - **Concepts**: PKI, ACME, CSR, SAN, mTLS, and OpenBao basics
