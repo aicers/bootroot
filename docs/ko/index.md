@@ -33,6 +33,47 @@ CA는 **Certificate Authority**의 약어로, 인증서를 서명해 신원을 �
 기관(또는 서비스)을 뜻합니다. ACME(Automated Certificate Management
 Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다.
 
+## 설계 철학
+
+Bootroot는 mTLS 인증서 수명 주기를 자동화하되, **안전하게 자동화할 수 없는
+딱 두 가지 작업**만 운영자에게 맡깁니다.
+
+**CA 키 범위.**
+CA 키는 `bootroot infra init` 과정에서 한 번 생성됩니다. CA 키 회전은
+지원하지 않으며, CA를 교체하려면 전체 재초기화가 필요합니다.
+
+**시크릿 관리.**
+인증서 발급/갱신에 필요한 모든 시크릿(EAB 자격 증명, 리스폰더 HMAC,
+step-ca 프로비저너 비밀번호, 데이터베이스 비밀번호 등)은 OpenBao에
+저장됩니다. Bootroot가 이 시크릿들을 자동으로 생성/회전/전달합니다.
+
+**두 가지 수동 작업.**
+
+1. **OpenBao unseal** — OpenBao가 시작될 때마다 운영자가 unseal 키를 직접
+   입력해야 합니다. (`--openbao-unseal-from-file`은 개발 편의 옵션이며 운영
+   환경용이 아닙니다.)
+2. **secret_id 회전 및 전달** — AppRole 인증은 정적 `role_id`(파일 저장
+   가능)와 회전 가능한 `secret_id`(민감)를 쌍으로 사용합니다. `secret_id`를
+   회전하면 실행 중인 OpenBao Agent의 인증 정보가 무효화되므로, 에이전트가
+   스스로 자신의 시크릿을 회전할 수 없습니다. 운영자가
+   `bootroot rotate secret-id`로 회전을 실행하고 `bootroot-remote
+   apply-secret-id`로 서비스 머신에 새 값을 전달합니다.
+
+**AppRole 모델.**
+`bootroot infra init` 이후에는 일상 운영에 root 토큰이 필요하지 않습니다.
+각 서비스는 AppRole을 통해 OpenBao에 인증합니다: `role_id`(정적, 파일에
+기록)와 `secret_id`(운영자가 주기적으로 회전).
+
+**초기 신뢰.**
+최초 인증서 발급 시에는 에이전트에 CA 인증서가 아직 없으므로, CA 신원 검증을
+건너뜁니다. 이 시점에서는 운영자가 CA와 에이전트를 모두 통제하므로
+안전합니다. 이후 갱신부터는 이미 확보한 CA 인증서로 CA 신원을 검증합니다.
+
+**나머지는 모두 자동.**
+EAB 자격 증명, 리스폰더 HMAC 키, step-ca 프로비저너 비밀번호, 데이터베이스
+비밀번호, 트러스트 번들 동기화는 모두 운영자 개입 없이 Bootroot가 자동으로
+회전합니다.
+
 ## 매뉴얼 구성
 
 - **개념**: PKI, ACME, CSR, SAN, mTLS, 시크릿 관리(OpenBao) 개요
