@@ -10,7 +10,8 @@ CLI는 infra 기동/초기화/상태 점검과 서비스 온보딩, 발급 검�
 역할:
 
 - `bootroot`: step-ca가 동작하는 머신에서 infra/init/service/rotate/monitoring 자동화
-- `bootroot-remote`: 원격 서비스가 동작하는 머신에서 pull/sync/ack 동기화 수행
+- `bootroot-remote`: 원격 서비스가 동작하는 머신에서 일회성 bootstrap 및
+  명시적 secret_id 전달 수행
 
 주요 명령:
 
@@ -19,11 +20,11 @@ CLI는 infra 기동/초기화/상태 점검과 서비스 온보딩, 발급 검�
 - `bootroot status`
 - `bootroot service add`
 - `bootroot service info`
-- `bootroot service sync-status`
 - `bootroot verify`
 - `bootroot rotate`
 - `bootroot monitoring`
-- `bootroot-remote pull/ack/sync`
+- `bootroot-remote bootstrap`
+- `bootroot-remote apply-secret-id`
 
 ## 공통 옵션
 
@@ -66,8 +67,9 @@ bootroot CLI가 자동으로 준비하는 항목:
 - 컨테이너 모드: 컨테이너 restart 정책 + Docker 데몬 부팅 자동 시작
 
 추가 서비스가 step-ca 운영 머신이 아닌 다른 머신에서 동작하는 경우, 해당
-서비스 머신에서 `bootroot-remote sync`를 주기 실행(systemd timer 또는 cron)으로
-구성해야 합니다.
+서비스 머신에서 `bootroot-remote bootstrap`을 1회 실행해 초기 설정 번들을
+반영한 뒤, secret_id 회전 이후에는 `bootroot-remote apply-secret-id`로
+명시적 secret_id 전달을 수행합니다.
 
 ## 이름 해석(DNS/hosts) 운영 책임
 
@@ -328,7 +330,8 @@ bootroot status
 운영자가 직접 해야 할 작업:
 
 - 서비스 머신에서 OpenBao Agent/bootroot-agent를 실제로 기동/상시 운영
-- `remote-bootstrap`인 경우 서비스 머신에서 `bootroot-remote` 주기 실행 구성
+- `remote-bootstrap`인 경우 서비스 머신에서 `bootroot-remote bootstrap` 1회
+  실행 및 secret_id 회전 이후 `bootroot-remote apply-secret-id` 실행
 - `bootroot verify` 또는 실제 서비스 실행으로 발급 경로 검증
 
 ### 4) trust 자동 처리와 preview
@@ -340,9 +343,9 @@ bootroot status
 
 #### 4-1) 전달 모드별 trust 자동 처리
 
-- `remote-bootstrap` 방식: `trusted_ca_sha256`를 서비스별 원격 sync
+- `remote-bootstrap` 방식: `trusted_ca_sha256`를 서비스별 원격 bootstrap
   번들(`secret/.../services/<service>/trust`)에 자동 기록하고, 원격 서비스
-  머신의 `bootroot-remote sync`가 이를 `agent.toml` trust 항목에 반영합니다.
+  머신의 `bootroot-remote bootstrap`이 이를 `agent.toml` trust 항목에 반영합니다.
 - `local-file` 방식: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)이
   `agent.toml`에 자동 병합되며, OpenBao trust 데이터에 `ca_bundle_pem`이
   있으면 로컬 `ca_bundle_path` 파일에도 자동 반영됩니다.
@@ -424,7 +427,7 @@ bootroot status
 
 - 서비스 메타데이터 요약
 - AppRole/정책/secret_id 경로 요약
-- 전달 모드 및 항목별 sync-status 요약(`local-file`은
+- 전달 모드 요약(`local-file`은
   `agent.toml`/OpenBao Agent 설정/템플릿 자동 반영 경로, `remote-bootstrap`은
   부트스트랩 아티팩트 + 순서형 원격 handoff 명령 출력)
 - 출력에 소유/책임 범위를 명시하는 라벨을 함께 표시:
@@ -463,45 +466,6 @@ bootroot status
 
 - `state.json` 누락
 - 등록되지 않은 서비스
-
-## bootroot service sync-status
-
-`bootroot-remote`가 생성한 summary JSON을 바탕으로 `state.json`의 sync-status를
-갱신합니다. 일반적으로 `bootroot-remote ack`가 이 명령을 호출합니다.
-
-### 입력
-
-- `--service-name`: 서비스 이름
-- `--summary-json`: `bootroot-remote pull/sync` summary JSON 경로
-- `--state-file`: `state.json` 경로 오버라이드(선택)
-
-### 추적 항목
-
-- `secret_id`
-- `eab`
-- `responder_hmac`
-- `trust_sync`
-
-### 상태 값
-
-- `none`: 아직 추적 대상 아님
-- `pending`: 원격 반영 대기
-- `applied`: 원격 반영 ack 완료
-- `failed`: 반영 실패
-- `expired`: pending 유지 시간이 기준을 초과해 만료됨
-
-### 출력
-
-- 대상 서비스의 항목별 sync-status 요약
-- 갱신된 `state.json`(또는 `--state-file`) 메타데이터/타임스탬프
-
-### 실패 조건
-
-다음 조건이면 실패로 판정합니다.
-
-- `state.json` 누락 또는 파싱 실패
-- summary JSON 누락/파싱 실패
-- 대상 서비스 미등록
 
 ## bootroot verify
 
@@ -742,18 +706,19 @@ OpenBao KV: `bootroot/responder/hmac`
 
 - 실행 중인 프로필을 자동 감지합니다. `--profile`은 받지 않습니다.
 
-## bootroot-remote (원격 동기화 실행 파일)
+## bootroot-remote (원격 bootstrap 실행 파일)
 
 `bootroot-remote`는 `bootroot service add --delivery-mode remote-bootstrap`로
 등록된 서비스를 위한 별도 실행 파일입니다. step-ca가 동작하는 머신의
 OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/`trust`)를
-원격 서비스 머신에서 `pull/sync/ack` 순서로 반영해 `agent.toml` 같은 로컬
-파일을 갱신하고, 결과를 `state.json`의 sync-status에 기록합니다.
+원격 서비스 머신에서 1회 bootstrap으로 반영해 `agent.toml` 같은 로컬
+파일을 갱신합니다. 이후 secret_id 회전 시에는 `bootroot-remote apply-secret-id`
+로 명시적 secret_id 전달을 수행합니다.
 `bootroot-remote`도 공통 옵션 `--lang`(환경 변수 `BOOTROOT_LANG`)을 지원합니다.
 
-### `bootroot-remote pull`
+### `bootroot-remote bootstrap`
 
-원격 노드에 서비스 시크릿/설정을 pull+apply합니다.
+원격 노드에 서비스 시크릿/설정을 1회 pull+apply합니다.
 
 주요 입력:
 
@@ -782,52 +747,23 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
     지정이 필요합니다.
 - `--summary-json`(선택), `--output text|json` (기본값 `text`)
 
-`agent.toml`이 아직 없으면 pull 단계에서 baseline을 생성한 뒤, 서비스용
+`agent.toml`이 아직 없으면 bootstrap 단계에서 baseline을 생성한 뒤, 서비스용
 관리 대상 프로필 블록을 갱신(없으면 추가)합니다.
 
-### `bootroot-remote ack`
+### `bootroot-remote apply-secret-id`
 
-summary 파일을 `state.json`의 sync-status로 반영합니다.
+회전된 secret_id를 원격 서비스 머신에 반영합니다. control node에서
+`bootroot rotate approle-secret-id` 실행 후, 새 secret_id를 서비스 머신에
+전달할 때 사용합니다.
 
 주요 입력:
 
+- `--openbao-url`: OpenBao API URL (환경 변수: `OPENBAO_URL`)
+- `--kv-mount`: OpenBao KV v2 마운트 경로 (환경 변수: `OPENBAO_KV_MOUNT`)
+  (기본값 `secret`)
 - `--service-name`
-- `--summary-json`
-- `--bootroot-bin`(기본 `bootroot`)
-- `--state-file`(선택)
-
-### `bootroot-remote sync`
-
-스케줄 실행을 위해 `pull + ack`를 retry/backoff/jitter와 함께 수행합니다.
-운영에서는 systemd timer 또는 cron으로 이 명령을 주기 실행해야 합니다.
-
-주요 재시도 입력:
-
-- `--retry-attempts` (기본값 `3`)
-- `--retry-backoff-secs` (기본값 `5`)
-- `--retry-jitter-secs` (기본값 `0`)
-
-그 외 입력:
-
-- sync는 pull 입력(`--openbao-url`, `--kv-mount`, `--service-name`,
-  `--role-id-path`, `--secret-id-path`, `--eab-file-path`,
-  `--agent-config-path`, baseline/profile 입력, `--ca-bundle-path`)을
-  그대로 받습니다.
-- `--summary-json`은 sync에서 필수입니다.
-- ack 연동용으로 `--bootroot-bin`(기본 `bootroot`), `--state-file`(선택)을
-  받을 수 있습니다.
-- pull 단계 출력 형식 제어용 `--output text|json`을 받을 수 있습니다
-  (기본값 `text`).
-
-summary JSON 계약 항목:
-
-- `secret_id`
-- `eab`
-- `responder_hmac`
-- `trust_sync`
-
-각 항목은 pull 결과에서 `applied|unchanged|failed`로 기록되고,
-ack 단계에서 `state.json`의 sync-status 값으로 매핑됩니다.
+- `--role-id-path`, `--secret-id-path`
+- `--output text|json` (기본값 `text`)
 
 출력 보안 규칙:
 

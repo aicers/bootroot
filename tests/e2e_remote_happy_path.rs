@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context;
 use rcgen::generate_simple_self_signed;
@@ -37,29 +37,7 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     run_service_add_remote(&control_dir, &service_dir).expect("service add remote");
     copy_remote_bootstrap_materials(&control_dir, &service_dir).expect("copy role/secret_id");
 
-    let summary_path = service_dir.join("edge-proxy-summary.json");
-    run_remote_sync(&service_dir, &control_dir, &server.uri(), &summary_path).expect("remote sync");
-
-    let control_state = control_dir.join("state.json");
-    let control_state_json: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&control_state).expect("read control state"))
-            .expect("parse control state");
-    assert_eq!(
-        control_state_json["services"][SERVICE_NAME]["sync_status"]["secret_id"],
-        "applied"
-    );
-    assert_eq!(
-        control_state_json["services"][SERVICE_NAME]["sync_status"]["eab"],
-        "applied"
-    );
-    assert_eq!(
-        control_state_json["services"][SERVICE_NAME]["sync_status"]["responder_hmac"],
-        "applied"
-    );
-    assert_eq!(
-        control_state_json["services"][SERVICE_NAME]["sync_status"]["trust_sync"],
-        "applied"
-    );
+    run_remote_bootstrap(&service_dir, &server.uri()).expect("remote bootstrap");
 
     let secret_id_path = service_dir
         .join("secrets")
@@ -167,12 +145,7 @@ fn run_service_add_remote(control_dir: &Path, service_dir: &Path) -> anyhow::Res
     Ok(())
 }
 
-fn run_remote_sync(
-    service_dir: &Path,
-    control_dir: &Path,
-    openbao_url: &str,
-    summary_path: &Path,
-) -> anyhow::Result<()> {
+fn run_remote_bootstrap(service_dir: &Path, openbao_url: &str) -> anyhow::Result<()> {
     let role_id_path = service_dir
         .join("secrets")
         .join("services")
@@ -190,12 +163,11 @@ fn run_remote_sync(
         .join("eab.json");
     let agent_config_path = service_dir.join("agent.toml");
     let ca_bundle_path = service_dir.join("certs").join("ca-bundle.pem");
-    let bootroot_proxy = write_bootroot_proxy(service_dir, control_dir)?;
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
         .current_dir(service_dir)
         .args([
-            "sync",
+            "bootstrap",
             "--openbao-url",
             openbao_url,
             "--kv-mount",
@@ -236,42 +208,16 @@ fn run_remote_sync(
                 .as_ref(),
             "--ca-bundle-path",
             ca_bundle_path.to_string_lossy().as_ref(),
-            "--summary-json",
-            summary_path.to_string_lossy().as_ref(),
-            "--bootroot-bin",
-            bootroot_proxy.to_string_lossy().as_ref(),
-            "--retry-attempts",
-            "1",
         ])
         .output()
-        .context("run bootroot-remote sync")?;
+        .context("run bootroot-remote bootstrap")?;
     if !output.status.success() {
         anyhow::bail!(
-            "remote sync failed: {}",
+            "remote bootstrap failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    assert!(summary_path.exists());
     Ok(())
-}
-
-fn write_bootroot_proxy(service_dir: &Path, control_dir: &Path) -> anyhow::Result<PathBuf> {
-    let bin_dir = service_dir.join("bin");
-    fs::create_dir_all(&bin_dir).context("create remote bin dir")?;
-    let proxy_path = bin_dir.join("bootroot-proxy");
-    let script = format!(
-        "#!/bin/sh\nset -eu\ncd '{}'\nexec '{}' \"$@\"\n",
-        shell_single_quote(control_dir),
-        shell_single_quote(Path::new(env!("CARGO_BIN_EXE_bootroot"))),
-    );
-    fs::write(&proxy_path, script).context("write bootroot proxy")?;
-    fs::set_permissions(&proxy_path, fs::Permissions::from_mode(0o700))
-        .context("chmod bootroot proxy")?;
-    Ok(proxy_path)
-}
-
-fn shell_single_quote(path: &Path) -> String {
-    path.display().to_string().replace('\'', "'\"'\"'")
 }
 
 fn write_control_state(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
@@ -330,12 +276,6 @@ fn write_verify_state(service_dir: &Path) -> anyhow::Result<()> {
                 "service_name": SERVICE_NAME,
                 "deploy_type": "daemon",
                 "delivery_mode": "remote-bootstrap",
-                "sync_status": {
-                    "secret_id": "applied",
-                    "eab": "applied",
-                    "responder_hmac": "applied",
-                    "trust_sync": "applied"
-                },
                 "hostname": HOSTNAME,
                 "domain": DOMAIN,
                 "agent_config_path": service_dir.join("agent.toml"),

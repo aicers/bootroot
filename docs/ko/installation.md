@@ -398,11 +398,11 @@ docker compose up --build -d bootroot-agent
 해당 서비스 머신에 `bootroot-remote`를 설치해야 합니다.
 
 - 설치: `cargo build --release --bin bootroot-remote`
-- 실행: `bootroot-remote sync ...`
-- 운영: systemd timer 또는 cron으로 주기 실행
+- 실행: `bootroot-remote bootstrap ...`(초기 1회 설정),
+  `bootroot-remote apply-secret-id ...`(secret_id 회전 이후)
 
 `remote-bootstrap` 방식의 상세 인자/예시는 [CLI](cli.md)의
-`bootroot-remote pull/ack/sync` 섹션을 참고하세요.
+`bootroot-remote bootstrap`/`apply-secret-id` 섹션을 참고하세요.
 
 ## HTTP-01 리스폰더
 

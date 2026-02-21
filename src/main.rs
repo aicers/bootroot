@@ -75,10 +75,6 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
             commands::service::run_service_info(&args, messages)
                 .with_context(|| messages.error_service_info_failed())?;
         }
-        CliCommand::Service(ServiceCommand::SyncStatus(args)) => {
-            commands::service::run_service_sync_status(&args, messages)
-                .with_context(|| messages.error_service_info_failed())?;
-        }
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,
         CliCommand::Rotate(args) => {

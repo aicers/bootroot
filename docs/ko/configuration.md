@@ -46,7 +46,7 @@ OpenBao Agent는 `role_id`/`secret_id` 파일을 사용해 AppRole로 로그인�
   `bootroot service add`가 서비스별 OpenBao Agent
   설정/템플릿과 managed `agent.toml` 프로필을 자동 반영합니다.
 - **`--delivery-mode remote-bootstrap`로 추가한 서비스**: `bootroot service add`가 부트스트랩
-  아티팩트를 만들고, `bootroot-remote sync`가 원격 호스트에서
+  아티팩트를 만들고, `bootroot-remote bootstrap`이 원격 호스트에서
   `agent.hcl`/템플릿/토큰과 managed `agent.toml` 프로필을 반영합니다.
 
 예시 `agent.hcl` 스니펫:
@@ -81,7 +81,7 @@ template {
 가장 간편합니다.
 
 `--delivery-mode remote-bootstrap` 방식에서는 원격에 `agent.toml`이 아직 없을 때
-`bootroot-remote sync`가 baseline을 생성할 수 있습니다. baseline 생성에는
+`bootroot-remote bootstrap`이 baseline을 생성할 수 있습니다. baseline 생성에는
 다음 입력이 사용됩니다.
 
 - `--agent-email`
@@ -200,8 +200,8 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 
 #### 3) `--delivery-mode` 연동
 
-- `remote-bootstrap`: 서비스별 원격 sync trust 경로에 지문이 기록되고,
-  `bootroot-remote sync`가 서비스 머신 `agent.toml`에 반영
+- `remote-bootstrap`: 서비스별 원격 bootstrap trust 경로에 지문이 기록되고,
+  `bootroot-remote bootstrap`이 서비스 머신 `agent.toml`에 반영
 - `local-file`: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)을
   `agent.toml`에 자동 병합, OpenBao trust 데이터에 `ca_bundle_pem`이 있으면
   `ca_bundle_path` 파일도 자동 반영

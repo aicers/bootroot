@@ -47,18 +47,8 @@ mod unix_integration {
         let phase_contents =
             std::fs::read_to_string(&phase_log).with_context(|| "Failed to read phase log")?;
         assert!(phase_contents.contains("\"phase\":\"bootstrap\""));
-        assert!(phase_contents.contains("\"phase\":\"runner-start\""));
-        assert!(phase_contents.contains("\"phase\":\"sync-loop\""));
-        assert!(phase_contents.contains("\"phase\":\"ack\""));
         assert!(phase_contents.contains("\"phase\":\"verify\""));
         assert!(phase_contents.contains("\"phase\":\"cleanup\""));
-
-        let state_contents =
-            std::fs::read_to_string(state_snapshot).with_context(|| "Failed to read state")?;
-        assert!(state_contents.contains("\"secret_id\": \"applied\""));
-        assert!(state_contents.contains("\"eab\": \"applied\""));
-        assert!(state_contents.contains("\"responder_hmac\": \"applied\""));
-        assert!(state_contents.contains("\"trust_sync\": \"applied\""));
 
         Ok(())
     }

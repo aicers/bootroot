@@ -221,7 +221,7 @@ next steps:
     secret_id file secrets/services/web-app/secret_id.
 ```
 
-### 3-3) remote-bootstrap delivery mode + remote sync
+### 3-3) remote-bootstrap delivery mode + one-shot bootstrap
 
 Control node onboarding (artifact generation):
 
@@ -239,10 +239,10 @@ bootroot service add \
   --root-token <OPENBAO_ROOT_TOKEN>
 ```
 
-Remote node convergence:
+Remote node one-shot bootstrap:
 
 ```bash
-bootroot-remote sync \
+bootroot-remote bootstrap \
   --openbao-url http://127.0.0.1:8200 \
   --kv-mount secret \
   --service-name edge-remote \
@@ -263,22 +263,22 @@ bootroot-remote sync \
   --output json
 ```
 
-`bootroot-remote sync` runs pull and ack together, then applies the summary to
-`bootroot service sync-status` for `secret_id`, `eab`, `responder_hmac`, and
-`trust_sync`.
-Add `--state-file <path>` only when state.json is not in the default location.
+`bootroot-remote bootstrap` performs a one-shot pull and apply of the service
+configuration bundle (`secret_id`, `eab`, `responder_hmac`, `trust`).
 In operations, prefer the exact `remote run command` printed by
 `bootroot service add`.
 
-Additional input notes:
+After secret_id rotation on the control node, deliver the new secret_id to the
+remote node:
 
-- sync accepts the same pull inputs (`--openbao-url`, `--kv-mount`,
-  `--service-name`, `--role-id-path`, `--secret-id-path`, `--eab-file-path`,
-  `--agent-config-path`, baseline/profile inputs, `--ca-bundle-path`).
-- `--summary-json` is required for sync.
-- For ack passthrough, it also accepts `--bootroot-bin` (default `bootroot`)
-  and optional `--state-file`.
-- It also accepts `--output text|json` for pull-stage output format.
+```bash
+bootroot-remote apply-secret-id \
+  --openbao-url http://127.0.0.1:8200 \
+  --kv-mount secret \
+  --service-name edge-remote \
+  --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
+  --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
+```
 
 ## 4) DNS/hosts setup for CLI examples
 

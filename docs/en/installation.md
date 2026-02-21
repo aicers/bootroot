@@ -390,11 +390,11 @@ When a service is added on a machine different from where step-ca/OpenBao run,
 install `bootroot-remote` on that service machine.
 
 - Build/install: `cargo build --release --bin bootroot-remote`
-- Runtime: `bootroot-remote sync ...`
-- Operations: periodic execution via systemd timer or cron
+- Runtime: `bootroot-remote bootstrap ...` (one-shot initial setup),
+  `bootroot-remote apply-secret-id ...` (after secret_id rotation)
 
 For detailed arguments/examples in `remote-bootstrap` mode, see
-`bootroot-remote pull/ack/sync` in [CLI](cli.md).
+`bootroot-remote bootstrap`/`apply-secret-id` in [CLI](cli.md).
 
 ## HTTP-01 responder
 

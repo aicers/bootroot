@@ -12,8 +12,8 @@ Roles:
 
 - `bootroot`: automates infra/init/service/rotate/monitoring on the
   machine hosting step-ca
-- `bootroot-remote`: performs pull/sync/ack convergence on machines
-  hosting remote services
+- `bootroot-remote`: performs one-shot bootstrap and explicit secret_id
+  handoff on machines hosting remote services
 
 Primary commands:
 
@@ -22,11 +22,11 @@ Primary commands:
 - `bootroot status`
 - `bootroot service add`
 - `bootroot service info`
-- `bootroot service sync-status`
 - `bootroot verify`
 - `bootroot rotate`
 - `bootroot monitoring`
-- `bootroot-remote pull/ack/sync`
+- `bootroot-remote bootstrap`
+- `bootroot-remote apply-secret-id`
 
 ## Global Options
 
@@ -74,8 +74,9 @@ Runtime supervision is also operator-owned:
   reboot
 
 When an added service runs on a different machine from the step-ca host,
-schedule `bootroot-remote sync` periodically on that service machine
-(systemd timer or cron).
+run `bootroot-remote bootstrap` once on that service machine to apply the
+initial configuration bundle, then use `bootroot-remote apply-secret-id`
+for explicit secret_id handoff after rotation.
 
 ## Name resolution responsibilities
 
@@ -344,8 +345,8 @@ automation in the following structure.
 You still need to perform:
 
 - Start and keep OpenBao Agent/bootroot-agent running on the service machine
-- For `remote-bootstrap`, configure periodic `bootroot-remote` runs on the
-  service machine
+- For `remote-bootstrap`, run `bootroot-remote bootstrap` on the service
+  machine and use `bootroot-remote apply-secret-id` after secret_id rotation
 - Validate issuance path via `bootroot verify` or real service startup
 
 ### 4) Trust automation and preview
@@ -358,8 +359,8 @@ automatically as part of onboarding.
 #### 4-1) Trust automation by delivery mode
 
 - `remote-bootstrap` mode: it writes
-  `trusted_ca_sha256` into the per-service remote sync bundle
-  (`secret/.../services/<service>/trust`), and `bootroot-remote sync`
+  `trusted_ca_sha256` into the per-service remote bootstrap bundle
+  (`secret/.../services/<service>/trust`), and `bootroot-remote bootstrap`
   applies it to trust settings in `agent.toml` on the service machine.
 - `local-file` mode: trust settings are auto-merged into `agent.toml`
   (`trusted_ca_sha256` and `ca_bundle_path`), and CA bundle PEM is written
@@ -444,7 +445,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 
 - App metadata summary
 - AppRole/policy/secret_id path summary
-- Delivery mode + per-item sync-status summary (`local-file` provides
+- Delivery mode summary (`local-file` provides
   auto-applied `agent.toml`/OpenBao Agent config/template paths, and
   `remote-bootstrap` provides a generated bootstrap artifact + ordered remote
   handoff commands)
@@ -485,45 +486,6 @@ The command is considered failed when:
 
 - Missing `state.json`
 - App not found
-
-## bootroot service sync-status
-
-Updates `state.json` sync-status from a `bootroot-remote` summary JSON.
-This command is usually called by `bootroot-remote ack`.
-
-### Inputs
-
-- `--service-name`: service name identifier
-- `--summary-json`: summary JSON path from `bootroot-remote pull/sync`
-- `--state-file`: optional `state.json` path override
-
-### Tracked items
-
-- `secret_id`
-- `eab`
-- `responder_hmac`
-- `trust_sync`
-
-### Status values
-
-- `none`: not tracked yet
-- `pending`: waiting for remote apply
-- `applied`: remote apply acknowledged
-- `failed`: apply failed
-- `expired`: pending window exceeded and timed out
-
-### Outputs
-
-- Per-item sync-status summary for the target service
-- Updated `state.json` (or `--state-file`) metadata/timestamps
-
-### Failure conditions
-
-The command is considered failed when:
-
-- `state.json` is missing or cannot be parsed
-- summary JSON is missing or invalid
-- target service is not registered
 
 ## bootroot verify
 
@@ -770,20 +732,22 @@ Notes:
 - This command auto-detects the running profile(s). It does not accept
   `--profile`.
 
-## bootroot-remote (remote sync binary)
+## bootroot-remote (remote bootstrap binary)
 
 `bootroot-remote` is a separate binary used for services registered with
-`bootroot service add --delivery-mode remote-bootstrap`. It applies the desired
-service state (`secret_id`/`eab`/`responder_hmac`/`trust`) stored in OpenBao on
-the step-ca machine to files on remote service machines via `pull/sync/ack`,
-updates local files such as `agent.toml`, and records results in `state.json`
-sync-status.
+`bootroot service add --delivery-mode remote-bootstrap`. It performs a one-shot
+bootstrap of service state (`secret_id`/`eab`/`responder_hmac`/`trust`) stored
+in OpenBao on the step-ca machine to files on remote service machines, and
+updates local files such as `agent.toml`. After the initial bootstrap,
+`bootroot-remote apply-secret-id` handles explicit secret_id handoff after
+rotation.
 `bootroot-remote` also supports the global `--lang` option
 (environment variable: `BOOTROOT_LANG`).
 
-### `bootroot-remote pull`
+### `bootroot-remote bootstrap`
 
-Pulls and applies service secrets/config to remote file paths.
+Performs a one-shot pull and apply of service secrets/config to remote file
+paths.
 
 Key inputs:
 
@@ -812,51 +776,24 @@ Key inputs:
   - required to write bundle files when trust data includes `ca_bundle_pem`.
 - `--summary-json` (optional) and `--output text|json` (default `text`)
 
-If `agent.toml` does not exist yet, pull creates a baseline config and then
-updates (or creates) a managed profile block for the service.
+If `agent.toml` does not exist yet, bootstrap creates a baseline config and
+then updates (or creates) a managed profile block for the service.
 
-### `bootroot-remote ack`
+### `bootroot-remote apply-secret-id`
 
-Acknowledges a summary file back into `state.json` sync-status.
+Applies a rotated secret_id to the remote service machine. Use this command
+after `bootroot rotate approle-secret-id` on the control node to deliver the
+new secret_id to the service machine.
 
 Key inputs:
 
+- `--openbao-url`: OpenBao API URL (environment variable: `OPENBAO_URL`)
+- `--kv-mount`: OpenBao KV v2 mount path
+  (environment variable: `OPENBAO_KV_MOUNT`)
+  (default `secret`)
 - `--service-name`
-- `--summary-json`
-- `--bootroot-bin` (default `bootroot`)
-- `--state-file` (optional)
-
-### `bootroot-remote sync`
-
-Runs `pull + ack` with retry/backoff/jitter for scheduled execution.
-In production, run this command periodically via systemd timer or cron.
-
-Key retry controls:
-
-- `--retry-attempts` (default `3`)
-- `--retry-backoff-secs` (default `5`)
-- `--retry-jitter-secs` (default `0`)
-
-Other inputs:
-
-- sync accepts the same pull inputs (`--openbao-url`, `--kv-mount`,
-  `--service-name`, `--role-id-path`, `--secret-id-path`, `--eab-file-path`,
-  `--agent-config-path`, baseline/profile inputs, `--ca-bundle-path`).
-- `--summary-json` is required for sync.
-- For ack passthrough, it also accepts `--bootroot-bin` (default `bootroot`)
-  and optional `--state-file`.
-- It also accepts `--output text|json` for pull-stage output format.
-  (default `text`)
-
-Summary JSON contract items:
-
-- `secret_id`
-- `eab`
-- `responder_hmac`
-- `trust_sync`
-
-Each item returns `applied|unchanged|failed` in the pull summary. `ack` maps
-that result into `state.json` sync-status values.
+- `--role-id-path`, `--secret-id-path`
+- `--output text|json` (default `text`)
 
 Output safety semantics:
 

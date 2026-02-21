@@ -113,12 +113,6 @@ def main() -> None:
                 "service_name": service_name,
                 "deploy_type": deploy_type,
                 "delivery_mode": "remote-bootstrap",
-                "sync_status": {
-                    "secret_id": "pending",
-                    "eab": "pending",
-                    "responder_hmac": "pending",
-                    "trust_sync": "pending",
-                },
                 "hostname": hostname,
                 "domain": DOMAIN,
                 "agent_config_path": f"configs/{service_name}.toml",

@@ -11,8 +11,9 @@ For CI/test operations, see [CI & E2E](e2e-ci.md).
 Bootroot-managed scope:
 
 - generation and updates of config/material files (`agent.toml`, `agent.hcl`,
-  `agent.toml.ctmpl`, `token`, and sync-related files)
-- per-delivery-mode state recording and sync input preparation during service add
+  `agent.toml.ctmpl`, `token`, and bootstrap-related files)
+- per-delivery-mode state recording and bootstrap input preparation
+  during service add
 - operational command flow entry points (`rotate`, `verify`, `status`)
 
 Operator-managed scope:
@@ -50,7 +51,7 @@ bootroot monitoring status
 - `bootroot verify --service-name <service> --db-check`:
   non-interactive issuance/verification/DB/responder checks
 - `bootroot service info --service-name <service>`:
-  current per-service state including delivery mode and per-item sync-status
+  current per-service state including delivery mode
 - `bootroot monitoring status`: Prometheus/Grafana container status
 
 ## bootroot-agent
@@ -109,8 +110,8 @@ bootroot monitoring status
   `Restart=on-failure` and `WantedBy=multi-user.target`.
 - If OpenBao Agent is systemd-managed, split it per service and define
   dependency ordering such as `After=network-online.target`.
-- Run `bootroot-remote` periodically per service (timer/cron) and apply overlap
-  prevention lock (`flock`).
+- Run `bootroot-remote bootstrap` once per service at initial setup, then use
+  `bootroot-remote apply-secret-id` after secret_id rotation.
 - Triage flow:
   `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
   -> `bootroot verify --service-name <service>`.
@@ -154,22 +155,16 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-## Remote sync periodic operations
+## Remote bootstrap and secret_id handoff operations
 
-For targets added with `--delivery-mode remote-bootstrap`, run a periodic
-`bootroot-remote sync` job.
-Template files are provided:
+For targets added with `--delivery-mode remote-bootstrap`, the operational
+model is one-shot bootstrap followed by explicit secret_id handoff:
 
-- `scripts/bootroot-remote-sync.service`
-- `scripts/bootroot-remote-sync.timer`
-- `scripts/bootroot-remote-sync.cron`
-
-Recommended pattern:
-
-- one periodic sync job per service
-- one `--summary-json` file per service
-- keep role/secret/token/config paths service-scoped
-- apply overlap prevention lock (`flock` or equivalent)
+1. Run `bootroot-remote bootstrap` once on the service machine after
+   `bootroot service add` to apply the initial configuration bundle.
+2. After `bootroot rotate approle-secret-id` on the control node, run
+   `bootroot-remote apply-secret-id` on the service machine to deliver the
+   new secret_id.
 
 Minimum environment/config checklist:
 
@@ -177,39 +172,11 @@ Minimum environment/config checklist:
 - service name and AppRole file paths (`role_id`, `secret_id`)
 - EAB file path and `agent.toml` path
 - profile identity/path fields (hostname, instance_id, cert/key paths)
-- CA bundle path when trust sync is enabled
-
-Failure handling guidance:
-
-- use retry/backoff/jitter controls in `bootroot-remote sync`
-- alert on repeated `failed`/`expired` sync-status values
-- inspect pull summary JSON + `bootroot service sync-status` output together
-
-systemd timer example (overlap prevention):
-
-```ini
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/flock -n /var/lock/bootroot-remote-<service>.lock \
-  /usr/local/bin/bootroot-remote sync ...
-```
-
-Manual ingest (exception path):
-
-- Use the command below only when you need to ingest a previously generated
-  summary JSON manually.
-
-```bash
-bootroot service sync-status \
-  --service-name <service> \
-  --summary-json <service>-remote-summary.json
-```
+- CA bundle path when trust data includes `ca_bundle_pem`
 
 Security notes:
 
 - secret directories `0700`, secret files `0600`
-- summary JSON is primarily status/error metadata; still keep it out of broad
-  shared logs and apply retention controls
 - limit service account access to service-specific paths only
 - treat `bootroot init --summary-json` output as sensitive because it may
   include `root_token`

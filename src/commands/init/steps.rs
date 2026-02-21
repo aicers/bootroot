@@ -49,7 +49,7 @@ use crate::commands::guardrails::{ensure_postgres_localhost_binding, is_single_h
 use crate::commands::infra::{ensure_infra_ready, run_docker};
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
-use crate::state::{DeliveryMode, StateFile, SyncApplyStatus};
+use crate::state::StateFile;
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
     ensure_postgres_localhost_binding(&args.compose.compose_file, messages)?;
@@ -189,7 +189,7 @@ async fn run_init_inner(
     }
 
     let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
-    let trust_changed = write_ca_trust_fingerprints_with_retry(
+    let _trust_changed = write_ca_trust_fingerprints_with_retry(
         client,
         &args.openbao.kv_mount,
         &secrets_dir,
@@ -213,9 +213,6 @@ async fn run_init_inner(
         &args.secrets_dir.secrets_dir,
         messages,
     )?;
-    if trust_changed {
-        mark_remote_trust_sync_pending(messages)?;
-    }
 
     Ok(InitSummary {
         openbao_url: args.openbao.openbao_url.clone(),
@@ -1850,37 +1847,6 @@ fn write_state_file(
     Ok(())
 }
 
-fn mark_remote_trust_sync_pending(messages: &Messages) -> Result<()> {
-    let state_path = StateFile::default_path();
-    if !state_path.exists() {
-        return Ok(());
-    }
-    mark_remote_trust_sync_pending_at_path(&state_path, messages)?;
-    Ok(())
-}
-
-fn mark_remote_trust_sync_pending_at_path(state_path: &Path, messages: &Messages) -> Result<bool> {
-    let mut state =
-        StateFile::load(state_path).with_context(|| messages.error_parse_state_failed())?;
-    let mut changed = false;
-    for entry in state
-        .services
-        .values_mut()
-        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
-    {
-        if entry.sync_status.trust_sync != SyncApplyStatus::Pending {
-            entry.sync_status.trust_sync = SyncApplyStatus::Pending;
-            changed = true;
-        }
-    }
-    if changed {
-        state
-            .save(state_path)
-            .with_context(|| messages.error_serialize_state_failed())?;
-    }
-    Ok(changed)
-}
-
 #[derive(Debug)]
 struct RollbackFile {
     path: PathBuf,
@@ -2543,91 +2509,5 @@ services:
             &["a".repeat(64), "b".repeat(64)],
             "bundle-pem-updated"
         ));
-    }
-
-    #[test]
-    fn test_mark_remote_trust_sync_pending_at_path_updates_remote_only() {
-        let temp_dir = tempdir().expect("tempdir");
-        let state_path = temp_dir.path().join("state.json");
-        let state = serde_json::json!({
-            "openbao_url": "http://localhost:8200",
-            "kv_mount": "secret",
-            "secrets_dir": "secrets",
-            "policies": {},
-            "approles": {},
-            "services": {
-                "remote-service": {
-                    "service_name": "remote-service",
-                    "deploy_type": "daemon",
-                    "delivery_mode": "remote-bootstrap",
-                    "sync_status": {
-                        "secret_id": "none",
-                        "eab": "none",
-                        "responder_hmac": "none",
-                        "trust_sync": "applied"
-                    },
-                    "hostname": "edge-node-01",
-                    "domain": "trusted.domain",
-                    "agent_config_path": "agent.toml",
-                    "cert_path": "certs/remote.crt",
-                    "key_path": "certs/remote.key",
-                    "instance_id": "001",
-                    "container_name": null,
-                    "notes": null,
-                    "approle": {
-                        "role_name": "bootroot-service-remote-service",
-                        "role_id": "role-id-remote",
-                        "secret_id_path": "secrets/services/remote-service/secret_id",
-                        "policy_name": "bootroot-service-remote-service"
-                    }
-                },
-                "local-service": {
-                    "service_name": "local-service",
-                    "deploy_type": "daemon",
-                    "delivery_mode": "local-file",
-                    "sync_status": {
-                        "secret_id": "none",
-                        "eab": "none",
-                        "responder_hmac": "none",
-                        "trust_sync": "applied"
-                    },
-                    "hostname": "edge-node-02",
-                    "domain": "trusted.domain",
-                    "agent_config_path": "agent-local.toml",
-                    "cert_path": "certs/local.crt",
-                    "key_path": "certs/local.key",
-                    "instance_id": "002",
-                    "container_name": null,
-                    "notes": null,
-                    "approle": {
-                        "role_name": "bootroot-service-local-service",
-                        "role_id": "role-id-local",
-                        "secret_id_path": "secrets/services/local-service/secret_id",
-                        "policy_name": "bootroot-service-local-service"
-                    }
-                }
-            }
-        });
-        fs::write(
-            &state_path,
-            serde_json::to_string_pretty(&state).expect("serialize state"),
-        )
-        .expect("write state");
-
-        let changed = mark_remote_trust_sync_pending_at_path(&state_path, &test_messages())
-            .expect("mark remote pending");
-        assert!(changed);
-
-        let updated: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
-                .expect("parse state");
-        assert_eq!(
-            updated["services"]["remote-service"]["sync_status"]["trust_sync"],
-            "pending"
-        );
-        assert_eq!(
-            updated["services"]["local-service"]["sync_status"]["trust_sync"],
-            "applied"
-        );
     }
 }

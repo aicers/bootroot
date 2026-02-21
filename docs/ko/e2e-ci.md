@@ -37,7 +37,7 @@ E2E 시나리오는 다음 두 축의 조합으로 구성됩니다.
   responder가 동작하는 같은 머신에 추가될 때 사용합니다.
 - `remote-bootstrap`: `--delivery-mode`의 선택지입니다. 서비스가 다른
   머신에 추가될 때 사용하며, control node의 `bootroot`와 서비스 머신의
-  `bootroot-remote sync`를 함께 사용합니다.
+  `bootroot-remote bootstrap`을 함께 사용합니다.
 
 호스트 이름 매핑 모드(E2E 실행 모드):
 
@@ -63,7 +63,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - 로컬 전달 E2E 시나리오 (`hosts-all`)
 - 원격 전달 E2E 시나리오 (`fqdn-only-hosts`)
 - 원격 전달 E2E 시나리오 (`hosts-all`)
-- rotation/recovery matrix (`secret_id,eab,responder_hmac,trust_sync`)
+- rotation/recovery matrix (`secret_id,eab,responder_hmac`)
 
 주요 스크립트:
 
@@ -75,7 +75,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 
 - baseline 경합/스케일 동작
 - 반복 장애/복구 동작
-- 주기 실행 모드 동등성(`systemd-timer`, `cron`)
+- 회전 스케줄 동등성(`systemd-timer`, `cron`)
 
 주요 스크립트:
 
@@ -194,15 +194,15 @@ sudo -n cp "$tmp_file" /etc/hosts
   `control-node` (step-ca 머신 역할), `remote-node` (서비스 머신 역할)
 - 서비스는 `--delivery-mode remote-bootstrap`으로 추가
 - 이 시나리오의 서비스 구성(총 1개): `edge-proxy` (`daemon`)
-- 원격 동기화 반영은 `bootroot-remote sync`로 수행
+- 원격 bootstrap 반영은 `bootroot-remote bootstrap`으로 수행
 - 해석 모드는 `fqdn-only-hosts`
 
 목적:
 
-- remote-bootstrap 온보딩과 동기화 반영 방식 검증
-- `secret_id`, `eab`, `responder_hmac`, `trust_sync` 항목의
-  sync/ack 기반 상태 반영 검증
-- 원격 회전/복구 시퀀스를 항목별로 검증
+- remote-bootstrap 온보딩과 일회성 bootstrap 반영 방식 검증
+- `secret_id`, `eab`, `responder_hmac` 항목의
+  bootstrap 기반 반영 검증
+- 원격 회전/복구 시퀀스와 명시적 secret_id handoff 검증
 
 실행 단계:
 
@@ -210,17 +210,13 @@ sudo -n cp "$tmp_file" /etc/hosts
    AppRole 자격증명 파싱
 2. control node에서 `remote-bootstrap` 모드로 `service-add` 실행
 3. bootstrap 재료(`role_id`, `secret_id`)를 remote node로 복사
-4. `sync-initial`: remote node에서 `bootroot-remote sync` 실행
-5. control node `state.json`에서 sync status가 `applied`인지 확인
-6. `verify-initial`: remote node에서 인증서 발급/검증
-7. 회전 + sync + verify 반복: `rotate-secret-id` -> `sync-after-secret-id` ->
-   `verify-after-secret-id`,
-   `rotate-eab` -> `sync-after-eab` -> `verify-after-eab`,
-   `rotate-trust-sync` ->
-   `sync-after-trust-sync` -> `verify-after-trust-sync`,
-   `rotate-responder-hmac` ->
-   `sync-after-responder-hmac` -> `verify-after-responder-hmac`
-8. 각 검증 단계 사이 인증서 fingerprint 변경 여부 확인
+4. `bootstrap-initial`: remote node에서 `bootroot-remote bootstrap` 실행
+5. `verify-initial`: remote node에서 인증서 발급/검증
+6. 회전 + apply-secret-id + verify 반복:
+   `rotate-secret-id` -> `apply-secret-id` -> `verify-after-secret-id`,
+   `rotate-eab` -> `verify-after-eab`,
+   `rotate-responder-hmac` -> `verify-after-responder-hmac`
+7. 각 검증 단계 사이 인증서 fingerprint 변경 여부 확인
 
 실제 실행 명령(스크립트 발췌):
 
@@ -234,8 +230,8 @@ BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
 bootroot service add --service-name "$SERVICE_NAME" --deploy-type daemon \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
 
-# remote node: sync
-bootroot-remote sync --openbao-url "http://127.0.0.1:8200" \
+# remote node: bootstrap
+bootroot-remote bootstrap --openbao-url "http://127.0.0.1:8200" \
   --service-name "$SERVICE_NAME" \
   --role-id-path "$role_id_path" --secret-id-path "$secret_id_path" \
   --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
@@ -303,23 +299,21 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 #### 회전 항목
 
-- `secret_id,eab,responder_hmac,trust_sync`
+- `secret_id,eab,responder_hmac`
 
 목적:
 
-- pending/applied/failed/expired 상태 전이 검증
+- 항목별 회전 및 복구 동작 검증
 - 단일 타깃 실패 주입 후 복구 검증
-- `expired` 전이와 재동기화(`applied`) 검증
+- `bootroot-remote apply-secret-id`를 통한 명시적 secret_id handoff 검증
 
 실행 단계(항목별 반복):
 
-1. 모든 서비스 상태를 `pending`으로 마킹
-2. sync cycle 1: `pending -> applied` 확인
-3. sync cycle 2(재회전): `pending -> applied` 재확인
-4. 실패 cycle: 특정 서비스 1회 실패를 주입하고, 타깃 서비스가 `failed` 또는 `pending`인지,
-   다른 서비스가 `applied`를 유지하는지 확인
-5. 복구 cycle: 타깃 서비스를 다시 `pending`으로 설정한 뒤 sync를 재실행해 `applied` 복구 확인
-6. `secret_id` 항목은 추가로 summary+ack로 `expired`를 강제하고, sync 재실행 후 `applied` 복귀 확인
+1. control node에서 대상 항목 회전
+2. `secret_id`의 경우: remote node에서 `bootroot-remote apply-secret-id` 실행
+3. 회전 후 인증서 발급이 정상 동작하는지 검증
+4. 실패 cycle: 특정 서비스 실패 주입 후 복구 확인
+5. 복구 cycle: 재회전/재반영 후 정상 동작 확인
 
 실제 실행 명령(스크립트 발췌):
 
@@ -327,13 +321,10 @@ sudo -n cp "$tmp_file" /etc/hosts
 # 시나리오 실행
 ./scripts/e2e/docker/run-rotation-recovery.sh
 
-# 항목별 sync/ack 루프에서 사용하는 핵심 명령
-./scripts/e2e/docker/run-sync-once.sh
+# 회전/verify 루프에서 사용하는 핵심 명령
+bootroot rotate --yes approle-secret-id --service-name "$service"
+bootroot-remote apply-secret-id --service-name "$service" ...
 bootroot verify --service-name "$service" --agent-config "$agent_config_path"
-
-# expired 강제 및 ack 반영
-bootroot service sync-status --service-name "$service_name" \
-  --summary-json "$summary_path"
 ```
 
 ### 6) extended workflow 케이스
@@ -349,7 +340,7 @@ bootroot service sync-status --service-name "$service_name" \
 목적:
 
 - 무거운 stress/recovery 검증을 PR 필수 경로 밖에서 수행
-- 주기 실행 모드 동등성(`systemd-timer`, `cron`) 검증
+- 회전 스케줄 동등성(`systemd-timer`, `cron`) 검증
 - 더 긴 cycle/time window에서 반복 안정성 검증
 
 실행 단계:
@@ -428,42 +419,30 @@ E2E에서 OpenBao 언실/런타임 인증 사용 방식:
 - 로그에 원문 시크릿 출력 금지
 - 시크릿 파일/디렉터리 권한 `0600`/`0700` 유지
 
-## 원격 동기화 검증 기준
+## 원격 bootstrap 검증 기준
 
-이 섹션의 목적은 "원격 동기화가 실제로 반영되었는지"를 E2E에서 어떤 기준으로
+이 섹션의 목적은 "원격 bootstrap이 실제로 반영되었는지"를 E2E에서 어떤 기준으로
 판정하는지 명확히 정의하는 것입니다.
 
 검증 흐름:
 
 1. control node의 `bootroot service add --delivery-mode remote-bootstrap`가
    목표 상태를 기록합니다.
-2. remote node의 `bootroot-remote sync`가 해당 상태를 읽어 로컬 파일/설정에
-   반영합니다. (`sync` 내부에서 `pull`/`ack` 단계가 함께 수행됨)
-3. E2E는 다음 두 출력이 같은 결과를 가리키는지 비교합니다:
+2. remote node의 `bootroot-remote bootstrap`이 해당 상태를 읽어 로컬 파일/설정에
+   반영합니다.
+3. E2E는 bootstrap summary JSON 출력에서 모든 항목이 `applied`인지 확인합니다.
 
-    - `bootroot-remote sync --summary-json ...` 결과 JSON
-    - control node의 `bootroot service sync-status` 조회 결과
-
-비교 항목(서비스별):
+검증 항목(서비스별):
 
 - `secret_id`
 - `eab`
 - `responder_hmac`
-- `trust_sync`
 
 판정 규칙:
 
-- 각 항목의 상태가 두 출력에서 일치해야 함
-- 회전 테스트에서는 `pending -> applied` 전이가 예상대로 발생해야 함
-- 하나라도 `failed`로 남거나 두 출력이 불일치하면 해당 단계를 실패로 처리함
-
-상태값 의미:
-
-- `none`: 아직 대상 항목이 생성/기록되지 않음
-- `pending`: 목표 상태는 기록되었지만 아직 반영 전
-- `applied`: 원격 반영이 성공적으로 완료됨
-- `failed`: 반영 중 오류가 발생함
-- `expired`: 사용 가능 기간이 끝나 재동기화가 필요함
+- 모든 bootstrap 항목이 summary 출력에서 `applied` 상태여야 함
+- secret_id 회전 후 `bootroot-remote apply-secret-id`가 정상 완료되어야 함
+- 하나라도 `failed`이면 해당 단계를 실패로 처리함
 
 ## E2E `phases.log` 형식
 

@@ -30,7 +30,7 @@ Components:
 - **bootroot CLI**: A CLI tool developed in this project that automates
   install, init, and operations
 - **bootroot-agent**: A Rust ACME client daemon developed in this project
-- **bootroot-remote**: A synchronization CLI tool developed in this
+- **bootroot-remote**: A bootstrap CLI tool developed in this
   project for configuring remote services
 - **HTTP-01 responder**: An HTTP-01 daemon developed in this project
 - **Prometheus**: Metrics collector (open source)
@@ -57,14 +57,14 @@ RFC 8555 protocol used for automated issuance.
 CLI usage is documented in the [CLI manual](cli.md) and the
 [CLI examples](cli-examples.md). The CLI manual covers
 core commands like `infra up/init/status`, `service add/verify`, `rotate`, and
-`monitoring`, plus `bootroot-remote pull/ack/sync`.
+`monitoring`, plus `bootroot-remote bootstrap`/`apply-secret-id`.
 In this manual, the **Installation/Configuration** pages focus on a
 non-CLI manual flow; other pages keep an operations/concepts/validation focus.
 
 ## Automation Boundary (Summary)
 
 - Bootroot-managed: config/material generation and updates, state recording,
-  sync input preparation
+  bootstrap input preparation
 - Operator-managed: binary installation/update, process always-on ownership,
   runtime setup (for example, Compose service definitions or systemd
   units/timers) and boot-time start/restart policies
@@ -116,9 +116,8 @@ for isolation, lifecycle alignment, and failure blast-radius reasons.
 
 bootroot-remote placement rules:
 
-- Each service should have its own periodic `bootroot-remote` instance.
-- When multiple services sync at the same time, use a separate
-  `--summary-json` path per service to avoid file collisions.
+- Each service should have `bootroot-remote bootstrap` run once during initial
+  setup, with `bootroot-remote apply-secret-id` run after secret_id rotation.
 
 Note:
 If a service is added on the machine where step-ca is installed,

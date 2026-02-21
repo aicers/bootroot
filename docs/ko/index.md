@@ -24,7 +24,7 @@ Bootroot는 제품 내장형 PKI 부트스트랩 계층입니다. 부트스트�
 - **bootroot CLI**: 이 프로젝트에서 직접 개발한 전체 설치/초기화/운영 자동화 CLI 도구
 - **bootroot-agent**: 이 프로젝트에서 직접 개발한 Rust ACME 클라이언트 데몬
 - **bootroot-remote**: 이 프로젝트에서 직접 개발한 원격 서비스의 설정을
-  위한 동기화 CLI 도구
+  위한 bootstrap CLI 도구
 - **HTTP-01 리스폰더**: 이 프로젝트에서 직접 개발한 HTTP-01 전용 데몬
 - **Prometheus**: 메트릭 수집기 (오픈 소스)
 - **Grafana**: 메트릭 시각화 대시보드 (오픈 소스)
@@ -48,14 +48,14 @@ Environment)는 RFC 8555에서 정의된 표준 프로토콜입니다.
 
 CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리되어 있습니다. CLI 문서에서는
 `infra up/init/status`, `service add/verify`, `rotate`, `monitoring`과
-`bootroot-remote pull/ack/sync` 등 주요 명령을 다룹니다.
+`bootroot-remote bootstrap`/`apply-secret-id` 등 주요 명령을 다룹니다.
 이 매뉴얼에서 **설치/설정 섹션은 CLI를 쓰지 않는 수동 절차**를 기준으로
 설명하고, 나머지 섹션은 목적에 맞는 운영/개념/검증 관점으로 설명합니다.
 
 ## 자동화 경계(요약)
 
 - bootroot가 자동화하는 것: 설정/산출물 생성과 갱신, 상태 기록,
-  동기화 입력 준비, `bootroot infra up` 기반 인프라 Compose 구성/기동
+  bootstrap 입력 준비, `bootroot infra up` 기반 인프라 Compose 구성/기동
 - 운영자가 책임지는 것: 실행 구성요소 설치/업데이트(bootroot 관련 실행 파일과
   OpenBao Agent 포함), 프로세스 상시 실행 보장, 실행 환경 구성(예: Compose
   서비스 정의, systemd 유닛/타이머 등록)과 부팅 후 자동 시작/재시작 정책 적용
@@ -99,9 +99,8 @@ bootroot-agent 배치 규칙:
 
 bootroot-remote 배치 규칙:
 
-- 서비스별로 개별 인스턴스가 주기적으로 실행되도록 해야 합니다.
-- 여러 서비스가 동시에 sync할 때에는 서비스별 `--summary-json` 경로를
-  분리해 파일 충돌을 피해야 합니다.
+- 초기 설정 시 서비스별로 `bootroot-remote bootstrap`을 1회 실행하고,
+  secret_id 회전 이후에는 `bootroot-remote apply-secret-id`를 실행합니다.
 
 참고:
 step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-remote가

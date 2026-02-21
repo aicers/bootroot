@@ -11,8 +11,8 @@ CI/테스트 운영 기준은 [CI/E2E](e2e-ci.md)를 참고하세요.
 bootroot 자동화 범위:
 
 - 설정/산출물 생성 및 갱신(`agent.toml`, `agent.hcl`, `agent.toml.ctmpl`,
-  `token`, sync 관련 파일)
-- 서비스 추가 시 전달 모드별 상태 기록과 동기화 데이터 준비
+  `token`, bootstrap 관련 파일)
+- 서비스 추가 시 전달 모드별 상태 기록과 bootstrap 입력 준비
 - rotate/verify/status 등 운영 명령 실행 흐름 제공
 
 운영자 책임 범위:
@@ -43,7 +43,7 @@ bootroot monitoring status
 - `bootroot verify --service-name <service> --db-check`:
   비대화형으로 발급/검증/DB/리스폰더 연동 점검
 - `bootroot service info --service-name <service>`:
-  서비스별 전달 모드/항목별 sync-status 등 현재 상태 확인
+  서비스별 전달 모드 등 현재 상태 확인
 - `bootroot monitoring status`: Prometheus/Grafana 컨테이너 상태 확인
 
 ## bootroot-agent
@@ -100,8 +100,8 @@ bootroot monitoring status
   `WantedBy=multi-user.target`를 적용합니다.
 - OpenBao Agent를 systemd로 운영한다면 서비스별로 분리하고
   `After=network-online.target` 같은 의존성 순서를 명시합니다.
-- `bootroot-remote`는 서비스별 timer/cron으로 주기 실행하고, 중복 실행 방지
-  잠금(`flock`)을 적용합니다.
+- 초기 설정 시 서비스별로 `bootroot-remote bootstrap`을 1회 실행하고,
+  secret_id 회전 이후에는 `bootroot-remote apply-secret-id`를 실행합니다.
 - 점검 순서:
   `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
   -> `bootroot verify --service-name <service>`.
@@ -146,22 +146,16 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-## 원격 sync 주기 실행 운영
+## 원격 bootstrap 및 secret_id handoff 운영
 
-`--delivery-mode remote-bootstrap`으로 추가한 대상은
-`bootroot-remote sync`를 주기 실행해야 합니다.
-다음 템플릿 파일을 제공합니다.
+`--delivery-mode remote-bootstrap`으로 추가한 대상의 운영 모델은 일회성
+bootstrap + 명시적 secret_id handoff입니다.
 
-- `scripts/bootroot-remote-sync.service`
-- `scripts/bootroot-remote-sync.timer`
-- `scripts/bootroot-remote-sync.cron`
-
-권장 패턴:
-
-- 서비스별 주기 실행 작업 1개
-- 서비스별 `--summary-json` 경로 분리
-- role/secret/token/config 경로를 서비스 단위로 분리
-- 중복 실행 방지 잠금 적용(`flock` 등)
+1. `bootroot service add` 이후 서비스 머신에서 `bootroot-remote bootstrap`을
+   1회 실행해 초기 설정 번들을 반영합니다.
+2. control node에서 `bootroot rotate approle-secret-id` 실행 후, 서비스
+   머신에서 `bootroot-remote apply-secret-id`를 실행해 새 secret_id를
+   전달합니다.
 
 최소 환경/설정 체크리스트:
 
@@ -169,39 +163,11 @@ WantedBy=timers.target
 - 서비스 이름, AppRole 파일 경로(`role_id`, `secret_id`)
 - EAB 파일 경로, `agent.toml` 경로
 - 프로필 식별/경로 입력(hostname, instance_id, cert/key 경로)
-- trust sync 사용 시 CA 번들 경로
-
-장애 처리 가이드:
-
-- `bootroot-remote sync`의 retry/backoff/jitter 사용
-- `failed`/`expired` 상태가 반복되면 알림 연계
-- pull summary JSON과 `bootroot service sync-status`를 함께 확인
-
-systemd timer 권장 예시(중복 실행 방지):
-
-```ini
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/flock -n /var/lock/bootroot-remote-<service>.lock \
-  /usr/local/bin/bootroot-remote sync ...
-```
-
-수동 반영(예외 상황):
-
-- `bootroot-remote sync`가 만든 summary JSON을 수동 반영해야 할 때만
-  아래 명령을 사용합니다.
-
-```bash
-bootroot service sync-status \
-  --service-name <service> \
-  --summary-json <service>-remote-summary.json
-```
+- trust 데이터에 `ca_bundle_pem`이 포함된 경우 CA 번들 경로
 
 보안 참고:
 
 - 시크릿 디렉터리 `0700`, 파일 `0600`
-- summary JSON은 상태/오류 요약 중심이지만, 운영 로그에는 필요한 범위만 남기고
-  장기 보관 정책을 분리하기
 - 서비스 계정 권한을 서비스별 경로로 최소화
 - `bootroot init --summary-json` 산출물은 `root_token`을 포함할 수 있으므로
   민감 아티팩트로 취급하고 접근/보관 기간을 제한하기

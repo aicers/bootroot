@@ -91,15 +91,12 @@ If you see `dial tcp 127.0.0.1:5432: connect: connection refused`, DSN host in
 
 If mode and placement do not match, file/state updates go to the wrong path.
 
-## `remote-bootstrap` sync failures
+## `remote-bootstrap` failures
 
-- Ensure `bootroot-remote sync` is configured as a periodic run on service hosts
-- Use a unique `--summary-json` path per service for concurrent syncs
-- Compare these two outputs
-  - `bootroot-remote sync --summary-json ...`
-  - `bootroot service sync-status` on the control machine
-
-If only one side changes, the flow is usually broken in `pull/sync/ack`.
+- Ensure `bootroot-remote bootstrap` completed successfully on the service host
+- After secret_id rotation, run `bootroot-remote apply-secret-id` on the
+  service host
+- Verify the bootstrap summary JSON shows all items as `applied`
 
 ## Issuance and renewal failures
 
