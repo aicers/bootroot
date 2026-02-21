@@ -50,8 +50,6 @@ pub(crate) enum MonitoringCommand {
 pub(crate) enum ServiceCommand {
     Add(Box<ServiceAddArgs>),
     Info(ServiceInfoArgs),
-    #[command(name = "sync-status")]
-    SyncStatus(ServiceSyncStatusArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -497,21 +495,6 @@ pub(crate) struct ServiceInfoArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ServiceSyncStatusArgs {
-    /// Service name identifier
-    #[arg(long, required = true)]
-    pub(crate) service_name: String,
-
-    /// Path to bootroot-remote JSON summary file
-    #[arg(long = "summary-json", required = true)]
-    pub(crate) summary_json: PathBuf,
-
-    /// Path to state.json
-    #[arg(long)]
-    pub(crate) state_file: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
 pub(crate) struct VerifyArgs {
     /// Service name identifier
     #[arg(long)]
@@ -626,50 +609,6 @@ mod tests {
                 assert!(args.dry_run);
             }
             _ => panic!("expected service add"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parses_service_sync_status() {
-        let cli = Cli::parse_from([
-            "bootroot",
-            "service",
-            "sync-status",
-            "--service-name",
-            "edge-proxy",
-            "--summary-json",
-            "remote-summary.json",
-        ]);
-        match cli.command {
-            CliCommand::Service(ServiceCommand::SyncStatus(args)) => {
-                assert_eq!(args.service_name, "edge-proxy");
-                assert_eq!(args.summary_json, PathBuf::from("remote-summary.json"));
-                assert_eq!(args.state_file, None);
-            }
-            _ => panic!("expected service sync-status"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parses_service_sync_status_with_state_file() {
-        let cli = Cli::parse_from([
-            "bootroot",
-            "service",
-            "sync-status",
-            "--service-name",
-            "edge-proxy",
-            "--summary-json",
-            "remote-summary.json",
-            "--state-file",
-            "state.custom.json",
-        ]);
-        match cli.command {
-            CliCommand::Service(ServiceCommand::SyncStatus(args)) => {
-                assert_eq!(args.service_name, "edge-proxy");
-                assert_eq!(args.summary_json, PathBuf::from("remote-summary.json"));
-                assert_eq!(args.state_file, Some(PathBuf::from("state.custom.json")));
-            }
-            _ => panic!("expected service sync-status"),
         }
     }
 

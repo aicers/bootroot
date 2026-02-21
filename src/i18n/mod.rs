@@ -197,15 +197,11 @@ pub(crate) struct Strings {
     pub(crate) service_add_summary: &'static str,
     pub(crate) service_add_plan_title: &'static str,
     pub(crate) service_info_summary: &'static str,
-    pub(crate) service_sync_status_summary_title: &'static str,
-    pub(crate) service_sync_status_service: &'static str,
-    pub(crate) service_sync_status_item: &'static str,
     pub(crate) service_summary_kind: &'static str,
     pub(crate) service_summary_deploy_type: &'static str,
     pub(crate) service_summary_hostname: &'static str,
     pub(crate) service_summary_domain: &'static str,
     pub(crate) service_summary_delivery_mode: &'static str,
-    pub(crate) service_summary_sync_status: &'static str,
     pub(crate) service_summary_instance_id: &'static str,
     pub(crate) service_summary_container_name: &'static str,
     pub(crate) service_summary_notes: &'static str,
@@ -222,10 +218,8 @@ pub(crate) struct Strings {
     pub(crate) service_scope_operator_optional: &'static str,
     pub(crate) service_summary_remote_bootstrap_file: &'static str,
     pub(crate) service_summary_remote_run_command: &'static str,
-    pub(crate) service_summary_remote_sync_command: &'static str,
     pub(crate) service_summary_remote_handoff_title: &'static str,
     pub(crate) service_summary_remote_handoff_service_host: &'static str,
-    pub(crate) service_summary_remote_handoff_control_host: &'static str,
     pub(crate) service_summary_remote_handoff_status_check: &'static str,
     pub(crate) service_summary_agent_config: &'static str,
     pub(crate) service_summary_cert_path: &'static str,
@@ -279,7 +273,6 @@ pub(crate) struct Strings {
     pub(crate) status_kv_path_entry: &'static str,
     pub(crate) status_approle_entry: &'static str,
     pub(crate) status_service_delivery_mode: &'static str,
-    pub(crate) status_service_sync_status: &'static str,
     pub(crate) status_value_ok: &'static str,
     pub(crate) status_value_unreachable: &'static str,
     pub(crate) status_value_present: &'static str,
@@ -1130,24 +1123,6 @@ impl Messages {
         self.strings().service_info_summary
     }
 
-    pub(crate) fn service_sync_status_summary_title(&self) -> &'static str {
-        self.strings().service_sync_status_summary_title
-    }
-
-    pub(crate) fn service_sync_status_service(&self, value: &str) -> String {
-        format_template(
-            self.strings().service_sync_status_service,
-            &[("value", value)],
-        )
-    }
-
-    pub(crate) fn service_sync_status_item(&self, name: &str, value: &str) -> String {
-        format_template(
-            self.strings().service_sync_status_item,
-            &[("name", name), ("value", value)],
-        )
-    }
-
     pub(crate) fn service_summary_kind(&self, value: &str) -> String {
         format_template(self.strings().service_summary_kind, &[("value", value)])
     }
@@ -1171,13 +1146,6 @@ impl Messages {
         format_template(
             self.strings().service_summary_delivery_mode,
             &[("value", value)],
-        )
-    }
-
-    pub(crate) fn service_summary_sync_status(&self, name: &str, value: &str) -> String {
-        format_template(
-            self.strings().service_summary_sync_status,
-            &[("name", name), ("value", value)],
         )
     }
 
@@ -1272,13 +1240,6 @@ impl Messages {
         )
     }
 
-    pub(crate) fn service_summary_remote_sync_command(&self, value: &str) -> String {
-        format_template(
-            self.strings().service_summary_remote_sync_command,
-            &[("value", value)],
-        )
-    }
-
     pub(crate) fn service_summary_remote_handoff_title(&self) -> &'static str {
         self.strings().service_summary_remote_handoff_title
     }
@@ -1286,13 +1247,6 @@ impl Messages {
     pub(crate) fn service_summary_remote_handoff_service_host(&self, value: &str) -> String {
         format_template(
             self.strings().service_summary_remote_handoff_service_host,
-            &[("value", value)],
-        )
-    }
-
-    pub(crate) fn service_summary_remote_handoff_control_host(&self, value: &str) -> String {
-        format_template(
-            self.strings().service_summary_remote_handoff_control_host,
             &[("value", value)],
         )
     }
@@ -1619,18 +1573,6 @@ impl Messages {
         format_template(
             self.strings().status_service_delivery_mode,
             &[("service", service), ("value", value)],
-        )
-    }
-
-    pub(crate) fn status_service_sync_status(
-        &self,
-        service: &str,
-        name: &str,
-        value: &str,
-    ) -> String {
-        format_template(
-            self.strings().status_service_sync_status,
-            &[("service", service), ("name", name), ("value", value)],
         )
     }
 

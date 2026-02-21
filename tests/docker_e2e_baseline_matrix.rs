@@ -55,9 +55,6 @@ mod unix_integration {
         let phase_contents = std::fs::read_to_string(&phase_log)
             .with_context(|| "Failed to read baseline phase log")?;
         assert!(phase_contents.contains("\"phase\":\"bootstrap\""));
-        assert!(phase_contents.contains("\"phase\":\"runner-start\""));
-        assert!(phase_contents.contains("\"phase\":\"sync-loop\""));
-        assert!(phase_contents.contains("\"phase\":\"ack\""));
         assert!(phase_contents.contains("\"phase\":\"verify\""));
         assert!(phase_contents.contains("\"phase\":\"cleanup\""));
 

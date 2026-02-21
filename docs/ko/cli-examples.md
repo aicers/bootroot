@@ -220,7 +220,7 @@ OpenBao root token: ********
     secret_id 파일 secrets/services/web-app/secret_id를 사용하세요.
 ```
 
-### 3-3) remote-bootstrap 전달 모드 + 원격 sync
+### 3-3) remote-bootstrap 전달 모드 + 일회성 bootstrap
 
 제어 노드 온보딩(아티팩트 생성):
 
@@ -238,10 +238,10 @@ bootroot service add \
   --root-token <OPENBAO_ROOT_TOKEN>
 ```
 
-원격 노드 수렴:
+원격 노드 일회성 bootstrap:
 
 ```bash
-bootroot-remote sync \
+bootroot-remote bootstrap \
   --openbao-url http://127.0.0.1:8200 \
   --kv-mount secret \
   --service-name edge-remote \
@@ -262,23 +262,21 @@ bootroot-remote sync \
   --output json
 ```
 
-`bootroot-remote sync`는 pull과 ack를 함께 수행하며, summary를
-`bootroot service sync-status`에 반영해 `secret_id`, `eab`,
-`responder_hmac`, `trust_sync` 상태를 갱신합니다.
-`state.json` 경로가 기본값이 아닌 경우에만 `--state-file <path>`를 추가하세요.
-또한 실제 운영에서는 `bootroot service add` 요약 출력의
+`bootroot-remote bootstrap`은 서비스 설정 번들(`secret_id`, `eab`,
+`responder_hmac`, `trust`)을 1회 pull+apply합니다.
+실제 운영에서는 `bootroot service add` 요약 출력의
 `원격 실행 명령`을 그대로 사용하는 것을 권장합니다.
 
-추가 입력 정리:
+control node에서 secret_id 회전 후 새 secret_id를 원격 노드에 전달:
 
-- sync는 pull 입력(`--openbao-url`, `--kv-mount`, `--service-name`,
-  `--role-id-path`, `--secret-id-path`, `--eab-file-path`,
-  `--agent-config-path`, baseline/profile 입력, `--ca-bundle-path`)을
-  그대로 받습니다.
-- `--summary-json`은 sync에서 필수입니다.
-- ack 연동용으로 `--bootroot-bin`(기본 `bootroot`), `--state-file`(선택)을
-  받을 수 있습니다.
-- pull 단계 출력 형식 제어용 `--output text|json`을 받을 수 있습니다.
+```bash
+bootroot-remote apply-secret-id \
+  --openbao-url http://127.0.0.1:8200 \
+  --kv-mount secret \
+  --service-name edge-remote \
+  --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
+  --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
+```
 
 ## 4) DNS/hosts 준비 (CLI 예제 실행용)
 

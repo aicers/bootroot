@@ -43,18 +43,6 @@ async fn test_same_host_local_file_happy_path() {
         state["services"][SERVICE_NAME]["delivery_mode"],
         "local-file"
     );
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["secret_id"],
-        "none"
-    );
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["eab"],
-        "none"
-    );
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["responder_hmac"],
-        "none"
-    );
 
     let agent_contents = fs::read_to_string(&files.agent_config).expect("read agent.toml");
     assert!(agent_contents.contains("[[profiles]]"));
@@ -120,21 +108,6 @@ async fn test_same_host_local_rotation_sequence_keeps_service_operational() {
     );
     assert!(String::from_utf8_lossy(&rotate_secret.stdout).contains("AppRole login OK"));
 
-    let state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(temp.path().join("state.json")).expect("state"))
-            .expect("parse state");
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["secret_id"],
-        "none"
-    );
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["eab"],
-        "none"
-    );
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["responder_hmac"],
-        "none"
-    );
     let secret_id = fs::read_to_string(files.secret_id_path).expect("read secret_id");
     assert!(!secret_id.trim().is_empty());
     assert_eq!(
@@ -167,7 +140,7 @@ async fn test_same_host_trust_change_propagates_to_agent_config() {
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
         .current_dir(temp.path())
         .args([
-            "pull",
+            "bootstrap",
             "--openbao-url",
             &server.uri(),
             "--kv-mount",
@@ -186,7 +159,7 @@ async fn test_same_host_trust_change_propagates_to_agent_config() {
             files.ca_bundle_path.to_string_lossy().as_ref(),
         ])
         .output()
-        .expect("run bootroot-remote pull");
+        .expect("run bootroot-remote bootstrap");
     assert!(
         output.status.success(),
         "stderr: {}",

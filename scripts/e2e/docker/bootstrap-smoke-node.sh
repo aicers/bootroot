@@ -26,12 +26,6 @@ cat >"$WORK_DIR/state.json" <<JSON
       "service_name": "$SERVICE_NAME",
       "deploy_type": "daemon",
       "delivery_mode": "remote-bootstrap",
-      "sync_status": {
-        "secret_id": "pending",
-        "eab": "pending",
-        "responder_hmac": "pending",
-        "trust_sync": "pending"
-      },
       "hostname": "$HOSTNAME",
       "domain": "$DOMAIN",
       "agent_config_path": "agent.toml",

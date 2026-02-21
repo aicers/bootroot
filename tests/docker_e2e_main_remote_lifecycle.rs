@@ -47,19 +47,19 @@ mod unix_integration {
         assert!(phase_contents.contains("\"phase\":\"infra-up\""));
         assert!(phase_contents.contains("\"phase\":\"init\""));
         assert!(phase_contents.contains("\"phase\":\"service-add\""));
-        assert!(phase_contents.contains("\"phase\":\"sync-initial\""));
+        assert!(phase_contents.contains("\"phase\":\"bootstrap-initial\""));
         assert!(phase_contents.contains("\"phase\":\"verify-initial\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-secret-id\""));
-        assert!(phase_contents.contains("\"phase\":\"sync-after-secret-id\""));
+        assert!(phase_contents.contains("\"phase\":\"bootstrap-after-secret-id\""));
         assert!(phase_contents.contains("\"phase\":\"verify-after-secret-id\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-eab\""));
-        assert!(phase_contents.contains("\"phase\":\"sync-after-eab\""));
+        assert!(phase_contents.contains("\"phase\":\"bootstrap-after-eab\""));
         assert!(phase_contents.contains("\"phase\":\"verify-after-eab\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-trust-sync\""));
-        assert!(phase_contents.contains("\"phase\":\"sync-after-trust-sync\""));
+        assert!(phase_contents.contains("\"phase\":\"bootstrap-after-trust-sync\""));
         assert!(phase_contents.contains("\"phase\":\"verify-after-trust-sync\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-responder-hmac\""));
-        assert!(phase_contents.contains("\"phase\":\"sync-after-responder-hmac\""));
+        assert!(phase_contents.contains("\"phase\":\"bootstrap-after-responder-hmac\""));
         assert!(phase_contents.contains("\"phase\":\"cleanup\""));
 
         let initial = cert_meta.join("edge-proxy-initial.txt");

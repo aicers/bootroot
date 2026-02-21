@@ -106,10 +106,6 @@ fn load_service_statuses(messages: &Messages) -> Result<Vec<ServiceStatusEntry>>
         service_statuses.push(ServiceStatusEntry {
             service_name: entry.service_name.clone(),
             delivery_mode: entry.delivery_mode.as_str().to_string(),
-            secret_id: entry.sync_status.secret_id.as_str().to_string(),
-            eab: entry.sync_status.eab.as_str().to_string(),
-            responder_hmac: entry.sync_status.responder_hmac.as_str().to_string(),
-            trust_sync: entry.sync_status.trust_sync.as_str().to_string(),
         });
     }
     Ok(service_statuses)
@@ -178,10 +174,6 @@ struct StatusSummary<'a> {
 struct ServiceStatusEntry {
     service_name: String,
     delivery_mode: String,
-    secret_id: String,
-    eab: String,
-    responder_hmac: String,
-    trust_sync: String,
 }
 
 fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
@@ -302,34 +294,6 @@ fn print_services_section(messages: &Messages, summary: &StatusSummary<'_>) {
                 "{}",
                 messages
                     .status_service_delivery_mode(&service.service_name, &service.delivery_mode)
-            );
-            println!(
-                "{}",
-                messages.status_service_sync_status(
-                    &service.service_name,
-                    "secret_id",
-                    &service.secret_id
-                )
-            );
-            println!(
-                "{}",
-                messages.status_service_sync_status(&service.service_name, "eab", &service.eab)
-            );
-            println!(
-                "{}",
-                messages.status_service_sync_status(
-                    &service.service_name,
-                    "responder_hmac",
-                    &service.responder_hmac,
-                )
-            );
-            println!(
-                "{}",
-                messages.status_service_sync_status(
-                    &service.service_name,
-                    "trust_sync",
-                    &service.trust_sync
-                )
             );
         }
     }

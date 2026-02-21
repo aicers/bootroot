@@ -344,8 +344,7 @@ wait_for_stepca_http01_target() {
   done
 }
 
-run_remote_sync() {
-  local summary_path="$REMOTE_DIR/${SERVICE_NAME}-remote-summary.json"
+run_remote_bootstrap() {
   local role_id_path="$REMOTE_DIR/secrets/services/$SERVICE_NAME/role_id"
   local secret_id_path="$REMOTE_DIR/secrets/services/$SERVICE_NAME/secret_id"
   local eab_path="$REMOTE_DIR/secrets/services/$SERVICE_NAME/eab.json"
@@ -353,7 +352,7 @@ run_remote_sync() {
 
   (
     cd "$REMOTE_DIR"
-    "$BOOTROOT_REMOTE_BIN" sync \
+    "$BOOTROOT_REMOTE_BIN" bootstrap \
       --openbao-url "http://${STEPCA_HOST_IP}:8200" \
       --kv-mount "secret" \
       --service-name "$SERVICE_NAME" \
@@ -370,26 +369,8 @@ run_remote_sync() {
       --profile-cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt" \
       --profile-key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key" \
       --ca-bundle-path "$ca_bundle_path" \
-      --summary-json "$summary_path" \
-      --bootroot-bin "$BOOTROOT_BIN" \
-      --state-file "$CONTROL_DIR/state.json" \
       --output json >>"$RUN_LOG" 2>&1
   )
-}
-
-assert_control_sync_applied() {
-  python3 - "$CONTROL_DIR/state.json" "$SERVICE_NAME" <<'PY'
-import json
-import sys
-
-state_path = sys.argv[1]
-service = sys.argv[2]
-state = json.load(open(state_path, encoding='utf-8'))
-status = state['services'][service]['sync_status']
-for key in ('secret_id', 'eab', 'responder_hmac', 'trust_sync'):
-    if status.get(key) != 'applied':
-        raise SystemExit(f"sync status mismatch: {service}:{key} => {status.get(key)}")
-PY
 }
 
 verify_with_retry() {
@@ -542,40 +523,35 @@ main() {
   wire_stepca_hosts
   wait_for_stepca_http01_target
 
-  log_phase "sync-initial"
-  run_remote_sync
-  assert_control_sync_applied
+  log_phase "bootstrap-initial"
+  run_remote_bootstrap
 
   run_verify_pair "initial"
 
   run_rotation_secret_id
-  log_phase "sync-after-secret-id"
-  run_remote_sync
-  assert_control_sync_applied
+  log_phase "bootstrap-after-secret-id"
+  run_remote_bootstrap
   force_reissue_remote_service
   run_verify_pair "after-secret-id"
   assert_fingerprint_changed "initial" "after-secret-id"
 
   run_rotation_eab
-  log_phase "sync-after-eab"
-  run_remote_sync
-  assert_control_sync_applied
+  log_phase "bootstrap-after-eab"
+  run_remote_bootstrap
   force_reissue_remote_service
   run_verify_pair "after-eab"
   assert_fingerprint_changed "after-secret-id" "after-eab"
 
   run_rotation_trust_sync
-  log_phase "sync-after-trust-sync"
-  run_remote_sync
-  assert_control_sync_applied
+  log_phase "bootstrap-after-trust-sync"
+  run_remote_bootstrap
   force_reissue_remote_service
   run_verify_pair "after-trust-sync"
   assert_fingerprint_changed "after-eab" "after-trust-sync"
 
   run_rotation_responder_hmac
-  log_phase "sync-after-responder-hmac"
-  run_remote_sync
-  assert_control_sync_applied
+  log_phase "bootstrap-after-responder-hmac"
+  run_remote_bootstrap
 
   force_reissue_remote_service
   run_verify_pair "after-responder-hmac"

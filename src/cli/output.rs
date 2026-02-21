@@ -27,7 +27,6 @@ pub(crate) struct ServiceAddAppliedPaths<'a> {
 pub(crate) struct ServiceAddRemoteBootstrap<'a> {
     pub(crate) bootstrap_file: &'a str,
     pub(crate) remote_run_command: &'a str,
-    pub(crate) control_sync_command: &'a str,
 }
 
 pub(crate) struct ServiceAddSummaryOptions<'a> {
@@ -141,18 +140,10 @@ fn print_remote_handoff_summary(
         "{}",
         messages.service_summary_remote_run_command(remote.remote_run_command)
     );
-    println!(
-        "{}",
-        messages.service_summary_remote_sync_command(remote.control_sync_command)
-    );
     println!("{}", messages.service_summary_remote_handoff_title());
     println!(
         "{}",
         messages.service_summary_remote_handoff_service_host(remote.remote_run_command)
-    );
-    println!(
-        "{}",
-        messages.service_summary_remote_handoff_control_host(remote.control_sync_command)
     );
     println!("{}", messages.service_scope_operator_recommended());
     let status_check_command = format!("bootroot service info --service-name '{service_name}'");
@@ -285,25 +276,6 @@ fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
     println!(
         "{}",
         messages.service_summary_delivery_mode(entry.delivery_mode.as_str())
-    );
-    println!(
-        "{}",
-        messages.service_summary_sync_status("secret_id", entry.sync_status.secret_id.as_str())
-    );
-    println!(
-        "{}",
-        messages.service_summary_sync_status("eab", entry.sync_status.eab.as_str())
-    );
-    println!(
-        "{}",
-        messages.service_summary_sync_status(
-            "responder_hmac",
-            entry.sync_status.responder_hmac.as_str(),
-        )
-    );
-    println!(
-        "{}",
-        messages.service_summary_sync_status("trust_sync", entry.sync_status.trust_sync.as_str())
     );
     if let Some(notes) = entry.notes.as_deref() {
         println!("{}", messages.service_summary_notes(notes));

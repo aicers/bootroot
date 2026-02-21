@@ -25,7 +25,7 @@ const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
 #[command(
     author,
     version,
-    about = "Pull/apply remote service secrets from OpenBao"
+    about = "One-shot bootstrap and secret_id handoff for remote services"
 )]
 struct Args {
     /// Language for CLI output (en or ko)
@@ -61,8 +61,8 @@ fn localized(lang: CliLang, en: &str, ko: &str) -> String {
 
 fn summary_header(lang: CliLang) -> &'static str {
     match lang {
-        CliLang::En => "bootroot-remote sync summary",
-        CliLang::Ko => "bootroot-remote 동기화 요약",
+        CliLang::En => "bootroot-remote bootstrap summary",
+        CliLang::Ko => "bootroot-remote 부트스트랩 요약",
     }
 }
 
@@ -75,16 +75,14 @@ fn redacted_error_label(lang: CliLang) -> &'static str {
 
 #[derive(clap::Subcommand, Debug)]
 enum Command {
-    /// Pull and apply service secrets from `OpenBao`
-    Pull(PullArgs),
-    /// Acknowledge pull summary into control-plane sync-status
-    Ack(AckArgs),
-    /// Run pull + ack with retry/backoff for scheduled sync
-    Sync(SyncArgs),
+    /// One-shot bootstrap: pull and apply all service secrets from `OpenBao`
+    Bootstrap(Box<BootstrapArgs>),
+    /// Apply a rotated `secret_id` from `OpenBao` KV to the local file
+    ApplySecretId(ApplySecretIdArgs),
 }
 
 #[derive(clap::Args, Debug)]
-struct PullArgs {
+struct BootstrapArgs {
     /// `OpenBao` base URL
     #[arg(long, env = "OPENBAO_URL")]
     openbao_url: String,
@@ -152,33 +150,10 @@ struct PullArgs {
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     output: OutputFormat,
-
-    /// Optional path to write summary JSON for later ack ingest
-    #[arg(long)]
-    summary_json: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
-struct AckArgs {
-    /// Service name
-    #[arg(long)]
-    service_name: String,
-
-    /// Path to summary JSON produced by `pull`
-    #[arg(long)]
-    summary_json: PathBuf,
-
-    /// bootroot CLI binary path
-    #[arg(long, default_value = "bootroot")]
-    bootroot_bin: PathBuf,
-
-    /// Optional state file path to pass through
-    #[arg(long)]
-    state_file: Option<PathBuf>,
-}
-
-#[derive(clap::Args, Debug)]
-struct SyncArgs {
+struct ApplySecretIdArgs {
     /// `OpenBao` base URL
     #[arg(long, env = "OPENBAO_URL")]
     openbao_url: String,
@@ -195,81 +170,13 @@ struct SyncArgs {
     #[arg(long)]
     role_id_path: PathBuf,
 
-    /// Destination path for rotated `secret_id`
+    /// Destination path for `secret_id`
     #[arg(long)]
     secret_id_path: PathBuf,
 
-    /// Destination path for EAB JSON (kid/hmac)
-    #[arg(long)]
-    eab_file_path: PathBuf,
-
-    /// bootroot-agent config path to update
-    #[arg(long)]
-    agent_config_path: PathBuf,
-
-    /// bootroot-agent email for baseline config generation
-    #[arg(long, default_value = DEFAULT_AGENT_EMAIL)]
-    agent_email: String,
-
-    /// bootroot-agent ACME server URL for baseline config generation
-    #[arg(long, default_value = DEFAULT_AGENT_SERVER)]
-    agent_server: String,
-
-    /// bootroot-agent domain for baseline config generation
-    #[arg(long, default_value = DEFAULT_AGENT_DOMAIN)]
-    agent_domain: String,
-
-    /// HTTP-01 responder admin URL for baseline config generation
-    #[arg(long, default_value = DEFAULT_AGENT_RESPONDER_URL)]
-    agent_responder_url: String,
-
-    /// Service profile hostname for baseline generation
-    #[arg(long, default_value = "localhost")]
-    profile_hostname: String,
-
-    /// Service profile `instance_id` for baseline generation
-    #[arg(long, default_value = "")]
-    profile_instance_id: String,
-
-    /// Service profile cert path for baseline generation
-    #[arg(long)]
-    profile_cert_path: Option<PathBuf>,
-
-    /// Service profile key path for baseline generation
-    #[arg(long)]
-    profile_key_path: Option<PathBuf>,
-
-    /// CA bundle output path (required when trust data includes `ca_bundle_pem`)
-    #[arg(long)]
-    ca_bundle_path: Option<PathBuf>,
-
-    /// Summary JSON path shared between pull and ack
-    #[arg(long)]
-    summary_json: PathBuf,
-
-    /// bootroot CLI binary path for ack
-    #[arg(long, default_value = "bootroot")]
-    bootroot_bin: PathBuf,
-
-    /// Optional state file path to pass through ack
-    #[arg(long)]
-    state_file: Option<PathBuf>,
-
-    /// Output format for pull stage
+    /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     output: OutputFormat,
-
-    /// Maximum sync attempts before failure (must be >= 1)
-    #[arg(long, default_value_t = 3)]
-    retry_attempts: u32,
-
-    /// Base backoff between retries in seconds
-    #[arg(long, default_value_t = 5)]
-    retry_backoff_secs: u64,
-
-    /// Extra randomized delay upper bound in seconds (0 disables jitter)
-    #[arg(long, default_value_t = 0)]
-    retry_jitter_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -371,17 +278,16 @@ async fn main() {
 
 async fn run(args: Args, lang: CliLang) -> Result<i32> {
     match args.command {
-        Command::Pull(args) => run_pull(args, lang).await,
-        Command::Ack(args) => run_ack(&args, lang),
-        Command::Sync(args) => run_sync(args, lang).await,
+        Command::Bootstrap(args) => run_bootstrap(*args, lang).await,
+        Command::ApplySecretId(args) => run_apply_secret_id(args, lang).await,
     }
 }
 
-// This function intentionally keeps end-to-end pull orchestration in one place
+// This function intentionally keeps end-to-end bootstrap orchestration in one place
 // so status aggregation and exit-code semantics stay easy to audit.
 #[allow(clippy::too_many_lines)]
-async fn run_pull(args: PullArgs, lang: CliLang) -> Result<i32> {
-    validate_pull_args(&args, lang)?;
+async fn run_bootstrap(args: BootstrapArgs, lang: CliLang) -> Result<i32> {
+    validate_bootstrap_args(&args, lang)?;
 
     let role_id = read_secret_file(&args.role_id_path, lang)
         .await
@@ -489,12 +395,125 @@ async fn run_pull(args: PullArgs, lang: CliLang) -> Result<i32> {
         responder_hmac: responder_hmac_status,
         trust_sync: trust_sync_status,
     };
-    if let Some(summary_json) = args.summary_json.as_deref() {
-        write_summary_json(summary_json, &summary).await?;
-    }
     print_summary(&summary, args.output, lang)?;
     if summary.has_failures() {
         return Ok(1);
+    }
+    Ok(0)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_apply_secret_id(args: ApplySecretIdArgs, lang: CliLang) -> Result<i32> {
+    if args.service_name.trim().is_empty() {
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                "--service-name must not be empty",
+                "--service-name 값은 비어 있으면 안 됩니다",
+            )
+        );
+    }
+    let role_id = read_secret_file(&args.role_id_path, lang)
+        .await
+        .with_context(|| {
+            localized(
+                lang,
+                &format!(
+                    "Failed to read role_id from {}",
+                    args.role_id_path.display()
+                ),
+                &format!(
+                    "role_id 파일을 읽지 못했습니다: {}",
+                    args.role_id_path.display()
+                ),
+            )
+        })?;
+    let current_secret_id = read_secret_file(&args.secret_id_path, lang)
+        .await
+        .with_context(|| {
+            localized(
+                lang,
+                &format!(
+                    "Failed to read current secret_id from {}",
+                    args.secret_id_path.display()
+                ),
+                &format!(
+                    "현재 secret_id 파일을 읽지 못했습니다: {}",
+                    args.secret_id_path.display()
+                ),
+            )
+        })?;
+
+    let mut client = OpenBaoClient::new(&args.openbao_url).with_context(|| {
+        localized(
+            lang,
+            "Failed to create OpenBao client",
+            "OpenBao 클라이언트를 생성하지 못했습니다",
+        )
+    })?;
+    let token = client
+        .login_approle(&role_id, &current_secret_id)
+        .await
+        .with_context(|| {
+            localized(
+                lang,
+                "OpenBao AppRole login failed",
+                "OpenBao AppRole 로그인에 실패했습니다",
+            )
+        })?;
+    client.set_token(token);
+
+    let kv_path = format!("{SERVICE_KV_BASE}/{}/secret_id", args.service_name);
+    let data = client
+        .read_kv(&args.kv_mount, &kv_path)
+        .await
+        .with_context(|| {
+            localized(
+                lang,
+                "Failed to read service secret_id from OpenBao",
+                "OpenBao에서 서비스 secret_id를 읽지 못했습니다",
+            )
+        })?;
+    let new_secret_id = read_required_string(&data, &[SECRET_ID_KEY, "value"], lang)?;
+    let status = write_secret_file(&args.secret_id_path, &new_secret_id)
+        .await
+        .with_context(|| {
+            localized(
+                lang,
+                &format!(
+                    "Failed to write secret_id to {}",
+                    args.secret_id_path.display()
+                ),
+                &format!(
+                    "secret_id 파일을 쓰지 못했습니다: {}",
+                    args.secret_id_path.display()
+                ),
+            )
+        })?;
+
+    match args.output {
+        OutputFormat::Text => {
+            let label = match status {
+                ApplyStatus::Applied => "applied",
+                ApplyStatus::Unchanged => "unchanged",
+                ApplyStatus::Failed => "failed",
+            };
+            println!(
+                "{}",
+                localized(
+                    lang,
+                    &format!("secret_id: {label}"),
+                    &format!("secret_id: {label}"),
+                )
+            );
+        }
+        OutputFormat::Json => {
+            let payload = serde_json::to_string_pretty(
+                &serde_json::json!({ "secret_id": status_to_str(status) }),
+            )?;
+            println!("{payload}");
+        }
     }
     Ok(0)
 }
@@ -503,7 +522,7 @@ async fn run_pull(args: PullArgs, lang: CliLang) -> Result<i32> {
 // per-item status/error mapping remains consistent for summary JSON contracts.
 #[allow(clippy::too_many_lines)]
 async fn apply_agent_config_updates(
-    args: &PullArgs,
+    args: &BootstrapArgs,
     pulled: &PulledSecrets,
     lang: CliLang,
 ) -> (ApplyItemSummary, ApplyItemSummary) {
@@ -662,119 +681,7 @@ fn merge_apply_status(
     ApplyItemSummary::applied(ApplyStatus::Unchanged)
 }
 
-fn run_ack(args: &AckArgs, lang: CliLang) -> Result<i32> {
-    validate_ack_args(args, lang)?;
-    let status = std::process::Command::new(&args.bootroot_bin)
-        .arg("service")
-        .arg("sync-status")
-        .arg("--service-name")
-        .arg(&args.service_name)
-        .arg("--summary-json")
-        .arg(&args.summary_json)
-        .args(
-            args.state_file
-                .as_ref()
-                .map(|path| ["--state-file".to_string(), path.display().to_string()])
-                .into_iter()
-                .flatten(),
-        )
-        .status()
-        .with_context(|| {
-            localized(
-                lang,
-                &format!(
-                    "Failed to execute bootroot sync-status via {}",
-                    args.bootroot_bin.display()
-                ),
-                &format!(
-                    "bootroot sync-status 실행 실패 ({})",
-                    args.bootroot_bin.display()
-                ),
-            )
-        })?;
-    if !status.success() {
-        anyhow::bail!(
-            "{}",
-            localized(
-                lang,
-                &format!("bootroot service sync-status failed with status {status}"),
-                &format!("bootroot service sync-status 실행 실패: {status}"),
-            )
-        );
-    }
-    Ok(0)
-}
-
-async fn run_sync(args: SyncArgs, lang: CliLang) -> Result<i32> {
-    validate_sync_args(&args, lang)?;
-    for attempt in 1..=args.retry_attempts {
-        let pull_args = PullArgs {
-            openbao_url: args.openbao_url.clone(),
-            kv_mount: args.kv_mount.clone(),
-            service_name: args.service_name.clone(),
-            role_id_path: args.role_id_path.clone(),
-            secret_id_path: args.secret_id_path.clone(),
-            eab_file_path: args.eab_file_path.clone(),
-            agent_config_path: args.agent_config_path.clone(),
-            agent_email: args.agent_email.clone(),
-            agent_server: args.agent_server.clone(),
-            agent_domain: args.agent_domain.clone(),
-            agent_responder_url: args.agent_responder_url.clone(),
-            profile_hostname: args.profile_hostname.clone(),
-            profile_instance_id: args.profile_instance_id.clone(),
-            profile_cert_path: args.profile_cert_path.clone(),
-            profile_key_path: args.profile_key_path.clone(),
-            ca_bundle_path: args.ca_bundle_path.clone(),
-            output: args.output,
-            summary_json: Some(args.summary_json.clone()),
-        };
-        match run_pull(pull_args, lang).await {
-            Ok(0) => {
-                let ack_args = AckArgs {
-                    service_name: args.service_name.clone(),
-                    summary_json: args.summary_json.clone(),
-                    bootroot_bin: args.bootroot_bin.clone(),
-                    state_file: args.state_file.clone(),
-                };
-                return run_ack(&ack_args, lang);
-            }
-            Ok(_pull_code) => {}
-            Err(err) => {
-                eprintln!(
-                    "{}",
-                    localized(
-                        lang,
-                        &format!("bootroot-remote sync pull attempt {attempt} failed: {err}"),
-                        &format!("bootroot-remote sync pull {attempt}회차 실패: {err}"),
-                    )
-                );
-            }
-        }
-
-        if attempt < args.retry_attempts {
-            let delay_secs =
-                compute_retry_delay_secs(args.retry_backoff_secs, args.retry_jitter_secs);
-            eprintln!(
-                "{}",
-                localized(
-                    lang,
-                    &format!(
-                        "bootroot-remote sync retry {attempt}/{} in {}s",
-                        args.retry_attempts, delay_secs
-                    ),
-                    &format!(
-                        "bootroot-remote sync 재시도 {attempt}/{} ({}초 후)",
-                        args.retry_attempts, delay_secs
-                    ),
-                )
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        }
-    }
-    Ok(1)
-}
-
-fn validate_pull_args(args: &PullArgs, lang: CliLang) -> Result<()> {
+fn validate_bootstrap_args(args: &BootstrapArgs, lang: CliLang) -> Result<()> {
     if args.service_name.trim().is_empty() {
         anyhow::bail!(
             "{}",
@@ -841,101 +748,6 @@ fn validate_pull_args(args: &PullArgs, lang: CliLang) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn validate_ack_args(args: &AckArgs, lang: CliLang) -> Result<()> {
-    if args.service_name.trim().is_empty() {
-        anyhow::bail!(
-            "{}",
-            localized(
-                lang,
-                "--service-name must not be empty",
-                "--service-name 값은 비어 있으면 안 됩니다",
-            )
-        );
-    }
-    if !args.summary_json.exists() {
-        anyhow::bail!(
-            "{}",
-            localized(
-                lang,
-                &format!("summary JSON not found: {}", args.summary_json.display()),
-                &format!(
-                    "summary JSON 파일을 찾을 수 없습니다: {}",
-                    args.summary_json.display()
-                ),
-            )
-        );
-    }
-    Ok(())
-}
-
-fn validate_sync_args(args: &SyncArgs, lang: CliLang) -> Result<()> {
-    if args.retry_attempts == 0 {
-        anyhow::bail!(
-            "{}",
-            localized(
-                lang,
-                "--retry-attempts must be >= 1",
-                "--retry-attempts는 1 이상이어야 합니다",
-            )
-        );
-    }
-    let pull_args = PullArgs {
-        openbao_url: args.openbao_url.clone(),
-        kv_mount: args.kv_mount.clone(),
-        service_name: args.service_name.clone(),
-        role_id_path: args.role_id_path.clone(),
-        secret_id_path: args.secret_id_path.clone(),
-        eab_file_path: args.eab_file_path.clone(),
-        agent_config_path: args.agent_config_path.clone(),
-        agent_email: args.agent_email.clone(),
-        agent_server: args.agent_server.clone(),
-        agent_domain: args.agent_domain.clone(),
-        agent_responder_url: args.agent_responder_url.clone(),
-        profile_hostname: args.profile_hostname.clone(),
-        profile_instance_id: args.profile_instance_id.clone(),
-        profile_cert_path: args.profile_cert_path.clone(),
-        profile_key_path: args.profile_key_path.clone(),
-        ca_bundle_path: args.ca_bundle_path.clone(),
-        output: args.output,
-        summary_json: Some(args.summary_json.clone()),
-    };
-    validate_pull_args(&pull_args, lang)?;
-    let ack_args = AckArgs {
-        service_name: args.service_name.clone(),
-        summary_json: args.summary_json.clone(),
-        bootroot_bin: args.bootroot_bin.clone(),
-        state_file: args.state_file.clone(),
-    };
-    validate_ack_args_for_sync(&ack_args, lang)
-}
-
-fn validate_ack_args_for_sync(args: &AckArgs, lang: CliLang) -> Result<()> {
-    if args.service_name.trim().is_empty() {
-        anyhow::bail!(
-            "{}",
-            localized(
-                lang,
-                "--service-name must not be empty",
-                "--service-name 값은 비어 있으면 안 됩니다",
-            )
-        );
-    }
-    Ok(())
-}
-
-fn compute_retry_delay_secs(base: u64, jitter: u64) -> u64 {
-    if jitter == 0 {
-        return base;
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let nanos_u64 = u64::try_from(nanos).unwrap_or(u64::MAX);
-    let extra = nanos_u64 % jitter.saturating_add(1);
-    base.saturating_add(extra)
 }
 
 async fn read_secret_file(path: &Path, lang: CliLang) -> Result<String> {
@@ -1208,7 +1020,7 @@ struct ProfilePaths {
     key_path: PathBuf,
 }
 
-fn resolve_profile_paths(args: &PullArgs) -> ProfilePaths {
+fn resolve_profile_paths(args: &BootstrapArgs) -> ProfilePaths {
     let fallback_dir = args
         .agent_config_path
         .parent()
@@ -1228,7 +1040,7 @@ fn resolve_profile_paths(args: &PullArgs) -> ProfilePaths {
     }
 }
 
-fn render_agent_config_baseline(args: &PullArgs, cert_path: &Path, key_path: &Path) -> String {
+fn render_agent_config_baseline(args: &BootstrapArgs, cert_path: &Path, key_path: &Path) -> String {
     let profile_block = render_managed_profile_block(
         &args.service_name,
         &args.profile_instance_id,
@@ -1311,7 +1123,7 @@ fn upsert_managed_profile_block(contents: &str, service_name: &str, replacement:
 }
 
 async fn write_openbao_agent_artifacts(
-    args: &PullArgs,
+    args: &BootstrapArgs,
     agent_template: &str,
     lang: CliLang,
 ) -> Result<()> {
@@ -1496,16 +1308,6 @@ fn print_summary(summary: &ApplySummary, output: OutputFormat, lang: CliLang) ->
     }
 }
 
-async fn write_summary_json(path: &Path, summary: &ApplySummary) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs_util::ensure_secrets_dir(parent).await?;
-    }
-    let payload = serde_json::to_string_pretty(summary)?;
-    fs::write(path, payload).await?;
-    fs_util::set_key_permissions(path).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1538,8 +1340,14 @@ mod tests {
 
     #[test]
     fn test_summary_header_localization() {
-        assert_eq!(summary_header(CliLang::En), "bootroot-remote sync summary");
-        assert_eq!(summary_header(CliLang::Ko), "bootroot-remote 동기화 요약");
+        assert_eq!(
+            summary_header(CliLang::En),
+            "bootroot-remote bootstrap summary"
+        );
+        assert_eq!(
+            summary_header(CliLang::Ko),
+            "bootroot-remote 부트스트랩 요약"
+        );
     }
 
     #[test]
@@ -1567,16 +1375,5 @@ mod tests {
         let current = ApplyItemSummary::failed("failed".to_string());
         let merged = merge_apply_status(current, ApplyStatus::Applied, None);
         assert!(matches!(merged.status, ApplyStatus::Failed));
-    }
-
-    #[test]
-    fn test_compute_retry_delay_without_jitter_returns_base() {
-        assert_eq!(compute_retry_delay_secs(7, 0), 7);
-    }
-
-    #[test]
-    fn test_compute_retry_delay_with_jitter_is_bounded() {
-        let value = compute_retry_delay_secs(5, 3);
-        assert!((5..=8).contains(&value));
     }
 }

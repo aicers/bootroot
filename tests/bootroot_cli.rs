@@ -167,7 +167,6 @@ async fn test_status_command_summary() {
     assert!(stdout.contains("- AppRoles:"));
     assert!(stdout.contains("- services:"));
     assert!(stdout.contains("- edge-proxy delivery mode: local-file"));
-    assert!(stdout.contains("- edge-proxy sync secret_id: none"));
 }
 
 #[cfg(unix)]
@@ -382,12 +381,6 @@ fn write_state_with_service(root: &std::path::Path) -> anyhow::Result<()> {
                 "service_name": "edge-proxy",
                 "deploy_type": "daemon",
                 "delivery_mode": "local-file",
-                "sync_status": {
-                    "secret_id": "none",
-                    "eab": "none",
-                    "responder_hmac": "none",
-                    "trust_sync": "none"
-                },
                 "hostname": "edge-node-01",
                 "domain": "trusted.domain",
                 "agent_config_path": "agent.toml",

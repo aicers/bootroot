@@ -89,15 +89,11 @@
 
 모드와 실제 배치가 맞지 않으면 설정 반영 경로가 어긋납니다.
 
-## `remote-bootstrap` 동기화가 실패할 때
+## `remote-bootstrap`이 실패할 때
 
-- 서비스 머신에서 `bootroot-remote sync`가 **주기 실행**되도록 구성했는지 확인
-- 여러 서비스를 동시에 돌릴 때 서비스별 `--summary-json` 경로를 분리했는지 확인
-- 아래 두 결과가 일치하는지 확인
-  - `bootroot-remote sync --summary-json ...` 출력
-  - control 머신의 `bootroot service sync-status` 출력
-
-어느 한쪽만 갱신되면 `pull/sync/ack` 흐름 중간에서 끊긴 상태일 수 있습니다.
+- 서비스 머신에서 `bootroot-remote bootstrap`이 성공적으로 완료되었는지 확인
+- secret_id 회전 후에는 서비스 머신에서 `bootroot-remote apply-secret-id`를 실행
+- bootstrap summary JSON에서 모든 항목이 `applied` 상태인지 확인
 
 ## 인증서 발급/갱신이 실패할 때
 

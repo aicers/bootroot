@@ -19,7 +19,6 @@ MOCK_OPENBAO_PORT="${MOCK_OPENBAO_PORT:-18200}"
 PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUNNER_LOG="$ARTIFACT_DIR/runner.log"
 SERVICES_TSV="$ARTIFACT_DIR/services.tsv"
-RUNNER_PIDS_FILE="$ARTIFACT_DIR/runner-pids.txt"
 SCENARIO_ID=""
 LAST_PHASE="init"
 LAST_NODE="n/a"
@@ -146,123 +145,125 @@ start_mock_openbao() {
   wait_for_mock_openbao || fail_with_context "mock OpenBao did not become healthy"
 }
 
-mark_pending_all() {
-  local item="$1"
-  python3 - "$SERVICES_TSV" "$item" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-_, tsv_path, item = sys.argv
-for line in Path(tsv_path).read_text(encoding='utf-8').splitlines():
-    if not line.strip():
-        continue
-    parts = line.split('\t')
-    state_path = Path(parts[9])
-    state = json.loads(state_path.read_text(encoding='utf-8'))
-    service_name = parts[1]
-    state['services'][service_name]['sync_status'][item] = 'pending'
-    state_path.write_text(json.dumps(state, indent=2), encoding='utf-8')
-PY
+bootstrap_all() {
+  local cycle="$1"
+  local item="$2"
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+    set_context "bootstrap" "$node" "$service" "$work_dir"
+    log_phase "bootstrap" "$node" "$service" "$cycle" "$item"
+    local output_file="$ARTIFACT_DIR/bootstrap-output-${node}-${service}.json"
+    (
+      cd "$work_dir"
+      "$BOOTROOT_REMOTE_BIN" bootstrap \
+        --openbao-url "http://127.0.0.1:$MOCK_OPENBAO_PORT" \
+        --service-name "$service" \
+        --role-id-path "$role_id_path" \
+        --secret-id-path "$secret_id_path" \
+        --eab-file-path "$eab_file_path" \
+        --agent-config-path "$agent_config_path" \
+        --ca-bundle-path "$ca_bundle_path" \
+        --output json
+    ) >"$output_file" 2>>"$RUNNER_LOG" || true
+  done <"$SERVICES_TSV"
 }
 
-mark_pending_one() {
-  local item="$1"
-  local service_name="$2"
-  python3 - "$SERVICES_TSV" "$item" "$service_name" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-_, tsv_path, item, target = sys.argv
-for line in Path(tsv_path).read_text(encoding='utf-8').splitlines():
-    if not line.strip():
-        continue
-    parts = line.split('\t')
-    service_name = parts[1]
-    if service_name != target:
-        continue
-    state_path = Path(parts[9])
-    state = json.loads(state_path.read_text(encoding='utf-8'))
-    state['services'][service_name]['sync_status'][item] = 'pending'
-    state_path.write_text(json.dumps(state, indent=2), encoding='utf-8')
-PY
-}
-
-assert_item_status() {
+assert_bootstrap_status() {
   local item="$1"
   local expected="$2"
   local service_filter="${3:-}"
-  python3 - "$SERVICES_TSV" "$item" "$expected" "$service_filter" <<'PY'
+  python3 - "$SERVICES_TSV" "$ARTIFACT_DIR" "$item" "$expected" "$service_filter" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-_, tsv_path, item, expected, service_filter = sys.argv
-for line in Path(tsv_path).read_text(encoding='utf-8').splitlines():
+_, tsv_path, artifact_dir, item, expected, service_filter = sys.argv
+artifact = Path(artifact_dir)
+for line in Path(tsv_path).read_text(encoding="utf-8").splitlines():
     if not line.strip():
         continue
-    parts = line.split('\t')
-    service_name = parts[1]
-    if service_filter and service_name != service_filter:
+    parts = line.split("\t")
+    node, service = parts[0], parts[1]
+    if service_filter and service != service_filter:
         continue
-    state_path = Path(parts[9])
-    state = json.loads(state_path.read_text(encoding='utf-8'))
-    actual = state['services'][service_name]['sync_status'][item]
+    output_file = artifact / f"bootstrap-output-{node}-{service}.json"
+    if not output_file.exists():
+        raise SystemExit(f"no bootstrap output for {service} (expected {expected})")
+    text = output_file.read_text(encoding="utf-8").strip()
+    if not text:
+        raise SystemExit(f"empty bootstrap output for {service} (expected {expected})")
+    data = json.loads(text)
+    actual = data[item]["status"]
     if actual != expected:
-        raise SystemExit(f"status mismatch for {service_name}:{item} expected={expected} actual={actual}")
+        raise SystemExit(
+            f"status mismatch for {service}:{item} expected={expected} actual={actual}"
+        )
 PY
 }
 
-assert_other_services_not_failed() {
+assert_bootstrap_other_not_failed() {
   local item="$1"
   local excluded_service="$2"
-  python3 - "$SERVICES_TSV" "$item" "$excluded_service" <<'PY'
+  python3 - "$SERVICES_TSV" "$ARTIFACT_DIR" "$item" "$excluded_service" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-_, tsv_path, item, excluded = sys.argv
-for line in Path(tsv_path).read_text(encoding='utf-8').splitlines():
+_, tsv_path, artifact_dir, item, excluded = sys.argv
+artifact = Path(artifact_dir)
+for line in Path(tsv_path).read_text(encoding="utf-8").splitlines():
     if not line.strip():
         continue
-    parts = line.split('\t')
-    service_name = parts[1]
-    if service_name == excluded:
+    parts = line.split("\t")
+    node, service = parts[0], parts[1]
+    if service == excluded:
         continue
-    state_path = Path(parts[9])
-    state = json.loads(state_path.read_text(encoding='utf-8'))
-    actual = state['services'][service_name]['sync_status'][item]
-    if actual != 'applied':
-        raise SystemExit(f"unexpected non-applied status for {service_name}:{item} => {actual}")
+    output_file = artifact / f"bootstrap-output-{node}-{service}.json"
+    if not output_file.exists():
+        raise SystemExit(f"no bootstrap output for {service}")
+    text = output_file.read_text(encoding="utf-8").strip()
+    if not text:
+        raise SystemExit(f"empty bootstrap output for {service}")
+    data = json.loads(text)
+    actual = data[item]["status"]
+    if actual == "failed":
+        raise SystemExit(f"unexpected failed status for {service}:{item}")
 PY
 }
 
-assert_item_status_any() {
-  local item="$1"
-  local service_name="$2"
-  local allowed_csv="$3"
-  python3 - "$SERVICES_TSV" "$item" "$service_name" "$allowed_csv" <<'PY'
+assert_bootstrap_failed() {
+  local service_name="$1"
+  python3 - "$SERVICES_TSV" "$ARTIFACT_DIR" "$service_name" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-_, tsv_path, item, target, allowed_csv = sys.argv
-allowed = {value.strip() for value in allowed_csv.split(",") if value.strip()}
-for line in Path(tsv_path).read_text(encoding='utf-8').splitlines():
+_, tsv_path, artifact_dir, target = sys.argv
+artifact = Path(artifact_dir)
+found = False
+for line in Path(tsv_path).read_text(encoding="utf-8").splitlines():
     if not line.strip():
         continue
-    parts = line.split('\t')
-    service_name = parts[1]
-    if service_name != target:
+    parts = line.split("\t")
+    node, service = parts[0], parts[1]
+    if service != target:
         continue
-    state_path = Path(parts[9])
-    state = json.loads(state_path.read_text(encoding='utf-8'))
-    actual = state['services'][service_name]['sync_status'][item]
-    if actual not in allowed:
-        raise SystemExit(
-            f"status mismatch for {service_name}:{item} expected one of {sorted(allowed)} actual={actual}"
+    found = True
+    output_file = artifact / f"bootstrap-output-{node}-{service}.json"
+    if output_file.exists() and output_file.read_text(encoding="utf-8").strip():
+        data = json.loads(output_file.read_text(encoding="utf-8"))
+        has_failure = any(
+            v.get("status") == "failed"
+            for v in data.values()
+            if isinstance(v, dict)
         )
+        if not has_failure:
+            raise SystemExit(
+                f"expected bootstrap failure for {service} but all items succeeded"
+            )
+    # Empty or absent output means bootstrap failed before producing JSON
+    break
+if not found:
+    raise SystemExit(f"service {target} not found in services")
 PY
 }
 
@@ -271,31 +272,6 @@ set_versions_all() {
   local version="$2"
   while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
     control_mock "set-version" "{\"service\":\"$service\",\"item\":\"$mock_item\",\"version\":$version}"
-  done <"$SERVICES_TSV"
-}
-
-sync_all() {
-  local cycle="$1"
-  local item="$2"
-  local retry_attempts="$3"
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
-    set_context "sync-loop" "$node" "$service" "$summary_json_path"
-    log_phase "sync-loop" "$node" "$service" "$cycle" "$item"
-    RETRY_ATTEMPTS="$retry_attempts" \
-    WORK_DIR="$work_dir" \
-    SERVICE_NAME="$service" \
-    BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
-    BOOTROOT_BIN="$BOOTROOT_BIN" \
-    OPENBAO_URL="http://127.0.0.1:$MOCK_OPENBAO_PORT" \
-    ROLE_ID_PATH="$role_id_path" \
-    SECRET_ID_PATH="$secret_id_path" \
-    EAB_FILE_PATH="$eab_file_path" \
-    AGENT_CONFIG_PATH="$agent_config_path" \
-    CA_BUNDLE_PATH="$ca_bundle_path" \
-    SUMMARY_JSON_PATH="$summary_json_path" \
-    TICK_FILE="$ARTIFACT_DIR/ticks-${node}-${service}.log" \
-    "$ROOT_DIR/scripts/e2e/docker/run-sync-once.sh" >>"$RUNNER_LOG" 2>&1 || true
-    log_phase "ack" "$node" "$service" "$cycle" "$item"
   done <"$SERVICES_TSV"
 }
 
@@ -318,25 +294,6 @@ run_verify_all() {
   done <"$SERVICES_TSV"
 }
 
-write_expired_summary_and_ack() {
-  local service_name="$1"
-  local summary_path="$2"
-  local work_dir
-  work_dir="$(dirname "$(dirname "$summary_path")")"
-  cat >"$summary_path" <<JSON
-{
-  "secret_id": {"status": "expired"},
-  "eab": {"status": "applied"},
-  "responder_hmac": {"status": "applied"},
-  "trust_sync": {"status": "applied"}
-}
-JSON
-  (
-    cd "$work_dir"
-    "$BOOTROOT_BIN" service sync-status --service-name "$service_name" --summary-json "$summary_path" >/dev/null
-  )
-}
-
 cleanup() {
   if [ -n "$MOCK_OPENBAO_PID" ]; then
     kill "$MOCK_OPENBAO_PID" >/dev/null 2>&1 || true
@@ -351,7 +308,6 @@ cleanup() {
 
 main() {
   mkdir -p "$ARTIFACT_DIR"
-  mkdir -p "$ARTIFACT_DIR/ticks"
   : >"$PHASE_LOG"
   : >"$RUNNER_LOG"
 
@@ -370,9 +326,8 @@ main() {
   run_verify_all 0 "none"
   snapshot_state "pre-rotation"
 
-  local first_service first_summary
+  local first_service
   first_service="$(awk -F '\t' 'NR==1{print $2}' "$SERVICES_TSV")"
-  first_summary="$(awk -F '\t' 'NR==1{print $9}' "$SERVICES_TSV")"
 
   for item in "${ITEMS[@]}"; do
     local mock_item
@@ -384,49 +339,50 @@ main() {
       *) fail_with_context "unsupported item $item" ;;
     esac
 
+    # Cycle 1: normal rotation
     log_phase "rotate" "control-plane" "$first_service" 1 "$item"
-    set_versions_all "$mock_item" 1
-    mark_pending_all "$item"
-    sync_all 1 "$item" 3
-    set_transition "pending->applied" "cycle1"
-    assert_item_status "$item" "applied"
+    set_versions_all "$mock_item" 10
+    bootstrap_all 1 "$item"
+    set_transition "applied" "cycle1"
+    assert_bootstrap_status "$item" "applied"
     run_verify_all 1 "$item"
     snapshot_state "${item}-cycle1"
 
+    # Cycle 2: re-rotation
     log_phase "rotate" "control-plane" "$first_service" 2 "$item"
-    set_versions_all "$mock_item" 2
-    mark_pending_all "$item"
-    sync_all 2 "$item" 3
-    set_transition "pending->applied" "cycle2"
-    assert_item_status "$item" "applied"
+    set_versions_all "$mock_item" 20
+    bootstrap_all 2 "$item"
+    set_transition "applied" "cycle2"
+    assert_bootstrap_status "$item" "applied"
     run_verify_all 2 "$item"
     snapshot_state "${item}-cycle2"
 
+    # Cycle 3: targeted failure + recovery
     log_phase "rotate" "control-plane" "$first_service" 3 "$item"
-    mark_pending_all "$item"
+    set_versions_all "$mock_item" 30
     control_mock "fail-next" "{\"service\":\"$first_service\",\"item\":\"$mock_item\",\"count\":1}"
-    sync_all 3 "$item" 1
-    set_transition "targeted failed + others applied" "cycle3-failure"
-    assert_item_status_any "$item" "$first_service" "failed,pending"
-    assert_other_services_not_failed "$item" "$first_service"
+    bootstrap_all 3 "$item"
+    set_transition "targeted failed + others ok" "cycle3-failure"
+    assert_bootstrap_failed "$first_service"
+    assert_bootstrap_other_not_failed "$item" "$first_service"
 
-    mark_pending_one "$item" "$first_service"
-    sync_all 4 "$item" 3
-    set_transition "failed/pending->applied" "cycle3-recovery"
-    assert_item_status "$item" "applied"
+    bootstrap_all 4 "$item"
+    set_transition "recovered" "cycle3-recovery"
+    assert_bootstrap_status "$item" "applied" "$first_service"
     run_verify_all 4 "$item"
     snapshot_state "${item}-cycle3-recovery"
   done
 
+  # Transient secret_id failure and recovery
   log_phase "rotate" "control-plane" "$first_service" 99 "secret_id"
-  mark_pending_one "secret_id" "$first_service"
-  write_expired_summary_and_ack "$first_service" "$first_summary"
-  assert_item_status "secret_id" "expired" "$first_service"
+  set_versions_all "secret_id" 99
+  control_mock "fail-next" "{\"service\":\"$first_service\",\"item\":\"secret_id\",\"count\":1}"
+  bootstrap_all 99 "secret_id"
+  assert_bootstrap_failed "$first_service"
 
-  mark_pending_one "secret_id" "$first_service"
-  sync_all 100 "secret_id" 3
-  assert_item_status "secret_id" "applied" "$first_service"
-  snapshot_state "secret-id-expired-recovery"
+  bootstrap_all 100 "secret_id"
+  assert_bootstrap_status "secret_id" "applied" "$first_service"
+  snapshot_state "secret-id-transient-recovery"
 
   cat >"$ARTIFACT_DIR/rotation-manifest.json" <<JSON
 {
@@ -437,8 +393,8 @@ main() {
     "normal": 1,
     "rerotation": 2,
     "failure_recovery": [3, 4],
-    "expiry": 99,
-    "expiry_recovery": 100
+    "transient_failure": 99,
+    "transient_recovery": 100
   }
 }
 JSON

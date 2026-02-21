@@ -5,7 +5,7 @@ use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 use tokio::fs;
 
-use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs, ServiceSyncStatusArgs};
+use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs};
 use crate::cli::output::{
     ServiceAddAppliedPaths, ServiceAddPlan, ServiceAddRemoteBootstrap, ServiceAddSummaryOptions,
     print_service_add_plan, print_service_add_summary, print_service_info_summary,
@@ -19,10 +19,7 @@ use crate::commands::openbao_auth::{
     resolve_runtime_auth_optional,
 };
 use crate::i18n::Messages;
-use crate::state::{
-    DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, ServiceSyncMetadata,
-    ServiceSyncStatus, StateFile, SyncApplyStatus, SyncTiming,
-};
+use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, StateFile};
 const SERVICE_ROLE_PREFIX: &str = "bootroot-service-";
 const SERVICE_KV_BASE: &str = "bootroot/services";
 const SERVICE_SECRET_DIR: &str = "services";
@@ -280,8 +277,6 @@ fn build_service_entry(
         service_name: resolved.service_name.clone(),
         deploy_type: resolved.deploy_type,
         delivery_mode: resolved.delivery_mode,
-        sync_status: initial_sync_status(resolved.delivery_mode),
-        sync_metadata: ServiceSyncMetadata::default(),
         hostname: resolved.hostname.clone(),
         domain: resolved.domain.clone(),
         agent_config_path: resolved.agent_config.clone(),
@@ -319,7 +314,6 @@ fn print_service_add_apply_summary(
             remote: remote_bootstrap.map(|result| ServiceAddRemoteBootstrap {
                 bootstrap_file: &result.bootstrap_file,
                 remote_run_command: &result.remote_run_command,
-                control_sync_command: &result.control_sync_command,
             }),
             trusted_ca_sha256,
             show_snippets: true,
@@ -367,7 +361,6 @@ async fn run_service_add_remote_idempotent(
             remote: Some(ServiceAddRemoteBootstrap {
                 bootstrap_file: &remote_bootstrap.bootstrap_file,
                 remote_run_command: &remote_bootstrap.remote_run_command,
-                control_sync_command: &remote_bootstrap.control_sync_command,
             }),
             trusted_ca_sha256: None,
             show_snippets: true,
@@ -395,114 +388,6 @@ pub(crate) fn run_service_info(args: &ServiceInfoArgs, messages: &Messages) -> R
         .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
     print_service_info_summary(entry, messages);
     Ok(())
-}
-
-pub(crate) fn run_service_sync_status(
-    args: &ServiceSyncStatusArgs,
-    messages: &Messages,
-) -> Result<()> {
-    let state_path = args
-        .state_file
-        .clone()
-        .unwrap_or_else(StateFile::default_path);
-    if !state_path.exists() {
-        anyhow::bail!(messages.error_state_missing());
-    }
-    let mut state =
-        StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
-    let service_name = args.service_name.clone();
-    let summary_contents = std::fs::read_to_string(&args.summary_json).with_context(|| {
-        messages.error_read_file_failed(&args.summary_json.display().to_string())
-    })?;
-    let summary: RemoteApplySummary = serde_json::from_str(&summary_contents)
-        .context("Failed to parse remote sync summary JSON")?;
-    let secret_id_status = map_remote_status(&summary.secret_id.status)?;
-    let eab_status = map_remote_status(&summary.eab.status)?;
-    let responder_hmac_status = map_remote_status(&summary.responder_hmac.status)?;
-    let trust_sync_status = map_remote_status(&summary.trust_sync.status)?;
-
-    {
-        let entry = state
-            .services
-            .get_mut(&service_name)
-            .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&service_name)))?;
-        apply_sync_status_with_metadata(
-            &mut entry.sync_status.secret_id,
-            &mut entry.sync_metadata.secret_id,
-            secret_id_status,
-        );
-        apply_sync_status_with_metadata(
-            &mut entry.sync_status.eab,
-            &mut entry.sync_metadata.eab,
-            eab_status,
-        );
-        apply_sync_status_with_metadata(
-            &mut entry.sync_status.responder_hmac,
-            &mut entry.sync_metadata.responder_hmac,
-            responder_hmac_status,
-        );
-        entry.sync_status.trust_sync = trust_sync_status;
-    }
-
-    state
-        .save(&state_path)
-        .with_context(|| messages.error_serialize_state_failed())?;
-
-    println!("{}", messages.service_sync_status_summary_title());
-    println!("{}", messages.service_sync_status_service(&service_name));
-    println!(
-        "{}",
-        messages.service_sync_status_item("secret_id", secret_id_status.as_str())
-    );
-    println!(
-        "{}",
-        messages.service_sync_status_item("eab", eab_status.as_str())
-    );
-    println!(
-        "{}",
-        messages.service_sync_status_item("responder_hmac", responder_hmac_status.as_str())
-    );
-    println!(
-        "{}",
-        messages.service_sync_status_item("trust_sync", trust_sync_status.as_str())
-    );
-    Ok(())
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct RemoteApplySummary {
-    secret_id: RemoteApplyItem,
-    eab: RemoteApplyItem,
-    responder_hmac: RemoteApplyItem,
-    trust_sync: RemoteApplyItem,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct RemoteApplyItem {
-    status: String,
-}
-
-fn map_remote_status(value: &str) -> Result<SyncApplyStatus> {
-    match value {
-        "applied" | "unchanged" => Ok(SyncApplyStatus::Applied),
-        "failed" => Ok(SyncApplyStatus::Failed),
-        "none" => Ok(SyncApplyStatus::None),
-        "pending" => Ok(SyncApplyStatus::Pending),
-        "expired" => Ok(SyncApplyStatus::Expired),
-        _ => anyhow::bail!("Unsupported remote sync status: {value}"),
-    }
-}
-
-fn apply_sync_status_with_metadata(
-    status: &mut SyncApplyStatus,
-    metadata: &mut SyncTiming,
-    next: SyncApplyStatus,
-) {
-    *status = next;
-    if !matches!(next, SyncApplyStatus::Pending) {
-        metadata.started_at_unix = None;
-        metadata.expires_at_unix = None;
-    }
 }
 
 fn validate_service_add(args: &ResolvedServiceAdd, messages: &Messages) -> Result<()> {
@@ -591,7 +476,6 @@ struct LocalApplyResult {
 struct RemoteBootstrapResult {
     bootstrap_file: String,
     remote_run_command: String,
-    control_sync_command: String,
 }
 
 #[derive(serde::Serialize)]
@@ -1005,16 +889,10 @@ async fn write_remote_bootstrap_artifact(
         .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
     fs_util::set_key_permissions(&artifact_path).await?;
 
-    let remote_summary_path = format!("{}-remote-summary.json", resolved.service_name);
-    let remote_run_command = render_remote_run_command(&artifact, &remote_summary_path);
-    let control_sync_command = format!(
-        "bootroot-remote ack --service-name '{}' --summary-json '{}'",
-        resolved.service_name, remote_summary_path
-    );
+    let remote_run_command = render_remote_run_command(&artifact);
     Ok(RemoteBootstrapResult {
         bootstrap_file: artifact_path.display().to_string(),
         remote_run_command,
-        control_sync_command,
     })
 }
 
@@ -1085,22 +963,16 @@ async fn write_remote_bootstrap_artifact_file(
         .await
         .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
     fs_util::set_key_permissions(&artifact_path).await?;
-    let remote_summary_path = format!("{service_name}-remote-summary.json");
-    let remote_run_command = render_remote_run_command(artifact, &remote_summary_path);
-    let control_sync_command = format!(
-        "bootroot-remote ack --service-name '{}' --summary-json '{}'",
-        artifact.service_name, remote_summary_path
-    );
+    let remote_run_command = render_remote_run_command(artifact);
     Ok(RemoteBootstrapResult {
         bootstrap_file: artifact_path.display().to_string(),
         remote_run_command,
-        control_sync_command,
     })
 }
 
-fn render_remote_run_command(artifact: &RemoteBootstrapArtifact, summary_path: &str) -> String {
+fn render_remote_run_command(artifact: &RemoteBootstrapArtifact) -> String {
     format!(
-        "bootroot-remote sync --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --agent-email '{}' --agent-server '{}' --agent-domain '{}' --agent-responder-url '{}' --profile-hostname '{}' --profile-instance-id '{}' --profile-cert-path '{}' --profile-key-path '{}' --ca-bundle-path '{}' --summary-json '{}' --output json",
+        "bootroot-remote bootstrap --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --agent-email '{}' --agent-server '{}' --agent-domain '{}' --agent-responder-url '{}' --profile-hostname '{}' --profile-instance-id '{}' --profile-cert-path '{}' --profile-key-path '{}' --ca-bundle-path '{}' --output json",
         artifact.openbao_url,
         artifact.kv_mount,
         artifact.service_name,
@@ -1117,7 +989,6 @@ fn render_remote_run_command(artifact: &RemoteBootstrapArtifact, summary_path: &
         artifact.profile_cert_path,
         artifact.profile_key_path,
         artifact.ca_bundle_path,
-        summary_path
     )
 }
 
@@ -1138,18 +1009,6 @@ fn remote_openbao_agent_paths(
         openbao_service_dir.join(OPENBAO_AGENT_TEMPLATE_FILENAME),
         openbao_service_dir.join(OPENBAO_AGENT_TOKEN_FILENAME),
     )
-}
-
-fn initial_sync_status(delivery_mode: DeliveryMode) -> ServiceSyncStatus {
-    match delivery_mode {
-        DeliveryMode::LocalFile => ServiceSyncStatus::default(),
-        DeliveryMode::RemoteBootstrap => ServiceSyncStatus {
-            secret_id: SyncApplyStatus::Pending,
-            eab: SyncApplyStatus::Pending,
-            responder_hmac: SyncApplyStatus::Pending,
-            trust_sync: SyncApplyStatus::Pending,
-        },
-    }
 }
 
 async fn ensure_service_approle(
@@ -1336,8 +1195,6 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
         service_name: resolved.service_name.clone(),
         deploy_type: resolved.deploy_type,
         delivery_mode: resolved.delivery_mode,
-        sync_status: ServiceSyncStatus::default(),
-        sync_metadata: ServiceSyncMetadata::default(),
         hostname: resolved.hostname.clone(),
         domain: resolved.domain.clone(),
         agent_config_path: resolved.agent_config.clone(),
@@ -1657,24 +1514,5 @@ mod tests {
 
         assert!(output.contains("extra = true"));
         assert!(output.contains("ca_bundle_path = \"certs/ca.pem\""));
-    }
-
-    #[test]
-    fn test_map_remote_status_treats_unchanged_as_applied() {
-        let status = map_remote_status("unchanged").expect("map status");
-        assert_eq!(status, SyncApplyStatus::Applied);
-    }
-
-    #[test]
-    fn test_apply_sync_status_with_metadata_clears_window_for_terminal_status() {
-        let mut status = SyncApplyStatus::Pending;
-        let mut timing = SyncTiming {
-            started_at_unix: Some(10),
-            expires_at_unix: Some(20),
-        };
-        apply_sync_status_with_metadata(&mut status, &mut timing, SyncApplyStatus::Applied);
-        assert_eq!(status, SyncApplyStatus::Applied);
-        assert_eq!(timing.started_at_unix, None);
-        assert_eq!(timing.expires_at_unix, None);
     }
 }

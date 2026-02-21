@@ -55,6 +55,7 @@ mod unix_integration {
 
         let phase_contents = std::fs::read_to_string(phase_log)
             .with_context(|| "Failed to read rotation phase log")?;
+        assert!(phase_contents.contains("\"phase\":\"bootstrap\""));
         assert!(phase_contents.contains("\"phase\":\"rotate\""));
         assert!(phase_contents.contains("\"phase\":\"renew\""));
         assert!(phase_contents.contains("\"phase\":\"verify\""));

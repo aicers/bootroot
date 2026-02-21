@@ -206,9 +206,8 @@ Bootroot는 서비스 추가를 두 가지 방식으로 지원합니다. 인증�
 
 - `local-file`: 서비스가 step-ca 설치 머신에 함께 있을 때 사용합니다.
 - `remote-bootstrap`: 서비스가 다른 머신에 있을 때 사용하며, 서비스 머신의
-  `bootroot-remote`가 `pull/sync/ack` 흐름으로 반영합니다.
+  `bootroot-remote bootstrap`이 1회 실행으로 반영합니다.
   이 흐름에서는 step-ca 설치 머신의 `bootroot` CLI가 서비스의 목표 상태를
-  기록하고, 서비스 머신의 `bootroot-remote`가 이를 읽어 반영합니다.
-  `pull`은 step-ca 설치 머신에 기록된 목표 상태를 읽고, `sync`는 읽은 상태를
-  서비스 머신의 로컬 파일/설정에 적용하며, `ack`는 적용 결과를 step-ca 설치
-  머신의 상태 파일(`state.json`)에 기록합니다.
+  기록하고, 서비스 머신의 `bootroot-remote bootstrap`이 이를 읽어 한 번에
+  반영합니다. 초기 bootstrap 이후 secret_id 회전은
+  `bootroot-remote apply-secret-id`로 명시적으로 처리합니다.

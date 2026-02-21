@@ -208,9 +208,9 @@ In `bootroot service add`, `--delivery-mode` is the selector option.
 
 - `local-file`: used when the service runs on the step-ca machine.
 - `remote-bootstrap`: used when the service runs on a different machine; the
-  service machine converges updates via `bootroot-remote` (`pull/sync/ack`).
+  service machine applies initial configuration via
+  `bootroot-remote bootstrap` (one-shot).
   In this flow, the `bootroot` CLI on the step-ca machine writes desired
-  service state, and `bootroot-remote` on the service machine reads and applies
-  it. `pull` reads desired state recorded on the step-ca machine, `sync`
-  applies it to local files/config on the service machine, and `ack` writes
-  apply results to the state file (`state.json`) on the step-ca machine.
+  service state, and `bootroot-remote bootstrap` on the service machine reads
+  and applies it in a single run. After initial bootstrap, secret_id rotation
+  is handled explicitly via `bootroot-remote apply-secret-id`.

@@ -304,21 +304,6 @@ async fn test_rotate_approle_secret_id_remote_sets_pending_status() {
         output.status.success(),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-
-    let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
-    )
-    .expect("parse state");
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["secret_id"],
-        "pending"
-    );
-    assert!(
-        state["services"][SERVICE_NAME]["sync_metadata"]["secret_id"]["started_at_unix"].is_i64()
-    );
-    assert!(
-        state["services"][SERVICE_NAME]["sync_metadata"]["secret_id"]["expires_at_unix"].is_i64()
-    );
 }
 
 #[cfg(unix)]
@@ -360,17 +345,6 @@ async fn test_rotate_eab_remote_sets_pending_status() {
         output.status.success(),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-
-    let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
-    )
-    .expect("parse state");
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["eab"],
-        "pending"
-    );
-    assert!(state["services"][SERVICE_NAME]["sync_metadata"]["eab"]["started_at_unix"].is_i64());
-    assert!(state["services"][SERVICE_NAME]["sync_metadata"]["eab"]["expires_at_unix"].is_i64());
 }
 
 #[cfg(unix)]
@@ -413,23 +387,6 @@ async fn test_rotate_responder_hmac_remote_sets_pending_status() {
     assert!(
         output.status.success(),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-
-    let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
-    )
-    .expect("parse state");
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["responder_hmac"],
-        "pending"
-    );
-    assert!(
-        state["services"][SERVICE_NAME]["sync_metadata"]["responder_hmac"]["started_at_unix"]
-            .is_i64()
-    );
-    assert!(
-        state["services"][SERVICE_NAME]["sync_metadata"]["responder_hmac"]["expires_at_unix"]
-            .is_i64()
     );
 }
 
@@ -574,33 +531,12 @@ async fn test_rotate_eab_marks_remote_pending_and_updates_local_service() {
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
-    )
-    .expect("parse state");
-    assert_eq!(
-        state["services"][SERVICE_NAME]["sync_status"]["eab"],
-        "pending"
-    );
-    assert_eq!(
-        state["services"][SECONDARY_SERVICE_NAME]["sync_status"]["eab"],
-        "none"
-    );
-
     let local_agent = fs::read_to_string(temp_dir.path().join("agent-local.toml"))
         .expect("read local agent config");
     assert!(local_agent.contains("[eab]"));
     assert!(local_agent.contains("kid = \"new-kid\""));
     assert!(local_agent.contains("hmac = \"new-hmac\""));
     assert!(local_agent.contains("[profiles.eab]"));
-    assert_eq!(
-        state["services"][SECONDARY_SERVICE_NAME]["sync_status"]["secret_id"],
-        "none"
-    );
-    assert_eq!(
-        state["services"][SECONDARY_SERVICE_NAME]["sync_status"]["responder_hmac"],
-        "none"
-    );
 }
 
 fn prepare_app_state(
@@ -656,12 +592,6 @@ fn prepare_mixed_service_state(root: &Path, openbao_url: &str) -> anyhow::Result
         "key_path": "certs/edge-proxy.key",
         "instance_id": "001",
         "container_name": "edge-proxy",
-        "sync_status": {
-            "secret_id": "none",
-            "eab": "none",
-            "responder_hmac": "none",
-            "trust_sync": "none"
-        },
         "approle": {
             "role_name": ROLE_NAME,
             "role_id": ROLE_ID,
@@ -680,12 +610,6 @@ fn prepare_mixed_service_state(root: &Path, openbao_url: &str) -> anyhow::Result
         "key_path": "certs/edge-alt.key",
         "instance_id": "002",
         "container_name": "edge-alt",
-        "sync_status": {
-            "secret_id": "none",
-            "eab": "none",
-            "responder_hmac": "none",
-            "trust_sync": "none"
-        },
         "approle": {
             "role_name": "bootroot-service-edge-alt",
             "role_id": "role-edge-alt",

@@ -8,7 +8,6 @@ DEFAULT_SCENARIO_FILE="$ROOT_DIR/tests/e2e/docker_harness/scenarios/scenario-a-s
 SCENARIO_FILE="${SCENARIO_FILE:-$DEFAULT_SCENARIO_FILE}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-baseline-$(date +%s)}"
 PROJECT_NAME="${PROJECT_NAME:-bootroot-e2e-baseline-$$}"
-INTERVAL_SECS="${INTERVAL_SECS:-1}"
 MAX_CYCLES="${MAX_CYCLES:-2}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-45}"
 COMPOSE_FILE="$ROOT_DIR/docker-compose.yml"
@@ -21,7 +20,6 @@ MOCK_OPENBAO_PORT="${MOCK_OPENBAO_PORT:-18200}"
 PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUNNER_LOG="$ARTIFACT_DIR/runner.log"
 SERVICES_TSV="$ARTIFACT_DIR/services.tsv"
-RUNNER_PIDS_FILE="$ARTIFACT_DIR/runner-pids.txt"
 SCENARIO_ID=""
 LAST_PHASE="init"
 LAST_NODE="n/a"
@@ -137,60 +135,28 @@ start_mock_openbao() {
   fi
 }
 
-start_runners() {
-  mkdir -p "$ARTIFACT_DIR/ticks"
-  : >"$RUNNER_PIDS_FILE"
+bootstrap_all() {
   while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
-    local tick_file
-    tick_file="$ARTIFACT_DIR/ticks/${node}__${service}.log"
-    : >"$tick_file"
-    set_context "runner-start" "$node" "$service" "$state_path"
-    log_phase "runner-start" "$node" "$service"
-
-    local sync_command
-    sync_command="WORK_DIR='$work_dir' SERVICE_NAME='$service' BOOTROOT_REMOTE_BIN='$BOOTROOT_REMOTE_BIN' BOOTROOT_BIN='$BOOTROOT_BIN' OPENBAO_URL='http://127.0.0.1:$MOCK_OPENBAO_PORT' ROLE_ID_PATH='$role_id_path' SECRET_ID_PATH='$secret_id_path' EAB_FILE_PATH='$eab_file_path' AGENT_CONFIG_PATH='$agent_config_path' CA_BUNDLE_PATH='$ca_bundle_path' SUMMARY_JSON_PATH='$summary_json_path' TICK_FILE='$tick_file' '$ROOT_DIR/scripts/e2e/docker/run-sync-once.sh'"
-
-    SCENARIO_ID="$SCENARIO_ID" \
-    NODE_ID="$node" \
-    SERVICE_ID="$service" \
-    INTERVAL_SECS="$INTERVAL_SECS" \
-    MAX_CYCLES="$MAX_CYCLES" \
-    RUNNER_LOG="$RUNNER_LOG" \
-    SYNC_COMMAND="$sync_command" \
-    "$ROOT_DIR/scripts/e2e/docker/sync-runner-loop.sh" &
-
-    printf '%s\t%s\t%s\t%s\n' "$!" "$tick_file" "$node" "$service" >>"$RUNNER_PIDS_FILE"
+    set_context "bootstrap" "$node" "$service" "$work_dir"
+    log_phase "bootstrap" "$node" "$service"
+    local output_file="$ARTIFACT_DIR/bootstrap-output-${node}-${service}.json"
+    (
+      cd "$work_dir"
+      "$BOOTROOT_REMOTE_BIN" bootstrap \
+        --openbao-url "http://127.0.0.1:$MOCK_OPENBAO_PORT" \
+        --service-name "$service" \
+        --role-id-path "$role_id_path" \
+        --secret-id-path "$secret_id_path" \
+        --eab-file-path "$eab_file_path" \
+        --agent-config-path "$agent_config_path" \
+        --ca-bundle-path "$ca_bundle_path" \
+        --output json
+    ) >"$output_file" 2>>"$RUNNER_LOG" || true
   done <"$SERVICES_TSV"
 }
 
-wait_for_runners() {
-  local start
-  start="$(date +%s)"
-  while IFS=$'\t' read -r pid tick_file node service; do
-    while true; do
-      local line_count
-      line_count=0
-      if [ -f "$tick_file" ]; then
-        line_count="$(wc -l <"$tick_file" | tr -d ' ')"
-      fi
-      if [ "$line_count" -ge "$MAX_CYCLES" ]; then
-        set_context "sync-loop" "$node" "$service" "$tick_file"
-        log_phase "sync-loop" "$node" "$service"
-        break
-      fi
-      if [ $(( $(date +%s) - start )) -ge "$TIMEOUT_SECS" ]; then
-        fail_with_context "runner did not complete expected cycles"
-      fi
-      sleep 1
-    done
-    if ! wait "$pid"; then
-      fail_with_context "sync runner failed"
-    fi
-  done <"$RUNNER_PIDS_FILE"
-}
-
 assert_state_and_isolation() {
-  python3 - "$SERVICES_TSV" <<'PY'
+  python3 - "$SERVICES_TSV" "$ARTIFACT_DIR" <<'PY'
 import hashlib
 import json
 import sys
@@ -210,28 +176,19 @@ for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
             "eab_file_path": Path(eab_file_path),
             "agent_config_path": Path(agent_config_path),
             "ca_bundle_path": Path(ca_bundle_path),
-            "summary_json_path": Path(summary_json_path),
             "state_path": Path(state_path),
         }
     )
 
+artifact = Path(sys.argv[2])
 secret_paths = set()
 eab_paths = set()
 config_paths = set()
 for item in services:
     service = item["service"]
+    node = item["node"]
     state = json.loads(item["state_path"].read_text(encoding='utf-8'))
     entry = state["services"][service]
-    expected = {
-        "secret_id": "applied",
-        "eab": "applied",
-        "responder_hmac": "applied",
-        "trust_sync": "applied",
-    }
-    for key, value in expected.items():
-        actual = entry["sync_status"][key]
-        if actual != value:
-            raise SystemExit(f"sync_status mismatch for {service}:{key} => {actual}")
     if entry["delivery_mode"] != "remote-bootstrap":
         raise SystemExit(f"delivery_mode mismatch for {service}: {entry['delivery_mode']}")
 
@@ -255,7 +212,10 @@ for item in services:
     if f"SMOKE-{service}-v1" not in ca_bundle_contents:
         raise SystemExit(f"ca_bundle mismatch for {service}")
 
-    summary = json.loads(item["summary_json_path"].read_text(encoding='utf-8'))
+    output_file = artifact / f"bootstrap-output-{node}-{service}.json"
+    if not output_file.exists():
+        raise SystemExit(f"bootstrap output missing for {service}")
+    summary = json.loads(output_file.read_text(encoding='utf-8'))
     for key in ["secret_id", "eab", "responder_hmac", "trust_sync"]:
         status = summary[key]["status"]
         if status not in ("applied", "unchanged"):
@@ -290,18 +250,14 @@ run_verify_all() {
 }
 
 cleanup() {
-  if [ -f "$RUNNER_PIDS_FILE" ]; then
-    while IFS=$'\t' read -r pid tick_file node service; do
-      kill "$pid" >/dev/null 2>&1 || true
-      wait "$pid" 2>/dev/null || true
-      log_phase "cleanup" "$node" "$service"
-    done <"$RUNNER_PIDS_FILE"
-  fi
-
   if [ -n "$MOCK_OPENBAO_PID" ]; then
     kill "$MOCK_OPENBAO_PID" >/dev/null 2>&1 || true
     wait "$MOCK_OPENBAO_PID" 2>/dev/null || true
   fi
+
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+    log_phase "cleanup" "$node" "$service"
+  done <"$SERVICES_TSV" 2>/dev/null || true
 
   capture_artifacts
   compose_down
@@ -317,20 +273,13 @@ main() {
   ensure_prerequisites
   generate_workspace
 
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
-    set_context "bootstrap" "$node" "$service" "$state_path"
-    log_phase "bootstrap" "$node" "$service"
-  done <"$SERVICES_TSV"
-
   compose_up
   start_mock_openbao
-  start_runners
-  wait_for_runners
 
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
-    set_context "ack" "$node" "$service" "$summary_json_path"
-    log_phase "ack" "$node" "$service"
-  done <"$SERVICES_TSV"
+  local cycle
+  for cycle in $(seq 1 "$MAX_CYCLES"); do
+    bootstrap_all
+  done
 
   assert_state_and_isolation
   run_verify_all

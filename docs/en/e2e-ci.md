@@ -39,7 +39,7 @@ Delivery mode (`--delivery-mode`):
   the same machine where step-ca/OpenBao/responder run.
 - `remote-bootstrap`: a `--delivery-mode` option. Used when the service is
   added on a different machine; it combines control-node `bootroot` with
-  service-node `bootroot-remote sync`.
+  service-node `bootroot-remote bootstrap`.
 
 Host name mapping mode (E2E run mode):
 
@@ -65,7 +65,7 @@ PR-critical Docker test set validates:
 - local-delivery E2E scenario (`hosts-all`)
 - remote-delivery E2E scenario (`fqdn-only-hosts`)
 - remote-delivery E2E scenario (`hosts-all`)
-- rotation/recovery matrix (`secret_id,eab,responder_hmac,trust_sync`)
+- rotation/recovery matrix (`secret_id,eab,responder_hmac`)
 
 Primary scripts:
 
@@ -77,7 +77,7 @@ Extended workflow validates:
 
 - baseline scale/contention behavior
 - repeated failure/recovery behavior
-- periodic execution mode parity (`systemd-timer`, `cron`)
+- rotation scheduling parity (`systemd-timer`, `cron`)
 
 Primary script:
 
@@ -198,15 +198,15 @@ Configuration:
   `remote node` (service machine role)
 - Service is added with `--delivery-mode remote-bootstrap`
 - Service set in this scenario (1 service): `edge-proxy` (`daemon`)
-- Remote sync apply is executed by `bootroot-remote sync`
+- Remote bootstrap apply is executed by `bootroot-remote bootstrap`
 - Resolution mode is `fqdn-only-hosts`
 
 Purpose:
 
-- Validate remote-bootstrap onboarding and remote sync-apply mode
-- Validate sync/ack-driven `sync_status` updates for
-  `secret_id`, `eab`, `responder_hmac`, `trust_sync`
-- Validate remote rotation/recovery sequence across all sync items
+- Validate remote-bootstrap onboarding and one-shot bootstrap apply mode
+- Validate bootstrap-driven updates for
+  `secret_id`, `eab`, `responder_hmac`
+- Validate remote rotation/recovery sequence and explicit secret_id handoff
 
 Execution steps:
 
@@ -214,17 +214,13 @@ Execution steps:
    from summary JSON
 2. `service-add` in `remote-bootstrap` mode (control node writes desired state)
 3. Copy bootstrap materials (`role_id`, `secret_id`) to remote node
-4. `sync-initial`: run `bootroot-remote sync` on remote node
-5. Assert control-node `state.json` sync status is `applied`
-6. `verify-initial`: issue/verify certificate on remote node
-7. Rotation + sync + verify cycles: `rotate-secret-id` -> `sync-after-secret-id`
-   -> `verify-after-secret-id`,
-   `rotate-eab` -> `sync-after-eab` -> `verify-after-eab`,
-   `rotate-trust-sync` ->
-   `sync-after-trust-sync` -> `verify-after-trust-sync`,
-   `rotate-responder-hmac` ->
-   `sync-after-responder-hmac` -> `verify-after-responder-hmac`
-8. Confirm certificate fingerprint changes between each verification snapshot
+4. `bootstrap-initial`: run `bootroot-remote bootstrap` on remote node
+5. `verify-initial`: issue/verify certificate on remote node
+6. Rotation + apply-secret-id + verify cycles:
+   `rotate-secret-id` -> `apply-secret-id` -> `verify-after-secret-id`,
+   `rotate-eab` -> `verify-after-eab`,
+   `rotate-responder-hmac` -> `verify-after-responder-hmac`
+7. Confirm certificate fingerprint changes between each verification snapshot
 
 Actual commands (script excerpt):
 
@@ -238,8 +234,8 @@ BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
 bootroot service add --service-name "$SERVICE_NAME" --deploy-type daemon \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
 
-# remote node: sync
-bootroot-remote sync --openbao-url "http://127.0.0.1:8200" \
+# remote node: bootstrap
+bootroot-remote bootstrap --openbao-url "http://127.0.0.1:8200" \
   --service-name "$SERVICE_NAME" \
   --role-id-path "$role_id_path" --secret-id-path "$secret_id_path" \
   --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
@@ -307,26 +303,21 @@ Each service is validated across all rotation items.
 
 #### Rotation items
 
-- `secret_id,eab,responder_hmac,trust_sync`
+- `secret_id,eab,responder_hmac`
 
 Purpose:
 
-- Validate state-machine behavior for pending/applied/failed/expired
+- Validate rotation and recovery behavior per item
 - Validate targeted failure handling and subsequent recovery
-- Validate expiry (`expired`) and re-sync to `applied`
+- Validate explicit secret_id handoff via `bootroot-remote apply-secret-id`
 
 Execution steps (per rotation item):
 
-1. Mark all services `pending`
-2. Sync cycle 1: expect `pending -> applied`
-3. Sync cycle 2 (re-rotation): expect `pending -> applied`
-4. Failure cycle: inject one targeted failure, expect target service `failed`
-   or `pending`,
-   and expect other services to remain `applied`
-5. Recovery cycle: mark target `pending` again, rerun sync, and expect
-   `applied`
-6. For `secret_id`, also validate forced `expired` via summary+ack, then
-   rerun sync and return to `applied`
+1. Rotate target item on control node
+2. For `secret_id`: run `bootroot-remote apply-secret-id` on remote node
+3. Verify certificate issuance still works after rotation
+4. Failure cycle: inject one targeted failure and verify recovery
+5. Recovery cycle: re-rotate and re-apply, confirm normal operation
 
 Actual commands (script excerpt):
 
@@ -334,13 +325,10 @@ Actual commands (script excerpt):
 # scenario entrypoint
 ./scripts/e2e/docker/run-rotation-recovery.sh
 
-# key commands used in sync/ack/verify loops
-./scripts/e2e/docker/run-sync-once.sh
+# key commands used in rotation/verify loops
+bootroot rotate --yes approle-secret-id --service-name "$service"
+bootroot-remote apply-secret-id --service-name "$service" ...
 bootroot verify --service-name "$service" --agent-config "$agent_config_path"
-
-# force expired and ack it to state
-bootroot service sync-status --service-name "$service_name" \
-  --summary-json "$summary_path"
 ```
 
 ### 6) extended workflow cases
@@ -356,7 +344,7 @@ Configuration:
 Purpose:
 
 - Keep heavier stress/recovery coverage outside PR-critical CI path
-- Validate periodic execution mode parity (`systemd-timer` vs `cron`)
+- Validate rotation scheduling parity (`systemd-timer` vs `cron`)
 - Validate repeatability under higher cycle counts/time windows
 
 Execution steps:
@@ -438,43 +426,31 @@ Operational guidance:
 - avoid printing raw secrets in logs
 - keep secret files/dirs with `0600`/`0700` permissions
 
-## Remote sync verification criteria
+## Remote bootstrap verification criteria
 
-This section defines how E2E decides whether remote synchronization was
+This section defines how E2E decides whether remote bootstrap was
 actually applied.
 
 Verification flow:
 
 1. `bootroot service add --delivery-mode remote-bootstrap` on the control node
    records desired state.
-2. `bootroot-remote sync` on the remote node reads that state and applies it to
-   local files/config. (`sync` includes `pull`/`ack` behavior internally)
-3. E2E compares two outputs and requires the same result:
+2. `bootroot-remote bootstrap` on the remote node reads that state and applies
+   it to local files/config.
+3. E2E verifies the bootstrap summary JSON output shows all items as `applied`.
 
-    - JSON from `bootroot-remote sync --summary-json ...`
-    - State view from `bootroot service sync-status` on the control node
-
-Per-service comparison items:
+Per-service verification items:
 
 - `secret_id`
 - `eab`
 - `responder_hmac`
-- `trust_sync`
 
 Pass/fail rules:
 
-- item status must match between the two outputs
-- in rotation tests, expected transitions (for example `pending -> applied`)
-  must appear
-- if any item remains `failed` or outputs disagree, the phase fails
-
-Status meanings:
-
-- `none`: item not created/recorded yet
-- `pending`: desired state recorded but not applied yet
-- `applied`: remote apply completed successfully
-- `failed`: apply failed with an error
-- `expired`: item age/validity requires re-sync
+- all bootstrap items must show `applied` in the summary output
+- after secret_id rotation, `bootroot-remote apply-secret-id` must complete
+  successfully
+- if any item shows `failed`, the phase fails
 
 ## E2E `phases.log` format
 
