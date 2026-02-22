@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(settings.acme.directory_fetch_max_delay_secs, 10);
         assert_eq!(settings.acme.poll_attempts, 15);
         assert_eq!(settings.acme.poll_interval_secs, 2);
-        assert_eq!(settings.retry.backoff_secs, vec![5, 10, 30]);
+        assert_eq!(settings.retry.backoff_secs, vec![5, 10, 30, 60]);
         assert_eq!(settings.scheduler.max_concurrent_issuances, 3);
         assert!(!settings.trust.verify_certificates);
 

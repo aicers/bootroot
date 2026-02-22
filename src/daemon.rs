@@ -257,10 +257,30 @@ async fn issue_with_retry(
     settings: &config::Settings,
     profile: &config::DaemonProfileSettings,
     eab: Option<eab::EabCredentials>,
+    config_path: &Path,
 ) -> anyhow::Result<()> {
     let backoff = select_retry_backoff(settings, profile);
+    let profile_domain = config::profile_domain(settings, profile);
+    let config_path_owned = config_path.to_path_buf();
     issue_with_retry_inner(
-        || acme::issue_certificate(settings, profile, eab.clone()),
+        || {
+            let path = config_path_owned.clone();
+            let domain = profile_domain.clone();
+            let eab = eab.clone();
+            async move {
+                let fresh = config::Settings::new(Some(path))?;
+                let fresh_profile = fresh
+                    .profiles
+                    .iter()
+                    .find(|p| config::profile_domain(&fresh, p) == domain)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Profile '{domain}' not found in reloaded config")
+                    })?
+                    .clone();
+                let fresh_eab = profile::resolve_profile_eab(&fresh_profile, eab);
+                acme::issue_certificate(&fresh, &fresh_profile, fresh_eab).await
+            }
+        },
         |duration| tokio::time::sleep(duration),
         backoff,
     )
@@ -377,7 +397,7 @@ async fn check_and_renew_profile(
             );
             let _permit = semaphore.acquire().await?;
             let profile_eab = profile::resolve_profile_eab(profile, default_eab);
-            match issue_with_retry(settings, profile, profile_eab).await {
+            match issue_with_retry(settings, profile, profile_eab, &hardening.config_path).await {
                 Ok(()) => {
                     maybe_harden_tls_verify(
                         settings,
