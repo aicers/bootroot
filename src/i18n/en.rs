@@ -131,6 +131,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_secrets_dir_resolve_failed: "Failed to resolve secrets dir",
     error_parse_ca_json_failed: "Failed to parse ca.json",
     error_serialize_ca_json_failed: "Failed to serialize ca.json",
+    error_rendered_file_timeout: "Timed out waiting for OpenBao Agent to render {value}",
     error_ca_json_db_missing: "ca.json missing db.dataSource field",
     error_ca_cert_missing: "CA certificate not found: {value}",
     error_ca_cert_parse_failed: "Failed to parse CA certificate: {value}",

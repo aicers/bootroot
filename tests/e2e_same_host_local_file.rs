@@ -342,8 +342,22 @@ fn run_rotate_eab(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
 }
 
 fn run_rotate_responder_hmac(root: &Path, openbao_url: &str, hmac: &str) -> anyhow::Result<()> {
+    write_fake_docker(root)?;
+
+    let responder_dir = root.join("secrets").join("responder");
+    fs::create_dir_all(&responder_dir).context("create responder dir")?;
+    let render_source = root.join("responder-render-src.toml");
+    fs::write(&render_source, format!("hmac_secret = \"{hmac}\"\n"))
+        .context("write render source")?;
+
+    let path_env = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{path_env}", root.join("bin").display());
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(root)
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", root.join("docker.log"))
+        .env("RENDER_SOURCE", &render_source)
+        .env("RENDER_TARGET", responder_dir.join("responder.toml"))
         .args([
             "rotate",
             "--openbao-url",
@@ -452,6 +466,36 @@ fn write_fake_bootroot_agent(root: &Path, exit_code: i32) -> anyhow::Result<()> 
     fs::write(&script_path, script).context("write fake bootroot-agent")?;
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .context("chmod fake bootroot-agent")?;
+    Ok(())
+}
+
+fn write_fake_docker(root: &Path) -> anyhow::Result<()> {
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).context("create bin dir")?;
+    let script = r#"#!/bin/sh
+set -eu
+
+if [ -n "${DOCKER_OUTPUT:-}" ]; then
+  printf "%s\n" "$*" >> "$DOCKER_OUTPUT"
+fi
+
+# Simulate OpenBao Agent rendering on restart of OBA containers
+if [ "${1:-}" = "restart" ]; then
+  case "${2:-}" in
+    bootroot-openbao-agent-*)
+      if [ -n "${RENDER_SOURCE:-}" ] && [ -n "${RENDER_TARGET:-}" ]; then
+        cp "$RENDER_SOURCE" "$RENDER_TARGET"
+      fi
+      ;;
+  esac
+fi
+
+exit 0
+"#;
+    let script_path = bin_dir.join("docker");
+    fs::write(&script_path, script).context("write fake docker")?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .context("chmod fake docker")?;
     Ok(())
 }
 

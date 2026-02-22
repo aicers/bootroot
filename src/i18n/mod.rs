@@ -163,6 +163,7 @@ pub(crate) struct Strings {
     pub(crate) error_docker_command_failed: &'static str,
     pub(crate) error_bootroot_agent_run_failed: &'static str,
     pub(crate) error_secrets_dir_resolve_failed: &'static str,
+    pub(crate) error_rendered_file_timeout: &'static str,
     pub(crate) error_parse_ca_json_failed: &'static str,
     pub(crate) error_serialize_ca_json_failed: &'static str,
     pub(crate) error_ca_json_db_missing: &'static str,
@@ -986,6 +987,13 @@ impl Messages {
 
     pub(crate) fn error_secrets_dir_resolve_failed(&self) -> &'static str {
         self.strings().error_secrets_dir_resolve_failed
+    }
+
+    pub(crate) fn error_rendered_file_timeout(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_rendered_file_timeout,
+            &[("value", value)],
+        )
     }
 
     pub(crate) fn error_parse_ca_json_failed(&self) -> &'static str {

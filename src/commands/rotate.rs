@@ -33,6 +33,10 @@ const SERVICE_EAB_HMAC_KEY: &str = "hmac";
 const SERVICE_RESPONDER_HMAC_KEY: &str = "hmac";
 const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
 const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
+const OPENBAO_AGENT_STEPCA_CONTAINER: &str = "bootroot-openbao-agent-stepca";
+const OPENBAO_AGENT_RESPONDER_CONTAINER: &str = "bootroot-openbao-agent-responder";
+const RENDERED_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const RENDERED_FILE_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOTROOT_AGENT_CONTAINER_PREFIX: &str = "bootroot-agent";
 
 #[derive(Debug, Clone)]
@@ -198,7 +202,6 @@ async fn rotate_stepca_password(
         messages,
     )?;
 
-    write_secret_file(&password_path, &new_password, messages).await?;
     client
         .write_kv(
             &ctx.kv_mount,
@@ -207,6 +210,14 @@ async fn rotate_stepca_password(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
+    restart_container(OPENBAO_AGENT_STEPCA_CONTAINER, messages)?;
+    wait_for_rendered_file(
+        &password_path,
+        &new_password,
+        RENDERED_FILE_TIMEOUT,
+        messages,
+    )
+    .await?;
 
     restart_compose_service(&ctx.compose_file, "step-ca", messages)?;
 
@@ -334,7 +345,8 @@ async fn rotate_db(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
-    write_ca_json_dsn(&ca_json_path, &new_dsn, messages)?;
+    restart_container(OPENBAO_AGENT_STEPCA_CONTAINER, messages)?;
+    wait_for_rendered_file(&ca_json_path, &new_dsn, RENDERED_FILE_TIMEOUT, messages).await?;
 
     restart_compose_service(&ctx.compose_file, "step-ca", messages)?;
 
@@ -375,15 +387,8 @@ async fn rotate_responder_hmac(
     sync_service_responder_hmac_payloads(ctx, client, &hmac, messages).await?;
 
     let responder_path = ctx.paths.responder_config();
-    let config = if responder_path.exists() {
-        let contents = fs::read_to_string(&responder_path).with_context(|| {
-            messages.error_read_file_failed(&responder_path.display().to_string())
-        })?;
-        update_responder_hmac(&contents, &hmac)
-    } else {
-        build_responder_config(&hmac)
-    };
-    write_secret_file(&responder_path, &config, messages).await?;
+    restart_container(OPENBAO_AGENT_RESPONDER_CONTAINER, messages)?;
+    wait_for_rendered_file(&responder_path, &hmac, RENDERED_FILE_TIMEOUT, messages).await?;
 
     let updated = update_agent_configs(
         ctx.state
@@ -652,6 +657,31 @@ fn change_stepca_passphrase(
     Ok(())
 }
 
+fn restart_container(container: &str, messages: &Messages) -> Result<()> {
+    let args = ["restart", container];
+    run_docker(&args, "docker restart", messages)
+}
+
+async fn wait_for_rendered_file(
+    path: &Path,
+    expected: &str,
+    timeout: Duration,
+    messages: &Messages,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = tokio::fs::read_to_string(path).await
+            && contents.contains(expected)
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(messages.error_rendered_file_timeout(&path.display().to_string()));
+        }
+        tokio::time::sleep(RENDERED_FILE_POLL_INTERVAL).await;
+    }
+}
+
 fn restart_compose_service(compose_file: &Path, service: &str, messages: &Messages) -> Result<()> {
     let compose_file = compose_file.to_string_lossy();
     let args = ["compose", "-f", compose_file.as_ref(), "restart", service];
@@ -687,24 +717,6 @@ fn read_ca_json_dsn(path: &Path, messages: &Messages) -> Result<String> {
     Ok(data_source.to_string())
 }
 
-fn write_ca_json_dsn(path: &Path, dsn: &str, messages: &Messages) -> Result<()> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&contents).context(messages.error_parse_ca_json_failed())?;
-    let db = value
-        .get_mut("db")
-        .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
-    let data_source = db
-        .get_mut("dataSource")
-        .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
-    *data_source = serde_json::Value::String(dsn.to_string());
-    let updated =
-        serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
-    fs::write(path, updated)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
-}
-
 async fn write_secret_file(path: &Path, contents: &str, messages: &Messages) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs_util::ensure_secrets_dir(parent).await?;
@@ -726,43 +738,6 @@ fn generate_secret(messages: &Messages) -> Result<String> {
     rng.fill(&mut buffer)
         .map_err(|_| anyhow::anyhow!(messages.error_generate_secret_failed()))?;
     Ok(URL_SAFE_NO_PAD.encode(buffer))
-}
-
-fn build_responder_config(hmac: &str) -> String {
-    format!(
-        r#"# HTTP-01 responder config (rendered)
-
-listen_addr = "0.0.0.0:80"
-admin_addr = "0.0.0.0:8080"
-hmac_secret = "{hmac}"
-token_ttl_secs = 300
-cleanup_interval_secs = 30
-max_skew_secs = 60
-"#
-    )
-}
-
-fn update_responder_hmac(contents: &str, hmac: &str) -> String {
-    let mut output = String::new();
-    let mut updated = false;
-    for line in contents.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("hmac_secret") && trimmed.contains('=') {
-            let indent = line
-                .chars()
-                .take_while(|ch| ch.is_whitespace())
-                .collect::<String>();
-            let _ = writeln!(output, "{indent}hmac_secret = \"{hmac}\"");
-            updated = true;
-        } else {
-            output.push_str(line);
-            output.push('\n');
-        }
-    }
-    if !updated {
-        let _ = writeln!(output, "hmac_secret = \"{hmac}\"");
-    }
-    output
 }
 
 fn update_agent_configs<'a, I, F>(
@@ -1451,13 +1426,6 @@ exit 0
     }
 
     #[test]
-    fn update_responder_hmac_replaces_value() {
-        let input = "listen_addr = \"0.0.0.0:80\"\nhmac_secret = \"old\"\n";
-        let updated = update_responder_hmac(input, "new");
-        assert!(updated.contains("hmac_secret = \"new\""));
-    }
-
-    #[test]
     fn openbao_agent_container_name_uses_prefix() {
         let name = openbao_agent_container_name("api");
         assert_eq!(name, "bootroot-openbao-agent-api");
@@ -1552,46 +1520,38 @@ exit 0
         assert!(err.to_string().contains("ca.json"));
     }
 
-    #[test]
-    fn write_ca_json_dsn_updates_data_source() {
+    #[tokio::test]
+    async fn wait_for_rendered_file_immediate() {
         let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("ca.json");
+        let path = dir.path().join("rendered.txt");
+        fs::write(&path, "expected-value").expect("write file");
         let messages = test_messages();
-        fs::write(
-            &path,
-            r#"{"db":{"type":"postgresql","dataSource":"postgresql://step:old@postgres:5432/stepca?sslmode=disable"},"authority":{"provisioners":[]}}"#,
-        )
-        .expect("write ca.json");
 
-        write_ca_json_dsn(
+        wait_for_rendered_file(
             &path,
-            "postgresql://step:new@postgres:5432/stepca?sslmode=disable",
+            "expected-value",
+            Duration::from_millis(500),
             &messages,
         )
-        .expect("write dsn");
-
-        let updated = fs::read_to_string(&path).expect("read ca.json");
-        let value: serde_json::Value = serde_json::from_str(&updated).expect("parse updated json");
-        assert_eq!(
-            value["db"]["dataSource"].as_str(),
-            Some("postgresql://step:new@postgres:5432/stepca?sslmode=disable")
-        );
-        assert!(value["authority"].is_object());
+        .await
+        .expect("should return immediately when file already contains expected content");
     }
 
-    #[test]
-    fn write_ca_json_dsn_rejects_missing_db_section() {
+    #[tokio::test]
+    async fn wait_for_rendered_file_timeout() {
         let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("ca.json");
+        let path = dir.path().join("never.txt");
+        fs::write(&path, "wrong-content").expect("write file");
         let messages = test_messages();
-        fs::write(&path, r#"{"authority":{"provisioners":[]}}"#).expect("write ca.json");
 
-        let err = write_ca_json_dsn(
+        let err = wait_for_rendered_file(
             &path,
-            "postgresql://step:new@postgres:5432/stepca?sslmode=disable",
+            "expected-value",
+            Duration::from_millis(100),
             &messages,
         )
-        .expect_err("expected missing db section");
-        assert!(err.to_string().contains("ca.json"));
+        .await
+        .expect_err("should timeout when content never matches");
+        assert!(err.to_string().contains("Timed out"));
     }
 }

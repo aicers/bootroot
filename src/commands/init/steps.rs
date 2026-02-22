@@ -35,6 +35,8 @@ use super::constants::{
     RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME, SECRET_BYTES, STEPCA_CA_JSON_TEMPLATE_NAME,
     STEPCA_PASSWORD_TEMPLATE_NAME,
 };
+
+const STATIC_SECRET_RENDER_INTERVAL: &str = "5m";
 use super::paths::{
     OpenBaoAgentPaths, ResponderPaths, StepCaTemplatePaths, compose_has_openbao,
     compose_has_responder, resolve_openbao_agent_addr, resolve_responder_url, to_container_path,
@@ -553,6 +555,10 @@ auto_auth {{
       path = "/openbao/secrets/openbao/token"
     }}
   }}
+}}
+
+template_config {{
+  static_secret_render_interval = "{STATIC_SECRET_RENDER_INTERVAL}"
 }}
 "#
     );
@@ -2515,5 +2521,38 @@ services:
             &["a".repeat(64), "b".repeat(64)],
             "bundle-pem-updated"
         ));
+    }
+
+    #[test]
+    fn test_build_openbao_agent_config_includes_template_config() {
+        let config = build_openbao_agent_config(
+            "http://openbao:8200",
+            "/openbao/secrets/openbao/stepca/role_id",
+            "/openbao/secrets/openbao/stepca/secret_id",
+            &[(
+                "/openbao/templates/password.ctmpl".to_string(),
+                "/openbao/secrets/password.txt".to_string(),
+            )],
+        );
+        assert!(
+            config.contains("template_config"),
+            "config should contain template_config block"
+        );
+        assert!(
+            config.contains("static_secret_render_interval = \"5m\""),
+            "config should set static_secret_render_interval to 5m"
+        );
+        assert!(
+            config.contains("vault {"),
+            "config should contain vault block"
+        );
+        assert!(
+            config.contains("auto_auth {"),
+            "config should contain auto_auth block"
+        );
+        assert!(
+            config.contains("template {"),
+            "config should contain template block"
+        );
     }
 }
