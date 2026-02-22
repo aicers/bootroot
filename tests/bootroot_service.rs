@@ -1099,6 +1099,22 @@ fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str
     assert_eq!(hcl_mode, 0o600);
     assert_eq!(ctmpl_mode, 0o600);
     assert_eq!(token_mode, 0o600);
+
+    let ctmpl_contents = fs::read_to_string(&openbao_ctmpl).expect("read ctmpl");
+    assert!(
+        ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
+        "ctmpl should contain template directives"
+    );
+    assert!(
+        !ctmpl_contents.contains("test-responder-hmac"),
+        "ctmpl should not contain literal secret values"
+    );
+
+    let hcl_contents = fs::read_to_string(&openbao_hcl).expect("read agent.hcl");
+    assert!(
+        hcl_contents.contains("vault {"),
+        "agent.hcl should contain vault block"
+    );
 }
 
 fn write_cert_with_dns(

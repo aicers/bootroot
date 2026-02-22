@@ -68,14 +68,31 @@ async fn test_same_host_local_file_happy_path() {
             .join("agent.hcl")
             .exists()
     );
+    let ctmpl_path = temp
+        .path()
+        .join("secrets")
+        .join("openbao")
+        .join("services")
+        .join(SERVICE_NAME)
+        .join("agent.toml.ctmpl");
+    assert!(ctmpl_path.exists());
+    let ctmpl_contents = fs::read_to_string(&ctmpl_path).expect("read ctmpl");
     assert!(
-        temp.path()
-            .join("secrets")
-            .join("openbao")
-            .join("services")
-            .join(SERVICE_NAME)
-            .join("agent.toml.ctmpl")
-            .exists()
+        ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
+        "ctmpl should contain template directives"
+    );
+
+    let hcl_path = temp
+        .path()
+        .join("secrets")
+        .join("openbao")
+        .join("services")
+        .join(SERVICE_NAME)
+        .join("agent.hcl");
+    let hcl_contents = fs::read_to_string(&hcl_path).expect("read agent.hcl");
+    assert!(
+        hcl_contents.contains("vault {"),
+        "agent.hcl should contain vault block"
     );
 
     write_service_cert(&files.cert_path, &files.key_path).expect("write cert");

@@ -225,6 +225,8 @@ async fn run_service_add_apply(
                 resolved,
                 &secret_id_path,
                 ca_trust_material.as_ref(),
+                &state.kv_mount,
+                &state.openbao_url,
                 messages,
             )
             .await?,
@@ -526,6 +528,8 @@ async fn apply_local_service_configs(
     resolved: &ResolvedServiceAdd,
     secret_id_path: &Path,
     ca_trust_material: Option<&CaTrustMaterial>,
+    kv_mount: &str,
+    openbao_url: &str,
     messages: &Messages,
 ) -> Result<LocalApplyResult> {
     let profile = render_managed_profile_block(resolved);
@@ -564,8 +568,9 @@ async fn apply_local_service_configs(
         .join(&resolved.service_name);
     fs_util::ensure_secrets_dir(&openbao_service_dir).await?;
 
+    let ctmpl = build_ctmpl_content(&next, kv_mount, &resolved.service_name);
     let template_path = openbao_service_dir.join(OPENBAO_AGENT_TEMPLATE_FILENAME);
-    fs::write(&template_path, &next)
+    fs::write(&template_path, &ctmpl)
         .await
         .with_context(|| messages.error_write_file_failed(&template_path.display().to_string()))?;
     fs_util::set_key_permissions(&template_path).await?;
@@ -583,6 +588,7 @@ async fn apply_local_service_configs(
     fs_util::set_key_permissions(&token_path).await?;
     let agent_config_path = openbao_service_dir.join(OPENBAO_AGENT_CONFIG_FILENAME);
     let agent_hcl = render_openbao_agent_config(
+        openbao_url,
         &role_id_path,
         secret_id_path,
         &token_path,
@@ -790,6 +796,7 @@ fn render_missing_keys(
 }
 
 fn render_openbao_agent_config(
+    openbao_url: &str,
     role_id_path: &Path,
     secret_id_path: &Path,
     token_path: &Path,
@@ -797,7 +804,11 @@ fn render_openbao_agent_config(
     destination_path: &Path,
 ) -> String {
     format!(
-        r#"auto_auth {{
+        r#"vault {{
+  address = "{openbao_url}"
+}}
+
+auto_auth {{
   method "approle" {{
     mount_path = "auth/approle"
     config = {{
@@ -818,12 +829,113 @@ template {{
   perms = "0600"
 }}
 "#,
+        openbao_url = openbao_url,
         role_id_path = role_id_path.display(),
         secret_id_path = secret_id_path.display(),
         token_path = token_path.display(),
         template_path = template_path.display(),
         destination_path = destination_path.display(),
     )
+}
+
+fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> String {
+    let base = format!("{SERVICE_KV_BASE}/{service_name}");
+
+    let hmac_template = format!(
+        "{{{{ with secret \"{kv_mount}/data/{base}/http_responder_hmac\" }}}}\
+         {{{{ .Data.data.hmac }}}}\
+         {{{{ end }}}}"
+    );
+    let acme_pairs = vec![("http_responder_hmac", hmac_template)];
+    let with_hmac = upsert_toml_section_keys(contents, "acme", &acme_pairs);
+
+    let without_eab = remove_toml_sections(&with_hmac, &["eab", "profiles.eab"]);
+
+    let trust_template_line = format!(
+        "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
+         trusted_ca_sha256 = {{{{ .Data.data.trusted_ca_sha256 | toJSON }}}}\
+         {{{{ end }}}}"
+    );
+    let with_trust = replace_key_line_in_section(
+        &without_eab,
+        "trust",
+        "trusted_ca_sha256",
+        &trust_template_line,
+    );
+
+    let eab_block = format!(
+        "\n{{{{ with secret \"{kv_mount}/data/{base}/eab\" }}}}{{{{ if .Data.data.kid }}}}\n\
+         [eab]\n\
+         kid = \"{{{{ .Data.data.kid }}}}\"\n\
+         hmac = \"{{{{ .Data.data.hmac }}}}\"\n\
+         \n\
+         [profiles.eab]\n\
+         kid = \"{{{{ .Data.data.kid }}}}\"\n\
+         hmac = \"{{{{ .Data.data.hmac }}}}\"\n\
+         {{{{ end }}}}{{{{ end }}}}\n"
+    );
+
+    let mut result = with_trust;
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(&eab_block);
+    result
+}
+
+fn remove_toml_sections(contents: &str, sections: &[&str]) -> String {
+    let mut output = String::new();
+    let mut skip = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed) {
+            let section_name = &trimmed[1..trimmed.len() - 1];
+            skip = sections.contains(&section_name);
+            if skip {
+                continue;
+            }
+        }
+        if skip {
+            if trimmed.is_empty() {
+                continue;
+            }
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
+fn replace_key_line_in_section(
+    contents: &str,
+    section: &str,
+    key: &str,
+    replacement: &str,
+) -> String {
+    let mut output = String::new();
+    let mut in_section = false;
+    let mut replaced = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed) {
+            in_section = trimmed == format!("[{section}]");
+        }
+        if in_section
+            && !replaced
+            && (trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")))
+        {
+            output.push_str(replacement);
+            output.push('\n');
+            replaced = true;
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
 }
 
 fn is_idempotent_remote_rerun(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
@@ -1150,19 +1262,19 @@ async fn write_service_kv_secrets(
     messages: &Messages,
 ) -> Result<()> {
     let base = format!("{SERVICE_KV_BASE}/{service_name}");
-    if let (Some(kid), Some(hmac)) = (&material.eab_kid, &material.eab_hmac) {
-        client
-            .write_kv(
-                kv_mount,
-                &format!("{base}/eab"),
-                serde_json::json!({
-                    SERVICE_EAB_KID_KEY: kid,
-                    SERVICE_EAB_HMAC_KEY: hmac,
-                }),
-            )
-            .await
-            .with_context(|| messages.error_openbao_kv_write_failed())?;
-    }
+    let eab_kid = material.eab_kid.as_deref().unwrap_or("");
+    let eab_hmac = material.eab_hmac.as_deref().unwrap_or("");
+    client
+        .write_kv(
+            kv_mount,
+            &format!("{base}/eab"),
+            serde_json::json!({
+                SERVICE_EAB_KID_KEY: eab_kid,
+                SERVICE_EAB_HMAC_KEY: eab_hmac,
+            }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
     client
         .write_kv(
             kv_mount,
@@ -1513,5 +1625,61 @@ mod tests {
 
         assert!(output.contains("extra = true"));
         assert!(output.contains("ca_bundle_path = \"certs/ca.pem\""));
+    }
+
+    #[test]
+    fn test_build_ctmpl_replaces_http_responder_hmac() {
+        let input = "[acme]\nhttp_responder_hmac = \"old-hmac\"\n";
+        let output = build_ctmpl_content(input, "secret", "edge-proxy");
+        assert!(output.contains(
+            r#"http_responder_hmac = "{{ with secret "secret/data/bootroot/services/edge-proxy/http_responder_hmac" }}{{ .Data.data.hmac }}{{ end }}"#
+        ));
+        assert!(!output.contains("old-hmac"));
+    }
+
+    #[test]
+    fn test_build_ctmpl_injects_eab_block() {
+        let input = "[acme]\nhttp_responder_hmac = \"hmac\"\n";
+        let output = build_ctmpl_content(input, "secret", "edge-proxy");
+        assert!(output.contains(
+            r#"{{ with secret "secret/data/bootroot/services/edge-proxy/eab" }}{{ if .Data.data.kid }}"#
+        ));
+        assert!(output.contains("[eab]"));
+        assert!(output.contains("[profiles.eab]"));
+    }
+
+    #[test]
+    fn test_build_ctmpl_removes_existing_eab_section() {
+        let input =
+            "[acme]\nhttp_responder_hmac = \"hmac\"\n\n[eab]\nkid = \"old\"\nhmac = \"old\"\n";
+        let output = build_ctmpl_content(input, "secret", "edge-proxy");
+        assert!(!output.contains("kid = \"old\""));
+        assert!(
+            output.contains(r#"{{ with secret "secret/data/bootroot/services/edge-proxy/eab" }}"#)
+        );
+    }
+
+    #[test]
+    fn test_build_ctmpl_replaces_trusted_ca_sha256() {
+        let fp = "a".repeat(64);
+        let input =
+            format!("[trust]\nca_bundle_path = \"certs/ca.pem\"\ntrusted_ca_sha256 = [\"{fp}\"]\n");
+        let output = build_ctmpl_content(&input, "secret", "edge-proxy");
+        assert!(output.contains(
+            r#"{{ with secret "secret/data/bootroot/services/edge-proxy/trust" }}trusted_ca_sha256 = {{ .Data.data.trusted_ca_sha256 | toJSON }}{{ end }}"#
+        ));
+        assert!(!output.contains(&fp));
+    }
+
+    #[test]
+    fn test_build_ctmpl_preserves_static_content() {
+        let input = "email = \"admin@example.com\"\nserver = \"https://localhost\"\n\n\
+                     [acme]\nhttp_responder_hmac = \"hmac\"\n\n\
+                     [[profiles]]\nservice_name = \"edge-proxy\"\n";
+        let output = build_ctmpl_content(input, "secret", "edge-proxy");
+        assert!(output.contains("email = \"admin@example.com\""));
+        assert!(output.contains("server = \"https://localhost\""));
+        assert!(output.contains("[[profiles]]"));
+        assert!(output.contains("service_name = \"edge-proxy\""));
     }
 }
