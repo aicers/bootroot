@@ -403,6 +403,12 @@ bootroot rotate db \
 bootroot rotate responder-hmac
 bootroot rotate approle-secret-id --service-name edge-proxy
 bootroot rotate approle-secret-id --service-name web-app
+
+# CA trust 데이터를 OpenBao와 모든 서비스에 동기화
+bootroot rotate trust-sync
+
+# 특정 서비스의 인증서 강제 재발급
+bootroot rotate force-reissue --service-name edge-proxy
 ```
 
 주기 실행(예: cron, 모든 회전 스텝을 한 번에 실행하는 스크립트):
