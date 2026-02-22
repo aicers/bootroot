@@ -620,13 +620,6 @@ async fn test_rotate_eab_marks_remote_pending_and_updates_local_service() {
         output.status.success(),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-
-    let local_agent = fs::read_to_string(temp_dir.path().join("agent-local.toml"))
-        .expect("read local agent config");
-    assert!(local_agent.contains("[eab]"));
-    assert!(local_agent.contains("kid = \"new-kid\""));
-    assert!(local_agent.contains("hmac = \"new-hmac\""));
-    assert!(local_agent.contains("[profiles.eab]"));
 }
 
 fn prepare_app_state(

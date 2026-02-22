@@ -304,9 +304,6 @@ pub(crate) struct Strings {
     pub(crate) rotate_summary_restart_stepca: &'static str,
     pub(crate) rotate_summary_db_dsn: &'static str,
     pub(crate) rotate_summary_responder_config: &'static str,
-    pub(crate) rotate_summary_agent_configs_updated: &'static str,
-    pub(crate) rotate_summary_agent_configs_skipped: &'static str,
-    pub(crate) rotate_summary_reload_agent: &'static str,
     pub(crate) rotate_summary_reload_responder: &'static str,
     pub(crate) rotate_summary_approle_secret_id: &'static str,
     pub(crate) rotate_summary_reload_openbao_agent: &'static str,
@@ -1727,21 +1724,6 @@ impl Messages {
             self.strings().rotate_summary_responder_config,
             &[("value", value)],
         )
-    }
-
-    pub(crate) fn rotate_summary_agent_configs_updated(&self, value: &str) -> String {
-        format_template(
-            self.strings().rotate_summary_agent_configs_updated,
-            &[("value", value)],
-        )
-    }
-
-    pub(crate) fn rotate_summary_agent_configs_skipped(&self) -> &'static str {
-        self.strings().rotate_summary_agent_configs_skipped
-    }
-
-    pub(crate) fn rotate_summary_reload_agent(&self) -> &'static str {
-        self.strings().rotate_summary_reload_agent
     }
 
     pub(crate) fn rotate_summary_reload_responder(&self) -> &'static str {
