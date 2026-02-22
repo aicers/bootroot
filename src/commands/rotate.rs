@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -250,38 +248,9 @@ async fn rotate_eab(
         .with_context(|| messages.error_openbao_kv_write_failed())?;
     sync_service_eab_payloads(ctx, client, &credentials.kid, &credentials.hmac, messages).await?;
 
-    let updated = update_agent_configs(
-        ctx.state
-            .services
-            .values()
-            .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::LocalFile)),
-        messages,
-        |contents| {
-            let updated = upsert_toml_section_keys(
-                contents,
-                "eab",
-                &[("kid", &credentials.kid), ("hmac", &credentials.hmac)],
-            );
-            upsert_toml_section_keys(
-                &updated,
-                "profiles.eab",
-                &[("kid", &credentials.kid), ("hmac", &credentials.hmac)],
-            )
-        },
-    )?;
-
     println!("{}", messages.rotate_summary_title());
     println!("{}", messages.summary_eab_kid(&credentials.kid));
     println!("{}", messages.summary_eab_hmac(&credentials.hmac));
-    if updated.is_empty() {
-        println!("{}", messages.rotate_summary_agent_configs_skipped());
-    } else {
-        println!(
-            "{}",
-            messages.rotate_summary_agent_configs_updated(&updated.join(", "))
-        );
-    }
-    println!("{}", messages.rotate_summary_reload_agent());
     Ok(())
 }
 
@@ -390,15 +359,6 @@ async fn rotate_responder_hmac(
     restart_container(OPENBAO_AGENT_RESPONDER_CONTAINER, messages)?;
     wait_for_rendered_file(&responder_path, &hmac, RENDERED_FILE_TIMEOUT, messages).await?;
 
-    let updated = update_agent_configs(
-        ctx.state
-            .services
-            .values()
-            .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::LocalFile)),
-        messages,
-        |contents| upsert_toml_section_keys(contents, "acme", &[("http_responder_hmac", &hmac)]),
-    )?;
-
     let mut reloaded = false;
     if compose_has_responder(&ctx.compose_file, messages)? {
         reload_compose_service(&ctx.compose_file, "bootroot-http01", messages)?;
@@ -410,14 +370,6 @@ async fn rotate_responder_hmac(
         "{}",
         messages.rotate_summary_responder_config(&responder_path.display().to_string())
     );
-    if updated.is_empty() {
-        println!("{}", messages.rotate_summary_agent_configs_skipped());
-    } else {
-        println!(
-            "{}",
-            messages.rotate_summary_agent_configs_updated(&updated.join(", "))
-        );
-    }
     if reloaded {
         println!("{}", messages.rotate_summary_reload_responder());
     }
@@ -451,8 +403,8 @@ async fn rotate_approle_secret_id(
         .create_secret_id(&entry.approle.role_name)
         .await
         .with_context(|| messages.error_openbao_secret_id_failed())?;
-    write_secret_id_atomic(&entry.approle.secret_id_path, &new_secret_id, messages).await?;
     if !is_remote {
+        write_secret_id_atomic(&entry.approle.secret_id_path, &new_secret_id, messages).await?;
         reload_openbao_agent(&entry, messages)?;
     }
     client
@@ -740,112 +692,6 @@ fn generate_secret(messages: &Messages) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(buffer))
 }
 
-fn update_agent_configs<'a, I, F>(
-    services: I,
-    messages: &Messages,
-    mut update: F,
-) -> Result<Vec<String>>
-where
-    I: IntoIterator<Item = &'a ServiceEntry>,
-    F: FnMut(&str) -> String,
-{
-    let mut updated = Vec::new();
-    let mut seen = HashSet::new();
-    for entry in services {
-        if !seen.insert(entry.agent_config_path.clone()) {
-            continue;
-        }
-        let contents = fs::read_to_string(&entry.agent_config_path).with_context(|| {
-            messages.error_read_file_failed(&entry.agent_config_path.display().to_string())
-        })?;
-        let next = update(&contents);
-        if next != contents {
-            fs::write(&entry.agent_config_path, next).with_context(|| {
-                messages.error_write_file_failed(&entry.agent_config_path.display().to_string())
-            })?;
-            updated.push(entry.agent_config_path.display().to_string());
-        }
-    }
-    Ok(updated)
-}
-
-fn upsert_toml_section_keys(contents: &str, section: &str, pairs: &[(&str, &str)]) -> String {
-    let mut output = String::new();
-    let mut section_found = false;
-    let mut in_section = false;
-    let mut seen_keys = HashSet::new();
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if is_section_header(trimmed) {
-            if in_section {
-                output.push_str(&render_missing_keys(pairs, &seen_keys));
-            }
-            in_section = trimmed == format!("[{section}]");
-            if in_section {
-                section_found = true;
-                seen_keys.clear();
-            }
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-
-        if in_section && let Some((key, indent)) = parse_key_line(line, pairs) {
-            let value = pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
-            if let Some(value) = value {
-                let _ = writeln!(output, "{indent}{key} = \"{value}\"");
-                seen_keys.insert(key.to_string());
-                continue;
-            }
-        }
-        output.push_str(line);
-        output.push('\n');
-    }
-
-    if in_section {
-        output.push_str(&render_missing_keys(pairs, &seen_keys));
-    }
-
-    if !section_found {
-        output.push('\n');
-        let _ = writeln!(output, "[{section}]");
-        for (key, value) in pairs {
-            let _ = writeln!(output, "{key} = \"{value}\"");
-        }
-    }
-    output
-}
-
-fn parse_key_line<'a>(line: &'a str, pairs: &[(&'a str, &str)]) -> Option<(&'a str, String)> {
-    for (key, _) in pairs {
-        let prefix = format!("{key} ");
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(&prefix) || trimmed.starts_with(&format!("{key}=")) {
-            let indent = line
-                .chars()
-                .take_while(|ch| ch.is_whitespace())
-                .collect::<String>();
-            return Some((key, indent));
-        }
-    }
-    None
-}
-
-fn render_missing_keys(pairs: &[(&str, &str)], seen: &HashSet<String>) -> String {
-    let mut rendered = String::new();
-    for (key, value) in pairs {
-        if !seen.contains(*key) {
-            let _ = writeln!(rendered, "{key} = \"{value}\"");
-        }
-    }
-    rendered
-}
-
-fn is_section_header(line: &str) -> bool {
-    line.starts_with('[') && line.ends_with(']')
-}
-
 fn to_container_path(secrets_dir: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(secrets_dir)
@@ -1014,27 +860,6 @@ async fn rotate_trust_sync(
             .with_context(|| messages.error_openbao_kv_write_failed())?;
     }
 
-    // Update local agent configs and write ca-bundle.pem files
-    let local_services: Vec<ServiceEntry> = ctx
-        .state
-        .services
-        .values()
-        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::LocalFile))
-        .cloned()
-        .collect();
-    let fingerprints_for_closure = fingerprints.clone();
-    let _updated = update_agent_configs(local_services.iter(), messages, |contents| {
-        replace_trust_keys(contents, &fingerprints_for_closure)
-    })?;
-    for entry in &local_services {
-        let ca_bundle_path = entry
-            .cert_path
-            .parent()
-            .unwrap_or(Path::new("certs"))
-            .join("ca-bundle.pem");
-        write_ca_bundle_file(&ca_bundle_path, &ca_bundle_pem, messages)?;
-    }
-
     println!("{}", messages.rotate_summary_title());
     println!(
         "{}",
@@ -1129,88 +954,6 @@ fn signal_bootroot_agent_daemon(entry: &ServiceEntry, messages: &Messages) -> Re
 #[cfg(not(unix))]
 fn signal_bootroot_agent_daemon(_entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
-}
-
-fn replace_trust_keys(contents: &str, fingerprints: &[String]) -> String {
-    let fingerprints_toml = format!(
-        "[{}]",
-        fingerprints
-            .iter()
-            .map(|fp| format!("\"{fp}\""))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let mut output = String::new();
-    let mut in_trust = false;
-    let mut trust_found = false;
-    let mut seen_keys = HashSet::new();
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if is_section_header(trimmed) {
-            if in_trust {
-                append_missing_trust_keys(&mut output, &fingerprints_toml, &seen_keys);
-            }
-            in_trust = trimmed == "[trust]";
-            if in_trust {
-                trust_found = true;
-                seen_keys.clear();
-            }
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-
-        if in_trust {
-            let key_trimmed = trimmed;
-            if key_trimmed.starts_with("trusted_ca_sha256 =")
-                || key_trimmed.starts_with("trusted_ca_sha256=")
-            {
-                let indent = line
-                    .chars()
-                    .take_while(|ch| ch.is_whitespace())
-                    .collect::<String>();
-                let _ = writeln!(output, "{indent}{CA_TRUST_KEY} = {fingerprints_toml}");
-                seen_keys.insert(CA_TRUST_KEY);
-                continue;
-            }
-        }
-
-        output.push_str(line);
-        output.push('\n');
-    }
-
-    if in_trust {
-        append_missing_trust_keys(&mut output, &fingerprints_toml, &seen_keys);
-    }
-
-    if !trust_found {
-        output.push('\n');
-        let _ = writeln!(output, "[trust]");
-        let _ = writeln!(output, "{CA_TRUST_KEY} = {fingerprints_toml}");
-    }
-    output
-}
-
-fn append_missing_trust_keys(output: &mut String, fingerprints_toml: &str, seen: &HashSet<&str>) {
-    if !seen.contains(CA_TRUST_KEY) {
-        let _ = writeln!(output, "{CA_TRUST_KEY} = {fingerprints_toml}");
-    }
-}
-
-fn write_ca_bundle_file(path: &Path, bundle_pem: &str, messages: &Messages) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| messages.error_write_file_failed(&parent.display().to_string()))?;
-    }
-    let contents = if bundle_pem.ends_with('\n') {
-        bundle_pem.to_string()
-    } else {
-        format!("{bundle_pem}\n")
-    };
-    fs::write(path, contents)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1407,22 +1150,6 @@ exit 0
         .expect_err("docker failure should bubble up");
         let message = err.to_string();
         assert!(message.contains("docker step-ca change-pass"));
-    }
-
-    #[test]
-    fn upsert_toml_section_keys_updates_existing() {
-        let input = "[acme]\nhttp_responder_hmac = \"old\"\n";
-        let updated = upsert_toml_section_keys(input, "acme", &[("http_responder_hmac", "new")]);
-        assert!(updated.contains("http_responder_hmac = \"new\""));
-    }
-
-    #[test]
-    fn upsert_toml_section_keys_adds_missing_section() {
-        let input = "email = \"a@b\"";
-        let updated = upsert_toml_section_keys(input, "eab", &[("kid", "k"), ("hmac", "h")]);
-        assert!(updated.contains("[eab]"));
-        assert!(updated.contains("kid = \"k\""));
-        assert!(updated.contains("hmac = \"h\""));
     }
 
     #[test]
