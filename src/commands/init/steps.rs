@@ -548,6 +548,7 @@ auto_auth {{
     config = {{
       role_id_file_path = "{role_id_path}"
       secret_id_file_path = "{secret_id_path}"
+      remove_secret_id_file_after_reading = false
     }}
   }}
   sink "file" {{
@@ -591,16 +592,26 @@ async fn write_responder_compose_override(
     let responder_dir = secrets_dir.join(RESPONDER_CONFIG_DIR);
     fs_util::ensure_secrets_dir(&responder_dir).await?;
     let override_path = responder_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME);
-    let config_path = std::fs::canonicalize(config_path)
-        .with_context(|| messages.error_resolve_path_failed(&config_path.display().to_string()))?;
+    let config_dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("responder config has no parent directory"))?;
+    let config_dir = std::fs::canonicalize(config_dir)
+        .with_context(|| messages.error_resolve_path_failed(&config_dir.display().to_string()))?;
+    let file_name = config_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("responder config has no file name"))?
+        .to_string_lossy();
     let contents = format!(
         r#"version: "3.8"
 services:
   bootroot-http01:
     volumes:
-      - {path}:/app/responder.toml:ro
+      - {dir}:/app/responder:ro
+    command:
+      - --config=/app/responder/{file_name}
 "#,
-        path = config_path.display()
+        dir = config_dir.display(),
+        file_name = file_name,
     );
     tokio::fs::write(&override_path, contents)
         .await
@@ -2345,10 +2356,17 @@ services:
         .unwrap()
         .expect("override path");
         let contents = fs::read_to_string(&override_path).unwrap();
-        let config_path = std::fs::canonicalize(&paths.config_path).unwrap();
+        let config_dir = std::fs::canonicalize(paths.config_path.parent().unwrap()).unwrap();
 
         assert!(contents.contains("bootroot-http01"));
-        assert!(contents.contains(&config_path.display().to_string()));
+        assert!(
+            contents.contains(&format!("{}:/app/responder:ro", config_dir.display())),
+            "should mount responder directory: {contents}"
+        );
+        assert!(
+            contents.contains("--config=/app/responder/responder.toml"),
+            "should set config path to directory-based path: {contents}"
+        );
     }
 
     #[test]
