@@ -959,7 +959,10 @@ async fn write_ca_trust_fingerprints_with_retry(
     Ok(changed)
 }
 
-pub(crate) async fn compute_ca_fingerprints(secrets_dir: &Path, messages: &Messages) -> Result<Vec<String>> {
+pub(crate) async fn compute_ca_fingerprints(
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<Vec<String>> {
     let certs_dir = secrets_dir.join(CA_CERTS_DIR);
     let root_path = certs_dir.join(CA_ROOT_CERT_FILENAME);
     let intermediate_path = certs_dir.join(CA_INTERMEDIATE_CERT_FILENAME);
@@ -968,7 +971,10 @@ pub(crate) async fn compute_ca_fingerprints(secrets_dir: &Path, messages: &Messa
     Ok(vec![root, intermediate])
 }
 
-pub(crate) async fn compute_ca_bundle_pem(secrets_dir: &Path, messages: &Messages) -> Result<String> {
+pub(crate) async fn compute_ca_bundle_pem(
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<String> {
     let certs_dir = secrets_dir.join(CA_CERTS_DIR);
     let root_path = certs_dir.join(CA_ROOT_CERT_FILENAME);
     let intermediate_path = certs_dir.join(CA_INTERMEDIATE_CERT_FILENAME);

@@ -17,8 +17,8 @@ use crate::cli::prompt::Prompt;
 use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
-    compute_ca_bundle_pem, compute_ca_fingerprints, CA_TRUST_KEY, PATH_AGENT_EAB, PATH_CA_TRUST,
-    PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
+    CA_TRUST_KEY, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
+    PATH_STEPCA_PASSWORD, compute_ca_bundle_pem, compute_ca_fingerprints,
 };
 use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
 use crate::i18n::Messages;
@@ -1007,11 +1007,7 @@ async fn rotate_trust_sync(
     auto_confirm: bool,
     messages: &Messages,
 ) -> Result<()> {
-    confirm_action(
-        messages.prompt_rotate_trust_sync(),
-        auto_confirm,
-        messages,
-    )?;
+    confirm_action(messages.prompt_rotate_trust_sync(), auto_confirm, messages)?;
 
     let secrets_dir = ctx.paths.secrets_dir();
     let fingerprints = compute_ca_fingerprints(secrets_dir, messages).await?;
@@ -1224,11 +1220,7 @@ fn replace_trust_keys(contents: &str, fingerprints: &[String]) -> String {
     output
 }
 
-fn append_missing_trust_keys(
-    output: &mut String,
-    fingerprints_toml: &str,
-    seen: &HashSet<&str>,
-) {
+fn append_missing_trust_keys(output: &mut String, fingerprints_toml: &str, seen: &HashSet<&str>) {
     if !seen.contains(CA_TRUST_KEY) {
         let _ = writeln!(output, "{CA_TRUST_KEY} = {fingerprints_toml}");
     }

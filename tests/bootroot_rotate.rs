@@ -866,8 +866,13 @@ async fn test_rotate_trust_sync_writes_global_and_per_service() {
     let openbao = MockServer::start().await;
 
     support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
-    prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "remote-bootstrap")
-        .expect("prepare state");
+    prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
