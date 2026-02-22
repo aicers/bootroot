@@ -523,6 +523,55 @@ async fn stub_service_add_openbao(server: &MockServer) {
         })))
         .mount(server)
         .await;
+
+    stub_service_kv_sync(server).await;
+}
+
+async fn stub_service_kv_sync(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/agent/eab"))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "kid": "test-kid", "hmac": "test-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/responder/hmac"))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "value": "test-responder-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/eab"
+        )))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/http_responder_hmac"
+        )))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/trust"
+        )))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
 }
 
 async fn stub_rotate_sequence_openbao(
@@ -551,6 +600,25 @@ async fn stub_rotate_sequence_openbao(
 
     Mock::given(method("POST"))
         .and(path("/v1/secret/data/bootroot/responder/hmac"))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+
+    // Per-service KV writes for rotation
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/eab"
+        )))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/http_responder_hmac"
+        )))
         .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)

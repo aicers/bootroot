@@ -237,7 +237,7 @@ async fn rotate_eab(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
-    sync_remote_eab_payloads(ctx, client, &credentials.kid, &credentials.hmac, messages).await?;
+    sync_service_eab_payloads(ctx, client, &credentials.kid, &credentials.hmac, messages).await?;
 
     let updated = update_agent_configs(
         ctx.state
@@ -372,7 +372,7 @@ async fn rotate_responder_hmac(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
-    sync_remote_responder_hmac_payloads(ctx, client, &hmac, messages).await?;
+    sync_service_responder_hmac_payloads(ctx, client, &hmac, messages).await?;
 
     let responder_path = ctx.paths.responder_config();
     let config = if responder_path.exists() {
@@ -527,7 +527,7 @@ async fn write_remote_service_secret_id(
         .with_context(|| messages.error_openbao_kv_write_failed())
 }
 
-async fn sync_remote_eab_payloads(
+async fn sync_service_eab_payloads(
     ctx: &RotateContext,
     client: &OpenBaoClient,
     kid: &str,
@@ -538,7 +538,6 @@ async fn sync_remote_eab_payloads(
         .state
         .services
         .values()
-        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
         .map(|entry| entry.service_name.as_str())
     {
         client
@@ -553,7 +552,7 @@ async fn sync_remote_eab_payloads(
     Ok(())
 }
 
-async fn sync_remote_responder_hmac_payloads(
+async fn sync_service_responder_hmac_payloads(
     ctx: &RotateContext,
     client: &OpenBaoClient,
     hmac: &str,
@@ -563,7 +562,6 @@ async fn sync_remote_responder_hmac_payloads(
         .state
         .services
         .values()
-        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
         .map(|entry| entry.service_name.as_str())
     {
         client
@@ -1023,15 +1021,14 @@ async fn rotate_trust_sync(
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
 
-    // Sync trust to each remote service KV
-    let remote_services: Vec<String> = ctx
+    // Sync trust to each service KV
+    let service_names: Vec<String> = ctx
         .state
         .services
         .values()
-        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
         .map(|entry| entry.service_name.clone())
         .collect();
-    for service_name in &remote_services {
+    for service_name in &service_names {
         client
             .write_kv(
                 &ctx.kv_mount,
@@ -1068,10 +1065,10 @@ async fn rotate_trust_sync(
         "{}",
         messages.rotate_summary_trust_sync_global(&fingerprints.join(", "))
     );
-    for service_name in &remote_services {
+    for service_name in &service_names {
         println!(
             "{}",
-            messages.rotate_summary_trust_sync_remote(service_name)
+            messages.rotate_summary_trust_sync_service(service_name)
         );
     }
     Ok(())
