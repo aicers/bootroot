@@ -748,6 +748,15 @@ async fn stub_openbao_for_eab_rotation(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)
         .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SECONDARY_SERVICE_NAME}/eab"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
 }
 
 async fn stub_openbao_for_responder_hmac_rotation(server: &MockServer, hmac: &str) {

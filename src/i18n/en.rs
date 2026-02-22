@@ -279,7 +279,7 @@ pub(super) static STRINGS: Strings = Strings {
     prompt_rotate_trust_sync: "Sync CA trust data to OpenBao and update services? [y/N]",
     prompt_rotate_force_reissue: "Delete certificates for {service_name} and trigger reissuance? [y/N]",
     rotate_summary_trust_sync_global: "- CA trust updated: {value}",
-    rotate_summary_trust_sync_remote: "- remote service trust synced: {value}",
+    rotate_summary_trust_sync_service: "- service trust synced: {value}",
     rotate_summary_force_reissue_deleted: "- {service_name}: cert/key deleted ({cert_path}, {key_path})",
     rotate_summary_force_reissue_local_signal: "- {service_name}: signaled bootroot-agent for renewal",
     rotate_summary_force_reissue_remote_hint: "- {service_name}: run `bootroot-remote bootstrap` on the service host to reissue",

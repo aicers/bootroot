@@ -313,7 +313,7 @@ pub(crate) struct Strings {
     pub(crate) prompt_rotate_trust_sync: &'static str,
     pub(crate) prompt_rotate_force_reissue: &'static str,
     pub(crate) rotate_summary_trust_sync_global: &'static str,
-    pub(crate) rotate_summary_trust_sync_remote: &'static str,
+    pub(crate) rotate_summary_trust_sync_service: &'static str,
     pub(crate) rotate_summary_force_reissue_deleted: &'static str,
     pub(crate) rotate_summary_force_reissue_local_signal: &'static str,
     pub(crate) rotate_summary_force_reissue_remote_hint: &'static str,
@@ -1780,9 +1780,9 @@ impl Messages {
         )
     }
 
-    pub(crate) fn rotate_summary_trust_sync_remote(&self, value: &str) -> String {
+    pub(crate) fn rotate_summary_trust_sync_service(&self, value: &str) -> String {
         format_template(
-            self.strings().rotate_summary_trust_sync_remote,
+            self.strings().rotate_summary_trust_sync_service,
             &[("value", value)],
         )
     }

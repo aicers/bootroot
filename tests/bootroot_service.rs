@@ -30,12 +30,7 @@ async fn test_app_add_writes_state_and_secret() {
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
     stub_app_add_trust_missing(&server).await;
-    stub_app_add_trust_missing(&server).await;
-    stub_app_add_trust_missing(&server).await;
-    stub_app_add_trust_missing(&server).await;
-    stub_app_add_trust_missing(&server).await;
-    stub_app_add_trust_missing(&server).await;
-    stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -67,7 +62,11 @@ async fn test_app_add_writes_state_and_secret() {
         .expect("run service add");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(stdout.contains("bootroot service add: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
     assert!(stdout.contains("- deploy type: daemon"));
@@ -141,6 +140,7 @@ async fn test_app_add_supports_approle_runtime_auth() {
     .await;
     stub_app_add_openbao_with_token(&server, "edge-proxy", "runtime-client").await;
     stub_app_add_trust_missing_with_token(&server, "runtime-client").await;
+    stub_app_add_service_sync_material_with_token(&server, "edge-proxy", "runtime-client").await;
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -378,6 +378,7 @@ async fn test_app_add_prompts_for_missing_inputs() {
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let input = format!(
         "edge-proxy\n\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n",
@@ -422,6 +423,7 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let input = format!(
         "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\n{}\nmissing/edge-proxy.crt\n{}\n{}\n\n001\n",
@@ -696,6 +698,7 @@ async fn test_app_add_local_file_sets_verify_prerequisites() {
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
     stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let add_output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -766,6 +769,7 @@ async fn test_app_add_prompts_for_docker_instance_id() {
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -819,6 +823,7 @@ async fn test_app_add_rejects_duplicate() {
 
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let _ = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -895,6 +900,7 @@ async fn test_app_add_includes_trust_snippet_when_present() {
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
     stub_app_add_trust_present(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -959,6 +965,7 @@ async fn test_app_add_omits_trust_snippet_when_missing() {
     write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
     stub_app_add_openbao(&server, "edge-proxy").await;
     stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -1253,6 +1260,71 @@ async fn stub_approle_login(
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "auth": { "client_token": client_token }
         })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_app_add_service_sync_material(server: &MockServer, service_name: &str) {
+    stub_app_add_service_sync_material_with_token(server, service_name, support::ROOT_TOKEN).await;
+}
+
+async fn stub_app_add_service_sync_material_with_token(
+    server: &MockServer,
+    service_name: &str,
+    token: &str,
+) {
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/agent/eab"))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "kid": "test-kid", "hmac": "test-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/responder/hmac"))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "value": "test-responder-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": {
+                "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
+                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+            } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/eab"
+        )))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/http_responder_hmac"
+        )))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/trust"
+        )))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 }

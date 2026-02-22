@@ -279,7 +279,7 @@ pub(super) static STRINGS: Strings = Strings {
     prompt_rotate_trust_sync: "CA trust 데이터를 OpenBao에 동기화하고 서비스를 갱신할까요? [y/N]",
     prompt_rotate_force_reissue: "{service_name} 인증서를 삭제하고 재발급을 시작할까요? [y/N]",
     rotate_summary_trust_sync_global: "- CA trust 갱신: {value}",
-    rotate_summary_trust_sync_remote: "- 원격 서비스 trust 동기화: {value}",
+    rotate_summary_trust_sync_service: "- 서비스 trust 동기화: {value}",
     rotate_summary_force_reissue_deleted: "- {service_name}: cert/key 삭제 ({cert_path}, {key_path})",
     rotate_summary_force_reissue_local_signal: "- {service_name}: 인증서 갱신을 위해 bootroot-agent에 시그널 전송",
     rotate_summary_force_reissue_remote_hint: "- {service_name}: 서비스 머신에서 `bootroot-remote bootstrap`을 실행하여 재발급하세요",
