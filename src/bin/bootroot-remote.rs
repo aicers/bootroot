@@ -1122,6 +1122,99 @@ fn upsert_managed_profile_block(contents: &str, service_name: &str, replacement:
     updated
 }
 
+fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> String {
+    let base = format!("{SERVICE_KV_BASE}/{service_name}");
+
+    let hmac_template = format!(
+        "{{{{ with secret \"{kv_mount}/data/{base}/http_responder_hmac\" }}}}\
+         {{{{ .Data.data.hmac }}}}\
+         {{{{ end }}}}"
+    );
+    let acme_pairs = vec![("http_responder_hmac", hmac_template)];
+    let with_hmac = upsert_toml_section_keys(contents, "acme", &acme_pairs);
+
+    let without_eab = remove_toml_sections(&with_hmac, &["eab", "profiles.eab"]);
+
+    let trust_template_line = format!(
+        "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
+         trusted_ca_sha256 = {{{{ .Data.data.trusted_ca_sha256 | toJSON }}}}\
+         {{{{ end }}}}"
+    );
+    let with_trust =
+        replace_key_line_in_section(&without_eab, "trust", TRUSTED_CA_KEY, &trust_template_line);
+
+    let eab_block = format!(
+        "\n{{{{ with secret \"{kv_mount}/data/{base}/eab\" }}}}{{{{ if .Data.data.kid }}}}\n\
+         [eab]\n\
+         kid = \"{{{{ .Data.data.kid }}}}\"\n\
+         hmac = \"{{{{ .Data.data.hmac }}}}\"\n\
+         \n\
+         [profiles.eab]\n\
+         kid = \"{{{{ .Data.data.kid }}}}\"\n\
+         hmac = \"{{{{ .Data.data.hmac }}}}\"\n\
+         {{{{ end }}}}{{{{ end }}}}\n"
+    );
+
+    let mut result = with_trust;
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(&eab_block);
+    result
+}
+
+fn remove_toml_sections(contents: &str, sections: &[&str]) -> String {
+    let mut output = String::new();
+    let mut skip = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed) {
+            let section_name = &trimmed[1..trimmed.len() - 1];
+            skip = sections.contains(&section_name);
+            if skip {
+                continue;
+            }
+        }
+        if skip {
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
+fn replace_key_line_in_section(
+    contents: &str,
+    section: &str,
+    key: &str,
+    replacement: &str,
+) -> String {
+    let mut output = String::new();
+    let mut in_section = false;
+    let mut replaced = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed) {
+            in_section = trimmed == format!("[{section}]");
+        }
+        if in_section
+            && !replaced
+            && (trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")))
+        {
+            output.push_str(replacement);
+            output.push('\n');
+            replaced = true;
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
 async fn write_openbao_agent_artifacts(
     args: &BootstrapArgs,
     agent_template: &str,
@@ -1167,13 +1260,15 @@ async fn write_openbao_agent_artifacts(
     let token_path = openbao_service_dir.join("token");
     let config_path = openbao_service_dir.join("agent.hcl");
 
-    fs::write(&template_path, agent_template).await?;
+    let ctmpl = build_ctmpl_content(agent_template, &args.kv_mount, &args.service_name);
+    fs::write(&template_path, ctmpl).await?;
     fs_util::set_key_permissions(&template_path).await?;
     if !token_path.exists() {
         fs::write(&token_path, "").await?;
     }
     fs_util::set_key_permissions(&token_path).await?;
     let config = render_openbao_agent_config(
+        &args.openbao_url,
         &args.role_id_path,
         &args.secret_id_path,
         &token_path,
@@ -1186,6 +1281,7 @@ async fn write_openbao_agent_artifacts(
 }
 
 fn render_openbao_agent_config(
+    openbao_url: &str,
     role_id_path: &Path,
     secret_id_path: &Path,
     token_path: &Path,
@@ -1193,7 +1289,11 @@ fn render_openbao_agent_config(
     destination_path: &Path,
 ) -> String {
     format!(
-        r#"auto_auth {{
+        r#"vault {{
+  address = "{openbao_url}"
+}}
+
+auto_auth {{
   method "approle" {{
     mount_path = "auth/approle"
     config = {{
@@ -1214,6 +1314,7 @@ template {{
   perms = "0600"
 }}
 "#,
+        openbao_url = openbao_url,
         role_id_path = role_id_path.display(),
         secret_id_path = secret_id_path.display(),
         token_path = token_path.display(),
