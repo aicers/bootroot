@@ -49,6 +49,9 @@ async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
 
     let path = env::var("PATH").unwrap_or_default();
     let combined_path = format!("{}:{}", bin_dir.display(), path);
+    // The fake docker will copy RENDER_SOURCE to RENDER_TARGET when it sees
+    // `docker restart bootroot-openbao-agent-*`, simulating OBA rendering.
+    let render_source = secrets_dir.join("password.txt.new");
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
@@ -66,6 +69,8 @@ async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
         ])
         .env("PATH", combined_path)
         .env("DOCKER_OUTPUT", &docker_log)
+        .env("RENDER_SOURCE", &render_source)
+        .env("RENDER_TARGET", secrets_dir.join("password.txt"))
         .output()
         .expect("run rotate stepca-password");
 
@@ -94,19 +99,36 @@ async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
         );
     }
 
-    let restart_line = lines
+    // Verify restart OBA-stepca comes BEFORE compose restart step-ca
+    let oba_restart_idx = lines
         .iter()
-        .find(|line| {
+        .position(|line| line.contains("restart") && line.contains("bootroot-openbao-agent-stepca"))
+        .unwrap_or_else(|| panic!("restart OBA-stepca should be invoked\nlog:\n{docker_args_log}"));
+    let compose_restart_idx = lines
+        .iter()
+        .position(|line| {
             line.contains("compose") && line.contains("restart") && line.contains("step-ca")
         })
-        .copied()
         .unwrap_or_else(|| {
             panic!("restart step-ca command should be invoked\nlog:\n{docker_args_log}")
         });
     assert!(
+        oba_restart_idx < compose_restart_idx,
+        "OBA restart should come before compose restart\nlog:\n{docker_args_log}"
+    );
+
+    let restart_line = lines
+        .get(compose_restart_idx)
+        .expect("compose restart line");
+    assert!(
         restart_line.contains(" -f "),
         "compose command should include -f: {restart_line}"
     );
+
+    // Verify password.txt was rendered with new value
+    let rendered =
+        fs::read_to_string(secrets_dir.join("password.txt")).expect("read rendered password.txt");
+    assert_eq!(rendered, "new-pass-123");
 }
 
 #[cfg(unix)]
@@ -361,9 +383,26 @@ async fn test_rotate_responder_hmac_remote_sets_pending_status() {
     .expect("prepare state");
 
     let compose_file = temp_dir.path().join("docker-compose.yml");
-    fs::write(&compose_file, "services: {}\n").expect("write compose");
+    fs::write(
+        &compose_file,
+        "services:\n  bootroot-http01:\n    image: test\n",
+    )
+    .expect("write compose");
     stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-remote").await;
 
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+
+    // Prepare render source: write a responder.toml containing the expected hmac
+    let responder_dir = temp_dir.path().join("secrets").join("responder");
+    fs::create_dir_all(&responder_dir).expect("create responder dir");
+    let render_source = temp_dir.path().join("responder-render-src.toml");
+    fs::write(&render_source, "hmac_secret = \"hmac-remote\"\n").expect("write render source");
+
+    let path = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
@@ -379,6 +418,10 @@ async fn test_rotate_responder_hmac_remote_sets_pending_status() {
             "--hmac",
             "hmac-remote",
         ])
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
+        .env("RENDER_SOURCE", &render_source)
+        .env("RENDER_TARGET", responder_dir.join("responder.toml"))
         .output()
         .expect("run rotate responder-hmac");
 
@@ -387,6 +430,37 @@ async fn test_rotate_responder_hmac_remote_sets_pending_status() {
     assert!(
         output.status.success(),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Verify OBA-responder restart comes BEFORE compose kill -s HUP bootroot-http01
+    let docker_args_log = fs::read_to_string(&docker_log).expect("read docker log");
+    let lines: Vec<&str> = docker_args_log.lines().collect();
+
+    let oba_restart_idx = lines
+        .iter()
+        .position(|line| {
+            line.contains("restart") && line.contains("bootroot-openbao-agent-responder")
+        })
+        .unwrap_or_else(|| {
+            panic!("restart OBA-responder should be invoked\nlog:\n{docker_args_log}")
+        });
+    let hup_idx = lines
+        .iter()
+        .position(|line| line.contains("kill") && line.contains("HUP"))
+        .unwrap_or_else(|| {
+            panic!("compose kill -s HUP should be invoked\nlog:\n{docker_args_log}")
+        });
+    assert!(
+        oba_restart_idx < hup_idx,
+        "OBA restart should come before HUP reload\nlog:\n{docker_args_log}"
+    );
+
+    // Verify responder.toml was rendered with new hmac value
+    let rendered = fs::read_to_string(responder_dir.join("responder.toml"))
+        .expect("read rendered responder.toml");
+    assert!(
+        rendered.contains("hmac-remote"),
+        "responder.toml should contain new hmac"
     );
 }
 
@@ -415,6 +489,18 @@ async fn test_rotate_responder_hmac_supports_approle_runtime_auth() {
     stub_openbao_for_responder_hmac_rotation_with_token(&openbao, "hmac-runtime", "runtime-client")
         .await;
 
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+
+    let responder_dir = temp_dir.path().join("secrets").join("responder");
+    fs::create_dir_all(&responder_dir).expect("create responder dir");
+    let render_source = temp_dir.path().join("responder-render-src.toml");
+    fs::write(&render_source, "hmac_secret = \"hmac-runtime\"\n").expect("write render source");
+
+    let path = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
@@ -434,6 +520,10 @@ async fn test_rotate_responder_hmac_supports_approle_runtime_auth() {
             "--hmac",
             "hmac-runtime",
         ])
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
+        .env("RENDER_SOURCE", &render_source)
+        .env("RENDER_TARGET", responder_dir.join("responder.toml"))
         .output()
         .expect("run rotate responder-hmac");
 
@@ -856,6 +946,17 @@ set -eu
 
 if [ -n "${DOCKER_OUTPUT:-}" ]; then
   printf "%s\n" "$*" >> "$DOCKER_OUTPUT"
+fi
+
+# Simulate OpenBao Agent rendering on restart of OBA containers
+if [ "${1:-}" = "restart" ]; then
+  case "${2:-}" in
+    bootroot-openbao-agent-*)
+      if [ -n "${RENDER_SOURCE:-}" ] && [ -n "${RENDER_TARGET:-}" ]; then
+        cp "$RENDER_SOURCE" "$RENDER_TARGET"
+      fi
+      ;;
+  esac
 fi
 
 exit 0

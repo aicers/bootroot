@@ -131,6 +131,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_secrets_dir_resolve_failed: "secrets dir 확인 실패",
     error_parse_ca_json_failed: "ca.json 파싱 실패",
     error_serialize_ca_json_failed: "ca.json 직렬화 실패",
+    error_rendered_file_timeout: "OpenBao Agent가 {value}을(를) 렌더링하기를 기다리다 시간이 초과되었습니다",
     error_ca_json_db_missing: "ca.json에 db.dataSource 필드가 없습니다",
     error_ca_cert_missing: "CA 인증서 파일이 없습니다: {value}",
     error_ca_cert_parse_failed: "CA 인증서 파싱 실패: {value}",
