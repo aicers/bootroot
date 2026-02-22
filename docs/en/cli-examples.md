@@ -404,6 +404,12 @@ bootroot rotate db \
 bootroot rotate responder-hmac
 bootroot rotate approle-secret-id --service-name edge-proxy
 bootroot rotate approle-secret-id --service-name web-app
+
+# Sync CA trust data to OpenBao and all services
+bootroot rotate trust-sync
+
+# Force certificate reissue for a specific service
+bootroot rotate force-reissue --service-name edge-proxy
 ```
 
 Scheduled execution (cron example, script to run all rotations):

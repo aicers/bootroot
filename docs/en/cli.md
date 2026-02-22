@@ -532,6 +532,8 @@ Supported subcommands:
 - `rotate db`
 - `rotate responder-hmac`
 - `rotate approle-secret-id`
+- `rotate trust-sync`
+- `rotate force-reissue`
 
 ### Inputs
 
@@ -581,6 +583,24 @@ Per subcommand:
 - `--hmac`: new responder HMAC (optional, auto-generated if omitted)
 
 #### `rotate approle-secret-id`
+
+- `--service-name`: target service name
+
+#### `rotate trust-sync`
+
+Syncs CA certificate fingerprints and bundle PEM to OpenBao and updates
+each service's trust data. For remote services, the trust payload is
+written to per-service KV paths. For local services, the agent config
+`[trust]` section is updated and the CA bundle PEM is written to disk.
+
+No additional arguments.
+
+#### `rotate force-reissue`
+
+Deletes a service's cert/key files to trigger bootroot-agent to reissue
+certificates. For local (daemon) services, sends SIGHUP to the
+bootroot-agent process. For Docker services, restarts the container. For
+remote services, prints a hint to run `bootroot-remote bootstrap`.
 
 - `--service-name`: target service name
 

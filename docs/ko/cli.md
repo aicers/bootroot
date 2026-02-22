@@ -512,6 +512,8 @@ OpenBao와 통신해 값을 갱신합니다.
 - `rotate db`
 - `rotate responder-hmac`
 - `rotate approle-secret-id`
+- `rotate trust-sync`
+- `rotate force-reissue`
 
 ### 입력
 
@@ -561,6 +563,24 @@ OpenBao와 통신해 값을 갱신합니다.
 - `--hmac`: 새 responder HMAC(선택, 미지정 시 자동 생성)
 
 #### `rotate approle-secret-id`
+
+- `--service-name`: 대상 서비스 이름
+
+#### `rotate trust-sync`
+
+CA 인증서 지문과 번들 PEM을 OpenBao에 동기화하고 각 서비스의 trust
+데이터를 갱신합니다. 원격 서비스의 경우 서비스별 KV 경로에 trust 페이로드를
+기록합니다. 로컬 서비스의 경우 에이전트 설정의 `[trust]` 섹션을 갱신하고
+CA 번들 PEM을 디스크에 기록합니다.
+
+추가 인수 없음.
+
+#### `rotate force-reissue`
+
+서비스의 cert/key 파일을 삭제해 bootroot-agent가 인증서를 재발급하도록
+합니다. 로컬(daemon) 서비스의 경우 bootroot-agent 프로세스에 SIGHUP을
+보냅니다. Docker 서비스의 경우 컨테이너를 재시작합니다. 원격 서비스의 경우
+`bootroot-remote bootstrap` 실행을 안내합니다.
 
 - `--service-name`: 대상 서비스 이름
 

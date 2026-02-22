@@ -221,3 +221,36 @@ Permissions/ownership:
 - The **service consuming** the CA bundle must be able to read the file.
 - The simplest setup is running bootroot-agent and the service as the **same
   user or group**.
+
+## Trust rotation
+
+After renewing or replacing CA certificates, run `bootroot rotate trust-sync`
+to propagate the updated fingerprints and bundle PEM:
+
+```bash
+bootroot rotate trust-sync --yes
+```
+
+This command:
+
+1. Computes SHA-256 fingerprints for root and intermediate CA certs under
+   `secrets/certs/`.
+2. Writes the fingerprints and concatenated PEM bundle to OpenBao
+   (`bootroot/ca`).
+3. For each remote service, writes the trust payload to
+   `bootroot/services/<name>/trust`.
+4. For each local service, updates the `[trust]` section in the agent config
+   and writes `ca-bundle.pem` to disk.
+
+## Force reissue
+
+To delete a service's certificate and key and trigger bootroot-agent to
+reissue:
+
+```bash
+bootroot rotate force-reissue --service-name edge-proxy --yes
+```
+
+For local services (daemon/docker), the command signals bootroot-agent after
+deleting the files. For remote services, it prints a hint to run
+`bootroot-remote bootstrap` on the service host.

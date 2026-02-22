@@ -959,7 +959,10 @@ async fn write_ca_trust_fingerprints_with_retry(
     Ok(changed)
 }
 
-async fn compute_ca_fingerprints(secrets_dir: &Path, messages: &Messages) -> Result<Vec<String>> {
+pub(crate) async fn compute_ca_fingerprints(
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<Vec<String>> {
     let certs_dir = secrets_dir.join(CA_CERTS_DIR);
     let root_path = certs_dir.join(CA_ROOT_CERT_FILENAME);
     let intermediate_path = certs_dir.join(CA_INTERMEDIATE_CERT_FILENAME);
@@ -968,7 +971,10 @@ async fn compute_ca_fingerprints(secrets_dir: &Path, messages: &Messages) -> Res
     Ok(vec![root, intermediate])
 }
 
-async fn compute_ca_bundle_pem(secrets_dir: &Path, messages: &Messages) -> Result<String> {
+pub(crate) async fn compute_ca_bundle_pem(
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<String> {
     let certs_dir = secrets_dir.join(CA_CERTS_DIR);
     let root_path = certs_dir.join(CA_ROOT_CERT_FILENAME);
     let intermediate_path = certs_dir.join(CA_INTERMEDIATE_CERT_FILENAME);
@@ -1007,7 +1013,7 @@ fn trust_payload_changed(
     current_fingerprints.as_deref() != Some(fingerprints) || current_bundle != Some(ca_bundle_pem)
 }
 
-async fn read_ca_cert_fingerprint(path: &Path, messages: &Messages) -> Result<String> {
+pub(crate) async fn read_ca_cert_fingerprint(path: &Path, messages: &Messages) -> Result<String> {
     if !path.exists() {
         anyhow::bail!(messages.error_ca_cert_missing(&path.display().to_string()));
     }
@@ -1023,7 +1029,7 @@ async fn read_ca_cert_fingerprint(path: &Path, messages: &Messages) -> Result<St
     Ok(sha256_hex(&pem.contents))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = digest::digest(&digest::SHA256, bytes);
     let mut output = String::with_capacity(64);
     for byte in digest.as_ref() {

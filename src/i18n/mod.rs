@@ -310,6 +310,13 @@ pub(crate) struct Strings {
     pub(crate) rotate_summary_approle_secret_id: &'static str,
     pub(crate) rotate_summary_reload_openbao_agent: &'static str,
     pub(crate) rotate_summary_approle_login_ok: &'static str,
+    pub(crate) prompt_rotate_trust_sync: &'static str,
+    pub(crate) prompt_rotate_force_reissue: &'static str,
+    pub(crate) rotate_summary_trust_sync_global: &'static str,
+    pub(crate) rotate_summary_trust_sync_remote: &'static str,
+    pub(crate) rotate_summary_force_reissue_deleted: &'static str,
+    pub(crate) rotate_summary_force_reissue_local_signal: &'static str,
+    pub(crate) rotate_summary_force_reissue_remote_hint: &'static str,
     pub(crate) summary_responder_check_ok: &'static str,
     pub(crate) summary_responder_check_skipped: &'static str,
     pub(crate) summary_db_check_ok: &'static str,
@@ -1751,6 +1758,61 @@ impl Messages {
     pub(crate) fn rotate_summary_approle_login_ok(&self, service_name: &str) -> String {
         format_template(
             self.strings().rotate_summary_approle_login_ok,
+            &[("service_name", service_name)],
+        )
+    }
+
+    pub(crate) fn prompt_rotate_trust_sync(&self) -> &'static str {
+        self.strings().prompt_rotate_trust_sync
+    }
+
+    pub(crate) fn prompt_rotate_force_reissue(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().prompt_rotate_force_reissue,
+            &[("service_name", service_name)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_trust_sync_global(&self, value: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_trust_sync_global,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_trust_sync_remote(&self, value: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_trust_sync_remote,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_force_reissue_deleted(
+        &self,
+        service_name: &str,
+        cert_path: &str,
+        key_path: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_summary_force_reissue_deleted,
+            &[
+                ("service_name", service_name),
+                ("cert_path", cert_path),
+                ("key_path", key_path),
+            ],
+        )
+    }
+
+    pub(crate) fn rotate_summary_force_reissue_local_signal(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_force_reissue_local_signal,
+            &[("service_name", service_name)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_force_reissue_remote_hint(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_force_reissue_remote_hint,
             &[("service_name", service_name)],
         )
     }

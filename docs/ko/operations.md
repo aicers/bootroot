@@ -210,3 +210,33 @@ bootstrap + 명시적 secret_id handoff입니다.
 - CA 번들을 **읽는 서비스**가 파일을 읽을 수 있어야 합니다.
 - 가장 단순한 방법은 bootroot-agent와 서비스가 **같은 사용자/그룹**으로
   실행되도록 맞추는 것입니다.
+
+## Trust 회전
+
+CA 인증서를 갱신하거나 교체한 후, `bootroot rotate trust-sync`를 실행해
+갱신된 지문과 번들 PEM을 전파합니다:
+
+```bash
+bootroot rotate trust-sync --yes
+```
+
+이 명령은:
+
+1. `secrets/certs/` 아래의 루트/중간 CA 인증서에서 SHA-256 지문을 계산합니다.
+2. 지문과 연결된 PEM 번들을 OpenBao(`bootroot/ca`)에 기록합니다.
+3. 원격 서비스마다 `bootroot/services/<name>/trust`에 trust 페이로드를
+   기록합니다.
+4. 로컬 서비스마다 에이전트 설정의 `[trust]` 섹션을 갱신하고
+   `ca-bundle.pem`을 디스크에 기록합니다.
+
+## 강제 재발급
+
+서비스의 인증서/키를 삭제하고 bootroot-agent가 재발급하도록 하려면:
+
+```bash
+bootroot rotate force-reissue --service-name edge-proxy --yes
+```
+
+로컬 서비스(daemon/docker)의 경우 파일 삭제 후 bootroot-agent에 시그널을
+보냅니다. 원격 서비스의 경우 서비스 머신에서 `bootroot-remote bootstrap`을
+실행하라는 안내를 출력합니다.

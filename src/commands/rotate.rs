@@ -11,17 +11,18 @@ use reqwest::StatusCode;
 
 use crate::cli::args::{
     RotateAppRoleSecretIdArgs, RotateArgs, RotateCommand, RotateDbArgs, RotateEabArgs,
-    RotateResponderHmacArgs, RotateStepcaPasswordArgs,
+    RotateForceReissueArgs, RotateResponderHmacArgs, RotateStepcaPasswordArgs,
 };
 use crate::cli::prompt::Prompt;
 use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
-    PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
+    CA_TRUST_KEY, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
+    PATH_STEPCA_PASSWORD, compute_ca_bundle_pem, compute_ca_fingerprints,
 };
 use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
 use crate::i18n::Messages;
-use crate::state::{DeliveryMode, ServiceEntry, StateFile};
+use crate::state::{DeliveryMode, DeployType, ServiceEntry, StateFile};
 const SECRET_BYTES: usize = 32;
 const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
 const ROLE_ID_FILENAME: &str = "role_id";
@@ -30,6 +31,9 @@ const SERVICE_SECRET_ID_KEY: &str = "secret_id";
 const SERVICE_EAB_KID_KEY: &str = "kid";
 const SERVICE_EAB_HMAC_KEY: &str = "hmac";
 const SERVICE_RESPONDER_HMAC_KEY: &str = "hmac";
+const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
+const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
+const BOOTROOT_AGENT_CONTAINER_PREFIX: &str = "bootroot-agent";
 
 #[derive(Debug, Clone)]
 struct StatePaths {
@@ -137,6 +141,12 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         }
         RotateCommand::AppRoleSecretId(step_args) => {
             rotate_approle_secret_id(&mut ctx, &client, step_args, args.yes, messages).await?;
+        }
+        RotateCommand::TrustSync(_) => {
+            rotate_trust_sync(&mut ctx, &client, args.yes, messages).await?;
+        }
+        RotateCommand::ForceReissue(step_args) => {
+            rotate_force_reissue(&mut ctx, step_args, args.yes, messages)?;
         }
     }
 
@@ -989,6 +999,246 @@ struct EabAutoResponse {
 struct EabCredentials {
     kid: String,
     hmac: String,
+}
+
+async fn rotate_trust_sync(
+    ctx: &mut RotateContext,
+    client: &OpenBaoClient,
+    auto_confirm: bool,
+    messages: &Messages,
+) -> Result<()> {
+    confirm_action(messages.prompt_rotate_trust_sync(), auto_confirm, messages)?;
+
+    let secrets_dir = ctx.paths.secrets_dir();
+    let fingerprints = compute_ca_fingerprints(secrets_dir, messages).await?;
+    let ca_bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
+
+    // Write global CA trust KV
+    client
+        .write_kv(
+            &ctx.kv_mount,
+            PATH_CA_TRUST,
+            serde_json::json!({ CA_TRUST_KEY: fingerprints, CA_BUNDLE_PEM_KEY: ca_bundle_pem }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
+
+    // Sync trust to each remote service KV
+    let remote_services: Vec<String> = ctx
+        .state
+        .services
+        .values()
+        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap))
+        .map(|entry| entry.service_name.clone())
+        .collect();
+    for service_name in &remote_services {
+        client
+            .write_kv(
+                &ctx.kv_mount,
+                &format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_TRUST_KV_SUFFIX}"),
+                serde_json::json!({ CA_TRUST_KEY: fingerprints, CA_BUNDLE_PEM_KEY: ca_bundle_pem }),
+            )
+            .await
+            .with_context(|| messages.error_openbao_kv_write_failed())?;
+    }
+
+    // Update local agent configs and write ca-bundle.pem files
+    let local_services: Vec<ServiceEntry> = ctx
+        .state
+        .services
+        .values()
+        .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::LocalFile))
+        .cloned()
+        .collect();
+    let fingerprints_for_closure = fingerprints.clone();
+    let _updated = update_agent_configs(local_services.iter(), messages, |contents| {
+        replace_trust_keys(contents, &fingerprints_for_closure)
+    })?;
+    for entry in &local_services {
+        let ca_bundle_path = entry
+            .cert_path
+            .parent()
+            .unwrap_or(Path::new("certs"))
+            .join("ca-bundle.pem");
+        write_ca_bundle_file(&ca_bundle_path, &ca_bundle_pem, messages)?;
+    }
+
+    println!("{}", messages.rotate_summary_title());
+    println!(
+        "{}",
+        messages.rotate_summary_trust_sync_global(&fingerprints.join(", "))
+    );
+    for service_name in &remote_services {
+        println!(
+            "{}",
+            messages.rotate_summary_trust_sync_remote(service_name)
+        );
+    }
+    Ok(())
+}
+
+fn rotate_force_reissue(
+    ctx: &mut RotateContext,
+    args: &RotateForceReissueArgs,
+    auto_confirm: bool,
+    messages: &Messages,
+) -> Result<()> {
+    let entry = ctx
+        .state
+        .services
+        .get(&args.service_name)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?
+        .clone();
+
+    confirm_action(
+        &messages.prompt_rotate_force_reissue(&args.service_name),
+        auto_confirm,
+        messages,
+    )?;
+
+    // Delete cert and key files (ignore if already missing)
+    let cert_path = &entry.cert_path;
+    let key_path = &entry.key_path;
+    let _ = fs::remove_file(cert_path);
+    let _ = fs::remove_file(key_path);
+
+    println!("{}", messages.rotate_summary_title());
+    println!(
+        "{}",
+        messages.rotate_summary_force_reissue_deleted(
+            &args.service_name,
+            &cert_path.display().to_string(),
+            &key_path.display().to_string(),
+        )
+    );
+
+    if matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
+        signal_bootroot_agent(&entry, messages)?;
+        println!(
+            "{}",
+            messages.rotate_summary_force_reissue_local_signal(&args.service_name)
+        );
+    } else {
+        println!(
+            "{}",
+            messages.rotate_summary_force_reissue_remote_hint(&args.service_name)
+        );
+    }
+    Ok(())
+}
+
+fn signal_bootroot_agent(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
+    match entry.deploy_type {
+        DeployType::Docker => {
+            let container = format!("{BOOTROOT_AGENT_CONTAINER_PREFIX}-{}", entry.service_name);
+            run_docker(
+                &["restart", &container],
+                "docker restart bootroot-agent",
+                messages,
+            )
+        }
+        DeployType::Daemon => signal_bootroot_agent_daemon(entry, messages),
+    }
+}
+
+#[cfg(unix)]
+fn signal_bootroot_agent_daemon(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
+    let config_path = entry.agent_config_path.display().to_string();
+    let status = std::process::Command::new("pkill")
+        .args(["-HUP", "-f", &config_path])
+        .status()
+        .with_context(|| messages.error_command_run_failed("pkill -HUP"))?;
+    if !status.success() {
+        anyhow::bail!(messages.error_command_failed_status("pkill -HUP", &status.to_string()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn signal_bootroot_agent_daemon(_entry: &ServiceEntry, messages: &Messages) -> Result<()> {
+    anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
+}
+
+fn replace_trust_keys(contents: &str, fingerprints: &[String]) -> String {
+    let fingerprints_toml = format!(
+        "[{}]",
+        fingerprints
+            .iter()
+            .map(|fp| format!("\"{fp}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut output = String::new();
+    let mut in_trust = false;
+    let mut trust_found = false;
+    let mut seen_keys = HashSet::new();
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed) {
+            if in_trust {
+                append_missing_trust_keys(&mut output, &fingerprints_toml, &seen_keys);
+            }
+            in_trust = trimmed == "[trust]";
+            if in_trust {
+                trust_found = true;
+                seen_keys.clear();
+            }
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+
+        if in_trust {
+            let key_trimmed = trimmed;
+            if key_trimmed.starts_with("trusted_ca_sha256 =")
+                || key_trimmed.starts_with("trusted_ca_sha256=")
+            {
+                let indent = line
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace())
+                    .collect::<String>();
+                let _ = writeln!(output, "{indent}{CA_TRUST_KEY} = {fingerprints_toml}");
+                seen_keys.insert(CA_TRUST_KEY);
+                continue;
+            }
+        }
+
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    if in_trust {
+        append_missing_trust_keys(&mut output, &fingerprints_toml, &seen_keys);
+    }
+
+    if !trust_found {
+        output.push('\n');
+        let _ = writeln!(output, "[trust]");
+        let _ = writeln!(output, "{CA_TRUST_KEY} = {fingerprints_toml}");
+    }
+    output
+}
+
+fn append_missing_trust_keys(output: &mut String, fingerprints_toml: &str, seen: &HashSet<&str>) {
+    if !seen.contains(CA_TRUST_KEY) {
+        let _ = writeln!(output, "{CA_TRUST_KEY} = {fingerprints_toml}");
+    }
+}
+
+fn write_ca_bundle_file(path: &Path, bundle_pem: &str, messages: &Messages) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| messages.error_write_file_failed(&parent.display().to_string()))?;
+    }
+    let contents = if bundle_pem.ends_with('\n') {
+        bundle_pem.to_string()
+    } else {
+        format!("{bundle_pem}\n")
+    };
+    fs::write(path, contents)
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    Ok(())
 }
 
 #[cfg(test)]

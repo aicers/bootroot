@@ -858,3 +858,202 @@ exit 0
     fs::write(output_path, "").context("seed docker log")?;
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_trust_sync_writes_global_and_per_service() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/trust"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&openbao)
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "trust-sync",
+        ])
+        .output()
+        .expect("run rotate trust-sync");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("CA trust updated"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_force_reissue_deletes_cert_and_key() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let _secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
+        .expect("prepare state");
+
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(temp_dir.path().join("certs")).expect("create certs dir");
+    fs::write(&cert_path, "fake-cert").expect("write cert");
+    fs::write(&key_path, "fake-key").expect("write key");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let pkill_log = temp_dir.path().join("pkill.log");
+    write_fake_pkill(&bin_dir, &pkill_log).expect("write fake pkill");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    let path_env = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path_env);
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "force-reissue",
+            "--service-name",
+            SERVICE_NAME,
+        ])
+        .env("PATH", combined_path)
+        .env("PKILL_OUTPUT", &pkill_log)
+        .output()
+        .expect("run rotate force-reissue");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("cert/key deleted"));
+    assert!(!cert_path.exists(), "cert should be deleted");
+    assert!(!key_path.exists(), "key should be deleted");
+
+    let pkill_args = fs::read_to_string(&pkill_log).expect("read pkill log");
+    assert!(pkill_args.contains("-HUP"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_force_reissue_remote_prints_hint() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let _secret_path = prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "force-reissue",
+            "--service-name",
+            SERVICE_NAME,
+        ])
+        .output()
+        .expect("run rotate force-reissue");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("bootroot-remote bootstrap"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_force_reissue_missing_service_fails() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "force-reissue",
+            "--service-name",
+            "missing-service",
+        ])
+        .output()
+        .expect("run rotate force-reissue");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains("Service not found"));
+}

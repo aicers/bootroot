@@ -184,6 +184,10 @@ pub(crate) enum RotateCommand {
     ResponderHmac(RotateResponderHmacArgs),
     #[command(name = "approle-secret-id")]
     AppRoleSecretId(RotateAppRoleSecretIdArgs),
+    #[command(name = "trust-sync")]
+    TrustSync(RotateTrustSyncArgs),
+    #[command(name = "force-reissue")]
+    ForceReissue(RotateForceReissueArgs),
 }
 
 #[derive(Args, Debug)]
@@ -227,6 +231,16 @@ pub(crate) struct RotateResponderHmacArgs {
 #[derive(Args, Debug)]
 pub(crate) struct RotateAppRoleSecretIdArgs {
     /// App service name to rotate the `AppRole` `secret_id` for
+    #[arg(long)]
+    pub(crate) service_name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RotateTrustSyncArgs {}
+
+#[derive(Args, Debug)]
+pub(crate) struct RotateForceReissueArgs {
+    /// Service name to force-reissue certificates for
     #[arg(long)]
     pub(crate) service_name: String,
 }
