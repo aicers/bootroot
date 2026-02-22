@@ -36,7 +36,7 @@ use super::constants::{
     STEPCA_PASSWORD_TEMPLATE_NAME,
 };
 
-const STATIC_SECRET_RENDER_INTERVAL: &str = "5m";
+const STATIC_SECRET_RENDER_INTERVAL: &str = "30s";
 use super::paths::{
     OpenBaoAgentPaths, ResponderPaths, StepCaTemplatePaths, compose_has_openbao,
     compose_has_responder, resolve_openbao_agent_addr, resolve_responder_url, to_container_path,
@@ -2557,8 +2557,8 @@ services:
             "config should contain template_config block"
         );
         assert!(
-            config.contains("static_secret_render_interval = \"5m\""),
-            "config should set static_secret_render_interval to 5m"
+            config.contains("static_secret_render_interval = \"30s\""),
+            "config should set static_secret_render_interval to 30s"
         );
         assert!(
             config.contains("vault {"),
