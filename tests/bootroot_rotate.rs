@@ -1160,3 +1160,388 @@ async fn test_rotate_force_reissue_missing_service_fails() {
     );
     assert!(stderr.contains("Service not found"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_db_writes_kv_and_restarts_stepca() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    // Start mock PostgreSQL server.
+    let (pg_port, _pg_handle) = start_mock_postgres();
+
+    let admin_dsn =
+        format!("postgresql://admin:adminpass@127.0.0.1:{pg_port}/postgres?sslmode=disable");
+    let current_dsn =
+        format!("postgresql://step:old-pass@127.0.0.1:{pg_port}/stepca?sslmode=disable");
+
+    // Write state.json.
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    // Create secrets/config/ca.json with a current DSN.
+    let secrets_dir = temp_dir.path().join("secrets");
+    fs::create_dir_all(secrets_dir.join("config")).expect("create config dir");
+    fs::write(
+        secrets_dir.join("config").join("ca.json"),
+        serde_json::to_string(&json!({
+            "db": {
+                "type": "postgresql",
+                "dataSource": current_dsn
+            }
+        }))
+        .expect("serialize ca.json"),
+    )
+    .expect("write ca.json");
+
+    let compose_file = temp_dir.path().join("docker-compose.yml");
+    fs::write(&compose_file, "services: {}\n").expect("write compose file");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+
+    // The new DSN that `rotate_db` will build after provisioning.
+    let expected_new_dsn =
+        format!("postgresql://step:new-db-pass-123@127.0.0.1:{pg_port}/stepca?sslmode=disable");
+
+    stub_openbao_for_db_rotation(&openbao, &expected_new_dsn).await;
+
+    let path_env = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path_env);
+    // Fake docker copies RENDER_SOURCE → RENDER_TARGET on OBA restart,
+    // simulating OpenBao Agent rendering the ca.json template.
+    let render_source = secrets_dir.join("config").join("ca.json.new");
+    fs::write(
+        &render_source,
+        serde_json::to_string(&json!({
+            "db": {
+                "type": "postgresql",
+                "dataSource": expected_new_dsn
+            }
+        }))
+        .expect("serialize new ca.json"),
+    )
+    .expect("write ca.json.new");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--compose-file",
+            compose_file.to_string_lossy().as_ref(),
+            "--yes",
+            "db",
+            "--db-admin-dsn",
+            &admin_dsn,
+            "--db-password",
+            "new-db-pass-123",
+        ])
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
+        .env("RENDER_SOURCE", &render_source)
+        .env("RENDER_TARGET", secrets_dir.join("config").join("ca.json"))
+        .output()
+        .expect("run rotate db");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("bootroot rotate: summary"));
+
+    // Verify OBA-stepca restart comes BEFORE compose restart step-ca.
+    let docker_args_log = fs::read_to_string(&docker_log).expect("read docker log");
+    let lines: Vec<&str> = docker_args_log.lines().collect();
+    let oba_restart_idx = lines
+        .iter()
+        .position(|line| line.contains("restart") && line.contains("bootroot-openbao-agent-stepca"))
+        .unwrap_or_else(|| panic!("restart OBA-stepca should be invoked\nlog:\n{docker_args_log}"));
+    let compose_restart_idx = lines
+        .iter()
+        .position(|line| {
+            line.contains("compose") && line.contains("restart") && line.contains("step-ca")
+        })
+        .unwrap_or_else(|| {
+            panic!("restart step-ca command should be invoked\nlog:\n{docker_args_log}")
+        });
+    assert!(
+        oba_restart_idx < compose_restart_idx,
+        "OBA restart should come before compose restart\nlog:\n{docker_args_log}"
+    );
+
+    // Verify ca.json was rendered with the new DSN.
+    let rendered = fs::read_to_string(secrets_dir.join("config").join("ca.json"))
+        .expect("read rendered ca.json");
+    assert!(
+        rendered.contains("new-db-pass-123"),
+        "ca.json should contain the new password:\n{rendered}"
+    );
+}
+
+async fn stub_openbao_for_db_rotation(server: &MockServer, expected_dsn: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/stepca/db"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "data": {
+                "dsn": expected_dsn
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+}
+
+/// Starts a mock `PostgreSQL` wire-protocol server on a random port.
+///
+/// Returns the port and a join handle for the background thread.
+fn start_mock_postgres() -> (u16, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock pg");
+    let port = listener.local_addr().expect("mock pg addr").port();
+    let handle = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            mock_pg_session(stream);
+        }
+    });
+    (port, handle)
+}
+
+/// Handles a single `PostgreSQL` wire-protocol session for the mock server.
+///
+/// Supports the startup handshake and the extended query protocol messages
+/// used by the `postgres` crate: Parse, Bind, Describe, Execute, Sync, Close.
+#[allow(clippy::too_many_lines)]
+fn mock_pg_session(mut stream: std::net::TcpStream) {
+    use std::io::{Read, Write};
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("set read timeout");
+
+    let mut buf = [0u8; 4096];
+
+    // Read startup message (may be SSL probe first).
+    let n = stream.read(&mut buf).expect("read startup");
+    if n == 0 {
+        return;
+    }
+
+    // SSL probe: 8 bytes with code 80877103.
+    if n == 8 {
+        let code = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        if code == 80_877_103 {
+            stream.write_all(b"N").expect("write ssl reject");
+            stream.flush().expect("flush ssl reject");
+            let _n2 = stream.read(&mut buf).expect("read real startup");
+        }
+    }
+
+    mock_pg_send_startup(&mut stream);
+
+    let mut is_select = false;
+    let mut param_count: u16 = 0;
+    while let Some(tag) = mock_pg_read_byte(&mut stream) {
+        match tag {
+            b'P' => {
+                let payload = mock_pg_read_payload(&mut stream);
+                mock_pg_handle_parse(&payload, &mut is_select, &mut param_count);
+                stream
+                    .write_all(&[b'1', 0, 0, 0, 4])
+                    .expect("write ParseComplete");
+            }
+            b'D' => {
+                let payload = mock_pg_read_payload(&mut stream);
+                mock_pg_handle_describe(&mut stream, &payload, is_select, param_count);
+            }
+            b'B' => {
+                let _payload = mock_pg_read_payload(&mut stream);
+                stream
+                    .write_all(&[b'2', 0, 0, 0, 4])
+                    .expect("write BindComplete");
+            }
+            b'E' => {
+                let _payload = mock_pg_read_payload(&mut stream);
+                mock_pg_send_command_complete(&mut stream, is_select);
+            }
+            b'S' => {
+                let _payload = mock_pg_read_payload(&mut stream);
+                stream
+                    .write_all(&[b'Z', 0, 0, 0, 5, b'I'])
+                    .expect("write ReadyForQuery");
+                stream.flush().expect("flush sync");
+            }
+            b'C' => {
+                let _payload = mock_pg_read_payload(&mut stream);
+                stream
+                    .write_all(&[b'3', 0, 0, 0, 4])
+                    .expect("write CloseComplete");
+            }
+            b'X' => {
+                let _payload = mock_pg_read_payload(&mut stream);
+                break;
+            }
+            _ => {
+                let _payload = mock_pg_read_payload(&mut stream);
+            }
+        }
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn mock_pg_send_startup(stream: &mut std::net::TcpStream) {
+    use std::io::Write;
+
+    // AuthenticationOk: 'R' + i32(8) + i32(0)
+    stream
+        .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0])
+        .expect("write auth ok");
+
+    // Required ParameterStatus messages.
+    for (key, val) in [
+        ("server_version", "16.0"),
+        ("client_encoding", "UTF8"),
+        ("server_encoding", "UTF8"),
+        ("integer_datetimes", "on"),
+    ] {
+        let mut msg = vec![b'S'];
+        let body_len: i32 = 4 + key.len() as i32 + 1 + val.len() as i32 + 1;
+        msg.extend_from_slice(&body_len.to_be_bytes());
+        msg.extend_from_slice(key.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(val.as_bytes());
+        msg.push(0);
+        stream.write_all(&msg).expect("write ParameterStatus");
+    }
+
+    // BackendKeyData: 'K' + i32(12) + pid(4) + secret(4)
+    stream
+        .write_all(&[b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 1])
+        .expect("write BackendKeyData");
+
+    // ReadyForQuery (idle): 'Z' + i32(5) + 'I'
+    stream
+        .write_all(&[b'Z', 0, 0, 0, 5, b'I'])
+        .expect("write ready");
+    stream.flush().expect("flush startup");
+}
+
+fn mock_pg_handle_parse(payload: &[u8], is_select: &mut bool, param_count: &mut u16) {
+    // Parse payload: statement_name\0 + query\0 + i16(param_types) + type_oids...
+    if let Some(pos) = payload.iter().position(|&b| b == 0) {
+        let after = &payload[pos + 1..];
+        if let Some(end) = after.iter().position(|&b| b == 0) {
+            let query_str = String::from_utf8_lossy(&after[..end]).to_string();
+            *is_select = query_str.to_uppercase().starts_with("SELECT");
+            // Count $N placeholders — the client may send 0 param types
+            // in Parse (meaning "server decides").
+            *param_count = 0;
+            for i in 1..=10u16 {
+                if query_str.contains(&format!("${i}")) {
+                    *param_count = i;
+                }
+            }
+        }
+    }
+}
+
+fn mock_pg_handle_describe(
+    stream: &mut std::net::TcpStream,
+    payload: &[u8],
+    is_select: bool,
+    param_count: u16,
+) {
+    use std::io::Write;
+
+    let describe_type = payload.first().copied().unwrap_or(b'?');
+
+    if describe_type == b'S' {
+        // ParameterDescription: 't' + len + i16(count) + type_oids...
+        let pd_body: i32 = 4 + 2 + i32::from(param_count) * 4;
+        let mut msg = vec![b't'];
+        msg.extend_from_slice(&pd_body.to_be_bytes());
+        msg.extend_from_slice(&param_count.to_be_bytes());
+        for _ in 0..param_count {
+            msg.extend_from_slice(&25i32.to_be_bytes()); // TEXT OID
+        }
+        stream.write_all(&msg).expect("write ParamDesc");
+    }
+
+    if is_select {
+        // RowDescription with 1 column (int4).
+        // Fixed layout: 'T' + len + i16(1) + "col\0" + table_oid(4) +
+        //   col_num(2) + type_oid(4) + type_size(2) + type_mod(4) + fmt(2)
+        let col_name = b"col\0";
+        let body_len: i32 = 4 + 2 + 4 + 4 + 2 + 4 + 2 + 4 + 2; // col_name is 4 bytes
+        let mut msg = vec![b'T'];
+        msg.extend_from_slice(&body_len.to_be_bytes());
+        msg.extend_from_slice(&1i16.to_be_bytes());
+        msg.extend_from_slice(col_name);
+        msg.extend_from_slice(&0i32.to_be_bytes()); // table OID
+        msg.extend_from_slice(&0i16.to_be_bytes()); // column num
+        msg.extend_from_slice(&23i32.to_be_bytes()); // type OID (int4)
+        msg.extend_from_slice(&4i16.to_be_bytes()); // type size
+        msg.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
+        msg.extend_from_slice(&0i16.to_be_bytes()); // format code
+        stream.write_all(&msg).expect("write RowDescription");
+    } else {
+        // NoData: 'n' + i32(4)
+        stream.write_all(&[b'n', 0, 0, 0, 4]).expect("write NoData");
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn mock_pg_send_command_complete(stream: &mut std::net::TcpStream, is_select: bool) {
+    use std::io::Write;
+
+    let tag = if is_select {
+        b"SELECT 0\0" as &[u8]
+    } else {
+        b"COMMAND\0"
+    };
+    let len: i32 = 4 + tag.len() as i32;
+    let mut msg = vec![b'C'];
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(tag);
+    stream.write_all(&msg).expect("write CommandComplete");
+}
+
+fn mock_pg_read_byte(stream: &mut std::net::TcpStream) -> Option<u8> {
+    use std::io::Read;
+    let mut b = [0u8; 1];
+    match stream.read_exact(&mut b) {
+        Ok(()) => Some(b[0]),
+        Err(_) => None,
+    }
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn mock_pg_read_payload(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut len_buf = [0u8; 4];
+    if stream.read_exact(&mut len_buf).is_err() {
+        return Vec::new();
+    }
+    let len = i32::from_be_bytes(len_buf);
+    if len <= 4 {
+        return Vec::new();
+    }
+    let payload_len = (len - 4) as usize;
+    let mut payload = vec![0u8; payload_len];
+    if stream.read_exact(&mut payload).is_err() {
+        return Vec::new();
+    }
+    payload
+}
