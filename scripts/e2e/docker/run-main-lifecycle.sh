@@ -339,7 +339,9 @@ reset_stepca_materials_for_e2e() {
     "$SECRETS_DIR/config" \
     "$SECRETS_DIR/certs" \
     "$SECRETS_DIR/db" \
-    "$SECRETS_DIR/secrets"
+    "$SECRETS_DIR/secrets" \
+    "$SECRETS_DIR/password.txt" \
+    "$SECRETS_DIR/password.txt.new"
 }
 
 run_bootstrap_chain() {
