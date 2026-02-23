@@ -374,6 +374,8 @@ run_bootstrap_chain() {
     --stepca-provisioner "admin" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \
+    --eab-kid "dev-kid" \
+    --eab-hmac "dev-hmac" \
     --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
     --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then
     {
@@ -665,6 +667,7 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     stepca-password >>"$RUN_LOG" 2>&1
+  wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-stepca-password"
@@ -679,9 +682,10 @@ run_rotations_with_verification() {
     --auth-mode approle \
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
-    --admin-dsn "postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/stepca?sslmode=disable" \
     --yes \
-    db >>"$RUN_LOG" 2>&1
+    db \
+    --db-admin-dsn "postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/stepca?sslmode=disable" >>"$RUN_LOG" 2>&1
+  wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-db"

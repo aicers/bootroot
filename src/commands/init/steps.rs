@@ -360,6 +360,8 @@ fn build_password_template(kv_mount: &str) -> String {
 }
 
 fn build_ca_json_template(contents: &str, kv_mount: &str, messages: &Messages) -> Result<String> {
+    const PLACEHOLDER: &str = "__BOOTROOT_CTMPL_DB__";
+
     let mut value: serde_json::Value =
         serde_json::from_str(contents).context(messages.error_parse_ca_json_failed())?;
     let db = value
@@ -368,10 +370,19 @@ fn build_ca_json_template(contents: &str, kv_mount: &str, messages: &Messages) -
     let data_source = db
         .get_mut("dataSource")
         .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
-    *data_source = serde_json::Value::String(format!(
-        "{{{{ with secret \"{kv_mount}/data/{PATH_STEPCA_DB}\" }}}}{{{{ .Data.data.value }}}}{{{{ end }}}}"
-    ));
-    serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())
+    *data_source = serde_json::Value::String(PLACEHOLDER.to_string());
+
+    let serialized =
+        serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
+
+    // serde_json escapes double quotes inside strings, but the Go template
+    // engine in OpenBao Agent requires unescaped quotes within {{ }} blocks.
+    // Replace the JSON-quoted placeholder with a raw Go template directive
+    // so the .ctmpl file is parseable by the template engine.
+    let directive = format!(
+        "\"{{{{ with secret \"{kv_mount}/data/{PATH_STEPCA_DB}\" }}}}{{{{ .Data.data.value }}}}{{{{ end }}}}\""
+    );
+    Ok(serialized.replace(&format!("\"{PLACEHOLDER}\""), &directive))
 }
 
 fn build_responder_config(hmac: &str) -> String {
@@ -1706,7 +1717,7 @@ async fn write_openbao_secrets(
         .write_kv(
             kv_mount,
             PATH_STEPCA_DB,
-            serde_json::json!({ "dsn": db_dsn }),
+            serde_json::json!({ "value": db_dsn }),
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
