@@ -40,6 +40,12 @@ DOMAIN="trusted.domain"
 INSTANCE_ID="101"
 INIT_EAB_KID="${INIT_EAB_KID:-dev-kid}"
 INIT_EAB_HMAC="${INIT_EAB_HMAC:-dev-hmac}"
+SERVICE_NAME_2="web-app"
+HOSTNAME_2="web-02"
+INSTANCE_ID_2="102"
+REMOTE_AGENT_CONFIG_PATH_2="$REMOTE_DIR/agent-${SERVICE_NAME_2}.toml"
+SERVICE_KV_PATH_BASE="bootroot/services/${SERVICE_NAME}"
+SERVICE_KV_PATH_BASE_2="bootroot/services/${SERVICE_NAME_2}"
 
 STEPCA_HOST_IP="127.0.0.1"
 RESPONDER_HOST_IP="127.0.0.1"
@@ -54,7 +60,6 @@ RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
 CURRENT_PHASE="init"
-SERVICE_KV_PATH_BASE="bootroot/services/${SERVICE_NAME}"
 
 log_phase() {
   local phase="$1"
@@ -313,11 +318,27 @@ run_bootstrap_chain() {
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
+
+  run_bootroot_control service add \
+    --service-name "$SERVICE_NAME_2" \
+    --deploy-type docker \
+    --delivery-mode remote-bootstrap \
+    --hostname "$HOSTNAME_2" \
+    --domain "$DOMAIN" \
+    --agent-config "$REMOTE_AGENT_CONFIG_PATH_2" \
+    --cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME_2}.crt" \
+    --key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME_2}.key" \
+    --instance-id "$INSTANCE_ID_2" \
+    --container-name "$SERVICE_NAME_2" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 }
 
 copy_remote_bootstrap_materials() {
-  local control_service_dir="$SECRETS_DIR/services/$SERVICE_NAME"
-  local remote_service_dir="$REMOTE_DIR/secrets/services/$SERVICE_NAME"
+  local service="$1"
+  local control_service_dir="$SECRETS_DIR/services/$service"
+  local remote_service_dir="$REMOTE_DIR/secrets/services/$service"
   mkdir -p "$remote_service_dir"
   cp "$control_service_dir/role_id" "$remote_service_dir/role_id"
   cp "$control_service_dir/secret_id" "$remote_service_dir/secret_id"
@@ -330,26 +351,40 @@ wire_stepca_hosts() {
   [ -n "${responder_ip:-}" ] || fail "Failed to resolve responder container IP"
   docker exec bootroot-ca sh -c \
     "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${SERVICE_NAME}.${HOSTNAME}.${DOMAIN}' >> /etc/hosts"
+  docker exec bootroot-ca sh -c \
+    "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID_2}.${SERVICE_NAME_2}.${HOSTNAME_2}.${DOMAIN}' >> /etc/hosts"
 }
 
-wait_for_stepca_http01_target() {
-  local host="${INSTANCE_ID}.${SERVICE_NAME}.${HOSTNAME}.${DOMAIN}"
-  local attempt
-  for attempt in $(seq 1 "$HTTP01_TARGET_ATTEMPTS"); do
-    if docker exec bootroot-ca bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${host}/80'" >/dev/null 2>&1; then
-      return 0
-    fi
-    if [ "$attempt" -eq "$HTTP01_TARGET_ATTEMPTS" ]; then
-      fail "step-ca cannot reach HTTP-01 target: ${host}:80"
-    fi
-    sleep "$HTTP01_TARGET_DELAY_SECS"
+wait_for_stepca_http01_targets() {
+  local hosts
+  hosts=(
+    "${INSTANCE_ID}.${SERVICE_NAME}.${HOSTNAME}.${DOMAIN}"
+    "${INSTANCE_ID_2}.${SERVICE_NAME_2}.${HOSTNAME_2}.${DOMAIN}"
+  )
+
+  local host
+  for host in "${hosts[@]}"; do
+    local attempt
+    for attempt in $(seq 1 "$HTTP01_TARGET_ATTEMPTS"); do
+      if docker exec bootroot-ca bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${host}/80'" >/dev/null 2>&1; then
+        break
+      fi
+      if [ "$attempt" -eq "$HTTP01_TARGET_ATTEMPTS" ]; then
+        fail "step-ca cannot reach HTTP-01 target: ${host}:80"
+      fi
+      sleep "$HTTP01_TARGET_DELAY_SECS"
+    done
   done
 }
 
 run_remote_bootstrap() {
-  local role_id_path="$REMOTE_DIR/secrets/services/$SERVICE_NAME/role_id"
-  local secret_id_path="$REMOTE_DIR/secrets/services/$SERVICE_NAME/secret_id"
-  local eab_path="$REMOTE_DIR/secrets/services/$SERVICE_NAME/eab.json"
+  local service="$1"
+  local agent_config="$2"
+  local hostname_val="$3"
+  local instance_id="$4"
+  local role_id_path="$REMOTE_DIR/secrets/services/$service/role_id"
+  local secret_id_path="$REMOTE_DIR/secrets/services/$service/secret_id"
+  local eab_path="$REMOTE_DIR/secrets/services/$service/eab.json"
   local ca_bundle_path="$REMOTE_CERTS_DIR/ca-bundle.pem"
 
   (
@@ -357,74 +392,82 @@ run_remote_bootstrap() {
     "$BOOTROOT_REMOTE_BIN" bootstrap \
       --openbao-url "http://${STEPCA_HOST_IP}:8200" \
       --kv-mount "secret" \
-      --service-name "$SERVICE_NAME" \
+      --service-name "$service" \
       --role-id-path "$role_id_path" \
       --secret-id-path "$secret_id_path" \
       --eab-file-path "$eab_path" \
-      --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
+      --agent-config-path "$agent_config" \
       --agent-email "admin@example.com" \
       --agent-server "$STEPCA_SERVER_URL" \
       --agent-domain "$DOMAIN" \
       --agent-responder-url "$RESPONDER_URL" \
-      --profile-hostname "$HOSTNAME" \
-      --profile-instance-id "$INSTANCE_ID" \
-      --profile-cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt" \
-      --profile-key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key" \
+      --profile-hostname "$hostname_val" \
+      --profile-instance-id "$instance_id" \
+      --profile-cert-path "$REMOTE_CERTS_DIR/${service}.crt" \
+      --profile-key-path "$REMOTE_CERTS_DIR/${service}.key" \
       --ca-bundle-path "$ca_bundle_path" \
       --output json >>"$RUN_LOG" 2>&1
   )
 }
 
 verify_with_retry() {
+  local service="$1"
+  local agent_config="$2"
   local attempt
   local agent_bin_dir
   agent_bin_dir="$(dirname "$BOOTROOT_AGENT_BIN")"
   for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
-    if PATH="${agent_bin_dir}:$PATH" run_bootroot_control verify --service-name "$SERVICE_NAME" --agent-config "$REMOTE_AGENT_CONFIG_PATH" >>"$RUN_LOG" 2>&1; then
+    if PATH="${agent_bin_dir}:$PATH" run_bootroot_control verify --service-name "$service" --agent-config "$agent_config" >>"$RUN_LOG" 2>&1; then
       return 0
     fi
     if [ "$attempt" -eq "$VERIFY_ATTEMPTS" ]; then
-      fail "verify failed for ${SERVICE_NAME} after ${VERIFY_ATTEMPTS} attempts"
+      fail "verify failed for ${service} after ${VERIFY_ATTEMPTS} attempts"
     fi
     sleep "$VERIFY_DELAY_SECS"
   done
 }
 
 snapshot_cert_meta() {
-  local label="$1"
-  local cert_path="$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt"
-  local meta_file="$CERT_META_DIR/${SERVICE_NAME}-${label}.txt"
+  local service="$1"
+  local label="$2"
+  local cert_path="$REMOTE_CERTS_DIR/${service}.crt"
+  local meta_file="$CERT_META_DIR/${service}-${label}.txt"
   [ -f "$cert_path" ] || fail "Missing certificate: $cert_path"
   openssl x509 -in "$cert_path" -noout -serial -startdate -enddate -fingerprint -sha256 >"$meta_file"
 }
 
 fingerprint_of() {
-  local label="$1"
-  local meta_file="$CERT_META_DIR/${SERVICE_NAME}-${label}.txt"
+  local service="$1"
+  local label="$2"
+  local meta_file="$CERT_META_DIR/${service}-${label}.txt"
   awk -F= '/^sha256 Fingerprint=/{print $2}' "$meta_file"
 }
 
 assert_fingerprint_changed() {
-  local before_label="$1"
-  local after_label="$2"
+  local service="$1"
+  local before_label="$2"
+  local after_label="$3"
   local before_fp after_fp
-  before_fp="$(fingerprint_of "$before_label")"
-  after_fp="$(fingerprint_of "$after_label")"
-  [ -n "$before_fp" ] || fail "Missing fingerprint for ${SERVICE_NAME}/${before_label}"
-  [ -n "$after_fp" ] || fail "Missing fingerprint for ${SERVICE_NAME}/${after_label}"
-  [ "$before_fp" != "$after_fp" ] || fail "Fingerprint did not change for ${SERVICE_NAME} (${before_label} -> ${after_label})"
+  before_fp="$(fingerprint_of "$service" "$before_label")"
+  after_fp="$(fingerprint_of "$service" "$after_label")"
+  [ -n "$before_fp" ] || fail "Missing fingerprint for ${service}/${before_label}"
+  [ -n "$after_fp" ] || fail "Missing fingerprint for ${service}/${after_label}"
+  [ "$before_fp" != "$after_fp" ] || fail "Fingerprint did not change for ${service} (${before_label} -> ${after_label})"
 }
 
 run_verify_pair() {
   local label="$1"
   log_phase "verify-${label}"
-  verify_with_retry
-  snapshot_cert_meta "$label"
+  verify_with_retry "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH"
+  verify_with_retry "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2"
+  snapshot_cert_meta "$SERVICE_NAME" "$label"
+  snapshot_cert_meta "$SERVICE_NAME_2" "$label"
 }
 
 openbao_write_service_kv() {
-  local item="$1"
-  local payload="$2"
+  local kv_path_base="$1"
+  local item="$2"
+  local payload="$3"
   local runtime_token
   runtime_token="$(
     curl -fsS \
@@ -442,12 +485,13 @@ openbao_write_service_kv() {
     -X POST \
     -H "X-Vault-Token: ${runtime_token}" \
     -H "Content-Type: application/json" \
-    "http://${STEPCA_HOST_IP}:8200/v1/secret/data/${SERVICE_KV_PATH_BASE}/${item}" \
+    "http://${STEPCA_HOST_IP}:8200/v1/secret/data/${kv_path_base}/${item}" \
     -d "$payload" >/dev/null
 }
 
 force_reissue_remote_service() {
-  rm -f "$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt" "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key"
+  local service="$1"
+  rm -f "$REMOTE_CERTS_DIR/${service}.crt" "$REMOTE_CERTS_DIR/${service}.key"
 }
 
 run_rotation_secret_id() {
@@ -461,6 +505,15 @@ run_rotation_secret_id() {
     --yes \
     approle-secret-id \
     --service-name "$SERVICE_NAME" >>"$RUN_LOG" 2>&1
+  run_bootroot_control rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
+    --yes \
+    approle-secret-id \
+    --service-name "$SERVICE_NAME_2" >>"$RUN_LOG" 2>&1
 }
 
 run_rotation_eab() {
@@ -469,7 +522,8 @@ run_rotation_eab() {
   kid="remote-kid-$(date +%s)"
   hmac="remote-hmac-$(date +%s)"
   payload="$(jq -n --arg kid "$kid" --arg hmac "$hmac" '{data:{kid:$kid,hmac:$hmac}}')"
-  openbao_write_service_kv "eab" "$payload"
+  openbao_write_service_kv "$SERVICE_KV_PATH_BASE" "eab" "$payload"
+  openbao_write_service_kv "$SERVICE_KV_PATH_BASE_2" "eab" "$payload"
 }
 
 run_rotation_trust_sync() {
@@ -491,7 +545,8 @@ PY
   extra_fingerprint="$(openssl rand -hex 32)"
   ca_bundle_pem="$(cat "$REMOTE_CERTS_DIR/ca-bundle.pem")"
   payload="$(jq -n --argjson current "$current_trust_json" --arg extra "$extra_fingerprint" --arg pem "$ca_bundle_pem" '{data:{trusted_ca_sha256:($current + [$extra]),ca_bundle_pem:$pem}}')"
-  openbao_write_service_kv "trust" "$payload"
+  openbao_write_service_kv "$SERVICE_KV_PATH_BASE" "trust" "$payload"
+  openbao_write_service_kv "$SERVICE_KV_PATH_BASE_2" "trust" "$payload"
 }
 
 run_rotation_responder_hmac() {
@@ -521,43 +576,56 @@ main() {
   prepare_test_ca_materials
 
   run_bootstrap_chain
-  copy_remote_bootstrap_materials
+  copy_remote_bootstrap_materials "$SERVICE_NAME"
+  copy_remote_bootstrap_materials "$SERVICE_NAME_2"
   wire_stepca_hosts
-  wait_for_stepca_http01_target
+  wait_for_stepca_http01_targets
 
   log_phase "bootstrap-initial"
-  run_remote_bootstrap
+  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
+  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
 
   run_verify_pair "initial"
 
   run_rotation_secret_id
   log_phase "bootstrap-after-secret-id"
-  run_remote_bootstrap
-  force_reissue_remote_service
+  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
+  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
+  force_reissue_remote_service "$SERVICE_NAME"
+  force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-secret-id"
-  assert_fingerprint_changed "initial" "after-secret-id"
+  assert_fingerprint_changed "$SERVICE_NAME" "initial" "after-secret-id"
+  assert_fingerprint_changed "$SERVICE_NAME_2" "initial" "after-secret-id"
 
   run_rotation_eab
   log_phase "bootstrap-after-eab"
-  run_remote_bootstrap
-  force_reissue_remote_service
+  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
+  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
+  force_reissue_remote_service "$SERVICE_NAME"
+  force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-eab"
-  assert_fingerprint_changed "after-secret-id" "after-eab"
+  assert_fingerprint_changed "$SERVICE_NAME" "after-secret-id" "after-eab"
+  assert_fingerprint_changed "$SERVICE_NAME_2" "after-secret-id" "after-eab"
 
   run_rotation_trust_sync
   log_phase "bootstrap-after-trust-sync"
-  run_remote_bootstrap
-  force_reissue_remote_service
+  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
+  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
+  force_reissue_remote_service "$SERVICE_NAME"
+  force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-trust-sync"
-  assert_fingerprint_changed "after-eab" "after-trust-sync"
+  assert_fingerprint_changed "$SERVICE_NAME" "after-eab" "after-trust-sync"
+  assert_fingerprint_changed "$SERVICE_NAME_2" "after-eab" "after-trust-sync"
 
   run_rotation_responder_hmac
   log_phase "bootstrap-after-responder-hmac"
-  run_remote_bootstrap
-
-  force_reissue_remote_service
+  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
+  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
+  force_reissue_remote_service "$SERVICE_NAME"
+  force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-responder-hmac"
-  assert_fingerprint_changed "after-trust-sync" "after-responder-hmac"
+  assert_fingerprint_changed "$SERVICE_NAME" "after-trust-sync" "after-responder-hmac"
+  assert_fingerprint_changed "$SERVICE_NAME_2" "after-trust-sync" "after-responder-hmac"
 }
 
 main "$@"
