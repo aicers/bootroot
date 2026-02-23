@@ -359,6 +359,8 @@ async fn rotate_responder_hmac(
     restart_container(OPENBAO_AGENT_RESPONDER_CONTAINER, messages)?;
     wait_for_rendered_file(&responder_path, &hmac, RENDERED_FILE_TIMEOUT, messages).await?;
 
+    restart_service_sidecar_agents(ctx, &hmac, messages).await?;
+
     let mut reloaded = false;
     if compose_has_responder(&ctx.compose_file, messages)? {
         reload_compose_service(&ctx.compose_file, "bootroot-http01", messages)?;
@@ -762,6 +764,38 @@ fn reload_openbao_agent_daemon(entry: &ServiceEntry, messages: &Messages) -> Res
 #[cfg(not(unix))]
 fn reload_openbao_agent_daemon(_entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
+}
+
+async fn restart_service_sidecar_agents(
+    ctx: &RotateContext,
+    expected_hmac: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let mut agent_config_paths = std::collections::BTreeSet::new();
+    for entry in ctx.state.services.values() {
+        if !matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
+            continue;
+        }
+        let container = openbao_agent_container_name(&entry.service_name);
+        let _ = try_restart_container(&container);
+        agent_config_paths.insert(entry.agent_config_path.clone());
+    }
+    for path in &agent_config_paths {
+        wait_for_rendered_file(path, expected_hmac, RENDERED_FILE_TIMEOUT, messages).await?;
+    }
+    Ok(())
+}
+
+fn try_restart_container(container: &str) -> Result<()> {
+    let status = std::process::Command::new("docker")
+        .args(["restart", container])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("container {container} not found or restart failed");
+    }
+    Ok(())
 }
 
 fn openbao_agent_container_name(service_name: &str) -> String {
