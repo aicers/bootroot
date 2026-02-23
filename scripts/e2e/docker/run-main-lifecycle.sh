@@ -181,8 +181,10 @@ start_service_sidecar_oba() {
 
   # Run sidecar OBA sharing the OpenBao container network so that
   # localhost:8200 in agent.hcl resolves to the OpenBao server.
+  # --user ensures the container can read secrets/ (0700, owned by runner).
   docker run -d \
     --name "$container" \
+    --user "$(id -u):$(id -g)" \
     --network "container:bootroot-openbao" \
     -v "$ROOT_DIR:$ROOT_DIR" \
     -v "$ARTIFACT_DIR:$ARTIFACT_DIR" \
