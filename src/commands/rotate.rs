@@ -310,7 +310,7 @@ async fn rotate_db(
         .write_kv(
             &ctx.kv_mount,
             PATH_STEPCA_DB,
-            serde_json::json!({ "dsn": new_dsn }),
+            serde_json::json!({ "value": new_dsn }),
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;

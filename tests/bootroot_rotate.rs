@@ -1297,7 +1297,7 @@ async fn stub_openbao_for_db_rotation(server: &MockServer, expected_dsn: &str) {
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .and(body_json(json!({
             "data": {
-                "dsn": expected_dsn
+                "value": expected_dsn
             }
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
