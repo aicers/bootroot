@@ -73,5 +73,11 @@ before generating code.
 * Before committing, ensure the `check` job (Quality Check) in `.github/workflows/ci.yml`
   would pass for the changed files.
 * Before pushing or opening a PR, ensure all CI jobs pass (`check`,
-  `test-core`, `test-docker-e2e-matrix`). The Docker E2E job may be skipped
-  locally unless your changes affect the Docker lifecycle or E2E scripts.
+  `test-core`, `test-docker-e2e-matrix` from `ci.yml`, and
+  `run-extended` from `e2e-extended.yml`).
+* **Local E2E verification**: Run the Docker E2E scripts locally before
+  pushing. At minimum, run `scripts/e2e/docker/run-main-lifecycle.sh` and
+  `scripts/e2e/docker/run-extended-suite.sh`. These may be skipped only
+  when your changes do not affect the Docker lifecycle, E2E scripts, or
+  any code paths exercised by the E2E tests (rotation, service add/verify,
+  daemon, config, etc.).

@@ -132,6 +132,15 @@ async fn test_same_host_local_rotation_sequence_keeps_service_operational() {
         ROLE_ID
     );
 
+    // Simulate OBA sidecar rendering agent.toml from ctmpl with rotated KV
+    // values. In production the sidecar polls KV via static_secret_render_interval
+    // and re-renders the template; here we write the expected output directly.
+    simulate_oba_sidecar_render(
+        &files.agent_config,
+        "eab-kid-2",
+        "eab-hmac-2",
+        "hmac-updated",
+    );
     let agent_contents = fs::read_to_string(&files.agent_config).expect("read agent.toml");
     assert!(agent_contents.contains("[eab]"));
     assert!(agent_contents.contains("kid = \"eab-kid-2\""));
@@ -350,6 +359,23 @@ fn run_rotate_responder_hmac(root: &Path, openbao_url: &str, hmac: &str) -> anyh
     fs::write(&render_source, format!("hmac_secret = \"{hmac}\"\n"))
         .context("write render source")?;
 
+    // Register sidecar OBA render mapping: when docker restart is called for
+    // the service sidecar container, the fake docker writes agent.toml with
+    // the rotated HMAC, simulating what the real OBA would render from ctmpl.
+    let agent_render_source = root.join("agent-render-src.toml");
+    fs::write(
+        &agent_render_source,
+        format!("[acme]\nhttp_responder_hmac = \"{hmac}\"\n"),
+    )
+    .context("write agent render source")?;
+    let agent_config = root.join("agent.toml");
+    let render_map_dir = write_render_map(
+        root,
+        &format!("bootroot-openbao-agent-{SERVICE_NAME}"),
+        &agent_render_source,
+        &agent_config,
+    )?;
+
     let path_env = env::var("PATH").unwrap_or_default();
     let combined_path = format!("{}:{path_env}", root.join("bin").display());
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
@@ -358,6 +384,7 @@ fn run_rotate_responder_hmac(root: &Path, openbao_url: &str, hmac: &str) -> anyh
         .env("DOCKER_OUTPUT", root.join("docker.log"))
         .env("RENDER_SOURCE", &render_source)
         .env("RENDER_TARGET", responder_dir.join("responder.toml"))
+        .env("RENDER_MAP_DIR", &render_map_dir)
         .args([
             "rotate",
             "--openbao-url",
@@ -479,11 +506,19 @@ if [ -n "${DOCKER_OUTPUT:-}" ]; then
   printf "%s\n" "$*" >> "$DOCKER_OUTPUT"
 fi
 
-# Simulate OpenBao Agent rendering on restart of OBA containers
+# Simulate OpenBao Agent rendering on restart of OBA containers.
+# Each container can have its own render mapping registered via a file
+# at $RENDER_MAP_DIR/<container-name> containing two lines: source, target.
+# Falls back to the global RENDER_SOURCE / RENDER_TARGET env vars.
 if [ "${1:-}" = "restart" ]; then
   case "${2:-}" in
     bootroot-openbao-agent-*)
-      if [ -n "${RENDER_SOURCE:-}" ] && [ -n "${RENDER_TARGET:-}" ]; then
+      container="${2}"
+      if [ -n "${RENDER_MAP_DIR:-}" ] && [ -f "${RENDER_MAP_DIR}/${container}" ]; then
+        src="$(sed -n '1p' "${RENDER_MAP_DIR}/${container}")"
+        dst="$(sed -n '2p' "${RENDER_MAP_DIR}/${container}")"
+        cp "$src" "$dst"
+      elif [ -n "${RENDER_SOURCE:-}" ] && [ -n "${RENDER_TARGET:-}" ]; then
         cp "$RENDER_SOURCE" "$RENDER_TARGET"
       fi
       ;;
@@ -497,6 +532,33 @@ exit 0
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .context("chmod fake docker")?;
     Ok(())
+}
+
+fn write_render_map(
+    root: &Path,
+    container: &str,
+    source: &Path,
+    target: &Path,
+) -> anyhow::Result<PathBuf> {
+    let map_dir = root.join("render-map");
+    fs::create_dir_all(&map_dir).context("create render-map dir")?;
+    let content = format!("{}\n{}\n", source.display(), target.display());
+    fs::write(map_dir.join(container), content).context("write render map entry")?;
+    Ok(map_dir)
+}
+
+fn simulate_oba_sidecar_render(agent_config: &Path, eab_kid: &str, eab_hmac: &str, hmac: &str) {
+    let rendered = format!(
+        "\
+[acme]
+http_responder_hmac = \"{hmac}\"
+
+[eab]
+kid = \"{eab_kid}\"
+hmac = \"{eab_hmac}\"
+"
+    );
+    fs::write(agent_config, rendered).expect("simulate OBA sidecar render");
 }
 
 fn write_fake_pkill(root: &Path, exit_code: i32) -> anyhow::Result<()> {

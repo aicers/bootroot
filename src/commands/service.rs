@@ -42,6 +42,7 @@ const SERVICE_CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
 const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
 const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
+const SIDECAR_STATIC_SECRET_RENDER_INTERVAL: &str = "30s";
 
 pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) -> Result<()> {
     let state_path = StateFile::default_path();
@@ -814,6 +815,7 @@ auto_auth {{
     config = {{
       role_id_file_path = "{role_id_path}"
       secret_id_file_path = "{secret_id_path}"
+      remove_secret_id_file_after_reading = false
     }}
   }}
   sink "file" {{
@@ -821,6 +823,10 @@ auto_auth {{
       path = "{token_path}"
     }}
   }}
+}}
+
+template_config {{
+  static_secret_render_interval = "{SIDECAR_STATIC_SECRET_RENDER_INTERVAL}"
 }}
 
 template {{

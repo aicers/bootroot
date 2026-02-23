@@ -53,6 +53,10 @@ RUNTIME_SERVICE_ADD_ROLE_ID=""
 RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
+SIDECAR_OBA_SERVICE="$WEB_SERVICE"
+SIDECAR_OBA_CONTAINER="bootroot-openbao-agent-${SIDECAR_OBA_SERVICE}"
+SIDECAR_OBA_READY_ATTEMPTS="${SIDECAR_OBA_READY_ATTEMPTS:-30}"
+SIDECAR_OBA_READY_DELAY_SECS="${SIDECAR_OBA_READY_DELAY_SECS:-2}"
 CURRENT_PHASE="init"
 
 log_phase() {
@@ -165,6 +169,39 @@ capture_artifacts() {
   docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs bootroot-openbao-agent-stepca >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs bootroot-openbao-agent-responder >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+  docker logs "$SIDECAR_OBA_CONTAINER" >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+}
+
+start_service_sidecar_oba() {
+  local service="$1"
+  local container="bootroot-openbao-agent-${service}"
+  local agent_hcl="$SECRETS_DIR/openbao/services/${service}/agent.hcl"
+
+  docker rm -f "$container" >/dev/null 2>&1 || true
+
+  # Run sidecar OBA sharing the OpenBao container network so that
+  # localhost:8200 in agent.hcl resolves to the OpenBao server.
+  docker run -d \
+    --name "$container" \
+    --network "container:bootroot-openbao" \
+    -v "$ROOT_DIR:$ROOT_DIR" \
+    -v "$ARTIFACT_DIR:$ARTIFACT_DIR" \
+    openbao/openbao:latest \
+    agent -config="$agent_hcl" >>"$RUN_LOG" 2>&1
+
+  local attempt
+  for attempt in $(seq 1 "$SIDECAR_OBA_READY_ATTEMPTS"); do
+    if [ -f "$AGENT_CONFIG_PATH" ] && grep -q 'http_responder_hmac' "$AGENT_CONFIG_PATH" 2>/dev/null; then
+      return 0
+    fi
+    sleep "$SIDECAR_OBA_READY_DELAY_SECS"
+  done
+  docker logs "$container" >>"$RUN_LOG" 2>&1 || true
+  fail "sidecar OBA ($container) did not render agent config within timeout"
+}
+
+stop_service_sidecar_oba() {
+  docker rm -f "$SIDECAR_OBA_CONTAINER" >/dev/null 2>&1 || true
 }
 
 cleanup_hosts() {
@@ -185,6 +222,7 @@ cleanup() {
   log_phase "cleanup"
   cleanup_hosts
   capture_artifacts
+  stop_service_sidecar_oba
   compose_down
 }
 
@@ -578,6 +616,8 @@ main() {
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"
+
+  start_service_sidecar_oba "$SIDECAR_OBA_SERVICE"
 
   run_verify_pair "initial"
   run_rotations_with_verification
