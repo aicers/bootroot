@@ -62,6 +62,9 @@ ensure_prerequisites() {
 }
 
 compose_up() {
+  # Pre-create the secrets directory so Docker does not create it as root when
+  # bind-mounting ./secrets:/home/step for the step-ca service.
+  mkdir -p "$ROOT_DIR/secrets"
   docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" up -d $COMPOSE_SERVICES
 }
 
