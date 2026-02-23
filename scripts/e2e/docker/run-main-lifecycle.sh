@@ -40,6 +40,12 @@ WEB_SERVICE="web-app"
 WEB_HOSTNAME="web-01"
 DOMAIN="trusted.domain"
 INSTANCE_ID="001"
+REMOTE_SERVICE="api-gw"
+REMOTE_HOSTNAME="api-01"
+REMOTE_INSTANCE_ID="002"
+REMOTE_DIR="$ARTIFACT_DIR/remote-workspace"
+REMOTE_AGENT_CONFIG="$REMOTE_DIR/agent.toml"
+REMOTE_CERTS_DIR="$REMOTE_DIR/certs"
 
 STEPCA_HOST_IP="127.0.0.1"
 RESPONDER_HOST_IP="127.0.0.1"
@@ -430,6 +436,20 @@ run_bootstrap_chain() {
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
+
+  run_bootroot service add \
+    --service-name "$REMOTE_SERVICE" \
+    --deploy-type daemon \
+    --delivery-mode remote-bootstrap \
+    --hostname "$REMOTE_HOSTNAME" \
+    --domain "$DOMAIN" \
+    --agent-config "$REMOTE_AGENT_CONFIG" \
+    --cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" \
+    --key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
+    --instance-id "$REMOTE_INSTANCE_ID" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 }
 
 wait_for_openbao_api() {
@@ -469,6 +489,8 @@ wire_stepca_hosts() {
     "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${EDGE_SERVICE}.${EDGE_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
   docker exec bootroot-ca sh -c \
     "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${WEB_SERVICE}.${WEB_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
+  docker exec bootroot-ca sh -c \
+    "printf '%s %s\n' '$responder_ip' '${REMOTE_INSTANCE_ID}.${REMOTE_SERVICE}.${REMOTE_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
 }
 
 wait_for_stepca_http01_targets() {
@@ -476,6 +498,7 @@ wait_for_stepca_http01_targets() {
   hosts=(
     "${INSTANCE_ID}.${EDGE_SERVICE}.${EDGE_HOSTNAME}.${DOMAIN}"
     "${INSTANCE_ID}.${WEB_SERVICE}.${WEB_HOSTNAME}.${DOMAIN}"
+    "${REMOTE_INSTANCE_ID}.${REMOTE_SERVICE}.${REMOTE_HOSTNAME}.${DOMAIN}"
   )
 
   local host
@@ -509,7 +532,8 @@ wait_for_stepca_health() {
 snapshot_cert_meta() {
   local service="$1"
   local label="$2"
-  local cert_path="$CERTS_DIR/${service}.crt"
+  local certs_dir="${3:-$CERTS_DIR}"
+  local cert_path="$certs_dir/${service}.crt"
   local meta_file="$CERT_META_DIR/${service}-${label}.txt"
   [ -f "$cert_path" ] || fail "Missing certificate: $cert_path"
   openssl x509 -in "$cert_path" -noout -serial -startdate -enddate -fingerprint -sha256 >"$meta_file"
@@ -527,8 +551,10 @@ run_verify_pair() {
   log_phase "verify-${label}"
   verify_service_with_retry "$EDGE_SERVICE"
   verify_service_with_retry "$WEB_SERVICE"
+  verify_service_with_retry "$REMOTE_SERVICE" "$REMOTE_AGENT_CONFIG"
   snapshot_cert_meta "$EDGE_SERVICE" "$label"
   snapshot_cert_meta "$WEB_SERVICE" "$label"
+  snapshot_cert_meta "$REMOTE_SERVICE" "$label" "$REMOTE_CERTS_DIR"
 }
 
 force_reissue_for_service() {
@@ -536,16 +562,22 @@ force_reissue_for_service() {
   rm -f "$CERTS_DIR/${service}.crt" "$CERTS_DIR/${service}.key"
 }
 
+force_reissue_remote() {
+  rm -f "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key"
+}
+
 force_reissue_all_services() {
   force_reissue_for_service "$EDGE_SERVICE"
   force_reissue_for_service "$WEB_SERVICE"
+  force_reissue_remote
 }
 
 verify_service_with_retry() {
   local service="$1"
+  local agent_config="${2:-$AGENT_CONFIG_PATH}"
   local attempt
   for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
-    if run_bootroot verify --service-name "$service" --agent-config "$AGENT_CONFIG_PATH" >>"$RUN_LOG" 2>&1; then
+    if run_bootroot verify --service-name "$service" --agent-config "$agent_config" >>"$RUN_LOG" 2>&1; then
       return 0
     fi
     if [ "$attempt" -eq "$VERIFY_ATTEMPTS" ]; then
@@ -569,6 +601,44 @@ assert_fingerprint_changed() {
   fi
 }
 
+copy_remote_materials() {
+  local control_service_dir="$SECRETS_DIR/services/$REMOTE_SERVICE"
+  local remote_service_dir="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE"
+  mkdir -p "$remote_service_dir"
+  cp "$control_service_dir/role_id" "$remote_service_dir/role_id"
+  cp "$control_service_dir/secret_id" "$remote_service_dir/secret_id"
+  chmod 600 "$remote_service_dir/role_id" "$remote_service_dir/secret_id"
+}
+
+run_remote_bootstrap() {
+  local role_id_path="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE/role_id"
+  local secret_id_path="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE/secret_id"
+  local eab_path="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE/eab.json"
+  local ca_bundle_path="$REMOTE_CERTS_DIR/ca-bundle.pem"
+
+  (
+    cd "$REMOTE_DIR"
+    "$BOOTROOT_REMOTE_BIN" bootstrap \
+      --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+      --kv-mount "secret" \
+      --service-name "$REMOTE_SERVICE" \
+      --role-id-path "$role_id_path" \
+      --secret-id-path "$secret_id_path" \
+      --eab-file-path "$eab_path" \
+      --agent-config-path "$REMOTE_AGENT_CONFIG" \
+      --agent-email "admin@example.com" \
+      --agent-server "$STEPCA_SERVER_URL" \
+      --agent-domain "$DOMAIN" \
+      --agent-responder-url "$RESPONDER_URL" \
+      --profile-hostname "$REMOTE_HOSTNAME" \
+      --profile-instance-id "$REMOTE_INSTANCE_ID" \
+      --profile-cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" \
+      --profile-key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
+      --ca-bundle-path "$ca_bundle_path" \
+      --output json >>"$RUN_LOG" 2>&1
+  )
+}
+
 run_rotations_with_verification() {
   log_phase "rotate-responder-hmac"
   run_bootroot rotate \
@@ -579,10 +649,45 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     responder-hmac >>"$RUN_LOG" 2>&1
+  run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-responder-hmac"
   assert_fingerprint_changed "$EDGE_SERVICE" "initial" "after-responder-hmac"
   assert_fingerprint_changed "$WEB_SERVICE" "initial" "after-responder-hmac"
+  assert_fingerprint_changed "$REMOTE_SERVICE" "initial" "after-responder-hmac"
+
+  log_phase "rotate-stepca-password"
+  run_bootroot rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
+    --yes \
+    stepca-password >>"$RUN_LOG" 2>&1
+  run_remote_bootstrap
+  force_reissue_all_services
+  run_verify_pair "after-stepca-password"
+  assert_fingerprint_changed "$EDGE_SERVICE" "after-responder-hmac" "after-stepca-password"
+  assert_fingerprint_changed "$WEB_SERVICE" "after-responder-hmac" "after-stepca-password"
+  assert_fingerprint_changed "$REMOTE_SERVICE" "after-responder-hmac" "after-stepca-password"
+
+  log_phase "rotate-db"
+  run_bootroot rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
+    --admin-dsn "postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/stepca?sslmode=disable" \
+    --yes \
+    db >>"$RUN_LOG" 2>&1
+  run_remote_bootstrap
+  force_reissue_all_services
+  run_verify_pair "after-db"
+  assert_fingerprint_changed "$EDGE_SERVICE" "after-stepca-password" "after-db"
+  assert_fingerprint_changed "$WEB_SERVICE" "after-stepca-password" "after-db"
+  assert_fingerprint_changed "$REMOTE_SERVICE" "after-stepca-password" "after-db"
 }
 
 write_manifest() {
@@ -592,13 +697,13 @@ write_manifest() {
   "compose_file": "${COMPOSE_FILE}",
   "state_file": "${ROOT_DIR}/state.json",
   "agent_config_path": "${AGENT_CONFIG_PATH}",
-  "services": ["${EDGE_SERVICE}", "${WEB_SERVICE}"]
+  "services": ["${EDGE_SERVICE}", "${WEB_SERVICE}", "${REMOTE_SERVICE}"]
 }
 EOF
 }
 
 main() {
-  mkdir -p "$ARTIFACT_DIR" "$WORKSPACE_DIR" "$CERT_META_DIR"
+  mkdir -p "$ARTIFACT_DIR" "$WORKSPACE_DIR" "$CERT_META_DIR" "$REMOTE_DIR" "$REMOTE_CERTS_DIR"
   : >"$PHASE_LOG"
   : >"$RUN_LOG"
   trap cleanup EXIT
@@ -620,6 +725,10 @@ main() {
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"
 
   start_service_sidecar_oba "$SIDECAR_OBA_SERVICE"
+
+  copy_remote_materials
+  log_phase "remote-bootstrap-initial"
+  run_remote_bootstrap
 
   run_verify_pair "initial"
   run_rotations_with_verification
