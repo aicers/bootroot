@@ -635,12 +635,19 @@ async fn write_openbao_agent_compose_override(
     } else {
         ""
     };
+    let meta = std::fs::metadata(&mount_root)
+        .with_context(|| messages.error_resolve_path_failed(&mount_root.display().to_string()))?;
+    let user = {
+        use std::os::unix::fs::MetadataExt;
+        format!("{}:{}", meta.uid(), meta.gid())
+    };
     let contents = format!(
         r#"version: "3.8"
 services:
   {stepca_service}:
     image: openbao/openbao:latest
     container_name: bootroot-openbao-agent-stepca
+    user: "{user}"
     restart: always
     command: ["agent", "-config=/openbao/secrets/openbao/stepca/agent.hcl"]
 {depends_on}    environment:
@@ -650,6 +657,7 @@ services:
   {responder_service}:
     image: openbao/openbao:latest
     container_name: bootroot-openbao-agent-responder
+    user: "{user}"
     restart: always
     command: ["agent", "-config=/openbao/secrets/openbao/responder/agent.hcl"]
 {depends_on}    environment:
@@ -661,7 +669,8 @@ services:
         responder_service = OPENBAO_AGENT_RESPONDER_SERVICE,
         depends_on = depends_on,
         openbao_addr = openbao_addr,
-        secrets_path = mount_root.display()
+        secrets_path = mount_root.display(),
+        user = user
     );
     tokio::fs::write(&override_path, contents)
         .await
@@ -2485,6 +2494,10 @@ services:
         assert!(contents.contains("openbao-agent-stepca"));
         assert!(contents.contains("openbao-agent-responder"));
         assert!(contents.contains(&secrets_dir.display().to_string()));
+        assert!(
+            contents.contains("user:"),
+            "compose override must set user for infra OBA containers"
+        );
     }
 
     #[test]
