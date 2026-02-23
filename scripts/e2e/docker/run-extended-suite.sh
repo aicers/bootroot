@@ -14,6 +14,7 @@ INTERVAL_SECS_SCALE="${INTERVAL_SECS_SCALE:-1}"
 TIMEOUT_SECS_SCALE="${TIMEOUT_SECS_SCALE:-90}"
 TIMEOUT_SECS_ROTATION="${TIMEOUT_SECS_ROTATION:-90}"
 TIMEOUT_SECS_RUNNER="${TIMEOUT_SECS_RUNNER:-45}"
+TIMEOUT_SECS_LIFECYCLE="${TIMEOUT_SECS_LIFECYCLE:-600}"
 MAX_CYCLES_RUNNER="${MAX_CYCLES_RUNNER:-4}"
 INTERVAL_SECS_RUNNER="${INTERVAL_SECS_RUNNER:-1}"
 
@@ -86,6 +87,16 @@ case_runner_timer() {
   "$ROOT_DIR/scripts/e2e/docker/run-harness-smoke.sh"
 }
 
+case_infra_lifecycle() {
+  local case_dir="$ARTIFACT_DIR/infra-lifecycle"
+  ARTIFACT_DIR="$case_dir" \
+  PROJECT_NAME="${PROJECT_PREFIX}-lifecycle-$$" \
+  TIMEOUT_SECS="$TIMEOUT_SECS_LIFECYCLE" \
+  BOOTROOT_BIN="$BOOTROOT_BIN" \
+  BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
+  "$ROOT_DIR/scripts/e2e/docker/run-main-lifecycle.sh"
+}
+
 case_runner_cron() {
   local case_dir="$ARTIFACT_DIR/runner-cron"
   ARTIFACT_DIR="$case_dir" \
@@ -126,6 +137,13 @@ main() {
   fi
 
   if line="$(run_case "runner-cron" case_runner_cron)"; then
+    lines+=("$line")
+  else
+    lines+=("$line")
+    overall_status="fail"
+  fi
+
+  if line="$(run_case "infra-lifecycle" case_infra_lifecycle)"; then
     lines+=("$line")
   else
     lines+=("$line")
