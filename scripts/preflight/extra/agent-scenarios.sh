@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 
 SCENARIO="${1:-all}"
@@ -32,9 +32,9 @@ load_env_file() {
 }
 
 normalize_stepca_config() {
-  if [ -f "$ROOT_DIR/secrets/config/ca.json" ] && [ -x "$ROOT_DIR/scripts/update-ca-db-dsn.sh" ]; then
+  if [ -f "$ROOT_DIR/secrets/config/ca.json" ] && [ -x "$ROOT_DIR/scripts/impl/update-ca-db-dsn.sh" ]; then
     log "Updating step-ca DB DSN for compose network"
-    "$ROOT_DIR/scripts/update-ca-db-dsn.sh"
+    "$ROOT_DIR/scripts/impl/update-ca-db-dsn.sh"
   fi
 
   if [ -f "$ROOT_DIR/secrets/provisioner_password.txt" ]; then

@@ -58,7 +58,7 @@ case_scale_contention() {
   TIMEOUT_SECS="$TIMEOUT_SECS_SCALE" \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
-  "$ROOT_DIR/scripts/e2e/docker/run-baseline.sh"
+  "$ROOT_DIR/scripts/impl/run-baseline.sh"
 }
 
 case_failure_recovery() {
@@ -70,7 +70,7 @@ case_failure_recovery() {
   ROTATION_ITEMS="secret_id,eab,responder_hmac,trust_sync" \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
-  "$ROOT_DIR/scripts/e2e/docker/run-rotation-recovery.sh"
+  "$ROOT_DIR/scripts/impl/run-rotation-recovery.sh"
 }
 
 case_runner_timer() {
@@ -84,7 +84,7 @@ case_runner_timer() {
   INTERVAL_SECS="$INTERVAL_SECS_RUNNER" \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
-  "$ROOT_DIR/scripts/e2e/docker/run-harness-smoke.sh"
+  "$ROOT_DIR/scripts/impl/run-harness-smoke.sh"
 }
 
 case_infra_lifecycle() {
@@ -94,7 +94,7 @@ case_infra_lifecycle() {
   TIMEOUT_SECS="$TIMEOUT_SECS_LIFECYCLE" \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
-  "$ROOT_DIR/scripts/e2e/docker/run-main-lifecycle.sh"
+  "$ROOT_DIR/scripts/impl/run-main-lifecycle.sh"
 }
 
 case_runner_cron() {
@@ -108,7 +108,7 @@ case_runner_cron() {
   INTERVAL_SECS="$INTERVAL_SECS_RUNNER" \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
-  "$ROOT_DIR/scripts/e2e/docker/run-harness-smoke.sh"
+  "$ROOT_DIR/scripts/impl/run-harness-smoke.sh"
 }
 
 main() {

@@ -149,7 +149,7 @@ Selection guide:
 In local Compose, set `.env` and run:
 
 ```bash
-scripts/update-ca-db-dsn.sh
+scripts/impl/update-ca-db-dsn.sh
 ```
 
 This script reads `POSTGRES_*` from `.env` and updates `db.type` and
@@ -293,7 +293,7 @@ will be discarded.**
 3. Re-initialize step-ca and update the DB DSN:
 
    - Repeat the `Initialize step-ca (first run)` steps above.
-   - For local Compose, run `scripts/update-ca-db-dsn.sh` to refresh
+   - For local Compose, run `scripts/impl/update-ca-db-dsn.sh` to refresh
      `secrets/config/ca.json`.
 
 4. Initialize and unseal OpenBao:

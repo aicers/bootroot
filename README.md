@@ -106,20 +106,38 @@ Docs PR quick checklist:
   `markdownlint-cli2 "**/*.md" "#node_modules" "#target"`
 - If both KR/EN pages were changed, verify wording/structure parity.
 
-## Quality Checks
+## Preflight (required before push)
 
-Run quality gates locally before pushing:
+Run all preflight checks before pushing:
 
 ```bash
-cargo fmt -- --check --config group_imports=StdExternalCrate
-cargo clippy --all-targets -- -D warnings
-biome ci --error-on-warnings .
-markdownlint-cli2 "**/*.md" "#node_modules" "#target"
-ruff format --check .
-ruff check .
-cargo audit
-cargo test
+./scripts/preflight/run-all.sh
 ```
+
+Or run individual scripts. Scripts under `preflight/ci/` mirror CI workflow
+jobs; scripts under `preflight/extra/` are local-only checks not in CI.
+
+### CI-equivalent (`preflight/ci/`)
+
+| Script | CI job |
+| --- | --- |
+| `./scripts/preflight/ci/check.sh` | `ci.yml` Quality Check |
+| `./scripts/preflight/ci/test-core.sh` | `ci.yml` Test Suite (Core) |
+| `./scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` Docker E2E Matrix |
+| `./scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` Run Extended |
+
+### Local-only (`preflight/extra/`)
+
+| Script | Description |
+| --- | --- |
+| `./scripts/preflight/extra/agent-scenarios.sh` | Agent scenario tests |
+| `./scripts/preflight/extra/cli-scenarios.sh` | CLI scenario tests |
+
+Notes:
+
+- If your machine cannot run non-interactive sudo (`sudo -n`) for `hosts-all`,
+  use `./scripts/preflight/ci/e2e-matrix.sh --skip-hosts-all`.
+- Artifacts are written under `tmp/e2e/` for triage.
 
 If Python formatting/linting fails, auto-fix first:
 
@@ -128,59 +146,12 @@ ruff format .
 ruff check --fix .
 ```
 
-## Local E2E Preflight (required before push)
-
-To reduce avoidable CI failures, run the local E2E preflight below in addition
-to `cargo test`:
-
-```bash
-./scripts/ci-local-e2e.sh
-./scripts/e2e/docker/run-extended-suite.sh
-```
-
-Why both:
-
-- `./scripts/ci-local-e2e.sh` mirrors the core Docker E2E matrix used by CI
-  (main lifecycle, main remote lifecycle, and rotation/recovery).
-- `./scripts/e2e/docker/run-extended-suite.sh` covers the extended scenarios
-  used by the separate Extended workflow.
-
-If these do not pass locally, CI/Extended workflow failures are likely after
-push.
-
-Notes:
-
-- If your machine cannot run non-interactive sudo (`sudo -n`) for `hosts-all`,
-  use `./scripts/ci-local-e2e.sh --skip-hosts-all`.
-- Artifacts are written under `tmp/e2e/` for triage.
-
 Install scope:
 
 - If you use a per-repo virtualenv (`.venv`), you need to create it and
   install dependencies each time you clone the repo.
 - If you install MkDocs globally, it is a one-time machine install, but we
   recommend the per-repo virtualenv to avoid version conflicts.
-
-## Local Scenario Tests
-
-We keep a local end-to-end scenario script that exercises the happy paths and
-failure cases across step-ca, PostgreSQL, OpenBao, the HTTP-01 responder, and
-bootroot-agent.
-
-Run it from the repo root:
-
-```bash
-./scripts/run-local-scenarios.sh happy
-```
-
-Script notes:
-
-- `happy` runs the happy-path scenarios (this is what CI uses).
-- `all` runs every scenario, including failure cases.
-- `TIMEOUT_SECS=180` and `TMP_DIR=./tmp/scenarios` can be overridden as needed.
-- The script expects Docker + Compose and uses the local Compose stack.
-- Monitoring integration tests (via `cargo test`) require Docker and bind
-  Grafana to `127.0.0.1:3000` during the run.
 
 ## License
 

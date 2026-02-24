@@ -12,32 +12,28 @@ pub(crate) fn unique_scenario_id(prefix: &str) -> String {
 pub(crate) fn smoke_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
-        .join("e2e")
-        .join("docker")
+        .join("impl")
         .join("run-harness-smoke.sh")
 }
 
 pub(crate) fn baseline_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
-        .join("e2e")
-        .join("docker")
+        .join("impl")
         .join("run-baseline.sh")
 }
 
 pub(crate) fn main_lifecycle_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
-        .join("e2e")
-        .join("docker")
+        .join("impl")
         .join("run-main-lifecycle.sh")
 }
 
 pub(crate) fn main_remote_lifecycle_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
-        .join("e2e")
-        .join("docker")
+        .join("impl")
         .join("run-main-remote-lifecycle.sh")
 }
 

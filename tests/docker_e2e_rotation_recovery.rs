@@ -25,8 +25,7 @@ mod unix_integration {
             .arg(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("scripts")
-                    .join("e2e")
-                    .join("docker")
+                    .join("impl")
                     .join("run-rotation-recovery.sh"),
             )
             .env("SCENARIO_FILE", scenario_file)

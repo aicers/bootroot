@@ -156,7 +156,7 @@ POSTGRES_PORT=5432
 바꿨을 때 수동 편집 없이 동기화할 수 있습니다.
 
 ```bash
-scripts/update-ca-db-dsn.sh
+scripts/impl/update-ca-db-dsn.sh
 ```
 
 ### 단일 호스트 가드레일
@@ -303,7 +303,7 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 3. step-ca 재초기화 및 DB DSN 갱신:
 
    - `step-ca 초기화(최초 1회)` 절차를 다시 수행합니다.
-   - 로컬 Compose라면 `scripts/update-ca-db-dsn.sh`로
+   - 로컬 Compose라면 `scripts/impl/update-ca-db-dsn.sh`로
      `secrets/config/ca.json`을 갱신합니다.
 
 4. OpenBao 초기화/언실:

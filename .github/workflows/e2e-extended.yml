@@ -72,7 +72,7 @@ jobs:
           SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json" \
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
-          ./scripts/e2e/docker/run-extended-suite.sh || {
+          ./scripts/impl/run-extended-suite.sh || {
             echo "extended suite failed"
             [ -f "$ARTIFACT_DIR/extended-summary.json" ] && cat "$ARTIFACT_DIR/extended-summary.json" || true
             [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
