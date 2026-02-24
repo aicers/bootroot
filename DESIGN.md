@@ -29,8 +29,9 @@ intervention, and Bootroot is designed to minimize those manual steps.
 ## Not Automated (1) — CA Key Renewal
 
 Bootroot does not provide a feature to change the CA's private/public key pair
-after initial generation. To change the CA keys, the entire initialization
-process must be run again.
+after initial generation. CA key rotation is not supported; replacing the CA
+keys currently requires a full re-initialization. (A dedicated CA key
+replacement feature is planned for the future.)
 
 ## Derived Goal for Certificate Rotation Automation — Secret Management
 
