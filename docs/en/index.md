@@ -47,7 +47,11 @@ RFC 8555 protocol used for automated issuance.
 Bootroot is a system that issues and rotates certificates when (daemon or
 Docker) services authenticate each other via mTLS. The security emphasis is on
 rotation: whereas renewal responds to expiration, rotation replaces
-certificates periodically regardless of whether they have expired.
+certificates periodically regardless of whether they have expired. There are
+two ways to implement rotation. One is to replace certificates on a fixed
+schedule regardless of expiration. The other is to set a short validity period
+and renew before expiration, so that periodic replacement happens as a natural
+consequence. Bootroot uses the latter approach.
 
 ### Secondary Goal — Automation
 
