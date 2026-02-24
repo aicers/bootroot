@@ -337,7 +337,7 @@ jobs:
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/e2e/docker/run-main-lifecycle.sh || {
+          ./scripts/impl/run-main-lifecycle.sh || {
             echo "main lifecycle (fqdn-only-hosts) failed"
             [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
             [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
@@ -362,7 +362,7 @@ jobs:
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/e2e/docker/run-main-lifecycle.sh || {
+          ./scripts/impl/run-main-lifecycle.sh || {
             echo "main lifecycle (hosts-all) failed"
             [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
             [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
@@ -387,7 +387,7 @@ jobs:
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/e2e/docker/run-main-remote-lifecycle.sh || {
+          ./scripts/impl/run-main-remote-lifecycle.sh || {
             echo "main remote lifecycle (fqdn-only-hosts) failed"
             [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
             [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
@@ -412,7 +412,7 @@ jobs:
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/e2e/docker/run-main-remote-lifecycle.sh || {
+          ./scripts/impl/run-main-remote-lifecycle.sh || {
             echo "main remote lifecycle (hosts-all) failed"
             [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
             [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
@@ -431,7 +431,7 @@ jobs:
           TIMEOUT_SECS=90 \
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
-          ./scripts/e2e/docker/run-rotation-recovery.sh
+          ./scripts/impl/run-rotation-recovery.sh
 
       - name: Upload Baseline Artifacts
         if: always()

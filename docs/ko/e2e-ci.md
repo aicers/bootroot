@@ -67,9 +67,9 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 
 주요 스크립트:
 
-- `scripts/e2e/docker/run-main-lifecycle.sh`
-- `scripts/e2e/docker/run-main-remote-lifecycle.sh`
-- `scripts/e2e/docker/run-rotation-recovery.sh`
+- `scripts/impl/run-main-lifecycle.sh`
+- `scripts/impl/run-main-remote-lifecycle.sh`
+- `scripts/impl/run-rotation-recovery.sh`
 
 확장 워크플로는 다음을 검증합니다.
 
@@ -79,7 +79,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 
 주요 스크립트:
 
-- `scripts/e2e/docker/run-extended-suite.sh`
+- `scripts/impl/run-extended-suite.sh`
 
 ## 시나리오별 구성과 실행 단계
 
@@ -90,7 +90,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 
 구성:
 
-- `scripts/e2e/docker/run-main-lifecycle.sh` 기반 단일 머신 시나리오
+- `scripts/impl/run-main-lifecycle.sh` 기반 단일 머신 시나리오
 - Docker Compose에서 `openbao`, `postgres`, `step-ca`, `bootroot-http01` 실행
 - 서비스는 `--delivery-mode local-file`로 추가
 - 이 시나리오의 서비스 구성(총 2개): `edge-proxy` (`daemon`), `web-app` (`docker`)
@@ -176,7 +176,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
 
 ```bash
 # hosts-all 모드로 실행
-RESOLUTION_MODE=hosts-all ./scripts/e2e/docker/run-main-lifecycle.sh
+RESOLUTION_MODE=hosts-all ./scripts/impl/run-main-lifecycle.sh
 
 # 내부적으로 /etc/hosts 추가/정리
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -271,7 +271,7 @@ bootroot rotate --yes responder-hmac
 
 ```bash
 # hosts-all 모드로 원격 전체 흐름 실행
-RESOLUTION_MODE=hosts-all ./scripts/e2e/docker/run-main-remote-lifecycle.sh
+RESOLUTION_MODE=hosts-all ./scripts/impl/run-main-remote-lifecycle.sh
 
 # 내부적으로 /etc/hosts 추가/정리
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -285,7 +285,7 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 구성:
 
-- 스크립트: `scripts/e2e/docker/run-rotation-recovery.sh`
+- 스크립트: `scripts/impl/run-rotation-recovery.sh`
 - 기본 시나리오 입력:
   `tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json`
 
@@ -319,7 +319,7 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 ```bash
 # 시나리오 실행
-./scripts/e2e/docker/run-rotation-recovery.sh
+./scripts/impl/run-rotation-recovery.sh
 
 # 회전/verify 루프에서 사용하는 핵심 명령
 bootroot rotate --yes approle-secret-id --service-name "$service"
@@ -331,7 +331,7 @@ bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 
 구성:
 
-- 스크립트: `scripts/e2e/docker/run-extended-suite.sh`
+- 스크립트: `scripts/impl/run-extended-suite.sh`
 - 케이스: `scale-contention`, `failure-recovery`, `runner-timer`, `runner-cron`
 - 케이스 결과는 `extended-summary.json`에 집계
 - 서비스 구성: 각 케이스가 사용하는 하위 시나리오/스크립트 구성을 그대로 상속하며,
@@ -354,33 +354,44 @@ bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 
 ```bash
 # 확장 스위트 실행
-./scripts/e2e/docker/run-extended-suite.sh
+./scripts/impl/run-extended-suite.sh
 
 # 케이스별 내부 호출
-./scripts/e2e/docker/run-baseline.sh
-./scripts/e2e/docker/run-rotation-recovery.sh
-RUNNER_MODE=systemd-timer ./scripts/e2e/docker/run-harness-smoke.sh
-RUNNER_MODE=cron ./scripts/e2e/docker/run-harness-smoke.sh
+./scripts/impl/run-baseline.sh
+./scripts/impl/run-rotation-recovery.sh
+RUNNER_MODE=systemd-timer ./scripts/impl/run-harness-smoke.sh
+RUNNER_MODE=cron ./scripts/impl/run-harness-smoke.sh
 ```
 
 ## 로컬 사전검증 표준
 
-푸시 전 최소 다음을 모두 실행하세요.
+푸시 전 `scripts/preflight/` 스크립트를 실행합니다.
 
-1. `cargo test`
-2. `./scripts/ci-local-e2e.sh`
-3. `./scripts/e2e/docker/run-extended-suite.sh`
+CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 
-실행 가이드:
+| 스크립트 | CI 워크플로 대응 |
+| --- | --- |
+| `scripts/preflight/ci/check.sh` | `ci.yml` → Quality Check |
+| `scripts/preflight/ci/test-core.sh` | `ci.yml` → test-core |
+| `scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` → test-docker-e2e-matrix |
+| `scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` → run-extended |
+
+로컬 전용 스크립트(`scripts/preflight/extra/`):
+
+| 스크립트 | 설명 |
+| --- | --- |
+| `scripts/preflight/extra/agent-scenarios.sh` | 에이전트 시나리오 |
+| `scripts/preflight/extra/cli-scenarios.sh` | CLI 시나리오 |
+
+전체 실행:
 
 ```bash
-./scripts/ci-local-e2e.sh
-./scripts/e2e/docker/run-extended-suite.sh
+scripts/preflight/run-all.sh
 ```
 
 로컬에서 `sudo -n`이 불가능하면:
 
-- `./scripts/ci-local-e2e.sh --skip-hosts-all`을 실행합니다.
+- `scripts/preflight/ci/e2e-matrix.sh --skip-hosts-all`을 실행합니다.
 - 이유: `hosts-all` 케이스는 실행 중 호스트 머신의 `/etc/hosts`를
   추가/복원해야 하며, 이 작업은 비대화식 관리자 권한(`sudo -n`)이
   필요합니다.

@@ -69,9 +69,9 @@ PR-critical Docker test set validates:
 
 Primary scripts:
 
-- `scripts/e2e/docker/run-main-lifecycle.sh`
-- `scripts/e2e/docker/run-main-remote-lifecycle.sh`
-- `scripts/e2e/docker/run-rotation-recovery.sh`
+- `scripts/impl/run-main-lifecycle.sh`
+- `scripts/impl/run-main-remote-lifecycle.sh`
+- `scripts/impl/run-rotation-recovery.sh`
 
 Extended workflow validates:
 
@@ -81,7 +81,7 @@ Extended workflow validates:
 
 Primary script:
 
-- `scripts/e2e/docker/run-extended-suite.sh`
+- `scripts/impl/run-extended-suite.sh`
 
 ## Scenario details and execution steps
 
@@ -93,7 +93,7 @@ reproduction.
 
 Configuration:
 
-- Single machine baseline used by `scripts/e2e/docker/run-main-lifecycle.sh`
+- Single machine baseline used by `scripts/impl/run-main-lifecycle.sh`
 - `openbao`, `postgres`, `step-ca`, `bootroot-http01` run in Docker Compose
 - Services are added with `--delivery-mode local-file`
 - Service set in this scenario (2 services): `edge-proxy` (`daemon`),
@@ -180,7 +180,7 @@ Actual commands (script excerpt):
 
 ```bash
 # run in hosts-all mode
-RESOLUTION_MODE=hosts-all ./scripts/e2e/docker/run-main-lifecycle.sh
+RESOLUTION_MODE=hosts-all ./scripts/impl/run-main-lifecycle.sh
 
 # internal host-entry add/remove sequence
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -275,7 +275,7 @@ Actual commands (script excerpt):
 
 ```bash
 # run remote lifecycle in hosts-all mode
-RESOLUTION_MODE=hosts-all ./scripts/e2e/docker/run-main-remote-lifecycle.sh
+RESOLUTION_MODE=hosts-all ./scripts/impl/run-main-remote-lifecycle.sh
 
 # internal host-entry add/remove sequence
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -289,7 +289,7 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 Configuration:
 
-- Script: `scripts/e2e/docker/run-rotation-recovery.sh`
+- Script: `scripts/impl/run-rotation-recovery.sh`
 - Scenario input defaults to
   `tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json`
 
@@ -323,7 +323,7 @@ Actual commands (script excerpt):
 
 ```bash
 # scenario entrypoint
-./scripts/e2e/docker/run-rotation-recovery.sh
+./scripts/impl/run-rotation-recovery.sh
 
 # key commands used in rotation/verify loops
 bootroot rotate --yes approle-secret-id --service-name "$service"
@@ -335,7 +335,7 @@ bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 
 Configuration:
 
-- Script: `scripts/e2e/docker/run-extended-suite.sh`
+- Script: `scripts/impl/run-extended-suite.sh`
 - Cases: `scale-contention`, `failure-recovery`, `runner-timer`, `runner-cron`
 - Case results are aggregated into `extended-summary.json`
 - Service set: inherited from each case's underlying scenario/script and includes
@@ -358,33 +358,42 @@ Actual commands (script excerpt):
 
 ```bash
 # extended suite entrypoint
-./scripts/e2e/docker/run-extended-suite.sh
+./scripts/impl/run-extended-suite.sh
 
 # internal case dispatch
-./scripts/e2e/docker/run-baseline.sh
-./scripts/e2e/docker/run-rotation-recovery.sh
-RUNNER_MODE=systemd-timer ./scripts/e2e/docker/run-harness-smoke.sh
-RUNNER_MODE=cron ./scripts/e2e/docker/run-harness-smoke.sh
+./scripts/impl/run-baseline.sh
+./scripts/impl/run-rotation-recovery.sh
+RUNNER_MODE=systemd-timer ./scripts/impl/run-harness-smoke.sh
+RUNNER_MODE=cron ./scripts/impl/run-harness-smoke.sh
 ```
 
 ## Local preflight standard
 
-Before pushing code, run all of these:
-
-1. `cargo test`
-2. `./scripts/ci-local-e2e.sh`
-3. `./scripts/e2e/docker/run-extended-suite.sh`
-
-Execution guide:
+Before pushing code, run all preflight checks:
 
 ```bash
-./scripts/ci-local-e2e.sh
-./scripts/e2e/docker/run-extended-suite.sh
+./scripts/preflight/run-all.sh
 ```
+
+Or run individual scripts:
+
+| Script | CI job |
+| --- | --- |
+| `./scripts/preflight/ci/check.sh` | `ci.yml` Quality Check |
+| `./scripts/preflight/ci/test-core.sh` | `ci.yml` Test Suite (Core) |
+| `./scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` Docker E2E Matrix |
+| `./scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` Run Extended |
+
+Local-only extras (not in any CI workflow):
+
+| Script | Description |
+| --- | --- |
+| `./scripts/preflight/extra/agent-scenarios.sh` | Agent scenario tests |
+| `./scripts/preflight/extra/cli-scenarios.sh` | CLI scenario tests |
 
 When local `sudo -n` is unavailable:
 
-- Run `./scripts/ci-local-e2e.sh --skip-hosts-all`.
+- Run `./scripts/preflight/ci/e2e-matrix.sh --skip-hosts-all`.
 - Reason: `hosts-all` cases add and restore host-machine `/etc/hosts` during
   the run, and that operation requires non-interactive admin privileges
   (`sudo -n`).

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 INIT_SUMMARY_JSON="$ROOT_DIR/tmp/cli-init-summary.json"
 
@@ -64,9 +64,9 @@ run_init_scenario() {
   log "Starting infra"
   log "Building local images"
   docker compose -f docker-compose.yml -f docker-compose.test.yml build step-ca bootroot-http01
-  if [ -x "$ROOT_DIR/scripts/update-ca-db-dsn.sh" ]; then
+  if [ -x "$ROOT_DIR/scripts/impl/update-ca-db-dsn.sh" ]; then
     log "Updating ca.json DB DSN"
-    "$ROOT_DIR/scripts/update-ca-db-dsn.sh"
+    "$ROOT_DIR/scripts/impl/update-ca-db-dsn.sh"
   fi
   log "Starting minimal infra (openbao/postgres/responder)"
   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d openbao postgres bootroot-http01

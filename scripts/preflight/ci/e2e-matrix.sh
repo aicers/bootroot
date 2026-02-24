@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 
 RUN_ID="${GITHUB_RUN_ID:-local-$(date +%s)}"
@@ -11,7 +11,7 @@ SECRETS_BACKUP_DIR=""
 
 usage() {
   cat <<'EOF'
-Usage: scripts/ci-local-e2e.sh [--skip-hosts-all] [--fresh-secrets]
+Usage: scripts/preflight/ci/e2e-matrix.sh [--skip-hosts-all] [--fresh-secrets]
 
 Runs the same Docker E2E matrix steps used in CI:
 1) main lifecycle (fqdn-only-hosts)
@@ -82,7 +82,7 @@ INFRA_UP_DELAY_SECS=10 \
 BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
 BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
-"$ROOT_DIR/scripts/e2e/docker/run-main-lifecycle.sh"
+"$ROOT_DIR/scripts/impl/run-main-lifecycle.sh"
 
 if [ "$SKIP_HOSTS_ALL" -eq 0 ]; then
   echo "[ci-local-e2e] run main lifecycle (hosts-all)"
@@ -96,7 +96,7 @@ if [ "$SKIP_HOSTS_ALL" -eq 0 ]; then
   BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
   BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
   BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
-  "$ROOT_DIR/scripts/e2e/docker/run-main-lifecycle.sh"
+  "$ROOT_DIR/scripts/impl/run-main-lifecycle.sh"
 else
   echo "[ci-local-e2e] skip main lifecycle (hosts-all)"
 fi
@@ -114,7 +114,7 @@ VERIFY_DELAY_SECS=5 \
 BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
 BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
-"$ROOT_DIR/scripts/e2e/docker/run-main-remote-lifecycle.sh"
+"$ROOT_DIR/scripts/impl/run-main-remote-lifecycle.sh"
 
 if [ "$SKIP_HOSTS_ALL" -eq 0 ]; then
   echo "[ci-local-e2e] run main remote lifecycle (hosts-all)"
@@ -130,7 +130,7 @@ if [ "$SKIP_HOSTS_ALL" -eq 0 ]; then
   BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
   BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
   BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
-  "$ROOT_DIR/scripts/e2e/docker/run-main-remote-lifecycle.sh"
+  "$ROOT_DIR/scripts/impl/run-main-remote-lifecycle.sh"
 else
   echo "[ci-local-e2e] skip main remote lifecycle (hosts-all)"
 fi
@@ -143,7 +143,7 @@ ROTATION_ITEMS="secret_id,eab,responder_hmac,trust_sync" \
 TIMEOUT_SECS=90 \
 BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
-"$ROOT_DIR/scripts/e2e/docker/run-rotation-recovery.sh"
+"$ROOT_DIR/scripts/impl/run-rotation-recovery.sh"
 
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"

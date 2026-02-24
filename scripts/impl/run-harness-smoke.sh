@@ -187,10 +187,10 @@ main() {
   log_phase "bootstrap" "control-plane" "all"
   compose_up
 
-  "$ROOT_DIR/scripts/e2e/docker/bootstrap-smoke-node.sh" "$WORK_DIR"
+  "$ROOT_DIR/scripts/impl/bootstrap-smoke-node.sh" "$WORK_DIR"
 
   SERVICE_NAME="$SERVICE_NAME" MOCK_OPENBAO_PORT="$MOCK_OPENBAO_PORT" \
-    python3 "$ROOT_DIR/scripts/e2e/docker/mock-openbao-server.py" >/dev/null 2>&1 &
+    python3 "$ROOT_DIR/scripts/impl/mock-openbao-server.py" >/dev/null 2>&1 &
   printf "%s" "$!" >"$MOCK_OPENBAO_PID_FILE"
   if ! wait_for_mock_openbao; then
     printf "mock OpenBao did not become healthy\n" >&2

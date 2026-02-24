@@ -112,7 +112,7 @@ wait_for_mock_openbao() {
 }
 
 generate_workspace() {
-  python3 "$ROOT_DIR/scripts/e2e/docker/generate-baseline-workspace.py" \
+  python3 "$ROOT_DIR/scripts/impl/generate-baseline-workspace.py" \
     --scenario-file "$SCENARIO_FILE" \
     --artifact-dir "$ARTIFACT_DIR"
 
@@ -143,7 +143,7 @@ control_mock() {
 }
 
 start_mock_openbao() {
-  python3 "$ROOT_DIR/scripts/e2e/docker/mock-openbao-server.py" >/dev/null 2>&1 &
+  python3 "$ROOT_DIR/scripts/impl/mock-openbao-server.py" >/dev/null 2>&1 &
   MOCK_OPENBAO_PID="$!"
   wait_for_mock_openbao || fail_with_context "mock OpenBao did not become healthy"
 }

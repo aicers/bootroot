@@ -75,9 +75,9 @@ before generating code.
 * Before pushing or opening a PR, ensure all CI jobs pass (`check`,
   `test-core`, `test-docker-e2e-matrix` from `ci.yml`, and
   `run-extended` from `e2e-extended.yml`).
-* **Local E2E verification**: Run the Docker E2E scripts locally before
-  pushing. At minimum, run `scripts/e2e/docker/run-main-lifecycle.sh` and
-  `scripts/e2e/docker/run-extended-suite.sh`. These may be skipped only
+* **Local preflight verification**: Run `scripts/preflight/run-all.sh`
+  before pushing. At minimum, run `scripts/preflight/ci/e2e-matrix.sh`
+  and `scripts/preflight/ci/e2e-extended.sh`. These may be skipped only
   when your changes do not affect the Docker lifecycle, E2E scripts, or
   any code paths exercised by the E2E tests (rotation, service add/verify,
   daemon, config, etc.).
