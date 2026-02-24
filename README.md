@@ -10,7 +10,8 @@ bring up a private CA and issue/renew mTLS certificates.
 
 - **bootroot CLI** (`bootroot`)
 - **bootroot-agent** (`bootroot-agent`)
-- **HTTP-01 responder** (`bootroot-http01`)
+- **bootroot-remote** (`bootroot-remote`)
+- **HTTP-01 responder** (`bootroot-http01-responder`)
 - **Prometheus** (monitoring)
 - **Grafana** (monitoring dashboards)
 
@@ -28,10 +29,11 @@ Open source dependencies:
   step-ca, and the HTTP-01 responder with Docker Compose on the step-ca host.
 - **Monitoring**: Prometheus scrapes step-ca/OpenBao metrics and Grafana
   visualizes them for local ops.
-- **App onboarding**: `bootroot app add` registers app metadata, creates an
-  AppRole, and prints the run instructions for bootroot-agent and OpenBao Agent.
+- **Service onboarding**: `bootroot service add` registers service metadata,
+  creates an AppRole, and prints the run instructions for bootroot-agent and
+  OpenBao Agent.
 - **Certificate flow**: bootroot-agent issues/renews certs; OpenBao Agent
-  renders secrets and config files for each app.
+  renders secrets and config files for each service.
 
 For multi-machine or manual deployment, follow the manual guides in `docs/`.
 
@@ -44,7 +46,7 @@ Typical sequence:
 ```bash
 bootroot infra up
 bootroot init
-bootroot app add
+bootroot service add
 bootroot verify
 bootroot rotate ...
 bootroot monitoring up|status|down
@@ -52,10 +54,14 @@ bootroot monitoring up|status|down
 
 ## Documentation
 
-- Manual entry point: `docs/en/index.md` (English)
-- 매뉴얼 시작점: `docs/ko/index.md` (한국어)
-- CLI guide (EN): `docs/en/cli.md`
-- CLI guide (KO): `docs/ko/cli.md`
+- Design philosophy: [`DESIGN.md`](DESIGN.md)
+- Manual entry point: [`docs/en/index.md`](docs/en/index.md) (English)
+- 매뉴얼 시작점: [`docs/ko/index.md`](docs/ko/index.md) (한국어)
+- CLI guide (EN): [`docs/en/cli.md`](docs/en/cli.md)
+- CLI guide (KO): [`docs/ko/cli.md`](docs/ko/cli.md)
+
+For detailed architecture, installation, configuration, and operations
+guides, refer to the manuals above.
 
 Build locally:
 
