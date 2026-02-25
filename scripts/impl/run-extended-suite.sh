@@ -94,7 +94,7 @@ case_infra_lifecycle() {
   TIMEOUT_SECS="$TIMEOUT_SECS_LIFECYCLE" \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
-  "$ROOT_DIR/scripts/impl/run-main-lifecycle.sh"
+  "$ROOT_DIR/scripts/impl/run-local-lifecycle.sh"
 }
 
 case_runner_cron() {

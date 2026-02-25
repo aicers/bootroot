@@ -9,19 +9,19 @@ mod unix_integration {
     use anyhow::{Context, Result};
 
     fn run_mode(mode: &str) -> Result<PathBuf> {
-        let scenario_id = super::support::docker_harness::unique_scenario_id("main-lifecycle");
+        let scenario_id = super::support::docker_harness::unique_scenario_id("local-lifecycle");
         let artifact_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tmp")
             .join("e2e")
-            .join(format!("docker-main-lifecycle-{mode}-{scenario_id}"));
+            .join(format!("docker-local-lifecycle-{mode}-{scenario_id}"));
 
         let output = Command::new("bash")
             .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .arg(super::support::docker_harness::main_lifecycle_script_path())
+            .arg(super::support::docker_harness::local_lifecycle_script_path())
             .env("ARTIFACT_DIR", &artifact_dir)
             .env(
                 "PROJECT_NAME",
-                format!("bootroot-e2e-main-lifecycle-{mode}-{scenario_id}"),
+                format!("bootroot-e2e-local-lifecycle-{mode}-{scenario_id}"),
             )
             .env("RESOLUTION_MODE", mode)
             .env("TIMEOUT_SECS", "120")
@@ -29,11 +29,11 @@ mod unix_integration {
             .env("BOOTROOT_REMOTE_BIN", env!("CARGO_BIN_EXE_bootroot-remote"))
             .env("BOOTROOT_AGENT_BIN", env!("CARGO_BIN_EXE_bootroot-agent"))
             .output()
-            .with_context(|| "Failed to run docker main lifecycle script")?;
+            .with_context(|| "Failed to run docker local lifecycle script")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("main lifecycle script failed ({mode}): {stderr}");
+            anyhow::bail!("local lifecycle script failed ({mode}): {stderr}");
         }
 
         let phase_log = artifact_dir.join("phases.log");
@@ -67,7 +67,7 @@ mod unix_integration {
 
     #[test]
     #[ignore = "Requires local Docker and root-level hosts updates for hosts-all mode"]
-    fn docker_main_lifecycle_hosts_variants() -> Result<()> {
+    fn docker_local_lifecycle_hosts_variants() -> Result<()> {
         for mode in ["fqdn-only-hosts", "hosts-all"] {
             let artifact_dir = run_mode(mode)?;
             let manifest = std::fs::read_to_string(artifact_dir.join("manifest.json"))

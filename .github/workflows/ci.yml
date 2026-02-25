@@ -111,7 +111,7 @@ jobs:
         run: cargo audit
 
   test-core:
-    name: Test Suite (Core)
+    name: Unit & CLI Smoke
     needs: [check, changes]
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
@@ -314,22 +314,22 @@ jobs:
       fail-fast: false
       matrix:
         scenario:
-          - label: main-fqdn
-            script: run-main-lifecycle.sh
+          - label: local-default
+            script: run-local-lifecycle.sh
             resolution: fqdn-only-hosts
-            artifact: ci-main-fqdn
-          - label: main-hosts
-            script: run-main-lifecycle.sh
+            artifact: ci-local-default
+          - label: local-hosts
+            script: run-local-lifecycle.sh
             resolution: hosts-all
-            artifact: ci-main-hosts
-          - label: remote-fqdn
-            script: run-main-remote-lifecycle.sh
+            artifact: ci-local-hosts
+          - label: remote-default
+            script: run-remote-lifecycle.sh
             resolution: fqdn-only-hosts
-            artifact: ci-main-remote-fqdn
+            artifact: ci-remote-default
           - label: remote-hosts
-            script: run-main-remote-lifecycle.sh
+            script: run-remote-lifecycle.sh
             resolution: hosts-all
-            artifact: ci-main-remote-hosts
+            artifact: ci-remote-hosts
           - label: rotation
             script: run-rotation-recovery.sh
             resolution: ""

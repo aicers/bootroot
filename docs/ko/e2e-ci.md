@@ -68,8 +68,8 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 
 주요 스크립트:
 
-- `scripts/impl/run-main-lifecycle.sh`
-- `scripts/impl/run-main-remote-lifecycle.sh`
+- `scripts/impl/run-local-lifecycle.sh`
+- `scripts/impl/run-remote-lifecycle.sh`
 - `scripts/impl/run-rotation-recovery.sh`
 
 확장 워크플로는 다음을 검증합니다.
@@ -91,7 +91,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 
 구성:
 
-- `scripts/impl/run-main-lifecycle.sh` 기반 단일 머신 시나리오
+- `scripts/impl/run-local-lifecycle.sh` 기반 단일 머신 시나리오
 - Docker Compose에서 `openbao`, `postgres`, `step-ca`, `bootroot-http01` 실행
 - 서비스는 `--delivery-mode local-file`로 추가
 - 이 시나리오의 서비스 구성(총 2개): `edge-proxy` (`daemon`), `web-app` (`docker`)
@@ -177,7 +177,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
 
 ```bash
 # hosts-all 모드로 실행
-RESOLUTION_MODE=hosts-all ./scripts/impl/run-main-lifecycle.sh
+RESOLUTION_MODE=hosts-all ./scripts/impl/run-local-lifecycle.sh
 
 # 내부적으로 /etc/hosts 추가/정리
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -272,7 +272,7 @@ bootroot rotate --yes responder-hmac
 
 ```bash
 # hosts-all 모드로 원격 전체 흐름 실행
-RESOLUTION_MODE=hosts-all ./scripts/impl/run-main-remote-lifecycle.sh
+RESOLUTION_MODE=hosts-all ./scripts/impl/run-remote-lifecycle.sh
 
 # 내부적으로 /etc/hosts 추가/정리
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -461,7 +461,7 @@ E2E에서 OpenBao 언실/런타임 인증 사용 방식:
 E2E 스크립트는 단계 진행 상태를 `phases.log` 파일로 남깁니다.
 아래는 그 파일에 기록되는 이벤트 JSON 형식입니다.
 
-로컬 전달 E2E 시나리오 스크립트는 다음 형식으로 기록합니다.
+라이프사이클 스크립트는 다음 형식으로 기록합니다.
 
 ```json
 {"ts":"2026-02-17T04:49:01Z","phase":"infra-up","mode":"fqdn-only-hosts"}
@@ -492,10 +492,10 @@ CI 실패를 직접 디버깅하는 사용자/기여자 관점에서는 유용�
 
 PR 필수 아티팩트 예시:
 
-- `tmp/e2e/ci-main-fqdn-<run-id>`
-- `tmp/e2e/ci-main-hosts-<run-id>`
-- `tmp/e2e/ci-main-remote-fqdn-<run-id>`
-- `tmp/e2e/ci-main-remote-hosts-<run-id>`
+- `tmp/e2e/ci-local-default-<run-id>`
+- `tmp/e2e/ci-local-hosts-<run-id>`
+- `tmp/e2e/ci-remote-default-<run-id>`
+- `tmp/e2e/ci-remote-hosts-<run-id>`
 - `tmp/e2e/ci-rotation-<run-id>`
 
 확장 아티팩트 예시:
