@@ -305,11 +305,35 @@ jobs:
         run: docker compose -f docker-compose.yml -f docker-compose.test.yml down
 
   test-docker-e2e-matrix:
-    name: Docker E2E Matrix
+    name: Docker E2E (${{ matrix.scenario.label }})
     needs: [check, changes]
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - label: main-fqdn
+            script: run-main-lifecycle.sh
+            resolution: fqdn-only-hosts
+            artifact: ci-main-fqdn
+          - label: main-hosts
+            script: run-main-lifecycle.sh
+            resolution: hosts-all
+            artifact: ci-main-hosts
+          - label: remote-fqdn
+            script: run-main-remote-lifecycle.sh
+            resolution: fqdn-only-hosts
+            artifact: ci-main-remote-fqdn
+          - label: remote-hosts
+            script: run-main-remote-lifecycle.sh
+            resolution: hosts-all
+            artifact: ci-main-remote-hosts
+          - label: rotation
+            script: run-rotation-recovery.sh
+            resolution: ""
+            artifact: ci-rotation
     steps:
       - uses: actions/checkout@v6
 
@@ -322,12 +346,13 @@ jobs:
       - name: Build bootroot binaries
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
-      - name: Run Docker main lifecycle (fqdn-only-hosts)
+      - name: Run E2E scenario (lifecycle)
+        if: matrix.scenario.label != 'rotation'
         run: |
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-fqdn-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           ARTIFACT_DIR="$ARTIFACT_DIR" \
-          PROJECT_NAME="bootroot-e2e-ci-main-fqdn-${GITHUB_RUN_ID}" \
-          RESOLUTION_MODE="fqdn-only-hosts" \
+          PROJECT_NAME="bootroot-e2e-ci-${{ matrix.scenario.label }}-${GITHUB_RUN_ID}" \
+          RESOLUTION_MODE="${{ matrix.scenario.resolution }}" \
           SECRETS_DIR="$(pwd)/secrets" \
           TIMEOUT_SECS=120 \
           INFRA_UP_ATTEMPTS=12 \
@@ -337,8 +362,8 @@ jobs:
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/impl/run-main-lifecycle.sh || {
-            echo "main lifecycle (fqdn-only-hosts) failed"
+          ./scripts/impl/${{ matrix.scenario.script }} || {
+            echo "${{ matrix.scenario.label }} failed"
             [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
             [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
             [ -f "$ARTIFACT_DIR/init.raw.log" ] && tail -n 200 "$ARTIFACT_DIR/init.raw.log" || true
@@ -347,85 +372,11 @@ jobs:
             exit 1
           }
 
-      - name: Run Docker main lifecycle (hosts-all)
-        run: |
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-hosts-${GITHUB_RUN_ID}"
-          ARTIFACT_DIR="$ARTIFACT_DIR" \
-          PROJECT_NAME="bootroot-e2e-ci-main-hosts-${GITHUB_RUN_ID}" \
-          RESOLUTION_MODE="hosts-all" \
-          SECRETS_DIR="$(pwd)/secrets" \
-          TIMEOUT_SECS=120 \
-          INFRA_UP_ATTEMPTS=12 \
-          INFRA_UP_DELAY_SECS=10 \
-          VERIFY_ATTEMPTS=5 \
-          VERIFY_DELAY_SECS=5 \
-          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
-          BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
-          BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/impl/run-main-lifecycle.sh || {
-            echo "main lifecycle (hosts-all) failed"
-            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
-            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
-            [ -f "$ARTIFACT_DIR/init.raw.log" ] && tail -n 200 "$ARTIFACT_DIR/init.raw.log" || true
-            [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
-            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
-            exit 1
-          }
-
-      - name: Run Docker main remote lifecycle (fqdn-only-hosts)
-        run: |
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-remote-fqdn-${GITHUB_RUN_ID}"
-          ARTIFACT_DIR="$ARTIFACT_DIR" \
-          PROJECT_NAME="bootroot-e2e-ci-main-remote-fqdn-${GITHUB_RUN_ID}" \
-          RESOLUTION_MODE="fqdn-only-hosts" \
-          SECRETS_DIR="$(pwd)/secrets" \
-          TIMEOUT_SECS=120 \
-          INFRA_UP_ATTEMPTS=12 \
-          INFRA_UP_DELAY_SECS=10 \
-          VERIFY_ATTEMPTS=5 \
-          VERIFY_DELAY_SECS=5 \
-          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
-          BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
-          BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/impl/run-main-remote-lifecycle.sh || {
-            echo "main remote lifecycle (fqdn-only-hosts) failed"
-            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
-            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
-            [ -f "$ARTIFACT_DIR/init.raw.log" ] && tail -n 200 "$ARTIFACT_DIR/init.raw.log" || true
-            [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
-            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
-            exit 1
-          }
-
-      - name: Run Docker main remote lifecycle (hosts-all)
-        run: |
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-main-remote-hosts-${GITHUB_RUN_ID}"
-          ARTIFACT_DIR="$ARTIFACT_DIR" \
-          PROJECT_NAME="bootroot-e2e-ci-main-remote-hosts-${GITHUB_RUN_ID}" \
-          RESOLUTION_MODE="hosts-all" \
-          SECRETS_DIR="$(pwd)/secrets" \
-          TIMEOUT_SECS=120 \
-          INFRA_UP_ATTEMPTS=12 \
-          INFRA_UP_DELAY_SECS=10 \
-          VERIFY_ATTEMPTS=5 \
-          VERIFY_DELAY_SECS=5 \
-          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
-          BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
-          BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \
-          ./scripts/impl/run-main-remote-lifecycle.sh || {
-            echo "main remote lifecycle (hosts-all) failed"
-            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
-            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
-            [ -f "$ARTIFACT_DIR/init.raw.log" ] && tail -n 200 "$ARTIFACT_DIR/init.raw.log" || true
-            [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
-            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
-            exit 1
-          }
-
-      - name: Run Docker rotation/recovery full matrix
+      - name: Run E2E scenario (rotation)
+        if: matrix.scenario.label == 'rotation'
         run: |
           SCENARIO_FILE="$(pwd)/tests/e2e/docker_harness/scenarios/scenario-c-multi-node-uneven.json" \
-          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-rotation-${GITHUB_RUN_ID}" \
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}" \
           PROJECT_NAME="bootroot-e2e-ci-rotation-${GITHUB_RUN_ID}" \
           ROTATION_ITEMS="secret_id,eab,responder_hmac,trust_sync" \
           TIMEOUT_SECS=90 \
@@ -433,42 +384,10 @@ jobs:
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           ./scripts/impl/run-rotation-recovery.sh
 
-      - name: Upload Baseline Artifacts
+      - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ci-main-fqdn-${{ github.run_id }}
-          path: tmp/e2e/ci-main-fqdn-${{ github.run_id }}
-          if-no-files-found: warn
-
-      - name: Upload Hosts-All Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-main-hosts-${{ github.run_id }}
-          path: tmp/e2e/ci-main-hosts-${{ github.run_id }}
-          if-no-files-found: warn
-
-      - name: Upload Remote FQDN Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-main-remote-fqdn-${{ github.run_id }}
-          path: tmp/e2e/ci-main-remote-fqdn-${{ github.run_id }}
-          if-no-files-found: warn
-
-      - name: Upload Remote Hosts-All Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-main-remote-hosts-${{ github.run_id }}
-          path: tmp/e2e/ci-main-remote-hosts-${{ github.run_id }}
-          if-no-files-found: warn
-
-      - name: Upload Rotation Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-rotation-${{ github.run_id }}
-          path: tmp/e2e/ci-rotation-${{ github.run_id }}
+          name: ${{ matrix.scenario.artifact }}-${{ github.run_id }}
+          path: tmp/e2e/${{ matrix.scenario.artifact }}-${{ github.run_id }}
           if-no-files-found: warn
