@@ -9,6 +9,7 @@ PR 필수 CI(`.github/workflows/ci.yml`)는 다음을 실행합니다.
 
 - `test-core`: 단위/통합 스모크 경로
 - `test-docker-e2e-matrix`: 전체 흐름 + 회전/복구 Docker E2E 조합 검증
+  (5개 시나리오가 matrix 전략으로 병렬 실행)
 
 확장 E2E(`.github/workflows/e2e-extended.yml`)는 별도 실행됩니다.
 
