@@ -70,8 +70,8 @@ PR-critical Docker test set validates:
 
 Primary scripts:
 
-- `scripts/impl/run-main-lifecycle.sh`
-- `scripts/impl/run-main-remote-lifecycle.sh`
+- `scripts/impl/run-local-lifecycle.sh`
+- `scripts/impl/run-remote-lifecycle.sh`
 - `scripts/impl/run-rotation-recovery.sh`
 
 Extended workflow validates:
@@ -94,7 +94,7 @@ reproduction.
 
 Configuration:
 
-- Single machine baseline used by `scripts/impl/run-main-lifecycle.sh`
+- Single machine baseline used by `scripts/impl/run-local-lifecycle.sh`
 - `openbao`, `postgres`, `step-ca`, `bootroot-http01` run in Docker Compose
 - Services are added with `--delivery-mode local-file`
 - Service set in this scenario (2 services): `edge-proxy` (`daemon`),
@@ -181,7 +181,7 @@ Actual commands (script excerpt):
 
 ```bash
 # run in hosts-all mode
-RESOLUTION_MODE=hosts-all ./scripts/impl/run-main-lifecycle.sh
+RESOLUTION_MODE=hosts-all ./scripts/impl/run-local-lifecycle.sh
 
 # internal host-entry add/remove sequence
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -276,7 +276,7 @@ Actual commands (script excerpt):
 
 ```bash
 # run remote lifecycle in hosts-all mode
-RESOLUTION_MODE=hosts-all ./scripts/impl/run-main-remote-lifecycle.sh
+RESOLUTION_MODE=hosts-all ./scripts/impl/run-remote-lifecycle.sh
 
 # internal host-entry add/remove sequence
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -381,7 +381,7 @@ Or run individual scripts:
 | Script | CI job |
 | --- | --- |
 | `./scripts/preflight/ci/check.sh` | `ci.yml` Quality Check |
-| `./scripts/preflight/ci/test-core.sh` | `ci.yml` Test Suite (Core) |
+| `./scripts/preflight/ci/test-core.sh` | `ci.yml` Unit & CLI Smoke |
 | `./scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` Docker E2E Matrix |
 | `./scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` Run Extended |
 
@@ -467,7 +467,7 @@ Pass/fail rules:
 E2E scripts write step-progress events to `phases.log`.
 The examples below describe the JSON event format in that file.
 
-Main lifecycle scripts write:
+Lifecycle scripts write:
 
 ```json
 {"ts":"2026-02-17T04:49:01Z","phase":"infra-up","mode":"fqdn-only-hosts"}
@@ -498,10 +498,10 @@ For users/contributors debugging CI failures directly, it is useful.
 
 Typical PR-critical artifacts:
 
-- `tmp/e2e/ci-main-fqdn-<run-id>`
-- `tmp/e2e/ci-main-hosts-<run-id>`
-- `tmp/e2e/ci-main-remote-fqdn-<run-id>`
-- `tmp/e2e/ci-main-remote-hosts-<run-id>`
+- `tmp/e2e/ci-local-default-<run-id>`
+- `tmp/e2e/ci-local-hosts-<run-id>`
+- `tmp/e2e/ci-remote-default-<run-id>`
+- `tmp/e2e/ci-remote-hosts-<run-id>`
 - `tmp/e2e/ci-rotation-<run-id>`
 
 Typical extended artifact:

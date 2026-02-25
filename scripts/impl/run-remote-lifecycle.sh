@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-main-remote-lifecycle-$(date +%s)}"
+ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-remote-lifecycle-$(date +%s)}"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
@@ -140,7 +140,7 @@ cleanup() {
 
 on_error() {
   local line="$1"
-  echo "run-main-remote-lifecycle failed at phase=${CURRENT_PHASE} line=${line}" >&2
+  echo "run-remote-lifecycle failed at phase=${CURRENT_PHASE} line=${line}" >&2
   echo "artifact dir: ${ARTIFACT_DIR}" >&2
   [ -f "$RUN_LOG" ] && tail -n 120 "$RUN_LOG" >&2 || true
   [ -f "$INIT_RAW_LOG" ] && tail -n 120 "$INIT_RAW_LOG" >&2 || true

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-main-lifecycle-$(date +%s)}"
+ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-local-lifecycle-$(date +%s)}"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
@@ -236,7 +236,7 @@ cleanup() {
 
 on_error() {
   local line="$1"
-  echo "run-main-lifecycle failed at phase=${CURRENT_PHASE} line=${line}" >&2
+  echo "run-local-lifecycle failed at phase=${CURRENT_PHASE} line=${line}" >&2
   echo "artifact dir: ${ARTIFACT_DIR}" >&2
   if [ -f "$RUN_LOG" ]; then
     echo "--- run.log (tail) ---" >&2
