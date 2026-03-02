@@ -7,4 +7,5 @@ pub(crate) mod openbao_unseal;
 pub(crate) mod rotate;
 pub(crate) mod service;
 pub(crate) mod status;
+pub(crate) mod trust;
 pub(crate) mod verify;

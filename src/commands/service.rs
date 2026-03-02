@@ -1289,16 +1289,27 @@ async fn write_service_kv_secrets(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
-    let mut trust_payload = serde_json::json!({
-        CA_TRUST_KEY: &material.trusted_ca_sha256,
-    });
     if let Some(bundle) = material.ca_bundle_pem.as_deref() {
-        trust_payload[SERVICE_CA_BUNDLE_PEM_KEY] = serde_json::Value::String(bundle.to_string());
+        crate::commands::trust::write_service_trust(
+            client,
+            kv_mount,
+            service_name,
+            &material.trusted_ca_sha256,
+            bundle,
+            messages,
+        )
+        .await?;
+    } else {
+        // Legacy fallback for installations before ca_bundle_pem was introduced.
+        client
+            .write_kv(
+                kv_mount,
+                &format!("{base}/trust"),
+                serde_json::json!({ CA_TRUST_KEY: &material.trusted_ca_sha256 }),
+            )
+            .await
+            .with_context(|| messages.error_openbao_kv_write_failed())?;
     }
-    client
-        .write_kv(kv_mount, &format!("{base}/trust"), trust_payload)
-        .await
-        .with_context(|| messages.error_openbao_kv_write_failed())?;
     Ok(())
 }
 
