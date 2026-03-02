@@ -982,19 +982,21 @@ async fn test_rotate_trust_sync_writes_global_and_per_service() {
         .respond_with(ResponseTemplate::new(200))
         .mount(&openbao)
         .await;
-    Mock::given(method("POST"))
+    let global_mock = Mock::given(method("POST"))
         .and(path("/v1/secret/data/bootroot/ca"))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&openbao)
+        .expect(1)
+        .mount_as_scoped(&openbao)
         .await;
-    Mock::given(method("POST"))
+    let service_mock = Mock::given(method("POST"))
         .and(path(format!(
             "/v1/secret/data/bootroot/services/{SERVICE_NAME}/trust"
         )))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&openbao)
+        .expect(1)
+        .mount_as_scoped(&openbao)
         .await;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
@@ -1018,6 +1020,14 @@ async fn test_rotate_trust_sync_writes_global_and_per_service() {
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stdout.contains("CA trust updated"));
+    assert!(
+        stdout.contains(SERVICE_NAME),
+        "stdout should mention the service name: {stdout}"
+    );
+
+    // Verify mock expectations: global and per-service writes each called exactly once.
+    drop(global_mock);
+    drop(service_mock);
 }
 
 #[cfg(unix)]
@@ -1544,4 +1554,57 @@ fn mock_pg_read_payload(stream: &mut std::net::TcpStream) -> Vec<u8> {
         return Vec::new();
     }
     payload
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_trust_sync_blocked_by_rotation_state() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
+
+    // Simulate an in-progress CA key rotation.
+    fs::write(
+        temp_dir.path().join("rotation-state.json"),
+        r#"{"mode":"intermediate-only","phase":3}"#,
+    )
+    .expect("write rotation-state.json");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "trust-sync",
+        ])
+        .output()
+        .expect("run rotate trust-sync");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "trust-sync should fail when rotation-state.json exists; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("rotation-state.json") || stderr.contains("trust-sync is blocked"),
+        "stderr should mention rotation conflict: {stderr}"
+    );
 }

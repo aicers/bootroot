@@ -281,6 +281,8 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_summary_force_reissue_deleted: "- {service_name}: cert/key deleted ({cert_path}, {key_path})",
     rotate_summary_force_reissue_local_signal: "- {service_name}: signaled bootroot-agent for renewal",
     rotate_summary_force_reissue_remote_hint: "- {service_name}: run `bootroot-remote bootstrap` on the service host to reissue",
+    warning_rotation_in_progress: "WARNING: rotation-state.json exists, indicating a CA key rotation is in progress.",
+    error_trust_sync_blocked_by_rotation: "trust-sync is blocked while CA key rotation is in progress; complete or abort the rotation first",
     summary_responder_check_ok: "- responder check: ok",
     summary_responder_check_skipped: "- responder check: skipped",
     summary_db_check_ok: "- db check: ok",

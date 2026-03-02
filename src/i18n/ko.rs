@@ -281,6 +281,8 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_summary_force_reissue_deleted: "- {service_name}: cert/key 삭제 ({cert_path}, {key_path})",
     rotate_summary_force_reissue_local_signal: "- {service_name}: 인증서 갱신을 위해 bootroot-agent에 시그널 전송",
     rotate_summary_force_reissue_remote_hint: "- {service_name}: 서비스 머신에서 `bootroot-remote bootstrap`을 실행하여 재발급하세요",
+    warning_rotation_in_progress: "경고: rotation-state.json이 존재합니다. CA 키 교체가 진행 중입니다.",
+    error_trust_sync_blocked_by_rotation: "CA 키 교체가 진행 중일 때 trust-sync가 차단됩니다. 먼저 교체를 완료하거나 중단하세요",
     summary_responder_check_ok: "- responder 점검: ok",
     summary_responder_check_skipped: "- responder 점검: 생략",
     summary_db_check_ok: "- DB 점검: ok",

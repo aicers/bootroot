@@ -315,6 +315,8 @@ pub(crate) struct Strings {
     pub(crate) rotate_summary_force_reissue_deleted: &'static str,
     pub(crate) rotate_summary_force_reissue_local_signal: &'static str,
     pub(crate) rotate_summary_force_reissue_remote_hint: &'static str,
+    pub(crate) warning_rotation_in_progress: &'static str,
+    pub(crate) error_trust_sync_blocked_by_rotation: &'static str,
     pub(crate) summary_responder_check_ok: &'static str,
     pub(crate) summary_responder_check_skipped: &'static str,
     pub(crate) summary_db_check_ok: &'static str,
@@ -1805,6 +1807,14 @@ impl Messages {
             self.strings().rotate_summary_force_reissue_remote_hint,
             &[("service_name", service_name)],
         )
+    }
+
+    pub(crate) fn warning_rotation_in_progress(&self) -> &'static str {
+        self.strings().warning_rotation_in_progress
+    }
+
+    pub(crate) fn error_trust_sync_blocked_by_rotation(&self) -> &'static str {
+        self.strings().error_trust_sync_blocked_by_rotation
     }
 
     pub(crate) fn summary_responder_check_ok(&self) -> &'static str {

@@ -15,8 +15,8 @@ use crate::cli::prompt::Prompt;
 use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
-    CA_TRUST_KEY, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
-    PATH_STEPCA_PASSWORD, compute_ca_bundle_pem, compute_ca_fingerprints,
+    PATH_AGENT_EAB, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
+    compute_ca_bundle_pem, compute_ca_fingerprints,
 };
 use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
 use crate::i18n::Messages;
@@ -29,8 +29,6 @@ const SERVICE_SECRET_ID_KEY: &str = "secret_id";
 const SERVICE_EAB_KID_KEY: &str = "kid";
 const SERVICE_EAB_HMAC_KEY: &str = "hmac";
 const SERVICE_RESPONDER_HMAC_KEY: &str = "hmac";
-const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
-const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
 const OPENBAO_AGENT_STEPCA_CONTAINER: &str = "bootroot-openbao-agent-stepca";
 const OPENBAO_AGENT_RESPONDER_CONTAINER: &str = "bootroot-openbao-agent-responder";
 const RENDERED_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -83,6 +81,7 @@ struct RotateContext {
     compose_file: PathBuf,
     state: StateFile,
     paths: StatePaths,
+    state_dir: PathBuf,
 }
 
 pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result<()> {
@@ -112,6 +111,9 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         .clone()
         .unwrap_or_else(|| state.secrets_dir());
     let paths = StatePaths::new(secrets_dir.clone());
+    let state_dir = state_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let runtime_auth = resolve_runtime_auth(&args.runtime_auth, true, messages)?;
     let mut ctx = RotateContext {
         openbao_url,
@@ -119,6 +121,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         compose_file: args.compose.compose_file.clone(),
         state,
         paths,
+        state_dir,
     };
     let mut client = OpenBaoClient::new(&ctx.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
@@ -862,43 +865,36 @@ async fn rotate_trust_sync(
 ) -> Result<()> {
     confirm_action(messages.prompt_rotate_trust_sync(), auto_confirm, messages)?;
 
+    if crate::commands::trust::rotation_in_progress(&ctx.state_dir) {
+        eprintln!("{}", messages.warning_rotation_in_progress());
+        anyhow::bail!(messages.error_trust_sync_blocked_by_rotation());
+    }
+
     let secrets_dir = ctx.paths.secrets_dir();
     let fingerprints = compute_ca_fingerprints(secrets_dir, messages).await?;
     let ca_bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
 
-    // Write global CA trust KV
-    client
-        .write_kv(
-            &ctx.kv_mount,
-            PATH_CA_TRUST,
-            serde_json::json!({ CA_TRUST_KEY: fingerprints, CA_BUNDLE_PEM_KEY: ca_bundle_pem }),
-        )
-        .await
-        .with_context(|| messages.error_openbao_kv_write_failed())?;
-
-    // Sync trust to each service KV
-    let service_names: Vec<String> = ctx
-        .state
-        .services
-        .values()
-        .map(|entry| entry.service_name.clone())
-        .collect();
-    for service_name in &service_names {
-        client
-            .write_kv(
-                &ctx.kv_mount,
-                &format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_TRUST_KV_SUFFIX}"),
-                serde_json::json!({ CA_TRUST_KEY: fingerprints, CA_BUNDLE_PEM_KEY: ca_bundle_pem }),
-            )
-            .await
-            .with_context(|| messages.error_openbao_kv_write_failed())?;
-    }
+    crate::commands::trust::write_trust_to_openbao(
+        client,
+        &ctx.kv_mount,
+        &ctx.state.services,
+        &fingerprints,
+        &ca_bundle_pem,
+        messages,
+    )
+    .await?;
 
     println!("{}", messages.rotate_summary_title());
     println!(
         "{}",
         messages.rotate_summary_trust_sync_global(&fingerprints.join(", "))
     );
+    let service_names: Vec<String> = ctx
+        .state
+        .services
+        .values()
+        .map(|entry| entry.service_name.clone())
+        .collect();
     for service_name in &service_names {
         println!(
             "{}",
