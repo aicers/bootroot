@@ -703,7 +703,7 @@ run_rotations_with_verification() {
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
-    ca-key --cleanup >>"$RUN_LOG" 2>&1
+    ca-key --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1
   wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
