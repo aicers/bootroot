@@ -37,6 +37,13 @@ pub(crate) fn remote_lifecycle_script_path() -> PathBuf {
         .join("run-remote-lifecycle.sh")
 }
 
+pub(crate) fn ca_key_rotation_recovery_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("impl")
+        .join("run-ca-key-rotation-recovery.sh")
+}
+
 pub(crate) fn baseline_scenario_path(file_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

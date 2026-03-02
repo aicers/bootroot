@@ -55,6 +55,7 @@ mod unix_integration {
         assert!(phase_contents.contains("\"phase\":\"failure-recovery\""));
         assert!(phase_contents.contains("\"phase\":\"runner-timer\""));
         assert!(phase_contents.contains("\"phase\":\"runner-cron\""));
+        assert!(phase_contents.contains("\"phase\":\"ca-key-recovery\""));
 
         Ok(())
     }
