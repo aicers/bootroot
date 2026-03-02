@@ -183,6 +183,8 @@ start_service_sidecar_oba() {
   local container="bootroot-openbao-agent-${service}"
   local agent_hcl="$SECRETS_DIR/openbao/services/${service}/agent.hcl"
 
+  # Remove the pre-seeded config so readiness waits for sidecar-rendered content.
+  rm -f "$AGENT_CONFIG_PATH"
   docker rm -f "$container" >/dev/null 2>&1 || true
 
   # Run sidecar OBA sharing the OpenBao container network so that
@@ -199,7 +201,9 @@ start_service_sidecar_oba() {
 
   local attempt
   for attempt in $(seq 1 "$SIDECAR_OBA_READY_ATTEMPTS"); do
-    if [ -f "$AGENT_CONFIG_PATH" ] && grep -q 'http_responder_hmac' "$AGENT_CONFIG_PATH" 2>/dev/null; then
+    if [ -f "$AGENT_CONFIG_PATH" ] &&
+      grep -Eq '^[[:space:]]*http_responder_hmac[[:space:]]*=[[:space:]]*"[^"]+"' \
+        "$AGENT_CONFIG_PATH" 2>/dev/null; then
       return 0
     fi
     sleep "$SIDECAR_OBA_READY_DELAY_SECS"
