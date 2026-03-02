@@ -64,22 +64,21 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - 로컬 전달 E2E 시나리오 (`hosts-all`)
 - 원격 전달 E2E 시나리오 (`fqdn-only-hosts`)
 - 원격 전달 E2E 시나리오 (`hosts-all`)
-- rotation/recovery matrix (`secret_id,eab,responder_hmac`)
-- CA 키 회전 장애/복구(5개 장애 주입 시나리오)
+- rotation/recovery matrix (`secret_id,eab,responder_hmac,trust_sync`)
 
 주요 스크립트:
 
 - `scripts/impl/run-local-lifecycle.sh`
 - `scripts/impl/run-remote-lifecycle.sh`
 - `scripts/impl/run-rotation-recovery.sh`
-- `scripts/impl/run-ca-key-rotation-recovery.sh`
 
 확장 워크플로는 다음을 검증합니다.
 
 - baseline 경합/스케일 동작
 - 반복 장애/복구 동작
 - 회전 스케줄 동등성(`systemd-timer`, `cron`)
-- CA 키 회전 장애/복구
+- CA 키 회전 장애/복구(5개 장애 주입 시나리오)
+- 인프라 라이프사이클(전체 로컬 전달 왕복)
 
 주요 스크립트:
 
@@ -197,29 +196,32 @@ sudo -n cp "$tmp_file" /etc/hosts
 - 한 번의 실행에서 두 workspace 사용:
   `control-node` (step-ca 머신 역할), `remote-node` (서비스 머신 역할)
 - 서비스는 `--delivery-mode remote-bootstrap`으로 추가
-- 이 시나리오의 서비스 구성(총 1개): `edge-proxy` (`daemon`)
+- 이 시나리오의 서비스 구성(총 2개): `edge-proxy` (`daemon`),
+  `web-app` (`docker`)
 - 원격 bootstrap 반영은 `bootroot-remote bootstrap`으로 수행
 - 해석 모드는 `fqdn-only-hosts`
 
 목적:
 
 - remote-bootstrap 온보딩과 일회성 bootstrap 반영 방식 검증
-- `secret_id`, `eab`, `responder_hmac` 항목의
+- `secret_id`, `eab`, `trust_sync`, `responder_hmac` 항목의
   bootstrap 기반 반영 검증
-- 원격 회전/복구 시퀀스와 명시적 secret_id handoff 검증
+- 원격 회전/복구 시퀀스와 전체 `bootstrap` 재반영 검증
 
 실행 단계:
 
 1. control node에서 `infra-up`, `init` 실행 후 summary JSON에서 런타임
    AppRole 자격증명 파싱
-2. control node에서 `remote-bootstrap` 모드로 `service-add` 실행
+2. control node에서 `remote-bootstrap` 모드로 두 서비스 `service-add` 실행
 3. bootstrap 재료(`role_id`, `secret_id`)를 remote node로 복사
-4. `bootstrap-initial`: remote node에서 `bootroot-remote bootstrap` 실행
+4. `bootstrap-initial`: remote node에서 서비스별 `bootroot-remote bootstrap`
+   실행
 5. `verify-initial`: remote node에서 인증서 발급/검증
-6. 회전 + apply-secret-id + verify 반복:
-   `rotate-secret-id` -> `apply-secret-id` -> `verify-after-secret-id`,
-   `rotate-eab` -> `verify-after-eab`,
-   `rotate-responder-hmac` -> `verify-after-responder-hmac`
+6. 회전 + bootstrap 재반영 + verify 반복:
+   `rotate-secret-id` -> `bootstrap` -> `verify-after-secret-id`,
+   `rotate-eab` -> `bootstrap` -> `verify-after-eab`,
+   `rotate-trust-sync` -> `bootstrap` -> `verify-after-trust-sync`,
+   `rotate-responder-hmac` -> `bootstrap` -> `verify-after-responder-hmac`
 7. 각 검증 단계 사이 인증서 fingerprint 변경 여부 확인
 
 실제 실행 명령(스크립트 발췌):
@@ -231,21 +233,24 @@ BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
   --auto-generate --show-secrets --eab-kid "$INIT_EAB_KID" \
   --eab-hmac "$INIT_EAB_HMAC"
-bootroot service add --service-name "$SERVICE_NAME" --deploy-type daemon \
+bootroot service add --service-name edge-proxy --deploy-type daemon \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
+bootroot service add --service-name web-app --deploy-type docker \
+  --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH_2"
 
-# remote node: bootstrap
+# remote node: bootstrap (서비스별)
 bootroot-remote bootstrap --openbao-url "http://127.0.0.1:8200" \
   --service-name "$SERVICE_NAME" \
   --role-id-path "$role_id_path" --secret-id-path "$secret_id_path" \
   --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
-  --summary-json "$summary_path" --output json
+  --output json
 
-# control node: verify / rotate
-bootroot verify --service-name "$SERVICE_NAME" \
-  --agent-config "$REMOTE_AGENT_CONFIG_PATH"
-bootroot rotate --yes approle-secret-id --service-name "$SERVICE_NAME"
+# control node: rotate / remote node: bootstrap 재반영
+bootroot rotate --yes approle-secret-id --service-name edge-proxy
+bootroot rotate --yes approle-secret-id --service-name web-app
+bootroot-remote bootstrap ...  # 서비스별 재반영
 bootroot rotate --yes responder-hmac
+bootroot-remote bootstrap ...  # 서비스별 재반영
 ```
 
 ### 4) 원격 전달 E2E 시나리오 (`hosts-all`)
@@ -253,7 +258,8 @@ bootroot rotate --yes responder-hmac
 구성:
 
 - 위 원격 전달 E2E 시나리오와 동일한 control-node/remote-node 모델
-- remote `fqdn-only-hosts`와 동일한 서비스 구성: `edge-proxy` (`daemon`)
+- remote `fqdn-only-hosts`와 동일한 서비스 구성: `edge-proxy` (`daemon`),
+  `web-app` (`docker`)
 - 해석 모드는 `hosts-all`
 - 스크립트가 임시 `/etc/hosts` entry를 추가/정리
 
@@ -303,18 +309,18 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 #### 회전 항목
 
-- `secret_id,eab,responder_hmac`
+- `secret_id,eab,responder_hmac,trust_sync`
 
 목적:
 
 - 항목별 회전 및 복구 동작 검증
 - 단일 타깃 실패 주입 후 복구 검증
-- `bootroot-remote apply-secret-id`를 통한 명시적 secret_id handoff 검증
+- 원격 노드에서 회전 후 bootstrap 재반영 검증
 
 실행 단계(항목별 반복):
 
 1. control node에서 대상 항목 회전
-2. `secret_id`의 경우: remote node에서 `bootroot-remote apply-secret-id` 실행
+2. 각 remote node에서 `bootroot-remote bootstrap` 실행하여 재반영
 3. 회전 후 인증서 발급이 정상 동작하는지 검증
 4. 실패 cycle: 특정 서비스 실패 주입 후 복구 확인
 5. 복구 cycle: 재회전/재반영 후 정상 동작 확인
@@ -327,7 +333,7 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 # 회전/verify 루프에서 사용하는 핵심 명령
 bootroot rotate --yes approle-secret-id --service-name "$service"
-bootroot-remote apply-secret-id --service-name "$service" ...
+bootroot-remote bootstrap --service-name "$service" ...
 bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 ```
 
@@ -416,7 +422,7 @@ docker compose -f "$COMPOSE_FILE" rm -sf step-ca
 
 - 스크립트: `scripts/impl/run-extended-suite.sh`
 - 케이스: `scale-contention`, `failure-recovery`, `runner-timer`, `runner-cron`,
-  `ca-key-recovery`
+  `ca-key-recovery`, `infra-lifecycle`
 - 케이스 결과는 `extended-summary.json`에 집계
 - 서비스 구성: 각 케이스가 사용하는 하위 시나리오/스크립트 구성을 그대로 상속하며,
   scale/contention, failure/recovery 케이스는 복수 서비스를 포함
@@ -446,6 +452,7 @@ docker compose -f "$COMPOSE_FILE" rm -sf step-ca
 RUNNER_MODE=systemd-timer ./scripts/impl/run-harness-smoke.sh
 RUNNER_MODE=cron ./scripts/impl/run-harness-smoke.sh
 ./scripts/impl/run-ca-key-rotation-recovery.sh
+./scripts/impl/run-local-lifecycle.sh
 ```
 
 ## 로컬 사전검증 표준
@@ -533,11 +540,12 @@ E2E에서 OpenBao 언실/런타임 인증 사용 방식:
 - `secret_id`
 - `eab`
 - `responder_hmac`
+- `trust_sync`
 
 판정 규칙:
 
 - 모든 bootstrap 항목이 summary 출력에서 `applied` 상태여야 함
-- secret_id 회전 후 `bootroot-remote apply-secret-id`가 정상 완료되어야 함
+- 회전 후 `bootroot-remote bootstrap` 재반영이 정상 완료되어야 함
 - 하나라도 `failed`이면 해당 단계를 실패로 처리함
 
 ## E2E `phases.log` 형식
@@ -581,11 +589,11 @@ PR 필수 아티팩트 예시:
 - `tmp/e2e/ci-remote-default-<run-id>`
 - `tmp/e2e/ci-remote-hosts-<run-id>`
 - `tmp/e2e/ci-rotation-<run-id>`
-- `tmp/e2e/docker-ca-key-recovery-<run-id>`
 
 확장 아티팩트 예시:
 
-- `tmp/e2e/extended-<run-id>`
+- `tmp/e2e/extended-<run-id>` (케이스별 하위 디렉터리 포함:
+  `ca-key-recovery/`, `infra-lifecycle/` 등)
 
 ## 실패 점검 순서
 
