@@ -44,7 +44,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Fixed `bootroot rotate db` panic with "Cannot start a runtime from within a
   runtime" error by running the synchronous postgres client on a blocking
   thread via `tokio::task::spawn_blocking`.
-- Fixed hosts-all lifecycle instability and related CI reproducibility issues.
+- Fixed hosts-mode lifecycle instability and related CI reproducibility issues.
 - Fixed and strengthened trust sync and trust verification behavior with
   stronger E2E assertions.
 

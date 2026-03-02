@@ -5,31 +5,31 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 
 RUN_ID="${GITHUB_RUN_ID:-local-$(date +%s)}"
-SKIP_HOSTS_ALL=0
+SKIP_HOSTS=0
 FRESH_SECRETS=0
 SECRETS_BACKUP_DIR=""
 
 usage() {
   cat <<'EOF'
-Usage: scripts/preflight/ci/e2e-matrix.sh [--skip-hosts-all] [--fresh-secrets]
+Usage: scripts/preflight/ci/e2e-matrix.sh [--skip-hosts] [--fresh-secrets]
 
 Runs the same Docker E2E matrix steps used in CI:
-1) local lifecycle (fqdn-only-hosts)
-2) local lifecycle (hosts-all)
-3) remote lifecycle (fqdn-only-hosts)
-4) remote lifecycle (hosts-all)
+1) local lifecycle (no-hosts)
+2) local lifecycle (hosts)
+3) remote lifecycle (no-hosts)
+4) remote lifecycle (hosts)
 5) rotation/recovery full matrix
 
 Options:
-  --skip-hosts-all  Skip hosts-all steps (useful when sudo -n is unavailable locally)
+  --skip-hosts  Skip hosts steps (useful when sudo -n is unavailable locally)
   --fresh-secrets   Temporarily replace ./secrets with a clean directory and restore it on exit
 EOF
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --skip-hosts-all)
-      SKIP_HOSTS_ALL=1
+    --skip-hosts)
+      SKIP_HOSTS=1
       shift
       ;;
     --fresh-secrets)
@@ -71,10 +71,10 @@ echo "[ci-local-e2e] run id: $RUN_ID"
 echo "[ci-local-e2e] building bootroot binaries"
 cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
-echo "[ci-local-e2e] run local lifecycle (fqdn-only-hosts)"
-ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-default-${RUN_ID}" \
-PROJECT_NAME="bootroot-e2e-ci-local-default-${RUN_ID}" \
-RESOLUTION_MODE="fqdn-only-hosts" \
+echo "[ci-local-e2e] run local lifecycle (no-hosts)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}" \
+PROJECT_NAME="bootroot-e2e-ci-local-no-hosts-${RUN_ID}" \
+RESOLUTION_MODE="no-hosts" \
 SECRETS_DIR="$ROOT_DIR/secrets" \
 TIMEOUT_SECS=120 \
 INFRA_UP_ATTEMPTS=12 \
@@ -84,11 +84,11 @@ BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
 BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
 "$ROOT_DIR/scripts/impl/run-local-lifecycle.sh"
 
-if [ "$SKIP_HOSTS_ALL" -eq 0 ]; then
-  echo "[ci-local-e2e] run local lifecycle (hosts-all)"
+if [ "$SKIP_HOSTS" -eq 0 ]; then
+  echo "[ci-local-e2e] run local lifecycle (hosts)"
   ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-hosts-${RUN_ID}" \
   PROJECT_NAME="bootroot-e2e-ci-local-hosts-${RUN_ID}" \
-  RESOLUTION_MODE="hosts-all" \
+  RESOLUTION_MODE="hosts" \
   SECRETS_DIR="$ROOT_DIR/secrets" \
   TIMEOUT_SECS=120 \
   INFRA_UP_ATTEMPTS=12 \
@@ -98,13 +98,13 @@ if [ "$SKIP_HOSTS_ALL" -eq 0 ]; then
   BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
   "$ROOT_DIR/scripts/impl/run-local-lifecycle.sh"
 else
-  echo "[ci-local-e2e] skip local lifecycle (hosts-all)"
+  echo "[ci-local-e2e] skip local lifecycle (hosts)"
 fi
 
-echo "[ci-local-e2e] run remote lifecycle (fqdn-only-hosts)"
-ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-remote-default-${RUN_ID}" \
-PROJECT_NAME="bootroot-e2e-ci-remote-default-${RUN_ID}" \
-RESOLUTION_MODE="fqdn-only-hosts" \
+echo "[ci-local-e2e] run remote lifecycle (no-hosts)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-remote-no-hosts-${RUN_ID}" \
+PROJECT_NAME="bootroot-e2e-ci-remote-no-hosts-${RUN_ID}" \
+RESOLUTION_MODE="no-hosts" \
 SECRETS_DIR="$ROOT_DIR/secrets" \
 TIMEOUT_SECS=120 \
 INFRA_UP_ATTEMPTS=12 \
@@ -116,11 +116,11 @@ BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
 BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
 "$ROOT_DIR/scripts/impl/run-remote-lifecycle.sh"
 
-if [ "$SKIP_HOSTS_ALL" -eq 0 ]; then
-  echo "[ci-local-e2e] run remote lifecycle (hosts-all)"
+if [ "$SKIP_HOSTS" -eq 0 ]; then
+  echo "[ci-local-e2e] run remote lifecycle (hosts)"
   ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-remote-hosts-${RUN_ID}" \
   PROJECT_NAME="bootroot-e2e-ci-remote-hosts-${RUN_ID}" \
-  RESOLUTION_MODE="hosts-all" \
+  RESOLUTION_MODE="hosts" \
   SECRETS_DIR="$ROOT_DIR/secrets" \
   TIMEOUT_SECS=120 \
   INFRA_UP_ATTEMPTS=12 \
@@ -132,7 +132,7 @@ if [ "$SKIP_HOSTS_ALL" -eq 0 ]; then
   BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
   "$ROOT_DIR/scripts/impl/run-remote-lifecycle.sh"
 else
-  echo "[ci-local-e2e] skip remote lifecycle (hosts-all)"
+  echo "[ci-local-e2e] skip remote lifecycle (hosts)"
 fi
 
 echo "[ci-local-e2e] run rotation/recovery full matrix"
@@ -147,8 +147,8 @@ BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
 
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
-echo "  - $ROOT_DIR/tmp/e2e/ci-local-default-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-hosts-${RUN_ID}"
-echo "  - $ROOT_DIR/tmp/e2e/ci-remote-default-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-remote-no-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-remote-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-rotation-${RUN_ID}"
