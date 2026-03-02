@@ -44,9 +44,9 @@ Delivery mode (`--delivery-mode`):
 
 Host name mapping mode (E2E run mode):
 
-- `fqdn-only-hosts`: an E2E script mode name. It does not modify host-machine
+- `no-hosts`: an E2E script mode name. It does not modify host-machine
   `/etc/hosts`; it connects to step-ca and responder via `localhost`/IP.
-- `hosts-all`: an E2E script mode name. It adds host-machine `/etc/hosts`
+- `hosts`: an E2E script mode name. It adds host-machine `/etc/hosts`
   entries for `stepca.internal` and `responder.internal`, then connects by
   those names. In E2E, entries are added during the run and removed in cleanup;
   in production, DNS/hosts must be managed continuously.
@@ -62,10 +62,10 @@ state for services/agents continuously.
 
 PR-critical Docker test set validates:
 
-- local-delivery E2E scenario (`fqdn-only-hosts`)
-- local-delivery E2E scenario (`hosts-all`)
-- remote-delivery E2E scenario (`fqdn-only-hosts`)
-- remote-delivery E2E scenario (`hosts-all`)
+- local-delivery E2E scenario (`no-hosts`)
+- local-delivery E2E scenario (`hosts`)
+- remote-delivery E2E scenario (`no-hosts`)
+- remote-delivery E2E scenario (`hosts`)
 - rotation/recovery matrix (`secret_id,eab,responder_hmac,trust_sync`)
 
 Primary scripts:
@@ -92,7 +92,7 @@ This section repeats key context from other manual pages on purpose.
 Use this page alone as an operational guide for CI/E2E understanding and
 reproduction.
 
-### 1) local-delivery E2E scenario (`fqdn-only-hosts`)
+### 1) local-delivery E2E scenario (`no-hosts`)
 
 Configuration:
 
@@ -101,7 +101,7 @@ Configuration:
 - Services are added with `--delivery-mode local-file`
 - Service set in this scenario (2 services): `edge-proxy` (`daemon`),
   `web-app` (`docker`)
-- Resolution mode is `fqdn-only-hosts` (no `/etc/hosts` mutation)
+- Resolution mode is `no-hosts` (no `/etc/hosts` mutation)
 
 Purpose:
 
@@ -158,32 +158,32 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
   --yes responder-hmac
 ```
 
-### 2) local-delivery E2E scenario (`hosts-all`)
+### 2) local-delivery E2E scenario (`hosts`)
 
 Configuration:
 
 - Same script and same-machine topology as above
-- Same service set as `fqdn-only-hosts`: `edge-proxy` (`daemon`), `web-app` (`docker`)
-- Resolution mode is `hosts-all`
+- Same service set as `no-hosts`: `edge-proxy` (`daemon`), `web-app` (`docker`)
+- Resolution mode is `hosts`
 - Script writes temporary `stepca.internal` / `responder.internal` host entries
   (requires `sudo -n`)
 
 Purpose:
 
-- Validate hostname-based resolution path used by `hosts-all`
+- Validate hostname-based resolution path used by `hosts`
 - Catch breakage tied to `/etc/hosts`-driven name resolution
 
 Execution steps:
 
 1. Add host entries for `stepca.internal` and `responder.internal`
-2. Run the same end-to-end flow phases as `fqdn-only-hosts`
+2. Run the same end-to-end flow phases as `no-hosts`
 3. Remove temporary host entries during cleanup
 
 Actual commands (script excerpt):
 
 ```bash
-# run in hosts-all mode
-RESOLUTION_MODE=hosts-all ./scripts/impl/run-local-lifecycle.sh
+# run in hosts mode
+RESOLUTION_MODE=hosts ./scripts/impl/run-local-lifecycle.sh
 
 # internal host-entry add/remove sequence
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -193,7 +193,7 @@ sudo -n awk -v marker="$HOSTS_MARKER" 'index($0, marker) == 0 { print }' \
 sudo -n cp "$tmp_file" /etc/hosts
 ```
 
-### 3) remote-delivery E2E scenario (`fqdn-only-hosts`)
+### 3) remote-delivery E2E scenario (`no-hosts`)
 
 Configuration:
 
@@ -203,7 +203,7 @@ Configuration:
 - Service set in this scenario (2 services): `edge-proxy` (`daemon`),
   `web-app` (`docker`)
 - Remote bootstrap apply is executed by `bootroot-remote bootstrap`
-- Resolution mode is `fqdn-only-hosts`
+- Resolution mode is `no-hosts`
 
 Purpose:
 
@@ -257,14 +257,14 @@ bootroot rotate --yes responder-hmac
 bootroot-remote bootstrap ...  # re-apply for each service
 ```
 
-### 4) remote-delivery E2E scenario (`hosts-all`)
+### 4) remote-delivery E2E scenario (`hosts`)
 
 Configuration:
 
 - Same control node/remote node model as above
-- Same service set as remote `fqdn-only-hosts`: `edge-proxy` (`daemon`),
+- Same service set as remote `no-hosts`: `edge-proxy` (`daemon`),
   `web-app` (`docker`)
-- Resolution mode is `hosts-all`
+- Resolution mode is `hosts`
 - Temporary `/etc/hosts` entries are added/removed by the script
 
 Purpose:
@@ -284,8 +284,8 @@ Execution steps:
 Actual commands (script excerpt):
 
 ```bash
-# run remote lifecycle in hosts-all mode
-RESOLUTION_MODE=hosts-all ./scripts/impl/run-remote-lifecycle.sh
+# run remote lifecycle in hosts mode
+RESOLUTION_MODE=hosts ./scripts/impl/run-remote-lifecycle.sh
 
 # internal host-entry add/remove sequence
 echo "127.0.0.1 stepca.internal ${HOSTS_MARKER}" | sudo -n tee -a /etc/hosts
@@ -485,13 +485,13 @@ Local-only extras (not in any CI workflow):
 
 When local `sudo -n` is unavailable:
 
-- Run `./scripts/preflight/ci/e2e-matrix.sh --skip-hosts-all`.
-- Reason: `hosts-all` cases add and restore host-machine `/etc/hosts` during
+- Run `./scripts/preflight/ci/e2e-matrix.sh --skip-hosts`.
+- Reason: `hosts` cases add and restore host-machine `/etc/hosts` during
   the run, and that operation requires non-interactive admin privileges
   (`sudo -n`).
 
 Use this only as a local constraint workaround. CI still executes
-`hosts-all` variants.
+`hosts` variants.
 
 ## Init automation input/output rules
 
@@ -562,14 +562,14 @@ The examples below describe the JSON event format in that file.
 Lifecycle scripts write:
 
 ```json
-{"ts":"2026-02-17T04:49:01Z","phase":"infra-up","mode":"fqdn-only-hosts"}
+{"ts":"2026-02-17T04:49:01Z","phase":"infra-up","mode":"no-hosts"}
 ```
 
 Fields:
 
 - `ts`: UTC timestamp
 - `phase`: step identifier
-- `mode`: resolution mode (`fqdn-only-hosts` or `hosts-all`)
+- `mode`: resolution mode (`no-hosts` or `hosts`)
 
 Extended suite writes:
 
@@ -590,9 +590,9 @@ For users/contributors debugging CI failures directly, it is useful.
 
 Typical PR-critical artifacts:
 
-- `tmp/e2e/ci-local-default-<run-id>`
+- `tmp/e2e/ci-local-no-hosts-<run-id>`
 - `tmp/e2e/ci-local-hosts-<run-id>`
-- `tmp/e2e/ci-remote-default-<run-id>`
+- `tmp/e2e/ci-remote-no-hosts-<run-id>`
 - `tmp/e2e/ci-remote-hosts-<run-id>`
 - `tmp/e2e/ci-rotation-<run-id>`
 

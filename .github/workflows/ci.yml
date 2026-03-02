@@ -314,21 +314,21 @@ jobs:
       fail-fast: false
       matrix:
         scenario:
-          - label: local-default
+          - label: local-no-hosts
             script: run-local-lifecycle.sh
-            resolution: fqdn-only-hosts
-            artifact: ci-local-default
+            resolution: no-hosts
+            artifact: ci-local-no-hosts
           - label: local-hosts
             script: run-local-lifecycle.sh
-            resolution: hosts-all
+            resolution: hosts
             artifact: ci-local-hosts
-          - label: remote-default
+          - label: remote-no-hosts
             script: run-remote-lifecycle.sh
-            resolution: fqdn-only-hosts
-            artifact: ci-remote-default
+            resolution: no-hosts
+            artifact: ci-remote-no-hosts
           - label: remote-hosts
             script: run-remote-lifecycle.sh
-            resolution: hosts-all
+            resolution: hosts
             artifact: ci-remote-hosts
           - label: rotation
             script: run-rotation-recovery.sh

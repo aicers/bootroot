@@ -24,7 +24,7 @@ RESPONDER_READY_DELAY_SECS="${RESPONDER_READY_DELAY_SECS:-1}"
 BOOTROOT_BIN="${BOOTROOT_BIN:-$ROOT_DIR/target/debug/bootroot}"
 BOOTROOT_REMOTE_BIN="${BOOTROOT_REMOTE_BIN:-$ROOT_DIR/target/debug/bootroot-remote}"
 BOOTROOT_AGENT_BIN="${BOOTROOT_AGENT_BIN:-$ROOT_DIR/target/debug/bootroot-agent}"
-RESOLUTION_MODE="${RESOLUTION_MODE:-fqdn-only-hosts}"
+RESOLUTION_MODE="${RESOLUTION_MODE:-no-hosts}"
 
 PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUN_LOG="$ARTIFACT_DIR/run.log"
@@ -118,7 +118,7 @@ capture_artifacts() {
 }
 
 cleanup_hosts() {
-  if [ "$RESOLUTION_MODE" != "hosts-all" ]; then
+  if [ "$RESOLUTION_MODE" != "hosts" ]; then
     return 0
   fi
   if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
@@ -158,10 +158,10 @@ add_hosts_entry() {
 
 configure_resolution_mode() {
   case "$RESOLUTION_MODE" in
-    hosts-all)
+    hosts)
       if [ "$(id -u)" -ne 0 ]; then
-        command -v sudo >/dev/null 2>&1 || fail "hosts-all mode requires sudo"
-        run_sudo true || fail "hosts-all mode requires non-interactive sudo (sudo -n)"
+        command -v sudo >/dev/null 2>&1 || fail "hosts mode requires sudo"
+        run_sudo true || fail "hosts mode requires non-interactive sudo (sudo -n)"
       fi
       add_hosts_entry "$STEPCA_HOST_IP" "$STEPCA_HOST_NAME"
       add_hosts_entry "$RESPONDER_HOST_IP" "$RESPONDER_HOST_NAME"
@@ -169,7 +169,7 @@ configure_resolution_mode() {
       STEPCA_EAB_URL="https://${STEPCA_HOST_NAME}:9000"
       RESPONDER_URL="http://${RESPONDER_HOST_NAME}:8080"
       ;;
-    fqdn-only-hosts)
+    no-hosts)
       STEPCA_SERVER_URL="https://localhost:9000/acme/acme/directory"
       STEPCA_EAB_URL="https://localhost:9000"
       RESPONDER_URL="http://${RESPONDER_HOST_IP}:8080"

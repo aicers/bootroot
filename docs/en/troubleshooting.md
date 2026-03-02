@@ -132,6 +132,6 @@ If mode and placement do not match, file/state updates go to the wrong path.
 
 ## Local E2E-only failures
 
-- `hosts-all` needs host `/etc/hosts` mutation, so `sudo -n` is required
-- If `sudo -n` is unavailable locally, use `--skip-hosts-all`
-- This is a local workaround; CI still validates `hosts-all`
+- `hosts` mode needs host `/etc/hosts` mutation, so `sudo -n` is required
+- If `sudo -n` is unavailable locally, use `--skip-hosts`
+- This is a local workaround; CI still validates `hosts` mode

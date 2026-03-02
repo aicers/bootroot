@@ -76,9 +76,9 @@ mod unix_integration {
     }
 
     #[test]
-    #[ignore = "Requires local Docker and root-level hosts updates for hosts-all mode"]
+    #[ignore = "Requires local Docker and root-level hosts updates for hosts mode"]
     fn docker_local_lifecycle_hosts_variants() -> Result<()> {
-        for mode in ["fqdn-only-hosts", "hosts-all"] {
+        for mode in ["no-hosts", "hosts"] {
             let artifact_dir = run_mode(mode)?;
             let manifest = std::fs::read_to_string(artifact_dir.join("manifest.json"))
                 .with_context(|| format!("Failed to read manifest for mode={mode}"))?;

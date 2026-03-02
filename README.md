@@ -135,8 +135,8 @@ jobs; scripts under `preflight/extra/` are local-only checks not in CI.
 
 Notes:
 
-- If your machine cannot run non-interactive sudo (`sudo -n`) for `hosts-all`,
-  use `./scripts/preflight/ci/e2e-matrix.sh --skip-hosts-all`.
+- If your machine cannot run non-interactive sudo (`sudo -n`) for `hosts` mode,
+  use `./scripts/preflight/ci/e2e-matrix.sh --skip-hosts`.
 - Artifacts are written under `tmp/e2e/` for triage.
 
 If Python formatting/linting fails, auto-fix first:
