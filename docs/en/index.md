@@ -68,12 +68,16 @@ automating procedures such as initial trust establishment can itself become a
 security vulnerability. Some steps in Bootroot therefore require manual
 intervention, and Bootroot is designed to minimize those manual steps.
 
-### Not Automated (1) — CA Key Renewal
+### Semi-Automated — CA Key Rotation
 
-Bootroot does not provide a feature to change the CA's private/public key pair
-after initial generation. CA key rotation is not supported; replacing the CA
-keys currently requires a full re-initialization. (A dedicated CA key
-replacement feature is planned for the future.)
+`bootroot rotate ca-key` replaces the intermediate CA key pair, and
+`bootroot rotate ca-key --full` replaces both the root and intermediate CA
+key pairs. Both modes use an 8-phase approach (backup, generate, additive
+trust, restart step-ca, re-issue, finalize trust, cleanup), each phase
+idempotent so re-running after failure automatically resumes. A
+`rotation-state.json` file tracks progress and prevents concurrent
+modifications. Full mode uses 4-fingerprint transitional trust to allow
+clients to verify certificates during the migration window.
 
 ### Derived Goal for Certificate Rotation Automation — Secret Management
 
@@ -90,7 +94,7 @@ As with certificates, the security emphasis for secrets is on rotation. The
 secrets manager only stores secrets securely; automated rotation is performed
 by Bootroot.
 
-### Not Automated (2) — OpenBao Unseal Keys and SecretID
+### Not Automated (1) — OpenBao Unseal Keys and SecretID
 
 Secrets required to use the secrets manager itself must inevitably be managed
 manually by the operator.
@@ -121,7 +125,7 @@ OpenBao itself, but the remaining secrets can be retrieved by connecting to
 OpenBao, which makes their rotation automatable. OpenBao Agent handles
 retrieving secrets from OpenBao.
 
-### Not Automated (3) — Initial CA Trust
+### Not Automated (2) — Initial CA Trust
 
 The initial trust problem exists not only on the secrets-manager side but also
 on the certificate issuance/renewal side. When `bootroot-agent` communicates
@@ -135,7 +139,7 @@ acceptable. Because the CA certificate is obtained during this initial process,
 CA verification is guaranteed for all subsequent automated certificate
 rotations.
 
-### Not Automated (4) — Installation and Operations
+### Not Automated (3) — Installation and Operations
 
 There are aspects of installation and operations that fall outside Bootroot's
 automation scope:

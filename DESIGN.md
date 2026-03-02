@@ -52,7 +52,7 @@ As with certificates, the security emphasis for secrets is on rotation. The
 secrets manager only stores secrets securely; automated rotation is performed
 by Bootroot.
 
-## Not Automated (2) — OpenBao Unseal Keys and SecretID
+## Not Automated (1) — OpenBao Unseal Keys and SecretID
 
 Secrets required to use the secrets manager itself must inevitably be managed
 manually by the operator.
@@ -83,7 +83,7 @@ OpenBao itself, but the remaining secrets can be retrieved by connecting to
 OpenBao, which makes their rotation automatable. OpenBao Agent handles
 retrieving secrets from OpenBao.
 
-## Not Automated (3) — Initial CA Trust
+## Not Automated (2) — Initial CA Trust
 
 The initial trust problem exists not only on the secrets-manager side but also
 on the certificate issuance/renewal side. When `bootroot-agent` communicates
@@ -97,7 +97,7 @@ acceptable. Because the CA certificate is obtained during this initial process,
 CA verification is guaranteed for all subsequent automated certificate
 rotations.
 
-## Not Automated (4) — Installation and Operations
+## Not Automated (3) — Installation and Operations
 
 There are aspects of installation and operations that fall outside Bootroot's
 automation scope:

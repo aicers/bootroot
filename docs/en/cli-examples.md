@@ -412,6 +412,39 @@ bootroot rotate trust-sync
 bootroot rotate force-reissue --service-name edge-proxy
 ```
 
+CA key rotation (intermediate-only):
+
+```bash
+bootroot rotate \
+  --compose-file docker-compose.yml \
+  --openbao-url http://localhost:8200 \
+  --auth-mode approle \
+  --approle-role-id "$ROTATE_ROLE_ID" \
+  --approle-secret-id "$ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --cleanup
+```
+
+CA key rotation (full — root + intermediate):
+
+```bash
+bootroot rotate \
+  --compose-file docker-compose.yml \
+  --openbao-url http://localhost:8200 \
+  --auth-mode approle \
+  --approle-role-id "$ROTATE_ROLE_ID" \
+  --approle-secret-id "$ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --full --cleanup
+```
+
+After CA key rotation, force-reissue certificates for all services:
+
+```bash
+bootroot rotate force-reissue --service-name edge-proxy
+bootroot rotate force-reissue --service-name web-app
+```
+
 Scheduled execution (cron example, script to run all rotations):
 
 ```bash

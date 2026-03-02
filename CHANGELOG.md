@@ -8,6 +8,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added `bootroot rotate ca-key` for intermediate-only CA key rotation
+  and `bootroot rotate ca-key --full` for root + intermediate rotation.
+  Both modes use an 8-phase idempotent workflow with crash-safe resume
+  via `rotation-state.json`.
 - Added core Bootroot CLI lifecycle foundations, including infra readiness,
   init/status, service onboarding, verify/rotate flows, and related guardrails.
 - Added remote-bootstrap operations via `bootroot-remote` with pull/ack/sync,

@@ -67,18 +67,21 @@ PR-critical Docker test set validates:
 - remote-delivery E2E scenario (`fqdn-only-hosts`)
 - remote-delivery E2E scenario (`hosts-all`)
 - rotation/recovery matrix (`secret_id,eab,responder_hmac`)
+- CA key rotation failure/recovery (5 failure injection scenarios)
 
 Primary scripts:
 
 - `scripts/impl/run-local-lifecycle.sh`
 - `scripts/impl/run-remote-lifecycle.sh`
 - `scripts/impl/run-rotation-recovery.sh`
+- `scripts/impl/run-ca-key-rotation-recovery.sh`
 
 Extended workflow validates:
 
 - baseline scale/contention behavior
 - repeated failure/recovery behavior
 - rotation scheduling parity (`systemd-timer`, `cron`)
+- CA key rotation failure/recovery
 
 Primary script:
 
@@ -332,12 +335,92 @@ bootroot-remote apply-secret-id --service-name "$service" ...
 bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 ```
 
-### 6) extended workflow cases
+### 6) CA key rotation failure/recovery
+
+Configuration:
+
+- Script: `scripts/impl/run-ca-key-rotation-recovery.sh`
+- Single machine baseline with Docker Compose infra
+- Service set (3 services): `edge-proxy` (`daemon`, `local-file`),
+  `web-app` (`docker`, `local-file`), `edge-proxy` (`daemon`,
+  `remote-bootstrap`)
+- 5 failure injection scenarios run sequentially on the same infra
+
+Purpose:
+
+- Validate that `bootroot rotate ca-key` resumes correctly after
+  infrastructure failures at each phase
+- Validate that mTLS is never disrupted during CA key rotation
+- Validate `rotation-state.json` idempotent phase tracking
+- Validate `--skip-reissue`, `--force`, `--cleanup` flag behaviors
+- Validate `trust-sync` conflict guard during active rotation
+
+#### Scenarios
+
+Scenario 1 — Phase 3 failure (OpenBao unreachable):
+
+1. Stop OpenBao container so Phase 3 (additive trust write) fails
+2. Run `rotate ca-key` — expect failure
+3. Verify services still work (certs unchanged, step-ca running)
+4. Restart OpenBao, re-run rotation — resumes and completes
+5. Force-reissue and verify new certificates
+
+Scenario 2 — Phase 4 failure (step-ca removed):
+
+1. Remove step-ca container so Phase 4 (restart) fails
+2. Run `rotate ca-key` — Phases 0-3 succeed, Phase 4 fails
+3. Verify services still work (transitional trust active)
+4. Bring step-ca back, re-run rotation — resumes and completes
+5. Force-reissue and verify new certificates
+
+Scenario 3 — Phase 5 partial re-issuance:
+
+1. Run `rotate ca-key --skip-reissue` — Phase 6 bails (unmigrated)
+2. Force-reissue only one service (edge-proxy)
+3. Verify both old-cert (web-app) and new-cert (edge-proxy) work
+4. Force-reissue remaining services
+5. Re-run rotation with `--force` — completes
+
+Scenario 4 — Phase 6 entry blocked:
+
+1. Run `rotate ca-key --skip-reissue` — Phase 6 blocks
+2. Verify error output mentions un-migrated service names
+3. Re-run with `--force` — Phase 6 completes with warning
+4. Force-reissue and verify
+
+Scenario 5 — trust-sync conflict during active rotation:
+
+1. Create active rotation by stopping step-ca mid-rotation
+2. Verify `rotation-state.json` exists
+3. Run `trust-sync` — expect abort with rotation-in-progress error
+4. Recover: bring step-ca back, complete rotation
+5. Verify all services
+
+Actual commands (script excerpt):
+
+```bash
+# wrapper for rotate ca-key with AppRole auth
+bootroot rotate \
+  --compose-file "$COMPOSE_FILE" \
+  --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+  --auth-mode approle \
+  --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+  --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --skip-reissue --force --cleanup
+
+# failure injection via Docker manipulation
+docker compose -f "$COMPOSE_FILE" stop openbao
+docker compose -f "$COMPOSE_FILE" rm -sf step-ca
+```
+
+### 7) extended workflow cases
 
 Configuration:
 
 - Script: `scripts/impl/run-extended-suite.sh`
-- Cases: `scale-contention`, `failure-recovery`, `runner-timer`, `runner-cron`
+- Cases: `scale-contention`, `failure-recovery`, `runner-timer`, `runner-cron`,
+  `ca-key-recovery`
 - Case results are aggregated into `extended-summary.json`
 - Service set: inherited from each case's underlying scenario/script and includes
   multi-service cases (for scale/contention and failure/recovery)
@@ -366,6 +449,7 @@ Actual commands (script excerpt):
 ./scripts/impl/run-rotation-recovery.sh
 RUNNER_MODE=systemd-timer ./scripts/impl/run-harness-smoke.sh
 RUNNER_MODE=cron ./scripts/impl/run-harness-smoke.sh
+./scripts/impl/run-ca-key-rotation-recovery.sh
 ```
 
 ## Local preflight standard
@@ -503,6 +587,7 @@ Typical PR-critical artifacts:
 - `tmp/e2e/ci-remote-default-<run-id>`
 - `tmp/e2e/ci-remote-hosts-<run-id>`
 - `tmp/e2e/ci-rotation-<run-id>`
+- `tmp/e2e/docker-ca-key-recovery-<run-id>`
 
 Typical extended artifact:
 
