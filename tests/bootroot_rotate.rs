@@ -3129,3 +3129,341 @@ async fn test_rotate_ca_key_full_mode_resumes_from_phase() {
         "rotation-state.json should be cleaned up after completion"
     );
 }
+
+// ─── rotate openbao-recovery tests ──────────────────────────────────
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_openbao_recovery_fails_without_target() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "openbao-recovery",
+        ])
+        .output()
+        .expect("run rotate openbao-recovery");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "should fail without --rotate-unseal-keys or --rotate-root-token"
+    );
+    assert!(
+        stderr.contains("--rotate-unseal-keys") || stderr.contains("--rotate-root-token"),
+        "stderr should mention missing flags: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_openbao_recovery_fails_when_sealed() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/seal-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sealed": true,
+            "t": 1
+        })))
+        .mount(&openbao)
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+        ])
+        .output()
+        .expect("run rotate openbao-recovery");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "should fail when OpenBao is sealed"
+    );
+    assert!(
+        stderr.contains("sealed"),
+        "stderr should mention sealed: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_rotate_openbao_recovery_rekey_unseal_keys() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    // Health check
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    // Seal status: unsealed with threshold 1
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/seal-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sealed": false,
+            "t": 1
+        })))
+        .mount(&openbao)
+        .await;
+
+    // Rekey status: not started
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/rekey/init"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "started": false,
+            "nonce": "",
+            "t": 0,
+            "n": 0,
+            "progress": 0,
+            "required": 0
+        })))
+        .mount(&openbao)
+        .await;
+
+    // Rekey init
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/rekey/init"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "started": true,
+            "nonce": "test-nonce-123",
+            "t": 1,
+            "n": 1,
+            "progress": 0,
+            "required": 1
+        })))
+        .mount(&openbao)
+        .await;
+
+    // Rekey update: complete with new keys
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/rekey/update"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "complete": true,
+            "keys": ["new-key-hex"],
+            "keys_base64": ["bmV3LWtleS1iYXNlNjQ="],
+            "nonce": "test-nonce-123"
+        })))
+        .mount(&openbao)
+        .await;
+
+    let output_file = temp_dir.path().join("recovery-creds.txt");
+
+    // Provide unseal key via stdin
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--root-token",
+            support::ROOT_TOKEN,
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+            "--output",
+            output_file.to_string_lossy().as_ref(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rotate openbao-recovery");
+
+    // Send confirmation and unseal key
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(stdin, "y").expect("write confirmation");
+        writeln!(stdin, "test-unseal-key").expect("write unseal key");
+    }
+
+    let output = child.wait_with_output().expect("wait for child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "rekey should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("unseal keys rotated"),
+        "summary should mention unseal keys: {stdout}"
+    );
+    assert!(
+        stdout.contains("Rekey progress"),
+        "output should show rekey progress: {stdout}"
+    );
+    assert!(output_file.exists(), "output file should be created");
+    let creds = fs::read_to_string(&output_file).expect("read output");
+    assert!(
+        creds.contains("unseal_keys:"),
+        "output should contain unseal keys: {creds}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_rotate_openbao_recovery_root_token() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/seal-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sealed": false,
+            "t": 1
+        })))
+        .mount(&openbao)
+        .await;
+
+    // Generate-root status: not started
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/generate-root/attempt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "started": false,
+            "nonce": "",
+            "progress": 0,
+            "required": 0,
+            "complete": false,
+            "otp_length": 0,
+            "otp": ""
+        })))
+        .mount(&openbao)
+        .await;
+
+    // Construct a valid XOR-encoded token/OTP pair
+    let new_token = b"s.new-root-token";
+    let otp_bytes = b"otp-xor-key-1234";
+    assert_eq!(new_token.len(), otp_bytes.len());
+
+    let encoded: Vec<u8> = new_token
+        .iter()
+        .zip(otp_bytes.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    let encoded_b64 = STANDARD.encode(&encoded);
+    let otp_b64 = STANDARD.encode(otp_bytes);
+
+    // Generate-root init
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/generate-root/attempt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "started": true,
+            "nonce": "root-nonce-456",
+            "progress": 0,
+            "required": 1,
+            "complete": false,
+            "otp_length": otp_bytes.len(),
+            "otp": otp_b64
+        })))
+        .mount(&openbao)
+        .await;
+
+    // Generate-root update: complete
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/generate-root/update"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "complete": true,
+            "nonce": "root-nonce-456",
+            "progress": 1,
+            "required": 1,
+            "encoded_token": encoded_b64,
+            "encoded_root_token": ""
+        })))
+        .mount(&openbao)
+        .await;
+
+    let output_file = temp_dir.path().join("root-creds.txt");
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--root-token",
+            support::ROOT_TOKEN,
+            "openbao-recovery",
+            "--rotate-root-token",
+            "--output",
+            output_file.to_string_lossy().as_ref(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(stdin, "y").expect("write confirmation");
+        writeln!(stdin, "test-unseal-key").expect("write unseal key");
+    }
+
+    let output = child.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "root generation should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("root token rotated"),
+        "summary should mention root token: {stdout}"
+    );
+    assert!(output_file.exists(), "output file should be created");
+    let creds = fs::read_to_string(&output_file).expect("read output");
+    assert!(
+        creds.contains("root_token:"),
+        "output should contain root_token: {creds}"
+    );
+    assert!(
+        creds.contains("s.new-root-token"),
+        "output should contain the decoded token: {creds}"
+    );
+}

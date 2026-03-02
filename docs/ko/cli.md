@@ -622,6 +622,36 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 - `--force`: 미이전 서비스가 있어도 Phase 6 강제 실행
 - `--cleanup`: 완료 시 백업 파일 삭제(Phase 7)
 
+#### `rotate openbao-recovery`
+
+OpenBao 복구 자격증명(unseal 키 및/또는 루트 토큰)을
+교체합니다. `--rotate-unseal-keys` 또는
+`--rotate-root-token` 중 하나 이상을 설정해야 합니다.
+
+이 명령은 항상 사용자가 명시적으로 실행하며 자동으로
+실행되지 않습니다. 기존 AppRole 설정, `role_id`,
+`secret_id` 값은 변경되지 않습니다.
+
+워크플로:
+
+1. 사전 점검: OpenBao 접근 가능 및 봉인 해제 확인
+2. 작업 확인(--yes로 생략 가능)
+3. 현재 unseal 키를 대화형으로 수집
+4. `--rotate-unseal-keys`: 리키 작업 시작, 키 제출,
+   새 unseal 키 공유 수신
+5. `--rotate-root-token`: 루트 생성 시도 시작, 키 제출,
+   새 루트 토큰 디코딩
+6. `--output <path>` 또는 stdout으로 새 자격증명 출력
+7. 교체 후 체크리스트 출력
+
+입력:
+
+- `--rotate-unseal-keys`: 리키 플로우로 unseal 키 교체
+- `--rotate-root-token`: 루트 생성으로 루트 토큰 교체
+- `--output <path>`: stdout 대신 파일에 자격증명 기록
+  (모드 0600)
+- `--yes`(공유 플래그): 확인 프롬프트 생략
+
 ### 회전 시크릿 쓰기 대상
 
 아래 3개 서브커맨드는 OpenBao만 갱신하지 않고, 로컬 런타임 파일도 함께

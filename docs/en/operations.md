@@ -190,6 +190,37 @@ Security notes:
 - Keep unseal and runtime-auth steps separate in runbooks: unseal completion
   does not satisfy OpenBao auth requirements by itself.
 
+## OpenBao recovery credential rotation
+
+Use `bootroot rotate openbao-recovery` to replace unseal keys
+and/or the root token without re-initializing the cluster.
+
+```bash
+# Rotate unseal keys only
+bootroot rotate openbao-recovery --rotate-unseal-keys \
+  --output /secure/new-unseal-keys.txt
+
+# Rotate root token only
+bootroot rotate openbao-recovery --rotate-root-token \
+  --output /secure/new-root-token.txt
+
+# Rotate both
+bootroot rotate openbao-recovery \
+  --rotate-unseal-keys --rotate-root-token \
+  --output /secure/recovery-creds.txt
+```
+
+The command requires interactive unseal key input (one key per
+threshold). After rotation:
+
+1. Store the new credentials in a secure vault or HSM.
+2. Revoke the old root token if it is still valid.
+3. Run `bootroot status` to verify OpenBao health.
+4. Verify that existing AppRole-based agent logins still succeed.
+
+AppRole roles, `role_id`, and `secret_id` values are **not**
+modified by this command.
+
 ## CA bundle (trust) operations
 
 This section covers how to operate three trust settings together:

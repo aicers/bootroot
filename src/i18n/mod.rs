@@ -342,6 +342,25 @@ pub(crate) struct Strings {
     pub(crate) rotate_ca_key_phase_generate_root: &'static str,
     pub(crate) rotate_ca_key_current_fingerprints: &'static str,
     pub(crate) rotate_ca_key_phase_skipped: &'static str,
+    pub(crate) error_openbao_recovery_no_target: &'static str,
+    pub(crate) error_openbao_recovery_sealed: &'static str,
+    pub(crate) error_openbao_recovery_rekey_failed: &'static str,
+    pub(crate) error_openbao_recovery_root_gen_failed: &'static str,
+    pub(crate) error_openbao_recovery_unseal_keys_required: &'static str,
+    pub(crate) prompt_rotate_openbao_recovery: &'static str,
+    pub(crate) prompt_rotate_openbao_unseal_key: &'static str,
+    pub(crate) rotate_openbao_recovery_preflight: &'static str,
+    pub(crate) rotate_openbao_recovery_rekey_start: &'static str,
+    pub(crate) rotate_openbao_recovery_rekey_progress: &'static str,
+    pub(crate) rotate_openbao_recovery_rekey_complete: &'static str,
+    pub(crate) rotate_openbao_recovery_root_gen_start: &'static str,
+    pub(crate) rotate_openbao_recovery_root_gen_progress: &'static str,
+    pub(crate) rotate_openbao_recovery_root_gen_complete: &'static str,
+    pub(crate) rotate_openbao_recovery_checklist: &'static str,
+    pub(crate) rotate_summary_openbao_unseal_keys: &'static str,
+    pub(crate) rotate_summary_openbao_root_token: &'static str,
+    pub(crate) rotate_openbao_recovery_output_written: &'static str,
+    pub(crate) warning_openbao_recovery_secrets_stdout: &'static str,
     pub(crate) summary_responder_check_ok: &'static str,
     pub(crate) summary_responder_check_skipped: &'static str,
     pub(crate) summary_db_check_ok: &'static str,
@@ -1994,6 +2013,117 @@ impl Messages {
             self.strings().rotate_ca_key_phase_skipped,
             &[("phase", phase)],
         )
+    }
+
+    pub(crate) fn error_openbao_recovery_no_target(&self) -> &'static str {
+        self.strings().error_openbao_recovery_no_target
+    }
+
+    pub(crate) fn error_openbao_recovery_sealed(&self) -> &'static str {
+        self.strings().error_openbao_recovery_sealed
+    }
+
+    pub(crate) fn error_openbao_recovery_rekey_failed(&self) -> &'static str {
+        self.strings().error_openbao_recovery_rekey_failed
+    }
+
+    pub(crate) fn error_openbao_recovery_root_gen_failed(&self) -> &'static str {
+        self.strings().error_openbao_recovery_root_gen_failed
+    }
+
+    pub(crate) fn error_openbao_recovery_unseal_keys_required(&self) -> &'static str {
+        self.strings().error_openbao_recovery_unseal_keys_required
+    }
+
+    pub(crate) fn prompt_rotate_openbao_recovery(&self, scope: &str) -> String {
+        format_template(
+            self.strings().prompt_rotate_openbao_recovery,
+            &[("scope", scope)],
+        )
+    }
+
+    pub(crate) fn prompt_rotate_openbao_unseal_key(&self, index: u32, required: u32) -> String {
+        format_template(
+            self.strings().prompt_rotate_openbao_unseal_key,
+            &[
+                ("index", &index.to_string()),
+                ("required", &required.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn rotate_openbao_recovery_preflight(&self) -> &'static str {
+        self.strings().rotate_openbao_recovery_preflight
+    }
+
+    pub(crate) fn rotate_openbao_recovery_rekey_start(&self) -> &'static str {
+        self.strings().rotate_openbao_recovery_rekey_start
+    }
+
+    pub(crate) fn rotate_openbao_recovery_rekey_progress(
+        &self,
+        progress: u32,
+        required: u32,
+    ) -> String {
+        format_template(
+            self.strings().rotate_openbao_recovery_rekey_progress,
+            &[
+                ("progress", &progress.to_string()),
+                ("required", &required.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn rotate_openbao_recovery_rekey_complete(&self) -> &'static str {
+        self.strings().rotate_openbao_recovery_rekey_complete
+    }
+
+    pub(crate) fn rotate_openbao_recovery_root_gen_start(&self) -> &'static str {
+        self.strings().rotate_openbao_recovery_root_gen_start
+    }
+
+    pub(crate) fn rotate_openbao_recovery_root_gen_progress(
+        &self,
+        progress: u32,
+        required: u32,
+    ) -> String {
+        format_template(
+            self.strings().rotate_openbao_recovery_root_gen_progress,
+            &[
+                ("progress", &progress.to_string()),
+                ("required", &required.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn rotate_openbao_recovery_root_gen_complete(&self) -> &'static str {
+        self.strings().rotate_openbao_recovery_root_gen_complete
+    }
+
+    pub(crate) fn rotate_openbao_recovery_checklist(&self) -> &'static str {
+        self.strings().rotate_openbao_recovery_checklist
+    }
+
+    pub(crate) fn rotate_summary_openbao_unseal_keys(&self, count: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_openbao_unseal_keys,
+            &[("count", count)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_openbao_root_token(&self) -> &'static str {
+        self.strings().rotate_summary_openbao_root_token
+    }
+
+    pub(crate) fn rotate_openbao_recovery_output_written(&self, path: &str) -> String {
+        format_template(
+            self.strings().rotate_openbao_recovery_output_written,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn warning_openbao_recovery_secrets_stdout(&self) -> &'static str {
+        self.strings().warning_openbao_recovery_secrets_stdout
     }
 
     pub(crate) fn summary_responder_check_ok(&self) -> &'static str {

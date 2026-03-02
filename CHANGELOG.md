@@ -8,6 +8,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added `bootroot rotate openbao-recovery` for manual rotation
+  of OpenBao recovery credentials (unseal keys and/or root
+  token). Supports `--rotate-unseal-keys`,
+  `--rotate-root-token`, `--output`, and `--yes` flags.
+  Cancels stale in-progress operations for safe re-runs.
 - Added `bootroot rotate ca-key` for intermediate-only CA key rotation
   and `bootroot rotate ca-key --full` for root + intermediate rotation.
   Both modes use an 8-phase idempotent workflow with crash-safe resume

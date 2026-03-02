@@ -9,7 +9,8 @@ use reqwest::StatusCode;
 
 use crate::cli::args::{
     RotateAppRoleSecretIdArgs, RotateArgs, RotateCaKeyArgs, RotateCommand, RotateDbArgs,
-    RotateEabArgs, RotateForceReissueArgs, RotateResponderHmacArgs, RotateStepcaPasswordArgs,
+    RotateEabArgs, RotateForceReissueArgs, RotateOpenBaoRecoveryArgs, RotateResponderHmacArgs,
+    RotateStepcaPasswordArgs,
 };
 use crate::cli::prompt::Prompt;
 use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
@@ -194,6 +195,9 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         }
         RotateCommand::CaKey(step_args) => {
             rotate_ca_key(&mut ctx, &client, step_args, args.yes, messages).await?;
+        }
+        RotateCommand::OpenBaoRecovery(step_args) => {
+            rotate_openbao_recovery(&client, step_args, args.yes, messages).await?;
         }
     }
 
@@ -1026,6 +1030,278 @@ fn signal_bootroot_agent_daemon(entry: &ServiceEntry, messages: &Messages) -> Re
 #[cfg(not(unix))]
 fn signal_bootroot_agent_daemon(_entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
+}
+
+/// Collects unseal keys from the user interactively.
+fn collect_unseal_keys(
+    required: u32,
+    auto_confirm: bool,
+    messages: &Messages,
+) -> Result<Vec<String>> {
+    if auto_confirm {
+        anyhow::bail!(messages.error_openbao_recovery_unseal_keys_required());
+    }
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout();
+    let mut prompt_reader = Prompt::new(&mut input, &mut output, messages);
+    let mut keys = Vec::with_capacity(required as usize);
+    for i in 1..=required {
+        let label = messages.prompt_rotate_openbao_unseal_key(i, required);
+        let key = prompt_reader.prompt_with_validation(&label, None, |v| {
+            let trimmed = v.trim().to_string();
+            if trimmed.is_empty() {
+                anyhow::bail!(messages.error_value_required());
+            }
+            Ok(trimmed)
+        })?;
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
+/// Describes the scope of rotation for display purposes.
+fn rotation_scope_label(rotate_unseal_keys: bool, rotate_root_token: bool) -> &'static str {
+    match (rotate_unseal_keys, rotate_root_token) {
+        (true, true) => "unseal keys + root token",
+        (true, false) => "unseal keys",
+        (false, true) => "root token",
+        (false, false) => "none",
+    }
+}
+
+/// Decodes an XOR-encoded root token using the OTP.
+fn decode_root_token(encoded: &str, otp: &str) -> Result<String> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
+    let encoded_bytes = STANDARD
+        .decode(encoded)
+        .context("Failed to base64-decode encoded root token")?;
+    let otp_bytes = STANDARD
+        .decode(otp)
+        .context("Failed to base64-decode OTP")?;
+    if encoded_bytes.len() != otp_bytes.len() {
+        anyhow::bail!(
+            "Encoded token length ({}) does not match OTP length ({})",
+            encoded_bytes.len(),
+            otp_bytes.len()
+        );
+    }
+    let decoded: Vec<u8> = encoded_bytes
+        .iter()
+        .zip(otp_bytes.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    String::from_utf8(decoded).context("Decoded root token is not valid UTF-8")
+}
+
+/// Writes rotation output credentials to a file or stdout.
+async fn write_recovery_output(
+    output_path: Option<&Path>,
+    new_unseal_keys: &[String],
+    new_root_token: Option<&str>,
+    messages: &Messages,
+) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let mut content = String::new();
+    if !new_unseal_keys.is_empty() {
+        content.push_str("unseal_keys:\n");
+        for (i, key) in new_unseal_keys.iter().enumerate() {
+            let _ = writeln!(content, "  {}: {key}", i + 1);
+        }
+    }
+    if let Some(token) = new_root_token {
+        let _ = writeln!(content, "root_token: {token}");
+    }
+
+    if let Some(path) = output_path {
+        write_secret_file(path, &content, messages).await?;
+        println!(
+            "{}",
+            messages.rotate_openbao_recovery_output_written(&path.display().to_string())
+        );
+    } else {
+        println!("{}", messages.warning_openbao_recovery_secrets_stdout());
+        println!("{content}");
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn rotate_openbao_recovery(
+    client: &OpenBaoClient,
+    args: &RotateOpenBaoRecoveryArgs,
+    auto_confirm: bool,
+    messages: &Messages,
+) -> Result<()> {
+    // Validate: at least one target must be set
+    if !args.rotate_unseal_keys && !args.rotate_root_token {
+        anyhow::bail!(messages.error_openbao_recovery_no_target());
+    }
+
+    // Preflight: check OpenBao is reachable and unsealed
+    let seal_status = client
+        .seal_status()
+        .await
+        .with_context(|| messages.error_openbao_seal_status_failed())?;
+    if seal_status.sealed {
+        anyhow::bail!(messages.error_openbao_recovery_sealed());
+    }
+    println!("{}", messages.rotate_openbao_recovery_preflight());
+
+    let scope = rotation_scope_label(args.rotate_unseal_keys, args.rotate_root_token);
+
+    // Confirmation
+    confirm_action(
+        &messages.prompt_rotate_openbao_recovery(scope),
+        auto_confirm,
+        messages,
+    )?;
+
+    // Determine how many unseal keys are needed from seal status threshold.
+    let threshold = seal_status.t.unwrap_or(1);
+
+    // Cancel any stale in-progress rekey or root generation operations
+    if args.rotate_unseal_keys
+        && let Ok(status) = client.rekey_status().await
+        && status.started
+    {
+        client.rekey_cancel().await.ok();
+    }
+    if args.rotate_root_token
+        && let Ok(status) = client.generate_root_status().await
+        && status.started
+    {
+        client.generate_root_cancel().await.ok();
+    }
+
+    // Collect unseal keys from the user (needed for both operations)
+    let unseal_keys = collect_unseal_keys(threshold, auto_confirm, messages)?;
+
+    let mut new_unseal_keys: Vec<String> = Vec::new();
+    let mut new_root_token: Option<String> = None;
+
+    // --- Unseal key rotation (rekey) ---
+    if args.rotate_unseal_keys {
+        println!("{}", messages.rotate_openbao_recovery_rekey_start());
+
+        let rekey_init = client
+            .rekey_init(threshold, threshold)
+            .await
+            .with_context(|| messages.error_openbao_recovery_rekey_failed())?;
+
+        let nonce = rekey_init.nonce;
+
+        for (i, key) in unseal_keys.iter().enumerate() {
+            let result = client
+                .rekey_update(key, &nonce)
+                .await
+                .with_context(|| messages.error_openbao_recovery_rekey_failed())?;
+
+            let progress = u32::try_from(i + 1).unwrap_or(u32::MAX);
+            println!(
+                "{}",
+                messages.rotate_openbao_recovery_rekey_progress(progress, threshold)
+            );
+
+            if result.complete {
+                new_unseal_keys = result.keys_base64;
+                break;
+            }
+        }
+
+        if new_unseal_keys.is_empty() {
+            anyhow::bail!(messages.error_openbao_recovery_rekey_failed());
+        }
+        println!("{}", messages.rotate_openbao_recovery_rekey_complete());
+    }
+
+    // --- Root token rotation (generate-root) ---
+    if args.rotate_root_token {
+        println!("{}", messages.rotate_openbao_recovery_root_gen_start());
+
+        let gen_init = client
+            .generate_root_init()
+            .await
+            .with_context(|| messages.error_openbao_recovery_root_gen_failed())?;
+
+        let nonce = gen_init.nonce;
+        let otp = gen_init.otp;
+
+        // When rekeying was also done, use new keys for root gen.
+        // However, the new keys are not yet active for unseal
+        // since no re-seal happened. The *current* unseal keys
+        // we collected are still valid for this API call.
+        let keys_for_root = if args.rotate_unseal_keys {
+            // After rekey, the NEW unseal keys are what OpenBao now
+            // requires. But OpenBao does not require re-sealing; the
+            // rekey takes effect immediately for future unseals but
+            // the generate-root/update API still accepts the keys that
+            // match the current barrier. After a rekey, the new keys
+            // are the current barrier keys.
+            &new_unseal_keys
+        } else {
+            &unseal_keys
+        };
+
+        let mut encoded_token = String::new();
+        for (i, key) in keys_for_root.iter().enumerate() {
+            let result = client
+                .generate_root_update(key, &nonce)
+                .await
+                .with_context(|| messages.error_openbao_recovery_root_gen_failed())?;
+
+            let progress = u32::try_from(i + 1).unwrap_or(u32::MAX);
+            println!(
+                "{}",
+                messages.rotate_openbao_recovery_root_gen_progress(progress, threshold)
+            );
+
+            if result.complete {
+                encoded_token = if result.encoded_root_token.is_empty() {
+                    result.encoded_token
+                } else {
+                    result.encoded_root_token
+                };
+                break;
+            }
+        }
+
+        if encoded_token.is_empty() {
+            anyhow::bail!(messages.error_openbao_recovery_root_gen_failed());
+        }
+
+        new_root_token = Some(decode_root_token(&encoded_token, &otp)?);
+        println!("{}", messages.rotate_openbao_recovery_root_gen_complete());
+    }
+
+    // --- Summary ---
+    println!("\n{}", messages.rotate_summary_title());
+    if !new_unseal_keys.is_empty() {
+        println!(
+            "{}",
+            messages.rotate_summary_openbao_unseal_keys(&new_unseal_keys.len().to_string())
+        );
+    }
+    if new_root_token.is_some() {
+        println!("{}", messages.rotate_summary_openbao_root_token());
+    }
+
+    // --- Output ---
+    write_recovery_output(
+        args.output.as_deref(),
+        &new_unseal_keys,
+        new_root_token.as_deref(),
+        messages,
+    )
+    .await?;
+
+    // --- Checklist ---
+    println!("\n{}", messages.rotate_openbao_recovery_checklist());
+
+    Ok(())
 }
 
 // Phases 0–7 form a single logical workflow; splitting would harm readability.
@@ -1915,5 +2191,62 @@ exit 0
 
         let result = cert_issued_by_new_intermediate(&missing, &also_missing, &messages);
         assert!(result.is_err(), "missing file should return error");
+    }
+
+    #[test]
+    fn test_rotation_scope_label_both() {
+        assert_eq!(rotation_scope_label(true, true), "unseal keys + root token");
+    }
+
+    #[test]
+    fn test_rotation_scope_label_unseal_only() {
+        assert_eq!(rotation_scope_label(true, false), "unseal keys");
+    }
+
+    #[test]
+    fn test_rotation_scope_label_root_only() {
+        assert_eq!(rotation_scope_label(false, true), "root token");
+    }
+
+    #[test]
+    fn test_rotation_scope_label_none() {
+        assert_eq!(rotation_scope_label(false, false), "none");
+    }
+
+    #[test]
+    fn test_decode_root_token_valid() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        let token = b"s.my-secret-root-token!!";
+        let otp = b"otp-xor-key-bytes-here!!";
+        assert_eq!(token.len(), otp.len());
+
+        let encoded: Vec<u8> = token.iter().zip(otp.iter()).map(|(a, b)| a ^ b).collect();
+        let encoded_b64 = STANDARD.encode(&encoded);
+        let otp_b64 = STANDARD.encode(otp);
+
+        let result = decode_root_token(&encoded_b64, &otp_b64).expect("decode");
+        assert_eq!(result, "s.my-secret-root-token!!");
+    }
+
+    #[test]
+    fn test_decode_root_token_length_mismatch() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        let encoded_b64 = STANDARD.encode(b"short");
+        let otp_b64 = STANDARD.encode(b"longer-otp-value");
+
+        let result = decode_root_token(&encoded_b64, &otp_b64);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("does not match OTP length"));
+    }
+
+    #[test]
+    fn test_decode_root_token_invalid_base64() {
+        let result = decode_root_token("not-valid-base64!!", "also-invalid!!");
+        assert!(result.is_err());
     }
 }

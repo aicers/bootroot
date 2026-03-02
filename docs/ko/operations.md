@@ -181,6 +181,39 @@ bootstrap + 명시적 secret_id handoff입니다.
 - 언실(unseal)과 런타임 인증 주입은 별도 단계입니다. 언실이 끝났다고
   OpenBao 인증 요구가 사라지지는 않습니다.
 
+## OpenBao 복구 자격증명 교체
+
+`bootroot rotate openbao-recovery`를 사용하여 클러스터를
+재초기화하지 않고 unseal 키 및/또는 루트 토큰을
+교체합니다.
+
+```bash
+# unseal 키만 교체
+bootroot rotate openbao-recovery --rotate-unseal-keys \
+  --output /secure/new-unseal-keys.txt
+
+# 루트 토큰만 교체
+bootroot rotate openbao-recovery --rotate-root-token \
+  --output /secure/new-root-token.txt
+
+# 둘 다 교체
+bootroot rotate openbao-recovery \
+  --rotate-unseal-keys --rotate-root-token \
+  --output /secure/recovery-creds.txt
+```
+
+명령은 임계값당 하나의 대화형 unseal 키 입력이
+필요합니다. 교체 후:
+
+1. 새 자격증명을 안전한 볼트 또는 HSM에 저장합니다.
+2. 이전 루트 토큰이 유효하다면 폐기합니다.
+3. `bootroot status`로 OpenBao 상태를 확인합니다.
+4. 기존 AppRole 기반 에이전트 로그인이 성공하는지
+   확인합니다.
+
+AppRole 역할, `role_id`, `secret_id` 값은 이 명령으로
+**변경되지 않습니다**.
+
 ## CA 번들(trust) 운영
 
 이 섹션은 `trust.ca_bundle_path`, `trust.trusted_ca_sha256`,

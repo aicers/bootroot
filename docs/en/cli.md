@@ -648,6 +648,43 @@ Inputs:
 - `--force`: force Phase 6 even when un-migrated services remain
 - `--cleanup`: delete backup files on completion (Phase 7)
 
+#### `rotate openbao-recovery`
+
+Rotates OpenBao recovery credentials: unseal keys and/or the root
+token. At least one of `--rotate-unseal-keys` or
+`--rotate-root-token` must be set.
+
+This command is always explicitly user-invoked and never runs
+automatically. Existing AppRole configuration, `role_id`, and
+`secret_id` values are not modified.
+
+Workflow:
+
+1. Preflight: verify OpenBao is reachable and unsealed.
+2. Confirm the operation (skipped with `--yes`).
+3. Collect current unseal keys interactively.
+4. If `--rotate-unseal-keys`: start a rekey operation, submit
+   keys, and receive new unseal key shares.
+5. If `--rotate-root-token`: start a root generation attempt,
+   submit keys, and decode the new root token.
+6. Output new credentials to `--output <path>` or stdout.
+7. Print a post-rotation checklist.
+
+If a previous rekey or root generation is in progress, it is
+cancelled before starting a new one, making the command safely
+re-runnable.
+
+Inputs:
+
+- `--rotate-unseal-keys`: rotate unseal keys via the rekey flow
+- `--rotate-root-token`: rotate the root token via root
+  generation
+- `--output <path>`: write credentials to a file (mode 0600)
+  instead of stdout
+- `--yes` (shared flag): skip confirmation prompts; requires
+  unseal keys via another mechanism since interactive input is
+  skipped
+
 ### Rotated secret write targets
 
 For the following three subcommands, bootroot updates OpenBao **and** local

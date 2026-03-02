@@ -63,6 +63,64 @@ struct MountOptions {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RekeyInitResponse {
+    pub started: bool,
+    #[serde(default)]
+    pub nonce: String,
+    #[serde(default)]
+    pub t: u32,
+    #[serde(default)]
+    pub n: u32,
+    #[serde(default)]
+    pub progress: u32,
+    #[serde(default)]
+    pub required: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RekeyUpdateResponse {
+    pub complete: bool,
+    #[serde(default)]
+    pub keys: Vec<String>,
+    #[serde(default)]
+    pub keys_base64: Vec<String>,
+    #[serde(default)]
+    pub nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateRootInitResponse {
+    pub started: bool,
+    #[serde(default)]
+    pub nonce: String,
+    #[serde(default)]
+    pub progress: u32,
+    #[serde(default)]
+    pub required: u32,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub otp_length: u32,
+    #[serde(default)]
+    pub otp: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateRootUpdateResponse {
+    pub complete: bool,
+    #[serde(default)]
+    pub nonce: String,
+    #[serde(default)]
+    pub progress: u32,
+    #[serde(default)]
+    pub required: u32,
+    #[serde(default)]
+    pub encoded_token: String,
+    #[serde(default)]
+    pub encoded_root_token: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AuthListResponse {
     data: serde_json::Value,
 }
@@ -467,6 +525,130 @@ impl OpenBaoClient {
         Ok(KvMountStatus::Ok)
     }
 
+    /// Starts a rekey operation to rotate unseal keys.
+    ///
+    /// # Errors
+    /// Returns an error if the rekey init request fails.
+    pub async fn rekey_init(
+        &self,
+        secret_shares: u32,
+        secret_threshold: u32,
+    ) -> Result<RekeyInitResponse> {
+        #[derive(Serialize)]
+        struct RekeyInitRequest {
+            secret_shares: u32,
+            secret_threshold: u32,
+        }
+        self.put_json(
+            "sys/rekey/init",
+            &RekeyInitRequest {
+                secret_shares,
+                secret_threshold,
+            },
+        )
+        .await
+    }
+
+    /// Fetches the current rekey progress.
+    ///
+    /// # Errors
+    /// Returns an error if the request fails.
+    pub async fn rekey_status(&self) -> Result<RekeyInitResponse> {
+        self.get_json("sys/rekey/init", true).await
+    }
+
+    /// Cancels an in-progress rekey operation.
+    ///
+    /// # Errors
+    /// Returns an error if the cancel request fails.
+    pub async fn rekey_cancel(&self) -> Result<()> {
+        let _: serde_json::Value = self.delete_json("sys/rekey/init").await?;
+        Ok(())
+    }
+
+    /// Submits an unseal key to an in-progress rekey operation.
+    ///
+    /// # Errors
+    /// Returns an error if the update request fails.
+    pub async fn rekey_update(&self, key: &str, nonce: &str) -> Result<RekeyUpdateResponse> {
+        #[derive(Serialize)]
+        struct RekeyUpdateRequest<'a> {
+            key: &'a str,
+            nonce: &'a str,
+        }
+        self.put_json("sys/rekey/update", &RekeyUpdateRequest { key, nonce })
+            .await
+    }
+
+    /// Starts a root token generation attempt.
+    ///
+    /// # Errors
+    /// Returns an error if the generate-root init request fails.
+    pub async fn generate_root_init(&self) -> Result<GenerateRootInitResponse> {
+        self.put_json("sys/generate-root/attempt", &serde_json::json!({}))
+            .await
+    }
+
+    /// Fetches the current root generation progress.
+    ///
+    /// # Errors
+    /// Returns an error if the request fails.
+    pub async fn generate_root_status(&self) -> Result<GenerateRootInitResponse> {
+        self.get_json("sys/generate-root/attempt", true).await
+    }
+
+    /// Cancels an in-progress root generation attempt.
+    ///
+    /// # Errors
+    /// Returns an error if the cancel request fails.
+    pub async fn generate_root_cancel(&self) -> Result<()> {
+        let _: serde_json::Value = self.delete_json("sys/generate-root/attempt").await?;
+        Ok(())
+    }
+
+    /// Submits an unseal key to an in-progress root generation.
+    ///
+    /// # Errors
+    /// Returns an error if the update request fails.
+    pub async fn generate_root_update(
+        &self,
+        key: &str,
+        nonce: &str,
+    ) -> Result<GenerateRootUpdateResponse> {
+        #[derive(Serialize)]
+        struct GenerateRootUpdateRequest<'a> {
+            key: &'a str,
+            nonce: &'a str,
+        }
+        self.put_json(
+            "sys/generate-root/update",
+            &GenerateRootUpdateRequest { key, nonce },
+        )
+        .await
+    }
+
+    /// Revokes a token.
+    ///
+    /// # Errors
+    /// Returns an error if the revoke request fails.
+    pub async fn revoke_token(&self, token_to_revoke: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .post_json(
+                "auth/token/revoke",
+                &serde_json::json!({ "token": token_to_revoke }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Looks up the current token to verify it is valid.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup fails.
+    pub async fn token_lookup_self(&self) -> Result<serde_json::Value> {
+        self.get_json("auth/token/lookup-self", true).await
+    }
+
     /// Deletes KV v2 secret metadata and all versions.
     ///
     /// # Errors
@@ -575,6 +757,29 @@ impl OpenBaoClient {
         let response = self
             .client
             .post(url)
+            .header(VAULT_TOKEN_HEADER, token)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("OpenBao request failed: {path}"))?;
+        Self::parse_response(response)
+            .await
+            .with_context(|| format!("OpenBao response parse failed: {path}"))
+    }
+
+    async fn put_json<T: Serialize, R: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<R> {
+        let url = self.endpoint(path);
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenBao token is not set"))?;
+        let response = self
+            .client
+            .put(url)
             .header(VAULT_TOKEN_HEADER, token)
             .json(body)
             .send()

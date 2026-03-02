@@ -190,6 +190,8 @@ pub(crate) enum RotateCommand {
     ForceReissue(RotateForceReissueArgs),
     #[command(name = "ca-key")]
     CaKey(RotateCaKeyArgs),
+    #[command(name = "openbao-recovery")]
+    OpenBaoRecovery(RotateOpenBaoRecoveryArgs),
 }
 
 #[derive(Args, Debug)]
@@ -266,6 +268,22 @@ pub(crate) struct RotateCaKeyArgs {
     /// Delete backup files on completion
     #[arg(long)]
     pub(crate) cleanup: bool,
+}
+
+// At least one of `rotate_unseal_keys` or `rotate_root_token` must be set.
+#[derive(Args, Debug)]
+pub(crate) struct RotateOpenBaoRecoveryArgs {
+    /// Rotate unseal keys via the rekey workflow
+    #[arg(long)]
+    pub(crate) rotate_unseal_keys: bool,
+
+    /// Rotate the root token via root generation
+    #[arg(long)]
+    pub(crate) rotate_root_token: bool,
+
+    /// Write new credentials to a file instead of stdout
+    #[arg(long)]
+    pub(crate) output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -682,6 +700,71 @@ mod tests {
                 assert_eq!(args.summary_json, Some(PathBuf::from("init-summary.json")));
             }
             _ => panic!("expected init"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_openbao_recovery_both_flags() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+            "--rotate-root-token",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::OpenBaoRecovery(recovery) => {
+                    assert!(recovery.rotate_unseal_keys);
+                    assert!(recovery.rotate_root_token);
+                    assert!(recovery.output.is_none());
+                }
+                _ => panic!("expected OpenBaoRecovery subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_openbao_recovery_unseal_only() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::OpenBaoRecovery(recovery) => {
+                    assert!(recovery.rotate_unseal_keys);
+                    assert!(!recovery.rotate_root_token);
+                }
+                _ => panic!("expected OpenBaoRecovery subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_openbao_recovery_with_output() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "openbao-recovery",
+            "--rotate-root-token",
+            "--output",
+            "/tmp/creds.txt",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::OpenBaoRecovery(recovery) => {
+                    assert!(!recovery.rotate_unseal_keys);
+                    assert!(recovery.rotate_root_token);
+                    assert_eq!(recovery.output, Some(PathBuf::from("/tmp/creds.txt")));
+                }
+                _ => panic!("expected OpenBaoRecovery subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
         }
     }
 }
