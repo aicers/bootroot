@@ -318,8 +318,10 @@ pub(crate) struct Strings {
     pub(crate) warning_rotation_in_progress: &'static str,
     pub(crate) error_trust_sync_blocked_by_rotation: &'static str,
     pub(crate) prompt_rotate_ca_key: &'static str,
-    pub(crate) error_ca_key_full_not_implemented: &'static str,
+    pub(crate) prompt_rotate_ca_key_full: &'static str,
+    pub(crate) rotate_ca_key_full_checklist: &'static str,
     pub(crate) error_rotation_state_corrupt: &'static str,
+    pub(crate) error_rotation_mode_mismatch: &'static str,
     pub(crate) error_parse_cert_failed: &'static str,
     pub(crate) warning_stale_backup: &'static str,
     pub(crate) rotate_ca_key_resuming: &'static str,
@@ -334,7 +336,10 @@ pub(crate) struct Strings {
     pub(crate) rotate_ca_key_reissue_remote_hint: &'static str,
     pub(crate) rotate_ca_key_finalize_blocked: &'static str,
     pub(crate) warning_force_finalize: &'static str,
+    pub(crate) warning_force_finalize_full: &'static str,
     pub(crate) rotate_ca_key_complete: &'static str,
+    pub(crate) rotate_ca_key_complete_full: &'static str,
+    pub(crate) rotate_ca_key_phase_generate_root: &'static str,
     pub(crate) rotate_ca_key_current_fingerprints: &'static str,
     pub(crate) rotate_ca_key_phase_skipped: &'static str,
     pub(crate) summary_responder_check_ok: &'static str,
@@ -1844,8 +1849,22 @@ impl Messages {
         )
     }
 
-    pub(crate) fn error_ca_key_full_not_implemented(&self) -> &'static str {
-        self.strings().error_ca_key_full_not_implemented
+    pub(crate) fn prompt_rotate_ca_key_full(&self, root_fp: &str, inter_fp: &str) -> String {
+        format_template(
+            self.strings().prompt_rotate_ca_key_full,
+            &[("root_fp", root_fp), ("inter_fp", inter_fp)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_full_checklist(&self) -> &'static str {
+        self.strings().rotate_ca_key_full_checklist
+    }
+
+    pub(crate) fn error_rotation_mode_mismatch(&self, mode: &str) -> String {
+        format_template(
+            self.strings().error_rotation_mode_mismatch,
+            &[("mode", mode)],
+        )
     }
 
     pub(crate) fn error_rotation_state_corrupt(&self, path: &str) -> String {
@@ -1923,11 +1942,40 @@ impl Messages {
         self.strings().warning_force_finalize
     }
 
+    pub(crate) fn warning_force_finalize_full(&self, services: &str) -> String {
+        format_template(
+            self.strings().warning_force_finalize_full,
+            &[("services", services)],
+        )
+    }
+
     pub(crate) fn rotate_ca_key_complete(&self, old_fp: &str, new_fp: &str) -> String {
         format_template(
             self.strings().rotate_ca_key_complete,
             &[("old_fp", old_fp), ("new_fp", new_fp)],
         )
+    }
+
+    pub(crate) fn rotate_ca_key_complete_full(
+        &self,
+        old_root_fp: &str,
+        new_root_fp: &str,
+        old_inter_fp: &str,
+        new_inter_fp: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_ca_key_complete_full,
+            &[
+                ("old_root_fp", old_root_fp),
+                ("new_root_fp", new_root_fp),
+                ("old_inter_fp", old_inter_fp),
+                ("new_inter_fp", new_inter_fp),
+            ],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_phase_generate_root(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_generate_root
     }
 
     pub(crate) fn rotate_ca_key_current_fingerprints(
