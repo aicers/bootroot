@@ -36,6 +36,7 @@ const SERVICE_EAB_HMAC_KEY: &str = "hmac";
 const SERVICE_RESPONDER_HMAC_KEY: &str = "hmac";
 const OPENBAO_AGENT_STEPCA_CONTAINER: &str = "bootroot-openbao-agent-stepca";
 const OPENBAO_AGENT_RESPONDER_CONTAINER: &str = "bootroot-openbao-agent-responder";
+const ROOT_CA_COMMON_NAME: &str = "Bootroot Root CA";
 const INTERMEDIATE_CA_COMMON_NAME: &str = "Bootroot Intermediate CA";
 const RENDERED_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RENDERED_FILE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -89,6 +90,15 @@ impl StatePaths {
 
     fn intermediate_cert(&self) -> PathBuf {
         self.ca_certs_dir().join(CA_INTERMEDIATE_CERT_FILENAME)
+    }
+
+    fn root_cert_bak(&self) -> PathBuf {
+        self.ca_certs_dir()
+            .join(format!("{CA_ROOT_CERT_FILENAME}.bak"))
+    }
+
+    fn root_key_bak(&self) -> PathBuf {
+        self.secrets_dir.join("secrets").join("root_ca_key.bak")
     }
 
     fn intermediate_cert_bak(&self) -> PathBuf {
@@ -1028,14 +1038,13 @@ async fn rotate_ca_key(
     messages: &Messages,
 ) -> Result<()> {
     // Phase 0 — Pre-flight
-    if args.full {
-        anyhow::bail!(messages.error_ca_key_full_not_implemented());
-    }
-
     ensure_file_exists(&ctx.paths.root_cert(), messages)?;
     ensure_file_exists(&ctx.paths.intermediate_cert(), messages)?;
     ensure_file_exists(&ctx.paths.stepca_intermediate_key(), messages)?;
     ensure_file_exists(&ctx.paths.stepca_password(), messages)?;
+    if args.full {
+        ensure_file_exists(&ctx.paths.stepca_root_key(), messages)?;
+    }
 
     let root_fp = read_ca_cert_fingerprint(&ctx.paths.root_cert(), messages).await?;
     let current_inter_fp =
@@ -1046,8 +1055,26 @@ async fn rotate_ca_key(
         messages.rotate_ca_key_current_fingerprints(&root_fp, &current_inter_fp)
     );
 
+    if args.full {
+        println!("{}", messages.rotate_ca_key_full_checklist());
+    }
+
+    let expected_mode = if args.full {
+        RotationMode::Full
+    } else {
+        RotationMode::IntermediateOnly
+    };
+
     let mut start_phase: u8 = 0;
     let mut rot_state = if let Some(state) = load_rotation_state(&ctx.state_dir, messages)? {
+        if state.mode != expected_mode {
+            let mode_str = if state.mode == RotationMode::Full {
+                "full"
+            } else {
+                "intermediate-only"
+            };
+            anyhow::bail!(messages.error_rotation_mode_mismatch(mode_str));
+        }
         println!(
             "{}",
             messages.rotate_ca_key_resuming(&state.phase.to_string())
@@ -1058,15 +1085,17 @@ async fn rotate_ca_key(
         if ctx.paths.intermediate_cert_bak().exists() || ctx.paths.intermediate_key_bak().exists() {
             eprintln!("{}", messages.warning_stale_backup());
         }
-        confirm_action(
-            messages
-                .prompt_rotate_ca_key(&root_fp, &current_inter_fp)
-                .as_str(),
-            auto_confirm,
-            messages,
-        )?;
+        if args.full && (ctx.paths.root_cert_bak().exists() || ctx.paths.root_key_bak().exists()) {
+            eprintln!("{}", messages.warning_stale_backup());
+        }
+        let prompt = if args.full {
+            messages.prompt_rotate_ca_key_full(&root_fp, &current_inter_fp)
+        } else {
+            messages.prompt_rotate_ca_key(&root_fp, &current_inter_fp)
+        };
+        confirm_action(prompt.as_str(), auto_confirm, messages)?;
         RotationState {
-            mode: RotationMode::IntermediateOnly,
+            mode: expected_mode,
             started_at: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
@@ -1081,6 +1110,14 @@ async fn rotate_ca_key(
     // Phase 1 — Backup
     if start_phase < 1 {
         println!("{}", messages.rotate_ca_key_phase_backup());
+        if rot_state.mode == RotationMode::Full {
+            backup_file(&ctx.paths.root_cert(), &ctx.paths.root_cert_bak(), messages)?;
+            backup_file(
+                &ctx.paths.stepca_root_key(),
+                &ctx.paths.root_key_bak(),
+                messages,
+            )?;
+        }
         backup_file(
             &ctx.paths.intermediate_cert(),
             &ctx.paths.intermediate_cert_bak(),
@@ -1101,14 +1138,25 @@ async fn rotate_ca_key(
         println!("{}", messages.rotate_ca_key_phase_skipped("1"));
     }
 
-    // Phase 2 — Generate new intermediate
+    // Phase 2 — Generate new key pair(s)
     if start_phase < 2 {
-        println!("{}", messages.rotate_ca_key_phase_generate());
+        if rot_state.mode == RotationMode::Full {
+            // Phase 2a — Generate new root CA
+            println!("{}", messages.rotate_ca_key_phase_generate_root());
+            let pre_root_fp = read_ca_cert_fingerprint(&ctx.paths.root_cert(), messages).await?;
+            if pre_root_fp != rot_state.old_root_fp && !rot_state.old_root_fp.is_empty() {
+                rot_state.new_root_fp = pre_root_fp;
+            } else {
+                generate_new_root(ctx, messages)?;
+                rot_state.new_root_fp =
+                    read_ca_cert_fingerprint(&ctx.paths.root_cert(), messages).await?;
+            }
+        }
 
-        // Check if already regenerated (idempotency)
+        // Phase 2b — Generate new intermediate CA (signed by current root on disk)
+        println!("{}", messages.rotate_ca_key_phase_generate());
         let pre_fp = read_ca_cert_fingerprint(&ctx.paths.intermediate_cert(), messages).await?;
         if pre_fp != rot_state.old_intermediate_fp && !rot_state.old_intermediate_fp.is_empty() {
-            // Already regenerated in a previous partial run
             rot_state.new_intermediate_fp = pre_fp;
         } else {
             generate_new_intermediate(ctx, messages)?;
@@ -1126,11 +1174,20 @@ async fn rotate_ca_key(
     if start_phase < 3 {
         println!("{}", messages.rotate_ca_key_phase_trust_additive());
 
-        let transitional_fps = vec![
-            rot_state.old_root_fp.clone(),
-            rot_state.old_intermediate_fp.clone(),
-            rot_state.new_intermediate_fp.clone(),
-        ];
+        let transitional_fps = if rot_state.mode == RotationMode::Full {
+            vec![
+                rot_state.old_root_fp.clone(),
+                rot_state.old_intermediate_fp.clone(),
+                rot_state.new_root_fp.clone(),
+                rot_state.new_intermediate_fp.clone(),
+            ]
+        } else {
+            vec![
+                rot_state.old_root_fp.clone(),
+                rot_state.old_intermediate_fp.clone(),
+                rot_state.new_intermediate_fp.clone(),
+            ]
+        };
         let ca_bundle_pem = compute_ca_bundle_pem(ctx.paths.secrets_dir(), messages).await?;
         trust::write_trust_to_openbao(
             client,
@@ -1220,7 +1277,11 @@ async fn rotate_ca_key(
             if !args.force {
                 anyhow::bail!(messages.rotate_ca_key_finalize_blocked(&list));
             }
-            eprintln!("{}", messages.warning_force_finalize());
+            if rot_state.mode == RotationMode::Full {
+                eprintln!("{}", messages.warning_force_finalize_full(&list));
+            } else {
+                eprintln!("{}", messages.warning_force_finalize());
+            }
             if !auto_confirm {
                 confirm_action(
                     messages.rotate_ca_key_finalize_blocked(&list).as_str(),
@@ -1256,17 +1317,62 @@ async fn rotate_ca_key(
     if args.cleanup {
         let _ = fs::remove_file(ctx.paths.intermediate_cert_bak());
         let _ = fs::remove_file(ctx.paths.intermediate_key_bak());
+        if rot_state.mode == RotationMode::Full {
+            let _ = fs::remove_file(ctx.paths.root_cert_bak());
+            let _ = fs::remove_file(ctx.paths.root_key_bak());
+        }
     }
     delete_rotation_state(&ctx.state_dir, messages)?;
 
-    println!(
-        "{}",
-        messages.rotate_ca_key_complete(
-            &rot_state.old_intermediate_fp,
-            &rot_state.new_intermediate_fp,
-        )
-    );
+    if rot_state.mode == RotationMode::Full {
+        println!(
+            "{}",
+            messages.rotate_ca_key_complete_full(
+                &rot_state.old_root_fp,
+                &rot_state.new_root_fp,
+                &rot_state.old_intermediate_fp,
+                &rot_state.new_intermediate_fp,
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            messages.rotate_ca_key_complete(
+                &rot_state.old_intermediate_fp,
+                &rot_state.new_intermediate_fp,
+            )
+        );
+    }
 
+    Ok(())
+}
+
+fn generate_new_root(ctx: &RotateContext, messages: &Messages) -> Result<()> {
+    let mount_root = fs::canonicalize(ctx.paths.secrets_dir()).with_context(|| {
+        messages.error_resolve_path_failed(&ctx.paths.secrets_dir().display().to_string())
+    })?;
+    let mount = format!("{}:/home/step", mount_root.display());
+    let args = vec![
+        "run",
+        "--user",
+        "root",
+        "--rm",
+        "-v",
+        &mount,
+        "smallstep/step-ca",
+        "step",
+        "certificate",
+        "create",
+        ROOT_CA_COMMON_NAME,
+        "/home/step/certs/root_ca.crt",
+        "/home/step/secrets/root_ca_key",
+        "--profile",
+        "root-ca",
+        "--password-file",
+        "/home/step/password.txt",
+        "--force",
+    ];
+    run_docker(&args, "docker step certificate create (root)", messages)?;
     Ok(())
 }
 

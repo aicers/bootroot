@@ -1558,7 +1558,7 @@ fn mock_pg_read_payload(stream: &mut std::net::TcpStream) -> Vec<u8> {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_rotate_ca_key_full_mode_rejected() {
+async fn test_rotate_ca_key_full_mode_validates_root_key() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
 
@@ -1566,6 +1566,14 @@ async fn test_rotate_ca_key_full_mode_rejected() {
     support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
         .expect("write password");
     write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    // Delete root_ca_key so pre-flight validation fails
+    let root_key = temp_dir
+        .path()
+        .join("secrets")
+        .join("secrets")
+        .join("root_ca_key");
+    let _ = fs::remove_file(&root_key);
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
@@ -1591,11 +1599,11 @@ async fn test_rotate_ca_key_full_mode_rejected() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "ca-key --full should fail; stderr:\n{stderr}"
+        "ca-key --full should fail without root key; stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("not yet implemented") || stderr.contains("Full CA key rotation"),
-        "stderr should mention --full not implemented: {stderr}"
+        stderr.contains("root_ca_key"),
+        "stderr should mention missing root key: {stderr}"
     );
 }
 
@@ -1949,6 +1957,48 @@ esac
 exit 0
 "#,
         new_cert = new_cert_source.display()
+    );
+    let docker_path = bin_dir.join("docker");
+    fs::write(&docker_path, script).expect("write fake docker");
+    fs::set_permissions(&docker_path, fs::Permissions::from_mode(0o700))
+        .expect("chmod fake docker");
+    fs::write(docker_log, "").expect("seed docker log");
+    docker_path
+}
+
+/// Writes a fake docker that handles both root and intermediate cert
+/// generation for full-mode rotation tests.
+fn write_full_mode_rotation_fake_docker(
+    bin_dir: &Path,
+    docker_log: &Path,
+    new_root_cert_source: &Path,
+    new_inter_cert_source: &Path,
+) -> PathBuf {
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+if [ -n "${{DOCKER_OUTPUT:-}}" ]; then
+  printf "%s\n" "$*" >> "$DOCKER_OUTPUT"
+fi
+case "$*" in
+  *"--profile"*"root-ca"*)
+    # Root CA generation: copy staged root cert to target
+    cp "{new_root}" "${{ROTATION_NEW_ROOT_TARGET:-/dev/null}}" 2>/dev/null || true
+    exit 0
+    ;;
+  *"step certificate create"*)
+    # Intermediate CA generation: copy staged intermediate cert
+    cp "{new_inter}" "${{ROTATION_NEW_CERT_TARGET:-/dev/null}}" 2>/dev/null || true
+    exit 0
+    ;;
+  *"compose"*"restart"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+        new_root = new_root_cert_source.display(),
+        new_inter = new_inter_cert_source.display(),
     );
     let docker_path = bin_dir.join("docker");
     fs::write(&docker_path, script).expect("write fake docker");
@@ -2385,5 +2435,697 @@ async fn test_rotate_ca_key_stale_backup_warning() {
     assert!(
         stderr.contains("WARNING") || stderr.contains("backup"),
         "should warn about stale backup files: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_full_mode_state_records_full() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    // Use a fake docker that fails on root cert generation so Phase 2 fails
+    // but Phase 1 (backup) completes, creating rotation-state.json
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let fake_docker = "#!/bin/sh\nexit 1\n";
+    fs::write(bin_dir.join("docker"), fake_docker).expect("write fake docker");
+    fs::set_permissions(bin_dir.join("docker"), fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    let path_var = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{path_var}", bin_dir.display());
+
+    let _output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "ca-key",
+            "--full",
+        ])
+        .env("PATH", &combined_path)
+        .output()
+        .expect("run rotate ca-key --full");
+
+    // Phase 1 should have created rotation-state.json with mode "full"
+    let state_path = temp_dir.path().join("rotation-state.json");
+    assert!(state_path.exists(), "rotation-state.json should exist");
+
+    let contents = fs::read_to_string(&state_path).expect("read state");
+    let state: serde_json::Value = serde_json::from_str(&contents).expect("parse json");
+    assert_eq!(
+        state["mode"],
+        json!("full"),
+        "rotation-state.json mode should be 'full'"
+    );
+    assert_eq!(
+        state["phase"],
+        json!(1),
+        "should have completed phase 1 (backup)"
+    );
+    // Root backup files should exist in full mode
+    let secrets = temp_dir.path().join("secrets");
+    assert!(
+        secrets.join("certs").join("root_ca.crt.bak").exists(),
+        "root cert backup should exist"
+    );
+    assert!(
+        secrets.join("secrets").join("root_ca_key.bak").exists(),
+        "root key backup should exist"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_full_mode_4_fingerprints() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    // Capture what's written to the trust path
+    let trust_mock = Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1..)
+        .mount_as_scoped(&openbao)
+        .await;
+
+    // Pre-create rotation-state.json at phase 2 with mode=full and 4 distinct fingerprints
+    fs::write(
+        temp_dir.path().join("rotation-state.json"),
+        serde_json::to_string_pretty(&json!({
+            "mode": "full",
+            "started_at": "2026-03-01T10:00:00Z",
+            "old_root_fp": "old-root-aaa",
+            "new_root_fp": "new-root-bbb",
+            "old_intermediate_fp": "old-inter-ccc",
+            "new_intermediate_fp": "new-inter-ddd",
+            "phase": 2
+        }))
+        .unwrap(),
+    )
+    .expect("write rotation-state.json");
+
+    // Fake docker for compose restart (Phase 4)
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let fake_docker = "#!/bin/sh\nexit 0\n";
+    fs::write(bin_dir.join("docker"), fake_docker).expect("write fake docker");
+    fs::set_permissions(bin_dir.join("docker"), fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    let path_var = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{path_var}", bin_dir.display());
+
+    // Run only phases 3+ (skip-reissue, skip-finalize to isolate phase 3)
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "ca-key",
+            "--full",
+            "--skip-reissue",
+            "--skip-finalize",
+            "--cleanup",
+        ])
+        .env("PATH", &combined_path)
+        .output()
+        .expect("run rotate ca-key --full from phase 2");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Verify the mock was actually called (trust was written)
+    drop(trust_mock);
+    assert!(
+        stdout.contains("complete") || stdout.contains("Complete"),
+        "stdout should mention completion: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_mode_mismatch_bails() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    // Pre-create rotation-state.json with intermediate-only mode
+    fs::write(
+        temp_dir.path().join("rotation-state.json"),
+        serde_json::to_string_pretty(&json!({
+            "mode": "intermediate-only",
+            "started_at": "2026-03-01T10:00:00Z",
+            "old_root_fp": "aaa",
+            "new_root_fp": "aaa",
+            "old_intermediate_fp": "bbb",
+            "new_intermediate_fp": "ccc",
+            "phase": 3
+        }))
+        .unwrap(),
+    )
+    .expect("write rotation-state.json");
+
+    // Run with --full — mode mismatch should bail
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "ca-key",
+            "--full",
+        ])
+        .output()
+        .expect("run rotate ca-key --full with mismatched state");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "should fail with mode mismatch; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("does not match") || stderr.contains("mode"),
+        "stderr should mention mode mismatch: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_full_force_finalize_enhanced_warning() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
+        .expect("prepare state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/trust"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&openbao)
+        .await;
+
+    // Pre-create rotation-state.json at phase 5 with mode=full
+    fs::write(
+        temp_dir.path().join("rotation-state.json"),
+        serde_json::to_string_pretty(&json!({
+            "mode": "full",
+            "started_at": "2026-03-01T10:00:00Z",
+            "old_root_fp": "old-root",
+            "new_root_fp": "new-root",
+            "old_intermediate_fp": "old-inter",
+            "new_intermediate_fp": "new-inter",
+            "phase": 5
+        }))
+        .unwrap(),
+    )
+    .expect("write rotation-state.json");
+
+    // Service certs don't match new intermediate → blocks finalization
+    // --force should override with enhanced full-mode warning
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "ca-key",
+            "--full",
+            "--force",
+        ])
+        .output()
+        .expect("run rotate ca-key --full --force");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "should succeed with --force; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Root fingerprint has changed")
+            || stderr.contains("루트 지문이 변경되었고"),
+        "stderr should have enhanced full-mode warning: {stderr}"
+    );
+    assert!(
+        !temp_dir.path().join("rotation-state.json").exists(),
+        "rotation-state.json should be deleted after completion"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Integration test exercising all 8 phases end-to-end
+async fn test_rotate_ca_key_full_mode_happy_path_phase_0_through_7() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
+        .expect("prepare state");
+
+    fs::write(
+        temp_dir.path().join("docker-compose.yml"),
+        "version: '3'\nservices:\n  step-ca:\n    image: test\n",
+    )
+    .expect("write compose file");
+
+    // Generate distinct certs for root and intermediate
+    let new_root_pem = generate_test_cert_pem("new-root.example");
+    let new_inter_pem = generate_test_cert_pem("new-intermediate.example");
+    let new_root_staging = temp_dir.path().join("new_root_staged.crt");
+    let new_inter_staging = temp_dir.path().join("new_inter_staged.crt");
+    fs::write(&new_root_staging, &new_root_pem).expect("write staged root cert");
+    fs::write(&new_inter_staging, &new_inter_pem).expect("write staged intermediate cert");
+
+    let root_cert_path = temp_dir
+        .path()
+        .join("secrets")
+        .join("certs")
+        .join("root_ca.crt");
+    let inter_cert_path = temp_dir
+        .path()
+        .join("secrets")
+        .join("certs")
+        .join("intermediate_ca.crt");
+
+    // Service cert matches new intermediate (self-signed = issuer == subject)
+    let svc_cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    fs::create_dir_all(svc_cert_path.parent().unwrap()).expect("create certs dir");
+    fs::write(&svc_cert_path, &new_inter_pem).expect("write service cert");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_full_mode_rotation_fake_docker(
+        &bin_dir,
+        &docker_log,
+        &new_root_staging,
+        &new_inter_staging,
+    );
+
+    let pkill_log = temp_dir.path().join("pkill.log");
+    write_fake_pkill(&bin_dir, &pkill_log).expect("write fake pkill");
+
+    let path_var = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{path_var}", bin_dir.display());
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/trust"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&openbao)
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "ca-key",
+            "--full",
+        ])
+        .env("PATH", &combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
+        .env("PKILL_OUTPUT", &pkill_log)
+        .env("ROTATION_NEW_ROOT_TARGET", &root_cert_path)
+        .env("ROTATION_NEW_CERT_TARGET", &inter_cert_path)
+        .output()
+        .expect("run rotate ca-key --full happy path");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "full mode happy path should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Completion summary should mention "full" and show both fingerprints
+    assert!(
+        stdout.contains("complete") || stdout.contains("Complete"),
+        "stdout should mention completion: {stdout}"
+    );
+    assert!(
+        stdout.contains("root") || stdout.contains("루트"),
+        "full mode completion should mention root fingerprint: {stdout}"
+    );
+    assert!(
+        !temp_dir.path().join("rotation-state.json").exists(),
+        "rotation-state.json should be deleted after completion"
+    );
+    // Root backups should exist (no --cleanup)
+    assert!(
+        temp_dir
+            .path()
+            .join("secrets")
+            .join("certs")
+            .join("root_ca.crt.bak")
+            .exists(),
+        "root cert backup should be preserved without --cleanup"
+    );
+    assert!(
+        temp_dir
+            .path()
+            .join("secrets")
+            .join("secrets")
+            .join("root_ca_key.bak")
+            .exists(),
+        "root key backup should be preserved without --cleanup"
+    );
+    // Intermediate backups should also exist
+    assert!(
+        temp_dir
+            .path()
+            .join("secrets")
+            .join("certs")
+            .join("intermediate_ca.crt.bak")
+            .exists(),
+        "intermediate cert backup should be preserved without --cleanup"
+    );
+
+    // Verify docker log shows both root-ca and intermediate-ca generation
+    let docker_commands = fs::read_to_string(&docker_log).expect("read docker log");
+    assert!(
+        docker_commands.contains("root-ca"),
+        "docker log should contain root-ca profile: {docker_commands}"
+    );
+    assert!(
+        docker_commands.contains("intermediate-ca"),
+        "docker log should contain intermediate-ca profile: {docker_commands}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_full_mode_cleanup_deletes_root_backups() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    let secrets = temp_dir.path().join("secrets");
+    // Create all .bak files that Phase 7 should delete in full mode
+    fs::write(
+        secrets.join("certs").join("root_ca.crt.bak"),
+        "old-root-cert",
+    )
+    .expect("write root cert bak");
+    fs::write(
+        secrets.join("secrets").join("root_ca_key.bak"),
+        "old-root-key",
+    )
+    .expect("write root key bak");
+    fs::write(
+        secrets.join("certs").join("intermediate_ca.crt.bak"),
+        "old-cert",
+    )
+    .expect("write cert bak");
+    fs::write(
+        secrets.join("secrets").join("intermediate_ca_key.bak"),
+        "old-key",
+    )
+    .expect("write key bak");
+
+    // Pre-create rotation-state.json at phase 6 with mode=full
+    fs::write(
+        temp_dir.path().join("rotation-state.json"),
+        serde_json::to_string_pretty(&json!({
+            "mode": "full",
+            "started_at": "2026-03-01T10:00:00Z",
+            "old_root_fp": "old-root",
+            "new_root_fp": "new-root",
+            "old_intermediate_fp": "old-inter",
+            "new_intermediate_fp": "new-inter",
+            "phase": 6
+        }))
+        .unwrap(),
+    )
+    .expect("write rotation-state.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "ca-key",
+            "--full",
+            "--cleanup",
+        ])
+        .output()
+        .expect("run rotate ca-key --full --cleanup");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Root backups should be deleted
+    assert!(
+        !secrets.join("certs").join("root_ca.crt.bak").exists(),
+        "root cert backup should be deleted with --cleanup in full mode"
+    );
+    assert!(
+        !secrets.join("secrets").join("root_ca_key.bak").exists(),
+        "root key backup should be deleted with --cleanup in full mode"
+    );
+    // Intermediate backups should also be deleted
+    assert!(
+        !secrets
+            .join("certs")
+            .join("intermediate_ca.crt.bak")
+            .exists(),
+        "intermediate cert backup should be deleted with --cleanup"
+    );
+    assert!(
+        !secrets
+            .join("secrets")
+            .join("intermediate_ca_key.bak")
+            .exists(),
+        "intermediate key backup should be deleted with --cleanup"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_reverse_mode_mismatch_bails() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    // Pre-create rotation-state.json with full mode
+    fs::write(
+        temp_dir.path().join("rotation-state.json"),
+        serde_json::to_string_pretty(&json!({
+            "mode": "full",
+            "started_at": "2026-03-01T10:00:00Z",
+            "old_root_fp": "old-root",
+            "new_root_fp": "new-root",
+            "old_intermediate_fp": "old-inter",
+            "new_intermediate_fp": "new-inter",
+            "phase": 3
+        }))
+        .unwrap(),
+    )
+    .expect("write rotation-state.json");
+
+    // Run WITHOUT --full — mode mismatch should bail
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "ca-key",
+        ])
+        .output()
+        .expect("run rotate ca-key without --full with full state");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "should fail with reverse mode mismatch; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("does not match") || stderr.contains("mode"),
+        "stderr should mention mode mismatch: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_full_mode_resumes_from_phase() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    // Pre-create rotation-state.json at phase 6 with mode=full
+    fs::write(
+        temp_dir.path().join("rotation-state.json"),
+        serde_json::to_string_pretty(&json!({
+            "mode": "full",
+            "started_at": "2026-03-01T10:00:00Z",
+            "old_root_fp": "old-root",
+            "new_root_fp": "new-root",
+            "old_intermediate_fp": "old-inter",
+            "new_intermediate_fp": "new-inter",
+            "phase": 6
+        }))
+        .unwrap(),
+    )
+    .expect("write rotation-state.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "ca-key",
+            "--full",
+        ])
+        .output()
+        .expect("run rotate ca-key --full resume from phase 6");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "should succeed resuming from phase 6; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Resuming") || stdout.contains("재개"),
+        "stdout should mention resuming: {stdout}"
+    );
+    // Completion summary should show all 4 fingerprints for full mode
+    assert!(
+        stdout.contains("old-root") && stdout.contains("new-root"),
+        "full mode summary should show old and new root fingerprints: {stdout}"
+    );
+    assert!(
+        stdout.contains("old-inter") && stdout.contains("new-inter"),
+        "full mode summary should show old and new intermediate fingerprints: {stdout}"
+    );
+    assert!(
+        !temp_dir.path().join("rotation-state.json").exists(),
+        "rotation-state.json should be cleaned up after completion"
     );
 }

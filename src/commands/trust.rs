@@ -22,6 +22,9 @@ pub(crate) enum RotationMode {
     /// Rotates only the intermediate CA key (root CA stays unchanged).
     #[serde(rename = "intermediate-only")]
     IntermediateOnly,
+    /// Rotates both root and intermediate CA keys.
+    #[serde(rename = "full")]
+    Full,
 }
 
 /// Tracks CA key rotation progress for idempotency and concurrency control.
@@ -310,5 +313,14 @@ mod tests {
         let mode: RotationMode =
             serde_json::from_str("\"intermediate-only\"").expect("deserialize");
         assert_eq!(mode, RotationMode::IntermediateOnly);
+    }
+
+    #[test]
+    fn rotation_mode_serializes_to_full_string() {
+        let json = serde_json::to_string(&RotationMode::Full).expect("serialize");
+        assert_eq!(json, "\"full\"");
+
+        let mode: RotationMode = serde_json::from_str("\"full\"").expect("deserialize");
+        assert_eq!(mode, RotationMode::Full);
     }
 }

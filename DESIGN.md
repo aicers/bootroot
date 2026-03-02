@@ -28,13 +28,14 @@ intervention, and Bootroot is designed to minimize those manual steps.
 
 ## Semi-Automated — CA Key Rotation
 
-`bootroot rotate ca-key` replaces the intermediate CA key pair without full
-re-initialization. The command uses an 8-phase approach (backup, generate,
+`bootroot rotate ca-key` replaces the intermediate CA key pair, and
+`bootroot rotate ca-key --full` replaces both the root and intermediate CA
+key pairs. Both modes use the same 8-phase approach (backup, generate,
 additive trust, restart step-ca, re-issue, finalize trust, cleanup), each
 idempotent so re-running after failure automatically resumes. A
 `rotation-state.json` file tracks progress and prevents concurrent
-modifications. Full CA rotation (root + intermediate) is reserved for the
-future.
+modifications. Full mode uses 4-fingerprint transitional trust to allow
+clients to verify certificates during the migration window.
 
 ## Derived Goal for Certificate Rotation Automation — Secret Management
 

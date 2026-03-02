@@ -711,6 +711,23 @@ run_rotations_with_verification() {
   assert_fingerprint_changed "$EDGE_SERVICE" "after-db" "after-ca-key"
   assert_fingerprint_changed "$WEB_SERVICE" "after-db" "after-ca-key"
   assert_fingerprint_changed "$REMOTE_SERVICE" "after-db" "after-ca-key"
+
+  log_phase "rotate-ca-key-full"
+  run_bootroot rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
+    --yes \
+    ca-key --full --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1
+  wire_stepca_hosts
+  run_remote_bootstrap
+  force_reissue_all_services
+  run_verify_pair "after-ca-key-full"
+  assert_fingerprint_changed "$EDGE_SERVICE" "after-ca-key" "after-ca-key-full"
+  assert_fingerprint_changed "$WEB_SERVICE" "after-ca-key" "after-ca-key-full"
+  assert_fingerprint_changed "$REMOTE_SERVICE" "after-ca-key" "after-ca-key-full"
 }
 
 write_manifest() {

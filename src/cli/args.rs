@@ -251,7 +251,7 @@ pub(crate) struct RotateForceReissueArgs {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug)]
 pub(crate) struct RotateCaKeyArgs {
-    /// Include root CA in rotation (reserved, not implemented)
+    /// Rotate both root and intermediate CA keys (full rotation)
     #[arg(long)]
     pub(crate) full: bool,
     /// Skip service certificate re-issuance (Phase 5)
