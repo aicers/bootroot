@@ -411,6 +411,39 @@ bootroot rotate trust-sync
 bootroot rotate force-reissue --service-name edge-proxy
 ```
 
+CA 키 회전(중간 CA만):
+
+```bash
+bootroot rotate \
+  --compose-file docker-compose.yml \
+  --openbao-url http://localhost:8200 \
+  --auth-mode approle \
+  --approle-role-id "$ROTATE_ROLE_ID" \
+  --approle-secret-id "$ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --cleanup
+```
+
+CA 키 회전(전체 — 루트 + 중간):
+
+```bash
+bootroot rotate \
+  --compose-file docker-compose.yml \
+  --openbao-url http://localhost:8200 \
+  --auth-mode approle \
+  --approle-role-id "$ROTATE_ROLE_ID" \
+  --approle-secret-id "$ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --full --cleanup
+```
+
+CA 키 회전 후 모든 서비스에 대해 인증서 강제 재발급:
+
+```bash
+bootroot rotate force-reissue --service-name edge-proxy
+bootroot rotate force-reissue --service-name web-app
+```
+
 주기 실행(예: cron, 모든 회전 스텝을 한 번에 실행하는 스크립트):
 
 ```bash

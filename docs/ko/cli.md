@@ -514,6 +514,7 @@ OpenBao와 통신해 값을 갱신합니다.
 - `rotate approle-secret-id`
 - `rotate trust-sync`
 - `rotate force-reissue`
+- `rotate ca-key`
 
 ### 입력
 
@@ -583,6 +584,43 @@ CA 번들 PEM을 디스크에 기록합니다.
 `bootroot-remote bootstrap` 실행을 안내합니다.
 
 - `--service-name`: 대상 서비스 이름
+
+#### `rotate ca-key`
+
+step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 CA 키 쌍만
+교체하며, `--full` 옵션을 주면 루트 CA와 중간 CA 키 쌍을 모두 교체합니다.
+
+두 모드 모두 8단계 멱등(idempotent) 워크플로를 사용합니다.
+`rotation-state.json` 파일이 진행 상태를 추적하므로, 실패 후 재실행하면
+마지막으로 완료된 단계부터 자동으로 이어서 진행합니다. 이 파일은 동시
+수정도 방지합니다.
+
+단계:
+
+- Phase 0 — 사전 점검: 필수 파일 존재 확인, 현재 fingerprint 조회
+- Phase 1 — 백업: 현재 cert/key 파일 백업
+- Phase 2 — 생성: 새 CA 키 쌍 및 인증서 생성
+- Phase 3 — 가산적 trust: 전이 trust(기존 + 신규 fingerprint)를 OpenBao에
+  기록해 서비스가 기존/신규 인증서를 모두 수락하도록 함
+- Phase 4 — step-ca 재시작: step-ca 컨테이너를 재시작해 새 키 쌍 적용
+- Phase 5 — 재발급: 서비스 cert/key 삭제 후 bootroot-agent에 시그널
+  (daemon은 SIGHUP, Docker는 컨테이너 재시작)을 보내 새 CA로 재발급 유도.
+  원격 서비스는 안내 메시지 출력
+- Phase 6 — trust 확정: 최종 trust(신규 fingerprint만)를 OpenBao에 기록해
+  기존 fingerprint 제거
+- Phase 7 — 정리: `rotation-state.json` 삭제, 선택적으로 백업 파일 제거
+
+중간 CA만 교체하는 모드는 3-fingerprint 전이 trust(기존 루트, 기존 중간,
+신규 중간)를 사용합니다. 전체 모드는 4-fingerprint 전이 trust(기존 루트,
+기존 중간, 신규 루트, 신규 중간)를 사용합니다.
+
+입력:
+
+- `--full`: 루트 + 중간 CA 키 모두 교체(기본: 중간 CA만)
+- `--skip-reissue`: Phase 5(서비스 인증서 재발급) 생략
+- `--skip-finalize`: Phase 6(trust 확정) 생략
+- `--force`: 미이전 서비스가 있어도 Phase 6 강제 실행
+- `--cleanup`: 완료 시 백업 파일 삭제(Phase 7)
 
 ### 회전 시크릿 쓰기 대상
 

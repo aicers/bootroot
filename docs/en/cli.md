@@ -534,6 +534,7 @@ Supported subcommands:
 - `rotate approle-secret-id`
 - `rotate trust-sync`
 - `rotate force-reissue`
+- `rotate ca-key`
 
 ### Inputs
 
@@ -603,6 +604,49 @@ bootroot-agent process. For Docker services, restarts the container. For
 remote services, prints a hint to run `bootroot-remote bootstrap`.
 
 - `--service-name`: target service name
+
+#### `rotate ca-key`
+
+Rotates the CA key pair used by step-ca. By default, only the intermediate
+CA key pair is replaced. With `--full`, both root and intermediate CA key
+pairs are replaced.
+
+Both modes use an 8-phase idempotent workflow. A `rotation-state.json`
+file tracks progress, so re-running after any failure automatically resumes
+from the last completed phase. The file also prevents concurrent
+modifications.
+
+Phases:
+
+- Phase 0 — Pre-flight: verify required files exist and read current
+  fingerprints
+- Phase 1 — Backup: back up current cert/key files
+- Phase 2 — Generate: create new CA key pair(s) and certificate(s)
+- Phase 3 — Additive trust: write transitional trust (old + new
+  fingerprints) to OpenBao so services accept both old and new certificates
+- Phase 4 — Restart step-ca: restart the step-ca container so it uses the
+  new key pair
+- Phase 5 — Re-issue: delete service cert/key files and signal
+  bootroot-agent (SIGHUP for daemon, container restart for Docker) to
+  trigger re-issuance with the new CA. Remote services print a hint instead
+- Phase 6 — Finalize trust: write final trust (new fingerprints only) to
+  OpenBao, removing old fingerprints
+- Phase 7 — Cleanup: delete `rotation-state.json` and optionally remove
+  backup files
+
+Intermediate-only mode uses 3-fingerprint transitional trust (old root,
+old intermediate, new intermediate). Full mode uses 4-fingerprint
+transitional trust (old root, old intermediate, new root, new
+intermediate).
+
+Inputs:
+
+- `--full`: rotate both root and intermediate CA keys (default:
+  intermediate only)
+- `--skip-reissue`: skip Phase 5 (service certificate re-issuance)
+- `--skip-finalize`: skip Phase 6 (trust finalization)
+- `--force`: force Phase 6 even when un-migrated services remain
+- `--cleanup`: delete backup files on completion (Phase 7)
 
 ### Rotated secret write targets
 

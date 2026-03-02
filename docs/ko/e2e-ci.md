@@ -65,18 +65,21 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - 원격 전달 E2E 시나리오 (`fqdn-only-hosts`)
 - 원격 전달 E2E 시나리오 (`hosts-all`)
 - rotation/recovery matrix (`secret_id,eab,responder_hmac`)
+- CA 키 회전 장애/복구(5개 장애 주입 시나리오)
 
 주요 스크립트:
 
 - `scripts/impl/run-local-lifecycle.sh`
 - `scripts/impl/run-remote-lifecycle.sh`
 - `scripts/impl/run-rotation-recovery.sh`
+- `scripts/impl/run-ca-key-rotation-recovery.sh`
 
 확장 워크플로는 다음을 검증합니다.
 
 - baseline 경합/스케일 동작
 - 반복 장애/복구 동작
 - 회전 스케줄 동등성(`systemd-timer`, `cron`)
+- CA 키 회전 장애/복구
 
 주요 스크립트:
 
@@ -328,12 +331,92 @@ bootroot-remote apply-secret-id --service-name "$service" ...
 bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 ```
 
-### 6) extended workflow 케이스
+### 6) CA 키 회전 장애/복구
+
+구성:
+
+- 스크립트: `scripts/impl/run-ca-key-rotation-recovery.sh`
+- Docker Compose 인프라 기반 단일 머신
+- 서비스 구성(총 3개): `edge-proxy` (`daemon`, `local-file`),
+  `web-app` (`docker`, `local-file`), `edge-proxy` (`daemon`,
+  `remote-bootstrap`)
+- 5개 장애 주입 시나리오를 동일 인프라에서 순차 실행
+
+목적:
+
+- `bootroot rotate ca-key`가 인프라 장애 후 올바르게 이어서
+  진행되는지 검증
+- CA 키 회전 중 mTLS가 중단되지 않는지 검증
+- `rotation-state.json` 멱등 phase 추적 검증
+- `--skip-reissue`, `--force`, `--cleanup` 플래그 동작 검증
+- 활성 회전 중 `trust-sync` 충돌 방지 검증
+
+#### 시나리오
+
+시나리오 1 — Phase 3 장애(OpenBao 접근 불가):
+
+1. OpenBao 컨테이너 중지 → Phase 3(가산적 trust 기록) 실패
+2. `rotate ca-key` 실행 → 실패 기대
+3. 서비스 정상 동작 확인(cert 미변경, step-ca 실행 중)
+4. OpenBao 재시작 후 회전 재실행 → 이어서 완료
+5. 강제 재발급 후 새 인증서 검증
+
+시나리오 2 — Phase 4 장애(step-ca 제거):
+
+1. step-ca 컨테이너 제거 → Phase 4(재시작) 실패
+2. `rotate ca-key` 실행 → Phase 0-3 성공, Phase 4 실패
+3. 서비스 정상 동작 확인(전이 trust 활성)
+4. step-ca 복구 후 회전 재실행 → 이어서 완료
+5. 강제 재발급 후 새 인증서 검증
+
+시나리오 3 — Phase 5 부분 재발급:
+
+1. `rotate ca-key --skip-reissue` 실행 → Phase 6 중단(미이전 서비스)
+2. 서비스 1개(edge-proxy)만 강제 재발급
+3. 기존 cert(web-app)과 신규 cert(edge-proxy) 모두 동작 확인
+4. 나머지 서비스 강제 재발급
+5. `--force`로 회전 재실행 → 완료
+
+시나리오 4 — Phase 6 진입 차단:
+
+1. `rotate ca-key --skip-reissue` 실행 → Phase 6 차단
+2. 오류 출력에 미이전 서비스 이름 포함 확인
+3. `--force`로 재실행 → Phase 6 경고와 함께 완료
+4. 강제 재발급 후 검증
+
+시나리오 5 — 활성 회전 중 trust-sync 충돌:
+
+1. step-ca 중지로 회전 중간에 중단 → 활성 회전 생성
+2. `rotation-state.json` 존재 확인
+3. `trust-sync` 실행 → 회전 진행 중 오류로 중단 기대
+4. step-ca 복구 후 회전 완료
+5. 전체 서비스 검증
+
+실제 실행 명령(스크립트 발췌):
+
+```bash
+# AppRole 인증을 사용한 rotate ca-key 래퍼
+bootroot rotate \
+  --compose-file "$COMPOSE_FILE" \
+  --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+  --auth-mode approle \
+  --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+  --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --skip-reissue --force --cleanup
+
+# Docker 조작을 통한 장애 주입
+docker compose -f "$COMPOSE_FILE" stop openbao
+docker compose -f "$COMPOSE_FILE" rm -sf step-ca
+```
+
+### 7) extended workflow 케이스
 
 구성:
 
 - 스크립트: `scripts/impl/run-extended-suite.sh`
-- 케이스: `scale-contention`, `failure-recovery`, `runner-timer`, `runner-cron`
+- 케이스: `scale-contention`, `failure-recovery`, `runner-timer`, `runner-cron`,
+  `ca-key-recovery`
 - 케이스 결과는 `extended-summary.json`에 집계
 - 서비스 구성: 각 케이스가 사용하는 하위 시나리오/스크립트 구성을 그대로 상속하며,
   scale/contention, failure/recovery 케이스는 복수 서비스를 포함
@@ -362,6 +445,7 @@ bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 ./scripts/impl/run-rotation-recovery.sh
 RUNNER_MODE=systemd-timer ./scripts/impl/run-harness-smoke.sh
 RUNNER_MODE=cron ./scripts/impl/run-harness-smoke.sh
+./scripts/impl/run-ca-key-rotation-recovery.sh
 ```
 
 ## 로컬 사전검증 표준
@@ -497,6 +581,7 @@ PR 필수 아티팩트 예시:
 - `tmp/e2e/ci-remote-default-<run-id>`
 - `tmp/e2e/ci-remote-hosts-<run-id>`
 - `tmp/e2e/ci-rotation-<run-id>`
+- `tmp/e2e/docker-ca-key-recovery-<run-id>`
 
 확장 아티팩트 예시:
 
