@@ -188,6 +188,8 @@ pub(crate) enum RotateCommand {
     TrustSync(RotateTrustSyncArgs),
     #[command(name = "force-reissue")]
     ForceReissue(RotateForceReissueArgs),
+    #[command(name = "ca-key")]
+    CaKey(RotateCaKeyArgs),
 }
 
 #[derive(Args, Debug)]
@@ -243,6 +245,27 @@ pub(crate) struct RotateForceReissueArgs {
     /// Service name to force-reissue certificates for
     #[arg(long)]
     pub(crate) service_name: String,
+}
+
+// All fields are independent CLI flags for controlling rotation phases.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Args, Debug)]
+pub(crate) struct RotateCaKeyArgs {
+    /// Include root CA in rotation (reserved, not implemented)
+    #[arg(long)]
+    pub(crate) full: bool,
+    /// Skip service certificate re-issuance (Phase 5)
+    #[arg(long)]
+    pub(crate) skip_reissue: bool,
+    /// Skip trust finalization (Phase 6)
+    #[arg(long)]
+    pub(crate) skip_finalize: bool,
+    /// Force finalization even with un-migrated services
+    #[arg(long)]
+    pub(crate) force: bool,
+    /// Delete backup files on completion
+    #[arg(long)]
+    pub(crate) cleanup: bool,
 }
 
 #[derive(Args, Debug)]
@@ -545,6 +568,31 @@ mod tests {
     fn test_cli_parses_rotate_stepca() {
         let cli = Cli::parse_from(["bootroot", "rotate", "stepca-password"]);
         assert!(matches!(cli.command, CliCommand::Rotate(_)));
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_ca_key_flags() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "ca-key",
+            "--skip-reissue",
+            "--force",
+            "--cleanup",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::CaKey(ca) => {
+                    assert!(!ca.full);
+                    assert!(ca.skip_reissue);
+                    assert!(!ca.skip_finalize);
+                    assert!(ca.force);
+                    assert!(ca.cleanup);
+                }
+                _ => panic!("expected CaKey subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
     }
 
     #[test]

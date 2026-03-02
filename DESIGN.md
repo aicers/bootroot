@@ -26,12 +26,15 @@ automating procedures such as initial trust establishment can itself become a
 security vulnerability. Some steps in Bootroot therefore require manual
 intervention, and Bootroot is designed to minimize those manual steps.
 
-## Not Automated (1) — CA Key Renewal
+## Semi-Automated — CA Key Rotation
 
-Bootroot does not provide a feature to change the CA's private/public key pair
-after initial generation. CA key rotation is not supported; replacing the CA
-keys currently requires a full re-initialization. (A dedicated CA key
-replacement feature is planned for the future.)
+`bootroot rotate ca-key` replaces the intermediate CA key pair without full
+re-initialization. The command uses an 8-phase approach (backup, generate,
+additive trust, restart step-ca, re-issue, finalize trust, cleanup), each
+idempotent so re-running after failure automatically resumes. A
+`rotation-state.json` file tracks progress and prevents concurrent
+modifications. Full CA rotation (root + intermediate) is reserved for the
+future.
 
 ## Derived Goal for Certificate Rotation Automation — Secret Management
 

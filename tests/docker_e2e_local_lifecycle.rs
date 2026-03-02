@@ -50,17 +50,22 @@ mod unix_integration {
         assert!(phase_contents.contains("\"phase\":\"service-add\""));
         assert!(phase_contents.contains("\"phase\":\"verify-initial\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-responder-hmac\""));
+        assert!(phase_contents.contains("\"phase\":\"rotate-ca-key\""));
         assert!(phase_contents.contains("\"phase\":\"cleanup\""));
 
         let edge_initial = cert_meta.join("edge-proxy-initial.txt");
         let edge_after_hmac = cert_meta.join("edge-proxy-after-responder-hmac.txt");
+        let edge_after_ca_key = cert_meta.join("edge-proxy-after-ca-key.txt");
         let web_initial = cert_meta.join("web-app-initial.txt");
         let web_after_hmac = cert_meta.join("web-app-after-responder-hmac.txt");
+        let web_after_ca_key = cert_meta.join("web-app-after-ca-key.txt");
 
         assert!(edge_initial.exists());
         assert!(edge_after_hmac.exists());
+        assert!(edge_after_ca_key.exists());
         assert!(web_initial.exists());
         assert!(web_after_hmac.exists());
+        assert!(web_after_ca_key.exists());
 
         Ok(artifact_dir)
     }

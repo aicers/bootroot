@@ -317,6 +317,26 @@ pub(crate) struct Strings {
     pub(crate) rotate_summary_force_reissue_remote_hint: &'static str,
     pub(crate) warning_rotation_in_progress: &'static str,
     pub(crate) error_trust_sync_blocked_by_rotation: &'static str,
+    pub(crate) prompt_rotate_ca_key: &'static str,
+    pub(crate) error_ca_key_full_not_implemented: &'static str,
+    pub(crate) error_rotation_state_corrupt: &'static str,
+    pub(crate) error_parse_cert_failed: &'static str,
+    pub(crate) warning_stale_backup: &'static str,
+    pub(crate) rotate_ca_key_resuming: &'static str,
+    pub(crate) rotate_ca_key_phase_backup: &'static str,
+    pub(crate) rotate_ca_key_phase_generate: &'static str,
+    pub(crate) rotate_ca_key_phase_trust_additive: &'static str,
+    pub(crate) rotate_ca_key_phase_restart_stepca: &'static str,
+    pub(crate) rotate_ca_key_phase_reissue: &'static str,
+    pub(crate) rotate_ca_key_phase_finalize: &'static str,
+    pub(crate) rotate_ca_key_phase_cleanup: &'static str,
+    pub(crate) rotate_ca_key_skip_migrated: &'static str,
+    pub(crate) rotate_ca_key_reissue_remote_hint: &'static str,
+    pub(crate) rotate_ca_key_finalize_blocked: &'static str,
+    pub(crate) warning_force_finalize: &'static str,
+    pub(crate) rotate_ca_key_complete: &'static str,
+    pub(crate) rotate_ca_key_current_fingerprints: &'static str,
+    pub(crate) rotate_ca_key_phase_skipped: &'static str,
     pub(crate) summary_responder_check_ok: &'static str,
     pub(crate) summary_responder_check_skipped: &'static str,
     pub(crate) summary_db_check_ok: &'static str,
@@ -1815,6 +1835,117 @@ impl Messages {
 
     pub(crate) fn error_trust_sync_blocked_by_rotation(&self) -> &'static str {
         self.strings().error_trust_sync_blocked_by_rotation
+    }
+
+    pub(crate) fn prompt_rotate_ca_key(&self, root_fp: &str, inter_fp: &str) -> String {
+        format_template(
+            self.strings().prompt_rotate_ca_key,
+            &[("root_fp", root_fp), ("inter_fp", inter_fp)],
+        )
+    }
+
+    pub(crate) fn error_ca_key_full_not_implemented(&self) -> &'static str {
+        self.strings().error_ca_key_full_not_implemented
+    }
+
+    pub(crate) fn error_rotation_state_corrupt(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_rotation_state_corrupt,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_parse_cert_failed(&self, path: &str, reason: &str) -> String {
+        format_template(
+            self.strings().error_parse_cert_failed,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn warning_stale_backup(&self) -> &'static str {
+        self.strings().warning_stale_backup
+    }
+
+    pub(crate) fn rotate_ca_key_resuming(&self, phase: &str) -> String {
+        format_template(self.strings().rotate_ca_key_resuming, &[("phase", phase)])
+    }
+
+    pub(crate) fn rotate_ca_key_phase_backup(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_backup
+    }
+
+    pub(crate) fn rotate_ca_key_phase_generate(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_generate
+    }
+
+    pub(crate) fn rotate_ca_key_phase_trust_additive(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_trust_additive
+    }
+
+    pub(crate) fn rotate_ca_key_phase_restart_stepca(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_restart_stepca
+    }
+
+    pub(crate) fn rotate_ca_key_phase_reissue(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_reissue
+    }
+
+    pub(crate) fn rotate_ca_key_phase_finalize(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_finalize
+    }
+
+    pub(crate) fn rotate_ca_key_phase_cleanup(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_cleanup
+    }
+
+    pub(crate) fn rotate_ca_key_skip_migrated(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_skip_migrated,
+            &[("service_name", service_name)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_reissue_remote_hint(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_reissue_remote_hint,
+            &[("service_name", service_name)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_finalize_blocked(&self, services: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_finalize_blocked,
+            &[("services", services)],
+        )
+    }
+
+    pub(crate) fn warning_force_finalize(&self) -> &'static str {
+        self.strings().warning_force_finalize
+    }
+
+    pub(crate) fn rotate_ca_key_complete(&self, old_fp: &str, new_fp: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_complete,
+            &[("old_fp", old_fp), ("new_fp", new_fp)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_current_fingerprints(
+        &self,
+        root_fp: &str,
+        inter_fp: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_ca_key_current_fingerprints,
+            &[("root_fp", root_fp), ("inter_fp", inter_fp)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_phase_skipped(&self, phase: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_phase_skipped,
+            &[("phase", phase)],
+        )
     }
 
     pub(crate) fn summary_responder_check_ok(&self) -> &'static str {
