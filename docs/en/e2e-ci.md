@@ -66,22 +66,21 @@ PR-critical Docker test set validates:
 - local-delivery E2E scenario (`hosts-all`)
 - remote-delivery E2E scenario (`fqdn-only-hosts`)
 - remote-delivery E2E scenario (`hosts-all`)
-- rotation/recovery matrix (`secret_id,eab,responder_hmac`)
-- CA key rotation failure/recovery (5 failure injection scenarios)
+- rotation/recovery matrix (`secret_id,eab,responder_hmac,trust_sync`)
 
 Primary scripts:
 
 - `scripts/impl/run-local-lifecycle.sh`
 - `scripts/impl/run-remote-lifecycle.sh`
 - `scripts/impl/run-rotation-recovery.sh`
-- `scripts/impl/run-ca-key-rotation-recovery.sh`
 
 Extended workflow validates:
 
 - baseline scale/contention behavior
 - repeated failure/recovery behavior
 - rotation scheduling parity (`systemd-timer`, `cron`)
-- CA key rotation failure/recovery
+- CA key rotation failure/recovery (5 failure injection scenarios)
+- infra lifecycle (full local-delivery round-trip)
 
 Primary script:
 
@@ -200,8 +199,9 @@ Configuration:
 
 - Two workspaces in one run: `control node` (step-ca machine role),
   `remote node` (service machine role)
-- Service is added with `--delivery-mode remote-bootstrap`
-- Service set in this scenario (1 service): `edge-proxy` (`daemon`)
+- Services are added with `--delivery-mode remote-bootstrap`
+- Service set in this scenario (2 services): `edge-proxy` (`daemon`),
+  `web-app` (`docker`)
 - Remote bootstrap apply is executed by `bootroot-remote bootstrap`
 - Resolution mode is `fqdn-only-hosts`
 
@@ -209,21 +209,23 @@ Purpose:
 
 - Validate remote-bootstrap onboarding and one-shot bootstrap apply mode
 - Validate bootstrap-driven updates for
-  `secret_id`, `eab`, `responder_hmac`
-- Validate remote rotation/recovery sequence and explicit secret_id handoff
+  `secret_id`, `eab`, `trust_sync`, `responder_hmac`
+- Validate remote rotation/recovery sequence via full `bootstrap` re-apply
 
 Execution steps:
 
 1. `infra-up`, `init` on control node, then parse runtime AppRole credentials
    from summary JSON
-2. `service-add` in `remote-bootstrap` mode (control node writes desired state)
+2. `service-add` in `remote-bootstrap` mode for both services
 3. Copy bootstrap materials (`role_id`, `secret_id`) to remote node
 4. `bootstrap-initial`: run `bootroot-remote bootstrap` on remote node
-5. `verify-initial`: issue/verify certificate on remote node
-6. Rotation + apply-secret-id + verify cycles:
-   `rotate-secret-id` -> `apply-secret-id` -> `verify-after-secret-id`,
-   `rotate-eab` -> `verify-after-eab`,
-   `rotate-responder-hmac` -> `verify-after-responder-hmac`
+   for each service
+5. `verify-initial`: issue/verify certificates on remote node
+6. Rotation + bootstrap re-apply + verify cycles:
+   `rotate-secret-id` -> `bootstrap` -> `verify-after-secret-id`,
+   `rotate-eab` -> `bootstrap` -> `verify-after-eab`,
+   `rotate-trust-sync` -> `bootstrap` -> `verify-after-trust-sync`,
+   `rotate-responder-hmac` -> `bootstrap` -> `verify-after-responder-hmac`
 7. Confirm certificate fingerprint changes between each verification snapshot
 
 Actual commands (script excerpt):
@@ -235,21 +237,24 @@ BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
   --auto-generate --show-secrets --eab-kid "$INIT_EAB_KID" \
   --eab-hmac "$INIT_EAB_HMAC"
-bootroot service add --service-name "$SERVICE_NAME" --deploy-type daemon \
+bootroot service add --service-name edge-proxy --deploy-type daemon \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
+bootroot service add --service-name web-app --deploy-type docker \
+  --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH_2"
 
-# remote node: bootstrap
+# remote node: bootstrap (per service)
 bootroot-remote bootstrap --openbao-url "http://127.0.0.1:8200" \
   --service-name "$SERVICE_NAME" \
   --role-id-path "$role_id_path" --secret-id-path "$secret_id_path" \
   --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
-  --summary-json "$summary_path" --output json
+  --output json
 
-# control node: verify / rotate
-bootroot verify --service-name "$SERVICE_NAME" \
-  --agent-config "$REMOTE_AGENT_CONFIG_PATH"
-bootroot rotate --yes approle-secret-id --service-name "$SERVICE_NAME"
+# control node: rotate / remote node: re-apply via bootstrap
+bootroot rotate --yes approle-secret-id --service-name edge-proxy
+bootroot rotate --yes approle-secret-id --service-name web-app
+bootroot-remote bootstrap ...  # re-apply for each service
 bootroot rotate --yes responder-hmac
+bootroot-remote bootstrap ...  # re-apply for each service
 ```
 
 ### 4) remote-delivery E2E scenario (`hosts-all`)
@@ -257,7 +262,8 @@ bootroot rotate --yes responder-hmac
 Configuration:
 
 - Same control node/remote node model as above
-- Same service set as remote `fqdn-only-hosts`: `edge-proxy` (`daemon`)
+- Same service set as remote `fqdn-only-hosts`: `edge-proxy` (`daemon`),
+  `web-app` (`docker`)
 - Resolution mode is `hosts-all`
 - Temporary `/etc/hosts` entries are added/removed by the script
 
@@ -307,18 +313,18 @@ Each service is validated across all rotation items.
 
 #### Rotation items
 
-- `secret_id,eab,responder_hmac`
+- `secret_id,eab,responder_hmac,trust_sync`
 
 Purpose:
 
 - Validate rotation and recovery behavior per item
 - Validate targeted failure handling and subsequent recovery
-- Validate explicit secret_id handoff via `bootroot-remote apply-secret-id`
+- Validate remote bootstrap re-apply after each rotation
 
 Execution steps (per rotation item):
 
 1. Rotate target item on control node
-2. For `secret_id`: run `bootroot-remote apply-secret-id` on remote node
+2. Run `bootroot-remote bootstrap` on each remote node to re-apply
 3. Verify certificate issuance still works after rotation
 4. Failure cycle: inject one targeted failure and verify recovery
 5. Recovery cycle: re-rotate and re-apply, confirm normal operation
@@ -331,7 +337,7 @@ Actual commands (script excerpt):
 
 # key commands used in rotation/verify loops
 bootroot rotate --yes approle-secret-id --service-name "$service"
-bootroot-remote apply-secret-id --service-name "$service" ...
+bootroot-remote bootstrap --service-name "$service" ...
 bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 ```
 
@@ -420,7 +426,7 @@ Configuration:
 
 - Script: `scripts/impl/run-extended-suite.sh`
 - Cases: `scale-contention`, `failure-recovery`, `runner-timer`, `runner-cron`,
-  `ca-key-recovery`
+  `ca-key-recovery`, `infra-lifecycle`
 - Case results are aggregated into `extended-summary.json`
 - Service set: inherited from each case's underlying scenario/script and includes
   multi-service cases (for scale/contention and failure/recovery)
@@ -450,6 +456,7 @@ Actual commands (script excerpt):
 RUNNER_MODE=systemd-timer ./scripts/impl/run-harness-smoke.sh
 RUNNER_MODE=cron ./scripts/impl/run-harness-smoke.sh
 ./scripts/impl/run-ca-key-rotation-recovery.sh
+./scripts/impl/run-local-lifecycle.sh
 ```
 
 ## Local preflight standard
@@ -538,11 +545,12 @@ Per-service verification items:
 - `secret_id`
 - `eab`
 - `responder_hmac`
+- `trust_sync`
 
 Pass/fail rules:
 
 - all bootstrap items must show `applied` in the summary output
-- after secret_id rotation, `bootroot-remote apply-secret-id` must complete
+- after rotation, `bootroot-remote bootstrap` re-apply must complete
   successfully
 - if any item shows `failed`, the phase fails
 
@@ -587,11 +595,11 @@ Typical PR-critical artifacts:
 - `tmp/e2e/ci-remote-default-<run-id>`
 - `tmp/e2e/ci-remote-hosts-<run-id>`
 - `tmp/e2e/ci-rotation-<run-id>`
-- `tmp/e2e/docker-ca-key-recovery-<run-id>`
 
-Typical extended artifact:
+Typical extended artifacts:
 
-- `tmp/e2e/extended-<run-id>`
+- `tmp/e2e/extended-<run-id>` (contains per-case subdirectories including
+  `ca-key-recovery/`, `infra-lifecycle/`, etc.)
 
 ## Failure check order
 
