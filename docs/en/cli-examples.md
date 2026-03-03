@@ -402,6 +402,7 @@ bootroot rotate eab
 bootroot rotate db \
   --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
 bootroot rotate responder-hmac
+bootroot rotate openbao-recovery --rotate-root-token
 bootroot rotate approle-secret-id --service-name edge-proxy
 bootroot rotate approle-secret-id --service-name web-app
 
@@ -410,6 +411,20 @@ bootroot rotate trust-sync
 
 # Force certificate reissue for a specific service
 bootroot rotate force-reissue --service-name edge-proxy
+```
+
+Rotate OpenBao recovery credentials manually (unseal keys + root token):
+
+```bash
+bootroot rotate \
+  --openbao-url http://localhost:8200 \
+  --root-token "$OPENBAO_ROOT_TOKEN" \
+  --yes \
+  openbao-recovery \
+  --rotate-unseal-keys \
+  --rotate-root-token \
+  --unseal-key-file ./secure/openbao-unseal-keys.txt \
+  --output ./secure/openbao-recovery-rotated.json
 ```
 
 CA key rotation (intermediate-only):

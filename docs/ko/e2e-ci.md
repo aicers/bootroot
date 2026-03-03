@@ -112,9 +112,12 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
    자격증명 파싱
 3. `service-add`: daemon + docker 서비스를 `local-file` 모드로 추가
 4. `verify-initial`: 초기 인증서 발급/검증 후 fingerprint 스냅샷 저장
-5. `rotate-responder-hmac`: 회전 실행 후 재발급 강제
-6. `verify-after-responder-hmac`: 재검증 및 fingerprint 변경 확인
-7. `cleanup`: 로그/아티팩트 수집 후 Compose 정리
+5. `rotate-openbao-recovery`: OpenBao 루트 토큰 수동 회전
+6. `bootstrap-after-openbao-recovery`: remote bootstrap 재실행으로
+   AppRole 기반 접근 연속성 검증
+7. `rotate-responder-hmac`: 회전 실행 후 재발급 강제
+8. `verify-after-responder-hmac`: 재검증 및 fingerprint 변경 확인
+9. `cleanup`: 로그/아티팩트 수집 후 Compose 정리
 
 실제 실행 명령(스크립트 발췌):
 
@@ -138,11 +141,20 @@ bootroot service add --service-name edge-proxy --deploy-type daemon \
 bootroot service add --service-name web-app --deploy-type docker \
   --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
 
-# 4) verify-initial / 6) verify-after-responder-hmac
+# 4) verify-initial / 8) verify-after-responder-hmac
 bootroot verify --service-name edge-proxy --agent-config "$AGENT_CONFIG_PATH"
 bootroot verify --service-name web-app --agent-config "$AGENT_CONFIG_PATH"
 
-# 5) rotate-responder-hmac
+# 5) rotate-openbao-recovery (명시적 수동 실행)
+bootroot rotate --compose-file "$COMPOSE_FILE" \
+  --openbao-url "http://127.0.0.1:8200" \
+  --root-token "$INIT_ROOT_TOKEN" \
+  --yes \
+  openbao-recovery \
+  --rotate-root-token \
+  --output "$OPENBAO_RECOVERY_OUTPUT_FILE"
+
+# 7) rotate-responder-hmac
 # init summary에서
 #   runtime_service_add: role_id/secret_id
 #   runtime_rotate: role_id/secret_id
@@ -579,8 +591,8 @@ E2E 스크립트는 단계 진행 상태를 `phases.log` 파일로 남깁니다.
 
 ## 아티팩트 경로
 
-일반 사용자 관점에서는 필수 정보가 아닙니다.  
-CI 실패를 직접 디버깅하는 사용자/기여자 관점에서는 유용한 정보입니다.
+일반 운영자 관점에서는 필수 정보가 아닙니다.  
+CI 실패를 직접 디버깅하는 운영자/기여자 관점에서는 유용한 정보입니다.
 
 PR 필수 아티팩트 예시:
 

@@ -401,6 +401,7 @@ bootroot rotate eab
 bootroot rotate db \
   --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
 bootroot rotate responder-hmac
+bootroot rotate openbao-recovery --rotate-root-token
 bootroot rotate approle-secret-id --service-name edge-proxy
 bootroot rotate approle-secret-id --service-name web-app
 
@@ -409,6 +410,20 @@ bootroot rotate trust-sync
 
 # 특정 서비스의 인증서 강제 재발급
 bootroot rotate force-reissue --service-name edge-proxy
+```
+
+OpenBao 복구 자격증명 수동 회전(언실 키 + 루트 토큰):
+
+```bash
+bootroot rotate \
+  --openbao-url http://localhost:8200 \
+  --root-token "$OPENBAO_ROOT_TOKEN" \
+  --yes \
+  openbao-recovery \
+  --rotate-unseal-keys \
+  --rotate-root-token \
+  --unseal-key-file ./secure/openbao-unseal-keys.txt \
+  --output ./secure/openbao-recovery-rotated.json
 ```
 
 CA 키 회전(중간 CA만):

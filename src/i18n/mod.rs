@@ -308,6 +308,13 @@ pub(crate) struct Strings {
     pub(crate) rotate_summary_approle_secret_id: &'static str,
     pub(crate) rotate_summary_reload_openbao_agent: &'static str,
     pub(crate) rotate_summary_approle_login_ok: &'static str,
+    pub(crate) rotate_summary_openbao_recovery_targets: &'static str,
+    pub(crate) rotate_summary_openbao_recovery_output: &'static str,
+    pub(crate) rotate_summary_openbao_recovery_approle_unchanged: &'static str,
+    pub(crate) rotate_summary_openbao_recovery_next_steps: &'static str,
+    pub(crate) prompt_rotate_openbao_recovery: &'static str,
+    pub(crate) error_openbao_recovery_target_required: &'static str,
+    pub(crate) error_openbao_recovery_unseal_keys_required: &'static str,
     pub(crate) prompt_rotate_trust_sync: &'static str,
     pub(crate) prompt_rotate_force_reissue: &'static str,
     pub(crate) rotate_summary_trust_sync_global: &'static str,
@@ -1776,6 +1783,47 @@ impl Messages {
         format_template(
             self.strings().rotate_summary_approle_login_ok,
             &[("service_name", service_name)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_openbao_recovery_targets(&self, value: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_openbao_recovery_targets,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_openbao_recovery_output(&self, value: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_openbao_recovery_output,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_openbao_recovery_approle_unchanged(&self) -> &'static str {
+        self.strings()
+            .rotate_summary_openbao_recovery_approle_unchanged
+    }
+
+    pub(crate) fn rotate_summary_openbao_recovery_next_steps(&self) -> &'static str {
+        self.strings().rotate_summary_openbao_recovery_next_steps
+    }
+
+    pub(crate) fn prompt_rotate_openbao_recovery(&self, value: &str) -> String {
+        format_template(
+            self.strings().prompt_rotate_openbao_recovery,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_openbao_recovery_target_required(&self) -> &'static str {
+        self.strings().error_openbao_recovery_target_required
+    }
+
+    pub(crate) fn error_openbao_recovery_unseal_keys_required(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_openbao_recovery_unseal_keys_required,
+            &[("value", value)],
         )
     }
 

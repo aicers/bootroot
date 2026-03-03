@@ -622,6 +622,269 @@ async fn test_rotate_eab_marks_remote_pending_and_updates_local_service() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_openbao_recovery_rotates_root_token_only() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    stub_openbao_for_recovery_root_token_rotation(&openbao).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "openbao-recovery",
+            "--rotate-root-token",
+        ])
+        .output()
+        .expect("run rotate openbao-recovery root-token");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("bootroot rotate: summary"));
+    assert!(stdout.contains("OpenBao recovery rotation: root-token"));
+    assert!(stdout.contains("- root token: new-root-token"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_openbao_recovery_writes_output_file() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    let output_path = temp_dir
+        .path()
+        .join("secrets")
+        .join("openbao-recovery.json");
+    stub_openbao_for_recovery_combined_rotation(&openbao).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+            "--rotate-root-token",
+            "--unseal-key",
+            "old-unseal-1",
+            "--unseal-key",
+            "old-unseal-2",
+            "--unseal-key",
+            "old-unseal-3",
+            "--output",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run rotate openbao-recovery combined");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("recovery credentials written"));
+    assert!(!stdout.contains("new-unseal-1"));
+    assert!(!stdout.contains("new-root-token"));
+
+    let saved = fs::read_to_string(&output_path).expect("read output file");
+    let parsed: serde_json::Value = serde_json::from_str(&saved).expect("parse output json");
+    assert_eq!(parsed["root_token"], "new-root-token");
+    assert_eq!(
+        parsed["unseal_keys"],
+        json!([
+            "new-unseal-1",
+            "new-unseal-2",
+            "new-unseal-3",
+            "new-unseal-4",
+            "new-unseal-5"
+        ])
+    );
+
+    let mode = fs::metadata(&output_path)
+        .expect("output metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_openbao_recovery_keeps_approle_state_unchanged() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
+        .expect("prepare state");
+    fs::write(&secret_path, "existing-secret-id").expect("write existing secret_id");
+
+    let state_path = temp_dir.path().join("state.json");
+    let state_before = fs::read_to_string(&state_path).expect("read initial state");
+
+    let unseal_file = temp_dir.path().join("unseal-keys.txt");
+    fs::write(&unseal_file, "old-unseal-1\nold-unseal-2\nold-unseal-3\n")
+        .expect("write unseal key file");
+    let output_path = temp_dir
+        .path()
+        .join("secrets")
+        .join("openbao-recovery.json");
+    stub_openbao_for_recovery_combined_rotation(&openbao).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+            "--rotate-root-token",
+            "--unseal-key-file",
+            unseal_file.to_string_lossy().as_ref(),
+            "--output",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run rotate openbao-recovery");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("AppRole + SecretID configuration unchanged"));
+
+    let state_after = fs::read_to_string(&state_path).expect("read final state");
+    assert_eq!(state_before, state_after, "state.json should not change");
+
+    let secret_after = fs::read_to_string(&secret_path).expect("read final secret_id");
+    assert_eq!(
+        secret_after, "existing-secret-id",
+        "secret_id file should not be changed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_openbao_recovery_unseal_keys_fails_when_openbao_sealed() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+    stub_openbao_for_recovery_sealed(&openbao).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+            "--unseal-key",
+            "old-unseal-1",
+            "--unseal-key",
+            "old-unseal-2",
+            "--unseal-key",
+            "old-unseal-3",
+        ])
+        .output()
+        .expect("run rotate openbao-recovery sealed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("OpenBao remains sealed"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_openbao_recovery_unseal_keys_fails_when_rekey_not_complete() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+    stub_openbao_for_recovery_rekey_incomplete(&openbao).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+            "--unseal-key",
+            "old-unseal-1",
+            "--unseal-key",
+            "old-unseal-2",
+            "--unseal-key",
+            "old-unseal-3",
+        ])
+        .output()
+        .expect("run rotate openbao-recovery rekey incomplete");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("rekey did not complete"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_openbao_recovery_unseal_keys_requires_enough_keys_in_yes_mode() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+    stub_openbao_for_recovery_rekey_ready(&openbao).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+            "--unseal-key",
+            "old-unseal-1",
+            "--unseal-key",
+            "old-unseal-2",
+        ])
+        .output()
+        .expect("run rotate openbao-recovery with insufficient keys");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("At least 3 existing unseal keys are required for rekey"));
+}
+
 fn prepare_app_state(
     root: &Path,
     openbao_url: &str,
@@ -913,6 +1176,171 @@ async fn stub_openbao_for_runtime_approle_login(
         })))
         .mount(server)
         .await;
+}
+
+async fn stub_openbao_for_recovery_root_token_rotation(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/seal-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sealed": false,
+            "t": 3,
+            "n": 5
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/token/create"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "policies": ["root"],
+            "renewable": false,
+            "no_parent": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "new-root-token" }
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_openbao_for_recovery_combined_rotation(server: &MockServer) {
+    stub_openbao_for_recovery_root_token_rotation(server).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/rekey/init"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "secret_shares": 5,
+            "secret_threshold": 3
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "nonce": "nonce-1",
+            "progress": 0
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/rekey/update"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "nonce": "nonce-1",
+            "key": "old-unseal-1"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "complete": false
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/rekey/update"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "nonce": "nonce-1",
+            "key": "old-unseal-2"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "complete": false
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/rekey/update"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "nonce": "nonce-1",
+            "key": "old-unseal-3"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "complete": true,
+            "keys": [
+                "new-unseal-1",
+                "new-unseal-2",
+                "new-unseal-3",
+                "new-unseal-4",
+                "new-unseal-5"
+            ]
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_openbao_for_recovery_sealed(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/seal-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sealed": true,
+            "t": 3,
+            "n": 5
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_openbao_for_recovery_rekey_ready(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/seal-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sealed": false,
+            "t": 3,
+            "n": 5
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_openbao_for_recovery_rekey_incomplete(server: &MockServer) {
+    stub_openbao_for_recovery_rekey_ready(server).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/rekey/init"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(body_json(json!({
+            "secret_shares": 5,
+            "secret_threshold": 3
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "nonce": "nonce-incomplete",
+            "progress": 0
+        })))
+        .mount(server)
+        .await;
+
+    for key in ["old-unseal-1", "old-unseal-2", "old-unseal-3"] {
+        Mock::given(method("PUT"))
+            .and(path("/v1/sys/rekey/update"))
+            .and(header("X-Vault-Token", support::ROOT_TOKEN))
+            .and(body_json(json!({
+                "nonce": "nonce-incomplete",
+                "key": key
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "complete": false
+            })))
+            .mount(server)
+            .await;
+    }
 }
 
 fn write_fake_pkill(bin_dir: &Path, output_path: &Path) -> anyhow::Result<()> {

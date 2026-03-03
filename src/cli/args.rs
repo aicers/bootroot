@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::ValueEnum;
+use clap::{ArgGroup, ValueEnum};
 use clap::{Args, Parser, Subcommand};
 
 use crate::commands::init::{
@@ -182,6 +182,18 @@ pub(crate) enum RotateCommand {
     Eab(RotateEabArgs),
     Db(RotateDbArgs),
     ResponderHmac(RotateResponderHmacArgs),
+    /// Rotates `OpenBao` recovery credentials manually.
+    ///
+    /// `--rotate-unseal-keys` requires existing unseal keys. The operator must
+    /// provide at least the configured unseal threshold number of key shares
+    /// (for example, 3 of 5). If existing unseal keys are lost, unseal key
+    /// rotation is impossible and the operator must re-initialize `OpenBao`
+    /// (which implies re-running `bootroot init` and re-bootstrapping
+    /// services).
+    ///
+    /// `--rotate-root-token` can run without unseal key input.
+    #[command(name = "openbao-recovery")]
+    OpenBaoRecovery(RotateOpenBaoRecoveryArgs),
     #[command(name = "approle-secret-id")]
     AppRoleSecretId(RotateAppRoleSecretIdArgs),
     #[command(name = "trust-sync")]
@@ -228,6 +240,47 @@ pub(crate) struct RotateResponderHmacArgs {
     /// New responder HMAC
     #[arg(long)]
     pub(crate) hmac: Option<String>,
+}
+
+#[derive(Args, Debug)]
+#[command(
+    group(
+        ArgGroup::new("recovery_targets")
+            .required(true)
+            .multiple(true)
+            .args(["rotate_unseal_keys", "rotate_root_token"])
+    )
+)]
+pub(crate) struct RotateOpenBaoRecoveryArgs {
+    /// Rotates unseal keys via rekey.
+    ///
+    /// Requires existing unseal keys. Provide at least the configured unseal
+    /// threshold number of key shares. If those keys are lost, this rotation
+    /// cannot proceed.
+    #[arg(long)]
+    pub(crate) rotate_unseal_keys: bool,
+
+    /// Rotates `OpenBao` root token.
+    ///
+    /// Does not require unseal key input.
+    #[arg(long)]
+    pub(crate) rotate_root_token: bool,
+
+    /// Supplies existing unseal key(s), repeat for multiple keys.
+    ///
+    /// Used only with `--rotate-unseal-keys`.
+    #[arg(long)]
+    pub(crate) unseal_key: Vec<String>,
+
+    /// Supplies a file with existing unseal keys (one key per line).
+    ///
+    /// Used only with `--rotate-unseal-keys`.
+    #[arg(long)]
+    pub(crate) unseal_key_file: Option<PathBuf>,
+
+    /// Output path for newly generated recovery credentials
+    #[arg(long)]
+    pub(crate) output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -605,6 +658,44 @@ mod tests {
             "api",
         ]);
         assert!(matches!(cli.command, CliCommand::Rotate(_)));
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_openbao_recovery() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "openbao-recovery",
+            "--rotate-unseal-keys",
+            "--rotate-root-token",
+            "--unseal-key",
+            "key-1",
+            "--unseal-key",
+            "key-2",
+            "--output",
+            "secrets/openbao-recovery.json",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::OpenBaoRecovery(openbao_recovery) => {
+                    assert!(openbao_recovery.rotate_unseal_keys);
+                    assert!(openbao_recovery.rotate_root_token);
+                    assert_eq!(openbao_recovery.unseal_key, vec!["key-1", "key-2"]);
+                    assert_eq!(
+                        openbao_recovery.output,
+                        Some(PathBuf::from("secrets/openbao-recovery.json"))
+                    );
+                }
+                _ => panic!("expected OpenBaoRecovery subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rejects_rotate_openbao_recovery_without_target() {
+        let result = Cli::try_parse_from(["bootroot", "rotate", "openbao-recovery"]);
+        assert!(result.is_err(), "expected clap validation error");
     }
 
     #[test]
