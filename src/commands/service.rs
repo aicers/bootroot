@@ -552,7 +552,7 @@ async fn apply_local_service_configs(
             .unwrap_or(Path::new("certs"))
             .join("ca-bundle.pem");
         let trust_updates = build_trust_updates(&material.trusted_ca_sha256, &ca_bundle_path);
-        next = upsert_toml_section_keys(&next, "trust", &trust_updates);
+        next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates)?;
         if let Some(bundle_pem) = material.ca_bundle_pem.as_deref() {
             write_local_ca_bundle(&ca_bundle_path, bundle_pem, messages).await?;
         }
@@ -699,101 +699,8 @@ fn build_trust_updates(
     ]
 }
 
-fn upsert_toml_section_keys(contents: &str, section: &str, pairs: &[(&str, String)]) -> String {
-    let mut output = String::new();
-    let mut section_found = false;
-    let mut in_section = false;
-    let mut seen_keys = std::collections::BTreeSet::new();
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if is_section_header(trimmed) {
-            if in_section {
-                output.push_str(&render_missing_keys(pairs, &seen_keys));
-            }
-            in_section = trimmed == format!("[{section}]");
-            if in_section {
-                section_found = true;
-                seen_keys.clear();
-            }
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-
-        if in_section
-            && let Some((key, indent)) = parse_key_line(line, pairs)
-            && let Some(value) = pairs
-                .iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| value.as_str())
-        {
-            output.push_str(&format_key_line(&indent, key, value));
-            seen_keys.insert(key.to_string());
-            continue;
-        }
-
-        output.push_str(line);
-        output.push('\n');
-    }
-
-    if in_section {
-        output.push_str(&render_missing_keys(pairs, &seen_keys));
-    }
-
-    if !section_found {
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push('[');
-        output.push_str(section);
-        output.push_str("]\n");
-        for (key, value) in pairs {
-            output.push_str(&format_key_line("", key, value));
-        }
-    }
-
-    output
-}
-
 fn is_section_header(line: &str) -> bool {
     line.starts_with('[') && line.ends_with(']')
-}
-
-fn parse_key_line<'a>(line: &'a str, pairs: &[(&'a str, String)]) -> Option<(&'a str, String)> {
-    for (key, _) in pairs {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")) {
-            let indent = line
-                .chars()
-                .take_while(|ch| ch.is_whitespace())
-                .collect::<String>();
-            return Some((key, indent));
-        }
-    }
-    None
-}
-
-fn format_key_line(indent: &str, key: &str, value: &str) -> String {
-    let rendered = if value.starts_with('[') {
-        value.to_string()
-    } else {
-        format!("\"{value}\"")
-    };
-    format!("{indent}{key} = {rendered}\n")
-}
-
-fn render_missing_keys(
-    pairs: &[(&str, String)],
-    seen_keys: &std::collections::BTreeSet<String>,
-) -> String {
-    let mut extra = String::new();
-    for (key, value) in pairs {
-        if !seen_keys.contains(*key) {
-            extra.push_str(&format_key_line("", key, value));
-        }
-    }
-    extra
 }
 
 fn render_openbao_agent_config(
@@ -852,10 +759,14 @@ fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> St
          {{{{ .Data.data.hmac }}}}\
          {{{{ end }}}}"
     );
-    let acme_pairs = vec![("http_responder_hmac", hmac_template)];
-    let with_hmac = upsert_toml_section_keys(contents, "acme", &acme_pairs);
+    let with_hmac = replace_key_line_in_section(
+        contents,
+        "acme",
+        "http_responder_hmac",
+        &format!("http_responder_hmac = \"{hmac_template}\""),
+    );
 
-    let without_eab = remove_toml_sections(&with_hmac, &["eab", "profiles.eab"]);
+    let without_eab = remove_line_sections(&with_hmac, &["eab", "profiles.eab"]);
 
     let trust_template_line = format!(
         "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
@@ -889,7 +800,11 @@ fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> St
     result
 }
 
-fn remove_toml_sections(contents: &str, sections: &[&str]) -> String {
+/// Removes sections from pseudo-TOML content using line-based matching.
+///
+/// Used for Go template (ctmpl) files where the content is not valid
+/// TOML and cannot be parsed by `toml_edit`.
+fn remove_line_sections(contents: &str, sections: &[&str]) -> String {
     let mut output = String::new();
     let mut skip = false;
 
@@ -903,9 +818,6 @@ fn remove_toml_sections(contents: &str, sections: &[&str]) -> String {
             }
         }
         if skip {
-            if trimmed.is_empty() {
-                continue;
-            }
             continue;
         }
         output.push_str(line);
@@ -1625,8 +1537,8 @@ mod tests {
             Path::new("certs/ca-bundle.pem"),
         );
         let original = "[acme]\nhttp_responder_hmac = \"old\"\n";
-        let once = upsert_toml_section_keys(original, "trust", &updates);
-        let twice = upsert_toml_section_keys(&once, "trust", &updates);
+        let once = bootroot::toml_util::upsert_section_keys(original, "trust", &updates).unwrap();
+        let twice = bootroot::toml_util::upsert_section_keys(&once, "trust", &updates).unwrap();
 
         assert_eq!(once, twice);
         assert!(once.contains("[trust]"));
@@ -1638,7 +1550,7 @@ mod tests {
     fn test_upsert_toml_section_keys_preserves_existing_unmanaged_lines() {
         let updates = vec![("ca_bundle_path", "certs/ca.pem".to_string())];
         let original = "[trust]\nextra = true\n";
-        let output = upsert_toml_section_keys(original, "trust", &updates);
+        let output = bootroot::toml_util::upsert_section_keys(original, "trust", &updates).unwrap();
 
         assert!(output.contains("extra = true"));
         assert!(output.contains("ca_bundle_path = \"certs/ca.pem\""));

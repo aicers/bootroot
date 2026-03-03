@@ -530,7 +530,7 @@ async fn apply_agent_config_updates(
     let agent_config = match fs::read_to_string(&args.agent_config_path).await {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            render_agent_config_baseline(args, &profile_paths.cert_path, &profile_paths.key_path)
+            render_agent_config_baseline(args)
         }
         Err(err) => {
             let message = localized(
@@ -550,8 +550,33 @@ async fn apply_agent_config_updates(
             );
         }
     };
+    let acme_pairs = vec![("http_responder_hmac", pulled.responder_hmac.clone())];
+    let hmac_updated =
+        match bootroot::toml_util::upsert_section_keys(&agent_config, "acme", &acme_pairs) {
+            Ok(output) => output,
+            Err(err) => {
+                let msg = format!("agent config TOML parse error: {err}");
+                return (
+                    ApplyItemSummary::failed(msg.clone()),
+                    ApplyItemSummary::failed(msg),
+                );
+            }
+        };
+    let trust_pairs =
+        build_trust_updates(&pulled.trusted_ca_sha256, args.ca_bundle_path.as_deref());
+    let trust_updated =
+        match bootroot::toml_util::upsert_section_keys(&hmac_updated, "trust", &trust_pairs) {
+            Ok(output) => output,
+            Err(err) => {
+                let msg = format!("agent config TOML parse error: {err}");
+                return (
+                    ApplyItemSummary::failed(msg.clone()),
+                    ApplyItemSummary::failed(msg),
+                );
+            }
+        };
     let with_profile = upsert_managed_profile_block(
-        &agent_config,
+        &trust_updated,
         &args.service_name,
         &render_managed_profile_block(
             &args.service_name,
@@ -562,15 +587,9 @@ async fn apply_agent_config_updates(
         ),
     );
 
-    let acme_pairs = vec![("http_responder_hmac", pulled.responder_hmac.clone())];
-    let hmac_updated = upsert_toml_section_keys(&with_profile, "acme", &acme_pairs);
-    let trust_pairs =
-        build_trust_updates(&pulled.trusted_ca_sha256, args.ca_bundle_path.as_deref());
-    let trust_updated = upsert_toml_section_keys(&hmac_updated, "trust", &trust_pairs);
-
-    let responder_changed = hmac_updated != with_profile;
+    let responder_changed = hmac_updated != agent_config;
     let trust_changed = trust_updated != hmac_updated;
-    let profile_changed = with_profile != agent_config;
+    let profile_changed = with_profile != trust_updated;
 
     let mut responder_hmac_status = ApplyItemSummary::applied(if responder_changed {
         ApplyStatus::Applied
@@ -583,7 +602,7 @@ async fn apply_agent_config_updates(
         ApplyStatus::Unchanged
     });
 
-    if trust_updated != agent_config {
+    if with_profile != agent_config {
         if let Some(parent) = args.agent_config_path.parent()
             && let Err(err) = fs_util::ensure_secrets_dir(parent).await
         {
@@ -603,7 +622,7 @@ async fn apply_agent_config_updates(
                 ApplyItemSummary::failed(message),
             );
         }
-        if let Err(err) = fs::write(&args.agent_config_path, &trust_updated).await {
+        if let Err(err) = fs::write(&args.agent_config_path, &with_profile).await {
             let message = localized(
                 lang,
                 &format!(
@@ -644,7 +663,7 @@ async fn apply_agent_config_updates(
             return (responder_hmac_status, trust_sync_status);
         }
     }
-    if let Err(err) = write_openbao_agent_artifacts(args, &trust_updated, lang).await {
+    if let Err(err) = write_openbao_agent_artifacts(args, &with_profile, lang).await {
         let message = localized(
             lang,
             &format!("openbao agent setup failed: {err}"),
@@ -958,63 +977,6 @@ async fn write_eab_file(path: &Path, kid: &str, hmac: &str) -> Result<ApplyStatu
     write_secret_file(path, &payload).await
 }
 
-fn upsert_toml_section_keys(contents: &str, section: &str, pairs: &[(&str, String)]) -> String {
-    let mut output = String::new();
-    let mut section_found = false;
-    let mut in_section = false;
-    let mut seen_keys = std::collections::BTreeSet::new();
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if is_section_header(trimmed) {
-            if in_section {
-                output.push_str(&render_missing_keys(pairs, &seen_keys));
-            }
-            in_section = trimmed == format!("[{section}]");
-            if in_section {
-                section_found = true;
-                seen_keys.clear();
-            }
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-
-        if in_section
-            && let Some((key, indent)) = parse_key_line(line, pairs)
-            && let Some(value) = pairs
-                .iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| value.as_str())
-        {
-            output.push_str(&format_key_line(&indent, key, value));
-            seen_keys.insert(key.to_string());
-            continue;
-        }
-
-        output.push_str(line);
-        output.push('\n');
-    }
-
-    if in_section {
-        output.push_str(&render_missing_keys(pairs, &seen_keys));
-    }
-
-    if !section_found {
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push('[');
-        output.push_str(section);
-        output.push_str("]\n");
-        for (key, value) in pairs {
-            output.push_str(&format_key_line("", key, value));
-        }
-    }
-
-    output
-}
-
 struct ProfilePaths {
     cert_path: PathBuf,
     key_path: PathBuf,
@@ -1040,14 +1002,7 @@ fn resolve_profile_paths(args: &BootstrapArgs) -> ProfilePaths {
     }
 }
 
-fn render_agent_config_baseline(args: &BootstrapArgs, cert_path: &Path, key_path: &Path) -> String {
-    let profile_block = render_managed_profile_block(
-        &args.service_name,
-        &args.profile_instance_id,
-        &args.profile_hostname,
-        cert_path,
-        key_path,
-    );
+fn render_agent_config_baseline(args: &BootstrapArgs) -> String {
     format!(
         "email = \"{email}\"\n\
 server = \"{server}\"\n\
@@ -1061,8 +1016,7 @@ poll_interval_secs = 2\n\
 http_responder_url = \"{responder_url}\"\n\
 http_responder_hmac = \"\"\n\
 http_responder_timeout_secs = 5\n\
-http_responder_token_ttl_secs = 300\n\n\
-{profile_block}",
+http_responder_token_ttl_secs = 300\n",
         email = args.agent_email,
         server = args.agent_server,
         domain = args.agent_domain,
@@ -1130,10 +1084,14 @@ fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> St
          {{{{ .Data.data.hmac }}}}\
          {{{{ end }}}}"
     );
-    let acme_pairs = vec![("http_responder_hmac", hmac_template)];
-    let with_hmac = upsert_toml_section_keys(contents, "acme", &acme_pairs);
+    let with_hmac = replace_key_line_in_section(
+        contents,
+        "acme",
+        "http_responder_hmac",
+        &format!("http_responder_hmac = \"{hmac_template}\""),
+    );
 
-    let without_eab = remove_toml_sections(&with_hmac, &["eab", "profiles.eab"]);
+    let without_eab = remove_line_sections(&with_hmac, &["eab", "profiles.eab"]);
 
     let trust_template_line = format!(
         "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
@@ -1163,7 +1121,11 @@ fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> St
     result
 }
 
-fn remove_toml_sections(contents: &str, sections: &[&str]) -> String {
+/// Removes sections from pseudo-TOML content using line-based matching.
+///
+/// Used for Go template (ctmpl) files where the content is not valid
+/// TOML and cannot be parsed by `toml_edit`.
+fn remove_line_sections(contents: &str, sections: &[&str]) -> String {
     let mut output = String::new();
     let mut skip = false;
 
@@ -1323,41 +1285,6 @@ template {{
     )
 }
 
-fn parse_key_line<'a>(line: &'a str, pairs: &[(&'a str, String)]) -> Option<(&'a str, String)> {
-    for (key, _) in pairs {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")) {
-            let indent = line
-                .chars()
-                .take_while(|ch| ch.is_whitespace())
-                .collect::<String>();
-            return Some((key, indent));
-        }
-    }
-    None
-}
-
-fn render_missing_keys(
-    pairs: &[(&str, String)],
-    seen_keys: &std::collections::BTreeSet<String>,
-) -> String {
-    let mut output = String::new();
-    for (key, value) in pairs {
-        if !seen_keys.contains(*key) {
-            output.push_str(&format_key_line("", key, value));
-        }
-    }
-    output
-}
-
-fn format_key_line(indent: &str, key: &str, value: &str) -> String {
-    if value.starts_with('[') {
-        format!("{indent}{key} = {value}\n")
-    } else {
-        format!("{indent}{key} = \"{value}\"\n")
-    }
-}
-
 fn is_section_header(value: &str) -> bool {
     value.starts_with('[') && value.ends_with(']')
 }
@@ -1454,19 +1381,24 @@ mod tests {
     #[test]
     fn test_upsert_toml_section_keys_updates_existing_section() {
         let input = "[acme]\nhttp_responder_hmac = \"old\"\n";
-        let output =
-            upsert_toml_section_keys(input, "acme", &[("http_responder_hmac", "new".to_string())]);
+        let output = bootroot::toml_util::upsert_section_keys(
+            input,
+            "acme",
+            &[("http_responder_hmac", "new".to_string())],
+        )
+        .unwrap();
         assert!(output.contains("http_responder_hmac = \"new\""));
     }
 
     #[test]
     fn test_upsert_toml_section_keys_adds_new_section() {
         let input = "[acme]\nhttp_responder_hmac = \"old\"\n";
-        let output = upsert_toml_section_keys(
+        let output = bootroot::toml_util::upsert_section_keys(
             input,
             "trust",
             &[("ca_bundle_path", "certs/ca.pem".to_string())],
-        );
+        )
+        .unwrap();
         assert!(output.contains("[trust]"));
         assert!(output.contains("ca_bundle_path = \"certs/ca.pem\""));
     }

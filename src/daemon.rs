@@ -494,14 +494,14 @@ async fn set_verify_certificates_true(
             )
         })?;
 
-    let updated = upsert_toml_section_keys(
+    let updated = crate::toml_util::upsert_section_keys(
         &current,
         TRUST_SECTION,
         &[(
             VERIFY_CERTIFICATES_KEY,
             VERIFY_CERTIFICATES_TRUE.to_string(),
         )],
-    );
+    )?;
     if updated != current {
         tokio::fs::write(config_path, updated)
             .await
@@ -535,102 +535,6 @@ async fn set_verify_certificates_true(
         config_path.display()
     );
     Ok(())
-}
-
-fn upsert_toml_section_keys(contents: &str, section: &str, pairs: &[(&str, String)]) -> String {
-    let mut output = String::new();
-    let mut section_found = false;
-    let mut in_section = false;
-    let mut seen_keys = std::collections::BTreeSet::new();
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if is_section_header(trimmed) {
-            if in_section {
-                output.push_str(&render_missing_keys(pairs, &seen_keys));
-            }
-            in_section = trimmed == format!("[{section}]");
-            if in_section {
-                section_found = true;
-                seen_keys.clear();
-            }
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-
-        if in_section
-            && let Some((key, indent)) = parse_key_line(line, pairs)
-            && let Some(value) = pairs
-                .iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| value.as_str())
-        {
-            output.push_str(&format_key_line(&indent, key, value));
-            seen_keys.insert(key.to_string());
-            continue;
-        }
-
-        output.push_str(line);
-        output.push('\n');
-    }
-
-    if in_section {
-        output.push_str(&render_missing_keys(pairs, &seen_keys));
-    }
-
-    if !section_found {
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push('[');
-        output.push_str(section);
-        output.push_str("]\n");
-        for (key, value) in pairs {
-            output.push_str(&format_key_line("", key, value));
-        }
-    }
-
-    output
-}
-
-fn parse_key_line<'a>(line: &'a str, pairs: &[(&'a str, String)]) -> Option<(&'a str, String)> {
-    for (key, _) in pairs {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")) {
-            let indent = line
-                .chars()
-                .take_while(|ch| ch.is_whitespace())
-                .collect::<String>();
-            return Some((key, indent));
-        }
-    }
-    None
-}
-
-fn render_missing_keys(
-    pairs: &[(&str, String)],
-    seen_keys: &std::collections::BTreeSet<String>,
-) -> String {
-    let mut output = String::new();
-    for (key, value) in pairs {
-        if !seen_keys.contains(*key) {
-            output.push_str(&format_key_line("", key, value));
-        }
-    }
-    output
-}
-
-fn format_key_line(indent: &str, key: &str, value: &str) -> String {
-    if value.starts_with('[') || value == VERIFY_CERTIFICATES_TRUE {
-        format!("{indent}{key} = {value}\n")
-    } else {
-        format!("{indent}{key} = \"{value}\"\n")
-    }
-}
-
-fn is_section_header(value: &str) -> bool {
-    value.starts_with('[') && value.ends_with(']')
 }
 
 async fn wait_for_shutdown() -> anyhow::Result<()> {
@@ -743,28 +647,30 @@ mod tests {
     #[test]
     fn test_upsert_toml_section_keys_updates_existing_trust_flag() {
         let input = "[trust]\nverify_certificates = false\n";
-        let output = upsert_toml_section_keys(
+        let output = crate::toml_util::upsert_section_keys(
             input,
             TRUST_SECTION,
             &[(
                 VERIFY_CERTIFICATES_KEY,
                 VERIFY_CERTIFICATES_TRUE.to_string(),
             )],
-        );
+        )
+        .unwrap();
         assert!(output.contains("verify_certificates = true"));
     }
 
     #[test]
     fn test_upsert_toml_section_keys_adds_trust_section() {
         let input = "email = \"admin@example.com\"\n";
-        let output = upsert_toml_section_keys(
+        let output = crate::toml_util::upsert_section_keys(
             input,
             TRUST_SECTION,
             &[(
                 VERIFY_CERTIFICATES_KEY,
                 VERIFY_CERTIFICATES_TRUE.to_string(),
             )],
-        );
+        )
+        .unwrap();
         assert!(output.contains("[trust]"));
         assert!(output.contains("verify_certificates = true"));
     }
@@ -888,10 +794,10 @@ http_responder_hmac = "dev-hmac"
 
         let err = set_verify_certificates_true(&config_path, "test-profile")
             .await
-            .expect_err("must fail when config remains invalid");
+            .expect_err("must fail when config is malformed TOML");
         assert!(
-            err.to_string()
-                .contains("failed to reload hardening config")
+            err.to_string().contains("failed to parse TOML content"),
+            "unexpected error: {err}"
         );
     }
 

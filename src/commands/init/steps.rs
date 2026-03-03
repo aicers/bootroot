@@ -449,28 +449,22 @@ async fn write_openbao_agent_files(
 
     let stepca_agent_config = stepca_dir.join(OPENBAO_AGENT_CONFIG_NAME);
     let responder_agent_config = responder_dir.join(OPENBAO_AGENT_CONFIG_NAME);
-    let password_template = to_container_path(
-        secrets_dir,
-        &stepca_templates.password_template_path,
-        messages,
-    )?;
-    let ca_json_template = to_container_path(
-        secrets_dir,
-        &stepca_templates.ca_json_template_path,
-        messages,
-    )?;
-    let responder_template = to_container_path(secrets_dir, responder_template, messages)?;
-    let password_output =
-        to_container_path(secrets_dir, &secrets_dir.join("password.txt"), messages)?;
+    let mount = "/openbao/secrets";
+    let password_template =
+        to_container_path(secrets_dir, &stepca_templates.password_template_path, mount)?;
+    let ca_json_template =
+        to_container_path(secrets_dir, &stepca_templates.ca_json_template_path, mount)?;
+    let responder_template = to_container_path(secrets_dir, responder_template, mount)?;
+    let password_output = to_container_path(secrets_dir, &secrets_dir.join("password.txt"), mount)?;
     let ca_json_output = to_container_path(
         secrets_dir,
         &secrets_dir.join("config").join("ca.json"),
-        messages,
+        mount,
     )?;
     let responder_output = to_container_path(
         secrets_dir,
         &secrets_dir.join("responder").join("responder.toml"),
-        messages,
+        mount,
     )?;
     let stepca_config = build_openbao_agent_config(
         openbao_addr,
@@ -1194,7 +1188,8 @@ fn resolve_secret(
         return Ok(value);
     }
     if auto_generate {
-        return generate_secret(messages);
+        return bootroot::utils::generate_secret(SECRET_BYTES)
+            .with_context(|| messages.error_generate_secret_failed());
     }
     prompt_text(&format!("{label}: "), messages)
 }
@@ -1493,7 +1488,8 @@ fn resolve_db_provision_inputs(args: &InitArgs, messages: &Messages) -> Result<D
     let db_password = if let Some(value) = args.db_password.clone() {
         value
     } else if args.auto_generate {
-        generate_secret(messages)?
+        bootroot::utils::generate_secret(SECRET_BYTES)
+            .with_context(|| messages.error_generate_secret_failed())?
     } else {
         prompt_text(&format!("{}: ", messages.prompt_db_password()), messages)?
     };
@@ -1559,18 +1555,6 @@ fn build_dsn_from_env() -> Option<String> {
     let port = env::var("POSTGRES_PORT").unwrap_or_else(|_| "5432".to_string());
     let dsn = format!("postgresql://{user}:{password}@{host}:{port}/{db}?sslmode=disable");
     Some(dsn)
-}
-
-fn generate_secret(messages: &Messages) -> Result<String> {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use ring::rand::{SecureRandom, SystemRandom};
-
-    let mut buffer = vec![0u8; SECRET_BYTES];
-    let rng = SystemRandom::new();
-    rng.fill(&mut buffer)
-        .map_err(|_| anyhow::anyhow!(messages.error_generate_secret_failed()))?;
-    Ok(URL_SAFE_NO_PAD.encode(buffer))
 }
 
 fn build_policy_map(kv_mount: &str) -> BTreeMap<String, String> {

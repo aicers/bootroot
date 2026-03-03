@@ -17,8 +17,8 @@ use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_sing
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME, PATH_AGENT_EAB,
-    PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, compute_ca_bundle_pem,
-    compute_ca_fingerprints, read_ca_cert_fingerprint,
+    PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, SECRET_BYTES, compute_ca_bundle_pem,
+    compute_ca_fingerprints, read_ca_cert_fingerprint, to_container_path,
 };
 use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
@@ -28,7 +28,6 @@ use crate::commands::trust::{
 };
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, DeployType, ServiceEntry, StateFile};
-const SECRET_BYTES: usize = 32;
 const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
 const ROLE_ID_FILENAME: &str = "role_id";
 const SERVICE_KV_BASE: &str = "bootroot/services";
@@ -218,7 +217,8 @@ async fn rotate_stepca_password(
 ) -> Result<()> {
     let new_password = match args.new_password.clone() {
         Some(value) => value,
-        None => generate_secret(messages)?,
+        None => bootroot::utils::generate_secret(SECRET_BYTES)
+            .with_context(|| messages.error_generate_secret_failed())?,
     };
     confirm_action(
         messages.prompt_rotate_stepca_password(),
@@ -323,7 +323,8 @@ async fn rotate_db(
     ensure_single_host_db_host(&admin.host, messages)?;
     let db_password = match args.password.clone() {
         Some(value) => value,
-        None => generate_secret(messages)?,
+        None => bootroot::utils::generate_secret(SECRET_BYTES)
+            .with_context(|| messages.error_generate_secret_failed())?,
     };
     let ca_json_path = ctx.paths.ca_json();
     let current_dsn = read_ca_json_dsn(&ca_json_path, messages)?;
@@ -397,7 +398,8 @@ async fn rotate_responder_hmac(
 
     let hmac = match args.hmac.clone() {
         Some(value) => value,
-        None => generate_secret(messages)?,
+        None => bootroot::utils::generate_secret(SECRET_BYTES)
+            .with_context(|| messages.error_generate_secret_failed())?,
     };
     client
         .write_kv(
@@ -859,11 +861,11 @@ fn change_stepca_passphrase(
         "step".to_string(),
         "crypto".to_string(),
         "change-pass".to_string(),
-        to_container_path(secrets_dir, key_path)?,
+        to_container_path(secrets_dir, key_path, "/home/step")?,
         "--password-file".to_string(),
-        to_container_path(secrets_dir, current_password)?,
+        to_container_path(secrets_dir, current_password, "/home/step")?,
         "--new-password-file".to_string(),
-        to_container_path(secrets_dir, new_password)?,
+        to_container_path(secrets_dir, new_password, "/home/step")?,
         "-f".to_string(),
     ];
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -940,25 +942,6 @@ async fn write_secret_file(path: &Path, contents: &str, messages: &Messages) -> 
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     fs_util::set_key_permissions(path).await?;
     Ok(())
-}
-
-fn generate_secret(messages: &Messages) -> Result<String> {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use ring::rand::{SecureRandom, SystemRandom};
-
-    let mut buffer = vec![0u8; SECRET_BYTES];
-    let rng = SystemRandom::new();
-    rng.fill(&mut buffer)
-        .map_err(|_| anyhow::anyhow!(messages.error_generate_secret_failed()))?;
-    Ok(URL_SAFE_NO_PAD.encode(buffer))
-}
-
-fn to_container_path(secrets_dir: &Path, path: &Path) -> Result<String> {
-    let relative = path
-        .strip_prefix(secrets_dir)
-        .with_context(|| format!("Path {} is not under secrets dir", path.display()))?;
-    Ok(format!("/home/step/{}", relative.to_string_lossy()))
 }
 
 async fn write_secret_id_atomic(path: &Path, value: &str, messages: &Messages) -> Result<()> {
