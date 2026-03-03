@@ -12,6 +12,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and `bootroot rotate ca-key --full` for root + intermediate rotation.
   Both modes use an 8-phase idempotent workflow with crash-safe resume
   via `rotation-state.json`.
+- Added `bootroot rotate openbao-recovery` for manual OpenBao recovery
+  credential rotation (unseal keys and/or root token), including
+  operator-confirmed execution and post-rotation continuity coverage.
 - Added core Bootroot CLI lifecycle foundations, including infra readiness,
   init/status, service onboarding, verify/rotate flows, and related guardrails.
 - Added remote-bootstrap operations via `bootroot-remote` with pull/ack/sync,
