@@ -11,6 +11,10 @@ use crate::cli::output::{
     print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
 use crate::cli::prompt::Prompt;
+use crate::commands::constants::{
+    CA_TRUST_KEY, SERVICE_EAB_HMAC_KEY, SERVICE_EAB_KID_KEY, SERVICE_KV_BASE,
+    SERVICE_RESPONDER_HMAC_KEY, SERVICE_SECRET_ID_KEY,
+};
 use crate::commands::init::{
     PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, SECRET_ID_TTL, TOKEN_TTL,
 };
@@ -21,7 +25,6 @@ use crate::commands::openbao_auth::{
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, StateFile};
 const SERVICE_ROLE_PREFIX: &str = "bootroot-service-";
-const SERVICE_KV_BASE: &str = "bootroot/services";
 const SERVICE_SECRET_DIR: &str = "services";
 const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
 const SERVICE_SECRET_ID_FILENAME: &str = "secret_id";
@@ -31,13 +34,8 @@ const OPENBAO_AGENT_TEMPLATE_FILENAME: &str = "agent.toml.ctmpl";
 const OPENBAO_AGENT_TOKEN_FILENAME: &str = "token";
 const REMOTE_BOOTSTRAP_DIR: &str = "remote-bootstrap/services";
 const REMOTE_BOOTSTRAP_FILENAME: &str = "bootstrap.json";
-const CA_TRUST_KEY: &str = "trusted_ca_sha256";
 const MANAGED_PROFILE_BEGIN_PREFIX: &str = "# BEGIN bootroot managed profile:";
 const MANAGED_PROFILE_END_PREFIX: &str = "# END bootroot managed profile:";
-const SERVICE_SECRET_ID_KEY: &str = "secret_id";
-const SERVICE_EAB_KID_KEY: &str = "kid";
-const SERVICE_EAB_HMAC_KEY: &str = "hmac";
-const SERVICE_RESPONDER_HMAC_KEY: &str = "hmac";
 const SERVICE_CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
 const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
 const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";

@@ -328,6 +328,7 @@ pub(crate) struct InfraUpArgs {
     pub(crate) compose_file: PathBuf,
 
     /// Comma-separated list of services to start
+    // Keep "bootroot-http01" in sync with RESPONDER_SERVICE_NAME.
     #[arg(
         long,
         default_value = "openbao,postgres,step-ca,bootroot-http01",
