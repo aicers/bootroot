@@ -13,6 +13,10 @@ use crate::cli::args::{
     RotateStepcaPasswordArgs,
 };
 use crate::cli::prompt::Prompt;
+use crate::commands::constants::{
+    RESPONDER_SERVICE_NAME, SERVICE_EAB_HMAC_KEY, SERVICE_EAB_KID_KEY, SERVICE_KV_BASE,
+    SERVICE_RESPONDER_HMAC_KEY, SERVICE_SECRET_ID_KEY,
+};
 use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
@@ -30,11 +34,6 @@ use crate::i18n::Messages;
 use crate::state::{DeliveryMode, DeployType, ServiceEntry, StateFile};
 const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
 const ROLE_ID_FILENAME: &str = "role_id";
-const SERVICE_KV_BASE: &str = "bootroot/services";
-const SERVICE_SECRET_ID_KEY: &str = "secret_id";
-const SERVICE_EAB_KID_KEY: &str = "kid";
-const SERVICE_EAB_HMAC_KEY: &str = "hmac";
-const SERVICE_RESPONDER_HMAC_KEY: &str = "hmac";
 const OPENBAO_AGENT_STEPCA_CONTAINER: &str = "bootroot-openbao-agent-stepca";
 const OPENBAO_AGENT_RESPONDER_CONTAINER: &str = "bootroot-openbao-agent-responder";
 const ROOT_CA_COMMON_NAME: &str = "Bootroot Root CA";
@@ -419,7 +418,7 @@ async fn rotate_responder_hmac(
 
     let mut reloaded = false;
     if compose_has_responder(&ctx.compose_file, messages)? {
-        reload_compose_service(&ctx.compose_file, "bootroot-http01", messages)?;
+        reload_compose_service(&ctx.compose_file, RESPONDER_SERVICE_NAME, messages)?;
         reloaded = true;
     }
 
@@ -1048,7 +1047,7 @@ fn openbao_agent_container_name(service_name: &str) -> String {
 fn compose_has_responder(compose_file: &Path, messages: &Messages) -> Result<bool> {
     let compose_contents = fs::read_to_string(compose_file)
         .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
-    Ok(compose_contents.contains("bootroot-http01"))
+    Ok(compose_contents.contains(RESPONDER_SERVICE_NAME))
 }
 
 async fn issue_eab_via_stepca(args: &RotateEabArgs, messages: &Messages) -> Result<EabCredentials> {

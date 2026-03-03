@@ -25,9 +25,9 @@ use super::constants::openbao_constants::{
     SECRET_ID_TTL, TOKEN_TTL,
 };
 use super::constants::{
-    CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME, CA_TRUST_KEY,
-    DEFAULT_CA_ADDRESS, DEFAULT_CA_DNS, DEFAULT_CA_NAME, DEFAULT_CA_PROVISIONER, DEFAULT_DB_NAME,
-    DEFAULT_DB_USER, DEFAULT_EAB_ENDPOINT_PATH, DEFAULT_RESPONDER_TOKEN_TTL_SECS,
+    CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME, DEFAULT_CA_ADDRESS,
+    DEFAULT_CA_DNS, DEFAULT_CA_NAME, DEFAULT_CA_PROVISIONER, DEFAULT_DB_NAME, DEFAULT_DB_USER,
+    DEFAULT_EAB_ENDPOINT_PATH, DEFAULT_RESPONDER_TOKEN_TTL_SECS,
     OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME, OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR,
     OPENBAO_AGENT_RESPONDER_DIR, OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME,
     OPENBAO_AGENT_SECRET_ID_NAME, OPENBAO_AGENT_STEPCA_DIR, OPENBAO_AGENT_STEPCA_SERVICE,
@@ -35,6 +35,7 @@ use super::constants::{
     RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME, SECRET_BYTES, STEPCA_CA_JSON_TEMPLATE_NAME,
     STEPCA_PASSWORD_TEMPLATE_NAME,
 };
+use crate::commands::constants::{CA_TRUST_KEY, RESPONDER_SERVICE_NAME};
 
 const STATIC_SECRET_RENDER_INTERVAL: &str = "30s";
 use super::paths::{
@@ -609,7 +610,7 @@ async fn write_responder_compose_override(
     let contents = format!(
         r#"version: "3.8"
 services:
-  bootroot-http01:
+  {RESPONDER_SERVICE_NAME}:
     volumes:
       - {dir}:/app/responder:ro
     command:
@@ -696,7 +697,7 @@ fn apply_responder_compose_override(
         override_path.to_string_lossy().to_string(),
         "up".to_string(),
         "-d".to_string(),
-        "bootroot-http01".to_string(),
+        RESPONDER_SERVICE_NAME.to_string(),
     ];
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
     run_docker(&args_ref, "docker compose responder override", messages)?;
@@ -2261,11 +2262,9 @@ mod tests {
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(
             &compose_file,
-            r"
-services:
-  bootroot-http01:
-    image: bootroot-http01-responder:latest
-",
+            format!(
+                "\nservices:\n  {RESPONDER_SERVICE_NAME}:\n    image: {RESPONDER_SERVICE_NAME}-responder:latest\n"
+            ),
         )
         .unwrap();
         let mut args = default_init_args();
@@ -2342,11 +2341,9 @@ services:
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(
             &compose_file,
-            r"
-services:
-  bootroot-http01:
-    image: bootroot-http01-responder:latest
-",
+            format!(
+                "\nservices:\n  {RESPONDER_SERVICE_NAME}:\n    image: {RESPONDER_SERVICE_NAME}-responder:latest\n"
+            ),
         )
         .unwrap();
 
@@ -2368,7 +2365,7 @@ services:
         let contents = fs::read_to_string(&override_path).unwrap();
         let config_dir = std::fs::canonicalize(paths.config_path.parent().unwrap()).unwrap();
 
-        assert!(contents.contains("bootroot-http01"));
+        assert!(contents.contains(RESPONDER_SERVICE_NAME));
         assert!(
             contents.contains(&format!("{}:/app/responder:ro", config_dir.display())),
             "should mount responder directory: {contents}"

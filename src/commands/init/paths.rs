@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 use super::constants::DEFAULT_RESPONDER_ADMIN_URL;
 use crate::cli::args::InitArgs;
+use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::i18n::Messages;
 
 pub(crate) struct ResponderPaths {
@@ -43,7 +44,7 @@ pub(crate) fn to_container_path(
 pub(crate) fn compose_has_responder(compose_file: &Path, messages: &Messages) -> Result<bool> {
     let compose_contents = std::fs::read_to_string(compose_file)
         .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
-    Ok(compose_contents.contains("bootroot-http01"))
+    Ok(compose_contents.contains(RESPONDER_SERVICE_NAME))
 }
 
 pub(crate) fn compose_has_openbao(compose_file: &Path, messages: &Messages) -> Result<bool> {

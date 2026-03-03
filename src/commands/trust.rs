@@ -7,12 +7,12 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 use serde::{Deserialize, Serialize};
 
-use crate::commands::init::{CA_TRUST_KEY, PATH_CA_TRUST};
+use crate::commands::constants::{CA_TRUST_KEY, SERVICE_KV_BASE};
+use crate::commands::init::PATH_CA_TRUST;
 use crate::i18n::Messages;
 use crate::state::ServiceEntry;
 
 const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
-const SERVICE_KV_BASE: &str = "bootroot/services";
 const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
 const ROTATION_STATE_FILENAME: &str = "rotation-state.json";
 

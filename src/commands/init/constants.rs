@@ -11,6 +11,7 @@ pub(crate) const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca";
 pub(crate) const DEFAULT_CA_ADDRESS: &str = ":9000";
 pub(crate) const SECRET_BYTES: usize = 32;
 pub(crate) const DEFAULT_RESPONDER_TOKEN_TTL_SECS: u64 = 60;
+// Keep "bootroot-http01" in sync with RESPONDER_SERVICE_NAME.
 pub(crate) const DEFAULT_RESPONDER_ADMIN_URL: &str = "http://bootroot-http01:8080";
 pub(crate) const RESPONDER_TEMPLATE_DIR: &str = "templates";
 pub(crate) const RESPONDER_TEMPLATE_NAME: &str = "responder.toml.ctmpl";
@@ -35,7 +36,6 @@ pub(crate) const DEFAULT_DB_NAME: &str = "stepca";
 pub(crate) const CA_CERTS_DIR: &str = "certs";
 pub(crate) const CA_ROOT_CERT_FILENAME: &str = "root_ca.crt";
 pub(crate) const CA_INTERMEDIATE_CERT_FILENAME: &str = "intermediate_ca.crt";
-pub(crate) const CA_TRUST_KEY: &str = "trusted_ca_sha256";
 
 pub(crate) mod openbao_constants {
     pub(crate) const INIT_SECRET_SHARES: u8 = 3;
