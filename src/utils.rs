@@ -1,7 +1,26 @@
 use std::future::Future;
 use std::time::Duration;
 
+use anyhow::Result;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ring::rand::{SecureRandom, SystemRandom};
+
 pub const MIN_JITTER_DELAY_NANOS: i128 = 1_000_000_000;
+
+/// Generates a cryptographically secure random secret encoded as
+/// URL-safe base64 (no padding).
+///
+/// # Errors
+///
+/// Returns an error if the system random number generator fails.
+pub fn generate_secret(len: usize) -> Result<String> {
+    let mut buffer = vec![0u8; len];
+    let rng = SystemRandom::new();
+    rng.fill(&mut buffer)
+        .map_err(|_| anyhow::anyhow!("Failed to generate random secret"))?;
+    Ok(URL_SAFE_NO_PAD.encode(buffer))
+}
 
 /// Retries an operation using the provided backoff delays.
 ///

@@ -22,15 +22,22 @@ pub(crate) struct OpenBaoAgentPaths {
     pub(crate) compose_override_path: Option<PathBuf>,
 }
 
+/// Resolves a host path to its container-internal equivalent.
+///
+/// Strips the `secrets_dir` prefix and prepends `container_mount`.
 pub(crate) fn to_container_path(
     secrets_dir: &Path,
     path: &Path,
-    messages: &Messages,
+    container_mount: &str,
 ) -> Result<String> {
-    let relative = path
-        .strip_prefix(secrets_dir)
-        .with_context(|| messages.error_resolve_path_failed(&path.display().to_string()))?;
-    Ok(format!("/openbao/secrets/{}", relative.to_string_lossy()))
+    let relative = path.strip_prefix(secrets_dir).with_context(|| {
+        format!(
+            "path {} is not under secrets dir {}",
+            path.display(),
+            secrets_dir.display()
+        )
+    })?;
+    Ok(format!("{container_mount}/{}", relative.to_string_lossy()))
 }
 
 pub(crate) fn compose_has_responder(compose_file: &Path, messages: &Messages) -> Result<bool> {

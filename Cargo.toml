@@ -23,6 +23,7 @@ serde_json = "1"
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
+toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x509-parser = "0.18"
