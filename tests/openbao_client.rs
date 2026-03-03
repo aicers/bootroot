@@ -362,3 +362,85 @@ async fn is_initialized_errors_on_malformed_body() {
         .expect_err("is_initialized should fail on malformed body");
     assert!(err.to_string().contains("OpenBao response parse failed"));
 }
+
+#[tokio::test]
+async fn start_rekey_uses_sys_rekey_init_path() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/rekey/init"))
+        .and(header("X-Vault-Token", "root-token"))
+        .and(body_json(json!({
+            "secret_shares": 5,
+            "secret_threshold": 3
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "nonce": "nonce-1",
+            "progress": 0
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let response = client
+        .start_rekey(5, 3)
+        .await
+        .expect("start_rekey should succeed");
+    assert_eq!(response.nonce, "nonce-1");
+}
+
+#[tokio::test]
+async fn submit_rekey_share_uses_sys_rekey_update_path() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/sys/rekey/update"))
+        .and(header("X-Vault-Token", "root-token"))
+        .and(body_json(json!({
+            "nonce": "nonce-1",
+            "key": "old-unseal-key"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "complete": true,
+            "keys": ["new-unseal-1", "new-unseal-2", "new-unseal-3"]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let response = client
+        .submit_rekey_share("nonce-1", "old-unseal-key")
+        .await
+        .expect("submit_rekey_share should succeed");
+    assert!(response.complete);
+    assert_eq!(
+        response.keys,
+        vec!["new-unseal-1", "new-unseal-2", "new-unseal-3"]
+    );
+}
+
+#[tokio::test]
+async fn create_root_token_uses_auth_token_create_path() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/token/create"))
+        .and(header("X-Vault-Token", "root-token"))
+        .and(body_json(json!({
+            "policies": ["root"],
+            "renewable": false,
+            "no_parent": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "new-root-token" }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let token = client
+        .create_root_token()
+        .await
+        .expect("create_root_token should succeed");
+    assert_eq!(token, "new-root-token");
+}

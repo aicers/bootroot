@@ -26,17 +26,6 @@ automating procedures such as initial trust establishment can itself become a
 security vulnerability. Some steps in Bootroot therefore require manual
 intervention, and Bootroot is designed to minimize those manual steps.
 
-## Semi-Automated — CA Key Rotation
-
-`bootroot rotate ca-key` replaces the intermediate CA key pair, and
-`bootroot rotate ca-key --full` replaces both the root and intermediate CA
-key pairs. Both modes use the same 8-phase approach (backup, generate,
-additive trust, restart step-ca, re-issue, finalize trust, cleanup), each
-idempotent so re-running after failure automatically resumes. A
-`rotation-state.json` file tracks progress and prevents concurrent
-modifications. Full mode uses 4-fingerprint transitional trust to allow
-clients to verify certificates during the migration window.
-
 ## Derived Goal for Certificate Rotation Automation — Secret Management
 
 The ACME protocol used by Bootroot requires the CA to authenticate the
@@ -51,6 +40,15 @@ OpenBao. (Values like passwords that must be kept safe are called secrets.)
 As with certificates, the security emphasis for secrets is on rotation. The
 secrets manager only stores secrets securely; automated rotation is performed
 by Bootroot.
+
+## Automatic vs. Manual Secret Rotation
+
+SecretID rotation and delivery must be performed by the operator using
+Bootroot CLI (`bootroot` & `bootroot-remote`) commands. All other secrets are
+rotated and delivered automatically by Bootroot. SecretID grants access to
+OpenBao itself, but the remaining secrets can be retrieved by connecting to
+OpenBao, which makes their rotation automatable. OpenBao Agent handles
+retrieving secrets from OpenBao.
 
 ## Not Automated (1) — OpenBao Unseal Keys and SecretID
 
@@ -68,22 +66,32 @@ them when OpenBao starts.)
 
 **Root token.** Bootroot uses the root token only during initialization; it is
 not required for day-to-day operations. Instead, Bootroot defaults to AppRole
-with SecretID authentication. AppRole and SecretID are, like EAB, an
-authentication mechanism for OpenBao. The critical security concern is
-SecretID rotation. Bootroot does not automate SecretID rotation because, when
-SecretID must be delivered to a different machine, additional management
-infrastructure would be needed to do so securely.
+with SecretID authentication.
 
-## Automatic vs. Manual Secret Rotation
+**SecretID.** AppRole and SecretID are, like EAB, an authentication mechanism
+for OpenBao. The critical security concern is SecretID rotation. Bootroot does
+not automate SecretID rotation because, when SecretID must be delivered to a
+different machine, additional management infrastructure would be needed to do
+so securely.
 
-SecretID rotation and delivery must be performed by the operator using
-Bootroot CLI (`bootroot` & `bootroot-remote`) commands. All other secrets are
-rotated and delivered automatically by Bootroot. SecretID grants access to
-OpenBao itself, but the remaining secrets can be retrieved by connecting to
-OpenBao, which makes their rotation automatable. OpenBao Agent handles
-retrieving secrets from OpenBao.
+### Rotation of Unseal Keys and Root Token
 
-## Not Automated (2) — Initial CA Trust
+Rotating unseal keys and the root token is a manual operator action by
+design and is not performed by automatic scheduling.
+
+Root token rotation can proceed without unseal-key input, but unseal-key
+rotation requires currently valid key shares up to OpenBao's configured
+unseal threshold, and if those keys are lost, OpenBao must be re-initialized
+before Bootroot re-initialization and service re-bootstrap.
+
+## Not Automated (2) — CA Key Rotation
+
+CA key rotation is not performed by automatic scheduling and must be executed
+manually by the operator in a planned change window. Because this work
+involves certificate trust-chain transition and service-impact checks, the
+operator must directly own both pre-checks and post-rotation validation.
+
+## Not Automated (3) — Initial CA Trust
 
 The initial trust problem exists not only on the secrets-manager side but also
 on the certificate issuance/renewal side. When `bootroot-agent` communicates
@@ -97,7 +105,7 @@ acceptable. Because the CA certificate is obtained during this initial process,
 CA verification is guaranteed for all subsequent automated certificate
 rotations.
 
-## Not Automated (3) — Installation and Operations
+## Not Automated (4) — Installation and Operations
 
 There are aspects of installation and operations that fall outside Bootroot's
 automation scope:

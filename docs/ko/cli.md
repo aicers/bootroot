@@ -154,7 +154,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--db-dsn`: step-ca용 PostgreSQL DSN
 - `--db-provision`: step-ca용 PostgreSQL 역할/DB 생성
 - `--db-admin-dsn`: PostgreSQL 관리자 DSN (환경 변수: `BOOTROOT_DB_ADMIN_DSN`)
-- `--db-user`: step-ca용 PostgreSQL 사용자 (환경 변수: `BOOTROOT_DB_USER`)
+- `--db-user`: step-ca용 PostgreSQL 계정 (환경 변수: `BOOTROOT_DB_USER`)
 - `--db-password`: step-ca용 PostgreSQL 비밀번호 (환경 변수: `BOOTROOT_DB_PASSWORD`)
 - `--db-name`: step-ca용 PostgreSQL DB 이름 (환경 변수: `BOOTROOT_DB_NAME`)
 - `--db-check`: DB 연결/인증 점검
@@ -515,6 +515,7 @@ OpenBao와 통신해 값을 갱신합니다.
 - `rotate trust-sync`
 - `rotate force-reissue`
 - `rotate ca-key`
+- `rotate openbao-recovery`
 
 ### 입력
 
@@ -622,6 +623,31 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 - `--force`: 미이전 서비스가 있어도 Phase 6 강제 실행
 - `--cleanup`: 완료 시 백업 파일 삭제(Phase 7)
 
+#### `rotate openbao-recovery`
+
+OpenBao 복구 자격증명을 수동으로 회전합니다. 이 작업은 자동 실행되지
+않으며 운영자가 명시적으로 실행해야 합니다.
+
+- `--rotate-unseal-keys`: rekey를 통해 언실 키 회전
+- `--rotate-root-token`: 새 루트 토큰 생성
+- `--unseal-key`: 기존 언실 키(반복 지정 가능)
+- `--unseal-key-file`: 기존 언실 키 파일(줄바꿈 구분)
+- `--output`: 새 자격증명을 파일로 저장(`0600`)
+
+최소 하나의 대상 플래그(`--rotate-unseal-keys` / `--rotate-root-token`)를
+반드시 지정해야 합니다. `rotate openbao-recovery`는 AppRole role/role_id/
+secret_id를 변경하지 않습니다.
+
+중요 동작:
+
+- `--rotate-unseal-keys`는 기존 언실 키가 필요합니다.
+  OpenBao에 설정된 언실 해제 최소 필요 개수만큼 키 조각을
+  `--unseal-key`, `--unseal-key-file`, 또는 대화형 입력으로 제공해야 합니다.
+- 기존 언실 키를 분실하면 언실 키 회전은 수행할 수 없습니다.
+  이 경우 현실적인 복구 경로는 OpenBao 재초기화이며, 결과적으로
+  `bootroot init` 재실행과 서비스 재bootstrap이 필요합니다.
+- `--rotate-root-token`은 언실 키 입력 없이 실행할 수 있습니다.
+
 ### 회전 시크릿 쓰기 대상
 
 아래 3개 서브커맨드는 OpenBao만 갱신하지 않고, 로컬 런타임 파일도 함께
@@ -687,6 +713,7 @@ OpenBao KV: `bootroot/responder/hmac`
 - DB 회전 시 관리자 DSN 누락 또는 DB 프로비저닝 실패
 - EAB 발급 요청 실패
 - responder 설정 파일 쓰기 실패 또는 리로드 실패
+- OpenBao 복구 자격증명(rekey/루트 토큰) 회전 실패
 - AppRole 대상 서비스 미등록 또는 secret_id 갱신 실패
 
 ## bootroot monitoring

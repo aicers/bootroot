@@ -59,6 +59,8 @@ RUNTIME_SERVICE_ADD_ROLE_ID=""
 RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
+INIT_ROOT_TOKEN=""
+OPENBAO_RECOVERY_OUTPUT_FILE="$ARTIFACT_DIR/openbao-recovery.json"
 SIDECAR_OBA_SERVICE="$WEB_SERVICE"
 SIDECAR_OBA_CONTAINER="bootroot-openbao-agent-${SIDECAR_OBA_SERVICE}"
 SIDECAR_OBA_READY_ATTEMPTS="${SIDECAR_OBA_READY_ATTEMPTS:-30}"
@@ -409,10 +411,12 @@ run_bootstrap_chain() {
     jq -r '.approles[] | select(.label == "runtime_rotate") | .secret_id // empty' \
       "$INIT_SUMMARY_JSON"
   )"
+  INIT_ROOT_TOKEN="$(jq -r '.root_token // empty' "$INIT_SUMMARY_JSON")"
   [ -n "${RUNTIME_SERVICE_ADD_ROLE_ID:-}" ] || fail "Failed to parse runtime_service_add role_id"
   [ -n "${RUNTIME_SERVICE_ADD_SECRET_ID:-}" ] || fail "Failed to parse runtime_service_add secret_id"
   [ -n "${RUNTIME_ROTATE_ROLE_ID:-}" ] || fail "Failed to parse runtime_rotate role_id"
   [ -n "${RUNTIME_ROTATE_SECRET_ID:-}" ] || fail "Failed to parse runtime_rotate secret_id"
+  [ -n "${INIT_ROOT_TOKEN:-}" ] || fail "Failed to parse init root token"
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 
   log_phase "service-add"
@@ -648,6 +652,20 @@ run_remote_bootstrap() {
 }
 
 run_rotations_with_verification() {
+  log_phase "rotate-openbao-recovery"
+  run_bootroot rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --root-token "$INIT_ROOT_TOKEN" \
+    --yes \
+    openbao-recovery \
+    --rotate-root-token \
+    --output "$OPENBAO_RECOVERY_OUTPUT_FILE" >>"$RUN_LOG" 2>&1
+  [ -s "$OPENBAO_RECOVERY_OUTPUT_FILE" ] || fail "openbao recovery output not written"
+  log_phase "bootstrap-after-openbao-recovery"
+  run_remote_bootstrap
+  run_verify_pair "after-openbao-recovery"
+
   log_phase "rotate-responder-hmac"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \

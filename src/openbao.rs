@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const VAULT_TOKEN_HEADER: &str = "X-Vault-Token";
+const ROOT_POLICY: &str = "root";
 
 #[derive(Debug, Clone)]
 pub struct OpenBaoClient {
@@ -24,6 +25,8 @@ pub struct SealStatus {
     pub sealed: bool,
     #[serde(default)]
     pub t: Option<u32>,
+    #[serde(default)]
+    pub n: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +98,25 @@ struct AppRoleLoginResponse {
 #[derive(Debug, Deserialize)]
 struct AppRoleAuth {
     client_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RekeyInitResponse {
+    pub nonce: String,
+    #[serde(default)]
+    pub progress: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RekeyUpdateResponse {
+    pub complete: bool,
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenCreateResponse {
+    auth: AppRoleAuth,
 }
 
 impl OpenBaoClient {
@@ -200,6 +222,67 @@ impl OpenBaoClient {
             .await
             .context("OpenBao unseal request failed")?;
         Self::parse_response(response).await
+    }
+
+    /// Starts unseal key rekey with the given share and threshold values.
+    ///
+    /// # Errors
+    /// Returns an error if the rekey init request fails.
+    pub async fn start_rekey(&self, shares: u32, threshold: u32) -> Result<RekeyInitResponse> {
+        #[derive(Serialize)]
+        struct RekeyInitRequest {
+            secret_shares: u32,
+            secret_threshold: u32,
+        }
+
+        self.put_json(
+            "sys/rekey/init",
+            &RekeyInitRequest {
+                secret_shares: shares,
+                secret_threshold: threshold,
+            },
+        )
+        .await
+    }
+
+    /// Submits one existing unseal key for an in-progress rekey operation.
+    ///
+    /// # Errors
+    /// Returns an error if the rekey update request fails.
+    pub async fn submit_rekey_share(&self, nonce: &str, key: &str) -> Result<RekeyUpdateResponse> {
+        #[derive(Serialize)]
+        struct RekeyUpdateRequest<'a> {
+            nonce: &'a str,
+            key: &'a str,
+        }
+
+        self.put_json("sys/rekey/update", &RekeyUpdateRequest { nonce, key })
+            .await
+    }
+
+    /// Creates a new root-policy token.
+    ///
+    /// # Errors
+    /// Returns an error if token creation fails.
+    pub async fn create_root_token(&self) -> Result<String> {
+        #[derive(Serialize)]
+        struct TokenCreateRequest<'a> {
+            policies: &'a [&'a str],
+            renewable: bool,
+            no_parent: bool,
+        }
+
+        let response: TokenCreateResponse = self
+            .post_json(
+                "auth/token/create",
+                &TokenCreateRequest {
+                    policies: &[ROOT_POLICY],
+                    renewable: false,
+                    no_parent: true,
+                },
+            )
+            .await?;
+        Ok(response.auth.client_token)
     }
 
     /// Ensures a KV v2 secrets engine is mounted at the given path.
@@ -595,6 +678,29 @@ impl OpenBaoClient {
             .client
             .delete(url)
             .header(VAULT_TOKEN_HEADER, token)
+            .send()
+            .await
+            .with_context(|| format!("OpenBao request failed: {path}"))?;
+        Self::parse_response(response)
+            .await
+            .with_context(|| format!("OpenBao response parse failed: {path}"))
+    }
+
+    async fn put_json<T: Serialize, R: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<R> {
+        let url = self.endpoint(path);
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenBao token is not set"))?;
+        let response = self
+            .client
+            .put(url)
+            .header(VAULT_TOKEN_HEADER, token)
+            .json(body)
             .send()
             .await
             .with_context(|| format!("OpenBao request failed: {path}"))?;

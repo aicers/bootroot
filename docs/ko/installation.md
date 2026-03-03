@@ -3,7 +3,7 @@
 이 섹션은 step-ca, PostgreSQL, OpenBao Agent, bootroot-agent, HTTP-01
 리스폰더의 설치/배치 원리를 설명합니다.
 실제 운영에서는 보통 `bootroot` CLI 자동화를 사용하지만, 이 문서는
-**사용자 이해도를 높이기 위해 CLI 자동화를 배제한 수동 관점**으로
+**운영자 이해도를 높이기 위해 CLI 자동화를 배제한 수동 관점**으로
 구성되어 있습니다.
 즉, "CLI가 내부에서 어떤 구성을 만들어 주는지"를 사람이 직접 따라가며
 이해할 수 있게 설명합니다.
@@ -371,7 +371,7 @@ TLS 검증 오버라이드:
 
 mTLS를 사용하는 서비스는 `trust.ca_bundle_path`에 저장되는 CA 번들을 읽을
 수 있어야 합니다. 가장 단순한 구성은 bootroot-agent와 해당 서비스를
-같은 사용자/그룹으로 실행하는 것입니다.
+같은 계정/그룹으로 실행하는 것입니다.
 
 ### Docker
 
@@ -388,7 +388,7 @@ docker compose up --build -d bootroot-agent
 `--oneshot`으로 실행됩니다(1회 발급 후 종료).
 지속 갱신이 필요한 운영 구성에서는 `--oneshot` 없이 데몬 모드로 실행하고
 재시작 정책(`restart: always` 또는 `unless-stopped`)을 함께 설정하세요.
-사용자가 직접 중지한 컨테이너를 유지하려면 `restart: unless-stopped`로
+운영자가 직접 중지한 컨테이너를 유지하려면 `restart: unless-stopped`로
 바꿔 사용하세요. 또한 호스트 재부팅에도 유지되도록 Docker/Compose
 서비스 자체를 systemd 등으로 관리해야 합니다.
 

@@ -535,6 +535,7 @@ Supported subcommands:
 - `rotate trust-sync`
 - `rotate force-reissue`
 - `rotate ca-key`
+- `rotate openbao-recovery`
 
 ### Inputs
 
@@ -648,6 +649,31 @@ Inputs:
 - `--force`: force Phase 6 even when un-migrated services remain
 - `--cleanup`: delete backup files on completion (Phase 7)
 
+#### `rotate openbao-recovery`
+
+Manually rotates OpenBao recovery credentials. This operation is explicit
+operator action only and does not run automatically.
+
+- `--rotate-unseal-keys`: rotate unseal keys via rekey
+- `--rotate-root-token`: create a new root token
+- `--unseal-key`: existing unseal key (repeatable)
+- `--unseal-key-file`: file containing existing unseal keys (one per line)
+- `--output`: write new credentials to a file (`0600`)
+
+At least one target flag (`--rotate-unseal-keys` / `--rotate-root-token`)
+is required. `rotate openbao-recovery` does not modify AppRole roles,
+role_id, or secret_id.
+
+Important behavior:
+
+- `--rotate-unseal-keys` requires existing unseal keys. Provide at least the
+  minimum number of key shares configured as the OpenBao unseal threshold,
+  using `--unseal-key`, `--unseal-key-file`, or interactive input.
+- If existing unseal keys are lost, unseal-key rotation cannot be performed.
+  In that case, the practical recovery path is re-initializing OpenBao, which
+  implies re-running `bootroot init` and re-bootstrapping services.
+- `--rotate-root-token` can be executed without unseal-key input.
+
 ### Rotated secret write targets
 
 For the following three subcommands, bootroot updates OpenBao **and** local
@@ -714,6 +740,7 @@ The command is considered failed when:
 - DB rotation is missing admin DSN or provisioning fails
 - EAB issuance request fails
 - responder config write fails or reload fails
+- OpenBao recovery rekey/root-token rotation fails
 - AppRole target is missing or secret_id update fails
 
 ## bootroot monitoring
