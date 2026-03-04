@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-
 use bootroot::openbao::OpenBaoClient;
 
 use super::agent_config::apply_agent_config_updates;

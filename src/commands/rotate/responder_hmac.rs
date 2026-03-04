@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-
 use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{

@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-
 use bootroot::acme::responder_client;
 use bootroot::fs_util;
 
@@ -11,13 +10,12 @@ use super::super::constants::{
     RESPONDER_CONFIG_NAME, RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME,
 };
 use super::super::paths::{ResponderPaths, compose_has_responder};
+use super::super::types::ResponderCheck;
 use super::InitSecrets;
 use crate::cli::args::InitArgs;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::infra::run_docker;
 use crate::i18n::Messages;
-
-use super::super::types::ResponderCheck;
 
 pub(super) async fn write_responder_files(
     secrets_dir: &Path,

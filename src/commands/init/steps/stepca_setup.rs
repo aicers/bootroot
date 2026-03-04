@@ -2,7 +2,6 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-
 use bootroot::fs_util;
 
 use super::super::constants::openbao_constants::{PATH_STEPCA_DB, PATH_STEPCA_PASSWORD};

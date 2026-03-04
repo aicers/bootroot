@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-
 use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::{RotateArgs, RotateCommand};

@@ -2,7 +2,6 @@ use std::env;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-
 use bootroot::db::{
     DbDsn, build_db_dsn, check_auth_sync, check_tcp, parse_db_dsn, provision_db_sync,
     validate_db_identifier,

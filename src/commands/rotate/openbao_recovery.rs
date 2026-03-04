@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-
 use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 

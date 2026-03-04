@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-
 use bootroot::openbao::OpenBaoClient;
 
 use super::io::{read_required_string, read_secret_file, write_secret_file};

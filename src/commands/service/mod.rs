@@ -7,7 +7,6 @@ mod secrets;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-
 use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs};

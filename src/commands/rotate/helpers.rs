@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-
 use bootroot::fs_util;
 
 use super::{OPENBAO_AGENT_CONTAINER_PREFIX, RENDERED_FILE_POLL_INTERVAL, RotateContext};

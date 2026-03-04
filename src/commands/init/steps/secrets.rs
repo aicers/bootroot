@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
-use reqwest::StatusCode;
-
 use bootroot::openbao::OpenBaoClient;
+use reqwest::StatusCode;
 
 use super::super::constants::openbao_constants::PATH_AGENT_EAB;
 use super::super::constants::{DEFAULT_EAB_ENDPOINT_PATH, SECRET_BYTES};

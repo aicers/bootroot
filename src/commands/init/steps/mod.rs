@@ -7,18 +7,16 @@ mod responder_setup;
 mod secrets;
 mod stepca_setup;
 
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use bootroot::openbao::{InitResponse, OpenBaoClient};
 pub(crate) use ca_certs::{
     compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
 };
 pub(crate) use orchestrator::run_init;
 
-use std::path::PathBuf;
-
-use anyhow::{Context, Result};
-
 use super::types::EabCredentials;
-use bootroot::openbao::{InitResponse, OpenBaoClient};
-
 use crate::i18n::Messages;
 
 pub(super) struct InitBootstrap {
@@ -110,10 +108,9 @@ pub(super) mod test_support {
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
+    use super::super::constants::{DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL};
     use crate::cli::args::InitArgs;
     use crate::i18n::Messages;
-
-    use super::super::constants::{DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
