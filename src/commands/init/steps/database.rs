@@ -305,6 +305,8 @@ mod tests {
     fn test_resolve_db_dsn_uses_env() {
         let _guard = env_lock();
         // SAFETY: tests run single-threaded for this scope; vars are restored below.
+        // CodeQL flags "secret" as a hard-coded credential, but this is a test-only
+        // fixture value with no relation to any real credential. Dismiss as false positive.
         unsafe {
             env::set_var("POSTGRES_USER", "step");
             env::set_var("POSTGRES_PASSWORD", "secret");

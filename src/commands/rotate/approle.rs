@@ -58,7 +58,8 @@ pub(super) async fn rotate_approle_secret_id(
     }
 
     println!("{}", messages.rotate_summary_title());
-    // codeql[rust/cleartext-logging]: output is a secret_id file path, not the secret value.
+    // CodeQL flags this as cleartext-logging, but the second argument is
+    // `secret_id_path` (a file path), not the secret_id value. Dismiss as false positive.
     println!(
         "{}",
         messages.rotate_summary_approle_secret_id(

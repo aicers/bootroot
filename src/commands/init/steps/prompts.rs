@@ -25,7 +25,8 @@ pub(super) fn prompt_unseal_keys(
 
 pub(super) fn prompt_text(prompt: &str, messages: &Messages) -> Result<String> {
     use std::io::{self, Write};
-    // codeql[rust/cleartext-logging]: prompt text is non-secret UI output.
+    // CodeQL flags this as cleartext-logging, but `prompt` is a UI label
+    // (e.g. "PostgreSQL password: "), not a secret value. Dismiss as false positive.
     print!("{prompt}");
     io::stdout()
         .flush()
