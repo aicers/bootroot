@@ -131,8 +131,11 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--kv-mount`: OpenBao KV v2 마운트 경로 (기본값 `secret`)
 - `--secrets-dir`: 시크릿 디렉터리 (기본값 `secrets`)
 - `--compose-file`: infra 상태 점검용 compose 파일 (기본값 `docker-compose.yml`)
-- `--auto-generate`: 비밀번호/HMAC 등을 자동 생성
-- `--show-secrets`: 요약 출력에 시크릿 표시
+- `--enable <feature,...>`: 선택 기능 활성화(쉼표 구분).
+  값: `auto-generate`, `show-secrets`, `db-provision`, `db-check`,
+  `eab-auto`
+- `--skip <phase,...>`: 선택 단계 건너뛰기(쉼표 구분).
+  값: `responder-check`
 - `--summary-json`: init 요약을 머신 파싱용 JSON 파일로 저장
   (민감 필드 포함 가능: 예 `root_token`)
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`).
@@ -152,18 +155,14 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--stepca-password`: step-ca 키 암호 값 (저장 위치: `secrets/password.txt`,
   환경 변수: `STEPCA_PASSWORD`)
 - `--db-dsn`: step-ca용 PostgreSQL DSN
-- `--db-provision`: step-ca용 PostgreSQL 역할/DB 생성
 - `--db-admin-dsn`: PostgreSQL 관리자 DSN (환경 변수: `BOOTROOT_DB_ADMIN_DSN`)
 - `--db-user`: step-ca용 PostgreSQL 계정 (환경 변수: `BOOTROOT_DB_USER`)
 - `--db-password`: step-ca용 PostgreSQL 비밀번호 (환경 변수: `BOOTROOT_DB_PASSWORD`)
 - `--db-name`: step-ca용 PostgreSQL DB 이름 (환경 변수: `BOOTROOT_DB_NAME`)
-- `--db-check`: DB 연결/인증 점검
 - `--db-timeout-secs`: DB 연결 타임아웃(초, 기본값 `2`)
 - `--http-hmac`: HTTP-01 responder HMAC (환경 변수: `HTTP01_HMAC`)
 - `--responder-url`: HTTP-01 responder 관리자 URL (선택, 환경 변수: `HTTP01_RESPONDER_URL`)
-- `--skip-responder-check`: init 시 responder 체크 생략(테스트/제약 환경용)
 - `--responder-timeout-secs`: responder 요청 타임아웃(초, 기본값 `5`)
-- `--eab-auto`: step-ca에서 EAB 자동 발급
 - `--stepca-url`: step-ca URL (기본값 `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner 이름 (기본값 `acme`)
 - `--eab-kid`, `--eab-hmac`: 수동 EAB 입력
@@ -254,7 +253,7 @@ OpenBao와 step-ca/responder가 서로 다른 머신에 배치되면, 이 섹션
 ### 예시
 
 ```bash
-bootroot init --auto-generate --eab-auto --responder-url http://localhost:8080
+bootroot init --enable auto-generate,eab-auto --responder-url http://localhost:8080
 ```
 
 ## bootroot status
@@ -618,8 +617,9 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 입력:
 
 - `--full`: 루트 + 중간 CA 키 모두 교체(기본: 중간 CA만)
-- `--skip-reissue`: Phase 5(서비스 인증서 재발급) 생략
-- `--skip-finalize`: Phase 6(trust 확정) 생략
+- `--skip <phase,...>`: 선택 단계 건너뛰기(쉼표 구분).
+  값: `reissue`(Phase 5 — 서비스 인증서 재발급),
+  `finalize`(Phase 6 — trust 확정)
 - `--force`: 미이전 서비스가 있어도 Phase 6 강제 실행
 - `--cleanup`: 완료 시 백업 파일 삭제(Phase 7)
 

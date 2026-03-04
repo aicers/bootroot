@@ -52,11 +52,11 @@ bootroot infra up: completed
 >   generated `root token` and `unseal keys`
 > - If OpenBao is **initialized but sealed**, you need `unseal keys`
 > - DB DSN is required (`--db-dsn` or DB provisioning options)
-> - step-ca password can be auto-generated with `--auto-generate`
+> - step-ca password can be auto-generated with `--enable auto-generate`
 > - `--responder-url` enables responder validation (otherwise skipped)
 
 ```bash
-bootroot init --auto-generate \
+bootroot init --enable auto-generate \
   --summary-json ./tmp/init-summary.json \
   --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
   --responder-url "http://localhost:8080"

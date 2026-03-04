@@ -139,8 +139,11 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--kv-mount`: OpenBao KV v2 mount path (default `secret`)
 - `--secrets-dir`: secrets directory (default `secrets`)
 - `--compose-file`: compose file used for infra checks (default `docker-compose.yml`)
-- `--auto-generate`: auto-generate secrets where possible
-- `--show-secrets`: show secrets in the summary
+- `--enable <feature,...>`: enable optional features (comma-separated).
+  Values: `auto-generate`, `show-secrets`, `db-provision`, `db-check`,
+  `eab-auto`
+- `--skip <phase,...>`: skip optional phases (comma-separated).
+  Values: `responder-check`
 - `--summary-json`: write init summary as machine-readable JSON
   (it may include sensitive fields such as `root_token`)
 - `--root-token`: OpenBao root token (environment variable:
@@ -162,20 +165,15 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--stepca-password`: step-ca password value (stored at `secrets/password.txt`,
   environment variable: `STEPCA_PASSWORD`)
 - `--db-dsn`: PostgreSQL DSN for step-ca
-- `--db-provision`: provision PostgreSQL role/database for step-ca
 - `--db-admin-dsn`: PostgreSQL admin DSN (environment variable: `BOOTROOT_DB_ADMIN_DSN`)
 - `--db-user`: PostgreSQL user for step-ca (environment variable: `BOOTROOT_DB_USER`)
 - `--db-password`: PostgreSQL password for step-ca (environment variable: `BOOTROOT_DB_PASSWORD`)
 - `--db-name`: PostgreSQL database name for step-ca (environment variable: `BOOTROOT_DB_NAME`)
-- `--db-check`: validate DB connectivity and auth
 - `--db-timeout-secs`: DB connectivity timeout (seconds, default `2`)
 - `--http-hmac`: HTTP-01 responder HMAC (environment variable: `HTTP01_HMAC`)
 - `--responder-url`: HTTP-01 responder admin URL (optional, environment
   variable: `HTTP01_RESPONDER_URL`)
-- `--skip-responder-check`: skip responder check during init (for constrained
-  test environments)
 - `--responder-timeout-secs`: responder timeout (seconds, default `5`)
-- `--eab-auto`: auto-issue EAB via step-ca
 - `--stepca-url`: step-ca URL (default `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
 - `--eab-kid`, `--eab-hmac`: manual EAB input
@@ -266,7 +264,7 @@ The command is considered failed when:
 ### Examples
 
 ```bash
-bootroot init --auto-generate --eab-auto --responder-url http://localhost:8080
+bootroot init --enable auto-generate,eab-auto --responder-url http://localhost:8080
 ```
 
 ## bootroot status
@@ -644,8 +642,9 @@ Inputs:
 
 - `--full`: rotate both root and intermediate CA keys (default:
   intermediate only)
-- `--skip-reissue`: skip Phase 5 (service certificate re-issuance)
-- `--skip-finalize`: skip Phase 6 (trust finalization)
+- `--skip <phase,...>`: skip optional phases (comma-separated).
+  Values: `reissue` (Phase 5 — service certificate re-issuance),
+  `finalize` (Phase 6 — trust finalization)
 - `--force`: force Phase 6 even when un-migrated services remain
 - `--cleanup`: delete backup files on completion (Phase 7)
 

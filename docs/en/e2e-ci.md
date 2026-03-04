@@ -134,7 +134,7 @@ BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
-  --auto-generate --show-secrets \
+  --enable auto-generate,show-secrets \
   --stepca-url "$STEPCA_EAB_URL" \
   --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
   --responder-url "$RESPONDER_URL"
@@ -247,7 +247,7 @@ Actual commands (script excerpt):
 bootroot infra up --compose-file "$COMPOSE_FILE"
 BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
-  --auto-generate --show-secrets --eab-kid "$INIT_EAB_KID" \
+  --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \
   --eab-hmac "$INIT_EAB_HMAC"
 bootroot service add --service-name edge-proxy --deploy-type daemon \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
@@ -370,7 +370,7 @@ Purpose:
   infrastructure failures at each phase
 - Validate that mTLS is never disrupted during CA key rotation
 - Validate `rotation-state.json` idempotent phase tracking
-- Validate `--skip-reissue`, `--force`, `--cleanup` flag behaviors
+- Validate `--skip reissue`, `--force`, `--cleanup` flag behaviors
 - Validate `trust-sync` conflict guard during active rotation
 
 #### Scenarios
@@ -393,7 +393,7 @@ Scenario 2 — Phase 4 failure (step-ca removed):
 
 Scenario 3 — Phase 5 partial re-issuance:
 
-1. Run `rotate ca-key --skip-reissue` — Phase 6 bails (unmigrated)
+1. Run `rotate ca-key --skip reissue` — Phase 6 bails (unmigrated)
 2. Force-reissue only one service (edge-proxy)
 3. Verify both old-cert (web-app) and new-cert (edge-proxy) work
 4. Force-reissue remaining services
@@ -401,7 +401,7 @@ Scenario 3 — Phase 5 partial re-issuance:
 
 Scenario 4 — Phase 6 entry blocked:
 
-1. Run `rotate ca-key --skip-reissue` — Phase 6 blocks
+1. Run `rotate ca-key --skip reissue` — Phase 6 blocks
 2. Verify error output mentions un-migrated service names
 3. Re-run with `--force` — Phase 6 completes with warning
 4. Force-reissue and verify
@@ -425,7 +425,7 @@ bootroot rotate \
   --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
   --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
   --yes \
-  ca-key --skip-reissue --force --cleanup
+  ca-key --skip reissue --force --cleanup
 
 # failure injection via Docker manipulation
 docker compose -f "$COMPOSE_FILE" stop openbao

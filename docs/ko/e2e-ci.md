@@ -130,7 +130,7 @@ BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
-  --auto-generate --show-secrets \
+  --enable auto-generate,show-secrets \
   --stepca-url "$STEPCA_EAB_URL" \
   --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
   --responder-url "$RESPONDER_URL"
@@ -243,7 +243,7 @@ sudo -n cp "$tmp_file" /etc/hosts
 bootroot infra up --compose-file "$COMPOSE_FILE"
 BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
-  --auto-generate --show-secrets --eab-kid "$INIT_EAB_KID" \
+  --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \
   --eab-hmac "$INIT_EAB_HMAC"
 bootroot service add --service-name edge-proxy --deploy-type daemon \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
@@ -366,7 +366,7 @@ bootroot verify --service-name "$service" --agent-config "$agent_config_path"
   진행되는지 검증
 - CA 키 회전 중 mTLS가 중단되지 않는지 검증
 - `rotation-state.json` 멱등 phase 추적 검증
-- `--skip-reissue`, `--force`, `--cleanup` 플래그 동작 검증
+- `--skip reissue`, `--force`, `--cleanup` 플래그 동작 검증
 - 활성 회전 중 `trust-sync` 충돌 방지 검증
 
 #### 시나리오
@@ -389,7 +389,7 @@ bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 
 시나리오 3 — Phase 5 부분 재발급:
 
-1. `rotate ca-key --skip-reissue` 실행 → Phase 6 중단(미이전 서비스)
+1. `rotate ca-key --skip reissue` 실행 → Phase 6 중단(미이전 서비스)
 2. 서비스 1개(edge-proxy)만 강제 재발급
 3. 기존 cert(web-app)과 신규 cert(edge-proxy) 모두 동작 확인
 4. 나머지 서비스 강제 재발급
@@ -397,7 +397,7 @@ bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 
 시나리오 4 — Phase 6 진입 차단:
 
-1. `rotate ca-key --skip-reissue` 실행 → Phase 6 차단
+1. `rotate ca-key --skip reissue` 실행 → Phase 6 차단
 2. 오류 출력에 미이전 서비스 이름 포함 확인
 3. `--force`로 재실행 → Phase 6 경고와 함께 완료
 4. 강제 재발급 후 검증
@@ -421,7 +421,7 @@ bootroot rotate \
   --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
   --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
   --yes \
-  ca-key --skip-reissue --force --cleanup
+  ca-key --skip reissue --force --cleanup
 
 # Docker 조작을 통한 장애 주입
 docker compose -f "$COMPOSE_FILE" stop openbao
