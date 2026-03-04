@@ -730,19 +730,20 @@ pub(super) fn apply_openbao_agent_compose_override(
     override_path: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    let compose_str = compose_file.to_string_lossy();
+    let override_str = override_path.to_string_lossy();
     let args = [
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().to_string(),
-        "-f".to_string(),
-        override_path.to_string_lossy().to_string(),
-        "up".to_string(),
-        "-d".to_string(),
-        OPENBAO_AGENT_STEPCA_SERVICE.to_string(),
-        OPENBAO_AGENT_RESPONDER_SERVICE.to_string(),
+        "compose",
+        "-f",
+        &*compose_str,
+        "-f",
+        &*override_str,
+        "up",
+        "-d",
+        OPENBAO_AGENT_STEPCA_SERVICE,
+        OPENBAO_AGENT_RESPONDER_SERVICE,
     ];
-    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_docker(&args_ref, "docker compose openbao agent override", messages)?;
+    run_docker(&args, "docker compose openbao agent override", messages)?;
     Ok(())
 }
 

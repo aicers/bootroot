@@ -15,10 +15,21 @@ pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) ->
         println!("{}", messages.monitoring_up_already_running());
         return Ok(());
     }
-    let compose_args = compose_up_args(&args.compose_file, args.profile, &services);
-    let compose_args_ref: Vec<&str> = compose_args.iter().map(String::as_str).collect();
+    let compose_str = args.compose_file.to_string_lossy();
+    let profile_str = args.profile.to_string();
+    let svc_refs: Vec<&str> = services.iter().map(String::as_str).collect();
+    let mut up_args: Vec<&str> = vec![
+        "compose",
+        "-f",
+        &compose_str,
+        "--profile",
+        &profile_str,
+        "up",
+        "-d",
+    ];
+    up_args.extend(&svc_refs);
     run_docker_with_env(
-        &compose_args_ref,
+        &up_args,
         "docker compose up",
         messages,
         args.grafana_admin_password.as_deref(),
@@ -133,13 +144,32 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
 
     for profile in &profiles {
         let services = monitoring_services(*profile);
-        let stop_args = compose_stop_args(&args.compose_file, *profile, &services);
-        let stop_args_ref: Vec<&str> = stop_args.iter().map(String::as_str).collect();
-        run_docker(&stop_args_ref, "docker compose stop", messages)?;
+        let compose_str = args.compose_file.to_string_lossy();
+        let profile_str = profile.to_string();
+        let svc_refs: Vec<&str> = services.iter().map(String::as_str).collect();
 
-        let rm_args = compose_rm_args(&args.compose_file, *profile, &services);
-        let rm_args_ref: Vec<&str> = rm_args.iter().map(String::as_str).collect();
-        run_docker(&rm_args_ref, "docker compose rm", messages)?;
+        let mut stop_args: Vec<&str> = vec![
+            "compose",
+            "-f",
+            &compose_str,
+            "--profile",
+            &profile_str,
+            "stop",
+        ];
+        stop_args.extend(&svc_refs);
+        run_docker(&stop_args, "docker compose stop", messages)?;
+
+        let mut rm_args: Vec<&str> = vec![
+            "compose",
+            "-f",
+            &compose_str,
+            "--profile",
+            &profile_str,
+            "rm",
+            "-f",
+        ];
+        rm_args.extend(&svc_refs);
+        run_docker(&rm_args, "docker compose rm", messages)?;
     }
 
     if args.reset_grafana_admin_password {
@@ -304,24 +334,6 @@ fn ensure_all_healthy(readiness: &[ContainerReadiness], messages: &Messages) -> 
     } else {
         anyhow::bail!(messages.monitoring_unhealthy(&failures.join(", ")))
     }
-}
-
-fn compose_up_args(
-    compose_file: &Path,
-    profile: MonitoringProfile,
-    services: &[String],
-) -> Vec<String> {
-    let mut args = vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().to_string(),
-        "--profile".to_string(),
-        profile.to_string(),
-        "up".to_string(),
-        "-d".to_string(),
-    ];
-    args.extend(services.iter().cloned());
-    args
 }
 
 fn monitoring_already_running(
@@ -494,39 +506,4 @@ fn run_docker(args: &[&str], context: &str, messages: &Messages) -> Result<()> {
         anyhow::bail!(messages.error_command_failed_status(context, &status.to_string()));
     }
     Ok(())
-}
-
-fn compose_stop_args(
-    compose_file: &Path,
-    profile: MonitoringProfile,
-    services: &[String],
-) -> Vec<String> {
-    let mut args = vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().to_string(),
-        "--profile".to_string(),
-        profile.to_string(),
-        "stop".to_string(),
-    ];
-    args.extend(services.iter().cloned());
-    args
-}
-
-fn compose_rm_args(
-    compose_file: &Path,
-    profile: MonitoringProfile,
-    services: &[String],
-) -> Vec<String> {
-    let mut args = vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().to_string(),
-        "--profile".to_string(),
-        profile.to_string(),
-        "rm".to_string(),
-        "-f".to_string(),
-    ];
-    args.extend(services.iter().cloned());
-    args
 }

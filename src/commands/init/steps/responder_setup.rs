@@ -120,18 +120,19 @@ pub(super) fn apply_responder_compose_override(
     override_path: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    let compose_str = compose_file.to_string_lossy();
+    let override_str = override_path.to_string_lossy();
     let args = [
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().to_string(),
-        "-f".to_string(),
-        override_path.to_string_lossy().to_string(),
-        "up".to_string(),
-        "-d".to_string(),
-        RESPONDER_SERVICE_NAME.to_string(),
+        "compose",
+        "-f",
+        &*compose_str,
+        "-f",
+        &*override_str,
+        "up",
+        "-d",
+        RESPONDER_SERVICE_NAME,
     ];
-    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_docker(&args_ref, "docker compose responder override", messages)?;
+    run_docker(&args, "docker compose responder override", messages)?;
     Ok(())
 }
 

@@ -19,15 +19,24 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
         0
     };
 
+    let compose_str = args.compose_file.to_string_lossy();
+    let svc_refs: Vec<&str> = args.services.iter().map(String::as_str).collect();
+
     if loaded_archives == 0 {
-        let pull_args = compose_pull_args(&args.compose_file, &args.services);
-        let pull_args_ref: Vec<&str> = pull_args.iter().map(String::as_str).collect();
-        run_docker(&pull_args_ref, "docker compose pull", messages)?;
+        let mut pull_args: Vec<&str> = vec![
+            "compose",
+            "-f",
+            &compose_str,
+            "pull",
+            "--ignore-pull-failures",
+        ];
+        pull_args.extend(&svc_refs);
+        run_docker(&pull_args, "docker compose pull", messages)?;
     }
 
-    let compose_args = compose_up_args(&args.compose_file, &args.services);
-    let compose_args_ref: Vec<&str> = compose_args.iter().map(String::as_str).collect();
-    run_docker(&compose_args_ref, "docker compose up", messages)?;
+    let mut up_args: Vec<&str> = vec!["compose", "-f", &compose_str, "up", "-d"];
+    up_args.extend(&svc_refs);
+    run_docker(&up_args, "docker compose up", messages)?;
 
     if let Some(path) = args.openbao_unseal_from_file.as_deref() {
         auto_unseal_openbao(path, &args.openbao_url, messages)?;
@@ -36,9 +45,13 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
     let readiness = collect_readiness(&args.compose_file, &args.services, messages)?;
 
     for entry in &readiness {
-        let update_args = docker_update_args(&args.restart_policy, &entry.container_id);
-        let update_args_ref: Vec<&str> = update_args.iter().map(String::as_str).collect();
-        run_docker(&update_args_ref, "docker update", messages)?;
+        let update_args = [
+            "update",
+            "--restart",
+            &*args.restart_policy,
+            &*entry.container_id,
+        ];
+        run_docker(&update_args, "docker update", messages)?;
     }
 
     print_readiness_summary(&readiness, messages);
@@ -246,39 +259,6 @@ fn is_image_archive(path: &Path) -> bool {
     name.to_ascii_lowercase().ends_with(".tar.gz")
 }
 
-fn compose_pull_args(compose_file: &Path, services: &[String]) -> Vec<String> {
-    let mut args = vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().to_string(),
-        "pull".to_string(),
-        "--ignore-pull-failures".to_string(),
-    ];
-    args.extend(services.iter().cloned());
-    args
-}
-
-fn compose_up_args(compose_file: &Path, services: &[String]) -> Vec<String> {
-    let mut args = vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().to_string(),
-        "up".to_string(),
-        "-d".to_string(),
-    ];
-    args.extend(services.iter().cloned());
-    args
-}
-
-fn docker_update_args(restart_policy: &str, container_id: &str) -> Vec<String> {
-    vec![
-        "update".to_string(),
-        "--restart".to_string(),
-        restart_policy.to_string(),
-        container_id.to_string(),
-    ]
-}
-
 pub(crate) fn run_docker(args: &[&str], context: &str, messages: &Messages) -> Result<()> {
     let status = ProcessCommand::new("docker")
         .args(args)
@@ -317,8 +297,6 @@ fn docker_output(args: &[&str], messages: &Messages) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     #[test]
@@ -331,50 +309,6 @@ mod tests {
         assert!(is_image_archive(Path::new("image.TAR.GZ")));
         assert!(!is_image_archive(Path::new("image.zip")));
         assert!(!is_image_archive(Path::new("image")));
-    }
-
-    #[test]
-    fn test_compose_up_args_includes_services() {
-        let compose_file = PathBuf::from("compose.yml");
-        let services = vec!["openbao".to_string(), "postgres".to_string()];
-        let args = compose_up_args(&compose_file, &services);
-        assert_eq!(
-            args,
-            vec![
-                "compose",
-                "-f",
-                "compose.yml",
-                "up",
-                "-d",
-                "openbao",
-                "postgres"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_docker_update_args() {
-        let args = docker_update_args("always", "container123");
-        assert_eq!(args, vec!["update", "--restart", "always", "container123"]);
-    }
-
-    #[test]
-    fn test_compose_pull_args_includes_services() {
-        let compose_file = PathBuf::from("docker-compose.yml");
-        let services = vec!["openbao".to_string(), "postgres".to_string()];
-        let args = compose_pull_args(&compose_file, &services);
-        assert_eq!(
-            args,
-            vec![
-                "compose",
-                "-f",
-                "docker-compose.yml",
-                "pull",
-                "--ignore-pull-failures",
-                "openbao",
-                "postgres"
-            ]
-        );
     }
 
     #[test]
