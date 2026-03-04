@@ -101,26 +101,28 @@ pub(super) fn change_stepca_passphrase(
     let mount_root = fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let mount = format!("{}:/home/step", mount_root.display());
+    let key_container = to_container_path(secrets_dir, key_path, "/home/step")?;
+    let pwd_container = to_container_path(secrets_dir, current_password, "/home/step")?;
+    let new_pwd_container = to_container_path(secrets_dir, new_password, "/home/step")?;
     let args = vec![
-        "run".to_string(),
-        "--user".to_string(),
-        "root".to_string(),
-        "--rm".to_string(),
-        "-v".to_string(),
-        mount,
-        "smallstep/step-ca".to_string(),
-        "step".to_string(),
-        "crypto".to_string(),
-        "change-pass".to_string(),
-        to_container_path(secrets_dir, key_path, "/home/step")?,
-        "--password-file".to_string(),
-        to_container_path(secrets_dir, current_password, "/home/step")?,
-        "--new-password-file".to_string(),
-        to_container_path(secrets_dir, new_password, "/home/step")?,
-        "-f".to_string(),
+        "run",
+        "--user",
+        "root",
+        "--rm",
+        "-v",
+        &*mount,
+        "smallstep/step-ca",
+        "step",
+        "crypto",
+        "change-pass",
+        &*key_container,
+        "--password-file",
+        &*pwd_container,
+        "--new-password-file",
+        &*new_pwd_container,
+        "-f",
     ];
-    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_docker(&args_ref, "docker step-ca change-pass", messages)?;
+    run_docker(&args, "docker step-ca change-pass", messages)?;
     Ok(())
 }
 

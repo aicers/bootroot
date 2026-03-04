@@ -152,32 +152,31 @@ pub(super) fn ensure_step_ca_initialized(
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let mount = format!("{}:/home/step", mount_root.display());
     let args = vec![
-        "run".to_string(),
-        "--user".to_string(),
-        "root".to_string(),
-        "--rm".to_string(),
-        "-v".to_string(),
-        mount,
-        "smallstep/step-ca".to_string(),
-        "step".to_string(),
-        "ca".to_string(),
-        "init".to_string(),
-        "--name".to_string(),
-        DEFAULT_CA_NAME.to_string(),
-        "--provisioner".to_string(),
-        DEFAULT_CA_PROVISIONER.to_string(),
-        "--dns".to_string(),
-        DEFAULT_CA_DNS.to_string(),
-        "--address".to_string(),
-        DEFAULT_CA_ADDRESS.to_string(),
-        "--password-file".to_string(),
-        "/home/step/password.txt".to_string(),
-        "--provisioner-password-file".to_string(),
-        "/home/step/password.txt".to_string(),
-        "--acme".to_string(),
+        "run",
+        "--user",
+        "root",
+        "--rm",
+        "-v",
+        &*mount,
+        "smallstep/step-ca",
+        "step",
+        "ca",
+        "init",
+        "--name",
+        DEFAULT_CA_NAME,
+        "--provisioner",
+        DEFAULT_CA_PROVISIONER,
+        "--dns",
+        DEFAULT_CA_DNS,
+        "--address",
+        DEFAULT_CA_ADDRESS,
+        "--password-file",
+        "/home/step/password.txt",
+        "--provisioner-password-file",
+        "/home/step/password.txt",
+        "--acme",
     ];
-    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_docker(&args_ref, "docker step-ca init", messages)?;
+    run_docker(&args, "docker step-ca init", messages)?;
     Ok(StepCaInitResult::Initialized)
 }
 
