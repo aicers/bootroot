@@ -81,6 +81,8 @@ pub(super) async fn rotate_stepca_password(
     restart_compose_service(&ctx.compose_file, "step-ca", messages)?;
 
     println!("{}", messages.rotate_summary_title());
+    // CodeQL flags this as cleartext-logging, but `password_path` is a file
+    // path, not the password value. Dismiss as false positive.
     println!(
         "{}",
         messages.rotate_summary_stepca_password(&password_path.display().to_string())
