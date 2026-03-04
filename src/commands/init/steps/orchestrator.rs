@@ -6,12 +6,10 @@ use bootroot::db::parse_db_dsn;
 use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 
-use super::super::constants::openbao_constants::{
-    POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER, POLICY_BOOTROOT_RUNTIME_ROTATE,
-    POLICY_BOOTROOT_RUNTIME_SERVICE_ADD, POLICY_BOOTROOT_STEPCA,
-};
 use super::super::paths::{compose_has_responder, resolve_responder_url};
-use super::super::types::{DbCheckStatus, InitPlan, InitSummary};
+use super::super::types::{
+    AppRoleLabel, DbCheckStatus, InitPlan, InitSummary, OpenBaoConfigResult,
+};
 use super::InitRollback;
 use super::database::{check_db_connectivity, resolve_db_dsn_for_init};
 use super::openbao_setup::{
@@ -28,7 +26,7 @@ use super::stepca_setup::{
     ensure_step_ca_initialized, update_ca_json_with_backup, write_password_file_with_backup,
     write_stepca_templates,
 };
-use crate::cli::args::InitArgs;
+use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
 use crate::commands::guardrails::ensure_postgres_localhost_binding;
 use crate::commands::infra::ensure_infra_ready;
@@ -112,7 +110,7 @@ async fn run_init_inner(
     if overwrite_state {
         confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
     }
-    if args.db_provision {
+    if args.has_feature(InitFeature::DbProvision) {
         confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
     }
 
@@ -120,7 +118,7 @@ async fn run_init_inner(
     let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
     let db_info = parse_db_dsn(&secrets.db_dsn)
         .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-    let db_check = if args.db_check {
+    let db_check = if args.has_feature(InitFeature::DbCheck) {
         check_db_connectivity(
             &db_info,
             &secrets.db_dsn,
@@ -133,8 +131,10 @@ async fn run_init_inner(
         DbCheckStatus::Skipped
     };
 
-    let (role_outputs, _policies, approles) =
-        configure_openbao(client, args, &secrets, rollback, messages).await?;
+    let OpenBaoConfigResult {
+        role_outputs,
+        approles,
+    } = configure_openbao(client, args, &secrets, rollback, messages).await?;
 
     let secrets_dir = args.secrets_dir.secrets_dir.clone();
     rollback.password_backup = Some(
@@ -202,7 +202,7 @@ async fn run_init_inner(
         openbao_url: args.openbao.openbao_url.clone(),
         kv_mount: args.openbao.kv_mount.clone(),
         secrets_dir: args.secrets_dir.secrets_dir.clone(),
-        show_secrets: args.show_secrets,
+        show_secrets: args.has_feature(InitFeature::ShowSecrets),
         init_response: bootstrap.init_response.is_some(),
         root_token: bootstrap.root_token,
         unseal_keys: bootstrap.unseal_keys,
@@ -240,27 +240,7 @@ pub(super) fn write_state_file(
     } else {
         BTreeMap::new()
     };
-    let policy_map = [
-        (
-            "bootroot_agent".to_string(),
-            POLICY_BOOTROOT_AGENT.to_string(),
-        ),
-        (
-            "responder".to_string(),
-            POLICY_BOOTROOT_RESPONDER.to_string(),
-        ),
-        ("stepca".to_string(), POLICY_BOOTROOT_STEPCA.to_string()),
-        (
-            "runtime_service_add".to_string(),
-            POLICY_BOOTROOT_RUNTIME_SERVICE_ADD.to_string(),
-        ),
-        (
-            "runtime_rotate".to_string(),
-            POLICY_BOOTROOT_RUNTIME_ROTATE.to_string(),
-        ),
-    ]
-    .into_iter()
-    .collect::<BTreeMap<_, _>>();
+    let policy_map = AppRoleLabel::policy_map();
     let state = StateFile {
         openbao_url: openbao_url.to_string(),
         kv_mount: kv_mount.to_string(),

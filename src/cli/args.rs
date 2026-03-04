@@ -300,19 +300,22 @@ pub(crate) struct RotateForceReissueArgs {
     pub(crate) service_name: String,
 }
 
-// All fields are independent CLI flags for controlling rotation phases.
-#[allow(clippy::struct_excessive_bools)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RotateSkipPhase {
+    /// Skip service certificate re-issuance (Phase 5)
+    Reissue,
+    /// Skip trust finalization (Phase 6)
+    Finalize,
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct RotateCaKeyArgs {
     /// Rotate both root and intermediate CA keys (full rotation)
     #[arg(long)]
     pub(crate) full: bool,
-    /// Skip service certificate re-issuance (Phase 5)
-    #[arg(long)]
-    pub(crate) skip_reissue: bool,
-    /// Skip trust finalization (Phase 6)
-    #[arg(long)]
-    pub(crate) skip_finalize: bool,
+    /// Skip specific rotation phases
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub(crate) skip: Vec<RotateSkipPhase>,
     /// Force finalization even with un-migrated services
     #[arg(long)]
     pub(crate) force: bool,
@@ -401,9 +404,27 @@ pub(crate) struct MonitoringDownArgs {
     pub(crate) reset_grafana_admin_password: bool,
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitFeature {
+    /// Auto-generate secrets where possible
+    AutoGenerate,
+    /// Show secrets in output summaries
+    ShowSecrets,
+    /// Provision `PostgreSQL` role/database for step-ca
+    DbProvision,
+    /// Validate DB DSN connectivity and auth
+    DbCheck,
+    /// Auto-issue ACME EAB via step-ca
+    EabAuto,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitSkipPhase {
+    /// Skip HTTP-01 responder check during init
+    ResponderCheck,
+}
+
 #[derive(Args, Debug)]
-#[allow(clippy::struct_excessive_bools)]
-// CLI flags intentionally expose independent toggles for init behavior.
 pub(crate) struct InitArgs {
     #[command(flatten)]
     pub(crate) openbao: OpenBaoArgs,
@@ -414,13 +435,13 @@ pub(crate) struct InitArgs {
     #[command(flatten)]
     pub(crate) compose: ComposeFileArgs,
 
-    /// Auto-generate secrets where possible
-    #[arg(long)]
-    pub(crate) auto_generate: bool,
+    /// Enable optional features
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub(crate) enable: Vec<InitFeature>,
 
-    /// Show secrets in output summaries
-    #[arg(long)]
-    pub(crate) show_secrets: bool,
+    /// Skip optional checks
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub(crate) skip: Vec<InitSkipPhase>,
 
     /// Path to init summary JSON file
     #[arg(long = "summary-json")]
@@ -445,10 +466,6 @@ pub(crate) struct InitArgs {
     #[arg(long)]
     pub(crate) db_dsn: Option<String>,
 
-    /// Provision `PostgreSQL` role/database for step-ca
-    #[arg(long)]
-    pub(crate) db_provision: bool,
-
     #[command(flatten)]
     pub(crate) db_admin: DbAdminDsnArgs,
 
@@ -464,10 +481,6 @@ pub(crate) struct InitArgs {
     #[arg(long, env = "BOOTROOT_DB_NAME")]
     pub(crate) db_name: Option<String>,
 
-    /// Validate DB DSN connectivity and auth
-    #[arg(long)]
-    pub(crate) db_check: bool,
-
     #[command(flatten)]
     pub(crate) db_timeout: DbTimeoutArgs,
 
@@ -479,17 +492,9 @@ pub(crate) struct InitArgs {
     #[arg(long, env = "HTTP01_RESPONDER_URL")]
     pub(crate) responder_url: Option<String>,
 
-    /// Skip HTTP-01 responder check during init
-    #[arg(long)]
-    pub(crate) skip_responder_check: bool,
-
     /// HTTP-01 responder request timeout (seconds)
     #[arg(long, default_value_t = 5)]
     pub(crate) responder_timeout_secs: u64,
-
-    /// Auto-issue ACME EAB via step-ca
-    #[arg(long)]
-    pub(crate) eab_auto: bool,
 
     /// step-ca URL for EAB issuance
     #[arg(long, default_value = DEFAULT_STEPCA_URL)]
@@ -506,6 +511,16 @@ pub(crate) struct InitArgs {
     /// ACME EAB HMAC (optional)
     #[arg(long, env = "EAB_HMAC")]
     pub(crate) eab_hmac: Option<String>,
+}
+
+impl InitArgs {
+    pub(crate) fn has_feature(&self, feature: InitFeature) -> bool {
+        self.enable.contains(&feature)
+    }
+
+    pub(crate) fn has_skip(&self, phase: InitSkipPhase) -> bool {
+        self.skip.contains(&phase)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -630,7 +645,8 @@ mod tests {
             "bootroot",
             "rotate",
             "ca-key",
-            "--skip-reissue",
+            "--skip",
+            "reissue",
             "--force",
             "--cleanup",
         ]);
@@ -638,8 +654,8 @@ mod tests {
             CliCommand::Rotate(args) => match args.command {
                 RotateCommand::CaKey(ca) => {
                     assert!(!ca.full);
-                    assert!(ca.skip_reissue);
-                    assert!(!ca.skip_finalize);
+                    assert!(ca.skip.contains(&RotateSkipPhase::Reissue));
+                    assert!(!ca.skip.contains(&RotateSkipPhase::Finalize));
                     assert!(ca.force);
                     assert!(ca.cleanup);
                 }

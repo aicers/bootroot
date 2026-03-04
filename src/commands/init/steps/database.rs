@@ -10,7 +10,7 @@ use bootroot::db::{
 use super::super::constants::{DEFAULT_DB_NAME, DEFAULT_DB_USER, SECRET_BYTES};
 use super::DbDsnNormalization;
 use super::prompts::{prompt_text, prompt_text_with_default};
-use crate::cli::args::InitArgs;
+use crate::cli::args::{InitArgs, InitFeature};
 use crate::commands::guardrails::is_single_host_db_host;
 use crate::i18n::Messages;
 
@@ -20,10 +20,10 @@ pub(super) async fn resolve_db_dsn_for_init(
     args: &InitArgs,
     messages: &Messages,
 ) -> Result<(String, DbDsnNormalization)> {
-    if args.db_provision && args.db_dsn.is_some() {
+    if args.has_feature(InitFeature::DbProvision) && args.db_dsn.is_some() {
         anyhow::bail!(messages.error_db_provision_conflict());
     }
-    if args.db_provision {
+    if args.has_feature(InitFeature::DbProvision) {
         let inputs = resolve_db_provision_inputs(args, messages)?;
         let admin = parse_db_dsn(&inputs.admin_dsn)
             .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
@@ -116,7 +116,7 @@ fn resolve_db_provision_inputs(args: &InitArgs, messages: &Messages) -> Result<D
     };
     let db_password = if let Some(value) = args.db_password.clone() {
         value
-    } else if args.auto_generate {
+    } else if args.has_feature(InitFeature::AutoGenerate) {
         bootroot::utils::generate_secret(SECRET_BYTES)
             .with_context(|| messages.error_generate_secret_failed())?
     } else {
@@ -339,7 +339,7 @@ mod tests {
         let admin_password = format!("admin-{nonce}");
         let db_password = format!("step-{nonce}");
         let mut args = default_init_args();
-        args.db_provision = true;
+        args.enable.push(InitFeature::DbProvision);
         args.db_admin.admin_dsn = Some(format!(
             "postgresql://admin:{admin_password}@localhost:5432/postgres?sslmode=disable"
         ));
@@ -367,7 +367,7 @@ mod tests {
         let admin_password = format!("admin-{nonce}");
         let db_password = format!("step-{nonce}");
         let mut args = default_init_args();
-        args.db_provision = true;
+        args.enable.push(InitFeature::DbProvision);
         args.db_admin.admin_dsn = Some(format!(
             "postgresql://admin:{admin_password}@localhost:5432/postgres?sslmode=disable"
         ));
@@ -390,7 +390,7 @@ mod tests {
         let db_password = format!("step-{nonce}");
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://user:pass@localhost/db".to_string());
-        args.db_provision = true;
+        args.enable.push(InitFeature::DbProvision);
         args.db_admin.admin_dsn = Some(format!(
             "postgresql://admin:{admin_password}@localhost:5432/postgres?sslmode=disable"
         ));

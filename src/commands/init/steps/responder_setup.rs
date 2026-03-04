@@ -12,7 +12,7 @@ use super::super::constants::{
 use super::super::paths::{ResponderPaths, compose_has_responder};
 use super::super::types::ResponderCheck;
 use super::InitSecrets;
-use crate::cli::args::InitArgs;
+use crate::cli::args::{InitArgs, InitSkipPhase};
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::infra::run_docker;
 use crate::i18n::Messages;
@@ -141,7 +141,7 @@ pub(super) async fn verify_responder(
     messages: &Messages,
     secrets: &InitSecrets,
 ) -> Result<ResponderCheck> {
-    if args.skip_responder_check {
+    if args.has_skip(InitSkipPhase::ResponderCheck) {
         return Ok(ResponderCheck::Skipped);
     }
     let Some(responder_url) = responder_url else {

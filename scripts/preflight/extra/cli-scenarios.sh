@@ -73,14 +73,13 @@ run_init_scenario() {
 
   log "Running bootroot init"
   BOOTROOT_LANG=en printf "y\ny\nn\n" | cargo run --bin bootroot -- init \
-    --auto-generate \
-    --show-secrets \
+    --enable auto-generate,show-secrets \
     --summary-json "$INIT_SUMMARY_JSON" \
     --http-hmac "dev-hmac" \
     --stepca-password "$stepca_password" \
     --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
     --responder-url "http://localhost:8080" \
-    --skip-responder-check | tee "$ROOT_DIR/tmp/cli-init.log"
+    --skip responder-check | tee "$ROOT_DIR/tmp/cli-init.log"
 
   if [ ! -f "$INIT_SUMMARY_JSON" ]; then
     fail "Init summary JSON not found: $INIT_SUMMARY_JSON"

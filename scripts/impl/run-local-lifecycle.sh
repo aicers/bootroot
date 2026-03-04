@@ -376,8 +376,7 @@ run_bootstrap_chain() {
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$INIT_SUMMARY_JSON" \
-    --auto-generate \
-    --show-secrets \
+    --enable auto-generate,show-secrets \
     --stepca-url "$STEPCA_EAB_URL" \
     --stepca-provisioner "admin" \
     --stepca-password "password" \
@@ -725,7 +724,7 @@ run_rotations_with_verification() {
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
-    ca-key --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1
+    ca-key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
   wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
@@ -742,7 +741,7 @@ run_rotations_with_verification() {
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
-    ca-key --full --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1
+    ca-key --full --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
   wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services

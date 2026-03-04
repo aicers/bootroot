@@ -265,8 +265,7 @@ run_bootstrap_chain() {
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$INIT_SUMMARY_JSON" \
-    --auto-generate \
-    --show-secrets \
+    --enable auto-generate,show-secrets \
     --stepca-url "$STEPCA_EAB_URL" \
     --stepca-provisioner "acme" \
     --stepca-password "password" \

@@ -2713,17 +2713,17 @@ async fn test_rotate_ca_key_skip_reissue_skips_phase_5() {
             support::ROOT_TOKEN,
             "--yes",
             "ca-key",
-            "--skip-reissue",
-            "--skip-finalize",
+            "--skip",
+            "reissue,finalize",
         ])
         .output()
-        .expect("run rotate ca-key --skip-reissue --skip-finalize");
+        .expect("run rotate ca-key --skip reissue,finalize");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "should succeed with --skip-reissue --skip-finalize; stdout:\n{stdout}\nstderr:\n{stderr}"
+        "should succeed with --skip reissue,finalize; stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     // Phase 5 skipped — service cert should remain untouched
     assert!(
@@ -3001,8 +3001,8 @@ async fn test_rotate_ca_key_full_mode_4_fingerprints() {
             "--yes",
             "ca-key",
             "--full",
-            "--skip-reissue",
-            "--skip-finalize",
+            "--skip",
+            "reissue,finalize",
             "--cleanup",
         ])
         .env("PATH", &combined_path)
