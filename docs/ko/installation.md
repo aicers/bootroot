@@ -121,7 +121,7 @@ postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=<mode>
 주입하는 방식을 권장합니다.
 
 참고: DB 비밀번호 자동 생성은 `bootroot init`에서
-`--db-provision`과 `--auto-generate`를 함께 사용할 때만 적용됩니다.
+`--enable db-provision,auto-generate`를 함께 사용할 때만 적용됩니다.
 `--db-dsn` 경로에서는 DSN에 포함된 비밀번호를 그대로 사용합니다.
 
 `.env`에는 다음처럼 입력합니다(예시):
@@ -314,7 +314,7 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 5. bootroot 초기화:
 
    ```bash
-   bootroot init --auto-generate \
+   bootroot init --enable auto-generate \
      --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable"
    ```
 

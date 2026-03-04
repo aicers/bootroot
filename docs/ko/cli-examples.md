@@ -52,11 +52,11 @@ bootroot 인프라 기동: 완료
 >   초기화 후 생성된 `root token`/`unseal keys`를 사용
 > - OpenBao가 **초기화되었지만 언실되지 않았다면** `unseal keys` 필요
 > - DB DSN은 반드시 필요 (`--db-dsn` 또는 DB 프로비저닝 옵션)
-> - step-ca 비밀번호는 `--auto-generate`로 자동 생성 가능
+> - step-ca 비밀번호는 `--enable auto-generate`로 자동 생성 가능
 > - `--responder-url`을 주면 responder 검증을 수행 (없으면 스킵)
 
 ```bash
-bootroot init --auto-generate \
+bootroot init --enable auto-generate \
   --summary-json ./tmp/init-summary.json \
   --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
   --responder-url "http://localhost:8080"

@@ -123,8 +123,9 @@ same value. In production, replace it with a strong password. In production
 we recommend injecting this DB password via a Secret Manager.
 
 Note: automatic DB password generation applies only when `bootroot init` runs
-with both `--db-provision` and `--auto-generate`. In the `--db-dsn` path, the
-password embedded in the DSN is used as-is.
+with both `--enable db-provision` and `--enable auto-generate` (or combined as
+`--enable db-provision,auto-generate`). In the `--db-dsn` path, the password
+embedded in the DSN is used as-is.
 
 Example `.env`:
 
@@ -304,7 +305,7 @@ will be discarded.**
 5. Initialize bootroot:
 
    ```bash
-   bootroot init --auto-generate \
+   bootroot init --enable auto-generate \
      --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable"
    ```
 

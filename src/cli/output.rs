@@ -491,7 +491,7 @@ fn print_init_secrets(summary: &InitSummary, messages: &Messages) {
         }
     }
 
-    // codeql[rust/cleartext-logging]: secrets can be shown intentionally via --show-secrets.
+    // codeql[rust/cleartext-logging]: secrets can be shown intentionally via --enable show-secrets.
     println!(
         "{}",
         messages.summary_stepca_password(&display_secret(
@@ -563,7 +563,7 @@ fn print_approles(summary: &InitSummary, messages: &Messages) {
     println!("{}", messages.summary_approles());
     for role in &summary.approles {
         println!("  - {} ({})", role.label, role.role_name);
-        // codeql[rust/cleartext-logging]: secrets can be shown intentionally via --show-secrets.
+        // codeql[rust/cleartext-logging]: secrets can be shown intentionally via --enable show-secrets.
         println!(
             "{}",
             messages.summary_role_id(&display_secret(&role.role_id, summary.show_secrets))
