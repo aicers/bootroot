@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-
 use bootroot::fs_util;
 use tokio::fs;
 
@@ -350,10 +349,9 @@ fn replace_key_line_in_section(
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use super::super::resolve::ResolvedServiceAdd;
     use super::*;
     use crate::state::{DeliveryMode, DeployType};
-
-    use super::super::resolve::ResolvedServiceAdd;
 
     fn test_resolved() -> ResolvedServiceAdd {
         ResolvedServiceAdd {

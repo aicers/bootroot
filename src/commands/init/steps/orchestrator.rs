@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-
 use bootroot::db::parse_db_dsn;
 use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;

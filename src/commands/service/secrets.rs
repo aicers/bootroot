@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-
 use bootroot::openbao::OpenBaoClient;
 
 use super::resolve::ResolvedServiceAdd;
@@ -230,9 +229,8 @@ fn is_valid_sha256_fingerprint(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::i18n::Messages;
-
     use super::*;
+    use crate::i18n::Messages;
 
     fn test_messages() -> Messages {
         Messages::new("en").expect("valid language")
