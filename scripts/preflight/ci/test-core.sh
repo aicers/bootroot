@@ -61,13 +61,12 @@ cargo run --bin bootroot -- infra up
 # --- CLI Init ---
 echo "[test-core] CLI init (smoke)"
 BOOTROOT_LANG=en printf "y\ny\ny\nn\n" | cargo run --bin bootroot -- init \
-  --auto-generate \
-  --show-secrets \
+  --enable auto-generate,show-secrets \
   --http-hmac "dev-hmac" \
   --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
   --secrets-dir "$BOOTROOT_SECRETS_DIR" \
   --responder-url "http://localhost:8080" \
-  --skip-responder-check | tee cli-init.log
+  --skip responder-check | tee cli-init.log
 
 ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' cli-init.log)"
 if [ -z "${ROOT_TOKEN:-}" ]; then

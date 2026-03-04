@@ -12,7 +12,7 @@ use super::{
     INTERMEDIATE_CA_COMMON_NAME, OPENBAO_AGENT_RESPONDER_CONTAINER, OPENBAO_AGENT_STEPCA_CONTAINER,
     ROOT_CA_COMMON_NAME, RotateContext,
 };
-use crate::cli::args::{RotateCaKeyArgs, RotateForceReissueArgs};
+use crate::cli::args::{RotateCaKeyArgs, RotateForceReissueArgs, RotateSkipPhase};
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
     compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
@@ -215,7 +215,7 @@ pub(super) async fn rotate_ca_key(
     }
 
     // Phase 5 — Re-issue service certificates
-    if start_phase < 5 && !args.skip_reissue {
+    if start_phase < 5 && !args.skip.contains(&RotateSkipPhase::Reissue) {
         println!("{}", messages.rotate_ca_key_phase_reissue());
 
         let new_inter_cert_path = ctx.paths.intermediate_cert();
@@ -251,7 +251,7 @@ pub(super) async fn rotate_ca_key(
     }
 
     // Phase 6 — Finalize trust (subtractive)
-    if start_phase < 6 && !args.skip_finalize {
+    if start_phase < 6 && !args.skip.contains(&RotateSkipPhase::Finalize) {
         println!("{}", messages.rotate_ca_key_phase_finalize());
 
         let new_inter_cert_path = ctx.paths.intermediate_cert();

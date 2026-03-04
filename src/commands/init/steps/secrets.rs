@@ -7,7 +7,7 @@ use super::super::constants::{DEFAULT_EAB_ENDPOINT_PATH, SECRET_BYTES};
 use super::super::types::EabCredentials;
 use super::prompts::{prompt_text, prompt_yes_no};
 use super::{InitRollback, InitSecrets};
-use crate::cli::args::InitArgs;
+use crate::cli::args::{InitArgs, InitFeature};
 use crate::i18n::Messages;
 
 #[derive(serde::Deserialize)]
@@ -26,13 +26,13 @@ pub(super) fn resolve_init_secrets(
     let stepca_password = resolve_secret(
         messages.prompt_stepca_password(),
         args.stepca_password.clone(),
-        args.auto_generate,
+        args.has_feature(InitFeature::AutoGenerate),
         messages,
     )?;
     let http_hmac = resolve_secret(
         messages.prompt_http_hmac(),
         args.http_hmac.clone(),
-        args.auto_generate,
+        args.has_feature(InitFeature::AutoGenerate),
         messages,
     )?;
     let eab = resolve_eab(args, messages)?;
@@ -82,7 +82,7 @@ pub(super) async fn maybe_register_eab(
     if secrets.eab.is_some() {
         return Ok(None);
     }
-    if args.eab_auto {
+    if args.has_feature(InitFeature::EabAuto) {
         let credentials = issue_eab_via_stepca(args, messages)
             .await
             .with_context(|| messages.error_eab_auto_failed())?;

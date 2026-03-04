@@ -489,8 +489,7 @@ run_bootstrap_chain() {
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$INIT_SUMMARY_JSON" \
-    --auto-generate \
-    --show-secrets \
+    --enable auto-generate,show-secrets \
     --stepca-url "$STEPCA_EAB_URL" \
     --stepca-provisioner "admin" \
     --stepca-password "password" \
@@ -561,7 +560,7 @@ scenario_1_phase3_failure() {
   # Run rotation in background so we can stop OpenBao mid-execution.
   # Phase 0 (auth) completes while OpenBao is still up; Phase 1-2 are
   # local-only ops; Phase 3 writes trust to OpenBao and will fail.
-  run_rotate_ca_key --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1 &
+  run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1 &
   local rot_pid=$!
 
   # Wait for Phase 1 to complete (state file appears)
@@ -604,7 +603,7 @@ scenario_1_phase3_failure() {
   stop_service_sidecar_oba
   start_service_sidecar_oba "$SIDECAR_OBA_SERVICE"
 
-  run_rotate_ca_key --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1
+  run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
   wire_stepca_hosts
   run_remote_bootstrap
@@ -627,7 +626,7 @@ scenario_2_phase4_failure() {
 
   # Run rotation in background and kill it after Phase 2+ completes.
   # This simulates a process crash mid-rotation.
-  run_rotate_ca_key --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1 &
+  run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1 &
   local rot_pid=$!
 
   local attempt
@@ -657,7 +656,7 @@ scenario_2_phase4_failure() {
     || fail "S2: unexpected saved phase: $saved_phase (expected 2..6)"
 
   # Resume rotation from the crashed state
-  run_rotate_ca_key --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1
+  run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
   wire_stepca_hosts
   run_remote_bootstrap
@@ -682,7 +681,7 @@ scenario_3_partial_reissuance() {
   # Phase 6 will detect the missing cert as unmigrated and bail.
   rm -f "$CERTS_DIR/${EDGE_SERVICE}.crt" "$CERTS_DIR/${EDGE_SERVICE}.key"
 
-  if run_rotate_ca_key --skip-reissue >>"$RUN_LOG" 2>&1; then
+  if run_rotate_ca_key --skip reissue >>"$RUN_LOG" 2>&1; then
     fail "S3: Expected Phase 6 to bail on unmigrated services"
   fi
 
@@ -725,7 +724,7 @@ scenario_4_finalize_blocked() {
   # Delete a service cert so Phase 6 detects unmigrated services.
   rm -f "$CERTS_DIR/${EDGE_SERVICE}.crt" "$CERTS_DIR/${EDGE_SERVICE}.key"
 
-  if run_rotate_ca_key --skip-reissue 2>"$ARTIFACT_DIR/s4-blocked-stderr.log" >>"$RUN_LOG"; then
+  if run_rotate_ca_key --skip reissue 2>"$ARTIFACT_DIR/s4-blocked-stderr.log" >>"$RUN_LOG"; then
     fail "S4: Expected Phase 6 to block on unmigrated services"
   fi
 
@@ -733,7 +732,7 @@ scenario_4_finalize_blocked() {
     || fail "S4: blocked error should mention $EDGE_SERVICE"
 
   # Re-run with --force → Phase 6 forces despite unmigrated services
-  run_rotate_ca_key --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1
+  run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
   wire_stepca_hosts
   run_remote_bootstrap
@@ -751,11 +750,11 @@ scenario_4_finalize_blocked() {
 scenario_5_trustsync_conflict() {
   log_phase "scenario-5-trustsync"
 
-  # Create active rotation by deleting a cert and running with --skip-reissue
+  # Create active rotation by deleting a cert and running with --skip reissue
   # (Phase 6 bails on the missing cert, leaving rotation-state.json behind).
   rm -f "$CERTS_DIR/${EDGE_SERVICE}.crt" "$CERTS_DIR/${EDGE_SERVICE}.key"
 
-  if run_rotate_ca_key --skip-reissue >>"$RUN_LOG" 2>&1; then
+  if run_rotate_ca_key --skip reissue >>"$RUN_LOG" 2>&1; then
     fail "S5: Expected Phase 6 to bail on unmigrated services"
   fi
 
@@ -779,7 +778,7 @@ scenario_5_trustsync_conflict() {
   # Complete the rotation with --force --cleanup (skip-reissue because
   # there is no running daemon for the Daemon-type service).
   wire_stepca_hosts
-  run_rotate_ca_key --skip-reissue --force --cleanup >>"$RUN_LOG" 2>&1
+  run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
   run_remote_bootstrap
   force_reissue_all_services

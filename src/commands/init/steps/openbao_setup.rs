@@ -6,10 +6,8 @@ use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 
 use super::super::constants::openbao_constants::{
-    APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_RUNTIME_ROTATE,
-    APPROLE_BOOTROOT_RUNTIME_SERVICE_ADD, APPROLE_BOOTROOT_STEPCA, INIT_SECRET_SHARES,
-    INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
-    PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER,
+    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC,
+    PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER,
     POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD, POLICY_BOOTROOT_STEPCA,
     SECRET_ID_TTL, TOKEN_TTL,
 };
@@ -22,7 +20,7 @@ use super::super::paths::{
     OpenBaoAgentPaths, StepCaTemplatePaths, compose_has_openbao, resolve_openbao_agent_addr,
     to_container_path,
 };
-use super::super::types::{AppRoleOutput, EabCredentials};
+use super::super::types::{AppRoleLabel, AppRoleOutput, EabCredentials, OpenBaoConfigResult};
 use super::ca_certs::{compute_ca_bundle_pem, compute_ca_fingerprints};
 use super::prompts::{confirm_overwrite, prompt_text, prompt_unseal_keys};
 use super::{InitBootstrap, InitRollback, InitSecrets};
@@ -140,11 +138,7 @@ pub(super) async fn configure_openbao(
     secrets: &InitSecrets,
     rollback: &mut InitRollback,
     messages: &Messages,
-) -> Result<(
-    Vec<AppRoleOutput>,
-    BTreeMap<String, String>,
-    BTreeMap<String, String>,
-)> {
+) -> Result<OpenBaoConfigResult> {
     client
         .ensure_kv_v2(&args.openbao.kv_mount)
         .await
@@ -169,22 +163,15 @@ pub(super) async fn configure_openbao(
             .with_context(|| messages.error_openbao_policy_write_failed())?;
     }
 
-    let approles = build_approle_map();
-    for (label, role_name) in &approles {
-        let policy_name = match label.as_str() {
-            "bootroot_agent" => POLICY_BOOTROOT_AGENT,
-            "responder" => POLICY_BOOTROOT_RESPONDER,
-            "stepca" => POLICY_BOOTROOT_STEPCA,
-            "runtime_service_add" => POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
-            "runtime_rotate" => POLICY_BOOTROOT_RUNTIME_ROTATE,
-            _ => continue,
-        };
+    for &label in AppRoleLabel::all() {
+        let role_name = label.role_name();
+        let policy_name = label.policy_name();
         if !client
             .approle_exists(role_name)
             .await
             .with_context(|| messages.error_openbao_approle_exists_failed())?
         {
-            rollback.created_approles.push(role_name.clone());
+            rollback.created_approles.push(role_name.to_string());
         }
         client
             .create_approle(
@@ -199,7 +186,8 @@ pub(super) async fn configure_openbao(
     }
 
     let mut role_outputs = Vec::new();
-    for (label, role_name) in &approles {
+    for &label in AppRoleLabel::all() {
+        let role_name = label.role_name();
         let role_id = client
             .read_role_id(role_name)
             .await
@@ -209,12 +197,13 @@ pub(super) async fn configure_openbao(
             .await
             .with_context(|| messages.error_openbao_secret_id_failed())?;
         role_outputs.push(AppRoleOutput {
-            label: label.clone(),
-            role_name: role_name.clone(),
+            label,
+            role_name: role_name.to_string(),
             role_id,
             secret_id,
         });
     }
+    let approles = AppRoleLabel::approle_map();
 
     let mut kv_paths = vec![PATH_STEPCA_PASSWORD, PATH_STEPCA_DB, PATH_RESPONDER_HMAC];
     if secrets.eab.is_some() {
@@ -232,7 +221,10 @@ pub(super) async fn configure_openbao(
 
     write_openbao_secrets_with_retry(client, &args.openbao.kv_mount, secrets, messages).await?;
 
-    Ok((role_outputs, policies, approles))
+    Ok(OpenBaoConfigResult {
+        role_outputs,
+        approles,
+    })
 }
 
 async fn write_openbao_secrets_with_retry(
@@ -442,28 +434,6 @@ path "auth/approle/role/bootroot-service-*/secret-id" {{
     policies
 }
 
-fn build_approle_map() -> BTreeMap<String, String> {
-    let mut approles = BTreeMap::new();
-    approles.insert(
-        "bootroot_agent".to_string(),
-        APPROLE_BOOTROOT_AGENT.to_string(),
-    );
-    approles.insert(
-        "responder".to_string(),
-        APPROLE_BOOTROOT_RESPONDER.to_string(),
-    );
-    approles.insert("stepca".to_string(), APPROLE_BOOTROOT_STEPCA.to_string());
-    approles.insert(
-        "runtime_service_add".to_string(),
-        APPROLE_BOOTROOT_RUNTIME_SERVICE_ADD.to_string(),
-    );
-    approles.insert(
-        "runtime_rotate".to_string(),
-        APPROLE_BOOTROOT_RUNTIME_ROTATE.to_string(),
-    );
-    approles
-}
-
 async fn write_openbao_secrets(
     client: &OpenBaoClient,
     kv_mount: &str,
@@ -561,8 +531,8 @@ async fn write_openbao_agent_files(
     fs_util::ensure_secrets_dir(&stepca_dir).await?;
     fs_util::ensure_secrets_dir(&responder_dir).await?;
 
-    let stepca_role = find_role_output(role_outputs, "stepca", messages)?;
-    let responder_role = find_role_output(role_outputs, "responder", messages)?;
+    let stepca_role = find_role_output(role_outputs, AppRoleLabel::Stepca, messages)?;
+    let responder_role = find_role_output(role_outputs, AppRoleLabel::Responder, messages)?;
 
     let stepca_role_id_path = stepca_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
     let stepca_secret_id_path = stepca_dir.join(OPENBAO_AGENT_SECRET_ID_NAME);
@@ -778,13 +748,15 @@ pub(super) fn apply_openbao_agent_compose_override(
 
 pub(super) fn find_role_output<'a>(
     role_outputs: &'a [AppRoleOutput],
-    label: &str,
+    label: AppRoleLabel,
     messages: &Messages,
 ) -> Result<&'a AppRoleOutput> {
     role_outputs
         .iter()
         .find(|output| output.label == label)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_openbao_role_output_missing(label)))
+        .ok_or_else(|| {
+            anyhow::anyhow!(messages.error_openbao_role_output_missing(&label.to_string()))
+        })
 }
 
 #[cfg(test)]
@@ -797,7 +769,7 @@ mod tests {
         POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
     };
     use super::super::super::paths::resolve_openbao_agent_addr;
-    use super::super::super::types::AppRoleOutput;
+    use super::super::super::types::{AppRoleLabel, AppRoleOutput};
     use super::super::responder_setup::write_responder_files;
     use super::super::stepca_setup::write_stepca_templates;
     use super::super::test_support::test_messages;
@@ -824,13 +796,13 @@ mod tests {
 
         let role_outputs = vec![
             AppRoleOutput {
-                label: "stepca".to_string(),
+                label: AppRoleLabel::Stepca,
                 role_name: "bootroot-stepca-role".to_string(),
                 role_id: "stepca-role-id".to_string(),
                 secret_id: "stepca-secret-id".to_string(),
             },
             AppRoleOutput {
-                label: "responder".to_string(),
+                label: AppRoleLabel::Responder,
                 role_name: "bootroot-responder-role".to_string(),
                 role_id: "responder-role-id".to_string(),
                 secret_id: "responder-secret-id".to_string(),
