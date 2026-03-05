@@ -28,7 +28,13 @@ use crate::config::TrustSettings;
 pub fn build_http_client(trust: &TrustSettings) -> Result<Client> {
     install_crypto_provider();
     if !trust.verify_certificates {
-        // codeql[rust/disabled-certificate-check]: allowed for bootstrap/diagnostics when TLS trust is not yet configured.
+        // CodeQL flags `danger_accept_invalid_certs(true)` as
+        // rust/disabled-certificate-check.  This is intentional: during
+        // initial bootstrap the TLS CA has not yet been provisioned, so
+        // certificate verification cannot succeed.  The caller opts in
+        // explicitly via `verify_certificates = false` in TrustSettings;
+        // once init completes, the flag is set to `true` and this branch
+        // is no longer taken.  Dismiss the alert as a false positive.
         return Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
