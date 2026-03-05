@@ -29,6 +29,18 @@ before generating code.
   * Otherwise use `num_traits` conversions and handle errors explicitly.
 * **Types**:
   * Prefer `enum` over `String` whenever a finite set of values is expected.
+* **Minimizing `clone`**: Avoid unnecessary `clone()` or similar methods
+  (e.g., `to_string()`, `to_owned()`). Performance-critical code must not
+  harbour hidden copies.
+  * **Prefer references and slices**: Use `&str` over `String` and `&[T]`
+    over `Vec<T>` for function parameters and struct field getters. This
+    avoids copies and increases compatibility via deref coercion.
+  * **Defer cloning**: When cloning is unavoidable, call it at the latest
+    possible stage to minimise the scope of copied data and to make the
+    necessity visible.
+  * **Use clone-avoiding idioms**: Prefer `Iterator::cloned()`,
+    `Option::cloned()`, and `Option::as_deref()` over explicit
+    `.map(Clone::clone)` or manual unwrap-and-clone patterns.
 * **Comments**:
   * Delete redundant or "noisy" comments that just describe code syntax.
 * **Documentation (Rustdoc)**:
