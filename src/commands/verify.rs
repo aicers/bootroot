@@ -111,11 +111,11 @@ fn verify_db_connectivity(state: &StateFile, timeout_secs: u64, messages: &Messa
 }
 
 fn resolve_verify_service_name(args: &VerifyArgs, messages: &Messages) -> Result<String> {
-    if let Some(value) = args.service_name.clone() {
+    if let Some(value) = args.service_name.as_deref() {
         if value.trim().is_empty() {
             anyhow::bail!(messages.error_value_required());
         }
-        return Ok(value);
+        return Ok(value.to_string());
     }
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();

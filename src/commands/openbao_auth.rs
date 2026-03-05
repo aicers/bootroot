@@ -20,20 +20,20 @@ pub(crate) fn resolve_runtime_auth(
     messages: &Messages,
 ) -> Result<RuntimeAuthResolved> {
     let approle_role_id = resolve_from_value_or_file(
-        args.approle_role_id.clone(),
+        args.approle_role_id.as_deref(),
         args.approle_role_id_file.as_deref(),
         "AppRole role_id",
     )?;
     let approle_secret_id = resolve_from_value_or_file(
-        args.approle_secret_id.clone(),
+        args.approle_secret_id.as_deref(),
         args.approle_secret_id_file.as_deref(),
         "AppRole secret_id",
     )?;
 
     match args.auth_mode {
         AuthMode::Auto => {
-            if let Some(root_token) = args.root_token.clone() {
-                return Ok(RuntimeAuthResolved::RootToken(root_token));
+            if let Some(root_token) = &args.root_token {
+                return Ok(RuntimeAuthResolved::RootToken(root_token.clone()));
             }
             if let (Some(role_id), Some(secret_id)) = (approle_role_id, approle_secret_id) {
                 return Ok(RuntimeAuthResolved::AppRole { role_id, secret_id });
@@ -47,8 +47,8 @@ pub(crate) fn resolve_runtime_auth(
             );
         }
         AuthMode::Root => {
-            if let Some(root_token) = args.root_token.clone() {
-                return Ok(RuntimeAuthResolved::RootToken(root_token));
+            if let Some(root_token) = &args.root_token {
+                return Ok(RuntimeAuthResolved::RootToken(root_token.clone()));
             }
             if allow_root_prompt {
                 return prompt_root_token(messages).map(RuntimeAuthResolved::RootToken);
@@ -69,20 +69,20 @@ pub(crate) fn resolve_runtime_auth_optional(
     args: &RuntimeAuthArgs,
 ) -> Result<Option<RuntimeAuthResolved>> {
     let approle_role_id = resolve_from_value_or_file(
-        args.approle_role_id.clone(),
+        args.approle_role_id.as_deref(),
         args.approle_role_id_file.as_deref(),
         "AppRole role_id",
     )?;
     let approle_secret_id = resolve_from_value_or_file(
-        args.approle_secret_id.clone(),
+        args.approle_secret_id.as_deref(),
         args.approle_secret_id_file.as_deref(),
         "AppRole secret_id",
     )?;
 
     let auth = match args.auth_mode {
         AuthMode::Auto => {
-            if let Some(root_token) = args.root_token.clone() {
-                Some(RuntimeAuthResolved::RootToken(root_token))
+            if let Some(root_token) = &args.root_token {
+                Some(RuntimeAuthResolved::RootToken(root_token.clone()))
             } else if let (Some(role_id), Some(secret_id)) = (approle_role_id, approle_secret_id) {
                 Some(RuntimeAuthResolved::AppRole { role_id, secret_id })
             } else {
@@ -135,12 +135,12 @@ fn prompt_root_token(messages: &Messages) -> Result<String> {
 }
 
 fn resolve_from_value_or_file(
-    value: Option<String>,
+    value: Option<&str>,
     path: Option<&Path>,
     label: &str,
 ) -> Result<Option<String>> {
     if let Some(value) = value {
-        return Ok(Some(value));
+        return Ok(Some(value.to_string()));
     }
     let Some(path) = path else {
         return Ok(None);

@@ -35,8 +35,8 @@ pub(super) fn resolve_service_add_args(
     let mut output = std::io::stdout().lock();
     let mut prompt = Prompt::new(&mut input, &mut output, messages);
 
-    let service_name = match args.service_name.clone() {
-        Some(value) => value,
+    let service_name = match &args.service_name {
+        Some(value) => value.clone(),
         None => prompt.prompt_with_validation(messages.prompt_service_name(), None, |value| {
             ensure_non_empty(value, messages)
         })?,
@@ -52,15 +52,15 @@ pub(super) fn resolve_service_add_args(
     };
     let delivery_mode = args.delivery_mode.unwrap_or_default();
 
-    let hostname = match args.hostname.clone() {
-        Some(value) => value,
+    let hostname = match &args.hostname {
+        Some(value) => value.clone(),
         None => prompt.prompt_with_validation(messages.prompt_hostname(), None, |value| {
             ensure_non_empty(value, messages)
         })?,
     };
 
-    let domain = match args.domain.clone() {
-        Some(value) => value,
+    let domain = match &args.domain {
+        Some(value) => value.clone(),
         None => prompt.prompt_with_validation(messages.prompt_domain(), None, |value| {
             ensure_non_empty(value, messages)
         })?,
@@ -90,16 +90,16 @@ pub(super) fn resolve_service_add_args(
         messages,
     )?;
 
-    let instance_id = match args.instance_id.clone() {
-        Some(value) => value,
+    let instance_id = match &args.instance_id {
+        Some(value) => value.clone(),
         None => prompt.prompt_with_validation(messages.prompt_instance_id(), None, |value| {
             ensure_non_empty(value, messages)
         })?,
     };
     let container_name = match deploy_type {
         DeployType::Daemon => None,
-        DeployType::Docker => Some(match args.container_name.clone() {
-            Some(value) => value,
+        DeployType::Docker => Some(match &args.container_name {
+            Some(value) => value.clone(),
             None => {
                 prompt.prompt_with_validation(messages.prompt_container_name(), None, |value| {
                     ensure_non_empty(value, messages)

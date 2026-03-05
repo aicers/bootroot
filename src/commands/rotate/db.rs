@@ -30,8 +30,8 @@ pub(super) async fn rotate_db(
     let admin_dsn = resolve_db_admin_dsn(args, messages)?;
     let admin = db::parse_db_dsn(&admin_dsn).with_context(|| messages.error_invalid_db_dsn())?;
     ensure_single_host_db_host(&admin.host, messages)?;
-    let db_password = match args.password.clone() {
-        Some(value) => value,
+    let db_password = match &args.password {
+        Some(value) => value.clone(),
         None => bootroot::utils::generate_secret(SECRET_BYTES)
             .with_context(|| messages.error_generate_secret_failed())?,
     };
@@ -45,13 +45,12 @@ pub(super) async fn rotate_db(
     // "Cannot start a runtime from within a runtime" panic. The postgres
     // crate internally calls block_on, which conflicts with the existing
     // tokio runtime when called from an async context.
-    let admin_dsn_clone = admin_dsn.clone();
     let user_clone = parsed.user.clone();
     let password_clone = db_password.clone();
     let database_clone = parsed.database.clone();
     tokio::task::spawn_blocking(move || {
         db::provision_db_sync(
-            &admin_dsn_clone,
+            &admin_dsn,
             &user_clone,
             &password_clone,
             &database_clone,
@@ -93,8 +92,8 @@ pub(super) async fn rotate_db(
 }
 
 fn resolve_db_admin_dsn(args: &RotateDbArgs, messages: &Messages) -> Result<String> {
-    if let Some(value) = args.admin_dsn.admin_dsn.clone() {
-        return Ok(value);
+    if let Some(value) = &args.admin_dsn.admin_dsn {
+        return Ok(value.clone());
     }
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout();

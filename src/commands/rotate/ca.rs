@@ -96,8 +96,8 @@ pub(super) async fn rotate_ca_key(
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
             old_root_fp: root_fp.clone(),
-            new_root_fp: root_fp.clone(),
-            old_intermediate_fp: current_inter_fp.clone(),
+            new_root_fp: root_fp,
+            old_intermediate_fp: current_inter_fp,
             new_intermediate_fp: String::new(),
             phase: 0,
         }
@@ -503,16 +503,10 @@ pub(super) async fn rotate_trust_sync(
         "{}",
         messages.rotate_summary_trust_sync_global(&fingerprints.join(", "))
     );
-    let service_names: Vec<String> = ctx
-        .state
-        .services
-        .values()
-        .map(|entry| entry.service_name.clone())
-        .collect();
-    for service_name in &service_names {
+    for entry in ctx.state.services.values() {
         println!(
             "{}",
-            messages.rotate_summary_trust_sync_service(service_name)
+            messages.rotate_summary_trust_sync_service(&entry.service_name)
         );
     }
     Ok(())

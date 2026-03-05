@@ -32,8 +32,8 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         None
     };
 
-    if let Some(token) = args.root_token.root_token.clone() {
-        client.set_token(token);
+    if let Some(token) = &args.root_token.root_token {
+        client.set_token(token.clone());
     }
 
     let kv_mount_status = if openbao_ok && args.root_token.root_token.is_some() {
