@@ -26,8 +26,8 @@ pub(super) async fn rotate_responder_hmac(
         messages,
     )?;
 
-    let hmac = match args.hmac.clone() {
-        Some(value) => value,
+    let hmac = match &args.hmac {
+        Some(value) => value.clone(),
         None => bootroot::utils::generate_secret(SECRET_BYTES)
             .with_context(|| messages.error_generate_secret_failed())?,
     };

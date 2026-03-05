@@ -90,8 +90,8 @@ struct DbProvisionInputs {
 }
 
 fn resolve_db_provision_inputs(args: &InitArgs, messages: &Messages) -> Result<DbProvisionInputs> {
-    let admin_dsn = if let Some(value) = args.db_admin.admin_dsn.clone() {
-        value
+    let admin_dsn = if let Some(value) = &args.db_admin.admin_dsn {
+        value.clone()
     } else if let Some(value) = build_admin_dsn_from_env() {
         value
     } else {
@@ -102,20 +102,20 @@ fn resolve_db_provision_inputs(args: &InitArgs, messages: &Messages) -> Result<D
         .clone()
         .or_else(|| env::var("POSTGRES_DB").ok())
         .unwrap_or_else(|| DEFAULT_DB_NAME.to_string());
-    let db_user = if let Some(value) = args.db_user.clone() {
-        value
+    let db_user = if let Some(value) = &args.db_user {
+        value.clone()
     } else {
         let prompt = format!("{} [{}]: ", messages.prompt_db_user(), DEFAULT_DB_USER);
         prompt_text_with_default(&prompt, DEFAULT_DB_USER, messages)?
     };
-    let db_name = if let Some(value) = args.db_name.clone() {
-        value
+    let db_name = if let Some(value) = &args.db_name {
+        value.clone()
     } else {
         let prompt = format!("{} [{}]: ", messages.prompt_db_name(), default_db_name);
         prompt_text_with_default(&prompt, &default_db_name, messages)?
     };
-    let db_password = if let Some(value) = args.db_password.clone() {
-        value
+    let db_password = if let Some(value) = &args.db_password {
+        value.clone()
     } else if args.has_feature(InitFeature::AutoGenerate) {
         bootroot::utils::generate_secret(SECRET_BYTES)
             .with_context(|| messages.error_generate_secret_failed())?
@@ -161,8 +161,8 @@ fn build_admin_dsn_from_env() -> Option<String> {
 }
 
 fn resolve_db_dsn(args: &InitArgs, messages: &Messages) -> Result<String> {
-    if let Some(dsn) = args.db_dsn.clone() {
-        return Ok(dsn);
+    if let Some(dsn) = &args.db_dsn {
+        return Ok(dsn.clone());
     }
     if let Some(dsn) = build_dsn_from_env() {
         return Ok(dsn);

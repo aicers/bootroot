@@ -25,13 +25,13 @@ pub(super) fn resolve_init_secrets(
 ) -> Result<InitSecrets> {
     let stepca_password = resolve_secret(
         messages.prompt_stepca_password(),
-        args.stepca_password.clone(),
+        args.stepca_password.as_deref(),
         args.has_feature(InitFeature::AutoGenerate),
         messages,
     )?;
     let http_hmac = resolve_secret(
         messages.prompt_http_hmac(),
-        args.http_hmac.clone(),
+        args.http_hmac.as_deref(),
         args.has_feature(InitFeature::AutoGenerate),
         messages,
     )?;
@@ -47,12 +47,12 @@ pub(super) fn resolve_init_secrets(
 
 fn resolve_secret(
     label: &str,
-    value: Option<String>,
+    value: Option<&str>,
     auto_generate: bool,
     messages: &Messages,
 ) -> Result<String> {
     if let Some(value) = value {
-        return Ok(value);
+        return Ok(value.to_string());
     }
     if auto_generate {
         return bootroot::utils::generate_secret(SECRET_BYTES)
@@ -195,13 +195,7 @@ mod tests {
     #[test]
     fn test_resolve_secret_prefers_value() {
         let messages = test_messages();
-        let value = resolve_secret(
-            "step-ca password",
-            Some("value".to_string()),
-            false,
-            &messages,
-        )
-        .unwrap();
+        let value = resolve_secret("step-ca password", Some("value"), false, &messages).unwrap();
         assert_eq!(value, "value");
     }
 

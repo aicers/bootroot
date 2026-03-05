@@ -22,8 +22,8 @@ pub(super) async fn rotate_stepca_password(
     auto_confirm: bool,
     messages: &Messages,
 ) -> Result<()> {
-    let new_password = match args.new_password.clone() {
-        Some(value) => value,
+    let new_password = match &args.new_password {
+        Some(value) => value.clone(),
         None => bootroot::utils::generate_secret(SECRET_BYTES)
             .with_context(|| messages.error_generate_secret_failed())?,
     };

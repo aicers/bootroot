@@ -193,7 +193,7 @@ async fn run_init_inner(
     write_state_file(
         &args.openbao.openbao_url,
         &args.openbao.kv_mount,
-        &approles,
+        approles,
         &args.secrets_dir.secrets_dir,
         messages,
     )?;
@@ -228,7 +228,7 @@ async fn run_init_inner(
 pub(super) fn write_state_file(
     openbao_url: &str,
     kv_mount: &str,
-    approles: &BTreeMap<String, String>,
+    approles: BTreeMap<String, String>,
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
@@ -246,10 +246,7 @@ pub(super) fn write_state_file(
         kv_mount: kv_mount.to_string(),
         secrets_dir: Some(secrets_dir.to_path_buf()),
         policies: policy_map,
-        approles: approles
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        approles,
         services: existing_services,
     };
     state
