@@ -41,6 +41,21 @@ before generating code.
   * **Use clone-avoiding idioms**: Prefer `Iterator::cloned()`,
     `Option::cloned()`, and `Option::as_deref()` over explicit
     `.map(Clone::clone)` or manual unwrap-and-clone patterns.
+* **Visibility**: Expose the minimum necessary scope.
+  * Prefer `pub(super)` or `pub(crate)` over `pub`. Use `pub` only for
+    library public APIs exported from `lib.rs`.
+  * When adding a new item, start with the most restrictive visibility and
+    widen only when a compiler error or an explicit design decision requires
+    it.
+* **Imports**:
+  * Do NOT use wildcard imports (`use module::*`). The only exception is
+    `use super::*` inside `#[cfg(test)]` test modules.
+* **Testing**:
+  * Use `tempfile::tempdir()` for tests that need temporary files or
+    directories. Never write to fixed paths.
+  * When tests manipulate environment variables (`env::set_var`), protect
+    them with a shared `Mutex` lock so that parallel test threads do not
+    interfere with each other.
 * **Comments**:
   * Delete redundant or "noisy" comments that just describe code syntax.
 * **Documentation (Rustdoc)**:
