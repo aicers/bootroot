@@ -8,6 +8,7 @@ pub mod fs_util;
 pub mod hooks;
 pub mod openbao;
 pub mod profile;
+pub mod tls;
 pub mod toml_util;
 pub mod utils;
 
