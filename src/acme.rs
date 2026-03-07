@@ -1,5 +1,6 @@
 pub mod client;
 pub mod flow;
+pub mod http01_protocol;
 pub mod responder_client;
 pub mod types;
 

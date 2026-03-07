@@ -8,7 +8,7 @@ use super::resolve::ResolvedServiceAdd;
 use super::{
     CaTrustMaterial, LocalApplyResult, MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX,
     OPENBAO_AGENT_CONFIG_FILENAME, OPENBAO_AGENT_TEMPLATE_FILENAME, OPENBAO_AGENT_TOKEN_FILENAME,
-    OPENBAO_SERVICE_CONFIG_DIR, SERVICE_ROLE_ID_FILENAME, SIDECAR_STATIC_SECRET_RENDER_INTERVAL,
+    OPENBAO_SERVICE_CONFIG_DIR, SERVICE_ROLE_ID_FILENAME,
 };
 use crate::commands::constants::{CA_TRUST_KEY, SERVICE_KV_BASE};
 use crate::i18n::Messages;
@@ -200,43 +200,19 @@ fn render_openbao_agent_config(
     template_path: &Path,
     destination_path: &Path,
 ) -> String {
-    format!(
-        r#"vault {{
-  address = "{openbao_url}"
-}}
-
-auto_auth {{
-  method "approle" {{
-    mount_path = "auth/approle"
-    config = {{
-      role_id_file_path = "{role_id_path}"
-      secret_id_file_path = "{secret_id_path}"
-      remove_secret_id_file_after_reading = false
-    }}
-  }}
-  sink "file" {{
-    config = {{
-      path = "{token_path}"
-    }}
-  }}
-}}
-
-template_config {{
-  static_secret_render_interval = "{SIDECAR_STATIC_SECRET_RENDER_INTERVAL}"
-}}
-
-template {{
-  source = "{template_path}"
-  destination = "{destination_path}"
-  perms = "0600"
-}}
-"#,
-        openbao_url = openbao_url,
-        role_id_path = role_id_path.display(),
-        secret_id_path = secret_id_path.display(),
-        token_path = token_path.display(),
-        template_path = template_path.display(),
-        destination_path = destination_path.display(),
+    let role_id = role_id_path.display().to_string();
+    let secret_id = secret_id_path.display().to_string();
+    let token = token_path.display().to_string();
+    let tpl = template_path.display().to_string();
+    let dest = destination_path.display().to_string();
+    bootroot::openbao::build_agent_config(
+        openbao_url,
+        &role_id,
+        &secret_id,
+        &token,
+        Some("auth/approle"),
+        bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
+        &[(&tpl, &dest)],
     )
 }
 

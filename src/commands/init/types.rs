@@ -98,11 +98,7 @@ pub(crate) enum DbCheckStatus {
     Ok,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct EabCredentials {
-    pub(crate) kid: String,
-    pub(crate) hmac: String,
-}
+pub(crate) type EabCredentials = bootroot::eab::EabCredentials;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct InitSummary {

@@ -132,8 +132,6 @@ pub(crate) struct Strings {
     pub(crate) error_db_auth_task_failed: &'static str,
     pub(crate) error_db_provision_task_failed: &'static str,
     pub(crate) error_stepca_password_missing: &'static str,
-    pub(crate) error_eab_request_failed: &'static str,
-    pub(crate) error_eab_response_parse_failed: &'static str,
     pub(crate) error_openbao_client_create_failed: &'static str,
     pub(crate) error_openbao_health_check_failed: &'static str,
     pub(crate) error_openbao_init_status_failed: &'static str,
@@ -879,14 +877,6 @@ impl Messages {
             self.strings().error_stepca_password_missing,
             &[("value", value)],
         )
-    }
-
-    pub(crate) fn error_eab_request_failed(&self) -> &'static str {
-        self.strings().error_eab_request_failed
-    }
-
-    pub(crate) fn error_eab_response_parse_failed(&self) -> &'static str {
-        self.strings().error_eab_response_parse_failed
     }
 
     pub(crate) fn error_openbao_client_create_failed(&self) -> &'static str {

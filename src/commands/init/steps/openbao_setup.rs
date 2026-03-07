@@ -30,7 +30,7 @@ use crate::commands::infra::run_docker;
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 
-const STATIC_SECRET_RENDER_INTERVAL: &str = "30s";
+const INIT_AGENT_TOKEN_PATH: &str = "/openbao/secrets/openbao/token";
 
 pub(super) async fn bootstrap_openbao(
     client: &mut OpenBaoClient,
@@ -624,46 +624,19 @@ fn build_openbao_agent_config(
     secret_id_path: &str,
     templates: &[(String, String)],
 ) -> String {
-    let mut config = format!(
-        r#"vault {{
-  address = "{openbao_addr}"
-}}
-
-auto_auth {{
-  method "approle" {{
-    config = {{
-      role_id_file_path = "{role_id_path}"
-      secret_id_file_path = "{secret_id_path}"
-      remove_secret_id_file_after_reading = false
-    }}
-  }}
-  sink "file" {{
-    config = {{
-      path = "/openbao/secrets/openbao/token"
-    }}
-  }}
-}}
-
-template_config {{
-  static_secret_render_interval = "{STATIC_SECRET_RENDER_INTERVAL}"
-}}
-"#
-    );
-    for (source_path, destination_path) in templates {
-        use std::fmt::Write as _;
-        write!(
-            &mut config,
-            r#"
-template {{
-  source = "{source_path}"
-  destination = "{destination_path}"
-  perms = "0600"
-}}
-"#
-        )
-        .expect("write template");
-    }
-    config
+    let tpl_refs: Vec<(&str, &str)> = templates
+        .iter()
+        .map(|(s, d)| (s.as_str(), d.as_str()))
+        .collect();
+    bootroot::openbao::build_agent_config(
+        openbao_addr,
+        role_id_path,
+        secret_id_path,
+        INIT_AGENT_TOKEN_PATH,
+        None,
+        bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
+        &tpl_refs,
+    )
 }
 
 async fn write_openbao_agent_compose_override(

@@ -34,7 +34,6 @@ pub(super) const SERVICE_CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
 pub(super) const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
 pub(super) const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 pub(super) const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
-pub(super) const SIDECAR_STATIC_SECRET_RENDER_INTERVAL: &str = "30s";
 
 pub(super) struct ServiceAppRoleMaterialized {
     pub(super) role_name: String,
