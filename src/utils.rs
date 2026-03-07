@@ -24,7 +24,13 @@ pub fn generate_secret(len: usize) -> Result<String> {
 
 /// Retries an operation using the provided backoff delays.
 ///
+/// # Panics
+///
+/// Panics if the internal delay index is out of bounds, which cannot
+/// happen because `attempt` never exceeds `delays.len()`.
+///
 /// # Errors
+///
 /// Returns the final error if all attempts fail.
 pub async fn retry_with_backoff<F, Fut>(delays: &[u64], mut operation: F) -> anyhow::Result<()>
 where
@@ -41,7 +47,10 @@ where
                 if attempt > delays.len() {
                     return Err(err);
                 }
-                let delay = delays[attempt - 1];
+                let delay = delays
+                    .get(attempt - 1)
+                    .copied()
+                    .expect("attempt is within delays.len() bounds");
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
         }

@@ -19,7 +19,7 @@ const ENV_RENEW_ERROR: &str = "RENEW_ERROR";
 const ENV_SERVER_URL: &str = "ACME_SERVER_URL";
 
 #[derive(Debug, Clone, Copy)]
-pub enum HookStatus {
+pub(crate) enum HookStatus {
     Success,
     Failure,
 }
@@ -37,7 +37,7 @@ impl HookStatus {
 ///
 /// # Errors
 /// Returns error when a hook fails and its policy is set to stop.
-pub async fn run_post_renew_hooks(
+pub(crate) async fn run_post_renew_hooks(
     settings: &Settings,
     profile: &DaemonProfileSettings,
     status: HookStatus,
@@ -81,46 +81,41 @@ struct HookContext {
 }
 
 impl HookContext {
-    fn envs(&self, settings: &Settings, profile: &DaemonProfileSettings) -> Vec<(String, String)> {
+    fn envs(
+        &self,
+        settings: &Settings,
+        profile: &DaemonProfileSettings,
+    ) -> Vec<(&'static str, String)> {
         let mut envs = base_envs(settings, profile);
         envs.extend(self.context_envs());
         envs
     }
 
-    fn context_envs(&self) -> Vec<(String, String)> {
+    fn context_envs(&self) -> Vec<(&'static str, String)> {
         vec![
             (
-                ENV_RENEWED_AT.to_string(),
+                ENV_RENEWED_AT,
                 self.renewed_at
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_else(|_| self.renewed_at.to_string()),
             ),
+            (ENV_RENEW_STATUS, self.status.as_str().to_string()),
             (
-                ENV_RENEW_STATUS.to_string(),
-                self.status.as_str().to_string(),
-            ),
-            (
-                ENV_RENEW_ERROR.to_string(),
+                ENV_RENEW_ERROR,
                 self.error_message.clone().unwrap_or_default(),
             ),
         ]
     }
 }
 
-fn base_envs(settings: &Settings, profile: &DaemonProfileSettings) -> Vec<(String, String)> {
+fn base_envs(settings: &Settings, profile: &DaemonProfileSettings) -> Vec<(&'static str, String)> {
     let primary_domain = crate::config::profile_domain(settings, profile);
     vec![
-        (
-            ENV_CERT_PATH.to_string(),
-            profile.paths.cert.display().to_string(),
-        ),
-        (
-            ENV_KEY_PATH.to_string(),
-            profile.paths.key.display().to_string(),
-        ),
-        (ENV_DOMAINS.to_string(), primary_domain.clone()),
-        (ENV_PRIMARY_DOMAIN.to_string(), primary_domain),
-        (ENV_SERVER_URL.to_string(), settings.server.clone()),
+        (ENV_CERT_PATH, profile.paths.cert.display().to_string()),
+        (ENV_KEY_PATH, profile.paths.key.display().to_string()),
+        (ENV_DOMAINS, primary_domain.clone()),
+        (ENV_PRIMARY_DOMAIN, primary_domain),
+        (ENV_SERVER_URL, settings.server.clone()),
     ]
 }
 
@@ -362,12 +357,12 @@ mod tests {
         let envs = super::base_envs(&settings, &profile);
         let domains = envs
             .iter()
-            .find(|(key, _)| key == ENV_DOMAINS)
+            .find(|(key, _)| *key == ENV_DOMAINS)
             .map(|(_, value)| value.as_str())
             .unwrap();
         let primary_domain = envs
             .iter()
-            .find(|(key, _)| key == ENV_PRIMARY_DOMAIN)
+            .find(|(key, _)| *key == ENV_PRIMARY_DOMAIN)
             .map(|(_, value)| value.as_str())
             .unwrap();
 
