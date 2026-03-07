@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use anyhow::{Context, Result};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -720,5 +722,126 @@ impl OpenBaoClient {
             .await
             .context("Failed to read OpenBao response body")?;
         anyhow::bail!("OpenBao API error ({status}): {text}");
+    }
+}
+
+/// Interval at which the `OpenBao` agent re-renders static secrets.
+pub const STATIC_SECRET_RENDER_INTERVAL: &str = "30s";
+
+/// Builds an `OpenBao` agent HCL configuration string.
+///
+/// # Arguments
+///
+/// * `openbao_addr` – Vault/`OpenBao` server address.
+/// * `role_id_path` – Path to the `AppRole` role-ID file.
+/// * `secret_id_path` – Path to the `AppRole` secret-ID file.
+/// * `token_path` – Path where the agent writes its token.
+/// * `mount_path` – Optional auth mount path (e.g. `"auth/approle"`).
+/// * `render_interval` – Value for `static_secret_render_interval`.
+/// * `templates` – `(source, destination)` pairs for template blocks.
+#[must_use]
+pub fn build_agent_config(
+    openbao_addr: &str,
+    role_id_path: &str,
+    secret_id_path: &str,
+    token_path: &str,
+    mount_path: Option<&str>,
+    render_interval: &str,
+    templates: &[(&str, &str)],
+) -> String {
+    let mount_line = match mount_path {
+        Some(mp) => format!("\n    mount_path = \"{mp}\""),
+        None => String::new(),
+    };
+    let mut config = format!(
+        r#"vault {{
+  address = "{openbao_addr}"
+}}
+
+auto_auth {{
+  method "approle" {{{mount_line}
+    config = {{
+      role_id_file_path = "{role_id_path}"
+      secret_id_file_path = "{secret_id_path}"
+      remove_secret_id_file_after_reading = false
+    }}
+  }}
+  sink "file" {{
+    config = {{
+      path = "{token_path}"
+    }}
+  }}
+}}
+
+template_config {{
+  static_secret_render_interval = "{render_interval}"
+}}
+"#
+    );
+    for (source_path, destination_path) in templates {
+        write!(
+            &mut config,
+            r#"
+template {{
+  source = "{source_path}"
+  destination = "{destination_path}"
+  perms = "0600"
+}}
+"#
+        )
+        .expect("write template");
+    }
+    config
+}
+
+#[cfg(test)]
+mod agent_config_tests {
+    use super::*;
+
+    #[test]
+    fn without_mount_path() {
+        let hcl = build_agent_config(
+            "http://openbao:8200",
+            "/role_id",
+            "/secret_id",
+            "/token",
+            None,
+            "30s",
+            &[("/tpl.ctmpl", "/out.toml")],
+        );
+        assert!(hcl.contains(r#"address = "http://openbao:8200""#));
+        assert!(hcl.contains("role_id_file_path = \"/role_id\""));
+        assert!(!hcl.contains("mount_path"));
+        assert!(hcl.contains(r#"static_secret_render_interval = "30s""#));
+        assert!(hcl.contains(r#"source = "/tpl.ctmpl""#));
+    }
+
+    #[test]
+    fn with_mount_path() {
+        let hcl = build_agent_config(
+            "http://openbao:8200",
+            "/role_id",
+            "/secret_id",
+            "/token",
+            Some("auth/approle"),
+            "30s",
+            &[("/tpl.ctmpl", "/out.toml")],
+        );
+        assert!(hcl.contains(r#"mount_path = "auth/approle""#));
+    }
+
+    #[test]
+    fn multiple_templates() {
+        let hcl = build_agent_config(
+            "http://openbao:8200",
+            "/role_id",
+            "/secret_id",
+            "/token",
+            None,
+            "30s",
+            &[("/a.ctmpl", "/a.out"), ("/b.ctmpl", "/b.out")],
+        );
+        assert!(hcl.contains(r#"source = "/a.ctmpl""#));
+        assert!(hcl.contains(r#"source = "/b.ctmpl""#));
     }
 }

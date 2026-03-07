@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
+use bootroot::eab::EabCredentials;
 use bootroot::openbao::OpenBaoClient;
-use reqwest::StatusCode;
 
 use super::RotateContext;
 use super::helpers::confirm_action;
@@ -9,17 +9,7 @@ use crate::commands::constants::{SERVICE_EAB_HMAC_KEY, SERVICE_EAB_KID_KEY, SERV
 use crate::commands::init::PATH_AGENT_EAB;
 use crate::i18n::Messages;
 
-#[derive(Debug, serde::Deserialize)]
-struct EabAutoResponse {
-    kid: String,
-    hmac: String,
-}
-
-#[derive(Debug)]
-struct EabCredentials {
-    kid: String,
-    hmac: String,
-}
+const DEFAULT_EAB_PATH: &str = "eab";
 
 pub(super) async fn rotate_eab(
     ctx: &mut RotateContext,
@@ -30,7 +20,7 @@ pub(super) async fn rotate_eab(
 ) -> Result<()> {
     confirm_action(messages.prompt_rotate_eab(), auto_confirm, messages)?;
 
-    let credentials = issue_eab_via_stepca(args, messages).await?;
+    let credentials = issue_eab(args, messages).await?;
     client
         .write_kv(
             &ctx.kv_mount,
@@ -47,38 +37,14 @@ pub(super) async fn rotate_eab(
     Ok(())
 }
 
-async fn issue_eab_via_stepca(args: &RotateEabArgs, messages: &Messages) -> Result<EabCredentials> {
-    let base = args.stepca_url.trim_end_matches('/');
-    let provisioner = args.stepca_provisioner.trim();
-    let endpoint = format!("{base}/acme/{provisioner}/eab");
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(&endpoint)
-        .send()
-        .await
-        .with_context(|| messages.error_eab_request_failed())?;
-    let response = if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-        client
-            .get(&endpoint)
-            .send()
-            .await
-            .with_context(|| messages.error_eab_request_failed())?
-    } else {
-        response
-    };
-    let response = response
-        .error_for_status()
-        .with_context(|| messages.error_eab_request_failed())?;
-
-    let payload: EabAutoResponse = response
-        .json()
-        .await
-        .with_context(|| messages.error_eab_response_parse_failed())?;
-    Ok(EabCredentials {
-        kid: payload.kid,
-        hmac: payload.hmac,
-    })
+async fn issue_eab(args: &RotateEabArgs, messages: &Messages) -> Result<EabCredentials> {
+    bootroot::eab::issue_eab_via_stepca(
+        &args.stepca_url,
+        &args.stepca_provisioner,
+        DEFAULT_EAB_PATH,
+    )
+    .await
+    .with_context(|| messages.error_eab_auto_failed())
 }
 
 async fn sync_service_eab_payloads(

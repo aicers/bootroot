@@ -98,8 +98,6 @@ pub(super) static STRINGS: Strings = Strings {
     error_db_auth_task_failed: "DB 인증 점검 작업 실패",
     error_db_provision_task_failed: "DB 프로비저닝 작업 실패",
     error_stepca_password_missing: "step-ca 비밀번호 파일을 찾을 수 없습니다: {value}",
-    error_eab_request_failed: "EAB 요청 실패",
-    error_eab_response_parse_failed: "EAB 응답 파싱 실패",
     error_openbao_client_create_failed: "OpenBao 클라이언트 생성 실패",
     error_openbao_health_check_failed: "OpenBao 헬스 체크 실패",
     error_openbao_init_status_failed: "OpenBao 초기화 상태 조회 실패",
