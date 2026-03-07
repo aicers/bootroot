@@ -31,7 +31,7 @@ pub(super) async fn ensure_service_approle(
     client
         .create_approle(
             &role_name,
-            std::slice::from_ref(&policy_name),
+            &[policy_name.as_str()],
             TOKEN_TTL,
             SECRET_ID_TTL,
             true,
