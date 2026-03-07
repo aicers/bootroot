@@ -174,13 +174,7 @@ pub(super) async fn configure_openbao(
             rollback.created_approles.push(role_name.to_string());
         }
         client
-            .create_approle(
-                role_name,
-                &[policy_name.to_string()],
-                TOKEN_TTL,
-                SECRET_ID_TTL,
-                true,
-            )
+            .create_approle(role_name, &[policy_name], TOKEN_TTL, SECRET_ID_TTL, true)
             .await
             .with_context(|| messages.error_openbao_approle_create_failed())?;
     }
