@@ -139,7 +139,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         .secrets_dir
         .secrets_dir
         .clone()
-        .unwrap_or_else(|| state.secrets_dir());
+        .unwrap_or_else(|| state.secrets_dir().to_path_buf());
     let paths = StatePaths::new(secrets_dir.clone());
     let state_dir = state_path
         .parent()

@@ -4,6 +4,7 @@ use anyhow::Context;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tracing::warn;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EabCredentials {
@@ -94,6 +95,7 @@ pub async fn load_credentials(
             serde_json::from_str(&content).context("Failed to parse EAB JSON")?;
 
         if creds.kid.is_empty() || creds.hmac.is_empty() {
+            warn!("EAB file has empty kid or hmac field; treating as no credentials");
             return Ok(None);
         }
 

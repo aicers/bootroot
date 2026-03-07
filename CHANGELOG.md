@@ -33,6 +33,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Log a warning when an EAB JSON file contains empty `kid` or
+  `hmac` fields instead of returning `Ok(None)` silently.
+- Preserve original error chains in filesystem helpers
+  (`fs_util`) by using `with_context` instead of formatting the
+  error into a new string.
 - Fix `bootroot rotate stepca-password` failing with TTY allocation error
   when running in non-interactive environments by adding `-f` flag to `step
   crypto change-pass` command

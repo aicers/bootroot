@@ -42,10 +42,10 @@ impl StateFile {
             .with_context(|| format!("Failed to write {}", path.display()))
     }
 
-    pub(crate) fn secrets_dir(&self) -> PathBuf {
+    pub(crate) fn secrets_dir(&self) -> &Path {
         self.secrets_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_SECRETS_DIR))
+            .as_deref()
+            .unwrap_or(Path::new(DEFAULT_SECRETS_DIR))
     }
 }
 
@@ -111,5 +111,21 @@ mod tests {
         let mode = DeliveryMode::default();
         assert_eq!(mode, DeliveryMode::LocalFile);
         assert_eq!(mode.as_str(), "local-file");
+    }
+
+    #[test]
+    fn delivery_mode_as_str_matches_serde() {
+        for variant in [DeliveryMode::LocalFile, DeliveryMode::RemoteBootstrap] {
+            let serialized = serde_json::to_value(variant)
+                .expect("serialize DeliveryMode")
+                .as_str()
+                .expect("serde value is a string")
+                .to_string();
+            assert_eq!(
+                variant.as_str(),
+                serialized,
+                "as_str() and serde disagree for {variant:?}"
+            );
+        }
     }
 }

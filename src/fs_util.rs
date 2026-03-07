@@ -1,7 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::fs;
 
 const KEY_FILE_MODE: u32 = 0o600;
@@ -14,10 +14,10 @@ const SECRETS_DIR_MODE: u32 = 0o700;
 pub async fn ensure_secrets_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to create secrets dir {}: {e}", path.display()))?;
+        .with_context(|| format!("Failed to create secrets dir {}", path.display()))?;
     fs::set_permissions(path, std::fs::Permissions::from_mode(SECRETS_DIR_MODE))
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to set secrets dir permissions: {e}"))?;
+        .context("Failed to set secrets dir permissions")?;
     Ok(())
 }
 
@@ -28,7 +28,7 @@ pub async fn ensure_secrets_dir(path: &Path) -> Result<()> {
 pub async fn set_key_permissions(path: &Path) -> Result<()> {
     fs::set_permissions(path, std::fs::Permissions::from_mode(KEY_FILE_MODE))
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to set key file permissions: {e}"))?;
+        .context("Failed to set key file permissions")?;
     Ok(())
 }
 
@@ -48,7 +48,7 @@ pub async fn write_cert_and_key(
         .ok_or_else(|| anyhow::anyhow!("Cert path has no parent directory"))?;
     fs::create_dir_all(cert_dir)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to create cert dir {}: {e}", cert_dir.display()))?;
+        .with_context(|| format!("Failed to create cert dir {}", cert_dir.display()))?;
 
     let secrets_dir = key_path
         .parent()
@@ -57,11 +57,11 @@ pub async fn write_cert_and_key(
 
     fs::write(cert_path, cert_pem)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to write cert file: {e}"))?;
+        .context("Failed to write cert file")?;
 
     fs::write(key_path, key_pem)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to write key file: {e}"))?;
+        .context("Failed to write key file")?;
     set_key_permissions(key_path).await?;
 
     Ok(())
@@ -75,15 +75,12 @@ pub async fn write_ca_bundle(bundle_path: &Path, bundle_pem: &str) -> Result<()>
     let bundle_dir = bundle_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("CA bundle path has no parent directory"))?;
-    fs::create_dir_all(bundle_dir).await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to create CA bundle dir {}: {e}",
-            bundle_dir.display()
-        )
-    })?;
+    fs::create_dir_all(bundle_dir)
+        .await
+        .with_context(|| format!("Failed to create CA bundle dir {}", bundle_dir.display()))?;
     fs::write(bundle_path, bundle_pem)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to write CA bundle file: {e}"))?;
+        .context("Failed to write CA bundle file")?;
     Ok(())
 }
 
