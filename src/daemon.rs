@@ -9,7 +9,6 @@ use tracing::{error, info};
 
 use crate::{acme, config, eab, hooks, profile, utils};
 
-pub const MIN_DAEMON_CHECK_DELAY_NANOS: i128 = utils::MIN_JITTER_DELAY_NANOS;
 const DEFAULT_AGENT_CONFIG_PATH: &str = "agent.toml";
 const TRUST_SECTION: &str = "trust";
 const VERIFY_CERTIFICATES_KEY: &str = "verify_certificates";
@@ -68,26 +67,7 @@ pub async fn run_daemon(
     }
 
     let _ = shutdown_handle.await;
-    let mut first_error = None;
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                error!("Profile daemon exited with error: {err}");
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-            Err(err) => {
-                error!("Profile daemon task join error: {err}");
-                if first_error.is_none() {
-                    first_error = Some(anyhow::anyhow!("Profile daemon task join error: {err}"));
-                }
-            }
-        }
-    }
-
-    first_error.map_or(Ok(()), Err)
+    collect_task_results(handles, "daemon").await
 }
 
 async fn run_profile_daemon(
@@ -177,30 +157,34 @@ pub async fn run_oneshot(
         }));
     }
 
+    collect_task_results(handles, "oneshot").await
+}
+
+/// Collects results from spawned task handles, logging errors and
+/// returning the first observed failure.
+async fn collect_task_results(
+    handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    label: &str,
+) -> anyhow::Result<()> {
     let mut first_error = None;
     for handle in handles {
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                error!("Profile oneshot failed: {err}");
+                error!("Profile {label} failed: {err}");
                 if first_error.is_none() {
                     first_error = Some(err);
                 }
             }
             Err(err) => {
-                error!("Profile oneshot task join error: {err}");
+                error!("Profile {label} task join error: {err}");
                 if first_error.is_none() {
-                    first_error = Some(anyhow::anyhow!("Profile task join error: {err}"));
+                    first_error = Some(anyhow::anyhow!("Profile {label} task join error: {err}"));
                 }
             }
         }
     }
-
-    if let Some(err) = first_error {
-        Err(err)
-    } else {
-        Ok(())
-    }
+    first_error.map_or(Ok(()), Err)
 }
 
 async fn run_profile_oneshot(
@@ -214,17 +198,34 @@ async fn run_profile_oneshot(
     let profile_eab = profile::resolve_profile_eab(&profile, default_eab);
     let profile_label = config::profile_domain(&settings, &profile);
 
-    match acme::issue_certificate(&settings, &profile, profile_eab).await {
+    let result = acme::issue_certificate(&settings, &profile, profile_eab).await;
+    handle_issuance_result(&result, &settings, &profile, &profile_label, &hardening).await?;
+    result
+}
+
+/// Dispatches post-issuance hooks and optionally hardens TLS
+/// configuration based on the issuance outcome.
+///
+/// On success: hardens TLS verify, then runs success hooks.
+/// On failure: runs failure hooks.
+async fn handle_issuance_result(
+    result: &anyhow::Result<()>,
+    settings: &config::Settings,
+    profile: &config::DaemonProfileSettings,
+    profile_label: &str,
+    hardening: &HardeningPolicy,
+) -> anyhow::Result<()> {
+    match result {
         Ok(()) => {
             maybe_harden_tls_verify(
-                &settings,
+                settings,
                 &hardening.config_path,
-                &profile_label,
+                profile_label,
                 hardening.insecure_mode,
             )
             .await?;
             if let Err(err) =
-                hooks::run_post_renew_hooks(&settings, &profile, hooks::HookStatus::Success, None)
+                hooks::run_post_renew_hooks(settings, profile, hooks::HookStatus::Success, None)
                     .await
             {
                 error!(
@@ -232,12 +233,11 @@ async fn run_profile_oneshot(
                     profile_label
                 );
             }
-            Ok(())
         }
         Err(err) => {
             if let Err(hook_err) = hooks::run_post_renew_hooks(
-                &settings,
-                &profile,
+                settings,
+                profile,
                 hooks::HookStatus::Failure,
                 Some(err.to_string()),
             )
@@ -248,9 +248,9 @@ async fn run_profile_oneshot(
                     profile_label
                 );
             }
-            Err(err)
         }
     }
+    Ok(())
 }
 
 async fn issue_with_retry(
@@ -303,7 +303,7 @@ fn select_retry_backoff<'a>(
 ///
 /// # Errors
 /// Returns an error if all retries fail.
-pub async fn issue_with_retry_inner<IssueFn, IssueFut, SleepFn, SleepFut>(
+pub(crate) async fn issue_with_retry_inner<IssueFn, IssueFut, SleepFn, SleepFut>(
     mut issue_fn: IssueFn,
     mut sleep_fn: SleepFn,
     delays: &[u64],
@@ -333,7 +333,7 @@ where
 ///
 /// # Errors
 /// Returns an error if the certificate cannot be parsed or read.
-pub async fn should_renew(
+pub(crate) async fn should_renew(
     profile: &config::DaemonProfileSettings,
     renew_before: Duration,
 ) -> anyhow::Result<bool> {
@@ -365,18 +365,13 @@ pub async fn should_renew(
 ///
 /// # Errors
 /// Returns an error if the certificate cannot be parsed.
-pub fn parse_cert_not_after(cert_bytes: &[u8]) -> anyhow::Result<time::OffsetDateTime> {
+pub(crate) fn parse_cert_not_after(cert_bytes: &[u8]) -> anyhow::Result<time::OffsetDateTime> {
     let pem = x509_parser::pem::parse_x509_pem(cert_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to parse PEM certificate: {e}"))?
         .1;
     let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
         .map_err(|e| anyhow::anyhow!("Failed to parse X509 certificate: {e}"))?;
     Ok(cert.validity().not_after.to_datetime())
-}
-
-#[must_use]
-pub fn jittered_delay_with_seed(base: Duration, jitter: Duration, now_ns: i128) -> Duration {
-    utils::jittered_delay_with_seed(base, jitter, now_ns)
 }
 
 async fn check_and_renew_profile(
@@ -389,65 +384,34 @@ async fn check_and_renew_profile(
     hardening: &HardeningPolicy,
 ) -> anyhow::Result<()> {
     tracing::debug!("Profile '{}' checking renewal status...", profile_label);
-    match should_renew(profile, renew_before).await {
-        Ok(true) => {
-            info!(
-                "Profile '{}' renewal required. Starting ACME issuance...",
-                profile_label
-            );
-            let _permit = semaphore.acquire().await?;
-            let profile_eab = profile::resolve_profile_eab(profile, default_eab);
-            match issue_with_retry(settings, profile, profile_eab, &hardening.config_path).await {
-                Ok(()) => {
-                    maybe_harden_tls_verify(
-                        settings,
-                        &hardening.config_path,
-                        profile_label,
-                        hardening.insecure_mode,
-                    )
-                    .await?;
-                    if let Err(err) = hooks::run_post_renew_hooks(
-                        settings,
-                        profile,
-                        hooks::HookStatus::Success,
-                        None,
-                    )
-                    .await
-                    {
-                        error!(
-                            "Post-renew success hooks failed for '{}': {err}",
-                            profile_label
-                        );
-                    }
-                }
-                Err(err) => {
-                    error!(
-                        "Profile '{}' renewal failed after retries: {err}",
-                        profile_label
-                    );
-                    if let Err(hook_err) = hooks::run_post_renew_hooks(
-                        settings,
-                        profile,
-                        hooks::HookStatus::Failure,
-                        Some(err.to_string()),
-                    )
-                    .await
-                    {
-                        error!(
-                            "Post-renew failure hooks failed for '{}': {hook_err}",
-                            profile_label
-                        );
-                    }
-                }
-            }
-        }
-        Ok(false) => {
-            tracing::debug!("Profile '{}' certificate still valid.", profile_label);
-        }
+
+    let needs_renewal = match should_renew(profile, renew_before).await {
+        Ok(val) => val,
         Err(err) => {
             error!("Profile '{}' renewal check failed: {err}", profile_label);
+            return Ok(());
         }
+    };
+
+    if !needs_renewal {
+        tracing::debug!("Profile '{}' certificate still valid.", profile_label);
+        return Ok(());
     }
+
+    info!(
+        "Profile '{}' renewal required. Starting ACME issuance...",
+        profile_label
+    );
+    let _permit = semaphore.acquire().await?;
+    let profile_eab = profile::resolve_profile_eab(profile, default_eab);
+    let result = issue_with_retry(settings, profile, profile_eab, &hardening.config_path).await;
+    if let Err(err) = &result {
+        error!(
+            "Profile '{}' renewal failed after retries: {err}",
+            profile_label
+        );
+    }
+    handle_issuance_result(&result, settings, profile, profile_label, hardening).await?;
     Ok(())
 }
 
@@ -567,19 +531,27 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::config::{
         AcmeSettings, DaemonRuntimeSettings, Paths, RetrySettings, SchedulerSettings,
     };
 
-    fn build_profile() -> config::DaemonProfileSettings {
+    const TEST_DOMAIN: &str = "example.com";
+    const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;
+    const TEST_DELAYS: [u64; 3] = [1, 2, 3];
+    const TEST_JITTER_SECS: u64 = 10;
+    const TEST_BASE_SECS: u64 = 60;
+    const TEST_SEED_NS: i128 = 123_456_789;
+
+    fn build_profile(cert_path: PathBuf) -> config::DaemonProfileSettings {
         config::DaemonProfileSettings {
             service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
             paths: Paths {
-                cert: PathBuf::from("unused.pem"),
+                cert: cert_path,
                 key: PathBuf::from("unused.key"),
             },
             daemon: DaemonRuntimeSettings {
@@ -621,10 +593,20 @@ mod tests {
         }
     }
 
+    fn write_cert(cert_path: &PathBuf, not_after: time::OffsetDateTime) {
+        let mut params = rcgen::CertificateParams::new(vec![TEST_DOMAIN.to_string()]).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = not_after;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        fs::write(cert_path, cert.pem()).unwrap();
+    }
+
     #[test]
     fn test_select_retry_backoff_uses_profile_override() {
         let settings = build_settings(vec![5, 10, 30]);
-        let mut profile = build_profile();
+        let mut profile = build_profile(PathBuf::from("unused.pem"));
         profile.retry = Some(RetrySettings {
             backoff_secs: vec![1, 2],
         });
@@ -637,7 +619,7 @@ mod tests {
     #[test]
     fn test_select_retry_backoff_falls_back_to_global() {
         let settings = build_settings(vec![5, 10, 30]);
-        let profile = build_profile();
+        let profile = build_profile(PathBuf::from("unused.pem"));
 
         let selected = select_retry_backoff(&settings, &profile);
 
@@ -862,5 +844,225 @@ trusted_ca_sha256 = ["aa11"]
         let provided = PathBuf::from("/tmp/custom-agent.toml");
         let resolved = resolve_config_path(Some(&provided));
         assert_eq!(resolved, provided);
+    }
+
+    #[test]
+    fn test_jittered_delay_zero_jitter_returns_base() {
+        let base = Duration::from_secs(TEST_BASE_SECS);
+        let jitter = Duration::from_secs(0);
+
+        let delay = crate::utils::jittered_delay_with_seed(base, jitter, TEST_SEED_NS);
+
+        assert_eq!(delay, base);
+    }
+
+    #[test]
+    fn test_jittered_delay_bounds() {
+        let base = Duration::from_secs(TEST_BASE_SECS);
+        let jitter = Duration::from_secs(TEST_JITTER_SECS);
+        let delay = crate::utils::jittered_delay_with_seed(base, jitter, TEST_SEED_NS);
+
+        let min = base.saturating_sub(jitter);
+        let max = base + jitter;
+
+        assert!(delay >= min);
+        assert!(delay <= max);
+    }
+
+    #[test]
+    fn test_jittered_delay_minimum_floor() {
+        let base = Duration::from_secs(2);
+        let jitter = Duration::from_secs(10);
+        let delay = crate::utils::jittered_delay_with_seed(base, jitter, 0);
+
+        let min =
+            Duration::from_nanos(u64::try_from(crate::utils::MIN_JITTER_DELAY_NANOS).unwrap());
+        let max = base + jitter;
+
+        assert!(delay >= min);
+        assert!(delay <= max);
+    }
+
+    #[tokio::test]
+    async fn test_should_renew_when_missing_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("missing.pem");
+        let profile = build_profile(cert_path);
+
+        let renew = should_renew(&profile, Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        assert!(renew);
+    }
+
+    #[tokio::test]
+    async fn test_should_renew_when_far_from_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("valid.pem");
+        let profile = build_profile(cert_path.clone());
+
+        let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(90);
+        write_cert(&cert_path, not_after);
+
+        let renew = should_renew(&profile, Duration::from_secs(THIRTY_DAYS_SECS))
+            .await
+            .unwrap();
+
+        assert!(!renew);
+    }
+
+    #[tokio::test]
+    async fn test_should_renew_when_near_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("expiring.pem");
+        let profile = build_profile(cert_path.clone());
+
+        let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(1);
+        write_cert(&cert_path, not_after);
+
+        let renew = should_renew(&profile, Duration::from_secs(THIRTY_DAYS_SECS))
+            .await
+            .unwrap();
+
+        assert!(renew);
+    }
+
+    #[tokio::test]
+    async fn test_should_renew_invalid_pem_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("invalid.pem");
+        fs::write(&cert_path, "not a cert").unwrap();
+        let profile = build_profile(cert_path);
+
+        let err = should_renew(&profile, Duration::from_secs(THIRTY_DAYS_SECS))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Failed to parse PEM certificate"));
+    }
+
+    #[test]
+    fn test_parse_cert_not_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("parse.pem");
+        let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(10);
+        write_cert(&cert_path, not_after);
+        let cert_bytes = fs::read(cert_path).unwrap();
+
+        let parsed = parse_cert_not_after(&cert_bytes).unwrap();
+
+        assert_eq!(parsed.unix_timestamp(), not_after.unix_timestamp());
+    }
+
+    #[tokio::test]
+    async fn test_should_renew_rejects_large_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("valid.pem");
+        let profile = build_profile(cert_path.clone());
+
+        let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(90);
+        write_cert(&cert_path, not_after);
+
+        let err = should_renew(&profile, Duration::MAX).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("renew_before duration is too large")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_with_retry_succeeds_after_retries() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+
+        let attempts_issue = Arc::clone(&attempts);
+        let issue_fn = move || {
+            let attempts_inner = Arc::clone(&attempts_issue);
+            async move {
+                let mut guard = attempts_inner.lock().unwrap();
+                *guard += 1;
+                if *guard < 3 {
+                    anyhow::bail!("transient failure");
+                }
+                Ok(())
+            }
+        };
+
+        let sleeps_log = Arc::clone(&sleeps);
+        let sleep_fn = move |duration: Duration| {
+            let sleeps_inner = Arc::clone(&sleeps_log);
+            async move {
+                sleeps_inner.lock().unwrap().push(duration);
+            }
+        };
+
+        let ok = issue_with_retry_inner(issue_fn, sleep_fn, &TEST_DELAYS).await;
+
+        assert!(ok.is_ok());
+        assert_eq!(*attempts.lock().unwrap(), 3);
+        assert_eq!(
+            *sleeps.lock().unwrap(),
+            vec![Duration::from_secs(1), Duration::from_secs(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_with_retry_gives_up() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+
+        let attempts_issue = Arc::clone(&attempts);
+        let issue_fn = move || {
+            let attempts_inner = Arc::clone(&attempts_issue);
+            async move {
+                let mut guard = attempts_inner.lock().unwrap();
+                *guard += 1;
+                anyhow::bail!("persistent failure");
+            }
+        };
+
+        let sleeps_log = Arc::clone(&sleeps);
+        let sleep_fn = move |duration: Duration| {
+            let sleeps_inner = Arc::clone(&sleeps_log);
+            async move {
+                sleeps_inner.lock().unwrap().push(duration);
+            }
+        };
+
+        let ok = issue_with_retry_inner(issue_fn, sleep_fn, &TEST_DELAYS).await;
+
+        assert!(ok.is_err());
+        assert_eq!(*attempts.lock().unwrap(), 3);
+        assert_eq!(
+            *sleeps.lock().unwrap(),
+            vec![Duration::from_secs(1), Duration::from_secs(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_task_results_returns_ok_when_all_succeed() {
+        let handles = vec![
+            tokio::spawn(async { Ok(()) }),
+            tokio::spawn(async { Ok(()) }),
+        ];
+
+        let result = collect_task_results(handles, "test").await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_collect_task_results_returns_first_error() {
+        let handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = vec![
+            tokio::spawn(async { anyhow::bail!("first failure") }),
+            tokio::spawn(async { anyhow::bail!("second failure") }),
+        ];
+
+        let result = collect_task_results(handles, "test").await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("first failure"));
     }
 }
