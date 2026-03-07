@@ -21,6 +21,14 @@ const CONTENT_TYPE_JOSE_JSON: &str = "application/jose+json";
 const HEADER_REPLAY_NONCE: &str = "replay-nonce";
 const SCHEME_HTTP: &str = "http";
 const SCHEME_HTTPS: &str = "https";
+
+/// Length of an uncompressed P-256 public key: 1-byte prefix + two
+/// 32-byte coordinates.
+const EC_P256_UNCOMPRESSED_LEN: usize = 65;
+/// Prefix byte indicating an uncompressed EC point (SEC 1, §2.3.3).
+const EC_UNCOMPRESSED_PREFIX: u8 = 0x04;
+/// Length of a single P-256 coordinate (32 bytes for a 256-bit curve).
+const EC_P256_COORD_LEN: usize = 32;
 #[derive(Debug, Deserialize, Clone)]
 struct Directory {
     #[serde(rename = "newNonce")]
@@ -31,7 +39,7 @@ struct Directory {
     order: String,
 }
 
-pub struct AcmeClient {
+pub(crate) struct AcmeClient {
     client: Client,
     directory_url: String,
     directory: Option<Directory>,
@@ -48,7 +56,7 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if account key generation fails or HTTP client build fails.
-    pub fn new(
+    pub(crate) fn new(
         directory_url: String,
         settings: &AcmeSettings,
         trust: &TrustSettings,
@@ -82,7 +90,7 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if the directory fetch or JSON parsing fails.
-    pub async fn fetch_directory(&mut self) -> Result<()> {
+    pub(crate) async fn fetch_directory(&mut self) -> Result<()> {
         if self.directory.is_some() {
             return Ok(());
         }
@@ -126,7 +134,7 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if the nonce request fails or the response is missing a nonce.
-    pub async fn get_nonce(&mut self) -> Result<String> {
+    pub(crate) async fn get_nonce(&mut self) -> Result<String> {
         if let Some(nonce) = self.nonce.take() {
             return Ok(nonce);
         }
@@ -152,7 +160,7 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if ACME API fails or EAB data is invalid.
-    pub async fn register_account(
+    pub(crate) async fn register_account(
         &mut self,
         contact: &[String],
         eab_creds: Option<&EabCredentials>,
@@ -176,15 +184,8 @@ impl AcmeClient {
         }
 
         info!("Registering account...");
-        let resp = self.post(&url, &payload).await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!(
-                "Account registration failed: {status} - {text}"
-            ));
-        }
+        let resp = self.signed_post(&url, Some(&payload)).await?;
+        let resp = check_response(resp, "Account registration").await?;
 
         let kid = resp
             .headers()
@@ -203,7 +204,7 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if ACME API fails.
-    pub async fn create_order(&mut self, domains: &[String]) -> Result<Order> {
+    pub(crate) async fn create_order(&mut self, domains: &[String]) -> Result<Order> {
         self.fetch_directory().await?;
         let url = self
             .directory
@@ -229,13 +230,8 @@ impl AcmeClient {
         });
 
         info!("Creating new order for domains: {:?}", domains);
-        let resp = self.post(&url, &payload).await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!("Order creation failed: {status} - {text}"));
-        }
+        let resp = self.signed_post(&url, Some(&payload)).await?;
+        let resp = check_response(resp, "Order creation").await?;
 
         let order_url = resp
             .headers()
@@ -252,15 +248,9 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if network fails or status is not success.
-    pub async fn fetch_authorization(&mut self, url: &str) -> Result<Authorization> {
-        let resp = self.post_as_get(url).await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!("Fetch Authz failed: {status} - {text}"));
-        }
-
+    pub(crate) async fn fetch_authorization(&mut self, url: &str) -> Result<Authorization> {
+        let resp = self.signed_post::<()>(url, None).await?;
+        let resp = check_response(resp, "Fetch authorization").await?;
         let authz: Authorization = resp.json().await?;
         Ok(authz)
     }
@@ -269,7 +259,7 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if JWK construction or serialization fails.
-    pub fn compute_key_authorization(&self, token: &str) -> Result<String> {
+    pub(crate) fn compute_key_authorization(&self, token: &str) -> Result<String> {
         let jwk = self.jwk()?;
 
         let mut map = std::collections::BTreeMap::new();
@@ -293,19 +283,11 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if network fails.
-    pub async fn trigger_challenge(&mut self, url: &str) -> Result<()> {
+    pub(crate) async fn trigger_challenge(&mut self, url: &str) -> Result<()> {
         info!("Triggering challenge at {}", url);
         let payload = serde_json::json!({});
-        let resp = self.post(url, &payload).await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!(
-                "Trigger challenge failed: {status} - {text}"
-            ));
-        }
-
+        let resp = self.signed_post(url, Some(&payload)).await?;
+        check_response(resp, "Trigger challenge").await?;
         Ok(())
     }
 
@@ -313,21 +295,15 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if finalize call fails.
-    pub async fn finalize_order(&mut self, url: &str, csr_der: &[u8]) -> Result<Order> {
+    pub(crate) async fn finalize_order(&mut self, url: &str, csr_der: &[u8]) -> Result<Order> {
         let csr_b64 = Self::b64(csr_der);
         let payload = serde_json::json!({
             "csr": csr_b64
         });
 
         info!("Finalizing order...");
-        let resp = self.post(url, &payload).await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!("Finalize failed: {status} - {text}"));
-        }
-
+        let resp = self.signed_post(url, Some(&payload)).await?;
+        let resp = check_response(resp, "Finalize order").await?;
         let order: Order = resp.json().await?;
         Ok(order)
     }
@@ -336,13 +312,9 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if download fails.
-    pub async fn download_certificate(&mut self, url: &str) -> Result<String> {
-        let resp = self.post_as_get(url).await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!("Download cert failed: {status} - {text}"));
-        }
+    pub(crate) async fn download_certificate(&mut self, url: &str) -> Result<String> {
+        let resp = self.signed_post::<()>(url, None).await?;
+        let resp = check_response(resp, "Download certificate").await?;
         let cert_pem = resp.text().await?;
         Ok(cert_pem)
     }
@@ -351,13 +323,9 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if poll request fails.
-    pub async fn poll_order(&mut self, url: &str) -> Result<Order> {
-        let resp = self.post_as_get(url).await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!("Poll order failed: {status} - {text}"));
-        }
+    pub(crate) async fn poll_order(&mut self, url: &str) -> Result<Order> {
+        let resp = self.signed_post::<()>(url, None).await?;
+        let resp = check_response(resp, "Poll order").await?;
         let order: Order = resp.json().await?;
         Ok(order)
     }
@@ -366,12 +334,12 @@ impl AcmeClient {
         let pk = self.key_pair.public_key();
         let pk_bytes = pk.as_ref();
 
-        if pk_bytes.len() != 65 || pk_bytes[0] != 0x04 {
+        if pk_bytes.len() != EC_P256_UNCOMPRESSED_LEN || pk_bytes[0] != EC_UNCOMPRESSED_PREFIX {
             return Err(anyhow::anyhow!("Unexpected public key format"));
         }
 
-        let x = &pk_bytes[1..33];
-        let y = &pk_bytes[33..65];
+        let x = &pk_bytes[1..=EC_P256_COORD_LEN];
+        let y = &pk_bytes[1 + EC_P256_COORD_LEN..EC_P256_UNCOMPRESSED_LEN];
 
         Ok(Jwk {
             kty: KTY_EC.to_string(),
@@ -470,28 +438,19 @@ impl AcmeClient {
         Ok(jws_body)
     }
 
-    async fn post<T: Serialize + ?Sized>(
+    async fn signed_post<T: Serialize + ?Sized>(
         &mut self,
         url: &str,
-        payload: &T,
+        payload: Option<&T>,
     ) -> Result<reqwest::Response> {
         let url = Self::enforce_https(url)?;
-        let body = self.sign_request(&url, Some(payload)).await?;
-        debug!("POST {} body: {}", url, body);
-        let resp = self
-            .client
-            .post(url)
-            .header("Content-Type", CONTENT_TYPE_JOSE_JSON)
-            .json(&body)
-            .send()
-            .await?;
-        Ok(resp)
-    }
-
-    async fn post_as_get(&mut self, url: &str) -> Result<reqwest::Response> {
-        let url = Self::enforce_https(url)?;
-        let body = self.sign_request::<()>(&url, None).await?;
-        debug!("POST-as-GET {} body: {}", url, body);
+        let body = self.sign_request(&url, payload).await?;
+        let label = if payload.is_some() {
+            "POST"
+        } else {
+            "POST-as-GET"
+        };
+        debug!("{label} {url} body: {body}");
         let resp = self
             .client
             .post(url)
@@ -515,6 +474,20 @@ impl AcmeClient {
             "Refusing to send ACME request over non-HTTPS URL: {parsed}"
         ))
     }
+}
+
+/// Checks an HTTP response status and returns the response on success.
+///
+/// # Errors
+/// Returns error with context message if the response status is not
+/// successful.
+async fn check_response(resp: reqwest::Response, context: &str) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let text = resp.text().await?;
+    Err(anyhow::anyhow!("{context} failed: {status} - {text}"))
 }
 
 fn decode_eab_key(encoded: &str) -> Result<Vec<u8>> {
@@ -958,5 +931,258 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("Poll order failed"));
+    }
+
+    #[tokio::test]
+    async fn test_check_response_returns_response_on_success() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("all good"))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/ok", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        let resp = check_response(resp, "test ok").await.unwrap();
+        assert_eq!(resp.text().await.unwrap(), "all good");
+    }
+
+    #[tokio::test]
+    async fn test_check_response_returns_error_on_failure() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/fail"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/fail", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        let err = check_response(resp, "test fail").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("test fail failed"));
+        assert!(msg.contains("403"));
+        assert!(msg.contains("forbidden"));
+    }
+
+    mod trust {
+        use std::net::SocketAddr;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use anyhow::{Context, Result};
+        use rcgen::generate_simple_self_signed;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::task::JoinHandle;
+        use tokio_rustls::TlsAcceptor;
+
+        use super::*;
+
+        struct TlsTestServer {
+            addr: SocketAddr,
+            cert_der: Vec<u8>,
+            cert_pem: String,
+            handle: JoinHandle<()>,
+        }
+
+        impl TlsTestServer {
+            fn url(&self) -> String {
+                format!("https://localhost:{}", self.addr.port())
+            }
+        }
+
+        async fn start_tls_server() -> Result<TlsTestServer> {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let rcgen::CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed(vec!["localhost".to_string()])
+                    .context("generate self-signed cert")?;
+            let cert_der = cert.der().to_vec();
+            let cert_pem = cert.pem();
+            let key_der = signing_key.serialize_der();
+
+            let config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![rustls::pki_types::CertificateDer::from(cert_der.clone())],
+                    rustls::pki_types::PrivateKeyDer::from(
+                        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+                    ),
+                )
+                .context("build tls config")?;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.context("bind tcp")?;
+            let addr = listener.local_addr().context("local addr")?;
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut stream) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        let mut buffer = [0u8; 4096];
+                        let read = match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(value) => value,
+                        };
+                        let request = String::from_utf8_lossy(&buffer[..read]);
+                        let path = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let body = if path == "/directory" {
+                            let base = format!("https://localhost:{}", addr.port());
+                            format!(
+                                r#"{{"newNonce":"{base}/nonce","newAccount":"{base}/account","newOrder":"{base}/order"}}"#
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let status = if path == "/directory" {
+                            "200 OK"
+                        } else {
+                            "404 Not Found"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            });
+
+            Ok(TlsTestServer {
+                addr,
+                cert_der,
+                cert_pem,
+                handle,
+            })
+        }
+
+        fn trust_test_settings() -> AcmeSettings {
+            AcmeSettings {
+                directory_fetch_attempts: 1,
+                directory_fetch_base_delay_secs: 0,
+                directory_fetch_max_delay_secs: 0,
+                poll_attempts: 1,
+                poll_interval_secs: 1,
+                http_responder_url: "http://localhost:8080".to_string(),
+                http_responder_hmac: "dev-hmac".to_string(),
+                http_responder_timeout_secs: 5,
+                http_responder_token_ttl_secs: 300,
+            }
+        }
+
+        fn sha256_hex(bytes: &[u8]) -> String {
+            let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+            let mut output = String::with_capacity(digest.as_ref().len() * 2);
+            for byte in digest.as_ref() {
+                use std::fmt::Write;
+                write!(output, "{byte:02x}").expect("hex write");
+            }
+            output
+        }
+
+        fn write_ca_bundle(cert_pem: &str, dir: &tempfile::TempDir) -> Result<PathBuf> {
+            let path = dir.path().join("ca-bundle.pem");
+            std::fs::write(&path, cert_pem).context("write bundle")?;
+            Ok(path)
+        }
+
+        #[tokio::test]
+        async fn allows_insecure_when_disabled() -> Result<()> {
+            let server = start_tls_server().await?;
+            let trust = TrustSettings {
+                verify_certificates: false,
+                ..TrustSettings::default()
+            };
+            let mut client = AcmeClient::new(
+                format!("{}/directory", server.url()),
+                &trust_test_settings(),
+                &trust,
+            )?;
+            client.fetch_directory().await?;
+            server.handle.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn rejects_self_signed_without_trust() -> Result<()> {
+            let server = start_tls_server().await?;
+            let trust = TrustSettings {
+                verify_certificates: true,
+                ..TrustSettings::default()
+            };
+            let mut client = AcmeClient::new(
+                format!("{}/directory", server.url()),
+                &trust_test_settings(),
+                &trust,
+            )?;
+            assert!(client.fetch_directory().await.is_err());
+            server.handle.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn accepts_bundle_and_pin() -> Result<()> {
+            let server = start_tls_server().await?;
+            let dir = tempfile::tempdir().context("tempdir")?;
+            let bundle_path = write_ca_bundle(&server.cert_pem, &dir)?;
+            let trust = TrustSettings {
+                verify_certificates: true,
+                ca_bundle_path: Some(bundle_path),
+                trusted_ca_sha256: vec![sha256_hex(&server.cert_der)],
+            };
+
+            let mut client = AcmeClient::new(
+                format!("{}/directory", server.url()),
+                &trust_test_settings(),
+                &trust,
+            )?;
+            client.fetch_directory().await?;
+            server.handle.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn rejects_pin_mismatch() -> Result<()> {
+            let server = start_tls_server().await?;
+            let dir = tempfile::tempdir().context("tempdir")?;
+            let bundle_path = write_ca_bundle(&server.cert_pem, &dir)?;
+            let trust = TrustSettings {
+                verify_certificates: true,
+                ca_bundle_path: Some(bundle_path),
+                trusted_ca_sha256: vec!["00".repeat(32)],
+            };
+
+            let mut client = AcmeClient::new(
+                format!("{}/directory", server.url()),
+                &trust_test_settings(),
+                &trust,
+            )?;
+            assert!(client.fetch_directory().await.is_err());
+            server.handle.abort();
+            Ok(())
+        }
     }
 }
