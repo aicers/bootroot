@@ -6,7 +6,6 @@ use bootroot::fs_util;
 
 use super::{OPENBAO_AGENT_CONTAINER_PREFIX, RENDERED_FILE_POLL_INTERVAL, RotateContext};
 use crate::cli::prompt::Prompt;
-use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::infra::run_docker;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry};
@@ -147,11 +146,7 @@ pub(super) async fn wait_for_rendered_file(
     }
 }
 
-pub(super) fn compose_has_responder(compose_file: &Path, messages: &Messages) -> Result<bool> {
-    let compose_contents = std::fs::read_to_string(compose_file)
-        .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
-    Ok(compose_contents.contains(RESPONDER_SERVICE_NAME))
-}
+pub(super) use crate::commands::init::compose_has_responder;
 
 pub(super) fn openbao_agent_container_name(service_name: &str) -> String {
     format!("{OPENBAO_AGENT_CONTAINER_PREFIX}-{service_name}")

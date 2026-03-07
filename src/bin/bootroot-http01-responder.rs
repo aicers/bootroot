@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use bootroot::acme::http01_protocol::{HEADER_SIGNATURE, HEADER_TIMESTAMP, signature_payload};
 use clap::Parser;
 use config::{Config, ConfigError, Environment, File};
 use poem::http::StatusCode;
@@ -20,8 +21,6 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-const HEADER_TIMESTAMP: &str = "x-bootroot-timestamp";
-const HEADER_SIGNATURE: &str = "x-bootroot-signature";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:80";
 const DEFAULT_ADMIN_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
@@ -133,7 +132,7 @@ async fn register_token_inner(
         let settings = state.settings.read().await;
         request.ttl_secs.unwrap_or(settings.token_ttl_secs)
     };
-    let payload = signature_payload(timestamp, &request, ttl_secs);
+    let payload = register_signature_payload(timestamp, &request, ttl_secs);
     let key = { state.hmac_key.read().await.clone() };
     if !verify_signature(&key, signature, &payload) {
         return Err("Invalid signature".to_string());
@@ -183,7 +182,7 @@ mod tests {
             key_authorization: "key-auth".to_string(),
             ttl_secs: Some(60),
         };
-        let payload = signature_payload(123, &request, 60);
+        let payload = register_signature_payload(123, &request, 60);
         let signature = STANDARD.encode(hmac::sign(&key, payload.as_bytes()).as_ref());
         assert!(verify_signature(&key, &signature, &payload));
         assert!(!verify_signature(&key, "invalid", &payload));
@@ -234,7 +233,7 @@ mod tests {
             key_authorization: "token-2.key".to_string(),
             ttl_secs: Some(60),
         };
-        let payload = signature_payload(timestamp, &request, 60);
+        let payload = register_signature_payload(timestamp, &request, 60);
         let key = state.hmac_key.read().await;
         let signature = STANDARD.encode(hmac::sign(&key, payload.as_bytes()).as_ref());
 
@@ -314,10 +313,12 @@ fn within_skew(timestamp: i64, max_skew_secs: u64) -> bool {
     (now - timestamp).unsigned_abs() <= max_skew_secs
 }
 
-fn signature_payload(timestamp: i64, request: &RegisterRequest, ttl_secs: u64) -> String {
-    format!(
-        "{timestamp}.{}.{}.{}",
-        request.token, request.key_authorization, ttl_secs
+fn register_signature_payload(timestamp: i64, request: &RegisterRequest, ttl_secs: u64) -> String {
+    signature_payload(
+        timestamp,
+        &request.token,
+        &request.key_authorization,
+        ttl_secs,
     )
 }
 
