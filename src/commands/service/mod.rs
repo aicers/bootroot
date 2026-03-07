@@ -234,14 +234,14 @@ async fn run_service_add_apply(
         approle::ensure_service_approle(&client, state, &resolved.service_name, messages).await?;
     let secrets_dir = state.secrets_dir();
     approle::write_role_id_file(
-        &secrets_dir,
+        secrets_dir,
         &resolved.service_name,
         &approle_result.role_id,
         messages,
     )
     .await?;
     let secret_id_path = approle::write_secret_id_file(
-        &secrets_dir,
+        secrets_dir,
         &resolved.service_name,
         &approle_result.secret_id,
         messages,
@@ -259,7 +259,7 @@ async fn run_service_add_apply(
     let applied = if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
         Some(
             local_config::apply_local_service_configs(
-                &secrets_dir,
+                secrets_dir,
                 resolved,
                 &secret_id_path,
                 ca_trust_material.as_ref(),
@@ -277,7 +277,7 @@ async fn run_service_add_apply(
         Some(
             remote_bootstrap::write_remote_bootstrap_artifact(
                 state,
-                &secrets_dir,
+                secrets_dir,
                 resolved,
                 &secret_id_path,
                 messages,
@@ -371,7 +371,7 @@ async fn run_service_add_remote_idempotent(
     let secrets_dir = state.secrets_dir();
     let remote_bootstrap = remote_bootstrap::write_remote_bootstrap_artifact_from_entry(
         state,
-        &secrets_dir,
+        secrets_dir,
         entry,
         messages,
     )

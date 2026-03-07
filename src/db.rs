@@ -84,6 +84,11 @@ pub fn build_db_dsn(
 
 /// Validates that a DB identifier is safe to embed in SQL.
 ///
+/// # Panics
+///
+/// Panics if `chars.next()` returns `None` after a non-empty guard,
+/// which cannot happen.
+///
 /// # Errors
 ///
 /// Returns an error when the identifier is empty or contains invalid
@@ -94,9 +99,9 @@ pub fn validate_db_identifier(value: &str) -> Result<()> {
         anyhow::bail!("DB identifier must not be empty");
     }
     let mut chars = trimmed.chars();
-    let Some(first) = chars.next() else {
-        anyhow::bail!("DB identifier must not be empty");
-    };
+    let first = chars
+        .next()
+        .expect("trimmed is non-empty after is_empty() guard");
     if !first.is_ascii_alphabetic() {
         anyhow::bail!("DB identifier must start with a letter");
     }
