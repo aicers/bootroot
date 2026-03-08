@@ -6,10 +6,9 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::Client;
 use ring::hmac;
 
+use super::http01_protocol::{HEADER_SIGNATURE, HEADER_TIMESTAMP, signature_payload};
 use crate::config::Settings;
 
-const HEADER_TIMESTAMP: &str = "x-bootroot-timestamp";
-const HEADER_SIGNATURE: &str = "x-bootroot-signature";
 const DEFAULT_ADMIN_PATH: &str = "/admin/http01";
 
 #[derive(serde::Serialize)]
@@ -17,15 +16,6 @@ struct RegisterRequest<'a> {
     token: &'a str,
     key_authorization: &'a str,
     ttl_secs: u64,
-}
-
-fn signature_payload(
-    timestamp: i64,
-    token: &str,
-    key_authorization: &str,
-    ttl_secs: u64,
-) -> String {
-    format!("{timestamp}.{token}.{key_authorization}.{ttl_secs}")
 }
 
 fn sign_request(secret: &str, payload: &str) -> String {

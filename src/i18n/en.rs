@@ -98,8 +98,6 @@ pub(super) static STRINGS: Strings = Strings {
     error_db_auth_task_failed: "DB auth check task failed",
     error_db_provision_task_failed: "DB provisioning task failed",
     error_stepca_password_missing: "step-ca password file not found at {value}",
-    error_eab_request_failed: "EAB request failed",
-    error_eab_response_parse_failed: "Failed to parse EAB response",
     error_openbao_client_create_failed: "Failed to create OpenBao client",
     error_openbao_health_check_failed: "OpenBao health check failed",
     error_openbao_init_status_failed: "OpenBao init status check failed",

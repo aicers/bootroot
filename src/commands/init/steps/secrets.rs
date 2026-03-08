@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
-use reqwest::StatusCode;
 
 use super::super::constants::openbao_constants::PATH_AGENT_EAB;
 use super::super::constants::{DEFAULT_EAB_ENDPOINT_PATH, SECRET_BYTES};
@@ -9,14 +8,6 @@ use super::prompts::{prompt_text, prompt_yes_no};
 use super::{InitRollback, InitSecrets};
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::i18n::Messages;
-
-#[derive(serde::Deserialize)]
-struct EabAutoResponse {
-    #[serde(alias = "keyId", alias = "kid")]
-    kid: String,
-    #[serde(alias = "hmacKey", alias = "hmac")]
-    hmac: String,
-}
 
 pub(super) fn resolve_init_secrets(
     args: &InitArgs,
@@ -154,37 +145,13 @@ async fn register_eab_secret(
 }
 
 async fn issue_eab_via_stepca(args: &InitArgs, messages: &Messages) -> Result<EabCredentials> {
-    let base = args.stepca_url.trim_end_matches('/');
-    let provisioner = args.stepca_provisioner.trim();
-    let endpoint = format!("{base}/acme/{provisioner}/{DEFAULT_EAB_ENDPOINT_PATH}");
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(&endpoint)
-        .send()
-        .await
-        .with_context(|| messages.error_eab_request_failed())?;
-    let response = if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-        client
-            .get(&endpoint)
-            .send()
-            .await
-            .with_context(|| messages.error_eab_request_failed())?
-    } else {
-        response
-    };
-    let response = response
-        .error_for_status()
-        .with_context(|| messages.error_eab_request_failed())?;
-
-    let payload: EabAutoResponse = response
-        .json()
-        .await
-        .with_context(|| messages.error_eab_response_parse_failed())?;
-    Ok(EabCredentials {
-        kid: payload.kid,
-        hmac: payload.hmac,
-    })
+    bootroot::eab::issue_eab_via_stepca(
+        &args.stepca_url,
+        &args.stepca_provisioner,
+        DEFAULT_EAB_ENDPOINT_PATH,
+    )
+    .await
+    .with_context(|| messages.error_eab_auto_failed())
 }
 
 #[cfg(test)]
