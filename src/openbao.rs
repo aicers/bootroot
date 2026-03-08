@@ -1,7 +1,5 @@
-use std::any::TypeId;
-
 use anyhow::{Context, Result};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +14,8 @@ pub struct OpenBaoClient {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct InitStatus {
-    pub initialized: bool,
+struct InitStatus {
+    initialized: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +117,15 @@ struct TokenCreateResponse {
     auth: AppRoleAuth,
 }
 
+/// Checks whether a response status and body indicate a missing resource.
+///
+/// `OpenBao` returns 404 for most missing resources but some endpoints
+/// (e.g. `sys/mounts`) return 400 with a specific message instead.
+fn is_not_found(status: StatusCode, text: &str) -> bool {
+    status == StatusCode::NOT_FOUND
+        || (status == StatusCode::BAD_REQUEST && text.contains("No secret engine mount"))
+}
+
 impl OpenBaoClient {
     /// Creates a new `OpenBao` client targeting the provided base URL.
     ///
@@ -153,6 +160,13 @@ impl OpenBaoClient {
             .await
             .context("OpenBao health check failed")?;
         let status = response.status();
+        // The Vault/OpenBao health endpoint returns non-200 codes for
+        // degraded-but-running states:
+        //   429 – node is a standby (HA mode)
+        //   503 – node is sealed
+        //   501 – node is not yet initialized
+        // All of these indicate that the server is reachable, so we treat
+        // them as a successful health check.
         if status == StatusCode::OK
             || status == StatusCode::TOO_MANY_REQUESTS
             || status == StatusCode::SERVICE_UNAVAILABLE
@@ -310,15 +324,14 @@ impl OpenBaoClient {
             struct MountOptionsRequest<'a> {
                 version: &'a str,
             }
-            let _: serde_json::Value = self
-                .post_json(
-                    &format!("sys/mounts/{mount}"),
-                    &MountRequest {
-                        mount_type: "kv",
-                        options: MountOptionsRequest { version: "2" },
-                    },
-                )
-                .await?;
+            self.post_action(
+                &format!("sys/mounts/{mount}"),
+                &MountRequest {
+                    mount_type: "kv",
+                    options: MountOptionsRequest { version: "2" },
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -340,14 +353,13 @@ impl OpenBaoClient {
                 #[serde(rename = "type")]
                 auth_type: &'a str,
             }
-            let _: serde_json::Value = self
-                .post_json(
-                    "sys/auth/approle",
-                    &AuthRequest {
-                        auth_type: "approle",
-                    },
-                )
-                .await?;
+            self.post_action(
+                "sys/auth/approle",
+                &AuthRequest {
+                    auth_type: "approle",
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -361,13 +373,11 @@ impl OpenBaoClient {
         struct PolicyRequest<'a> {
             policy: &'a str,
         }
-        let _: serde_json::Value = self
-            .post_json(
-                &format!("sys/policies/acl/{name}"),
-                &PolicyRequest { policy },
-            )
-            .await?;
-        Ok(())
+        self.post_action(
+            &format!("sys/policies/acl/{name}"),
+            &PolicyRequest { policy },
+        )
+        .await
     }
 
     /// Checks if a policy exists.
@@ -384,10 +394,8 @@ impl OpenBaoClient {
     /// # Errors
     /// Returns an error if the delete request fails.
     pub async fn delete_policy(&self, name: &str) -> Result<()> {
-        let _: serde_json::Value = self
-            .delete_json(&format!("sys/policies/acl/{name}"))
-            .await?;
-        Ok(())
+        self.delete_action(&format!("sys/policies/acl/{name}"))
+            .await
     }
 
     /// Creates or updates an `AppRole` with the given settings.
@@ -397,32 +405,30 @@ impl OpenBaoClient {
     pub async fn create_approle(
         &self,
         name: &str,
-        policies: &[String],
+        policies: &[&str],
         token_ttl: &str,
         secret_id_ttl: &str,
         token_renewable: bool,
     ) -> Result<()> {
         #[derive(Serialize)]
         struct AppRoleRequest<'a> {
-            token_policies: &'a [String],
+            token_policies: &'a [&'a str],
             token_ttl: &'a str,
             token_max_ttl: &'a str,
             token_renewable: bool,
             secret_id_ttl: &'a str,
         }
-        let _: serde_json::Value = self
-            .post_json(
-                &format!("auth/approle/role/{name}"),
-                &AppRoleRequest {
-                    token_policies: policies,
-                    token_ttl,
-                    token_max_ttl: token_ttl,
-                    token_renewable,
-                    secret_id_ttl,
-                },
-            )
-            .await?;
-        Ok(())
+        self.post_action(
+            &format!("auth/approle/role/{name}"),
+            &AppRoleRequest {
+                token_policies: policies,
+                token_ttl,
+                token_max_ttl: token_ttl,
+                token_renewable,
+                secret_id_ttl,
+            },
+        )
+        .await
     }
 
     /// Checks if an `AppRole` exists.
@@ -439,10 +445,8 @@ impl OpenBaoClient {
     /// # Errors
     /// Returns an error if the delete request fails.
     pub async fn delete_approle(&self, name: &str) -> Result<()> {
-        let _: serde_json::Value = self
-            .delete_json(&format!("auth/approle/role/{name}"))
-            .await?;
-        Ok(())
+        self.delete_action(&format!("auth/approle/role/{name}"))
+            .await
     }
 
     /// Reads the `role_id` for an `AppRole`.
@@ -501,7 +505,7 @@ impl OpenBaoClient {
         struct KvRequest {
             data: serde_json::Value,
         }
-        self.post_json(&format!("{mount}/data/{path}"), &KvRequest { data })
+        self.post_action(&format!("{mount}/data/{path}"), &KvRequest { data })
             .await
     }
 
@@ -555,14 +559,23 @@ impl OpenBaoClient {
     /// # Errors
     /// Returns an error if the delete request fails.
     pub async fn delete_kv(&self, mount: &str, path: &str) -> Result<()> {
-        let _: serde_json::Value = self
-            .delete_json(&format!("{mount}/metadata/{path}"))
-            .await?;
-        Ok(())
+        self.delete_action(&format!("{mount}/metadata/{path}"))
+            .await
     }
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}/v1/{path}", self.base_url)
+    }
+
+    fn require_token(&self) -> Result<&str> {
+        self.token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("OpenBao token is not set"))
+    }
+
+    fn with_auth_header(&self, builder: RequestBuilder) -> Result<RequestBuilder> {
+        let token = self.require_token()?;
+        Ok(builder.header(VAULT_TOKEN_HEADER, token))
     }
 
     async fn get_mount(&self, mount: &str) -> Result<Option<MountData>> {
@@ -580,9 +593,7 @@ impl OpenBaoClient {
             .text()
             .await
             .context("Failed to read OpenBao mount response")?;
-        if status == StatusCode::NOT_FOUND
-            || (status == StatusCode::BAD_REQUEST && text.contains("No secret engine mount"))
-        {
+        if is_not_found(status, &text) {
             return Ok(None);
         }
         if !status.is_success() {
@@ -593,19 +604,11 @@ impl OpenBaoClient {
         Ok(Some(parsed.data))
     }
 
-    async fn get_json<T: DeserializeOwned + 'static>(
-        &self,
-        path: &str,
-        use_token: bool,
-    ) -> Result<T> {
+    async fn get_json<T: DeserializeOwned>(&self, path: &str, use_token: bool) -> Result<T> {
         let url = self.endpoint(path);
         let mut request = self.client.get(url);
         if use_token {
-            let token = self
-                .token
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("OpenBao token is not set"))?;
-            request = request.header(VAULT_TOKEN_HEADER, token);
+            request = request.header(VAULT_TOKEN_HEADER, self.require_token()?);
         }
         let response = request
             .send()
@@ -618,14 +621,8 @@ impl OpenBaoClient {
 
     async fn resource_exists(&self, path: &str) -> Result<bool> {
         let url = self.endpoint(path);
-        let token = self
-            .token
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenBao token is not set"))?;
         let response = self
-            .client
-            .get(url)
-            .header(VAULT_TOKEN_HEADER, token)
+            .with_auth_header(self.client.get(url))?
             .send()
             .await
             .with_context(|| format!("OpenBao request failed: {path}"))?;
@@ -634,9 +631,7 @@ impl OpenBaoClient {
             .text()
             .await
             .context("Failed to read OpenBao response body")?;
-        if status == StatusCode::NOT_FOUND
-            || (status == StatusCode::BAD_REQUEST && text.contains("No secret engine mount"))
-        {
+        if is_not_found(status, &text) {
             return Ok(false);
         }
         if !status.is_success() {
@@ -645,20 +640,14 @@ impl OpenBaoClient {
         Ok(true)
     }
 
-    async fn post_json<T: Serialize, R: DeserializeOwned + 'static>(
+    async fn post_json<T: Serialize, R: DeserializeOwned>(
         &self,
         path: &str,
         body: &T,
     ) -> Result<R> {
         let url = self.endpoint(path);
-        let token = self
-            .token
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenBao token is not set"))?;
         let response = self
-            .client
-            .post(url)
-            .header(VAULT_TOKEN_HEADER, token)
+            .with_auth_header(self.client.post(url))?
             .json(body)
             .send()
             .await
@@ -668,38 +657,35 @@ impl OpenBaoClient {
             .with_context(|| format!("OpenBao response parse failed: {path}"))
     }
 
-    async fn delete_json<R: DeserializeOwned + 'static>(&self, path: &str) -> Result<R> {
+    async fn post_action<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
         let url = self.endpoint(path);
-        let token = self
-            .token
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenBao token is not set"))?;
         let response = self
-            .client
-            .delete(url)
-            .header(VAULT_TOKEN_HEADER, token)
+            .with_auth_header(self.client.post(url))?
+            .json(body)
             .send()
             .await
             .with_context(|| format!("OpenBao request failed: {path}"))?;
-        Self::parse_response(response)
+        Self::ensure_success(response)
             .await
-            .with_context(|| format!("OpenBao response parse failed: {path}"))
+            .with_context(|| format!("OpenBao response failed: {path}"))
     }
 
-    async fn put_json<T: Serialize, R: DeserializeOwned + 'static>(
-        &self,
-        path: &str,
-        body: &T,
-    ) -> Result<R> {
+    async fn delete_action(&self, path: &str) -> Result<()> {
         let url = self.endpoint(path);
-        let token = self
-            .token
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenBao token is not set"))?;
         let response = self
-            .client
-            .put(url)
-            .header(VAULT_TOKEN_HEADER, token)
+            .with_auth_header(self.client.delete(url))?
+            .send()
+            .await
+            .with_context(|| format!("OpenBao request failed: {path}"))?;
+        Self::ensure_success(response)
+            .await
+            .with_context(|| format!("OpenBao response failed: {path}"))
+    }
+
+    async fn put_json<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
+        let url = self.endpoint(path);
+        let response = self
+            .with_auth_header(self.client.put(url))?
             .json(body)
             .send()
             .await
@@ -709,9 +695,7 @@ impl OpenBaoClient {
             .with_context(|| format!("OpenBao response parse failed: {path}"))
     }
 
-    async fn parse_response<T: DeserializeOwned + 'static>(
-        response: reqwest::Response,
-    ) -> Result<T> {
+    async fn parse_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
         let status = response.status();
         let text = response
             .text()
@@ -721,21 +705,20 @@ impl OpenBaoClient {
             anyhow::bail!("OpenBao API error ({status}): {text}");
         }
         if text.trim().is_empty() {
-            let parsed =
-                serde_json::from_str("null").context("Failed to parse empty OpenBao response")?;
-            return Ok(parsed);
+            return serde_json::from_str("null").context("Failed to parse empty OpenBao response");
         }
-        match serde_json::from_str(&text) {
-            Ok(parsed) => Ok(parsed),
-            Err(err) => {
-                if TypeId::of::<T>() == TypeId::of::<()>() {
-                    let parsed = serde_json::from_str("null")
-                        .context("Failed to parse OpenBao response as unit")?;
-                    Ok(parsed)
-                } else {
-                    Err(err).context("Failed to parse OpenBao response")
-                }
-            }
+        serde_json::from_str(&text).context("Failed to parse OpenBao response")
+    }
+
+    async fn ensure_success(response: reqwest::Response) -> Result<()> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
         }
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        anyhow::bail!("OpenBao API error ({status}): {text}");
     }
 }
