@@ -129,14 +129,10 @@ impl PinnedCertVerifier {
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
     ) -> Result<(), rustls::Error> {
-        let mut matches = false;
-        matches |= self.allowed.contains(&sha256_hex(end_entity.as_ref()));
-        for cert in intermediates {
-            if self.allowed.contains(&sha256_hex(cert.as_ref())) {
-                matches = true;
-                break;
-            }
-        }
+        let matches = self.allowed.contains(&sha256_hex(end_entity.as_ref()))
+            || intermediates
+                .iter()
+                .any(|cert| self.allowed.contains(&sha256_hex(cert.as_ref())));
         if matches {
             Ok(())
         } else {
