@@ -294,8 +294,7 @@ mod tests {
     #[test]
     fn parse_db_dsn_finds_sslmode_after_other_params() {
         let password = test_password();
-        let dsn =
-            format!("postgresql://user:{password}@localhost:5432/db?foo=bar&sslmode=require");
+        let dsn = format!("postgresql://user:{password}@localhost:5432/db?foo=bar&sslmode=require");
         let parsed = parse_db_dsn(&dsn).unwrap();
         assert_eq!(parsed.sslmode.as_deref(), Some("require"));
     }
