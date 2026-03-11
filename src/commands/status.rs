@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use bootroot::openbao::{KvMountStatus, OpenBaoClient};
 
 use crate::cli::args::StatusArgs;
-use crate::commands::infra::{ContainerReadiness, collect_readiness, default_infra_services};
+use crate::commands::infra::{
+    ContainerReadiness, collect_container_failures, collect_readiness, default_infra_services,
+};
 use crate::commands::init::{
     PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
 };
@@ -12,7 +14,7 @@ use crate::state::StateFile;
 pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result<()> {
     let services = default_infra_services();
     let readiness = collect_readiness(&args.compose.compose_file, &services, messages)?;
-    let infra_failures = collect_infra_failures(&readiness);
+    let infra_failures = collect_container_failures(&readiness);
 
     let mut client = OpenBaoClient::new(&args.openbao.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
@@ -109,22 +111,6 @@ fn load_service_statuses(messages: &Messages) -> Result<Vec<ServiceStatusEntry>>
         });
     }
     Ok(service_statuses)
-}
-
-fn collect_infra_failures(readiness: &[ContainerReadiness]) -> Vec<String> {
-    let mut failures = Vec::new();
-    for entry in readiness {
-        if entry.status != "running" {
-            failures.push(format!("{} status={}", entry.service, entry.status));
-            continue;
-        }
-        if let Some(health) = entry.health.as_deref()
-            && health != "healthy"
-        {
-            failures.push(format!("{} health={}", entry.service, health));
-        }
-    }
-    failures
 }
 
 async fn fetch_kv_statuses(
