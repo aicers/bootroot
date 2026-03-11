@@ -173,7 +173,7 @@ pub(crate) fn collect_readiness(
     Ok(readiness)
 }
 
-fn parse_container_state(raw: &str) -> (String, Option<String>) {
+pub(crate) fn parse_container_state(raw: &str) -> (String, Option<String>) {
     let trimmed = raw.trim();
     let mut parts = trimmed.splitn(2, '|');
     let status = parts.next().unwrap_or_default().to_string();
@@ -204,7 +204,7 @@ fn print_readiness_summary(readiness: &[ContainerReadiness], messages: &Messages
     }
 }
 
-fn ensure_all_healthy(readiness: &[ContainerReadiness], messages: &Messages) -> Result<()> {
+pub(crate) fn collect_container_failures(readiness: &[ContainerReadiness]) -> Vec<String> {
     let mut failures = Vec::new();
     for entry in readiness {
         if entry.status != "running" {
@@ -217,6 +217,11 @@ fn ensure_all_healthy(readiness: &[ContainerReadiness], messages: &Messages) -> 
             failures.push(format!("{} health={}", entry.service, health));
         }
     }
+    failures
+}
+
+fn ensure_all_healthy(readiness: &[ContainerReadiness], messages: &Messages) -> Result<()> {
+    let failures = collect_container_failures(readiness);
     if failures.is_empty() {
         Ok(())
     } else {
@@ -283,7 +288,7 @@ fn docker_compose_output(args: &[&str], messages: &Messages) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn docker_output(args: &[&str], messages: &Messages) -> Result<String> {
+pub(crate) fn docker_output(args: &[&str], messages: &Messages) -> Result<String> {
     let output = ProcessCommand::new("docker")
         .args(args)
         .output()

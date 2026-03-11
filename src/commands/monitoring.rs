@@ -7,6 +7,10 @@ use serde_json::Value;
 use crate::cli::args::{
     MonitoringDownArgs, MonitoringProfile, MonitoringStatusArgs, MonitoringUpArgs,
 };
+use crate::commands::infra::{
+    ContainerReadiness, collect_container_failures, docker_output, parse_container_state,
+    run_docker,
+};
 use crate::i18n::Messages;
 
 pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) -> Result<()> {
@@ -99,7 +103,7 @@ pub(crate) fn run_monitoring_status(
             messages.monitoring_status_grafana_admin_password(grafana_status.as_str(messages))
         );
 
-        failures.extend(collect_failures(&readiness));
+        failures.extend(collect_container_failures(&readiness));
     }
 
     if !failures.is_empty() {
@@ -188,14 +192,6 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct ContainerReadiness {
-    service: String,
-    container_id: String,
-    status: String,
-    health: Option<String>,
-}
-
 fn monitoring_services(profile: MonitoringProfile) -> Vec<String> {
     let grafana_service = match profile {
         MonitoringProfile::Lan => "grafana",
@@ -280,37 +276,6 @@ fn collect_readiness(
     Ok(readiness)
 }
 
-fn parse_container_state(raw: &str) -> (String, Option<String>) {
-    let trimmed = raw.trim();
-    let mut parts = trimmed.splitn(2, '|');
-    let status = parts.next().unwrap_or_default().to_string();
-    let health = parts.next().and_then(|value| {
-        let value = value.trim();
-        if value.is_empty() {
-            None
-        } else {
-            Some(value.to_string())
-        }
-    });
-    (status, health)
-}
-
-fn collect_failures(readiness: &[ContainerReadiness]) -> Vec<String> {
-    let mut failures = Vec::new();
-    for entry in readiness {
-        if entry.status != "running" {
-            failures.push(format!("{} status={}", entry.service, entry.status));
-            continue;
-        }
-        if let Some(health) = entry.health.as_deref()
-            && health != "healthy"
-        {
-            failures.push(format!("{} health={}", entry.service, health));
-        }
-    }
-    failures
-}
-
 fn print_readiness_summary(readiness: &[ContainerReadiness], messages: &Messages) {
     println!("{}", messages.monitoring_readiness_summary());
     for entry in readiness {
@@ -328,7 +293,7 @@ fn print_readiness_summary(readiness: &[ContainerReadiness], messages: &Messages
 }
 
 fn ensure_all_healthy(readiness: &[ContainerReadiness], messages: &Messages) -> Result<()> {
-    let failures = collect_failures(readiness);
+    let failures = collect_container_failures(readiness);
     if failures.is_empty() {
         Ok(())
     } else {
@@ -384,18 +349,6 @@ fn docker_compose_output_with_profile(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(messages.error_docker_compose_failed(&stderr));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn docker_output(args: &[&str], messages: &Messages) -> Result<String> {
-    let output = ProcessCommand::new("docker")
-        .args(args)
-        .output()
-        .with_context(|| messages.error_command_run_failed("docker"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(messages.error_docker_command_failed(&stderr));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -489,17 +442,6 @@ fn run_docker_with_env(
         command.env("GRAFANA_ADMIN_PASSWORD", password);
     }
     let status = command
-        .status()
-        .with_context(|| messages.error_command_run_failed(context))?;
-    if !status.success() {
-        anyhow::bail!(messages.error_command_failed_status(context, &status.to_string()));
-    }
-    Ok(())
-}
-
-fn run_docker(args: &[&str], context: &str, messages: &Messages) -> Result<()> {
-    let status = ProcessCommand::new("docker")
-        .args(args)
         .status()
         .with_context(|| messages.error_command_run_failed(context))?;
     if !status.success() {
