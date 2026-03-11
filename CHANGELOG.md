@@ -33,6 +33,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `parse_db_dsn` silently ignoring `sslmode` when it is
+  not the first query parameter in the DSN string.
 - Log a warning when an EAB JSON file contains empty `kid` or
   `hmac` fields instead of returning `Ok(None)` silently.
 - Preserve original error chains in filesystem helpers

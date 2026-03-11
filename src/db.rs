@@ -55,8 +55,8 @@ pub fn parse_db_dsn(input: &str) -> Result<DbDsn> {
     }
     let sslmode = query
         .split('&')
-        .find_map(|pair| pair.split_once('='))
-        .filter(|(key, _)| *key == "sslmode")
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "sslmode")
         .map(|(_, value)| value.to_string());
     Ok(DbDsn {
         user: user.to_string(),
@@ -289,6 +289,15 @@ mod tests {
         assert_eq!(parsed.port, 5432);
         assert_eq!(parsed.database, "db");
         assert_eq!(parsed.sslmode.as_deref(), Some("disable"));
+    }
+
+    #[test]
+    fn parse_db_dsn_finds_sslmode_after_other_params() {
+        let password = test_password();
+        let dsn =
+            format!("postgresql://user:{password}@localhost:5432/db?foo=bar&sslmode=require");
+        let parsed = parse_db_dsn(&dsn).unwrap();
+        assert_eq!(parsed.sslmode.as_deref(), Some("require"));
     }
 
     #[test]
