@@ -42,7 +42,7 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
         auto_unseal_openbao(path, &args.openbao_url, messages)?;
     }
 
-    let readiness = collect_readiness(&args.compose_file, &args.services, messages)?;
+    let readiness = collect_readiness(&args.compose_file, None, &args.services, messages)?;
 
     for entry in &readiness {
         let update_args = [
@@ -110,7 +110,7 @@ fn prompt_yes_no(prompt: &str, messages: &Messages) -> Result<bool> {
 
 pub(crate) fn ensure_infra_ready(compose_file: &Path, messages: &Messages) -> Result<()> {
     let services = default_infra_services();
-    let readiness = collect_readiness(compose_file, &services, messages)?;
+    let readiness = collect_readiness(compose_file, None, &services, messages)?;
     ensure_all_healthy(&readiness, messages)?;
     Ok(())
 }
@@ -134,21 +134,14 @@ pub(crate) struct ContainerReadiness {
 
 pub(crate) fn collect_readiness(
     compose_file: &Path,
+    profile: Option<&str>,
     services: &[String],
     messages: &Messages,
 ) -> Result<Vec<ContainerReadiness>> {
     let mut readiness = Vec::with_capacity(services.len());
     for service in services {
-        let container_id = docker_compose_output(
-            &[
-                "-f",
-                compose_file.to_string_lossy().as_ref(),
-                "ps",
-                "-q",
-                service,
-            ],
-            messages,
-        )?;
+        let container_id =
+            docker_compose_output(compose_file, profile, &["ps", "-q", service], messages)?;
         let container_id = container_id.trim().to_string();
         if container_id.is_empty() {
             anyhow::bail!(messages.error_service_no_container(service));
@@ -275,10 +268,20 @@ pub(crate) fn run_docker(args: &[&str], context: &str, messages: &Messages) -> R
     Ok(())
 }
 
-fn docker_compose_output(args: &[&str], messages: &Messages) -> Result<String> {
-    let output = ProcessCommand::new("docker")
-        .args(["compose"])
-        .args(args)
+pub(crate) fn docker_compose_output(
+    compose_file: &Path,
+    profile: Option<&str>,
+    args: &[&str],
+    messages: &Messages,
+) -> Result<String> {
+    let compose_str = compose_file.to_string_lossy();
+    let mut cmd = ProcessCommand::new("docker");
+    cmd.args(["compose", "-f", compose_str.as_ref()]);
+    if let Some(profile) = profile {
+        cmd.args(["--profile", profile]);
+    }
+    cmd.args(args);
+    let output = cmd
         .output()
         .with_context(|| messages.error_command_run_failed("docker compose"))?;
     if !output.status.success() {
