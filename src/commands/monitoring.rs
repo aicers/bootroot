@@ -8,8 +8,8 @@ use crate::cli::args::{
     MonitoringDownArgs, MonitoringProfile, MonitoringStatusArgs, MonitoringUpArgs,
 };
 use crate::commands::infra::{
-    ContainerReadiness, collect_container_failures, docker_output, parse_container_state,
-    run_docker,
+    ContainerReadiness, collect_container_failures, collect_readiness, docker_compose_output,
+    docker_output, run_docker,
 };
 use crate::i18n::Messages;
 
@@ -39,7 +39,12 @@ pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) ->
         args.grafana_admin_password.as_deref(),
     )?;
 
-    let readiness = collect_readiness(&args.compose_file, args.profile, &services, messages)?;
+    let readiness = collect_readiness(
+        &args.compose_file,
+        Some(&profile_str),
+        &services,
+        messages,
+    )?;
     print_readiness_summary(&readiness, messages);
     ensure_all_healthy(&readiness, messages)?;
 
@@ -61,7 +66,13 @@ pub(crate) fn run_monitoring_status(
     let mut failures = Vec::new();
     for profile in profiles {
         let services = monitoring_services(profile);
-        let readiness = collect_readiness(&args.compose_file, profile, &services, messages)?;
+        let profile_str = profile.to_string();
+        let readiness = collect_readiness(
+            &args.compose_file,
+            Some(&profile_str),
+            &services,
+            messages,
+        )?;
 
         println!(
             "{}",
@@ -126,9 +137,10 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
                 MonitoringProfile::Lan => "grafana",
                 MonitoringProfile::Public => "grafana-public",
             };
-            let grafana_container_id = docker_compose_output_with_profile(
+            let profile_str = profile.to_string();
+            let grafana_container_id = docker_compose_output(
                 &args.compose_file,
-                *profile,
+                Some(&profile_str),
                 &["ps", "-q", grafana_service],
                 messages,
             )?
@@ -207,11 +219,12 @@ fn detect_running_profiles(
     let mut profiles = Vec::new();
     for profile in [MonitoringProfile::Lan, MonitoringProfile::Public] {
         let services = monitoring_services(profile);
+        let profile_str = profile.to_string();
         let mut any_running = false;
         for service in &services {
-            let container_id = docker_compose_output_with_profile(
+            let container_id = docker_compose_output(
                 compose_file,
-                profile,
+                Some(&profile_str),
                 &["ps", "-q", service],
                 messages,
             )?;
@@ -236,44 +249,6 @@ fn grafana_url(profile: MonitoringProfile) -> String {
         }
         MonitoringProfile::Public => "http://0.0.0.0:3000".to_string(),
     }
-}
-
-fn collect_readiness(
-    compose_file: &Path,
-    profile: MonitoringProfile,
-    services: &[String],
-    messages: &Messages,
-) -> Result<Vec<ContainerReadiness>> {
-    let mut readiness = Vec::with_capacity(services.len());
-    for service in services {
-        let container_id = docker_compose_output_with_profile(
-            compose_file,
-            profile,
-            &["ps", "-q", service],
-            messages,
-        )?;
-        let container_id = container_id.trim().to_string();
-        if container_id.is_empty() {
-            anyhow::bail!(messages.error_service_no_container(service));
-        }
-        let inspect_output = docker_output(
-            &[
-                "inspect",
-                "--format",
-                "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}",
-                &container_id,
-            ],
-            messages,
-        )?;
-        let (status, health) = parse_container_state(&inspect_output);
-        readiness.push(ContainerReadiness {
-            service: service.clone(),
-            container_id,
-            status,
-            health,
-        });
-    }
-    Ok(readiness)
 }
 
 fn print_readiness_summary(readiness: &[ContainerReadiness], messages: &Messages) {
@@ -307,10 +282,11 @@ fn monitoring_already_running(
     services: &[String],
     messages: &Messages,
 ) -> Result<bool> {
+    let profile_str = profile.to_string();
     for service in services {
-        let container_id = docker_compose_output_with_profile(
+        let container_id = docker_compose_output(
             compose_file,
-            profile,
+            Some(&profile_str),
             &["ps", "-q", service],
             messages,
         )?;
@@ -327,30 +303,6 @@ fn monitoring_already_running(
         }
     }
     Ok(true)
-}
-
-fn docker_compose_output_with_profile(
-    compose_file: &Path,
-    profile: MonitoringProfile,
-    args: &[&str],
-    messages: &Messages,
-) -> Result<String> {
-    let output = ProcessCommand::new("docker")
-        .args([
-            "compose",
-            "-f",
-            compose_file.to_string_lossy().as_ref(),
-            "--profile",
-            &profile.to_string(),
-        ])
-        .args(args)
-        .output()
-        .with_context(|| messages.error_command_run_failed("docker compose"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(messages.error_docker_compose_failed(&stderr));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 #[derive(Clone, Copy, Debug)]

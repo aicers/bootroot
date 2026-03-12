@@ -13,7 +13,7 @@ use crate::state::StateFile;
 
 pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result<()> {
     let services = default_infra_services();
-    let readiness = collect_readiness(&args.compose.compose_file, &services, messages)?;
+    let readiness = collect_readiness(&args.compose.compose_file, None, &services, messages)?;
     let infra_failures = collect_container_failures(&readiness);
 
     let mut client = OpenBaoClient::new(&args.openbao.openbao_url)
