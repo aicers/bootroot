@@ -102,6 +102,16 @@ pub(crate) enum DeployType {
     Docker,
 }
 
+impl DeployType {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Daemon => "daemon",
+            Self::Docker => "docker",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +128,22 @@ mod tests {
         for variant in [DeliveryMode::LocalFile, DeliveryMode::RemoteBootstrap] {
             let serialized = serde_json::to_value(variant)
                 .expect("serialize DeliveryMode")
+                .as_str()
+                .expect("serde value is a string")
+                .to_string();
+            assert_eq!(
+                variant.as_str(),
+                serialized,
+                "as_str() and serde disagree for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_type_as_str_matches_serde() {
+        for variant in [DeployType::Daemon, DeployType::Docker] {
+            let serialized = serde_json::to_value(variant)
+                .expect("serialize DeployType")
                 .as_str()
                 .expect("serde value is a string")
                 .to_string();
