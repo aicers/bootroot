@@ -307,10 +307,9 @@ async fn run_service_add_apply(
     Ok(())
 }
 
-fn build_service_entry(
+fn build_service_entry_from_role(
     resolved: &ResolvedServiceAdd,
-    approle: ServiceAppRoleMaterialized,
-    secret_id_path: &Path,
+    approle: ServiceRoleEntry,
 ) -> ServiceEntry {
     ServiceEntry {
         service_name: resolved.service_name.clone(),
@@ -324,13 +323,24 @@ fn build_service_entry(
         instance_id: resolved.instance_id.clone(),
         container_name: resolved.container_name.clone(),
         notes: resolved.notes.clone(),
-        approle: ServiceRoleEntry {
+        approle,
+    }
+}
+
+fn build_service_entry(
+    resolved: &ResolvedServiceAdd,
+    approle: ServiceAppRoleMaterialized,
+    secret_id_path: &Path,
+) -> ServiceEntry {
+    build_service_entry_from_role(
+        resolved,
+        ServiceRoleEntry {
             role_name: approle.role_name,
             role_id: approle.role_id,
             secret_id_path: secret_id_path.to_path_buf(),
             policy_name: approle.policy_name,
         },
-    }
+    )
 }
 
 fn print_service_add_apply_summary(
@@ -418,25 +428,15 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
         .join(SERVICE_SECRET_DIR)
         .join(&resolved.service_name)
         .join(SERVICE_SECRET_ID_FILENAME);
-    ServiceEntry {
-        service_name: resolved.service_name.clone(),
-        deploy_type: resolved.deploy_type,
-        delivery_mode: resolved.delivery_mode,
-        hostname: resolved.hostname.clone(),
-        domain: resolved.domain.clone(),
-        agent_config_path: resolved.agent_config.clone(),
-        cert_path: resolved.cert_path.clone(),
-        key_path: resolved.key_path.clone(),
-        instance_id: resolved.instance_id.clone(),
-        container_name: resolved.container_name.clone(),
-        notes: resolved.notes.clone(),
-        approle: ServiceRoleEntry {
+    build_service_entry_from_role(
+        resolved,
+        ServiceRoleEntry {
             role_name: approle::service_role_name(&resolved.service_name),
             role_id: "dry-run".to_string(),
             secret_id_path: preview_secret_id_path,
             policy_name: approle::service_policy_name(&resolved.service_name),
         },
-    }
+    )
 }
 
 fn is_idempotent_remote_rerun(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
@@ -451,4 +451,102 @@ fn is_idempotent_remote_rerun(entry: &ServiceEntry, resolved: &ResolvedServiceAd
         && entry.instance_id == resolved.instance_id
         && entry.container_name == resolved.container_name
         && entry.notes == resolved.notes
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::resolve::ResolvedServiceAdd;
+    use super::{ServiceAppRoleMaterialized, build_service_entry, build_service_entry_from_role};
+    use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry};
+
+    fn sample_resolved() -> ResolvedServiceAdd {
+        ResolvedServiceAdd {
+            service_name: "test-svc".to_string(),
+            deploy_type: DeployType::Docker,
+            delivery_mode: DeliveryMode::LocalFile,
+            hostname: "host1".to_string(),
+            domain: "example.com".to_string(),
+            agent_config: PathBuf::from("/etc/agent.toml"),
+            cert_path: PathBuf::from("/certs/cert.pem"),
+            key_path: PathBuf::from("/certs/key.pem"),
+            instance_id: Some("inst-1".to_string()),
+            container_name: Some("ctr-1".to_string()),
+            runtime_auth: None,
+            notes: Some("test note".to_string()),
+        }
+    }
+
+    fn assert_common_fields(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) {
+        assert_eq!(entry.service_name, resolved.service_name);
+        assert_eq!(entry.deploy_type, resolved.deploy_type);
+        assert_eq!(entry.delivery_mode, resolved.delivery_mode);
+        assert_eq!(entry.hostname, resolved.hostname);
+        assert_eq!(entry.domain, resolved.domain);
+        assert_eq!(entry.agent_config_path, resolved.agent_config);
+        assert_eq!(entry.cert_path, resolved.cert_path);
+        assert_eq!(entry.key_path, resolved.key_path);
+        assert_eq!(entry.instance_id, resolved.instance_id);
+        assert_eq!(entry.container_name, resolved.container_name);
+        assert_eq!(entry.notes, resolved.notes);
+    }
+
+    #[test]
+    fn build_service_entry_from_role_sets_all_fields() {
+        let resolved = sample_resolved();
+        let role = ServiceRoleEntry {
+            role_name: "role-a".to_string(),
+            role_id: "rid-a".to_string(),
+            secret_id_path: PathBuf::from("/secrets/a"),
+            policy_name: "policy-a".to_string(),
+        };
+        let entry = build_service_entry_from_role(&resolved, role);
+
+        assert_common_fields(&entry, &resolved);
+        assert_eq!(entry.approle.role_name, "role-a");
+        assert_eq!(entry.approle.role_id, "rid-a");
+        assert_eq!(entry.approle.secret_id_path, PathBuf::from("/secrets/a"));
+        assert_eq!(entry.approle.policy_name, "policy-a");
+    }
+
+    #[test]
+    fn build_service_entry_delegates_to_common_helper() {
+        let resolved = sample_resolved();
+        let materialized = ServiceAppRoleMaterialized {
+            role_name: "mat-role".to_string(),
+            role_id: "mat-rid".to_string(),
+            secret_id: "unused-in-entry".to_string(),
+            policy_name: "mat-policy".to_string(),
+        };
+        let secret_id_path = PathBuf::from("/secrets/mat");
+        let entry = build_service_entry(&resolved, materialized, &secret_id_path);
+
+        assert_common_fields(&entry, &resolved);
+        assert_eq!(entry.approle.role_name, "mat-role");
+        assert_eq!(entry.approle.role_id, "mat-rid");
+        assert_eq!(entry.approle.secret_id_path, secret_id_path);
+        assert_eq!(entry.approle.policy_name, "mat-policy");
+    }
+
+    #[test]
+    fn build_service_entry_from_role_with_none_optional_fields() {
+        let mut resolved = sample_resolved();
+        resolved.instance_id = None;
+        resolved.container_name = None;
+        resolved.notes = None;
+
+        let role = ServiceRoleEntry {
+            role_name: "r".to_string(),
+            role_id: "id".to_string(),
+            secret_id_path: PathBuf::from("/s"),
+            policy_name: "p".to_string(),
+        };
+        let entry = build_service_entry_from_role(&resolved, role);
+
+        assert_common_fields(&entry, &resolved);
+        assert!(entry.instance_id.is_none());
+        assert!(entry.container_name.is_none());
+        assert!(entry.notes.is_none());
+    }
 }
