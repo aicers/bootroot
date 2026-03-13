@@ -37,6 +37,54 @@ struct RemoteBootstrapArtifact {
     profile_key_path: String,
 }
 
+/// Builds a `RemoteBootstrapArtifact` from common inputs shared by both
+/// the initial service-add and the idempotent re-run paths.
+#[allow(clippy::too_many_arguments)] // mirrors the many fields of RemoteBootstrapArtifact
+fn build_artifact(
+    openbao_url: &str,
+    kv_mount: &str,
+    service_name: &str,
+    secret_id_path: &Path,
+    agent_config_path: &Path,
+    cert_path: &Path,
+    key_path: &Path,
+    domain: &str,
+    hostname: &str,
+    instance_id: Option<&str>,
+) -> RemoteBootstrapArtifact {
+    let secret_id_parent = secret_id_path.parent().unwrap_or(Path::new("."));
+    let role_id_path = secret_id_parent.join(SERVICE_ROLE_ID_FILENAME);
+    let eab_path = secret_id_parent.join("eab.json");
+    let ca_bundle_path = cert_path
+        .parent()
+        .unwrap_or(Path::new("certs"))
+        .join("ca-bundle.pem");
+    let (openbao_agent_config_path, openbao_agent_template_path, openbao_agent_token_path) =
+        remote_openbao_agent_paths(secret_id_path, service_name);
+
+    RemoteBootstrapArtifact {
+        openbao_url: openbao_url.to_string(),
+        kv_mount: kv_mount.to_string(),
+        service_name: service_name.to_string(),
+        role_id_path: role_id_path.display().to_string(),
+        secret_id_path: secret_id_path.display().to_string(),
+        eab_file_path: eab_path.display().to_string(),
+        agent_config_path: agent_config_path.display().to_string(),
+        ca_bundle_path: ca_bundle_path.display().to_string(),
+        openbao_agent_config_path: openbao_agent_config_path.display().to_string(),
+        openbao_agent_template_path: openbao_agent_template_path.display().to_string(),
+        openbao_agent_token_path: openbao_agent_token_path.display().to_string(),
+        agent_email: DEFAULT_AGENT_EMAIL.to_string(),
+        agent_server: DEFAULT_AGENT_SERVER.to_string(),
+        agent_domain: domain.to_string(),
+        agent_responder_url: DEFAULT_AGENT_RESPONDER_URL.to_string(),
+        profile_hostname: hostname.to_string(),
+        profile_instance_id: instance_id.unwrap_or_default().to_string(),
+        profile_cert_path: cert_path.display().to_string(),
+        profile_key_path: key_path.display().to_string(),
+    }
+}
+
 pub(super) async fn write_remote_bootstrap_artifact(
     state: &StateFile,
     secrets_dir: &Path,
@@ -44,60 +92,20 @@ pub(super) async fn write_remote_bootstrap_artifact(
     secret_id_path: &Path,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
-    let role_id_path = secret_id_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(SERVICE_ROLE_ID_FILENAME);
-    let eab_path = secret_id_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("eab.json");
-    let ca_bundle_path = resolved
-        .cert_path
-        .parent()
-        .unwrap_or(Path::new("certs"))
-        .join("ca-bundle.pem");
-    let (openbao_agent_config_path, openbao_agent_template_path, openbao_agent_token_path) =
-        remote_openbao_agent_paths(secret_id_path, &resolved.service_name);
-
-    let artifact = RemoteBootstrapArtifact {
-        openbao_url: state.openbao_url.clone(),
-        kv_mount: state.kv_mount.clone(),
-        service_name: resolved.service_name.clone(),
-        role_id_path: role_id_path.display().to_string(),
-        secret_id_path: secret_id_path.display().to_string(),
-        eab_file_path: eab_path.display().to_string(),
-        agent_config_path: resolved.agent_config.display().to_string(),
-        ca_bundle_path: ca_bundle_path.display().to_string(),
-        openbao_agent_config_path: openbao_agent_config_path.display().to_string(),
-        openbao_agent_template_path: openbao_agent_template_path.display().to_string(),
-        openbao_agent_token_path: openbao_agent_token_path.display().to_string(),
-        agent_email: DEFAULT_AGENT_EMAIL.to_string(),
-        agent_server: DEFAULT_AGENT_SERVER.to_string(),
-        agent_domain: resolved.domain.clone(),
-        agent_responder_url: DEFAULT_AGENT_RESPONDER_URL.to_string(),
-        profile_hostname: resolved.hostname.clone(),
-        profile_instance_id: resolved.instance_id.clone().unwrap_or_default(),
-        profile_cert_path: resolved.cert_path.display().to_string(),
-        profile_key_path: resolved.key_path.display().to_string(),
-    };
-    let artifact_dir = secrets_dir
-        .join(REMOTE_BOOTSTRAP_DIR)
-        .join(&resolved.service_name);
-    fs_util::ensure_secrets_dir(&artifact_dir).await?;
-    let artifact_path = artifact_dir.join(REMOTE_BOOTSTRAP_FILENAME);
-    let payload = serde_json::to_string_pretty(&artifact)
-        .with_context(|| "Failed to serialize remote bootstrap artifact".to_string())?;
-    fs::write(&artifact_path, payload)
+    let artifact = build_artifact(
+        &state.openbao_url,
+        &state.kv_mount,
+        &resolved.service_name,
+        secret_id_path,
+        &resolved.agent_config,
+        &resolved.cert_path,
+        &resolved.key_path,
+        &resolved.domain,
+        &resolved.hostname,
+        resolved.instance_id.as_deref(),
+    );
+    write_remote_bootstrap_artifact_file(secrets_dir, &resolved.service_name, &artifact, messages)
         .await
-        .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
-    fs_util::set_key_permissions(&artifact_path).await?;
-
-    let remote_run_command = render_remote_run_command(&artifact);
-    Ok(RemoteBootstrapResult {
-        bootstrap_file: artifact_path.display().to_string(),
-        remote_run_command,
-    })
 }
 
 pub(super) async fn write_remote_bootstrap_artifact_from_entry(
@@ -106,50 +114,20 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
     entry: &ServiceEntry,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
-    let secret_id_path = entry.approle.secret_id_path.clone();
-    let role_id_path = secret_id_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(SERVICE_ROLE_ID_FILENAME);
-    let eab_path = secret_id_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("eab.json");
-    let ca_bundle_path = entry
-        .cert_path
-        .parent()
-        .unwrap_or(Path::new("certs"))
-        .join("ca-bundle.pem");
-    let (openbao_agent_config_path, openbao_agent_template_path, openbao_agent_token_path) =
-        remote_openbao_agent_paths(&secret_id_path, &entry.service_name);
-    let artifact = RemoteBootstrapArtifact {
-        openbao_url: state.openbao_url.clone(),
-        kv_mount: state.kv_mount.clone(),
-        service_name: entry.service_name.clone(),
-        role_id_path: role_id_path.display().to_string(),
-        secret_id_path: secret_id_path.display().to_string(),
-        eab_file_path: eab_path.display().to_string(),
-        agent_config_path: entry.agent_config_path.display().to_string(),
-        ca_bundle_path: ca_bundle_path.display().to_string(),
-        openbao_agent_config_path: openbao_agent_config_path.display().to_string(),
-        openbao_agent_template_path: openbao_agent_template_path.display().to_string(),
-        openbao_agent_token_path: openbao_agent_token_path.display().to_string(),
-        agent_email: DEFAULT_AGENT_EMAIL.to_string(),
-        agent_server: DEFAULT_AGENT_SERVER.to_string(),
-        agent_domain: entry.domain.clone(),
-        agent_responder_url: DEFAULT_AGENT_RESPONDER_URL.to_string(),
-        profile_hostname: entry.hostname.clone(),
-        profile_instance_id: entry.instance_id.clone().unwrap_or_default(),
-        profile_cert_path: entry.cert_path.display().to_string(),
-        profile_key_path: entry.key_path.display().to_string(),
-    };
-    write_remote_bootstrap_artifact_file(
-        secrets_dir,
-        entry.service_name.as_str(),
-        &artifact,
-        messages,
-    )
-    .await
+    let artifact = build_artifact(
+        &state.openbao_url,
+        &state.kv_mount,
+        &entry.service_name,
+        &entry.approle.secret_id_path,
+        &entry.agent_config_path,
+        &entry.cert_path,
+        &entry.key_path,
+        &entry.domain,
+        &entry.hostname,
+        entry.instance_id.as_deref(),
+    );
+    write_remote_bootstrap_artifact_file(secrets_dir, &entry.service_name, &artifact, messages)
+        .await
 }
 
 async fn write_remote_bootstrap_artifact_file(
@@ -213,4 +191,184 @@ fn remote_openbao_agent_paths(
         openbao_service_dir.join(OPENBAO_AGENT_TEMPLATE_FILENAME),
         openbao_service_dir.join(OPENBAO_AGENT_TOKEN_FILENAME),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::build_artifact;
+
+    #[test]
+    fn build_artifact_typical_case() {
+        let artifact = build_artifact(
+            "https://openbao.example.com:8200",
+            "secret",
+            "my-service",
+            Path::new("/secrets/services/my-service/secret_id"),
+            Path::new("/etc/my-service/agent.toml"),
+            Path::new("/certs/my-service/cert.pem"),
+            Path::new("/certs/my-service/key.pem"),
+            "example.com",
+            "host1",
+            Some("instance-42"),
+        );
+
+        assert_eq!(artifact.openbao_url, "https://openbao.example.com:8200");
+        assert_eq!(artifact.kv_mount, "secret");
+        assert_eq!(artifact.service_name, "my-service");
+        assert_eq!(
+            artifact.role_id_path,
+            "/secrets/services/my-service/role_id"
+        );
+        assert_eq!(
+            artifact.secret_id_path,
+            "/secrets/services/my-service/secret_id"
+        );
+        assert_eq!(
+            artifact.eab_file_path,
+            "/secrets/services/my-service/eab.json"
+        );
+        assert_eq!(artifact.agent_config_path, "/etc/my-service/agent.toml");
+        assert_eq!(artifact.ca_bundle_path, "/certs/my-service/ca-bundle.pem");
+        assert_eq!(
+            artifact.openbao_agent_config_path,
+            "/secrets/openbao/services/my-service/agent.hcl"
+        );
+        assert_eq!(
+            artifact.openbao_agent_template_path,
+            "/secrets/openbao/services/my-service/agent.toml.ctmpl"
+        );
+        assert_eq!(
+            artifact.openbao_agent_token_path,
+            "/secrets/openbao/services/my-service/token"
+        );
+        assert_eq!(artifact.agent_domain, "example.com");
+        assert_eq!(artifact.profile_hostname, "host1");
+        assert_eq!(artifact.profile_instance_id, "instance-42");
+        assert_eq!(artifact.profile_cert_path, "/certs/my-service/cert.pem");
+        assert_eq!(artifact.profile_key_path, "/certs/my-service/key.pem");
+    }
+
+    #[test]
+    fn build_artifact_no_instance_id() {
+        let artifact = build_artifact(
+            "https://openbao.local",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/svc/cert.pem"),
+            Path::new("/certs/svc/key.pem"),
+            "local.dev",
+            "node-a",
+            None,
+        );
+
+        assert_eq!(artifact.profile_instance_id, "");
+    }
+
+    #[test]
+    fn build_artifact_different_service_names_produce_different_paths() {
+        let a = build_artifact(
+            "https://ob",
+            "kv",
+            "alpha",
+            Path::new("/secrets/services/alpha/secret_id"),
+            Path::new("/etc/alpha/agent.toml"),
+            Path::new("/certs/alpha/cert.pem"),
+            Path::new("/certs/alpha/key.pem"),
+            "a.com",
+            "h1",
+            None,
+        );
+        let b = build_artifact(
+            "https://ob",
+            "kv",
+            "beta",
+            Path::new("/secrets/services/beta/secret_id"),
+            Path::new("/etc/beta/agent.toml"),
+            Path::new("/certs/beta/cert.pem"),
+            Path::new("/certs/beta/key.pem"),
+            "b.com",
+            "h2",
+            None,
+        );
+
+        assert_ne!(a.role_id_path, b.role_id_path);
+        assert_ne!(a.openbao_agent_config_path, b.openbao_agent_config_path);
+        assert_ne!(a.ca_bundle_path, b.ca_bundle_path);
+    }
+
+    #[test]
+    fn build_artifact_secret_id_path_without_parent() {
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+        );
+
+        // Path::new("secret_id").parent() returns Some(""), not None
+        assert_eq!(artifact.role_id_path, "role_id");
+        assert_eq!(artifact.eab_file_path, "eab.json");
+    }
+
+    #[test]
+    fn build_artifact_cert_path_without_parent() {
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/secrets/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("cert.pem"),
+            Path::new("key.pem"),
+            "d.com",
+            "h",
+            None,
+        );
+
+        // Path::new("cert.pem").parent() returns Some(""), not None
+        assert_eq!(artifact.ca_bundle_path, "ca-bundle.pem");
+    }
+
+    #[test]
+    fn build_artifact_empty_instance_id_same_as_none() {
+        let with_empty = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            Some(""),
+        );
+        let with_none = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+        );
+
+        assert_eq!(
+            with_empty.profile_instance_id,
+            with_none.profile_instance_id
+        );
+    }
 }
