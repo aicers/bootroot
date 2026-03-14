@@ -32,6 +32,20 @@ fn main() {
     }
 }
 
+/// Creates a Tokio runtime and passes it to `f`, returning its result.
+///
+/// # Errors
+///
+/// Returns an error if the runtime cannot be created.
+fn with_runtime<F, R>(command: &str, messages: &Messages, f: F) -> Result<R>
+where
+    F: FnOnce(&tokio::runtime::Runtime) -> R,
+{
+    let runtime = tokio::runtime::Runtime::new()
+        .with_context(|| messages.error_runtime_init_failed(command))?;
+    Ok(f(&runtime))
+}
+
 fn run(cli: Cli, messages: &Messages) -> Result<()> {
     match cli.command {
         CliCommand::Infra(InfraCommand::Up(args)) => {
@@ -51,25 +65,22 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
                 .with_context(|| messages.error_monitoring_failed())?;
         }
         CliCommand::Init(args) => {
-            let runtime = tokio::runtime::Runtime::new()
-                .with_context(|| messages.error_runtime_init_failed("init"))?;
-            runtime
-                .block_on(commands::init::run_init(&args, messages))
-                .with_context(|| messages.error_init_failed())?;
+            with_runtime("init", messages, |rt| {
+                rt.block_on(commands::init::run_init(&args, messages))
+            })?
+            .with_context(|| messages.error_init_failed())?;
         }
         CliCommand::Status(args) => {
-            let runtime = tokio::runtime::Runtime::new()
-                .with_context(|| messages.error_runtime_init_failed("status"))?;
-            runtime
-                .block_on(commands::status::run_status(&args, messages))
-                .with_context(|| messages.error_status_failed())?;
+            with_runtime("status", messages, |rt| {
+                rt.block_on(commands::status::run_status(&args, messages))
+            })?
+            .with_context(|| messages.error_status_failed())?;
         }
         CliCommand::Service(ServiceCommand::Add(args)) => {
-            let runtime = tokio::runtime::Runtime::new()
-                .with_context(|| messages.error_runtime_init_failed("service add"))?;
-            runtime
-                .block_on(commands::service::run_service_add(&args, messages))
-                .with_context(|| messages.error_service_add_failed())?;
+            with_runtime("service add", messages, |rt| {
+                rt.block_on(commands::service::run_service_add(&args, messages))
+            })?
+            .with_context(|| messages.error_service_add_failed())?;
         }
         CliCommand::Service(ServiceCommand::Info(args)) => {
             commands::service::run_service_info(&args, messages)
@@ -78,12 +89,23 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,
         CliCommand::Rotate(args) => {
-            let runtime = tokio::runtime::Runtime::new()
-                .with_context(|| messages.error_runtime_init_failed("rotate"))?;
-            runtime
-                .block_on(commands::rotate::run_rotate(&args, messages))
-                .with_context(|| messages.error_rotate_failed())?;
+            with_runtime("rotate", messages, |rt| {
+                rt.block_on(commands::rotate::run_rotate(&args, messages))
+            })?
+            .with_context(|| messages.error_rotate_failed())?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_runtime_executes_closure() {
+        let messages = Messages::new("en").expect("failed to load messages");
+        let result = with_runtime("test", &messages, |rt| rt.block_on(async { 1 + 1 })).unwrap();
+        assert_eq!(result, 2);
+    }
 }
