@@ -187,11 +187,11 @@ fn print_readiness_summary(readiness: &[ContainerReadiness], messages: &Messages
         match entry.health.as_deref() {
             Some(health) => println!(
                 "{}",
-                messages.infra_entry_with_health(&entry.service, &entry.status, health)
+                messages.readiness_entry_with_health(&entry.service, &entry.status, health)
             ),
             None => println!(
                 "{}",
-                messages.infra_entry_without_health(&entry.service, &entry.status)
+                messages.readiness_entry_without_health(&entry.service, &entry.status)
             ),
         }
     }

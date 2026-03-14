@@ -266,10 +266,7 @@ fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
     println!("{}", messages.service_summary_kind(&entry.service_name));
     println!(
         "{}",
-        messages.service_summary_deploy_type(match entry.deploy_type {
-            DeployType::Daemon => "daemon",
-            DeployType::Docker => "docker",
-        })
+        messages.service_summary_deploy_type(entry.deploy_type.as_str())
     );
     println!("{}", messages.service_summary_hostname(&entry.hostname));
     println!("{}", messages.service_summary_domain(&entry.domain));
@@ -286,10 +283,7 @@ fn print_service_plan_fields(plan: &ServiceAddPlan<'_>, messages: &Messages) {
     println!("{}", messages.service_summary_kind(plan.service_name));
     println!(
         "{}",
-        messages.service_summary_deploy_type(match plan.deploy_type {
-            DeployType::Daemon => "daemon",
-            DeployType::Docker => "docker",
-        })
+        messages.service_summary_deploy_type(plan.deploy_type.as_str())
     );
     println!("{}", messages.service_summary_hostname(plan.hostname));
     println!("{}", messages.service_summary_domain(plan.domain));

@@ -169,11 +169,11 @@ fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
         match entry.health.as_deref() {
             Some(health) => println!(
                 "{}",
-                messages.status_infra_entry_with_health(&entry.service, &entry.status, health)
+                messages.status_entry_with_health(&entry.service, &entry.status, health)
             ),
             None => println!(
                 "{}",
-                messages.status_infra_entry_without_health(&entry.service, &entry.status)
+                messages.status_entry_without_health(&entry.service, &entry.status)
             ),
         }
     }
