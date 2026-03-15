@@ -24,6 +24,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Consolidated duplicate i18n entry templates:
+  `infra_entry_*`/`monitoring_entry_*` merged into
+  `readiness_entry_*`, and `status_infra_entry_*`/
+  `monitoring_status_entry_*` merged into `status_entry_*`.
+  No user-visible output changes.
+
 - Changed DB DSN runtime handling to normalize local hosts for compose runtime
   compatibility.
 - Changed service onboarding output to clarify Bootroot-managed vs

@@ -88,15 +88,11 @@ pub(crate) fn run_monitoring_status(
             match entry.health.as_deref() {
                 Some(health) => println!(
                     "{}",
-                    messages.monitoring_status_entry_with_health(
-                        &entry.service,
-                        &entry.status,
-                        health
-                    )
+                    messages.status_entry_with_health(&entry.service, &entry.status, health)
                 ),
                 None => println!(
                     "{}",
-                    messages.monitoring_status_entry_without_health(&entry.service, &entry.status)
+                    messages.status_entry_without_health(&entry.service, &entry.status)
                 ),
             }
         }
@@ -262,11 +258,11 @@ fn print_readiness_summary(readiness: &[ContainerReadiness], messages: &Messages
         match entry.health.as_deref() {
             Some(health) => println!(
                 "{}",
-                messages.monitoring_entry_with_health(&entry.service, &entry.status, health)
+                messages.readiness_entry_with_health(&entry.service, &entry.status, health)
             ),
             None => println!(
                 "{}",
-                messages.monitoring_entry_without_health(&entry.service, &entry.status)
+                messages.readiness_entry_without_health(&entry.service, &entry.status)
             ),
         }
     }

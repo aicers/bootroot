@@ -37,19 +37,17 @@ pub(crate) struct ServiceOpenBaoAgentSteps<'a> {
 pub(crate) struct Strings {
     pub(crate) infra_up_completed: &'static str,
     pub(crate) infra_readiness_summary: &'static str,
-    pub(crate) infra_entry_with_health: &'static str,
-    pub(crate) infra_entry_without_health: &'static str,
+    pub(crate) readiness_entry_with_health: &'static str,
+    pub(crate) readiness_entry_without_health: &'static str,
     pub(crate) infra_unhealthy: &'static str,
     pub(crate) monitoring_up_completed: &'static str,
     pub(crate) monitoring_readiness_summary: &'static str,
-    pub(crate) monitoring_entry_with_health: &'static str,
-    pub(crate) monitoring_entry_without_health: &'static str,
     pub(crate) monitoring_unhealthy: &'static str,
     pub(crate) monitoring_status_title: &'static str,
     pub(crate) monitoring_status_profile: &'static str,
     pub(crate) monitoring_status_section_services: &'static str,
-    pub(crate) monitoring_status_entry_with_health: &'static str,
-    pub(crate) monitoring_status_entry_without_health: &'static str,
+    pub(crate) status_entry_with_health: &'static str,
+    pub(crate) status_entry_without_health: &'static str,
     pub(crate) monitoring_status_grafana_url: &'static str,
     pub(crate) monitoring_status_grafana_admin_password: &'static str,
     pub(crate) monitoring_status_value_set: &'static str,
@@ -264,8 +262,6 @@ pub(crate) struct Strings {
     pub(crate) status_section_approles: &'static str,
     pub(crate) status_section_services: &'static str,
     pub(crate) status_services_none: &'static str,
-    pub(crate) status_infra_entry_with_health: &'static str,
-    pub(crate) status_infra_entry_without_health: &'static str,
     pub(crate) status_openbao_health: &'static str,
     pub(crate) status_openbao_sealed: &'static str,
     pub(crate) status_openbao_kv_mount: &'static str,
@@ -409,21 +405,21 @@ impl Messages {
         self.strings().infra_readiness_summary
     }
 
-    pub(crate) fn infra_entry_with_health(
+    pub(crate) fn readiness_entry_with_health(
         &self,
         service: &str,
         status: &str,
         health: &str,
     ) -> String {
         format_template(
-            self.strings().infra_entry_with_health,
+            self.strings().readiness_entry_with_health,
             &[("service", service), ("status", status), ("health", health)],
         )
     }
 
-    pub(crate) fn infra_entry_without_health(&self, service: &str, status: &str) -> String {
+    pub(crate) fn readiness_entry_without_health(&self, service: &str, status: &str) -> String {
         format_template(
-            self.strings().infra_entry_without_health,
+            self.strings().readiness_entry_without_health,
             &[("service", service), ("status", status)],
         )
     }
@@ -438,25 +434,6 @@ impl Messages {
 
     pub(crate) fn monitoring_readiness_summary(&self) -> &'static str {
         self.strings().monitoring_readiness_summary
-    }
-
-    pub(crate) fn monitoring_entry_with_health(
-        &self,
-        service: &str,
-        status: &str,
-        health: &str,
-    ) -> String {
-        format_template(
-            self.strings().monitoring_entry_with_health,
-            &[("service", service), ("status", status), ("health", health)],
-        )
-    }
-
-    pub(crate) fn monitoring_entry_without_health(&self, service: &str, status: &str) -> String {
-        format_template(
-            self.strings().monitoring_entry_without_health,
-            &[("service", service), ("status", status)],
-        )
     }
 
     pub(crate) fn monitoring_unhealthy(&self, failures: &str) -> String {
@@ -481,25 +458,21 @@ impl Messages {
         self.strings().monitoring_status_section_services
     }
 
-    pub(crate) fn monitoring_status_entry_with_health(
+    pub(crate) fn status_entry_with_health(
         &self,
         service: &str,
         status: &str,
         health: &str,
     ) -> String {
         format_template(
-            self.strings().monitoring_status_entry_with_health,
+            self.strings().status_entry_with_health,
             &[("service", service), ("status", status), ("health", health)],
         )
     }
 
-    pub(crate) fn monitoring_status_entry_without_health(
-        &self,
-        service: &str,
-        status: &str,
-    ) -> String {
+    pub(crate) fn status_entry_without_health(&self, service: &str, status: &str) -> String {
         format_template(
-            self.strings().monitoring_status_entry_without_health,
+            self.strings().status_entry_without_health,
             &[("service", service), ("status", status)],
         )
     }
@@ -1557,25 +1530,6 @@ impl Messages {
         self.strings().status_services_none
     }
 
-    pub(crate) fn status_infra_entry_with_health(
-        &self,
-        service: &str,
-        status: &str,
-        health: &str,
-    ) -> String {
-        format_template(
-            self.strings().status_infra_entry_with_health,
-            &[("service", service), ("status", status), ("health", health)],
-        )
-    }
-
-    pub(crate) fn status_infra_entry_without_health(&self, service: &str, status: &str) -> String {
-        format_template(
-            self.strings().status_infra_entry_without_health,
-            &[("service", service), ("status", status)],
-        )
-    }
-
     pub(crate) fn status_openbao_health(&self, value: &str) -> String {
         format_template(self.strings().status_openbao_health, &[("value", value)])
     }
@@ -2173,5 +2127,71 @@ mod tests {
     fn test_locale_parse_invalid() {
         let err = Locale::parse("fr").unwrap_err();
         assert!(err.to_string().contains("Unsupported language"));
+    }
+
+    #[test]
+    fn readiness_entry_templates_identical_across_locales() {
+        let en = Messages::new("en").unwrap();
+        let ko = Messages::new("ko").unwrap();
+
+        let svc = "test-svc";
+        let st = "running";
+        let hp = "healthy";
+
+        assert_eq!(
+            en.readiness_entry_with_health(svc, st, hp),
+            ko.readiness_entry_with_health(svc, st, hp),
+        );
+        assert_eq!(
+            en.readiness_entry_without_health(svc, st),
+            ko.readiness_entry_without_health(svc, st),
+        );
+    }
+
+    #[test]
+    fn status_entry_templates_identical_across_locales() {
+        let en = Messages::new("en").unwrap();
+        let ko = Messages::new("ko").unwrap();
+
+        let svc = "test-svc";
+        let st = "running";
+        let hp = "healthy";
+
+        assert_eq!(
+            en.status_entry_with_health(svc, st, hp),
+            ko.status_entry_with_health(svc, st, hp),
+        );
+        assert_eq!(
+            en.status_entry_without_health(svc, st),
+            ko.status_entry_without_health(svc, st),
+        );
+    }
+
+    #[test]
+    fn readiness_entry_template_output() {
+        let messages = Messages::new("en").unwrap();
+
+        assert_eq!(
+            messages.readiness_entry_with_health("nginx", "running", "healthy"),
+            "- nginx: running (health: healthy)"
+        );
+        assert_eq!(
+            messages.readiness_entry_without_health("nginx", "running"),
+            "- nginx: running"
+        );
+    }
+
+    #[test]
+    fn status_entry_template_output() {
+        let messages = Messages::new("en").unwrap();
+
+        assert_eq!(
+            messages.status_entry_with_health("nginx", "running", "healthy"),
+            "  - nginx: running (health: healthy)"
+        );
+        assert_eq!(
+            messages.status_entry_without_health("nginx", "running"),
+            "  - nginx: running"
+        );
     }
 }
