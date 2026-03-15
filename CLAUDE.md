@@ -61,6 +61,8 @@ before generating code.
 * **Documentation (Rustdoc)**:
   * Doc comments (`///`) must start with a verb in the **third-person singular**
     form (e.g., "Creates...", "Returns...", "Calculates...").
+* **Module files**: Prefer `module_name.rs` over `module_name/mod.rs`.
+  Use the named sibling file style introduced in Rust 2018.
 * **Lints (Clippy)**:
   * Avoid `#[allow(...)]` as much as possible.
   * If `allow` is necessary, you **MUST** add a comment explaining why.
