@@ -230,11 +230,7 @@ fn is_valid_sha256_fingerprint(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::i18n::Messages;
-
-    fn test_messages() -> Messages {
-        Messages::new("en").expect("valid language")
-    }
+    use crate::i18n::test_messages;
 
     #[test]
     fn test_parse_trusted_ca_list_accepts_valid() {

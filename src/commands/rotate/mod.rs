@@ -208,7 +208,7 @@ pub(super) mod test_support {
     use std::path::Path;
     use std::sync::{LazyLock, Mutex, MutexGuard};
 
-    use crate::i18n::Messages;
+    pub(super) use crate::i18n::test_messages;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     pub(super) const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
@@ -275,7 +275,4 @@ exit 0
         env::join_paths(paths).expect("PATH components should be valid")
     }
 
-    pub(super) fn test_messages() -> Messages {
-        Messages::new("en").expect("valid language")
-    }
 }

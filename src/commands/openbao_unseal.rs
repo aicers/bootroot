@@ -24,10 +24,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-
-    fn test_messages() -> Messages {
-        Messages::new("en").expect("messages")
-    }
+    use crate::i18n::test_messages;
 
     #[test]
     fn test_read_unseal_keys_from_file_filters_empty_lines() {

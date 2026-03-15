@@ -2106,6 +2106,12 @@ fn format_template(template: &str, pairs: &[(&str, &str)]) -> String {
     output
 }
 
+/// Creates a default English `Messages` instance for use in tests.
+#[cfg(test)]
+pub(crate) fn test_messages() -> Messages {
+    Messages::new("en").expect("valid language")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

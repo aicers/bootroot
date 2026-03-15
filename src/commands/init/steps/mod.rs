@@ -110,7 +110,7 @@ pub(super) mod test_support {
 
     use super::super::constants::{DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL};
     use crate::cli::args::InitArgs;
-    use crate::i18n::Messages;
+    pub(in crate::commands::init::steps) use crate::i18n::test_messages;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -154,10 +154,6 @@ pub(super) mod test_support {
             eab_kid: None,
             eab_hmac: None,
         }
-    }
-
-    pub(in crate::commands::init::steps) fn test_messages() -> Messages {
-        Messages::new("en").expect("valid language")
     }
 
     pub(in crate::commands::init::steps) fn test_cert_pem(common_name: &str) -> String {
