@@ -11,7 +11,7 @@ use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 
 pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
-    ensure_postgres_localhost_binding(&args.compose_file, messages)?;
+    ensure_postgres_localhost_binding(&args.compose_file.compose_file, messages)?;
 
     let loaded_archives = if let Some(dir) = args.image_archive_dir.as_deref() {
         load_local_images(dir, messages)?
@@ -19,7 +19,7 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
         0
     };
 
-    let compose_str = args.compose_file.to_string_lossy();
+    let compose_str = args.compose_file.compose_file.to_string_lossy();
     let svc_refs: Vec<&str> = args.services.iter().map(String::as_str).collect();
 
     if loaded_archives == 0 {
@@ -42,7 +42,12 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
         auto_unseal_openbao(path, &args.openbao_url, messages)?;
     }
 
-    let readiness = collect_readiness(&args.compose_file, None, &args.services, messages)?;
+    let readiness = collect_readiness(
+        &args.compose_file.compose_file,
+        None,
+        &args.services,
+        messages,
+    )?;
 
     for entry in &readiness {
         let update_args = [

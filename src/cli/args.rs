@@ -326,9 +326,8 @@ pub(crate) struct RotateCaKeyArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct InfraUpArgs {
-    /// Path to docker-compose.yml
-    #[arg(long, default_value = "docker-compose.yml")]
-    pub(crate) compose_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) compose_file: ComposeFileArgs,
 
     /// Comma-separated list of services to start
     // Keep "bootroot-http01" in sync with RESPONDER_SERVICE_NAME.
@@ -373,9 +372,8 @@ impl std::fmt::Display for MonitoringProfile {
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitoringUpArgs {
-    /// Path to docker-compose.yml
-    #[arg(long, default_value = "docker-compose.yml")]
-    pub(crate) compose_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) compose_file: ComposeFileArgs,
 
     /// Monitoring profile to start (lan or public)
     #[arg(long, value_enum, default_value_t = MonitoringProfile::Lan)]
@@ -388,16 +386,14 @@ pub(crate) struct MonitoringUpArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitoringStatusArgs {
-    /// Path to docker-compose.yml
-    #[arg(long, default_value = "docker-compose.yml")]
-    pub(crate) compose_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) compose_file: ComposeFileArgs,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct MonitoringDownArgs {
-    /// Path to docker-compose.yml
-    #[arg(long, default_value = "docker-compose.yml")]
-    pub(crate) compose_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) compose_file: ComposeFileArgs,
 
     /// Reset Grafana admin password on next up
     #[arg(long)]
@@ -790,6 +786,124 @@ mod tests {
                 assert_eq!(args.summary_json, Some(PathBuf::from("init-summary.json")));
             }
             _ => panic!("expected init"),
+        }
+    }
+
+    #[test]
+    fn test_infra_up_compose_file_default() {
+        let cli = Cli::parse_from(["bootroot", "infra", "up"]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Up(args)) => {
+                assert_eq!(
+                    args.compose_file.compose_file,
+                    PathBuf::from("docker-compose.yml")
+                );
+            }
+            _ => panic!("expected infra up"),
+        }
+    }
+
+    #[test]
+    fn test_infra_up_compose_file_custom() {
+        let cli = Cli::parse_from(["bootroot", "infra", "up", "--compose-file", "custom.yml"]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Up(args)) => {
+                assert_eq!(args.compose_file.compose_file, PathBuf::from("custom.yml"));
+            }
+            _ => panic!("expected infra up"),
+        }
+    }
+
+    #[test]
+    fn test_monitoring_up_compose_file_default() {
+        let cli = Cli::parse_from(["bootroot", "monitoring", "up"]);
+        match cli.command {
+            CliCommand::Monitoring(MonitoringCommand::Up(args)) => {
+                assert_eq!(
+                    args.compose_file.compose_file,
+                    PathBuf::from("docker-compose.yml")
+                );
+            }
+            _ => panic!("expected monitoring up"),
+        }
+    }
+
+    #[test]
+    fn test_monitoring_up_compose_file_custom() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "monitoring",
+            "up",
+            "--compose-file",
+            "custom.yml",
+        ]);
+        match cli.command {
+            CliCommand::Monitoring(MonitoringCommand::Up(args)) => {
+                assert_eq!(args.compose_file.compose_file, PathBuf::from("custom.yml"));
+            }
+            _ => panic!("expected monitoring up"),
+        }
+    }
+
+    #[test]
+    fn test_monitoring_status_compose_file_default() {
+        let cli = Cli::parse_from(["bootroot", "monitoring", "status"]);
+        match cli.command {
+            CliCommand::Monitoring(MonitoringCommand::Status(args)) => {
+                assert_eq!(
+                    args.compose_file.compose_file,
+                    PathBuf::from("docker-compose.yml")
+                );
+            }
+            _ => panic!("expected monitoring status"),
+        }
+    }
+
+    #[test]
+    fn test_monitoring_status_compose_file_custom() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "monitoring",
+            "status",
+            "--compose-file",
+            "custom.yml",
+        ]);
+        match cli.command {
+            CliCommand::Monitoring(MonitoringCommand::Status(args)) => {
+                assert_eq!(args.compose_file.compose_file, PathBuf::from("custom.yml"));
+            }
+            _ => panic!("expected monitoring status"),
+        }
+    }
+
+    #[test]
+    fn test_monitoring_down_compose_file_default() {
+        let cli = Cli::parse_from(["bootroot", "monitoring", "down"]);
+        match cli.command {
+            CliCommand::Monitoring(MonitoringCommand::Down(args)) => {
+                assert_eq!(
+                    args.compose_file.compose_file,
+                    PathBuf::from("docker-compose.yml")
+                );
+            }
+            _ => panic!("expected monitoring down"),
+        }
+    }
+
+    #[test]
+    fn test_monitoring_down_compose_file_custom() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "monitoring",
+            "down",
+            "--compose-file",
+            "custom.yml",
+        ]);
+        match cli.command {
+            CliCommand::Monitoring(MonitoringCommand::Down(args)) => {
+                assert_eq!(args.compose_file.compose_file, PathBuf::from("custom.yml"));
+            }
+            _ => panic!("expected monitoring down"),
         }
     }
 }

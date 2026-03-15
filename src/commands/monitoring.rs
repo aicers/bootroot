@@ -15,11 +15,16 @@ use crate::i18n::Messages;
 
 pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) -> Result<()> {
     let services = monitoring_services(args.profile);
-    if monitoring_already_running(&args.compose_file, args.profile, &services, messages)? {
+    if monitoring_already_running(
+        &args.compose_file.compose_file,
+        args.profile,
+        &services,
+        messages,
+    )? {
         println!("{}", messages.monitoring_up_already_running());
         return Ok(());
     }
-    let compose_str = args.compose_file.to_string_lossy();
+    let compose_str = args.compose_file.compose_file.to_string_lossy();
     let profile_str = args.profile.to_string();
     let svc_refs: Vec<&str> = services.iter().map(String::as_str).collect();
     let mut up_args: Vec<&str> = vec![
@@ -39,7 +44,12 @@ pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) ->
         args.grafana_admin_password.as_deref(),
     )?;
 
-    let readiness = collect_readiness(&args.compose_file, Some(&profile_str), &services, messages)?;
+    let readiness = collect_readiness(
+        &args.compose_file.compose_file,
+        Some(&profile_str),
+        &services,
+        messages,
+    )?;
     print_readiness_summary(&readiness, messages);
     ensure_all_healthy(&readiness, messages)?;
 
@@ -51,7 +61,7 @@ pub(crate) fn run_monitoring_status(
     args: &MonitoringStatusArgs,
     messages: &Messages,
 ) -> Result<()> {
-    let profiles = detect_running_profiles(&args.compose_file, messages)?;
+    let profiles = detect_running_profiles(&args.compose_file.compose_file, messages)?;
     if profiles.is_empty() {
         anyhow::bail!(messages.monitoring_status_no_services());
     }
@@ -62,8 +72,12 @@ pub(crate) fn run_monitoring_status(
     for profile in profiles {
         let services = monitoring_services(profile);
         let profile_str = profile.to_string();
-        let readiness =
-            collect_readiness(&args.compose_file, Some(&profile_str), &services, messages)?;
+        let readiness = collect_readiness(
+            &args.compose_file.compose_file,
+            Some(&profile_str),
+            &services,
+            messages,
+        )?;
 
         println!(
             "{}",
@@ -116,7 +130,7 @@ pub(crate) fn run_monitoring_status(
 }
 
 pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages) -> Result<()> {
-    let profiles = detect_running_profiles(&args.compose_file, messages)?;
+    let profiles = detect_running_profiles(&args.compose_file.compose_file, messages)?;
     if profiles.is_empty() {
         anyhow::bail!(messages.monitoring_status_no_services());
     }
@@ -130,7 +144,7 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
             };
             let profile_str = profile.to_string();
             let grafana_container_id = docker_compose_output(
-                &args.compose_file,
+                &args.compose_file.compose_file,
                 Some(&profile_str),
                 &["ps", "-q", grafana_service],
                 messages,
@@ -151,7 +165,7 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
 
     for profile in &profiles {
         let services = monitoring_services(*profile);
-        let compose_str = args.compose_file.to_string_lossy();
+        let compose_str = args.compose_file.compose_file.to_string_lossy();
         let profile_str = profile.to_string();
         let svc_refs: Vec<&str> = services.iter().map(String::as_str).collect();
 
