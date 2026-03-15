@@ -5,8 +5,71 @@
 //! names and payload format.  Keeping them in one place prevents silent
 //! protocol divergence.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use ring::hmac;
+
 pub const HEADER_TIMESTAMP: &str = "x-bootroot-timestamp";
 pub const HEADER_SIGNATURE: &str = "x-bootroot-signature";
+
+/// Encapsulates HMAC signing and verification for HTTP-01 registration.
+#[derive(Clone)]
+pub struct Http01HmacSigner {
+    key: hmac::Key,
+}
+
+impl Http01HmacSigner {
+    /// Creates a signer for the shared HTTP-01 responder HMAC protocol.
+    #[must_use]
+    pub fn new(secret: &str) -> Self {
+        Self {
+            key: hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes()),
+        }
+    }
+
+    /// Signs a canonical HTTP-01 registration payload.
+    #[must_use]
+    pub fn sign_payload(&self, payload: &str) -> String {
+        let tag = hmac::sign(&self.key, payload.as_bytes());
+        STANDARD.encode(tag.as_ref())
+    }
+
+    /// Signs a full HTTP-01 registration request.
+    #[must_use]
+    pub fn sign_request(
+        &self,
+        timestamp: i64,
+        token: &str,
+        key_authorization: &str,
+        ttl_secs: u64,
+    ) -> String {
+        let payload = signature_payload(timestamp, token, key_authorization, ttl_secs);
+        self.sign_payload(&payload)
+    }
+
+    /// Verifies a canonical HTTP-01 registration payload.
+    #[must_use]
+    pub fn verify_payload(&self, signature: &str, payload: &str) -> bool {
+        let Ok(decoded) = STANDARD.decode(signature.as_bytes()) else {
+            return false;
+        };
+        hmac::verify(&self.key, payload.as_bytes(), &decoded).is_ok()
+    }
+
+    /// Verifies a full HTTP-01 registration request.
+    #[must_use]
+    pub fn verify_request(
+        &self,
+        signature: &str,
+        timestamp: i64,
+        token: &str,
+        key_authorization: &str,
+        ttl_secs: u64,
+    ) -> bool {
+        let payload = signature_payload(timestamp, token, key_authorization, ttl_secs);
+        self.verify_payload(signature, &payload)
+    }
+}
 
 /// Builds the canonical payload that is HMAC-signed for token registration.
 ///
@@ -33,14 +96,18 @@ mod tests {
 
     #[test]
     fn payload_round_trip_sign_verify() {
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD;
-        use ring::hmac;
-
-        let key = hmac::Key::new(hmac::HMAC_SHA256, b"test-secret");
+        let signer = Http01HmacSigner::new("test-secret");
         let payload = signature_payload(123, "token", "key-auth", 60);
-        let sig = STANDARD.encode(hmac::sign(&key, payload.as_bytes()).as_ref());
-        let decoded = STANDARD.decode(sig.as_bytes()).expect("valid base64");
-        assert!(hmac::verify(&key, payload.as_bytes(), &decoded).is_ok());
+        let signature = signer.sign_payload(&payload);
+        assert!(signer.verify_payload(&signature, &payload));
+        assert!(!signer.verify_payload("invalid", &payload));
+    }
+
+    #[test]
+    fn request_round_trip_sign_verify() {
+        let signer = Http01HmacSigner::new("test-secret");
+        let signature = signer.sign_request(123, "token", "key-auth", 60);
+        assert!(signer.verify_request(&signature, 123, "token", "key-auth", 60));
+        assert!(!signer.verify_request(&signature, 124, "token", "key-auth", 60));
     }
 }
