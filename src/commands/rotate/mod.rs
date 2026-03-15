@@ -274,5 +274,4 @@ exit 0
         }
         env::join_paths(paths).expect("PATH components should be valid")
     }
-
 }
