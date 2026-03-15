@@ -1,12 +1,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use reqwest::Client;
-use ring::hmac;
 
-use super::http01_protocol::{HEADER_SIGNATURE, HEADER_TIMESTAMP, signature_payload};
+use super::http01_protocol::{HEADER_SIGNATURE, HEADER_TIMESTAMP, Http01HmacSigner};
 use crate::config::Settings;
 
 const DEFAULT_ADMIN_PATH: &str = "/admin/http01";
@@ -16,12 +13,6 @@ struct RegisterRequest<'a> {
     token: &'a str,
     key_authorization: &'a str,
     ttl_secs: u64,
-}
-
-fn sign_request(secret: &str, payload: &str) -> String {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
-    let tag = hmac::sign(&key, payload.as_bytes());
-    STANDARD.encode(tag.as_ref())
 }
 
 /// Registers an HTTP-01 token with the responder.
@@ -70,8 +61,8 @@ pub async fn register_http01_token_with(
     let timestamp = i64::try_from(timestamp)
         .map_err(|_| anyhow::anyhow!("System time is too large for timestamp"))?;
 
-    let payload = signature_payload(timestamp, token, key_authorization, ttl_secs);
-    let signature = sign_request(hmac_secret, &payload);
+    let signer = Http01HmacSigner::new(hmac_secret);
+    let signature = signer.sign_request(timestamp, token, key_authorization, ttl_secs);
 
     let client = Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
@@ -108,6 +99,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     use super::*;
+    use crate::acme::http01_protocol::{Http01HmacSigner, signature_payload};
 
     #[derive(serde::Deserialize)]
     struct ReceivedRequest {
@@ -147,7 +139,7 @@ mod tests {
                 &body.key_authorization,
                 body.ttl_secs,
             );
-            let expected = sign_request(&self.secret, &payload);
+            let expected = Http01HmacSigner::new(&self.secret).sign_payload(&payload);
 
             let Ok(signature) = signature.to_str() else {
                 return ResponseTemplate::new(400).set_body_string("Invalid signature");

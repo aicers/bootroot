@@ -5,11 +5,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-use bootroot::acme::http01_protocol::{HEADER_SIGNATURE, HEADER_TIMESTAMP, signature_payload};
+use bootroot::acme::http01_protocol::{HEADER_SIGNATURE, HEADER_TIMESTAMP, Http01HmacSigner};
 use reqwest::StatusCode;
-use ring::hmac;
 use serde_json::json;
 use tempfile::tempdir;
 use tokio::time::sleep;
@@ -151,9 +148,8 @@ fn sign_request(
         .expect("System time must be after UNIX_EPOCH")
         .as_secs();
     let timestamp = i64::try_from(timestamp).expect("System time must fit in i64");
-    let payload = signature_payload(timestamp, token, key_authorization, ttl_secs);
-    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
-    let signature = STANDARD.encode(hmac::sign(&key, payload.as_bytes()).as_ref());
+    let signer = Http01HmacSigner::new(secret);
+    let signature = signer.sign_request(timestamp, token, key_authorization, ttl_secs);
     (timestamp, signature)
 }
 

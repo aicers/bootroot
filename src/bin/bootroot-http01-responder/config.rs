@@ -4,9 +4,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use bootroot::acme::http01_protocol::Http01HmacSigner;
 use clap::Parser;
 use config::{Config, ConfigError, Environment, File};
-use ring::hmac;
 use serde::Deserialize;
 
 use super::state::ResponderState;
@@ -76,8 +76,8 @@ impl ResponderSettings {
         Ok(())
     }
 
-    pub(super) fn build_hmac_key(&self) -> hmac::Key {
-        hmac::Key::new(hmac::HMAC_SHA256, self.hmac_secret.as_bytes())
+    pub(super) fn build_hmac_signer(&self) -> Http01HmacSigner {
+        Http01HmacSigner::new(&self.hmac_secret)
     }
 }
 

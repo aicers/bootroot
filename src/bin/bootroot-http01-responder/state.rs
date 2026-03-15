@@ -4,12 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ring::hmac;
+use bootroot::acme::http01_protocol::Http01HmacSigner;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use super::config::ResponderSettings;
-use super::signature::{payload_for_request, verify_signature};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(super) struct RegisterRequest {
@@ -24,10 +23,9 @@ struct TokenEntry {
     expires_at: tokio::time::Instant,
 }
 
-#[derive(Debug)]
 pub(super) struct ResponderState {
     settings: RwLock<ResponderSettings>,
-    hmac_key: RwLock<hmac::Key>,
+    hmac_signer: RwLock<Http01HmacSigner>,
     tokens: RwLock<HashMap<String, TokenEntry>>,
 }
 
@@ -37,10 +35,10 @@ impl ResponderState {
     }
 
     fn new(settings: ResponderSettings) -> Self {
-        let hmac_key = settings.build_hmac_key();
+        let hmac_signer = settings.build_hmac_signer();
         Self {
             settings: RwLock::new(settings),
-            hmac_key: RwLock::new(hmac_key),
+            hmac_signer: RwLock::new(hmac_signer),
             tokens: RwLock::new(HashMap::new()),
         }
     }
@@ -66,14 +64,14 @@ impl ResponderState {
             let settings = self.settings.read().await;
             request.ttl_secs.unwrap_or(settings.token_ttl_secs)
         };
-        let payload = payload_for_request(
+        let signer = { self.hmac_signer.read().await.clone() };
+        if !signer.verify_request(
+            signature,
             timestamp,
             &request.token,
             &request.key_authorization,
             ttl_secs,
-        );
-        let key = { self.hmac_key.read().await.clone() };
-        if !verify_signature(&key, signature, &payload) {
+        ) {
             return Err("Invalid signature".to_string());
         }
 
@@ -98,14 +96,14 @@ impl ResponderState {
     }
 
     pub(super) async fn update_settings(&self, settings: ResponderSettings) {
-        let hmac_key = settings.build_hmac_key();
+        let hmac_signer = settings.build_hmac_signer();
         {
             let mut settings_lock = self.settings.write().await;
             *settings_lock = settings;
         }
         {
-            let mut key_lock = self.hmac_key.write().await;
-            *key_lock = hmac_key;
+            let mut signer_lock = self.hmac_signer.write().await;
+            *signer_lock = hmac_signer;
         }
     }
 
@@ -120,8 +118,7 @@ impl ResponderState {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
+    use bootroot::acme::http01_protocol::Http01HmacSigner;
 
     use super::*;
     use crate::config::{
@@ -191,9 +188,8 @@ mod tests {
             key_authorization: "token-2.key".to_string(),
             ttl_secs: Some(60),
         };
-        let payload = payload_for_request(123, &request.token, &request.key_authorization, 60);
-        let key = hmac::Key::new(hmac::HMAC_SHA256, b"test-secret");
-        let signature = STANDARD.encode(hmac::sign(&key, payload.as_bytes()).as_ref());
+        let signer = Http01HmacSigner::new("test-secret");
+        let signature = signer.sign_request(123, &request.token, &request.key_authorization, 60);
 
         state
             .register_request(123, &signature, request)
