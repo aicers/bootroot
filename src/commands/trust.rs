@@ -185,11 +185,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::i18n::Messages;
-
-    fn test_messages() -> Messages {
-        Messages::new("en").expect("valid language")
-    }
+    use crate::i18n::test_messages;
 
     fn sample_state() -> RotationState {
         RotationState {
