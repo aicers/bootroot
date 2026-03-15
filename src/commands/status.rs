@@ -107,7 +107,7 @@ fn load_service_statuses(messages: &Messages) -> Result<Vec<ServiceStatusEntry>>
     for entry in state.services.values() {
         service_statuses.push(ServiceStatusEntry {
             service_name: entry.service_name.clone(),
-            delivery_mode: entry.delivery_mode.as_str().to_string(),
+            delivery_mode: entry.delivery_mode.to_string(),
         });
     }
     Ok(service_statuses)
