@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -580,6 +580,36 @@ impl OpenBaoClient {
         Ok(builder.header(VAULT_TOKEN_HEADER, token))
     }
 
+    fn request_builder(&self, method: Method, path: &str) -> RequestBuilder {
+        self.client.request(method, self.endpoint(path))
+    }
+
+    fn authed_request_builder(&self, method: Method, path: &str) -> Result<RequestBuilder> {
+        self.with_auth_header(self.request_builder(method, path))
+    }
+
+    async fn send_request(&self, request: RequestBuilder, path: &str) -> Result<Response> {
+        request
+            .send()
+            .await
+            .with_context(|| format!("OpenBao request failed: {path}"))
+    }
+
+    async fn send_authed(&self, method: Method, path: &str) -> Result<Response> {
+        let request = self.authed_request_builder(method, path)?;
+        self.send_request(request, path).await
+    }
+
+    async fn send_authed_json<T: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &T,
+    ) -> Result<Response> {
+        let request = self.authed_request_builder(method, path)?.json(body);
+        self.send_request(request, path).await
+    }
+
     async fn get_mount(&self, mount: &str) -> Result<Option<MountData>> {
         let url = self.endpoint(&format!("sys/mounts/{mount}"));
         let mut request = self.client.get(url);
@@ -607,27 +637,18 @@ impl OpenBaoClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str, use_token: bool) -> Result<T> {
-        let url = self.endpoint(path);
-        let mut request = self.client.get(url);
+        let mut request = self.request_builder(Method::GET, path);
         if use_token {
             request = request.header(VAULT_TOKEN_HEADER, self.require_token()?);
         }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("OpenBao request failed: {path}"))?;
+        let response = self.send_request(request, path).await?;
         Self::parse_response(response)
             .await
             .with_context(|| format!("OpenBao response parse failed: {path}"))
     }
 
     async fn resource_exists(&self, path: &str) -> Result<bool> {
-        let url = self.endpoint(path);
-        let response = self
-            .with_auth_header(self.client.get(url))?
-            .send()
-            .await
-            .with_context(|| format!("OpenBao request failed: {path}"))?;
+        let response = self.send_authed(Method::GET, path).await?;
         let status = response.status();
         let text = response
             .text()
@@ -647,51 +668,28 @@ impl OpenBaoClient {
         path: &str,
         body: &T,
     ) -> Result<R> {
-        let url = self.endpoint(path);
-        let response = self
-            .with_auth_header(self.client.post(url))?
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("OpenBao request failed: {path}"))?;
+        let response = self.send_authed_json(Method::POST, path, body).await?;
         Self::parse_response(response)
             .await
             .with_context(|| format!("OpenBao response parse failed: {path}"))
     }
 
     async fn post_action<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
-        let url = self.endpoint(path);
-        let response = self
-            .with_auth_header(self.client.post(url))?
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("OpenBao request failed: {path}"))?;
+        let response = self.send_authed_json(Method::POST, path, body).await?;
         Self::ensure_success(response)
             .await
             .with_context(|| format!("OpenBao response failed: {path}"))
     }
 
     async fn delete_action(&self, path: &str) -> Result<()> {
-        let url = self.endpoint(path);
-        let response = self
-            .with_auth_header(self.client.delete(url))?
-            .send()
-            .await
-            .with_context(|| format!("OpenBao request failed: {path}"))?;
+        let response = self.send_authed(Method::DELETE, path).await?;
         Self::ensure_success(response)
             .await
             .with_context(|| format!("OpenBao response failed: {path}"))
     }
 
     async fn put_json<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
-        let url = self.endpoint(path);
-        let response = self
-            .with_auth_header(self.client.put(url))?
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("OpenBao request failed: {path}"))?;
+        let response = self.send_authed_json(Method::PUT, path, body).await?;
         Self::parse_response(response)
             .await
             .with_context(|| format!("OpenBao response parse failed: {path}"))
