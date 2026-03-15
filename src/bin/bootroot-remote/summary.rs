@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use super::{CliLang, redacted_error_label, summary_header};
+use super::{Locale, redacted_error_label, summary_header};
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,7 +83,7 @@ pub(super) fn status_to_str(status: ApplyStatus) -> &'static str {
     }
 }
 
-fn print_text_summary(summary: &ApplySummary, lang: CliLang) {
+fn print_text_summary(summary: &ApplySummary, lang: Locale) {
     println!("{}", summary_header(lang));
     println!("- secret_id: {}", status_to_str(summary.secret_id.status));
     print_optional_error("secret_id", summary.secret_id.error.as_deref(), lang);
@@ -102,7 +102,7 @@ fn print_text_summary(summary: &ApplySummary, lang: CliLang) {
     print_optional_error("trust_sync", summary.trust_sync.error.as_deref(), lang);
 }
 
-fn print_optional_error(name: &str, error: Option<&str>, lang: CliLang) {
+fn print_optional_error(name: &str, error: Option<&str>, lang: Locale) {
     if let Some(_value) = error {
         println!("  {}({name}): <redacted>", redacted_error_label(lang));
     }
@@ -111,7 +111,7 @@ fn print_optional_error(name: &str, error: Option<&str>, lang: CliLang) {
 pub(super) fn print_summary(
     summary: &ApplySummary,
     output: super::OutputFormat,
-    lang: CliLang,
+    lang: Locale,
 ) -> Result<()> {
     match output {
         super::OutputFormat::Text => {

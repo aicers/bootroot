@@ -6,6 +6,7 @@ pub mod db;
 pub mod eab;
 pub mod fs_util;
 pub mod hooks;
+pub mod locale;
 pub mod openbao;
 pub mod profile;
 pub mod tls;

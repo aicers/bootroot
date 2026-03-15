@@ -7,6 +7,7 @@ mod summary;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use bootroot::locale::Locale;
 use clap::{Parser, ValueEnum};
 
 const SERVICE_KV_BASE: &str = "bootroot/services";
@@ -38,40 +39,24 @@ struct Args {
     command: Command,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CliLang {
-    En,
-    Ko,
-}
-
-impl CliLang {
-    fn parse(input: &str) -> Result<Self> {
-        match input.trim().to_ascii_lowercase().as_str() {
-            "en" => Ok(Self::En),
-            "ko" => Ok(Self::Ko),
-            _ => anyhow::bail!("Unsupported language code '{input}'. Supported values: en, ko"),
-        }
+fn localized(lang: Locale, en: &str, ko: &str) -> String {
+    match lang {
+        Locale::En => en.to_string(),
+        Locale::Ko => ko.to_string(),
     }
 }
 
-fn localized(lang: CliLang, en: &str, ko: &str) -> String {
+fn summary_header(lang: Locale) -> &'static str {
     match lang {
-        CliLang::En => en.to_string(),
-        CliLang::Ko => ko.to_string(),
+        Locale::En => "bootroot-remote bootstrap summary",
+        Locale::Ko => "bootroot-remote 부트스트랩 요약",
     }
 }
 
-fn summary_header(lang: CliLang) -> &'static str {
+fn redacted_error_label(lang: Locale) -> &'static str {
     match lang {
-        CliLang::En => "bootroot-remote bootstrap summary",
-        CliLang::Ko => "bootroot-remote 부트스트랩 요약",
-    }
-}
-
-fn redacted_error_label(lang: CliLang) -> &'static str {
-    match lang {
-        CliLang::En => "error",
-        CliLang::Ko => "오류",
+        Locale::En => "error",
+        Locale::Ko => "오류",
     }
 }
 
@@ -190,7 +175,7 @@ enum OutputFormat {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let lang = match CliLang::parse(&args.lang) {
+    let lang = match Locale::parse(&args.lang) {
         Ok(lang) => lang,
         Err(err) => {
             eprintln!("{err}");
@@ -216,7 +201,7 @@ async fn main() {
     }
 }
 
-async fn run(args: Args, lang: CliLang) -> Result<i32> {
+async fn run(args: Args, lang: Locale) -> Result<i32> {
     match args.command {
         Command::Bootstrap(args) => bootstrap::run_bootstrap(*args, lang).await,
         Command::ApplySecretId(args) => apply_secret_id::run_apply_secret_id(args, lang).await,
@@ -229,16 +214,16 @@ mod tests {
 
     #[test]
     fn cli_lang_parse_en_and_ko() {
-        assert_eq!(CliLang::parse("en").expect("parse en"), CliLang::En);
-        assert_eq!(CliLang::parse("ko").expect("parse ko"), CliLang::Ko);
-        assert_eq!(CliLang::parse("EN").expect("parse EN"), CliLang::En);
+        assert_eq!(Locale::parse("en").expect("parse en"), Locale::En);
+        assert_eq!(Locale::parse("ko").expect("parse ko"), Locale::Ko);
+        assert_eq!(Locale::parse("EN").expect("parse EN"), Locale::En);
     }
 
     #[test]
     fn cli_lang_parse_invalid_fails() {
-        let err = CliLang::parse("jp").expect_err("invalid lang should fail");
+        let err = Locale::parse("jp").expect_err("invalid lang should fail");
         assert!(
-            err.to_string().contains("Unsupported language code"),
+            err.to_string().contains("Unsupported language"),
             "unexpected error: {err}"
         );
     }
@@ -246,11 +231,11 @@ mod tests {
     #[test]
     fn summary_header_localization() {
         assert_eq!(
-            summary_header(CliLang::En),
+            summary_header(Locale::En),
             "bootroot-remote bootstrap summary"
         );
         assert_eq!(
-            summary_header(CliLang::Ko),
+            summary_header(Locale::Ko),
             "bootroot-remote 부트스트랩 요약"
         );
     }
