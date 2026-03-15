@@ -37,6 +37,18 @@ Open source dependencies:
 
 For multi-machine or manual deployment, follow the manual guides in `docs/`.
 
+## Developer Layout
+
+The `bootroot-http01-responder` binary now lives under
+`src/bin/bootroot-http01-responder/` with focused modules for:
+
+- configuration loading and reload
+- in-memory token state
+- HTTP request handlers
+- HMAC/timestamp verification
+- expired-token cleanup
+- server startup and signal handling
+
 ## Quick Start (CLI)
 
 See `docs/en/cli.md` (EN) or `docs/ko/cli.md` (KO) for the full flow.
