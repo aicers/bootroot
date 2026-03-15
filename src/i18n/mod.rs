@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use bootroot::locale::Locale;
 
 pub(crate) mod en;
 pub(crate) mod ko;
@@ -364,27 +365,6 @@ pub(crate) struct Strings {
     pub(crate) next_steps_run_status: &'static str,
     pub(crate) next_steps_eab_issue: &'static str,
     pub(crate) next_steps_eab_hint: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Locale {
-    En,
-    Ko,
-}
-
-impl Locale {
-    pub(crate) fn parse(input: &str) -> Result<Self> {
-        let normalized = input.trim().to_ascii_lowercase();
-        let base = normalized
-            .split('-')
-            .next()
-            .context("Missing language code")?;
-        match base {
-            "en" => Ok(Locale::En),
-            "ko" => Ok(Locale::Ko),
-            _ => anyhow::bail!("Unsupported language: {input}"),
-        }
-    }
 }
 
 pub(crate) struct Messages {
@@ -2115,25 +2095,6 @@ pub(crate) fn test_messages() -> Messages {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_locale_parse_en() {
-        assert_eq!(Locale::parse("en").unwrap(), Locale::En);
-        assert_eq!(Locale::parse("EN").unwrap(), Locale::En);
-        assert_eq!(Locale::parse("en-US").unwrap(), Locale::En);
-    }
-
-    #[test]
-    fn test_locale_parse_ko() {
-        assert_eq!(Locale::parse("ko").unwrap(), Locale::Ko);
-        assert_eq!(Locale::parse("ko-KR").unwrap(), Locale::Ko);
-    }
-
-    #[test]
-    fn test_locale_parse_invalid() {
-        let err = Locale::parse("fr").unwrap_err();
-        assert!(err.to_string().contains("Unsupported language"));
-    }
 
     #[test]
     fn readiness_entry_templates_identical_across_locales() {

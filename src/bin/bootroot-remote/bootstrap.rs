@@ -4,12 +4,12 @@ use bootroot::openbao::OpenBaoClient;
 use super::agent_config::apply_agent_config_updates;
 use super::io::{pull_secrets, read_secret_file, write_eab_file, write_secret_file};
 use super::summary::{ApplyItemSummary, ApplySummary, merge_apply_status, print_summary};
-use super::{BootstrapArgs, CA_BUNDLE_PEM_KEY, CliLang, localized};
+use super::{BootstrapArgs, CA_BUNDLE_PEM_KEY, Locale, localized};
 
 // This function intentionally keeps end-to-end bootstrap orchestration in one place
 // so status aggregation and exit-code semantics stay easy to audit.
 #[allow(clippy::too_many_lines)]
-pub(super) async fn run_bootstrap(args: BootstrapArgs, lang: CliLang) -> Result<i32> {
+pub(super) async fn run_bootstrap(args: BootstrapArgs, lang: Locale) -> Result<i32> {
     validate_bootstrap_args(&args, lang)?;
 
     let role_id = read_secret_file(&args.role_id_path, lang)
@@ -125,7 +125,7 @@ pub(super) async fn run_bootstrap(args: BootstrapArgs, lang: CliLang) -> Result<
     Ok(0)
 }
 
-fn validate_bootstrap_args(args: &BootstrapArgs, lang: CliLang) -> Result<()> {
+fn validate_bootstrap_args(args: &BootstrapArgs, lang: Locale) -> Result<()> {
     if args.service_name.trim().is_empty() {
         anyhow::bail!(
             "{}",

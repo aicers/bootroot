@@ -7,7 +7,7 @@ use tokio::fs;
 use super::io::PulledSecrets;
 use super::summary::{ApplyItemSummary, ApplyStatus};
 use super::{
-    BootstrapArgs, CliLang, MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX,
+    BootstrapArgs, Locale, MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX,
     SERVICE_KV_BASE, TRUSTED_CA_KEY, localized,
 };
 
@@ -22,7 +22,7 @@ struct ProfilePaths {
 pub(super) async fn apply_agent_config_updates(
     args: &BootstrapArgs,
     pulled: &PulledSecrets,
-    lang: CliLang,
+    lang: Locale,
 ) -> (ApplyItemSummary, ApplyItemSummary) {
     let profile_paths = resolve_profile_paths(args);
     let agent_config = match fs::read_to_string(&args.agent_config_path).await {
@@ -398,7 +398,7 @@ fn replace_key_line_in_section(
 async fn write_openbao_agent_artifacts(
     args: &BootstrapArgs,
     agent_template: &str,
-    lang: CliLang,
+    lang: Locale,
 ) -> Result<()> {
     let secret_service_dir = args.secret_id_path.parent().ok_or_else(|| {
         anyhow::anyhow!(

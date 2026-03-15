@@ -5,9 +5,9 @@ use bootroot::fs_util;
 use tokio::fs;
 
 use super::summary::ApplyStatus;
-use super::{CA_BUNDLE_PEM_KEY, CliLang, TRUSTED_CA_KEY, localized};
+use super::{CA_BUNDLE_PEM_KEY, Locale, TRUSTED_CA_KEY, localized};
 
-pub(super) async fn read_secret_file(path: &Path, lang: CliLang) -> Result<String> {
+pub(super) async fn read_secret_file(path: &Path, lang: Locale) -> Result<String> {
     let value = fs::read_to_string(path).await?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -26,7 +26,7 @@ pub(super) async fn read_secret_file(path: &Path, lang: CliLang) -> Result<Strin
 pub(super) fn read_required_string(
     data: &serde_json::Value,
     keys: &[&str],
-    lang: CliLang,
+    lang: Locale,
 ) -> Result<String> {
     for key in keys {
         if let Some(value) = data.get(key).and_then(serde_json::Value::as_str) {
@@ -48,7 +48,7 @@ pub(super) fn read_required_string(
 
 pub(super) fn read_required_fingerprints(
     data: &serde_json::Value,
-    lang: CliLang,
+    lang: Locale,
 ) -> Result<Vec<String>> {
     let values = data
         .get(TRUSTED_CA_KEY)
@@ -145,7 +145,7 @@ pub(super) async fn pull_secrets(
     client: &bootroot::openbao::OpenBaoClient,
     mount: &str,
     service: &str,
-    lang: CliLang,
+    lang: Locale,
 ) -> Result<PulledSecrets> {
     let base = format!("{}/{service}", super::SERVICE_KV_BASE);
     let secret_id_data = client
@@ -222,7 +222,7 @@ mod tests {
             "trusted_ca_sha256": ["a".repeat(64), "b".repeat(64)]
         });
         let parsed =
-            read_required_fingerprints(&data, CliLang::En).expect("parse trust fingerprints");
+            read_required_fingerprints(&data, Locale::En).expect("parse trust fingerprints");
         assert_eq!(parsed.len(), 2);
     }
 }
