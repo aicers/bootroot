@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -77,13 +78,9 @@ pub(crate) enum DeliveryMode {
     RemoteBootstrap,
 }
 
-impl DeliveryMode {
-    #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::LocalFile => "local-file",
-            Self::RemoteBootstrap => "remote-bootstrap",
-        }
+impl fmt::Display for DeliveryMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_serde_string_value(self, formatter)
     }
 }
 
@@ -102,13 +99,19 @@ pub(crate) enum DeployType {
     Docker,
 }
 
-impl DeployType {
-    #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Daemon => "daemon",
-            Self::Docker => "docker",
-        }
+impl fmt::Display for DeployType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_serde_string_value(self, formatter)
+    }
+}
+
+fn write_serde_string_value<T: Serialize>(
+    value: &T,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    match serde_json::to_value(value).map_err(|_| fmt::Error)? {
+        serde_json::Value::String(name) => formatter.write_str(&name),
+        _ => Err(fmt::Error),
     }
 }
 
@@ -120,11 +123,11 @@ mod tests {
     fn delivery_mode_defaults_to_local_file() {
         let mode = DeliveryMode::default();
         assert_eq!(mode, DeliveryMode::LocalFile);
-        assert_eq!(mode.as_str(), "local-file");
+        assert_eq!(mode.to_string(), "local-file");
     }
 
     #[test]
-    fn deploy_type_as_str_matches_serde() {
+    fn deploy_type_display_matches_serde() {
         for variant in [DeployType::Daemon, DeployType::Docker] {
             let serialized = serde_json::to_value(variant)
                 .expect("serialize DeployType")
@@ -132,15 +135,15 @@ mod tests {
                 .expect("serde value is a string")
                 .to_string();
             assert_eq!(
-                variant.as_str(),
+                variant.to_string(),
                 serialized,
-                "as_str() and serde disagree for {variant:?}"
+                "Display and serde disagree for {variant:?}"
             );
         }
     }
 
     #[test]
-    fn delivery_mode_as_str_matches_serde() {
+    fn delivery_mode_display_matches_serde() {
         for variant in [DeliveryMode::LocalFile, DeliveryMode::RemoteBootstrap] {
             let serialized = serde_json::to_value(variant)
                 .expect("serialize DeliveryMode")
@@ -148,9 +151,9 @@ mod tests {
                 .expect("serde value is a string")
                 .to_string();
             assert_eq!(
-                variant.as_str(),
+                variant.to_string(),
                 serialized,
-                "as_str() and serde disagree for {variant:?}"
+                "Display and serde disagree for {variant:?}"
             );
         }
     }

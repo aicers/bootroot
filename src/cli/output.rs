@@ -263,34 +263,26 @@ pub(crate) fn print_service_info_summary(entry: &ServiceEntry, messages: &Messag
 }
 
 fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
+    let deploy_type = entry.deploy_type.to_string();
+    let delivery_mode = entry.delivery_mode.to_string();
     println!("{}", messages.service_summary_kind(&entry.service_name));
-    println!(
-        "{}",
-        messages.service_summary_deploy_type(entry.deploy_type.as_str())
-    );
+    println!("{}", messages.service_summary_deploy_type(&deploy_type));
     println!("{}", messages.service_summary_hostname(&entry.hostname));
     println!("{}", messages.service_summary_domain(&entry.domain));
-    println!(
-        "{}",
-        messages.service_summary_delivery_mode(entry.delivery_mode.as_str())
-    );
+    println!("{}", messages.service_summary_delivery_mode(&delivery_mode));
     if let Some(notes) = entry.notes.as_deref() {
         println!("{}", messages.service_summary_notes(notes));
     }
 }
 
 fn print_service_plan_fields(plan: &ServiceAddPlan<'_>, messages: &Messages) {
+    let deploy_type = plan.deploy_type.to_string();
+    let delivery_mode = plan.delivery_mode.to_string();
     println!("{}", messages.service_summary_kind(plan.service_name));
-    println!(
-        "{}",
-        messages.service_summary_deploy_type(plan.deploy_type.as_str())
-    );
+    println!("{}", messages.service_summary_deploy_type(&deploy_type));
     println!("{}", messages.service_summary_hostname(plan.hostname));
     println!("{}", messages.service_summary_domain(plan.domain));
-    println!(
-        "{}",
-        messages.service_summary_delivery_mode(plan.delivery_mode.as_str())
-    );
+    println!("{}", messages.service_summary_delivery_mode(&delivery_mode));
     if let Some(instance_id) = plan.instance_id {
         println!("{}", messages.service_summary_instance_id(instance_id));
     }

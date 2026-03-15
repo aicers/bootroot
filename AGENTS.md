@@ -70,12 +70,12 @@ before generating code.
 
 ## 2. Commit Messages
 
-* Title: max 50 characters, start with imperative verb (e.g., `Add`, `Fix`,
-  `Remove`)
+* Title: preferably under 50 characters, start with imperative verb
+  (e.g., `Add`, `Fix`, `Remove`)
 * Body: wrap at 72 characters, free-form, explain *why* not *what*
 * Separate title and body with a blank line
-* Reference issues with `Closes #N` or `Refs #N` in the body
-* **No Prefixes**: Do NOT use prefixes like `feat:`, `chore:`, `fix:`, etc.
+* Reference issues: use `Closes #N` to close an issue, or
+  `Part of #N` when the commit addresses part of an issue
 
 ## 3. Language
 

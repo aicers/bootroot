@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bootroot::{Args, config, daemon, eab, profile};
+use bootroot::{Args, config, eab, profile, run_daemon, run_oneshot};
 use clap::Parser;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
 
     if args.oneshot {
         let (settings, final_eab) = load_settings(&args).await?;
-        match daemon::run_oneshot(
+        match run_oneshot(
             Arc::new(settings),
             final_eab,
             args.config.clone(),
@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         };
         log_settings(&settings, final_eab.as_ref());
         let settings = Arc::new(settings);
-        let mut task = tokio::spawn(daemon::run_daemon(
+        let mut task = tokio::spawn(run_daemon(
             Arc::clone(&settings),
             final_eab,
             args.config.clone(),

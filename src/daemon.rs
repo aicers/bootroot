@@ -24,7 +24,7 @@ struct HardeningPolicy {
 ///
 /// # Errors
 /// Returns an error if issuance or shutdown handling fails.
-pub async fn run_daemon(
+pub(crate) async fn run_daemon(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
     config_path: Option<PathBuf>,
@@ -132,7 +132,7 @@ async fn run_profile_daemon(
 ///
 /// # Errors
 /// Returns an error if any profile issuance fails.
-pub async fn run_oneshot(
+pub(crate) async fn run_oneshot(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
     config_path: Option<PathBuf>,
