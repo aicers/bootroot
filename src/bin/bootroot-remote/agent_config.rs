@@ -324,6 +324,7 @@ fn build_trust_updates(
     let mut updates = Vec::new();
     if let Some(path) = ca_bundle_path {
         updates.push(("ca_bundle_path", path.display().to_string()));
+        updates.push(("verify_certificates", "true".to_string()));
     }
     updates.push((
         TRUSTED_CA_KEY,
@@ -336,7 +337,6 @@ fn build_trust_updates(
                 .join(", ")
         ),
     ));
-    updates.push(("verify_certificates", "true".to_string()));
     updates
 }
 

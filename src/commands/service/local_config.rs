@@ -40,7 +40,9 @@ pub(super) async fn apply_local_service_configs(
             .parent()
             .unwrap_or(Path::new("certs"))
             .join("ca-bundle.pem");
-        let trust_updates = build_trust_updates(&material.trusted_ca_sha256, &ca_bundle_path);
+        let has_bundle = material.ca_bundle_pem.is_some();
+        let trust_updates =
+            build_trust_updates(&material.trusted_ca_sha256, &ca_bundle_path, has_bundle);
         next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates)?;
         if let Some(bundle_pem) = material.ca_bundle_pem.as_deref() {
             write_local_ca_bundle(&ca_bundle_path, bundle_pem, messages).await?;
@@ -171,8 +173,9 @@ fn upsert_managed_profile(contents: &str, service_name: &str, replacement: &str)
 fn build_trust_updates(
     fingerprints: &[String],
     ca_bundle_path: &Path,
+    has_bundle: bool,
 ) -> Vec<(&'static str, String)> {
-    vec![
+    let mut updates = vec![
         ("ca_bundle_path", ca_bundle_path.display().to_string()),
         (
             CA_TRUST_KEY,
@@ -185,8 +188,11 @@ fn build_trust_updates(
                     .join(", ")
             ),
         ),
-        ("verify_certificates", "true".to_string()),
-    ]
+    ];
+    if has_bundle {
+        updates.push(("verify_certificates", "true".to_string()));
+    }
+    updates
 }
 
 fn is_section_header(line: &str) -> bool {
@@ -361,6 +367,7 @@ mod tests {
         let updates = build_trust_updates(
             &["a".repeat(64), "b".repeat(64)],
             Path::new("certs/ca-bundle.pem"),
+            true,
         );
         let original = "[acme]\nhttp_responder_hmac = \"old\"\n";
         let once = bootroot::toml_util::upsert_section_keys(original, "trust", &updates).unwrap();
