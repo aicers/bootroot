@@ -47,6 +47,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_db_host_not_single_host: "PostgreSQL host violates single-host guardrail: {host}",
     error_db_host_compose_runtime: "PostgreSQL host '{host}' is not reachable from step-ca container runtime; use '{expected}' in db-dsn/db-admin-dsn",
     error_postgres_port_binding_unsafe: "PostgreSQL port must be bound to localhost only (for example, 127.0.0.1:5432:5432)",
+    error_service_port_binding_unsafe: "{service} port must be bound to localhost only (for example, 127.0.0.1:<port>:<port>)",
     error_db_check_failed: "DB connectivity check failed",
     error_db_auth_failed: "DB authentication check failed",
     error_db_type_unsupported: "DB check requires postgresql db.type",

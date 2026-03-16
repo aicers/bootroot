@@ -19,7 +19,9 @@ directory_fetch_max_delay_secs = 10
 poll_attempts = 15
 poll_interval_secs = 2
 http_responder_url = "http://bootroot-http01:8080"
-http_responder_hmac = "dev-hmac"
+# http_responder_hmac must be set to a unique, random value before deployment.
+# Example: openssl rand -hex 32
+http_responder_hmac = "CHANGE-ME"
 http_responder_timeout_secs = 5
 http_responder_token_ttl_secs = 300
 

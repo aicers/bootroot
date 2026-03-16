@@ -113,6 +113,13 @@ impl Messages {
         self.strings().error_postgres_port_binding_unsafe
     }
 
+    pub(crate) fn error_service_port_binding_unsafe(&self, service: &str) -> String {
+        format_template(
+            self.strings().error_service_port_binding_unsafe,
+            &[("service", service)],
+        )
+    }
+
     pub(crate) fn error_db_check_failed(&self) -> &'static str {
         self.strings().error_db_check_failed
     }

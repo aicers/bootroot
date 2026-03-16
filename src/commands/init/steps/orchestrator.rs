@@ -28,13 +28,13 @@ use super::stepca_setup::{
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
-use crate::commands::guardrails::ensure_postgres_localhost_binding;
+use crate::commands::guardrails::ensure_all_services_localhost_binding;
 use crate::commands::infra::ensure_infra_ready;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
-    ensure_postgres_localhost_binding(&args.compose.compose_file, messages)?;
+    ensure_all_services_localhost_binding(&args.compose.compose_file, messages)?;
     ensure_infra_ready(&args.compose.compose_file, messages)?;
 
     let mut client = OpenBaoClient::new(&args.openbao.openbao_url)

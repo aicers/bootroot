@@ -87,6 +87,7 @@ pub(crate) struct Strings {
     pub(crate) error_db_host_not_single_host: &'static str,
     pub(crate) error_db_host_compose_runtime: &'static str,
     pub(crate) error_postgres_port_binding_unsafe: &'static str,
+    pub(crate) error_service_port_binding_unsafe: &'static str,
     pub(crate) error_db_check_failed: &'static str,
     pub(crate) error_db_auth_failed: &'static str,
     pub(crate) error_db_type_unsupported: &'static str,
