@@ -620,6 +620,11 @@ async fn test_rotate_eab_marks_remote_pending_and_updates_local_service() {
         output.status.success(),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    // EAB kid/hmac from mock are "new-kid" and "new-hmac"; both should be masked.
+    assert!(
+        !stdout.contains("- EAB HMAC: new-hmac"),
+        "EAB HMAC should be masked without --show-secrets:\n{stdout}"
+    );
 }
 
 #[cfg(unix)]
@@ -886,6 +891,43 @@ async fn test_rotate_openbao_recovery_unseal_keys_requires_enough_keys_in_yes_mo
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "stderr:\n{stderr}");
     assert!(stderr.contains("At least 3 existing unseal keys are required for rekey"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_openbao_recovery_show_secrets_reveals_plaintext() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    stub_openbao_for_recovery_root_token_rotation(&openbao).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "--show-secrets",
+            "openbao-recovery",
+            "--rotate-root-token",
+        ])
+        .output()
+        .expect("run rotate openbao-recovery with --show-secrets");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- root token: new-root-token"),
+        "expected plaintext root token in stdout:\n{stdout}"
+    );
 }
 
 fn prepare_app_state(
