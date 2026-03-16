@@ -5,6 +5,7 @@ use bootroot::openbao::OpenBaoClient;
 use super::RotateContext;
 use super::helpers::confirm_action;
 use crate::cli::args::RotateEabArgs;
+use crate::cli::output::display_secret;
 use crate::commands::constants::{SERVICE_EAB_HMAC_KEY, SERVICE_EAB_KID_KEY, SERVICE_KV_BASE};
 use crate::commands::init::PATH_AGENT_EAB;
 use crate::i18n::Messages;
@@ -16,6 +17,7 @@ pub(super) async fn rotate_eab(
     client: &OpenBaoClient,
     args: &RotateEabArgs,
     auto_confirm: bool,
+    show_secrets: bool,
     messages: &Messages,
 ) -> Result<()> {
     confirm_action(messages.prompt_rotate_eab(), auto_confirm, messages)?;
@@ -32,8 +34,14 @@ pub(super) async fn rotate_eab(
     sync_service_eab_payloads(ctx, client, &credentials.kid, &credentials.hmac, messages).await?;
 
     println!("{}", messages.rotate_summary_title());
-    println!("{}", messages.summary_eab_kid(&credentials.kid));
-    println!("{}", messages.summary_eab_hmac(&credentials.hmac));
+    println!(
+        "{}",
+        messages.summary_eab_kid(&display_secret(&credentials.kid, show_secrets))
+    );
+    println!(
+        "{}",
+        messages.summary_eab_hmac(&display_secret(&credentials.hmac, show_secrets))
+    );
     Ok(())
 }
 

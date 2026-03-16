@@ -152,7 +152,6 @@ async fn validate_authorization_http01(
     tracing::debug!("Found HTTP-01 challenge: token={challenge_token}");
 
     let key_auth = client.compute_key_authorization(&challenge_token)?;
-    tracing::debug!("Key Authorization computed: {key_auth}");
 
     responder_client::register_http01_token(settings, &challenge_token, &key_auth).await?;
 

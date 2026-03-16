@@ -169,7 +169,15 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
             .await?;
         }
         RotateCommand::Eab(step_args) => {
-            eab::rotate_eab(&mut ctx, &client, step_args, args.yes, messages).await?;
+            eab::rotate_eab(
+                &mut ctx,
+                &client,
+                step_args,
+                args.yes,
+                args.show_secrets,
+                messages,
+            )
+            .await?;
         }
         RotateCommand::Db(step_args) => {
             db::rotate_db(&mut ctx, &client, step_args, args.yes, messages).await?;
@@ -179,8 +187,14 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
                 .await?;
         }
         RotateCommand::OpenBaoRecovery(step_args) => {
-            openbao_recovery::rotate_openbao_recovery(&client, step_args, args.yes, messages)
-                .await?;
+            openbao_recovery::rotate_openbao_recovery(
+                &client,
+                step_args,
+                args.yes,
+                args.show_secrets,
+                messages,
+            )
+            .await?;
         }
         RotateCommand::AppRoleSecretId(step_args) => {
             approle::rotate_approle_secret_id(&mut ctx, &client, step_args, args.yes, messages)
