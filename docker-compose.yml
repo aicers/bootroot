@@ -4,7 +4,7 @@ services:
     container_name: bootroot-openbao
     restart: always
     ports:
-      - "8200:8200"
+      - "127.0.0.1:8200:8200"
     expose:
       - "9101"
     volumes:
@@ -21,7 +21,7 @@ services:
     restart: always
     environment:
       - POSTGRES_USER=step
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-step-pass}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       - POSTGRES_DB=stepca
     ports:
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
@@ -40,7 +40,7 @@ services:
     depends_on:
       - postgres
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
     expose:
       - "9102"
     environment:
@@ -63,7 +63,7 @@ services:
     container_name: bootroot-http01
     restart: always
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./responder.toml.compose:/app/responder.toml:ro
     command:
@@ -121,7 +121,7 @@ services:
       - prometheus
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
     volumes:
       - ./monitoring/grafana:/etc/grafana/provisioning:ro
       - ./monitoring/dashboards:/var/lib/grafana/dashboards:ro
@@ -139,7 +139,7 @@ services:
       - prometheus
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
     volumes:
       - ./monitoring/grafana:/etc/grafana/provisioning:ro
       - ./monitoring/dashboards:/var/lib/grafana/dashboards:ro

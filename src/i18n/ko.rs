@@ -47,6 +47,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_db_host_not_single_host: "PostgreSQL 호스트가 단일 호스트 가드레일을 위반합니다: {host}",
     error_db_host_compose_runtime: "PostgreSQL 호스트 '{host}'는 step-ca 컨테이너 런타임에서 접근할 수 없습니다. db-dsn/db-admin-dsn에 '{expected}'를 사용하세요",
     error_postgres_port_binding_unsafe: "PostgreSQL 포트는 localhost로만 바인딩되어야 합니다 (예: 127.0.0.1:5432:5432)",
+    error_service_port_binding_unsafe: "{service} 포트는 localhost로만 바인딩되어야 합니다 (예: 127.0.0.1:<port>:<port>)",
     error_db_check_failed: "DB 연결 점검에 실패했습니다",
     error_db_auth_failed: "DB 인증 점검에 실패했습니다",
     error_db_type_unsupported: "DB 점검은 postgresql db.type에서만 지원합니다",
