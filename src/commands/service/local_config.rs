@@ -185,6 +185,7 @@ fn build_trust_updates(
                     .join(", ")
             ),
         ),
+        ("verify_certificates", "true".to_string()),
     ]
 }
 

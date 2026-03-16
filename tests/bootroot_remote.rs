@@ -70,6 +70,10 @@ async fn test_bootroot_remote_applies_service_secrets() {
     assert!(agent_contents.contains("http_responder_hmac = \"responder-hmac-1\""));
     assert!(agent_contents.contains("ca_bundle_path = \""));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
+    assert!(
+        agent_contents.contains("verify_certificates = true"),
+        "bootstrap should enable TLS verification:\n{agent_contents}"
+    );
     let bundle_contents = fs::read_to_string(&ca_bundle_path).expect("read ca bundle");
     assert_eq!(
         bundle_contents,

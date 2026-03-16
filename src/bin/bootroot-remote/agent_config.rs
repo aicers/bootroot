@@ -336,6 +336,7 @@ fn build_trust_updates(
                 .join(", ")
         ),
     ));
+    updates.push(("verify_certificates", "true".to_string()));
     updates
 }
 
