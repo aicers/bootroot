@@ -174,6 +174,10 @@ pub(crate) struct RotateArgs {
     /// Skip confirmation prompts
     #[arg(long)]
     pub(crate) yes: bool,
+
+    /// Show secrets in plaintext instead of masking them
+    #[arg(long)]
+    pub(crate) show_secrets: bool,
 }
 
 #[derive(Subcommand, Debug)]

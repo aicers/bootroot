@@ -10,6 +10,7 @@ use super::{
     OPENBAO_REKEY_INCOMPLETE_ERROR,
 };
 use crate::cli::args::RotateOpenBaoRecoveryArgs;
+use crate::cli::output::display_secret;
 use crate::cli::prompt::Prompt;
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
@@ -26,6 +27,7 @@ pub(super) async fn rotate_openbao_recovery(
     client: &OpenBaoClient,
     args: &RotateOpenBaoRecoveryArgs,
     auto_confirm: bool,
+    show_secrets: bool,
     messages: &Messages,
 ) -> Result<()> {
     if !args.rotate_unseal_keys && !args.rotate_root_token {
@@ -80,7 +82,7 @@ pub(super) async fn rotate_openbao_recovery(
         return Ok(());
     }
 
-    print_openbao_recovery_stdout(&output, messages)?;
+    print_openbao_recovery_stdout(&output, show_secrets, messages)?;
 
     Ok(())
 }
@@ -146,10 +148,14 @@ async fn rotate_openbao_unseal_keys(
 
 fn print_openbao_recovery_stdout(
     output: &OpenBaoRecoveryRotationOutput,
+    show_secrets: bool,
     messages: &Messages,
 ) -> Result<()> {
     if let Some(root_token) = output.root_token.as_deref() {
-        println!("{}", messages.summary_root_token(root_token));
+        println!(
+            "{}",
+            messages.summary_root_token(&display_secret(root_token, show_secrets))
+        );
     }
 
     for (index, unseal_key) in output.unseal_keys.iter().enumerate() {
@@ -158,7 +164,8 @@ fn print_openbao_recovery_stdout(
             .ok_or_else(|| anyhow::anyhow!("failed to calculate one-based index for unseal key"))?;
         println!(
             "{}",
-            messages.summary_unseal_key(one_based_index, unseal_key)
+            messages
+                .summary_unseal_key(one_based_index, &display_secret(unseal_key, show_secrets),)
         );
     }
     Ok(())

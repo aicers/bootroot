@@ -95,7 +95,7 @@ services:
           --ca-url=https://bootroot-ca:9000/acme/acme/directory \
           --config=/app/certs/agent.runtime.toml
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
 
   prometheus:
     image: prom/prometheus:latest

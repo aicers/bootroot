@@ -654,7 +654,10 @@ async fn test_rotate_openbao_recovery_rotates_root_token_only() {
     );
     assert!(stdout.contains("bootroot rotate: summary"));
     assert!(stdout.contains("OpenBao recovery rotation: root-token"));
-    assert!(stdout.contains("- root token: new-root-token"));
+    assert!(
+        stdout.contains("- root token: ****oken"),
+        "expected masked root token in stdout:\n{stdout}"
+    );
 }
 
 #[cfg(unix)]
