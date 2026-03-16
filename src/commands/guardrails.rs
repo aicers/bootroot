@@ -8,7 +8,10 @@ use crate::i18n::Messages;
 const LOCAL_DB_HOSTS: [&str; 4] = ["postgres", "localhost", "127.0.0.1", "::1"];
 
 /// Compose service names that must bind their published ports to localhost.
-const GUARDED_SERVICES: [&str; 4] = ["postgres:", "openbao:", "bootroot-http01:", "grafana:"];
+/// Note: `grafana:` and `grafana-public:` are behind compose profiles
+/// (`lan`/`public`) and are not started by default `infra up`, so they are
+/// excluded from this guardrail.
+const GUARDED_SERVICES: [&str; 3] = ["postgres:", "openbao:", "bootroot-http01:"];
 
 /// Returns whether a DB host is allowed under the single-host guardrail.
 #[must_use]
@@ -232,27 +235,4 @@ services:
         ));
     }
 
-    #[test]
-    fn detects_unsafe_grafana_port_binding() {
-        let compose = r#"
-services:
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "0.0.0.0:3000:3000"
-"#;
-        assert!(has_unsafe_port_binding_for_service(compose, "grafana:"));
-    }
-
-    #[test]
-    fn accepts_safe_grafana_with_env_var_bind() {
-        let compose = r#"
-services:
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "127.0.0.1:3000:3000"
-"#;
-        assert!(!has_unsafe_port_binding_for_service(compose, "grafana:"));
-    }
 }
