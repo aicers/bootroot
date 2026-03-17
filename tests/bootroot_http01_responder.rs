@@ -17,6 +17,15 @@ const STARTUP_RETRIES: usize = 50;
 const STARTUP_DELAY: Duration = Duration::from_millis(100);
 const TEST_TTL_SECS: u64 = 60;
 
+#[derive(Default)]
+struct ResponderConfigOverrides {
+    token_ttl_secs: Option<u64>,
+    max_token_ttl_secs: Option<u64>,
+    admin_rate_limit_requests: Option<u64>,
+    admin_rate_limit_window_secs: Option<u64>,
+    admin_body_limit_bytes: Option<u64>,
+}
+
 #[tokio::test]
 async fn test_http01_responder_serves_registered_token() {
     let temp_dir = tempdir().expect("create temp dir");
@@ -46,6 +55,124 @@ async fn test_http01_responder_serves_registered_token() {
         challenge.text().await.expect("read challenge response"),
         "token-1.key"
     );
+}
+
+#[tokio::test]
+async fn test_http01_responder_clamps_requested_ttl_to_server_max() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let listen_addr = reserve_socket_addr();
+    let admin_addr = reserve_socket_addr();
+    let config_path = temp_dir.path().join("responder.toml");
+    write_responder_config_with_overrides(
+        &config_path,
+        &listen_addr,
+        &admin_addr,
+        "initial-secret",
+        &ResponderConfigOverrides {
+            token_ttl_secs: Some(1),
+            max_token_ttl_secs: Some(1),
+            ..ResponderConfigOverrides::default()
+        },
+    );
+
+    let mut responder = ResponderProcess::spawn(&config_path);
+    let challenge_base_url = format!("http://{listen_addr}");
+    let admin_base_url = format!("http://{admin_addr}");
+    wait_for_ready(&mut responder, &challenge_base_url).await;
+
+    let response = register_token(
+        &admin_base_url,
+        "initial-secret",
+        "token-clamped",
+        "token-clamped.key",
+        TEST_TTL_SECS,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    sleep(Duration::from_secs(2)).await;
+
+    let challenge = fetch_challenge(&challenge_base_url, "token-clamped").await;
+    assert_eq!(challenge.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_http01_responder_rate_limits_admin_registrations() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let listen_addr = reserve_socket_addr();
+    let admin_addr = reserve_socket_addr();
+    let config_path = temp_dir.path().join("responder.toml");
+    write_responder_config_with_overrides(
+        &config_path,
+        &listen_addr,
+        &admin_addr,
+        "initial-secret",
+        &ResponderConfigOverrides {
+            admin_rate_limit_requests: Some(1),
+            admin_rate_limit_window_secs: Some(60),
+            ..ResponderConfigOverrides::default()
+        },
+    );
+
+    let mut responder = ResponderProcess::spawn(&config_path);
+    let challenge_base_url = format!("http://{listen_addr}");
+    let admin_base_url = format!("http://{admin_addr}");
+    wait_for_ready(&mut responder, &challenge_base_url).await;
+
+    let first = register_token(
+        &admin_base_url,
+        "initial-secret",
+        "token-rate-limit-1",
+        "token-rate-limit-1.key",
+        TEST_TTL_SECS,
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = register_token(
+        &admin_base_url,
+        "initial-secret",
+        "token-rate-limit-2",
+        "token-rate-limit-2.key",
+        TEST_TTL_SECS,
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_http01_responder_rejects_large_admin_payloads() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let listen_addr = reserve_socket_addr();
+    let admin_addr = reserve_socket_addr();
+    let config_path = temp_dir.path().join("responder.toml");
+    write_responder_config_with_overrides(
+        &config_path,
+        &listen_addr,
+        &admin_addr,
+        "initial-secret",
+        &ResponderConfigOverrides {
+            admin_body_limit_bytes: Some(64),
+            ..ResponderConfigOverrides::default()
+        },
+    );
+
+    let mut responder = ResponderProcess::spawn(&config_path);
+    let challenge_base_url = format!("http://{listen_addr}");
+    let admin_base_url = format!("http://{admin_addr}");
+    wait_for_ready(&mut responder, &challenge_base_url).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{admin_base_url}{ADMIN_PATH}"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"token":"token-large","key_authorization":"token-large.key.token-large.key","ttl_secs":60}"#,
+        )
+        .send()
+        .await
+        .expect("send oversized register request");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[cfg(unix)]
@@ -126,13 +253,38 @@ fn reserve_socket_addr() -> String {
 }
 
 fn write_responder_config(config_path: &Path, listen_addr: &str, admin_addr: &str, secret: &str) {
+    write_responder_config_with_overrides(
+        config_path,
+        listen_addr,
+        admin_addr,
+        secret,
+        &ResponderConfigOverrides::default(),
+    );
+}
+
+fn write_responder_config_with_overrides(
+    config_path: &Path,
+    listen_addr: &str,
+    admin_addr: &str,
+    secret: &str,
+    overrides: &ResponderConfigOverrides,
+) {
     let contents = format!(
         "listen_addr = \"{listen_addr}\"\n\
 admin_addr = \"{admin_addr}\"\n\
 hmac_secret = \"{secret}\"\n\
-token_ttl_secs = 300\n\
+token_ttl_secs = {token_ttl_secs}\n\
+max_token_ttl_secs = {max_token_ttl_secs}\n\
 cleanup_interval_secs = 30\n\
-max_skew_secs = 60\n"
+max_skew_secs = 60\n\
+admin_rate_limit_requests = {admin_rate_limit_requests}\n\
+admin_rate_limit_window_secs = {admin_rate_limit_window_secs}\n\
+admin_body_limit_bytes = {admin_body_limit_bytes}\n",
+        token_ttl_secs = overrides.token_ttl_secs.unwrap_or(300),
+        max_token_ttl_secs = overrides.max_token_ttl_secs.unwrap_or(900),
+        admin_rate_limit_requests = overrides.admin_rate_limit_requests.unwrap_or(300),
+        admin_rate_limit_window_secs = overrides.admin_rate_limit_window_secs.unwrap_or(60),
+        admin_body_limit_bytes = overrides.admin_body_limit_bytes.unwrap_or(8 * 1024),
     );
     fs::write(config_path, contents).expect("write responder config");
 }

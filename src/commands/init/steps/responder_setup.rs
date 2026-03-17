@@ -56,8 +56,12 @@ listen_addr = "0.0.0.0:80"
 admin_addr = "0.0.0.0:8080"
 hmac_secret = "{{{{ with secret "{kv_mount}/data/{PATH_RESPONDER_HMAC}" }}}}{{{{ .Data.data.value }}}}{{{{ end }}}}"
 token_ttl_secs = 300
+max_token_ttl_secs = 900
 cleanup_interval_secs = 30
 max_skew_secs = 60
+admin_rate_limit_requests = 300
+admin_rate_limit_window_secs = 60
+admin_body_limit_bytes = 8192
 "#
     )
 }
@@ -70,8 +74,12 @@ listen_addr = "0.0.0.0:80"
 admin_addr = "0.0.0.0:8080"
 hmac_secret = "{hmac}"
 token_ttl_secs = 300
+max_token_ttl_secs = 900
 cleanup_interval_secs = 30
 max_skew_secs = 60
+admin_rate_limit_requests = 300
+admin_rate_limit_window_secs = 60
+admin_body_limit_bytes = 8192
 "#
     )
 }
@@ -185,7 +193,13 @@ mod tests {
         let config = fs::read_to_string(&paths.config_path).unwrap();
 
         assert!(template.contains("secret/data/bootroot/responder/hmac"));
+        assert!(template.contains("max_token_ttl_secs = 900"));
+        assert!(template.contains("admin_rate_limit_requests = 300"));
+        assert!(template.contains("admin_body_limit_bytes = 8192"));
         assert!(config.contains("hmac-123"));
+        assert!(config.contains("max_token_ttl_secs = 900"));
+        assert!(config.contains("admin_rate_limit_requests = 300"));
+        assert!(config.contains("admin_body_limit_bytes = 8192"));
     }
 
     #[tokio::test]

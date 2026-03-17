@@ -15,8 +15,12 @@ const DEFAULT_CONFIG_PATH: &str = "responder.toml";
 pub(super) const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:80";
 pub(super) const DEFAULT_ADMIN_ADDR: &str = "0.0.0.0:8080";
 pub(super) const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
+pub(super) const DEFAULT_MAX_TOKEN_TTL_SECS: u64 = 900;
 pub(super) const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 30;
 pub(super) const DEFAULT_MAX_SKEW_SECS: u64 = 60;
+pub(super) const DEFAULT_ADMIN_RATE_LIMIT_REQUESTS: u64 = 300;
+pub(super) const DEFAULT_ADMIN_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+pub(super) const DEFAULT_ADMIN_BODY_LIMIT_BYTES: u64 = 8 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Bootroot HTTP-01 responder")]
@@ -32,8 +36,12 @@ pub(super) struct ResponderSettings {
     pub(super) admin_addr: String,
     pub(super) hmac_secret: String,
     pub(super) token_ttl_secs: u64,
+    pub(super) max_token_ttl_secs: u64,
     pub(super) cleanup_interval_secs: u64,
     pub(super) max_skew_secs: u64,
+    pub(super) admin_rate_limit_requests: u64,
+    pub(super) admin_rate_limit_window_secs: u64,
+    pub(super) admin_body_limit_bytes: u64,
 }
 
 impl ResponderSettings {
@@ -45,8 +53,18 @@ impl ResponderSettings {
             .set_default("listen_addr", DEFAULT_LISTEN_ADDR)?
             .set_default("admin_addr", DEFAULT_ADMIN_ADDR)?
             .set_default("token_ttl_secs", DEFAULT_TOKEN_TTL_SECS)?
+            .set_default("max_token_ttl_secs", DEFAULT_MAX_TOKEN_TTL_SECS)?
             .set_default("cleanup_interval_secs", DEFAULT_CLEANUP_INTERVAL_SECS)?
             .set_default("max_skew_secs", DEFAULT_MAX_SKEW_SECS)?
+            .set_default(
+                "admin_rate_limit_requests",
+                DEFAULT_ADMIN_RATE_LIMIT_REQUESTS,
+            )?
+            .set_default(
+                "admin_rate_limit_window_secs",
+                DEFAULT_ADMIN_RATE_LIMIT_WINDOW_SECS,
+            )?
+            .set_default("admin_body_limit_bytes", DEFAULT_ADMIN_BODY_LIMIT_BYTES)?
             .add_source(File::from(path).required(false))
             .add_source(
                 Environment::with_prefix("BOOTROOT_RESPONDER")
@@ -65,11 +83,32 @@ impl ResponderSettings {
         if self.token_ttl_secs == 0 {
             anyhow::bail!("token_ttl_secs must be greater than 0");
         }
+        if self.max_token_ttl_secs == 0 {
+            anyhow::bail!("max_token_ttl_secs must be greater than 0");
+        }
+        if self.max_token_ttl_secs < self.token_ttl_secs {
+            anyhow::bail!("max_token_ttl_secs must be greater than or equal to token_ttl_secs");
+        }
         if self.cleanup_interval_secs == 0 {
             anyhow::bail!("cleanup_interval_secs must be greater than 0");
         }
         if self.max_skew_secs == 0 {
             anyhow::bail!("max_skew_secs must be greater than 0");
+        }
+        if self.admin_rate_limit_requests == 0 {
+            anyhow::bail!("admin_rate_limit_requests must be greater than 0");
+        }
+        if usize::try_from(self.admin_rate_limit_requests).is_err() {
+            anyhow::bail!("admin_rate_limit_requests must fit into usize");
+        }
+        if self.admin_rate_limit_window_secs == 0 {
+            anyhow::bail!("admin_rate_limit_window_secs must be greater than 0");
+        }
+        if self.admin_body_limit_bytes == 0 {
+            anyhow::bail!("admin_body_limit_bytes must be greater than 0");
+        }
+        if usize::try_from(self.admin_body_limit_bytes).is_err() {
+            anyhow::bail!("admin_body_limit_bytes must fit into usize");
         }
         validate_socket_addr(&self.listen_addr, "listen_addr")?;
         validate_socket_addr(&self.admin_addr, "admin_addr")?;
@@ -113,8 +152,12 @@ mod tests {
             admin_addr: DEFAULT_ADMIN_ADDR.to_string(),
             hmac_secret: "test-secret".to_string(),
             token_ttl_secs: DEFAULT_TOKEN_TTL_SECS,
+            max_token_ttl_secs: DEFAULT_MAX_TOKEN_TTL_SECS,
             cleanup_interval_secs: DEFAULT_CLEANUP_INTERVAL_SECS,
             max_skew_secs: DEFAULT_MAX_SKEW_SECS,
+            admin_rate_limit_requests: DEFAULT_ADMIN_RATE_LIMIT_REQUESTS,
+            admin_rate_limit_window_secs: DEFAULT_ADMIN_RATE_LIMIT_WINDOW_SECS,
+            admin_body_limit_bytes: DEFAULT_ADMIN_BODY_LIMIT_BYTES,
         }
     }
 
@@ -138,5 +181,27 @@ mod tests {
             .validate()
             .expect_err("invalid admin address must be rejected");
         assert!(err.to_string().contains("admin_addr"));
+    }
+
+    #[test]
+    fn test_validate_rejects_max_token_ttl_below_default_ttl() {
+        let mut settings = test_settings();
+        settings.max_token_ttl_secs = settings.token_ttl_secs - 1;
+
+        let err = settings
+            .validate()
+            .expect_err("max token TTL below default token TTL must be rejected");
+        assert!(err.to_string().contains("max_token_ttl_secs"));
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_admin_body_limit() {
+        let mut settings = test_settings();
+        settings.admin_body_limit_bytes = 0;
+
+        let err = settings
+            .validate()
+            .expect_err("zero admin body limit must be rejected");
+        assert!(err.to_string().contains("admin_body_limit_bytes"));
     }
 }
