@@ -53,9 +53,15 @@ The `bootroot-http01-responder` binary now lives under
 
 See `docs/en/cli.md` (EN) or `docs/ko/cli.md` (KO) for the full flow.
 
+Before `bootroot infra up`, set `POSTGRES_PASSWORD` in `.env` or export it in
+your shell. The full setup is documented in
+[`docs/en/installation.md`](docs/en/installation.md) and
+[`docs/ko/installation.md`](docs/ko/installation.md).
+
 Typical sequence:
 
 ```bash
+export POSTGRES_PASSWORD=step-pass
 bootroot infra up
 bootroot init
 bootroot service add
