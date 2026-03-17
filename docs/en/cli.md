@@ -555,7 +555,19 @@ Common:
   (env `OPENBAO_APPROLE_ROLE_ID_FILE`)
 - `--approle-secret-id-file`: file path containing AppRole secret_id
   (env `OPENBAO_APPROLE_SECRET_ID_FILE`)
+- `--show-secrets`: print secret-bearing stdout fields in plaintext instead of
+  masking them
 - `--yes`: skip confirmation prompts
+
+Output behavior:
+
+- By default, rotate subcommands mask secret-bearing stdout fields.
+- Use `--show-secrets` only when plaintext stdout is intentionally required.
+- This affects secret-bearing summary output such as EAB credentials, root
+  tokens, and unseal keys.
+- For `rotate openbao-recovery`, `--output` is separate from stdout masking:
+  it writes plaintext credentials to the destination file while stdout prints
+  only the summary and output path.
 
 Per subcommand:
 
@@ -570,6 +582,7 @@ Per subcommand:
 
 - `--stepca-url`: step-ca URL (default `https://localhost:9000`)
 - `--stepca-provisioner`: ACME provisioner name (default `acme`)
+- stdout summary masks EAB `kid` / `hmac` unless `--show-secrets` is set
 
 #### `rotate db`
 
@@ -658,6 +671,8 @@ operator action only and does not run automatically.
 - `--unseal-key`: existing unseal key (repeatable)
 - `--unseal-key-file`: file containing existing unseal keys (one per line)
 - `--output`: write new credentials to a file (`0600`)
+- stdout summary masks the new root token / unseal keys unless
+  `--show-secrets` is set
 
 At least one target flag (`--rotate-unseal-keys` / `--rotate-root-token`)
 is required. `rotate openbao-recovery` does not modify AppRole roles,
