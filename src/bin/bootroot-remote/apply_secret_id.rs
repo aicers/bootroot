@@ -3,22 +3,14 @@ use bootroot::openbao::OpenBaoClient;
 
 use super::io::{read_required_string, read_secret_file, write_secret_file};
 use super::summary::{ApplyStatus, status_to_str};
+use super::validation::validate_service_name;
 use super::{ApplySecretIdArgs, Locale, OutputFormat, SECRET_ID_KEY, SERVICE_KV_BASE, localized};
 
 // This function intentionally keeps all apply-secret-id logic in one place
 // so the single-value variant stays easy to audit and modify separately.
 #[allow(clippy::too_many_lines)]
 pub(super) async fn run_apply_secret_id(args: ApplySecretIdArgs, lang: Locale) -> Result<i32> {
-    if args.service_name.trim().is_empty() {
-        anyhow::bail!(
-            "{}",
-            localized(
-                lang,
-                "--service-name must not be empty",
-                "--service-name 값은 비어 있으면 안 됩니다",
-            )
-        );
-    }
+    validate_service_name(&args.service_name, lang)?;
     let role_id = read_secret_file(&args.role_id_path, lang)
         .await
         .with_context(|| {

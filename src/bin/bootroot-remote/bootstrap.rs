@@ -4,6 +4,10 @@ use bootroot::openbao::OpenBaoClient;
 use super::agent_config::apply_agent_config_updates;
 use super::io::{pull_secrets, read_secret_file, write_eab_file, write_secret_file};
 use super::summary::{ApplyItemSummary, ApplySummary, merge_apply_status, print_summary};
+use super::validation::{
+    validate_agent_domain, validate_profile_hostname, validate_profile_instance_id,
+    validate_service_name,
+};
 use super::{BootstrapArgs, CA_BUNDLE_PEM_KEY, Locale, localized};
 
 // This function intentionally keeps end-to-end bootstrap orchestration in one place
@@ -126,16 +130,10 @@ pub(super) async fn run_bootstrap(args: BootstrapArgs, lang: Locale) -> Result<i
 }
 
 fn validate_bootstrap_args(args: &BootstrapArgs, lang: Locale) -> Result<()> {
-    if args.service_name.trim().is_empty() {
-        anyhow::bail!(
-            "{}",
-            localized(
-                lang,
-                "--service-name must not be empty",
-                "--service-name 값은 비어 있으면 안 됩니다",
-            )
-        );
-    }
+    validate_service_name(&args.service_name, lang)?;
+    validate_profile_hostname(&args.profile_hostname, lang)?;
+    validate_agent_domain(&args.agent_domain, lang)?;
+    validate_profile_instance_id(args.profile_instance_id.as_deref(), lang)?;
     for path in [
         &args.role_id_path,
         &args.secret_id_path,

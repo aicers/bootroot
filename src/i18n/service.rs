@@ -30,6 +30,22 @@ impl Messages {
         self.strings().error_value_required
     }
 
+    pub(crate) fn error_service_name_invalid(&self) -> &'static str {
+        self.strings().error_service_name_invalid
+    }
+
+    pub(crate) fn error_hostname_invalid(&self) -> &'static str {
+        self.strings().error_hostname_invalid
+    }
+
+    pub(crate) fn error_domain_invalid(&self) -> &'static str {
+        self.strings().error_domain_invalid
+    }
+
+    pub(crate) fn error_instance_id_invalid(&self) -> &'static str {
+        self.strings().error_instance_id_invalid
+    }
+
     pub(crate) fn error_invalid_deploy_type(&self) -> &'static str {
         self.strings().error_invalid_deploy_type
     }

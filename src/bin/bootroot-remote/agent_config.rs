@@ -78,7 +78,9 @@ pub(super) async fn apply_agent_config_updates(
         &args.service_name,
         &render_managed_profile_block(
             &args.service_name,
-            &args.profile_instance_id,
+            args.profile_instance_id
+                .as_deref()
+                .expect("validate_bootstrap_args requires profile_instance_id"),
             &args.profile_hostname,
             &profile_paths.cert_path,
             &profile_paths.key_path,

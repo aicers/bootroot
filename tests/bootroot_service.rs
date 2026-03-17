@@ -450,6 +450,91 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_app_add_reprompts_on_invalid_identifier_inputs() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("edge-proxy.crt");
+    let key_path = cert_dir.join("edge-proxy.key");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let input = format!(
+        "edge.proxy\nedge-proxy\n\nedge_node\nedge-node-01\ntrusted_domain\ntrusted.domain\n{}\n{}\n{}\ninstance-01\n001\n",
+        agent_config.display(),
+        cert_path.display(),
+        key_path.display(),
+    );
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["service", "add", "--print-only"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn service add");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(input.as_bytes()).expect("write stdin");
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("run service add");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("service_name must be a DNS label"));
+    assert!(stdout.contains("hostname must be a DNS label"));
+    assert!(stdout.contains("domain must be a DNS name"));
+    assert!(stdout.contains("instance_id must be numeric"));
+    assert!(stdout.contains("bootroot service add: summary"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rejects_invalid_identifier_args() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("edge-proxy.crt");
+    let key_path = cert_dir.join("edge-proxy.key");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "edge.proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("service_name must be a DNS label"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_app_add_prints_docker_snippet() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");

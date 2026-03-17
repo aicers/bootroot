@@ -48,6 +48,8 @@ async fn test_bootroot_remote_applies_service_secrets() {
             agent_config_path.to_string_lossy().as_ref(),
             "--ca-bundle-path",
             ca_bundle_path.to_string_lossy().as_ref(),
+            "--profile-instance-id",
+            "001",
         ])
         .output()
         .expect("run bootroot-remote");
@@ -125,6 +127,8 @@ async fn test_bootroot_remote_is_idempotent_on_second_run() {
                 agent_config_path.to_string_lossy().as_ref(),
                 "--ca-bundle-path",
                 ca_bundle_path.to_string_lossy().as_ref(),
+                "--profile-instance-id",
+                "001",
             ])
             .output()
             .expect("run bootroot-remote")
@@ -176,6 +180,8 @@ async fn test_bootroot_remote_fails_when_trust_fingerprints_missing() {
             eab_file_path.to_string_lossy().as_ref(),
             "--agent-config-path",
             agent_config_path.to_string_lossy().as_ref(),
+            "--profile-instance-id",
+            "001",
         ])
         .output()
         .expect("run bootroot-remote");
@@ -184,6 +190,78 @@ async fn test_bootroot_remote_fails_when_trust_fingerprints_missing() {
     assert!(!output.status.success());
     assert!(stderr.contains("bootroot-remote failed"));
     assert!(stderr.contains("trusted_ca_sha256"));
+}
+
+#[tokio::test]
+async fn test_bootroot_remote_rejects_invalid_bootstrap_identifiers() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let role_id_path = temp_dir.path().join("role_id");
+    let secret_id_path = temp_dir.path().join("secret_id");
+    let eab_file_path = temp_dir.path().join("eab.json");
+    let agent_config_path = temp_dir.path().join("agent.toml");
+
+    let cases = [
+        (
+            "edge.proxy",
+            "edge-node-01",
+            "trusted.domain",
+            "001",
+            "DNS label",
+        ),
+        (
+            "edge-proxy",
+            "edge_node_01",
+            "trusted.domain",
+            "001",
+            "--profile-hostname",
+        ),
+        (
+            "edge-proxy",
+            "edge-node-01",
+            "trusted_domain",
+            "001",
+            "--agent-domain",
+        ),
+        (
+            "edge-proxy",
+            "edge-node-01",
+            "trusted.domain",
+            "instance-01",
+            "--profile-instance-id",
+        ),
+    ];
+
+    for (service_name, profile_hostname, agent_domain, profile_instance_id, needle) in cases {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+            .args([
+                "bootstrap",
+                "--openbao-url",
+                "http://127.0.0.1:8200",
+                "--service-name",
+                service_name,
+                "--role-id-path",
+                role_id_path.to_string_lossy().as_ref(),
+                "--secret-id-path",
+                secret_id_path.to_string_lossy().as_ref(),
+                "--eab-file-path",
+                eab_file_path.to_string_lossy().as_ref(),
+                "--agent-config-path",
+                agent_config_path.to_string_lossy().as_ref(),
+                "--agent-domain",
+                agent_domain,
+                "--profile-hostname",
+                profile_hostname,
+                "--profile-instance-id",
+                profile_instance_id,
+            ])
+            .output()
+            .expect("run bootroot-remote");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "stderr: {stderr}");
+        assert!(stderr.contains("bootroot-remote failed"));
+        assert!(stderr.contains(needle), "stderr:\n{stderr}");
+    }
 }
 
 #[tokio::test]
@@ -218,6 +296,8 @@ async fn test_bootroot_remote_reports_partial_failure_with_json_output() {
             eab_file_path.to_string_lossy().as_ref(),
             "--agent-config-path",
             agent_config_path.to_string_lossy().as_ref(),
+            "--profile-instance-id",
+            "001",
             "--output",
             "json",
         ])

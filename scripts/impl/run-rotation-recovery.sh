@@ -91,7 +91,7 @@ capture_artifacts() {
 snapshot_state() {
   local label="$1"
   mkdir -p "$ARTIFACT_DIR/snapshots/$label"
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
     cp -f "$state_path" "$ARTIFACT_DIR/snapshots/$label/state-${node}-${service}.json" 2>/dev/null || true
     cp -f "$summary_json_path" "$ARTIFACT_DIR/snapshots/$label/summary-${node}-${service}.json" 2>/dev/null || true
   done <"$SERVICES_TSV"
@@ -129,7 +129,7 @@ import json, sys
 with open(sys.argv[1], encoding='utf-8') as fh:
     layout = json.load(fh)
 for svc in layout['services']:
-    fields = [svc['node_id'], svc['service_name'], svc['work_dir'], svc['role_id_path'], svc['secret_id_path'], svc['eab_file_path'], svc['agent_config_path'], svc['ca_bundle_path'], svc['summary_json_path'], svc['state_path'], svc['deploy_type']]
+    fields = [svc['node_id'], svc['service_name'], svc['work_dir'], svc['role_id_path'], svc['secret_id_path'], svc['eab_file_path'], svc['agent_config_path'], svc['ca_bundle_path'], svc['summary_json_path'], svc['state_path'], svc['deploy_type'], svc['hostname'], svc['domain'], svc['instance_id']]
     print("\t".join(fields))
 PY
 }
@@ -151,7 +151,7 @@ start_mock_openbao() {
 bootstrap_all() {
   local cycle="$1"
   local item="$2"
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
     set_context "bootstrap" "$node" "$service" "$work_dir"
     log_phase "bootstrap" "$node" "$service" "$cycle" "$item"
     local output_file="$ARTIFACT_DIR/bootstrap-output-${node}-${service}.json"
@@ -164,6 +164,9 @@ bootstrap_all() {
         --secret-id-path "$secret_id_path" \
         --eab-file-path "$eab_file_path" \
         --agent-config-path "$agent_config_path" \
+        --agent-domain "$domain" \
+        --profile-hostname "$hostname" \
+        --profile-instance-id "$instance_id" \
         --ca-bundle-path "$ca_bundle_path" \
         --output json
     ) >"$output_file" 2>>"$RUNNER_LOG" || true
@@ -273,7 +276,7 @@ PY
 set_versions_all() {
   local mock_item="$1"
   local version="$2"
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
     control_mock "set-version" "{\"service\":\"$service\",\"item\":\"$mock_item\",\"version\":$version}"
   done <"$SERVICES_TSV"
 }
@@ -281,7 +284,7 @@ set_versions_all() {
 run_verify_all() {
   local cycle="$1"
   local item="$2"
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
     set_context "renew" "$node" "$service" "$agent_config_path"
     log_phase "renew" "$node" "$service" "$cycle" "$item"
     set_context "verify" "$node" "$service" "$agent_config_path"
@@ -302,7 +305,7 @@ cleanup() {
     kill "$MOCK_OPENBAO_PID" >/dev/null 2>&1 || true
     wait "$MOCK_OPENBAO_PID" 2>/dev/null || true
   fi
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
     log_phase "cleanup" "$node" "$service" 0 "all"
   done <"$SERVICES_TSV" 2>/dev/null || true
   capture_artifacts
@@ -319,7 +322,7 @@ main() {
   ensure_prerequisites
   generate_workspace
 
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
     set_context "bootstrap" "$node" "$service" "$state_path"
     log_phase "bootstrap" "$node" "$service" 0 "all"
   done <"$SERVICES_TSV"

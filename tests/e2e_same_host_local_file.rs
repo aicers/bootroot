@@ -183,6 +183,8 @@ async fn test_same_host_trust_change_propagates_to_agent_config() {
             files.agent_config.to_string_lossy().as_ref(),
             "--ca-bundle-path",
             files.ca_bundle_path.to_string_lossy().as_ref(),
+            "--profile-instance-id",
+            INSTANCE_ID,
         ])
         .output()
         .expect("run bootroot-remote bootstrap");
