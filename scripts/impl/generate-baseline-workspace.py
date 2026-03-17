@@ -133,6 +133,8 @@ def main() -> None:
                 "node_id": node_id,
                 "service_name": service_name,
                 "deploy_type": deploy_type,
+                "hostname": hostname,
+                "domain": DOMAIN,
                 "instance_id": instance_id,
                 "container_name": container_name,
                 "work_dir": str(work_dir),
