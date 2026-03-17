@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use bootroot::input_validation::{
+    ValidationError, validate_dns_label, validate_domain_name, validate_numeric_instance_id,
+};
 
 use crate::cli::args::ServiceAddArgs;
 use crate::cli::prompt::Prompt;
@@ -36,9 +39,9 @@ pub(super) fn resolve_service_add_args(
     let mut prompt = Prompt::new(&mut input, &mut output, messages);
 
     let service_name = match &args.service_name {
-        Some(value) => value.clone(),
+        Some(value) => validate_service_name(value, messages)?,
         None => prompt.prompt_with_validation(messages.prompt_service_name(), None, |value| {
-            ensure_non_empty(value, messages)
+            validate_service_name(value, messages)
         })?,
     };
 
@@ -53,16 +56,16 @@ pub(super) fn resolve_service_add_args(
     let delivery_mode = args.delivery_mode.unwrap_or_default();
 
     let hostname = match &args.hostname {
-        Some(value) => value.clone(),
+        Some(value) => validate_hostname(value, messages)?,
         None => prompt.prompt_with_validation(messages.prompt_hostname(), None, |value| {
-            ensure_non_empty(value, messages)
+            validate_hostname(value, messages)
         })?,
     };
 
     let domain = match &args.domain {
-        Some(value) => value.clone(),
+        Some(value) => validate_domain(value, messages)?,
         None => prompt.prompt_with_validation(messages.prompt_domain(), None, |value| {
-            ensure_non_empty(value, messages)
+            validate_domain(value, messages)
         })?,
     };
 
@@ -91,9 +94,9 @@ pub(super) fn resolve_service_add_args(
     )?;
 
     let instance_id = match &args.instance_id {
-        Some(value) => value.clone(),
+        Some(value) => validate_instance_id(value, messages)?,
         None => prompt.prompt_with_validation(messages.prompt_instance_id(), None, |value| {
-            ensure_non_empty(value, messages)
+            validate_instance_id(value, messages)
         })?,
     };
     let container_name = match deploy_type {
@@ -131,18 +134,10 @@ pub(super) fn resolve_service_add_args(
 }
 
 pub(super) fn validate_service_add(args: &ResolvedServiceAdd, messages: &Messages) -> Result<()> {
-    if args.service_name.trim().is_empty() {
-        anyhow::bail!(messages.error_value_required());
-    }
-    if args.hostname.trim().is_empty() {
-        anyhow::bail!(messages.error_value_required());
-    }
-    if args.domain.trim().is_empty() {
-        anyhow::bail!(messages.error_value_required());
-    }
-    if args.instance_id.as_deref().unwrap_or_default().is_empty() {
-        anyhow::bail!(messages.error_service_instance_id_required());
-    }
+    validate_service_name(&args.service_name, messages)?;
+    validate_hostname(&args.hostname, messages)?;
+    validate_domain(&args.domain, messages)?;
+    validate_instance_id(args.instance_id.as_deref().unwrap_or_default(), messages)?;
     if matches!(args.deploy_type, DeployType::Docker)
         && args
             .container_name
@@ -160,6 +155,62 @@ fn ensure_non_empty(value: &str, messages: &Messages) -> Result<String> {
         anyhow::bail!(messages.error_value_required());
     }
     Ok(value.trim().to_string())
+}
+
+fn validate_service_name(value: &str, messages: &Messages) -> Result<String> {
+    validate_dns_label(value).map_err(|err| service_name_error(err, messages))?;
+    Ok(value.to_string())
+}
+
+fn validate_hostname(value: &str, messages: &Messages) -> Result<String> {
+    validate_dns_label(value).map_err(|err| hostname_error(err, messages))?;
+    Ok(value.to_string())
+}
+
+fn validate_domain(value: &str, messages: &Messages) -> Result<String> {
+    validate_domain_name(value).map_err(|err| domain_error(err, messages))?;
+    Ok(value.to_string())
+}
+
+fn validate_instance_id(value: &str, messages: &Messages) -> Result<String> {
+    validate_numeric_instance_id(value).map_err(|err| instance_id_error(err, messages))?;
+    Ok(value.to_string())
+}
+
+fn service_name_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
+    match err {
+        ValidationError::Empty => anyhow::anyhow!(messages.error_value_required()),
+        ValidationError::InvalidDnsLabel
+        | ValidationError::InvalidDomainName
+        | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_service_name_invalid()),
+    }
+}
+
+fn hostname_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
+    match err {
+        ValidationError::Empty => anyhow::anyhow!(messages.error_value_required()),
+        ValidationError::InvalidDnsLabel
+        | ValidationError::InvalidDomainName
+        | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_hostname_invalid()),
+    }
+}
+
+fn domain_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
+    match err {
+        ValidationError::Empty => anyhow::anyhow!(messages.error_value_required()),
+        ValidationError::InvalidDnsLabel
+        | ValidationError::InvalidDomainName
+        | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_domain_invalid()),
+    }
+}
+
+fn instance_id_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
+    match err {
+        ValidationError::Empty => anyhow::anyhow!(messages.error_service_instance_id_required()),
+        ValidationError::InvalidDnsLabel
+        | ValidationError::InvalidDomainName
+        | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_instance_id_invalid()),
+    }
 }
 
 fn parse_deploy_type(value: &str, messages: &Messages) -> Result<DeployType> {

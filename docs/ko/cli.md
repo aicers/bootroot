@@ -389,16 +389,22 @@ bootroot status
 입력 우선순위는 **CLI 옵션 > 환경 변수 > 프롬프트/기본값**입니다.
 
 - `--service-name`: 서비스 이름 식별자
+  - 단일 DNS label이어야 합니다. 영문자/숫자/하이픈만 허용하며, 최대 63자,
+    점(`.`)과 밑줄(`_`)은 허용되지 않습니다.
 - `--deploy-type`: 배포 타입 (`daemon` 또는 `docker`)
 - `--delivery-mode`: 전달 모드 (`local-file` 또는 `remote-bootstrap`).
   참고: `remote-bootstrap`은 실행 파일이 아니라 모드 값이며, 이 모드에서
   사용하는 실행 파일은 `bootroot-remote`입니다.
 - `--hostname`: DNS SAN에 사용할 호스트명
+  - `--service-name`과 같은 단일 DNS label 규칙을 따릅니다.
 - `--domain`: DNS SAN 루트 도메인
+  - 점으로 구분된 DNS label들의 DNS 이름이어야 하며, 각 label은
+    영문자/숫자/하이픈만 사용할 수 있습니다.
 - `--agent-config`: bootroot-agent 설정 파일 경로
 - `--cert-path`: 인증서 출력 경로
 - `--key-path`: 개인키 출력 경로
 - `--instance-id`: 서비스 instance_id
+  - 숫자만 허용됩니다 (`001`, `42` 등)
 - `--container-name`: 도커 서비스 컨테이너 이름 (docker 필수)
 - `--auth-mode`: 런타임 인증 모드 (`auto`, `root`, `approle`, 기본값 `auto`)
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`,
@@ -418,8 +424,8 @@ bootroot status
 ### 대화형 동작
 
 - 누락된 필수 입력을 프롬프트로 받습니다(배포 타입 기본값: `daemon`).
-- 입력값은 빈 값 여부, 허용된 enum 값인지, 경로/상위 디렉터리가
-  유효한지 확인합니다.
+- 식별자 값이 비어 있지 않은지와 DNS/숫자 규칙을 만족하는지, 허용된 enum
+  값인지, 경로/상위 디렉터리가 유효한지 확인합니다.
 - 실행 전 계획 요약, 실행 후 최종 요약을 출력합니다.
 
 ### 출력
@@ -825,12 +831,18 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 - `--kv-mount`: OpenBao KV v2 마운트 경로 (환경 변수: `OPENBAO_KV_MOUNT`)
   (기본값 `secret`)
 - `--service-name`
+  - `bootroot service add`와 같은 단일 DNS label 규칙을 따릅니다.
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`
 - `--agent-config-path`
 - baseline/profile 입력:
   `--agent-email`, `--agent-server`, `--agent-domain`,
   `--agent-responder-url`, `--profile-hostname`,
   `--profile-instance-id`, `--profile-cert-path`, `--profile-key-path`
+  - `--agent-domain`은 점으로 구분된 DNS label들의 DNS 이름이어야 합니다.
+  - `--profile-hostname`은 `--service-name`과 같은 단일 DNS label이어야
+    합니다.
+  - `--profile-instance-id`는 숫자만 허용됩니다. `bootroot service add`가
+    생성하는 원격 handoff 명령은 이 값을 이미 채워 둡니다.
   - `--profile-cert-path`, `--profile-key-path`는 선택입니다.
     미지정 시 `--agent-config-path` 기준 `certs/<service>.crt`,
     `certs/<service>.key`를 기본 경로로 사용합니다.
@@ -840,7 +852,6 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
     - `--agent-domain`: `trusted.domain`
     - `--agent-responder-url`: `http://127.0.0.1:8080`
     - `--profile-hostname`: `localhost`
-    - `--profile-instance-id`: 빈 문자열(`""`)
 - `--ca-bundle-path`
   - trust 데이터에 `ca_bundle_pem`이 포함된 경우 번들을 파일로 반영하려면
     지정이 필요합니다.
@@ -861,6 +872,7 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 - `--kv-mount`: OpenBao KV v2 마운트 경로 (환경 변수: `OPENBAO_KV_MOUNT`)
   (기본값 `secret`)
 - `--service-name`
+  - `bootroot service add`와 같은 단일 DNS label 규칙을 따릅니다.
 - `--role-id-path`, `--secret-id-path`
 - `--output text|json` (기본값 `text`)
 

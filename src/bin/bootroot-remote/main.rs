@@ -3,6 +3,7 @@ mod apply_secret_id;
 mod bootstrap;
 mod io;
 mod summary;
+mod validation;
 
 use std::path::PathBuf;
 
@@ -119,8 +120,8 @@ struct BootstrapArgs {
     profile_hostname: String,
 
     /// Service profile `instance_id` for baseline generation
-    #[arg(long, default_value = "")]
-    profile_instance_id: String,
+    #[arg(long)]
+    profile_instance_id: Option<String>,
 
     /// Service profile cert path for baseline generation
     #[arg(long)]

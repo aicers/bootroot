@@ -406,16 +406,22 @@ not recommended (sidecars provide better isolation/lifecycle alignment).
 Input priority is **CLI flags > environment variables > prompts/defaults**.
 
 - `--service-name`: service name identifier
+  - Must be a single DNS label: letters, digits, and hyphens only, max 63
+    characters, no dots or underscores
 - `--deploy-type`: deployment type (`daemon` or `docker`)
 - `--delivery-mode`: delivery mode (`local-file` or `remote-bootstrap`).
   Note: `remote-bootstrap` is a mode value, not an executable binary, and the
   executable used for this mode is `bootroot-remote`.
 - `--hostname`: hostname used for DNS SAN
+  - Must follow the same single-label DNS rule as `--service-name`
 - `--domain`: root domain for DNS SAN
+  - Must be a DNS name made of dot-separated labels; each label uses only
+    letters, digits, and hyphens
 - `--agent-config`: bootroot-agent config path
 - `--cert-path`: certificate output path
 - `--key-path`: private key output path
 - `--instance-id`: service instance_id
+  - Must be numeric (`001`, `42`, ...)
 - `--container-name`: docker container name (required for docker)
 - `--auth-mode`: runtime auth mode (`auto`, `root`, `approle`, default `auto`)
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`,
@@ -435,8 +441,8 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 ### Interactive behavior
 
 - Prompts for missing required inputs (deploy type defaults to `daemon`).
-- Checks that inputs are non-empty, match allowed enum values, and have
-  valid paths/parent directories.
+- Checks that identifiers are non-empty and match the DNS/numeric rules above,
+  that enum values are allowed, and that paths/parent directories are valid.
 - Prints a plan summary before execution and the final summary after.
 
 ### Outputs
@@ -861,12 +867,18 @@ Key inputs:
   (environment variable: `OPENBAO_KV_MOUNT`)
   (default `secret`)
 - `--service-name`
+  - Must follow the same single-label DNS rule as `bootroot service add`
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`
 - `--agent-config-path`
 - baseline/profile inputs:
   `--agent-email`, `--agent-server`, `--agent-domain`,
   `--agent-responder-url`, `--profile-hostname`,
   `--profile-instance-id`, `--profile-cert-path`, `--profile-key-path`
+  - `--agent-domain` must be a DNS name made of dot-separated labels.
+  - `--profile-hostname` must be a single DNS label (same rule as
+    `--service-name`).
+  - `--profile-instance-id` must be numeric. Generated remote handoff commands
+    from `bootroot service add` already set this value.
   - `--profile-cert-path` and `--profile-key-path` are optional.
     If omitted, defaults are derived from `--agent-config-path` as
     `certs/<service>.crt` and `certs/<service>.key`.
@@ -876,7 +888,6 @@ Key inputs:
     - `--agent-domain`: `trusted.domain`
     - `--agent-responder-url`: `http://127.0.0.1:8080`
     - `--profile-hostname`: `localhost`
-    - `--profile-instance-id`: empty string (`""`)
 - `--ca-bundle-path`
   - required to write bundle files when trust data includes `ca_bundle_pem`.
 - `--summary-json` (optional) and `--output text|json` (default `text`)
@@ -897,6 +908,7 @@ Key inputs:
   (environment variable: `OPENBAO_KV_MOUNT`)
   (default `secret`)
 - `--service-name`
+  - Must follow the same single-label DNS rule as `bootroot service add`
 - `--role-id-path`, `--secret-id-path`
 - `--output text|json` (default `text`)
 
