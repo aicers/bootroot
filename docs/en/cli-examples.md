@@ -9,6 +9,8 @@ environment may differ.
 - Docker/Docker Compose installed
 - Ports 80/443/8200/9000/5432/8080 available
 - Pull/build images for step-ca and bootroot-http01 if missing
+- Set `POSTGRES_PASSWORD` in `.env` or export it in your shell before
+  `bootroot infra up`
 
 Image prep example:
 
@@ -20,6 +22,14 @@ docker compose build step-ca bootroot-http01
 The Docker daemon should be configured to **start on reboot**. bootroot's
 containers use restart policies, but Docker itself must be managed by the OS
 (for example, via systemctl).
+
+Minimal env example:
+
+```bash
+export POSTGRES_PASSWORD=step-pass
+```
+
+For the full `.env` setup, see the [installation guide](installation.md).
 
 > Note: The example assumes OpenBao/PostgreSQL/HTTP-01 responder run on the
 > **same machine as step-ca**.

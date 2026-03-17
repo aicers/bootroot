@@ -9,6 +9,8 @@
 - Docker/Docker Compose 설치
 - 80/443/8200/9000/5432/8080 포트 사용 가능
 - step-ca/bootroot-http01 이미지가 로컬에 없으면 먼저 pull/build
+- `bootroot infra up` 전에 `.env` 또는 셸 환경 변수로
+  `POSTGRES_PASSWORD` 설정
 
 이미지 준비 예시:
 
@@ -20,6 +22,14 @@ docker compose build step-ca bootroot-http01
 Docker 데몬은 **재부팅 시 자동 시작**되도록 설정되어 있어야 합니다.
 bootroot가 제공하는 컨테이너들은 `restart` 정책으로 자동 재기동되지만,
 Docker 데몬 자체는 OS에서 systemctl 등으로 별도 관리해야 합니다.
+
+최소 환경 변수 예시:
+
+```bash
+export POSTGRES_PASSWORD=step-pass
+```
+
+전체 `.env` 설정은 [설치 가이드](installation.md)를 참고하세요.
 
 > 참고: 아래 예제는 **step-ca가 실행되는 동일 머신**에서
 > OpenBao/PostgreSQL/HTTP-01 리스폰더를 함께 기동하는 구성을 전제로 합니다.
