@@ -370,8 +370,12 @@ listen_addr = "0.0.0.0:80"
 admin_addr = "0.0.0.0:8080"
 hmac_secret = "change-me"
 token_ttl_secs = 300
+max_token_ttl_secs = 900
 cleanup_interval_secs = 30
 max_skew_secs = 60
+admin_rate_limit_requests = 300
+admin_rate_limit_window_secs = 60
+admin_body_limit_bytes = 8192
 ```
 
 - `listen_addr`: step-ca가 HTTP-01 검증을 위해 **HTTP 요청을 보내는 주소**입니다.
@@ -387,7 +391,21 @@ max_skew_secs = 60
   `BOOTROOT_RESPONDER__HMAC_SECRET`)
 - `token_ttl_secs`: 토큰 유효 시간(초, 기본값 `300`, 환경 변수:
   `BOOTROOT_RESPONDER__TOKEN_TTL_SECS`, 0은 허용되지 않음)
+- `max_token_ttl_secs`: 요청에 포함된 `ttl_secs`의 상한입니다. 이 값을 넘는
+  요청은 HMAC 검증 후 거부하지 않고 이 상한으로 잘라서(clamp) 저장합니다.
+  (기본값 `900`, 환경 변수: `BOOTROOT_RESPONDER__MAX_TOKEN_TTL_SECS`, 0은
+  허용되지 않으며 `token_ttl_secs` 이상이어야 함)
 - `cleanup_interval_secs`: 만료 토큰 정리 주기(초, 기본값 `30`, 환경 변수:
   `BOOTROOT_RESPONDER__CLEANUP_INTERVAL_SECS`, 0은 허용되지 않음)
 - `max_skew_secs`: 관리자 요청 허용 시계 오차(초, 기본값 `60`, 환경 변수:
   `BOOTROOT_RESPONDER__MAX_SKEW_SECS`, 0은 허용되지 않음)
+- `admin_rate_limit_requests`: 한 rate-limit window 안에서 허용되는 성공한
+  관리자 토큰 등록 수입니다. 이를 넘는 요청은 HTTP `429 Too Many Requests`로
+  거부됩니다. (기본값 `300`, 환경 변수:
+  `BOOTROOT_RESPONDER__ADMIN_RATE_LIMIT_REQUESTS`, 0은 허용되지 않음)
+- `admin_rate_limit_window_secs`: 관리자 rate-limit window 길이(초, 기본값
+  `60`, 환경 변수: `BOOTROOT_RESPONDER__ADMIN_RATE_LIMIT_WINDOW_SECS`, 0은
+  허용되지 않음)
+- `admin_body_limit_bytes`: 관리자 등록 요청 본문 최대 크기입니다. 이 값을
+  넘는 요청은 HTTP `413 Payload Too Large`로 거부됩니다. (기본값 `8192`,
+  환경 변수: `BOOTROOT_RESPONDER__ADMIN_BODY_LIMIT_BYTES`, 0은 허용되지 않음)

@@ -402,8 +402,12 @@ listen_addr = "0.0.0.0:80"
 admin_addr = "0.0.0.0:8080"
 hmac_secret = "change-me"
 token_ttl_secs = 300
+max_token_ttl_secs = 900
 cleanup_interval_secs = 30
 max_skew_secs = 60
+admin_rate_limit_requests = 300
+admin_rate_limit_window_secs = 60
+admin_body_limit_bytes = 8192
 ```
 
 - `listen_addr`: address where step-ca sends **HTTP-01 validation requests**.
@@ -418,8 +422,24 @@ max_skew_secs = 60
   `BOOTROOT_RESPONDER__HMAC_SECRET`)
 - `token_ttl_secs`: how long tokens stay valid (default `300`, environment
   variable: `BOOTROOT_RESPONDER__TOKEN_TTL_SECS`, value must be > 0)
+- `max_token_ttl_secs`: upper bound for requested `ttl_secs` values. Requests
+  above this limit are accepted but stored with this capped TTL after HMAC
+  verification. (default `900`, environment variable:
+  `BOOTROOT_RESPONDER__MAX_TOKEN_TTL_SECS`, value must be > 0 and >=
+  `token_ttl_secs`)
 - `cleanup_interval_secs`: how often expired tokens are removed (default `30`,
   environment variable: `BOOTROOT_RESPONDER__CLEANUP_INTERVAL_SECS`, value
   must be > 0)
 - `max_skew_secs`: allowed clock skew for admin requests (default `60`,
   environment variable: `BOOTROOT_RESPONDER__MAX_SKEW_SECS`, value must be > 0)
+- `admin_rate_limit_requests`: maximum number of successful admin token
+  registrations accepted within one rate-limit window. Additional requests are
+  rejected with HTTP `429 Too Many Requests`. (default `300`, environment
+  variable: `BOOTROOT_RESPONDER__ADMIN_RATE_LIMIT_REQUESTS`, value must be > 0)
+- `admin_rate_limit_window_secs`: length of the admin rate-limit window in
+  seconds. (default `60`, environment variable:
+  `BOOTROOT_RESPONDER__ADMIN_RATE_LIMIT_WINDOW_SECS`, value must be > 0)
+- `admin_body_limit_bytes`: maximum size of an admin registration request body.
+  Oversized requests are rejected with HTTP `413 Payload Too Large`. (default
+  `8192`, environment variable:
+  `BOOTROOT_RESPONDER__ADMIN_BODY_LIMIT_BYTES`, value must be > 0)

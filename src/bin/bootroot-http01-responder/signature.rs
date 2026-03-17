@@ -20,7 +20,7 @@ pub(super) fn within_skew(timestamp: i64, max_skew_secs: u64) -> bool {
         },
         Err(_) => return false,
     };
-    (now - timestamp).unsigned_abs() <= max_skew_secs
+    now.abs_diff(timestamp) <= max_skew_secs
 }
 
 #[cfg(test)]
