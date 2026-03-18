@@ -25,6 +25,7 @@ pub(super) const SERVICE_SECRET_ID_FILENAME: &str = "secret_id";
 pub(super) const OPENBAO_SERVICE_CONFIG_DIR: &str = "openbao/services";
 pub(super) const OPENBAO_AGENT_CONFIG_FILENAME: &str = "agent.hcl";
 pub(super) const OPENBAO_AGENT_TEMPLATE_FILENAME: &str = "agent.toml.ctmpl";
+pub(super) const OPENBAO_AGENT_CA_BUNDLE_TEMPLATE_FILENAME: &str = "ca-bundle.pem.ctmpl";
 pub(super) const OPENBAO_AGENT_TOKEN_FILENAME: &str = "token";
 pub(super) const REMOTE_BOOTSTRAP_DIR: &str = "remote-bootstrap/services";
 pub(super) const REMOTE_BOOTSTRAP_FILENAME: &str = "bootstrap.json";

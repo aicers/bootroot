@@ -7,8 +7,9 @@ use tokio::fs;
 use super::resolve::ResolvedServiceAdd;
 use super::{
     CaTrustMaterial, LocalApplyResult, MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX,
-    OPENBAO_AGENT_CONFIG_FILENAME, OPENBAO_AGENT_TEMPLATE_FILENAME, OPENBAO_AGENT_TOKEN_FILENAME,
-    OPENBAO_SERVICE_CONFIG_DIR, SERVICE_ROLE_ID_FILENAME,
+    OPENBAO_AGENT_CA_BUNDLE_TEMPLATE_FILENAME, OPENBAO_AGENT_CONFIG_FILENAME,
+    OPENBAO_AGENT_TEMPLATE_FILENAME, OPENBAO_AGENT_TOKEN_FILENAME, OPENBAO_SERVICE_CONFIG_DIR,
+    SERVICE_ROLE_ID_FILENAME,
 };
 use crate::commands::constants::{CA_TRUST_KEY, SERVICE_KV_BASE};
 use crate::i18n::Messages;
@@ -23,6 +24,11 @@ pub(super) async fn apply_local_service_configs(
     messages: &Messages,
 ) -> Result<LocalApplyResult> {
     let profile = render_managed_profile_block(resolved);
+    let ca_bundle_path = resolved
+        .cert_path
+        .parent()
+        .unwrap_or(Path::new("certs"))
+        .join("ca-bundle.pem");
     let current = if resolved.agent_config.exists() {
         fs::read_to_string(&resolved.agent_config)
             .await
@@ -35,11 +41,6 @@ pub(super) async fn apply_local_service_configs(
     let with_profile = upsert_managed_profile(&current, &resolved.service_name, &profile);
     let mut next = with_profile;
     if let Some(material) = ca_trust_material {
-        let ca_bundle_path = resolved
-            .cert_path
-            .parent()
-            .unwrap_or(Path::new("certs"))
-            .join("ca-bundle.pem");
         let trust_updates = build_trust_updates(&material.trusted_ca_sha256, &ca_bundle_path);
         next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates)?;
         if let Some(bundle_pem) = material.ca_bundle_pem.as_deref() {
@@ -64,6 +65,24 @@ pub(super) async fn apply_local_service_configs(
         .await
         .with_context(|| messages.error_write_file_failed(&template_path.display().to_string()))?;
     fs_util::set_key_permissions(&template_path).await?;
+    let bundle_template_path = openbao_service_dir.join(OPENBAO_AGENT_CA_BUNDLE_TEMPLATE_FILENAME);
+    let bundle_template = build_ca_bundle_ctmpl_content(kv_mount, &resolved.service_name);
+    fs::write(&bundle_template_path, &bundle_template)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&bundle_template_path.display().to_string())
+        })?;
+    fs_util::set_key_permissions(&bundle_template_path).await?;
+    let template_specs = [
+        (
+            template_path.display().to_string(),
+            resolved.agent_config.display().to_string(),
+        ),
+        (
+            bundle_template_path.display().to_string(),
+            ca_bundle_path.display().to_string(),
+        ),
+    ];
 
     let role_id_path = secret_id_path
         .parent()
@@ -77,13 +96,16 @@ pub(super) async fn apply_local_service_configs(
     }
     fs_util::set_key_permissions(&token_path).await?;
     let agent_config_path = openbao_service_dir.join(OPENBAO_AGENT_CONFIG_FILENAME);
+    let templates = template_specs
+        .iter()
+        .map(|(source, destination)| (source.as_str(), destination.as_str()))
+        .collect::<Vec<_>>();
     let agent_hcl = render_openbao_agent_config(
         openbao_url,
         &role_id_path,
         secret_id_path,
         &token_path,
-        &template_path,
-        &resolved.agent_config,
+        &templates,
     );
     fs::write(&agent_config_path, agent_hcl)
         .await
@@ -197,14 +219,11 @@ fn render_openbao_agent_config(
     role_id_path: &Path,
     secret_id_path: &Path,
     token_path: &Path,
-    template_path: &Path,
-    destination_path: &Path,
+    templates: &[(&str, &str)],
 ) -> String {
     let role_id = role_id_path.display().to_string();
     let secret_id = secret_id_path.display().to_string();
     let token = token_path.display().to_string();
-    let tpl = template_path.display().to_string();
-    let dest = destination_path.display().to_string();
     bootroot::openbao::build_agent_config(
         openbao_url,
         &role_id,
@@ -212,7 +231,7 @@ fn render_openbao_agent_config(
         &token,
         Some("auth/approle"),
         bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
-        &[(&tpl, &dest)],
+        templates,
     )
 }
 
@@ -263,6 +282,17 @@ fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> St
     }
     result.push_str(&eab_block);
     result
+}
+
+fn build_ca_bundle_ctmpl_content(kv_mount: &str, service_name: &str) -> String {
+    let base = format!("{SERVICE_KV_BASE}/{service_name}");
+    format!(
+        "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
+         {{{{ if .Data.data.ca_bundle_pem }}}}\
+         {{{{ .Data.data.ca_bundle_pem }}}}\
+         {{{{ end }}}}\
+         {{{{ end }}}}\n"
+    )
 }
 
 /// Removes sections from pseudo-TOML content using line-based matching.
@@ -423,6 +453,17 @@ mod tests {
             r#"{{ with secret "secret/data/bootroot/services/edge-proxy/trust" }}trusted_ca_sha256 = {{ .Data.data.trusted_ca_sha256 | toJSON }}{{ end }}"#
         ));
         assert!(!output.contains(&fp));
+    }
+
+    #[test]
+    fn test_build_ca_bundle_ctmpl_reads_service_trust_bundle() {
+        let output = build_ca_bundle_ctmpl_content("secret", "edge-proxy");
+        assert!(
+            output
+                .contains(r#"{{ with secret "secret/data/bootroot/services/edge-proxy/trust" }}"#)
+        );
+        assert!(output.contains(r"{{ if .Data.data.ca_bundle_pem }}"));
+        assert!(output.contains(r"{{ .Data.data.ca_bundle_pem }}"));
     }
 
     #[test]

@@ -1165,9 +1165,11 @@ fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str
         .join(service_name);
     let openbao_hcl = openbao_service_dir.join("agent.hcl");
     let openbao_ctmpl = openbao_service_dir.join("agent.toml.ctmpl");
+    let openbao_bundle_ctmpl = openbao_service_dir.join("ca-bundle.pem.ctmpl");
     let openbao_token = openbao_service_dir.join("token");
     assert!(openbao_hcl.exists());
     assert!(openbao_ctmpl.exists());
+    assert!(openbao_bundle_ctmpl.exists());
     assert!(openbao_token.exists());
 
     let hcl_mode = fs::metadata(&openbao_hcl)
@@ -1180,6 +1182,11 @@ fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str
         .permissions()
         .mode()
         & 0o777;
+    let bundle_ctmpl_mode = fs::metadata(&openbao_bundle_ctmpl)
+        .expect("openbao bundle ctmpl metadata")
+        .permissions()
+        .mode()
+        & 0o777;
     let token_mode = fs::metadata(&openbao_token)
         .expect("openbao token metadata")
         .permissions()
@@ -1187,6 +1194,7 @@ fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str
         & 0o777;
     assert_eq!(hcl_mode, 0o600);
     assert_eq!(ctmpl_mode, 0o600);
+    assert_eq!(bundle_ctmpl_mode, 0o600);
     assert_eq!(token_mode, 0o600);
 
     let ctmpl_contents = fs::read_to_string(&openbao_ctmpl).expect("read ctmpl");
@@ -1198,12 +1206,54 @@ fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str
         !ctmpl_contents.contains("test-responder-hmac"),
         "ctmpl should not contain literal secret values"
     );
+    let bundle_ctmpl_contents =
+        fs::read_to_string(&openbao_bundle_ctmpl).expect("read bundle ctmpl");
+    assert!(
+        bundle_ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
+        "bundle ctmpl should contain template directives"
+    );
+    assert!(
+        bundle_ctmpl_contents.contains(".Data.data.ca_bundle_pem"),
+        "bundle ctmpl should render ca_bundle_pem"
+    );
+    assert!(
+        !bundle_ctmpl_contents.contains("TRUST"),
+        "bundle ctmpl should not contain literal trust values"
+    );
 
     let hcl_contents = fs::read_to_string(&openbao_hcl).expect("read agent.hcl");
     assert!(
         hcl_contents.contains("vault {"),
         "agent.hcl should contain vault block"
     );
+    assert!(
+        hcl_contents.contains(&format!(
+            "source = \"{}\"",
+            path_relative_to_root_or_self(root, &openbao_ctmpl).display()
+        )),
+        "agent.hcl should render agent.toml"
+    );
+    assert!(
+        hcl_contents.contains(&format!(
+            "source = \"{}\"",
+            path_relative_to_root_or_self(root, &openbao_bundle_ctmpl).display()
+        )),
+        "agent.hcl should render the CA bundle template"
+    );
+    assert!(
+        hcl_contents.contains(&format!(
+            "destination = \"{}\"",
+            root.join("certs").join("ca-bundle.pem").display()
+        )),
+        "agent.hcl should target a CA bundle output path"
+    );
+}
+
+fn path_relative_to_root_or_self<'a>(
+    root: &'a std::path::Path,
+    path: &'a std::path::Path,
+) -> &'a std::path::Path {
+    path.strip_prefix(root).unwrap_or(path)
 }
 
 fn write_cert_with_dns(

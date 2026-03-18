@@ -81,6 +81,21 @@ async fn test_same_host_local_file_happy_path() {
         ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
         "ctmpl should contain template directives"
     );
+    let bundle_ctmpl_path = temp
+        .path()
+        .join("secrets")
+        .join("openbao")
+        .join("services")
+        .join(SERVICE_NAME)
+        .join("ca-bundle.pem.ctmpl");
+    assert!(bundle_ctmpl_path.exists());
+    assert_mode(&bundle_ctmpl_path, 0o600);
+    let bundle_ctmpl_contents = fs::read_to_string(&bundle_ctmpl_path).expect("read bundle ctmpl");
+    assert!(
+        bundle_ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
+        "bundle ctmpl should contain template directives"
+    );
+    assert!(bundle_ctmpl_contents.contains(".Data.data.ca_bundle_pem"));
 
     let hcl_path = temp
         .path()
@@ -94,6 +109,18 @@ async fn test_same_host_local_file_happy_path() {
         hcl_contents.contains("vault {"),
         "agent.hcl should contain vault block"
     );
+    assert!(hcl_contents.contains(&format!(
+        "source = \"{}\"",
+        path_relative_to_root_or_self(temp.path(), &ctmpl_path).display()
+    )));
+    assert!(hcl_contents.contains(&format!(
+        "source = \"{}\"",
+        path_relative_to_root_or_self(temp.path(), &bundle_ctmpl_path).display()
+    )));
+    assert!(hcl_contents.contains(&format!(
+        "destination = \"{}\"",
+        files.ca_bundle_path.display()
+    )));
 
     write_service_cert(&files.cert_path, &files.key_path).expect("write cert");
     write_fake_bootroot_agent(temp.path(), 0).expect("write fake bootroot-agent");
@@ -272,6 +299,10 @@ fn init_service_files(root: &Path) -> anyhow::Result<ServicePaths> {
         eab_path,
         ca_bundle_path,
     })
+}
+
+fn path_relative_to_root_or_self<'a>(root: &'a Path, path: &'a Path) -> &'a Path {
+    path.strip_prefix(root).unwrap_or(path)
 }
 
 fn run_service_add_local(
