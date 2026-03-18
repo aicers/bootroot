@@ -109,8 +109,22 @@ impl ResponderState {
         signature: &str,
         request: RegisterRequest,
     ) -> Result<(), RegisterError> {
-        let settings = self.settings.read().await.clone();
-        let requested_ttl_secs = request.ttl_secs.unwrap_or(settings.token_ttl_secs);
+        let (
+            default_ttl_secs,
+            max_token_ttl_secs,
+            admin_rate_limit_requests,
+            admin_rate_limit_window_secs,
+        ) = {
+            let settings = self.settings.read().await;
+            (
+                settings.token_ttl_secs,
+                settings.max_token_ttl_secs,
+                usize::try_from(settings.admin_rate_limit_requests)
+                    .expect("validated admin_rate_limit_requests must fit into usize"),
+                Duration::from_secs(settings.admin_rate_limit_window_secs),
+            )
+        };
+        let requested_ttl_secs = request.ttl_secs.unwrap_or(default_ttl_secs);
         if requested_ttl_secs == 0 {
             return Err(RegisterError::InvalidTtl);
         }
@@ -128,14 +142,13 @@ impl ResponderState {
         let now = tokio::time::Instant::now();
         if !self.admin_rate_limiter.lock().await.allow_registration_at(
             now,
-            usize::try_from(settings.admin_rate_limit_requests)
-                .expect("validated admin_rate_limit_requests must fit into usize"),
-            Duration::from_secs(settings.admin_rate_limit_window_secs),
+            admin_rate_limit_requests,
+            admin_rate_limit_window_secs,
         ) {
             return Err(RegisterError::RateLimited);
         }
 
-        let effective_ttl_secs = requested_ttl_secs.min(settings.max_token_ttl_secs);
+        let effective_ttl_secs = requested_ttl_secs.min(max_token_ttl_secs);
         let expires_at = now + Duration::from_secs(effective_ttl_secs);
         let mut tokens = self.tokens.write().await;
         tokens.insert(

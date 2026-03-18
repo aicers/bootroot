@@ -94,11 +94,17 @@ fn is_json_content_type(content_type: &str) -> bool {
     let media_type = content_type
         .split_once(';')
         .map_or(content_type, |(value, _)| value)
-        .trim()
-        .to_ascii_lowercase();
+        .trim();
 
-    media_type == "application/json"
-        || (media_type.starts_with("application/") && media_type.ends_with("+json"))
+    let Some((type_part, subtype_part)) = media_type.split_once('/') else {
+        return false;
+    };
+
+    type_part.eq_ignore_ascii_case("application")
+        && (subtype_part.eq_ignore_ascii_case("json")
+            || subtype_part
+                .rsplit_once('+')
+                .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json")))
 }
 
 #[cfg(test)]
