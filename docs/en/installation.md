@@ -74,6 +74,11 @@ Because the example mounts `-v $(pwd)/secrets:/home/step`, the files are
 created under `/home/step` in the container and appear under `./secrets/` on
 the host. Keep them in `./secrets/` so `secrets/config/ca.json` stays valid.
 
+In Bootroot's default deployment, step-ca may present its CA certificate
+directly on the HTTPS endpoint. Bootroot stores the CA bundle and matching
+SHA-256 fingerprints in OpenBao so bootroot-agent can later verify that
+endpoint using the trusted CA material gathered during bootstrap.
+
 Next, update `secrets/config/ca.json` for your environment:
 
 1. Set `db.type` to `postgresql`
