@@ -125,6 +125,9 @@ for svc in layout['services']:
         svc['summary_json_path'],
         svc['state_path'],
         svc['deploy_type'],
+        svc['hostname'],
+        svc['domain'],
+        svc['instance_id'],
     ]
     print("\t".join(fields))
 PY
@@ -139,11 +142,11 @@ start_mock_openbao() {
 }
 
 bootstrap_all() {
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
     set_context "bootstrap" "$node" "$service" "$work_dir"
     log_phase "bootstrap" "$node" "$service"
     local output_file="$ARTIFACT_DIR/bootstrap-output-${node}-${service}.json"
-    (
+    if ! (
       cd "$work_dir"
       "$BOOTROOT_REMOTE_BIN" bootstrap \
         --openbao-url "http://127.0.0.1:$MOCK_OPENBAO_PORT" \
@@ -152,9 +155,16 @@ bootstrap_all() {
         --secret-id-path "$secret_id_path" \
         --eab-file-path "$eab_file_path" \
         --agent-config-path "$agent_config_path" \
+        --agent-domain "$domain" \
+        --profile-hostname "$hostname" \
+        --profile-instance-id "$instance_id" \
+        --profile-cert-path "certs/${service}.crt" \
+        --profile-key-path "certs/${service}.key" \
         --ca-bundle-path "$ca_bundle_path" \
         --output json
-    ) >"$output_file" 2>>"$RUNNER_LOG" || true
+    ) >"$output_file" 2>>"$RUNNER_LOG"; then
+      fail_with_context "bootroot-remote bootstrap failed"
+    fi
   done <"$SERVICES_TSV"
 }
 
@@ -169,7 +179,7 @@ services = []
 for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
     if not line.strip():
         continue
-    node, service, work_dir, role_id_path, secret_id_path, eab_file_path, agent_config_path, ca_bundle_path, summary_json_path, state_path, deploy_type = line.split('\t')
+    node, service, work_dir, role_id_path, secret_id_path, eab_file_path, agent_config_path, ca_bundle_path, summary_json_path, state_path, deploy_type, hostname, domain, instance_id = line.split('\t')
     services.append(
         {
             "node": node,
@@ -238,7 +248,7 @@ PY
 }
 
 run_verify_all() {
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
     set_context "verify" "$node" "$service" "$agent_config_path"
     log_phase "verify" "$node" "$service"
     (
