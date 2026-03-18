@@ -275,7 +275,9 @@ bootroot-remote bootstrap \
 `bootroot-remote bootstrap`은 서비스 설정 번들(`secret_id`, `eab`,
 `responder_hmac`, `trust`)을 1회 pull+apply합니다.
 실제 운영에서는 `bootroot service add` 요약 출력의
-`원격 실행 명령`을 그대로 사용하는 것을 권장합니다.
+`원격 실행 명령 템플릿`을 기준으로 시작하되,
+`--agent-server`, `--agent-responder-url`를 `stepca.internal`,
+`responder.internal` 같은 원격 접근 가능 엔드포인트로 바꿔서 사용하세요.
 
 control node에서 secret_id 회전 후 새 secret_id를 원격 노드에 전달:
 

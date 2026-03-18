@@ -145,6 +145,7 @@ fn print_remote_handoff_summary(
         "{}",
         messages.service_summary_remote_handoff_service_host(remote.remote_run_command)
     );
+    println!("{}", messages.service_summary_remote_placeholder_warning());
     println!("{}", messages.service_scope_operator_recommended());
     let status_check_command = format!("bootroot service info --service-name '{service_name}'");
     println!(

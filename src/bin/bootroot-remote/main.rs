@@ -104,6 +104,9 @@ struct BootstrapArgs {
     agent_email: String,
 
     /// bootroot-agent ACME server URL for baseline config generation
+    ///
+    /// The default points to same-host step-ca and should be treated as a
+    /// placeholder on true remote service machines.
     #[arg(long, default_value = DEFAULT_AGENT_SERVER)]
     agent_server: String,
 
@@ -112,6 +115,9 @@ struct BootstrapArgs {
     agent_domain: String,
 
     /// HTTP-01 responder admin URL for baseline config generation
+    ///
+    /// The default points to a same-host responder and should be treated as a
+    /// placeholder on true remote service machines.
     #[arg(long, default_value = DEFAULT_AGENT_RESPONDER_URL)]
     agent_responder_url: String,
 
@@ -211,6 +217,8 @@ async fn run(args: Args, lang: Locale) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     #[test]
@@ -239,5 +247,23 @@ mod tests {
             summary_header(Locale::Ko),
             "bootroot-remote 부트스트랩 요약"
         );
+    }
+
+    #[test]
+    fn bootstrap_help_describes_localhost_defaults_as_placeholders() {
+        let mut command = Args::command();
+        let bootstrap = command
+            .find_subcommand_mut("bootstrap")
+            .expect("bootstrap subcommand");
+        let mut help = Vec::new();
+        bootstrap
+            .write_long_help(&mut help)
+            .expect("write long help");
+        let help = String::from_utf8(help).expect("help is utf-8");
+
+        assert!(help.contains("same-host step-ca"));
+        assert!(help.contains("placeholder on true remote service machines"));
+        assert!(help.contains("--agent-server"));
+        assert!(help.contains("--agent-responder-url"));
     }
 }

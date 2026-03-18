@@ -343,8 +343,9 @@ automation in the following structure.
 You still need to perform:
 
 - Start and keep OpenBao Agent/bootroot-agent running on the service machine
-- For `remote-bootstrap`, run `bootroot-remote bootstrap` on the service
-  machine and use `bootroot-remote apply-secret-id` after secret_id rotation
+- For `remote-bootstrap`, edit the generated `remote run command template`,
+  run `bootroot-remote bootstrap` on the service machine, and use
+  `bootroot-remote apply-secret-id` after secret_id rotation
 - Validate issuance path via `bootroot verify` or real service startup
 
 ### 4) Trust automation and preview
@@ -452,7 +453,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - Delivery mode summary (`local-file` provides
   auto-applied `agent.toml`/OpenBao Agent config/template paths, and
   `remote-bootstrap` provides a generated bootstrap artifact + ordered remote
-  handoff commands)
+  handoff command template)
 - Explicit ownership/scope labels in output:
   `Bootroot-managed`, `Operator-managed (required)`,
   `Operator-managed (recommended)`, and
@@ -877,8 +878,8 @@ Key inputs:
   - `--agent-domain` must be a DNS name made of dot-separated labels.
   - `--profile-hostname` must be a single DNS label (same rule as
     `--service-name`).
-  - `--profile-instance-id` must be numeric. Generated remote handoff commands
-    from `bootroot service add` already set this value.
+  - `--profile-instance-id` must be numeric. Generated remote handoff command
+    templates from `bootroot service add` already set this value.
   - `--profile-cert-path` and `--profile-key-path` are optional.
     If omitted, defaults are derived from `--agent-config-path` as
     `certs/<service>.crt` and `certs/<service>.key`.
@@ -888,6 +889,12 @@ Key inputs:
     - `--agent-domain`: `trusted.domain`
     - `--agent-responder-url`: `http://127.0.0.1:8080`
     - `--profile-hostname`: `localhost`
+  - `bootroot service add` prints a `remote run command template`, not an
+    exact remote-ready command. The localhost defaults for `--agent-server`
+    and `--agent-responder-url` are only correct for same-host setups; on a
+    separate service machine you must replace them with remote-reachable
+    control-plane endpoints such as `stepca.internal` and
+    `responder.internal`.
 - `--ca-bundle-path`
   - required to write bundle files when trust data includes `ca_bundle_pem`.
 - `--summary-json` (optional) and `--output text|json` (default `text`)
