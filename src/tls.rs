@@ -7,7 +7,10 @@ use rustls::ClientConfig;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use x509_parser::certificate::X509Certificate;
 use x509_parser::pem::parse_x509_pem;
+use x509_parser::prelude::ASN1Time;
+use x509_parser::prelude::FromDer;
 
 use crate::config::TrustSettings;
 
@@ -141,6 +144,20 @@ impl PinnedCertVerifier {
             ))
         }
     }
+
+    fn check_direct_pin(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        now: UnixTime,
+    ) -> Result<(), rustls::Error> {
+        if !self.allowed.contains(&sha256_hex(end_entity.as_ref())) {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        validate_certificate_time(end_entity, now)?;
+        Ok(())
+    }
 }
 
 impl ServerCertVerifier for PinnedCertVerifier {
@@ -152,14 +169,18 @@ impl ServerCertVerifier for PinnedCertVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        self.inner.verify_server_cert(
+        match self.inner.verify_server_cert(
             end_entity,
             intermediates,
             server_name,
             ocsp_response,
             now,
-        )?;
-        self.check_pins(end_entity, intermediates)?;
+        ) {
+            Ok(_) => self.check_pins(end_entity, intermediates)?,
+            Err(inner_err) => self
+                .check_direct_pin(end_entity, now)
+                .map_err(|_| inner_err)?,
+        }
         Ok(ServerCertVerified::assertion())
     }
 
@@ -194,4 +215,125 @@ fn sha256_hex(bytes: &[u8]) -> String {
         write!(output, "{byte:02x}").expect("writing to string should not fail");
     }
     output
+}
+
+fn validate_certificate_time(
+    certificate: &CertificateDer<'_>,
+    now: UnixTime,
+) -> Result<(), rustls::Error> {
+    let (_, cert) = X509Certificate::from_der(certificate.as_ref())
+        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    let now = i64::try_from(now.as_secs()).map_err(|_| {
+        rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)
+    })?;
+    let now = ASN1Time::from_timestamp(now).map_err(|_| {
+        rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)
+    })?;
+    if cert.validity().is_valid_at(now) {
+        Ok(())
+    } else {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::Expired,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+    use rustls::DigitallySignedStruct;
+    use rustls::SignatureScheme;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct RejectingVerifier;
+
+    impl ServerCertVerifier for RejectingVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+        }
+    }
+
+    #[test]
+    fn pinned_verifier_accepts_directly_pinned_ca_certificate() {
+        let certificate = generate_ca_certificate();
+        let fingerprint = sha256_hex(certificate.as_ref());
+        let verifier =
+            PinnedCertVerifier::new(Arc::new(RejectingVerifier), HashSet::from([fingerprint]));
+
+        let result = verifier.verify_server_cert(
+            &certificate,
+            &[],
+            &ServerName::try_from("localhost").expect("valid server name"),
+            &[],
+            UnixTime::now(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn pinned_verifier_rejects_direct_certificate_without_matching_pin() {
+        let certificate = generate_ca_certificate();
+        let verifier = PinnedCertVerifier::new(
+            Arc::new(RejectingVerifier),
+            HashSet::from([String::from("00")]),
+        );
+
+        let result = verifier.verify_server_cert(
+            &certificate,
+            &[],
+            &ServerName::try_from("localhost").expect("valid server name"),
+            &[],
+            UnixTime::since_unix_epoch(Duration::from_secs(1_900_000_000)),
+        );
+
+        assert!(result.is_err());
+    }
+
+    fn generate_ca_certificate() -> CertificateDer<'static> {
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Bootroot Test Intermediate");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).expect("self-signed cert");
+        CertificateDer::from(cert.der().to_vec())
+    }
 }

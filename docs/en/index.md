@@ -145,7 +145,10 @@ where the operator controls both the CA and `bootroot-agent` when services are
 first installed, so skipping CA verification during initial issuance is
 acceptable. Because the CA certificate is obtained during this initial process,
 CA verification is guaranteed for all subsequent automated certificate
-rotations.
+rotations. In the default deployment, later verification relies on the CA
+bundle and pinned CA fingerprints, so bootroot-agent can authenticate the
+step-ca HTTPS endpoint even when step-ca presents its CA certificate
+directly.
 
 ### Not Automated (4) — Installation and Operations
 

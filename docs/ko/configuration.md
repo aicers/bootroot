@@ -221,6 +221,11 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 3. 첫 발급 성공 시 bootroot-agent가 `trust.verify_certificates = true`를 자동 기록합니다.
 4. 이후 정기 갱신(cron/daemon)을 `--insecure` 없이 실행해 검증 모드를 유지합니다.
 
+기본 Bootroot 배포에서는 step-ca가 HTTPS 엔드포인트에서 CA 인증서를 직접
+제시할 수 있습니다. `trusted_ca_sha256`가 설정되면 bootroot-agent는
+신뢰 번들로 이어지는 일반 HTTPS leaf뿐 아니라, 지문이 직접 pin된
+인증서도 허용합니다.
+
 #### 6) 실패/주의 사항
 
 - 자동 전환의 파일 쓰기/재로드 검증이 실패하면 bootroot-agent는 non-zero로 종료

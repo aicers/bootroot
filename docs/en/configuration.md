@@ -227,6 +227,12 @@ Goal: "first issuance without verification, then verification enabled"
    `trust.verify_certificates = true`.
 4. Run renewals (cron/daemon) without `--insecure` to keep verification on.
 
+In the default Bootroot deployment, step-ca may present its CA certificate
+directly on the HTTPS endpoint. When `trusted_ca_sha256` is configured,
+bootroot-agent accepts either a normal HTTPS leaf chaining to the trusted
+bundle or a directly presented certificate whose fingerprint is pinned in
+`trusted_ca_sha256`.
+
 #### 6) Failure/caution notes
 
 - if hardening write/reload verification fails, bootroot-agent exits non-zero
