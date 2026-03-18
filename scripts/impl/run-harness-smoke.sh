@@ -135,7 +135,29 @@ run_bootstrap() {
   local eab_file_path="$WORK_DIR/secrets/services/$SERVICE_NAME/eab.json"
   local agent_config_path="$WORK_DIR/agent.toml"
   local ca_bundle_path="$WORK_DIR/certs/ca-bundle.pem"
-  (
+  local profile_hostname agent_domain profile_instance_id profile_cert_path profile_key_path
+  IFS=$'\t' read -r profile_hostname agent_domain profile_instance_id profile_cert_path profile_key_path < <(
+    python3 - "$WORK_DIR/state.json" "$SERVICE_NAME" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+entry = state["services"][sys.argv[2]]
+print(
+    "\t".join(
+        [
+            entry["hostname"],
+            entry["domain"],
+            entry["instance_id"],
+            entry["cert_path"],
+            entry["key_path"],
+        ]
+    )
+)
+PY
+  )
+  if ! (
     cd "$WORK_DIR"
     "$BOOTROOT_REMOTE_BIN" bootstrap \
       --openbao-url "http://127.0.0.1:$MOCK_OPENBAO_PORT" \
@@ -144,9 +166,17 @@ run_bootstrap() {
       --secret-id-path "$secret_id_path" \
       --eab-file-path "$eab_file_path" \
       --agent-config-path "$agent_config_path" \
+      --agent-domain "$agent_domain" \
+      --profile-hostname "$profile_hostname" \
+      --profile-instance-id "$profile_instance_id" \
+      --profile-cert-path "$profile_cert_path" \
+      --profile-key-path "$profile_key_path" \
       --ca-bundle-path "$ca_bundle_path" \
       --output json
-  ) >"$BOOTSTRAP_OUTPUT" 2>>"$RUNNER_LOG"
+  ) >"$BOOTSTRAP_OUTPUT" 2>>"$RUNNER_LOG"; then
+    printf "bootroot-remote bootstrap failed\n" >&2
+    exit 1
+  fi
 }
 
 assert_bootstrap_applied() {
