@@ -95,6 +95,11 @@ these inputs:
 - `--profile-cert-path`
 - `--profile-key-path`
 
+On a separate service host, `--agent-server` and
+`--agent-responder-url` usually need override with remote-reachable
+control-plane endpoints instead of the localhost placeholders used in the
+generated handoff template.
+
 What each field means:
 
 - `exit_after_auth`: `true` exits after auth; `false` keeps the agent running.

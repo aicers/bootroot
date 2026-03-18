@@ -185,9 +185,15 @@ pub(super) static STRINGS: Strings = Strings {
     service_scope_operator_recommended: "운영자 실행 항목 (권장):",
     service_scope_operator_optional: "운영자 실행 항목 (선택):",
     service_summary_remote_bootstrap_file: "- 원격 부트스트랩 파일: {value}",
-    service_summary_remote_run_command: "- 원격 실행 명령: {value}",
+    service_summary_remote_run_command: "- 원격 실행 명령 템플릿: {value}",
     service_summary_remote_handoff_title: "- 원격 반영 실행 순서:",
-    service_summary_remote_handoff_service_host: "  1. 서비스 머신에서 실행: {value}",
+    service_summary_remote_handoff_service_host: "  1. 서비스 머신에서 값을 수정한 뒤 실행: {value}",
+    service_summary_remote_placeholder_warning: concat!(
+        "  - 경고: 출력된 명령 템플릿과 해당 bootstrap.json 필드는 ",
+        "`--agent-server`, `--agent-responder-url`에 localhost placeholder를 ",
+        "사용합니다. 별도 서비스 머신에서 실행하기 전에 원격에서 도달 가능한 ",
+        "step-ca/responder 엔드포인트로 바꿔야 합니다."
+    ),
     service_summary_remote_handoff_status_check: "  2. step-ca 머신에서 상태 확인: {value}",
     service_summary_agent_config: "- 에이전트 설정: {value}",
     service_summary_cert_path: "- cert 경로: {value}",

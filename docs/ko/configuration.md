@@ -93,6 +93,10 @@ template {
 - `--profile-cert-path`
 - `--profile-key-path`
 
+별도 서비스 머신에서는 생성된 handoff 템플릿의 localhost placeholder 대신
+원격에서 도달 가능한 제어면 엔드포인트로 `--agent-server`,
+`--agent-responder-url`를 대개 덮어써야 합니다.
+
 구성 설명:
 
 - `exit_after_auth`: `true`면 토큰 발급 후 종료, `false`면 상시 실행합니다.

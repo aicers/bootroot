@@ -329,8 +329,9 @@ bootroot status
 운영자가 직접 해야 할 작업:
 
 - 서비스 머신에서 OpenBao Agent/bootroot-agent를 실제로 기동/상시 운영
-- `remote-bootstrap`인 경우 서비스 머신에서 `bootroot-remote bootstrap` 1회
-  실행 및 secret_id 회전 이후 `bootroot-remote apply-secret-id` 실행
+- `remote-bootstrap`인 경우 생성된 `원격 실행 명령 템플릿`을 수정한 뒤
+  서비스 머신에서 `bootroot-remote bootstrap`을 1회 실행하고,
+  secret_id 회전 이후 `bootroot-remote apply-secret-id` 실행
 - `bootroot verify` 또는 실제 서비스 실행으로 발급 경로 검증
 
 ### 4) trust 자동 처리와 preview
@@ -434,7 +435,7 @@ bootroot status
 - AppRole/정책/secret_id 경로 요약
 - 전달 모드 요약(`local-file`은
   `agent.toml`/OpenBao Agent 설정/템플릿 자동 반영 경로, `remote-bootstrap`은
-  부트스트랩 아티팩트 + 순서형 원격 handoff 명령 출력)
+  부트스트랩 아티팩트 + 순서형 원격 handoff 명령 템플릿 출력)
 - 출력에 소유/책임 범위를 명시하는 라벨을 함께 표시:
   `Bootroot 자동 반영 항목`, `운영자 실행 항목 (필수)`,
   `운영자 실행 항목 (권장)`, `운영자 실행 항목 (선택)`
@@ -842,7 +843,7 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
   - `--profile-hostname`은 `--service-name`과 같은 단일 DNS label이어야
     합니다.
   - `--profile-instance-id`는 숫자만 허용됩니다. `bootroot service add`가
-    생성하는 원격 handoff 명령은 이 값을 이미 채워 둡니다.
+    생성하는 원격 handoff 명령 템플릿은 이 값을 이미 채워 둡니다.
   - `--profile-cert-path`, `--profile-key-path`는 선택입니다.
     미지정 시 `--agent-config-path` 기준 `certs/<service>.crt`,
     `certs/<service>.key`를 기본 경로로 사용합니다.
@@ -852,6 +853,12 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
     - `--agent-domain`: `trusted.domain`
     - `--agent-responder-url`: `http://127.0.0.1:8080`
     - `--profile-hostname`: `localhost`
+  - `bootroot service add`가 출력하는 것은 `원격 실행 명령 템플릿`이지
+    원격 환경에서 바로 실행 가능한 완성 명령이 아닙니다.
+    `--agent-server`, `--agent-responder-url`의 localhost 기본값은
+    동일 호스트 배치에서만 맞으며, 별도 서비스 머신에서는
+    `stepca.internal`, `responder.internal` 같은 원격 제어면 엔드포인트로
+    바꿔야 합니다.
 - `--ca-bundle-path`
   - trust 데이터에 `ca_bundle_pem`이 포함된 경우 번들을 파일로 반영하려면
     지정이 필요합니다.

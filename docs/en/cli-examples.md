@@ -275,8 +275,10 @@ bootroot-remote bootstrap \
 
 `bootroot-remote bootstrap` performs a one-shot pull and apply of the service
 configuration bundle (`secret_id`, `eab`, `responder_hmac`, `trust`).
-In operations, prefer the exact `remote run command` printed by
-`bootroot service add`.
+In operations, start from the `remote run command template` printed by
+`bootroot service add`, then replace `--agent-server` and
+`--agent-responder-url` with remote-reachable endpoints such as
+`stepca.internal` and `responder.internal`.
 
 After secret_id rotation on the control node, deliver the new secret_id to the
 remote node:

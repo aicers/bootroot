@@ -586,6 +586,10 @@ impl Messages {
         )
     }
 
+    pub(crate) fn service_summary_remote_placeholder_warning(&self) -> &'static str {
+        self.strings().service_summary_remote_placeholder_warning
+    }
+
     pub(crate) fn service_summary_remote_handoff_status_check(&self, value: &str) -> String {
         format_template(
             self.strings().service_summary_remote_handoff_status_check,

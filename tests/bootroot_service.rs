@@ -636,8 +636,12 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
     assert!(stdout.contains("Operator-managed (required):"));
     assert!(stdout.contains("Operator-managed (recommended):"));
     assert!(stdout.contains("- remote bootstrap file:"));
+    assert!(stdout.contains("- remote run command template:"));
     assert!(stdout.contains("- remote handoff order:"));
-    assert!(stdout.contains("1. Run on the service host:"));
+    assert!(stdout.contains("1. Edit and run on the service host:"));
+    assert!(
+        stdout.contains("localhost placeholders for `--agent-server` and `--agent-responder-url`")
+    );
     assert!(stdout.contains("2. Check status on the step-ca host:"));
 
     let state_contents =
