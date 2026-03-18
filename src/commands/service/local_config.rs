@@ -13,6 +13,9 @@ use super::{
 use crate::commands::constants::{CA_TRUST_KEY, SERVICE_KV_BASE};
 use crate::i18n::Messages;
 
+const VERIFY_CERTIFICATES_KEY: &str = "verify_certificates";
+const VERIFY_CERTIFICATES_TRUE: &str = "true";
+
 pub(super) async fn apply_local_service_configs(
     secrets_dir: &Path,
     resolved: &ResolvedServiceAdd,
@@ -173,6 +176,10 @@ fn build_trust_updates(
     ca_bundle_path: &Path,
 ) -> Vec<(&'static str, String)> {
     vec![
+        (
+            VERIFY_CERTIFICATES_KEY,
+            VERIFY_CERTIFICATES_TRUE.to_string(),
+        ),
         ("ca_bundle_path", ca_bundle_path.display().to_string()),
         (
             CA_TRUST_KEY,
@@ -367,6 +374,7 @@ mod tests {
 
         assert_eq!(once, twice);
         assert!(once.contains("[trust]"));
+        assert!(once.contains("verify_certificates = true"));
         assert!(once.contains("ca_bundle_path = \"certs/ca-bundle.pem\""));
         assert!(once.contains("trusted_ca_sha256 = ["));
     }

@@ -70,6 +70,7 @@ async fn test_bootroot_remote_applies_service_secrets() {
     assert!(eab_contents.contains("\"hmac\": \"hmac-1\""));
     let agent_contents = fs::read_to_string(&agent_config_path).expect("read agent config");
     assert!(agent_contents.contains("http_responder_hmac = \"responder-hmac-1\""));
+    assert!(agent_contents.contains("verify_certificates = true"));
     assert!(agent_contents.contains("ca_bundle_path = \""));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     let bundle_contents = fs::read_to_string(&ca_bundle_path).expect("read ca bundle");
