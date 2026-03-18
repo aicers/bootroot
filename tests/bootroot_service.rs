@@ -1025,6 +1025,7 @@ async fn test_app_add_includes_trust_snippet_when_present() {
     assert!(stdout.contains("ca_bundle_path"));
     let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
     assert!(agent_contents.contains("[trust]"));
+    assert!(agent_contents.contains("verify_certificates = true"));
     assert!(agent_contents.contains("trusted_ca_sha256"));
     assert!(agent_contents.contains("ca_bundle_path = \""));
     let bundle_path = temp_dir.path().join("certs").join("ca-bundle.pem");

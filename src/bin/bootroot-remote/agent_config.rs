@@ -11,6 +11,9 @@ use super::{
     SERVICE_KV_BASE, TRUSTED_CA_KEY, localized,
 };
 
+const VERIFY_CERTIFICATES_KEY: &str = "verify_certificates";
+const VERIFY_CERTIFICATES_TRUE: &str = "true";
+
 struct ProfilePaths {
     cert_path: PathBuf,
     key_path: PathBuf,
@@ -323,7 +326,10 @@ fn build_trust_updates(
     fingerprints: &[String],
     ca_bundle_path: Option<&Path>,
 ) -> Vec<(&'static str, String)> {
-    let mut updates = Vec::new();
+    let mut updates = vec![(
+        VERIFY_CERTIFICATES_KEY,
+        VERIFY_CERTIFICATES_TRUE.to_string(),
+    )];
     if let Some(path) = ca_bundle_path {
         updates.push(("ca_bundle_path", path.display().to_string()));
     }
@@ -511,6 +517,10 @@ fn is_section_header(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use super::build_trust_updates;
+
     #[test]
     fn upsert_toml_section_keys_updates_existing_section() {
         let input = "[acme]\nhttp_responder_hmac = \"old\"\n";
@@ -526,13 +536,11 @@ mod tests {
     #[test]
     fn upsert_toml_section_keys_adds_new_section() {
         let input = "[acme]\nhttp_responder_hmac = \"old\"\n";
-        let output = bootroot::toml_util::upsert_section_keys(
-            input,
-            "trust",
-            &[("ca_bundle_path", "certs/ca.pem".to_string())],
-        )
-        .unwrap();
+        let updates = build_trust_updates(&["a".repeat(64)], Some(Path::new("certs/ca.pem")));
+        let output = bootroot::toml_util::upsert_section_keys(input, "trust", &updates).unwrap();
         assert!(output.contains("[trust]"));
+        assert!(output.contains("verify_certificates = true"));
         assert!(output.contains("ca_bundle_path = \"certs/ca.pem\""));
+        assert!(output.contains("trusted_ca_sha256 = ["));
     }
 }

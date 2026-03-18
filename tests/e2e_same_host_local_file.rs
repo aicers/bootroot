@@ -51,6 +51,7 @@ async fn test_same_host_local_file_happy_path() {
     assert!(agent_contents.contains("cert = \""));
     assert!(agent_contents.contains("key = \""));
     assert!(agent_contents.contains("[trust]"));
+    assert!(agent_contents.contains("verify_certificates = true"));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     assert!(agent_contents.contains("ca_bundle_path = \""));
 
@@ -195,6 +196,7 @@ async fn test_same_host_trust_change_propagates_to_agent_config() {
     );
 
     let agent_contents = fs::read_to_string(&files.agent_config).expect("read agent.toml");
+    assert!(agent_contents.contains("verify_certificates = true"));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     assert!(agent_contents.contains("ca_bundle_path = \""));
     let bundle_contents = fs::read_to_string(&files.ca_bundle_path).expect("read ca-bundle");
