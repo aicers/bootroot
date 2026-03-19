@@ -92,6 +92,7 @@
 ## `remote-bootstrap`이 실패할 때
 
 - 서비스 머신에서 `bootroot-remote bootstrap`이 성공적으로 완료되었는지 확인
+- trust 회전 후에는 서비스 머신에서 `bootroot-remote bootstrap`을 다시 실행
 - secret_id 회전 후에는 서비스 머신에서 `bootroot-remote apply-secret-id`를 실행
 - bootstrap summary JSON에서 모든 항목이 `applied` 상태인지 확인
 
@@ -113,10 +114,15 @@
 - 시스템 trust 또는 `trust.ca_bundle_path`가 올바른지 확인
 - 임시 진단 용도로만 `bootroot-agent --insecure` 사용 (운영 비권장)
 
-### 발급 직후 자동 강화 실패
+### 발급 직후 호환성 자동 강화 실패
 
-- 증상: 발급은 성공했지만 직후 bootroot-agent가 non-zero로 종료됨
-- 원인: `trust.verify_certificates = true` 자동 기록/재로드 검증 실패
+- 증상: 레거시/수동 프로필에서 발급은 성공했지만 직후 bootroot-agent가
+  non-zero로 종료됨
+- 원인: `trust.verify_certificates = true`로 바꾸기 위한
+  `agent.toml` 기록/재로드 검증 실패
+- 현재 managed onboarding은 보통 첫 실행 전에 검증 설정을 써 둡니다.
+  이 증상이 보이면 프로필이 일반적인 local-file/remote-bootstrap 흐름 밖에서
+  생성되었는지 확인하세요.
 - 확인: `--config` 경로, 파일 권한, `agent.toml` 문법
 
 ## 파일/훅 관련 오류

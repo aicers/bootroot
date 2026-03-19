@@ -343,9 +343,12 @@ automation in the following structure.
 You still need to perform:
 
 - Start and keep OpenBao Agent/bootroot-agent running on the service machine
+- For `local-file`, `bootroot service add` already prepares trust files on the
+  same host so the first managed `bootroot-agent` run can start in verify mode
 - For `remote-bootstrap`, edit the generated `remote run command template`,
-  run `bootroot-remote bootstrap` on the service machine, and use
-  `bootroot-remote apply-secret-id` after secret_id rotation
+  run `bootroot-remote bootstrap` on the service machine before starting
+  `bootroot-agent`, and use `bootroot-remote apply-secret-id` after
+  secret_id rotation
 - Validate issuance path via `bootroot verify` or real service startup
 
 ### 4) Trust automation and preview
@@ -357,22 +360,28 @@ automatically as part of onboarding.
 
 #### 4-1) Trust automation by delivery mode
 
-- `remote-bootstrap` mode: it writes
-  `trusted_ca_sha256` into the per-service remote bootstrap bundle
-  (`secret/.../services/<service>/trust`), and `bootroot-remote bootstrap`
-  applies it to trust settings in `agent.toml` on the service machine.
+- `remote-bootstrap` mode: it writes service trust state into the per-service
+  remote bootstrap bundle (`secret/.../services/<service>/trust`), and
+  `bootroot-remote bootstrap` applies the trust settings and CA bundle on the
+  service machine before the first `bootroot-agent` run.
 - `local-file` mode: trust settings are auto-merged into `agent.toml`
-  (`trusted_ca_sha256` and `ca_bundle_path`), and CA bundle PEM is written
-  to the local `ca_bundle_path` when OpenBao trust data includes
-  `ca_bundle_pem`.
+  (`trusted_ca_sha256`, `ca_bundle_path`, and normally
+  `verify_certificates = true`), the CA bundle PEM is written to the local
+  `ca_bundle_path`, and the per-service OpenBao Agent keeps them
+  synchronized.
 
-#### 4-2) bootroot-agent runtime hardening (summary)
+#### 4-2) Managed trust bootstrap (summary)
 
-- After first successful issuance
-  in normal execution, bootroot-agent auto-writes
-  `trust.verify_certificates = true` to `agent.toml` and uses ACME server TLS
-  verification from subsequent runs. A run with `--insecure` bypasses
-  verification only for that run and skips hardening. For full rules and
+- In the normal managed onboarding flow, both delivery modes prepare trust
+  before the first `bootroot-agent` run.
+- `local-file`: `bootroot service add` writes trust settings and
+  `ca-bundle.pem` locally.
+- `remote-bootstrap`: `bootroot service add` prepares the service trust
+  payload in OpenBao, and `bootroot-remote bootstrap` applies it on the
+  remote host.
+- `--insecure` is a per-run break-glass override. If a legacy/manual profile
+  still starts with `trust.verify_certificates = false`, a successful
+  non-`--insecure` run auto-hardens it to `true`. For full rules and
   operating flow, see [Configuration > Trust](configuration.md#trust).
 
 #### 4-3) Preview mode (`--print-only`/`--dry-run`)

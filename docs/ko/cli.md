@@ -329,9 +329,12 @@ bootroot status
 운영자가 직접 해야 할 작업:
 
 - 서비스 머신에서 OpenBao Agent/bootroot-agent를 실제로 기동/상시 운영
+- `local-file`인 경우 `bootroot service add`가 같은 호스트에 trust 파일을
+  미리 준비하므로, 첫 managed `bootroot-agent` 실행부터 검증 모드로 시작 가능
 - `remote-bootstrap`인 경우 생성된 `원격 실행 명령 템플릿`을 수정한 뒤
-  서비스 머신에서 `bootroot-remote bootstrap`을 1회 실행하고,
-  secret_id 회전 이후 `bootroot-remote apply-secret-id` 실행
+  `bootroot-agent`를 시작하기 전에 서비스 머신에서
+  `bootroot-remote bootstrap`을 1회 실행하고, secret_id 회전 이후
+  `bootroot-remote apply-secret-id` 실행
 - `bootroot verify` 또는 실제 서비스 실행으로 발급 경로 검증
 
 ### 4) trust 자동 처리와 preview
@@ -343,20 +346,29 @@ bootroot status
 
 #### 4-1) 전달 모드별 trust 자동 처리
 
-- `remote-bootstrap` 방식: `trusted_ca_sha256`를 서비스별 원격 bootstrap
+- `remote-bootstrap` 방식: 서비스 trust 상태를 서비스별 원격 bootstrap
   번들(`secret/.../services/<service>/trust`)에 자동 기록하고, 원격 서비스
-  머신의 `bootroot-remote bootstrap`이 이를 `agent.toml` trust 항목에 반영합니다.
-- `local-file` 방식: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)이
-  `agent.toml`에 자동 병합되며, OpenBao trust 데이터에 `ca_bundle_pem`이
-  있으면 로컬 `ca_bundle_path` 파일에도 자동 반영됩니다.
+  머신의 `bootroot-remote bootstrap`이 첫 `bootroot-agent` 실행 전에
+  trust 설정과 CA 번들을 반영합니다.
+- `local-file` 방식: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`,
+  보통 `verify_certificates = true`)이 `agent.toml`에 자동 병합되고,
+  CA 번들 PEM이 로컬 `ca_bundle_path`에 기록되며, 서비스별 OpenBao Agent가
+  이를 계속 동기화합니다.
 
-#### 4-2) bootroot-agent 런타임 자동 강화(요약)
+#### 4-2) managed trust bootstrap(요약)
 
-- 일반 실행에서 첫 발급이 성공하면
-  `trust.verify_certificates = true`를 `agent.toml`에 자동 기록해 이후 실행부터
-  ACME 서버 TLS 검증을 사용합니다. `--insecure` 실행은 해당 실행에서만
-  검증을 우회하고 자동 강화를 건너뜁니다. 자세한 규칙/운영 흐름은
-  [설정 > 신뢰](configuration.md#_4) 섹션을 참고하세요.
+- 일반적인 managed onboarding 흐름에서는 두 delivery mode 모두 첫
+  `bootroot-agent` 실행 전에 trust를 준비합니다.
+- `local-file`: `bootroot service add`가 trust 설정과 `ca-bundle.pem`을
+  로컬에 기록합니다.
+- `remote-bootstrap`: `bootroot service add`가 OpenBao에 서비스 trust
+  payload를 준비하고, `bootroot-remote bootstrap`이 원격 호스트에
+  반영합니다.
+- `--insecure`는 실행 단위 break-glass 오버라이드입니다. 레거시/수동
+  프로필이 여전히 `trust.verify_certificates = false`로 시작하면,
+  `--insecure` 없이 성공한 실행이 이를 `true`로 자동 강화합니다.
+  자세한 규칙/운영 흐름은 [설정 > 신뢰](configuration.md#_4) 섹션을
+  참고하세요.
 
 #### 4-3) preview 모드(`--print-only`/`--dry-run`)
 
