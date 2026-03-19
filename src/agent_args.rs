@@ -41,11 +41,30 @@ pub struct Args {
     #[arg(long)]
     pub oneshot: bool,
 
-    /// Verify ACME server TLS certificates
+    /// Force ACME server TLS verification for this run
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "insecure")]
     pub verify_certificates: bool,
 
-    /// Disable TLS certificate verification (INSECURE)
+    /// Disable TLS certificate verification for this run only (INSECURE break-glass override)
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "verify_certificates")]
     pub insecure: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn help_describes_tls_override_semantics() {
+        let mut command = Args::command();
+        let mut help = Vec::new();
+        command.write_long_help(&mut help).expect("write help");
+        let help = String::from_utf8(help).expect("help is utf-8");
+
+        assert!(help.contains("Force ACME server TLS verification for this run"));
+        assert!(help.contains("for this run only"));
+        assert!(help.contains("break-glass override"));
+    }
 }

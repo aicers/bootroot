@@ -214,3 +214,8 @@ In `bootroot service add`, `--delivery-mode` is the selector option.
   service state, and `bootroot-remote bootstrap` on the service machine reads
   and applies it in a single run. After initial bootstrap, secret_id rotation
   is handled explicitly via `bootroot-remote apply-secret-id`.
+
+In both delivery modes, the intended model is the same: prepare trust first,
+then start `bootroot-agent` with verification enabled. `local-file` applies
+that trust directly on the step-ca host, while `remote-bootstrap` applies it
+on the service host through `bootroot-remote bootstrap`.

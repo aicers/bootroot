@@ -161,7 +161,9 @@ For targets added with `--delivery-mode remote-bootstrap`, the operational
 model is one-shot bootstrap followed by explicit secret_id handoff:
 
 1. Run `bootroot-remote bootstrap` once on the service machine after
-   `bootroot service add` to apply the initial configuration bundle.
+   `bootroot service add` to apply the initial configuration bundle,
+   including trust settings and the CA bundle, before the first
+   `bootroot-agent` run.
 2. After `bootroot rotate approle-secret-id` on the control node, run
    `bootroot-remote apply-secret-id` on the service machine to deliver the
    new secret_id.
@@ -210,11 +212,19 @@ This section covers how to operate three trust settings together:
 - CLI overrides:
   `bootroot-agent --verify-certificates` (force verify for that run) or
   `bootroot-agent --insecure` (disable verify only for that run).
-- In normal mode (without `--insecure`), after the first successful issuance,
-  bootroot-agent auto-writes `trust.verify_certificates = true` in
-  `agent.toml`, so subsequent runs switch to verification mode.
-- If file write or reload validation fails during this hardening step,
-  bootroot-agent exits non-zero.
+- In the managed onboarding flow, trust is prepared before the first
+  `bootroot-agent` run:
+  - `local-file`: `bootroot service add` writes trust settings and
+    `ca-bundle.pem` locally, and the per-service OpenBao Agent keeps them
+    synchronized.
+  - `remote-bootstrap`: `bootroot service add` writes trust state to
+    OpenBao, and `bootroot-remote bootstrap` applies the trust config and
+    CA bundle on the service machine.
+- Compatibility fallback: if a legacy/manual profile still starts with
+  `trust.verify_certificates = false`, a successful non-`--insecure` run
+  auto-writes `true`.
+- If file write or reload validation fails during this compatibility
+  hardening step, bootroot-agent exits non-zero.
 
 Permissions/ownership:
 
@@ -241,6 +251,13 @@ This command:
    `bootroot/services/<name>/trust`.
 4. For each local service, updates the `[trust]` section in the agent config
    and writes `ca-bundle.pem` to disk.
+
+After `trust-sync`:
+
+- `local-file`: the local service host already has the updated trust config
+  and bundle on disk.
+- `remote-bootstrap`: re-run `bootroot-remote bootstrap` on the service host
+  to apply the updated trust payload and CA bundle there.
 
 ## Force reissue
 

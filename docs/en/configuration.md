@@ -202,19 +202,22 @@ This section covers both mTLS trust and **ACME server TLS verification**.
 - `trusted_ca_sha256`: trusted CA fingerprint list (SHA-256 hex)
 - if `verify_certificates = true` and `ca_bundle_path` is missing,
   system CA store is used
-- default is `verify_certificates = false` (backward compatibility)
+- schema default is `verify_certificates = false` (backward compatibility),
+  but managed onboarding normally writes `verify_certificates = true`
+  before the first `bootroot-agent` run when trust bundle data is available
 
 `trusted_ca_sha256` must match real CA certificate fingerprints (not
 arbitrary values).
 
 #### 3) `--delivery-mode` integration
 
-- `remote-bootstrap`: fingerprints are written to per-service remote bootstrap
-  trust path, then applied to service-machine `agent.toml` by
-  `bootroot-remote bootstrap`
-- `local-file`: trust settings (`trusted_ca_sha256`, `ca_bundle_path`) are
-  auto-merged into `agent.toml`; if OpenBao trust includes `ca_bundle_pem`,
-  bootroot also writes `ca_bundle_path` automatically
+- `remote-bootstrap`: `bootroot service add` writes per-service trust state
+  in OpenBao, and `bootroot-remote bootstrap` applies
+  `trusted_ca_sha256`, `ca_bundle_path`, and verification settings on the
+  service machine before the first `bootroot-agent` run
+- `local-file`: `bootroot service add` auto-merges trust settings into
+  `agent.toml`, writes `ca_bundle_path`, and the per-service OpenBao Agent
+  keeps both the config and bundle file synchronized locally
 
 #### 4) Runtime flag behavior
 
@@ -224,13 +227,24 @@ arbitrary values).
 
 #### 5) Recommended operating flow
 
-Goal: "first issuance without verification, then verification enabled"
+Goal: "prepare trust first, then start `bootroot-agent` with verification
+enabled"
 
-1. Start with `trust.verify_certificates = false` in `agent.toml`.
-2. Run first issuance without `--insecure`.
-3. On first successful issuance, bootroot-agent auto-writes
-   `trust.verify_certificates = true`.
-4. Run renewals (cron/daemon) without `--insecure` to keep verification on.
+1. Run `bootroot init` so OpenBao `secret/bootroot/ca` contains
+   `trusted_ca_sha256` and `ca_bundle_pem`.
+2. Add the service with `bootroot service add`.
+3. Apply trust on the service host before the first `bootroot-agent` run:
+   - `local-file`: `bootroot service add` writes the trust config and
+     `ca-bundle.pem` locally.
+   - `remote-bootstrap`: run `bootroot-remote bootstrap` once to apply the
+     same trust payload on the remote host.
+4. Start `bootroot-agent` without `--insecure`; in the managed onboarding
+   flow it should already have `trust.verify_certificates = true`.
+5. Reserve `--insecure` for temporary diagnosis or other break-glass cases.
+
+Compatibility fallback: if an older or manually managed profile still starts
+with `trust.verify_certificates = false`, a successful non-`--insecure` run
+auto-writes `true`.
 
 In the default Bootroot deployment, step-ca may present its CA certificate
 directly on the HTTPS endpoint. When `trusted_ca_sha256` is configured,
@@ -240,18 +254,24 @@ bundle or a directly presented certificate whose fingerprint is pinned in
 
 #### 6) Failure/caution notes
 
-- if hardening write/reload verification fails, bootroot-agent exits non-zero
-- `--insecure` bypasses verification only for that run and skips hardening
-- next normal run checks hardening conditions again
+- if compatibility hardening write/reload verification fails,
+  bootroot-agent exits non-zero
+- `--insecure` bypasses verification only for that run and skips
+  compatibility hardening
+- if a profile still starts with `verify_certificates = false`, the next
+  normal run checks hardening conditions again
 - in single-step-ca setups, reusing one `ca_bundle_path` for both mTLS and
   ACME verification is acceptable
 
 #### 7) Validation checklist
 
-- if trust is missing/empty in `--delivery-mode remote-bootstrap`, check:
+- if trust is missing/empty in either delivery mode, check:
 - `secrets/certs/root_ca.crt` and `secrets/certs/intermediate_ca.crt` exist
 - `bootroot init` ran with the same `secrets_dir`
-- OpenBao `secret/bootroot/ca` contains `trusted_ca_sha256`
+- OpenBao `secret/bootroot/ca` contains `trusted_ca_sha256` and
+  `ca_bundle_pem`
+- `local-file`: the per-service OpenBao Agent renders `ca-bundle.pem`
+- `remote-bootstrap`: re-run `bootroot-remote bootstrap` after trust updates
 
 Permissions note: the service consuming the CA bundle must be able to read
 `ca_bundle_path`. The simplest setup is running bootroot-agent and service as

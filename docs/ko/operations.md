@@ -152,7 +152,8 @@ WantedBy=timers.target
 bootstrap + 명시적 secret_id handoff입니다.
 
 1. `bootroot service add` 이후 서비스 머신에서 `bootroot-remote bootstrap`을
-   1회 실행해 초기 설정 번들을 반영합니다.
+   1회 실행해 첫 `bootroot-agent` 실행 전에 trust 설정과 CA 번들을 포함한
+   초기 설정 번들을 반영합니다.
 2. control node에서 `bootroot rotate approle-secret-id` 실행 후, 서비스
    머신에서 `bootroot-remote apply-secret-id`를 실행해 새 secret_id를
    전달합니다.
@@ -199,10 +200,18 @@ bootstrap + 명시적 secret_id handoff입니다.
 - CLI 오버라이드:
   `bootroot-agent --verify-certificates`(해당 실행에서 검증 강제) 또는
   `bootroot-agent --insecure`(해당 실행에서만 검증 비활성화).
-- 일반 모드(`--insecure` 없이)에서 첫 발급이 성공하면, bootroot-agent는
-  `agent.toml`의 `trust.verify_certificates` 값을 `true`로 자동 기록해
-  이후 실행부터 검증 모드로 전환합니다.
-- 이 자동 전환 과정에서 파일 쓰기 또는 재로드 검증이 실패하면
+- managed onboarding 흐름에서는 첫 `bootroot-agent` 실행 전에 trust를
+  준비합니다.
+  - `local-file`: `bootroot service add`가 trust 설정과
+    `ca-bundle.pem`을 로컬에 기록하고, 서비스별 OpenBao Agent가 계속
+    동기화합니다.
+  - `remote-bootstrap`: `bootroot service add`가 OpenBao에 trust 상태를
+    기록하고, `bootroot-remote bootstrap`이 서비스 머신에 trust 설정과
+    CA 번들을 반영합니다.
+- 호환성 fallback: 레거시/수동 프로필이 여전히
+  `trust.verify_certificates = false`로 시작하면, `--insecure` 없이
+  성공한 실행이 `true`를 자동 기록합니다.
+- 이 호환성 자동 강화 과정에서 파일 쓰기 또는 재로드 검증이 실패하면
   bootroot-agent는 non-zero로 종료합니다.
 
 권한/소유권:
@@ -228,6 +237,12 @@ bootroot rotate trust-sync --yes
    기록합니다.
 4. 로컬 서비스마다 에이전트 설정의 `[trust]` 섹션을 갱신하고
    `ca-bundle.pem`을 디스크에 기록합니다.
+
+`trust-sync` 이후:
+
+- `local-file`: 로컬 서비스 호스트에 갱신된 trust 설정과 번들이 이미 기록됩니다.
+- `remote-bootstrap`: 서비스 호스트에서 `bootroot-remote bootstrap`을 다시
+  실행해 갱신된 trust payload와 CA 번들을 반영합니다.
 
 ## 강제 재발급
 

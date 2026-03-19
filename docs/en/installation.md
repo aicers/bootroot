@@ -359,8 +359,11 @@ For detailed behavior and the recommended operating flow, see
 
 - `--verify-certificates` forces ACME server TLS verification on.
 - `--insecure` disables verification for that run (**insecure**, overrides
-  config). In normal mode runs (without `--insecure`), successful issuance
-  auto-hardens `trust.verify_certificates = true`.
+  config). In the normal managed onboarding flow, trust is prepared before
+  the first `bootroot-agent` run so verification can already be on.
+  Auto-hardening after issuance remains as a compatibility fallback for
+  older/manual profiles that still start with `trust.verify_certificates =
+  false`.
 
 #### CA bundle consumer permissions
 
@@ -396,7 +399,8 @@ When a service is added on a machine different from where step-ca/OpenBao run,
 install `bootroot-remote` on that service machine.
 
 - Build/install: `cargo build --release --bin bootroot-remote`
-- Runtime: `bootroot-remote bootstrap ...` (one-shot initial setup),
+- Runtime: `bootroot-remote bootstrap ...` (one-shot initial trust/bootstrap
+  apply before the first agent run),
   `bootroot-remote apply-secret-id ...` (after secret_id rotation)
 
 For detailed arguments/examples in `remote-bootstrap` mode, see
