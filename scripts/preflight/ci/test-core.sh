@@ -93,8 +93,6 @@ http_responder_hmac = "dev-hmac"
 http_responder_timeout_secs = 5
 http_responder_token_ttl_secs = 300
 
-[trust]
-verify_certificates = true
 EOF
 
 cargo run --bin bootroot -- service add \

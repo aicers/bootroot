@@ -59,7 +59,7 @@ pub(super) struct ServiceSyncMaterial {
     pub(super) eab_hmac: Option<String>,
     pub(super) responder_hmac: String,
     pub(super) trusted_ca_sha256: Vec<String>,
-    pub(super) ca_bundle_pem: Option<String>,
+    pub(super) ca_bundle_pem: String,
 }
 
 pub(super) struct CaTrustMaterial {

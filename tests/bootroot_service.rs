@@ -818,11 +818,11 @@ async fn test_app_add_local_file_sets_verify_prerequisites() {
     assert!(add_output.status.success());
     let add_stdout = String::from_utf8_lossy(&add_output.stdout);
     assert!(add_stdout.contains("[trust]"));
-    assert!(add_stdout.contains("verify_certificates = true"));
+    assert!(!add_stdout.contains("verify_certificates"));
     assert!(add_stdout.contains("trusted_ca_sha256"));
     assert!(add_stdout.contains("ca_bundle_path"));
     let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
-    assert!(agent_contents.contains("verify_certificates = true"));
+    assert!(!agent_contents.contains("verify_certificates"));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     assert!(agent_contents.contains("ca_bundle_path = \""));
 
@@ -1030,12 +1030,12 @@ async fn test_app_add_includes_trust_snippet_when_present() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     assert!(stdout.contains("[trust]"));
-    assert!(stdout.contains("verify_certificates = true"));
+    assert!(!stdout.contains("verify_certificates"));
     assert!(stdout.contains("trusted_ca_sha256"));
     assert!(stdout.contains("ca_bundle_path"));
     let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
     assert!(agent_contents.contains("[trust]"));
-    assert!(agent_contents.contains("verify_certificates = true"));
+    assert!(!agent_contents.contains("verify_certificates"));
     assert!(agent_contents.contains("trusted_ca_sha256"));
     assert!(agent_contents.contains("ca_bundle_path = \""));
     let bundle_path = temp_dir.path().join("certs").join("ca-bundle.pem");
@@ -1097,11 +1097,11 @@ async fn test_app_add_uses_synced_trust_when_metadata_missing() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     assert!(stdout.contains("[trust]"));
-    assert!(stdout.contains("verify_certificates = true"));
+    assert!(!stdout.contains("verify_certificates"));
     assert!(stdout.contains("trusted_ca_sha256"));
     assert!(stdout.contains("ca_bundle_path"));
     let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
-    assert!(agent_contents.contains("verify_certificates = true"));
+    assert!(!agent_contents.contains("verify_certificates"));
     assert!(agent_contents.contains("trusted_ca_sha256"));
     assert!(agent_contents.contains("ca_bundle_path = \""));
 }

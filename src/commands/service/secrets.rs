@@ -110,10 +110,11 @@ async fn read_service_sync_material(
             "OpenBao responder HMAC data missing key: value",
         )?,
         trusted_ca_sha256,
-        ca_bundle_pem: trust
-            .get(SERVICE_CA_BUNDLE_PEM_KEY)
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
+        ca_bundle_pem: read_required_string(
+            &trust,
+            SERVICE_CA_BUNDLE_PEM_KEY,
+            &format!("OpenBao CA trust data missing key: {SERVICE_CA_BUNDLE_PEM_KEY}"),
+        )?,
     })
 }
 
@@ -146,27 +147,15 @@ async fn write_service_kv_secrets(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
-    if let Some(bundle) = material.ca_bundle_pem.as_deref() {
-        crate::commands::trust::write_service_trust(
-            client,
-            kv_mount,
-            service_name,
-            &material.trusted_ca_sha256,
-            bundle,
-            messages,
-        )
-        .await?;
-    } else {
-        // Legacy fallback for installations before ca_bundle_pem was introduced.
-        client
-            .write_kv(
-                kv_mount,
-                &format!("{base}/trust"),
-                serde_json::json!({ CA_TRUST_KEY: &material.trusted_ca_sha256 }),
-            )
-            .await
-            .with_context(|| messages.error_openbao_kv_write_failed())?;
-    }
+    crate::commands::trust::write_service_trust(
+        client,
+        kv_mount,
+        service_name,
+        &material.trusted_ca_sha256,
+        &material.ca_bundle_pem,
+        messages,
+    )
+    .await?;
     Ok(())
 }
 

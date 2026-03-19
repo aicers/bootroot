@@ -70,7 +70,7 @@ async fn test_bootroot_remote_applies_service_secrets() {
     assert!(eab_contents.contains("\"hmac\": \"hmac-1\""));
     let agent_contents = fs::read_to_string(&agent_config_path).expect("read agent config");
     assert!(agent_contents.contains("http_responder_hmac = \"responder-hmac-1\""));
-    assert!(agent_contents.contains("verify_certificates = true"));
+    assert!(!agent_contents.contains("verify_certificates"));
     assert!(agent_contents.contains("ca_bundle_path = \""));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     let bundle_contents = fs::read_to_string(&ca_bundle_path).expect("read ca bundle");
@@ -153,6 +153,7 @@ async fn test_bootroot_remote_fails_when_trust_fingerprints_missing() {
     let secret_id_path = temp_dir.path().join("secrets").join("secret_id");
     let eab_file_path = temp_dir.path().join("secrets").join("eab.json");
     let agent_config_path = temp_dir.path().join("agent.toml");
+    let ca_bundle_path = temp_dir.path().join("certs").join("ca-bundle.pem");
 
     fs::create_dir_all(role_id_path.parent().expect("role_id parent")).expect("create secrets dir");
     fs::write(&role_id_path, "role-edge-proxy\n").expect("write role_id");
@@ -181,6 +182,8 @@ async fn test_bootroot_remote_fails_when_trust_fingerprints_missing() {
             eab_file_path.to_string_lossy().as_ref(),
             "--agent-config-path",
             agent_config_path.to_string_lossy().as_ref(),
+            "--ca-bundle-path",
+            ca_bundle_path.to_string_lossy().as_ref(),
             "--profile-instance-id",
             "001",
         ])
@@ -200,6 +203,7 @@ async fn test_bootroot_remote_rejects_invalid_bootstrap_identifiers() {
     let secret_id_path = temp_dir.path().join("secret_id");
     let eab_file_path = temp_dir.path().join("eab.json");
     let agent_config_path = temp_dir.path().join("agent.toml");
+    let ca_bundle_path = temp_dir.path().join("certs").join("ca-bundle.pem");
 
     let cases = [
         (
@@ -248,6 +252,8 @@ async fn test_bootroot_remote_rejects_invalid_bootstrap_identifiers() {
                 eab_file_path.to_string_lossy().as_ref(),
                 "--agent-config-path",
                 agent_config_path.to_string_lossy().as_ref(),
+                "--ca-bundle-path",
+                ca_bundle_path.to_string_lossy().as_ref(),
                 "--agent-domain",
                 agent_domain,
                 "--profile-hostname",
@@ -272,6 +278,7 @@ async fn test_bootroot_remote_reports_partial_failure_with_json_output() {
     let secret_id_path = temp_dir.path().join("secrets").join("secret_id");
     let eab_file_path = temp_dir.path().join("secrets").join("eab.json");
     let agent_config_path = temp_dir.path().join("agent.toml");
+    let ca_bundle_path = temp_dir.path().join("certs").join("ca-bundle.pem");
 
     fs::create_dir_all(role_id_path.parent().expect("role_id parent")).expect("create secrets dir");
     fs::write(&role_id_path, "role-edge-proxy\n").expect("write role_id");
@@ -297,6 +304,8 @@ async fn test_bootroot_remote_reports_partial_failure_with_json_output() {
             eab_file_path.to_string_lossy().as_ref(),
             "--agent-config-path",
             agent_config_path.to_string_lossy().as_ref(),
+            "--ca-bundle-path",
+            ca_bundle_path.to_string_lossy().as_ref(),
             "--profile-instance-id",
             "001",
             "--output",

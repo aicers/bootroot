@@ -350,10 +350,10 @@ bootroot status
   번들(`secret/.../services/<service>/trust`)에 자동 기록하고, 원격 서비스
   머신의 `bootroot-remote bootstrap`이 첫 `bootroot-agent` 실행 전에
   trust 설정과 CA 번들을 반영합니다.
-- `local-file` 방식: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`,
-  보통 `verify_certificates = true`)이 `agent.toml`에 자동 병합되고,
-  CA 번들 PEM이 로컬 `ca_bundle_path`에 기록되며, 서비스별 OpenBao Agent가
-  이를 계속 동기화합니다.
+- `local-file` 방식: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)이
+  `agent.toml`에 자동 병합되고, CA 번들 PEM이 로컬
+  `ca_bundle_path`에 기록되며, 서비스별 OpenBao Agent가 이를 계속
+  동기화합니다.
 
 #### 4-2) managed trust bootstrap(요약)
 
@@ -364,10 +364,8 @@ bootroot status
 - `remote-bootstrap`: `bootroot service add`가 OpenBao에 서비스 trust
   payload를 준비하고, `bootroot-remote bootstrap`이 원격 호스트에
   반영합니다.
-- `--insecure`는 실행 단위 break-glass 오버라이드입니다. 레거시/수동
-  프로필이 여전히 `trust.verify_certificates = false`로 시작하면,
-  `--insecure` 없이 성공한 실행이 이를 `true`로 자동 강화합니다.
-  자세한 규칙/운영 흐름은 [설정 > 신뢰](configuration.md#_4) 섹션을
+- `--insecure`는 실행 단위 break-glass 오버라이드입니다. 자세한
+  규칙/운영 흐름은 [설정 > 신뢰](configuration.md#_4) 섹션을
   참고하세요.
 
 #### 4-3) preview 모드(`--print-only`/`--dry-run`)

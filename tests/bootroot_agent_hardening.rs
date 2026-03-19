@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
@@ -24,6 +23,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 struct AcmeTlsFixture {
     addr: SocketAddr,
     ca_pem: String,
+    ca_sha256: String,
     handle: JoinHandle<()>,
 }
 
@@ -35,6 +35,20 @@ impl AcmeTlsFixture {
     fn ca_pem(&self) -> &str {
         &self.ca_pem
     }
+
+    fn ca_sha256(&self) -> &str {
+        &self.ca_sha256
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut output = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write;
+        write!(output, "{byte:02x}").expect("hex write");
+    }
+    output
 }
 
 fn acme_fixture_response(
@@ -136,7 +150,7 @@ async fn start_acme_tls_fixture() -> Result<AcmeTlsFixture> {
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
-            vec![rustls::pki_types::CertificateDer::from(cert_der)],
+            vec![rustls::pki_types::CertificateDer::from(cert_der.clone())],
             rustls::pki_types::PrivateKeyDer::from(rustls::pki_types::PrivatePkcs8KeyDer::from(
                 key_der,
             )),
@@ -197,6 +211,7 @@ async fn start_acme_tls_fixture() -> Result<AcmeTlsFixture> {
     Ok(AcmeTlsFixture {
         addr,
         ca_pem: cert_pem,
+        ca_sha256: sha256_hex(&cert_der),
         handle,
     })
 }
@@ -213,10 +228,22 @@ fn write_agent_config(
     path: &Path,
     acme_directory_url: &str,
     responder_url: &str,
-) -> Result<(PathBuf, PathBuf)> {
-    let cert_path = path.join("certs").join("edge.crt");
-    let key_path = path.join("certs").join("edge.key");
-    fs::create_dir_all(cert_path.parent().expect("cert parent")).context("create cert dir")?;
+    trust: Option<(&str, &str)>,
+) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let cert_dir = path.join("certs");
+    let cert_path = cert_dir.join("edge.crt");
+    let key_path = cert_dir.join("edge.key");
+    let bundle_path = cert_dir.join("ca-bundle.pem");
+    fs::create_dir_all(&cert_dir).context("create cert dir")?;
+    let trust_block = if let Some((bundle_pem, fingerprint)) = trust {
+        fs::write(&bundle_path, bundle_pem).context("write ca bundle")?;
+        format!(
+            "\n[trust]\nca_bundle_path = \"{}\"\ntrusted_ca_sha256 = [\"{fingerprint}\"]\n",
+            bundle_path.display()
+        )
+    } else {
+        String::new()
+    };
     let config_path = path.join("agent.toml");
     let config = format!(
         r#"
@@ -245,21 +272,16 @@ hostname = "node-01"
 
 [profiles.paths]
 cert = "{cert_path}"
-key = "{key_path}"
-
-[trust]
-verify_certificates = false
+key = "{key_path}"{trust_block}
 "#,
-        acme_directory_url = acme_directory_url,
-        responder_url = responder_url,
         cert_path = cert_path.display(),
         key_path = key_path.display(),
     );
-    fs::write(&config_path, config).context("write agent config")?;
+    fs::write(&config_path, &config).context("write agent config")?;
     let loaded =
         config::Settings::new(Some(config_path.clone())).context("parse written config")?;
     assert_eq!(loaded.profiles.len(), 1);
-    Ok((config_path, cert_path))
+    Ok((config_path, cert_path, bundle_path))
 }
 
 async fn run_agent_oneshot(config_path: &Path, ca_url: &str, insecure: bool) -> Output {
@@ -312,14 +334,19 @@ async fn run_agent_oneshot(config_path: &Path, ca_url: &str, insecure: bool) -> 
 }
 
 #[tokio::test]
-async fn oneshot_normal_run_auto_hardens_verify_flag() -> Result<()> {
+async fn oneshot_normal_run_uses_prestaged_trust_without_rewriting_config() -> Result<()> {
     let fixture = start_acme_tls_fixture().await?;
     assert_fixture_reachable(&fixture.directory_url(), fixture.ca_pem()).await;
     let tmp = tempdir().context("create tempdir")?;
     let responder = MockServer::start().await;
     mount_responder_admin_mock(&responder).await;
-    let (config_path, cert_path) =
-        write_agent_config(tmp.path(), &fixture.directory_url(), &responder.uri())?;
+    let (config_path, cert_path, bundle_path) = write_agent_config(
+        tmp.path(),
+        &fixture.directory_url(),
+        &responder.uri(),
+        Some((fixture.ca_pem(), fixture.ca_sha256())),
+    )?;
+    let before = fs::read_to_string(&config_path).context("read config before run")?;
 
     let output = run_agent_oneshot(&config_path, "", false).await;
     assert!(
@@ -329,61 +356,52 @@ async fn oneshot_normal_run_auto_hardens_verify_flag() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let updated = fs::read_to_string(&config_path).context("read updated agent config")?;
-    assert!(updated.contains("verify_certificates = true"));
+    let after = fs::read_to_string(&config_path).context("read config after run")?;
+    assert_eq!(before, after);
     assert!(cert_path.exists());
+    assert!(bundle_path.exists());
 
     fixture.handle.abort();
     Ok(())
 }
 
 #[tokio::test]
-async fn oneshot_insecure_then_normal_enforces_hardening() -> Result<()> {
+async fn oneshot_insecure_override_allows_untrusted_server() -> Result<()> {
     let fixture = start_acme_tls_fixture().await?;
     assert_fixture_reachable(&fixture.directory_url(), fixture.ca_pem()).await;
     let tmp = tempdir().context("create tempdir")?;
     let responder = MockServer::start().await;
     mount_responder_admin_mock(&responder).await;
-    let (config_path, _cert_path) =
-        write_agent_config(tmp.path(), &fixture.directory_url(), &responder.uri())?;
+    let (config_path, cert_path, bundle_path) =
+        write_agent_config(tmp.path(), &fixture.directory_url(), &responder.uri(), None)?;
+    let before = fs::read_to_string(&config_path).context("read config before run")?;
 
-    let insecure_output = run_agent_oneshot(&config_path, "", true).await;
+    let output = run_agent_oneshot(&config_path, "", true).await;
     assert!(
-        insecure_output.status.success(),
+        output.status.success(),
         "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&insecure_output.stdout),
-        String::from_utf8_lossy(&insecure_output.stderr)
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    let after_insecure = fs::read_to_string(&config_path).context("read config after insecure")?;
-    assert!(after_insecure.contains("verify_certificates = false"));
 
-    let normal_output = run_agent_oneshot(&config_path, "", false).await;
-    assert!(
-        normal_output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&normal_output.stdout),
-        String::from_utf8_lossy(&normal_output.stderr)
-    );
-    let after_normal = fs::read_to_string(&config_path).context("read config after normal")?;
-    assert!(after_normal.contains("verify_certificates = true"));
+    let after = fs::read_to_string(&config_path).context("read config after run")?;
+    assert_eq!(before, after);
+    assert!(cert_path.exists());
+    assert!(!bundle_path.exists());
 
     fixture.handle.abort();
     Ok(())
 }
 
 #[tokio::test]
-async fn oneshot_hardening_write_failure_exits_non_zero() -> Result<()> {
+async fn oneshot_normal_run_without_trust_fails() -> Result<()> {
     let fixture = start_acme_tls_fixture().await?;
     assert_fixture_reachable(&fixture.directory_url(), fixture.ca_pem()).await;
     let tmp = tempdir().context("create tempdir")?;
     let responder = MockServer::start().await;
     mount_responder_admin_mock(&responder).await;
-    let (config_path, _cert_path) =
-        write_agent_config(tmp.path(), &fixture.directory_url(), &responder.uri())?;
-
-    let mut perms = fs::metadata(&config_path)?.permissions();
-    perms.set_mode(0o400);
-    fs::set_permissions(&config_path, perms).context("make config read-only")?;
+    let (config_path, _cert_path, _bundle_path) =
+        write_agent_config(tmp.path(), &fixture.directory_url(), &responder.uri(), None)?;
 
     let output = run_agent_oneshot(&config_path, "", false).await;
     assert!(
@@ -397,7 +415,10 @@ async fn oneshot_hardening_write_failure_exits_non_zero() -> Result<()> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(merged.contains("TLS hardening") || merged.contains("Failed to issue certificate"));
+    assert!(
+        merged.contains("certificate") || merged.contains("Failed to issue certificate"),
+        "{merged}"
+    );
 
     fixture.handle.abort();
     Ok(())

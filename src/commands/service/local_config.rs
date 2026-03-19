@@ -14,9 +14,6 @@ use super::{
 use crate::commands::constants::{CA_TRUST_KEY, SERVICE_KV_BASE};
 use crate::i18n::Messages;
 
-const VERIFY_CERTIFICATES_KEY: &str = "verify_certificates";
-const VERIFY_CERTIFICATES_TRUE: &str = "true";
-
 pub(super) async fn apply_local_service_configs(
     secrets_dir: &Path,
     resolved: &ResolvedServiceAdd,
@@ -43,15 +40,9 @@ pub(super) async fn apply_local_service_configs(
     };
     let with_profile = upsert_managed_profile(&current, &resolved.service_name, &profile);
     let mut next = with_profile;
-    let trust_updates = build_trust_updates(
-        &sync_material.trusted_ca_sha256,
-        &ca_bundle_path,
-        sync_material.ca_bundle_pem.is_some(),
-    );
+    let trust_updates = build_trust_updates(&sync_material.trusted_ca_sha256, &ca_bundle_path);
     next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates)?;
-    if let Some(bundle_pem) = sync_material.ca_bundle_pem.as_deref() {
-        write_local_ca_bundle(&ca_bundle_path, bundle_pem, messages).await?;
-    }
+    write_local_ca_bundle(&ca_bundle_path, &sync_material.ca_bundle_pem, messages).await?;
     fs::write(&resolved.agent_config, &next)
         .await
         .with_context(|| {
@@ -198,15 +189,8 @@ fn upsert_managed_profile(contents: &str, service_name: &str, replacement: &str)
 fn build_trust_updates(
     fingerprints: &[String],
     ca_bundle_path: &Path,
-    verify_certificates: bool,
 ) -> Vec<(&'static str, String)> {
-    let mut updates = Vec::with_capacity(3);
-    if verify_certificates {
-        updates.push((
-            VERIFY_CERTIFICATES_KEY,
-            VERIFY_CERTIFICATES_TRUE.to_string(),
-        ));
-    }
+    let mut updates = Vec::with_capacity(2);
     updates.push(("ca_bundle_path", ca_bundle_path.display().to_string()));
     updates.push((
         CA_TRUST_KEY,
@@ -300,9 +284,7 @@ fn build_ca_bundle_ctmpl_content(kv_mount: &str, service_name: &str) -> String {
     let base = format!("{SERVICE_KV_BASE}/{service_name}");
     format!(
         "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
-         {{{{ if .Data.data.ca_bundle_pem }}}}\
          {{{{ .Data.data.ca_bundle_pem }}}}\
-         {{{{ end }}}}\
          {{{{ end }}}}\n"
     )
 }
@@ -402,7 +384,6 @@ mod tests {
         let updates = build_trust_updates(
             &["a".repeat(64), "b".repeat(64)],
             Path::new("certs/ca-bundle.pem"),
-            true,
         );
         let original = "[acme]\nhttp_responder_hmac = \"old\"\n";
         let once = bootroot::toml_util::upsert_section_keys(original, "trust", &updates).unwrap();
@@ -410,7 +391,6 @@ mod tests {
 
         assert_eq!(once, twice);
         assert!(once.contains("[trust]"));
-        assert!(once.contains("verify_certificates = true"));
         assert!(once.contains("ca_bundle_path = \"certs/ca-bundle.pem\""));
         assert!(once.contains("trusted_ca_sha256 = ["));
     }
@@ -426,15 +406,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_trust_updates_skips_verify_without_bundle() {
-        let updates =
-            build_trust_updates(&["a".repeat(64)], Path::new("certs/ca-bundle.pem"), false);
+    fn test_build_trust_updates_writes_bundle_and_pins_only() {
+        let updates = build_trust_updates(&["a".repeat(64)], Path::new("certs/ca-bundle.pem"));
 
-        assert!(
-            !updates
-                .iter()
-                .any(|(key, _)| *key == VERIFY_CERTIFICATES_KEY)
-        );
+        assert_eq!(updates.len(), 2);
+        assert!(updates.iter().any(|(key, _)| *key == "ca_bundle_path"));
+        assert!(updates.iter().any(|(key, _)| *key == CA_TRUST_KEY));
     }
 
     #[test]
@@ -488,7 +465,6 @@ mod tests {
             output
                 .contains(r#"{{ with secret "secret/data/bootroot/services/edge-proxy/trust" }}"#)
         );
-        assert!(output.contains(r"{{ if .Data.data.ca_bundle_pem }}"));
         assert!(output.contains(r"{{ .Data.data.ca_bundle_pem }}"));
     }
 

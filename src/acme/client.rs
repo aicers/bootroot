@@ -60,6 +60,7 @@ impl AcmeClient {
         directory_url: String,
         settings: &AcmeSettings,
         trust: &TrustSettings,
+        insecure_mode: bool,
     ) -> Result<Self> {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
@@ -67,7 +68,7 @@ impl AcmeClient {
         let key_pair =
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
                 .map_err(|_| anyhow::anyhow!("Failed to parse generated key pair"))?;
-        let client = build_http_client(trust)?;
+        let client = build_http_client(trust, insecure_mode)?;
 
         Ok(Self {
             client,
@@ -552,6 +553,7 @@ mod tests {
             "http://example.com".to_string(),
             &test_settings(),
             &test_trust(),
+            false,
         );
         assert!(client.is_ok());
     }
@@ -562,6 +564,7 @@ mod tests {
             "http://example.com".to_string(),
             &test_settings(),
             &test_trust(),
+            false,
         )
         .unwrap();
         let token = "test_token_123_xyz";
@@ -586,6 +589,7 @@ mod tests {
             "http://example.com".to_string(),
             &test_settings(),
             &test_trust(),
+            false,
         )
         .unwrap();
         let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-secret");
@@ -661,6 +665,7 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
+            false,
         )
         .unwrap();
         client
@@ -744,6 +749,7 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
+            false,
         )
         .unwrap();
         client.fetch_directory().await.unwrap();
@@ -776,6 +782,7 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
+            false,
         )
         .unwrap();
         let nonce = client.get_nonce().await.unwrap();
@@ -824,6 +831,7 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
+            false,
         )
         .unwrap();
         let order = client
@@ -852,6 +860,7 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
+            false,
         )
         .unwrap();
         let err = client.fetch_directory().await.unwrap_err();
@@ -885,6 +894,7 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
+            false,
         )
         .unwrap();
         let err = client.get_nonce().await.unwrap_err();
@@ -923,6 +933,7 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
+            false,
         )
         .unwrap();
         let err = client
@@ -1112,14 +1123,12 @@ mod tests {
         #[tokio::test]
         async fn allows_insecure_when_disabled() -> Result<()> {
             let server = start_tls_server().await?;
-            let trust = TrustSettings {
-                verify_certificates: false,
-                ..TrustSettings::default()
-            };
+            let trust = TrustSettings::default();
             let mut client = AcmeClient::new(
                 format!("{}/directory", server.url()),
                 &trust_test_settings(),
                 &trust,
+                true,
             )?;
             client.fetch_directory().await?;
             server.handle.abort();
@@ -1129,14 +1138,12 @@ mod tests {
         #[tokio::test]
         async fn rejects_self_signed_without_trust() -> Result<()> {
             let server = start_tls_server().await?;
-            let trust = TrustSettings {
-                verify_certificates: true,
-                ..TrustSettings::default()
-            };
+            let trust = TrustSettings::default();
             let mut client = AcmeClient::new(
                 format!("{}/directory", server.url()),
                 &trust_test_settings(),
                 &trust,
+                false,
             )?;
             assert!(client.fetch_directory().await.is_err());
             server.handle.abort();
@@ -1149,7 +1156,6 @@ mod tests {
             let dir = tempfile::tempdir().context("tempdir")?;
             let bundle_path = write_ca_bundle(&server.cert_pem, &dir)?;
             let trust = TrustSettings {
-                verify_certificates: true,
                 ca_bundle_path: Some(bundle_path),
                 trusted_ca_sha256: vec![sha256_hex(&server.cert_der)],
             };
@@ -1158,6 +1164,7 @@ mod tests {
                 format!("{}/directory", server.url()),
                 &trust_test_settings(),
                 &trust,
+                false,
             )?;
             client.fetch_directory().await?;
             server.handle.abort();
@@ -1170,7 +1177,6 @@ mod tests {
             let dir = tempfile::tempdir().context("tempdir")?;
             let bundle_path = write_ca_bundle(&server.cert_pem, &dir)?;
             let trust = TrustSettings {
-                verify_certificates: true,
                 ca_bundle_path: Some(bundle_path),
                 trusted_ca_sha256: vec!["00".repeat(32)],
             };
@@ -1179,6 +1185,7 @@ mod tests {
                 format!("{}/directory", server.url()),
                 &trust_test_settings(),
                 &trust,
+                false,
             )?;
             assert!(client.fetch_directory().await.is_err());
             server.handle.abort();

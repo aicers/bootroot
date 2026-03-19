@@ -137,9 +137,9 @@ struct BootstrapArgs {
     #[arg(long)]
     profile_key_path: Option<PathBuf>,
 
-    /// CA bundle output path (required when trust data includes `ca_bundle_pem`)
+    /// CA bundle output path for the managed step-ca trust bundle
     #[arg(long)]
-    ca_bundle_path: Option<PathBuf>,
+    ca_bundle_path: PathBuf,
 
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]

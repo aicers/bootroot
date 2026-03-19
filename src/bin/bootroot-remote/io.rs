@@ -138,7 +138,7 @@ pub(super) struct PulledSecrets {
     pub(super) eab_hmac: String,
     pub(super) responder_hmac: String,
     pub(super) trusted_ca_sha256: Vec<String>,
-    pub(super) ca_bundle_pem: Option<String>,
+    pub(super) ca_bundle_pem: String,
 }
 
 pub(super) async fn pull_secrets(
@@ -195,10 +195,7 @@ pub(super) async fn pull_secrets(
     let responder_hmac =
         read_required_string(&hmac_data, &[super::HMAC_KEY, "http_responder_hmac"], lang)?;
     let trusted_ca_sha256 = read_required_fingerprints(&trust_data, lang)?;
-    let ca_bundle_pem = trust_data
-        .get(CA_BUNDLE_PEM_KEY)
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string);
+    let ca_bundle_pem = read_required_string(&trust_data, &[CA_BUNDLE_PEM_KEY], lang)?;
 
     Ok(PulledSecrets {
         secret_id,

@@ -3,19 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use tokio::sync::{Semaphore, watch};
 use tracing::{error, info};
 
 use crate::{acme, config, eab, hooks, profile, utils};
 
 const DEFAULT_AGENT_CONFIG_PATH: &str = "agent.toml";
-const TRUST_SECTION: &str = "trust";
-const VERIFY_CERTIFICATES_KEY: &str = "verify_certificates";
-const VERIFY_CERTIFICATES_TRUE: &str = "true";
 
 #[derive(Clone)]
-struct HardeningPolicy {
+struct IssuanceRuntime {
     config_path: PathBuf,
     insecure_mode: bool,
 }
@@ -33,7 +29,7 @@ pub(crate) async fn run_daemon(
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let hardening = HardeningPolicy {
+    let runtime = IssuanceRuntime {
         config_path: resolve_config_path(config_path.as_deref()),
         insecure_mode,
     };
@@ -51,7 +47,7 @@ pub(crate) async fn run_daemon(
         let semaphore = Arc::clone(&semaphore);
         let shutdown_rx = shutdown_rx.clone();
         let default_eab = default_eab.clone();
-        let hardening = hardening.clone();
+        let runtime = runtime.clone();
 
         handles.push(tokio::spawn(async move {
             run_profile_daemon(
@@ -60,7 +56,7 @@ pub(crate) async fn run_daemon(
                 default_eab,
                 semaphore,
                 shutdown_rx,
-                hardening,
+                runtime,
             )
             .await
         }));
@@ -76,7 +72,7 @@ async fn run_profile_daemon(
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
-    hardening: HardeningPolicy,
+    runtime: IssuanceRuntime,
 ) -> anyhow::Result<()> {
     let check_interval = profile.daemon.check_interval;
     let renew_before = profile.daemon.renew_before;
@@ -118,7 +114,7 @@ async fn run_profile_daemon(
                     Arc::clone(&semaphore),
                     renew_before,
                     &profile_label,
-                    &hardening,
+                    &runtime,
                 )
                 .await?;
             }
@@ -140,7 +136,7 @@ pub(crate) async fn run_oneshot(
 ) -> anyhow::Result<()> {
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
-    let hardening = HardeningPolicy {
+    let runtime = IssuanceRuntime {
         config_path: resolve_config_path(config_path.as_deref()),
         insecure_mode,
     };
@@ -150,10 +146,10 @@ pub(crate) async fn run_oneshot(
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
         let default_eab = default_eab.clone();
-        let hardening = hardening.clone();
+        let runtime = runtime.clone();
 
         handles.push(tokio::spawn(async move {
-            run_profile_oneshot(settings, profile, default_eab, semaphore, hardening).await
+            run_profile_oneshot(settings, profile, default_eab, semaphore, runtime).await
         }));
     }
 
@@ -192,38 +188,27 @@ async fn run_profile_oneshot(
     profile: config::DaemonProfileSettings,
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
-    hardening: HardeningPolicy,
+    runtime: IssuanceRuntime,
 ) -> anyhow::Result<()> {
     let _permit = semaphore.acquire().await?;
     let profile_eab = profile::resolve_profile_eab(&profile, default_eab);
     let profile_label = config::profile_domain(&settings, &profile);
 
-    let result = acme::issue_certificate(&settings, &profile, profile_eab).await;
-    handle_issuance_result(&result, &settings, &profile, &profile_label, &hardening).await?;
+    let result =
+        acme::issue_certificate(&settings, &profile, profile_eab, runtime.insecure_mode).await;
+    handle_issuance_result(&result, &settings, &profile, &profile_label).await?;
     result
 }
 
-/// Dispatches post-issuance hooks and optionally hardens TLS
-/// configuration based on the issuance outcome.
-///
-/// On success: hardens TLS verify, then runs success hooks.
-/// On failure: runs failure hooks.
+/// Dispatches post-issuance hooks based on the issuance outcome.
 async fn handle_issuance_result(
     result: &anyhow::Result<()>,
     settings: &config::Settings,
     profile: &config::DaemonProfileSettings,
     profile_label: &str,
-    hardening: &HardeningPolicy,
 ) -> anyhow::Result<()> {
     match result {
         Ok(()) => {
-            maybe_harden_tls_verify(
-                settings,
-                &hardening.config_path,
-                profile_label,
-                hardening.insecure_mode,
-            )
-            .await?;
             if let Err(err) =
                 hooks::run_post_renew_hooks(settings, profile, hooks::HookStatus::Success, None)
                     .await
@@ -258,6 +243,7 @@ async fn issue_with_retry(
     profile: &config::DaemonProfileSettings,
     eab: Option<eab::EabCredentials>,
     config_path: &Path,
+    insecure_mode: bool,
 ) -> anyhow::Result<()> {
     let backoff = select_retry_backoff(settings, profile);
     let profile_domain = config::profile_domain(settings, profile);
@@ -278,7 +264,7 @@ async fn issue_with_retry(
                     })?
                     .clone();
                 let fresh_eab = profile::resolve_profile_eab(&fresh_profile, eab);
-                acme::issue_certificate(&fresh, &fresh_profile, fresh_eab).await
+                acme::issue_certificate(&fresh, &fresh_profile, fresh_eab, insecure_mode).await
             }
         },
         |duration| tokio::time::sleep(duration),
@@ -381,7 +367,7 @@ async fn check_and_renew_profile(
     semaphore: Arc<Semaphore>,
     renew_before: Duration,
     profile_label: &str,
-    hardening: &HardeningPolicy,
+    runtime: &IssuanceRuntime,
 ) -> anyhow::Result<()> {
     tracing::debug!("Profile '{}' checking renewal status...", profile_label);
 
@@ -404,14 +390,21 @@ async fn check_and_renew_profile(
     );
     let _permit = semaphore.acquire().await?;
     let profile_eab = profile::resolve_profile_eab(profile, default_eab);
-    let result = issue_with_retry(settings, profile, profile_eab, &hardening.config_path).await;
+    let result = issue_with_retry(
+        settings,
+        profile,
+        profile_eab,
+        &runtime.config_path,
+        runtime.insecure_mode,
+    )
+    .await;
     if let Err(err) = &result {
         error!(
             "Profile '{}' renewal failed after retries: {err}",
             profile_label
         );
     }
-    handle_issuance_result(&result, settings, profile, profile_label, hardening).await?;
+    handle_issuance_result(&result, settings, profile, profile_label).await?;
     Ok(())
 }
 
@@ -420,85 +413,6 @@ fn resolve_config_path(config_path: Option<&Path>) -> PathBuf {
         || PathBuf::from(DEFAULT_AGENT_CONFIG_PATH),
         Path::to_path_buf,
     )
-}
-
-async fn maybe_harden_tls_verify(
-    settings: &config::Settings,
-    config_path: &Path,
-    profile_label: &str,
-    insecure_mode: bool,
-) -> anyhow::Result<()> {
-    if settings.trust.verify_certificates {
-        return Ok(());
-    }
-
-    if insecure_mode {
-        info!(
-            "Profile '{}' issued in --insecure mode. \
-verify_certificates stays false for this run.",
-            profile_label
-        );
-        return Ok(());
-    }
-
-    set_verify_certificates_true(config_path, profile_label).await
-}
-
-async fn set_verify_certificates_true(
-    config_path: &Path,
-    profile_label: &str,
-) -> anyhow::Result<()> {
-    let current = tokio::fs::read_to_string(config_path)
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "Profile '{}' failed to read config {} for TLS hardening: {err}",
-                profile_label,
-                config_path.display()
-            )
-        })?;
-
-    let updated = crate::toml_util::upsert_section_keys(
-        &current,
-        TRUST_SECTION,
-        &[(
-            VERIFY_CERTIFICATES_KEY,
-            VERIFY_CERTIFICATES_TRUE.to_string(),
-        )],
-    )?;
-    if updated != current {
-        tokio::fs::write(config_path, updated)
-            .await
-            .with_context(|| {
-                format!(
-                    "Profile '{}' failed to write TLS hardening config: {}",
-                    profile_label,
-                    config_path.display()
-                )
-            })?;
-    }
-
-    let reloaded = config::Settings::new(Some(config_path.to_path_buf())).with_context(|| {
-        format!(
-            "Profile '{}' failed to reload hardening config: {}",
-            profile_label,
-            config_path.display()
-        )
-    })?;
-    if !reloaded.trust.verify_certificates {
-        anyhow::bail!(
-            "Profile '{}' TLS hardening check failed: trust.verify_certificates is still false ({})",
-            profile_label,
-            config_path.display()
-        );
-    }
-
-    info!(
-        "Profile '{}' hardened TLS verify to true in {}",
-        profile_label,
-        config_path.display()
-    );
-    Ok(())
 }
 
 async fn wait_for_shutdown() -> anyhow::Result<()> {
@@ -624,213 +538,6 @@ mod tests {
         let selected = select_retry_backoff(&settings, &profile);
 
         assert_eq!(selected, settings.retry.backoff_secs);
-    }
-
-    #[test]
-    fn test_upsert_toml_section_keys_updates_existing_trust_flag() {
-        let input = "[trust]\nverify_certificates = false\n";
-        let output = crate::toml_util::upsert_section_keys(
-            input,
-            TRUST_SECTION,
-            &[(
-                VERIFY_CERTIFICATES_KEY,
-                VERIFY_CERTIFICATES_TRUE.to_string(),
-            )],
-        )
-        .unwrap();
-        assert!(output.contains("verify_certificates = true"));
-    }
-
-    #[test]
-    fn test_upsert_toml_section_keys_adds_trust_section() {
-        let input = "email = \"admin@example.com\"\n";
-        let output = crate::toml_util::upsert_section_keys(
-            input,
-            TRUST_SECTION,
-            &[(
-                VERIFY_CERTIFICATES_KEY,
-                VERIFY_CERTIFICATES_TRUE.to_string(),
-            )],
-        )
-        .unwrap();
-        assert!(output.contains("[trust]"));
-        assert!(output.contains("verify_certificates = true"));
-    }
-
-    #[tokio::test]
-    async fn test_set_verify_certificates_true_updates_config_file() {
-        let dir = tempfile::tempdir().expect("creates temp dir");
-        let config_path = dir.path().join("agent.toml");
-        fs::write(
-            &config_path,
-            r#"
-email = "admin@example.com"
-server = "https://localhost:9000/acme/acme/directory"
-domain = "example.internal"
-
-[acme]
-http_responder_url = "http://localhost:8080"
-http_responder_hmac = "dev-hmac"
-"#,
-        )
-        .expect("writes config fixture");
-
-        set_verify_certificates_true(&config_path, "test-profile")
-            .await
-            .expect("hardens config");
-
-        let updated = fs::read_to_string(&config_path).expect("reads updated config");
-        assert!(updated.contains("[trust]"));
-        assert!(updated.contains("verify_certificates = true"));
-    }
-
-    #[tokio::test]
-    async fn test_set_verify_certificates_true_fails_on_unwritable_path() {
-        let dir = tempfile::tempdir().expect("creates temp dir");
-        let config_path = dir.path().join("agent.toml");
-        fs::create_dir(&config_path).expect("creates directory path");
-
-        let err = set_verify_certificates_true(&config_path, "test-profile")
-            .await
-            .expect_err("must fail");
-        assert!(err.to_string().contains("failed to read config"));
-    }
-
-    #[tokio::test]
-    async fn test_set_verify_certificates_true_fails_when_config_missing() {
-        let dir = tempfile::tempdir().expect("creates temp dir");
-        let config_path = dir.path().join("missing-agent.toml");
-
-        let err = set_verify_certificates_true(&config_path, "test-profile")
-            .await
-            .expect_err("must fail when config file does not exist");
-        assert!(err.to_string().contains("failed to read config"));
-    }
-
-    #[tokio::test]
-    async fn test_maybe_harden_tls_verify_skips_when_insecure() {
-        let dir = tempfile::tempdir().expect("creates temp dir");
-        let config_path = dir.path().join("agent.toml");
-        fs::write(&config_path, "[trust]\nverify_certificates = false\n")
-            .expect("writes config fixture");
-        let settings = build_settings(vec![5, 10, 30]);
-
-        maybe_harden_tls_verify(&settings, &config_path, "test-profile", true)
-            .await
-            .expect("must skip hardening in insecure mode");
-
-        let updated = fs::read_to_string(&config_path).expect("reads config after skip");
-        assert!(updated.contains("verify_certificates = false"));
-    }
-
-    #[tokio::test]
-    async fn test_maybe_harden_tls_verify_retries_after_insecure_run() {
-        let dir = tempfile::tempdir().expect("creates temp dir");
-        let config_path = dir.path().join("agent.toml");
-        fs::write(
-            &config_path,
-            r#"
-email = "admin@example.com"
-server = "https://localhost:9000/acme/acme/directory"
-domain = "example.internal"
-
-[acme]
-http_responder_url = "http://localhost:8080"
-http_responder_hmac = "dev-hmac"
-[trust]
-verify_certificates = false
-"#,
-        )
-        .expect("writes config fixture");
-        let settings = build_settings(vec![5, 10, 30]);
-
-        maybe_harden_tls_verify(&settings, &config_path, "test-profile", true)
-            .await
-            .expect("insecure run skips hardening");
-        let skipped = fs::read_to_string(&config_path).expect("reads skipped config");
-        assert!(skipped.contains("verify_certificates = false"));
-
-        maybe_harden_tls_verify(&settings, &config_path, "test-profile", false)
-            .await
-            .expect("normal run hardens");
-        let hardened = fs::read_to_string(&config_path).expect("reads hardened config");
-        assert!(hardened.contains("verify_certificates = true"));
-    }
-
-    #[tokio::test]
-    async fn test_set_verify_certificates_true_fails_on_malformed_toml() {
-        let dir = tempfile::tempdir().expect("creates temp dir");
-        let config_path = dir.path().join("agent.toml");
-        fs::write(
-            &config_path,
-            r#"
-email = "admin@example.com"
-server = "https://localhost:9000/acme/acme/directory"
-domain = "example.internal"
-[acme
-http_responder_url = "http://localhost:8080"
-http_responder_hmac = "dev-hmac"
-"#,
-        )
-        .expect("writes malformed config fixture");
-
-        let err = set_verify_certificates_true(&config_path, "test-profile")
-            .await
-            .expect_err("must fail when config is malformed TOML");
-        assert!(
-            err.to_string().contains("failed to parse TOML content"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_maybe_harden_tls_verify_noop_when_already_true() {
-        let dir = tempfile::tempdir().expect("creates temp dir");
-        let config_path = dir.path().join("agent.toml");
-        fs::write(&config_path, "[trust]\nverify_certificates = false\n")
-            .expect("writes config fixture");
-        let mut settings = build_settings(vec![5, 10, 30]);
-        settings.trust.verify_certificates = true;
-
-        maybe_harden_tls_verify(&settings, &config_path, "test-profile", false)
-            .await
-            .expect("already true should be no-op");
-
-        let updated = fs::read_to_string(&config_path).expect("reads config");
-        assert!(updated.contains("verify_certificates = false"));
-    }
-
-    #[tokio::test]
-    async fn test_set_verify_certificates_true_preserves_other_trust_fields() {
-        let dir = tempfile::tempdir().expect("creates temp dir");
-        let config_path = dir.path().join("agent.toml");
-        fs::write(
-            &config_path,
-            r#"
-email = "admin@example.com"
-server = "https://localhost:9000/acme/acme/directory"
-domain = "example.internal"
-
-[acme]
-http_responder_url = "http://localhost:8080"
-http_responder_hmac = "dev-hmac"
-
-[trust]
-verify_certificates = false
-ca_bundle_path = "certs/ca-bundle.pem"
-trusted_ca_sha256 = ["aa11"]
-"#,
-        )
-        .expect("writes config fixture");
-
-        set_verify_certificates_true(&config_path, "test-profile")
-            .await
-            .expect("hardens config");
-
-        let updated = fs::read_to_string(&config_path).expect("reads updated config");
-        assert!(updated.contains("verify_certificates = true"));
-        assert!(updated.contains("ca_bundle_path = \"certs/ca-bundle.pem\""));
-        assert!(updated.contains("trusted_ca_sha256 = [\"aa11\"]"));
     }
 
     #[test]
