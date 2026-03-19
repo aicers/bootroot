@@ -51,6 +51,7 @@ async fn test_same_host_local_file_happy_path() {
     assert!(agent_contents.contains("cert = \""));
     assert!(agent_contents.contains("key = \""));
     assert!(agent_contents.contains("[trust]"));
+    assert!(agent_contents.contains("verify_certificates = true"));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     assert!(agent_contents.contains("ca_bundle_path = \""));
 

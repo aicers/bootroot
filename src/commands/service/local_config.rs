@@ -6,19 +6,22 @@ use tokio::fs;
 
 use super::resolve::ResolvedServiceAdd;
 use super::{
-    CaTrustMaterial, LocalApplyResult, MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX,
+    LocalApplyResult, MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX,
     OPENBAO_AGENT_CA_BUNDLE_TEMPLATE_FILENAME, OPENBAO_AGENT_CONFIG_FILENAME,
     OPENBAO_AGENT_TEMPLATE_FILENAME, OPENBAO_AGENT_TOKEN_FILENAME, OPENBAO_SERVICE_CONFIG_DIR,
-    SERVICE_ROLE_ID_FILENAME,
+    SERVICE_ROLE_ID_FILENAME, ServiceSyncMaterial,
 };
 use crate::commands::constants::{CA_TRUST_KEY, SERVICE_KV_BASE};
 use crate::i18n::Messages;
+
+const VERIFY_CERTIFICATES_KEY: &str = "verify_certificates";
+const VERIFY_CERTIFICATES_TRUE: &str = "true";
 
 pub(super) async fn apply_local_service_configs(
     secrets_dir: &Path,
     resolved: &ResolvedServiceAdd,
     secret_id_path: &Path,
-    ca_trust_material: Option<&CaTrustMaterial>,
+    sync_material: &ServiceSyncMaterial,
     kv_mount: &str,
     openbao_url: &str,
     messages: &Messages,
@@ -40,12 +43,14 @@ pub(super) async fn apply_local_service_configs(
     };
     let with_profile = upsert_managed_profile(&current, &resolved.service_name, &profile);
     let mut next = with_profile;
-    if let Some(material) = ca_trust_material {
-        let trust_updates = build_trust_updates(&material.trusted_ca_sha256, &ca_bundle_path);
-        next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates)?;
-        if let Some(bundle_pem) = material.ca_bundle_pem.as_deref() {
-            write_local_ca_bundle(&ca_bundle_path, bundle_pem, messages).await?;
-        }
+    let trust_updates = build_trust_updates(
+        &sync_material.trusted_ca_sha256,
+        &ca_bundle_path,
+        sync_material.ca_bundle_pem.is_some(),
+    );
+    next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates)?;
+    if let Some(bundle_pem) = sync_material.ca_bundle_pem.as_deref() {
+        write_local_ca_bundle(&ca_bundle_path, bundle_pem, messages).await?;
     }
     fs::write(&resolved.agent_config, &next)
         .await
@@ -193,21 +198,28 @@ fn upsert_managed_profile(contents: &str, service_name: &str, replacement: &str)
 fn build_trust_updates(
     fingerprints: &[String],
     ca_bundle_path: &Path,
+    verify_certificates: bool,
 ) -> Vec<(&'static str, String)> {
-    vec![
-        ("ca_bundle_path", ca_bundle_path.display().to_string()),
-        (
-            CA_TRUST_KEY,
-            format!(
-                "[{}]",
-                fingerprints
-                    .iter()
-                    .map(|value| format!("\"{value}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+    let mut updates = Vec::with_capacity(3);
+    if verify_certificates {
+        updates.push((
+            VERIFY_CERTIFICATES_KEY,
+            VERIFY_CERTIFICATES_TRUE.to_string(),
+        ));
+    }
+    updates.push(("ca_bundle_path", ca_bundle_path.display().to_string()));
+    updates.push((
+        CA_TRUST_KEY,
+        format!(
+            "[{}]",
+            fingerprints
+                .iter()
+                .map(|value| format!("\"{value}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
-    ]
+    ));
+    updates
 }
 
 fn is_section_header(line: &str) -> bool {
@@ -390,6 +402,7 @@ mod tests {
         let updates = build_trust_updates(
             &["a".repeat(64), "b".repeat(64)],
             Path::new("certs/ca-bundle.pem"),
+            true,
         );
         let original = "[acme]\nhttp_responder_hmac = \"old\"\n";
         let once = bootroot::toml_util::upsert_section_keys(original, "trust", &updates).unwrap();
@@ -397,6 +410,7 @@ mod tests {
 
         assert_eq!(once, twice);
         assert!(once.contains("[trust]"));
+        assert!(once.contains("verify_certificates = true"));
         assert!(once.contains("ca_bundle_path = \"certs/ca-bundle.pem\""));
         assert!(once.contains("trusted_ca_sha256 = ["));
     }
@@ -409,6 +423,18 @@ mod tests {
 
         assert!(output.contains("extra = true"));
         assert!(output.contains("ca_bundle_path = \"certs/ca.pem\""));
+    }
+
+    #[test]
+    fn test_build_trust_updates_skips_verify_without_bundle() {
+        let updates =
+            build_trust_updates(&["a".repeat(64)], Path::new("certs/ca-bundle.pem"), false);
+
+        assert!(
+            !updates
+                .iter()
+                .any(|(key, _)| *key == VERIFY_CERTIFICATES_KEY)
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub(super) async fn sync_service_kv_bundle(
     resolved: &ResolvedServiceAdd,
     secret_id: &str,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<ServiceSyncMaterial> {
     let material = read_service_sync_material(client, &state.kv_mount, messages).await?;
     write_service_kv_secrets(
         client,
@@ -38,7 +38,7 @@ pub(super) async fn sync_service_kv_bundle(
             .await
             .with_context(|| messages.error_openbao_kv_write_failed())?;
     }
-    Ok(())
+    Ok(material)
 }
 
 fn read_required_string(
@@ -193,13 +193,8 @@ pub(super) async fn read_ca_trust_material(
     if fingerprints.is_empty() {
         anyhow::bail!(messages.error_ca_trust_empty());
     }
-    let ca_bundle_pem = data
-        .get(SERVICE_CA_BUNDLE_PEM_KEY)
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
     Ok(Some(CaTrustMaterial {
         trusted_ca_sha256: fingerprints,
-        ca_bundle_pem,
     }))
 }
 
