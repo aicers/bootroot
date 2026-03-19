@@ -64,7 +64,6 @@ pub(super) struct ServiceSyncMaterial {
 
 pub(super) struct CaTrustMaterial {
     pub(super) trusted_ca_sha256: Vec<String>,
-    pub(super) ca_bundle_pem: Option<String>,
 }
 
 pub(crate) use resolve::ResolvedServiceAdd;
@@ -225,11 +224,6 @@ async fn run_service_add_apply(
         .with_context(|| messages.error_openbao_client_create_failed())?;
     authenticate_openbao_client(&mut client, auth, messages).await?;
 
-    let ca_trust_material =
-        secrets::read_ca_trust_material(&client, &state.kv_mount, messages).await?;
-    let trusted_ca_sha256 = ca_trust_material
-        .as_ref()
-        .map(|material| material.trusted_ca_sha256.as_slice());
     let approle_result =
         approle::ensure_service_approle(&client, state, &resolved.service_name, messages).await?;
     let secrets_dir = state.secrets_dir();
@@ -247,7 +241,7 @@ async fn run_service_add_apply(
         messages,
     )
     .await?;
-    secrets::sync_service_kv_bundle(
+    let service_sync_material = secrets::sync_service_kv_bundle(
         &client,
         state,
         resolved,
@@ -255,6 +249,7 @@ async fn run_service_add_apply(
         messages,
     )
     .await?;
+    let trusted_ca_sha256 = Some(service_sync_material.trusted_ca_sha256.as_slice());
 
     let applied = if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
         Some(
@@ -262,7 +257,7 @@ async fn run_service_add_apply(
                 secrets_dir,
                 resolved,
                 &secret_id_path,
-                ca_trust_material.as_ref(),
+                &service_sync_material,
                 &state.kv_mount,
                 &state.openbao_url,
                 messages,
