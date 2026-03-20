@@ -2,6 +2,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::trust_bootstrap::{
+    build_ca_bundle_ctmpl, build_managed_agent_ctmpl, build_trust_updates,
+    render_managed_profile_block as render_managed_profile, upsert_managed_profile_block,
+};
 use tokio::fs;
 
 use super::resolve::ResolvedServiceAdd;
@@ -11,7 +15,6 @@ use super::{
     OPENBAO_AGENT_TEMPLATE_FILENAME, OPENBAO_AGENT_TOKEN_FILENAME, OPENBAO_SERVICE_CONFIG_DIR,
     SERVICE_ROLE_ID_FILENAME, ServiceSyncMaterial,
 };
-use crate::commands::constants::{CA_TRUST_KEY, SERVICE_KV_BASE};
 use crate::i18n::Messages;
 
 pub(super) async fn apply_local_service_configs(
@@ -134,80 +137,25 @@ async fn write_local_ca_bundle(path: &Path, bundle_pem: &str, messages: &Message
 }
 
 fn render_managed_profile_block(args: &ResolvedServiceAdd) -> String {
-    let instance_id = args.instance_id.as_deref().unwrap_or_default();
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "{MANAGED_PROFILE_BEGIN_PREFIX} {}",
-        args.service_name
-    ));
-    lines.push("[[profiles]]".to_string());
-    lines.push(format!("service_name = \"{}\"", args.service_name));
-    lines.push(format!("instance_id = \"{instance_id}\""));
-    lines.push(format!("hostname = \"{}\"", args.hostname));
-    lines.push(String::new());
-    lines.push("[profiles.paths]".to_string());
-    lines.push(format!("cert = \"{}\"", args.cert_path.display()));
-    lines.push(format!("key = \"{}\"", args.key_path.display()));
-    lines.push(format!(
-        "{MANAGED_PROFILE_END_PREFIX} {}",
-        args.service_name
-    ));
-    format!("{}\n", lines.join("\n"))
+    render_managed_profile(
+        MANAGED_PROFILE_BEGIN_PREFIX,
+        MANAGED_PROFILE_END_PREFIX,
+        &args.service_name,
+        args.instance_id.as_deref().unwrap_or_default(),
+        &args.hostname,
+        &args.cert_path,
+        &args.key_path,
+    )
 }
 
 fn upsert_managed_profile(contents: &str, service_name: &str, replacement: &str) -> String {
-    let begin_marker = format!("{MANAGED_PROFILE_BEGIN_PREFIX} {service_name}");
-    let end_marker = format!("{MANAGED_PROFILE_END_PREFIX} {service_name}");
-    if let Some(begin) = contents.find(&begin_marker)
-        && let Some(end_relative) = contents[begin..].find(&end_marker)
-    {
-        let end = begin + end_relative + end_marker.len();
-        let suffix = contents[end..]
-            .strip_prefix('\n')
-            .unwrap_or(&contents[end..]);
-        let mut updated = String::new();
-        updated.push_str(&contents[..begin]);
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str(replacement);
-        if !suffix.is_empty() && !replacement.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str(suffix);
-        return updated;
-    }
-
-    let mut updated = contents.trim_end().to_string();
-    if !updated.is_empty() {
-        updated.push_str("\n\n");
-    }
-    updated.push_str(replacement);
-    updated
-}
-
-fn build_trust_updates(
-    fingerprints: &[String],
-    ca_bundle_path: &Path,
-) -> Vec<(&'static str, String)> {
-    let mut updates = Vec::with_capacity(2);
-    updates.push(("ca_bundle_path", ca_bundle_path.display().to_string()));
-    updates.push((
-        CA_TRUST_KEY,
-        format!(
-            "[{}]",
-            fingerprints
-                .iter()
-                .map(|value| format!("\"{value}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    ));
-    updates
-}
-
-fn is_section_header(line: &str) -> bool {
-    line.starts_with('[') && line.ends_with(']')
+    upsert_managed_profile_block(
+        contents,
+        MANAGED_PROFILE_BEGIN_PREFIX,
+        MANAGED_PROFILE_END_PREFIX,
+        service_name,
+        replacement,
+    )
 }
 
 fn render_openbao_agent_config(
@@ -232,117 +180,11 @@ fn render_openbao_agent_config(
 }
 
 fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> String {
-    let base = format!("{SERVICE_KV_BASE}/{service_name}");
-
-    let hmac_template = format!(
-        "{{{{ with secret \"{kv_mount}/data/{base}/http_responder_hmac\" }}}}\
-         {{{{ .Data.data.hmac }}}}\
-         {{{{ end }}}}"
-    );
-    let with_hmac = replace_key_line_in_section(
-        contents,
-        "acme",
-        "http_responder_hmac",
-        &format!("http_responder_hmac = \"{hmac_template}\""),
-    );
-
-    let without_eab = remove_line_sections(&with_hmac, &["eab", "profiles.eab"]);
-
-    let trust_template_line = format!(
-        "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
-         trusted_ca_sha256 = {{{{ .Data.data.trusted_ca_sha256 | toJSON }}}}\
-         {{{{ end }}}}"
-    );
-    let with_trust = replace_key_line_in_section(
-        &without_eab,
-        "trust",
-        "trusted_ca_sha256",
-        &trust_template_line,
-    );
-
-    let eab_block = format!(
-        "\n{{{{ with secret \"{kv_mount}/data/{base}/eab\" }}}}{{{{ if .Data.data.kid }}}}\n\
-         [eab]\n\
-         kid = \"{{{{ .Data.data.kid }}}}\"\n\
-         hmac = \"{{{{ .Data.data.hmac }}}}\"\n\
-         \n\
-         [profiles.eab]\n\
-         kid = \"{{{{ .Data.data.kid }}}}\"\n\
-         hmac = \"{{{{ .Data.data.hmac }}}}\"\n\
-         {{{{ end }}}}{{{{ end }}}}\n"
-    );
-
-    let mut result = with_trust;
-    if !result.ends_with('\n') {
-        result.push('\n');
-    }
-    result.push_str(&eab_block);
-    result
+    build_managed_agent_ctmpl(contents, kv_mount, service_name)
 }
 
 fn build_ca_bundle_ctmpl_content(kv_mount: &str, service_name: &str) -> String {
-    let base = format!("{SERVICE_KV_BASE}/{service_name}");
-    format!(
-        "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
-         {{{{ .Data.data.ca_bundle_pem }}}}\
-         {{{{ end }}}}\n"
-    )
-}
-
-/// Removes sections from pseudo-TOML content using line-based matching.
-///
-/// Used for Go template (ctmpl) files where the content is not valid
-/// TOML and cannot be parsed by `toml_edit`.
-fn remove_line_sections(contents: &str, sections: &[&str]) -> String {
-    let mut output = String::new();
-    let mut skip = false;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if is_section_header(trimmed) {
-            let section_name = &trimmed[1..trimmed.len() - 1];
-            skip = sections.contains(&section_name);
-            if skip {
-                continue;
-            }
-        }
-        if skip {
-            continue;
-        }
-        output.push_str(line);
-        output.push('\n');
-    }
-    output
-}
-
-fn replace_key_line_in_section(
-    contents: &str,
-    section: &str,
-    key: &str,
-    replacement: &str,
-) -> String {
-    let mut output = String::new();
-    let mut in_section = false;
-    let mut replaced = false;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if is_section_header(trimmed) {
-            in_section = trimmed == format!("[{section}]");
-        }
-        if in_section
-            && !replaced
-            && (trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")))
-        {
-            output.push_str(replacement);
-            output.push('\n');
-            replaced = true;
-            continue;
-        }
-        output.push_str(line);
-        output.push('\n');
-    }
-    output
+    build_ca_bundle_ctmpl(kv_mount, service_name)
 }
 
 #[cfg(test)]
@@ -351,6 +193,7 @@ mod tests {
 
     use super::super::resolve::ResolvedServiceAdd;
     use super::*;
+    use crate::commands::constants::CA_TRUST_KEY;
     use crate::state::{DeliveryMode, DeployType};
 
     fn test_resolved() -> ResolvedServiceAdd {

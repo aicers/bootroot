@@ -14,6 +14,7 @@ pub mod openbao;
 pub mod profile;
 pub mod tls;
 pub mod toml_util;
+pub mod trust_bootstrap;
 pub mod utils;
 
 mod daemon;

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bootroot::fs_util;
 use tokio::fs;
 
@@ -109,10 +109,14 @@ pub(super) async fn write_secret_file(path: &Path, contents: &str) -> Result<App
     } else {
         format!("{contents}\n")
     };
-    let current = if path.exists() {
-        fs::read_to_string(path).await.unwrap_or_default()
-    } else {
-        String::new()
+    let current = match fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("Failed to read existing secret file: {}", path.display())
+            });
+        }
     };
     if current == next {
         fs_util::set_key_permissions(path).await?;
@@ -206,11 +210,14 @@ pub(super) async fn pull_secrets(
         ca_bundle_pem,
     })
 }
-
-use anyhow::Context;
-
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -221,5 +228,26 @@ mod tests {
         let parsed =
             read_required_fingerprints(&data, Locale::En).expect("parse trust fingerprints");
         assert_eq!(parsed.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_secret_file_fails_when_existing_file_is_unreadable() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, "old\n").expect("write secret");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200))
+            .expect("chmod secret");
+
+        let err = write_secret_file(&path, "next")
+            .await
+            .expect_err("unreadable existing file should fail");
+        assert!(
+            err.to_string()
+                .contains("Failed to read existing secret file")
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restore secret permissions");
     }
 }

@@ -9,15 +9,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use bootroot::locale::Locale;
+use bootroot::trust_bootstrap::{
+    CA_BUNDLE_PEM_KEY, EAB_HMAC_KEY, EAB_KID_KEY, HMAC_KEY, SECRET_ID_KEY, SERVICE_KV_BASE,
+    TRUSTED_CA_KEY,
+};
 use clap::{Parser, ValueEnum};
 
-const SERVICE_KV_BASE: &str = "bootroot/services";
-const SECRET_ID_KEY: &str = "secret_id";
-const HMAC_KEY: &str = "hmac";
-const EAB_KID_KEY: &str = "kid";
-const EAB_HMAC_KEY: &str = "hmac";
-const TRUSTED_CA_KEY: &str = "trusted_ca_sha256";
-const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
 const MANAGED_PROFILE_BEGIN_PREFIX: &str = "# BEGIN BOOTROOT REMOTE PROFILE";
 const MANAGED_PROFILE_END_PREFIX: &str = "# END BOOTROOT REMOTE PROFILE";
 const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
