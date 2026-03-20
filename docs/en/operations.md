@@ -174,7 +174,7 @@ Minimum environment/config checklist:
 - service name and AppRole file paths (`role_id`, `secret_id`)
 - EAB file path and `agent.toml` path
 - profile identity/path fields (hostname, instance_id, cert/key paths)
-- CA bundle path when trust data includes `ca_bundle_pem`
+- CA bundle output path for the managed step-ca trust bundle
 
 Security notes:
 

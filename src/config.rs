@@ -88,6 +88,7 @@ pub struct RetrySettings {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TrustSettings {
     #[serde(default)]
     pub ca_bundle_path: Option<PathBuf>,
@@ -318,6 +319,24 @@ mod tests {
 
         let err = Settings::new(Some(file.path().to_path_buf())).unwrap_err();
         assert!(err.to_string().contains("check_interval"));
+    }
+
+    #[test]
+    fn test_load_settings_rejects_removed_trust_verify_key() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            r"
+            [trust]
+            verify_certificates = false
+        "
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let err = Settings::new(Some(file.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("verify_certificates"));
     }
 
     #[test]

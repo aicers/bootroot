@@ -271,6 +271,40 @@ async fn test_bootroot_remote_rejects_invalid_bootstrap_identifiers() {
     }
 }
 
+#[test]
+fn test_bootroot_remote_requires_ca_bundle_path() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let role_id_path = temp_dir.path().join("role_id");
+    let secret_id_path = temp_dir.path().join("secret_id");
+    let eab_file_path = temp_dir.path().join("eab.json");
+    let agent_config_path = temp_dir.path().join("agent.toml");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .args([
+            "bootstrap",
+            "--openbao-url",
+            "http://127.0.0.1:8200",
+            "--service-name",
+            "edge-proxy",
+            "--role-id-path",
+            role_id_path.to_string_lossy().as_ref(),
+            "--secret-id-path",
+            secret_id_path.to_string_lossy().as_ref(),
+            "--eab-file-path",
+            eab_file_path.to_string_lossy().as_ref(),
+            "--agent-config-path",
+            agent_config_path.to_string_lossy().as_ref(),
+            "--profile-instance-id",
+            "001",
+        ])
+        .output()
+        .expect("run bootroot-remote");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("--ca-bundle-path"), "stderr:\n{stderr}");
+}
+
 #[tokio::test]
 async fn test_bootroot_remote_reports_partial_failure_with_json_output() {
     let temp_dir = tempdir().expect("create temp dir");

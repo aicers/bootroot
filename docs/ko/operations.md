@@ -164,7 +164,7 @@ bootstrap + 명시적 secret_id handoff입니다.
 - 서비스 이름, AppRole 파일 경로(`role_id`, `secret_id`)
 - EAB 파일 경로, `agent.toml` 경로
 - 프로필 식별/경로 입력(hostname, instance_id, cert/key 경로)
-- trust 데이터에 `ca_bundle_pem`이 포함된 경우 CA 번들 경로
+- 관리되는 step-ca trust bundle을 쓸 CA 번들 출력 경로
 
 보안 참고:
 

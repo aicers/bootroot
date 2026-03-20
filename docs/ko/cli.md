@@ -870,8 +870,7 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
     `stepca.internal`, `responder.internal` 같은 원격 제어면 엔드포인트로
     바꿔야 합니다.
 - `--ca-bundle-path`
-  - trust 데이터에 `ca_bundle_pem`이 포함된 경우 번들을 파일로 반영하려면
-    지정이 필요합니다.
+  - 관리되는 step-ca trust bundle을 쓸 출력 경로로 항상 필요합니다.
 - `--summary-json`(선택), `--output text|json` (기본값 `text`)
 
 `agent.toml`이 아직 없으면 bootstrap 단계에서 baseline을 생성한 뒤, 서비스용

@@ -902,7 +902,7 @@ Key inputs:
     control-plane endpoints such as `stepca.internal` and
     `responder.internal`.
 - `--ca-bundle-path`
-  - required to write bundle files when trust data includes `ca_bundle_pem`.
+  - required output path for the managed step-ca trust bundle.
 - `--summary-json` (optional) and `--output text|json` (default `text`)
 
 If `agent.toml` does not exist yet, bootstrap creates a baseline config and
