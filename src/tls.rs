@@ -15,10 +15,10 @@ use x509_parser::prelude::FromDer;
 use crate::config::TrustSettings;
 
 /// Builds a [`reqwest::Client`] configured according to the given
-/// [`TrustSettings`].
+/// [`TrustSettings`] and runtime TLS override.
 ///
 /// Three modes:
-/// - **Insecure** (`verify_certificates = false`): accepts any certificate.
+/// - **Insecure override** (`--insecure`): accepts any certificate.
 /// - **System roots** (no `ca_bundle_path`): default webpki verification.
 /// - **Custom CA bundle** (with optional SHA-256 pinning): loads the bundle
 ///   and optionally enforces certificate pins.
@@ -28,16 +28,14 @@ use crate::config::TrustSettings;
 /// Returns an error if the CA bundle cannot be read or parsed, if
 /// certificate pins are specified without a CA bundle path, or if the
 /// HTTP client fails to build.
-pub fn build_http_client(trust: &TrustSettings) -> Result<Client> {
+pub fn build_http_client(trust: &TrustSettings, insecure_mode: bool) -> Result<Client> {
     install_crypto_provider();
-    if !trust.verify_certificates {
+    if insecure_mode {
         // CodeQL flags `danger_accept_invalid_certs(true)` as
         // rust/disabled-certificate-check.  This is intentional: during
-        // initial bootstrap the TLS CA has not yet been provisioned, so
-        // certificate verification cannot succeed.  The caller opts in
-        // explicitly via `verify_certificates = false` in TrustSettings;
-        // once init completes, the flag is set to `true` and this branch
-        // is no longer taken.  Dismiss the alert as a false positive.
+        // break-glass recovery or explicit diagnostics the caller may opt in
+        // to an insecure ACME TLS client via `--insecure`. Dismiss the alert
+        // as a false positive because the override is explicit and temporary.
         return Client::builder()
             .danger_accept_invalid_certs(true)
             .build()

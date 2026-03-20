@@ -164,7 +164,7 @@ bootstrap + 명시적 secret_id handoff입니다.
 - 서비스 이름, AppRole 파일 경로(`role_id`, `secret_id`)
 - EAB 파일 경로, `agent.toml` 경로
 - 프로필 식별/경로 입력(hostname, instance_id, cert/key 경로)
-- trust 데이터에 `ca_bundle_pem`이 포함된 경우 CA 번들 경로
+- 관리되는 step-ca trust bundle을 쓸 CA 번들 출력 경로
 
 보안 참고:
 
@@ -184,8 +184,8 @@ bootstrap + 명시적 secret_id handoff입니다.
 
 ## CA 번들(trust) 운영
 
-이 섹션은 `trust.ca_bundle_path`, `trust.trusted_ca_sha256`,
-`trust.verify_certificates` 3개 값의 운영 기준을 설명합니다.
+이 섹션은 `trust.ca_bundle_path`와 `trust.trusted_ca_sha256`의 운영
+기준을 설명합니다.
 
 - `trust.ca_bundle_path`와 `trust.trusted_ca_sha256`를 구성하면
   bootroot-agent는 발급 응답에서 리프 인증서와 체인을 분리합니다.
@@ -194,12 +194,11 @@ bootstrap + 명시적 secret_id handoff입니다.
 - `trust.trusted_ca_sha256`가 설정되어 있으면 체인 지문 검증을 통과한 경우에만
   번들을 저장합니다. 지문이 불일치하면 발급이 실패합니다.
 - 응답에 체인이 없으면 CA 번들은 갱신하지 않으며 로그에 경고를 남깁니다.
-- `trust.verify_certificates = true`이면 bootroot-agent가 ACME 서버(step-ca)의
-  TLS 인증서를 검증합니다. `ca_bundle_path`가 있으면 그 번들을 사용하고,
+- bootroot-agent는 기본적으로 ACME 서버(step-ca)의 TLS 인증서를
+  검증합니다. trust 설정이 있으면 관리되는 번들과 지문을 사용하고,
   없으면 시스템 CA 저장소를 사용합니다.
-- CLI 오버라이드:
-  `bootroot-agent --verify-certificates`(해당 실행에서 검증 강제) 또는
-  `bootroot-agent --insecure`(해당 실행에서만 검증 비활성화).
+- CLI 오버라이드: `bootroot-agent --insecure`
+  (해당 실행에서만 검증 비활성화).
 - managed onboarding 흐름에서는 첫 `bootroot-agent` 실행 전에 trust를
   준비합니다.
   - `local-file`: `bootroot service add`가 trust 설정과
@@ -208,11 +207,6 @@ bootstrap + 명시적 secret_id handoff입니다.
   - `remote-bootstrap`: `bootroot service add`가 OpenBao에 trust 상태를
     기록하고, `bootroot-remote bootstrap`이 서비스 머신에 trust 설정과
     CA 번들을 반영합니다.
-- 호환성 fallback: 레거시/수동 프로필이 여전히
-  `trust.verify_certificates = false`로 시작하면, `--insecure` 없이
-  성공한 실행이 `true`를 자동 기록합니다.
-- 이 호환성 자동 강화 과정에서 파일 쓰기 또는 재로드 검증이 실패하면
-  bootroot-agent는 non-zero로 종료합니다.
 
 권한/소유권:
 

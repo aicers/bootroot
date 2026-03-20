@@ -367,12 +367,10 @@ TLS 검증 오버라이드:
 자세한 동작 원리와 권장 운용 순서는 [설정 > 신뢰](configuration.md)를
 참고하세요.
 
-- `--verify-certificates`: ACME 서버 TLS 검증 강제
 - `--insecure`: 해당 실행에서만 ACME 서버 TLS 검증 비활성화
   (비보안 오버라이드). 일반적인 managed onboarding 흐름에서는 첫
   `bootroot-agent` 실행 전에 trust가 준비되므로 처음부터 검증을 켤 수
-  있습니다. 발급 후 자동 강화는 여전히 오래된/수동 프로필의 호환성
-  fallback으로 남아 있습니다.
+  있습니다.
 
 #### CA 번들 소비 서비스 권한
 

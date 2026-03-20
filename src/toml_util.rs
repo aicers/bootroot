@@ -69,19 +69,23 @@ mod tests {
 
     #[test]
     fn upsert_updates_existing_key() {
-        let input = "[trust]\nverify_certificates = false\n";
+        let input = "[acme]\nhttp_responder_hmac = \"old\"\n";
         let output =
-            upsert_section_keys(input, "trust", &[("verify_certificates", "true".into())]).unwrap();
-        assert!(output.contains("verify_certificates = true"), "{output}");
+            upsert_section_keys(input, "acme", &[("http_responder_hmac", "new".into())]).unwrap();
+        assert!(output.contains("http_responder_hmac = \"new\""), "{output}");
     }
 
     #[test]
     fn upsert_adds_missing_section() {
         let input = "email = \"admin@example.com\"\n";
         let output =
-            upsert_section_keys(input, "trust", &[("verify_certificates", "true".into())]).unwrap();
+            upsert_section_keys(input, "trust", &[("ca_bundle_path", "certs/ca.pem".into())])
+                .unwrap();
         assert!(output.contains("[trust]"), "{output}");
-        assert!(output.contains("verify_certificates = true"), "{output}");
+        assert!(
+            output.contains("ca_bundle_path = \"certs/ca.pem\""),
+            "{output}"
+        );
     }
 
     #[test]

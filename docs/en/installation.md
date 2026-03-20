@@ -357,13 +357,9 @@ TLS verification override:
 For detailed behavior and the recommended operating flow, see
 [Configuration > Trust](configuration.md#trust).
 
-- `--verify-certificates` forces ACME server TLS verification on.
 - `--insecure` disables verification for that run (**insecure**, overrides
-  config). In the normal managed onboarding flow, trust is prepared before
-  the first `bootroot-agent` run so verification can already be on.
-  Auto-hardening after issuance remains as a compatibility fallback for
-  older/manual profiles that still start with `trust.verify_certificates =
-  false`.
+  normal behavior). In the normal managed onboarding flow, trust is prepared
+  before the first `bootroot-agent` run so verification can already be on.
 
 #### CA bundle consumer permissions
 

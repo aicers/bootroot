@@ -8,7 +8,7 @@ use super::validation::{
     validate_agent_domain, validate_profile_hostname, validate_profile_instance_id,
     validate_service_name,
 };
-use super::{BootstrapArgs, CA_BUNDLE_PEM_KEY, Locale, localized};
+use super::{BootstrapArgs, Locale, localized};
 
 // This function intentionally keeps end-to-end bootstrap orchestration in one place
 // so status aggregation and exit-code semantics stay easy to audit.
@@ -88,31 +88,22 @@ pub(super) async fn run_bootstrap(args: BootstrapArgs, lang: Locale) -> Result<i
     let (responder_hmac_status, mut trust_sync_status) =
         apply_agent_config_updates(&args, &pulled, lang).await;
 
-    if let Some(bundle_path) = args.ca_bundle_path.as_deref() {
-        match pulled.ca_bundle_pem.as_deref() {
-            Some(pem) => match write_secret_file(bundle_path, pem).await {
-                Ok(bundle_status) => {
-                    trust_sync_status = merge_apply_status(trust_sync_status, bundle_status, None);
-                }
-                Err(err) => {
-                    trust_sync_status = ApplyItemSummary::failed(localized(
-                        lang,
-                        &format!("ca bundle apply failed ({}): {err}", bundle_path.display()),
-                        &format!("ca bundle 반영 실패 ({}): {err}", bundle_path.display()),
-                    ));
-                }
-            },
-            None => {
-                trust_sync_status = ApplyItemSummary::failed(localized(
-                    lang,
-                    &format!(
-                        "trust data missing {CA_BUNDLE_PEM_KEY} while --ca-bundle-path was provided"
-                    ),
-                    &format!(
-                        "--ca-bundle-path가 지정되었지만 trust 데이터에 {CA_BUNDLE_PEM_KEY}가 없습니다"
-                    ),
-                ));
-            }
+    match write_secret_file(&args.ca_bundle_path, &pulled.ca_bundle_pem).await {
+        Ok(bundle_status) => {
+            trust_sync_status = merge_apply_status(trust_sync_status, bundle_status, None);
+        }
+        Err(err) => {
+            trust_sync_status = ApplyItemSummary::failed(localized(
+                lang,
+                &format!(
+                    "ca bundle apply failed ({}): {err}",
+                    args.ca_bundle_path.display()
+                ),
+                &format!(
+                    "ca bundle 반영 실패 ({}): {err}",
+                    args.ca_bundle_path.display()
+                ),
+            ));
         }
     }
 

@@ -178,7 +178,6 @@ HTTP-01 리스폰더와 ACME 재시도 동작을 제어합니다.
 
 ```toml
 [trust]
-verify_certificates = true
 ca_bundle_path = "/etc/bootroot/ca-bundle.pem"
 trusted_ca_sha256 = ["<sha256-hex>"]
 ```
@@ -194,13 +193,12 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 
 #### 2) 핵심 설정
 
-- `verify_certificates`: ACME 서버 TLS 검증 사용 여부
 - `ca_bundle_path`: CA 번들(중간/루트) 저장 경로
 - `trusted_ca_sha256`: 신뢰할 CA 인증서 지문 목록(SHA-256 hex)
-- `verify_certificates = true`인데 `ca_bundle_path`가 없으면 시스템 CA 저장소를 사용
-- 스키마 기본값은 `verify_certificates = false`(호환성 목적)이지만,
-  managed onboarding에서는 trust 번들 데이터가 있으면 보통 첫
-  `bootroot-agent` 실행 전에 `verify_certificates = true`를 기록합니다
+- trust 두 값이 모두 있으면 bootroot-agent가 해당 번들과 지문으로
+  ACME 서버를 검증합니다
+- trust가 비어 있으면 `--insecure`를 쓰지 않는 한 시스템 CA 저장소로
+  일반 검증을 수행합니다
 
 `trusted_ca_sha256`는 임의 값이 아니라 실제 CA 인증서 지문이어야 합니다.
 
@@ -208,17 +206,16 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 
 - `remote-bootstrap`: `bootroot service add`가 서비스별 trust 상태를
   OpenBao에 기록하고, `bootroot-remote bootstrap`이 첫
-  `bootroot-agent` 실행 전에 서비스 머신에 `trusted_ca_sha256`,
-  `ca_bundle_path`, 검증 설정을 반영
+  `bootroot-agent` 실행 전에 서비스 머신에 `trusted_ca_sha256`와
+  `ca_bundle_path`를 반영
 - `local-file`: `bootroot service add`가 trust 설정을 `agent.toml`에
   자동 병합하고 `ca_bundle_path`를 기록하며, 서비스별 OpenBao Agent가
   설정 파일과 번들 파일을 로컬에서 계속 동기화
 
 #### 4) 실행 플래그 동작
 
-- `--insecure`: 해당 실행에서 `verify_certificates=false` 강제
-- `--verify-certificates`: 해당 실행에서 `verify_certificates=true` 강제
-- 둘 다 없으면 기존 설정값 그대로 사용
+- `--insecure`: 해당 실행에서만 ACME 서버 TLS 검증 비활성화
+- 오버라이드가 없으면: 구성된 trust 또는 시스템 CA 저장소로 일반 검증
 
 #### 5) 권장 운영 절차
 
@@ -233,12 +230,8 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
    - `remote-bootstrap`: `bootroot-remote bootstrap`을 1회 실행해 같은
      trust payload를 원격 호스트에 반영합니다.
 4. `--insecure` 없이 `bootroot-agent`를 시작합니다. managed onboarding
-   흐름에서는 이미 `trust.verify_certificates = true`여야 합니다.
+   흐름에서는 이미 정상 검증에 필요한 trust가 준비돼 있어야 합니다.
 5. `--insecure`는 임시 진단이나 break-glass 상황에서만 사용합니다.
-
-호환성 fallback: 오래된 프로필이나 수동 관리 프로필이 여전히
-`trust.verify_certificates = false`로 시작하면, `--insecure` 없이
-성공한 실행이 `true`를 자동 기록합니다.
 
 기본 Bootroot 배포에서는 step-ca가 HTTPS 엔드포인트에서 CA 인증서를 직접
 제시할 수 있습니다. `trusted_ca_sha256`가 설정되면 bootroot-agent는
@@ -247,11 +240,7 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 
 #### 6) 실패/주의 사항
 
-- 호환성 자동 강화의 파일 쓰기/재로드 검증이 실패하면
-  bootroot-agent는 non-zero로 종료
-- `--insecure` 실행은 해당 실행에서만 우회하며 호환성 자동 강화를 건너뜀
-- 프로필이 여전히 `verify_certificates = false`로 시작하면 다음 일반 실행에서
-  자동 강화 조건을 다시 검사
+- `--insecure` 실행은 해당 실행에서만 검증을 우회
 - 단일 step-ca 환경에서는 mTLS 번들과 ACME 검증에 같은 `ca_bundle_path` 재사용 가능
 
 #### 7) 점검 체크리스트
@@ -261,6 +250,8 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 - `bootroot init` 실행 시 동일 `secrets_dir` 사용 여부
 - OpenBao `secret/bootroot/ca` 경로의 `trusted_ca_sha256`,
   `ca_bundle_pem` 존재 여부
+- managed onboarding은 두 값이 모두 필요하며, 하나라도 없으면 trust를 복구할 때까지
+  `bootroot service add` 또는 `bootroot-remote bootstrap`이 실패
 - `local-file`: 서비스별 OpenBao Agent가 `ca-bundle.pem`을 렌더하는지 확인
 - `remote-bootstrap`: trust 갱신 후 `bootroot-remote bootstrap`을 다시 실행
 
@@ -376,7 +367,6 @@ backoff_secs = [5, 10, 30]
 - `--eab-hmac <HMAC>`: EAB HMAC Key
 - `--eab-file <PATH>`: EAB JSON 파일 경로
 - `--oneshot`: 1회 발급 후 종료(데몬 루프 비활성화, 기본값 `false`)
-- `--verify-certificates`: ACME 서버 TLS 검증 강제(기본값 `false`)
 - `--insecure`: ACME 서버 TLS 검증 비활성화(기본값 `false`)
 
 그 외 설정(프로필, 재시도, 스케줄러, 훅, CA 번들 경로 등)은

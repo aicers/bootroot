@@ -181,7 +181,6 @@ Controls HTTP-01 responder settings and retry behavior for ACME operations.
 
 ```toml
 [trust]
-verify_certificates = true
 ca_bundle_path = "/etc/bootroot/ca-bundle.pem"
 trusted_ca_sha256 = ["<sha256-hex>"]
 ```
@@ -197,14 +196,12 @@ This section covers both mTLS trust and **ACME server TLS verification**.
 
 #### 2) Core settings
 
-- `verify_certificates`: enable/disable ACME server TLS verification
 - `ca_bundle_path`: output path for CA bundle (intermediate/root)
 - `trusted_ca_sha256`: trusted CA fingerprint list (SHA-256 hex)
-- if `verify_certificates = true` and `ca_bundle_path` is missing,
-  system CA store is used
-- schema default is `verify_certificates = false` (backward compatibility),
-  but managed onboarding normally writes `verify_certificates = true`
-  before the first `bootroot-agent` run when trust bundle data is available
+- when both trust keys are configured, bootroot-agent verifies the ACME
+  server with that bundle and fingerprint set
+- when trust is not configured, bootroot-agent falls back to the system CA
+  store unless `--insecure` is used for a one-off override
 
 `trusted_ca_sha256` must match real CA certificate fingerprints (not
 arbitrary values).
@@ -213,17 +210,17 @@ arbitrary values).
 
 - `remote-bootstrap`: `bootroot service add` writes per-service trust state
   in OpenBao, and `bootroot-remote bootstrap` applies
-  `trusted_ca_sha256`, `ca_bundle_path`, and verification settings on the
-  service machine before the first `bootroot-agent` run
+  `trusted_ca_sha256` and `ca_bundle_path` on the service machine before the
+  first `bootroot-agent` run
 - `local-file`: `bootroot service add` auto-merges trust settings into
   `agent.toml`, writes `ca_bundle_path`, and the per-service OpenBao Agent
   keeps both the config and bundle file synchronized locally
 
 #### 4) Runtime flag behavior
 
-- `--insecure`: force `verify_certificates=false` for that run
-- `--verify-certificates`: force `verify_certificates=true` for that run
-- neither flag: use current config value as-is
+- `--insecure`: disable ACME server TLS verification for that run only
+- no override flag: verify normally using the configured trust material or
+  the system CA store
 
 #### 5) Recommended operating flow
 
@@ -239,12 +236,8 @@ enabled"
    - `remote-bootstrap`: run `bootroot-remote bootstrap` once to apply the
      same trust payload on the remote host.
 4. Start `bootroot-agent` without `--insecure`; in the managed onboarding
-   flow it should already have `trust.verify_certificates = true`.
+   flow trust should already be in place for normal verification.
 5. Reserve `--insecure` for temporary diagnosis or other break-glass cases.
-
-Compatibility fallback: if an older or manually managed profile still starts
-with `trust.verify_certificates = false`, a successful non-`--insecure` run
-auto-writes `true`.
 
 In the default Bootroot deployment, step-ca may present its CA certificate
 directly on the HTTPS endpoint. When `trusted_ca_sha256` is configured,
@@ -254,12 +247,7 @@ bundle or a directly presented certificate whose fingerprint is pinned in
 
 #### 6) Failure/caution notes
 
-- if compatibility hardening write/reload verification fails,
-  bootroot-agent exits non-zero
-- `--insecure` bypasses verification only for that run and skips
-  compatibility hardening
-- if a profile still starts with `verify_certificates = false`, the next
-  normal run checks hardening conditions again
+- `--insecure` bypasses verification only for that run
 - in single-step-ca setups, reusing one `ca_bundle_path` for both mTLS and
   ACME verification is acceptable
 
@@ -270,6 +258,8 @@ bundle or a directly presented certificate whose fingerprint is pinned in
 - `bootroot init` ran with the same `secrets_dir`
 - OpenBao `secret/bootroot/ca` contains `trusted_ca_sha256` and
   `ca_bundle_pem`
+- managed onboarding requires both values; if either is missing,
+  `bootroot service add` or `bootroot-remote bootstrap` fails until trust is repaired
 - `local-file`: the per-service OpenBao Agent renders `ca-bundle.pem`
 - `remote-bootstrap`: re-run `bootroot-remote bootstrap` after trust updates
 
@@ -319,8 +309,6 @@ Options:
 - `--eab-hmac <HMAC>`: EAB HMAC key
 - `--eab-file <PATH>`: EAB JSON file path
 - `--oneshot`: issue once and exit (disable daemon loop, default `false`)
-- `--verify-certificates`: force ACME server TLS verification
-  (default `false`)
 - `--insecure`: disable ACME server TLS verification (default `false`)
 
 All other settings (profiles, retry, scheduler, hooks, CA bundle paths, etc.)

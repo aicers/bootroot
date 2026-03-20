@@ -116,15 +116,6 @@
 
 ### 발급 직후 호환성 자동 강화 실패
 
-- 증상: 레거시/수동 프로필에서 발급은 성공했지만 직후 bootroot-agent가
-  non-zero로 종료됨
-- 원인: `trust.verify_certificates = true`로 바꾸기 위한
-  `agent.toml` 기록/재로드 검증 실패
-- 현재 managed onboarding은 보통 첫 실행 전에 검증 설정을 써 둡니다.
-  이 증상이 보이면 프로필이 일반적인 local-file/remote-bootstrap 흐름 밖에서
-  생성되었는지 확인하세요.
-- 확인: `--config` 경로, 파일 권한, `agent.toml` 문법
-
 ## 파일/훅 관련 오류
 
 - `profiles.paths`의 상위 디렉터리 존재 여부와 쓰기 권한 확인

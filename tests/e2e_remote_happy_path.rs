@@ -70,7 +70,7 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     assert!(openbao_agent_template.exists());
     assert!(openbao_agent_token.exists());
     assert!(agent_contents.contains("http_responder_hmac = \"remote-responder-hmac\""));
-    assert!(agent_contents.contains("verify_certificates = true"));
+    assert!(!agent_contents.contains("verify_certificates"));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     assert!(agent_contents.contains("ca_bundle_path = \""));
     assert!(agent_contents.contains("[[profiles]]"));

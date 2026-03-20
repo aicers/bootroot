@@ -117,17 +117,6 @@ If mode and placement do not match, file/state updates go to the wrong path.
 - Validate system trust or `trust.ca_bundle_path`
 - Use `bootroot-agent --insecure` only for temporary diagnosis
 
-### Compatibility hardening failed after issuance
-
-- Symptom: issuance succeeded, but bootroot-agent exits non-zero right after
-  on a legacy/manual profile.
-- Cause: writing/reloading `agent.toml` to switch
-  `trust.verify_certificates = true` failed.
-- Current managed onboarding usually writes verification settings before the
-  first run. If this still happens, check whether the profile was created
-  outside the normal local-file/remote-bootstrap flow.
-- Check `--config` path, file permissions, and config syntax.
-
 ## File and hook errors
 
 - Check parent directory existence and write permission for `profiles.paths`

@@ -1,4 +1,15 @@
 services:
+  bootroot-agent:
+    # Test stacks bootstrap the compose agent outside the managed trust flow,
+    # so the CI overlay keeps an explicit one-shot break-glass override.
+    command:
+      - |
+        cp /app/agent.toml /app/certs/agent.runtime.toml
+        exec /app/bootroot-agent \
+          --oneshot \
+          --insecure \
+          --ca-url=https://bootroot-ca:9000/acme/acme/directory \
+          --config=/app/certs/agent.runtime.toml
   bootroot-http01:
     networks:
       default:

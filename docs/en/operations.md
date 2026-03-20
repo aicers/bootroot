@@ -174,7 +174,7 @@ Minimum environment/config checklist:
 - service name and AppRole file paths (`role_id`, `secret_id`)
 - EAB file path and `agent.toml` path
 - profile identity/path fields (hostname, instance_id, cert/key paths)
-- CA bundle path when trust data includes `ca_bundle_pem`
+- CA bundle output path for the managed step-ca trust bundle
 
 Security notes:
 
@@ -194,9 +194,8 @@ Security notes:
 
 ## CA bundle (trust) operations
 
-This section covers how to operate three trust settings together:
-`trust.ca_bundle_path`, `trust.trusted_ca_sha256`, and
-`trust.verify_certificates`.
+This section covers how to operate two trust settings together:
+`trust.ca_bundle_path` and `trust.trusted_ca_sha256`.
 
 - When `trust.ca_bundle_path` and `trust.trusted_ca_sha256` are configured,
   bootroot-agent splits the ACME issuance response into leaf + chain.
@@ -206,12 +205,11 @@ This section covers how to operate three trust settings together:
   chain fingerprint check passes. A mismatch fails issuance.
 - If the response has no chain, the CA bundle is not updated and a warning
   is logged.
-- With `trust.verify_certificates = true`, bootroot-agent verifies the ACME
-  server (step-ca) TLS certificate. If `ca_bundle_path` is set, it uses that
-  bundle; otherwise it uses the system CA store.
-- CLI overrides:
-  `bootroot-agent --verify-certificates` (force verify for that run) or
-  `bootroot-agent --insecure` (disable verify only for that run).
+- bootroot-agent normally verifies the ACME server (step-ca) TLS
+  certificate. If trust settings are configured, it uses the managed CA
+  bundle and pins; otherwise it uses the system CA store.
+- CLI override: `bootroot-agent --insecure` disables verification only for
+  that run.
 - In the managed onboarding flow, trust is prepared before the first
   `bootroot-agent` run:
   - `local-file`: `bootroot service add` writes trust settings and
@@ -220,11 +218,6 @@ This section covers how to operate three trust settings together:
   - `remote-bootstrap`: `bootroot service add` writes trust state to
     OpenBao, and `bootroot-remote bootstrap` applies the trust config and
     CA bundle on the service machine.
-- Compatibility fallback: if a legacy/manual profile still starts with
-  `trust.verify_certificates = false`, a successful non-`--insecure` run
-  auto-writes `true`.
-- If file write or reload validation fails during this compatibility
-  hardening step, bootroot-agent exits non-zero.
 
 Permissions/ownership:
 
