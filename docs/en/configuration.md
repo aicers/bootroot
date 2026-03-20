@@ -258,6 +258,8 @@ bundle or a directly presented certificate whose fingerprint is pinned in
 - `bootroot init` ran with the same `secrets_dir`
 - OpenBao `secret/bootroot/ca` contains `trusted_ca_sha256` and
   `ca_bundle_pem`
+- managed onboarding requires both values; if either is missing,
+  `bootroot service add` or `bootroot-remote bootstrap` fails until trust is repaired
 - `local-file`: the per-service OpenBao Agent renders `ca-bundle.pem`
 - `remote-bootstrap`: re-run `bootroot-remote bootstrap` after trust updates
 

@@ -1108,6 +1108,57 @@ async fn test_app_add_uses_synced_trust_when_metadata_missing() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_app_add_fails_when_synced_trust_bundle_missing() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material_without_bundle(&server, "edge-proxy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("bootroot service add failed"));
+    assert!(stderr.contains("ca_bundle_pem"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_app_info_prints_summary() {
     let temp_dir = tempdir().expect("create temp dir");
     write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
@@ -1496,6 +1547,65 @@ async fn stub_app_add_service_sync_material_with_token(
             "/v1/secret/data/bootroot/services/{service_name}/trust"
         )))
         .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+}
+
+async fn stub_app_add_service_sync_material_without_bundle(
+    server: &MockServer,
+    service_name: &str,
+) {
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/agent/eab"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "kid": "test-kid", "hmac": "test-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/responder/hmac"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "value": "test-responder-hmac" } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": {
+                "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"]
+            } }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/eab"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/http_responder_hmac"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{service_name}/trust"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;

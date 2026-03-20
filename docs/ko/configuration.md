@@ -250,6 +250,8 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 - `bootroot init` 실행 시 동일 `secrets_dir` 사용 여부
 - OpenBao `secret/bootroot/ca` 경로의 `trusted_ca_sha256`,
   `ca_bundle_pem` 존재 여부
+- managed onboarding은 두 값이 모두 필요하며, 하나라도 없으면 trust를 복구할 때까지
+  `bootroot service add` 또는 `bootroot-remote bootstrap`이 실패
 - `local-file`: 서비스별 OpenBao Agent가 `ca-bundle.pem`을 렌더하는지 확인
 - `remote-bootstrap`: trust 갱신 후 `bootroot-remote bootstrap`을 다시 실행
 

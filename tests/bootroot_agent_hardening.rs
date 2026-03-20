@@ -138,6 +138,21 @@ async fn assert_fixture_reachable(directory_url: &str, ca_pem: &str) {
     assert!(response.status().is_success());
 }
 
+#[test]
+fn bootroot_agent_rejects_removed_verify_flag() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot-agent"))
+        .arg("--verify-certificates")
+        .output()
+        .expect("run bootroot-agent");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("--verify-certificates"),
+        "stderr:\n{stderr}"
+    );
+}
+
 async fn start_acme_tls_fixture() -> Result<AcmeTlsFixture> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let rcgen::CertifiedKey { cert, signing_key } =
