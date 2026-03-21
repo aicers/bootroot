@@ -10,3 +10,13 @@ fn postgres_port_is_bound_to_localhost_by_default() {
         "postgres port mapping must default to localhost binding"
     );
 }
+
+#[test]
+fn postgres_volume_uses_postgresql_root_for_postgres_18() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.yml");
+    let compose = fs::read_to_string(compose_path).expect("read docker-compose.yml");
+    assert!(
+        compose.contains("- postgres-data:/var/lib/postgresql"),
+        "postgres volume must mount /var/lib/postgresql for PostgreSQL 18"
+    );
+}
