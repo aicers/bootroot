@@ -112,6 +112,12 @@ Examples:
 - Production (TLS enforced):
   `postgresql://step:<secret>@db.internal:5432/stepca?sslmode=require`
 
+The `sslmode=disable` example is only for the default topology where step-ca
+and PostgreSQL stay on the same machine and inside the same local trust
+boundary. If PostgreSQL moves to another machine or another network trust
+boundary, do not reuse the local-only example. Switch to PostgreSQL TLS with
+an appropriate `sslmode`.
+
 **Important**: When step-ca runs in a container, the `db.dataSource` host is
 **inside the container network**. The effective host must be the Compose
 service name (for example, `postgres`).
@@ -177,7 +183,9 @@ If these conditions are violated, `bootroot init`, `bootroot infra up`, and
 `bootroot rotate db` fail fast.
 
 When moving beyond a single-host trust boundary, switch to TLS-based DB
-transport (`sslmode=require` or `sslmode=verify-full`).
+transport (`sslmode=require` or `sslmode=verify-full`). In other words,
+`sslmode=disable` is documented only for the same-machine default topology,
+not for split step-ca/PostgreSQL deployments.
 
 ### Bare Metal
 

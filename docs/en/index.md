@@ -223,6 +223,10 @@ automation path. For example, place `step-ca+PostgreSQL` on a CA machine,
 edge service machine. Also, we cannot guarantee that the current `bootroot`
 setup fully supports this topology class.
 
+In that split-deployment class, do not reuse the local PostgreSQL examples
+with `sslmode=disable`. Configure PostgreSQL TLS and choose an appropriate
+`sslmode` for the remote trust boundary.
+
 Services added by `bootroot service add` may run either on the same machine as
 step-ca or on different machines. Regardless of placement, each service runtime
 must include both OpenBao Agent and bootroot-agent.

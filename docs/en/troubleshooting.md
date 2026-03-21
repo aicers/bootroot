@@ -69,6 +69,9 @@ If you see `dial tcp 127.0.0.1:5432: connect: connection refused`, DSN host in
 - `localhost`/`127.0.0.1`/`::1` input should be normalized to `postgres`
 - Remote hosts like `db.internal` fail by design under single-host guardrails
 - Check init summary DB host conversion line (`from -> to`)
+- If you intentionally split step-ca and PostgreSQL across machines, do not
+  reuse the local `sslmode=disable` example. Use PostgreSQL TLS with
+  `sslmode=require` or `sslmode=verify-full`.
 
 ### responder check failures
 
