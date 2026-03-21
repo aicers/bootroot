@@ -372,18 +372,21 @@ run_bootstrap_chain() {
 
   log_phase "init"
   rm -f "$WORKSPACE_DIR/state.json"
-  if ! BOOTROOT_LANG=en printf "y\ny\nn\n" | run_bootroot init \
+  if ! BOOTROOT_LANG=en printf "y\ny\ny\n" | run_bootroot init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$INIT_SUMMARY_JSON" \
-    --enable auto-generate,show-secrets \
+    --enable auto-generate,show-secrets,db-provision \
     --stepca-url "$STEPCA_EAB_URL" \
     --stepca-provisioner "admin" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \
     --eab-kid "dev-kid" \
     --eab-hmac "dev-hmac" \
-    --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
+    --db-admin-dsn "postgresql://step:step@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
+    --db-user "step" \
+    --db-password "step-pass" \
+    --db-name "stepca" \
     --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"
@@ -540,6 +543,12 @@ wait_for_stepca_health() {
   fail "step-ca health endpoint did not become ready"
 }
 
+prepare_stepca_validation_targets() {
+  wait_for_stepca_health
+  wire_stepca_hosts
+  wait_for_stepca_http01_targets
+}
+
 snapshot_cert_meta() {
   local service="$1"
   local label="$2"
@@ -560,6 +569,7 @@ fingerprint_of() {
 run_verify_pair() {
   local label="$1"
   log_phase "verify-${label}"
+  prepare_stepca_validation_targets
   verify_service_with_retry "$EDGE_SERVICE"
   verify_service_with_retry "$WEB_SERVICE"
   verify_service_with_retry "$REMOTE_SERVICE" "$REMOTE_AGENT_CONFIG"
@@ -778,9 +788,7 @@ main() {
   prepare_test_ca_materials
   write_agent_config
   run_bootstrap_chain
-  wire_stepca_hosts
-  wait_for_stepca_http01_targets
-  wait_for_stepca_health
+  prepare_stepca_validation_targets
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"

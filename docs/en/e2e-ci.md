@@ -130,13 +130,17 @@ Actual commands (script excerpt):
 bootroot infra up --compose-file "$COMPOSE_FILE"
 
 # 2) init
-BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
+# POSTGRES_ADMIN_DSN should point to the local PostgreSQL admin DSN.
+BOOTROOT_LANG=en printf "y\ny\ny\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
-  --enable auto-generate,show-secrets \
+  --enable auto-generate,show-secrets,db-provision \
   --stepca-url "$STEPCA_EAB_URL" \
-  --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
+  --db-admin-dsn "$POSTGRES_ADMIN_DSN" \
+  --db-user "step" \
+  --db-password "step-pass" \
+  --db-name "stepca" \
   --responder-url "$RESPONDER_URL"
 
 # 3) service-add

@@ -63,6 +63,19 @@ detect_compose() {
   fail "docker compose is not available"
 }
 
+current_responder_hmac() {
+  if [ -f "$ROOT_DIR/responder.toml.compose" ]; then
+    awk -F'"' '/^hmac_secret = / {print $2; exit}' "$ROOT_DIR/responder.toml.compose"
+    return
+  fi
+  if [ -f "$ROOT_DIR/secrets/responder/responder.toml" ]; then
+    awk -F'"' '/^hmac_secret = / {print $2; exit}' \
+      "$ROOT_DIR/secrets/responder/responder.toml"
+    return
+  fi
+  printf '%s\n' "dev-hmac"
+}
+
 resolve_agent_image() {
   if docker image inspect bootroot-bootroot-agent:latest >/dev/null 2>&1; then
     echo "bootroot-bootroot-agent:latest"
@@ -78,21 +91,27 @@ resolve_agent_image() {
 run_agent_oneshot() {
   local cfg="$1"
   local compose_cmd
+  local responder_hmac
   compose_cmd="$(detect_compose)"
+  responder_hmac="$(current_responder_hmac)"
 
+  # Match the default compose agent behavior for the local self-signed test CA
+  # and avoid racing with the compose agent over the shared certs mount.
   $compose_cmd "${COMPOSE_FILES[@]}" run --rm --no-deps \
     --entrypoint /bin/sh \
     -v "$cfg:/app/agent.toml:ro" \
     bootroot-agent -lc \
-    "cp /app/agent.toml /app/certs/agent.runtime.toml && \
-     exec /app/bootroot-agent --oneshot --config=/app/certs/agent.runtime.toml"
+    "sed 's|^http_responder_hmac = \".*\"$|http_responder_hmac = \"$responder_hmac\"|' /app/agent.toml > /tmp/agent.runtime.toml && \
+     exec /app/bootroot-agent --oneshot --insecure --config=/tmp/agent.runtime.toml"
 }
 
 run_agent_oneshot_network() {
   local cfg="$1"
   local network="$2"
   local image
+  local responder_hmac
   image="$(resolve_agent_image)"
+  responder_hmac="$(current_responder_hmac)"
 
   docker run --rm \
     --entrypoint /bin/sh \
@@ -102,8 +121,8 @@ run_agent_oneshot_network() {
     -v "$ROOT_DIR/secrets:/app/secrets:ro" \
     -v "$cfg:/app/agent.toml:ro" \
     "$image" -lc \
-    "cp /app/agent.toml /app/certs/agent.runtime.toml && \
-     exec /app/bootroot-agent --oneshot --config=/app/certs/agent.runtime.toml"
+    "sed 's|^http_responder_hmac = \".*\"$|http_responder_hmac = \"$responder_hmac\"|' /app/agent.toml > /tmp/agent.runtime.toml && \
+     exec /app/bootroot-agent --oneshot --insecure --config=/tmp/agent.runtime.toml"
 }
 
 run_agent_expect_fail() {
@@ -229,12 +248,7 @@ scenario_oneshot() {
   normalize_stepca_config
   compose_up
 
-  if ! wait_for_file "$ROOT_DIR/certs/bootroot-agent.crt" "$TIMEOUT_SECS"; then
-    fail "Timeout waiting for certs/bootroot-agent.crt"
-  fi
-  if ! wait_for_file "$ROOT_DIR/certs/bootroot-agent.key" "$TIMEOUT_SECS"; then
-    fail "Timeout waiting for certs/bootroot-agent.key"
-  fi
+  run_agent_oneshot "$ROOT_DIR/agent.toml.compose"
 
   [ -f "$ROOT_DIR/certs/bootroot-agent.crt" ] || fail "Missing certs/bootroot-agent.crt"
   [ -f "$ROOT_DIR/certs/bootroot-agent.key" ] || fail "Missing certs/bootroot-agent.key"
@@ -245,6 +259,8 @@ scenario_daemon_renewal() {
   log "Scenario: happy-daemon-renewal"
   compose_up
   mkdir -p "$TMP_DIR"
+  local responder_hmac
+  responder_hmac="$(current_responder_hmac)"
 
   local cfg="$TMP_DIR/agent.toml.renewal-example"
   cat <<'TOML' > "$cfg"
@@ -292,8 +308,8 @@ TOML
     --entrypoint /bin/sh \
     -v "$cfg:/app/agent.toml:ro" \
     bootroot-agent -lc \
-    "cp /app/agent.toml /app/certs/agent.runtime.toml && \
-     exec /app/bootroot-agent --config=/app/certs/agent.runtime.toml"
+    "sed 's|^http_responder_hmac = \".*\"$|http_responder_hmac = \"$responder_hmac\"|' /app/agent.toml > /tmp/agent.runtime.toml && \
+     exec /app/bootroot-agent --insecure --config=/tmp/agent.runtime.toml"
 
   if ! wait_for_file "$ROOT_DIR/certs/renewal-example.crt" "$TIMEOUT_SECS"; then
     docker rm -f bootroot-agent-renewal >/dev/null 2>&1 || true
@@ -312,6 +328,8 @@ scenario_multi_profile() {
   log "Scenario: happy-multi-profile"
   compose_up
   mkdir -p "$TMP_DIR"
+  local responder_hmac
+  responder_hmac="$(current_responder_hmac)"
 
   local compose_override="$TMP_DIR/docker-compose.scenarios.yml"
   cat <<'YAML' > "$compose_override"
@@ -381,8 +399,8 @@ TOML
     --entrypoint /bin/sh \
     -v "$cfg:/app/agent.toml:ro" \
     bootroot-agent -lc \
-    "cp /app/agent.toml /app/certs/agent.runtime.toml && \
-     exec /app/bootroot-agent --oneshot --config=/app/certs/agent.runtime.toml"
+    "sed 's|^http_responder_hmac = \".*\"$|http_responder_hmac = \"$responder_hmac\"|' /app/agent.toml > /tmp/agent.runtime.toml && \
+     exec /app/bootroot-agent --oneshot --insecure --config=/tmp/agent.runtime.toml"
 
   [ -f "$ROOT_DIR/certs/multi-201.crt" ] || fail "Missing certs/multi-201.crt"
   [ -f "$ROOT_DIR/certs/multi-202.crt" ] || fail "Missing certs/multi-202.crt"

@@ -165,7 +165,7 @@ mod tests {
         let compose = r#"
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     ports:
       - "127.0.0.1:5432:5432"
 "#;
@@ -177,7 +177,7 @@ services:
         let compose = r#"
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     ports:
       - "5432:5432"
 "#;
@@ -189,7 +189,7 @@ services:
         let compose = r#"
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     ports:
       - "0.0.0.0:5432:5432"
 "#;

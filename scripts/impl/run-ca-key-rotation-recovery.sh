@@ -485,18 +485,21 @@ run_bootstrap_chain() {
 
   log_phase "init"
   rm -f "$WORKSPACE_DIR/state.json"
-  if ! BOOTROOT_LANG=en printf "y\ny\nn\n" | run_bootroot init \
+  if ! BOOTROOT_LANG=en printf "y\ny\ny\n" | run_bootroot init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$INIT_SUMMARY_JSON" \
-    --enable auto-generate,show-secrets \
+    --enable auto-generate,show-secrets,db-provision \
     --stepca-url "$STEPCA_EAB_URL" \
     --stepca-provisioner "admin" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \
     --eab-kid "dev-kid" \
     --eab-hmac "dev-hmac" \
-    --db-dsn "postgresql://step:step-pass@postgres:5432/step?sslmode=disable" \
+    --db-admin-dsn "postgresql://step:step@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
+    --db-user "step" \
+    --db-password "step-pass" \
+    --db-name "stepca" \
     --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"

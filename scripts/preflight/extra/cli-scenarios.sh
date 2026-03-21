@@ -18,6 +18,18 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"
 }
 
+current_responder_hmac() {
+  if [ -f "$ROOT_DIR/responder.toml.compose" ]; then
+    awk -F'"' '/^hmac_secret = / {print $2; exit}' "$ROOT_DIR/responder.toml.compose"
+    return
+  fi
+  if [ -f "$ROOT_DIR/secrets/responder/responder.toml" ]; then
+    awk -F'"' '/^hmac_secret = / {print $2; exit}' "$ROOT_DIR/secrets/responder/responder.toml"
+    return
+  fi
+  printf '%s\n' "dev-hmac"
+}
+
 run_cli_tests() {
   log "Running CLI unit tests"
   cargo test --bin bootroot
@@ -28,9 +40,8 @@ run_cli_tests() {
 
 reset_openbao() {
   log "Resetting OpenBao state"
-  docker compose -f docker-compose.yml -f docker-compose.test.yml stop openbao >/dev/null 2>&1 || true
-  docker rm bootroot-openbao >/dev/null 2>&1 || true
-  docker volume rm bootroot_openbao-data >/dev/null 2>&1 || true
+  docker compose -f docker-compose.yml -f docker-compose.test.yml down -v --remove-orphans \
+    >/dev/null 2>&1 || true
 }
 
 run_init_scenario() {
@@ -48,7 +59,9 @@ run_init_scenario() {
     chmod 600 "$ROOT_DIR/secrets/password.txt"
   fi
   local stepca_password
+  local responder_hmac
   stepca_password="$(cat "$ROOT_DIR/secrets/password.txt")"
+  responder_hmac="$(current_responder_hmac)"
   docker run --rm --user root \
     -v "$ROOT_DIR/secrets:/home/step" \
     smallstep/step-ca \
@@ -68,16 +81,19 @@ run_init_scenario() {
     log "Updating ca.json DB DSN"
     "$ROOT_DIR/scripts/impl/update-ca-db-dsn.sh"
   fi
-  log "Starting minimal infra (openbao/postgres/responder)"
-  docker compose -f docker-compose.yml -f docker-compose.test.yml up -d openbao postgres bootroot-http01
+  log "Starting bootstrap infra"
+  cargo run --bin bootroot -- infra up
 
   log "Running bootroot init"
-  BOOTROOT_LANG=en printf "y\ny\nn\n" | cargo run --bin bootroot -- init \
-    --enable auto-generate,show-secrets \
+  BOOTROOT_LANG=en printf "y\ny\ny\nn\n" | cargo run --bin bootroot -- init \
+    --enable auto-generate,show-secrets,db-provision \
     --summary-json "$INIT_SUMMARY_JSON" \
-    --http-hmac "dev-hmac" \
+    --http-hmac "$responder_hmac" \
     --stepca-password "$stepca_password" \
-    --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
+    --db-admin-dsn "postgresql://step:step@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
+    --db-user "step" \
+    --db-password "step-pass" \
+    --db-name "stepca" \
     --responder-url "http://localhost:8080" \
     --skip responder-check | tee "$ROOT_DIR/tmp/cli-init.log"
 
@@ -87,6 +103,12 @@ run_init_scenario() {
 
   log "Validating full infra"
   cargo run --bin bootroot -- infra up
+
+  # step-ca may have started before db-provision rotated the PostgreSQL role
+  # password. Restart it so new DB connections use the provisioned DSN.
+  log "Restarting step-ca with provisioned DB credentials"
+  docker restart bootroot-ca >/dev/null
+  wait_for_stepca_directory
 }
 
 add_stepca_host_aliases() {
@@ -131,7 +153,9 @@ wait_for_stepca_directory() {
 
 write_agent_config() {
   local output_path="$1"
-  cat >"$output_path" <<'EOF'
+  local responder_hmac
+  responder_hmac="$(current_responder_hmac)"
+  cat >"$output_path" <<EOF
 email = "admin@example.com"
 server = "https://localhost:9000/acme/acme/directory"
 domain = "trusted.domain"
@@ -143,37 +167,9 @@ directory_fetch_max_delay_secs = 10
 poll_attempts = 15
 poll_interval_secs = 2
 http_responder_url = "http://localhost:8080"
-http_responder_hmac = "dev-hmac"
+http_responder_hmac = "$responder_hmac"
 http_responder_timeout_secs = 5
 http_responder_token_ttl_secs = 300
-
-[[profiles]]
-service_name = "edge-proxy"
-instance_id = "001"
-hostname = "edge-node-01"
-
-[profiles.paths]
-cert = "certs/edge-proxy.crt"
-key = "certs/edge-proxy.key"
-
-[profiles.daemon]
-check_interval = "1h"
-renew_before = "720h"
-check_jitter = "0s"
-
-[[profiles]]
-service_name = "web-app"
-instance_id = "001"
-hostname = "web-01"
-
-[profiles.paths]
-cert = "certs/web-app.crt"
-key = "certs/web-app.key"
-
-[profiles.daemon]
-check_interval = "1h"
-renew_before = "720h"
-check_jitter = "0s"
 EOF
 }
 
