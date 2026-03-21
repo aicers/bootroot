@@ -60,6 +60,7 @@ RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
 CURRENT_PHASE="init"
+POSTGRES_ADMIN_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
 
 log_phase() {
   local phase="$1"
@@ -272,7 +273,7 @@ run_bootstrap_chain() {
     --eab-kid "$INIT_EAB_KID" \
     --eab-hmac "$INIT_EAB_HMAC" \
     --http-hmac "dev-hmac" \
-    --db-admin-dsn "postgresql://step:step@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
+    --db-admin-dsn "postgresql://step:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
     --db-user "step" \
     --db-password "step-pass" \
     --db-name "stepca" \
