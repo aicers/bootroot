@@ -19,6 +19,21 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"
 }
 
+wait_for_postgres_admin() {
+  local host_port="${POSTGRES_HOST_PORT:-5432}"
+  local admin_user="${POSTGRES_USER:-step}"
+  local attempt
+  for attempt in $(seq 1 30); do
+    if docker exec bootroot-postgres pg_isready -U "$admin_user" -d postgres >/dev/null 2>&1 &&
+      bash -lc ": >/dev/tcp/127.0.0.1/${host_port}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs bootroot-postgres >&2 || true
+  fail "PostgreSQL admin endpoint did not become reachable before init"
+}
+
 current_responder_hmac() {
   if [ -f "$ROOT_DIR/responder.toml.compose" ]; then
     awk -F'"' '/^hmac_secret = / {print $2; exit}' "$ROOT_DIR/responder.toml.compose"
@@ -85,6 +100,7 @@ run_init_scenario() {
   log "Starting bootstrap infra"
   cargo run --bin bootroot -- infra up
 
+  wait_for_postgres_admin
   log "Running bootroot init"
   BOOTROOT_LANG=en printf "y\ny\ny\nn\n" | cargo run --bin bootroot -- init \
     --enable auto-generate,show-secrets,db-provision \

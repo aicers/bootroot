@@ -229,6 +229,21 @@ wait_for_openbao_api() {
   fail "openbao API did not become reachable before init"
 }
 
+wait_for_postgres_admin() {
+  local host_port="${POSTGRES_HOST_PORT:-5432}"
+  local admin_user="${POSTGRES_USER:-step}"
+  local attempt
+  for attempt in $(seq 1 30); do
+    if docker exec bootroot-postgres pg_isready -U "$admin_user" -d postgres >/dev/null 2>&1 &&
+      bash -lc ": >/dev/tcp/127.0.0.1/${host_port}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs bootroot-postgres >>"$RUN_LOG" 2>&1 || true
+  fail "postgres admin endpoint did not become reachable before init"
+}
+
 wait_for_responder_admin() {
   local admin_url="${RESPONDER_URL%/}/admin/http01"
   local attempt
@@ -257,6 +272,7 @@ run_bootstrap_chain() {
     sleep "$INFRA_UP_DELAY_SECS"
   done
 
+  wait_for_postgres_admin
   wait_for_openbao_api
   wait_for_responder_admin
 
