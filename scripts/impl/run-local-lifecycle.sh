@@ -66,6 +66,7 @@ SIDECAR_OBA_CONTAINER="bootroot-openbao-agent-${SIDECAR_OBA_SERVICE}"
 SIDECAR_OBA_READY_ATTEMPTS="${SIDECAR_OBA_READY_ATTEMPTS:-30}"
 SIDECAR_OBA_READY_DELAY_SECS="${SIDECAR_OBA_READY_DELAY_SECS:-2}"
 CURRENT_PHASE="init"
+POSTGRES_ADMIN_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
 
 log_phase() {
   local phase="$1"
@@ -383,7 +384,7 @@ run_bootstrap_chain() {
     --http-hmac "dev-hmac" \
     --eab-kid "dev-kid" \
     --eab-hmac "dev-hmac" \
-    --db-admin-dsn "postgresql://step:step@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
+    --db-admin-dsn "postgresql://step:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
     --db-user "step" \
     --db-password "step-pass" \
     --db-name "stepca" \

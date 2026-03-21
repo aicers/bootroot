@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 INIT_SUMMARY_JSON="$ROOT_DIR/tmp/cli-init-summary.json"
+POSTGRES_ADMIN_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
 
 log() {
   printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"
@@ -90,7 +91,7 @@ run_init_scenario() {
     --summary-json "$INIT_SUMMARY_JSON" \
     --http-hmac "$responder_hmac" \
     --stepca-password "$stepca_password" \
-    --db-admin-dsn "postgresql://step:step@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
+    --db-admin-dsn "postgresql://step:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
     --db-user "step" \
     --db-password "step-pass" \
     --db-name "stepca" \
