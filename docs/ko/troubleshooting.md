@@ -68,6 +68,9 @@
 - `localhost`/`127.0.0.1`/`::1` 입력은 init 과정에서 `postgres`로 정규화되는지 확인
 - `db.internal` 같은 원격 호스트는 단일 호스트 가드레일에서 실패(설계된 동작)
 - init summary의 DB 호스트 변환 라인(`from -> to`) 확인
+- step-ca와 PostgreSQL을 서로 다른 머신에 분리 배치하려는 경우에는
+  로컬 예시의 `sslmode=disable`을 재사용하지 말고 PostgreSQL TLS와
+  `sslmode=require` 또는 `sslmode=verify-full`을 사용
 
 ### responder 체크 관련
 

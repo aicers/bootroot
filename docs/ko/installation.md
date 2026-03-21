@@ -109,6 +109,11 @@ postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=<mode>
 - 운영(SSL 강제):
   `postgresql://step:<secret>@db.internal:5432/stepca?sslmode=require`
 
+`sslmode=disable` 예시는 step-ca와 PostgreSQL이 같은 머신, 같은 로컬 신뢰
+경계 안에 있는 기본 토폴로지 전용입니다. PostgreSQL을 다른 머신이나 다른
+네트워크 신뢰 경계로 분리하는 경우에는 이 로컬 예시를 그대로 재사용하지 말고
+PostgreSQL TLS와 적절한 `sslmode`를 사용해야 합니다.
+
 **중요**: step-ca가 컨테이너에서 실행 중이면 `db.dataSource`의 호스트는
 **컨테이너 내부 기준**입니다. 최종적으로는 Compose 서비스 이름(예:
 `postgres`)을 사용해야 합니다.
@@ -181,7 +186,9 @@ scripts/impl/update-ca-db-dsn.sh
 `bootroot rotate db`는 즉시 실패합니다.
 
 단일 호스트 신뢰 경계를 벗어나는 경우에는 DB 전송을 TLS 기반으로
-전환하세요(`sslmode=require` 또는 `sslmode=verify-full`).
+전환하세요(`sslmode=require` 또는 `sslmode=verify-full`). 다시 말해
+`sslmode=disable`은 같은 머신 기본 토폴로지에만 해당하며,
+step-ca/PostgreSQL 분리 배치에는 사용하면 안 됩니다.
 
 ### 베어메탈
 
