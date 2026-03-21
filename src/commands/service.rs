@@ -31,10 +31,10 @@ pub(super) const REMOTE_BOOTSTRAP_DIR: &str = "remote-bootstrap/services";
 pub(super) const REMOTE_BOOTSTRAP_FILENAME: &str = "bootstrap.json";
 pub(super) const MANAGED_PROFILE_BEGIN_PREFIX: &str = "# BEGIN bootroot managed profile:";
 pub(super) const MANAGED_PROFILE_END_PREFIX: &str = "# END bootroot managed profile:";
-pub(super) const SERVICE_CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
 pub(super) const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
 pub(super) const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 pub(super) const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
+pub(super) use bootroot::trust_bootstrap::CA_BUNDLE_PEM_KEY as SERVICE_CA_BUNDLE_PEM_KEY;
 
 pub(super) struct ServiceAppRoleMaterialized {
     pub(super) role_name: String,
