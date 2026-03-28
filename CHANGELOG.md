@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-28
+
 ### Added
 
 - Added `bootroot rotate ca-key` for intermediate-only CA key rotation
@@ -74,5 +76,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Initial public release of the bootroot
 
-[Unreleased]: https://github.com/aicers/bootroot/compare/0.1.0...main
+[Unreleased]: https://github.com/aicers/bootroot/compare/0.2.0...main
+[0.2.0]: https://github.com/aicers/bootroot/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/aicers/bootroot/tree/0.1.0
