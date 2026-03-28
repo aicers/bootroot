@@ -70,9 +70,9 @@ docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
 맞춰서 정상 동작합니다.
 
 Bootroot의 기본 배포에서는 step-ca가 HTTPS 엔드포인트에서 CA 인증서를
-직접 제시할 수 있습니다. Bootroot는 bootstrap 과정에서 얻은 CA 번들과
-SHA-256 지문을 OpenBao에 저장하므로, 이후 bootroot-agent는 이 신뢰
-정보를 사용해 step-ca 엔드포인트를 검증할 수 있습니다.
+직접 제시할 수 있습니다. Bootroot는 `bootroot init` 시점에 CA 번들과
+대응하는 SHA-256 지문을 OpenBao에 저장하므로, 이후 bootroot-agent는 이
+관리되는 신뢰 정보를 사용해 step-ca 엔드포인트를 검증할 수 있습니다.
 
 그다음 `secrets/config/ca.json`을
 현재 환경에 맞게 갱신해야 합니다. 예:

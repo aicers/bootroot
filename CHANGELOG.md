@@ -34,6 +34,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   compatibility.
 - Changed service onboarding output to clarify Bootroot-managed vs
   operator-managed boundaries and trust-related behavior.
+- Changed managed trust bootstrap so `bootroot service add` and
+  `bootroot-remote bootstrap` stage the OpenBao-backed CA bundle and
+  fingerprints before the first `bootroot-agent` run, instead of relying on
+  skipped CA verification during initial issuance.
 - Expanded Docker E2E coverage (baseline, rotation recovery, main lifecycle,
   remote lifecycle) and aligned local preflight paths with CI expectations.
 
