@@ -29,6 +29,10 @@ before generating code.
   * Otherwise use `num_traits` conversions and handle errors explicitly.
 * **Types**:
   * Prefer `enum` over `String` whenever a finite set of values is expected.
+* **Sorting**: Prefer `sort_unstable`, `sort_unstable_by`, and
+  `sort_unstable_by_key` over their stable counterparts. The unstable
+  variants are faster and allocate no extra memory. Use stable `sort` only
+  when equal elements must preserve their original relative order.
 * **Minimizing `clone`**: Avoid unnecessary `clone()` or similar methods
   (e.g., `to_string()`, `to_owned()`). Performance-critical code must not
   harbour hidden copies.
