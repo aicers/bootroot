@@ -133,24 +133,7 @@ manually by the operator in a planned change window. Because this work
 involves certificate trust-chain transition and service-impact checks, the
 operator must directly own both pre-checks and post-rotation validation.
 
-### Not Automated (3) — Initial CA Trust
-
-The initial trust problem exists not only on the secrets-manager side but also
-on the certificate issuance/renewal side. When `bootroot-agent` communicates
-with the CA, it must verify that the CA is legitimate, which requires
-distributing the CA certificate in advance. Doing this manually is
-inconvenient, and doing it automatically requires a separate mechanism to
-secure the distribution. Fortunately, Bootroot's default environment is one
-where the operator controls both the CA and `bootroot-agent` when services are
-first installed, so skipping CA verification during initial issuance is
-acceptable. Because the CA certificate is obtained during this initial process,
-CA verification is guaranteed for all subsequent automated certificate
-rotations. In the default deployment, later verification relies on the CA
-bundle and pinned CA fingerprints, so bootroot-agent can authenticate the
-step-ca HTTPS endpoint even when step-ca presents its CA certificate
-directly.
-
-### Not Automated (4) — Installation and Operations
+### Not Automated (3) — Installation and Operations
 
 There are aspects of installation and operations that fall outside Bootroot's
 automation scope:
