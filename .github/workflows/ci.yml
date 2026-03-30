@@ -102,7 +102,7 @@ jobs:
         run: biome ci --error-on-warnings .
 
       - name: Run Markdown Lint
-        uses: DavidAnson/markdownlint-cli2-action@v22
+        uses: DavidAnson/markdownlint-cli2-action@v23
         with:
           globs: "**/*.md"
 
