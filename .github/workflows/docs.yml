@@ -29,6 +29,11 @@ jobs:
       - name: Install MkDocs
         run: python3 -m pip install --upgrade pip mkdocs-material mkdocs-static-i18n
 
+      - name: Fetch Docs Theme
+        run: ./scripts/fetch-theme.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Build
         run: mkdocs build --strict
 
