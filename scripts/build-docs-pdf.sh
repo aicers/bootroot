@@ -26,6 +26,11 @@ case "$locale" in
     ;;
 esac
 
+if [[ ! -d "docs/.theme" ]]; then
+  echo "Error: docs/.theme not found. Run ./scripts/fetch-theme.sh first." >&2
+  exit 1
+fi
+
 trap 'rm -f mkdocs.tmp.yml; if [[ "${BOOTROOT_PDF_DEBUG:-0}" != "1" ]]; then rm -rf .pdf-tmp; fi' EXIT
 
 BOOTROOT_LOCALE="$locale" "$python_bin" - <<'PY'
@@ -50,7 +55,11 @@ root = os.getcwd()
 tmp_pdf_dir = os.path.join(root, ".pdf-tmp")
 if os.path.exists(tmp_pdf_dir):
     shutil.rmtree(tmp_pdf_dir)
-shutil.copytree(os.path.join(root, "docs", "pdf"), tmp_pdf_dir)
+theme_dir = os.path.join(root, "docs", ".theme")
+shutil.copytree(os.path.join(theme_dir, "pdf"), tmp_pdf_dir)
+
+fonts_dir = os.path.join(theme_dir, "fonts")
+shutil.copytree(fonts_dir, os.path.join(tmp_pdf_dir, "fonts"))
 
 styles_path = os.path.join(tmp_pdf_dir, "styles.scss")
 fonts_base = f'file://{os.path.join(tmp_pdf_dir, "fonts")}/'
@@ -85,7 +94,7 @@ pdf_plugin = {
         "custom_template_path": tmp_pdf_dir,
         "author": f"Version 2.4.0-build.812\n{now.strftime('%B %-d, %Y')}",
         "copyright": "© 2026 ClumL Inc.",
-        "cover_logo": "docs/pdf/brand.svg",
+        "cover_logo": "docs/.theme/brand.svg",
     }
 }
 

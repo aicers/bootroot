@@ -22,6 +22,9 @@ biome ci --error-on-warnings .
 echo "[check] Markdown lint"
 markdownlint-cli2 "**/*.md" "#node_modules" "#target"
 
+echo "[check] Fetch docs theme"
+"$ROOT_DIR/scripts/fetch-theme.sh"
+
 echo "[check] Build docs"
 mkdocs build --strict
 

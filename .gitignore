@@ -7,6 +7,7 @@ secrets.bak/
 .vscode/
 .venv/
 .ruff_cache/
+docs/.theme/
 site/
 site-pdf-*/
 tmp/
