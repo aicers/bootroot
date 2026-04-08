@@ -183,15 +183,8 @@ GRAFANA_ADMIN_PASSWORD=admin
 - 운영/보안 우선: `verify-full`
 - 내부망 테스트/임시 환경: `require`
 
-수동 경로를 사용하는 로컬 Compose 환경이라면(`bootroot infra install`을
-사용하면 불필요) `.env` 값을 맞춘 뒤 아래 스크립트를 쓰면 됩니다.
-이 스크립트는 `.env`의 `POSTGRES_*` 값을 읽어서 `secrets/config/ca.json`의
-`db.type`과 `db.dataSource`를 자동으로 갱신합니다. 즉, 비밀번호나 호스트를
-바꿨을 때 수동 편집 없이 동기화할 수 있습니다.
-
-```bash
-scripts/impl/update-ca-db-dsn.sh
-```
+`bootroot infra install` 후 `bootroot init --enable db-provision`을 실행하면
+DB DSN이 `secrets/config/ca.json`에 자동으로 기록됩니다.
 
 ### 단일 호스트 가드레일
 

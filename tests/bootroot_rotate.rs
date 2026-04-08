@@ -29,7 +29,7 @@ async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
     write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
     let secrets_dir = temp_dir.path().join("secrets");
     fs::create_dir_all(secrets_dir.join("secrets")).expect("create secrets key dir");
-    fs::write(secrets_dir.join("password.txt"), "old-password").expect("write password");
+    support::write_password_file(&secrets_dir, "old-password").expect("write password");
     fs::write(secrets_dir.join("secrets").join("root_ca_key"), "root-key").expect("write root key");
     fs::write(
         secrets_dir.join("secrets").join("intermediate_ca_key"),

@@ -52,9 +52,6 @@ jobs:
     if: needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    env:
-      POSTGRES_PASSWORD: step-pass
-      GRAFANA_ADMIN_PASSWORD: admin
     steps:
       - uses: actions/checkout@v6
 

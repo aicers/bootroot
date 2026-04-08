@@ -66,7 +66,8 @@ SIDECAR_OBA_CONTAINER="bootroot-openbao-agent-${SIDECAR_OBA_SERVICE}"
 SIDECAR_OBA_READY_ATTEMPTS="${SIDECAR_OBA_READY_ATTEMPTS:-30}"
 SIDECAR_OBA_READY_DELAY_SECS="${SIDECAR_OBA_READY_DELAY_SECS:-2}"
 CURRENT_PHASE="init"
-POSTGRES_ADMIN_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+export POSTGRES_HOST="127.0.0.1"
+export POSTGRES_PORT="${POSTGRES_HOST_PORT:-5432}"
 
 log_phase() {
   local phase="$1"
@@ -311,6 +312,8 @@ EOF
 install_infra() {
   mkdir -p "$CERTS_DIR"
   chmod 700 "$CERTS_DIR"
+  # Remove stale .env so infra install generates a fresh bootstrap password.
+  rm -f "$ROOT_DIR/.env"
   run_bootroot infra install --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
 }
 
@@ -348,9 +351,7 @@ run_bootstrap_chain() {
     --http-hmac "dev-hmac" \
     --eab-kid "dev-kid" \
     --eab-hmac "dev-hmac" \
-    --db-admin-dsn "postgresql://step:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
     --db-user "step" \
-    --db-password "step-pass" \
     --db-name "stepca" \
     --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then
     {
@@ -475,16 +476,27 @@ wait_for_responder_admin() {
   fail "responder admin endpoint did not become reachable before init: $admin_url"
 }
 
-wire_stepca_hosts() {
-  local responder_ip
-  responder_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
-  [ -n "${responder_ip:-}" ] || fail "Failed to resolve responder container IP"
-  docker exec bootroot-ca sh -c \
-    "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${EDGE_SERVICE}.${EDGE_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
-  docker exec bootroot-ca sh -c \
-    "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${WEB_SERVICE}.${WEB_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
-  docker exec bootroot-ca sh -c \
-    "printf '%s %s\n' '$responder_ip' '${REMOTE_INSTANCE_ID}.${REMOTE_SERVICE}.${REMOTE_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
+apply_dns_aliases() {
+  local override="$ARTIFACT_DIR/docker-compose.dns-aliases.yml"
+  cat >"$override" <<YAML
+services:
+  bootroot-http01:
+    networks:
+      default:
+        aliases:
+          - ${INSTANCE_ID}.${EDGE_SERVICE}.${EDGE_HOSTNAME}.${DOMAIN}
+          - ${INSTANCE_ID}.${WEB_SERVICE}.${WEB_HOSTNAME}.${DOMAIN}
+          - ${REMOTE_INSTANCE_ID}.${REMOTE_SERVICE}.${REMOTE_HOSTNAME}.${DOMAIN}
+YAML
+  # Include the responder compose override (written by bootroot init) so
+  # that recreating bootroot-http01 preserves both the rendered config
+  # mount and the DNS aliases.
+  local responder_override="$SECRETS_DIR/responder/docker-compose.responder.override.yml"
+  local -a compose_args=(-f "$COMPOSE_FILE" -f "$override")
+  if [ -f "$responder_override" ]; then
+    compose_args+=(-f "$responder_override")
+  fi
+  docker compose "${compose_args[@]}" up -d bootroot-http01 >>"$RUN_LOG" 2>&1
 }
 
 wait_for_stepca_http01_targets() {
@@ -525,7 +537,6 @@ wait_for_stepca_health() {
 
 prepare_stepca_validation_targets() {
   wait_for_stepca_health
-  wire_stepca_hosts
   wait_for_stepca_http01_targets
 }
 
@@ -680,7 +691,6 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     stepca-password >>"$RUN_LOG" 2>&1
-  wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-stepca-password"
@@ -708,7 +718,6 @@ run_rotations_with_verification() {
     --yes \
     db \
     --db-admin-dsn "$db_admin_dsn" >>"$RUN_LOG" 2>&1
-  wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-db"
@@ -725,7 +734,6 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     ca-key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
-  wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-ca-key"
@@ -742,7 +750,6 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     ca-key --full --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
-  wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-ca-key-full"
@@ -777,6 +784,7 @@ main() {
   install_infra
   write_agent_config
   run_bootstrap_chain
+  apply_dns_aliases
   prepare_stepca_validation_targets
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1

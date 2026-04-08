@@ -29,6 +29,7 @@ pub(super) static STRINGS: Strings = Strings {
     prompt_openbao_root_token: "OpenBao 루트 토큰: ",
     error_openbao_root_token_required: "OpenBao 루트 토큰이 필요합니다",
     warning_openbao_unseal_from_file: "경고: 파일에서 자동 언실은 dev/test 전용이며 운영에서는 안전하지 않습니다.",
+    warning_openbao_sealed_non_interactive: "경고: OpenBao가 봉인되어 있지만 stdin이 비대화형입니다. --openbao-unseal-from-file을 지정하거나 먼저 `bootroot openbao save-unseal-keys`를 실행하세요.",
     warning_db_password_rotation_skipped: "경고: DB 비밀번호 회전이 건너뛰어졌습니다. 나중에 `bootroot rotate db`로 수동 회전하세요.",
     prompt_openbao_unseal_from_file_confirm: "파일 {value}에서 자동 언실을 진행할까요? [y/N]: ",
     error_openbao_unseal_file_empty: "언실 키 파일이 비어 있습니다: {value}",

@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 
@@ -231,6 +232,18 @@ fn auto_unseal_openbao(path: &Path, openbao_url: &str, messages: &Messages) -> R
     runtime.block_on(async {
         let client = OpenBaoClient::new(openbao_url)
             .with_context(|| messages.error_openbao_client_create_failed())?;
+
+        // An uninitialized instance always reports sealed=true but has
+        // no unseal keys yet.  A stale key file from a previous run
+        // would cause an unseal error, so skip gracefully.
+        if !client
+            .is_initialized()
+            .await
+            .with_context(|| messages.error_openbao_init_status_failed())?
+        {
+            return Ok(());
+        }
+
         for key in &keys {
             client
                 .unseal(key)
@@ -250,12 +263,27 @@ fn auto_unseal_openbao(path: &Path, openbao_url: &str, messages: &Messages) -> R
 
 /// Checks whether `OpenBao` is sealed and, if so, prompts the user
 /// for unseal keys interactively.
+///
+/// Skips the prompt when `OpenBao` has not been initialized yet (fresh
+/// `infra install`) or when stdin is not a terminal (CI / scripted
+/// usage).
 fn maybe_interactive_unseal(openbao_url: &str, messages: &Messages) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()
         .with_context(|| messages.error_runtime_init_failed("infra up"))?;
     runtime.block_on(async {
         let client = OpenBaoClient::new(openbao_url)
             .with_context(|| messages.error_openbao_client_create_failed())?;
+
+        // An uninitialized instance always reports sealed=true but has
+        // no unseal keys, so prompting is nonsensical.
+        if !client
+            .is_initialized()
+            .await
+            .with_context(|| messages.error_openbao_init_status_failed())?
+        {
+            return Ok(());
+        }
+
         let status = client
             .seal_status()
             .await
@@ -263,6 +291,12 @@ fn maybe_interactive_unseal(openbao_url: &str, messages: &Messages) -> Result<()
         if !status.sealed {
             return Ok(());
         }
+
+        if !std::io::stdin().is_terminal() {
+            eprintln!("{}", messages.warning_openbao_sealed_non_interactive());
+            return Ok(());
+        }
+
         let keys = prompt_unseal_keys_interactive(status.t, messages)?;
         for key in &keys {
             client

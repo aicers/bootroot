@@ -60,7 +60,8 @@ RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
 CURRENT_PHASE="init"
-POSTGRES_ADMIN_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+export POSTGRES_HOST="127.0.0.1"
+export POSTGRES_PORT="${POSTGRES_HOST_PORT:-5432}"
 
 log_phase() {
   local phase="$1"
@@ -187,6 +188,8 @@ reset_stepca_materials_for_e2e() {
 install_infra() {
   mkdir -p "$REMOTE_CERTS_DIR"
   chmod 700 "$REMOTE_CERTS_DIR"
+  # Remove stale .env so infra install generates a fresh bootstrap password.
+  rm -f "$ROOT_DIR/.env"
   run_bootroot_control infra install --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
 }
 
@@ -255,9 +258,7 @@ run_bootstrap_chain() {
     --eab-kid "$INIT_EAB_KID" \
     --eab-hmac "$INIT_EAB_HMAC" \
     --http-hmac "dev-hmac" \
-    --db-admin-dsn "postgresql://step:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
     --db-user "step" \
-    --db-password "step-pass" \
     --db-name "stepca" \
     --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then
     {
@@ -330,14 +331,26 @@ copy_remote_bootstrap_materials() {
   chmod 600 "$remote_service_dir/role_id" "$remote_service_dir/secret_id"
 }
 
-wire_stepca_hosts() {
-  local responder_ip
-  responder_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
-  [ -n "${responder_ip:-}" ] || fail "Failed to resolve responder container IP"
-  docker exec bootroot-ca sh -c \
-    "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${SERVICE_NAME}.${HOSTNAME}.${DOMAIN}' >> /etc/hosts"
-  docker exec bootroot-ca sh -c \
-    "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID_2}.${SERVICE_NAME_2}.${HOSTNAME_2}.${DOMAIN}' >> /etc/hosts"
+apply_dns_aliases() {
+  local override="$ARTIFACT_DIR/docker-compose.dns-aliases.yml"
+  cat >"$override" <<YAML
+services:
+  bootroot-http01:
+    networks:
+      default:
+        aliases:
+          - ${INSTANCE_ID}.${SERVICE_NAME}.${HOSTNAME}.${DOMAIN}
+          - ${INSTANCE_ID_2}.${SERVICE_NAME_2}.${HOSTNAME_2}.${DOMAIN}
+YAML
+  # Include the responder compose override (written by bootroot init) so
+  # that recreating bootroot-http01 preserves both the rendered config
+  # mount and the DNS aliases.
+  local responder_override="$SECRETS_DIR/responder/docker-compose.responder.override.yml"
+  local -a compose_args=(-f "$COMPOSE_FILE" -f "$override")
+  if [ -f "$responder_override" ]; then
+    compose_args+=(-f "$responder_override")
+  fi
+  docker compose "${compose_args[@]}" up -d bootroot-http01 >>"$RUN_LOG" 2>&1
 }
 
 wait_for_stepca_http01_targets() {
@@ -562,7 +575,7 @@ main() {
   run_bootstrap_chain
   copy_remote_bootstrap_materials "$SERVICE_NAME"
   copy_remote_bootstrap_materials "$SERVICE_NAME_2"
-  wire_stepca_hosts
+  apply_dns_aliases
   wait_for_stepca_http01_targets
 
   log_phase "bootstrap-initial"

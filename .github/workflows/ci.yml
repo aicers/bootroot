@@ -311,9 +311,6 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      POSTGRES_PASSWORD: step-pass
-      GRAFANA_ADMIN_PASSWORD: admin
     strategy:
       fail-fast: false
       matrix:

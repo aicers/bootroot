@@ -69,6 +69,7 @@ pub(crate) struct Strings {
     pub(crate) prompt_openbao_root_token: &'static str,
     pub(crate) error_openbao_root_token_required: &'static str,
     pub(crate) warning_openbao_unseal_from_file: &'static str,
+    pub(crate) warning_openbao_sealed_non_interactive: &'static str,
     pub(crate) warning_db_password_rotation_skipped: &'static str,
     pub(crate) prompt_openbao_unseal_from_file_confirm: &'static str,
     pub(crate) error_openbao_unseal_file_empty: &'static str,
