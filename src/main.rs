@@ -7,7 +7,9 @@ mod state;
 
 use clap::Parser;
 
-use crate::cli::args::{Cli, CliCommand, InfraCommand, MonitoringCommand, ServiceCommand};
+use crate::cli::args::{
+    Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand, ServiceCommand,
+};
 use crate::i18n::Messages;
 
 fn main() {
@@ -52,6 +54,10 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
             commands::infra::run_infra_up(&args, messages)
                 .with_context(|| messages.error_infra_failed())?;
         }
+        CliCommand::Infra(InfraCommand::Install(args)) => {
+            commands::infra::run_infra_install(&args, messages)
+                .with_context(|| messages.error_infra_install_failed())?;
+        }
         CliCommand::Monitoring(MonitoringCommand::Up(args)) => {
             commands::monitoring::run_monitoring_up(&args, messages)
                 .with_context(|| messages.error_monitoring_failed())?;
@@ -93,6 +99,18 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
                 rt.block_on(commands::rotate::run_rotate(&args, messages))
             })?
             .with_context(|| messages.error_rotate_failed())?;
+        }
+        CliCommand::Clean(args) => {
+            commands::clean::run_clean(&args, messages)
+                .with_context(|| messages.error_clean_failed())?;
+        }
+        CliCommand::Openbao(OpenbaoCommand::SaveUnsealKeys(args)) => {
+            commands::openbao_unseal::run_save_unseal_keys(&args, messages)
+                .with_context(|| messages.error_openbao_save_unseal_keys_failed())?;
+        }
+        CliCommand::Openbao(OpenbaoCommand::DeleteUnsealKeys(args)) => {
+            commands::openbao_unseal::delete_unseal_keys(&args.secrets_dir, messages)
+                .with_context(|| messages.error_openbao_delete_unseal_keys_failed())?;
         }
     }
     Ok(())

@@ -17,53 +17,39 @@ trap cleanup EXIT
 echo "[test-core] running unit tests"
 cargo test
 
-# --- Initialize Test CA ---
-echo "[test-core] initializing test CA"
-mkdir -p "$BOOTROOT_SECRETS_DIR"
-echo "password" > "$BOOTROOT_SECRETS_DIR/password.txt"
-docker run --user root --rm -v "$BOOTROOT_SECRETS_DIR:/home/step" smallstep/step-ca \
-  step ca init \
-  --name "Bootroot Local CA" \
-  --provisioner "admin" \
-  --dns "localhost,bootroot-ca" \
-  --address ":9000" \
-  --password-file /home/step/password.txt \
-  --provisioner-password-file /home/step/password.txt \
-  --acme
-
-# --- Fix Permissions ---
-echo "[test-core] fixing permissions"
-mkdir -p "$BOOTROOT_SECRETS_DIR" certs
-if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-  sudo chown -R "$USER":"$USER" "$BOOTROOT_SECRETS_DIR"
-  sudo chmod -R 700 "$BOOTROOT_SECRETS_DIR"
-  sudo chmod -R 755 certs
-else
-  chmod -R 700 "$BOOTROOT_SECRETS_DIR" || true
-  chmod -R 755 certs || true
-fi
-
 # --- Monitoring Integration Test ---
 echo "[test-core] monitoring integration test"
 cargo test --test monitoring_integration
 
-# --- Start Services ---
-echo "[test-core] starting compose stack"
-docker compose "${COMPOSE_FILES[@]}" up --build -d
-echo "[test-core] waiting for services"
-sleep 10
+# --- Install Infrastructure ---
+echo "[test-core] installing infrastructure"
+cargo run --bin bootroot -- infra install
 
-# --- CLI Infra Up ---
-echo "[test-core] CLI infra up (smoke)"
-docker compose "${COMPOSE_FILES[@]}" build step-ca bootroot-http01
-cargo run --bin bootroot -- infra up
+# --- Zero-config Init (answer n, no show-secrets) ---
+echo "[test-core] zero-config init (answer n, no show-secrets)"
+BOOTROOT_LANG=en printf "n\n" | cargo run --bin bootroot -- init \
+  --enable auto-generate \
+  --http-hmac "dev-hmac" \
+  --secrets-dir "$BOOTROOT_SECRETS_DIR" \
+  --responder-url "http://localhost:8080" \
+  --skip responder-check 2>&1 | tee zero-config-init.log
+
+if ! grep -q "unseal key" zero-config-init.log; then
+  echo "FAIL: unseal keys not shown when declining save"
+  exit 1
+fi
+echo "PASS: unseal keys displayed in cleartext after declining save"
+
+# --- Clean and Reinstall ---
+echo "[test-core] clean and reinstall"
+cargo run --bin bootroot -- clean -y
+cargo run --bin bootroot -- infra install
 
 # --- CLI Init ---
 echo "[test-core] CLI init (smoke)"
 BOOTROOT_LANG=en printf "y\ny\ny\nn\n" | cargo run --bin bootroot -- init \
   --enable auto-generate,show-secrets \
   --http-hmac "dev-hmac" \
-  --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
   --secrets-dir "$BOOTROOT_SECRETS_DIR" \
   --responder-url "http://localhost:8080" \
   --skip responder-check | tee cli-init.log

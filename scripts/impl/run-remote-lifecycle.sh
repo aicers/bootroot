@@ -103,10 +103,6 @@ ensure_prerequisites() {
   [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent binary not executable: $BOOTROOT_AGENT_BIN"
 }
 
-ensure_compose_images() {
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" build step-ca bootroot-http01 >>"$RUN_LOG" 2>&1
-}
-
 compose_down() {
   docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
 }
@@ -188,31 +184,10 @@ reset_stepca_materials_for_e2e() {
   rm -rf "$SECRETS_DIR/config" "$SECRETS_DIR/certs" "$SECRETS_DIR/db" "$SECRETS_DIR/secrets"
 }
 
-prepare_test_ca_materials() {
-  mkdir -p "$SECRETS_DIR" "$REMOTE_CERTS_DIR"
-  chmod 700 "$SECRETS_DIR" "$REMOTE_CERTS_DIR"
-  local uid gid
-  uid="$(id -u)"
-  gid="$(id -g)"
-
-  if [ ! -f "$SECRETS_DIR/password.txt" ]; then
-    printf '%s\n' "password" >"$SECRETS_DIR/password.txt"
-    chmod 600 "$SECRETS_DIR/password.txt"
-  fi
-
-  if [ ! -f "$SECRETS_DIR/config/ca.json" ]; then
-    docker run --user "${uid}:${gid}" --rm -v "$SECRETS_DIR:/home/step" smallstep/step-ca \
-      step ca init \
-      --name "Bootroot E2E CA" \
-      --provisioner "admin" \
-      --dns "localhost,bootroot-ca,stepca.internal" \
-      --address ":9000" \
-      --password-file /home/step/password.txt \
-      --provisioner-password-file /home/step/password.txt \
-      --acme >>"$RUN_LOG" 2>&1
-  fi
-
-  [ -r "$SECRETS_DIR/config/ca.json" ] || fail "secrets/config/ca.json is not readable"
+install_infra() {
+  mkdir -p "$REMOTE_CERTS_DIR"
+  chmod 700 "$REMOTE_CERTS_DIR"
+  run_bootroot_control infra install --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
 }
 
 wait_for_openbao_api() {
@@ -260,18 +235,9 @@ wait_for_responder_admin() {
 }
 
 run_bootstrap_chain() {
-  log_phase "infra-up"
-  local attempt
-  for attempt in $(seq 1 "$INFRA_UP_ATTEMPTS"); do
-    if run_bootroot_control infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1; then
-      break
-    fi
-    if [ "$attempt" -eq "$INFRA_UP_ATTEMPTS" ]; then
-      fail "bootroot infra up failed after ${INFRA_UP_ATTEMPTS} attempts"
-    fi
-    sleep "$INFRA_UP_DELAY_SECS"
-  done
-
+  # Containers are already running from install_infra().  step-ca is
+  # expected to be restarting (no ca.json yet); init will bootstrap it.
+  # Only wait for the services that init needs.
   wait_for_postgres_admin
   wait_for_openbao_api
   wait_for_responder_admin
@@ -588,11 +554,10 @@ main() {
   trap 'on_error $LINENO' ERR
 
   ensure_prerequisites
-  ensure_compose_images
   configure_resolution_mode
   compose_down
   reset_stepca_materials_for_e2e
-  prepare_test_ca_materials
+  install_infra
 
   run_bootstrap_chain
   copy_remote_bootstrap_materials "$SERVICE_NAME"

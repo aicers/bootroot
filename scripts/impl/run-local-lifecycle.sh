@@ -103,10 +103,6 @@ ensure_prerequisites() {
   [ -x "$BOOTROOT_REMOTE_BIN" ] || fail "bootroot-remote binary not executable: $BOOTROOT_REMOTE_BIN"
 }
 
-ensure_compose_images() {
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" build step-ca bootroot-http01 >>"$RUN_LOG" 2>&1
-}
-
 run_bootroot() {
   (
     cd "$WORKSPACE_DIR"
@@ -312,30 +308,10 @@ http_responder_token_ttl_secs = 300
 EOF
 }
 
-prepare_test_ca_materials() {
-  mkdir -p "$SECRETS_DIR" "$CERTS_DIR"
-  chmod 700 "$SECRETS_DIR" "$CERTS_DIR"
-  local uid gid
-  uid="$(id -u)"
-  gid="$(id -g)"
-  if [ ! -f "$SECRETS_DIR/password.txt" ]; then
-    printf '%s\n' "password" >"$SECRETS_DIR/password.txt"
-    chmod 600 "$SECRETS_DIR/password.txt"
-  fi
-
-  if [ ! -f "$SECRETS_DIR/config/ca.json" ]; then
-    docker run --user "${uid}:${gid}" --rm -v "$SECRETS_DIR:/home/step" smallstep/step-ca \
-      step ca init \
-      --name "Bootroot E2E CA" \
-      --provisioner "admin" \
-      --dns "localhost,bootroot-ca,stepca.internal" \
-      --address ":9000" \
-      --password-file /home/step/password.txt \
-      --provisioner-password-file /home/step/password.txt \
-      --acme >>"$RUN_LOG" 2>&1
-  fi
-
-  [ -r "$SECRETS_DIR/config/ca.json" ] || fail "secrets/config/ca.json is not readable"
+install_infra() {
+  mkdir -p "$CERTS_DIR"
+  chmod 700 "$CERTS_DIR"
+  run_bootroot infra install --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
 }
 
 reset_stepca_materials_for_e2e() {
@@ -352,22 +328,9 @@ reset_stepca_materials_for_e2e() {
 }
 
 run_bootstrap_chain() {
-  log_phase "infra-up"
-  if ! run_bootroot infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1; then
-    if ! wait_for_infra_ready; then
-      local attempt
-      for attempt in $(seq 1 "$INFRA_UP_ATTEMPTS"); do
-        if run_bootroot infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1; then
-          break
-        fi
-        if [ "$attempt" -eq "$INFRA_UP_ATTEMPTS" ]; then
-          fail "bootroot infra up failed after ${INFRA_UP_ATTEMPTS} attempts"
-        fi
-        sleep "$INFRA_UP_DELAY_SECS"
-      done
-    fi
-  fi
-
+  # Containers are already running from install_infra().  step-ca is
+  # expected to be restarting (no ca.json yet); init will bootstrap it.
+  # Only wait for the services that init needs.
   wait_for_postgres_admin
   wait_for_openbao_api
   wait_for_responder_admin
@@ -726,6 +689,16 @@ run_rotations_with_verification() {
   assert_fingerprint_changed "$REMOTE_SERVICE" "after-responder-hmac" "after-stepca-password"
 
   log_phase "rotate-db"
+  # Build admin DSN from ca.json so the password matches the current
+  # state (it may have been rotated by `init`).
+  local db_admin_dsn
+  db_admin_dsn="$(jq -r '.db.dataSource // empty' "$SECRETS_DIR/config/ca.json")"
+  if [ -z "${db_admin_dsn:-}" ]; then
+    db_admin_dsn="postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/stepca?sslmode=disable"
+  else
+    # Replace the Docker-internal host with localhost for host-side access.
+    db_admin_dsn="$(echo "$db_admin_dsn" | sed 's|@postgres:|@127.0.0.1:|')"
+  fi
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
     --openbao-url "http://${STEPCA_HOST_IP}:8200" \
@@ -734,7 +707,7 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     db \
-    --db-admin-dsn "postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/stepca?sslmode=disable" >>"$RUN_LOG" 2>&1
+    --db-admin-dsn "$db_admin_dsn" >>"$RUN_LOG" 2>&1
   wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
@@ -798,11 +771,10 @@ main() {
   trap 'on_error $LINENO' ERR
 
   ensure_prerequisites
-  ensure_compose_images
   configure_resolution_mode
   compose_down
   reset_stepca_materials_for_e2e
-  prepare_test_ca_materials
+  install_infra
   write_agent_config
   run_bootstrap_chain
   prepare_stepca_validation_targets

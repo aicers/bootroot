@@ -15,6 +15,7 @@ pub(crate) use ca_certs::{
     compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
 };
 pub(crate) use orchestrator::run_init;
+pub(crate) use prompts::prompt_yes_no;
 
 use super::types::EabCredentials;
 use crate::i18n::Messages;

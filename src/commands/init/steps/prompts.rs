@@ -51,7 +51,7 @@ pub(super) fn prompt_text_with_default(
     }
 }
 
-pub(super) fn prompt_yes_no(prompt: &str, messages: &Messages) -> Result<bool> {
+pub(crate) fn prompt_yes_no(prompt: &str, messages: &Messages) -> Result<bool> {
     let input = prompt_text(prompt, messages)?;
     let trimmed = input.trim().to_ascii_lowercase();
     Ok(trimmed == "y" || trimmed == "yes")

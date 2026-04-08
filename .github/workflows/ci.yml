@@ -121,9 +121,6 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      POSTGRES_PASSWORD: step-pass
-      GRAFANA_ADMIN_PASSWORD: admin
     steps:
       - uses: actions/checkout@v6
 
@@ -141,50 +138,46 @@ jobs:
       - name: Set secrets directory
         run: echo "BOOTROOT_SECRETS_DIR=$GITHUB_WORKSPACE/secrets" >> "$GITHUB_ENV"
 
-      - name: Initialize Test CA
-        run: |
-          mkdir -p "$BOOTROOT_SECRETS_DIR"
-          echo "password" > "$BOOTROOT_SECRETS_DIR/password.txt"
-          # Initialize step-ca configuration
-          docker run --user root --rm -v "$BOOTROOT_SECRETS_DIR:/home/step" smallstep/step-ca \
-            step ca init \
-            --name "Bootroot CI CA" \
-            --provisioner "admin" \
-            --dns "localhost,bootroot-ca" \
-            --address ":9000" \
-            --password-file /home/step/password.txt \
-            --provisioner-password-file /home/step/password.txt \
-            --acme
-
-      - name: Fix Permissions (for Docker mount)
-        run: |
-          mkdir -p "$BOOTROOT_SECRETS_DIR" certs
-          sudo chown -R "$USER":"$USER" "$BOOTROOT_SECRETS_DIR"
-          sudo chmod -R 700 "$BOOTROOT_SECRETS_DIR"
-          sudo chmod -R 755 certs
-
       - name: Monitoring Integration Test (E2E)
         run: cargo test --test monitoring_integration
 
-      - name: Start Services (Docker Compose)
-        run: docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d
+      - name: Build all binaries
+        run: cargo build --bins
 
-      - name: Wait for services
-        run: sleep 10
+      - name: Install Infrastructure
+        run: cargo run --bin bootroot -- infra install
 
-      - name: CLI Infra Up (Smoke)
+      - name: Zero-config Init (answer n, no show-secrets)
         run: |
-          docker compose -f docker-compose.yml -f docker-compose.test.yml build step-ca bootroot-http01
-          cargo run --bin bootroot -- infra up
+          BOOTROOT_LANG=en printf "n\n" | cargo run --bin bootroot -- init \
+            --enable auto-generate \
+            --http-hmac "dev-hmac" \
+            --secrets-dir "$BOOTROOT_SECRETS_DIR" \
+            --responder-url "http://localhost:8080" \
+            --eab-kid "dev-kid" \
+            --eab-hmac "dev-hmac" \
+            --skip responder-check 2>&1 | tee zero-config-init.log
+
+          if ! grep -q "unseal key" zero-config-init.log; then
+            echo "FAIL: unseal keys not shown when declining save"
+            exit 1
+          fi
+          echo "PASS: unseal keys displayed in cleartext after declining save"
+
+      - name: Clean and Reinstall
+        run: |
+          cargo run --bin bootroot -- clean -y
+          cargo run --bin bootroot -- infra install
 
       - name: CLI Init (Smoke)
         run: |
-          BOOTROOT_LANG=en printf "y\ny\ny\nn\n" | cargo run --bin bootroot -- init \
+          BOOTROOT_LANG=en printf "y\n" | cargo run --bin bootroot -- init \
             --enable auto-generate,show-secrets \
             --http-hmac "dev-hmac" \
-            --db-dsn "postgresql://step:step@127.0.0.1:5432/step" \
             --secrets-dir "$BOOTROOT_SECRETS_DIR" \
             --responder-url "http://localhost:8080" \
+            --eab-kid "dev-kid" \
+            --eab-hmac "dev-hmac" \
             --skip responder-check | tee cli-init.log
 
           ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' cli-init.log)"
@@ -239,30 +232,39 @@ jobs:
             --container-name web-app \
             --root-token "$OPENBAO_ROOT_TOKEN"
 
-          RESPONDER_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
-          if [ -z "${RESPONDER_IP:-}" ]; then
-            echo "Failed to read responder container IP"
-            exit 1
-          fi
-          docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
-          docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.web-app.web-01.trusted.domain' >> /etc/hosts"
+          cargo run --bin bootroot -- service add \
+            --service-name bootroot-agent \
+            --deploy-type daemon \
+            --hostname bootroot-agent \
+            --domain trusted.domain \
+            --agent-config "$(pwd)/tmp/agent.toml" \
+            --cert-path "$(pwd)/certs/bootroot-agent.crt" \
+            --key-path "$(pwd)/certs/bootroot-agent.key" \
+            --instance-id 001 \
+            --root-token "$OPENBAO_ROOT_TOKEN"
 
-          host="001.edge-proxy.edge-node-01.trusted.domain"
-          for attempt in {1..15}; do
-            if docker exec bootroot-ca bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${host}/80'" >/dev/null 2>&1; then
-              echo "Responder HTTP-01 is reachable from step-ca"
+          # Re-create the responder with Docker DNS aliases so step-ca
+          # can resolve challenge hostnames via Docker's internal DNS.
+          # Include the responder compose override written by init so the
+          # rendered config (with the correct HMAC) is preserved.
+          RESPONDER_OVERRIDE="$BOOTROOT_SECRETS_DIR/responder/docker-compose.responder.override.yml"
+          docker compose \
+            -f docker-compose.yml \
+            -f "$RESPONDER_OVERRIDE" \
+            -f docker-compose.test.yml \
+            up -d bootroot-http01
+
+          # Wait for step-ca to be healthy after the restart triggered
+          # by init's DB password rotation.
+          for i in {1..30}; do
+            if curl -k --fail -sS https://localhost:9000/health >/dev/null 2>&1; then
+              echo "step-ca is healthy"
               break
             fi
-            echo "Waiting for responder HTTP-01 (attempt ${attempt}/15)"
+            echo "Waiting for step-ca health (attempt ${i}/30)"
             sleep 1
           done
-          if ! docker exec bootroot-ca bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${host}/80'" >/dev/null 2>&1; then
-            echo "Responder HTTP-01 is not reachable from step-ca"
-            docker logs bootroot-http01
-            exit 1
-          fi
 
-          cargo build --bin bootroot-agent
           export PATH="$(pwd)/target/debug:$PATH"
 
           cargo run --bin bootroot -- verify \
@@ -271,6 +273,10 @@ jobs:
 
           cargo run --bin bootroot -- verify \
             --service-name web-app \
+            --agent-config "$(pwd)/tmp/agent.toml"
+
+          cargo run --bin bootroot -- verify \
+            --service-name bootroot-agent \
             --agent-config "$(pwd)/tmp/agent.toml"
 
       - name: Verify CA Health
@@ -287,27 +293,13 @@ jobs:
 
       - name: Verify Agent Success (E2E)
         run: |
-          for i in {1..6}; do
-            if docker logs bootroot-agent 2>&1 | grep -q "Successfully issued certificate"; then
-              echo "PASS: Certificate issued successfully"
-              exit 0
-            fi
-            if docker logs bootroot-agent 2>&1 | grep -q "Certificate issuance succeeded"; then
-              echo "PASS: Certificate issued successfully"
-              exit 0
-            fi
-            if [ -s certs/bootroot-agent.crt ] && [ -s certs/bootroot-agent.key ]; then
-              echo "PASS: Certificate files created"
-              exit 0
-            fi
-            echo "Waiting for certificate issuance..."
-            sleep 5
-          done
-
-          echo "FAIL: Certificate issue message not found"
-          echo "=== Agent Logs ==="
-          docker logs bootroot-agent
-          exit 1
+          if [ -s certs/bootroot-agent.crt ] && [ -s certs/bootroot-agent.key ]; then
+            echo "PASS: bootroot-agent certificate files created"
+          else
+            echo "FAIL: bootroot-agent certificate files not found"
+            ls -la certs/
+            exit 1
+          fi
 
       - name: Cleanup
         if: always()

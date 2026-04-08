@@ -32,11 +32,21 @@ pub(crate) enum CliCommand {
     Service(ServiceCommand),
     Verify(VerifyArgs),
     Rotate(RotateArgs),
+    Clean(CleanArgs),
+    #[command(subcommand)]
+    Openbao(OpenbaoCommand),
 }
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum InfraCommand {
     Up(InfraUpArgs),
+    Install(InfraInstallArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum OpenbaoCommand {
+    SaveUnsealKeys(OpenbaoSaveUnsealKeysArgs),
+    DeleteUnsealKeys(OpenbaoDeleteUnsealKeysArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -357,6 +367,56 @@ pub(crate) struct InfraUpArgs {
     /// Auto-unseal `OpenBao` from file (dev/test only)
     #[arg(long, env = "OPENBAO_UNSEAL_FILE")]
     pub(crate) openbao_unseal_from_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InfraInstallArgs {
+    #[command(flatten)]
+    pub(crate) compose_file: ComposeFileArgs,
+
+    /// Comma-separated list of services to start
+    #[arg(
+        long,
+        default_value = "openbao,postgres,step-ca,bootroot-http01",
+        value_delimiter = ','
+    )]
+    pub(crate) services: Vec<String>,
+
+    /// Directory containing local image archives (optional)
+    #[arg(long)]
+    pub(crate) image_archive_dir: Option<PathBuf>,
+
+    /// Docker restart policy to apply after containers start
+    #[arg(long, default_value = "always")]
+    pub(crate) restart_policy: String,
+
+    /// `OpenBao` API URL
+    #[arg(long, default_value = DEFAULT_OPENBAO_URL)]
+    pub(crate) openbao_url: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CleanArgs {
+    #[command(flatten)]
+    pub(crate) compose_file: ComposeFileArgs,
+
+    /// Skip confirmation prompts
+    #[arg(long, short)]
+    pub(crate) yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct OpenbaoSaveUnsealKeysArgs {
+    /// Secrets directory
+    #[arg(long, default_value = DEFAULT_SECRETS_DIR)]
+    pub(crate) secrets_dir: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct OpenbaoDeleteUnsealKeysArgs {
+    /// Secrets directory
+    #[arg(long, default_value = DEFAULT_SECRETS_DIR)]
+    pub(crate) secrets_dir: PathBuf,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -791,6 +851,63 @@ mod tests {
             }
             _ => panic!("expected init"),
         }
+    }
+
+    #[test]
+    fn test_cli_parses_infra_install() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "infra",
+            "install",
+            "--services",
+            "openbao,postgres",
+        ]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert_eq!(args.services, vec!["openbao", "postgres"]);
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_clean() {
+        let cli = Cli::parse_from(["bootroot", "clean", "--yes"]);
+        match cli.command {
+            CliCommand::Clean(args) => {
+                assert!(args.yes);
+            }
+            _ => panic!("expected clean"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_clean_short_yes() {
+        let cli = Cli::parse_from(["bootroot", "clean", "-y"]);
+        match cli.command {
+            CliCommand::Clean(args) => {
+                assert!(args.yes);
+            }
+            _ => panic!("expected clean"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_openbao_save_unseal_keys() {
+        let cli = Cli::parse_from(["bootroot", "openbao", "save-unseal-keys"]);
+        assert!(matches!(
+            cli.command,
+            CliCommand::Openbao(OpenbaoCommand::SaveUnsealKeys(_))
+        ));
+    }
+
+    #[test]
+    fn test_cli_parses_openbao_delete_unseal_keys() {
+        let cli = Cli::parse_from(["bootroot", "openbao", "delete-unseal-keys"]);
+        assert!(matches!(
+            cli.command,
+            CliCommand::Openbao(OpenbaoCommand::DeleteUnsealKeys(_))
+        ));
     }
 
     #[test]

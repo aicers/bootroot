@@ -12,3 +12,4 @@ site/
 site-pdf-*/
 tmp/
 state.json
+.env

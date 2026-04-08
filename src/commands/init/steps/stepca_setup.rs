@@ -1,4 +1,5 @@
 use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -151,10 +152,15 @@ pub(super) fn ensure_step_ca_initialized(
     let mount_root = std::fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let mount = format!("{}:/home/step", mount_root.display());
+    // Run as the owner of secrets_dir so generated files match the
+    // host ownership, avoiding permission errors when fixing modes.
+    let meta = std::fs::metadata(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let user_arg = format!("{}:{}", meta.uid(), meta.gid());
     let args = vec![
         "run",
         "--user",
-        "root",
+        &user_arg,
         "--rm",
         "-v",
         &*mount,

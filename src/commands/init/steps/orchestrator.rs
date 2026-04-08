@@ -29,13 +29,14 @@ use super::stepca_setup::{
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
 use crate::commands::guardrails::ensure_all_services_localhost_binding;
-use crate::commands::infra::ensure_infra_ready;
+use crate::commands::infra::{ensure_init_prereqs_ready, run_docker};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
     ensure_all_services_localhost_binding(&args.compose.compose_file, messages)?;
-    ensure_infra_ready(&args.compose.compose_file, messages)?;
+    // Only check openbao + postgres; step-ca may not be bootstrapped yet.
+    ensure_init_prereqs_ready(&args.compose.compose_file, messages)?;
 
     let mut client = OpenBaoClient::new(&args.openbao.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
@@ -53,6 +54,17 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
                 write_init_summary_json(summary_json, &summary).await?;
             }
             print_init_summary(&summary, messages);
+
+            // Prompt to save unseal keys if they were just generated.
+            if summary.init_response && !summary.unseal_keys.is_empty() {
+                maybe_save_unseal_keys(
+                    &args.secrets_dir.secrets_dir,
+                    &summary.unseal_keys,
+                    messages,
+                )
+                .await?;
+            }
+
             Ok(())
         }
         Err(err) => {
@@ -114,6 +126,12 @@ async fn run_init_inner(
         confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
     }
 
+    // Load .env into the process environment so that
+    // `build_admin_dsn_from_env()` and `build_dsn_from_env()` can discover
+    // the temporary POSTGRES_PASSWORD written by `infra install`.
+    let compose_dir = args.compose.compose_file.parent().unwrap_or(Path::new("."));
+    crate::commands::dotenv::load_dotenv_into_env(&compose_dir.join(".env"), messages)?;
+
     let (db_dsn, db_dsn_normalization) = resolve_db_dsn_for_init(args, messages).await?;
     let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
     let db_info = parse_db_dsn(&secrets.db_dsn)
@@ -137,11 +155,33 @@ async fn run_init_inner(
     } = configure_openbao(client, args, &secrets, rollback, messages).await?;
 
     let secrets_dir = args.secrets_dir.secrets_dir.clone();
+
+    // Write password.txt first - step-ca init needs it.
     rollback.password_backup = Some(
         write_password_file_with_backup(&secrets_dir, &secrets.stepca_password, messages).await?,
     );
+
+    // Bootstrap step-ca if not already initialized. This creates ca.json
+    // and keys inside secrets/config/ and secrets/secrets/.  Must run
+    // before update_ca_json_with_backup and write_stepca_templates, which
+    // both read ca.json.
+    let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
+    if step_ca_result == super::super::types::StepCaInitResult::Initialized {
+        // Fix ownership: step-ca init may create files with different
+        // ownership.  Re-apply correct perms before anything reads them.
+        fix_secrets_permissions(&secrets_dir).await?;
+    }
+
     rollback.ca_json_backup =
         Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn, messages).await?);
+
+    if step_ca_result == super::super::types::StepCaInitResult::Initialized {
+        // Restart step-ca after ca.json is patched with the DB DSN so it
+        // loads the fully configured file on first boot.
+        let compose_str = args.compose.compose_file.to_string_lossy();
+        let restart_args = ["compose", "-f", &*compose_str, "restart", "step-ca"];
+        let _ = run_docker(&restart_args, "docker compose restart step-ca", messages);
+    }
     let stepca_templates =
         write_stepca_templates(&secrets_dir, &args.openbao.kv_mount, messages).await?;
     let responder_paths = write_responder_files(
@@ -171,8 +211,6 @@ async fn run_init_inner(
     if let Some(override_path) = responder_compose_override.as_ref() {
         apply_responder_compose_override(&args.compose.compose_file, override_path, messages)?;
     }
-
-    let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
     let _trust_changed = write_ca_trust_fingerprints_with_retry(
         client,
         &args.openbao.kv_mount,
@@ -198,6 +236,19 @@ async fn run_init_inner(
         messages,
     )?;
 
+    // Rotate the temporary POSTGRES_PASSWORD from .env (written by
+    // `infra install`) before building the summary so that the emitted
+    // DB DSN reflects the real, post-rotation password.
+    let effective_db_dsn = maybe_rotate_env_db_password(
+        &args.compose.compose_file,
+        &args.openbao.kv_mount,
+        client,
+        &args.secrets_dir.secrets_dir,
+        messages,
+    )
+    .await?
+    .unwrap_or(secrets.db_dsn);
+
     Ok(InitSummary {
         openbao_url: args.openbao.openbao_url.clone(),
         kv_mount: args.openbao.kv_mount.clone(),
@@ -208,7 +259,7 @@ async fn run_init_inner(
         unseal_keys: bootstrap.unseal_keys,
         approles: role_outputs,
         stepca_password: secrets.stepca_password,
-        db_dsn: secrets.db_dsn,
+        db_dsn: effective_db_dsn,
         db_dsn_host_original: db_dsn_normalization.original_host,
         db_dsn_host_effective: db_dsn_normalization.effective_host,
         http_hmac: secrets.http_hmac,
@@ -223,6 +274,196 @@ async fn run_init_inner(
         openbao_agent_override_path: openbao_agent_paths.compose_override_path,
         db_check,
     })
+}
+
+async fn maybe_save_unseal_keys(
+    secrets_dir: &Path,
+    keys: &[String],
+    messages: &Messages,
+) -> Result<()> {
+    use super::prompts::prompt_yes_no;
+    if prompt_yes_no(messages.prompt_save_unseal_keys(), messages)? {
+        let path =
+            crate::commands::openbao_unseal::save_unseal_keys(secrets_dir, keys, messages).await?;
+        println!(
+            "{}",
+            messages.openbao_unseal_keys_saved(&path.display().to_string())
+        );
+    } else {
+        // User declined saving — display the keys in cleartext so they
+        // can be copied for manual safekeeping.
+        eprintln!("{}", messages.openbao_unseal_keys_not_saved_warning());
+        for (idx, key) in keys.iter().enumerate() {
+            println!("{}", messages.summary_unseal_key(idx + 1, key));
+        }
+    }
+    Ok(())
+}
+
+/// Rotates the temporary `POSTGRES_PASSWORD` from `.env` and returns
+/// the new DSN on success, or `None` if rotation was skipped.
+#[allow(clippy::too_many_lines)]
+async fn maybe_rotate_env_db_password(
+    compose_file: &Path,
+    kv_mount: &str,
+    client: &OpenBaoClient,
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<Option<String>> {
+    use crate::commands::dotenv::{read_dotenv, update_dotenv_key};
+    use crate::commands::init::PATH_STEPCA_DB;
+
+    // Docker Compose reads .env from the compose file's directory.
+    let compose_dir = compose_file.parent().unwrap_or(Path::new("."));
+    let env_path = compose_dir.join(".env");
+    if !env_path.exists() {
+        return Ok(None);
+    }
+
+    let Ok(env_map) = read_dotenv(&env_path, messages) else {
+        return Ok(None);
+    };
+
+    let Some(env_file_password) = env_map.get("POSTGRES_PASSWORD") else {
+        return Ok(None);
+    };
+
+    // If the password looks like it was already rotated, skip.
+    if env_file_password.starts_with("rotated-") {
+        return Ok(None);
+    }
+
+    // Docker Compose prefers process environment over .env when both
+    // are present.  Use the same source so the admin DSN connects
+    // with the password PostgreSQL was actually started with.
+    let temp_password = std::env::var("POSTGRES_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| env_file_password.clone());
+
+    // Read the current DB DSN from ca.json (if it exists).
+    let ca_json_path = secrets_dir.join("config").join("ca.json");
+    if !ca_json_path.exists() {
+        return Ok(None);
+    }
+    let Ok(ca_json_contents) = tokio::fs::read_to_string(&ca_json_path).await else {
+        return Ok(None);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&ca_json_contents) else {
+        return Ok(None);
+    };
+    let current_dsn = match value
+        .get("db")
+        .and_then(|db| db.get("dataSource"))
+        .and_then(|ds| ds.as_str())
+    {
+        Some(dsn) => dsn.to_string(),
+        None => return Ok(None),
+    };
+
+    // Parse current DSN, generate new password, rotate.
+    let Ok(parsed) = bootroot::db::parse_db_dsn(&current_dsn) else {
+        return Ok(None);
+    };
+
+    let new_password = bootroot::utils::generate_secret(crate::commands::init::SECRET_BYTES)
+        .with_context(|| messages.error_generate_secret_failed())?;
+
+    let admin_dsn = bootroot::db::build_db_dsn(
+        "step",
+        &temp_password,
+        "localhost",
+        parsed.port,
+        "postgres",
+        Some("disable"),
+    );
+
+    let user_clone = parsed.user.clone();
+    let password_clone = new_password.clone();
+    let database_clone = parsed.database.clone();
+    let admin_dsn_clone = admin_dsn.clone();
+    let timeout = std::time::Duration::from_secs(5);
+
+    let provision_result = tokio::task::spawn_blocking(move || {
+        bootroot::db::provision_db_sync(
+            &admin_dsn_clone,
+            &user_clone,
+            &password_clone,
+            &database_clone,
+            timeout,
+        )
+    })
+    .await;
+
+    if provision_result.is_err() || matches!(&provision_result, Ok(Err(_))) {
+        eprintln!("{}", messages.warning_db_password_rotation_skipped());
+        return Ok(None);
+    }
+
+    let new_dsn = bootroot::db::build_db_dsn(
+        &parsed.user,
+        &new_password,
+        &parsed.host,
+        parsed.port,
+        &parsed.database,
+        parsed.sslmode.as_deref(),
+    );
+
+    // Write new DSN to OpenBao KV.
+    client
+        .write_kv(
+            kv_mount,
+            PATH_STEPCA_DB,
+            serde_json::json!({ "value": new_dsn }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
+
+    // Patch ca.json directly so step-ca uses the new password on next
+    // restart.  The OpenBao Agent template will eventually overwrite
+    // this, but patching now avoids a window where step-ca would boot
+    // with the old (now-invalid) password.
+    if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&ca_json_contents) {
+        doc["db"]["dataSource"] = serde_json::Value::String(new_dsn.clone());
+        if let Ok(updated) = serde_json::to_string_pretty(&doc) {
+            let _ = tokio::fs::write(&ca_json_path, updated).await;
+        }
+    }
+
+    // Overwrite .env with a dummy password so docker compose doesn't error.
+    update_dotenv_key(
+        &env_path,
+        "POSTGRES_PASSWORD",
+        "rotated-use-openbao",
+        messages,
+    )?;
+
+    // Restart step-ca to pick up the new DSN from the patched ca.json.
+    let compose_str = compose_file.to_string_lossy();
+    let restart_args = ["compose", "-f", &*compose_str, "restart", "step-ca"];
+    let _ = run_docker(&restart_args, "docker compose restart step-ca", messages);
+
+    Ok(Some(new_dsn))
+}
+
+/// Fixes file ownership and permissions in the secrets directory after
+/// `step ca init` which runs as root inside Docker.
+async fn fix_secrets_permissions(secrets_dir: &Path) -> Result<()> {
+    fix_permissions_recursive(secrets_dir).await
+}
+
+async fn fix_permissions_recursive(dir: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_dir() {
+            fs_util::ensure_secrets_dir(&path).await?;
+            Box::pin(fix_permissions_recursive(&path)).await?;
+        } else if path.is_file() {
+            fs_util::set_key_permissions(&path).await?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn write_state_file(

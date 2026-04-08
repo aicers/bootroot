@@ -25,8 +25,11 @@ Open source dependencies:
 
 ## Architecture Summary
 
-- **Single-machine default**: `bootroot infra up` starts OpenBao, PostgreSQL,
-  step-ca, and the HTTP-01 responder with Docker Compose on the step-ca host.
+- **Single-machine default**: `bootroot infra install` performs first-time
+  setup (generates `.env`, creates `secrets/` and `certs/` directories, and
+  brings up Docker Compose with `--build`). `bootroot init` then bootstraps
+  OpenBao, step-ca, and rotates the DB password. `bootroot infra up` restarts
+  an already-configured environment.
 - **Monitoring**: Prometheus scrapes step-ca/OpenBao metrics and Grafana
   visualizes them for local ops.
 - **Service onboarding**: `bootroot service add` registers service metadata,
@@ -53,22 +56,24 @@ The `bootroot-http01-responder` binary now lives under
 
 See `docs/en/cli.md` (EN) or `docs/ko/cli.md` (KO) for the full flow.
 
-Before `bootroot infra up`, set `POSTGRES_PASSWORD` in `.env` or export it in
-your shell. The full setup is documented in
+The full setup is documented in
 [`docs/en/installation.md`](docs/en/installation.md) and
 [`docs/ko/installation.md`](docs/ko/installation.md).
 
-Typical sequence:
+Typical first-time sequence:
 
 ```bash
-export POSTGRES_PASSWORD=step-pass
-bootroot infra up
-bootroot init
+bootroot infra install          # first-time setup
+bootroot init                   # step-ca bootstrap (automatic)
 bootroot service add
 bootroot verify
 bootroot rotate ...
 bootroot monitoring up|status|down
 ```
+
+After the initial install, use `bootroot infra up` to restart the
+already-configured environment. Use `bootroot clean` to tear down everything
+for a fresh start.
 
 ## Documentation
 
