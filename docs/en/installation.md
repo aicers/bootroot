@@ -181,15 +181,9 @@ Selection guide:
 - Production / security first: `verify-full`
 - Internal test or lab: `require`
 
-In local Compose using the manual path (not needed when using
-`bootroot infra install`), set `.env` and run:
-
-```bash
-scripts/impl/update-ca-db-dsn.sh
-```
-
-This script reads `POSTGRES_*` from `.env` and updates `db.type` and
-`db.dataSource` in `secrets/config/ca.json`.
+When using `bootroot infra install` followed by `bootroot init
+--enable db-provision`, the DB DSN is written to `secrets/config/ca.json`
+automatically.
 
 ### Single-Host Guardrails
 

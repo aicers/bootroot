@@ -29,6 +29,7 @@ pub(super) static STRINGS: Strings = Strings {
     prompt_openbao_root_token: "OpenBao root token: ",
     error_openbao_root_token_required: "OpenBao root token is required",
     warning_openbao_unseal_from_file: "WARNING: Auto-unseal from file is for dev/test only and unsafe for production.",
+    warning_openbao_sealed_non_interactive: "WARNING: OpenBao is sealed but stdin is not interactive. Supply --openbao-unseal-from-file or run `bootroot openbao save-unseal-keys` first.",
     warning_db_password_rotation_skipped: "WARNING: DB password rotation skipped; run `bootroot rotate db` later to rotate manually.",
     prompt_openbao_unseal_from_file_confirm: "Proceed with auto-unseal from file {value}? [y/N]: ",
     error_openbao_unseal_file_empty: "Unseal key file is empty: {value}",

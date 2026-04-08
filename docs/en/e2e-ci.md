@@ -126,20 +126,20 @@ Execution steps:
 Actual commands (script excerpt):
 
 ```bash
-# 1) infra-up
-bootroot infra up --compose-file "$COMPOSE_FILE"
+# 1) infra-install (generates .env, starts containers)
+bootroot infra install --compose-file "$COMPOSE_FILE"
 
 # 2) init
-# POSTGRES_ADMIN_DSN should point to the local PostgreSQL admin DSN.
-BOOTROOT_LANG=en printf "y\ny\ny\n" | bootroot init \
+# DB credentials are read from .env created by infra install.
+# POSTGRES_HOST and POSTGRES_PORT are set by the script so that
+# build_admin_dsn_from_env() connects via the host-mapped port.
+BOOTROOT_LANG=en printf "y\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets,db-provision \
   --stepca-url "$STEPCA_EAB_URL" \
-  --db-admin-dsn "$POSTGRES_ADMIN_DSN" \
   --db-user "step" \
-  --db-password "step-pass" \
   --db-name "stepca" \
   --responder-url "$RESPONDER_URL"
 
@@ -247,8 +247,8 @@ Execution steps:
 Actual commands (script excerpt):
 
 ```bash
-# control node: infra-up / init / service-add
-bootroot infra up --compose-file "$COMPOSE_FILE"
+# control node: infra-install / init / service-add
+bootroot infra install --compose-file "$COMPOSE_FILE"
 BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \

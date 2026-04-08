@@ -62,7 +62,8 @@ RUNTIME_ROTATE_SECRET_ID=""
 SIDECAR_OBA_SERVICE="$WEB_SERVICE"
 SIDECAR_OBA_CONTAINER="bootroot-openbao-agent-${SIDECAR_OBA_SERVICE}"
 CURRENT_PHASE="init"
-POSTGRES_ADMIN_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+export POSTGRES_HOST="127.0.0.1"
+export POSTGRES_PORT="${POSTGRES_HOST_PORT:-5432}"
 
 # ---------------------------------------------------------------------------
 # Core helpers
@@ -272,16 +273,27 @@ wait_for_stepca_health() {
   fail "step-ca health endpoint did not become ready"
 }
 
-wire_stepca_hosts() {
-  local responder_ip
-  responder_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
-  [ -n "${responder_ip:-}" ] || fail "Failed to resolve responder container IP"
-  docker exec bootroot-ca sh -c \
-    "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${EDGE_SERVICE}.${EDGE_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
-  docker exec bootroot-ca sh -c \
-    "printf '%s %s\n' '$responder_ip' '${INSTANCE_ID}.${WEB_SERVICE}.${WEB_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
-  docker exec bootroot-ca sh -c \
-    "printf '%s %s\n' '$responder_ip' '${REMOTE_INSTANCE_ID}.${REMOTE_SERVICE}.${REMOTE_HOSTNAME}.${DOMAIN}' >> /etc/hosts"
+apply_dns_aliases() {
+  local override="$ARTIFACT_DIR/docker-compose.dns-aliases.yml"
+  cat >"$override" <<YAML
+services:
+  bootroot-http01:
+    networks:
+      default:
+        aliases:
+          - ${INSTANCE_ID}.${EDGE_SERVICE}.${EDGE_HOSTNAME}.${DOMAIN}
+          - ${INSTANCE_ID}.${WEB_SERVICE}.${WEB_HOSTNAME}.${DOMAIN}
+          - ${REMOTE_INSTANCE_ID}.${REMOTE_SERVICE}.${REMOTE_HOSTNAME}.${DOMAIN}
+YAML
+  # Include the responder compose override (written by bootroot init) so
+  # that recreating bootroot-http01 preserves both the rendered config
+  # mount and the DNS aliases.
+  local responder_override="$SECRETS_DIR/responder/docker-compose.responder.override.yml"
+  local -a compose_args=(-f "$COMPOSE_FILE" -f "$override")
+  if [ -f "$responder_override" ]; then
+    compose_args+=(-f "$responder_override")
+  fi
+  docker compose "${compose_args[@]}" up -d bootroot-http01 >>"$RUN_LOG" 2>&1
 }
 
 wait_for_stepca_http01_targets() {
@@ -453,30 +465,22 @@ EOF
 install_infra() {
   mkdir -p "$CERTS_DIR"
   chmod 700 "$CERTS_DIR"
+  # Remove stale .env so infra install generates a fresh bootstrap password.
+  rm -f "$ROOT_DIR/.env"
   run_bootroot infra install --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
 }
 
 reset_stepca_materials_for_e2e() {
   if [ "${RESET_STEPCA_MATERIALS:-1}" != "1" ]; then return 0; fi
   rm -rf "$SECRETS_DIR/config" "$SECRETS_DIR/certs" "$SECRETS_DIR/db" \
-    "$SECRETS_DIR/secrets" "$SECRETS_DIR/password.txt" "$SECRETS_DIR/password.txt.new"
+    "$SECRETS_DIR/secrets" "$SECRETS_DIR/openbao" \
+    "$SECRETS_DIR/password.txt" "$SECRETS_DIR/password.txt.new"
 }
 
 run_bootstrap_chain() {
-  log_phase "infra-up"
-  if ! run_bootroot infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1; then
-    if ! wait_for_infra_ready; then
-      local attempt
-      for attempt in $(seq 1 "$INFRA_UP_ATTEMPTS"); do
-        if run_bootroot infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1; then break; fi
-        if [ "$attempt" -eq "$INFRA_UP_ATTEMPTS" ]; then
-          fail "bootroot infra up failed after ${INFRA_UP_ATTEMPTS} attempts"
-        fi
-        sleep "$INFRA_UP_DELAY_SECS"
-      done
-    fi
-  fi
-
+  # Containers are already running from install_infra().  step-ca is
+  # expected to be restarting (no ca.json yet); init will bootstrap it.
+  # Only wait for the services that init needs.
   wait_for_postgres_admin
   wait_for_openbao_api
   wait_for_responder_admin
@@ -494,9 +498,7 @@ run_bootstrap_chain() {
     --http-hmac "dev-hmac" \
     --eab-kid "dev-kid" \
     --eab-hmac "dev-hmac" \
-    --db-admin-dsn "postgresql://step:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
     --db-user "step" \
-    --db-password "step-pass" \
     --db-name "stepca" \
     --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then
     {
@@ -606,7 +608,6 @@ scenario_1_phase3_failure() {
 
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
-  wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "s1-after"
@@ -659,7 +660,6 @@ scenario_2_phase4_failure() {
   # Resume rotation from the crashed state
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
-  wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "s2-after"
@@ -689,7 +689,6 @@ scenario_3_partial_reissuance() {
   [ -f "$WORKSPACE_DIR/rotation-state.json" ] || fail "S3: rotation-state.json should exist"
 
   # Manually reissue only edge-proxy (1 of 2 LocalFile services)
-  wire_stepca_hosts
   force_reissue_for_service "$EDGE_SERVICE"
   verify_service_with_retry "$EDGE_SERVICE"
 
@@ -735,7 +734,6 @@ scenario_4_finalize_blocked() {
   # Re-run with --force → Phase 6 forces despite unmigrated services
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
-  wire_stepca_hosts
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "s4-after"
@@ -778,7 +776,6 @@ scenario_5_trustsync_conflict() {
 
   # Complete the rotation with --force --cleanup (skip-reissue because
   # there is no running daemon for the Daemon-type service).
-  wire_stepca_hosts
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
   run_remote_bootstrap
@@ -803,7 +800,7 @@ main() {
   install_infra
   write_agent_config
   run_bootstrap_chain
-  wire_stepca_hosts
+  apply_dns_aliases
   wait_for_stepca_http01_targets
   wait_for_stepca_health
 

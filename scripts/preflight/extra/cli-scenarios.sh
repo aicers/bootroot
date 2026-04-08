@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 INIT_SUMMARY_JSON="$ROOT_DIR/tmp/cli-init-summary.json"
-POSTGRES_ADMIN_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+export POSTGRES_HOST="127.0.0.1"
+export POSTGRES_PORT="${POSTGRES_HOST_PORT:-5432}"
 
 log() {
   printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"
@@ -65,7 +66,7 @@ run_init_scenario() {
   reset_openbao
 
   log "Cleaning local secrets and outputs"
-  rm -rf "$ROOT_DIR/secrets" "$ROOT_DIR/certs" "$ROOT_DIR/tmp" "$ROOT_DIR/state.json"
+  rm -rf "$ROOT_DIR/secrets" "$ROOT_DIR/certs" "$ROOT_DIR/tmp" "$ROOT_DIR/state.json" "$ROOT_DIR/.env"
   mkdir -p "$ROOT_DIR/tmp"
 
   local responder_hmac
@@ -80,9 +81,7 @@ run_init_scenario() {
     --enable auto-generate,show-secrets,db-provision \
     --summary-json "$INIT_SUMMARY_JSON" \
     --http-hmac "$responder_hmac" \
-    --db-admin-dsn "postgresql://step:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
     --db-user "step" \
-    --db-password "step-pass" \
     --db-name "stepca" \
     --responder-url "http://localhost:8080" \
     --skip responder-check | tee "$ROOT_DIR/tmp/cli-init.log"
@@ -101,16 +100,19 @@ run_init_scenario() {
   wait_for_stepca_directory
 }
 
-add_stepca_host_aliases() {
-  local responder_ip
-  responder_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
-  if [[ -z "${responder_ip:-}" ]]; then
-    fail "Failed to read responder container IP"
-  fi
-
-  log "Injecting responder host aliases into step-ca"
-  docker exec bootroot-ca sh -c "printf '%s %s\n' '$responder_ip' '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
-  docker exec bootroot-ca sh -c "printf '%s %s\n' '$responder_ip' '001.web-app.web-01.trusted.domain' >> /etc/hosts"
+apply_dns_aliases() {
+  log "Applying DNS aliases for HTTP-01 validation"
+  local override="$ROOT_DIR/tmp/docker-compose.dns-aliases.yml"
+  cat >"$override" <<'YAML'
+services:
+  bootroot-http01:
+    networks:
+      default:
+        aliases:
+          - 001.edge-proxy.edge-node-01.trusted.domain
+          - 001.web-app.web-01.trusted.domain
+YAML
+  docker compose -f "$ROOT_DIR/docker-compose.yml" -f "$override" up -d bootroot-http01
 }
 
 wait_for_responder_http01() {
@@ -215,7 +217,7 @@ run_service_scenarios() {
     --approle-role-id "$runtime_service_add_role_id" \
     --approle-secret-id "$runtime_service_add_secret_id"
 
-  add_stepca_host_aliases
+  apply_dns_aliases
   wait_for_responder_http01
   wait_for_stepca_directory
 

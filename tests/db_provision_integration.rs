@@ -8,10 +8,10 @@ mod unix_integration {
 
     use anyhow::{Context, Result};
     use bootroot::db::{DbProvisionReport, provision_db_sync};
+    use bootroot::utils::generate_secret;
     use postgres::NoTls;
 
     const DB_USER: &str = "itest";
-    const DB_PASSWORD: &str = "itest-pass";
     const DB_NAME: &str = "postgres";
     const PROVISION_DB_USER: &str = "stepca_user";
     const PROVISION_DB_NAME: &str = "stepca_db";
@@ -49,6 +49,7 @@ mod unix_integration {
     struct PostgresContainer {
         name: String,
         port: u16,
+        admin_password: String,
     }
 
     impl Drop for PostgresContainer {
@@ -63,6 +64,8 @@ mod unix_integration {
         fn start() -> Result<Self> {
             let name = format!("bootroot-db-provision-itest-{}", unique_suffix());
             let port = reserve_local_port()?;
+            let admin_password =
+                generate_secret(16).context("Failed to generate test admin password")?;
             let port_mapping = format!("127.0.0.1:{port}:5432");
             let output = run_command(docker_command(&[
                 "run",
@@ -73,7 +76,7 @@ mod unix_integration {
                 "-e",
                 &format!("POSTGRES_USER={DB_USER}"),
                 "-e",
-                &format!("POSTGRES_PASSWORD={DB_PASSWORD}"),
+                &format!("POSTGRES_PASSWORD={admin_password}"),
                 "-e",
                 &format!("POSTGRES_DB={DB_NAME}"),
                 "-p",
@@ -84,15 +87,19 @@ mod unix_integration {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 anyhow::bail!("Failed to start postgres container: {stderr}");
             }
-            let container = Self { name, port };
+            let container = Self {
+                name,
+                port,
+                admin_password,
+            };
             container.wait_until_ready()?;
             Ok(container)
         }
 
         fn admin_dsn(&self) -> String {
             format!(
-                "postgresql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:{}/{}?sslmode=disable",
-                self.port, DB_NAME
+                "postgresql://{DB_USER}:{}@127.0.0.1:{}/{}?sslmode=disable",
+                self.admin_password, self.port, DB_NAME
             )
         }
 

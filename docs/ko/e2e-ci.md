@@ -122,20 +122,20 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 실제 실행 명령(스크립트 발췌):
 
 ```bash
-# 1) infra-up
-bootroot infra up --compose-file "$COMPOSE_FILE"
+# 1) infra-install (.env 생성, 컨테이너 시작)
+bootroot infra install --compose-file "$COMPOSE_FILE"
 
 # 2) init
-# POSTGRES_ADMIN_DSN은 로컬 PostgreSQL admin DSN을 가리켜야 합니다.
-BOOTROOT_LANG=en printf "y\ny\ny\n" | bootroot init \
+# DB 자격 증명은 infra install이 생성한 .env에서 자동으로 읽힙니다.
+# POSTGRES_HOST와 POSTGRES_PORT는 스크립트에서 설정하여
+# host-mapped 포트를 통해 연결합니다.
+BOOTROOT_LANG=en printf "y\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets,db-provision \
   --stepca-url "$STEPCA_EAB_URL" \
-  --db-admin-dsn "$POSTGRES_ADMIN_DSN" \
   --db-user "step" \
-  --db-password "step-pass" \
   --db-name "stepca" \
   --responder-url "$RESPONDER_URL"
 
@@ -243,8 +243,8 @@ sudo -n cp "$tmp_file" /etc/hosts
 실제 실행 명령(스크립트 발췌):
 
 ```bash
-# control node: infra-up / init / service-add
-bootroot infra up --compose-file "$COMPOSE_FILE"
+# control node: infra-install / init / service-add
+bootroot infra install --compose-file "$COMPOSE_FILE"
 BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \

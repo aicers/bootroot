@@ -15,8 +15,8 @@ mod unix_integration {
 
     use super::support::{
         ROOT_TOKEN, create_secrets_dir, expect_rollback_deletes, stub_openbao, stub_openbao_sealed,
-        stub_openbao_unseal_failure, stub_openbao_with_write_failure, write_fake_docker,
-        write_fake_docker_with_status, write_password_file,
+        stub_openbao_unseal_failure, stub_openbao_with_write_failure, write_dotenv_file,
+        write_fake_docker, write_fake_docker_with_status, write_password_file,
     };
 
     fn run_command_with_input(command: &mut Command, input: &str) -> Result<Output> {
@@ -44,6 +44,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
 
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
@@ -64,8 +65,6 @@ mod unix_integration {
                 &server.uri(),
                 "--root-token",
                 ROOT_TOKEN,
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate",
                 "--secrets-dir",
@@ -95,6 +94,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
 
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
@@ -122,8 +122,6 @@ mod unix_integration {
                 &server.uri(),
                 "--root-token",
                 ROOT_TOKEN,
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate",
                 "--secrets-dir",
@@ -150,6 +148,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
 
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
@@ -177,8 +176,6 @@ mod unix_integration {
                 &server.uri(),
                 "--root-token",
                 ROOT_TOKEN,
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate",
                 "--secrets-dir",
@@ -204,6 +201,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
 
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
@@ -231,8 +229,6 @@ mod unix_integration {
                 &server.uri(),
                 "--root-token",
                 ROOT_TOKEN,
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate",
                 "--secrets-dir",
@@ -261,6 +257,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
 
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
@@ -291,8 +288,6 @@ mod unix_integration {
                 &server.uri(),
                 "--root-token",
                 ROOT_TOKEN,
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate,eab-auto",
                 "--stepca-url",
@@ -321,6 +316,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
 
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
@@ -349,8 +345,6 @@ mod unix_integration {
                 &server.uri(),
                 "--root-token",
                 ROOT_TOKEN,
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate,eab-auto",
                 "--stepca-url",
@@ -374,6 +368,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
 
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
@@ -389,8 +384,6 @@ mod unix_integration {
                 "init",
                 "--openbao-url",
                 "http://127.0.0.1:9999",
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate",
                 "--secrets-dir",
@@ -414,6 +407,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
 
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
@@ -434,8 +428,6 @@ mod unix_integration {
                 &server.uri(),
                 "--unseal-key",
                 "key1",
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate",
                 "--secrets-dir",
@@ -459,6 +451,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
         let unseal_file = temp_dir.path().join("unseal.txt");
         fs::write(&unseal_file, "key1\n").context("Failed to write unseal file")?;
 
@@ -483,8 +476,6 @@ mod unix_integration {
                 ROOT_TOKEN,
                 "--openbao-unseal-from-file",
                 unseal_file.to_string_lossy().as_ref(),
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate",
                 "--secrets-dir",
@@ -513,6 +504,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
 
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
@@ -539,8 +531,6 @@ mod unix_integration {
                 &server.uri(),
                 "--root-token",
                 ROOT_TOKEN,
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate",
                 "--secrets-dir",
@@ -570,6 +560,7 @@ mod unix_integration {
         let secrets_dir = create_secrets_dir(temp_dir.path())?;
         let compose_file = temp_dir.path().join("docker-compose.yml");
         fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
         fs::write(temp_dir.path().join("state.json"), "{}")
             .context("Failed to write state.json")?;
 
@@ -592,8 +583,6 @@ mod unix_integration {
                 &server.uri(),
                 "--root-token",
                 ROOT_TOKEN,
-                "--db-dsn",
-                "postgresql://step:step@localhost:5432/step?sslmode=disable",
                 "--enable",
                 "auto-generate",
                 "--secrets-dir",

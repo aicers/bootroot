@@ -108,6 +108,14 @@ pub(crate) fn write_password_file(secrets_dir: &Path, contents: &str) -> Result<
     Ok(())
 }
 
+/// Writes a `.env` file with test DB credentials, matching the format
+/// produced by `infra install`.
+pub(crate) fn write_dotenv_file(root: &Path) -> Result<()> {
+    let content = "POSTGRES_USER=step\nPOSTGRES_PASSWORD=test-bootstrap-pass\nPOSTGRES_DB=stepca\n";
+    fs::write(root.join(".env"), content).context("Failed to write .env file")?;
+    Ok(())
+}
+
 pub(crate) async fn stub_openbao(server: &MockServer) {
     stub_health(server).await;
     stub_init_status(server).await;

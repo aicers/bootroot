@@ -76,6 +76,19 @@ compose_up() {
   # Pre-create the secrets directory so Docker does not create it as root when
   # bind-mounting ./secrets:/home/step for the step-ca service.
   mkdir -p "$ROOT_DIR/secrets"
+
+  # Always write a deterministic .env so Docker Compose can resolve
+  # required variables.  infra install normally creates this, but the
+  # rotation script bypasses that flow.  Overwriting unconditionally
+  # avoids picking up a stale file from a previous run (e.g. one where
+  # init rewrote POSTGRES_PASSWORD to "rotated-use-openbao").
+  cat >"$ROOT_DIR/.env" <<ENV
+POSTGRES_USER=step
+POSTGRES_PASSWORD=step-pass
+POSTGRES_DB=stepca
+GRAFANA_ADMIN_PASSWORD=admin
+ENV
+
   docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" up -d $COMPOSE_SERVICES
 }
 
