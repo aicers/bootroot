@@ -141,7 +141,8 @@ automation scope:
 - **Installation**: The operator must install the Bootroot CLI and per-service
   OpenBao Agent and `bootroot-agent` manually. (Infrastructure components
   including the CA and their OpenBao Agents are installed automatically during
-  `bootroot infra up`.)
+  `bootroot infra install` for first-time setup, or `bootroot infra up` for
+  restarting an already-configured environment.)
 - **Process management**: The operator must configure and verify systemd or
   Docker restart settings so that manually installed OpenBao Agents and
   `bootroot-agent` instances keep running.

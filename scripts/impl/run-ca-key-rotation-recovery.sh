@@ -118,10 +118,6 @@ ensure_prerequisites() {
   [ -x "$BOOTROOT_REMOTE_BIN" ] || fail "bootroot-remote binary not executable: $BOOTROOT_REMOTE_BIN"
 }
 
-ensure_compose_images() {
-  compose build step-ca bootroot-http01 >>"$RUN_LOG" 2>&1
-}
-
 infra_services() {
   printf '%s\n' "openbao" "postgres" "step-ca" "bootroot-http01"
 }
@@ -454,25 +450,10 @@ http_responder_token_ttl_secs = 300
 EOF
 }
 
-prepare_test_ca_materials() {
-  mkdir -p "$SECRETS_DIR" "$CERTS_DIR"
-  chmod 700 "$SECRETS_DIR" "$CERTS_DIR"
-  if [ ! -f "$SECRETS_DIR/password.txt" ]; then
-    printf '%s\n' "password" >"$SECRETS_DIR/password.txt"
-    chmod 600 "$SECRETS_DIR/password.txt"
-  fi
-  if [ ! -f "$SECRETS_DIR/config/ca.json" ]; then
-    docker run --user "$(id -u):$(id -g)" --rm -v "$SECRETS_DIR:/home/step" smallstep/step-ca \
-      step ca init \
-      --name "Bootroot E2E CA" \
-      --provisioner "admin" \
-      --dns "localhost,bootroot-ca,stepca.internal" \
-      --address ":9000" \
-      --password-file /home/step/password.txt \
-      --provisioner-password-file /home/step/password.txt \
-      --acme >>"$RUN_LOG" 2>&1
-  fi
-  [ -r "$SECRETS_DIR/config/ca.json" ] || fail "secrets/config/ca.json is not readable"
+install_infra() {
+  mkdir -p "$CERTS_DIR"
+  chmod 700 "$CERTS_DIR"
+  run_bootroot infra install --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
 }
 
 reset_stepca_materials_for_e2e() {
@@ -817,10 +798,9 @@ main() {
   trap 'on_error $LINENO' ERR
 
   ensure_prerequisites
-  ensure_compose_images
   compose_down
   reset_stepca_materials_for_e2e
-  prepare_test_ca_materials
+  install_infra
   write_agent_config
   run_bootstrap_chain
   wire_stepca_hosts

@@ -29,7 +29,30 @@ docker compose up --build -d step-ca
 
 #### step-ca 초기화(최초 1회)
 
-사전 생성된 개발용 시크릿을 쓰지 않는다면 아래처럼 초기화합니다.
+최초 설치 시 권장하는 방법은 다음과 같습니다:
+
+```bash
+bootroot infra install
+```
+
+이 명령은 임의의 PostgreSQL 비밀번호가 포함된 `.env`를 생성하고,
+`secrets/` 및 `certs/` 디렉터리를 만들고, Docker Compose 서비스를
+기동합니다(로컬 이미지 빌드 포함). 수동 파일 생성이나 편집이
+필요하지 않습니다.
+
+이미 구성된 환경을 나중에 다시 시작하려면:
+
+```bash
+bootroot infra up
+```
+
+`bootroot infra install` 이후 `bootroot init`은 step-ca 부트스트랩을
+자동으로 처리합니다(수동 `step ca init` 실행이 필요 없습니다).
+
+**수동 대안** (완전한 제어가 필요한 고급 사용자용):
+
+`bootroot infra install`을 사용하지 않는 경우, 수동으로 초기화할 수
+있습니다:
 
 ```bash
 mkdir -p secrets
@@ -74,8 +97,8 @@ Bootroot의 기본 배포에서는 step-ca가 HTTPS 엔드포인트에서 CA 인
 대응하는 SHA-256 지문을 OpenBao에 저장하므로, 이후 bootroot-agent는 이
 관리되는 신뢰 정보를 사용해 step-ca 엔드포인트를 검증할 수 있습니다.
 
-그다음 `secrets/config/ca.json`을
-현재 환경에 맞게 갱신해야 합니다. 예:
+수동 경로를 사용하는 경우, `secrets/config/ca.json`을 현재 환경에 맞게
+갱신해야 합니다:
 
 1. `secrets/config/ca.json`의 `db.type`을 `postgresql`로 설정
 2. `db.dataSource`를 실제 DSN으로 교체
@@ -134,14 +157,14 @@ PostgreSQL TLS와 적절한 `sslmode`를 사용해야 합니다.
 `--enable db-provision,auto-generate`를 함께 사용할 때만 적용됩니다.
 `--db-dsn` 경로에서는 DSN에 포함된 비밀번호를 그대로 사용합니다.
 
-`.env`에는 다음처럼 입력합니다(예시):
+`.env` 예시(`bootroot infra install`이 자동 생성하며, 수동 대안
+경로에서만 직접 생성이 필요합니다):
 
 ```text
 POSTGRES_USER=step
-POSTGRES_PASSWORD=step-pass
+POSTGRES_PASSWORD=<random-32-byte-hex>
 POSTGRES_DB=stepca
-POSTGRES_HOST=postgres
-POSTGRES_PORT=5432
+GRAFANA_ADMIN_PASSWORD=admin
 ```
 
 `sslmode`는 환경 정책에 맞게 `disable`, `require`, `verify-full` 중에서
@@ -160,7 +183,8 @@ POSTGRES_PORT=5432
 - 운영/보안 우선: `verify-full`
 - 내부망 테스트/임시 환경: `require`
 
-로컬 Compose 환경이라면 `.env` 값을 맞춘 뒤 아래 스크립트를 쓰면 됩니다.
+수동 경로를 사용하는 로컬 Compose 환경이라면(`bootroot infra install`을
+사용하면 불필요) `.env` 값을 맞춘 뒤 아래 스크립트를 쓰면 됩니다.
 이 스크립트는 `.env`의 `POSTGRES_*` 값을 읽어서 `secrets/config/ca.json`의
 `db.type`과 `db.dataSource`를 자동으로 갱신합니다. 즉, 비밀번호나 호스트를
 바꿨을 때 수동 편집 없이 동기화할 수 있습니다.
@@ -291,8 +315,34 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 
 ## 개발/테스트 환경 완전 초기화
 
-로컬 환경이 꼬였거나 시크릿을 완전히 새로 만들고 싶다면 아래 절차로
-깨끗하게 초기화하세요. **모든 기존 키/토큰/인증서가 폐기됩니다.**
+로컬 환경이 꼬였거나 시크릿을 완전히 새로 만들고 싶다면 `bootroot clean`
+으로 완전히 정리하세요. **모든 기존 키/토큰/인증서가 폐기됩니다.**
+
+```bash
+bootroot clean
+```
+
+이 명령은 컨테이너를 중지하고, 볼륨을 삭제하고, 생성된 시크릿과 산출물을
+제거합니다. 정리 후 최초 설치 흐름을 다시 실행합니다:
+
+```bash
+bootroot infra install
+bootroot init
+```
+
+그 다음 서비스를 기동하고 발급을 확인합니다:
+
+```bash
+docker compose up -d
+docker compose run --rm bootroot-agent
+```
+
+`certs/bootroot-agent.crt`에 PEM이 생성되면 정상입니다.
+
+리스폰더 HMAC 불일치가 발생하면 OpenBao의 HMAC 시크릿과
+리스폰더 설정이 일치하는지 확인하고 리스폰더를 재기동하세요.
+
+**수동 초기화 대안** (`bootroot clean`을 사용하지 않는 경우):
 
 1. 컨테이너/볼륨 정리:
 
@@ -311,36 +361,6 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
 
    `secrets/templates`까지 지웠다면 `git checkout -- secrets/templates`로
    복원하세요.
-
-3. step-ca 재초기화 및 DB DSN 갱신:
-
-   - `step-ca 초기화(최초 1회)` 절차를 다시 수행합니다.
-   - 로컬 Compose라면 `scripts/impl/update-ca-db-dsn.sh`로
-     `secrets/config/ca.json`을 갱신합니다.
-
-4. OpenBao 초기화/언실:
-
-   - OpenBao를 초기화해 `root token`/`unseal keys`를 확보합니다.
-   - OpenBao를 unseal 합니다.
-
-5. bootroot 초기화:
-
-   ```bash
-   bootroot init --enable auto-generate \
-     --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable"
-   ```
-
-6. 서비스 기동 및 발급 확인:
-
-   ```bash
-   docker compose up -d
-   docker compose run --rm bootroot-agent
-   ```
-
-   `certs/bootroot-agent.crt`에 PEM이 생성되면 정상입니다.
-
-리스폰더 HMAC 불일치가 발생하면 OpenBao의 HMAC 시크릿과
-리스폰더 설정이 일치하는지 확인하고 리스폰더를 재기동하세요.
 
 ## bootroot-agent
 

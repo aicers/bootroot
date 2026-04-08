@@ -24,6 +24,10 @@ impl Messages {
         self.strings().warning_openbao_unseal_from_file
     }
 
+    pub(crate) fn warning_db_password_rotation_skipped(&self) -> &'static str {
+        self.strings().warning_db_password_rotation_skipped
+    }
+
     pub(crate) fn prompt_openbao_unseal_from_file_confirm(&self, value: &str) -> String {
         format_template(
             self.strings().prompt_openbao_unseal_from_file_confirm,

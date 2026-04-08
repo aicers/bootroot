@@ -37,7 +37,29 @@ docker compose up --build -d step-ca
 
 #### Initialize step-ca (first run)
 
-If you are not using the pre-generated dev secrets, initialize the CA:
+The recommended way to perform first-time setup is:
+
+```bash
+bootroot infra install
+```
+
+This command generates `.env` with a random PostgreSQL password, creates
+`secrets/` and `certs/` directories, and brings up Docker Compose services
+(including building local images). No manual file creation or editing is
+required.
+
+To restart an already-configured environment later, use:
+
+```bash
+bootroot infra up
+```
+
+After `bootroot infra install`, `bootroot init` handles step-ca bootstrap
+automatically (no need to manually run `step ca init`).
+
+**Manual alternative** (for advanced users who need full control):
+
+If you are not using `bootroot infra install`, you can initialize manually:
 
 ```bash
 mkdir -p secrets
@@ -79,7 +101,8 @@ directly on the HTTPS endpoint. During `bootroot init`, Bootroot stores the CA
 bundle and matching SHA-256 fingerprints in OpenBao so bootroot-agent can
 later verify that endpoint using this managed trust material.
 
-Next, update `secrets/config/ca.json` for your environment:
+If using the manual path, update `secrets/config/ca.json` for your
+environment:
 
 1. Set `db.type` to `postgresql`
 2. Replace `db.dataSource` with the real DSN
@@ -138,14 +161,14 @@ with both `--enable db-provision` and `--enable auto-generate` (or combined as
 `--enable db-provision,auto-generate`). In the `--db-dsn` path, the password
 embedded in the DSN is used as-is.
 
-Example `.env`:
+Example `.env` (generated automatically by `bootroot infra install`;
+manual creation is needed only for the manual alternative path):
 
 ```text
 POSTGRES_USER=step
-POSTGRES_PASSWORD=step-pass
+POSTGRES_PASSWORD=<random-32-byte-hex>
 POSTGRES_DB=stepca
-POSTGRES_HOST=postgres
-POSTGRES_PORT=5432
+GRAFANA_ADMIN_PASSWORD=admin
 ```
 
 Choose `sslmode` based on your environment:
@@ -158,7 +181,8 @@ Selection guide:
 - Production / security first: `verify-full`
 - Internal test or lab: `require`
 
-In local Compose, set `.env` and run:
+In local Compose using the manual path (not needed when using
+`bootroot infra install`), set `.env` and run:
 
 ```bash
 scripts/impl/update-ca-db-dsn.sh
@@ -283,8 +307,34 @@ For service OpenBao Agent flow, `role_id`/`secret_id` live under
 ## Full reset (dev/test)
 
 If your local environment is in a bad state or you want to regenerate all
-secrets from scratch, use this clean reset. **All existing keys/tokens/certs
-will be discarded.**
+secrets from scratch, use `bootroot clean` for a full teardown. **All existing
+keys/tokens/certs will be discarded.**
+
+```bash
+bootroot clean
+```
+
+This stops containers, removes volumes, and clears generated secrets and
+outputs. After cleaning, re-run the first-time install flow:
+
+```bash
+bootroot infra install
+bootroot init
+```
+
+Then start services and verify issuance:
+
+```bash
+docker compose up -d
+docker compose run --rm bootroot-agent
+```
+
+If `certs/bootroot-agent.crt` is created, issuance is working.
+
+If the responder HMAC mismatches, ensure the OpenBao HMAC secret matches the
+responder config and restart the responder.
+
+**Manual reset alternative** (without `bootroot clean`):
 
 1. Stop containers and remove volumes:
 
@@ -303,36 +353,6 @@ will be discarded.**
 
    If you removed `secrets/templates`, restore it with
    `git checkout -- secrets/templates`.
-
-3. Re-initialize step-ca and update the DB DSN:
-
-   - Repeat the `Initialize step-ca (first run)` steps above.
-   - For local Compose, run `scripts/impl/update-ca-db-dsn.sh` to refresh
-     `secrets/config/ca.json`.
-
-4. Initialize and unseal OpenBao:
-
-   - Initialize OpenBao and capture the `root token` and `unseal keys`.
-   - Unseal OpenBao.
-
-5. Initialize bootroot:
-
-   ```bash
-   bootroot init --enable auto-generate \
-     --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable"
-   ```
-
-6. Start services and verify issuance:
-
-   ```bash
-   docker compose up -d
-   docker compose run --rm bootroot-agent
-   ```
-
-   If `certs/bootroot-agent.crt` is created, issuance is working.
-
-If the responder HMAC mismatches, ensure the OpenBao HMAC secret matches the
-responder config and restart the responder.
 
 ## bootroot-agent
 

@@ -126,4 +126,78 @@ impl Messages {
     pub(crate) fn monitoring_up_already_running(&self) -> &'static str {
         self.strings().monitoring_up_already_running
     }
+
+    pub(crate) fn infra_install_completed(&self) -> &'static str {
+        self.strings().infra_install_completed
+    }
+
+    pub(crate) fn infra_install_env_written(&self) -> &'static str {
+        self.strings().infra_install_env_written
+    }
+
+    pub(crate) fn infra_install_dirs_created(&self) -> &'static str {
+        self.strings().infra_install_dirs_created
+    }
+
+    pub(crate) fn error_infra_install_failed(&self) -> &'static str {
+        self.strings().error_infra_install_failed
+    }
+
+    pub(crate) fn clean_completed(&self) -> &'static str {
+        self.strings().clean_completed
+    }
+
+    pub(crate) fn clean_confirm(&self) -> &'static str {
+        self.strings().clean_confirm
+    }
+
+    pub(crate) fn clean_confirm_certs(&self) -> &'static str {
+        self.strings().clean_confirm_certs
+    }
+
+    pub(crate) fn error_clean_failed(&self) -> &'static str {
+        self.strings().error_clean_failed
+    }
+
+    pub(crate) fn error_env_parse_failed(&self, value: &str) -> String {
+        format_template(self.strings().error_env_parse_failed, &[("value", value)])
+    }
+
+    pub(crate) fn prompt_save_unseal_keys(&self) -> &'static str {
+        self.strings().prompt_save_unseal_keys
+    }
+
+    pub(crate) fn openbao_unseal_keys_saved(&self, value: &str) -> String {
+        format_template(
+            self.strings().openbao_unseal_keys_saved,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn openbao_unseal_keys_not_saved_warning(&self) -> &'static str {
+        self.strings().openbao_unseal_keys_not_saved_warning
+    }
+
+    pub(crate) fn openbao_unseal_keys_deleted(&self, value: &str) -> String {
+        format_template(
+            self.strings().openbao_unseal_keys_deleted,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_openbao_save_unseal_keys_failed(&self) -> &'static str {
+        self.strings().error_openbao_save_unseal_keys_failed
+    }
+
+    pub(crate) fn error_openbao_delete_unseal_keys_failed(&self) -> &'static str {
+        self.strings().error_openbao_delete_unseal_keys_failed
+    }
+
+    pub(crate) fn error_remove_dir_failed(&self, value: &str) -> String {
+        format_template(self.strings().error_remove_dir_failed, &[("value", value)])
+    }
+
+    pub(crate) fn infra_install_stepca_not_checked(&self) -> &'static str {
+        self.strings().infra_install_stepca_not_checked
+    }
 }

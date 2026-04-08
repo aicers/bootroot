@@ -66,39 +66,13 @@ run_init_scenario() {
 
   log "Cleaning local secrets and outputs"
   rm -rf "$ROOT_DIR/secrets" "$ROOT_DIR/certs" "$ROOT_DIR/tmp" "$ROOT_DIR/state.json"
+  mkdir -p "$ROOT_DIR/tmp"
 
-  log "Preparing step-ca config"
-  mkdir -p "$ROOT_DIR/secrets/config" "$ROOT_DIR/secrets/secrets" "$ROOT_DIR/tmp"
-  chmod 700 "$ROOT_DIR/secrets" "$ROOT_DIR/secrets/config" "$ROOT_DIR/secrets/secrets"
-  if [ ! -f "$ROOT_DIR/secrets/password.txt" ]; then
-    openssl rand -base64 32 > "$ROOT_DIR/secrets/password.txt"
-    chmod 600 "$ROOT_DIR/secrets/password.txt"
-  fi
-  local stepca_password
   local responder_hmac
-  stepca_password="$(cat "$ROOT_DIR/secrets/password.txt")"
   responder_hmac="$(current_responder_hmac)"
-  docker run --rm --user root \
-    -v "$ROOT_DIR/secrets:/home/step" \
-    smallstep/step-ca \
-    step ca init \
-    --name "Bootroot CA" \
-    --provisioner "admin" \
-    --dns "localhost,bootroot-ca" \
-    --address ":9000" \
-    --password-file /home/step/password.txt \
-    --provisioner-password-file /home/step/password.txt \
-    --acme
 
-  log "Starting infra"
-  log "Building local images"
-  docker compose -f docker-compose.yml -f docker-compose.test.yml build step-ca bootroot-http01
-  if [ -x "$ROOT_DIR/scripts/impl/update-ca-db-dsn.sh" ]; then
-    log "Updating ca.json DB DSN"
-    "$ROOT_DIR/scripts/impl/update-ca-db-dsn.sh"
-  fi
-  log "Starting bootstrap infra"
-  cargo run --bin bootroot -- infra up
+  log "Installing infrastructure"
+  cargo run --bin bootroot -- infra install
 
   wait_for_postgres_admin
   log "Running bootroot init"
@@ -106,7 +80,6 @@ run_init_scenario() {
     --enable auto-generate,show-secrets,db-provision \
     --summary-json "$INIT_SUMMARY_JSON" \
     --http-hmac "$responder_hmac" \
-    --stepca-password "$stepca_password" \
     --db-admin-dsn "postgresql://step:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/postgres?sslmode=disable" \
     --db-user "step" \
     --db-password "step-pass" \

@@ -7,7 +7,7 @@ pub(crate) const DEFAULT_STEPCA_PROVISIONER: &str = "acme";
 
 pub(crate) const DEFAULT_CA_NAME: &str = "Bootroot CA";
 pub(crate) const DEFAULT_CA_PROVISIONER: &str = "admin";
-pub(crate) const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca";
+pub(crate) const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca,stepca.internal";
 pub(crate) const DEFAULT_CA_ADDRESS: &str = ":9000";
 pub(crate) const SECRET_BYTES: usize = 32;
 pub(crate) const DEFAULT_RESPONDER_TOKEN_TTL_SECS: u64 = 60;
