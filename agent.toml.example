@@ -63,8 +63,8 @@ key = "certs/edge-proxy-a.key"
 [profiles.daemon]
 # How often to check certificate validity
 check_interval = "1h"
-# Start renewal 30 days (720h) before expiry
-renew_before = "720h"
+# Start renewal 16 hours before expiry
+renew_before = "16h"
 # Randomize check interval by +/- jitter (0s disables)
 check_jitter = "0s"
 

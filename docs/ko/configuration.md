@@ -297,7 +297,7 @@ key = "certs/edge-proxy-a.key"
 
 [profiles.daemon]
 check_interval = "1h"
-renew_before = "720h"
+renew_before = "16h"
 check_jitter = "0s"
 ```
 

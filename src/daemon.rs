@@ -470,7 +470,7 @@ mod tests {
             },
             daemon: DaemonRuntimeSettings {
                 check_interval: Duration::from_secs(60 * 60),
-                renew_before: Duration::from_secs(720 * 60 * 60),
+                renew_before: Duration::from_secs(16 * 60 * 60),
                 check_jitter: Duration::from_secs(0),
             },
             retry: None,

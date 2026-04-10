@@ -374,7 +374,7 @@ fn print_daemon_snippet(entry: &ServiceEntry, messages: &Messages) {
     );
     println!("[profiles.daemon]");
     println!("check_interval = \"1h\"");
-    println!("renew_before = \"720h\"");
+    println!("renew_before = \"16h\"");
     println!("check_jitter = \"0s\"");
     println!("{}", messages.service_snippet_domain_hint(&entry.domain));
 }

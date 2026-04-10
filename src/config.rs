@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(profile.daemon.check_interval, Duration::from_secs(60 * 60));
         assert_eq!(
             profile.daemon.renew_before,
-            Duration::from_secs(720 * 60 * 60)
+            Duration::from_secs(16 * 60 * 60)
         );
         assert_eq!(profile.daemon.check_jitter, Duration::from_secs(0));
         assert!(profile.hooks.post_renew.success.is_empty());
