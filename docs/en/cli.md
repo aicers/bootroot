@@ -360,7 +360,9 @@ automation in the following structure.
 - When to use: when the service is added on the same machine where
   OpenBao/PostgreSQL/step-ca/HTTP-01 responder are installed
 - Auto-applied: managed profile block update (or create) in `agent.toml`,
-  plus local OpenBao Agent template/config/token file generation
+  top-level `domain` from `--domain`, `[acme].http_responder_hmac` from
+  the responder HMAC stored in OpenBao, plus local OpenBao Agent
+  template/config/token file generation
 
 #### 2-2) `remote-bootstrap`
 

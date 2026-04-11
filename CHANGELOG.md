@@ -6,6 +6,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `bootroot service add` (`local-file` mode) generating an agent config
+  missing top-level `domain` and `[acme].http_responder_hmac`. The generated
+  `agent.toml` is now ready to use without manual editing.
+
 ### Added
 
 - Added `bootroot infra install` for zero-config first-time setup:

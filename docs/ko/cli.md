@@ -347,8 +347,10 @@ bootroot status
 
 - 사용 시점: 서비스가 OpenBao/PostgreSQL/step-ca/HTTP-01 responder가 설치된
   동일 머신에 추가될 때
-- 자동 반영: `agent.toml`의 관리 대상 프로필 블록 갱신(없으면 추가), OpenBao
-  Agent 템플릿/설정/토큰 파일 로컬 생성
+- 자동 반영: `agent.toml`의 관리 대상 프로필 블록 갱신(없으면 추가),
+  `--domain`에서 가져온 최상위 `domain`, OpenBao에 저장된 리스폰더 HMAC에서
+  가져온 `[acme].http_responder_hmac`, OpenBao Agent 템플릿/설정/토큰 파일
+  로컬 생성
 
 #### 2-2) `remote-bootstrap`
 

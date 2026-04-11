@@ -174,6 +174,11 @@ next steps:
     and reload bootroot-agent.
 ```
 
+The generated `agent.toml` is a complete, ready-to-run config: it includes
+the managed profile, `[trust]` section, top-level `domain` (from `--domain`),
+and `[acme].http_responder_hmac` (from the responder HMAC stored in OpenBao).
+No manual editing is required before running `bootroot-agent`.
+
 In current CLI output, the same information is also grouped under
 `Bootroot-managed` and `Operator-managed (required/recommended/optional)` labels
 to make ownership boundaries explicit.
