@@ -175,7 +175,8 @@ bootroot 서비스 추가: 계획
 생성된 `agent.toml`은 바로 실행 가능한 완전한 설정입니다: managed 프로필,
 `[trust]` 섹션, 최상위 `domain`(`--domain`에서 가져옴),
 `[acme].http_responder_hmac`(OpenBao에 저장된 리스폰더 HMAC에서 가져옴)을
-포함합니다. `bootroot-agent` 실행 전에 수동 편집이 필요하지 않습니다.
+포함합니다. HTTP-01 검증 FQDN도 `bootroot-http01` 컨테이너에 DNS 별칭으로
+자동 등록됩니다. `bootroot-agent` 실행 전에 수동 편집이 필요하지 않습니다.
 
 최신 CLI 출력에는 위 정보와 함께
 `Bootroot 자동 반영 항목`/`운영자 실행 항목 (필수/권장/선택)` 라벨이 표시되어
@@ -284,13 +285,18 @@ bootroot-remote apply-secret-id \
   --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
 ```
 
-## 4) DNS/hosts 준비 (CLI 예제 실행용)
+## 4) HTTP-01 검증을 위한 DNS 해석
 
-이 CLI 예제를 실행하려면 step-ca가 `HTTP-01` 검증 대상 FQDN을
-리스폰더 컨테이너로 해석할 수 있어야 합니다. DNS가 아직 준비되지 않은
-환경에서는 step-ca 컨테이너의 `/etc/hosts`에 매핑을 추가해
-**검증용 도메인 -> responder 컨테이너 IP**로 연결할 수 있습니다.
-검증 FQDN은 `<instance_id>.<service_name>.<hostname>.<domain>` 형식입니다.
+`bootroot service add`는 서비스의 검증 FQDN
+(`<instance_id>.<service_name>.<hostname>.<domain>`)을 `bootroot-http01`
+컨테이너에 Docker 네트워크 별칭으로 자동 등록합니다. 따라서 step-ca가 별도
+설정 없이 해당 FQDN을 리스폰더로 해석할 수 있습니다.
+
+`bootroot-http01`이 재시작된 경우(예: `docker compose down` / `up`),
+`bootroot infra up`이 `state.json`에서 별칭을 자동으로 재적용합니다.
+
+Compose 이외의 환경이나 수동 해석이 필요한 경우 step-ca 컨테이너의
+`/etc/hosts`에 항목을 추가하세요:
 
 ```bash
 RESPONDER_IP="$(docker inspect -f \
@@ -300,8 +306,6 @@ docker exec bootroot-ca sh -c \
   "printf '%s %s\n' \"$RESPONDER_IP\" \
   '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
 ```
-
-추가된 서비스가 더 있다면, 각 서비스의 FQDN에 대해 동일한 명령을 반복하세요.
 
 ## 5) service verify
 

@@ -442,6 +442,18 @@ The responder reads `responder.toml.compose` and listens on port 80 for
 `/.well-known/acme-challenge/` requests. bootroot-agent registers tokens via
 an admin API on port 8080 using the shared HMAC secret.
 
+#### DNS alias (automatic)
+
+For HTTP-01 validation, the step-ca container must resolve each service's
+challenge hostname to the responder.  `bootroot service add` handles this
+automatically: it registers the validation FQDN
+(`<instance_id>.<service_name>.<hostname>.<domain>`) as a Docker network
+alias on the `bootroot-http01` container.  No manual
+`docker-compose.override.yml` is required.
+
+If the responder container is restarted (e.g. `docker compose down` / `up`),
+run `bootroot infra up` to replay all aliases from `state.json`.
+
 ### Binary (optional)
 
 If you must run it outside Docker, use the binary and manage it with systemd.

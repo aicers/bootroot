@@ -7,10 +7,12 @@ use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::{InfraInstallArgs, InfraUpArgs};
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
+use crate::commands::dns_alias::replay_dns_aliases;
 use crate::commands::dotenv::write_dotenv;
 use crate::commands::guardrails::ensure_all_services_localhost_binding;
 use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unseal_keys_from_file};
 use crate::i18n::Messages;
+use crate::state::StateFile;
 
 const DEFAULT_GRAFANA_ADMIN_PASSWORD: &str = "admin";
 // Keep in sync with docker-compose.yml POSTGRES_USER / POSTGRES_DB.
@@ -89,6 +91,13 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
 
     print_readiness_summary(&readiness, messages);
     ensure_all_healthy(&readiness, messages)?;
+
+    let state_path = StateFile::default_path();
+    if state_path.exists()
+        && let Ok(state) = StateFile::load(&state_path)
+    {
+        replay_dns_aliases(&state, messages)?;
+    }
 
     println!("{}", messages.infra_up_completed());
     Ok(())

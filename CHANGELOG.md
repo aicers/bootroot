@@ -14,6 +14,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added automatic HTTP-01 DNS alias registration on `service add`. The
+  validation FQDN is registered as a Docker network alias on
+  `bootroot-http01` at runtime, removing the need for a hand-written
+  `docker-compose.override.yml`. Aliases are replayed automatically by
+  `infra up` after container restarts.
 - Added `bootroot infra install` for zero-config first-time setup:
   generates `.env` with a random PostgreSQL password, creates `secrets/`
   and `certs/` directories, and brings up Docker Compose services.

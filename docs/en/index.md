@@ -245,11 +245,13 @@ For certificate issuance/renewal to work reliably, name-to-IP mapping
 (`/etc/hosts` or DNS) must satisfy both conditions below. DNS also works, but
 in practice many deployments configure `/etc/hosts` mappings directly.
 
-1. step-ca -> service FQDN (HTTP-01 target) -> responder IP  
+1. step-ca -> service FQDN (HTTP-01 target) -> responder IP
    step-ca must resolve each service validation FQDN
    (`<instance_id>.<service_name>.<hostname>.<domain>`) to the responder IP.
-   Configure mappings in the environment where step-ca runs
-   (container/host `/etc/hosts`) or in DNS.
+   In Docker Compose environments, `bootroot service add` registers this
+   mapping automatically as a network alias on `bootroot-http01`.
+   For host installs, configure mappings in the environment where step-ca
+   runs (container/host `/etc/hosts`) or in DNS.
 
 2. Remote service machine -> step-ca/responder name -> IP  
    If a service runs on a different machine from step-ca/OpenBao and that
