@@ -7,7 +7,7 @@ use crate::commands::init::{
     DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL, DEFAULT_SECRETS_DIR,
     DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL,
 };
-use crate::state::{DeliveryMode, DeployType};
+use crate::state::{DeliveryMode, DeployType, HookFailurePolicyEntry};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -117,6 +117,33 @@ pub(crate) enum AuthMode {
     Auto,
     Root,
     Approle,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReloadStyle {
+    /// Send SIGHUP to a process by name
+    Sighup,
+    /// Reload a systemd unit
+    Systemd,
+    /// Restart a Docker container
+    DockerRestart,
+    /// No post-renew hook
+    None,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookFailurePolicyArg {
+    Continue,
+    Stop,
+}
+
+impl HookFailurePolicyArg {
+    pub(crate) fn into_entry(self) -> HookFailurePolicyEntry {
+        match self {
+            Self::Continue => HookFailurePolicyEntry::Continue,
+            Self::Stop => HookFailurePolicyEntry::Stop,
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -651,6 +678,30 @@ pub(crate) struct ServiceAddArgs {
     /// Freeform notes (optional)
     #[arg(long)]
     pub(crate) notes: Option<String>,
+
+    /// Reload style preset for post-renew hook
+    #[arg(long, value_enum)]
+    pub(crate) reload_style: Option<ReloadStyle>,
+
+    /// Target for reload-style preset (unit name, process name, or container)
+    #[arg(long)]
+    pub(crate) reload_target: Option<String>,
+
+    /// Post-renew success hook command (low-level)
+    #[arg(long)]
+    pub(crate) post_renew_command: Option<String>,
+
+    /// Post-renew success hook argument (repeatable, low-level)
+    #[arg(long)]
+    pub(crate) post_renew_arg: Vec<String>,
+
+    /// Post-renew success hook timeout in seconds (low-level)
+    #[arg(long)]
+    pub(crate) post_renew_timeout_secs: Option<u64>,
+
+    /// Post-renew success hook failure policy (low-level)
+    #[arg(long, value_enum)]
+    pub(crate) post_renew_on_failure: Option<HookFailurePolicyArg>,
 }
 
 #[derive(Args, Debug)]
@@ -1025,6 +1076,92 @@ mod tests {
                 assert_eq!(args.compose_file.compose_file, PathBuf::from("custom.yml"));
             }
             _ => panic!("expected monitoring down"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_reload_style() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--reload-style",
+            "systemd",
+            "--reload-target",
+            "nginx",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert!(matches!(args.reload_style, Some(ReloadStyle::Systemd)));
+                assert_eq!(args.reload_target.as_deref(), Some("nginx"));
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_post_renew_low_level() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--post-renew-command",
+            "systemctl",
+            "--post-renew-arg",
+            "reload",
+            "--post-renew-arg",
+            "nginx",
+            "--post-renew-timeout-secs",
+            "60",
+            "--post-renew-on-failure",
+            "stop",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert_eq!(args.post_renew_command.as_deref(), Some("systemctl"));
+                assert_eq!(args.post_renew_arg, vec!["reload", "nginx"]);
+                assert_eq!(args.post_renew_timeout_secs, Some(60));
+                assert!(matches!(
+                    args.post_renew_on_failure,
+                    Some(HookFailurePolicyArg::Stop)
+                ));
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_reload_style_docker_restart() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--reload-style",
+            "docker-restart",
+            "--reload-target",
+            "my-container",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert!(matches!(
+                    args.reload_style,
+                    Some(ReloadStyle::DockerRestart)
+                ));
+                assert_eq!(args.reload_target.as_deref(), Some("my-container"));
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_reload_style_none() {
+        let cli = Cli::parse_from(["bootroot", "service", "add", "--reload-style", "none"]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert!(matches!(args.reload_style, Some(ReloadStyle::None)));
+                assert!(args.reload_target.is_none());
+            }
+            _ => panic!("expected service add"),
         }
     }
 }

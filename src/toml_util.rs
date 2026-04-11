@@ -70,6 +70,16 @@ pub fn remove_sections(contents: &str, sections: &[&str]) -> Result<String> {
     Ok(doc.to_string())
 }
 
+/// Encodes a string as a TOML basic string with proper escaping.
+///
+/// Returns the value including surrounding double quotes, with all
+/// special characters (backslash, double quote, control characters
+/// such as newline and tab) properly escaped via `toml_edit`.
+#[must_use]
+pub fn toml_encode_string(s: &str) -> String {
+    Value::from(s).to_string()
+}
+
 /// Parses a raw string as a typed TOML value.
 ///
 /// Tries the TOML literal parser first to handle booleans (`true`,

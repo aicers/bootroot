@@ -19,6 +19,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added post-renew hook flags to `bootroot service add`. Services can now
+  configure a hook to run after successful certificate renewal at
+  registration time, removing the need to hand-edit `agent.toml`.
+  Two flag styles are supported: presets (`--reload-style systemd
+  --reload-target nginx`) and low-level (`--post-renew-command`,
+  `--post-renew-arg`, `--post-renew-timeout-secs`,
+  `--post-renew-on-failure`). Hook settings are persisted in
+  `state.json` and forwarded to `bootroot-remote bootstrap` for
+  remote-bootstrap delivery mode.
 - Added automatic HTTP-01 DNS alias registration on `service add`. The
   validation FQDN is registered as a Docker network alias on
   `bootroot-http01` at runtime, removing the need for a hand-written

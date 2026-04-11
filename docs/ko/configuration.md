@@ -335,6 +335,22 @@ backoff_secs = [5, 10, 30]
 훅은 인증서 발급/갱신이 끝난 뒤에 실행하는 후처리 작업입니다. `success`는
 해당 단계가 성공했을 때, `failure`는 실패했을 때 실행할 작업을 의미합니다.
 인증서를 읽는 데몬에 신호를 보내거나 재시작하는 등의 운영 작업을 넣습니다.
+
+훅은 `agent.toml`을 직접 편집하는 대신
+`bootroot service add` 시점에 CLI 플래그로도
+설정할 수 있습니다. 일반적인 리로드 패턴에는
+프리셋 플래그 `--reload-style`과
+`--reload-target`을 사용하고(예:
+`--reload-style systemd --reload-target nginx`),
+세부 제어가 필요하면 저수준 플래그
+`--post-renew-command`, `--post-renew-arg`,
+`--post-renew-timeout-secs`,
+`--post-renew-on-failure`를 사용합니다.
+이 플래그들은 관리 대상 프로필에 대응하는
+`[profiles.hooks.post_renew]` 항목을 생성합니다.
+`remote-bootstrap` 전달 모드에서는 동일한
+플래그가 `bootroot-remote bootstrap`으로
+전달됩니다.
 `systemctl reload`는 서비스가 `ExecReload`를 제공하거나 신호 기반 리로드를
 지원할 때만 동작합니다. 지원하지 않는 데몬은 `systemctl restart`로 다시
 시작해야 하고, 직접 `kill -HUP <pid>`처럼 신호를 보내는 방식도 사용할 수

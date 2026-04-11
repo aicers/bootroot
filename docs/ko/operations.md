@@ -51,6 +51,13 @@ bootroot monitoring status
 - 발급/검증/훅 결과 로그를 모니터링합니다.
 - 키/시크릿 권한이 `0600`/`0700`으로 유지되는지 확인합니다.
 - 갱신 후 리로드가 필요하면 **설정**의 훅을 사용합니다.
+  서비스 온보딩 시
+  `bootroot service add --reload-style`/
+  `--reload-target`(프리셋) 또는
+  `--post-renew-command`/`--post-renew-arg`(저수준)로
+  훅을 설정할 수 있으며, 이 플래그들은 관리 대상
+  `agent.toml` 프로필에
+  `[profiles.hooks.post_renew]` 항목을 기록합니다.
 - mTLS를 사용하는 서비스는 CA 번들을 읽을 수 있어야 합니다
   (예: `trust.ca_bundle_path`).
 

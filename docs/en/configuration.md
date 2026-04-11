@@ -376,6 +376,20 @@ Hooks run **after** issuance/renewal completes. Use `success` for actions that
 should run only when a certificate is issued/renewed, and `failure` for alerting
 or cleanup when issuance fails.
 
+Hooks can also be configured at `bootroot service add`
+time using CLI flags instead of editing `agent.toml`
+manually. Use the preset flags `--reload-style` and
+`--reload-target` for common reload patterns (e.g.
+`--reload-style systemd --reload-target nginx`), or the
+low-level flags `--post-renew-command`,
+`--post-renew-arg`, `--post-renew-timeout-secs`, and
+`--post-renew-on-failure` for full control. These flags
+generate the corresponding
+`[profiles.hooks.post_renew]` entry in the managed
+profile. For the `remote-bootstrap` delivery mode, the
+same flags are forwarded to
+`bootroot-remote bootstrap`.
+
 What hooks are used for:
 
 - Reload or restart a daemon so it reads the new certificate

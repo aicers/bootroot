@@ -1,7 +1,9 @@
+use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::toml_util::toml_encode_string;
 use bootroot::trust_bootstrap::{
     build_ca_bundle_ctmpl, build_managed_agent_ctmpl, build_trust_updates,
     render_managed_profile_block as render_managed_profile, upsert_managed_profile_block,
@@ -16,6 +18,7 @@ use super::{
     SERVICE_ROLE_ID_FILENAME, ServiceSyncMaterial,
 };
 use crate::i18n::Messages;
+use crate::state::PostRenewHookEntry;
 
 pub(super) async fn apply_local_service_configs(
     secrets_dir: &Path,
@@ -141,7 +144,7 @@ async fn write_local_ca_bundle(path: &Path, bundle_pem: &str, messages: &Message
 }
 
 fn render_managed_profile_block(args: &ResolvedServiceAdd) -> String {
-    render_managed_profile(
+    let base = render_managed_profile(
         MANAGED_PROFILE_BEGIN_PREFIX,
         MANAGED_PROFILE_END_PREFIX,
         &args.service_name,
@@ -149,7 +152,45 @@ fn render_managed_profile_block(args: &ResolvedServiceAdd) -> String {
         &args.hostname,
         &args.cert_path,
         &args.key_path,
-    )
+    );
+    inject_hooks_into_profile_block(&base, &args.post_renew_hooks)
+}
+
+fn inject_hooks_into_profile_block(block: &str, hooks: &[PostRenewHookEntry]) -> String {
+    if hooks.is_empty() {
+        return block.to_string();
+    }
+    let hooks_toml = render_hooks_toml(hooks);
+    if let Some(end_pos) = block.rfind(MANAGED_PROFILE_END_PREFIX) {
+        let mut result = block[..end_pos].to_string();
+        result.push_str(&hooks_toml);
+        result.push_str(&block[end_pos..]);
+        result
+    } else {
+        let mut result = block.to_string();
+        result.push_str(&hooks_toml);
+        result
+    }
+}
+
+fn render_hooks_toml(hooks: &[PostRenewHookEntry]) -> String {
+    let mut output = String::new();
+    for hook in hooks {
+        output.push_str("\n[[profiles.hooks.post_renew.success]]\n");
+        let _ = writeln!(output, "command = {}", toml_encode_string(&hook.command));
+        if !hook.args.is_empty() {
+            let args = hook
+                .args
+                .iter()
+                .map(|a| toml_encode_string(a))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(output, "args = [{args}]");
+        }
+        let _ = writeln!(output, "timeout_secs = {}", hook.timeout_secs);
+        let _ = writeln!(output, "on_failure = \"{}\"", hook.on_failure);
+    }
+    output
 }
 
 fn upsert_managed_profile(contents: &str, service_name: &str, replacement: &str) -> String {
@@ -214,6 +255,7 @@ mod tests {
             container_name: None,
             runtime_auth: None,
             notes: None,
+            post_renew_hooks: Vec::new(),
         }
     }
 
@@ -417,5 +459,118 @@ mod tests {
             bootroot::toml_util::upsert_section_keys(&twice, "acme", &acme_updates).unwrap();
 
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn test_render_hooks_toml_single_hook() {
+        use crate::state::{HookFailurePolicyEntry, PostRenewHookEntry};
+
+        let hooks = vec![PostRenewHookEntry {
+            command: "systemctl".to_string(),
+            args: vec!["reload".to_string(), "nginx".to_string()],
+            timeout_secs: 30,
+            on_failure: HookFailurePolicyEntry::Continue,
+        }];
+        let toml = render_hooks_toml(&hooks);
+        assert!(toml.contains("[[profiles.hooks.post_renew.success]]"));
+        assert!(toml.contains("command = \"systemctl\""));
+        assert!(toml.contains("args = [\"reload\", \"nginx\"]"));
+        assert!(toml.contains("timeout_secs = 30"));
+        assert!(toml.contains("on_failure = \"continue\""));
+    }
+
+    #[test]
+    fn test_render_hooks_toml_empty() {
+        let toml = render_hooks_toml(&[]);
+        assert!(toml.is_empty());
+    }
+
+    #[test]
+    fn test_inject_hooks_into_profile_block() {
+        use crate::state::{HookFailurePolicyEntry, PostRenewHookEntry};
+
+        let mut args = test_resolved();
+        args.post_renew_hooks = vec![PostRenewHookEntry {
+            command: "systemctl".to_string(),
+            args: vec!["reload".to_string(), "nginx".to_string()],
+            timeout_secs: 30,
+            on_failure: HookFailurePolicyEntry::Continue,
+        }];
+        let block = render_managed_profile_block(&args);
+        assert!(block.contains("[[profiles.hooks.post_renew.success]]"));
+        assert!(block.contains("command = \"systemctl\""));
+        assert!(block.contains(MANAGED_PROFILE_END_PREFIX));
+    }
+
+    #[test]
+    fn test_inject_hooks_preserves_end_marker() {
+        use crate::state::{HookFailurePolicyEntry, PostRenewHookEntry};
+
+        let mut args = test_resolved();
+        args.post_renew_hooks = vec![PostRenewHookEntry {
+            command: "pkill".to_string(),
+            args: vec!["-HUP".to_string(), "myproc".to_string()],
+            timeout_secs: 15,
+            on_failure: HookFailurePolicyEntry::Stop,
+        }];
+        let block = render_managed_profile_block(&args);
+
+        let end_pos = block
+            .find(MANAGED_PROFILE_END_PREFIX)
+            .expect("end marker must exist");
+        let hook_pos = block
+            .find("[[profiles.hooks.post_renew.success]]")
+            .expect("hook must exist");
+        assert!(hook_pos < end_pos, "hook should appear before end marker");
+        assert!(block.contains("on_failure = \"stop\""));
+    }
+
+    #[test]
+    fn test_managed_profile_with_hooks_is_idempotent() {
+        use crate::state::{HookFailurePolicyEntry, PostRenewHookEntry};
+
+        let mut args = test_resolved();
+        args.post_renew_hooks = vec![PostRenewHookEntry {
+            command: "systemctl".to_string(),
+            args: vec!["reload".to_string(), "nginx".to_string()],
+            timeout_secs: 30,
+            on_failure: HookFailurePolicyEntry::Continue,
+        }];
+        let block = render_managed_profile_block(&args);
+        let once = upsert_managed_profile("", "edge-proxy", &block);
+        let twice = upsert_managed_profile(&once, "edge-proxy", &block);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn test_render_hooks_toml_escapes_control_characters() {
+        use crate::state::{HookFailurePolicyEntry, PostRenewHookEntry};
+
+        let hooks = vec![PostRenewHookEntry {
+            command: "echo\nnext".to_string(),
+            args: vec!["line1\tline2".to_string(), "back\\slash".to_string()],
+            timeout_secs: 10,
+            on_failure: HookFailurePolicyEntry::Continue,
+        }];
+        let toml = render_hooks_toml(&hooks);
+
+        // The output must be valid TOML — parse it to confirm.
+        let wrapped = format!("[profiles]\n[profiles.hooks]\n[profiles.hooks.post_renew]{toml}");
+        let doc: toml_edit::DocumentMut = wrapped
+            .parse()
+            .expect("rendered hook TOML with control chars must be parseable");
+
+        let success = doc["profiles"]["hooks"]["post_renew"]["success"]
+            .as_array_of_tables()
+            .expect("success must be an array of tables");
+        let hook = success.get(0).expect("must have one hook entry");
+        assert_eq!(
+            hook["command"].as_str().unwrap(),
+            "echo\nnext",
+            "command must round-trip through TOML"
+        );
+        let args = hook["args"].as_array().expect("args must be an array");
+        assert_eq!(args.get(0).unwrap().as_str().unwrap(), "line1\tline2");
+        assert_eq!(args.get(1).unwrap().as_str().unwrap(), "back\\slash");
     }
 }

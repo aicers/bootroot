@@ -502,6 +502,13 @@ impl Messages {
         format_template(self.strings().service_summary_notes, &[("value", value)])
     }
 
+    pub(crate) fn service_summary_post_renew_hook(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_post_renew_hook,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn service_summary_policy(&self, value: &str) -> String {
         format_template(self.strings().service_summary_policy, &[("value", value)])
     }
