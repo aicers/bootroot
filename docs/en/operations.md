@@ -60,6 +60,10 @@ bootroot monitoring status
 - Ensure key/secret permissions stay `0600`/`0700` on disk.
 - Use hooks to reload dependent services after renewals
   (hook definitions live in **Configuration**).
+  Hooks can be configured at service onboarding time via
+  `bootroot service add --reload-style`/`--reload-target` (presets) or
+  `--post-renew-command`/`--post-renew-arg` (low-level), which write the
+  `[profiles.hooks.post_renew]` entry into the managed `agent.toml` profile.
 - Services that use mTLS must be able to read the CA bundle
   (for example, `trust.ca_bundle_path`).
 

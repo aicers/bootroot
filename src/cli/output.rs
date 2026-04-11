@@ -2,7 +2,7 @@ use crate::commands::init::{InitPlan, InitSummary};
 use crate::i18n::{
     Messages, ServiceNextStepsDaemon, ServiceNextStepsDocker, ServiceOpenBaoAgentSteps,
 };
-use crate::state::{DeployType, ServiceEntry};
+use crate::state::{DeployType, PostRenewHookEntry, ServiceEntry};
 
 pub(crate) struct ServiceAddPlan<'a> {
     pub(crate) service_name: &'a str,
@@ -16,6 +16,7 @@ pub(crate) struct ServiceAddPlan<'a> {
     pub(crate) instance_id: Option<&'a str>,
     pub(crate) container_name: Option<&'a str>,
     pub(crate) notes: Option<&'a str>,
+    pub(crate) post_renew_hooks: &'a [PostRenewHookEntry],
 }
 
 pub(crate) struct ServiceAddAppliedPaths<'a> {
@@ -274,6 +275,12 @@ fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
     if let Some(notes) = entry.notes.as_deref() {
         println!("{}", messages.service_summary_notes(notes));
     }
+    for hook in &entry.post_renew_hooks {
+        println!(
+            "{}",
+            messages.service_summary_post_renew_hook(&format_hook(hook))
+        );
+    }
 }
 
 fn print_service_plan_fields(plan: &ServiceAddPlan<'_>, messages: &Messages) {
@@ -295,6 +302,12 @@ fn print_service_plan_fields(plan: &ServiceAddPlan<'_>, messages: &Messages) {
     }
     if let Some(notes) = plan.notes {
         println!("{}", messages.service_summary_notes(notes));
+    }
+    for hook in plan.post_renew_hooks {
+        println!(
+            "{}",
+            messages.service_summary_post_renew_hook(&format_hook(hook))
+        );
     }
 }
 
@@ -609,6 +622,12 @@ fn print_next_steps(summary: &InitSummary, messages: &Messages) {
             messages.next_steps_eab_hint(crate::commands::init::PATH_AGENT_EAB)
         );
     }
+}
+
+fn format_hook(hook: &PostRenewHookEntry) -> String {
+    let mut parts = vec![hook.command.clone()];
+    parts.extend(hook.args.iter().cloned());
+    parts.join(" ")
 }
 
 pub(crate) fn display_secret(value: &str, show_secrets: bool) -> String {

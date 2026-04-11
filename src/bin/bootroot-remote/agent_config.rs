@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -12,7 +13,8 @@ use tokio::fs;
 use super::io::PulledSecrets;
 use super::summary::{ApplyItemSummary, ApplyStatus};
 use super::{
-    BootstrapArgs, Locale, MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX, localized,
+    BootstrapArgs, HookFailurePolicy, Locale, MANAGED_PROFILE_BEGIN_PREFIX,
+    MANAGED_PROFILE_END_PREFIX, localized,
 };
 
 struct ProfilePaths {
@@ -76,19 +78,18 @@ pub(super) async fn apply_agent_config_updates(
                 );
             }
         };
-    let with_profile = upsert_managed_profile_block(
-        &trust_updated,
+    let profile_block = render_managed_profile_block(
         &args.service_name,
-        &render_managed_profile_block(
-            &args.service_name,
-            args.profile_instance_id
-                .as_deref()
-                .expect("validate_bootstrap_args requires profile_instance_id"),
-            &args.profile_hostname,
-            &profile_paths.cert_path,
-            &profile_paths.key_path,
-        ),
+        args.profile_instance_id
+            .as_deref()
+            .expect("validate_bootstrap_args requires profile_instance_id"),
+        &args.profile_hostname,
+        &profile_paths.cert_path,
+        &profile_paths.key_path,
     );
+    let profile_block = inject_hooks_into_profile_block(&profile_block, args);
+    let with_profile =
+        upsert_managed_profile_block(&trust_updated, &args.service_name, &profile_block);
 
     let responder_changed = hmac_updated != agent_config;
     let trust_changed = trust_updated != hmac_updated;
@@ -200,6 +201,45 @@ fn resolve_profile_paths(args: &BootstrapArgs) -> ProfilePaths {
     ProfilePaths {
         cert_path,
         key_path,
+    }
+}
+
+fn inject_hooks_into_profile_block(block: &str, args: &BootstrapArgs) -> String {
+    let Some(command) = args.post_renew_command.as_deref() else {
+        return block.to_string();
+    };
+    let timeout_secs = args.post_renew_timeout_secs.unwrap_or(30);
+    let on_failure = match args.post_renew_on_failure {
+        Some(HookFailurePolicy::Stop) => "stop",
+        _ => "continue",
+    };
+    let mut hook_toml = String::from("\n[[profiles.hooks.post_renew.success]]\n");
+    let _ = writeln!(
+        hook_toml,
+        "command = {}",
+        bootroot::toml_util::toml_encode_string(command)
+    );
+    if !args.post_renew_arg.is_empty() {
+        let formatted_args = args
+            .post_renew_arg
+            .iter()
+            .map(|a| bootroot::toml_util::toml_encode_string(a))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(hook_toml, "args = [{formatted_args}]");
+    }
+    let _ = writeln!(hook_toml, "timeout_secs = {timeout_secs}");
+    let _ = writeln!(hook_toml, "on_failure = \"{on_failure}\"");
+
+    if let Some(end_pos) = block.rfind(MANAGED_PROFILE_END_PREFIX) {
+        let mut result = block[..end_pos].to_string();
+        result.push_str(&hook_toml);
+        result.push_str(&block[end_pos..]);
+        result
+    } else {
+        let mut result = block.to_string();
+        result.push_str(&hook_toml);
+        result
     }
 }
 
@@ -374,9 +414,10 @@ template {{
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::build_trust_updates;
+    use super::*;
+    use crate::OutputFormat;
 
     #[test]
     fn upsert_toml_section_keys_updates_existing_section() {
@@ -398,5 +439,72 @@ mod tests {
         assert!(output.contains("[trust]"));
         assert!(output.contains("ca_bundle_path = \"certs/ca.pem\""));
         assert!(output.contains("trusted_ca_sha256 = ["));
+    }
+
+    fn test_bootstrap_args() -> BootstrapArgs {
+        BootstrapArgs {
+            openbao_url: "https://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            service_name: "edge-proxy".to_string(),
+            role_id_path: PathBuf::from("/tmp/role_id"),
+            secret_id_path: PathBuf::from("/tmp/secrets/services/edge-proxy/secret_id"),
+            eab_file_path: PathBuf::from("/tmp/eab.json"),
+            agent_config_path: PathBuf::from("/tmp/agent.toml"),
+            agent_email: "admin@example.com".to_string(),
+            agent_server: "https://localhost:9443".to_string(),
+            agent_domain: "example.com".to_string(),
+            agent_responder_url: "http://localhost:8080".to_string(),
+            profile_hostname: "localhost".to_string(),
+            profile_instance_id: Some("001".to_string()),
+            profile_cert_path: None,
+            profile_key_path: None,
+            ca_bundle_path: PathBuf::from("/tmp/ca-bundle.pem"),
+            post_renew_command: None,
+            post_renew_arg: Vec::new(),
+            post_renew_timeout_secs: None,
+            post_renew_on_failure: None,
+            output: OutputFormat::Text,
+        }
+    }
+
+    #[test]
+    fn inject_hooks_escapes_control_characters() {
+        let mut args = test_bootstrap_args();
+        args.post_renew_command = Some("echo\nnext".to_string());
+        args.post_renew_arg = vec!["line1\tline2".to_string()];
+        args.post_renew_timeout_secs = Some(10);
+
+        let prefix = MANAGED_PROFILE_BEGIN_PREFIX;
+        let suffix = MANAGED_PROFILE_END_PREFIX;
+        let block = format!(
+            "{prefix} edge-proxy\n[[profiles]]\nservice_name = \"edge-proxy\"\n{suffix} edge-proxy\n",
+        );
+        let result = inject_hooks_into_profile_block(&block, &args);
+
+        // Extract just the hook section and parse it as TOML.
+        let wrapped = format!(
+            "[profiles]\n[profiles.hooks]\n[profiles.hooks.post_renew]{}",
+            &result[result
+                .find("\n[[profiles.hooks.post_renew.success]]")
+                .expect("hook header must exist")..]
+                .split(MANAGED_PROFILE_END_PREFIX)
+                .next()
+                .unwrap()
+        );
+        let doc: toml_edit::DocumentMut = wrapped
+            .parse()
+            .expect("rendered hook TOML with control chars must be parseable");
+
+        let success = doc["profiles"]["hooks"]["post_renew"]["success"]
+            .as_array_of_tables()
+            .expect("success must be an array of tables");
+        let hook = success.get(0).expect("must have one hook entry");
+        assert_eq!(
+            hook["command"].as_str().unwrap(),
+            "echo\nnext",
+            "command must round-trip through TOML"
+        );
+        let args_arr = hook["args"].as_array().expect("args must be an array");
+        assert_eq!(args_arr.get(0).unwrap().as_str().unwrap(), "line1\tline2");
     }
 }

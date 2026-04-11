@@ -189,6 +189,7 @@ mod tests {
             instance_id: instance_id.map(str::to_string),
             container_name: Some("ctr".to_string()),
             notes: None,
+            post_renew_hooks: Vec::new(),
             approle: ServiceRoleEntry {
                 role_name: "r".to_string(),
                 role_id: "id".to_string(),

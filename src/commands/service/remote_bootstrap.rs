@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -12,7 +13,7 @@ use super::{
     RemoteBootstrapResult, SERVICE_ROLE_ID_FILENAME,
 };
 use crate::i18n::Messages;
-use crate::state::{ServiceEntry, StateFile};
+use crate::state::{PostRenewHookEntry, ServiceEntry, StateFile};
 
 #[derive(serde::Serialize)]
 struct RemoteBootstrapArtifact {
@@ -35,6 +36,8 @@ struct RemoteBootstrapArtifact {
     profile_instance_id: String,
     profile_cert_path: String,
     profile_key_path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    post_renew_hooks: Vec<PostRenewHookEntry>,
 }
 
 /// Builds a `RemoteBootstrapArtifact` from common inputs shared by both
@@ -51,6 +54,7 @@ fn build_artifact(
     domain: &str,
     hostname: &str,
     instance_id: Option<&str>,
+    post_renew_hooks: &[PostRenewHookEntry],
 ) -> RemoteBootstrapArtifact {
     let secret_id_parent = secret_id_path.parent().unwrap_or(Path::new("."));
     let role_id_path = secret_id_parent.join(SERVICE_ROLE_ID_FILENAME);
@@ -82,6 +86,7 @@ fn build_artifact(
         profile_instance_id: instance_id.unwrap_or_default().to_string(),
         profile_cert_path: cert_path.display().to_string(),
         profile_key_path: key_path.display().to_string(),
+        post_renew_hooks: post_renew_hooks.to_vec(),
     }
 }
 
@@ -103,6 +108,7 @@ pub(super) async fn write_remote_bootstrap_artifact(
         &resolved.domain,
         &resolved.hostname,
         resolved.instance_id.as_deref(),
+        &resolved.post_renew_hooks,
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &resolved.service_name, &artifact, messages)
         .await
@@ -125,6 +131,7 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
         &entry.domain,
         &entry.hostname,
         entry.instance_id.as_deref(),
+        &entry.post_renew_hooks,
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &entry.service_name, &artifact, messages)
         .await
@@ -153,8 +160,8 @@ async fn write_remote_bootstrap_artifact_file(
 }
 
 fn render_remote_run_command(artifact: &RemoteBootstrapArtifact) -> String {
-    format!(
-        "bootroot-remote bootstrap --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --agent-email '{}' --agent-server '{}' --agent-domain '{}' --agent-responder-url '{}' --profile-hostname '{}' --profile-instance-id '{}' --profile-cert-path '{}' --profile-key-path '{}' --ca-bundle-path '{}' --output json",
+    let mut cmd = format!(
+        "bootroot-remote bootstrap --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --agent-email '{}' --agent-server '{}' --agent-domain '{}' --agent-responder-url '{}' --profile-hostname '{}' --profile-instance-id '{}' --profile-cert-path '{}' --profile-key-path '{}' --ca-bundle-path '{}'",
         artifact.openbao_url,
         artifact.kv_mount,
         artifact.service_name,
@@ -171,7 +178,36 @@ fn render_remote_run_command(artifact: &RemoteBootstrapArtifact) -> String {
         artifact.profile_cert_path,
         artifact.profile_key_path,
         artifact.ca_bundle_path,
-    )
+    );
+    if let Some(hook) = artifact.post_renew_hooks.first() {
+        let _ = write!(
+            cmd,
+            " --post-renew-command '{}'",
+            shell_escape_single_quoted(&hook.command)
+        );
+        for arg in &hook.args {
+            let _ = write!(
+                cmd,
+                " --post-renew-arg '{}'",
+                shell_escape_single_quoted(arg)
+            );
+        }
+        let _ = write!(cmd, " --post-renew-timeout-secs {}", hook.timeout_secs);
+        let _ = write!(
+            cmd,
+            " --post-renew-on-failure '{}'",
+            shell_escape_single_quoted(&hook.on_failure.to_string())
+        );
+    }
+    cmd.push_str(" --output json");
+    cmd
+}
+
+/// Escapes a string for embedding inside single quotes in a POSIX shell
+/// command. Replaces each `'` with `'\''` (end quote, literal quote,
+/// resume quote).
+fn shell_escape_single_quoted(value: &str) -> String {
+    value.replace('\'', "'\\''")
 }
 
 fn remote_openbao_agent_paths(
@@ -212,6 +248,7 @@ mod tests {
             "example.com",
             "host1",
             Some("instance-42"),
+            &[],
         );
 
         assert_eq!(artifact.openbao_url, "https://openbao.example.com:8200");
@@ -263,6 +300,7 @@ mod tests {
             "local.dev",
             "node-a",
             None,
+            &[],
         );
 
         assert_eq!(artifact.profile_instance_id, "");
@@ -281,6 +319,7 @@ mod tests {
             "a.com",
             "h1",
             None,
+            &[],
         );
         let b = build_artifact(
             "https://ob",
@@ -293,6 +332,7 @@ mod tests {
             "b.com",
             "h2",
             None,
+            &[],
         );
 
         assert_ne!(a.role_id_path, b.role_id_path);
@@ -313,6 +353,7 @@ mod tests {
             "d.com",
             "h",
             None,
+            &[],
         );
 
         // Path::new("secret_id").parent() returns Some(""), not None
@@ -333,10 +374,145 @@ mod tests {
             "d.com",
             "h",
             None,
+            &[],
         );
 
         // Path::new("cert.pem").parent() returns Some(""), not None
         assert_eq!(artifact.ca_bundle_path, "ca-bundle.pem");
+    }
+
+    #[test]
+    fn build_artifact_includes_hooks() {
+        use crate::state::{HookFailurePolicyEntry, PostRenewHookEntry};
+
+        let hooks = vec![PostRenewHookEntry {
+            command: "systemctl".to_string(),
+            args: vec!["reload".to_string(), "nginx".to_string()],
+            timeout_secs: 30,
+            on_failure: HookFailurePolicyEntry::Continue,
+        }];
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+            &hooks,
+        );
+
+        assert_eq!(artifact.post_renew_hooks.len(), 1);
+        assert_eq!(artifact.post_renew_hooks[0].command, "systemctl");
+        assert_eq!(artifact.post_renew_hooks[0].args, vec!["reload", "nginx"]);
+    }
+
+    #[test]
+    fn render_remote_run_command_includes_hook_flags() {
+        use crate::state::{HookFailurePolicyEntry, PostRenewHookEntry};
+
+        let hooks = vec![PostRenewHookEntry {
+            command: "systemctl".to_string(),
+            args: vec!["reload".to_string(), "nginx".to_string()],
+            timeout_secs: 60,
+            on_failure: HookFailurePolicyEntry::Stop,
+        }];
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+            &hooks,
+        );
+        let cmd = super::render_remote_run_command(&artifact);
+
+        assert!(
+            cmd.contains("--post-renew-command 'systemctl'"),
+            "missing --post-renew-command: {cmd}"
+        );
+        assert!(
+            cmd.contains("--post-renew-arg 'reload'"),
+            "missing first --post-renew-arg: {cmd}"
+        );
+        assert!(
+            cmd.contains("--post-renew-arg 'nginx'"),
+            "missing second --post-renew-arg: {cmd}"
+        );
+        assert!(
+            cmd.contains("--post-renew-timeout-secs 60"),
+            "missing --post-renew-timeout-secs: {cmd}"
+        );
+        assert!(
+            cmd.contains("--post-renew-on-failure 'stop'"),
+            "missing --post-renew-on-failure: {cmd}"
+        );
+    }
+
+    #[test]
+    fn render_remote_run_command_shell_escapes_single_quotes() {
+        use crate::state::{HookFailurePolicyEntry, PostRenewHookEntry};
+
+        let hooks = vec![PostRenewHookEntry {
+            command: "/usr/bin/notify-O'Brien".to_string(),
+            args: vec!["it's".to_string(), "done".to_string()],
+            timeout_secs: 30,
+            on_failure: HookFailurePolicyEntry::Continue,
+        }];
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+            &hooks,
+        );
+        let cmd = super::render_remote_run_command(&artifact);
+
+        assert!(
+            cmd.contains("--post-renew-command '/usr/bin/notify-O'\\''Brien'"),
+            "single quote in command not escaped: {cmd}"
+        );
+        assert!(
+            cmd.contains("--post-renew-arg 'it'\\''s'"),
+            "single quote in arg not escaped: {cmd}"
+        );
+    }
+
+    #[test]
+    fn render_remote_run_command_omits_hook_flags_when_empty() {
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+            &[],
+        );
+        let cmd = super::render_remote_run_command(&artifact);
+
+        assert!(
+            !cmd.contains("--post-renew"),
+            "should not contain hook flags: {cmd}"
+        );
     }
 
     #[test]
@@ -352,6 +528,7 @@ mod tests {
             "d.com",
             "h",
             Some(""),
+            &[],
         );
         let with_none = build_artifact(
             "https://ob",
@@ -364,11 +541,27 @@ mod tests {
             "d.com",
             "h",
             None,
+            &[],
         );
 
         assert_eq!(
             with_empty.profile_instance_id,
             with_none.profile_instance_id
         );
+    }
+
+    #[test]
+    fn shell_escape_single_quoted_no_quotes_unchanged() {
+        assert_eq!(super::shell_escape_single_quoted("hello"), "hello");
+    }
+
+    #[test]
+    fn shell_escape_single_quoted_replaces_single_quotes() {
+        assert_eq!(super::shell_escape_single_quoted("it's"), "it'\\''s");
+    }
+
+    #[test]
+    fn shell_escape_single_quoted_multiple_quotes() {
+        assert_eq!(super::shell_escape_single_quoted("a'b'c"), "a'\\''b'\\''c");
     }
 }

@@ -492,6 +492,35 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--print-only`: print snippets/next steps without writing state/files
 - `--dry-run`: alias of preview mode (same effect as `--print-only`)
 
+Post-renew hook flags (preset):
+
+- `--reload-style`: reload style preset
+  (`sighup`, `systemd`, `docker-restart`, or `none`)
+- `--reload-target`: target for the preset
+  (process name, systemd unit, or container name)
+
+Presets expand into the following `post_renew` hook
+entries in the generated `agent.toml` profile:
+
+- `systemd` + target `nginx` — `systemctl reload nginx`
+- `sighup` + target `nginx` — `pkill -HUP nginx`
+- `docker-restart` + target `my-container` — `docker restart my-container`
+- `none` — no hook
+
+Post-renew hook flags (low-level):
+
+- `--post-renew-command`: hook command to run after successful renewal
+- `--post-renew-arg`: hook argument (repeatable)
+- `--post-renew-timeout-secs`: hook timeout in seconds (default `30`)
+- `--post-renew-on-failure`: failure policy (`continue` or `stop`, default `continue`)
+
+Preset flags (`--reload-style`/`--reload-target`) and
+low-level flags (`--post-renew-*`) are mutually
+exclusive. When preset flags are used, they expand into
+the equivalent low-level hook settings. These flags are
+also forwarded to `bootroot-remote bootstrap` for the
+`remote-bootstrap` delivery mode.
+
 ### Interactive behavior
 
 - Prompts for missing required inputs (deploy type defaults to `daemon`).
@@ -1010,6 +1039,12 @@ Key inputs:
     `responder.internal`.
 - `--ca-bundle-path`
   - required output path for the managed step-ca trust bundle.
+- post-renew hook flags: `--reload-style`,
+  `--reload-target`, `--post-renew-command`,
+  `--post-renew-arg`, `--post-renew-timeout-secs`,
+  `--post-renew-on-failure` (same semantics as
+  `bootroot service add`; passed through from the
+  generated remote handoff command template)
 - `--summary-json` (optional) and `--output text|json` (default `text`)
 
 If `agent.toml` does not exist yet, bootstrap creates a baseline config and

@@ -97,6 +97,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
         instance_id: resolved.instance_id.as_deref(),
         container_name: resolved.container_name.as_deref(),
         notes: resolved.notes.as_deref(),
+        post_renew_hooks: &resolved.post_renew_hooks,
     };
     print_service_add_plan(&plan, messages);
 
@@ -322,6 +323,7 @@ fn build_service_entry_from_role(
         instance_id: resolved.instance_id.clone(),
         container_name: resolved.container_name.clone(),
         notes: resolved.notes.clone(),
+        post_renew_hooks: resolved.post_renew_hooks.clone(),
         approle,
     }
 }
@@ -450,6 +452,7 @@ fn is_idempotent_remote_rerun(entry: &ServiceEntry, resolved: &ResolvedServiceAd
         && entry.instance_id == resolved.instance_id
         && entry.container_name == resolved.container_name
         && entry.notes == resolved.notes
+        && entry.post_renew_hooks == resolved.post_renew_hooks
 }
 
 #[cfg(test)]
@@ -474,6 +477,7 @@ mod tests {
             container_name: Some("ctr-1".to_string()),
             runtime_auth: None,
             notes: Some("test note".to_string()),
+            post_renew_hooks: Vec::new(),
         }
     }
 
@@ -489,6 +493,7 @@ mod tests {
         assert_eq!(entry.instance_id, resolved.instance_id);
         assert_eq!(entry.container_name, resolved.container_name);
         assert_eq!(entry.notes, resolved.notes);
+        assert_eq!(entry.post_renew_hooks, resolved.post_renew_hooks);
     }
 
     #[test]

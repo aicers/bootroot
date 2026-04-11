@@ -478,6 +478,32 @@ bootroot status
 - `--print-only`: 파일/state 변경 없이 안내/스니펫만 출력
 - `--dry-run`: preview 모드 별칭(`--print-only`와 동일)
 
+갱신 후 훅 플래그(프리셋):
+
+- `--reload-style`: 리로드 스타일 프리셋 (`sighup`, `systemd`, `docker-restart`, `none`)
+- `--reload-target`: 프리셋 대상 (프로세스 이름, systemd 유닛, 컨테이너 이름)
+
+프리셋은 생성된 `agent.toml` 프로필에 다음과 같은 `post_renew` 훅 항목으로 확장됩니다:
+
+- `systemd` + 대상 `nginx` — `systemctl reload nginx`
+- `sighup` + 대상 `nginx` — `pkill -HUP nginx`
+- `docker-restart` + 대상 `my-container` — `docker restart my-container`
+- `none` — 훅 없음
+
+갱신 후 훅 플래그(저수준):
+
+- `--post-renew-command`: 갱신 성공 후 실행할 훅 명령
+- `--post-renew-arg`: 훅 인자 (반복 가능)
+- `--post-renew-timeout-secs`: 훅 타임아웃(초, 기본값 `30`)
+- `--post-renew-on-failure`: 실패 정책 (`continue` 또는 `stop`, 기본값 `continue`)
+
+프리셋 플래그(`--reload-style`/`--reload-target`)와
+저수준 플래그(`--post-renew-*`)는 상호
+배타적입니다. 프리셋 플래그를 사용하면 동등한
+저수준 훅 설정으로 확장됩니다.
+`remote-bootstrap` 전달 모드에서는 이 플래그가
+`bootroot-remote bootstrap`으로 전달됩니다.
+
 ### 대화형 동작
 
 - 누락된 필수 입력을 프롬프트로 받습니다(배포 타입 기본값: `daemon`).
@@ -978,6 +1004,12 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
     바꿔야 합니다.
 - `--ca-bundle-path`
   - 관리되는 step-ca trust bundle을 쓸 출력 경로로 항상 필요합니다.
+- 갱신 후 훅 플래그: `--reload-style`,
+  `--reload-target`, `--post-renew-command`,
+  `--post-renew-arg`, `--post-renew-timeout-secs`,
+  `--post-renew-on-failure` (`bootroot service add`와
+  동일한 의미; 생성된 원격 handoff 명령 템플릿에서
+  전달)
 - `--summary-json`(선택), `--output text|json` (기본값 `text`)
 
 `agent.toml`이 아직 없으면 bootstrap 단계에서 baseline을 생성한 뒤, 서비스용

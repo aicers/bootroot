@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_SECRETS_DIR: &str = "secrets";
 const DEFAULT_STATE_FILE: &str = "state.json";
+pub(crate) const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct StateFile {
@@ -67,6 +68,8 @@ pub(crate) struct ServiceEntry {
     pub(crate) container_name: Option<String>,
     #[serde(default)]
     pub(crate) notes: Option<String>,
+    #[serde(default)]
+    pub(crate) post_renew_hooks: Vec<PostRenewHookEntry>,
     pub(crate) approle: ServiceRoleEntry,
 }
 
@@ -103,6 +106,35 @@ impl fmt::Display for DeployType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_serde_string_value(self, formatter)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HookFailurePolicyEntry {
+    #[default]
+    Continue,
+    Stop,
+}
+
+impl fmt::Display for HookFailurePolicyEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_serde_string_value(self, formatter)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct PostRenewHookEntry {
+    pub(crate) command: String,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+    #[serde(default = "default_hook_timeout_secs")]
+    pub(crate) timeout_secs: u64,
+    #[serde(default)]
+    pub(crate) on_failure: HookFailurePolicyEntry,
+}
+
+fn default_hook_timeout_secs() -> u64 {
+    DEFAULT_HOOK_TIMEOUT_SECS
 }
 
 fn write_serde_string_value<T: Serialize>(
@@ -156,5 +188,95 @@ mod tests {
                 "Display and serde disagree for {variant:?}"
             );
         }
+    }
+
+    #[test]
+    fn hook_failure_policy_display_matches_serde() {
+        for variant in [
+            HookFailurePolicyEntry::Continue,
+            HookFailurePolicyEntry::Stop,
+        ] {
+            let serialized = serde_json::to_value(variant)
+                .expect("serialize HookFailurePolicyEntry")
+                .as_str()
+                .expect("serde value is a string")
+                .to_string();
+            assert_eq!(
+                variant.to_string(),
+                serialized,
+                "Display and serde disagree for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_renew_hook_entry_round_trips_json() {
+        let hook = PostRenewHookEntry {
+            command: "systemctl".to_string(),
+            args: vec!["reload".to_string(), "nginx".to_string()],
+            timeout_secs: 30,
+            on_failure: HookFailurePolicyEntry::Continue,
+        };
+        let json = serde_json::to_string(&hook).expect("serialize");
+        let parsed: PostRenewHookEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(hook, parsed);
+    }
+
+    #[test]
+    fn service_entry_with_hooks_round_trips_json() {
+        let entry = ServiceEntry {
+            service_name: "svc".to_string(),
+            deploy_type: DeployType::Daemon,
+            delivery_mode: DeliveryMode::LocalFile,
+            hostname: "h".to_string(),
+            domain: "d.com".to_string(),
+            agent_config_path: PathBuf::from("agent.toml"),
+            cert_path: PathBuf::from("cert.pem"),
+            key_path: PathBuf::from("key.pem"),
+            instance_id: Some("001".to_string()),
+            container_name: None,
+            notes: None,
+            post_renew_hooks: vec![PostRenewHookEntry {
+                command: "pkill".to_string(),
+                args: vec!["-HUP".to_string(), "nginx".to_string()],
+                timeout_secs: 15,
+                on_failure: HookFailurePolicyEntry::Stop,
+            }],
+            approle: ServiceRoleEntry {
+                role_name: "r".to_string(),
+                role_id: "id".to_string(),
+                secret_id_path: PathBuf::from("s"),
+                policy_name: "p".to_string(),
+            },
+        };
+        let json = serde_json::to_string_pretty(&entry).expect("serialize");
+        let parsed: ServiceEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.post_renew_hooks.len(), 1);
+        assert_eq!(parsed.post_renew_hooks[0].command, "pkill");
+        assert_eq!(
+            parsed.post_renew_hooks[0].on_failure,
+            HookFailurePolicyEntry::Stop
+        );
+    }
+
+    #[test]
+    fn service_entry_without_hooks_deserializes_empty_vec() {
+        let json = r#"{
+            "service_name": "svc",
+            "deploy_type": "daemon",
+            "hostname": "h",
+            "domain": "d.com",
+            "agent_config_path": "agent.toml",
+            "cert_path": "cert.pem",
+            "key_path": "key.pem",
+            "approle": {
+                "role_name": "r",
+                "role_id": "id",
+                "secret_id_path": "s",
+                "policy_name": "p"
+            }
+        }"#;
+        let parsed: ServiceEntry = serde_json::from_str(json).expect("deserialize");
+        assert!(parsed.post_renew_hooks.is_empty());
     }
 }

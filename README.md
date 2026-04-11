@@ -34,8 +34,9 @@ Open source dependencies:
   visualizes them for local ops.
 - **Service onboarding**: `bootroot service add` registers service metadata,
   creates an AppRole, automatically registers the HTTP-01 DNS alias on the
-  responder, and prints the run instructions for bootroot-agent and OpenBao
-  Agent — no manual `docker-compose.override.yml` required.
+  responder, optionally configures a post-renew hook (`--reload-style` or
+  `--post-renew-command`), and prints the run instructions for bootroot-agent
+  and OpenBao Agent — no manual config editing required.
 - **Certificate flow**: bootroot-agent issues/renews certs; OpenBao Agent
   renders secrets and config files for each service.
 

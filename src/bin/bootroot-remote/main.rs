@@ -138,9 +138,31 @@ struct BootstrapArgs {
     #[arg(long)]
     ca_bundle_path: PathBuf,
 
+    /// Post-renew success hook command
+    #[arg(long)]
+    post_renew_command: Option<String>,
+
+    /// Post-renew success hook argument (repeatable)
+    #[arg(long)]
+    post_renew_arg: Vec<String>,
+
+    /// Post-renew success hook timeout in seconds
+    #[arg(long)]
+    post_renew_timeout_secs: Option<u64>,
+
+    /// Post-renew success hook failure policy (continue or stop)
+    #[arg(long, value_enum)]
+    post_renew_on_failure: Option<HookFailurePolicy>,
+
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     output: OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum HookFailurePolicy {
+    Continue,
+    Stop,
 }
 
 #[derive(clap::Args, Debug)]

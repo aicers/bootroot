@@ -215,6 +215,7 @@ pub(crate) struct Strings {
     pub(crate) service_summary_instance_id: &'static str,
     pub(crate) service_summary_container_name: &'static str,
     pub(crate) service_summary_notes: &'static str,
+    pub(crate) service_summary_post_renew_hook: &'static str,
     pub(crate) service_summary_policy: &'static str,
     pub(crate) service_summary_approle: &'static str,
     pub(crate) service_summary_secret_path: &'static str,

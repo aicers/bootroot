@@ -274,6 +274,38 @@ bootroot-remote bootstrap \
 `--agent-server`, `--agent-responder-url`를 `stepca.internal`,
 `responder.internal` 같은 원격 접근 가능 엔드포인트로 바꿔서 사용하세요.
 
+### 3-4) 갱신 후 훅 (리로드 스타일 프리셋)
+
+`--reload-style`과 `--reload-target`을 사용하면
+인증서 갱신 후 서비스를 리로드하는 post-renew 훅을
+설정할 수 있습니다:
+
+```bash
+bootroot service add \
+  --service-name edge-proxy \
+  --deploy-type daemon \
+  --hostname edge-node-01 \
+  --domain trusted.domain \
+  --agent-config /etc/bootroot/agent.toml \
+  --cert-path /etc/bootroot/certs/edge-proxy.crt \
+  --key-path /etc/bootroot/certs/edge-proxy.key \
+  --instance-id 001 \
+  --reload-style systemd \
+  --reload-target nginx \
+  --root-token <OPENBAO_ROOT_TOKEN>
+```
+
+이 명령은 생성된 `agent.toml` 프로필에
+`[profiles.hooks.post_renew]` 항목을 추가하여
+갱신 성공 시마다 `systemctl reload nginx`를
+실행합니다. 다른 프리셋 스타일로는
+`sighup`(`pkill`로 `SIGHUP` 전송),
+`docker-restart`(`docker restart` 실행),
+`none`(훅 없음)이 있습니다. 세부 제어가 필요하면
+저수준 플래그 `--post-renew-command`,
+`--post-renew-arg`, `--post-renew-timeout-secs`,
+`--post-renew-on-failure`를 사용하세요.
+
 control node에서 secret_id 회전 후 새 secret_id를 원격 노드에 전달:
 
 ```bash

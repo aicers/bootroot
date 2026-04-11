@@ -175,6 +175,7 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_instance_id: "- instance_id: {value}",
     service_summary_container_name: "- container name: {value}",
     service_summary_notes: "- notes: {value}",
+    service_summary_post_renew_hook: "- post-renew hook: {value}",
     service_summary_policy: "- policy: {value}",
     service_summary_approle: "- AppRole: {value}",
     service_summary_secret_path: "- secret_id path: {value}",

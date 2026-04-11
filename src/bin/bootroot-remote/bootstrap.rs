@@ -120,7 +120,30 @@ pub(super) async fn run_bootstrap(args: BootstrapArgs, lang: Locale) -> Result<i
     Ok(0)
 }
 
+fn validate_hook_flags(args: &BootstrapArgs) -> Result<()> {
+    if args.post_renew_command.is_none()
+        && (!args.post_renew_arg.is_empty()
+            || args.post_renew_timeout_secs.is_some()
+            || args.post_renew_on_failure.is_some())
+    {
+        anyhow::bail!(
+            "--post-renew-arg, --post-renew-timeout-secs, and \
+             --post-renew-on-failure require --post-renew-command"
+        );
+    }
+    if let Some(cmd) = args.post_renew_command.as_deref()
+        && cmd.trim().is_empty()
+    {
+        anyhow::bail!("--post-renew-command must not be empty");
+    }
+    if let Some(0) = args.post_renew_timeout_secs {
+        anyhow::bail!("--post-renew-timeout-secs must be greater than 0");
+    }
+    Ok(())
+}
+
 fn validate_bootstrap_args(args: &BootstrapArgs, lang: Locale) -> Result<()> {
+    validate_hook_flags(args)?;
     validate_service_name(&args.service_name, lang)?;
     validate_profile_hostname(&args.profile_hostname, lang)?;
     validate_agent_domain(&args.agent_domain, lang)?;
@@ -181,4 +204,131 @@ fn validate_bootstrap_args(args: &BootstrapArgs, lang: Locale) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::{HookFailurePolicy, OutputFormat};
+
+    /// Builds a `BootstrapArgs` with dummy values.  Only hook-related fields
+    /// are meaningful — `validate_hook_flags` runs before any other check, so
+    /// the remaining fields are never inspected in these tests.
+    fn dummy_args() -> BootstrapArgs {
+        BootstrapArgs {
+            openbao_url: String::new(),
+            kv_mount: String::new(),
+            service_name: String::new(),
+            role_id_path: PathBuf::new(),
+            secret_id_path: PathBuf::new(),
+            eab_file_path: PathBuf::new(),
+            agent_config_path: PathBuf::new(),
+            agent_email: String::new(),
+            agent_server: String::new(),
+            agent_domain: String::new(),
+            agent_responder_url: String::new(),
+            profile_hostname: String::new(),
+            profile_instance_id: None,
+            profile_cert_path: None,
+            profile_key_path: None,
+            ca_bundle_path: PathBuf::new(),
+            post_renew_command: None,
+            post_renew_arg: Vec::new(),
+            post_renew_timeout_secs: None,
+            post_renew_on_failure: None,
+            output: OutputFormat::Text,
+        }
+    }
+
+    #[test]
+    fn hook_flags_without_command_are_rejected() {
+        let mut args = dummy_args();
+        args.post_renew_arg = vec!["reload".to_string()];
+        args.post_renew_timeout_secs = Some(60);
+
+        let err = validate_hook_flags(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("--post-renew-command"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hook_timeout_alone_without_command_is_rejected() {
+        let mut args = dummy_args();
+        args.post_renew_timeout_secs = Some(60);
+
+        let err = validate_hook_flags(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("--post-renew-command"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hook_on_failure_alone_without_command_is_rejected() {
+        let mut args = dummy_args();
+        args.post_renew_on_failure = Some(HookFailurePolicy::Stop);
+
+        let err = validate_hook_flags(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("--post-renew-command"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hook_flags_with_command_are_accepted() {
+        let mut args = dummy_args();
+        args.post_renew_command = Some("/usr/bin/reload.sh".to_string());
+        args.post_renew_arg = vec!["--fast".to_string()];
+        args.post_renew_timeout_secs = Some(60);
+
+        assert!(validate_hook_flags(&args).is_ok());
+    }
+
+    #[test]
+    fn no_hook_flags_are_accepted() {
+        let args = dummy_args();
+        assert!(validate_hook_flags(&args).is_ok());
+    }
+
+    #[test]
+    fn empty_command_is_rejected() {
+        let mut args = dummy_args();
+        args.post_renew_command = Some(String::new());
+
+        let err = validate_hook_flags(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_command_is_rejected() {
+        let mut args = dummy_args();
+        args.post_renew_command = Some("   ".to_string());
+
+        let err = validate_hook_flags(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_timeout_is_rejected() {
+        let mut args = dummy_args();
+        args.post_renew_command = Some("reload.sh".to_string());
+        args.post_renew_timeout_secs = Some(0);
+
+        let err = validate_hook_flags(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("greater than 0"),
+            "unexpected error: {err}"
+        );
+    }
 }

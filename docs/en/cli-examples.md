@@ -277,6 +277,37 @@ In operations, start from the `remote run command template` printed by
 `--agent-responder-url` with remote-reachable endpoints such as
 `stepca.internal` and `responder.internal`.
 
+### 3-4) Post-renew hook (reload style preset)
+
+Use `--reload-style` and `--reload-target` to configure
+a post-renew hook that reloads the service after
+certificate renewal:
+
+```bash
+bootroot service add \
+  --service-name edge-proxy \
+  --deploy-type daemon \
+  --hostname edge-node-01 \
+  --domain trusted.domain \
+  --agent-config /etc/bootroot/agent.toml \
+  --cert-path /etc/bootroot/certs/edge-proxy.crt \
+  --key-path /etc/bootroot/certs/edge-proxy.key \
+  --instance-id 001 \
+  --reload-style systemd \
+  --reload-target nginx \
+  --root-token <OPENBAO_ROOT_TOKEN>
+```
+
+This expands into a `[profiles.hooks.post_renew]` entry
+in the generated `agent.toml` profile that runs
+`systemctl reload nginx` after each successful renewal.
+Other preset styles are `sighup` (sends `SIGHUP` via
+`pkill`), `docker-restart` (runs `docker restart`), and
+`none` (no hook). For full control, use the low-level
+flags `--post-renew-command`, `--post-renew-arg`,
+`--post-renew-timeout-secs`, and
+`--post-renew-on-failure` instead.
+
 After secret_id rotation on the control node, deliver the new secret_id to the
 remote node:
 
