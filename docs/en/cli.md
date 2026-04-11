@@ -17,6 +17,7 @@ Roles:
 
 Primary commands:
 
+- `bootroot infra install`
 - `bootroot infra up`
 - `bootroot init`
 - `bootroot status`
@@ -24,6 +25,9 @@ Primary commands:
 - `bootroot service info`
 - `bootroot verify`
 - `bootroot rotate`
+- `bootroot clean`
+- `bootroot openbao save-unseal-keys`
+- `bootroot openbao delete-unseal-keys`
 - `bootroot monitoring`
 - `bootroot-remote bootstrap`
 - `bootroot-remote apply-secret-id`
@@ -124,6 +128,42 @@ The command is considered failed when:
 
 ```bash
 bootroot infra up
+```
+
+## bootroot infra install
+
+Performs zero-config first-time setup. Generates `.env` with a random
+PostgreSQL password, creates `secrets/` and `certs/` directories, and brings
+up Docker Compose services (including building local images). This is the
+recommended entry point on a fresh clone. Use `bootroot infra up` to restart
+an already-configured environment.
+
+### Inputs
+
+- `--compose-file`: compose file path (default `docker-compose.yml`)
+- `--services`: services to start (default `openbao,postgres,step-ca,bootroot-http01`)
+- `--image-archive-dir`: local image archive directory (optional)
+- `--restart-policy`: container restart policy (default `always`)
+- `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
+
+### Outputs
+
+- Generated `.env` file with random PostgreSQL credentials
+- Created `secrets/` and `certs/` directories
+- Container status/health summary
+- Completion message
+
+### Failure conditions
+
+The command is considered failed when:
+
+- docker compose build/pull failures
+- Missing or unhealthy containers
+
+### Examples
+
+```bash
+bootroot infra install
 ```
 
 ## bootroot init
@@ -849,6 +889,63 @@ Notes:
 
 - This command auto-detects the running profile(s). It does not accept
   `--profile`.
+
+## bootroot clean
+
+Tears down the local environment for a fresh start. Stops containers, removes
+volumes, and deletes generated secrets, state, and `.env`. After cleaning,
+re-run `bootroot infra install` and `bootroot init` to start over.
+
+### Inputs
+
+- `--compose-file`: compose file path (default `docker-compose.yml`)
+- `--yes` / `-y`: skip confirmation prompts
+
+### Behavior
+
+- Runs `docker compose down -v --remove-orphans`
+- Removes `secrets/`, `state.json`, `.env`, and optionally `certs/`
+- Prompts for confirmation before destructive actions (unless `--yes`)
+
+### Examples
+
+```bash
+bootroot clean
+```
+
+## bootroot openbao save-unseal-keys
+
+Interactively saves OpenBao unseal keys to a file so that `bootroot infra up`
+can auto-unseal on restart (dev/test convenience).
+
+### Inputs
+
+- `--secrets-dir`: secrets directory (default `secrets`)
+
+### Behavior
+
+- Prompts for unseal keys and writes them to the secrets directory
+- The saved file is used by `bootroot infra up --openbao-unseal-from-file`
+
+### Examples
+
+```bash
+bootroot openbao save-unseal-keys
+```
+
+## bootroot openbao delete-unseal-keys
+
+Deletes the previously saved unseal keys file.
+
+### Inputs
+
+- `--secrets-dir`: secrets directory (default `secrets`)
+
+### Examples
+
+```bash
+bootroot openbao delete-unseal-keys
+```
 
 ## bootroot-remote (remote bootstrap binary)
 

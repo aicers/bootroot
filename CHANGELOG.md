@@ -6,8 +6,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Added `bootroot infra install` for zero-config first-time setup:
+  generates `.env` with a random PostgreSQL password, creates `secrets/`
+  and `certs/` directories, and brings up Docker Compose services.
+- Added `bootroot clean` for full teardown (containers, volumes, secrets,
+  `.env`).
+- Added `bootroot openbao save-unseal-keys` and
+  `bootroot openbao delete-unseal-keys` for managing unseal key files
+  used by automatic unseal on `infra up`.
+- Added "Save unseal keys to file?" interactive prompt at the end of
+  `bootroot init`.
+
 ### Changed
 
+- Changed `bootroot init` to bootstrap step-ca automatically (no manual
+  `step ca init` required). DB credentials are read from `.env` when
+  available, so `--db-dsn` and `--db-password` are no longer required on
+  the command line after `bootroot infra install`.
 - Replaced local MkDocs theme assets with shared
   [aicers/docs-theme](https://github.com/aicers/docs-theme) `manual`
   template. Theme version and template are declared in `docs/theme.toml`

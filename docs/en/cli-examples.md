@@ -8,40 +8,24 @@ environment may differ.
 
 - Docker/Docker Compose installed
 - Ports 80/443/8200/9000/5432/8080 available
-- Pull/build images for step-ca and bootroot-http01 if missing
-- Set `POSTGRES_PASSWORD` in `.env` or export it in your shell before
-  `bootroot infra up`
-
-Image prep example:
-
-```bash
-docker compose pull openbao postgres
-docker compose build step-ca bootroot-http01
-```
 
 The Docker daemon should be configured to **start on reboot**. bootroot's
 containers use restart policies, but Docker itself must be managed by the OS
 (for example, via systemctl).
 
-Minimal env example:
-
-```bash
-export POSTGRES_PASSWORD=step-pass
-```
-
-For the full `.env` setup, see the [installation guide](installation.md).
-
 > Note: The example assumes OpenBao/PostgreSQL/HTTP-01 responder run on the
 > **same machine as step-ca**.
 
-## 1) infra up
+## 1) infra install
 
 ```bash
-bootroot infra up
+bootroot infra install
 ```
 
-> If local images are missing, you may see pull warnings. Use the
-> prerequisites section to pull/build first for cleaner output.
+This is the first command to run on a fresh clone. It generates `.env` with a
+random PostgreSQL password, creates `secrets/` and `certs/` directories,
+pulls/builds images, and starts Docker Compose services. No manual environment
+variable setup or image prep is needed.
 
 Sample output:
 
@@ -49,10 +33,13 @@ Sample output:
 bootroot infra up: readiness summary
 - openbao: running (health: healthy)
 - postgres: running (health: healthy)
-- step-ca: running (health: healthy)
 - bootroot-http01: running (health: healthy)
-bootroot infra up: completed
+- step-ca: not checked (will be bootstrapped by init)
+bootroot infra install: completed
 ```
+
+To restart an already-configured environment later, use `bootroot infra up`
+instead.
 
 ## 2) init
 
@@ -61,14 +48,16 @@ bootroot infra up: completed
 > - If OpenBao is **not initialized**, initialize it first and use the
 >   generated `root token` and `unseal keys`
 > - If OpenBao is **initialized but sealed**, you need `unseal keys`
-> - DB DSN is required (`--db-dsn` or DB provisioning options)
+> - After `bootroot infra install`, DB credentials come from `.env`
+>   automatically — use `--enable db-provision` to auto-provision the
+>   PostgreSQL role and database (no manual `--db-dsn` needed)
 > - step-ca password can be auto-generated with `--enable auto-generate`
 > - `--responder-url` enables responder validation (otherwise skipped)
+> - step-ca bootstrap (`step ca init`) runs automatically inside `init`
 
 ```bash
-bootroot init --enable auto-generate \
+bootroot init --enable auto-generate,db-provision \
   --summary-json ./tmp/init-summary.json \
-  --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
   --responder-url "http://localhost:8080"
 ```
 
@@ -92,11 +81,11 @@ bootroot init: summary
 - unseal key 3: ********
 - step-ca password: ********
 - db dsn: ********
+- db provision: completed
 - responder hmac: ********
 - eab: not configured
 - step-ca init: completed
 - responder check: ok
-- db check: skipped
 - db host resolution: localhost -> postgres
 - OpenBao KV paths:
   - bootroot/stepca/password
@@ -105,6 +94,7 @@ bootroot init: summary
   - bootroot/ca
   - bootroot/agent/eab
 - summary json: ./tmp/init-summary.json
+Save unseal keys to file for automatic unseal? [y/N]: y
 next steps:
   - Attach AppRole/secret_id to the service.
   - Prepare OpenBao Agent/bootroot-agent execution.

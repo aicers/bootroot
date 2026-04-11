@@ -8,40 +8,24 @@
 
 - Docker/Docker Compose 설치
 - 80/443/8200/9000/5432/8080 포트 사용 가능
-- step-ca/bootroot-http01 이미지가 로컬에 없으면 먼저 pull/build
-- `bootroot infra up` 전에 `.env` 또는 셸 환경 변수로
-  `POSTGRES_PASSWORD` 설정
-
-이미지 준비 예시:
-
-```bash
-docker compose pull openbao postgres
-docker compose build step-ca bootroot-http01
-```
 
 Docker 데몬은 **재부팅 시 자동 시작**되도록 설정되어 있어야 합니다.
 bootroot가 제공하는 컨테이너들은 `restart` 정책으로 자동 재기동되지만,
 Docker 데몬 자체는 OS에서 systemctl 등으로 별도 관리해야 합니다.
 
-최소 환경 변수 예시:
-
-```bash
-export POSTGRES_PASSWORD=step-pass
-```
-
-전체 `.env` 설정은 [설치 가이드](installation.md)를 참고하세요.
-
 > 참고: 아래 예제는 **step-ca가 실행되는 동일 머신**에서
 > OpenBao/PostgreSQL/HTTP-01 리스폰더를 함께 기동하는 구성을 전제로 합니다.
 
-## 1) infra up
+## 1) infra install
 
 ```bash
-bootroot infra up
+bootroot infra install
 ```
 
-> 로컬 이미지가 없으면 pull 경고가 뜰 수 있으므로,
-> 사전 준비 단계에서 pull/build를 해 두면 출력이 깔끔합니다.
+새로 클론한 환경에서 가장 먼저 실행하는 명령입니다. 임의의 PostgreSQL
+비밀번호가 포함된 `.env`를 생성하고, `secrets/` 및 `certs/` 디렉터리를
+만들고, 이미지 pull/build 후 Docker Compose 서비스를 기동합니다.
+수동 환경 변수 설정이나 이미지 준비가 필요하지 않습니다.
 
 예시 출력:
 
@@ -49,10 +33,12 @@ bootroot infra up
 bootroot 인프라 기동: 준비 상태 요약
 - openbao: running (health: healthy)
 - postgres: running (health: healthy)
-- step-ca: running (health: healthy)
 - bootroot-http01: running (health: healthy)
-bootroot 인프라 기동: 완료
+- step-ca: 검사 생략 (init에서 부트스트랩 예정)
+bootroot infra install: 완료
 ```
+
+이미 구성된 환경을 다시 시작하려면 `bootroot infra up`을 사용하세요.
 
 ## 2) init
 
@@ -61,14 +47,16 @@ bootroot 인프라 기동: 완료
 > - OpenBao가 **미초기화**라면 초기화를 먼저 수행해야 하며,
 >   초기화 후 생성된 `root token`/`unseal keys`를 사용
 > - OpenBao가 **초기화되었지만 언실되지 않았다면** `unseal keys` 필요
-> - DB DSN은 반드시 필요 (`--db-dsn` 또는 DB 프로비저닝 옵션)
+> - `bootroot infra install` 이후라면 DB 자격증명이 `.env`에서 자동으로
+>   제공되므로 `--enable db-provision`으로 PostgreSQL 역할/DB를
+>   자동 프로비저닝할 수 있습니다(수동 `--db-dsn` 불필요)
 > - step-ca 비밀번호는 `--enable auto-generate`로 자동 생성 가능
 > - `--responder-url`을 주면 responder 검증을 수행 (없으면 스킵)
+> - step-ca 부트스트랩(`step ca init`)은 `init` 내부에서 자동 실행
 
 ```bash
-bootroot init --enable auto-generate \
+bootroot init --enable auto-generate,db-provision \
   --summary-json ./tmp/init-summary.json \
-  --db-dsn "postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable" \
   --responder-url "http://localhost:8080"
 ```
 
@@ -92,11 +80,11 @@ bootroot init: 요약
 - 언실 키 3: ********
 - step-ca 비밀번호: ********
 - DB DSN: ********
+- DB 프로비저닝: 완료
 - responder HMAC: ********
 - EAB: 미설정
 - step-ca 초기화: 완료
 - responder 점검: ok
-- DB 점검: 생략
 - DB 호스트 해석: localhost -> postgres
 - OpenBao KV 경로:
   - bootroot/stepca/password
@@ -105,6 +93,7 @@ bootroot init: 요약
   - bootroot/ca
   - bootroot/agent/eab
 - summary json: ./tmp/init-summary.json
+자동 언실을 위해 언실 키를 파일에 저장할까요? [y/N]: y
 다음 단계:
   - AppRole/secret_id를 서비스에 연결하세요.
   - OpenBao Agent/bootroot-agent 실행을 준비하세요.
