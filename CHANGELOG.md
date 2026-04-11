@@ -8,6 +8,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed daemon-mode retries silently dropping CLI overrides (`--email`,
+  `--ca-url`, `--http-responder-url`, `--http-responder-hmac`). The retry
+  path reloaded the config file from disk without re-applying CLI-provided
+  values, causing the first attempt to succeed but subsequent attempts to
+  revert to file-only defaults.
 - Fixed `bootroot service add` (`local-file` mode) generating an agent config
   missing top-level `domain` and `[acme].http_responder_hmac`. The generated
   `agent.toml` is now ready to use without manual editing.

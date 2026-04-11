@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bootroot::config::CliOverrides;
 use bootroot::{Args, config, eab, profile, run_daemon, run_oneshot};
 use clap::Parser;
 #[cfg(unix)]
@@ -32,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let cli_overrides = CliOverrides::from(&args);
     let mut pending = None;
     #[cfg(unix)]
     let mut hup = signal(SignalKind::hangup())?;
@@ -47,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
             final_eab,
             args.config.clone(),
             args.insecure,
+            cli_overrides.clone(),
         ));
         #[cfg(unix)]
         loop {

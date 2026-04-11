@@ -405,6 +405,11 @@ so CLI has the highest priority. For example, if `agent.toml` sets
 `email = "admin@example.com"`, running `bootroot-agent --email ops@example.com`
 uses `ops@example.com`.
 
+In daemon mode, the agent periodically reloads the config file from disk
+when retrying failed issuances. CLI overrides are preserved across these
+reloads — a value supplied via `--http-responder-hmac` on the command line
+remains in effect for every retry, not just the first attempt.
+
 ## HTTP-01 responder (responder.toml)
 
 The responder reads `responder.toml` (or `BOOTROOT_RESPONDER__*` env vars).

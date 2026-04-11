@@ -118,6 +118,17 @@ If mode and placement do not match, file/state updates go to the wrong path.
 - Requested SANs do not match step-ca provisioner policy
 - Validate both SAN generation and CA policy together
 
+### CLI HMAC works once then fails on retry (older builds)
+
+If the first issuance attempt succeeds but retries fail with
+`401 Unauthorized: Invalid signature`, and you are passing
+`--http-responder-hmac` (or other CLI overrides) without putting the value
+in `agent.toml`, upgrade to a build that includes the fix for #475.
+Older builds dropped CLI overrides on retry because the daemon reloaded the
+config file without re-applying command-line values. As a workaround on
+older builds, add `http_responder_hmac` to the `[acme]` section of
+`agent.toml` directly.
+
 ### Repeated ACME directory retries
 
 - Ensure `server` URL is `https://` (`http://` is rejected)

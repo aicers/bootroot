@@ -373,6 +373,11 @@ backoff_secs = [5, 10, 30]
 그 외 설정(프로필, 재시도, 스케줄러, 훅, CA 번들 경로 등)은
 `agent.toml`에 정의해야 합니다.
 
+데몬 모드에서는 발급 재시도 시 설정 파일을 디스크에서 다시 읽습니다.
+CLI로 전달한 값은 매 재시도마다 다시 적용되므로, 예를 들어
+`--http-responder-hmac`으로 전달한 값은 첫 시도뿐 아니라 이후
+모든 재시도에서도 유지됩니다.
+
 ## HTTP-01 리스폰더 (responder.toml)
 
 리스폰더는 `responder.toml`(또는 `BOOTROOT_RESPONDER__*` 환경변수)을 읽습니다.

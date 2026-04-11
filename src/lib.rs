@@ -30,8 +30,16 @@ pub async fn run_daemon(
     default_eab: Option<eab::EabCredentials>,
     config_path: Option<PathBuf>,
     insecure_mode: bool,
+    cli_overrides: config::CliOverrides,
 ) -> anyhow::Result<()> {
-    daemon::run_daemon(settings, default_eab, config_path, insecure_mode).await
+    daemon::run_daemon(
+        settings,
+        default_eab,
+        config_path,
+        insecure_mode,
+        cli_overrides,
+    )
+    .await
 }
 
 /// Runs a single issuance pass for all profiles.

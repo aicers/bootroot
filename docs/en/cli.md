@@ -550,7 +550,10 @@ The command is considered failed when:
 Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 Use it after service onboarding or config changes to confirm issuance works.
 If you want **continuous renewal**, run bootroot-agent in daemon mode
-(without `--oneshot`) after verification.
+(without `--oneshot`) after verification. Any CLI overrides you pass
+(e.g. `--http-responder-hmac`, `--ca-url`) are preserved across
+daemon retry cycles, so the daemon behaves the same as `--oneshot`
+for those flags.
 
 ### Inputs
 

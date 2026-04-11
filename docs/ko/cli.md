@@ -534,7 +534,9 @@ bootroot status
 bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 서비스 온보딩 직후
 또는 설정 변경 후에 실제 발급이 가능한지 확인할 때 사용합니다.
 검증 이후에도 **주기적 갱신을 원하면 bootroot-agent를 상시 모드로
-실행**해야 합니다(oneshot 없이 실행).
+실행**해야 합니다(oneshot 없이 실행). CLI로 전달한 오버라이드
+(예: `--http-responder-hmac`, `--ca-url`)는 데몬 재시도 시에도
+유지되므로, 해당 플래그는 `--oneshot`과 동일하게 동작합니다.
 
 ### 입력
 
