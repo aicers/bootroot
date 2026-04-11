@@ -304,9 +304,9 @@ check_jitter = "0s"
 
 DNS SAN은 `<instance-id>.<service-name>.<hostname>.<domain>` 형식으로
 자동 생성됩니다(daemon/docker 공통). 이 이름은 HTTP-01 검증 대상이므로, step-ca에서
-HTTP-01 리스폰더 IP로 해석되어야 합니다(Compose는 네트워크 alias,
-베어메탈은 `/etc/hosts` 또는 DNS 설정).
-권장 형식: `<instance-id>.<service-name>.<hostname>.<domain>`.
+HTTP-01 리스폰더 IP로 해석되어야 합니다. Compose 환경에서는 `bootroot service add`가
+`bootroot-http01` 컨테이너에 별칭을 자동 등록합니다. 베어메탈 환경에서는
+`/etc/hosts` 또는 DNS를 수동으로 설정하세요.
 
 #### 프로필 재시도 재정의
 

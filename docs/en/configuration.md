@@ -340,8 +340,9 @@ check_jitter = "0s"
 The DNS SAN is auto-generated as
 `<instance-id>.<service-name>.<hostname>.<domain>` (daemon and docker). This
 name is also the target for HTTP-01 validation, so it must resolve from step-ca
-to the HTTP-01 responder IP (for Compose, update the network alias; for host
-installs, update `/etc/hosts` or DNS).
+to the HTTP-01 responder IP. In Compose environments, `bootroot service add`
+registers the alias on the `bootroot-http01` container automatically; for host
+installs, update `/etc/hosts` or DNS.
 
 #### Profile Retry Override
 

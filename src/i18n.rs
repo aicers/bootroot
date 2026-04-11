@@ -395,6 +395,14 @@ pub(crate) struct Strings {
     pub(crate) error_openbao_delete_unseal_keys_failed: &'static str,
     pub(crate) error_remove_dir_failed: &'static str,
     pub(crate) infra_install_stepca_not_checked: &'static str,
+    pub(crate) dns_alias_registered: &'static str,
+    pub(crate) dns_alias_replaying: &'static str,
+    pub(crate) dns_alias_responder_not_running: &'static str,
+    pub(crate) dns_alias_connect_failed: &'static str,
+    pub(crate) dns_alias_connect_rollback: &'static str,
+    pub(crate) dns_alias_connect_recovered: &'static str,
+    pub(crate) dns_alias_rollback_failed: &'static str,
+    pub(crate) dns_alias_network_not_found: &'static str,
 }
 
 pub(crate) struct Messages {

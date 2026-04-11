@@ -48,8 +48,11 @@ support environment-variable input.
 What bootroot CLI installs/starts automatically (Docker workflow):
 
 - for `bootroot infra up`: image pull plus container create/start for
-  OpenBao/PostgreSQL/step-ca/HTTP-01 responder
+  OpenBao/PostgreSQL/step-ca/HTTP-01 responder, plus replay of HTTP-01
+  DNS aliases from `state.json`
   (if service images require build, run `docker compose build` separately)
+- for `bootroot service add`: automatic registration of the service's
+  HTTP-01 validation FQDN as a Docker network alias on `bootroot-http01`
 - in the default topology (OpenBao/PostgreSQL/step-ca/HTTP-01 responder
   deployed on one machine),
   `bootroot init` generates step-ca/responder OpenBao Agent configs and enables
@@ -87,7 +90,8 @@ for explicit secret_id handoff after rotation.
 Key points:
 
 - For HTTP-01 validation, step-ca must resolve each service validation FQDN to
-  the responder IP.
+  the responder IP. In Docker Compose environments, `bootroot service add`
+  registers this alias automatically on `bootroot-http01`.
 - If step-ca/responder are accessed by hostname (not direct IP), keep DNS/hosts
   mappings consistent across participating hosts.
 
@@ -361,8 +365,9 @@ automation in the following structure.
   OpenBao/PostgreSQL/step-ca/HTTP-01 responder are installed
 - Auto-applied: managed profile block update (or create) in `agent.toml`,
   top-level `domain` from `--domain`, `[acme].http_responder_hmac` from
-  the responder HMAC stored in OpenBao, plus local OpenBao Agent
-  template/config/token file generation
+  the responder HMAC stored in OpenBao, local OpenBao Agent
+  template/config/token file generation, and HTTP-01 DNS alias registration
+  on the `bootroot-http01` container
 
 #### 2-2) `remote-bootstrap`
 

@@ -360,4 +360,12 @@ pub(super) static STRINGS: Strings = Strings {
     error_openbao_delete_unseal_keys_failed: "Failed to delete unseal keys file",
     error_remove_dir_failed: "Failed to remove directory: {value}",
     infra_install_stepca_not_checked: "- step-ca: not checked (will be bootstrapped by init)",
+    dns_alias_registered: "bootroot service add: registered HTTP-01 DNS alias {value}",
+    dns_alias_replaying: "bootroot infra up: replaying {value} DNS alias(es) on bootroot-http01",
+    dns_alias_responder_not_running: "WARNING: bootroot-http01 container not running — skipping DNS alias registration. Run `bootroot infra up` first.",
+    dns_alias_connect_failed: "Failed to reconnect bootroot-http01 with DNS aliases",
+    dns_alias_connect_rollback: "Reconnect failed; rolling back to restore bootroot-http01 network connectivity",
+    dns_alias_connect_recovered: "WARNING: DNS alias registration failed but network connectivity was restored. Run `bootroot infra up` to apply aliases later. ({error})",
+    dns_alias_rollback_failed: "CRITICAL: rollback also failed — bootroot-http01 is detached from network {network}. Reconnect manually: docker network connect {network} bootroot-http01 ({error})",
+    dns_alias_network_not_found: "No Docker network found for container {value}",
 };

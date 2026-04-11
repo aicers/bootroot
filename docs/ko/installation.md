@@ -448,6 +448,18 @@ docker compose up --build -d bootroot-http01
 `/.well-known/acme-challenge/` 요청에 응답합니다. bootroot-agent는
 포트 8080의 관리자 API로 토큰을 등록하며, 동일한 HMAC 시크릿을 사용합니다.
 
+#### DNS 별칭(자동)
+
+HTTP-01 검증 시 step-ca 컨테이너가 각 서비스의 챌린지 호스트명을 리스폰더로
+해석해야 합니다. `bootroot service add`가 이를 자동으로 처리합니다: 검증 FQDN
+(`<instance_id>.<service_name>.<hostname>.<domain>`)을 `bootroot-http01`
+컨테이너에 Docker 네트워크 별칭으로 등록합니다. 수동으로
+`docker-compose.override.yml`을 작성할 필요가 없습니다.
+
+리스폰더 컨테이너가 재시작된 경우(예: `docker compose down` / `up`),
+`bootroot infra up`을 실행하면 `state.json`에 저장된 모든 별칭이 자동으로
+재적용됩니다.
+
 ### 바이너리(선택)
 
 부득이하게 Docker 밖에서 실행해야 한다면 바이너리를 사용하고

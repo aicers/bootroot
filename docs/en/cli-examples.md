@@ -177,6 +177,8 @@ next steps:
 The generated `agent.toml` is a complete, ready-to-run config: it includes
 the managed profile, `[trust]` section, top-level `domain` (from `--domain`),
 and `[acme].http_responder_hmac` (from the responder HMAC stored in OpenBao).
+The HTTP-01 validation FQDN is also registered as a DNS alias on
+`bootroot-http01` automatically.
 No manual editing is required before running `bootroot-agent`.
 
 In current CLI output, the same information is also grouped under
@@ -287,13 +289,18 @@ bootroot-remote apply-secret-id \
   --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
 ```
 
-## 4) DNS/hosts setup for CLI examples
+## 4) DNS resolution for HTTP-01 validation
 
-To run these CLI examples, step-ca must resolve HTTP-01 validation FQDNs to
-the responder container. In environments where DNS is not ready yet, add
-/etc/hosts entries inside the step-ca container to map
-**validation FQDNs -> responder container IP**.
-The validation FQDN follows `<instance_id>.<service_name>.<hostname>.<domain>`.
+`bootroot service add` automatically registers each service's validation FQDN
+(`<instance_id>.<service_name>.<hostname>.<domain>`) as a Docker network alias
+on the `bootroot-http01` container. This lets step-ca resolve the FQDN to the
+responder without any manual configuration.
+
+If `bootroot-http01` is restarted (e.g. `docker compose down` / `up`),
+`bootroot infra up` replays all aliases from `state.json` automatically.
+
+For non-Compose environments or when manual resolution is needed, add
+`/etc/hosts` entries inside the step-ca container:
 
 ```bash
 RESPONDER_IP="$(docker inspect -f \
@@ -303,8 +310,6 @@ docker exec bootroot-ca sh -c \
   "printf '%s %s\n' \"$RESPONDER_IP\" \
   '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
 ```
-
-If you add more services, repeat the same command for each service FQDN.
 
 ## 5) service verify
 

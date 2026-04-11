@@ -14,6 +14,7 @@ use crate::cli::output::{
     ServiceAddAppliedPaths, ServiceAddPlan, ServiceAddRemoteBootstrap, ServiceAddSummaryOptions,
     print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
+use crate::commands::dns_alias::register_dns_alias;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry, StateFile};
@@ -291,6 +292,8 @@ async fn run_service_add_apply(
     state
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
+
+    register_dns_alias(state, messages)?;
 
     print_service_add_apply_summary(
         &entry,

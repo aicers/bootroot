@@ -230,7 +230,10 @@ step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-r
 - 필수 조건: step-ca가 각 서비스의 검증 FQDN
   (`<instance_id>.<service_name>.<hostname>.<domain>`)을 리스폰더 IP로
   찾을 수 있어야 합니다.
-- 설정 위치: step-ca가 동작하는 환경(컨테이너/호스트)의 `/etc/hosts` 또는 DNS
+- Docker Compose 환경: `bootroot service add`가 `bootroot-http01`
+  컨테이너에 네트워크 별칭을 자동 등록하므로 수동 설정이 필요 없습니다.
+- 베어메탈 환경: step-ca가 동작하는 환경(컨테이너/호스트)의
+  `/etc/hosts` 또는 DNS를 수동으로 설정하세요.
 
 ### 2) 원격 서비스 머신 -> step-ca/responder 이름 -> IP
 

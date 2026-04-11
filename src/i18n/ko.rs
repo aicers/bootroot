@@ -360,4 +360,12 @@ pub(super) static STRINGS: Strings = Strings {
     error_openbao_delete_unseal_keys_failed: "언실 키 파일 삭제 실패",
     error_remove_dir_failed: "디렉터리 삭제 실패: {value}",
     infra_install_stepca_not_checked: "- step-ca: 검사 생략 (init에서 부트스트랩 예정)",
+    dns_alias_registered: "bootroot service add: HTTP-01 DNS 별칭 등록 완료 {value}",
+    dns_alias_replaying: "bootroot infra up: bootroot-http01에 DNS 별칭 {value}개 재적용 중",
+    dns_alias_responder_not_running: "경고: bootroot-http01 컨테이너가 실행 중이 아닙니다 — DNS 별칭 등록을 건너뜁니다. 먼저 `bootroot infra up`을 실행하세요.",
+    dns_alias_connect_failed: "DNS 별칭으로 bootroot-http01 재연결 실패",
+    dns_alias_connect_rollback: "재연결 실패; bootroot-http01 네트워크 연결 복원을 위해 롤백 중",
+    dns_alias_connect_recovered: "경고: DNS 별칭 등록에 실패했지만 네트워크 연결이 복원되었습니다. 나중에 `bootroot infra up`을 실행하여 별칭을 적용하세요. ({error})",
+    dns_alias_rollback_failed: "심각: 롤백도 실패 — bootroot-http01이 네트워크 {network}에서 분리됨. 수동 복구: docker network connect {network} bootroot-http01 ({error})",
+    dns_alias_network_not_found: "컨테이너 {value}에 대한 Docker 네트워크를 찾을 수 없습니다",
 };

@@ -33,8 +33,9 @@ Open source dependencies:
 - **Monitoring**: Prometheus scrapes step-ca/OpenBao metrics and Grafana
   visualizes them for local ops.
 - **Service onboarding**: `bootroot service add` registers service metadata,
-  creates an AppRole, and prints the run instructions for bootroot-agent and
-  OpenBao Agent.
+  creates an AppRole, automatically registers the HTTP-01 DNS alias on the
+  responder, and prints the run instructions for bootroot-agent and OpenBao
+  Agent — no manual `docker-compose.override.yml` required.
 - **Certificate flow**: bootroot-agent issues/renews certs; OpenBao Agent
   renders secrets and config files for each service.
 

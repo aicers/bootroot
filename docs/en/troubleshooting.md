@@ -106,6 +106,10 @@ If mode and placement do not match, file/state updates go to the wrong path.
 
 ### HTTP-01 failures
 
+- `bootroot service add` registers the service FQDN as a Docker network
+  alias on `bootroot-http01` automatically. If the alias was lost (e.g.
+  after a container restart without running `bootroot infra up`), re-run
+  `bootroot infra up` to replay aliases from `state.json`.
 - step-ca must map service FQDN to responder IP
 - service hosts (remote mode) must also map step-ca/responder names correctly
 

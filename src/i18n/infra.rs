@@ -200,4 +200,48 @@ impl Messages {
     pub(crate) fn infra_install_stepca_not_checked(&self) -> &'static str {
         self.strings().infra_install_stepca_not_checked
     }
+
+    pub(crate) fn dns_alias_registered(&self, alias: &str) -> String {
+        format_template(self.strings().dns_alias_registered, &[("value", alias)])
+    }
+
+    pub(crate) fn dns_alias_replaying(&self, count: usize) -> String {
+        format_template(
+            self.strings().dns_alias_replaying,
+            &[("value", &count.to_string())],
+        )
+    }
+
+    pub(crate) fn dns_alias_responder_not_running(&self) -> &'static str {
+        self.strings().dns_alias_responder_not_running
+    }
+
+    pub(crate) fn dns_alias_connect_failed(&self) -> &'static str {
+        self.strings().dns_alias_connect_failed
+    }
+
+    pub(crate) fn dns_alias_connect_rollback(&self) -> &'static str {
+        self.strings().dns_alias_connect_rollback
+    }
+
+    pub(crate) fn dns_alias_connect_recovered(&self, error: &str) -> String {
+        format_template(
+            self.strings().dns_alias_connect_recovered,
+            &[("error", error)],
+        )
+    }
+
+    pub(crate) fn dns_alias_rollback_failed(&self, network: &str, error: &str) -> String {
+        format_template(
+            self.strings().dns_alias_rollback_failed,
+            &[("network", network), ("error", error)],
+        )
+    }
+
+    pub(crate) fn dns_alias_network_not_found(&self, container_id: &str) -> String {
+        format_template(
+            self.strings().dns_alias_network_not_found,
+            &[("value", container_id)],
+        )
+    }
 }

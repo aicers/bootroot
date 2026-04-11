@@ -100,19 +100,22 @@ run_init_scenario() {
   wait_for_stepca_directory
 }
 
-apply_dns_aliases() {
-  log "Applying DNS aliases for HTTP-01 validation"
-  local override="$ROOT_DIR/tmp/docker-compose.dns-aliases.yml"
-  cat >"$override" <<'YAML'
-services:
-  bootroot-http01:
-    networks:
-      default:
-        aliases:
-          - 001.edge-proxy.edge-node-01.trusted.domain
-          - 001.web-app.web-01.trusted.domain
-YAML
-  docker compose -f "$ROOT_DIR/docker-compose.yml" -f "$override" up -d bootroot-http01
+verify_dns_aliases() {
+  log "Verifying DNS aliases registered by service add"
+  local container_id
+  container_id="$(docker ps -q -f label=com.docker.compose.service=bootroot-http01)"
+  if [[ -z "$container_id" ]]; then
+    fail "bootroot-http01 container not running"
+  fi
+  local aliases
+  aliases="$(docker inspect --format '{{range $k, $v := (index .NetworkSettings.Networks)}}{{range $v.Aliases}}{{.}} {{end}}{{end}}' "$container_id")"
+  log "Current aliases on bootroot-http01: $aliases"
+  for expected in "001.edge-proxy.edge-node-01.trusted.domain" "001.web-app.web-01.trusted.domain"; do
+    if [[ "$aliases" != *"$expected"* ]]; then
+      fail "Missing expected DNS alias: $expected"
+    fi
+  done
+  log "All expected DNS aliases present"
 }
 
 wait_for_responder_http01() {
@@ -217,7 +220,7 @@ run_service_scenarios() {
     --approle-role-id "$runtime_service_add_role_id" \
     --approle-secret-id "$runtime_service_add_secret_id"
 
-  apply_dns_aliases
+  verify_dns_aliases
   wait_for_responder_http01
   wait_for_stepca_directory
 

@@ -103,6 +103,10 @@
 
 ### HTTP-01 실패
 
+- `bootroot service add`는 서비스 FQDN을 `bootroot-http01` 컨테이너에
+  Docker 네트워크 별칭으로 자동 등록합니다. 컨테이너 재시작 후 별칭이
+  사라진 경우 `bootroot infra up`을 실행하면 `state.json`에서 별칭을
+  자동 재적용합니다.
 - step-ca가 서비스 FQDN을 responder IP로 찾을 수 있어야 합니다.
 - 서비스 머신(원격 추가 시)도 step-ca/responder 이름을 올바른 IP로 찾을 수 있어야 합니다.
 
