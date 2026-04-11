@@ -1,6 +1,22 @@
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Value};
 
+/// Updates or inserts top-level key-value pairs in a TOML document.
+///
+/// Each value string is interpreted as a TOML literal first (handling
+/// booleans and arrays), then falls back to a quoted string.
+///
+/// # Errors
+///
+/// Returns an error if `contents` is not valid TOML.
+pub fn upsert_top_level_keys(contents: &str, pairs: &[(&str, String)]) -> Result<String> {
+    let mut doc: DocumentMut = contents.parse().context("failed to parse TOML content")?;
+    for (key, raw) in pairs {
+        doc[key] = Item::Value(parse_value(raw));
+    }
+    Ok(doc.to_string())
+}
+
 /// Updates or inserts key-value pairs in a TOML section, preserving
 /// existing formatting and comments.
 ///
@@ -137,6 +153,31 @@ mod tests {
         let input = "[broken\nkey = \"value\"\n";
         let result = upsert_section_keys(input, "trust", &[("key", "val".into())]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn upsert_top_level_adds_key() {
+        let input = "[acme]\nurl = \"x\"\n";
+        let output = upsert_top_level_keys(input, &[("domain", "test.local".into())]).unwrap();
+        assert!(output.contains("domain = \"test.local\""), "{output}");
+        assert!(output.contains("[acme]"), "{output}");
+    }
+
+    #[test]
+    fn upsert_top_level_updates_existing_key() {
+        let input = "domain = \"old.domain\"\n";
+        let output = upsert_top_level_keys(input, &[("domain", "new.domain".into())]).unwrap();
+        assert!(output.contains("domain = \"new.domain\""), "{output}");
+        assert!(!output.contains("old.domain"), "{output}");
+    }
+
+    #[test]
+    fn upsert_top_level_is_idempotent() {
+        let input = "domain = \"test.local\"\n";
+        let pairs = vec![("domain", "test.local".into())];
+        let once = upsert_top_level_keys(input, &pairs).unwrap();
+        let twice = upsert_top_level_keys(&once, &pairs).unwrap();
+        assert_eq!(once, twice);
     }
 
     #[test]

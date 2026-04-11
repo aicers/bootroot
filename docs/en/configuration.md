@@ -44,7 +44,8 @@ Ownership is split as follows:
 - **step-ca/responder**: `bootroot init` generates `agent.hcl` automatically.
 - **services added with `--delivery-mode local-file`**:
   `bootroot service add` auto-applies per-service
-  OpenBao Agent config/template and managed `agent.toml` profile.
+  OpenBao Agent config/template and managed `agent.toml` profile
+  (including top-level `domain` and `[acme].http_responder_hmac`).
 - **services added with `--delivery-mode remote-bootstrap`**:
   `bootroot service add` generates a bootstrap
   artifact, and `bootroot-remote bootstrap` applies `agent.hcl`/template/token

@@ -172,6 +172,11 @@ bootroot 서비스 추가: 계획
     bootroot-agent를 리로드하세요.
 ```
 
+생성된 `agent.toml`은 바로 실행 가능한 완전한 설정입니다: managed 프로필,
+`[trust]` 섹션, 최상위 `domain`(`--domain`에서 가져옴),
+`[acme].http_responder_hmac`(OpenBao에 저장된 리스폰더 HMAC에서 가져옴)을
+포함합니다. `bootroot-agent` 실행 전에 수동 편집이 필요하지 않습니다.
+
 최신 CLI 출력에는 위 정보와 함께
 `Bootroot 자동 반영 항목`/`운영자 실행 항목 (필수/권장/선택)` 라벨이 표시되어
 자동 처리 범위와 운영자 작업 범위를 명확히 구분해 줍니다.

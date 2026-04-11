@@ -26,6 +26,7 @@ const ROLE_NAME: &str = "bootroot-service-edge-proxy";
 const ROLE_ID: &str = "role-edge-proxy";
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_same_host_local_file_happy_path() {
     let temp = tempdir().expect("create tempdir");
     let server = MockServer::start().await;
@@ -54,6 +55,18 @@ async fn test_same_host_local_file_happy_path() {
     assert!(!agent_contents.contains("verify_certificates"));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     assert!(agent_contents.contains("ca_bundle_path = \""));
+    assert!(
+        agent_contents.contains("domain = \"trusted.domain\""),
+        "agent.toml missing domain: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("[acme]"),
+        "agent.toml missing [acme] section: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("http_responder_hmac = \"test-responder-hmac\""),
+        "agent.toml missing http_responder_hmac: {agent_contents}"
+    );
 
     let bundle_contents = fs::read_to_string(&files.ca_bundle_path).expect("read ca-bundle");
     assert!(bundle_contents.contains("BEGIN CERTIFICATE"));
@@ -81,6 +94,18 @@ async fn test_same_host_local_file_happy_path() {
     assert!(
         ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
         "ctmpl should contain template directives"
+    );
+    assert!(
+        ctmpl_contents.contains("domain = \"trusted.domain\""),
+        "ctmpl missing domain: {ctmpl_contents}"
+    );
+    assert!(
+        ctmpl_contents.contains("http_responder_hmac"),
+        "ctmpl missing http_responder_hmac: {ctmpl_contents}"
+    );
+    assert!(
+        !ctmpl_contents.contains("http_responder_hmac = \"test-responder-hmac\""),
+        "ctmpl should use template expression, not literal hmac: {ctmpl_contents}"
     );
     let bundle_ctmpl_path = temp
         .path()

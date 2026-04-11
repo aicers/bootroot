@@ -45,6 +45,10 @@ pub(super) async fn apply_local_service_configs(
     let mut next = with_profile;
     let trust_updates = build_trust_updates(&sync_material.trusted_ca_sha256, &ca_bundle_path);
     next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates)?;
+    let domain_updates = vec![("domain", resolved.domain.clone())];
+    next = bootroot::toml_util::upsert_top_level_keys(&next, &domain_updates)?;
+    let acme_updates = vec![("http_responder_hmac", sync_material.responder_hmac.clone())];
+    next = bootroot::toml_util::upsert_section_keys(&next, "acme", &acme_updates)?;
     write_local_ca_bundle(&ca_bundle_path, &sync_material.ca_bundle_pem, messages).await?;
     fs::write(&resolved.agent_config, &next)
         .await
@@ -321,5 +325,97 @@ mod tests {
         assert!(output.contains("server = \"https://localhost\""));
         assert!(output.contains("[[profiles]]"));
         assert!(output.contains("service_name = \"edge-proxy\""));
+    }
+
+    #[test]
+    fn test_generated_config_includes_domain_and_acme() {
+        let args = test_resolved();
+        let fp = "a".repeat(64);
+        let profile = render_managed_profile_block(&args);
+        let with_profile = upsert_managed_profile("", "edge-proxy", &profile);
+        let trust_updates = build_trust_updates(&[fp], Path::new("certs/ca-bundle.pem"));
+        let with_trust =
+            bootroot::toml_util::upsert_section_keys(&with_profile, "trust", &trust_updates)
+                .unwrap();
+        let domain_updates = vec![("domain", "trusted.domain".to_string())];
+        let with_domain =
+            bootroot::toml_util::upsert_top_level_keys(&with_trust, &domain_updates).unwrap();
+        let acme_updates = vec![("http_responder_hmac", "test-hmac-value".to_string())];
+        let output =
+            bootroot::toml_util::upsert_section_keys(&with_domain, "acme", &acme_updates).unwrap();
+
+        assert!(
+            output.contains("domain = \"trusted.domain\""),
+            "missing domain: {output}"
+        );
+        assert!(
+            output.contains("[acme]"),
+            "missing [acme] section: {output}"
+        );
+        assert!(
+            output.contains("http_responder_hmac = \"test-hmac-value\""),
+            "missing http_responder_hmac: {output}"
+        );
+        assert!(output.contains("[[profiles]]"), "missing profile: {output}");
+        assert!(output.contains("[trust]"), "missing trust: {output}");
+    }
+
+    #[test]
+    fn test_generated_config_ctmpl_replaces_hmac_from_full_config() {
+        let args = test_resolved();
+        let fp = "a".repeat(64);
+        let profile = render_managed_profile_block(&args);
+        let with_profile = upsert_managed_profile("", "edge-proxy", &profile);
+        let trust_updates = build_trust_updates(&[fp], Path::new("certs/ca-bundle.pem"));
+        let with_trust =
+            bootroot::toml_util::upsert_section_keys(&with_profile, "trust", &trust_updates)
+                .unwrap();
+        let domain_updates = vec![("domain", "trusted.domain".to_string())];
+        let with_domain =
+            bootroot::toml_util::upsert_top_level_keys(&with_trust, &domain_updates).unwrap();
+        let acme_updates = vec![("http_responder_hmac", "test-hmac-value".to_string())];
+        let config =
+            bootroot::toml_util::upsert_section_keys(&with_domain, "acme", &acme_updates).unwrap();
+
+        let ctmpl = build_ctmpl_content(&config, "secret", "edge-proxy");
+
+        assert!(
+            ctmpl.contains("domain = \"trusted.domain\""),
+            "ctmpl missing domain: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains(
+                r#"http_responder_hmac = "{{ with secret "secret/data/bootroot/services/edge-proxy/http_responder_hmac" }}{{ .Data.data.hmac }}{{ end }}"#
+            ),
+            "ctmpl missing hmac template: {ctmpl}"
+        );
+        assert!(
+            !ctmpl.contains("test-hmac-value"),
+            "ctmpl should not contain literal hmac: {ctmpl}"
+        );
+    }
+
+    #[test]
+    fn test_domain_and_acme_upsert_is_idempotent() {
+        let args = test_resolved();
+        let profile = render_managed_profile_block(&args);
+        let with_profile = upsert_managed_profile("", "edge-proxy", &profile);
+        let trust_updates =
+            build_trust_updates(&["a".repeat(64)], Path::new("certs/ca-bundle.pem"));
+        let with_trust =
+            bootroot::toml_util::upsert_section_keys(&with_profile, "trust", &trust_updates)
+                .unwrap();
+        let domain_updates = vec![("domain", "trusted.domain".to_string())];
+        let acme_updates = vec![("http_responder_hmac", "hmac-val".to_string())];
+
+        let once =
+            bootroot::toml_util::upsert_top_level_keys(&with_trust, &domain_updates).unwrap();
+        let once = bootroot::toml_util::upsert_section_keys(&once, "acme", &acme_updates).unwrap();
+
+        let twice = bootroot::toml_util::upsert_top_level_keys(&once, &domain_updates).unwrap();
+        let twice =
+            bootroot::toml_util::upsert_section_keys(&twice, "acme", &acme_updates).unwrap();
+
+        assert_eq!(once, twice);
     }
 }
