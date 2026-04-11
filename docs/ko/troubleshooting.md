@@ -115,6 +115,17 @@
 - 요청 SAN이 step-ca 프로비저너 정책과 맞지 않을 때 발생합니다.
 - 서비스 SAN 생성 규칙과 CA 정책을 함께 점검하세요.
 
+### CLI HMAC이 첫 시도에서만 작동하고 재시도 시 실패(이전 빌드)
+
+첫 발급 시도는 성공하지만 재시도에서
+`401 Unauthorized: Invalid signature`로 실패하고,
+`--http-responder-hmac`(또는 기타 CLI 오버라이드)을 `agent.toml` 없이
+명령행으로만 전달한 경우, #475 수정이 포함된 빌드로 업그레이드하세요.
+이전 빌드에서는 데몬이 설정 파일을 다시 읽을 때 CLI 값을 재적용하지 않아
+재시도 시 CLI 오버라이드가 사라졌습니다. 이전 빌드의 임시 해결 방법은
+`agent.toml`의 `[acme]` 섹션에 `http_responder_hmac`을 직접 추가하는
+것입니다.
+
 ### ACME 디렉터리 재시도 반복
 
 - `server` URL이 `https://`인지 확인 (`http://` 거부)

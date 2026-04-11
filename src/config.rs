@@ -8,6 +8,30 @@ use serde::Deserialize;
 mod defaults;
 mod validation;
 
+/// CLI-provided overrides that must survive config reloads in daemon mode.
+///
+/// Fields mirror the subset of [`crate::Args`] that [`Settings::merge_with_args`]
+/// applies. Storing them separately lets the daemon re-apply overrides after
+/// every file-based reload without depending on the CLI parser.
+#[derive(Clone, Debug, Default)]
+pub struct CliOverrides {
+    pub email: Option<String>,
+    pub ca_url: Option<String>,
+    pub http_responder_url: Option<String>,
+    pub http_responder_hmac: Option<String>,
+}
+
+impl From<&crate::Args> for CliOverrides {
+    fn from(args: &crate::Args) -> Self {
+        Self {
+            email: args.email.clone(),
+            ca_url: args.ca_url.clone(),
+            http_responder_url: args.http_responder_url.clone(),
+            http_responder_hmac: args.http_responder_hmac.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub email: String,
@@ -201,16 +225,21 @@ impl Settings {
 
     /// Merges CLI arguments into the settings, overriding values if present.
     pub fn merge_with_args(&mut self, args: &crate::Args) {
-        if let Some(email) = &args.email {
+        self.apply_overrides(&CliOverrides::from(args));
+    }
+
+    /// Re-applies CLI-provided overrides on top of these settings.
+    pub fn apply_overrides(&mut self, overrides: &CliOverrides) {
+        if let Some(email) = &overrides.email {
             email.clone_into(&mut self.email);
         }
-        if let Some(ca_url) = &args.ca_url {
+        if let Some(ca_url) = &overrides.ca_url {
             ca_url.clone_into(&mut self.server);
         }
-        if let Some(responder_url) = &args.http_responder_url {
+        if let Some(responder_url) = &overrides.http_responder_url {
             responder_url.clone_into(&mut self.acme.http_responder_url);
         }
-        if let Some(responder_hmac) = &args.http_responder_hmac {
+        if let Some(responder_hmac) = &overrides.http_responder_hmac {
             responder_hmac.clone_into(&mut self.acme.http_responder_hmac);
         }
     }
@@ -399,6 +428,93 @@ mod tests {
             settings.server,
             "https://localhost:9000/acme/acme/directory"
         );
+    }
+
+    #[test]
+    fn test_apply_overrides_replaces_all_fields() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+
+        let overrides = CliOverrides {
+            email: Some("override@example.com".to_string()),
+            ca_url: Some("https://override-ca".to_string()),
+            http_responder_url: Some("http://override-responder".to_string()),
+            http_responder_hmac: Some("override-hmac".to_string()),
+        };
+
+        settings.apply_overrides(&overrides);
+
+        assert_eq!(settings.email, "override@example.com");
+        assert_eq!(settings.server, "https://override-ca");
+        assert_eq!(
+            settings.acme.http_responder_url,
+            "http://override-responder"
+        );
+        assert_eq!(settings.acme.http_responder_hmac, "override-hmac");
+    }
+
+    #[test]
+    fn test_apply_overrides_skips_none_fields() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        let original_email = settings.email.clone();
+        let original_server = settings.server.clone();
+
+        let overrides = CliOverrides::default();
+        settings.apply_overrides(&overrides);
+
+        assert_eq!(settings.email, original_email);
+        assert_eq!(settings.server, original_server);
+    }
+
+    /// Regression test for #475: reloading the config from disk then applying
+    /// CLI overrides must produce the CLI value, not the file/default value.
+    #[test]
+    fn test_reload_then_apply_overrides_preserves_cli_values() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        // Config deliberately omits http_responder_hmac so it falls back to
+        // the compiled default (empty string).
+        writeln!(
+            file,
+            r#"
+            domain = "trusted.domain"
+            email = "file@example.com"
+
+            [acme]
+            http_responder_url = "http://localhost:8080"
+
+            [[profiles]]
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+
+            [profiles.paths]
+            cert = "certs/edge-proxy-a.pem"
+            key = "certs/edge-proxy-a.key"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let overrides = CliOverrides {
+            email: None,
+            ca_url: Some("https://cli-ca".to_string()),
+            http_responder_url: None,
+            http_responder_hmac: Some("cli-hmac-secret".to_string()),
+        };
+
+        // Simulate the daemon retry path: reload from disk, then apply overrides.
+        let mut fresh = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        fresh.apply_overrides(&overrides);
+
+        // CLI-provided values must win.
+        assert_eq!(fresh.server, "https://cli-ca");
+        assert_eq!(fresh.acme.http_responder_hmac, "cli-hmac-secret");
+        // File-provided values stay when CLI has no override.
+        assert_eq!(fresh.email, "file@example.com");
+        assert_eq!(fresh.acme.http_responder_url, "http://localhost:8080");
     }
 
     #[test]

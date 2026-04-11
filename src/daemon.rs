@@ -14,6 +14,7 @@ const DEFAULT_AGENT_CONFIG_PATH: &str = "agent.toml";
 struct IssuanceRuntime {
     config_path: PathBuf,
     insecure_mode: bool,
+    cli_overrides: config::CliOverrides,
 }
 
 /// Runs the agent daemon loop for all profiles.
@@ -25,6 +26,7 @@ pub(crate) async fn run_daemon(
     default_eab: Option<eab::EabCredentials>,
     config_path: Option<PathBuf>,
     insecure_mode: bool,
+    cli_overrides: config::CliOverrides,
 ) -> anyhow::Result<()> {
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
@@ -32,6 +34,7 @@ pub(crate) async fn run_daemon(
     let runtime = IssuanceRuntime {
         config_path: resolve_config_path(config_path.as_deref()),
         insecure_mode,
+        cli_overrides,
     };
 
     let shutdown_handle = tokio::spawn(async move {
@@ -139,6 +142,7 @@ pub(crate) async fn run_oneshot(
     let runtime = IssuanceRuntime {
         config_path: resolve_config_path(config_path.as_deref()),
         insecure_mode,
+        cli_overrides: config::CliOverrides::default(),
     };
     let mut handles = Vec::new();
 
@@ -242,19 +246,22 @@ async fn issue_with_retry(
     settings: &config::Settings,
     profile: &config::DaemonProfileSettings,
     eab: Option<eab::EabCredentials>,
-    config_path: &Path,
-    insecure_mode: bool,
+    runtime: &IssuanceRuntime,
 ) -> anyhow::Result<()> {
     let backoff = select_retry_backoff(settings, profile);
     let profile_domain = config::profile_domain(settings, profile);
-    let config_path_owned = config_path.to_path_buf();
+    let config_path_owned = runtime.config_path.clone();
+    let cli_overrides = runtime.cli_overrides.clone();
+    let insecure_mode = runtime.insecure_mode;
     issue_with_retry_inner(
         || {
             let path = config_path_owned.clone();
             let domain = profile_domain.clone();
             let eab = eab.clone();
+            let overrides = cli_overrides.clone();
             async move {
-                let fresh = config::Settings::new(Some(path))?;
+                let mut fresh = config::Settings::new(Some(path))?;
+                fresh.apply_overrides(&overrides);
                 let fresh_profile = fresh
                     .profiles
                     .iter()
@@ -390,14 +397,7 @@ async fn check_and_renew_profile(
     );
     let _permit = semaphore.acquire().await?;
     let profile_eab = profile::resolve_profile_eab(profile, default_eab);
-    let result = issue_with_retry(
-        settings,
-        profile,
-        profile_eab,
-        &runtime.config_path,
-        runtime.insecure_mode,
-    )
-    .await;
+    let result = issue_with_retry(settings, profile, profile_eab, runtime).await;
     if let Err(err) = &result {
         error!(
             "Profile '{}' renewal failed after retries: {err}",
