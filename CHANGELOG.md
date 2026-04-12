@@ -19,6 +19,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added `schema_version` field (`u32`, starting at `1`) to the
+  `RemoteBootstrapArtifact` JSON written by
+  `bootroot service add --delivery-mode remote-bootstrap`. Downstream
+  parsers should check this field before accessing artifact fields.
+- Added remote-bootstrap operator guide (`docs/en/remote-bootstrap.md`,
+  `docs/ko/remote-bootstrap.md`) covering transport options (SSH,
+  Ansible, cloud-init, systemd-credentials), `secret_id` hygiene,
+  network requirements, and the full `RemoteBootstrapArtifact` schema
+  reference.
 - Added post-renew hook flags to `bootroot service add`. Services can now
   configure a hook to run after successful certificate renewal at
   registration time, removing the need to hand-edit `agent.toml`.

@@ -227,6 +227,9 @@ OpenBao root token: ********
 
 ### 3-3) remote-bootstrap 전달 모드 + 일회성 bootstrap
 
+전송 옵션, `secret_id` 위생, 아티팩트 스키마 참조를 포함한 전체 운영자
+가이드는 [원격 부트스트랩 운영자 가이드](remote-bootstrap.md)를 참고하세요.
+
 제어 노드 온보딩(아티팩트 생성):
 
 ```bash

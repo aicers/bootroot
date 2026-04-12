@@ -15,8 +15,25 @@ use super::{
 use crate::i18n::Messages;
 use crate::state::{PostRenewHookEntry, ServiceEntry, StateFile};
 
+/// Machine-readable bootstrap artifact written to
+/// `secrets/remote-bootstrap/services/<service>/bootstrap.json`.
+///
+/// Downstream automation (shell scripts, Ansible, CI pipelines) can parse
+/// this JSON to drive `bootroot-remote bootstrap` invocations.
+///
+/// # `schema_version` contract
+///
+/// * The field starts at `1` and is bumped whenever the struct gains,
+///   removes, or renames a field in a way that would break existing
+///   parsers.
+/// * Additive changes that only append new *optional* fields (i.e.
+///   fields with `#[serde(default)]` or `skip_serializing_if`) do **not**
+///   require a bump — existing parsers will simply ignore unknown keys.
+/// * Consumers should check `schema_version` before accessing fields and
+///   fail explicitly if the version is higher than what they support.
 #[derive(serde::Serialize)]
 struct RemoteBootstrapArtifact {
+    schema_version: u32,
     openbao_url: String,
     kv_mount: String,
     service_name: String,
@@ -67,6 +84,7 @@ fn build_artifact(
         remote_openbao_agent_paths(secret_id_path, service_name);
 
     RemoteBootstrapArtifact {
+        schema_version: 1,
         openbao_url: openbao_url.to_string(),
         kv_mount: kv_mount.to_string(),
         service_name: service_name.to_string(),
@@ -251,6 +269,7 @@ mod tests {
             &[],
         );
 
+        assert_eq!(artifact.schema_version, 1);
         assert_eq!(artifact.openbao_url, "https://openbao.example.com:8200");
         assert_eq!(artifact.kv_mount, "secret");
         assert_eq!(artifact.service_name, "my-service");

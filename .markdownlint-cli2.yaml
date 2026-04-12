@@ -6,5 +6,7 @@ ignores:
   - ".github/**"
   - ".venv/**"
 config:
+  MD013:
+    tables: false
   MD024:
     siblings_only: true

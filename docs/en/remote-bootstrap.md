@@ -1,0 +1,375 @@
+# Remote Bootstrap Operator Guide
+
+This guide covers the **remote-bootstrap** delivery mode for services
+running on a machine other than the one hosting step-ca, OpenBao, and
+the HTTP-01 responder (the **control node**).
+
+## When to use remote-bootstrap vs local-file
+
+`bootroot service add` offers two delivery modes via `--delivery-mode`:
+
+| Mode | Use when | What happens |
+| --- | --- | --- |
+| `local-file` (default) | Service runs on the **same** machine as step-ca/OpenBao | `service add` writes configs directly to disk |
+| `remote-bootstrap` | Service runs on a **different** machine | `service add` produces a JSON artifact; operator ships it to the service host and runs `bootroot-remote bootstrap` there |
+
+Choose `remote-bootstrap` whenever the service machine cannot share a
+filesystem with the control node.
+
+## Prerequisites on the remote host
+
+1. **`bootroot-remote` binary installed.** Pre-built release binaries are
+    not yet available; build from source with
+    `cargo build --release --bin bootroot-remote` and distribute the binary
+    to each service machine. See [Installation](installation.md) for details.
+
+2. **Network reachability.** The remote host must reach:
+
+    - OpenBao's API endpoint (the `--openbao-url` value, typically
+      `https://openbao.internal:8200` or your environment's equivalent).
+    - step-ca's HTTPS ACME directory (the `--agent-server` value, e.g.
+      `https://stepca.internal:9000/acme/acme/directory`).
+    - The HTTP-01 responder (the `--agent-responder-url` value, e.g.
+      `http://responder.internal:8080`).
+
+3. **DNS / name resolution.** The SAN (Subject Alternative Name) for the
+    service certificate must resolve from whatever DNS, `/etc/hosts`, or
+    cloud-internal DNS the environment uses.
+
+    !!! note
+        The in-compose DNS alias automation tracked by
+        [#472](https://github.com/aicers/bootroot/issues/472) only covers
+        traffic between bundled containers on the Docker bridge network.
+        Remote hosts need real DNS or equivalent entries configured by the
+        operator.
+
+4. **Filesystem layout.** Directories for secrets, certs, and agent config
+    must exist (or be creatable) on the remote host. The paths are defined
+    in the bootstrap artifact and passed to `bootroot-remote bootstrap`.
+
+## The transport boundary
+
+By design, bootroot does **not** ship files to remote hosts.
+`bootroot service add --delivery-mode remote-bootstrap` produces a JSON
+artifact and credential files; the operator chooses the transport mechanism
+that fits their environment.
+
+The files that must reach the remote host are:
+
+| File | Source path (control node) | Purpose |
+| --- | --- | --- |
+| `bootstrap.json` | `secrets/remote-bootstrap/services/<service>/bootstrap.json` | Machine-readable artifact consumed by `bootroot-remote bootstrap` |
+| `role_id` | `secrets/services/<service>/role_id` | AppRole identity (long-lived) |
+| `secret_id` | `secrets/services/<service>/secret_id` | AppRole credential (**sensitive**) |
+
+### Option 1: SSH + shell script (recommended starting point)
+
+Best for small deployments with a handful of service machines.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICE=edge-remote
+CONTROL_SECRETS=./secrets
+REMOTE_HOST=edge-node-02
+REMOTE_USER=deploy
+REMOTE_BASE=/srv/bootroot
+ARTIFACT="$CONTROL_SECRETS/remote-bootstrap/services/$SERVICE/bootstrap.json"
+
+# Required: set these to remote-reachable endpoints.
+# The artifact may contain localhost placeholders that are only
+# valid on the control node.
+AGENT_SERVER=https://stepca.internal:9000/acme/acme/directory
+AGENT_RESPONDER_URL=http://responder.internal:8080
+
+# 1. Register the service on the control node
+bootroot service add \
+  --service-name "$SERVICE" \
+  --deploy-type daemon \
+  --delivery-mode remote-bootstrap \
+  --hostname "$REMOTE_HOST" \
+  --domain trusted.domain \
+  --agent-config "$REMOTE_BASE/agent.toml" \
+  --cert-path "$REMOTE_BASE/certs/$SERVICE.crt" \
+  --key-path "$REMOTE_BASE/certs/$SERVICE.key" \
+  --root-token "$OPENBAO_ROOT_TOKEN"
+
+# 2. Create the destination directory and ship the artifact
+ssh "$REMOTE_USER@$REMOTE_HOST" \
+  mkdir -p "$REMOTE_BASE/secrets/services/$SERVICE"
+
+scp -p \
+  "$ARTIFACT" \
+  "$CONTROL_SECRETS/services/$SERVICE/role_id" \
+  "$CONTROL_SECRETS/services/$SERVICE/secret_id" \
+  "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
+
+# 3. Validate schema_version before parsing fields
+if ! jq -e '.schema_version == 1' "$ARTIFACT" > /dev/null; then
+  echo "ERROR: unsupported schema_version in $ARTIFACT" >&2
+  exit 1
+fi
+
+field() { jq -r ".$1" "$ARTIFACT"; }
+
+INSTANCE_ID=$(field profile_instance_id)
+
+ssh "$REMOTE_USER@$REMOTE_HOST" \
+  bootroot-remote bootstrap \
+    --openbao-url "$(field openbao_url)" \
+    --kv-mount "$(field kv_mount)" \
+    --service-name "$(field service_name)" \
+    --role-id-path "$(field role_id_path)" \
+    --secret-id-path "$(field secret_id_path)" \
+    --eab-file-path "$(field eab_file_path)" \
+    --agent-config-path "$(field agent_config_path)" \
+    --agent-email "$(field agent_email)" \
+    --agent-server "$AGENT_SERVER" \
+    --agent-domain "$(field agent_domain)" \
+    --agent-responder-url "$AGENT_RESPONDER_URL" \
+    --profile-hostname "$(field profile_hostname)" \
+    --profile-cert-path "$(field profile_cert_path)" \
+    --profile-key-path "$(field profile_key_path)" \
+    --ca-bundle-path "$(field ca_bundle_path)" \
+    ${INSTANCE_ID:+--profile-instance-id "$INSTANCE_ID"} \
+    --output json
+
+# 4. Remove secret_id from the control node after delivery
+rm -f "$CONTROL_SECRETS/services/$SERVICE/secret_id"
+```
+
+### Option 2: systemd-credentials
+
+For single-host setups where the secret should never hit a plain filesystem.
+Use `systemd-creds encrypt` on the control node and `LoadCredential=` in
+the service unit on the remote host.
+
+```ini
+# /etc/systemd/system/bootroot-remote-bootstrap.service
+[Service]
+Type=oneshot
+LoadCredential=secret_id:/etc/credstore/bootroot-edge-remote-secret-id
+ExecStart=/usr/local/bin/bootroot-remote bootstrap \
+    --openbao-url https://openbao.internal:8200 \
+    --service-name edge-remote \
+    --secret-id-path %d/secret_id \
+    --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
+    --eab-file-path /srv/bootroot/secrets/services/edge-remote/eab.json \
+    --agent-config-path /srv/bootroot/agent.toml \
+    --agent-server https://stepca.internal:9000/acme/acme/directory \
+    --agent-domain trusted.domain \
+    --agent-responder-url http://responder.internal:8080 \
+    --profile-hostname edge-node-02 \
+    --profile-cert-path /srv/bootroot/certs/edge-remote.crt \
+    --profile-key-path /srv/bootroot/certs/edge-remote.key \
+    --ca-bundle-path /srv/bootroot/certs/ca-bundle.pem \
+    --output json
+```
+
+### Option 3: Ansible
+
+For larger fleets with existing configuration management.
+
+```yaml
+# playbook: bootroot-remote-bootstrap.yml
+- name: Bootstrap remote service via bootroot-remote
+  hosts: edge_nodes
+  become: true
+  vars:
+    service_name: edge-remote
+    control_secrets: ./secrets
+    remote_base: /srv/bootroot
+    # Required: set these to remote-reachable endpoints.
+    # The artifact may contain localhost placeholders that are only
+    # valid on the control node.
+    agent_server: https://stepca.internal:9000/acme/acme/directory
+    agent_responder_url: http://responder.internal:8080
+  tasks:
+    - name: Read bootstrap artifact from control node
+      ansible.builtin.slurp:
+        src: "{{ control_secrets }}/remote-bootstrap/services/{{ service_name }}/bootstrap.json"
+      delegate_to: localhost
+      become: false
+      register: artifact_b64
+
+    - name: Parse bootstrap artifact
+      ansible.builtin.set_fact:
+        artifact: "{{ artifact_b64.content | b64decode | from_json }}"
+
+    - name: Validate schema_version
+      ansible.builtin.assert:
+        that:
+          - artifact.schema_version == 1
+        fail_msg: >-
+          Unsupported schema_version {{ artifact.schema_version }};
+          this playbook supports version 1 only.
+
+    - name: Ensure secrets directory
+      ansible.builtin.file:
+        path: "{{ remote_base }}/secrets/services/{{ service_name }}"
+        state: directory
+        mode: "0700"
+
+    - name: Copy role_id
+      ansible.builtin.copy:
+        src: "{{ control_secrets }}/services/{{ service_name }}/role_id"
+        dest: "{{ artifact.role_id_path }}"
+        mode: "0600"
+
+    - name: Copy secret_id
+      ansible.builtin.copy:
+        src: "{{ control_secrets }}/services/{{ service_name }}/secret_id"
+        dest: "{{ artifact.secret_id_path }}"
+        mode: "0600"
+
+    - name: Build optional flags
+      ansible.builtin.set_fact:
+        instance_id_flag: >-
+          {{ '--profile-instance-id ' ~ artifact.profile_instance_id
+             if artifact.profile_instance_id | default('') | length > 0
+             else '' }}
+
+    - name: Run bootroot-remote bootstrap
+      ansible.builtin.command:
+        cmd: >-
+          bootroot-remote bootstrap
+          --openbao-url {{ artifact.openbao_url }}
+          --kv-mount {{ artifact.kv_mount }}
+          --service-name {{ artifact.service_name }}
+          --role-id-path {{ artifact.role_id_path }}
+          --secret-id-path {{ artifact.secret_id_path }}
+          --eab-file-path {{ artifact.eab_file_path }}
+          --agent-config-path {{ artifact.agent_config_path }}
+          --agent-email {{ artifact.agent_email }}
+          --agent-server {{ agent_server }}
+          --agent-domain {{ artifact.agent_domain }}
+          --agent-responder-url {{ agent_responder_url }}
+          --profile-hostname {{ artifact.profile_hostname }}
+          {{ instance_id_flag }}
+          --profile-cert-path {{ artifact.profile_cert_path }}
+          --profile-key-path {{ artifact.profile_key_path }}
+          --ca-bundle-path {{ artifact.ca_bundle_path }}
+          --output json
+      changed_when: true
+```
+
+### Option 4: cloud-init
+
+For first-boot provisioning of cloud VMs.
+
+```yaml
+#cloud-config
+write_files:
+  - path: /srv/bootroot/secrets/services/edge-remote/role_id
+    permissions: "0600"
+    content: |
+      <ROLE_ID_VALUE>
+  - path: /srv/bootroot/secrets/services/edge-remote/secret_id
+    permissions: "0600"
+    content: |
+      <SECRET_ID_VALUE>
+runcmd:
+  - >-
+    /usr/local/bin/bootroot-remote bootstrap
+    --openbao-url https://openbao.internal:8200
+    --service-name edge-remote
+    --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id
+    --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
+    --eab-file-path /srv/bootroot/secrets/services/edge-remote/eab.json
+    --agent-config-path /srv/bootroot/agent.toml
+    --agent-server https://stepca.internal:9000/acme/acme/directory
+    --agent-domain trusted.domain
+    --agent-responder-url http://responder.internal:8080
+    --profile-hostname edge-node-02
+    --profile-cert-path /srv/bootroot/certs/edge-remote.crt
+    --profile-key-path /srv/bootroot/certs/edge-remote.key
+    --ca-bundle-path /srv/bootroot/certs/ca-bundle.pem
+    --output json
+```
+
+## `secret_id` hygiene checklist
+
+The `secret_id` is the most sensitive artifact in the remote-bootstrap flow.
+Treat it as a short-lived credential:
+
+- **File permissions**: `0600`, owned by the service user.
+    `bootroot service add` already writes it with restricted permissions.
+- **Never log or commit**: exclude the file from version control
+    (`.gitignore`) and ensure deployment scripts do not echo it to stdout
+    or write it to log files.
+- **Remove from control node after delivery**: once the `secret_id` has
+    been shipped to the remote host, delete the local copy. The SSH script
+    example above demonstrates this.
+- **Short TTL / response wrapping**: when available, use AppRole
+    `secret_id` TTL controls or response wrapping to limit the credential's
+    validity window. This capability is tracked in
+    [#480](https://github.com/aicers/bootroot/issues/480); the
+    remote-bootstrap guide will be updated once it lands.
+- **Rotation**: after `bootroot rotate approle-secret-id` on the control
+    node, deliver the new `secret_id` via
+    `bootroot-remote apply-secret-id` on the service machine. See
+    [Operations](operations.md) for the rotation workflow.
+
+## Network requirements
+
+The remote host must have network connectivity to the following endpoints:
+
+| Endpoint | Protocol | Purpose |
+| --- | --- | --- |
+| OpenBao API (`--openbao-url`) | HTTPS | Pull secrets (EAB, responder HMAC, trust bundle) during bootstrap |
+| step-ca ACME directory (`--agent-server`) | HTTPS | Certificate issuance and renewal by `bootroot-agent` |
+| HTTP-01 responder (`--agent-responder-url`) | HTTP | Publish ACME challenge tokens for domain validation |
+
+The `--agent-server` and `--agent-responder-url` values in the bootstrap
+artifact default to localhost placeholders. Replace them with
+remote-reachable endpoints before running on a separate service machine.
+
+!!! warning
+    The automatic HTTP-01 DNS alias registration (added in the current
+    unreleased version) only covers traffic between bundled containers on
+    the Docker bridge network. For remote hosts, configure real DNS records
+    or `/etc/hosts` entries so that the service's SAN resolves correctly
+    from both the responder and the CA's perspective.
+
+## `RemoteBootstrapArtifact` schema reference
+
+The JSON artifact written to
+`secrets/remote-bootstrap/services/<service>/bootstrap.json` follows a
+versioned schema. Automation should check `schema_version` before parsing.
+
+Current version: **1**
+
+| Field | Type | Description | Consumed by |
+| --- | --- | --- | --- |
+| `schema_version` | `u32` | Schema version number. Bumped on breaking changes. | Parser pre-check |
+| `openbao_url` | `string` | OpenBao API URL | `--openbao-url` |
+| `kv_mount` | `string` | OpenBao KV v2 mount path | `--kv-mount` |
+| `service_name` | `string` | Registered service name | `--service-name` |
+| `role_id_path` | `string` | Path to AppRole `role_id` file on the remote host | `--role-id-path` |
+| `secret_id_path` | `string` | Path to AppRole `secret_id` file on the remote host | `--secret-id-path` |
+| `eab_file_path` | `string` | Path to EAB credentials JSON file | `--eab-file-path` |
+| `agent_config_path` | `string` | Path to `agent.toml` on the remote host | `--agent-config-path` |
+| `ca_bundle_path` | `string` | Path to CA trust bundle PEM file | `--ca-bundle-path` |
+| `openbao_agent_config_path` | `string` | Path to OpenBao Agent config (HCL) | Internal |
+| `openbao_agent_template_path` | `string` | Path to OpenBao Agent template | Internal |
+| `openbao_agent_token_path` | `string` | Path to OpenBao Agent token file | Internal |
+| `agent_email` | `string` | ACME account email | `--agent-email` |
+| `agent_server` | `string` | step-ca ACME directory URL (localhost placeholder by default) | `--agent-server` |
+| `agent_domain` | `string` | Domain for certificate SAN | `--agent-domain` |
+| `agent_responder_url` | `string` | HTTP-01 responder URL (localhost placeholder by default) | `--agent-responder-url` |
+| `profile_hostname` | `string` | Hostname for the agent profile | `--profile-hostname` |
+| `profile_instance_id` | `string` | Instance identifier (may be empty) | `--profile-instance-id` |
+| `profile_cert_path` | `string` | Output path for the issued certificate | `--profile-cert-path` |
+| `profile_key_path` | `string` | Output path for the private key | `--profile-key-path` |
+| `post_renew_hooks` | `array` | Post-renew hook entries (omitted when empty). Each entry has `command`, `args`, `timeout_secs`, `on_failure`. | `--post-renew-command` and related flags |
+
+### Versioning rules
+
+- **Breaking change** (field removed, renamed, or type changed): bump
+    `schema_version`.
+- **Additive change** (new optional field with `skip_serializing_if`):
+    no bump required. Existing parsers ignore unknown keys.
+- **Consumer contract**: check `schema_version >= 1` and
+    `schema_version <= <max supported>` before accessing fields. Fail
+    explicitly on unsupported versions.

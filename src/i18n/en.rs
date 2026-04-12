@@ -187,7 +187,7 @@ pub(super) static STRINGS: Strings = Strings {
     service_scope_operator_required: "Operator-managed (required):",
     service_scope_operator_recommended: "Operator-managed (recommended):",
     service_scope_operator_optional: "Operator-managed (optional):",
-    service_summary_remote_bootstrap_file: "- remote bootstrap file: {value}",
+    service_summary_remote_bootstrap_file: "- remote bootstrap file (machine-readable artifact for automation): {value}",
     service_summary_remote_run_command: "- remote run command template: {value}",
     service_summary_remote_handoff_title: "- remote handoff order:",
     service_summary_remote_handoff_service_host: "  1. Edit and run on the service host: {value}",

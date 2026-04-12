@@ -28,6 +28,7 @@ plugins:
             - CLI: cli.md
             - CLI Examples: cli-examples.md
             - Installation: installation.md
+            - Remote Bootstrap: remote-bootstrap.md
             - Configuration: configuration.md
             - Operations: operations.md
             - CI & E2E: e2e-ci.md
@@ -41,6 +42,7 @@ plugins:
             - CLI: cli.md
             - CLI Examples: cli-examples.md
             - Installation: installation.md
+            - Remote Bootstrap: remote-bootstrap.md
             - Configuration: configuration.md
             - Operations: operations.md
             - CI & E2E: e2e-ci.md
@@ -51,6 +53,7 @@ plugins:
             CLI: CLI
             CLI Examples: CLI 예제
             Installation: 설치
+            Remote Bootstrap: 원격 부트스트랩
             Configuration: 설정
             Operations: 운영
             CI & E2E: CI/E2E

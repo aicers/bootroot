@@ -187,7 +187,7 @@ pub(super) static STRINGS: Strings = Strings {
     service_scope_operator_required: "운영자 실행 항목 (필수):",
     service_scope_operator_recommended: "운영자 실행 항목 (권장):",
     service_scope_operator_optional: "운영자 실행 항목 (선택):",
-    service_summary_remote_bootstrap_file: "- 원격 부트스트랩 파일: {value}",
+    service_summary_remote_bootstrap_file: "- 원격 부트스트랩 파일 (자동화용 머신 판독 가능 아티팩트): {value}",
     service_summary_remote_run_command: "- 원격 실행 명령 템플릿: {value}",
     service_summary_remote_handoff_title: "- 원격 반영 실행 순서:",
     service_summary_remote_handoff_service_host: "  1. 서비스 머신에서 값을 수정한 뒤 실행: {value}",

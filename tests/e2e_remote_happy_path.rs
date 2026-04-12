@@ -141,7 +141,7 @@ fn run_service_add_remote(control_dir: &Path, service_dir: &Path) -> anyhow::Res
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("bootroot service add: summary"));
-    assert!(stdout.contains("- remote bootstrap file:"));
+    assert!(stdout.contains("- remote bootstrap file (machine-readable artifact for automation):"));
     assert!(stdout.contains("- remote run command template:"));
     Ok(())
 }

@@ -40,7 +40,10 @@ Open source dependencies:
 - **Certificate flow**: bootroot-agent issues/renews certs; OpenBao Agent
   renders secrets and config files for each service.
 
-For multi-machine or manual deployment, follow the manual guides in `docs/`.
+For multi-machine deployments using `--delivery-mode remote-bootstrap`, see
+the [Remote Bootstrap Operator Guide](docs/en/remote-bootstrap.md)
+([한국어](docs/ko/remote-bootstrap.md)). For other manual deployment options,
+follow the manual guides in `docs/`.
 
 ## Developer Layout
 

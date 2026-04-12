@@ -635,7 +635,7 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
     assert!(stdout.contains("Bootroot-managed:"));
     assert!(stdout.contains("Operator-managed (required):"));
     assert!(stdout.contains("Operator-managed (recommended):"));
-    assert!(stdout.contains("- remote bootstrap file:"));
+    assert!(stdout.contains("- remote bootstrap file (machine-readable artifact for automation):"));
     assert!(stdout.contains("- remote run command template:"));
     assert!(stdout.contains("- remote handoff order:"));
     assert!(stdout.contains("1. Edit and run on the service host:"));
@@ -676,6 +676,7 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
 }
 
 fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
+    assert_eq!(bootstrap["schema_version"], 1);
     assert_eq!(bootstrap["service_name"], "edge-proxy");
     assert_eq!(bootstrap["kv_mount"], "secret");
     assert!(bootstrap["role_id_path"].is_string());

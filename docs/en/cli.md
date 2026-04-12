@@ -998,6 +998,11 @@ rotation.
 `bootroot-remote` also supports the global `--lang` option
 (environment variable: `BOOTROOT_LANG`).
 
+For an end-to-end walkthrough including transport options (SSH, Ansible,
+cloud-init, systemd-credentials), `secret_id` hygiene, and the
+`RemoteBootstrapArtifact` schema reference, see the
+[Remote Bootstrap Operator Guide](remote-bootstrap.md).
+
 ### `bootroot-remote bootstrap`
 
 Performs a one-shot pull and apply of service secrets/config to remote file
