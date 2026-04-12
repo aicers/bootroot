@@ -13,7 +13,7 @@ use super::super::types::{
 use super::InitRollback;
 use super::database::{check_db_connectivity, resolve_db_dsn_for_init};
 use super::openbao_setup::{
-    bootstrap_openbao, configure_openbao, setup_openbao_agents,
+    bootstrap_openbao, configure_openbao, setup_openbao_agents, validate_secret_id_ttl,
     write_ca_trust_fingerprints_with_retry,
 };
 use super::prompts::confirm_overwrite;
@@ -34,6 +34,10 @@ use crate::i18n::Messages;
 use crate::state::StateFile;
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
+    if let Some(warning) = validate_secret_id_ttl(&args.secret_id_ttl, messages)? {
+        eprintln!("{warning}");
+    }
+
     ensure_all_services_localhost_binding(&args.compose.compose_file, messages)?;
     // Only check openbao + postgres; step-ca may not be bootstrapped yet.
     ensure_init_prereqs_ready(&args.compose.compose_file, messages)?;

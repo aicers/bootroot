@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
-use bootroot::openbao::OpenBaoClient;
+use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 
 use super::helpers::{confirm_action, reload_openbao_agent, write_secret_id_atomic};
 use super::{ROLE_ID_FILENAME, RotateContext};
@@ -35,7 +35,7 @@ pub(super) async fn rotate_approle_secret_id(
         ensure_role_id_file(&entry, client, messages).await?;
     }
     let new_secret_id = client
-        .create_secret_id(&entry.approle.role_name)
+        .create_secret_id(&entry.approle.role_name, &SecretIdOptions::default())
         .await
         .with_context(|| messages.error_openbao_secret_id_failed())?;
     if !is_remote {

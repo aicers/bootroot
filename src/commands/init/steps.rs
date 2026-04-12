@@ -109,6 +109,7 @@ pub(super) mod test_support {
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
+    use super::super::constants::openbao_constants::SECRET_ID_TTL;
     use super::super::constants::{DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL};
     use crate::cli::args::InitArgs;
     pub(in crate::commands::init::steps) use crate::i18n::test_messages;
@@ -140,6 +141,7 @@ pub(super) mod test_support {
             root_token: crate::cli::args::RootTokenArgs { root_token: None },
             unseal_key: Vec::new(),
             openbao_unseal_from_file: None,
+            secret_id_ttl: SECRET_ID_TTL.to_string(),
             stepca_password: None,
             db_dsn: None,
             db_admin: crate::cli::args::DbAdminDsnArgs { admin_dsn: None },

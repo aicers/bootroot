@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
+use bootroot::openbao::SecretIdOptions;
 
 use super::super::constants::openbao_constants::{
-    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC,
-    PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RESPONDER,
-    POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD, POLICY_BOOTROOT_STEPCA,
-    SECRET_ID_TTL, TOKEN_TTL,
+    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, MAX_SECRET_ID_TTL, PATH_AGENT_EAB, PATH_CA_TRUST,
+    PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT,
+    POLICY_BOOTROOT_RESPONDER, POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
+    POLICY_BOOTROOT_STEPCA, RECOMMENDED_SECRET_ID_TTL, TOKEN_TTL,
 };
 use super::super::constants::{
     OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME, OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR,
@@ -174,12 +175,19 @@ pub(super) async fn configure_openbao(
             rollback.created_approles.push(role_name.to_string());
         }
         client
-            .create_approle(role_name, &[policy_name], TOKEN_TTL, SECRET_ID_TTL, true)
+            .create_approle(
+                role_name,
+                &[policy_name],
+                TOKEN_TTL,
+                &args.secret_id_ttl,
+                true,
+            )
             .await
             .with_context(|| messages.error_openbao_approle_create_failed())?;
     }
 
     let mut role_outputs = Vec::new();
+    let default_opts = SecretIdOptions::default();
     for &label in AppRoleLabel::all() {
         let role_name = label.role_name();
         let role_id = client
@@ -187,7 +195,7 @@ pub(super) async fn configure_openbao(
             .await
             .with_context(|| messages.error_openbao_role_id_failed())?;
         let secret_id = client
-            .create_secret_id(role_name)
+            .create_secret_id(role_name, &default_opts)
             .await
             .with_context(|| messages.error_openbao_secret_id_failed())?;
         role_outputs.push(AppRoleOutput {
@@ -319,6 +327,52 @@ pub(super) async fn write_ca_trust_fingerprints_with_retry(
         }
     }
     Ok(changed)
+}
+
+/// Parses an OpenBao-style duration string into seconds.
+///
+/// Accepts formats: `"30s"`, `"10m"`, `"24h"`, or bare seconds `"3600"`.
+fn parse_ttl_to_secs(ttl: &str) -> Option<u64> {
+    let ttl = ttl.trim();
+    if ttl.is_empty() {
+        return None;
+    }
+    if let Some(h) = ttl.strip_suffix('h') {
+        return h.parse::<u64>().ok().and_then(|v| v.checked_mul(3600));
+    }
+    if let Some(m) = ttl.strip_suffix('m') {
+        return m.parse::<u64>().ok().and_then(|v| v.checked_mul(60));
+    }
+    if let Some(s) = ttl.strip_suffix('s') {
+        return s.parse::<u64>().ok();
+    }
+    ttl.parse::<u64>().ok()
+}
+
+/// Validates the `--secret-id-ttl` value against hard maximum and
+/// recommended thresholds.
+///
+/// Returns `Ok(Some(warning))` when the value exceeds the recommended
+/// threshold but is still within the hard maximum, `Ok(None)` when the
+/// value is within both limits, or `Err` when the value is invalid or
+/// exceeds the hard maximum.
+pub(super) fn validate_secret_id_ttl(ttl: &str, messages: &Messages) -> Result<Option<String>> {
+    let secs = parse_ttl_to_secs(ttl)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_secret_id_ttl_invalid(ttl)))?;
+    let max_secs =
+        parse_ttl_to_secs(MAX_SECRET_ID_TTL).expect("MAX_SECRET_ID_TTL must be a valid duration");
+    if secs > max_secs {
+        anyhow::bail!(messages.error_secret_id_ttl_exceeds_max(ttl, MAX_SECRET_ID_TTL));
+    }
+    let recommended_secs = parse_ttl_to_secs(RECOMMENDED_SECRET_ID_TTL)
+        .expect("RECOMMENDED_SECRET_ID_TTL must be a valid duration");
+    if secs > recommended_secs {
+        return Ok(Some(messages.warning_secret_id_ttl_exceeds_recommended(
+            ttl,
+            RECOMMENDED_SECRET_ID_TTL,
+        )));
+    }
+    Ok(None)
 }
 
 fn build_policy_map(kv_mount: &str) -> BTreeMap<String, String> {
@@ -893,5 +947,83 @@ services:
             config.contains("template {"),
             "config should contain template block"
         );
+    }
+
+    #[test]
+    fn test_parse_ttl_to_secs_hours() {
+        assert_eq!(parse_ttl_to_secs("24h"), Some(86400));
+        assert_eq!(parse_ttl_to_secs("168h"), Some(604_800));
+    }
+
+    #[test]
+    fn test_parse_ttl_to_secs_minutes() {
+        assert_eq!(parse_ttl_to_secs("30m"), Some(1800));
+    }
+
+    #[test]
+    fn test_parse_ttl_to_secs_seconds() {
+        assert_eq!(parse_ttl_to_secs("3600s"), Some(3600));
+        assert_eq!(parse_ttl_to_secs("3600"), Some(3600));
+    }
+
+    #[test]
+    fn test_parse_ttl_to_secs_invalid() {
+        assert_eq!(parse_ttl_to_secs(""), None);
+        assert_eq!(parse_ttl_to_secs("abc"), None);
+    }
+
+    #[test]
+    fn test_validate_secret_id_ttl_default_passes() {
+        let messages = test_messages();
+        assert!(validate_secret_id_ttl("24h", &messages).is_ok());
+    }
+
+    #[test]
+    fn test_validate_secret_id_ttl_exceeds_max_fails() {
+        let messages = test_messages();
+        assert!(validate_secret_id_ttl("200h", &messages).is_err());
+    }
+
+    #[test]
+    fn test_validate_secret_id_ttl_exceeds_recommended_passes_with_warning() {
+        let messages = test_messages();
+        // 72h > 48h recommended but < 168h max → Ok with warning
+        let warning = validate_secret_id_ttl("72h", &messages)
+            .expect("should succeed")
+            .expect("should return a warning");
+        assert!(
+            warning.contains("72h"),
+            "warning should mention the supplied value"
+        );
+        assert!(
+            warning.contains(RECOMMENDED_SECRET_ID_TTL),
+            "warning should mention the recommended threshold"
+        );
+    }
+
+    #[test]
+    fn test_validate_secret_id_ttl_within_recommended_has_no_warning() {
+        let messages = test_messages();
+        let warning = validate_secret_id_ttl("24h", &messages).expect("should succeed");
+        assert!(warning.is_none(), "no warning expected for 24h");
+    }
+
+    #[test]
+    fn test_validate_secret_id_ttl_invalid_fails() {
+        let messages = test_messages();
+        assert!(validate_secret_id_ttl("not-a-duration", &messages).is_err());
+    }
+
+    #[test]
+    fn test_validate_secret_id_ttl_overflow_fails() {
+        let messages = test_messages();
+        // A huge hours value that would overflow u64 when multiplied by 3600
+        assert!(validate_secret_id_ttl("99999999999999999999h", &messages).is_err());
+    }
+
+    #[test]
+    fn test_parse_ttl_to_secs_overflow_returns_none() {
+        assert_eq!(parse_ttl_to_secs("99999999999999999999h"), None);
+        assert_eq!(parse_ttl_to_secs("99999999999999999999m"), None);
     }
 }
