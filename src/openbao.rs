@@ -81,6 +81,21 @@ struct RoleIdData {
     role_id: String,
 }
 
+/// Per-issuance options for `create_secret_id`.
+///
+/// All fields are optional. When every field is `None` (the `Default`
+/// value) the resulting API payload is `{}`, which preserves the
+/// existing behaviour of deferring to the role-level defaults.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SecretIdOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_uses: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SecretIdResponse {
     data: SecretIdData,
@@ -484,11 +499,11 @@ impl OpenBaoClient {
     ///
     /// # Errors
     /// Returns an error if the `secret_id` cannot be created.
-    pub async fn create_secret_id(&self, name: &str) -> Result<String> {
+    pub async fn create_secret_id(&self, name: &str, options: &SecretIdOptions) -> Result<String> {
         let response: SecretIdResponse = self
             .post_json(
                 &format!("auth/approle/role/{name}/secret-id"),
-                &serde_json::json!({}),
+                options,
                 None,
             )
             .await?;
@@ -954,6 +969,70 @@ mod wrap_tests {
             .expect("put_json with wrap_ttl should succeed");
         assert_eq!(info.wrap_info.token, "wrap-put-token");
         assert_eq!(info.wrap_info.ttl, 30);
+    }
+}
+
+#[cfg(test)]
+mod secret_id_options_tests {
+    use super::*;
+
+    #[test]
+    fn default_serializes_to_empty_object() {
+        let opts = SecretIdOptions::default();
+        let json = serde_json::to_value(&opts).expect("serialize");
+        assert_eq!(json, serde_json::json!({}));
+    }
+
+    #[test]
+    fn serializes_ttl_only() {
+        let opts = SecretIdOptions {
+            ttl: Some("24h".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&opts).expect("serialize");
+        assert_eq!(json, serde_json::json!({"ttl": "24h"}));
+    }
+
+    #[test]
+    fn serializes_num_uses_only() {
+        let opts = SecretIdOptions {
+            num_uses: Some(1),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&opts).expect("serialize");
+        assert_eq!(json, serde_json::json!({"num_uses": 1}));
+    }
+
+    #[test]
+    fn serializes_all_fields() {
+        let opts = SecretIdOptions {
+            ttl: Some("30m".to_string()),
+            num_uses: Some(5),
+            metadata: Some(r#"{"source":"rotate"}"#.to_string()),
+        };
+        let json = serde_json::to_value(&opts).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "ttl": "30m",
+                "num_uses": 5,
+                "metadata": "{\"source\":\"rotate\"}"
+            })
+        );
+    }
+
+    #[test]
+    fn omits_none_fields() {
+        let opts = SecretIdOptions {
+            ttl: Some("1h".to_string()),
+            num_uses: None,
+            metadata: None,
+        };
+        let json = serde_json::to_value(&opts).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert!(obj.contains_key("ttl"));
+        assert!(!obj.contains_key("num_uses"));
+        assert!(!obj.contains_key("metadata"));
     }
 }
 

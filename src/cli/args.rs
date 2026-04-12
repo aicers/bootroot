@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::commands::init::{
     DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL, DEFAULT_SECRETS_DIR,
-    DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL,
+    DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL, SECRET_ID_TTL,
 };
 use crate::state::{DeliveryMode, DeployType, HookFailurePolicyEntry};
 
@@ -544,6 +544,10 @@ pub(crate) struct InitArgs {
     /// Auto-unseal `OpenBao` from file (dev/test only)
     #[arg(long, env = "OPENBAO_UNSEAL_FILE")]
     pub(crate) openbao_unseal_from_file: Option<PathBuf>,
+
+    /// Role-level `secret_id` TTL for `AppRole` roles created during init
+    #[arg(long, default_value = SECRET_ID_TTL)]
+    pub(crate) secret_id_ttl: String,
 
     /// step-ca password (password.txt)
     #[arg(long, env = "STEPCA_PASSWORD")]

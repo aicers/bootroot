@@ -32,6 +32,31 @@ impl Messages {
         self.strings().warning_db_password_rotation_skipped
     }
 
+    pub(crate) fn warning_secret_id_ttl_exceeds_recommended(
+        &self,
+        value: &str,
+        threshold: &str,
+    ) -> String {
+        format_template(
+            self.strings().warning_secret_id_ttl_exceeds_recommended,
+            &[("value", value), ("threshold", threshold)],
+        )
+    }
+
+    pub(crate) fn error_secret_id_ttl_exceeds_max(&self, value: &str, max: &str) -> String {
+        format_template(
+            self.strings().error_secret_id_ttl_exceeds_max,
+            &[("value", value), ("max", max)],
+        )
+    }
+
+    pub(crate) fn error_secret_id_ttl_invalid(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_secret_id_ttl_invalid,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn prompt_openbao_unseal_from_file_confirm(&self, value: &str) -> String {
         format_template(
             self.strings().prompt_openbao_unseal_from_file_confirm,

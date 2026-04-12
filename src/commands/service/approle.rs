@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
-use bootroot::openbao::OpenBaoClient;
+use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 use tokio::fs;
 
 use super::{
@@ -43,7 +43,7 @@ pub(super) async fn ensure_service_approle(
         .await
         .with_context(|| messages.error_openbao_role_id_failed())?;
     let secret_id = client
-        .create_secret_id(&role_name)
+        .create_secret_id(&role_name, &SecretIdOptions::default())
         .await
         .with_context(|| messages.error_openbao_secret_id_failed())?;
     Ok(ServiceAppRoleMaterialized {
