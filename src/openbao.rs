@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const VAULT_TOKEN_HEADER: &str = "X-Vault-Token";
+const VAULT_WRAP_TTL_HEADER: &str = "X-Vault-Wrap-TTL";
 const ROOT_POLICY: &str = "root";
 
 #[derive(Debug, Clone)]
@@ -100,6 +101,21 @@ struct AppRoleAuth {
     client_token: String,
 }
 
+/// Response-wrapping metadata returned by `OpenBao` when the
+/// `X-Vault-Wrap-TTL` header is set on a request.
+#[derive(Debug, Deserialize)]
+pub struct WrapInfo {
+    pub token: String,
+    pub ttl: u64,
+    pub creation_time: String,
+    pub creation_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WrappedResponse {
+    wrap_info: WrapInfo,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RekeyInitResponse {
     pub nonce: String,
@@ -184,7 +200,7 @@ impl OpenBaoClient {
     /// # Errors
     /// Returns an error if the init status endpoint cannot be queried.
     pub async fn is_initialized(&self) -> Result<bool> {
-        let status: InitStatus = self.get_json("sys/init", false).await?;
+        let status: InitStatus = self.get_json("sys/init", false, None).await?;
         Ok(status.initialized)
     }
 
@@ -217,7 +233,7 @@ impl OpenBaoClient {
     /// # Errors
     /// Returns an error if the seal status endpoint cannot be queried.
     pub async fn seal_status(&self) -> Result<SealStatus> {
-        self.get_json("sys/seal-status", false).await
+        self.get_json("sys/seal-status", false, None).await
     }
 
     /// Submits an unseal key to `OpenBao`.
@@ -257,6 +273,7 @@ impl OpenBaoClient {
                 secret_shares: shares,
                 secret_threshold: threshold,
             },
+            None,
         )
         .await
     }
@@ -272,7 +289,7 @@ impl OpenBaoClient {
             key: &'a str,
         }
 
-        self.put_json("sys/rekey/update", &RekeyUpdateRequest { nonce, key })
+        self.put_json("sys/rekey/update", &RekeyUpdateRequest { nonce, key }, None)
             .await
     }
 
@@ -296,6 +313,7 @@ impl OpenBaoClient {
                     renewable: false,
                     no_parent: true,
                 },
+                None,
             )
             .await?;
         Ok(response.auth.client_token)
@@ -344,7 +362,7 @@ impl OpenBaoClient {
     /// Returns an error if auth backends cannot be queried or enabling `AppRole`
     /// fails.
     pub async fn ensure_approle_auth(&self) -> Result<()> {
-        let auths: AuthListResponse = self.get_json("sys/auth", true).await?;
+        let auths: AuthListResponse = self.get_json("sys/auth", true, None).await?;
         let has_approle = auths
             .data
             .as_object()
@@ -457,7 +475,7 @@ impl OpenBaoClient {
     /// Returns an error if the `role_id` cannot be fetched.
     pub async fn read_role_id(&self, name: &str) -> Result<String> {
         let response: RoleIdResponse = self
-            .get_json(&format!("auth/approle/role/{name}/role-id"), true)
+            .get_json(&format!("auth/approle/role/{name}/role-id"), true, None)
             .await?;
         Ok(response.data.role_id)
     }
@@ -471,6 +489,7 @@ impl OpenBaoClient {
             .post_json(
                 &format!("auth/approle/role/{name}/secret-id"),
                 &serde_json::json!({}),
+                None,
             )
             .await?;
         Ok(response.data.secret_id)
@@ -524,7 +543,7 @@ impl OpenBaoClient {
         struct KvResponseData {
             data: serde_json::Value,
         }
-        self.get_json::<KvResponse>(&format!("{mount}/data/{path}"), true)
+        self.get_json::<KvResponse>(&format!("{mount}/data/{path}"), true, None)
             .await
             .map(|response| response.data.data)
     }
@@ -565,6 +584,42 @@ impl OpenBaoClient {
             .await
     }
 
+    /// Sends an authenticated POST with `X-Vault-Wrap-TTL` and returns
+    /// the response-wrapping metadata.
+    ///
+    /// This is a convenience wrapper around [`Self::post_json`] that
+    /// sets the wrap-TTL header and extracts the `wrap_info` envelope.
+    ///
+    /// # Errors
+    /// Returns an error if the request fails or the wrapped response
+    /// cannot be parsed.
+    pub async fn post_json_wrapped<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+        wrap_ttl: &str,
+    ) -> Result<WrapInfo> {
+        let wrapped: WrappedResponse = self.post_json(path, body, Some(wrap_ttl)).await?;
+        Ok(wrapped.wrap_info)
+    }
+
+    /// Unwraps a response-wrapped secret by consuming the given wrap
+    /// token via `sys/wrapping/unwrap`.
+    ///
+    /// # Errors
+    /// Returns an error if the unwrap request fails or the response
+    /// cannot be parsed.
+    pub async fn unwrap_secret<R: DeserializeOwned>(&self, wrap_token: &str) -> Result<R> {
+        let path = "sys/wrapping/unwrap";
+        let request = self
+            .request_builder(Method::POST, path)
+            .header(VAULT_TOKEN_HEADER, wrap_token);
+        let response = self.send_request(request, path).await?;
+        Self::parse_response(response)
+            .await
+            .with_context(|| format!("OpenBao response parse failed: {path}"))
+    }
+
     fn endpoint(&self, path: &str) -> String {
         format!("{}/v1/{path}", self.base_url)
     }
@@ -595,8 +650,16 @@ impl OpenBaoClient {
             .with_context(|| format!("OpenBao request failed: {path}"))
     }
 
-    async fn send_authed(&self, method: Method, path: &str) -> Result<Response> {
-        let request = self.authed_request_builder(method, path)?;
+    async fn send_authed(
+        &self,
+        method: Method,
+        path: &str,
+        wrap_ttl: Option<&str>,
+    ) -> Result<Response> {
+        let mut request = self.authed_request_builder(method, path)?;
+        if let Some(ttl) = wrap_ttl {
+            request = request.header(VAULT_WRAP_TTL_HEADER, ttl);
+        }
         self.send_request(request, path).await
     }
 
@@ -605,8 +668,13 @@ impl OpenBaoClient {
         method: Method,
         path: &str,
         body: &T,
+        wrap_ttl: Option<&str>,
     ) -> Result<Response> {
-        let request = self.authed_request_builder(method, path)?.json(body);
+        let mut request = self.authed_request_builder(method, path)?;
+        if let Some(ttl) = wrap_ttl {
+            request = request.header(VAULT_WRAP_TTL_HEADER, ttl);
+        }
+        let request = request.json(body);
         self.send_request(request, path).await
     }
 
@@ -636,10 +704,18 @@ impl OpenBaoClient {
         Ok(Some(parsed.data))
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, path: &str, use_token: bool) -> Result<T> {
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        use_token: bool,
+        wrap_ttl: Option<&str>,
+    ) -> Result<T> {
         let mut request = self.request_builder(Method::GET, path);
         if use_token {
             request = request.header(VAULT_TOKEN_HEADER, self.require_token()?);
+        }
+        if let Some(ttl) = wrap_ttl {
+            request = request.header(VAULT_WRAP_TTL_HEADER, ttl);
         }
         let response = self.send_request(request, path).await?;
         Self::parse_response(response)
@@ -648,7 +724,7 @@ impl OpenBaoClient {
     }
 
     async fn resource_exists(&self, path: &str) -> Result<bool> {
-        let response = self.send_authed(Method::GET, path).await?;
+        let response = self.send_authed(Method::GET, path, None).await?;
         let status = response.status();
         let text = response
             .text()
@@ -667,29 +743,41 @@ impl OpenBaoClient {
         &self,
         path: &str,
         body: &T,
+        wrap_ttl: Option<&str>,
     ) -> Result<R> {
-        let response = self.send_authed_json(Method::POST, path, body).await?;
+        let response = self
+            .send_authed_json(Method::POST, path, body, wrap_ttl)
+            .await?;
         Self::parse_response(response)
             .await
             .with_context(|| format!("OpenBao response parse failed: {path}"))
     }
 
     async fn post_action<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
-        let response = self.send_authed_json(Method::POST, path, body).await?;
+        let response = self
+            .send_authed_json(Method::POST, path, body, None)
+            .await?;
         Self::ensure_success(response)
             .await
             .with_context(|| format!("OpenBao response failed: {path}"))
     }
 
     async fn delete_action(&self, path: &str) -> Result<()> {
-        let response = self.send_authed(Method::DELETE, path).await?;
+        let response = self.send_authed(Method::DELETE, path, None).await?;
         Self::ensure_success(response)
             .await
             .with_context(|| format!("OpenBao response failed: {path}"))
     }
 
-    async fn put_json<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
-        let response = self.send_authed_json(Method::PUT, path, body).await?;
+    async fn put_json<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &T,
+        wrap_ttl: Option<&str>,
+    ) -> Result<R> {
+        let response = self
+            .send_authed_json(Method::PUT, path, body, wrap_ttl)
+            .await?;
         Self::parse_response(response)
             .await
             .with_context(|| format!("OpenBao response parse failed: {path}"))
@@ -790,6 +878,83 @@ template {{
         .expect("write template");
     }
     config
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    fn client_with_token(server: &MockServer) -> OpenBaoClient {
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client init");
+        client.set_token("root-token".to_string());
+        client
+    }
+
+    #[tokio::test]
+    async fn get_json_sends_wrap_ttl_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/data/test"))
+            .and(header("X-Vault-Token", "root-token"))
+            .and(header("X-Vault-Wrap-TTL", "90s"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "wrap_info": {
+                    "token": "wrap-get-token",
+                    "ttl": 90,
+                    "creation_time": "2026-04-12T00:00:00Z",
+                    "creation_path": "secret/data/test"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_with_token(&server);
+        let info: WrappedResponse = client
+            .get_json("secret/data/test", true, Some("90s"))
+            .await
+            .expect("get_json with wrap_ttl should succeed");
+        assert_eq!(info.wrap_info.token, "wrap-get-token");
+        assert_eq!(info.wrap_info.ttl, 90);
+    }
+
+    #[tokio::test]
+    async fn put_json_sends_wrap_ttl_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/v1/sys/rekey/init"))
+            .and(header("X-Vault-Token", "root-token"))
+            .and(header("X-Vault-Wrap-TTL", "30s"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "wrap_info": {
+                    "token": "wrap-put-token",
+                    "ttl": 30,
+                    "creation_time": "2026-04-12T00:00:00Z",
+                    "creation_path": "sys/rekey/init"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_with_token(&server);
+        let info: WrappedResponse = client
+            .put_json(
+                "sys/rekey/init",
+                &json!({"secret_shares": 5, "secret_threshold": 3}),
+                Some("30s"),
+            )
+            .await
+            .expect("put_json with wrap_ttl should succeed");
+        assert_eq!(info.wrap_info.token, "wrap-put-token");
+        assert_eq!(info.wrap_info.ttl, 30);
+    }
 }
 
 #[cfg(test)]
