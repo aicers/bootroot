@@ -1,4 +1,4 @@
-use bootroot::openbao::{KvMountStatus, OpenBaoClient};
+use bootroot::openbao::{KvMountStatus, OpenBaoClient, WrapInfo};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -443,4 +443,97 @@ async fn create_root_token_uses_auth_token_create_path() {
         .await
         .expect("create_root_token should succeed");
     assert_eq!(token, "new-root-token");
+}
+
+#[tokio::test]
+async fn post_json_wrapped_sends_wrap_ttl_via_common_path() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/role/my-role/secret-id"))
+        .and(header("X-Vault-Token", "root-token"))
+        .and(header("X-Vault-Wrap-TTL", "120s"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "wrap_info": {
+                "token": "wrap-token-abc",
+                "ttl": 120,
+                "creation_time": "2026-04-12T00:00:00Z",
+                "creation_path": "auth/approle/role/my-role/secret-id"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let info: WrapInfo = client
+        .post_json_wrapped("auth/approle/role/my-role/secret-id", &json!({}), "120s")
+        .await
+        .expect("post_json_wrapped should succeed");
+    assert_eq!(info.token, "wrap-token-abc");
+    assert_eq!(info.ttl, 120);
+    assert_eq!(info.creation_path, "auth/approle/role/my-role/secret-id");
+}
+
+#[tokio::test]
+async fn wrapped_response_envelope_is_parsed() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/test"))
+        .and(header("X-Vault-Token", "root-token"))
+        .and(header("X-Vault-Wrap-TTL", "60s"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "wrap_info": {
+                "token": "hvs.wrap-token-xyz",
+                "ttl": 60,
+                "creation_time": "2026-04-12T12:00:00.000000Z",
+                "creation_path": "secret/data/test"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let info: WrapInfo = client
+        .post_json_wrapped("secret/data/test", &json!({"data": {"key": "val"}}), "60s")
+        .await
+        .expect("wrapped response should parse");
+    assert_eq!(info.token, "hvs.wrap-token-xyz");
+    assert_eq!(info.ttl, 60);
+    assert_eq!(info.creation_time, "2026-04-12T12:00:00.000000Z");
+    assert_eq!(info.creation_path, "secret/data/test");
+}
+
+#[tokio::test]
+async fn unwrap_secret_sends_correct_request() {
+    #[derive(serde::Deserialize)]
+    struct UnwrapResult {
+        data: UnwrapData,
+    }
+    #[derive(serde::Deserialize)]
+    struct UnwrapData {
+        secret_id: String,
+    }
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/wrapping/unwrap"))
+        .and(header("X-Vault-Token", "wrap-token-abc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "secret_id": "unwrapped-secret-id"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = OpenBaoClient::new(&server.uri()).expect("client init should succeed");
+    let result: UnwrapResult = client
+        .unwrap_secret("wrap-token-abc")
+        .await
+        .expect("unwrap_secret should succeed");
+    assert_eq!(result.data.secret_id, "unwrapped-secret-id");
 }
