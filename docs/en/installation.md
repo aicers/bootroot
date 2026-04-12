@@ -422,7 +422,8 @@ install `bootroot-remote` on that service machine.
   `bootroot-remote apply-secret-id ...` (after secret_id rotation)
 
 For detailed arguments/examples in `remote-bootstrap` mode, see
-`bootroot-remote bootstrap`/`apply-secret-id` in [CLI](cli.md).
+`bootroot-remote bootstrap`/`apply-secret-id` in [CLI](cli.md) and the
+[Remote Bootstrap Operator Guide](remote-bootstrap.md).
 
 ## HTTP-01 responder
 

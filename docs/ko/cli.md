@@ -965,6 +965,10 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 로 명시적 secret_id 전달을 수행합니다.
 `bootroot-remote`도 공통 옵션 `--lang`(환경 변수 `BOOTROOT_LANG`)을 지원합니다.
 
+전송 옵션(SSH, Ansible, cloud-init, systemd-credentials), `secret_id` 위생,
+`RemoteBootstrapArtifact` 스키마 참조를 포함한 전체 워크스루는
+[원격 부트스트랩 운영자 가이드](remote-bootstrap.md)를 참고하세요.
+
 ### `bootroot-remote bootstrap`
 
 원격 노드에 서비스 시크릿/설정을 1회 pull+apply합니다.

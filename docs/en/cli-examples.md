@@ -230,6 +230,10 @@ next steps:
 
 ### 3-3) remote-bootstrap delivery mode + one-shot bootstrap
 
+For a full operator guide including transport options, `secret_id` hygiene,
+and the artifact schema reference, see
+[Remote Bootstrap Operator Guide](remote-bootstrap.md).
+
 Control node onboarding (artifact generation):
 
 ```bash

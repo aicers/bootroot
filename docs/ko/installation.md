@@ -428,7 +428,8 @@ docker compose up --build -d bootroot-agent
   `bootroot-remote apply-secret-id ...`(secret_id 회전 이후)
 
 `remote-bootstrap` 방식의 상세 인자/예시는 [CLI](cli.md)의
-`bootroot-remote bootstrap`/`apply-secret-id` 섹션을 참고하세요.
+`bootroot-remote bootstrap`/`apply-secret-id` 섹션 및
+[원격 부트스트랩 운영자 가이드](remote-bootstrap.md)를 참고하세요.
 
 ## HTTP-01 리스폰더
 
