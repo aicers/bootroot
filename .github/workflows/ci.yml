@@ -345,7 +345,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build bootroot binaries
-        run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
+        run: |
+          cargo clean -p bootroot 2>/dev/null || true
+          cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
         if: matrix.scenario.label != 'rotation'
