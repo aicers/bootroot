@@ -63,10 +63,12 @@ jobs:
 
       - name: Build bootroot binaries
         run: |
-          cargo clean -p bootroot 2>/dev/null || true
           rm -f target/debug/bootroot target/debug/bootroot-remote target/debug/bootroot-agent
           rm -rf target/debug/.fingerprint/bootroot-*
+          rm -f target/debug/deps/bootroot-* target/debug/deps/libbootroot-*
+          rm -rf target/debug/incremental/bootroot-*
           cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
+          target/debug/bootroot service add --help | grep -q secret-id-num-uses
 
       - name: Run extended Docker E2E suite
         run: |
