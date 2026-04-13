@@ -525,8 +525,6 @@ Per-issuance `secret_id` policy flags:
 
 - `--secret-id-ttl`: TTL for the generated `secret_id` (inherits the
   role-level default when omitted)
-- `--secret-id-num-uses`: maximum number of times the `secret_id` can be
-  used (default `1`)
 - `--secret-id-wrap-ttl`: response-wrapping TTL for the `secret_id`
   (default `30m`)
 - `--no-wrap`: disable response wrapping for the `secret_id`

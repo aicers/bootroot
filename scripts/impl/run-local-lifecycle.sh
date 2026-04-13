@@ -398,7 +398,7 @@ run_bootstrap_chain() {
     --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" \
     --key-path "$CERTS_DIR/${EDGE_SERVICE}.key" \
     --instance-id "$INSTANCE_ID" \
-    --secret-id-num-uses 0 \
+
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
@@ -414,7 +414,7 @@ run_bootstrap_chain() {
     --key-path "$CERTS_DIR/${WEB_SERVICE}.key" \
     --instance-id "$INSTANCE_ID" \
     --container-name "$WEB_SERVICE" \
-    --secret-id-num-uses 0 \
+
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
@@ -429,7 +429,7 @@ run_bootstrap_chain() {
     --cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" \
     --key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
     --instance-id "$REMOTE_INSTANCE_ID" \
-    --secret-id-num-uses 0 \
+
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
@@ -641,7 +641,7 @@ regenerate_remote_artifact() {
     --cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" \
     --key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
     --instance-id "$REMOTE_INSTANCE_ID" \
-    --secret-id-num-uses 0 \
+
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1

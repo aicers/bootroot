@@ -32,7 +32,6 @@ pub(crate) struct ResolvedServiceAdd {
     pub(crate) notes: Option<String>,
     pub(crate) post_renew_hooks: Vec<PostRenewHookEntry>,
     pub(crate) secret_id_ttl: Option<String>,
-    pub(crate) secret_id_num_uses: Option<u32>,
     pub(crate) secret_id_wrap_ttl: Option<String>,
 }
 
@@ -147,7 +146,6 @@ pub(super) fn resolve_service_add_args(
         notes: args.notes.clone(),
         post_renew_hooks,
         secret_id_ttl: args.secret_id_ttl.clone(),
-        secret_id_num_uses: args.secret_id_num_uses,
         secret_id_wrap_ttl,
     })
 }
@@ -418,7 +416,6 @@ mod tests {
             post_renew_timeout_secs: None,
             post_renew_on_failure: None,
             secret_id_ttl: None,
-            secret_id_num_uses: None,
             secret_id_wrap_ttl: None,
             no_wrap: false,
         }

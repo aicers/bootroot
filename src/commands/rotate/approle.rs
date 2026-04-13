@@ -7,9 +7,7 @@ use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 use super::helpers::{confirm_action, reload_openbao_agent, write_secret_id_atomic};
 use super::{ROLE_ID_FILENAME, RotateContext};
 use crate::cli::args::RotateAppRoleSecretIdArgs;
-use crate::commands::constants::{
-    DEFAULT_SECRET_ID_NUM_USES, SERVICE_KV_BASE, SERVICE_SECRET_ID_KEY,
-};
+use crate::commands::constants::{SERVICE_KV_BASE, SERVICE_SECRET_ID_KEY};
 use crate::commands::service::resolve::effective_wrap_ttl;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry};
@@ -37,25 +35,9 @@ pub(super) async fn rotate_approle_secret_id(
     if !is_remote {
         ensure_role_id_file(&entry, client, messages).await?;
     }
-    let stored_num_uses = entry
-        .approle
-        .secret_id_num_uses
-        .unwrap_or(DEFAULT_SECRET_ID_NUM_USES);
-    // Add 1 for the verify-login below so the caller's requested
-    // num_uses still remain after rotation verification.
-    let effective_num_uses = if stored_num_uses > 0 {
-        stored_num_uses.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!(
-                "secret_id_num_uses ({stored_num_uses}) is too large to \
-                 add the +1 verification allowance; use a smaller value"
-            )
-        })?
-    } else {
-        stored_num_uses
-    };
     let secret_id_options = SecretIdOptions {
         ttl: entry.approle.secret_id_ttl.clone(),
-        num_uses: Some(effective_num_uses),
+        num_uses: Some(0),
         metadata: None,
     };
     let wrap_ttl = effective_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref());

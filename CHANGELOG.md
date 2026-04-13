@@ -38,8 +38,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `state.json` and forwarded to `bootroot-remote bootstrap` for
   remote-bootstrap delivery mode.
 - Added per-issuance `secret_id` policy flags to `bootroot service add`
-  (`--secret-id-ttl`, `--secret-id-num-uses`, `--secret-id-wrap-ttl`,
-  `--no-wrap`). Policy values are persisted in `state.json` and applied
+  (`--secret-id-ttl`, `--secret-id-wrap-ttl`, `--no-wrap`). Service
+  SecretIDs always use unlimited uses (`num_uses=0`).
+  Policy values are persisted in `state.json` and applied
   automatically during `rotate approle-secret-id`. Re-running
   `service add` with different policy values on an existing service
   produces an error directing the operator to use a policy update
