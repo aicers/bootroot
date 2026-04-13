@@ -27,6 +27,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added `--artifact <path>` flag to `bootroot-remote bootstrap`. When
+  provided, all required fields are loaded from the artifact JSON file,
+  avoiding sensitive `wrap_token` exposure in shell command lines and
+  `ps` output. Per-field CLI flags still work for backward compatibility.
+- Added `wrap_token` and `wrap_expires_at` optional fields to
+  `RemoteBootstrapArtifact`. When wrapping is enabled (default),
+  `bootroot-remote` unwraps the token via `sys/wrapping/unwrap` to
+  obtain `secret_id` before login. Unwrap failures are classified as
+  expired (with recovery instructions) or already-unwrapped (flagged as
+  a potential security incident).
 - Added `schema_version` field (`u32`, starting at `1`) to the
   `RemoteBootstrapArtifact` JSON written by
   `bootroot service add --delivery-mode remote-bootstrap`. Downstream

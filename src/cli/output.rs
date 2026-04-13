@@ -28,6 +28,7 @@ pub(crate) struct ServiceAddAppliedPaths<'a> {
 pub(crate) struct ServiceAddRemoteBootstrap<'a> {
     pub(crate) bootstrap_file: &'a str,
     pub(crate) remote_run_command: &'a str,
+    pub(crate) wrapped: bool,
 }
 
 pub(crate) struct ServiceAddSummaryOptions<'a> {
@@ -142,10 +143,17 @@ fn print_remote_handoff_summary(
         messages.service_summary_remote_run_command(remote.remote_run_command)
     );
     println!("{}", messages.service_summary_remote_handoff_title());
-    println!(
-        "{}",
-        messages.service_summary_remote_handoff_service_host(remote.remote_run_command)
-    );
+    if remote.wrapped {
+        println!(
+            "{}",
+            messages.service_summary_remote_handoff_service_host(remote.remote_run_command)
+        );
+    } else {
+        println!(
+            "{}",
+            messages.service_summary_remote_handoff_service_host_no_wrap(remote.remote_run_command)
+        );
+    }
     println!("{}", messages.service_summary_remote_placeholder_warning());
     println!("{}", messages.service_scope_operator_recommended());
     let status_check_command = format!("bootroot service info --service-name '{service_name}'");

@@ -1023,14 +1023,26 @@ paths.
 
 Key inputs:
 
-- `--openbao-url`: OpenBao API URL (environment variable: `OPENBAO_URL`)
+- `--artifact <path>`: Path to the bootstrap artifact JSON file. When
+  provided, artifact values take precedence over per-field CLI flags.
+  CLI flags serve as fallbacks for fields absent from the artifact.
+  This avoids exposing sensitive `wrap_token` values in shell command
+  lines and `ps` output.
+  When wrapping is enabled (the default), `bootroot service add` emits
+  a command template using `--artifact`.
+  If the artifact contains `wrap_token` and `wrap_expires_at` fields,
+  `bootroot-remote` unwraps the token via `sys/wrapping/unwrap` to
+  obtain `secret_id` before proceeding with the login flow.
+- `--openbao-url`: OpenBao API URL (environment variable: `OPENBAO_URL`).
+  Required unless `--artifact` is provided.
 - `--kv-mount`: OpenBao KV v2 mount path
   (environment variable: `OPENBAO_KV_MOUNT`)
   (default `secret`)
-- `--service-name`
+- `--service-name`: required unless `--artifact` is provided.
   - Must follow the same single-label DNS rule as `bootroot service add`
-- `--role-id-path`, `--secret-id-path`, `--eab-file-path`
-- `--agent-config-path`
+- `--role-id-path`, `--secret-id-path`, `--eab-file-path`: required
+  unless `--artifact` is provided.
+- `--agent-config-path`: required unless `--artifact` is provided.
 - baseline/profile inputs:
   `--agent-email`, `--agent-server`, `--agent-domain`,
   `--agent-responder-url`, `--profile-hostname`,
@@ -1055,8 +1067,8 @@ Key inputs:
     separate service machine you must replace them with remote-reachable
     control-plane endpoints such as `stepca.internal` and
     `responder.internal`.
-- `--ca-bundle-path`
-  - required output path for the managed step-ca trust bundle.
+- `--ca-bundle-path`: required output path for the managed step-ca trust
+  bundle. Required unless `--artifact` is provided.
 - post-renew hook flags: `--reload-style`,
   `--reload-target`, `--post-renew-command`,
   `--post-renew-arg`, `--post-renew-timeout-secs`,

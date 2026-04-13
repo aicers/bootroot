@@ -194,7 +194,8 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_remote_bootstrap_file: "- 원격 부트스트랩 파일 (자동화용 머신 판독 가능 아티팩트): {value}",
     service_summary_remote_run_command: "- 원격 실행 명령 템플릿: {value}",
     service_summary_remote_handoff_title: "- 원격 반영 실행 순서:",
-    service_summary_remote_handoff_service_host: "  1. 서비스 머신에서 값을 수정한 뒤 실행: {value}",
+    service_summary_remote_handoff_service_host: "  1. bootstrap.json과 role_id를 서비스 호스트에 복사한 뒤 <REMOTE_ARTIFACT_PATH>를 교체하고 실행: {value}",
+    service_summary_remote_handoff_service_host_no_wrap: "  1. bootstrap.json, role_id, secret_id를 서비스 호스트에 복사한 뒤 <REMOTE_ARTIFACT_PATH>를 교체하고 실행: {value}",
     service_summary_remote_placeholder_warning: concat!(
         "  - 경고: 출력된 명령 템플릿과 해당 bootstrap.json 필드는 ",
         "`--agent-server`, `--agent-responder-url`에 localhost placeholder를 ",

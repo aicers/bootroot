@@ -54,7 +54,17 @@ By design, bootroot does **not** ship files to remote hosts.
 artifact and credential files; the operator chooses the transport mechanism
 that fits their environment.
 
-The files that must reach the remote host are:
+The files that must reach the remote host depend on whether response
+wrapping is enabled (the default):
+
+**With wrapping (default):**
+
+| File | Source path (control node) | Purpose |
+| --- | --- | --- |
+| `bootstrap.json` | `secrets/remote-bootstrap/services/<service>/bootstrap.json` | Machine-readable artifact containing a `wrap_token` that `bootroot-remote` unwraps to obtain `secret_id` (**sensitive**) |
+| `role_id` | `secrets/services/<service>/role_id` | AppRole identity (long-lived) |
+
+**Without wrapping (`--no-wrap`):**
 
 | File | Source path (control node) | Purpose |
 | --- | --- | --- |
@@ -64,7 +74,9 @@ The files that must reach the remote host are:
 
 ### Option 1: SSH + shell script (recommended starting point)
 
-Best for small deployments with a handful of service machines.
+Best for small deployments with a handful of service machines. The
+example below uses `--artifact`, the recommended invocation that avoids
+exposing sensitive tokens in shell command lines and `ps` output.
 
 ```bash
 #!/usr/bin/env bash
@@ -76,12 +88,6 @@ REMOTE_HOST=edge-node-02
 REMOTE_USER=deploy
 REMOTE_BASE=/srv/bootroot
 ARTIFACT="$CONTROL_SECRETS/remote-bootstrap/services/$SERVICE/bootstrap.json"
-
-# Required: set these to remote-reachable endpoints.
-# The artifact may contain localhost placeholders that are only
-# valid on the control node.
-AGENT_SERVER=https://stepca.internal:9000/acme/acme/directory
-AGENT_RESPONDER_URL=http://responder.internal:8080
 
 # 1. Register the service on the control node
 bootroot service add \
@@ -95,51 +101,46 @@ bootroot service add \
   --key-path "$REMOTE_BASE/certs/$SERVICE.key" \
   --root-token "$OPENBAO_ROOT_TOKEN"
 
-# 2. Create the destination directory and ship the artifact
+# 2. Create the destination directory and ship the artifact + role_id
 ssh "$REMOTE_USER@$REMOTE_HOST" \
   mkdir -p "$REMOTE_BASE/secrets/services/$SERVICE"
 
 scp -p \
   "$ARTIFACT" \
   "$CONTROL_SECRETS/services/$SERVICE/role_id" \
-  "$CONTROL_SECRETS/services/$SERVICE/secret_id" \
   "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
 
-# 3. Validate schema_version before parsing fields
+# 3. Validate schema_version before running bootstrap
 if ! jq -e '.schema_version == 1' "$ARTIFACT" > /dev/null; then
   echo "ERROR: unsupported schema_version in $ARTIFACT" >&2
   exit 1
 fi
 
-field() { jq -r ".$1" "$ARTIFACT"; }
-
-INSTANCE_ID=$(field profile_instance_id)
-
+# 4. Run bootstrap on the remote host using --artifact
+#    The artifact carries the wrap_token; bootroot-remote unwraps it
+#    to obtain secret_id at runtime.
 ssh "$REMOTE_USER@$REMOTE_HOST" \
   bootroot-remote bootstrap \
-    --openbao-url "$(field openbao_url)" \
-    --kv-mount "$(field kv_mount)" \
-    --service-name "$(field service_name)" \
-    --role-id-path "$(field role_id_path)" \
-    --secret-id-path "$(field secret_id_path)" \
-    --eab-file-path "$(field eab_file_path)" \
-    --agent-config-path "$(field agent_config_path)" \
-    --agent-email "$(field agent_email)" \
-    --agent-server "$AGENT_SERVER" \
-    --agent-domain "$(field agent_domain)" \
-    --agent-responder-url "$AGENT_RESPONDER_URL" \
-    --profile-hostname "$(field profile_hostname)" \
-    --profile-cert-path "$(field profile_cert_path)" \
-    --profile-key-path "$(field profile_key_path)" \
-    --ca-bundle-path "$(field ca_bundle_path)" \
-    ${INSTANCE_ID:+--profile-instance-id "$INSTANCE_ID"} \
+    --artifact "$REMOTE_BASE/secrets/services/$SERVICE/bootstrap.json" \
     --output json
-
-# 4. Remove secret_id from the control node after delivery
-rm -f "$CONTROL_SECRETS/services/$SERVICE/secret_id"
 ```
 
-### Option 2: systemd-credentials
+> **Note:** With wrapping enabled (the default), `bootstrap.json`
+> contains a `wrap_token` and is a **sensitive credential file**. Apply
+> the same handling as `secret_id`: restrict file permissions, transfer
+> over encrypted channels, and delete from the control node after
+> delivery if your threat model requires it.
+>
+> If wrapping is disabled (`--no-wrap`), you must also copy
+> `secret_id` to the remote host and can use per-field CLI flags
+> instead of `--artifact` for backward compatibility.
+
+### Option 2: systemd-credentials (`--no-wrap`)
+
+> **Legacy / backward-compatible path.** This option uses per-field CLI
+> flags and a raw `secret_id` file. It applies when wrapping is disabled
+> (`--no-wrap` on `bootroot service add`). For new deployments, prefer
+> Option 1 with `--artifact` and wrapping enabled (the default).
 
 For single-host setups where the secret should never hit a plain filesystem.
 Use `systemd-creds encrypt` on the control node and `LoadCredential=` in
@@ -167,7 +168,14 @@ ExecStart=/usr/local/bin/bootroot-remote bootstrap \
     --output json
 ```
 
-### Option 3: Ansible
+### Option 3: Ansible (`--no-wrap`)
+
+> **Legacy / backward-compatible path.** This option uses per-field CLI
+> flags and copies a raw `secret_id` file. It applies when wrapping is
+> disabled (`--no-wrap` on `bootroot service add`). For new deployments,
+> prefer Option 1 with `--artifact` and wrapping enabled (the default).
+> To adapt this playbook for the wrapped flow, copy `bootstrap.json`
+> instead of `secret_id` and invoke with `--artifact`.
 
 For larger fleets with existing configuration management.
 
@@ -254,7 +262,14 @@ For larger fleets with existing configuration management.
       changed_when: true
 ```
 
-### Option 4: cloud-init
+### Option 4: cloud-init (`--no-wrap`)
+
+> **Legacy / backward-compatible path.** This option uses per-field CLI
+> flags and writes a raw `secret_id` into cloud-init user data. It
+> applies when wrapping is disabled (`--no-wrap` on
+> `bootroot service add`). For new deployments, prefer Option 1 with
+> `--artifact` and wrapping enabled (the default). With wrapping, embed
+> `bootstrap.json` in `write_files` and invoke with `--artifact`.
 
 For first-boot provisioning of cloud VMs.
 
@@ -301,11 +316,12 @@ Treat it as a short-lived credential:
 - **Remove from control node after delivery**: once the `secret_id` has
     been shipped to the remote host, delete the local copy. The SSH script
     example above demonstrates this.
-- **Short TTL / response wrapping**: when available, use AppRole
-    `secret_id` TTL controls or response wrapping to limit the credential's
-    validity window. This capability is tracked in
-    [#480](https://github.com/aicers/bootroot/issues/480); the
-    remote-bootstrap guide will be updated once it lands.
+- **Short TTL / response wrapping**: use `--secret-id-ttl` on
+    `bootroot service add` to limit `secret_id` lifetime, and keep
+    response wrapping enabled (the default) so the raw `secret_id` is
+    never written to the control node. With wrapping, the artifact
+    carries a single-use `wrap_token` that `bootroot-remote` unwraps at
+    runtime — reducing the exposure window to seconds.
 - **Rotation**: after `bootroot rotate approle-secret-id` on the control
     node, deliver the new `secret_id` via
     `bootroot-remote apply-secret-id` on the service machine. See
@@ -363,6 +379,8 @@ Current version: **1**
 | `profile_cert_path` | `string` | Output path for the issued certificate | `--profile-cert-path` |
 | `profile_key_path` | `string` | Output path for the private key | `--profile-key-path` |
 | `post_renew_hooks` | `array` | Post-renew hook entries (omitted when empty). Each entry has `command`, `args`, `timeout_secs`, `on_failure`. | `--post-renew-command` and related flags |
+| `wrap_token` | `string?` | Response-wrapped `secret_id` token (omitted when wrapping is disabled via `--no-wrap`). Sensitive — treat as a credential. | `bootroot-remote` unwrap path |
+| `wrap_expires_at` | `string?` | RFC 3339 timestamp when `wrap_token` expires (omitted when wrapping is disabled). | `bootroot-remote` unwrap error classification |
 
 ### Versioning rules
 

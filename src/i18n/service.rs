@@ -597,6 +597,17 @@ impl Messages {
         )
     }
 
+    pub(crate) fn service_summary_remote_handoff_service_host_no_wrap(
+        &self,
+        value: &str,
+    ) -> String {
+        format_template(
+            self.strings()
+                .service_summary_remote_handoff_service_host_no_wrap,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn service_summary_remote_placeholder_warning(&self) -> &'static str {
         self.strings().service_summary_remote_placeholder_warning
     }

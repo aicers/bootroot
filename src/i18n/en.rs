@@ -194,7 +194,8 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_remote_bootstrap_file: "- remote bootstrap file (machine-readable artifact for automation): {value}",
     service_summary_remote_run_command: "- remote run command template: {value}",
     service_summary_remote_handoff_title: "- remote handoff order:",
-    service_summary_remote_handoff_service_host: "  1. Edit and run on the service host: {value}",
+    service_summary_remote_handoff_service_host: "  1. Copy bootstrap.json and role_id to the service host, then replace <REMOTE_ARTIFACT_PATH> and run: {value}",
+    service_summary_remote_handoff_service_host_no_wrap: "  1. Copy bootstrap.json, role_id, and secret_id to the service host, then replace <REMOTE_ARTIFACT_PATH> and run: {value}",
     service_summary_remote_placeholder_warning: concat!(
         "  - warning: the printed command template and matching bootstrap.json fields use ",
         "localhost placeholders for `--agent-server` and `--agent-responder-url`; ",
