@@ -96,8 +96,6 @@ pub(crate) struct ServiceRoleEntry {
     #[serde(default)]
     pub(crate) secret_id_ttl: Option<String>,
     #[serde(default)]
-    pub(crate) secret_id_num_uses: Option<u32>,
-    #[serde(default)]
     pub(crate) secret_id_wrap_ttl: Option<String>,
 }
 
@@ -254,7 +252,6 @@ mod tests {
                 secret_id_path: PathBuf::from("s"),
                 policy_name: "p".to_string(),
                 secret_id_ttl: None,
-                secret_id_num_uses: None,
                 secret_id_wrap_ttl: None,
             },
         };
@@ -278,8 +275,23 @@ mod tests {
         }"#;
         let parsed: ServiceRoleEntry = serde_json::from_str(json).expect("deserialize");
         assert!(parsed.secret_id_ttl.is_none());
-        assert!(parsed.secret_id_num_uses.is_none());
         assert!(parsed.secret_id_wrap_ttl.is_none());
+    }
+
+    #[test]
+    fn old_state_with_secret_id_num_uses_still_deserializes() {
+        let json = r#"{
+            "role_name": "r",
+            "role_id": "id",
+            "secret_id_path": "s",
+            "policy_name": "p",
+            "secret_id_ttl": "1h",
+            "secret_id_num_uses": 5,
+            "secret_id_wrap_ttl": "30m"
+        }"#;
+        let parsed: ServiceRoleEntry = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(parsed.secret_id_ttl.as_deref(), Some("1h"));
+        assert_eq!(parsed.secret_id_wrap_ttl.as_deref(), Some("30m"));
     }
 
     #[test]
@@ -290,13 +302,11 @@ mod tests {
             secret_id_path: PathBuf::from("s"),
             policy_name: "p".to_string(),
             secret_id_ttl: Some("1h".to_string()),
-            secret_id_num_uses: Some(5),
             secret_id_wrap_ttl: Some("0".to_string()),
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         let parsed: ServiceRoleEntry = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.secret_id_ttl.as_deref(), Some("1h"));
-        assert_eq!(parsed.secret_id_num_uses, Some(5));
         assert_eq!(parsed.secret_id_wrap_ttl.as_deref(), Some("0"));
     }
 

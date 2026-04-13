@@ -507,7 +507,6 @@ bootroot status
 발급 시점 `secret_id` 정책 플래그:
 
 - `--secret-id-ttl`: 생성되는 `secret_id`의 TTL (생략 시 역할 수준 기본값 상속)
-- `--secret-id-num-uses`: `secret_id` 최대 사용 횟수 (기본값 `1`)
 - `--secret-id-wrap-ttl`: `secret_id`에 대한 응답 래핑 TTL (기본값 `30m`)
 - `--no-wrap`: `secret_id` 응답 래핑 비활성화
 
