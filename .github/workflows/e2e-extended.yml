@@ -62,9 +62,18 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build bootroot binaries
+        env:
+          CARGO_INCREMENTAL: '0'
         run: |
-          cargo clean -p bootroot
+          cargo clean -p bootroot || true
+          rm -f target/debug/bootroot target/debug/bootroot-remote target/debug/bootroot-agent
+          rm -rf target/debug/.fingerprint/bootroot-* target/debug/deps/bootroot-* target/debug/deps/libbootroot-* target/debug/incremental/bootroot-*
           cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
+          if ! target/debug/bootroot service add --help 2>&1 | grep -q 'secret-id-num-uses'; then
+            echo "::error::Stale binary: --secret-id-num-uses not found. Performing full rebuild."
+            cargo clean
+            cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
+          fi
 
       - name: Run extended Docker E2E suite
         run: |
