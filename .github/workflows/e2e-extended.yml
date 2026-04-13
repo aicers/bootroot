@@ -61,12 +61,12 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Clean stale bootroot artifacts
+        run: cargo clean -p bootroot
+        continue-on-error: true
+
       - name: Build bootroot binaries
-        run: |
-          find target/debug -name '*bootroot*' -exec rm -rf {} + 2>/dev/null || true
-          cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
-          target/debug/bootroot service add --help > /tmp/bootroot-help.txt
-          grep -q secret-id-num-uses /tmp/bootroot-help.txt
+        run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run extended Docker E2E suite
         run: |
