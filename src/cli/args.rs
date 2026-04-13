@@ -706,6 +706,22 @@ pub(crate) struct ServiceAddArgs {
     /// Post-renew success hook failure policy (low-level)
     #[arg(long, value_enum)]
     pub(crate) post_renew_on_failure: Option<HookFailurePolicyArg>,
+
+    /// TTL for the generated `secret_id` (inherits role default when omitted)
+    #[arg(long)]
+    pub(crate) secret_id_ttl: Option<String>,
+
+    /// Maximum number of times the `secret_id` can be used [default: 1]
+    #[arg(long)]
+    pub(crate) secret_id_num_uses: Option<u32>,
+
+    /// Response-wrapping TTL for the `secret_id` [default: 30m]
+    #[arg(long)]
+    pub(crate) secret_id_wrap_ttl: Option<String>,
+
+    /// Disable response wrapping for the `secret_id`
+    #[arg(long, conflicts_with = "secret_id_wrap_ttl")]
+    pub(crate) no_wrap: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1167,5 +1183,67 @@ mod tests {
             }
             _ => panic!("expected service add"),
         }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_secret_id_defaults() {
+        let cli = Cli::parse_from(["bootroot", "service", "add"]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert!(args.secret_id_ttl.is_none());
+                assert!(args.secret_id_num_uses.is_none());
+                assert!(args.secret_id_wrap_ttl.is_none());
+                assert!(!args.no_wrap);
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_secret_id_overrides() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--secret-id-ttl",
+            "1h",
+            "--secret-id-num-uses",
+            "5",
+            "--secret-id-wrap-ttl",
+            "10m",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert_eq!(args.secret_id_ttl.as_deref(), Some("1h"));
+                assert_eq!(args.secret_id_num_uses, Some(5));
+                assert_eq!(args.secret_id_wrap_ttl.as_deref(), Some("10m"));
+                assert!(!args.no_wrap);
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_no_wrap() {
+        let cli = Cli::parse_from(["bootroot", "service", "add", "--no-wrap"]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert!(args.no_wrap);
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rejects_no_wrap_with_secret_id_wrap_ttl() {
+        let result = Cli::try_parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--no-wrap",
+            "--secret-id-wrap-ttl",
+            "10m",
+        ]);
+        assert!(result.is_err());
     }
 }

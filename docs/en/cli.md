@@ -521,6 +521,21 @@ the equivalent low-level hook settings. These flags are
 also forwarded to `bootroot-remote bootstrap` for the
 `remote-bootstrap` delivery mode.
 
+Per-issuance `secret_id` policy flags:
+
+- `--secret-id-ttl`: TTL for the generated `secret_id` (inherits the
+  role-level default when omitted)
+- `--secret-id-num-uses`: maximum number of times the `secret_id` can be
+  used (default `1`)
+- `--secret-id-wrap-ttl`: response-wrapping TTL for the `secret_id`
+  (default `30m`)
+- `--no-wrap`: disable response wrapping for the `secret_id`
+
+These values are persisted in `state.json` and applied on
+`rotate approle-secret-id`. `--no-wrap` and `--secret-id-wrap-ttl` control
+the same field: `--no-wrap` sets the stored wrap TTL to `0`, disabling
+wrapping entirely.
+
 ### Interactive behavior
 
 - Prompts for missing required inputs (deploy type defaults to `daemon`).

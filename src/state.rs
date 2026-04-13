@@ -93,6 +93,12 @@ pub(crate) struct ServiceRoleEntry {
     pub(crate) role_id: String,
     pub(crate) secret_id_path: PathBuf,
     pub(crate) policy_name: String,
+    #[serde(default)]
+    pub(crate) secret_id_ttl: Option<String>,
+    #[serde(default)]
+    pub(crate) secret_id_num_uses: Option<u32>,
+    #[serde(default)]
+    pub(crate) secret_id_wrap_ttl: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -247,6 +253,9 @@ mod tests {
                 role_id: "id".to_string(),
                 secret_id_path: PathBuf::from("s"),
                 policy_name: "p".to_string(),
+                secret_id_ttl: None,
+                secret_id_num_uses: None,
+                secret_id_wrap_ttl: None,
             },
         };
         let json = serde_json::to_string_pretty(&entry).expect("serialize");
@@ -257,6 +266,38 @@ mod tests {
             parsed.post_renew_hooks[0].on_failure,
             HookFailurePolicyEntry::Stop
         );
+    }
+
+    #[test]
+    fn service_role_entry_without_policy_fields_deserializes_as_none() {
+        let json = r#"{
+            "role_name": "r",
+            "role_id": "id",
+            "secret_id_path": "s",
+            "policy_name": "p"
+        }"#;
+        let parsed: ServiceRoleEntry = serde_json::from_str(json).expect("deserialize");
+        assert!(parsed.secret_id_ttl.is_none());
+        assert!(parsed.secret_id_num_uses.is_none());
+        assert!(parsed.secret_id_wrap_ttl.is_none());
+    }
+
+    #[test]
+    fn service_role_entry_with_policy_fields_round_trips() {
+        let entry = ServiceRoleEntry {
+            role_name: "r".to_string(),
+            role_id: "id".to_string(),
+            secret_id_path: PathBuf::from("s"),
+            policy_name: "p".to_string(),
+            secret_id_ttl: Some("1h".to_string()),
+            secret_id_num_uses: Some(5),
+            secret_id_wrap_ttl: Some("0".to_string()),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let parsed: ServiceRoleEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.secret_id_ttl.as_deref(), Some("1h"));
+        assert_eq!(parsed.secret_id_num_uses, Some(5));
+        assert_eq!(parsed.secret_id_wrap_ttl.as_deref(), Some("0"));
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub(crate) mod openbao_constants {
     pub(crate) const SECRET_ID_TTL: &str = "24h";
     // Used by upcoming sub-issues of #480 (response-wrapping, num_uses enforcement).
     #[allow(dead_code)]
-    pub(crate) const DEFAULT_SECRET_ID_NUM_USES: u32 = 1;
+    pub(crate) const DEFAULT_SECRET_ID_NUM_USES: u32 = 0;
     #[allow(dead_code)]
     pub(crate) const DEFAULT_SECRET_ID_WRAP_TTL: &str = "30m";
     pub(crate) const MAX_SECRET_ID_TTL: &str = "168h";

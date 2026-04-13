@@ -37,6 +37,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `--post-renew-on-failure`). Hook settings are persisted in
   `state.json` and forwarded to `bootroot-remote bootstrap` for
   remote-bootstrap delivery mode.
+- Added per-issuance `secret_id` policy flags to `bootroot service add`
+  (`--secret-id-ttl`, `--secret-id-num-uses`, `--secret-id-wrap-ttl`,
+  `--no-wrap`). Policy values are persisted in `state.json` and applied
+  automatically during `rotate approle-secret-id`. Re-running
+  `service add` with different policy values on an existing service
+  produces an error directing the operator to use a policy update
+  command.
 - Added automatic HTTP-01 DNS alias registration on `service add`. The
   validation FQDN is registered as a Docker network alias on
   `bootroot-http01` at runtime, removing the need for a hand-written
