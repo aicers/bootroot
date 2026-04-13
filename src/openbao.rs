@@ -527,6 +527,35 @@ impl OpenBaoClient {
         Ok(response.data.secret_id)
     }
 
+    /// Creates a new `secret_id` with response wrapping and returns the
+    /// [`WrapInfo`] without unwrapping.
+    ///
+    /// The caller is responsible for transporting the wrap token to the
+    /// consumer who will call [`Self::unwrap_secret_id`].
+    ///
+    /// # Errors
+    /// Returns an error if the wrapped creation request fails.
+    pub async fn create_secret_id_wrap_only(
+        &self,
+        name: &str,
+        options: &SecretIdOptions,
+        wrap_ttl: &str,
+    ) -> Result<WrapInfo> {
+        let path = format!("auth/approle/role/{name}/secret-id");
+        self.post_json_wrapped(&path, options, wrap_ttl).await
+    }
+
+    /// Unwraps a response-wrapped `secret_id` by consuming the given
+    /// wrap token via `sys/wrapping/unwrap`.
+    ///
+    /// # Errors
+    /// Returns an error if the token is expired, already consumed, or
+    /// the response cannot be parsed.
+    pub async fn unwrap_secret_id(&self, wrap_token: &str) -> Result<String> {
+        let response: SecretIdResponse = self.unwrap_secret(wrap_token).await?;
+        Ok(response.data.secret_id)
+    }
+
     /// Logs in using an `AppRole` `role_id/secret_id` pair.
     ///
     /// # Errors

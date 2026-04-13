@@ -235,6 +235,7 @@ pub(crate) struct Strings {
     pub(crate) service_summary_remote_run_command: &'static str,
     pub(crate) service_summary_remote_handoff_title: &'static str,
     pub(crate) service_summary_remote_handoff_service_host: &'static str,
+    pub(crate) service_summary_remote_handoff_service_host_no_wrap: &'static str,
     pub(crate) service_summary_remote_placeholder_warning: &'static str,
     pub(crate) service_summary_remote_handoff_status_check: &'static str,
     pub(crate) service_summary_agent_config: &'static str,

@@ -985,13 +985,24 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 
 주요 입력:
 
-- `--openbao-url`: OpenBao API URL (환경 변수: `OPENBAO_URL`)
+- `--artifact <path>`: 부트스트랩 아티팩트 JSON 파일 경로. 지정 시
+  아티팩트 값이 개별 CLI 플래그보다 우선합니다. CLI 플래그는 아티팩트에
+  없는 필드의 대체 값으로 사용됩니다. 민감한 `wrap_token` 값이 셸 명령줄과 `ps`
+  출력에 노출되지 않도록 합니다. 래핑이 활성(기본값)이면
+  `bootroot service add`는 `--artifact`를 사용하는 명령 템플릿을
+  출력합니다.
+  아티팩트에 `wrap_token`과 `wrap_expires_at` 필드가 포함된 경우
+  `bootroot-remote`는 `sys/wrapping/unwrap`을 통해 토큰을 언래핑하여
+  로그인 흐름 전에 `secret_id`를 얻습니다.
+- `--openbao-url`: OpenBao API URL (환경 변수: `OPENBAO_URL`).
+  `--artifact` 미지정 시 필수.
 - `--kv-mount`: OpenBao KV v2 마운트 경로 (환경 변수: `OPENBAO_KV_MOUNT`)
   (기본값 `secret`)
-- `--service-name`
+- `--service-name`: `--artifact` 미지정 시 필수.
   - `bootroot service add`와 같은 단일 DNS label 규칙을 따릅니다.
-- `--role-id-path`, `--secret-id-path`, `--eab-file-path`
-- `--agent-config-path`
+- `--role-id-path`, `--secret-id-path`, `--eab-file-path`:
+  `--artifact` 미지정 시 필수.
+- `--agent-config-path`: `--artifact` 미지정 시 필수.
 - baseline/profile 입력:
   `--agent-email`, `--agent-server`, `--agent-domain`,
   `--agent-responder-url`, `--profile-hostname`,
@@ -1016,8 +1027,8 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
     동일 호스트 배치에서만 맞으며, 별도 서비스 머신에서는
     `stepca.internal`, `responder.internal` 같은 원격 제어면 엔드포인트로
     바꿔야 합니다.
-- `--ca-bundle-path`
-  - 관리되는 step-ca trust bundle을 쓸 출력 경로로 항상 필요합니다.
+- `--ca-bundle-path`: 관리되는 step-ca trust bundle을 쓸 출력 경로.
+  `--artifact` 미지정 시 필수.
 - 갱신 후 훅 플래그: `--reload-style`,
   `--reload-target`, `--post-renew-command`,
   `--post-renew-arg`, `--post-renew-timeout-secs`,

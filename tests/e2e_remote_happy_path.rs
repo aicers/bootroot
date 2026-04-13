@@ -28,13 +28,13 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     fs::create_dir_all(&service_dir).expect("create service dir");
 
     let server = MockServer::start().await;
-    stub_control_plane_openbao(&server).await;
+    stub_control_plane_openbao_no_wrap(&server).await;
     stub_remote_service_secrets(&server).await;
 
     write_control_state(&control_dir, &server.uri()).expect("write control state");
     prepare_service_node_files(&service_dir).expect("prepare service node files");
 
-    run_service_add_remote(&control_dir, &service_dir).expect("service add remote");
+    run_service_add_remote_no_wrap(&control_dir, &service_dir).expect("service add remote");
     copy_remote_bootstrap_materials(&control_dir, &service_dir).expect("copy role/secret_id");
 
     run_remote_bootstrap(&service_dir, &server.uri()).expect("remote bootstrap");
@@ -93,44 +93,60 @@ async fn test_two_node_remote_bootstrap_happy_path() {
 }
 
 fn run_service_add_remote(control_dir: &Path, service_dir: &Path) -> anyhow::Result<()> {
+    run_service_add_remote_impl(control_dir, service_dir, false)
+}
+
+fn run_service_add_remote_no_wrap(control_dir: &Path, service_dir: &Path) -> anyhow::Result<()> {
+    run_service_add_remote_impl(control_dir, service_dir, true)
+}
+
+fn run_service_add_remote_impl(
+    control_dir: &Path,
+    service_dir: &Path,
+    no_wrap: bool,
+) -> anyhow::Result<()> {
+    let mut args = vec![
+        "service".to_string(),
+        "add".to_string(),
+        "--service-name".to_string(),
+        SERVICE_NAME.to_string(),
+        "--deploy-type".to_string(),
+        "daemon".to_string(),
+        "--delivery-mode".to_string(),
+        "remote-bootstrap".to_string(),
+        "--hostname".to_string(),
+        HOSTNAME.to_string(),
+        "--domain".to_string(),
+        DOMAIN.to_string(),
+        "--agent-config".to_string(),
+        service_dir.join("agent.toml").to_string_lossy().to_string(),
+        "--cert-path".to_string(),
+        service_dir
+            .join("certs")
+            .join("edge-proxy.crt")
+            .to_string_lossy()
+            .to_string(),
+        "--key-path".to_string(),
+        service_dir
+            .join("certs")
+            .join("edge-proxy.key")
+            .to_string_lossy()
+            .to_string(),
+        "--instance-id".to_string(),
+        INSTANCE_ID.to_string(),
+        "--auth-mode".to_string(),
+        "approle".to_string(),
+        "--approle-role-id".to_string(),
+        RUNTIME_SERVICE_ADD_ROLE_ID.to_string(),
+        "--approle-secret-id".to_string(),
+        RUNTIME_SERVICE_ADD_SECRET_ID.to_string(),
+    ];
+    if no_wrap {
+        args.push("--no-wrap".to_string());
+    }
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(control_dir)
-        .args([
-            "service",
-            "add",
-            "--service-name",
-            SERVICE_NAME,
-            "--deploy-type",
-            "daemon",
-            "--delivery-mode",
-            "remote-bootstrap",
-            "--hostname",
-            HOSTNAME,
-            "--domain",
-            DOMAIN,
-            "--agent-config",
-            service_dir.join("agent.toml").to_string_lossy().as_ref(),
-            "--cert-path",
-            service_dir
-                .join("certs")
-                .join("edge-proxy.crt")
-                .to_string_lossy()
-                .as_ref(),
-            "--key-path",
-            service_dir
-                .join("certs")
-                .join("edge-proxy.key")
-                .to_string_lossy()
-                .as_ref(),
-            "--instance-id",
-            INSTANCE_ID,
-            "--auth-mode",
-            "approle",
-            "--approle-role-id",
-            RUNTIME_SERVICE_ADD_ROLE_ID,
-            "--approle-secret-id",
-            RUNTIME_SERVICE_ADD_SECRET_ID,
-        ])
+        .args(&args)
         .output()
         .context("run bootroot service add")?;
     if !output.status.success() {
@@ -437,6 +453,76 @@ async fn stub_control_plane_approle(server: &MockServer, role_name: &str) {
         .await;
 }
 
+async fn stub_control_plane_openbao_no_wrap(server: &MockServer) {
+    let role_name = format!("bootroot-service-{SERVICE_NAME}");
+    stub_control_plane_approle_no_wrap(server, &role_name).await;
+    stub_control_plane_global_materials(server).await;
+    stub_control_plane_service_material_writes(server).await;
+}
+
+async fn stub_control_plane_approle_no_wrap(server: &MockServer, role_name: &str) {
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": RUNTIME_SERVICE_ADD_ROLE_ID,
+            "secret_id": RUNTIME_SERVICE_ADD_SECRET_ID
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": {
+                "client_token": RUNTIME_CLIENT_TOKEN
+            }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/auth"))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "approle/": {}
+            }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/sys/policies/acl/{role_name}")))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{role_name}")))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/auth/approle/role/{role_name}/role-id")))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "role_id": "role-edge-proxy" }
+        })))
+        .mount(server)
+        .await;
+
+    // Non-wrapped secret-id creation (no X-Vault-Wrap-TTL header).
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{role_name}/secret-id")))
+        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "secret_id": "secret-edge-proxy",
+                "secret_id_accessor": "acc"
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
 async fn stub_control_plane_global_materials(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/v1/secret/metadata/bootroot/ca"))
@@ -506,6 +592,275 @@ async fn stub_control_plane_service_material_writes(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
+}
+
+fn copy_bootstrap_artifact_and_role_id(
+    control_dir: &Path,
+    service_dir: &Path,
+) -> anyhow::Result<()> {
+    let control_service_dir = control_dir
+        .join("secrets")
+        .join("services")
+        .join(SERVICE_NAME);
+    let service_secret_dir = service_dir
+        .join("secrets")
+        .join("services")
+        .join(SERVICE_NAME);
+    fs::create_dir_all(&service_secret_dir).context("create service secret dir")?;
+    fs::copy(
+        control_service_dir.join("role_id"),
+        service_secret_dir.join("role_id"),
+    )
+    .context("copy role_id")?;
+
+    let artifact_dir = control_dir
+        .join("secrets")
+        .join("remote-bootstrap")
+        .join("services")
+        .join(SERVICE_NAME);
+    let artifact_path = artifact_dir.join("bootstrap.json");
+    let dest_artifact = service_dir.join("bootstrap.json");
+    fs::copy(&artifact_path, &dest_artifact).context("copy bootstrap artifact")?;
+    Ok(())
+}
+
+fn run_remote_bootstrap_with_artifact(
+    service_dir: &Path,
+    _openbao_url: &str,
+) -> anyhow::Result<()> {
+    let artifact_path = service_dir.join("bootstrap.json");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .current_dir(service_dir)
+        .args([
+            "bootstrap",
+            "--artifact",
+            artifact_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .context("run bootroot-remote bootstrap --artifact")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "remote bootstrap --artifact failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remote_bootstrap_artifact_invocation() {
+    let temp = tempdir().expect("create tempdir");
+    let control_dir = temp.path().join("artifact-control");
+    let service_dir = temp.path().join("artifact-service");
+    fs::create_dir_all(&control_dir).expect("create control dir");
+    fs::create_dir_all(&service_dir).expect("create service dir");
+
+    let server = MockServer::start().await;
+    stub_control_plane_openbao(&server).await;
+    stub_remote_service_secrets(&server).await;
+
+    write_control_state(&control_dir, &server.uri()).expect("write control state");
+    prepare_service_node_files(&service_dir).expect("prepare service node files");
+
+    run_service_add_remote(&control_dir, &service_dir).expect("service add remote");
+    copy_bootstrap_artifact_and_role_id(&control_dir, &service_dir)
+        .expect("copy artifact + role_id");
+
+    // Verify the artifact contains wrap_token
+    let artifact_contents =
+        fs::read_to_string(service_dir.join("bootstrap.json")).expect("read artifact");
+    assert!(
+        artifact_contents.contains("wrap_token"),
+        "artifact should contain wrap_token"
+    );
+    assert!(
+        artifact_contents.contains("wrap_expires_at"),
+        "artifact should contain wrap_expires_at"
+    );
+
+    run_remote_bootstrap_with_artifact(&service_dir, &server.uri())
+        .expect("remote bootstrap via artifact");
+
+    let secret_id_path = service_dir
+        .join("secrets")
+        .join("services")
+        .join(SERVICE_NAME)
+        .join("secret_id");
+    assert!(
+        secret_id_path.exists(),
+        "secret_id should be written after unwrap"
+    );
+    let eab_path = service_dir
+        .join("secrets")
+        .join("services")
+        .join(SERVICE_NAME)
+        .join("eab.json");
+    assert!(eab_path.exists(), "eab should be written after bootstrap");
+}
+
+#[tokio::test]
+async fn test_remote_bootstrap_expired_wrap_token() {
+    let temp = tempdir().expect("create tempdir");
+    let service_dir = temp.path().join("expired-service");
+    fs::create_dir_all(&service_dir).expect("create service dir");
+
+    let server = MockServer::start().await;
+    stub_remote_service_secrets(&server).await;
+
+    // Stub an unwrap failure
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/wrapping/unwrap"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "errors": ["wrapping token is not valid or does not exist"]
+        })))
+        .mount(&server)
+        .await;
+
+    prepare_service_node_files(&service_dir).expect("prepare service node files");
+    let role_id_path = service_dir
+        .join("secrets")
+        .join("services")
+        .join(SERVICE_NAME)
+        .join("role_id");
+    fs::write(&role_id_path, "role-edge-proxy").expect("write role_id");
+
+    // Create a fake artifact with an EXPIRED wrap token
+    let artifact = json!({
+        "schema_version": 1,
+        "openbao_url": server.uri(),
+        "kv_mount": "secret",
+        "service_name": SERVICE_NAME,
+        "role_id_path": role_id_path.to_string_lossy(),
+        "secret_id_path": service_dir.join("secrets").join("services").join(SERVICE_NAME).join("secret_id").to_string_lossy(),
+        "eab_file_path": service_dir.join("secrets").join("services").join(SERVICE_NAME).join("eab.json").to_string_lossy(),
+        "agent_config_path": service_dir.join("agent.toml").to_string_lossy(),
+        "ca_bundle_path": service_dir.join("certs").join("ca-bundle.pem").to_string_lossy(),
+        "agent_email": "admin@example.com",
+        "agent_server": "https://localhost:9000/acme/acme/directory",
+        "agent_domain": "trusted.domain",
+        "agent_responder_url": "http://127.0.0.1:8080",
+        "profile_hostname": HOSTNAME,
+        "profile_instance_id": INSTANCE_ID,
+        "profile_cert_path": "",
+        "profile_key_path": "",
+        "openbao_agent_config_path": "",
+        "openbao_agent_template_path": "",
+        "openbao_agent_token_path": "",
+        "wrap_token": "expired-token",
+        "wrap_expires_at": "2020-01-01T00:00:00Z"
+    });
+    let artifact_path = service_dir.join("bootstrap.json");
+    fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&artifact).unwrap(),
+    )
+    .expect("write artifact");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .current_dir(&service_dir)
+        .args([
+            "bootstrap",
+            "--artifact",
+            artifact_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run bootroot-remote");
+
+    assert!(
+        !output.status.success(),
+        "should fail with expired wrap token"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("expired"),
+        "should mention expiration: {stderr}"
+    );
+    assert!(
+        stderr.contains("bootroot rotate approle-secret-id"),
+        "should include recovery command: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn test_remote_bootstrap_already_unwrapped_token() {
+    let temp = tempdir().expect("create tempdir");
+    let service_dir = temp.path().join("unwrapped-service");
+    fs::create_dir_all(&service_dir).expect("create service dir");
+
+    let server = MockServer::start().await;
+
+    // Stub an unwrap failure (token already used)
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/wrapping/unwrap"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "errors": ["wrapping token is not valid or does not exist"]
+        })))
+        .mount(&server)
+        .await;
+
+    prepare_service_node_files(&service_dir).expect("prepare service node files");
+    let role_id_path = service_dir
+        .join("secrets")
+        .join("services")
+        .join(SERVICE_NAME)
+        .join("role_id");
+    fs::write(&role_id_path, "role-edge-proxy").expect("write role_id");
+
+    // Create a fake artifact with a NOT-YET-EXPIRED wrap token (far future)
+    let artifact = json!({
+        "schema_version": 1,
+        "openbao_url": server.uri(),
+        "kv_mount": "secret",
+        "service_name": SERVICE_NAME,
+        "role_id_path": role_id_path.to_string_lossy(),
+        "secret_id_path": service_dir.join("secrets").join("services").join(SERVICE_NAME).join("secret_id").to_string_lossy(),
+        "eab_file_path": service_dir.join("secrets").join("services").join(SERVICE_NAME).join("eab.json").to_string_lossy(),
+        "agent_config_path": service_dir.join("agent.toml").to_string_lossy(),
+        "ca_bundle_path": service_dir.join("certs").join("ca-bundle.pem").to_string_lossy(),
+        "agent_email": "admin@example.com",
+        "agent_server": "https://localhost:9000/acme/acme/directory",
+        "agent_domain": "trusted.domain",
+        "agent_responder_url": "http://127.0.0.1:8080",
+        "profile_hostname": HOSTNAME,
+        "profile_instance_id": INSTANCE_ID,
+        "profile_cert_path": "",
+        "profile_key_path": "",
+        "openbao_agent_config_path": "",
+        "openbao_agent_template_path": "",
+        "openbao_agent_token_path": "",
+        "wrap_token": "already-used-token",
+        "wrap_expires_at": "2099-12-31T23:59:59Z"
+    });
+    let artifact_path = service_dir.join("bootstrap.json");
+    fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&artifact).unwrap(),
+    )
+    .expect("write artifact");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .current_dir(&service_dir)
+        .args([
+            "bootstrap",
+            "--artifact",
+            artifact_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run bootroot-remote");
+
+    assert!(
+        !output.status.success(),
+        "should fail with already-unwrapped token"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SECURITY INCIDENT"),
+        "should flag security incident: {stderr}"
+    );
+    assert!(
+        stderr.contains("bootroot rotate approle-secret-id"),
+        "should include recovery command: {stderr}"
+    );
 }
 
 async fn stub_remote_service_secrets(server: &MockServer) {

@@ -53,6 +53,7 @@ pub(super) struct LocalApplyResult {
 pub(super) struct RemoteBootstrapResult {
     bootstrap_file: String,
     remote_run_command: String,
+    wrapped: bool,
 }
 
 pub(super) struct ServiceSyncMaterial {
@@ -103,7 +104,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
 
     if let Some(existing) = state.services.get(&resolved.service_name).cloned() {
         if is_idempotent_remote_rerun(&existing, &resolved) {
-            return run_service_add_remote_idempotent(&state, &existing, messages).await;
+            return run_service_add_remote_idempotent(&state, &existing, &resolved, messages).await;
         }
         if is_policy_only_mismatch(&existing, &resolved) {
             anyhow::bail!(messages.error_service_policy_mismatch());
@@ -283,12 +284,14 @@ async fn run_service_add_apply(
     };
     let remote_bootstrap_result = if matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap)
     {
+        let artifact_wrap_info = create_artifact_wrap_info(&client, resolved, messages).await?;
         Some(
             remote_bootstrap::write_remote_bootstrap_artifact(
                 state,
                 secrets_dir,
                 resolved,
                 &secret_id_path,
+                artifact_wrap_info.as_ref(),
                 messages,
             )
             .await?,
@@ -358,6 +361,28 @@ fn build_service_entry(
     )
 }
 
+/// Creates a wrap-only `secret_id` for the bootstrap artifact when
+/// wrapping is enabled. Returns `None` when wrapping is disabled.
+async fn create_artifact_wrap_info(
+    client: &OpenBaoClient,
+    resolved: &ResolvedServiceAdd,
+    messages: &Messages,
+) -> Result<Option<remote_bootstrap::ArtifactWrapInfo>> {
+    let wrap_ttl = resolve::effective_wrap_ttl(resolved.secret_id_wrap_ttl.as_deref());
+    let Some(ttl) = wrap_ttl else {
+        return Ok(None);
+    };
+    let role_name = approle::service_role_name(&resolved.service_name);
+    let secret_id_options = build_secret_id_options(resolved);
+    let wrap_info = client
+        .create_secret_id_wrap_only(&role_name, &secret_id_options, ttl)
+        .await
+        .with_context(|| messages.error_openbao_secret_id_failed())?;
+    Ok(Some(remote_bootstrap::ArtifactWrapInfo::from_wrap_info(
+        &wrap_info,
+    )))
+}
+
 fn build_secret_id_options(resolved: &ResolvedServiceAdd) -> SecretIdOptions {
     SecretIdOptions {
         ttl: resolved.secret_id_ttl.clone(),
@@ -386,6 +411,7 @@ fn print_service_add_apply_summary(
             remote: remote_bootstrap.map(|result| ServiceAddRemoteBootstrap {
                 bootstrap_file: &result.bootstrap_file,
                 remote_run_command: &result.remote_run_command,
+                wrapped: result.wrapped,
             }),
             trusted_ca_sha256,
             show_snippets: true,
@@ -398,13 +424,36 @@ fn print_service_add_apply_summary(
 async fn run_service_add_remote_idempotent(
     state: &StateFile,
     entry: &ServiceEntry,
+    resolved: &ResolvedServiceAdd,
     messages: &Messages,
 ) -> Result<()> {
     let secrets_dir = state.secrets_dir();
+    let wrap_ttl = resolve::effective_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref());
+    let artifact_wrap_info = if let Some(ttl) = wrap_ttl {
+        let mut client = OpenBaoClient::new(&state.openbao_url)
+            .with_context(|| messages.error_openbao_client_create_failed())?;
+        let auth = resolved
+            .runtime_auth
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenBao auth is required"))?;
+        crate::commands::openbao_auth::authenticate_openbao_client(&mut client, auth, messages)
+            .await?;
+        let secret_id_options = build_secret_id_options(resolved);
+        let wrap_info = client
+            .create_secret_id_wrap_only(&entry.approle.role_name, &secret_id_options, ttl)
+            .await
+            .with_context(|| messages.error_openbao_secret_id_failed())?;
+        Some(remote_bootstrap::ArtifactWrapInfo::from_wrap_info(
+            &wrap_info,
+        ))
+    } else {
+        None
+    };
     let remote_bootstrap = remote_bootstrap::write_remote_bootstrap_artifact_from_entry(
         state,
         secrets_dir,
         entry,
+        artifact_wrap_info.as_ref(),
         messages,
     )
     .await?;
@@ -416,6 +465,7 @@ async fn run_service_add_remote_idempotent(
             remote: Some(ServiceAddRemoteBootstrap {
                 bootstrap_file: &remote_bootstrap.bootstrap_file,
                 remote_run_command: &remote_bootstrap.remote_run_command,
+                wrapped: remote_bootstrap.wrapped,
             }),
             trusted_ca_sha256: None,
             show_snippets: true,

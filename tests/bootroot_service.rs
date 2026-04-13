@@ -638,7 +638,7 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
     assert!(stdout.contains("- remote bootstrap file (machine-readable artifact for automation):"));
     assert!(stdout.contains("- remote run command template:"));
     assert!(stdout.contains("- remote handoff order:"));
-    assert!(stdout.contains("1. Edit and run on the service host:"));
+    assert!(stdout.contains("1. Copy bootstrap.json and role_id to the service host"));
     assert!(
         stdout.contains("localhost placeholders for `--agent-server` and `--agent-responder-url`")
     );
@@ -673,6 +673,64 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
     let bootstrap: serde_json::Value =
         serde_json::from_str(&bootstrap_contents).expect("parse bootstrap json");
     assert_remote_bootstrap_artifact_shape(&bootstrap);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_remote_bootstrap_no_wrap_handoff_includes_secret_id() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao_no_wrap(&server, "edge-proxy").await;
+    stub_app_add_remote_sync_material(&server, "edge-proxy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--delivery-mode",
+            "remote-bootstrap",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+            "--no-wrap",
+        ])
+        .output()
+        .expect("run service add");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1. Copy bootstrap.json, role_id, and secret_id to the service host"),
+        "non-wrapped handoff must mention secret_id; got:\n{stdout}"
+    );
 }
 
 fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
@@ -757,6 +815,28 @@ async fn test_app_add_remote_bootstrap_rerun_is_idempotent() {
         String::from_utf8_lossy(&first.stderr)
     );
 
+    let artifact_path = temp_dir
+        .path()
+        .join("secrets/remote-bootstrap/services/edge-proxy/bootstrap.json");
+    let first_artifact: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifact_path).expect("read artifact first"))
+            .expect("parse artifact first");
+    assert_eq!(
+        first_artifact["wrap_token"].as_str(),
+        Some("wrap-token-edge-proxy"),
+        "first run must produce a wrapped artifact"
+    );
+
+    // Tamper with the artifact so the second run must regenerate it via
+    // a fresh OpenBao call rather than leaving the old file in place.
+    let mut tampered = first_artifact.clone();
+    tampered["wrap_token"] = json!("stale-sentinel");
+    fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&tampered).expect("serialize tampered artifact"),
+    )
+    .expect("write tampered artifact");
+
     let second = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args(args)
@@ -765,6 +845,15 @@ async fn test_app_add_remote_bootstrap_rerun_is_idempotent() {
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(second.status.success());
     assert!(stdout.contains("existing remote-bootstrap service matched input"));
+
+    let second_artifact: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifact_path).expect("read artifact second"))
+            .expect("parse artifact second");
+    assert_eq!(
+        second_artifact["wrap_token"].as_str(),
+        Some("wrap-token-edge-proxy"),
+        "idempotent rerun must issue a fresh wrapped secret-id and regenerate the artifact"
+    );
 
     let state_contents =
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
@@ -1378,31 +1467,9 @@ async fn stub_app_add_openbao(server: &MockServer, service_name: &str) {
 }
 
 async fn stub_app_add_openbao_with_token(server: &MockServer, service_name: &str, token: &str) {
+    stub_app_add_openbao_common(server, service_name, token).await;
+
     let role = format!("bootroot-service-{service_name}");
-
-    Mock::given(method("POST"))
-        .and(path(format!("/v1/sys/policies/acl/{role}")))
-        .and(header("X-Vault-Token", token))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path(format!("/v1/auth/approle/role/{role}")))
-        .and(header("X-Vault-Token", token))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path(format!("/v1/auth/approle/role/{role}/role-id")))
-        .and(header("X-Vault-Token", token))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "role_id": format!("role-{service_name}") }
-        })))
-        .mount(server)
-        .await;
-
     let wrap_token = format!("wrap-token-{service_name}");
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
@@ -1427,6 +1494,50 @@ async fn stub_app_add_openbao_with_token(server: &MockServer, service_name: &str
                 "secret_id": format!("secret-{service_name}"),
                 "secret_id_accessor": "acc"
             }
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_app_add_openbao_no_wrap(server: &MockServer, service_name: &str) {
+    stub_app_add_openbao_common(server, service_name, support::ROOT_TOKEN).await;
+
+    let role = format!("bootroot-service-{service_name}");
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "secret_id": format!("secret-{service_name}"),
+                "secret_id_accessor": "acc"
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_app_add_openbao_common(server: &MockServer, service_name: &str, token: &str) {
+    let role = format!("bootroot-service-{service_name}");
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/sys/policies/acl/{role}")))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{role}")))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/auth/approle/role/{role}/role-id")))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "role_id": format!("role-{service_name}") }
         })))
         .mount(server)
         .await;
