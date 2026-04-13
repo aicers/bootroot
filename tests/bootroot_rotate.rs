@@ -203,6 +203,56 @@ async fn test_rotate_approle_secret_id_daemon_updates_secret() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_rotate_approle_secret_id_applies_default_wrapping_when_policy_absent() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let secret_path =
+        prepare_app_state_no_policy(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
+            .expect("prepare state");
+    fs::write(&secret_path, "old-secret").expect("seed secret_id");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let pkill_log = temp_dir.path().join("pkill.log");
+    write_fake_pkill(&bin_dir, &pkill_log).expect("write fake pkill");
+
+    stub_openbao_for_wrapped_rotation(&openbao, "secret-wrapped").await;
+
+    let path = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "approle-secret-id",
+            "--service-name",
+            SERVICE_NAME,
+        ])
+        .env("PATH", combined_path)
+        .env("PKILL_OUTPUT", &pkill_log)
+        .output()
+        .expect("run rotate approle-secret-id");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("AppRole secret_id rotated"));
+    assert!(stdout.contains("AppRole login OK"));
+
+    let updated = fs::read_to_string(&secret_path).expect("read secret_id");
+    assert_eq!(updated, "secret-wrapped");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_rotate_approle_secret_id_docker_restarts_agent() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
@@ -930,7 +980,7 @@ async fn test_rotate_openbao_recovery_show_secrets_reveals_plaintext() {
     );
 }
 
-fn prepare_app_state(
+fn prepare_app_state_no_policy(
     root: &Path,
     openbao_url: &str,
     deploy_type: &str,
@@ -967,6 +1017,44 @@ fn prepare_app_state(
     Ok(root.join(secret_id_path))
 }
 
+fn prepare_app_state(
+    root: &Path,
+    openbao_url: &str,
+    deploy_type: &str,
+    delivery_mode: &str,
+) -> anyhow::Result<PathBuf> {
+    write_state_file(root, openbao_url)?;
+    let state_path = root.join("state.json");
+    let contents = fs::read_to_string(&state_path).context("read state")?;
+    let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
+    let secret_id_path = PathBuf::from("secrets/services/edge-proxy/secret_id");
+    state["services"][SERVICE_NAME] = json!({
+        "service_name": SERVICE_NAME,
+        "deploy_type": deploy_type,
+        "delivery_mode": delivery_mode,
+        "hostname": "edge-node-01",
+        "domain": "trusted.domain",
+        "agent_config_path": "agent.toml",
+        "cert_path": "certs/edge-proxy.crt",
+        "key_path": "certs/edge-proxy.key",
+        "instance_id": "001",
+        "container_name": "edge-proxy",
+        "approle": {
+            "role_name": ROLE_NAME,
+            "role_id": ROLE_ID,
+            "secret_id_path": secret_id_path,
+            "policy_name": ROLE_NAME,
+            "secret_id_wrap_ttl": "0"
+        }
+    });
+    fs::write(&state_path, serde_json::to_string_pretty(&state)?).context("write state")?;
+
+    let secret_dir = root.join("secrets").join("services").join(SERVICE_NAME);
+    fs::create_dir_all(&secret_dir).context("create secrets dir")?;
+    fs::write(root.join("agent.toml"), "# agent").context("write agent config")?;
+    Ok(root.join(secret_id_path))
+}
+
 fn prepare_mixed_service_state(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
     write_state_file(root, openbao_url)?;
     let state_path = root.join("state.json");
@@ -987,7 +1075,8 @@ fn prepare_mixed_service_state(root: &Path, openbao_url: &str) -> anyhow::Result
             "role_name": ROLE_NAME,
             "role_id": ROLE_ID,
             "secret_id_path": "secrets/services/edge-proxy/secret_id",
-            "policy_name": ROLE_NAME
+            "policy_name": ROLE_NAME,
+            "secret_id_wrap_ttl": "0"
         }
     });
     state["services"][SECONDARY_SERVICE_NAME] = json!({
@@ -1005,7 +1094,8 @@ fn prepare_mixed_service_state(root: &Path, openbao_url: &str) -> anyhow::Result
             "role_name": "bootroot-service-edge-alt",
             "role_id": "role-edge-alt",
             "secret_id_path": "secrets/services/edge-alt/secret_id",
-            "policy_name": "bootroot-service-edge-alt"
+            "policy_name": "bootroot-service-edge-alt",
+            "secret_id_wrap_ttl": "0"
         }
     });
     fs::write(&state_path, serde_json::to_string_pretty(&state)?).context("write state")?;
@@ -1048,6 +1138,73 @@ async fn stub_openbao_for_rotation(server: &MockServer, new_secret_id: &str) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "secret_id": new_secret_id }
         })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/role-id")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "role_id": ROLE_ID }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": ROLE_ID,
+            "secret_id": new_secret_id
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "client-token" }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/secret_id"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+}
+
+async fn stub_openbao_for_wrapped_rotation(server: &MockServer, new_secret_id: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .and(header("X-Vault-Wrap-TTL", "30m"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "wrap_info": {
+                "token": "wrap-rotation-token",
+                "ttl": 1800,
+                "creation_time": "2026-04-13T00:00:00Z",
+                "creation_path": format!("auth/approle/role/{ROLE_NAME}/secret-id")
+            }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/wrapping/unwrap"))
+        .and(header("X-Vault-Token", "wrap-rotation-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "secret_id": new_secret_id,
+                "secret_id_accessor": "acc"
+            }
+        })))
+        .expect(1)
         .mount(server)
         .await;
 

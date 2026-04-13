@@ -9,7 +9,7 @@ use anyhow::Context;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[cfg(unix)]
@@ -1403,11 +1403,30 @@ async fn stub_app_add_openbao_with_token(server: &MockServer, service_name: &str
         .mount(server)
         .await;
 
+    let wrap_token = format!("wrap-token-{service_name}");
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
         .and(header("X-Vault-Token", token))
+        .and(header_exists("X-Vault-Wrap-TTL"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "secret_id": format!("secret-{service_name}") }
+            "wrap_info": {
+                "token": &wrap_token,
+                "ttl": 1800,
+                "creation_time": "2026-04-12T00:00:00Z",
+                "creation_path": format!("auth/approle/role/{role}/secret-id")
+            }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/wrapping/unwrap"))
+        .and(header("X-Vault-Token", &wrap_token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "secret_id": format!("secret-{service_name}"),
+                "secret_id_accessor": "acc"
+            }
         })))
         .mount(server)
         .await;

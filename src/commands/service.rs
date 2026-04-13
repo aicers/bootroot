@@ -1,19 +1,20 @@
 mod approle;
 mod local_config;
 mod remote_bootstrap;
-mod resolve;
+pub(crate) mod resolve;
 mod secrets;
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use bootroot::openbao::OpenBaoClient;
+use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 
 use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs};
 use crate::cli::output::{
     ServiceAddAppliedPaths, ServiceAddPlan, ServiceAddRemoteBootstrap, ServiceAddSummaryOptions,
     print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
+use crate::commands::constants::DEFAULT_SECRET_ID_NUM_USES;
 use crate::commands::dns_alias::register_dns_alias;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
@@ -104,6 +105,9 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     if let Some(existing) = state.services.get(&resolved.service_name).cloned() {
         if is_idempotent_remote_rerun(&existing, &resolved) {
             return run_service_add_remote_idempotent(&state, &existing, messages).await;
+        }
+        if is_policy_only_mismatch(&existing, &resolved) {
+            anyhow::bail!(messages.error_service_policy_mismatch());
         }
         anyhow::bail!(messages.error_service_duplicate(&resolved.service_name));
     }
@@ -226,8 +230,17 @@ async fn run_service_add_apply(
         .with_context(|| messages.error_openbao_client_create_failed())?;
     authenticate_openbao_client(&mut client, auth, messages).await?;
 
-    let approle_result =
-        approle::ensure_service_approle(&client, state, &resolved.service_name, messages).await?;
+    let secret_id_options = build_secret_id_options(resolved);
+    let wrap_ttl = resolve::effective_wrap_ttl(resolved.secret_id_wrap_ttl.as_deref());
+    let approle_result = approle::ensure_service_approle(
+        &client,
+        state,
+        &resolved.service_name,
+        &secret_id_options,
+        wrap_ttl,
+        messages,
+    )
+    .await?;
     let secrets_dir = state.secrets_dir();
     approle::write_role_id_file(
         secrets_dir,
@@ -340,8 +353,23 @@ fn build_service_entry(
             role_id: approle.role_id,
             secret_id_path: secret_id_path.to_path_buf(),
             policy_name: approle.policy_name,
+            secret_id_ttl: resolved.secret_id_ttl.clone(),
+            secret_id_num_uses: resolved.secret_id_num_uses,
+            secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
         },
     )
+}
+
+fn build_secret_id_options(resolved: &ResolvedServiceAdd) -> SecretIdOptions {
+    SecretIdOptions {
+        ttl: resolved.secret_id_ttl.clone(),
+        num_uses: Some(
+            resolved
+                .secret_id_num_uses
+                .unwrap_or(DEFAULT_SECRET_ID_NUM_USES),
+        ),
+        metadata: None,
+    }
 }
 
 fn print_service_add_apply_summary(
@@ -436,11 +464,14 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
             role_id: "dry-run".to_string(),
             secret_id_path: preview_secret_id_path,
             policy_name: approle::service_policy_name(&resolved.service_name),
+            secret_id_ttl: resolved.secret_id_ttl.clone(),
+            secret_id_num_uses: resolved.secret_id_num_uses,
+            secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
         },
     )
 }
 
-fn is_idempotent_remote_rerun(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
+fn non_policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
     matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap)
         && matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap)
         && entry.deploy_type == resolved.deploy_type
@@ -455,12 +486,30 @@ fn is_idempotent_remote_rerun(entry: &ServiceEntry, resolved: &ResolvedServiceAd
         && entry.post_renew_hooks == resolved.post_renew_hooks
 }
 
+fn policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
+    entry.approle.secret_id_ttl == resolved.secret_id_ttl
+        && entry.approle.secret_id_num_uses == resolved.secret_id_num_uses
+        && entry.approle.secret_id_wrap_ttl == resolved.secret_id_wrap_ttl
+}
+
+fn is_idempotent_remote_rerun(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
+    non_policy_fields_match(entry, resolved) && policy_fields_match(entry, resolved)
+}
+
+fn is_policy_only_mismatch(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
+    non_policy_fields_match(entry, resolved) && !policy_fields_match(entry, resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::resolve::ResolvedServiceAdd;
-    use super::{ServiceAppRoleMaterialized, build_service_entry, build_service_entry_from_role};
+    use super::{
+        ServiceAppRoleMaterialized, build_secret_id_options, build_service_entry,
+        build_service_entry_from_role, is_idempotent_remote_rerun, is_policy_only_mismatch,
+        non_policy_fields_match, policy_fields_match,
+    };
     use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry};
 
     fn sample_resolved() -> ResolvedServiceAdd {
@@ -478,6 +527,9 @@ mod tests {
             runtime_auth: None,
             notes: Some("test note".to_string()),
             post_renew_hooks: Vec::new(),
+            secret_id_ttl: None,
+            secret_id_num_uses: None,
+            secret_id_wrap_ttl: None,
         }
     }
 
@@ -504,6 +556,9 @@ mod tests {
             role_id: "rid-a".to_string(),
             secret_id_path: PathBuf::from("/secrets/a"),
             policy_name: "policy-a".to_string(),
+            secret_id_ttl: None,
+            secret_id_num_uses: None,
+            secret_id_wrap_ttl: None,
         };
         let entry = build_service_entry_from_role(&resolved, role);
 
@@ -545,6 +600,9 @@ mod tests {
             role_id: "id".to_string(),
             secret_id_path: PathBuf::from("/s"),
             policy_name: "p".to_string(),
+            secret_id_ttl: None,
+            secret_id_num_uses: None,
+            secret_id_wrap_ttl: None,
         };
         let entry = build_service_entry_from_role(&resolved, role);
 
@@ -552,5 +610,147 @@ mod tests {
         assert!(entry.instance_id.is_none());
         assert!(entry.container_name.is_none());
         assert!(entry.notes.is_none());
+    }
+
+    fn sample_entry_from_resolved(resolved: &ResolvedServiceAdd) -> ServiceEntry {
+        build_service_entry_from_role(
+            resolved,
+            ServiceRoleEntry {
+                role_name: "role".to_string(),
+                role_id: "rid".to_string(),
+                secret_id_path: PathBuf::from("/s"),
+                policy_name: "policy".to_string(),
+                secret_id_ttl: resolved.secret_id_ttl.clone(),
+                secret_id_num_uses: resolved.secret_id_num_uses,
+                secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
+            },
+        )
+    }
+
+    #[test]
+    fn build_service_entry_persists_secret_id_policy_fields() {
+        let mut resolved = sample_resolved();
+        resolved.secret_id_ttl = Some("1h".to_string());
+        resolved.secret_id_num_uses = Some(5);
+        resolved.secret_id_wrap_ttl = Some("10m".to_string());
+
+        let materialized = ServiceAppRoleMaterialized {
+            role_name: "r".to_string(),
+            role_id: "id".to_string(),
+            secret_id: "sid".to_string(),
+            policy_name: "p".to_string(),
+        };
+        let entry = build_service_entry(&resolved, materialized, &PathBuf::from("/s"));
+
+        assert_eq!(entry.approle.secret_id_ttl.as_deref(), Some("1h"));
+        assert_eq!(entry.approle.secret_id_num_uses, Some(5));
+        assert_eq!(entry.approle.secret_id_wrap_ttl.as_deref(), Some("10m"));
+    }
+
+    #[test]
+    fn build_secret_id_options_maps_resolved_fields() {
+        let mut resolved = sample_resolved();
+        resolved.secret_id_ttl = Some("2h".to_string());
+        resolved.secret_id_num_uses = Some(3);
+
+        let opts = build_secret_id_options(&resolved);
+        assert_eq!(opts.ttl.as_deref(), Some("2h"));
+        assert_eq!(opts.num_uses, Some(3));
+        assert!(opts.metadata.is_none());
+    }
+
+    #[test]
+    fn build_secret_id_options_none_ttl() {
+        let resolved = sample_resolved();
+        let opts = build_secret_id_options(&resolved);
+        assert!(opts.ttl.is_none());
+        assert_eq!(opts.num_uses, Some(1));
+    }
+
+    #[test]
+    fn policy_fields_match_identical() {
+        let resolved = sample_resolved();
+        let entry = sample_entry_from_resolved(&resolved);
+        assert!(policy_fields_match(&entry, &resolved));
+    }
+
+    #[test]
+    fn policy_fields_match_differs_on_ttl() {
+        let resolved = sample_resolved();
+        let mut entry = sample_entry_from_resolved(&resolved);
+        entry.approle.secret_id_ttl = Some("999h".to_string());
+        assert!(!policy_fields_match(&entry, &resolved));
+    }
+
+    #[test]
+    fn policy_fields_match_differs_on_num_uses() {
+        let resolved = sample_resolved();
+        let mut entry = sample_entry_from_resolved(&resolved);
+        entry.approle.secret_id_num_uses = Some(99);
+        assert!(!policy_fields_match(&entry, &resolved));
+    }
+
+    #[test]
+    fn policy_fields_match_differs_on_wrap_ttl() {
+        let resolved = sample_resolved();
+        let mut entry = sample_entry_from_resolved(&resolved);
+        entry.approle.secret_id_wrap_ttl = Some("0".to_string());
+        assert!(!policy_fields_match(&entry, &resolved));
+    }
+
+    #[test]
+    fn non_policy_fields_match_requires_remote_bootstrap() {
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        let mut entry = sample_entry_from_resolved(&resolved);
+        // Both are remote-bootstrap → match
+        assert!(non_policy_fields_match(&entry, &resolved));
+        // Entry is local-file → no match
+        entry.delivery_mode = DeliveryMode::LocalFile;
+        assert!(!non_policy_fields_match(&entry, &resolved));
+    }
+
+    #[test]
+    fn is_idempotent_remote_rerun_true_when_all_match() {
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        let entry = sample_entry_from_resolved(&resolved);
+        assert!(is_idempotent_remote_rerun(&entry, &resolved));
+    }
+
+    #[test]
+    fn is_idempotent_remote_rerun_false_when_policy_differs() {
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        let mut entry = sample_entry_from_resolved(&resolved);
+        entry.approle.secret_id_num_uses = Some(99);
+        assert!(!is_idempotent_remote_rerun(&entry, &resolved));
+    }
+
+    #[test]
+    fn is_policy_only_mismatch_true_when_only_policy_differs() {
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        let mut entry = sample_entry_from_resolved(&resolved);
+        entry.approle.secret_id_wrap_ttl = Some("0".to_string());
+        assert!(is_policy_only_mismatch(&entry, &resolved));
+    }
+
+    #[test]
+    fn is_policy_only_mismatch_false_when_non_policy_also_differs() {
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        let mut entry = sample_entry_from_resolved(&resolved);
+        entry.approle.secret_id_wrap_ttl = Some("0".to_string());
+        entry.hostname = "different".to_string();
+        assert!(!is_policy_only_mismatch(&entry, &resolved));
+    }
+
+    #[test]
+    fn is_policy_only_mismatch_false_when_all_match() {
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        let entry = sample_entry_from_resolved(&resolved);
+        assert!(!is_policy_only_mismatch(&entry, &resolved));
     }
 }

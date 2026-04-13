@@ -510,6 +510,23 @@ impl OpenBaoClient {
         Ok(response.data.secret_id)
     }
 
+    /// Creates a new `secret_id` with response wrapping, then immediately
+    /// unwraps it to obtain the raw value.
+    ///
+    /// # Errors
+    /// Returns an error if wrapping or unwrapping fails.
+    pub async fn create_secret_id_wrapped(
+        &self,
+        name: &str,
+        options: &SecretIdOptions,
+        wrap_ttl: &str,
+    ) -> Result<String> {
+        let path = format!("auth/approle/role/{name}/secret-id");
+        let wrap_info = self.post_json_wrapped(&path, options, wrap_ttl).await?;
+        let response: SecretIdResponse = self.unwrap_secret(&wrap_info.token).await?;
+        Ok(response.data.secret_id)
+    }
+
     /// Logs in using an `AppRole` `role_id/secret_id` pair.
     ///
     /// # Errors
@@ -969,6 +986,51 @@ mod wrap_tests {
             .expect("put_json with wrap_ttl should succeed");
         assert_eq!(info.wrap_info.token, "wrap-put-token");
         assert_eq!(info.wrap_info.ttl, 30);
+    }
+
+    #[tokio::test]
+    async fn create_secret_id_wrapped_sends_header_and_unwraps() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/role/svc-role/secret-id"))
+            .and(header("X-Vault-Token", "root-token"))
+            .and(header("X-Vault-Wrap-TTL", "30m"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "wrap_info": {
+                    "token": "wrap-sid-token",
+                    "ttl": 1800,
+                    "creation_time": "2026-04-12T00:00:00Z",
+                    "creation_path": "auth/approle/role/svc-role/secret-id"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/wrapping/unwrap"))
+            .and(header("X-Vault-Token", "wrap-sid-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "secret_id": "unwrapped-secret-abc",
+                    "secret_id_accessor": "acc"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_with_token(&server);
+        let opts = SecretIdOptions {
+            num_uses: Some(1),
+            ..Default::default()
+        };
+        let secret_id = client
+            .create_secret_id_wrapped("svc-role", &opts, "30m")
+            .await
+            .expect("create_secret_id_wrapped should succeed");
+        assert_eq!(secret_id, "unwrapped-secret-abc");
     }
 }
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rcgen::{CertificateParams, DnType, KeyPair};
 use serde_json::json;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub(crate) const ROOT_TOKEN: &str = "root-token";
@@ -349,11 +349,41 @@ async fn stub_approles(server: &MockServer) {
             .mount(server)
             .await;
 
+        // Non-wrapped path (used by init flow)
         Mock::given(method("POST"))
             .and(path(format!("/v1/auth/approle/role/{approle}/secret-id")))
             .and(header("X-Vault-Token", ROOT_TOKEN))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "secret_id": format!("secret-{approle}") }
+            })))
+            .mount(server)
+            .await;
+
+        // Wrapped path (used by service add flow)
+        let wrap_token = format!("wrap-token-{approle}");
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/auth/approle/role/{approle}/secret-id")))
+            .and(header("X-Vault-Token", ROOT_TOKEN))
+            .and(header_exists("X-Vault-Wrap-TTL"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "wrap_info": {
+                    "token": &wrap_token,
+                    "ttl": 1800,
+                    "creation_time": "2026-04-12T00:00:00Z",
+                    "creation_path": format!("auth/approle/role/{approle}/secret-id")
+                }
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/wrapping/unwrap"))
+            .and(header("X-Vault-Token", &wrap_token))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "secret_id": format!("secret-{approle}"),
+                    "secret_id_accessor": "acc"
+                }
             })))
             .mount(server)
             .await;
