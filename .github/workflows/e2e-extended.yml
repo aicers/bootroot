@@ -61,23 +61,10 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Purge cached bootroot binaries
-        run: |
-          rm -f target/debug/bootroot target/debug/bootroot-remote target/debug/bootroot-agent
-          rm -rf target/debug/.fingerprint/bootroot-*
-          rm -f target/debug/deps/bootroot-* target/debug/deps/libbootroot-*
-          rm -rf target/debug/incremental/bootroot-*
-        continue-on-error: true
-
       - name: Build bootroot binaries
         run: |
-          touch src/main.rs
+          cargo clean -p bootroot
           cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
-
-      - name: Verify bootroot binary is current
-        run: |
-          target/debug/bootroot service add --help > /tmp/bootroot-help.txt
-          grep -q secret-id-num-uses /tmp/bootroot-help.txt
 
       - name: Run extended Docker E2E suite
         run: |
