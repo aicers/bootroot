@@ -14,7 +14,6 @@ use crate::cli::output::{
     ServiceAddAppliedPaths, ServiceAddPlan, ServiceAddRemoteBootstrap, ServiceAddSummaryOptions,
     print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
-use crate::commands::constants::DEFAULT_SECRET_ID_NUM_USES;
 use crate::commands::dns_alias::register_dns_alias;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
@@ -354,7 +353,6 @@ fn build_service_entry(
             secret_id_path: secret_id_path.to_path_buf(),
             policy_name: approle.policy_name,
             secret_id_ttl: resolved.secret_id_ttl.clone(),
-            secret_id_num_uses: resolved.secret_id_num_uses,
             secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
         },
     )
@@ -363,11 +361,7 @@ fn build_service_entry(
 fn build_secret_id_options(resolved: &ResolvedServiceAdd) -> SecretIdOptions {
     SecretIdOptions {
         ttl: resolved.secret_id_ttl.clone(),
-        num_uses: Some(
-            resolved
-                .secret_id_num_uses
-                .unwrap_or(DEFAULT_SECRET_ID_NUM_USES),
-        ),
+        num_uses: Some(0),
         metadata: None,
     }
 }
@@ -465,7 +459,6 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
             secret_id_path: preview_secret_id_path,
             policy_name: approle::service_policy_name(&resolved.service_name),
             secret_id_ttl: resolved.secret_id_ttl.clone(),
-            secret_id_num_uses: resolved.secret_id_num_uses,
             secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
         },
     )
@@ -488,7 +481,6 @@ fn non_policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) 
 
 fn policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
     entry.approle.secret_id_ttl == resolved.secret_id_ttl
-        && entry.approle.secret_id_num_uses == resolved.secret_id_num_uses
         && entry.approle.secret_id_wrap_ttl == resolved.secret_id_wrap_ttl
 }
 
@@ -528,7 +520,6 @@ mod tests {
             notes: Some("test note".to_string()),
             post_renew_hooks: Vec::new(),
             secret_id_ttl: None,
-            secret_id_num_uses: None,
             secret_id_wrap_ttl: None,
         }
     }
@@ -557,7 +548,6 @@ mod tests {
             secret_id_path: PathBuf::from("/secrets/a"),
             policy_name: "policy-a".to_string(),
             secret_id_ttl: None,
-            secret_id_num_uses: None,
             secret_id_wrap_ttl: None,
         };
         let entry = build_service_entry_from_role(&resolved, role);
@@ -601,7 +591,6 @@ mod tests {
             secret_id_path: PathBuf::from("/s"),
             policy_name: "p".to_string(),
             secret_id_ttl: None,
-            secret_id_num_uses: None,
             secret_id_wrap_ttl: None,
         };
         let entry = build_service_entry_from_role(&resolved, role);
@@ -621,7 +610,6 @@ mod tests {
                 secret_id_path: PathBuf::from("/s"),
                 policy_name: "policy".to_string(),
                 secret_id_ttl: resolved.secret_id_ttl.clone(),
-                secret_id_num_uses: resolved.secret_id_num_uses,
                 secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
             },
         )
@@ -631,7 +619,6 @@ mod tests {
     fn build_service_entry_persists_secret_id_policy_fields() {
         let mut resolved = sample_resolved();
         resolved.secret_id_ttl = Some("1h".to_string());
-        resolved.secret_id_num_uses = Some(5);
         resolved.secret_id_wrap_ttl = Some("10m".to_string());
 
         let materialized = ServiceAppRoleMaterialized {
@@ -643,7 +630,6 @@ mod tests {
         let entry = build_service_entry(&resolved, materialized, &PathBuf::from("/s"));
 
         assert_eq!(entry.approle.secret_id_ttl.as_deref(), Some("1h"));
-        assert_eq!(entry.approle.secret_id_num_uses, Some(5));
         assert_eq!(entry.approle.secret_id_wrap_ttl.as_deref(), Some("10m"));
     }
 
@@ -651,20 +637,19 @@ mod tests {
     fn build_secret_id_options_maps_resolved_fields() {
         let mut resolved = sample_resolved();
         resolved.secret_id_ttl = Some("2h".to_string());
-        resolved.secret_id_num_uses = Some(3);
 
         let opts = build_secret_id_options(&resolved);
         assert_eq!(opts.ttl.as_deref(), Some("2h"));
-        assert_eq!(opts.num_uses, Some(3));
+        assert_eq!(opts.num_uses, Some(0));
         assert!(opts.metadata.is_none());
     }
 
     #[test]
-    fn build_secret_id_options_none_ttl() {
+    fn build_secret_id_options_always_unlimited() {
         let resolved = sample_resolved();
         let opts = build_secret_id_options(&resolved);
         assert!(opts.ttl.is_none());
-        assert_eq!(opts.num_uses, Some(1));
+        assert_eq!(opts.num_uses, Some(0));
     }
 
     #[test]
@@ -679,14 +664,6 @@ mod tests {
         let resolved = sample_resolved();
         let mut entry = sample_entry_from_resolved(&resolved);
         entry.approle.secret_id_ttl = Some("999h".to_string());
-        assert!(!policy_fields_match(&entry, &resolved));
-    }
-
-    #[test]
-    fn policy_fields_match_differs_on_num_uses() {
-        let resolved = sample_resolved();
-        let mut entry = sample_entry_from_resolved(&resolved);
-        entry.approle.secret_id_num_uses = Some(99);
         assert!(!policy_fields_match(&entry, &resolved));
     }
 
@@ -723,7 +700,7 @@ mod tests {
         let mut resolved = sample_resolved();
         resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
         let mut entry = sample_entry_from_resolved(&resolved);
-        entry.approle.secret_id_num_uses = Some(99);
+        entry.approle.secret_id_wrap_ttl = Some("0".to_string());
         assert!(!is_idempotent_remote_rerun(&entry, &resolved));
     }
 

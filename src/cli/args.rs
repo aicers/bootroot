@@ -711,10 +711,6 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long)]
     pub(crate) secret_id_ttl: Option<String>,
 
-    /// Maximum number of times the `secret_id` can be used [default: 1]
-    #[arg(long)]
-    pub(crate) secret_id_num_uses: Option<u32>,
-
     /// Response-wrapping TTL for the `secret_id` [default: 30m]
     #[arg(long)]
     pub(crate) secret_id_wrap_ttl: Option<String>,
@@ -1191,7 +1187,6 @@ mod tests {
         match cli.command {
             CliCommand::Service(ServiceCommand::Add(args)) => {
                 assert!(args.secret_id_ttl.is_none());
-                assert!(args.secret_id_num_uses.is_none());
                 assert!(args.secret_id_wrap_ttl.is_none());
                 assert!(!args.no_wrap);
             }
@@ -1207,15 +1202,12 @@ mod tests {
             "add",
             "--secret-id-ttl",
             "1h",
-            "--secret-id-num-uses",
-            "5",
             "--secret-id-wrap-ttl",
             "10m",
         ]);
         match cli.command {
             CliCommand::Service(ServiceCommand::Add(args)) => {
                 assert_eq!(args.secret_id_ttl.as_deref(), Some("1h"));
-                assert_eq!(args.secret_id_num_uses, Some(5));
                 assert_eq!(args.secret_id_wrap_ttl.as_deref(), Some("10m"));
                 assert!(!args.no_wrap);
             }
