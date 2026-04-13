@@ -195,6 +195,9 @@ mod tests {
                 role_id: "id".to_string(),
                 secret_id_path: PathBuf::from("/s"),
                 policy_name: "p".to_string(),
+                secret_id_ttl: None,
+                secret_id_num_uses: None,
+                secret_id_wrap_ttl: None,
             },
         }
     }

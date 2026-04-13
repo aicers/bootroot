@@ -7,6 +7,7 @@ use bootroot::input_validation::{
 
 use crate::cli::args::{HookFailurePolicyArg, ReloadStyle, ServiceAddArgs};
 use crate::cli::prompt::Prompt;
+use crate::commands::constants::DEFAULT_SECRET_ID_WRAP_TTL;
 use crate::commands::openbao_auth::{
     RuntimeAuthResolved, resolve_runtime_auth, resolve_runtime_auth_optional,
 };
@@ -30,6 +31,9 @@ pub(crate) struct ResolvedServiceAdd {
     pub(crate) runtime_auth: Option<RuntimeAuthResolved>,
     pub(crate) notes: Option<String>,
     pub(crate) post_renew_hooks: Vec<PostRenewHookEntry>,
+    pub(crate) secret_id_ttl: Option<String>,
+    pub(crate) secret_id_num_uses: Option<u32>,
+    pub(crate) secret_id_wrap_ttl: Option<String>,
 }
 
 pub(super) fn resolve_service_add_args(
@@ -122,6 +126,12 @@ pub(super) fn resolve_service_add_args(
 
     let post_renew_hooks = resolve_post_renew_hooks(args)?;
 
+    let secret_id_wrap_ttl = if args.no_wrap {
+        Some("0".to_string())
+    } else {
+        args.secret_id_wrap_ttl.clone()
+    };
+
     Ok(ResolvedServiceAdd {
         service_name,
         deploy_type,
@@ -136,6 +146,9 @@ pub(super) fn resolve_service_add_args(
         runtime_auth,
         notes: args.notes.clone(),
         post_renew_hooks,
+        secret_id_ttl: args.secret_id_ttl.clone(),
+        secret_id_num_uses: args.secret_id_num_uses,
+        secret_id_wrap_ttl,
     })
 }
 
@@ -154,6 +167,19 @@ pub(super) fn validate_service_add(args: &ResolvedServiceAdd, messages: &Message
         anyhow::bail!(messages.error_service_container_name_required());
     }
     Ok(())
+}
+
+/// Resolves the effective wrap TTL from the stored `Option`.
+///
+/// - `None` → default (`"30m"`)
+/// - `Some("0")` → wrapping disabled → returns `None`
+/// - `Some(ttl)` → explicit override
+pub(crate) fn effective_wrap_ttl(stored: Option<&str>) -> Option<&str> {
+    match stored {
+        None => Some(DEFAULT_SECRET_ID_WRAP_TTL),
+        Some("0") => None,
+        Some(ttl) => Some(ttl),
+    }
 }
 
 fn ensure_non_empty(value: &str, messages: &Messages) -> Result<String> {
@@ -391,6 +417,10 @@ mod tests {
             post_renew_arg: Vec::new(),
             post_renew_timeout_secs: None,
             post_renew_on_failure: None,
+            secret_id_ttl: None,
+            secret_id_num_uses: None,
+            secret_id_wrap_ttl: None,
+            no_wrap: false,
         }
     }
 
@@ -627,5 +657,20 @@ mod tests {
             err.to_string().contains("--post-renew-command"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn effective_wrap_ttl_none_returns_default() {
+        assert_eq!(effective_wrap_ttl(None), Some("30m"));
+    }
+
+    #[test]
+    fn effective_wrap_ttl_custom_returns_custom() {
+        assert_eq!(effective_wrap_ttl(Some("10m")), Some("10m"));
+    }
+
+    #[test]
+    fn effective_wrap_ttl_zero_disables_wrapping() {
+        assert_eq!(effective_wrap_ttl(Some("0")), None);
     }
 }

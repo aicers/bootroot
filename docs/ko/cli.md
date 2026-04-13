@@ -504,6 +504,17 @@ bootroot status
 `remote-bootstrap` 전달 모드에서는 이 플래그가
 `bootroot-remote bootstrap`으로 전달됩니다.
 
+발급 시점 `secret_id` 정책 플래그:
+
+- `--secret-id-ttl`: 생성되는 `secret_id`의 TTL (생략 시 역할 수준 기본값 상속)
+- `--secret-id-num-uses`: `secret_id` 최대 사용 횟수 (기본값 `1`)
+- `--secret-id-wrap-ttl`: `secret_id`에 대한 응답 래핑 TTL (기본값 `30m`)
+- `--no-wrap`: `secret_id` 응답 래핑 비활성화
+
+이 값들은 `state.json`에 저장되며 `rotate approle-secret-id` 시 적용됩니다.
+`--no-wrap`과 `--secret-id-wrap-ttl`은 동일 필드를 제어합니다.
+`--no-wrap`은 저장되는 래핑 TTL을 `0`으로 설정하여 래핑을 완전히 비활성화합니다.
+
 ### 대화형 동작
 
 - 누락된 필수 입력을 프롬프트로 받습니다(배포 타입 기본값: `daemon`).

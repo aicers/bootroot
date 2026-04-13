@@ -8,7 +8,7 @@ use anyhow::Context;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const RUNTIME_SERVICE_ADD_ROLE_ID: &str = "runtime-service-add-role-id";
@@ -412,8 +412,26 @@ async fn stub_control_plane_approle(server: &MockServer, role_name: &str) {
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{role_name}/secret-id")))
         .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .and(header_exists("X-Vault-Wrap-TTL"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "secret_id": "secret-edge-proxy" }
+            "wrap_info": {
+                "token": "wrap-token-edge-proxy",
+                "ttl": 1800,
+                "creation_time": "2026-04-12T00:00:00Z",
+                "creation_path": format!("auth/approle/role/{role_name}/secret-id")
+            }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/wrapping/unwrap"))
+        .and(header("X-Vault-Token", "wrap-token-edge-proxy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "secret_id": "secret-edge-proxy",
+                "secret_id_accessor": "acc"
+            }
         })))
         .mount(server)
         .await;

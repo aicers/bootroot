@@ -18,6 +18,8 @@ pub(super) async fn ensure_service_approle(
     client: &OpenBaoClient,
     state: &StateFile,
     service_name: &str,
+    secret_id_options: &SecretIdOptions,
+    wrap_ttl: Option<&str>,
     messages: &Messages,
 ) -> Result<ServiceAppRoleMaterialized> {
     let policy_name = service_policy_name(service_name);
@@ -42,10 +44,15 @@ pub(super) async fn ensure_service_approle(
         .read_role_id(&role_name)
         .await
         .with_context(|| messages.error_openbao_role_id_failed())?;
-    let secret_id = client
-        .create_secret_id(&role_name, &SecretIdOptions::default())
-        .await
-        .with_context(|| messages.error_openbao_secret_id_failed())?;
+    let secret_id = match wrap_ttl {
+        Some(ttl) => {
+            client
+                .create_secret_id_wrapped(&role_name, secret_id_options, ttl)
+                .await
+        }
+        None => client.create_secret_id(&role_name, secret_id_options).await,
+    }
+    .with_context(|| messages.error_openbao_secret_id_failed())?;
     Ok(ServiceAppRoleMaterialized {
         role_name,
         role_id,

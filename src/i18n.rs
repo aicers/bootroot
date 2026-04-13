@@ -108,6 +108,7 @@ pub(crate) struct Strings {
     pub(crate) error_eab_auto_failed: &'static str,
     pub(crate) error_state_missing: &'static str,
     pub(crate) error_service_duplicate: &'static str,
+    pub(crate) error_service_policy_mismatch: &'static str,
     pub(crate) error_service_not_found: &'static str,
     pub(crate) error_service_instance_id_required: &'static str,
     pub(crate) error_service_container_name_required: &'static str,

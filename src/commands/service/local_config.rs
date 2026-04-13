@@ -256,6 +256,9 @@ mod tests {
             runtime_auth: None,
             notes: None,
             post_renew_hooks: Vec::new(),
+            secret_id_ttl: None,
+            secret_id_num_uses: None,
+            secret_id_wrap_ttl: None,
         }
     }
 

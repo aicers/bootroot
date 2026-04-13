@@ -10,7 +10,7 @@ use anyhow::Context;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const RUNTIME_SERVICE_ADD_ROLE_ID: &str = "runtime-service-add-role-id";
@@ -680,8 +680,26 @@ async fn stub_service_add_openbao(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
         .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .and(header_exists("X-Vault-Wrap-TTL"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "secret_id": "secret-initial" }
+            "wrap_info": {
+                "token": "wrap-token-initial",
+                "ttl": 1800,
+                "creation_time": "2026-04-12T00:00:00Z",
+                "creation_path": format!("auth/approle/role/{ROLE_NAME}/secret-id")
+            }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/wrapping/unwrap"))
+        .and(header("X-Vault-Token", "wrap-token-initial"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "secret_id": "secret-initial",
+                "secret_id_accessor": "acc"
+            }
         })))
         .mount(server)
         .await;
@@ -815,11 +833,30 @@ async fn stub_secret_id_rotation_openbao(server: &MockServer, secret_id: &str) {
         .mount(server)
         .await;
 
+    let wrap_token = format!("wrap-rot-{secret_id}");
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
         .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
+        .and(header_exists("X-Vault-Wrap-TTL"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "secret_id": secret_id }
+            "wrap_info": {
+                "token": &wrap_token,
+                "ttl": 1800,
+                "creation_time": "2026-04-12T00:00:00Z",
+                "creation_path": format!("auth/approle/role/{ROLE_NAME}/secret-id")
+            }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/wrapping/unwrap"))
+        .and(header("X-Vault-Token", &wrap_token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "secret_id": secret_id,
+                "secret_id_accessor": "acc"
+            }
         })))
         .mount(server)
         .await;

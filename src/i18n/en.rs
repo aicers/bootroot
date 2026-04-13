@@ -68,6 +68,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_eab_auto_failed: "Automatic EAB issuance failed",
     error_state_missing: "state.json not found (run `bootroot init` first)",
     error_service_duplicate: "Service already exists: {value}",
+    error_service_policy_mismatch: "To change the secret_id policy for an existing service, use a policy update command",
     error_service_not_found: "Service not found: {value}",
     error_service_instance_id_required: "instance_id is required for all services",
     error_service_container_name_required: "container_name is required for docker services",

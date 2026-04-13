@@ -68,6 +68,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_eab_auto_failed: "EAB 자동 발급에 실패했습니다",
     error_state_missing: "state.json을 찾을 수 없습니다 (`bootroot init`을 먼저 실행하세요)",
     error_service_duplicate: "서비스가 이미 존재합니다: {value}",
+    error_service_policy_mismatch: "기존 서비스의 secret_id 정책을 변경하려면 정책 업데이트 명령을 사용하세요",
     error_service_not_found: "서비스를 찾을 수 없습니다: {value}",
     error_service_instance_id_required: "모든 서비스에는 instance_id가 필요합니다",
     error_service_container_name_required: "도커 서비스에는 container_name이 필요합니다",
