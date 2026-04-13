@@ -389,37 +389,13 @@ run_verify_pair() {
 # Remote bootstrap
 # ---------------------------------------------------------------------------
 
-copy_remote_materials() {
-  local control_dir="$SECRETS_DIR/services/$REMOTE_SERVICE"
-  local remote_dir="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE"
-  mkdir -p "$remote_dir"
-  cp "$control_dir/role_id" "$remote_dir/role_id"
-  cp "$control_dir/secret_id" "$remote_dir/secret_id"
-  chmod 600 "$remote_dir/role_id" "$remote_dir/secret_id"
-}
-
 run_remote_bootstrap() {
-  local role_id_path="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE/role_id"
-  local secret_id_path="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE/secret_id"
-  local eab_path="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE/eab.json"
-  local ca_bundle_path="$REMOTE_CERTS_DIR/ca-bundle.pem"
+  local artifact_src="$SECRETS_DIR/remote-bootstrap/services/$REMOTE_SERVICE/bootstrap.json"
+  local artifact_dst="$REMOTE_DIR/bootstrap-${REMOTE_SERVICE}.json"
+  cp "$artifact_src" "$artifact_dst"
+  chmod 600 "$artifact_dst"
   ( cd "$REMOTE_DIR" && "$BOOTROOT_REMOTE_BIN" bootstrap \
-      --openbao-url "http://${STEPCA_HOST_IP}:8200" \
-      --kv-mount "secret" \
-      --service-name "$REMOTE_SERVICE" \
-      --role-id-path "$role_id_path" \
-      --secret-id-path "$secret_id_path" \
-      --eab-file-path "$eab_path" \
-      --agent-config-path "$REMOTE_AGENT_CONFIG" \
-      --agent-email "admin@example.com" \
-      --agent-server "$STEPCA_SERVER_URL" \
-      --agent-domain "$DOMAIN" \
-      --agent-responder-url "$RESPONDER_URL" \
-      --profile-hostname "$REMOTE_HOSTNAME" \
-      --profile-instance-id "$REMOTE_INSTANCE_ID" \
-      --profile-cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" \
-      --profile-key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
-      --ca-bundle-path "$ca_bundle_path" \
+      --artifact "$artifact_dst" \
       --output json >>"$RUN_LOG" 2>&1 )
 }
 
@@ -813,7 +789,6 @@ main() {
   rm -f "$AGENT_CONFIG_PATH"
   start_service_sidecar_oba "$SIDECAR_OBA_SERVICE"
 
-  copy_remote_materials
   log_phase "remote-bootstrap-initial"
   run_remote_bootstrap
 

@@ -323,16 +323,6 @@ run_bootstrap_chain() {
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 }
 
-copy_remote_bootstrap_materials() {
-  local service="$1"
-  local control_service_dir="$SECRETS_DIR/services/$service"
-  local remote_service_dir="$REMOTE_DIR/secrets/services/$service"
-  mkdir -p "$remote_service_dir"
-  cp "$control_service_dir/role_id" "$remote_service_dir/role_id"
-  cp "$control_service_dir/secret_id" "$remote_service_dir/secret_id"
-  chmod 600 "$remote_service_dir/role_id" "$remote_service_dir/secret_id"
-}
-
 apply_dns_aliases() {
   local override="$ARTIFACT_DIR/docker-compose.dns-aliases.yml"
   cat >"$override" <<YAML
@@ -379,33 +369,15 @@ wait_for_stepca_http01_targets() {
 
 run_remote_bootstrap() {
   local service="$1"
-  local agent_config="$2"
-  local hostname_val="$3"
-  local instance_id="$4"
-  local role_id_path="$REMOTE_DIR/secrets/services/$service/role_id"
-  local secret_id_path="$REMOTE_DIR/secrets/services/$service/secret_id"
-  local eab_path="$REMOTE_DIR/secrets/services/$service/eab.json"
-  local ca_bundle_path="$REMOTE_CERTS_DIR/ca-bundle.pem"
+  local artifact_src="$SECRETS_DIR/remote-bootstrap/services/$service/bootstrap.json"
+  local artifact_dst="$REMOTE_DIR/bootstrap-${service}.json"
+  cp "$artifact_src" "$artifact_dst"
+  chmod 600 "$artifact_dst"
 
   (
     cd "$REMOTE_DIR"
     "$BOOTROOT_REMOTE_BIN" bootstrap \
-      --openbao-url "http://${STEPCA_HOST_IP}:8200" \
-      --kv-mount "secret" \
-      --service-name "$service" \
-      --role-id-path "$role_id_path" \
-      --secret-id-path "$secret_id_path" \
-      --eab-file-path "$eab_path" \
-      --agent-config-path "$agent_config" \
-      --agent-email "admin@example.com" \
-      --agent-server "$STEPCA_SERVER_URL" \
-      --agent-domain "$DOMAIN" \
-      --agent-responder-url "$RESPONDER_URL" \
-      --profile-hostname "$hostname_val" \
-      --profile-instance-id "$instance_id" \
-      --profile-cert-path "$REMOTE_CERTS_DIR/${service}.crt" \
-      --profile-key-path "$REMOTE_CERTS_DIR/${service}.key" \
-      --ca-bundle-path "$ca_bundle_path" \
+      --artifact "$artifact_dst" \
       --output json >>"$RUN_LOG" 2>&1
   )
 }
@@ -575,21 +547,19 @@ main() {
   install_infra
 
   run_bootstrap_chain
-  copy_remote_bootstrap_materials "$SERVICE_NAME"
-  copy_remote_bootstrap_materials "$SERVICE_NAME_2"
   apply_dns_aliases
   wait_for_stepca_http01_targets
 
   log_phase "bootstrap-initial"
-  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
-  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
+  run_remote_bootstrap "$SERVICE_NAME"
+  run_remote_bootstrap "$SERVICE_NAME_2"
 
   run_verify_pair "initial"
 
   run_rotation_secret_id
   log_phase "bootstrap-after-secret-id"
-  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
-  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
+  run_remote_bootstrap "$SERVICE_NAME"
+  run_remote_bootstrap "$SERVICE_NAME_2"
   force_reissue_remote_service "$SERVICE_NAME"
   force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-secret-id"
@@ -598,8 +568,8 @@ main() {
 
   run_rotation_eab
   log_phase "bootstrap-after-eab"
-  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
-  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
+  run_remote_bootstrap "$SERVICE_NAME"
+  run_remote_bootstrap "$SERVICE_NAME_2"
   force_reissue_remote_service "$SERVICE_NAME"
   force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-eab"
@@ -608,8 +578,8 @@ main() {
 
   run_rotation_trust_sync
   log_phase "bootstrap-after-trust-sync"
-  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
-  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
+  run_remote_bootstrap "$SERVICE_NAME"
+  run_remote_bootstrap "$SERVICE_NAME_2"
   force_reissue_remote_service "$SERVICE_NAME"
   force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-trust-sync"
@@ -618,8 +588,8 @@ main() {
 
   run_rotation_responder_hmac
   log_phase "bootstrap-after-responder-hmac"
-  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
-  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
+  run_remote_bootstrap "$SERVICE_NAME"
+  run_remote_bootstrap "$SERVICE_NAME_2"
   force_reissue_remote_service "$SERVICE_NAME"
   force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-responder-hmac"
