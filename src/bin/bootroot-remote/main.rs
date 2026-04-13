@@ -7,7 +7,7 @@ mod validation;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bootroot::locale::Locale;
 use bootroot::trust_bootstrap::{
     CA_BUNDLE_PEM_KEY, EAB_HMAC_KEY, EAB_KID_KEY, HMAC_KEY, SECRET_ID_KEY, SERVICE_KV_BASE,
@@ -68,8 +68,12 @@ enum Command {
 
 #[derive(clap::Args, Debug)]
 struct BootstrapArgs {
+    /// Bootstrap artifact JSON file (overrides per-field flags)
+    #[arg(long)]
+    artifact: Option<PathBuf>,
+
     /// `OpenBao` base URL
-    #[arg(long, env = "OPENBAO_URL")]
+    #[arg(long, env = "OPENBAO_URL", default_value = "")]
     openbao_url: String,
 
     /// `OpenBao` KV mount (v2)
@@ -77,24 +81,24 @@ struct BootstrapArgs {
     kv_mount: String,
 
     /// Service name
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     service_name: String,
 
     /// `AppRole` `role_id` file path used for `OpenBao` login
     #[arg(long)]
-    role_id_path: PathBuf,
+    role_id_path: Option<PathBuf>,
 
     /// Destination path for rotated `secret_id`
     #[arg(long)]
-    secret_id_path: PathBuf,
+    secret_id_path: Option<PathBuf>,
 
     /// Destination path for EAB JSON (kid/hmac)
     #[arg(long)]
-    eab_file_path: PathBuf,
+    eab_file_path: Option<PathBuf>,
 
     /// bootroot-agent config path to update
     #[arg(long)]
-    agent_config_path: PathBuf,
+    agent_config_path: Option<PathBuf>,
 
     /// bootroot-agent email for baseline config generation
     #[arg(long, default_value = DEFAULT_AGENT_EMAIL)]
@@ -136,7 +140,7 @@ struct BootstrapArgs {
 
     /// CA bundle output path for the managed step-ca trust bundle
     #[arg(long)]
-    ca_bundle_path: PathBuf,
+    ca_bundle_path: Option<PathBuf>,
 
     /// Post-renew success hook command
     #[arg(long)]
@@ -227,11 +231,223 @@ async fn main() {
     }
 }
 
+/// Resolved bootstrap args where all required fields are present.
+struct ResolvedBootstrapArgs {
+    openbao_url: String,
+    kv_mount: String,
+    service_name: String,
+    role_id_path: PathBuf,
+    secret_id_path: PathBuf,
+    eab_file_path: PathBuf,
+    agent_config_path: PathBuf,
+    agent_email: String,
+    agent_server: String,
+    agent_domain: String,
+    agent_responder_url: String,
+    profile_hostname: String,
+    profile_instance_id: Option<String>,
+    profile_cert_path: Option<PathBuf>,
+    profile_key_path: Option<PathBuf>,
+    ca_bundle_path: PathBuf,
+    post_renew_command: Option<String>,
+    post_renew_arg: Vec<String>,
+    post_renew_timeout_secs: Option<u64>,
+    post_renew_on_failure: Option<HookFailurePolicy>,
+    output: OutputFormat,
+    wrap_token: Option<String>,
+    wrap_expires_at: Option<String>,
+}
+
 async fn run(args: Args, lang: Locale) -> Result<i32> {
     match args.command {
-        Command::Bootstrap(args) => bootstrap::run_bootstrap(*args, lang).await,
+        Command::Bootstrap(args) => {
+            let resolved = resolve_bootstrap_args(*args, lang)?;
+            bootstrap::run_bootstrap(resolved, lang).await
+        }
         Command::ApplySecretId(args) => apply_secret_id::run_apply_secret_id(args, lang).await,
     }
+}
+
+/// Parsed bootstrap artifact for loading from `--artifact <path>`.
+#[derive(serde::Deserialize)]
+struct ParsedArtifact {
+    openbao_url: String,
+    #[serde(default)]
+    kv_mount: String,
+    service_name: String,
+    role_id_path: String,
+    secret_id_path: String,
+    eab_file_path: String,
+    agent_config_path: String,
+    ca_bundle_path: String,
+    #[serde(default)]
+    agent_email: String,
+    #[serde(default)]
+    agent_server: String,
+    #[serde(default)]
+    agent_domain: String,
+    #[serde(default)]
+    agent_responder_url: String,
+    #[serde(default)]
+    profile_hostname: String,
+    #[serde(default)]
+    profile_instance_id: Option<String>,
+    #[serde(default)]
+    profile_cert_path: Option<String>,
+    #[serde(default)]
+    profile_key_path: Option<String>,
+    #[serde(default)]
+    post_renew_hooks: Vec<ParsedHook>,
+    #[serde(default)]
+    wrap_token: Option<String>,
+    #[serde(default)]
+    wrap_expires_at: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ParsedHook {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default = "default_hook_timeout")]
+    timeout_secs: u64,
+    #[serde(default)]
+    on_failure: String,
+}
+
+fn default_hook_timeout() -> u64 {
+    30
+}
+
+#[allow(clippy::too_many_lines)]
+fn resolve_bootstrap_args(args: BootstrapArgs, lang: Locale) -> Result<ResolvedBootstrapArgs> {
+    let err_required = || {
+        localized(
+            lang,
+            "Required field missing (provide --artifact or individual flags)",
+            "필수 필드가 누락되었습니다 (--artifact 또는 개별 플래그를 제공하세요)",
+        )
+    };
+
+    if let Some(artifact_path) = &args.artifact {
+        let content = std::fs::read_to_string(artifact_path).with_context(|| {
+            localized(
+                lang,
+                &format!("Failed to read artifact: {}", artifact_path.display()),
+                &format!(
+                    "아티팩트 파일을 읽지 못했습니다: {}",
+                    artifact_path.display()
+                ),
+            )
+        })?;
+        let p: ParsedArtifact = serde_json::from_str(&content).with_context(|| {
+            localized(
+                lang,
+                "Failed to parse bootstrap artifact JSON",
+                "부트스트랩 아티팩트 JSON 파싱에 실패했습니다",
+            )
+        })?;
+        let mut resolved = ResolvedBootstrapArgs {
+            openbao_url: p.openbao_url,
+            kv_mount: if p.kv_mount.is_empty() {
+                args.kv_mount
+            } else {
+                p.kv_mount
+            },
+            service_name: p.service_name,
+            role_id_path: PathBuf::from(p.role_id_path),
+            secret_id_path: PathBuf::from(p.secret_id_path),
+            eab_file_path: PathBuf::from(p.eab_file_path),
+            agent_config_path: PathBuf::from(p.agent_config_path),
+            ca_bundle_path: PathBuf::from(p.ca_bundle_path),
+            agent_email: if p.agent_email.is_empty() {
+                args.agent_email
+            } else {
+                p.agent_email
+            },
+            agent_server: if p.agent_server.is_empty() {
+                args.agent_server
+            } else {
+                p.agent_server
+            },
+            agent_domain: if p.agent_domain.is_empty() {
+                args.agent_domain
+            } else {
+                p.agent_domain
+            },
+            agent_responder_url: if p.agent_responder_url.is_empty() {
+                args.agent_responder_url
+            } else {
+                p.agent_responder_url
+            },
+            profile_hostname: if p.profile_hostname.is_empty() {
+                args.profile_hostname
+            } else {
+                p.profile_hostname
+            },
+            profile_instance_id: p.profile_instance_id.or(args.profile_instance_id),
+            profile_cert_path: p
+                .profile_cert_path
+                .map(PathBuf::from)
+                .or(args.profile_cert_path),
+            profile_key_path: p
+                .profile_key_path
+                .map(PathBuf::from)
+                .or(args.profile_key_path),
+            post_renew_command: args.post_renew_command,
+            post_renew_arg: args.post_renew_arg,
+            post_renew_timeout_secs: args.post_renew_timeout_secs,
+            post_renew_on_failure: args.post_renew_on_failure,
+            output: args.output,
+            wrap_token: p.wrap_token,
+            wrap_expires_at: p.wrap_expires_at,
+        };
+        if let Some(hook) = p.post_renew_hooks.first() {
+            resolved.post_renew_command = Some(hook.command.clone());
+            resolved.post_renew_arg.clone_from(&hook.args);
+            resolved.post_renew_timeout_secs = Some(hook.timeout_secs);
+            if hook.on_failure == "stop" {
+                resolved.post_renew_on_failure = Some(HookFailurePolicy::Stop);
+            }
+        }
+        return Ok(resolved);
+    }
+
+    Ok(ResolvedBootstrapArgs {
+        openbao_url: args.openbao_url,
+        kv_mount: args.kv_mount,
+        service_name: args.service_name,
+        role_id_path: args
+            .role_id_path
+            .ok_or_else(|| anyhow::anyhow!("{}", err_required()))?,
+        secret_id_path: args
+            .secret_id_path
+            .ok_or_else(|| anyhow::anyhow!("{}", err_required()))?,
+        eab_file_path: args
+            .eab_file_path
+            .ok_or_else(|| anyhow::anyhow!("{}", err_required()))?,
+        agent_config_path: args
+            .agent_config_path
+            .ok_or_else(|| anyhow::anyhow!("{}", err_required()))?,
+        ca_bundle_path: args
+            .ca_bundle_path
+            .ok_or_else(|| anyhow::anyhow!("{}", err_required()))?,
+        agent_email: args.agent_email,
+        agent_server: args.agent_server,
+        agent_domain: args.agent_domain,
+        agent_responder_url: args.agent_responder_url,
+        profile_hostname: args.profile_hostname,
+        profile_instance_id: args.profile_instance_id,
+        profile_cert_path: args.profile_cert_path,
+        profile_key_path: args.profile_key_path,
+        post_renew_command: args.post_renew_command,
+        post_renew_arg: args.post_renew_arg,
+        post_renew_timeout_secs: args.post_renew_timeout_secs,
+        post_renew_on_failure: args.post_renew_on_failure,
+        output: args.output,
+        wrap_token: None,
+        wrap_expires_at: None,
+    })
 }
 
 #[cfg(test)]

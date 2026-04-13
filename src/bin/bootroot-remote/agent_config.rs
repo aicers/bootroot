@@ -13,8 +13,8 @@ use tokio::fs;
 use super::io::PulledSecrets;
 use super::summary::{ApplyItemSummary, ApplyStatus};
 use super::{
-    BootstrapArgs, HookFailurePolicy, Locale, MANAGED_PROFILE_BEGIN_PREFIX,
-    MANAGED_PROFILE_END_PREFIX, localized,
+    HookFailurePolicy, Locale, MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX,
+    ResolvedBootstrapArgs, localized,
 };
 
 struct ProfilePaths {
@@ -26,7 +26,7 @@ struct ProfilePaths {
 // per-item status/error mapping remains consistent for summary JSON contracts.
 #[allow(clippy::too_many_lines)]
 pub(super) async fn apply_agent_config_updates(
-    args: &BootstrapArgs,
+    args: &ResolvedBootstrapArgs,
     pulled: &PulledSecrets,
     lang: Locale,
 ) -> (ApplyItemSummary, ApplyItemSummary) {
@@ -184,7 +184,7 @@ pub(super) async fn apply_agent_config_updates(
     (responder_hmac_status, trust_sync_status)
 }
 
-fn resolve_profile_paths(args: &BootstrapArgs) -> ProfilePaths {
+fn resolve_profile_paths(args: &ResolvedBootstrapArgs) -> ProfilePaths {
     let fallback_dir = args
         .agent_config_path
         .parent()
@@ -204,7 +204,7 @@ fn resolve_profile_paths(args: &BootstrapArgs) -> ProfilePaths {
     }
 }
 
-fn inject_hooks_into_profile_block(block: &str, args: &BootstrapArgs) -> String {
+fn inject_hooks_into_profile_block(block: &str, args: &ResolvedBootstrapArgs) -> String {
     let Some(command) = args.post_renew_command.as_deref() else {
         return block.to_string();
     };
@@ -243,7 +243,7 @@ fn inject_hooks_into_profile_block(block: &str, args: &BootstrapArgs) -> String 
     }
 }
 
-fn render_agent_config_baseline(args: &BootstrapArgs) -> String {
+fn render_agent_config_baseline(args: &ResolvedBootstrapArgs) -> String {
     format!(
         "email = \"{email}\"\n\
 server = \"{server}\"\n\
@@ -305,7 +305,7 @@ fn build_trust_updates(
 }
 
 async fn write_openbao_agent_artifacts(
-    args: &BootstrapArgs,
+    args: &ResolvedBootstrapArgs,
     agent_template: &str,
     lang: Locale,
 ) -> Result<()> {
@@ -417,7 +417,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::OutputFormat;
+    use crate::{OutputFormat, ResolvedBootstrapArgs};
 
     #[test]
     fn upsert_toml_section_keys_updates_existing_section() {
@@ -441,8 +441,8 @@ mod tests {
         assert!(output.contains("trusted_ca_sha256 = ["));
     }
 
-    fn test_bootstrap_args() -> BootstrapArgs {
-        BootstrapArgs {
+    fn test_bootstrap_args() -> ResolvedBootstrapArgs {
+        ResolvedBootstrapArgs {
             openbao_url: "https://localhost:8200".to_string(),
             kv_mount: "secret".to_string(),
             service_name: "edge-proxy".to_string(),
@@ -464,6 +464,8 @@ mod tests {
             post_renew_timeout_secs: None,
             post_renew_on_failure: None,
             output: OutputFormat::Text,
+            wrap_token: None,
+            wrap_expires_at: None,
         }
     }
 

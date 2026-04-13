@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::openbao::WrapInfo;
 use tokio::fs;
 
 use super::resolve::ResolvedServiceAdd;
@@ -55,6 +56,10 @@ struct RemoteBootstrapArtifact {
     profile_key_path: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     post_renew_hooks: Vec<PostRenewHookEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wrap_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wrap_expires_at: Option<String>,
 }
 
 /// Builds a `RemoteBootstrapArtifact` from common inputs shared by both
@@ -72,6 +77,7 @@ fn build_artifact(
     hostname: &str,
     instance_id: Option<&str>,
     post_renew_hooks: &[PostRenewHookEntry],
+    wrap_info: Option<&WrapInfo>,
 ) -> RemoteBootstrapArtifact {
     let secret_id_parent = secret_id_path.parent().unwrap_or(Path::new("."));
     let role_id_path = secret_id_parent.join(SERVICE_ROLE_ID_FILENAME);
@@ -105,7 +111,18 @@ fn build_artifact(
         profile_cert_path: cert_path.display().to_string(),
         profile_key_path: key_path.display().to_string(),
         post_renew_hooks: post_renew_hooks.to_vec(),
+        wrap_token: wrap_info.map(|w| w.token.clone()),
+        wrap_expires_at: wrap_info.map(|w| compute_wrap_expiry_epoch(w.ttl)),
     }
+}
+
+/// Computes the wrap expiry as a Unix epoch seconds string.
+fn compute_wrap_expiry_epoch(ttl_secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    (now + ttl_secs).to_string()
 }
 
 pub(super) async fn write_remote_bootstrap_artifact(
@@ -113,6 +130,7 @@ pub(super) async fn write_remote_bootstrap_artifact(
     secrets_dir: &Path,
     resolved: &ResolvedServiceAdd,
     secret_id_path: &Path,
+    wrap_info: Option<&WrapInfo>,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
     let artifact = build_artifact(
@@ -127,6 +145,7 @@ pub(super) async fn write_remote_bootstrap_artifact(
         &resolved.hostname,
         resolved.instance_id.as_deref(),
         &resolved.post_renew_hooks,
+        wrap_info,
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &resolved.service_name, &artifact, messages)
         .await
@@ -136,6 +155,7 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
     state: &StateFile,
     secrets_dir: &Path,
     entry: &ServiceEntry,
+    wrap_info: Option<&WrapInfo>,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
     let artifact = build_artifact(
@@ -150,6 +170,7 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
         &entry.hostname,
         entry.instance_id.as_deref(),
         &entry.post_renew_hooks,
+        wrap_info,
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &entry.service_name, &artifact, messages)
         .await
@@ -170,14 +191,20 @@ async fn write_remote_bootstrap_artifact_file(
         .await
         .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
     fs_util::set_key_permissions(&artifact_path).await?;
-    let remote_run_command = render_remote_run_command(artifact);
+    let remote_run_command = render_remote_run_command(artifact, &artifact_path);
     Ok(RemoteBootstrapResult {
         bootstrap_file: artifact_path.display().to_string(),
         remote_run_command,
     })
 }
 
-fn render_remote_run_command(artifact: &RemoteBootstrapArtifact) -> String {
+fn render_remote_run_command(artifact: &RemoteBootstrapArtifact, artifact_path: &Path) -> String {
+    if artifact.wrap_token.is_some() {
+        return format!(
+            "bootroot-remote bootstrap --artifact '{}' --output json",
+            shell_escape_single_quoted(&artifact_path.display().to_string()),
+        );
+    }
     let mut cmd = format!(
         "bootroot-remote bootstrap --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --agent-email '{}' --agent-server '{}' --agent-domain '{}' --agent-responder-url '{}' --profile-hostname '{}' --profile-instance-id '{}' --profile-cert-path '{}' --profile-key-path '{}' --ca-bundle-path '{}'",
         artifact.openbao_url,
@@ -267,6 +294,7 @@ mod tests {
             "host1",
             Some("instance-42"),
             &[],
+            None,
         );
 
         assert_eq!(artifact.schema_version, 1);
@@ -320,6 +348,7 @@ mod tests {
             "node-a",
             None,
             &[],
+            None,
         );
 
         assert_eq!(artifact.profile_instance_id, "");
@@ -339,6 +368,7 @@ mod tests {
             "h1",
             None,
             &[],
+            None,
         );
         let b = build_artifact(
             "https://ob",
@@ -352,6 +382,7 @@ mod tests {
             "h2",
             None,
             &[],
+            None,
         );
 
         assert_ne!(a.role_id_path, b.role_id_path);
@@ -373,6 +404,7 @@ mod tests {
             "h",
             None,
             &[],
+            None,
         );
 
         // Path::new("secret_id").parent() returns Some(""), not None
@@ -394,6 +426,7 @@ mod tests {
             "h",
             None,
             &[],
+            None,
         );
 
         // Path::new("cert.pem").parent() returns Some(""), not None
@@ -422,6 +455,7 @@ mod tests {
             "h",
             None,
             &hooks,
+            None,
         );
 
         assert_eq!(artifact.post_renew_hooks.len(), 1);
@@ -451,8 +485,9 @@ mod tests {
             "h",
             None,
             &hooks,
+            None,
         );
-        let cmd = super::render_remote_run_command(&artifact);
+        let cmd = super::render_remote_run_command(&artifact, Path::new("/tmp/bootstrap.json"));
 
         assert!(
             cmd.contains("--post-renew-command 'systemctl'"),
@@ -498,8 +533,9 @@ mod tests {
             "h",
             None,
             &hooks,
+            None,
         );
-        let cmd = super::render_remote_run_command(&artifact);
+        let cmd = super::render_remote_run_command(&artifact, Path::new("/tmp/bootstrap.json"));
 
         assert!(
             cmd.contains("--post-renew-command '/usr/bin/notify-O'\\''Brien'"),
@@ -525,8 +561,9 @@ mod tests {
             "h",
             None,
             &[],
+            None,
         );
-        let cmd = super::render_remote_run_command(&artifact);
+        let cmd = super::render_remote_run_command(&artifact, Path::new("/tmp/bootstrap.json"));
 
         assert!(
             !cmd.contains("--post-renew"),
@@ -548,6 +585,7 @@ mod tests {
             "h",
             Some(""),
             &[],
+            None,
         );
         let with_none = build_artifact(
             "https://ob",
@@ -561,6 +599,7 @@ mod tests {
             "h",
             None,
             &[],
+            None,
         );
 
         assert_eq!(
@@ -582,5 +621,98 @@ mod tests {
     #[test]
     fn shell_escape_single_quoted_multiple_quotes() {
         assert_eq!(super::shell_escape_single_quoted("a'b'c"), "a'\\''b'\\''c");
+    }
+
+    #[test]
+    fn render_remote_run_command_uses_artifact_flag_when_wrapped() {
+        use bootroot::openbao::WrapInfo;
+
+        let wrap = WrapInfo {
+            token: "s.wrap123".to_string(),
+            ttl: 1800,
+            creation_time: "2026-04-12T00:00:00Z".to_string(),
+            creation_path: "auth/approle/role/svc/secret-id".to_string(),
+        };
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+            &[],
+            Some(&wrap),
+        );
+        let cmd = super::render_remote_run_command(
+            &artifact,
+            Path::new("/secrets/remote-bootstrap/services/svc/bootstrap.json"),
+        );
+
+        assert!(
+            cmd.contains("--artifact"),
+            "wrapped artifact should use --artifact: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--openbao-url"),
+            "wrapped artifact should not list individual flags: {cmd}"
+        );
+        assert!(
+            cmd.contains("--output json"),
+            "should still include --output: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_artifact_includes_wrap_fields_when_present() {
+        use bootroot::openbao::WrapInfo;
+
+        let wrap = WrapInfo {
+            token: "s.wrap-tok".to_string(),
+            ttl: 1800,
+            creation_time: "2026-04-12T00:00:00Z".to_string(),
+            creation_path: "auth/approle/role/svc/secret-id".to_string(),
+        };
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+            &[],
+            Some(&wrap),
+        );
+
+        assert_eq!(artifact.wrap_token.as_deref(), Some("s.wrap-tok"));
+        assert!(artifact.wrap_expires_at.is_some());
+    }
+
+    #[test]
+    fn build_artifact_omits_wrap_fields_when_none() {
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+            &[],
+            None,
+        );
+
+        assert!(artifact.wrap_token.is_none());
+        assert!(artifact.wrap_expires_at.is_none());
     }
 }

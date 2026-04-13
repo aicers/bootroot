@@ -510,6 +510,25 @@ impl OpenBaoClient {
         Ok(response.data.secret_id)
     }
 
+    /// Creates a new `secret_id` with response wrapping and returns the
+    /// wrap metadata **without** unwrapping.
+    ///
+    /// Use this when the wrap token must be forwarded to another system
+    /// (e.g. embedded in a remote bootstrap artifact) so that the
+    /// recipient can unwrap it themselves.
+    ///
+    /// # Errors
+    /// Returns an error if the wrapped creation request fails.
+    pub async fn create_secret_id_wrap_only(
+        &self,
+        name: &str,
+        options: &SecretIdOptions,
+        wrap_ttl: &str,
+    ) -> Result<WrapInfo> {
+        let path = format!("auth/approle/role/{name}/secret-id");
+        self.post_json_wrapped(&path, options, wrap_ttl).await
+    }
+
     /// Creates a new `secret_id` with response wrapping, then immediately
     /// unwraps it to obtain the raw value.
     ///

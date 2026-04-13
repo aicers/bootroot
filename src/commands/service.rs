@@ -7,7 +7,7 @@ mod secrets;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
+use bootroot::openbao::{OpenBaoClient, SecretIdOptions, WrapInfo};
 
 use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs};
 use crate::cli::output::{
@@ -38,10 +38,15 @@ pub(super) const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/
 pub(super) const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
 pub(super) use bootroot::trust_bootstrap::CA_BUNDLE_PEM_KEY as SERVICE_CA_BUNDLE_PEM_KEY;
 
+pub(super) enum SecretIdMaterial {
+    Plain(String),
+    Wrapped(WrapInfo),
+}
+
 pub(super) struct ServiceAppRoleMaterialized {
     pub(super) role_name: String,
     pub(super) role_id: String,
-    pub(super) secret_id: String,
+    pub(super) secret_id_material: SecretIdMaterial,
     pub(super) policy_name: String,
 }
 
@@ -104,7 +109,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
 
     if let Some(existing) = state.services.get(&resolved.service_name).cloned() {
         if is_idempotent_remote_rerun(&existing, &resolved) {
-            return run_service_add_remote_idempotent(&state, &existing, messages).await;
+            return run_service_add_remote_idempotent(&state, &existing, &resolved, messages).await;
         }
         if is_policy_only_mismatch(&existing, &resolved) {
             anyhow::bail!(messages.error_service_policy_mismatch());
@@ -215,6 +220,7 @@ async fn run_service_add_preview(
     );
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_service_add_apply(
     state: &mut StateFile,
     state_path: &Path,
@@ -231,7 +237,11 @@ async fn run_service_add_apply(
     authenticate_openbao_client(&mut client, auth, messages).await?;
 
     let secret_id_options = build_secret_id_options(resolved);
-    let wrap_ttl = resolve::effective_wrap_ttl(resolved.secret_id_wrap_ttl.as_deref());
+    let wrap_ttl = if matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap) {
+        resolve::effective_wrap_ttl(resolved.secret_id_wrap_ttl.as_deref())
+    } else {
+        None
+    };
     let approle_result = approle::ensure_service_approle(
         &client,
         state,
@@ -249,21 +259,34 @@ async fn run_service_add_apply(
         messages,
     )
     .await?;
-    let secret_id_path = approle::write_secret_id_file(
-        secrets_dir,
-        &resolved.service_name,
-        &approle_result.secret_id,
-        messages,
-    )
-    .await?;
-    let service_sync_material = secrets::sync_service_kv_bundle(
-        &client,
-        state,
-        resolved,
-        &approle_result.secret_id,
-        messages,
-    )
-    .await?;
+
+    let (secret_id_path, wrap_info) = match &approle_result.secret_id_material {
+        SecretIdMaterial::Plain(secret_id) => {
+            let path = approle::write_secret_id_file(
+                secrets_dir,
+                &resolved.service_name,
+                secret_id,
+                messages,
+            )
+            .await?;
+            (path, None)
+        }
+        SecretIdMaterial::Wrapped(wi) => {
+            let path = secrets_dir
+                .join(SERVICE_SECRET_DIR)
+                .join(&resolved.service_name)
+                .join(SERVICE_SECRET_ID_FILENAME);
+            (path, Some(wi))
+        }
+    };
+
+    let plain_secret_id = match &approle_result.secret_id_material {
+        SecretIdMaterial::Plain(sid) => Some(sid.as_str()),
+        SecretIdMaterial::Wrapped(_) => None,
+    };
+    let service_sync_material =
+        secrets::sync_service_kv_bundle(&client, state, resolved, plain_secret_id, messages)
+            .await?;
     let trusted_ca_sha256 = Some(service_sync_material.trusted_ca_sha256.as_slice());
 
     let applied = if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
@@ -290,6 +313,7 @@ async fn run_service_add_apply(
                 secrets_dir,
                 resolved,
                 &secret_id_path,
+                wrap_info,
                 messages,
             )
             .await?,
@@ -404,13 +428,36 @@ fn print_service_add_apply_summary(
 async fn run_service_add_remote_idempotent(
     state: &StateFile,
     entry: &ServiceEntry,
+    resolved: &ResolvedServiceAdd,
     messages: &Messages,
 ) -> Result<()> {
+    let wrap_ttl = resolve::effective_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref());
+    let wrap_info = if let Some(ttl) = wrap_ttl {
+        let auth = resolved
+            .runtime_auth
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenBao auth is required for wrapped rerun"))?;
+        let mut client = OpenBaoClient::new(&state.openbao_url)
+            .with_context(|| messages.error_openbao_client_create_failed())?;
+        authenticate_openbao_client(&mut client, auth, messages).await?;
+        let secret_id_options = build_secret_id_options(resolved);
+        let role_name = approle::service_role_name(&entry.service_name);
+        Some(
+            client
+                .create_secret_id_wrap_only(&role_name, &secret_id_options, ttl)
+                .await
+                .with_context(|| messages.error_openbao_secret_id_failed())?,
+        )
+    } else {
+        None
+    };
+
     let secrets_dir = state.secrets_dir();
     let remote_bootstrap = remote_bootstrap::write_remote_bootstrap_artifact_from_entry(
         state,
         secrets_dir,
         entry,
+        wrap_info.as_ref(),
         messages,
     )
     .await?;
@@ -506,7 +553,7 @@ mod tests {
 
     use super::resolve::ResolvedServiceAdd;
     use super::{
-        ServiceAppRoleMaterialized, build_secret_id_options, build_service_entry,
+        SecretIdMaterial, ServiceAppRoleMaterialized, build_secret_id_options, build_service_entry,
         build_service_entry_from_role, is_idempotent_remote_rerun, is_policy_only_mismatch,
         non_policy_fields_match, policy_fields_match,
     };
@@ -575,7 +622,7 @@ mod tests {
         let materialized = ServiceAppRoleMaterialized {
             role_name: "mat-role".to_string(),
             role_id: "mat-rid".to_string(),
-            secret_id: "unused-in-entry".to_string(),
+            secret_id_material: SecretIdMaterial::Plain("unused-in-entry".to_string()),
             policy_name: "mat-policy".to_string(),
         };
         let secret_id_path = PathBuf::from("/secrets/mat");
@@ -637,7 +684,7 @@ mod tests {
         let materialized = ServiceAppRoleMaterialized {
             role_name: "r".to_string(),
             role_id: "id".to_string(),
-            secret_id: "sid".to_string(),
+            secret_id_material: SecretIdMaterial::Plain("sid".to_string()),
             policy_name: "p".to_string(),
         };
         let entry = build_service_entry(&resolved, materialized, &PathBuf::from("/s"));

@@ -149,19 +149,25 @@ pub(super) async fn pull_secrets(
     client: &bootroot::openbao::OpenBaoClient,
     mount: &str,
     service: &str,
+    skip_secret_id: bool,
     lang: Locale,
 ) -> Result<PulledSecrets> {
     let base = format!("{}/{service}", super::SERVICE_KV_BASE);
-    let secret_id_data = client
-        .read_kv(mount, &format!("{base}/secret_id"))
-        .await
-        .with_context(|| {
-            localized(
-                lang,
-                "Failed to read service secret_id from OpenBao",
-                "OpenBao에서 서비스 secret_id를 읽지 못했습니다",
-            )
-        })?;
+    let secret_id = if skip_secret_id {
+        String::new()
+    } else {
+        let secret_id_data = client
+            .read_kv(mount, &format!("{base}/secret_id"))
+            .await
+            .with_context(|| {
+                localized(
+                    lang,
+                    "Failed to read service secret_id from OpenBao",
+                    "OpenBao에서 서비스 secret_id를 읽지 못했습니다",
+                )
+            })?;
+        read_required_string(&secret_id_data, &[super::SECRET_ID_KEY, "value"], lang)?
+    };
     let eab_data = client
         .read_kv(mount, &format!("{base}/eab"))
         .await
@@ -193,7 +199,6 @@ pub(super) async fn pull_secrets(
             )
         })?;
 
-    let secret_id = read_required_string(&secret_id_data, &[super::SECRET_ID_KEY, "value"], lang)?;
     let eab_kid = read_required_string(&eab_data, &[super::EAB_KID_KEY], lang)?;
     let eab_hmac = read_required_string(&eab_data, &[super::EAB_HMAC_KEY], lang)?;
     let responder_hmac =

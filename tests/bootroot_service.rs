@@ -1403,6 +1403,7 @@ async fn stub_app_add_openbao_with_token(server: &MockServer, service_name: &str
         .mount(server)
         .await;
 
+    // Wrapped secret_id creation (used for remote-bootstrap delivery mode)
     let wrap_token = format!("wrap-token-{service_name}");
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
@@ -1419,9 +1420,11 @@ async fn stub_app_add_openbao_with_token(server: &MockServer, service_name: &str
         .mount(server)
         .await;
 
+    // Unwrapped secret_id creation (used for local-file delivery mode
+    // and --no-wrap remote-bootstrap)
     Mock::given(method("POST"))
-        .and(path("/v1/sys/wrapping/unwrap"))
-        .and(header("X-Vault-Token", &wrap_token))
+        .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
+        .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "secret_id": format!("secret-{service_name}"),

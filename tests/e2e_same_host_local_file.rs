@@ -677,30 +677,19 @@ async fn stub_service_add_openbao(server: &MockServer) {
         .mount(server)
         .await;
 
+    // Plain secret_id creation (local-file delivery does not use wrapping).
+    // Priority 10 (lower than default 5) so that wrapped mocks mounted by
+    // rotation stubs take precedence when both would match.
     Mock::given(method("POST"))
         .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
         .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
-        .and(header_exists("X-Vault-Wrap-TTL"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "wrap_info": {
-                "token": "wrap-token-initial",
-                "ttl": 1800,
-                "creation_time": "2026-04-12T00:00:00Z",
-                "creation_path": format!("auth/approle/role/{ROLE_NAME}/secret-id")
-            }
-        })))
-        .mount(server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/sys/wrapping/unwrap"))
-        .and(header("X-Vault-Token", "wrap-token-initial"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "secret_id": "secret-initial",
                 "secret_id_accessor": "acc"
             }
         })))
+        .with_priority(10)
         .mount(server)
         .await;
 

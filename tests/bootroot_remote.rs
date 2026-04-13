@@ -352,7 +352,10 @@ fn test_bootroot_remote_requires_ca_bundle_path() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "stderr: {stderr}");
-    assert!(stderr.contains("--ca-bundle-path"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("--ca-bundle-path") || stderr.contains("Required field missing"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[tokio::test]

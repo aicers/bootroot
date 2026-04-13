@@ -15,7 +15,7 @@ pub(super) async fn sync_service_kv_bundle(
     client: &OpenBaoClient,
     state: &StateFile,
     resolved: &ResolvedServiceAdd,
-    secret_id: &str,
+    secret_id: Option<&str>,
     messages: &Messages,
 ) -> Result<ServiceSyncMaterial> {
     let material = read_service_sync_material(client, &state.kv_mount, messages).await?;
@@ -27,13 +27,15 @@ pub(super) async fn sync_service_kv_bundle(
         messages,
     )
     .await?;
-    if matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap) {
+    if matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap)
+        && let Some(sid) = secret_id
+    {
         let base = format!("{SERVICE_KV_BASE}/{}", resolved.service_name);
         client
             .write_kv(
                 &state.kv_mount,
                 &format!("{base}/secret_id"),
-                serde_json::json!({ SERVICE_SECRET_ID_KEY: secret_id }),
+                serde_json::json!({ SERVICE_SECRET_ID_KEY: sid }),
             )
             .await
             .with_context(|| messages.error_openbao_kv_write_failed())?;
