@@ -399,6 +399,18 @@ run_remote_bootstrap() {
       --output json >>"$RUN_LOG" 2>&1 )
 }
 
+regenerate_remote_artifact() {
+  run_bootroot service add \
+    --service-name "$REMOTE_SERVICE" --deploy-type daemon --delivery-mode remote-bootstrap \
+    --hostname "$REMOTE_HOSTNAME" --domain "$DOMAIN" \
+    --agent-config "$REMOTE_AGENT_CONFIG" \
+    --cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" --key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
+    --instance-id "$REMOTE_INSTANCE_ID" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
+}
+
 # ---------------------------------------------------------------------------
 # Rotation helpers
 # ---------------------------------------------------------------------------
@@ -584,6 +596,7 @@ scenario_1_phase3_failure() {
 
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "s1-after"
@@ -636,6 +649,7 @@ scenario_2_phase4_failure() {
   # Resume rotation from the crashed state
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "s2-after"
@@ -674,6 +688,7 @@ scenario_3_partial_reissuance() {
   # Reissue remaining services
   force_reissue_for_service "$WEB_SERVICE"
   verify_service_with_retry "$WEB_SERVICE"
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_remote
   verify_service_with_retry "$REMOTE_SERVICE" "$REMOTE_AGENT_CONFIG"
@@ -710,6 +725,7 @@ scenario_4_finalize_blocked() {
   # Re-run with --force → Phase 6 forces despite unmigrated services
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "s4-after"
@@ -754,6 +770,7 @@ scenario_5_trustsync_conflict() {
   # there is no running daemon for the Daemon-type service).
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "s5-after"

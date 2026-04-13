@@ -630,6 +630,23 @@ run_remote_bootstrap() {
   )
 }
 
+regenerate_remote_artifact() {
+  run_bootroot service add \
+    --service-name "$REMOTE_SERVICE" \
+    --deploy-type daemon \
+    --delivery-mode remote-bootstrap \
+    --hostname "$REMOTE_HOSTNAME" \
+    --domain "$DOMAIN" \
+    --agent-config "$REMOTE_AGENT_CONFIG" \
+    --cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" \
+    --key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
+    --instance-id "$REMOTE_INSTANCE_ID" \
+    --secret-id-num-uses 0 \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
+}
+
 run_rotations_with_verification() {
   log_phase "rotate-openbao-recovery"
   run_bootroot rotate \
@@ -641,6 +658,7 @@ run_rotations_with_verification() {
     --rotate-root-token \
     --output "$OPENBAO_RECOVERY_OUTPUT_FILE" >>"$RUN_LOG" 2>&1
   [ -s "$OPENBAO_RECOVERY_OUTPUT_FILE" ] || fail "openbao recovery output not written"
+  regenerate_remote_artifact
   log_phase "bootstrap-after-openbao-recovery"
   run_remote_bootstrap
   run_verify_pair "after-openbao-recovery"
@@ -654,6 +672,7 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     responder-hmac >>"$RUN_LOG" 2>&1
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-responder-hmac"
@@ -670,6 +689,7 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     stepca-password >>"$RUN_LOG" 2>&1
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-stepca-password"
@@ -697,6 +717,7 @@ run_rotations_with_verification() {
     --yes \
     db \
     --db-admin-dsn "$db_admin_dsn" >>"$RUN_LOG" 2>&1
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-db"
@@ -713,6 +734,7 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     ca-key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-ca-key"
@@ -729,6 +751,7 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     ca-key --full --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
+  regenerate_remote_artifact
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-ca-key-full"

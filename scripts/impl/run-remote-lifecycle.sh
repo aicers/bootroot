@@ -382,6 +382,39 @@ run_remote_bootstrap() {
   )
 }
 
+regenerate_remote_artifacts() {
+  run_bootroot_control service add \
+    --service-name "$SERVICE_NAME" \
+    --deploy-type daemon \
+    --delivery-mode remote-bootstrap \
+    --hostname "$HOSTNAME" \
+    --domain "$DOMAIN" \
+    --agent-config "$REMOTE_AGENT_CONFIG_PATH" \
+    --cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.crt" \
+    --key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME}.key" \
+    --instance-id "$INSTANCE_ID" \
+    --secret-id-num-uses 0 \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
+
+  run_bootroot_control service add \
+    --service-name "$SERVICE_NAME_2" \
+    --deploy-type docker \
+    --delivery-mode remote-bootstrap \
+    --hostname "$HOSTNAME_2" \
+    --domain "$DOMAIN" \
+    --agent-config "$REMOTE_AGENT_CONFIG_PATH_2" \
+    --cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME_2}.crt" \
+    --key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME_2}.key" \
+    --instance-id "$INSTANCE_ID_2" \
+    --container-name "$SERVICE_NAME_2" \
+    --secret-id-num-uses 0 \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
+}
+
 verify_with_retry() {
   local service="$1"
   local agent_config="$2"
@@ -557,6 +590,7 @@ main() {
   run_verify_pair "initial"
 
   run_rotation_secret_id
+  regenerate_remote_artifacts
   log_phase "bootstrap-after-secret-id"
   run_remote_bootstrap "$SERVICE_NAME"
   run_remote_bootstrap "$SERVICE_NAME_2"
@@ -567,6 +601,7 @@ main() {
   assert_fingerprint_changed "$SERVICE_NAME_2" "initial" "after-secret-id"
 
   run_rotation_eab
+  regenerate_remote_artifacts
   log_phase "bootstrap-after-eab"
   run_remote_bootstrap "$SERVICE_NAME"
   run_remote_bootstrap "$SERVICE_NAME_2"
@@ -577,6 +612,7 @@ main() {
   assert_fingerprint_changed "$SERVICE_NAME_2" "after-secret-id" "after-eab"
 
   run_rotation_trust_sync
+  regenerate_remote_artifacts
   log_phase "bootstrap-after-trust-sync"
   run_remote_bootstrap "$SERVICE_NAME"
   run_remote_bootstrap "$SERVICE_NAME_2"
@@ -587,6 +623,7 @@ main() {
   assert_fingerprint_changed "$SERVICE_NAME_2" "after-eab" "after-trust-sync"
 
   run_rotation_responder_hmac
+  regenerate_remote_artifacts
   log_phase "bootstrap-after-responder-hmac"
   run_remote_bootstrap "$SERVICE_NAME"
   run_remote_bootstrap "$SERVICE_NAME_2"
