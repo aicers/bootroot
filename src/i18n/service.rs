@@ -814,6 +814,10 @@ impl Messages {
         self.strings().service_update_rotate_hint
     }
 
+    pub(crate) fn hint_secret_id_ttl_rotation_cadence(&self) -> &'static str {
+        self.strings().hint_secret_id_ttl_rotation_cadence
+    }
+
     pub(crate) fn service_info_secret_id_ttl(&self, value: &str) -> String {
         format_template(
             self.strings().service_info_secret_id_ttl,

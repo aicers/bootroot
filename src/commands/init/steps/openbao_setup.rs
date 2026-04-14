@@ -356,7 +356,7 @@ fn parse_ttl_to_secs(ttl: &str) -> Option<u64> {
 /// threshold but is still within the hard maximum, `Ok(None)` when the
 /// value is within both limits, or `Err` when the value is invalid or
 /// exceeds the hard maximum.
-pub(super) fn validate_secret_id_ttl(ttl: &str, messages: &Messages) -> Result<Option<String>> {
+pub(crate) fn validate_secret_id_ttl(ttl: &str, messages: &Messages) -> Result<Option<String>> {
     let secs = parse_ttl_to_secs(ttl)
         .ok_or_else(|| anyhow::anyhow!(messages.error_secret_id_ttl_invalid(ttl)))?;
     let max_secs =

@@ -379,6 +379,7 @@ pub(super) static STRINGS: Strings = Strings {
     service_update_summary: "bootroot service update: 요약",
     service_update_field_changed: "- {field}: {old} -> {new}",
     service_update_rotate_hint: "새로운 정책을 적용하려면 `bootroot rotate approle-secret-id`를 실행하세요.",
+    hint_secret_id_ttl_rotation_cadence: "참고: secret_id TTL은 회전 주기의 최소 2배 이상이어야 합니다. 예를 들어, 12시간 회전 스케줄에는 24시간 이상의 TTL을 사용하세요. 이 여유는 누락된 실행, 유지보수 기간, 재시작 복구를 고려한 것입니다.",
     service_info_secret_id_ttl: "- secret_id TTL: {value}",
     service_info_secret_id_wrap_ttl: "- secret_id wrap TTL: {value}",
     policy_label_inherit: "상속",

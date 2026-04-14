@@ -159,6 +159,52 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+## SecretID TTL and rotation cadence
+
+Service AppRole `secret_id` values are reusable runtime credentials. They
+survive normal restarts and re-authentication until the next planned
+rotation. The `secret_id_ttl` controls how long a SecretID remains valid
+after issuance.
+
+**Default TTL model:**
+
+- `24h` is the role-level default set during `bootroot init`. This is the
+  security-conservative choice: a shorter lifetime limits exposure when a
+  SecretID leaks.
+- `48h` (`RECOMMENDED_SECRET_ID_TTL`) is the CLI warning threshold. Values
+  above `48h` emit a CLI warning; values above `168h` (7 days) are rejected.
+  Use `48h` or longer when surviving missed rotation runs, maintenance
+  windows, and restart recovery is more important than minimising the
+  exposure window.
+
+**Rotation cadence rule:**
+
+Set the `secret_id_ttl` to at least **2× your rotation interval**. This
+buffer ensures that a single missed or delayed rotation run does not expire
+credentials and leave services unable to re-authenticate.
+
+| Rotation interval | Minimum recommended TTL |
+|-------------------|-------------------------|
+| 8h                | 16h                     |
+| 12h               | 24h (default)           |
+| 24h               | 48h                     |
+
+For example, with a 12-hour rotation schedule, the default `24h` TTL
+provides exactly one missed-run buffer. If your automation cannot
+guarantee timely execution, increase the TTL or shorten the rotation
+interval.
+
+**Per-service overrides:**
+
+- `bootroot service add --secret-id-ttl 48h` sets the TTL at issuance time.
+- `bootroot service update --secret-id-ttl 48h` changes the stored policy
+  (run `bootroot rotate approle-secret-id` afterward to apply).
+- Use `--secret-id-ttl inherit` to clear a per-service override and fall
+  back to the role-level default.
+
+When `--secret-id-ttl` is omitted during `service add`, the service
+inherits the role-level TTL configured during `bootroot init`.
+
 ## Updating service secret_id policy
 
 Use `bootroot service update` to change per-service `secret_id` policy

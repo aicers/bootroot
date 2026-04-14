@@ -15,6 +15,6 @@ pub(crate) use constants::{
 pub(crate) use paths::{compose_has_responder, to_container_path};
 pub(crate) use steps::{
     compute_ca_bundle_pem, compute_ca_fingerprints, prompt_yes_no, read_ca_cert_fingerprint,
-    run_init,
+    run_init, validate_secret_id_ttl,
 };
 pub(crate) use types::{DbCheckStatus, InitPlan, InitSummary, ResponderCheck, StepCaInitResult};

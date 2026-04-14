@@ -211,10 +211,16 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--stepca-url`: step-ca URL (기본값 `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner 이름 (기본값 `acme`)
 - `--secret-id-ttl`: 초기화 중 생성되는 AppRole 역할의 역할 수준
-  `secret_id` TTL (기본값 `24h`). 권장 임계값 `48h`를 초과하면 경고를
-  출력합니다. 하드 상한 `168h`를 초과하면 거부합니다. 서비스별
-  오버라이드는 이후 `bootroot service add --secret-id-ttl` 또는
+  `secret_id` TTL (기본값 `24h`). 계획된 회전 주기의 최소 2배 이상으로
+  설정하여 누락된 실행이 자격증명을 만료시키지 않도록 하세요. `24h`는
+  보안 보수적 기본값이며, 운영 여유가 노출 최소화보다 중요할 때 `48h`
+  이상을 사용하세요. `48h` 초과 시 경고를 출력하고, `168h` 초과 시
+  거부합니다. 회전 주기 안내가 항상 stderr에 출력됩니다.
+  서비스별 오버라이드는 이후
+  `bootroot service add --secret-id-ttl` 또는
   `bootroot service update --secret-id-ttl`로 설정할 수 있습니다.
+  [운영 > SecretID TTL과 회전 주기](operations.md#secretid-ttl)를
+  참고하세요.
 - `--eab-kid`, `--eab-hmac`: 수동 EAB 입력
   (환경 변수: `EAB_KID`, `EAB_HMAC`)
 
@@ -512,7 +518,8 @@ bootroot status
 
 발급 시점 `secret_id` 정책 플래그:
 
-- `--secret-id-ttl`: 생성되는 `secret_id`의 TTL (생략 시 역할 수준 기본값 상속)
+- `--secret-id-ttl`: 생성되는 `secret_id`의 TTL (생략 시 역할 수준 기본값
+  상속). 회전 주기의 최소 2배 이상이어야 합니다
 - `--secret-id-wrap-ttl`: `secret_id`에 대한 응답 래핑 TTL (기본값 `30m`)
 - `--no-wrap`: `secret_id` 응답 래핑 비활성화
 
@@ -560,7 +567,8 @@ bootroot status
 
 - `--service-name`: 서비스 이름 식별자
 - `--secret-id-ttl`: 생성되는 `secret_id`의 TTL (서비스별 오버라이드를
-  지우고 역할 수준 기본값으로 되돌리려면 `"inherit"` 사용)
+  지우고 역할 수준 기본값으로 되돌리려면 `"inherit"` 사용). 회전 주기의
+  최소 2배 이상이어야 합니다
 - `--secret-id-wrap-ttl`: `secret_id`의 응답 래핑 TTL (기본 래핑 동작을
   복원하려면 `"inherit"` 사용)
 - `--no-wrap`: `secret_id`의 응답 래핑 비활성화
