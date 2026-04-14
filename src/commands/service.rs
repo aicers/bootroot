@@ -9,11 +9,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 
-use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs};
+use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs, ServiceUpdateArgs};
 use crate::cli::output::{
     ServiceAddAppliedPaths, ServiceAddPlan, ServiceAddRemoteBootstrap, ServiceAddSummaryOptions,
     print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
+use crate::commands::constants::DEFAULT_SECRET_ID_WRAP_TTL;
 use crate::commands::dns_alias::register_dns_alias;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
@@ -495,6 +496,103 @@ pub(crate) fn run_service_info(args: &ServiceInfoArgs, messages: &Messages) -> R
     Ok(())
 }
 
+const INHERIT_SENTINEL: &str = "inherit";
+
+pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) -> Result<()> {
+    if args.secret_id_ttl.is_none() && args.secret_id_wrap_ttl.is_none() && !args.no_wrap {
+        anyhow::bail!(messages.error_service_update_no_flags());
+    }
+
+    let state_path = StateFile::default_path();
+    if !state_path.exists() {
+        anyhow::bail!(messages.error_state_missing());
+    }
+    let mut state =
+        StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
+
+    let entry = state
+        .services
+        .get_mut(&args.service_name)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
+
+    let mut changes: Vec<String> = Vec::new();
+
+    if let Some(ref new_ttl) = args.secret_id_ttl {
+        let old_value = entry.approle.secret_id_ttl.clone();
+        if new_ttl.eq_ignore_ascii_case(INHERIT_SENTINEL) {
+            entry.approle.secret_id_ttl = None;
+        } else {
+            entry.approle.secret_id_ttl = Some(new_ttl.clone());
+        }
+        if old_value != entry.approle.secret_id_ttl {
+            changes.push(messages.service_update_field_changed(
+                "secret_id_ttl",
+                &display_policy_value(old_value.as_deref(), messages),
+                &display_policy_value(entry.approle.secret_id_ttl.as_deref(), messages),
+            ));
+        }
+    }
+
+    if args.no_wrap {
+        let old_value = entry.approle.secret_id_wrap_ttl.clone();
+        entry.approle.secret_id_wrap_ttl = Some("0".to_string());
+        if old_value != entry.approle.secret_id_wrap_ttl {
+            changes.push(messages.service_update_field_changed(
+                "secret_id_wrap_ttl",
+                &display_wrap_ttl(old_value.as_deref(), messages),
+                &display_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref(), messages),
+            ));
+        }
+    } else if let Some(ref new_wrap_ttl) = args.secret_id_wrap_ttl {
+        let old_value = entry.approle.secret_id_wrap_ttl.clone();
+        if new_wrap_ttl.eq_ignore_ascii_case(INHERIT_SENTINEL) {
+            entry.approle.secret_id_wrap_ttl = None;
+        } else {
+            entry.approle.secret_id_wrap_ttl = Some(new_wrap_ttl.clone());
+        }
+        if old_value != entry.approle.secret_id_wrap_ttl {
+            changes.push(messages.service_update_field_changed(
+                "secret_id_wrap_ttl",
+                &display_wrap_ttl(old_value.as_deref(), messages),
+                &display_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref(), messages),
+            ));
+        }
+    }
+
+    if changes.is_empty() {
+        println!("{}", messages.service_update_no_changes());
+        return Ok(());
+    }
+
+    state
+        .save(&state_path)
+        .with_context(|| messages.error_serialize_state_failed())?;
+
+    println!("{}", messages.service_update_summary());
+    println!("{}", messages.service_summary_kind(&args.service_name));
+    for change in &changes {
+        println!("{change}");
+    }
+    println!("{}", messages.service_update_rotate_hint());
+
+    Ok(())
+}
+
+pub(crate) fn display_policy_value(value: Option<&str>, messages: &Messages) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => messages.policy_label_inherit().to_string(),
+    }
+}
+
+pub(crate) fn display_wrap_ttl(value: Option<&str>, messages: &Messages) -> String {
+    match value {
+        Some("0") => messages.policy_label_disabled().to_string(),
+        Some(v) => v.to_string(),
+        None => messages.policy_label_default_wrap_ttl(DEFAULT_SECRET_ID_WRAP_TTL),
+    }
+}
+
 fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile) -> ServiceEntry {
     let preview_secret_id_path = state
         .secrets_dir()
@@ -549,9 +647,11 @@ mod tests {
     use super::resolve::ResolvedServiceAdd;
     use super::{
         ServiceAppRoleMaterialized, build_secret_id_options, build_service_entry,
-        build_service_entry_from_role, is_idempotent_remote_rerun, is_policy_only_mismatch,
-        non_policy_fields_match, policy_fields_match,
+        build_service_entry_from_role, display_policy_value, display_wrap_ttl,
+        is_idempotent_remote_rerun, is_policy_only_mismatch, non_policy_fields_match,
+        policy_fields_match,
     };
+    use crate::i18n::Messages;
     use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry};
 
     fn sample_resolved() -> ResolvedServiceAdd {
@@ -779,5 +879,35 @@ mod tests {
         resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
         let entry = sample_entry_from_resolved(&resolved);
         assert!(!is_policy_only_mismatch(&entry, &resolved));
+    }
+
+    #[test]
+    fn display_policy_value_none_shows_inherit() {
+        let messages = Messages::new("en").unwrap();
+        assert_eq!(display_policy_value(None, &messages), "inherit");
+    }
+
+    #[test]
+    fn display_policy_value_some_shows_value() {
+        let messages = Messages::new("en").unwrap();
+        assert_eq!(display_policy_value(Some("1h"), &messages), "1h");
+    }
+
+    #[test]
+    fn display_wrap_ttl_none_shows_default() {
+        let messages = Messages::new("en").unwrap();
+        assert_eq!(display_wrap_ttl(None, &messages), "30m (default)");
+    }
+
+    #[test]
+    fn display_wrap_ttl_zero_shows_disabled() {
+        let messages = Messages::new("en").unwrap();
+        assert_eq!(display_wrap_ttl(Some("0"), &messages), "disabled");
+    }
+
+    #[test]
+    fn display_wrap_ttl_explicit_shows_value() {
+        let messages = Messages::new("en").unwrap();
+        assert_eq!(display_wrap_ttl(Some("10m"), &messages), "10m");
     }
 }

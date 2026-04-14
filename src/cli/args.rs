@@ -60,6 +60,7 @@ pub(crate) enum MonitoringCommand {
 pub(crate) enum ServiceCommand {
     Add(Box<ServiceAddArgs>),
     Info(ServiceInfoArgs),
+    Update(ServiceUpdateArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -725,6 +726,26 @@ pub(crate) struct ServiceInfoArgs {
     /// Service name identifier
     #[arg(long, required = true)]
     pub(crate) service_name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ServiceUpdateArgs {
+    /// Service name identifier
+    #[arg(long, required = true)]
+    pub(crate) service_name: String,
+
+    /// TTL for the generated `secret_id` (use "inherit" to clear override)
+    #[arg(long)]
+    pub(crate) secret_id_ttl: Option<String>,
+
+    /// Response-wrapping TTL for the `secret_id` (use "inherit" to restore
+    /// the default wrapping behavior)
+    #[arg(long, conflicts_with = "no_wrap")]
+    pub(crate) secret_id_wrap_ttl: Option<String>,
+
+    /// Disable response wrapping for the `secret_id`
+    #[arg(long, conflicts_with = "secret_id_wrap_ttl")]
+    pub(crate) no_wrap: bool,
 }
 
 #[derive(Args, Debug)]

@@ -92,6 +92,10 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
             commands::service::run_service_info(&args, messages)
                 .with_context(|| messages.error_service_info_failed())?;
         }
+        CliCommand::Service(ServiceCommand::Update(args)) => {
+            commands::service::run_service_update(&args, messages)
+                .with_context(|| messages.error_service_update_failed())?;
+        }
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,
         CliCommand::Rotate(args) => {

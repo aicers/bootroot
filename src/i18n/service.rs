@@ -790,4 +790,60 @@ impl Messages {
             &[("value", value)],
         )
     }
+
+    pub(crate) fn error_service_update_failed(&self) -> &'static str {
+        self.strings().error_service_update_failed
+    }
+
+    pub(crate) fn error_service_update_no_flags(&self) -> &'static str {
+        self.strings().error_service_update_no_flags
+    }
+
+    pub(crate) fn service_update_summary(&self) -> &'static str {
+        self.strings().service_update_summary
+    }
+
+    pub(crate) fn service_update_field_changed(&self, field: &str, old: &str, new: &str) -> String {
+        format_template(
+            self.strings().service_update_field_changed,
+            &[("field", field), ("old", old), ("new", new)],
+        )
+    }
+
+    pub(crate) fn service_update_rotate_hint(&self) -> &'static str {
+        self.strings().service_update_rotate_hint
+    }
+
+    pub(crate) fn service_info_secret_id_ttl(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_info_secret_id_ttl,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_info_secret_id_wrap_ttl(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_info_secret_id_wrap_ttl,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn policy_label_inherit(&self) -> &'static str {
+        self.strings().policy_label_inherit
+    }
+
+    pub(crate) fn policy_label_disabled(&self) -> &'static str {
+        self.strings().policy_label_disabled
+    }
+
+    pub(crate) fn policy_label_default_wrap_ttl(&self, value: &str) -> String {
+        format_template(
+            self.strings().policy_label_default_wrap_ttl,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_update_no_changes(&self) -> &'static str {
+        self.strings().service_update_no_changes
+    }
 }
