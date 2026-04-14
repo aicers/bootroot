@@ -546,7 +546,9 @@ pub(crate) struct InitArgs {
     #[arg(long, env = "OPENBAO_UNSEAL_FILE")]
     pub(crate) openbao_unseal_from_file: Option<PathBuf>,
 
-    /// Role-level `secret_id` TTL for `AppRole` roles created during init
+    /// Role-level `secret_id` TTL for `AppRole` roles created during init.
+    /// Set this to at least 2× your planned rotation interval so that a
+    /// missed or delayed run does not expire credentials
     #[arg(long, default_value = SECRET_ID_TTL)]
     pub(crate) secret_id_ttl: String,
 
@@ -708,7 +710,8 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long, value_enum)]
     pub(crate) post_renew_on_failure: Option<HookFailurePolicyArg>,
 
-    /// TTL for the generated `secret_id` (inherits role default when omitted)
+    /// TTL for the generated `secret_id` (inherits role default when omitted).
+    /// Should be at least 2× the rotation interval
     #[arg(long)]
     pub(crate) secret_id_ttl: Option<String>,
 
@@ -734,7 +737,8 @@ pub(crate) struct ServiceUpdateArgs {
     #[arg(long, required = true)]
     pub(crate) service_name: String,
 
-    /// TTL for the generated `secret_id` (use "inherit" to clear override)
+    /// TTL for the generated `secret_id` (use "inherit" to clear override).
+    /// Should be at least 2× the rotation interval
     #[arg(long)]
     pub(crate) secret_id_ttl: Option<String>,
 

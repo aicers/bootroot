@@ -41,11 +41,27 @@ pub(crate) mod openbao_constants {
     pub(crate) const INIT_SECRET_SHARES: u8 = 3;
     pub(crate) const INIT_SECRET_THRESHOLD: u8 = 2;
     pub(crate) const TOKEN_TTL: &str = "1h";
+
+    /// Default role-level `secret_id` TTL applied to every `AppRole` created
+    /// during `bootroot init`. This is the security-conservative default:
+    /// a shorter lifetime limits exposure when a `SecretID` leaks.
+    ///
+    /// Operators who rotate on a longer cadence should pass
+    /// `--secret-id-ttl` with a value that is at least 2× their rotation
+    /// interval so that a missed or delayed rotation run does not leave
+    /// services unable to re-authenticate.
     pub(crate) const SECRET_ID_TTL: &str = "24h";
-    // Used by upcoming sub-issues of #480 (response-wrapping).
-    #[allow(dead_code)]
-    pub(crate) const DEFAULT_SECRET_ID_WRAP_TTL: &str = "30m";
+
     pub(crate) const MAX_SECRET_ID_TTL: &str = "168h";
+
+    /// Warning threshold for `secret_id` TTL. Values above this threshold
+    /// trigger a CLI warning but are still accepted (up to
+    /// [`MAX_SECRET_ID_TTL`]).
+    ///
+    /// `24h` is the security-conservative default; use `48h` or longer
+    /// when operational slack (surviving missed rotation runs, maintenance
+    /// windows, restart recovery) is more important than minimising the
+    /// exposure window.
     pub(crate) const RECOMMENDED_SECRET_ID_TTL: &str = "48h";
 
     pub(crate) const POLICY_BOOTROOT_AGENT: &str = "bootroot-agent";

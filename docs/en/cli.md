@@ -222,11 +222,16 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--stepca-url`: step-ca URL (default `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
 - `--secret-id-ttl`: role-level `secret_id` TTL for AppRole roles
-  created during init (default `24h`). Values above the recommended
-  threshold of `48h` emit a warning. Values above the hard maximum of
-  `168h` are rejected. Per-service overrides can be set later with
+  created during init (default `24h`). Set this to at least 2× your
+  planned rotation interval so that a missed run does not expire
+  credentials. `24h` is the security-conservative default; use `48h` or
+  longer when operational slack is more important than minimising
+  exposure. Values above `48h` emit a warning; values above `168h` are
+  rejected. A rotation-cadence reminder is always printed to stderr.
+  Per-service overrides can be set later with
   `bootroot service add --secret-id-ttl` or
   `bootroot service update --secret-id-ttl`.
+  See [Operations > SecretID TTL and rotation cadence](operations.md#secretid-ttl-and-rotation-cadence).
 - `--eab-kid`, `--eab-hmac`: manual EAB input
   (environment variables: `EAB_KID`, `EAB_HMAC`)
 
@@ -531,7 +536,8 @@ also forwarded to `bootroot-remote bootstrap` for the
 Per-issuance `secret_id` policy flags:
 
 - `--secret-id-ttl`: TTL for the generated `secret_id` (inherits the
-  role-level default when omitted)
+  role-level default when omitted). Should be at least 2× the rotation
+  interval
 - `--secret-id-wrap-ttl`: response-wrapping TTL for the `secret_id`
   (default `30m`)
 - `--no-wrap`: disable response wrapping for the `secret_id`
@@ -584,7 +590,7 @@ full `service add` flow. At least one policy flag is required.
 - `--service-name`: service name identifier
 - `--secret-id-ttl`: TTL for the generated `secret_id` (use `"inherit"`
   to clear the per-service override and fall back to the role-level
-  default)
+  default). Should be at least 2× the rotation interval
 - `--secret-id-wrap-ttl`: response-wrapping TTL for the `secret_id`
   (use `"inherit"` to restore default wrapping behavior)
 - `--no-wrap`: disable response wrapping for the `secret_id`

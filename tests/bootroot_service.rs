@@ -2030,6 +2030,101 @@ fn test_service_update_shows_rotate_hint() {
 
 #[cfg(unix)]
 #[test]
+fn test_service_update_shows_ttl_rotation_cadence_hint() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--secret-id-ttl",
+            "2h",
+        ])
+        .output()
+        .expect("run service update");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("NOTE: Ensure the secret_id TTL is at least 2"),
+        "should show rotation cadence hint on stderr, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_warns_when_ttl_exceeds_recommended() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--secret-id-ttl",
+            "72h",
+        ])
+        .output()
+        .expect("run service update");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("WARNING: --secret-id-ttl (72h) exceeds the recommended threshold"),
+        "should warn about exceeding recommended TTL, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_rejects_ttl_exceeding_max() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--secret-id-ttl",
+            "200h",
+        ])
+        .output()
+        .expect("run service update");
+
+    assert!(
+        !output.status.success(),
+        "should fail when TTL exceeds 168h"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exceeds the maximum allowed value"),
+        "should report TTL exceeds max, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_service_update_noop_when_value_unchanged() {
     let temp_dir = tempdir().expect("create temp dir");
     write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
@@ -2060,7 +2155,8 @@ fn test_service_update_noop_when_value_unchanged() {
         "should report no changes when value is already set, got: {stdout}"
     );
 
-    // --secret-id-ttl with same value should also be a no-op
+    // --secret-id-ttl with same value should also be a no-op but still
+    // show the rotation-cadence hint
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .args([
@@ -2075,14 +2171,167 @@ fn test_service_update_noop_when_value_unchanged() {
         .expect("run service update");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}",);
+    assert!(
+        stdout.contains("No fields changed"),
+        "should report no changes when TTL is already set, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("NOTE: Ensure the secret_id TTL is at least 2"),
+        "should show rotation cadence hint even when value unchanged, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_add_print_only_shows_ttl_rotation_cadence_hint() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--secret-id-ttl",
+            "2h",
+        ])
+        .output()
+        .expect("run service add");
+
     assert!(
         output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("No fields changed"),
-        "should report no changes when TTL is already set, got: {stdout}"
+        stderr.contains("NOTE: Ensure the secret_id TTL is at least 2"),
+        "should show rotation cadence hint on stderr, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_add_print_only_warns_when_ttl_exceeds_recommended() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--secret-id-ttl",
+            "72h",
+        ])
+        .output()
+        .expect("run service add");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("WARNING: --secret-id-ttl (72h) exceeds the recommended threshold"),
+        "should warn about exceeding recommended TTL, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_add_print_only_rejects_ttl_exceeding_max() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--secret-id-ttl",
+            "200h",
+        ])
+        .output()
+        .expect("run service add");
+
+    assert!(
+        !output.status.success(),
+        "should fail when TTL exceeds 168h"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exceeds the maximum allowed value"),
+        "should report TTL exceeds max, got: {stderr}"
     );
 }
 

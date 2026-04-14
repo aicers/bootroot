@@ -88,6 +88,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Added rotation cadence guidance to `service add`, `service update`,
+  and `init` CLI output. `init` always prints the rotation-cadence
+  note; `service add` and `service update` print it when
+  `--secret-id-ttl` is set explicitly. Documented the default vs
+  recommended TTL model and the rotation cadence rule in the
+  operations guide.
 - Changed idempotent `bootroot service add` rerun behavior for
   `remote-bootstrap` mode: when wrapping is enabled (the default), a
   rerun now issues a fresh `secret_id` with wrapping and regenerates

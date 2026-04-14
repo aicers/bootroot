@@ -414,6 +414,7 @@ pub(crate) struct Strings {
     pub(crate) service_update_summary: &'static str,
     pub(crate) service_update_field_changed: &'static str,
     pub(crate) service_update_rotate_hint: &'static str,
+    pub(crate) hint_secret_id_ttl_rotation_cadence: &'static str,
     pub(crate) service_info_secret_id_ttl: &'static str,
     pub(crate) service_info_secret_id_wrap_ttl: &'static str,
     pub(crate) policy_label_inherit: &'static str,

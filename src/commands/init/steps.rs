@@ -14,6 +14,7 @@ use bootroot::openbao::{InitResponse, OpenBaoClient};
 pub(crate) use ca_certs::{
     compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
 };
+pub(crate) use openbao_setup::validate_secret_id_ttl;
 pub(crate) use orchestrator::run_init;
 pub(crate) use prompts::prompt_yes_no;
 

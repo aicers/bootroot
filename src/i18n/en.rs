@@ -379,6 +379,7 @@ pub(super) static STRINGS: Strings = Strings {
     service_update_summary: "bootroot service update: summary",
     service_update_field_changed: "- {field}: {old} -> {new}",
     service_update_rotate_hint: "Run `bootroot rotate approle-secret-id` for the new policy to take effect.",
+    hint_secret_id_ttl_rotation_cadence: "NOTE: Ensure the secret_id TTL is at least 2× your rotation interval. For example, with a 12h rotation schedule, use a TTL of 24h or more. This buffer accounts for missed runs, maintenance windows, and restart recovery.",
     service_info_secret_id_ttl: "- secret_id TTL: {value}",
     service_info_secret_id_wrap_ttl: "- secret_id wrap TTL: {value}",
     policy_label_inherit: "inherit",

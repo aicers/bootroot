@@ -153,6 +153,48 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+## SecretID TTL과 회전 주기
+
+서비스 AppRole `secret_id` 값은 재사용 가능한 런타임 자격증명입니다.
+정상적인 재시작과 재인증을 거쳐 다음 계획된 회전까지 유효합니다.
+`secret_id_ttl`은 발급 후 SecretID가 유효한 기간을 제어합니다.
+
+**기본 TTL 모델:**
+
+- `24h`는 `bootroot init` 시 설정되는 역할 수준 기본값입니다. 보안
+  보수적 선택으로, 짧은 수명은 SecretID 유출 시 노출을 제한합니다.
+- `48h`(`RECOMMENDED_SECRET_ID_TTL`)는 CLI 경고 임계값입니다. `48h` 초과
+  시 CLI 경고가 표시되며, `168h`(7일) 초과 시 거부됩니다. 누락된 회전
+  실행, 유지보수 기간, 재시작 복구를 견디는 것이 노출 창 최소화보다
+  중요할 때 `48h` 이상을 사용하세요.
+
+**회전 주기 규칙:**
+
+`secret_id_ttl`을 **회전 주기의 최소 2배** 이상으로 설정하세요. 이
+여유는 단일 누락 또는 지연된 회전 실행이 자격증명을 만료시켜 서비스가
+재인증할 수 없는 상황을 방지합니다.
+
+| 회전 주기 | 최소 권장 TTL   |
+|-----------|-----------------|
+| 8시간     | 16시간          |
+| 12시간    | 24시간 (기본값) |
+| 24시간    | 48시간          |
+
+예를 들어, 12시간 회전 스케줄에서 기본 `24h` TTL은 정확히 한 번의 누락
+버퍼를 제공합니다. 자동화가 적시 실행을 보장할 수 없다면 TTL을 늘리거나
+회전 주기를 줄이세요.
+
+**서비스별 재정의:**
+
+- `bootroot service add --secret-id-ttl 48h`는 발급 시 TTL을 설정합니다.
+- `bootroot service update --secret-id-ttl 48h`는 저장된 정책을
+  변경합니다(이후 `bootroot rotate approle-secret-id` 실행 필요).
+- `--secret-id-ttl inherit`를 사용하면 서비스별 재정의를 지우고 역할
+  수준 기본값으로 복원합니다.
+
+`service add` 시 `--secret-id-ttl`을 생략하면 `bootroot init` 시
+설정된 역할 수준 TTL을 상속합니다.
+
 ## 서비스 secret_id 정책 변경
 
 `bootroot service update`를 사용하면 `service add`를 다시 실행하지 않고

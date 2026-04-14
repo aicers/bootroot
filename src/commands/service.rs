@@ -16,6 +16,7 @@ use crate::cli::output::{
 };
 use crate::commands::constants::DEFAULT_SECRET_ID_WRAP_TTL;
 use crate::commands::dns_alias::register_dns_alias;
+use crate::commands::init::validate_secret_id_ttl;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry, StateFile};
@@ -83,6 +84,13 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let resolved = resolve::resolve_service_add_args(args, messages, preview)?;
 
     resolve::validate_service_add(&resolved, messages)?;
+
+    if let Some(ref ttl) = resolved.secret_id_ttl {
+        if let Some(warning) = validate_secret_id_ttl(ttl, messages)? {
+            eprintln!("{warning}");
+        }
+        eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
+    }
 
     let agent_config = resolved.agent_config.display().to_string();
     let cert_path = resolved.cert_path.display().to_string();
@@ -517,11 +525,16 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
 
     let mut changes: Vec<String> = Vec::new();
 
+    let mut explicit_ttl_set = false;
     if let Some(ref new_ttl) = args.secret_id_ttl {
         let old_value = entry.approle.secret_id_ttl.clone();
         if new_ttl.eq_ignore_ascii_case(INHERIT_SENTINEL) {
             entry.approle.secret_id_ttl = None;
         } else {
+            if let Some(warning) = validate_secret_id_ttl(new_ttl, messages)? {
+                eprintln!("{warning}");
+            }
+            explicit_ttl_set = true;
             entry.approle.secret_id_ttl = Some(new_ttl.clone());
         }
         if old_value != entry.approle.secret_id_ttl {
@@ -557,6 +570,10 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
                 &display_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref(), messages),
             ));
         }
+    }
+
+    if explicit_ttl_set {
+        eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
     }
 
     if changes.is_empty() {

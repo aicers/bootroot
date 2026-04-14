@@ -37,6 +37,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     if let Some(warning) = validate_secret_id_ttl(&args.secret_id_ttl, messages)? {
         eprintln!("{warning}");
     }
+    eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
 
     ensure_all_services_localhost_binding(&args.compose.compose_file, messages)?;
     // Only check openbao + postgres; step-ca may not be bootstrapped yet.
