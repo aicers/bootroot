@@ -1435,9 +1435,29 @@ fn write_fake_bootroot_agent(dir: &std::path::Path, exit_code: i32) -> anyhow::R
 }
 
 fn write_state_with_app(root: &std::path::Path) {
+    write_state_with_app_policy(root, None, None);
+}
+
+fn write_state_with_app_policy(
+    root: &std::path::Path,
+    secret_id_ttl: Option<&str>,
+    secret_id_wrap_ttl: Option<&str>,
+) {
     let state_path = root.join("state.json");
     let contents = fs::read_to_string(&state_path).expect("read state");
     let mut value: serde_json::Value = serde_json::from_str(&contents).expect("parse state");
+    let mut approle = json!({
+        "role_name": "bootroot-service-edge-proxy",
+        "role_id": "role-edge-proxy",
+        "secret_id_path": "secrets/services/edge-proxy/secret_id",
+        "policy_name": "bootroot-service-edge-proxy"
+    });
+    if let Some(ttl) = secret_id_ttl {
+        approle["secret_id_ttl"] = json!(ttl);
+    }
+    if let Some(wrap_ttl) = secret_id_wrap_ttl {
+        approle["secret_id_wrap_ttl"] = json!(wrap_ttl);
+    }
     value["services"]["edge-proxy"] = json!({
         "service_name": "edge-proxy",
         "deploy_type": "daemon",
@@ -1448,12 +1468,7 @@ fn write_state_with_app(root: &std::path::Path) {
         "key_path": "certs/edge-proxy.key",
         "instance_id": "001",
         "notes": "primary",
-        "approle": {
-            "role_name": "bootroot-service-edge-proxy",
-            "role_id": "role-edge-proxy",
-            "secret_id_path": "secrets/services/edge-proxy/secret_id",
-            "policy_name": "bootroot-service-edge-proxy"
-        }
+        "approle": approle
     });
     fs::write(
         &state_path,
@@ -1740,6 +1755,390 @@ async fn stub_app_add_service_sync_material_without_bundle(
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_sets_secret_id_ttl() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--secret-id-ttl",
+            "2h",
+        ])
+        .output()
+        .expect("run service update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("secret_id_ttl"));
+    assert!(stdout.contains("2h"));
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["services"]["edge-proxy"]["approle"]["secret_id_ttl"],
+        "2h"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_disables_wrapping() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--no-wrap",
+        ])
+        .output()
+        .expect("run service update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("secret_id_wrap_ttl"));
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["services"]["edge-proxy"]["approle"]["secret_id_wrap_ttl"],
+        "0"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_inherit_clears_ttl() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app_policy(temp_dir.path(), Some("1h"), None);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--secret-id-ttl",
+            "inherit",
+        ])
+        .output()
+        .expect("run service update");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["services"]["edge-proxy"]["approle"]["secret_id_ttl"].is_null(),
+        "secret_id_ttl should be cleared (null)"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_reenables_wrapping() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app_policy(temp_dir.path(), None, Some("0"));
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--secret-id-wrap-ttl",
+            "15m",
+        ])
+        .output()
+        .expect("run service update");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["services"]["edge-proxy"]["approle"]["secret_id_wrap_ttl"],
+        "15m"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_wrap_ttl_inherit_restores_default() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app_policy(temp_dir.path(), None, Some("0"));
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--secret-id-wrap-ttl",
+            "inherit",
+        ])
+        .output()
+        .expect("run service update");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["services"]["edge-proxy"]["approle"]["secret_id_wrap_ttl"].is_null(),
+        "secret_id_wrap_ttl should be cleared (null) after inherit"
+    );
+
+    // Verify service info shows the default wrap TTL label
+    let info_output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["service", "info", "--service-name", "edge-proxy"])
+        .output()
+        .expect("run service info");
+
+    let info_stdout = String::from_utf8_lossy(&info_output.stdout);
+    assert!(
+        info_stdout.contains("30m (default)"),
+        "service info should report default wrap TTL, got: {info_stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_not_found() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "nonexistent",
+            "--secret-id-ttl",
+            "1h",
+        ])
+        .output()
+        .expect("run service update");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Service not found"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_no_flags_errors() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["service", "update", "--service-name", "edge-proxy"])
+        .output()
+        .expect("run service update");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No policy flags specified"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_shows_rotate_hint() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--secret-id-ttl",
+            "1h",
+        ])
+        .output()
+        .expect("run service update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("rotate approle-secret-id"),
+        "should show rotate hint"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_noop_when_value_unchanged() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    // Wrapping already disabled (secret_id_wrap_ttl = "0")
+    write_state_with_app_policy(temp_dir.path(), Some("1h"), Some("0"));
+
+    // --no-wrap on already-disabled wrapping should be a no-op
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--no-wrap",
+        ])
+        .output()
+        .expect("run service update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("No fields changed"),
+        "should report no changes when value is already set, got: {stdout}"
+    );
+
+    // --secret-id-ttl with same value should also be a no-op
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--secret-id-ttl",
+            "1h",
+        ])
+        .output()
+        .expect("run service update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("No fields changed"),
+        "should report no changes when TTL is already set, got: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_info_shows_policy_fields() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app_policy(temp_dir.path(), Some("4h"), Some("10m"));
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["service", "info", "--service-name", "edge-proxy"])
+        .output()
+        .expect("run service info");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("secret_id TTL: 4h"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("secret_id wrap TTL: 10m"),
+        "stdout: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_info_shows_default_policy_fields() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["service", "info", "--service-name", "edge-proxy"])
+        .output()
+        .expect("run service info");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("secret_id TTL: inherit"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("secret_id wrap TTL: 30m (default)"),
+        "stdout: {stdout}"
+    );
 }
 
 async fn stub_app_add_remote_sync_material(server: &MockServer, service_name: &str) {

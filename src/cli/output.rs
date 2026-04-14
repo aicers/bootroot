@@ -1,4 +1,5 @@
 use crate::commands::init::{InitPlan, InitSummary};
+use crate::commands::service::{display_policy_value, display_wrap_ttl};
 use crate::i18n::{
     Messages, ServiceNextStepsDaemon, ServiceNextStepsDocker, ServiceOpenBaoAgentSteps,
 };
@@ -248,6 +249,19 @@ pub(crate) fn print_service_info_summary(entry: &ServiceEntry, messages: &Messag
         messages.service_summary_approle(&entry.approle.role_name)
     );
     println!("{}", messages.summary_role_id(&entry.approle.role_id));
+    let secret_id_ttl_display =
+        display_policy_value(entry.approle.secret_id_ttl.as_deref(), messages);
+    // codeql[rust/cleartext-logging]: output is a non-secret TTL duration label.
+    println!(
+        "{}",
+        messages.service_info_secret_id_ttl(&secret_id_ttl_display)
+    );
+    let wrap_ttl_display = display_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref(), messages);
+    // codeql[rust/cleartext-logging]: output is a non-secret wrap-TTL duration label.
+    println!(
+        "{}",
+        messages.service_info_secret_id_wrap_ttl(&wrap_ttl_display)
+    );
     println!(
         "{}",
         messages.service_summary_openbao_path(&entry.service_name)

@@ -409,6 +409,17 @@ pub(crate) struct Strings {
     pub(crate) dns_alias_connect_recovered: &'static str,
     pub(crate) dns_alias_rollback_failed: &'static str,
     pub(crate) dns_alias_network_not_found: &'static str,
+    pub(crate) error_service_update_failed: &'static str,
+    pub(crate) error_service_update_no_flags: &'static str,
+    pub(crate) service_update_summary: &'static str,
+    pub(crate) service_update_field_changed: &'static str,
+    pub(crate) service_update_rotate_hint: &'static str,
+    pub(crate) service_info_secret_id_ttl: &'static str,
+    pub(crate) service_info_secret_id_wrap_ttl: &'static str,
+    pub(crate) policy_label_inherit: &'static str,
+    pub(crate) policy_label_disabled: &'static str,
+    pub(crate) policy_label_default_wrap_ttl: &'static str,
+    pub(crate) service_update_no_changes: &'static str,
 }
 
 pub(crate) struct Messages {
