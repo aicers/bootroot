@@ -300,6 +300,53 @@ runcmd:
     --output json
 ```
 
+## Wrap token 복구
+
+래핑이 활성(기본값)이면 `bootstrap.json`에 포함된 `wrap_token`은
+제한된 TTL(기본값 30분)을 가집니다.
+`bootroot-remote bootstrap --artifact` 실행 시 두 가지 실패 모드가
+발생할 수 있습니다:
+
+### 만료된 wrap token
+
+`bootroot-remote`가 언래핑하기 전에 `wrap_token` TTL이 경과한 경우입니다.
+`bootroot-remote`는 `wrap_expires_at`과 현재 시간을 비교하여 **만료** 오류와
+복구 안내를 출력합니다.
+
+**복구:**
+
+1. control node에서 동일한 인자로 `bootroot service add`를 다시 실행합니다.
+   멱등 재실행으로 새 `wrap_token`이 포함된 bootstrap 아티팩트를 재생성합니다.
+2. 갱신된 `bootstrap.json`을 원격 호스트로 전송합니다.
+3. `bootroot-remote bootstrap --artifact <경로>`를 실행합니다.
+
+### 이미 언래핑된 wrap token
+
+토큰이 이미 소비된 경우입니다. 정당한 `bootroot-remote` 호출 전에 제3자가
+언래핑했음을 의미합니다. `bootroot-remote`는 이를 **잠재적 보안 사고**로
+표시합니다.
+
+**복구:**
+
+1. 누가 또는 무엇이 토큰을 소비했는지 조사합니다.
+2. `secret_id`를 즉시 회전합니다:
+   `bootroot rotate approle-secret-id --service-name <service>`.
+3. 동일한 인자로 `bootroot service add`를 다시 실행해 새 `wrap_token`을
+   생성합니다.
+4. 아티팩트를 전송하고 원격 호스트에서 `bootroot-remote bootstrap`을
+   실행합니다.
+
+## 멱등 service add 재실행
+
+기존 `remote-bootstrap` 서비스에 동일한 인자로 `bootroot service add`를
+다시 실행하면 안전합니다. 래핑이 활성(기본값)이면 재실행 시 래핑된 새
+`secret_id`를 발급하고 새 `wrap_token`이 포함된 `bootstrap.json`을
+기록합니다. 운영자는 갱신된 아티팩트를 원격 호스트로 전달한 뒤
+`bootroot-remote bootstrap`을 다시 실행해야 합니다.
+
+정책 필드(`--secret-id-ttl`, `--secret-id-wrap-ttl`, `--no-wrap`)만
+다른 경우 명령이 거부되며 `bootroot service update` 사용을 안내합니다.
+
 ## `secret_id` 위생 체크리스트
 
 `secret_id`는 remote-bootstrap 흐름에서 가장 민감한 아티팩트입니다.
@@ -310,13 +357,15 @@ runcmd:
 - **로그 및 커밋 금지**: 버전 관리(`.gitignore`)에서 제외하고, 배포
     스크립트에서 stdout이나 로그 파일에 기록하지 않도록 하세요.
 - **전달 후 제어 노드에서 삭제**: `secret_id`를 원격 호스트로 전달한 후
-    로컬 복사본을 삭제하세요. 위의 SSH 스크립트 예시에서 이를 보여줍니다.
+    로컬 복사본을 삭제하세요.
 - **짧은 TTL / response wrapping**: `bootroot service add`의
     `--secret-id-ttl`로 `secret_id` 수명을 제한하고, response wrapping을
-    활성화(기본값) 상태로 유지하여 원본 `secret_id`가 제어 노드에 기록되지
-    않도록 하세요. 래핑 활성 시 아티팩트에 일회용 `wrap_token`이 포함되며,
-    `bootroot-remote`가 런타임에 언래핑합니다 — 노출 시간을 초 단위로
-    줄입니다.
+    활성화(기본값) 상태로 유지하여 부트스트랩 아티팩트에 원본 `secret_id`
+    대신 일회용 `wrap_token`이 포함되도록 하세요. 이렇게 하면 wrap token이
+    명령줄이나 `ps` 출력에 노출되지 않으며, 원격 전송 노출 시간을 초
+    단위로 줄입니다. 단, 제어 노드에는 로컬 운영을 위해
+    `secrets/services/<service>/secret_id`에 원본 `secret_id`가 기록되므로,
+    전달 후 이 파일을 보호하거나 삭제하세요.
 - **회전**: 제어 노드에서 `bootroot rotate approle-secret-id` 실행 후,
     서비스 머신에서 `bootroot-remote apply-secret-id`로 새 `secret_id`를
     전달하세요. 회전 워크플로우는 [운영](operations.md)을 참고하세요.

@@ -776,7 +776,7 @@ async fn test_remote_bootstrap_expired_wrap_token() {
         "should mention expiration: {stderr}"
     );
     assert!(
-        stderr.contains("bootroot rotate approle-secret-id"),
+        stderr.contains("bootroot service add"),
         "should include recovery command: {stderr}"
     );
 }
@@ -859,7 +859,11 @@ async fn test_remote_bootstrap_already_unwrapped_token() {
     );
     assert!(
         stderr.contains("bootroot rotate approle-secret-id"),
-        "should include recovery command: {stderr}"
+        "should include rotate recovery command: {stderr}"
+    );
+    assert!(
+        stderr.contains("bootroot service add"),
+        "should include service-add step to mint fresh wrap token: {stderr}"
     );
 }
 

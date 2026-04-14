@@ -153,6 +153,31 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+## 서비스 secret_id 정책 변경
+
+`bootroot service update`를 사용하면 `service add`를 다시 실행하지 않고
+서비스별 `secret_id` 정책을 변경할 수 있습니다:
+
+```bash
+bootroot service update --service-name edge-proxy --secret-id-ttl 12h
+bootroot service update --service-name edge-proxy --no-wrap
+```
+
+이 명령은 `state.json`만 수정합니다. 갱신된 정책을 실제 `secret_id`에
+적용하려면 이후 `rotate approle-secret-id`를 실행합니다:
+
+```bash
+bootroot rotate approle-secret-id --service-name edge-proxy
+```
+
+`"inherit"`를 사용하면 서비스별 오버라이드를 지우고 OpenBao의 AppRole에
+설정된 역할 수준 기본값으로 되돌립니다:
+
+```bash
+bootroot service update --service-name edge-proxy --secret-id-ttl inherit
+bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+```
+
 ## 원격 bootstrap 및 secret_id handoff 운영
 
 `--delivery-mode remote-bootstrap`으로 추가한 대상의 운영 모델은 일회성
@@ -179,6 +204,54 @@ bootstrap + 명시적 secret_id handoff입니다.
 - 서비스 계정 권한을 서비스별 경로로 최소화
 - `bootroot init --summary-json` 산출물은 `root_token`을 포함할 수 있으므로
   민감 아티팩트로 취급하고 접근/보관 기간을 제한하기
+- 래핑이 활성(기본값)이면 `bootstrap.json`에 `wrap_token`이 포함되므로
+  `secret_id`와 동일한 수준의 민감 자격증명 파일로 취급해야 합니다
+
+### 멱등 service add 재실행
+
+기존 `remote-bootstrap` 서비스에 동일한 인자로 `bootroot service add`를
+다시 실행하면 멱등합니다. 래핑이 활성(기본값)이면 재실행 시 래핑된 새
+`secret_id`를 발급하고 새 `wrap_token`이 포함된 bootstrap 아티팩트를
+재생성합니다. 운영자는 갱신된 `bootstrap.json`을 원격 호스트로 전달한 뒤
+`bootroot-remote bootstrap`을 다시 실행해야 합니다.
+
+정책 필드(`--secret-id-ttl`, `--secret-id-wrap-ttl`, `--no-wrap`)만
+다르면 명령이 거부되며 `bootroot service update` 사용을 안내합니다.
+
+### OpenBao Agent 회전 전파
+
+`local-file` 서비스의 경우, `bootroot rotate approle-secret-id`가 새
+`secret_id`를 디스크에 원자적으로 기록하고 서비스별 OpenBao Agent를
+리로드합니다. 데몬 모드 배치에서는 에이전트가 `SIGHUP`을 받아 재시작 없이
+자격증명을 다시 읽습니다. Docker 배치에서는 에이전트 컨테이너가
+재시작됩니다(`docker restart`).
+
+`remote-bootstrap` 서비스의 경우, 회전된 `secret_id`는 서비스별 KV 경로
+(`bootroot/services/<service>/secret_id`)에 기록됩니다. 운영자가 서비스
+머신에서 `bootroot-remote apply-secret-id`를 실행해야 합니다. 서비스의
+OpenBao Agent는 로컬 `secret_id` 파일을 읽고 다음 토큰 갱신 주기에
+재인증합니다.
+
+참고: `bootroot-agent` 자체는 `remote-bootstrap` 흐름에서 AppRole로
+직접 재인증하지 않습니다. OpenBao Agent가 유지하는 토큰 파일을 소비합니다.
+
+### Wrap token 만료 복구
+
+래핑이 활성이면 `bootstrap.json`에 포함된 `wrap_token`의 TTL은 제한적입니다
+(기본값 30분). 토큰이 만료되기 전에 `bootroot-remote bootstrap`을 실행하지
+않으면 언래핑 호출이 **만료** 오류로 실패합니다.
+
+복구 절차:
+
+1. control node에서 동일한 인자로 `bootroot service add`를 다시 실행합니다.
+   서비스가 이미 존재하므로 새 `wrap_token`을 발급하는 멱등 재실행입니다.
+2. 갱신된 `bootstrap.json`을 원격 호스트로 전송합니다.
+3. 원격 호스트에서 `bootroot-remote bootstrap --artifact <경로>`를
+   실행합니다.
+
+언래핑 호출이 토큰이 **이미 언래핑됨**(비인가 당사자가 소비)으로 실패하면,
+`bootroot-remote`가 잠재적 보안 사고로 표시합니다. 이 경우 `secret_id`를
+즉시 회전하고 비인가 접근을 조사하세요.
 
 ## OpenBao 재기동/복구 체크리스트
 

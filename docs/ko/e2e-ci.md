@@ -220,9 +220,11 @@ sudo -n cp "$tmp_file" /etc/hosts
 목적:
 
 - remote-bootstrap 온보딩과 일회성 bootstrap 반영 방식 검증
-- `secret_id`, `eab`, `trust_sync`, `responder_hmac` 항목의
-  bootstrap 기반 반영 검증
-- 원격 회전/복구 시퀀스와 전체 `bootstrap` 재반영 검증
+- `eab`, `trust_sync`, `responder_hmac` 항목의 bootstrap 기반 반영 검증
+- `secret_id` 회전 전달 검증 (운영 환경에서는
+  `bootroot-remote apply-secret-id`를 사용하고, E2E 테스트에서는 이전
+  `secret_id`가 테스트 기간 동안 유효하므로 `bootstrap`을 일괄 사용)
+- 원격 회전/복구 시퀀스 검증
 
 실행 단계:
 
@@ -331,7 +333,14 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 - 항목별 회전 및 복구 동작 검증
 - 단일 타깃 실패 주입 후 복구 검증
-- 원격 노드에서 회전 후 bootstrap 재반영 검증
+- 회전 후 재반영 검증
+
+> **참고:** E2E 테스트는 `secret_id`를 포함한 모든 회전 항목에
+> `bootroot-remote bootstrap`을 일괄 사용합니다. 이전 `secret_id`가
+> 테스트 기간 동안 유효하고, `bootstrap`과 `apply-secret-id` 모두 동일한
+> 방식으로 인증하기 때문에 동작합니다. 운영 환경에서 `secret_id` 단독
+> 회전 시에는 `bootroot-remote apply-secret-id`를 권장합니다
+> (운영 가이드 참조).
 
 실행 단계(항목별 반복):
 
@@ -561,7 +570,8 @@ E2E에서 OpenBao 언실/런타임 인증 사용 방식:
 판정 규칙:
 
 - 모든 bootstrap 항목이 summary 출력에서 `applied` 상태여야 함
-- 회전 후 `bootroot-remote bootstrap` 재반영이 정상 완료되어야 함
+- 회전 후 재반영이 정상 완료되어야 함 (E2E에서는 `bootstrap` 사용,
+  운영 환경에서 `secret_id` 단독 회전 시에는 `apply-secret-id` 사용)
 - 하나라도 `failed`이면 해당 단계를 실패로 처리함
 
 ## E2E `phases.log` 형식

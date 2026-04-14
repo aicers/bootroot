@@ -250,7 +250,20 @@ bootroot service add \
   --root-token <OPENBAO_ROOT_TOKEN>
 ```
 
-Remote node one-shot bootstrap:
+Remote node one-shot bootstrap (recommended `--artifact` invocation):
+
+```bash
+bootroot-remote bootstrap \
+  --artifact /srv/bootroot/secrets/services/edge-remote/bootstrap.json \
+  --output json
+```
+
+When wrapping is enabled (the default), the artifact carries a
+`wrap_token` that `bootroot-remote` unwraps at runtime to obtain
+`secret_id`. This avoids exposing sensitive tokens in shell command
+lines and `ps` output. The per-field CLI flag style shown below still
+works for backward compatibility or when wrapping is disabled
+(`--no-wrap`):
 
 ```bash
 bootroot-remote bootstrap \
@@ -276,10 +289,12 @@ bootroot-remote bootstrap \
 
 `bootroot-remote bootstrap` performs a one-shot pull and apply of the service
 configuration bundle (`secret_id`, `eab`, `responder_hmac`, `trust`).
-In operations, start from the `remote run command template` printed by
-`bootroot service add`, then replace `--agent-server` and
-`--agent-responder-url` with remote-reachable endpoints such as
-`stepca.internal` and `responder.internal`.
+The `remote run command template` printed by `bootroot service add` uses the
+`--artifact` flag, so `--agent-server` and `--agent-responder-url` values are
+read from the artifact rather than the command line. If the service machine
+cannot reach the default localhost endpoints, edit `bootstrap.json` and
+replace them with remote-reachable values (e.g., `stepca.internal`,
+`responder.internal`) before transferring the artifact.
 
 ### 3-4) Post-renew hook (reload style preset)
 
@@ -322,6 +337,33 @@ bootroot-remote apply-secret-id \
   --service-name edge-remote \
   --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
   --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
+```
+
+### 3-5) service update (policy change)
+
+To change per-service `secret_id` policy without re-running
+`service add`:
+
+```bash
+bootroot service update --service-name edge-proxy --secret-id-ttl 12h
+```
+
+To disable response wrapping for a service:
+
+```bash
+bootroot service update --service-name edge-proxy --no-wrap
+```
+
+To restore the default wrapping behavior:
+
+```bash
+bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+```
+
+After updating policy, apply it on the next rotation:
+
+```bash
+bootroot rotate approle-secret-id --service-name edge-proxy
 ```
 
 ## 4) DNS resolution for HTTP-01 validation

@@ -303,6 +303,57 @@ runcmd:
     --output json
 ```
 
+## Wrap token recovery
+
+When wrapping is enabled (the default), `bootstrap.json` contains a
+single-use `wrap_token` with a limited TTL (default 30 minutes). Two
+failure modes can occur during `bootroot-remote bootstrap --artifact`:
+
+### Expired wrap token
+
+The `wrap_token` TTL has elapsed before `bootroot-remote` could unwrap
+it. `bootroot-remote` detects this by comparing `wrap_expires_at` with
+the current time and reports an **expired** error with recovery
+instructions.
+
+**Recovery:**
+
+1. Re-run `bootroot service add` with the same arguments on the control
+   node. This is an idempotent rerun: it issues a fresh `secret_id` with
+   wrapping and regenerates the bootstrap artifact with a new
+   `wrap_token`.
+2. Ship the updated `bootstrap.json` to the remote host.
+3. Run `bootroot-remote bootstrap --artifact <path>`.
+
+### Already-unwrapped wrap token
+
+The token was already consumed. This means a third party unwrapped it
+before the legitimate `bootroot-remote` call. `bootroot-remote` flags
+this as a **potential security incident**.
+
+**Recovery:**
+
+1. Investigate who or what consumed the token.
+2. Rotate the service's `secret_id` immediately:
+   `bootroot rotate approle-secret-id --service-name <service>`.
+3. Re-run `bootroot service add` with the same arguments to generate a
+   new `wrap_token`.
+4. Ship the artifact and run `bootroot-remote bootstrap` on the remote
+   host.
+
+## Idempotent service add rerun
+
+Re-running `bootroot service add` on an existing `remote-bootstrap`
+service with the same arguments is safe. When wrapping is enabled (the
+default), the rerun issues a fresh `secret_id` with wrapping and writes
+an updated `bootstrap.json` containing a new `wrap_token`. The operator
+must transfer the updated artifact to the remote host and re-run
+`bootroot-remote bootstrap`.
+
+If the rerun arguments differ only in policy fields (`--secret-id-ttl`,
+`--secret-id-wrap-ttl`, `--no-wrap`), the command rejects the request
+and directs the operator to use `bootroot service update` instead.
+
 ## `secret_id` hygiene checklist
 
 The `secret_id` is the most sensitive artifact in the remote-bootstrap flow.
@@ -314,14 +365,16 @@ Treat it as a short-lived credential:
     (`.gitignore`) and ensure deployment scripts do not echo it to stdout
     or write it to log files.
 - **Remove from control node after delivery**: once the `secret_id` has
-    been shipped to the remote host, delete the local copy. The SSH script
-    example above demonstrates this.
+    been shipped to the remote host, delete the local copy.
 - **Short TTL / response wrapping**: use `--secret-id-ttl` on
     `bootroot service add` to limit `secret_id` lifetime, and keep
-    response wrapping enabled (the default) so the raw `secret_id` is
-    never written to the control node. With wrapping, the artifact
-    carries a single-use `wrap_token` that `bootroot-remote` unwraps at
-    runtime — reducing the exposure window to seconds.
+    response wrapping enabled (the default) so the bootstrap artifact
+    carries a single-use `wrap_token` instead of the raw `secret_id`.
+    This keeps wrap tokens out of command lines and `ps` output, and
+    shortens the remote-transfer exposure window to seconds. Note that
+    the control node still writes a raw `secret_id` to
+    `secrets/services/<service>/secret_id` for local operations —
+    protect and delete this file after delivery.
 - **Rotation**: after `bootroot rotate approle-secret-id` on the control
     node, deliver the new `secret_id` via
     `bootroot-remote apply-secret-id` on the service machine. See
