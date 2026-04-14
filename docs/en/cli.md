@@ -22,6 +22,7 @@ Primary commands:
 - `bootroot init`
 - `bootroot status`
 - `bootroot service add`
+- `bootroot service update`
 - `bootroot service info`
 - `bootroot verify`
 - `bootroot rotate`
@@ -220,6 +221,12 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--responder-timeout-secs`: responder timeout (seconds, default `5`)
 - `--stepca-url`: step-ca URL (default `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
+- `--secret-id-ttl`: role-level `secret_id` TTL for AppRole roles
+  created during init (default `24h`). Values above the recommended
+  threshold of `48h` emit a warning. Values above the hard maximum of
+  `168h` are rejected. Per-service overrides can be set later with
+  `bootroot service add --secret-id-ttl` or
+  `bootroot service update --secret-id-ttl`.
 - `--eab-kid`, `--eab-hmac`: manual EAB input
   (environment variables: `EAB_KID`, `EAB_HMAC`)
 
@@ -566,6 +573,52 @@ The command is considered failed when:
 - Missing `instance-id`
 - Missing `container-name` for docker
 - OpenBao AppRole creation failure
+
+## bootroot service update
+
+Modifies per-service `secret_id` policy fields without re-running the
+full `service add` flow. At least one policy flag is required.
+
+### Inputs
+
+- `--service-name`: service name identifier
+- `--secret-id-ttl`: TTL for the generated `secret_id` (use `"inherit"`
+  to clear the per-service override and fall back to the role-level
+  default)
+- `--secret-id-wrap-ttl`: response-wrapping TTL for the `secret_id`
+  (use `"inherit"` to restore default wrapping behavior)
+- `--no-wrap`: disable response wrapping for the `secret_id`
+  (conflicts with `--secret-id-wrap-ttl`)
+
+### Behavior
+
+- Reads the service entry from `state.json` and updates only the
+  specified policy fields.
+- If no fields change, the command exits without writing.
+- Prints a summary of before/after values.
+- Hints to run `rotate approle-secret-id` to apply the updated policy
+  on the next issuance.
+
+### Outputs
+
+- Policy change summary (before → after)
+- Next-step guidance
+
+### Failure conditions
+
+The command is considered failed when:
+
+- Missing `state.json`
+- Service not found
+- No policy flag provided
+
+### Examples
+
+```bash
+bootroot service update --service-name edge-proxy --secret-id-ttl 12h
+bootroot service update --service-name edge-proxy --no-wrap
+bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+```
 
 ## bootroot service info
 
@@ -1061,12 +1114,13 @@ Key inputs:
     - `--agent-domain`: `trusted.domain`
     - `--agent-responder-url`: `http://127.0.0.1:8080`
     - `--profile-hostname`: `localhost`
-  - `bootroot service add` prints a `remote run command template`, not an
-    exact remote-ready command. The localhost defaults for `--agent-server`
-    and `--agent-responder-url` are only correct for same-host setups; on a
-    separate service machine you must replace them with remote-reachable
-    control-plane endpoints such as `stepca.internal` and
-    `responder.internal`.
+  - `bootroot service add` prints a `remote run command template` that uses
+    the `--artifact` flag. The `--agent-server` and `--agent-responder-url`
+    values are baked into the artifact, not passed on the command line. The
+    localhost defaults are only correct for same-host setups; on a separate
+    service machine, edit `bootstrap.json` and replace them with
+    remote-reachable endpoints (e.g., `stepca.internal`,
+    `responder.internal`) before transferring the artifact.
 - `--ca-bundle-path`: required output path for the managed step-ca trust
   bundle. Required unless `--artifact` is provided.
 - post-renew hook flags: `--reload-style`,

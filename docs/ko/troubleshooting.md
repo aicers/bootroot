@@ -99,6 +99,40 @@
 - secret_id 회전 후에는 서비스 머신에서 `bootroot-remote apply-secret-id`를 실행
 - bootstrap summary JSON에서 모든 항목이 `applied` 상태인지 확인
 
+### Wrap token 만료
+
+`bootroot-remote bootstrap --artifact` 실행 시 wrap-token-expired 오류가
+발생하면, `wrap_token` TTL(기본값 30분)이 명령 실행 전에 경과한 것입니다.
+
+복구:
+
+1. control node에서 동일한 인자로 `bootroot service add`를 다시 실행합니다.
+   멱등 재실행으로 새 `wrap_token`을 발급합니다.
+2. 갱신된 `bootstrap.json`을 원격 호스트로 전송합니다.
+3. `bootroot-remote bootstrap --artifact <경로>`를 다시 실행합니다.
+
+### Wrap token 이미 언래핑됨
+
+`bootroot-remote bootstrap --artifact` 실행 시 토큰이 이미 언래핑되었다고
+보고되면, 정당한 호출 전에 제3자가 `wrap_token`을 소비한 것입니다.
+잠재적 보안 사고로 표시됩니다.
+
+복구:
+
+1. 누가 또는 무엇이 토큰을 소비했는지 조사합니다.
+2. `secret_id`를 회전합니다:
+   `bootroot rotate approle-secret-id --service-name <service>`.
+3. `bootroot service add`를 다시 실행해 새 `wrap_token`을 생성합니다.
+4. 아티팩트를 전송하고 원격 호스트에서 `bootroot-remote bootstrap`을
+   실행합니다.
+
+### service add 재실행 시 정책만 불일치
+
+기존 서비스에 `bootroot service add`를 다시 실행했을 때 정책 불일치 오류가
+발생하면, 비정책 인자는 일치하지만 정책 플래그(`--secret-id-ttl`,
+`--secret-id-wrap-ttl`, `--no-wrap`)가 저장된 값과 다른 경우입니다.
+`bootroot service update`를 사용해 정책 필드를 별도로 변경하세요.
+
 ## 인증서 발급/갱신이 실패할 때
 
 ### HTTP-01 실패

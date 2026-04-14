@@ -14,7 +14,7 @@ use super::{Locale, ResolvedBootstrapArgs, localized};
 #[derive(Debug)]
 enum UnwrapError {
     /// The wrap token has expired. Operator must re-run `bootroot service add`
-    /// or `bootroot rotate approle-secret-id` to generate a fresh artifact.
+    /// on the control node to mint a fresh wrap token and ship the updated artifact.
     Expired { service_name: String },
     /// The wrap token was already consumed. This indicates the `secret_id`
     /// may have been intercepted by a third party.
@@ -208,14 +208,18 @@ async fn unwrap_and_write_secret_id(
                     let msg = localized(
                         lang,
                         &format!(
-                            "Wrap token has expired. To recover, re-run:\n\n  \
-                             bootroot rotate approle-secret-id --service-name {service_name}\n\n\
-                             Then transfer the regenerated artifact to this node and retry bootstrap."
+                            "Wrap token for service '{service_name}' has expired. To recover:\n\n  \
+                             1. Re-run `bootroot service add` with the same arguments on the control node.\n     \
+                                The idempotent rerun issues a fresh wrap token.\n  \
+                             2. Ship the updated bootstrap.json to this node.\n  \
+                             3. Re-run `bootroot-remote bootstrap --artifact <path>`."
                         ),
                         &format!(
-                            "래핑 토큰이 만료되었습니다. 복구하려면 다시 실행하세요:\n\n  \
-                             bootroot rotate approle-secret-id --service-name {service_name}\n\n\
-                             재생성된 아티팩트를 이 노드로 전송한 뒤 부트스트랩을 재시도하세요."
+                            "서비스 '{service_name}'의 래핑 토큰이 만료되었습니다. 복구 절차:\n\n  \
+                             1. control node에서 동일한 인자로 `bootroot service add`를 다시 실행하세요.\n     \
+                                멱등 재실행으로 새 wrap token을 발급합니다.\n  \
+                             2. 갱신된 bootstrap.json을 이 노드로 전송하세요.\n  \
+                             3. `bootroot-remote bootstrap --artifact <경로>`를 다시 실행하세요."
                         ),
                     );
                     anyhow::bail!("{msg}");
@@ -231,7 +235,8 @@ async fn unwrap_and_write_secret_id(
                              1. Investigate who or what consumed the token.\n  \
                              2. Rotate the compromised secret_id:\n     \
                                 bootroot rotate approle-secret-id --service-name {service_name}\n  \
-                             3. Transfer the new artifact and retry bootstrap."
+                             3. Re-run `bootroot service add` to generate a new wrap token.\n  \
+                             4. Ship the updated bootstrap.json and retry bootstrap."
                         ),
                         &format!(
                             "보안 사고: 래핑 토큰이 이미 언래핑되었습니다.\n\
@@ -241,7 +246,8 @@ async fn unwrap_and_write_secret_id(
                              1. 토큰을 소비한 주체를 조사하세요.\n  \
                              2. 노출된 secret_id를 교체하세요:\n     \
                                 bootroot rotate approle-secret-id --service-name {service_name}\n  \
-                             3. 새 아티팩트를 전송하고 부트스트랩을 재시도하세요."
+                             3. `bootroot service add`를 다시 실행해 새 wrap token을 생성하세요.\n  \
+                             4. 갱신된 bootstrap.json을 전송하고 부트스트랩을 재시도하세요."
                         ),
                     );
                     anyhow::bail!("{msg}");

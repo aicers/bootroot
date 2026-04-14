@@ -225,8 +225,11 @@ Purpose:
 
 - Validate remote-bootstrap onboarding and one-shot bootstrap apply mode
 - Validate bootstrap-driven updates for
-  `secret_id`, `eab`, `trust_sync`, `responder_hmac`
-- Validate remote rotation/recovery sequence via full `bootstrap` re-apply
+  `eab`, `trust_sync`, `responder_hmac`
+- Validate `secret_id` rotation delivery (in production, operators use
+  `bootroot-remote apply-secret-id`; the E2E test uses `bootstrap` for
+  uniformity since the old `secret_id` is still valid during the test window)
+- Validate remote rotation/recovery sequence
 
 Execution steps:
 
@@ -335,7 +338,14 @@ Purpose:
 
 - Validate rotation and recovery behavior per item
 - Validate targeted failure handling and subsequent recovery
-- Validate remote bootstrap re-apply after each rotation
+- Validate re-apply after each rotation
+
+> **Note:** The E2E test uses `bootroot-remote bootstrap` to re-apply all
+> rotation items uniformly (including `secret_id`). This works because the
+> old `secret_id` remains valid during the test window and both `bootstrap`
+> and `apply-secret-id` authenticate the same way. In production, the
+> recommended path for `secret_id`-only rotation is
+> `bootroot-remote apply-secret-id` (see the operations guide).
 
 Execution steps (per rotation item):
 
@@ -566,8 +576,8 @@ Per-service verification items:
 Pass/fail rules:
 
 - all bootstrap items must show `applied` in the summary output
-- after rotation, `bootroot-remote bootstrap` re-apply must complete
-  successfully
+- after rotation, re-apply must complete successfully (`bootstrap` in
+  E2E; `apply-secret-id` for `secret_id`-only rotation in production)
 - if any item shows `failed`, the phase fails
 
 ## E2E `phases.log` format

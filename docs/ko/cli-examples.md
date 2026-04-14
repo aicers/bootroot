@@ -246,7 +246,19 @@ bootroot service add \
   --root-token <OPENBAO_ROOT_TOKEN>
 ```
 
-원격 노드 일회성 bootstrap:
+원격 노드 일회성 bootstrap (권장 `--artifact` 호출 방식):
+
+```bash
+bootroot-remote bootstrap \
+  --artifact /srv/bootroot/secrets/services/edge-remote/bootstrap.json \
+  --output json
+```
+
+래핑이 활성(기본값)이면 아티팩트에 `wrap_token`이 포함되며,
+`bootroot-remote`가 런타임에 이를 언래핑하여 `secret_id`를 얻습니다.
+민감한 토큰이 셸 명령줄과 `ps` 출력에 노출되지 않습니다.
+아래의 개별 CLI 플래그 방식은 하위 호환 또는 래핑 비활성(`--no-wrap`)
+시에도 사용할 수 있습니다:
 
 ```bash
 bootroot-remote bootstrap \
@@ -272,10 +284,11 @@ bootroot-remote bootstrap \
 
 `bootroot-remote bootstrap`은 서비스 설정 번들(`secret_id`, `eab`,
 `responder_hmac`, `trust`)을 1회 pull+apply합니다.
-실제 운영에서는 `bootroot service add` 요약 출력의
-`원격 실행 명령 템플릿`을 기준으로 시작하되,
-`--agent-server`, `--agent-responder-url`를 `stepca.internal`,
-`responder.internal` 같은 원격 접근 가능 엔드포인트로 바꿔서 사용하세요.
+`bootroot service add`가 출력하는 `원격 실행 명령 템플릿`은 `--artifact`
+플래그를 사용하므로, `--agent-server`와 `--agent-responder-url` 값은
+명령줄이 아닌 아티팩트에서 읽힙니다. 서비스 머신이 기본 localhost 엔드포인트에
+접근할 수 없는 경우, 아티팩트 전송 전에 `bootstrap.json`을 편집하여 원격 접근
+가능 값(예: `stepca.internal`, `responder.internal`)으로 교체하세요.
 
 ### 3-4) 갱신 후 훅 (리로드 스타일 프리셋)
 
@@ -318,6 +331,32 @@ bootroot-remote apply-secret-id \
   --service-name edge-remote \
   --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
   --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
+```
+
+### 3-5) service update (정책 변경)
+
+`service add`를 다시 실행하지 않고 서비스별 `secret_id` 정책을 변경하려면:
+
+```bash
+bootroot service update --service-name edge-proxy --secret-id-ttl 12h
+```
+
+서비스의 응답 래핑을 비활성화하려면:
+
+```bash
+bootroot service update --service-name edge-proxy --no-wrap
+```
+
+기본 래핑 동작을 복원하려면:
+
+```bash
+bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+```
+
+정책 변경 후 다음 회전에 적용:
+
+```bash
+bootroot rotate approle-secret-id --service-name edge-proxy
 ```
 
 ## 4) HTTP-01 검증을 위한 DNS 해석

@@ -102,6 +102,41 @@ If mode and placement do not match, file/state updates go to the wrong path.
   service host
 - Verify the bootstrap summary JSON shows all items as `applied`
 
+### Wrap token expired
+
+If `bootroot-remote bootstrap --artifact` fails with a wrap-token-expired
+error, the `wrap_token` TTL (default 30 minutes) elapsed before the
+operator ran the command.
+
+Recovery:
+
+1. Re-run `bootroot service add` with the same arguments on the control
+   node. The idempotent rerun issues a fresh `wrap_token`.
+2. Ship the updated `bootstrap.json` to the remote host.
+3. Re-run `bootroot-remote bootstrap --artifact <path>`.
+
+### Wrap token already unwrapped
+
+If `bootroot-remote bootstrap --artifact` reports the token was already
+unwrapped, a third party consumed the `wrap_token` before the legitimate
+call. This is flagged as a potential security incident.
+
+Recovery:
+
+1. Investigate who or what consumed the token.
+2. Rotate the `secret_id`:
+   `bootroot rotate approle-secret-id --service-name <service>`.
+3. Re-run `bootroot service add` to generate a new `wrap_token`.
+4. Ship and run `bootroot-remote bootstrap` on the remote host.
+
+### Policy-only mismatch on service add rerun
+
+If re-running `bootroot service add` on an existing service fails with
+a policy mismatch error, the non-policy arguments match but the policy
+flags (`--secret-id-ttl`, `--secret-id-wrap-ttl`, `--no-wrap`) differ
+from the stored values. Use `bootroot service update` to change policy
+fields independently.
+
 ## Issuance and renewal failures
 
 ### HTTP-01 failures

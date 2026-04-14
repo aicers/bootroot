@@ -82,21 +82,24 @@ template {
 가장 간편합니다.
 
 `--delivery-mode remote-bootstrap` 방식에서는 원격에 `agent.toml`이 아직 없을 때
-`bootroot-remote bootstrap`이 baseline을 생성할 수 있습니다. baseline 생성에는
-다음 입력이 사용됩니다.
+`bootroot-remote bootstrap`이 baseline을 생성할 수 있습니다. baseline 값은
+`bootroot service add`가 생성한 `bootstrap.json` 아티팩트에서 읽습니다.
+아티팩트가 있으면(`--artifact <경로>`) 아티팩트 값이 CLI 플래그보다 우선합니다.
 
-- `--agent-email`
-- `--agent-server`
-- `--agent-domain`
-- `--agent-responder-url`
-- `--profile-hostname`
-- `--profile-instance-id`
-- `--profile-cert-path`
-- `--profile-key-path`
+아티팩트의 `agent-server`, `agent-responder-url` 필드는 기본적으로 localhost
+placeholder를 사용합니다. 별도 서비스 머신의 경우, 서비스 호스트로 전송하기
+전에 `bootstrap.json`을 편집하여 원격 접근 가능한 엔드포인트로 교체하십시오.
 
-별도 서비스 머신에서는 생성된 handoff 템플릿의 localhost placeholder 대신
-원격에서 도달 가능한 제어면 엔드포인트로 `--agent-server`,
-`--agent-responder-url`를 대개 덮어써야 합니다.
+아티팩트에 포함되는 baseline 필드:
+
+- `agent-email`
+- `agent-server`
+- `agent-domain`
+- `agent-responder-url`
+- `profile-hostname`
+- `profile-instance-id`
+- `profile-cert-path`
+- `profile-key-path`
 
 구성 설명:
 

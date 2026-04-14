@@ -159,6 +159,31 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+## Updating service secret_id policy
+
+Use `bootroot service update` to change per-service `secret_id` policy
+without re-running `service add`:
+
+```bash
+bootroot service update --service-name edge-proxy --secret-id-ttl 12h
+bootroot service update --service-name edge-proxy --no-wrap
+```
+
+The command modifies `state.json` only. To apply the updated policy to
+the actual `secret_id`, run `rotate approle-secret-id` afterward:
+
+```bash
+bootroot rotate approle-secret-id --service-name edge-proxy
+```
+
+Use `"inherit"` to clear a per-service override and fall back to the
+role-level default configured on the AppRole in OpenBao:
+
+```bash
+bootroot service update --service-name edge-proxy --secret-id-ttl inherit
+bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+```
+
 ## Remote bootstrap and secret_id handoff operations
 
 For targets added with `--delivery-mode remote-bootstrap`, the operational
@@ -186,6 +211,60 @@ Security notes:
 - limit service account access to service-specific paths only
 - treat `bootroot init --summary-json` output as sensitive because it may
   include `root_token`
+- when wrapping is enabled (the default), `bootstrap.json` contains a
+  `wrap_token` and must be treated as a sensitive credential file with
+  the same handling as `secret_id`
+
+### Idempotent service add rerun
+
+Re-running `bootroot service add` on an existing `remote-bootstrap`
+service with the same arguments is idempotent. When wrapping is enabled
+(the default), the rerun issues a fresh `secret_id` with wrapping and
+regenerates the bootstrap artifact with a new `wrap_token`. The operator
+must ship the updated `bootstrap.json` to the remote host and re-run
+`bootroot-remote bootstrap`.
+
+If the arguments differ only in policy fields (`--secret-id-ttl`,
+`--secret-id-wrap-ttl`, `--no-wrap`), the command rejects the request
+and directs the operator to `bootroot service update` instead.
+
+### OpenBao Agent rotation propagation
+
+For `local-file` services, `bootroot rotate approle-secret-id` writes
+the new `secret_id` atomically to disk and reloads the per-service
+OpenBao Agent. For daemon-mode deployments the agent receives a `SIGHUP`
+and re-reads the credential without restarting. For Docker deployments
+the agent container is restarted (`docker restart`).
+
+For `remote-bootstrap` services, the rotated `secret_id` is written to
+the per-service KV path (`bootroot/services/<service>/secret_id`). The
+operator must then run `bootroot-remote apply-secret-id` on the service
+machine to deliver it. The service's OpenBao Agent reads the local
+`secret_id` file and re-authenticates on the next token renewal cycle.
+
+Note: `bootroot-agent` itself does not re-authenticate with AppRole
+directly in the `remote-bootstrap` flow. It consumes the token file that
+the OpenBao Agent maintains.
+
+### Wrap token expiry recovery
+
+When wrapping is enabled, the `wrap_token` embedded in `bootstrap.json`
+has a limited TTL (default 30 minutes). If the operator does not run
+`bootroot-remote bootstrap` before the token expires, the unwrap call
+fails with an **expired** error.
+
+Recovery procedure:
+
+1. Re-run `bootroot service add` with the same arguments on the control
+   node. Because the service already exists, this is an idempotent rerun
+   that issues a fresh `wrap_token`.
+2. Ship the updated `bootstrap.json` to the remote host.
+3. Run `bootroot-remote bootstrap --artifact <path>` on the remote host.
+
+If the unwrap call fails because the token was **already unwrapped**
+(consumed by an unauthorized party), `bootroot-remote` flags the event
+as a potential security incident. In this case, rotate the `secret_id`
+immediately and investigate the unauthorized access.
 
 ## OpenBao restart/recovery checklist
 
