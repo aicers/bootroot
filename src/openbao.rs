@@ -175,6 +175,37 @@ impl OpenBaoClient {
         })
     }
 
+    /// Creates a new `OpenBao` client whose TLS verification is anchored
+    /// to the given PEM-encoded CA bundle with optional SHA-256 pins.
+    ///
+    /// This is the primary constructor for RN-side bootstrap: the PEM
+    /// content travels inside the bootstrap artifact and `pins` carries
+    /// optional SHA-256 fingerprints from `trust.trusted_ca_sha256`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PEM content cannot be parsed or the HTTP
+    /// client fails to build.
+    pub fn with_pem_trust(base_url: &str, ca_pem: &str, pins: &[String]) -> Result<Self> {
+        let client = crate::tls::build_http_client_from_pem(ca_pem, pins)?;
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client,
+            token: None,
+        })
+    }
+
+    /// Creates a new `OpenBao` client with a pre-configured
+    /// [`reqwest::Client`].
+    #[must_use]
+    pub fn with_client(base_url: &str, client: Client) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client,
+            token: None,
+        }
+    }
+
     pub fn set_token(&mut self, token: String) {
         self.token = Some(token);
     }
@@ -1176,5 +1207,141 @@ mod agent_config_tests {
         );
         assert!(hcl.contains(r#"source = "/a.ctmpl""#));
         assert!(hcl.contains(r#"source = "/b.ctmpl""#));
+    }
+}
+
+/// End-to-end HTTPS tests proving that [`OpenBaoClient::with_pem_trust`]
+/// verifies against the artifact-embedded CA and rejects unknown CAs.
+#[cfg(test)]
+mod tls_integration_tests {
+    use std::sync::Arc;
+
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    use super::*;
+
+    struct TestCa {
+        cert: rcgen::Certificate,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    impl TestCa {
+        fn generate() -> Self {
+            let key = KeyPair::generate().expect("generate CA key");
+            let mut params = CertificateParams::new(Vec::new()).expect("cert params");
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "Test CA");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let cert = params.self_signed(&key).expect("self-signed CA");
+            let issuer = Issuer::new(params, key);
+            Self { cert, issuer }
+        }
+
+        fn pem(&self) -> String {
+            self.cert.pem()
+        }
+
+        fn sign_server_cert(&self) -> ServerCert {
+            let key = KeyPair::generate().expect("generate server key");
+            let mut params =
+                CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "localhost");
+            params.is_ca = IsCa::NoCa;
+            let cert = params
+                .signed_by(&key, &self.issuer)
+                .expect("signed server cert");
+            ServerCert {
+                cert_der: cert.der().to_vec(),
+                key_der: key.serialize_der(),
+            }
+        }
+    }
+
+    struct ServerCert {
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+    }
+
+    /// Starts a minimal HTTPS server that returns `200 OK` for every
+    /// request. Returns the port on `127.0.0.1`.
+    async fn start_tls_server(server: ServerCert) -> u16 {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = CertificateDer::from(server.cert_der);
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server.key_der));
+
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("server TLS config");
+
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 4096];
+                    let _ = tls.read(&mut buf).await;
+                    let _ = tls
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\n\
+                              Content-Length: 0\r\n\
+                              Connection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        port
+    }
+
+    #[tokio::test]
+    async fn with_pem_trust_validates_against_artifact_ca() {
+        let ca = TestCa::generate();
+        let server_cert = ca.sign_server_cert();
+        let port = start_tls_server(server_cert).await;
+
+        let client =
+            OpenBaoClient::with_pem_trust(&format!("https://localhost:{port}"), &ca.pem(), &[])
+                .expect("client with correct CA");
+
+        client
+            .health_check()
+            .await
+            .expect("health check should pass with artifact CA");
+    }
+
+    #[tokio::test]
+    async fn with_pem_trust_rejects_unknown_ca() {
+        let ca = TestCa::generate();
+        let wrong_ca = TestCa::generate();
+        let server_cert = ca.sign_server_cert();
+        let port = start_tls_server(server_cert).await;
+
+        let client = OpenBaoClient::with_pem_trust(
+            &format!("https://localhost:{port}"),
+            &wrong_ca.pem(),
+            &[],
+        )
+        .expect("client with wrong CA");
+
+        client
+            .health_check()
+            .await
+            .expect_err("health check should fail with wrong CA");
     }
 }

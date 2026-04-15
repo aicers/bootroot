@@ -111,7 +111,7 @@ scp -p \
   "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
 
 # 3. Validate schema_version before running bootstrap
-if ! jq -e '.schema_version == 1' "$ARTIFACT" > /dev/null; then
+if ! jq -e '.schema_version == 2' "$ARTIFACT" > /dev/null; then
   echo "ERROR: unsupported schema_version in $ARTIFACT" >&2
   exit 1
 fi
@@ -208,10 +208,10 @@ For larger fleets with existing configuration management.
     - name: Validate schema_version
       ansible.builtin.assert:
         that:
-          - artifact.schema_version == 1
+          - artifact.schema_version == 2
         fail_msg: >-
           Unsupported schema_version {{ artifact.schema_version }};
-          this playbook supports version 1 only.
+          this playbook supports version 2 only.
 
     - name: Ensure secrets directory
       ansible.builtin.file:
@@ -407,7 +407,7 @@ The JSON artifact written to
 `secrets/remote-bootstrap/services/<service>/bootstrap.json` follows a
 versioned schema. Automation should check `schema_version` before parsing.
 
-Current version: **1**
+Current version: **2**
 
 | Field | Type | Description | Consumed by |
 | --- | --- | --- | --- |
@@ -419,7 +419,8 @@ Current version: **1**
 | `secret_id_path` | `string` | Path to AppRole `secret_id` file on the remote host | `--secret-id-path` |
 | `eab_file_path` | `string` | Path to EAB credentials JSON file | `--eab-file-path` |
 | `agent_config_path` | `string` | Path to `agent.toml` on the remote host | `--agent-config-path` |
-| `ca_bundle_path` | `string` | Path to CA trust bundle PEM file | `--ca-bundle-path` |
+| `ca_bundle_path` | `string` | Path to CA trust bundle PEM file on the remote host | `--ca-bundle-path` |
+| `ca_bundle_pem` | `string` | Inline PEM content of the control-plane CA trust anchor. Written to `ca_bundle_path` during bootstrap. When `openbao_url` uses HTTPS, this CA is used as the TLS trust anchor instead of the system trust store. Shared primitive — also consumed by the http01 admin client (#514). | Internal (TLS trust) |
 | `openbao_agent_config_path` | `string` | Path to OpenBao Agent config (HCL) | Internal |
 | `openbao_agent_template_path` | `string` | Path to OpenBao Agent template | Internal |
 | `openbao_agent_token_path` | `string` | Path to OpenBao Agent token file | Internal |
@@ -435,6 +436,13 @@ Current version: **1**
 | `wrap_token` | `string?` | Response-wrapped `secret_id` token (omitted when wrapping is disabled via `--no-wrap`). Sensitive — treat as a credential. | `bootroot-remote` unwrap path |
 | `wrap_expires_at` | `string?` | RFC 3339 timestamp when `wrap_token` expires (omitted when wrapping is disabled). | `bootroot-remote` unwrap error classification |
 
+### Version history
+
+| Version | Change |
+| --- | --- |
+| 2 | Added required `ca_bundle_pem` field (inline PEM of the control-plane CA anchor). |
+| 1 | Initial schema. |
+
 ### Versioning rules
 
 - **Breaking change** (field removed, renamed, or type changed): bump
@@ -443,4 +451,5 @@ Current version: **1**
     no bump required. Existing parsers ignore unknown keys.
 - **Consumer contract**: check `schema_version >= 1` and
     `schema_version <= <max supported>` before accessing fields. Fail
-    explicitly on unsupported versions.
+    explicitly on unsupported versions. `bootroot-remote` enforces this
+    check automatically when using `--artifact`.

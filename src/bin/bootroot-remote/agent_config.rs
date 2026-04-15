@@ -459,6 +459,7 @@ mod tests {
             profile_cert_path: None,
             profile_key_path: None,
             ca_bundle_path: PathBuf::from("/tmp/ca-bundle.pem"),
+            ca_bundle_pem: None,
             post_renew_command: None,
             post_renew_arg: Vec::new(),
             post_renew_timeout_secs: None,

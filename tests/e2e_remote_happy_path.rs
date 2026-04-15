@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::Context;
-use rcgen::generate_simple_self_signed;
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, generate_simple_self_signed,
+};
 use serde_json::json;
 use tempfile::tempdir;
 use wiremock::matchers::{body_json, header, header_exists, method, path};
@@ -864,6 +866,308 @@ async fn test_remote_bootstrap_already_unwrapped_token() {
     assert!(
         stderr.contains("bootroot service add"),
         "should include service-add step to mint fresh wrap token: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TLS test infrastructure — CA generation and minimal HTTPS mock server
+// ---------------------------------------------------------------------------
+
+struct TestCa {
+    cert: rcgen::Certificate,
+    issuer: Issuer<'static, KeyPair>,
+}
+
+struct TlsServerCert {
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+}
+
+impl TestCa {
+    fn generate() -> Self {
+        let key = KeyPair::generate().expect("generate CA key");
+        let mut params = CertificateParams::new(Vec::new()).expect("cert params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Test CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).expect("self-signed CA");
+        let issuer = Issuer::new(params, key);
+        Self { cert, issuer }
+    }
+
+    fn pem(&self) -> String {
+        self.cert.pem()
+    }
+
+    fn sign_server_cert(&self) -> TlsServerCert {
+        let key = KeyPair::generate().expect("generate server key");
+        let mut params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
+        params.is_ca = IsCa::NoCa;
+        let cert = params
+            .signed_by(&key, &self.issuer)
+            .expect("signed server cert");
+        TlsServerCert {
+            cert_der: cert.der().to_vec(),
+            key_der: key.serialize_der(),
+        }
+    }
+}
+
+/// Routes an HTTP request path to a canned `OpenBao` JSON response.
+fn openbao_route(request_path: &str) -> (u16, String) {
+    let body = match request_path {
+        "/v1/auth/approle/login" => json!({
+            "auth": { "client_token": "tls-token" }
+        }),
+        "/v1/secret/data/bootroot/services/edge-proxy/secret_id" => json!({
+            "data": { "data": { "secret_id": "tls-secret-id" } }
+        }),
+        "/v1/secret/data/bootroot/services/edge-proxy/eab" => json!({
+            "data": { "data": { "kid": "tls-kid", "hmac": "tls-hmac" } }
+        }),
+        "/v1/secret/data/bootroot/services/edge-proxy/http_responder_hmac" => json!({
+            "data": { "data": { "hmac": "tls-responder-hmac" } }
+        }),
+        "/v1/secret/data/bootroot/services/edge-proxy/trust" => json!({
+            "data": { "data": {
+                "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
+                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nTLS-MOCK\n-----END CERTIFICATE-----"
+            } }
+        }),
+        _ => return (404, r#"{"errors":["not found"]}"#.to_string()),
+    };
+    (200, body.to_string())
+}
+
+/// Starts a minimal HTTPS server that routes requests to canned `OpenBao`
+/// responses.  Returns the port on `127.0.0.1`.
+async fn start_openbao_tls_mock(server_cert: TlsServerCert) -> u16 {
+    use std::sync::Arc;
+
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert = CertificateDer::from(server_cert.cert_der);
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_cert.key_der));
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server TLS config");
+
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local addr").port();
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = tls.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let request_path = request
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, body) = openbao_route(request_path);
+                let status_text = if status == 200 { "OK" } else { "Not Found" };
+                let response = format!(
+                    "HTTP/1.1 {status} {status_text}\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n\
+                     {body}",
+                    body.len()
+                );
+                let _ = tls.write_all(response.as_bytes()).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+
+    port
+}
+
+/// Proves that `bootroot-remote bootstrap --artifact` with an HTTPS
+/// `openbao_url` succeeds when the artifact-embedded CA matches the
+/// server's issuer.  This exercises the full bootstrap code path
+/// (`build_openbao_client` → `OpenBaoClient::with_pem_trust` → TLS
+/// handshake → `AppRole` login → secret reads) over a real TLS connection.
+#[tokio::test]
+async fn test_remote_bootstrap_https_with_artifact_ca() {
+    let ca = TestCa::generate();
+    let server_cert = ca.sign_server_cert();
+    let port = start_openbao_tls_mock(server_cert).await;
+
+    let temp = tempdir().expect("create tempdir");
+    let service_dir = temp.path().join("tls-service");
+    fs::create_dir_all(&service_dir).expect("create service dir");
+    prepare_service_node_files(&service_dir).expect("prepare service node files");
+
+    let service_secrets = service_dir
+        .join("secrets")
+        .join("services")
+        .join(SERVICE_NAME);
+    let role_id_path = service_secrets.join("role_id");
+    let secret_id_path = service_secrets.join("secret_id");
+    fs::write(&role_id_path, "role-edge-proxy").expect("write role_id");
+    fs::write(&secret_id_path, "secret-edge-proxy").expect("write secret_id");
+
+    let openbao_agent_dir = service_dir
+        .join("secrets")
+        .join("openbao")
+        .join("services")
+        .join(SERVICE_NAME);
+
+    let artifact = json!({
+        "schema_version": 2,
+        "openbao_url": format!("https://localhost:{port}"),
+        "kv_mount": "secret",
+        "service_name": SERVICE_NAME,
+        "role_id_path": role_id_path.to_string_lossy(),
+        "secret_id_path": secret_id_path.to_string_lossy(),
+        "eab_file_path": service_secrets.join("eab.json").to_string_lossy(),
+        "agent_config_path": service_dir.join("agent.toml").to_string_lossy(),
+        "ca_bundle_path": service_dir.join("certs").join("ca-bundle.pem").to_string_lossy(),
+        "ca_bundle_pem": ca.pem(),
+        "openbao_agent_config_path": openbao_agent_dir.join("agent.hcl").to_string_lossy(),
+        "openbao_agent_template_path": openbao_agent_dir.join("agent.toml.ctmpl").to_string_lossy(),
+        "openbao_agent_token_path": openbao_agent_dir.join("token").to_string_lossy(),
+        "agent_email": "admin@example.com",
+        "agent_server": "https://localhost:9000/acme/acme/directory",
+        "agent_domain": DOMAIN,
+        "agent_responder_url": "http://127.0.0.1:8080",
+        "profile_hostname": HOSTNAME,
+        "profile_instance_id": INSTANCE_ID,
+        "profile_cert_path": service_dir.join("certs").join("edge-proxy.crt").to_string_lossy(),
+        "profile_key_path": service_dir.join("certs").join("edge-proxy.key").to_string_lossy(),
+    });
+    let artifact_path = service_dir.join("bootstrap.json");
+    fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&artifact).unwrap(),
+    )
+    .expect("write artifact");
+
+    // Use tokio::process so the child process does not block the tokio
+    // thread — the TLS mock server is a tokio task on the same runtime.
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .current_dir(&service_dir)
+        .arg("bootstrap")
+        .arg("--artifact")
+        .arg(&artifact_path)
+        .output()
+        .await
+        .expect("run bootroot-remote");
+
+    assert!(
+        output.status.success(),
+        "HTTPS bootstrap should succeed with artifact CA: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify secrets were written through the TLS-protected path.
+    let written_secret = fs::read_to_string(&secret_id_path).expect("read secret_id");
+    assert_eq!(written_secret.trim(), "tls-secret-id");
+}
+
+/// Proves that `bootroot-remote bootstrap --artifact` with an HTTPS
+/// `openbao_url` fails when the artifact carries a CA that did not issue
+/// the server certificate.  This confirms the bootstrap path does not
+/// fall back to the system trust store.
+#[tokio::test]
+async fn test_remote_bootstrap_https_rejects_wrong_ca() {
+    let ca = TestCa::generate();
+    let wrong_ca = TestCa::generate();
+    let server_cert = ca.sign_server_cert();
+    let port = start_openbao_tls_mock(server_cert).await;
+
+    let temp = tempdir().expect("create tempdir");
+    let service_dir = temp.path().join("tls-wrong-ca");
+    fs::create_dir_all(&service_dir).expect("create service dir");
+    prepare_service_node_files(&service_dir).expect("prepare service node files");
+
+    let service_secrets = service_dir
+        .join("secrets")
+        .join("services")
+        .join(SERVICE_NAME);
+    let role_id_path = service_secrets.join("role_id");
+    let secret_id_path = service_secrets.join("secret_id");
+    fs::write(&role_id_path, "role-edge-proxy").expect("write role_id");
+    fs::write(&secret_id_path, "secret-edge-proxy").expect("write secret_id");
+
+    let openbao_agent_dir = service_dir
+        .join("secrets")
+        .join("openbao")
+        .join("services")
+        .join(SERVICE_NAME);
+
+    // Embed the WRONG CA — the server cert was signed by `ca`, not `wrong_ca`.
+    let artifact = json!({
+        "schema_version": 2,
+        "openbao_url": format!("https://localhost:{port}"),
+        "kv_mount": "secret",
+        "service_name": SERVICE_NAME,
+        "role_id_path": role_id_path.to_string_lossy(),
+        "secret_id_path": secret_id_path.to_string_lossy(),
+        "eab_file_path": service_secrets.join("eab.json").to_string_lossy(),
+        "agent_config_path": service_dir.join("agent.toml").to_string_lossy(),
+        "ca_bundle_path": service_dir.join("certs").join("ca-bundle.pem").to_string_lossy(),
+        "ca_bundle_pem": wrong_ca.pem(),
+        "openbao_agent_config_path": openbao_agent_dir.join("agent.hcl").to_string_lossy(),
+        "openbao_agent_template_path": openbao_agent_dir.join("agent.toml.ctmpl").to_string_lossy(),
+        "openbao_agent_token_path": openbao_agent_dir.join("token").to_string_lossy(),
+        "agent_email": "admin@example.com",
+        "agent_server": "https://localhost:9000/acme/acme/directory",
+        "agent_domain": DOMAIN,
+        "agent_responder_url": "http://127.0.0.1:8080",
+        "profile_hostname": HOSTNAME,
+        "profile_instance_id": INSTANCE_ID,
+        "profile_cert_path": service_dir.join("certs").join("edge-proxy.crt").to_string_lossy(),
+        "profile_key_path": service_dir.join("certs").join("edge-proxy.key").to_string_lossy(),
+    });
+    let artifact_path = service_dir.join("bootstrap.json");
+    fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&artifact).unwrap(),
+    )
+    .expect("write artifact");
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .current_dir(&service_dir)
+        .arg("bootstrap")
+        .arg("--artifact")
+        .arg(&artifact_path)
+        .output()
+        .await
+        .expect("run bootroot-remote");
+
+    assert!(
+        !output.status.success(),
+        "HTTPS bootstrap should fail with wrong CA"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The exact error text depends on the TLS stack; check that bootstrap
+    // fails on the login request (which is the first network call).
+    assert!(
+        stderr.contains("TLS")
+            || stderr.contains("certificate")
+            || stderr.contains("login failed")
+            || stderr.contains("request failed"),
+        "error should indicate connection/TLS failure: {stderr}"
     );
 }
 

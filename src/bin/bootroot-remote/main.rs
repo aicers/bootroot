@@ -188,6 +188,7 @@ struct ResolvedBootstrapArgs {
     profile_cert_path: Option<PathBuf>,
     profile_key_path: Option<PathBuf>,
     ca_bundle_path: PathBuf,
+    ca_bundle_pem: Option<String>,
     post_renew_command: Option<String>,
     post_renew_arg: Vec<String>,
     post_renew_timeout_secs: Option<u64>,
@@ -275,8 +276,18 @@ async fn run(args: Args, lang: Locale) -> Result<i32> {
     }
 }
 
+/// Lowest `schema_version` that this binary understands.
+const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
 /// Highest `schema_version` that this binary understands.
-const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 2;
+
+/// Minimal header used for the first stage of artifact parsing so that
+/// `schema_version` can be validated before attempting full deserialization.
+#[derive(serde::Deserialize)]
+struct ArtifactHeader {
+    schema_version: u32,
+}
 
 /// Bootstrap artifact JSON schema (subset relevant to bootroot-remote).
 #[derive(serde::Deserialize)]
@@ -308,6 +319,8 @@ struct BootstrapArtifact {
     profile_key_path: Option<String>,
     #[serde(default)]
     ca_bundle_path: Option<String>,
+    #[serde(default)]
+    ca_bundle_pem: Option<String>,
     #[serde(default)]
     post_renew_hooks: Vec<ArtifactHookEntry>,
     #[serde(default)]
@@ -346,16 +359,29 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         let contents = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read artifact file: {}", path.display()))?;
-        let parsed: BootstrapArtifact = serde_json::from_str(&contents)
+
+        // Stage 1: extract only schema_version so we can reject unsupported
+        // versions before full deserialization (a future schema may remove or
+        // rename fields, causing a confusing serde error).
+        let header: ArtifactHeader = serde_json::from_str(&contents)
             .with_context(|| format!("Failed to parse artifact file: {}", path.display()))?;
-        if parsed.schema_version > MAX_SUPPORTED_SCHEMA_VERSION {
+        if header.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
+            || header.schema_version > MAX_SUPPORTED_SCHEMA_VERSION
+        {
             anyhow::bail!(
-                "Artifact schema_version {} is not supported (max supported: {}). \
+                "Artifact schema_version {} is not supported \
+                 (supported range: {}..={}). \
                  Upgrade bootroot-remote to a newer version.",
-                parsed.schema_version,
+                header.schema_version,
+                MIN_SUPPORTED_SCHEMA_VERSION,
                 MAX_SUPPORTED_SCHEMA_VERSION,
             );
         }
+
+        // Stage 2: deserialize the full artifact now that the version is known
+        // to be supported.
+        let parsed: BootstrapArtifact = serde_json::from_str(&contents)
+            .with_context(|| format!("Failed to parse artifact file: {}", path.display()))?;
         Some(parsed)
     } else {
         None
@@ -436,6 +462,8 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         .and_then(|a| a.profile_key_path.as_ref().map(PathBuf::from))
         .or(args.profile_key_path);
 
+    let ca_bundle_pem = artifact.as_ref().and_then(|a| a.ca_bundle_pem.clone());
+
     let wrap_token = artifact.as_ref().and_then(|a| a.wrap_token.clone());
     let wrap_expires_at = artifact.as_ref().and_then(|a| a.wrap_expires_at.clone());
 
@@ -483,6 +511,7 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         profile_cert_path,
         profile_key_path,
         ca_bundle_path,
+        ca_bundle_pem,
         post_renew_command,
         post_renew_arg,
         post_renew_timeout_secs,
@@ -726,22 +755,10 @@ mod tests {
         assert_eq!(resolved.post_renew_on_failure, None);
     }
 
-    #[tokio::test]
-    async fn resolve_bootstrap_args_rejects_unsupported_schema_version() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let artifact_json = serde_json::json!({
-            "schema_version": 99,
-            "openbao_url": "https://ob:8200",
-            "kv_mount": "kv",
-            "service_name": "svc",
-            "role_id_path": "/r",
-            "secret_id_path": "/s",
-            "eab_file_path": "/e",
-            "agent_config_path": "/a",
-        });
-        let artifact_path = write_artifact_file(dir.path(), &artifact_json.to_string());
-
-        let args = BootstrapArgs {
+    /// Returns `BootstrapArgs` pointing at the given artifact file with all
+    /// other fields set to defaults.
+    fn default_bootstrap_args(artifact_path: PathBuf) -> BootstrapArgs {
+        BootstrapArgs {
             artifact: Some(artifact_path),
             openbao_url: None,
             kv_mount: "secret".to_string(),
@@ -764,19 +781,69 @@ mod tests {
             post_renew_timeout_secs: None,
             post_renew_on_failure: None,
             output: OutputFormat::Text,
-        };
+        }
+    }
+
+    /// Asserts that `resolve_bootstrap_args` rejects the given artifact JSON
+    /// with the schema-version error message containing the given version.
+    async fn assert_rejects_schema_version(artifact_json: &serde_json::Value, version: u32) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact_path = write_artifact_file(dir.path(), &artifact_json.to_string());
+        let args = default_bootstrap_args(artifact_path);
 
         let err = resolve_bootstrap_args(args)
             .await
             .expect_err("should reject unsupported schema");
         let msg = err.to_string();
-        assert!(
-            msg.contains("schema_version 99 is not supported"),
-            "unexpected error: {msg}"
-        );
+        let expected = format!("schema_version {version} is not supported");
+        assert!(msg.contains(&expected), "unexpected error: {msg}");
         assert!(
             msg.contains("Upgrade bootroot-remote"),
             "should suggest upgrade: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_bootstrap_args_rejects_future_schema_version() {
+        // Artifact with a future schema version whose shape matches today's
+        // struct — ensures the header-stage check fires before full parse.
+        let artifact_json = serde_json::json!({
+            "schema_version": 99,
+            "openbao_url": "https://ob:8200",
+            "kv_mount": "kv",
+            "service_name": "svc",
+            "role_id_path": "/r",
+            "secret_id_path": "/s",
+            "eab_file_path": "/e",
+            "agent_config_path": "/a",
+        });
+        assert_rejects_schema_version(&artifact_json, 99).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_bootstrap_args_rejects_schema_version_zero() {
+        let artifact_json = serde_json::json!({
+            "schema_version": 0,
+            "openbao_url": "https://ob:8200",
+            "kv_mount": "kv",
+            "service_name": "svc",
+            "role_id_path": "/r",
+            "secret_id_path": "/s",
+            "eab_file_path": "/e",
+            "agent_config_path": "/a",
+        });
+        assert_rejects_schema_version(&artifact_json, 0).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_bootstrap_args_rejects_future_schema_with_unknown_fields() {
+        // A future v3 artifact that has completely different fields.  Without
+        // two-stage parsing, serde would fail with a confusing missing-field
+        // error instead of the explicit version rejection.
+        let artifact_json = serde_json::json!({
+            "schema_version": 3,
+            "completely_new_field": true,
+        });
+        assert_rejects_schema_version(&artifact_json, 3).await;
     }
 }

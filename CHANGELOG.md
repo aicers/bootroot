@@ -6,6 +6,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Security
+
+- Bumped `rustls-webpki` from 0.103.10 to 0.103.12 to address
+  RUSTSEC-2026-0098 and RUSTSEC-2026-0099 (incorrect name-constraint
+  validation for URI and wildcard names).
+
 ### Removed
 
 - Removed `--secret-id-num-uses` from `bootroot service add` and from
@@ -37,10 +43,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   obtain `secret_id` before login. Unwrap failures are classified as
   expired (with recovery instructions) or already-unwrapped (flagged as
   a potential security incident).
-- Added `schema_version` field (`u32`, starting at `1`) to the
+- Added `schema_version` field (`u32`, currently `2`) to the
   `RemoteBootstrapArtifact` JSON written by
   `bootroot service add --delivery-mode remote-bootstrap`. Downstream
   parsers should check this field before accessing artifact fields.
+- Added `ca_bundle_pem` field to `RemoteBootstrapArtifact`, embedding
+  the control-plane CA PEM inline. During `bootroot-remote bootstrap`,
+  the PEM is written to `ca_bundle_path` before any OpenBao call and
+  used as the TLS trust anchor for HTTPS `openbao_url` endpoints.
+- Added `OpenBaoClient::with_pem_trust` constructor that anchors TLS
+  verification to an in-memory CA bundle with optional SHA-256 pinning,
+  integrating the same `PinnedCertVerifier` path used by
+  `build_http_client`. `tls::build_http_client_from_pem` now accepts
+  an optional `pins` parameter. `OpenBaoClient::with_client` remains
+  as an escape hatch for callers needing full `reqwest::Client` control.
 - Added remote-bootstrap operator guide (`docs/en/remote-bootstrap.md`,
   `docs/ko/remote-bootstrap.md`) covering transport options (SSH,
   Ansible, cloud-init, systemd-credentials), `secret_id` hygiene,

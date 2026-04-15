@@ -159,6 +159,27 @@ async fn write_service_kv_secrets(
     Ok(())
 }
 
+pub(super) async fn read_ca_bundle_pem(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    messages: &Messages,
+) -> Result<String> {
+    let trust = client
+        .read_kv(kv_mount, PATH_CA_TRUST)
+        .await
+        .with_context(|| {
+            format!(
+                "{} ({PATH_CA_TRUST})",
+                messages.error_openbao_kv_read_failed()
+            )
+        })?;
+    read_required_string(
+        &trust,
+        SERVICE_CA_BUNDLE_PEM_KEY,
+        &format!("OpenBao CA trust data missing key: {SERVICE_CA_BUNDLE_PEM_KEY}"),
+    )
+}
+
 pub(super) async fn read_ca_trust_material(
     client: &OpenBaoClient,
     kv_mount: &str,

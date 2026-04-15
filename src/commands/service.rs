@@ -301,6 +301,7 @@ async fn run_service_add_apply(
                 resolved,
                 &secret_id_path,
                 artifact_wrap_info.as_ref(),
+                &service_sync_material.ca_bundle_pem,
                 messages,
             )
             .await?,
@@ -437,16 +438,16 @@ async fn run_service_add_remote_idempotent(
     messages: &Messages,
 ) -> Result<()> {
     let secrets_dir = state.secrets_dir();
+    let mut client = OpenBaoClient::new(&state.openbao_url)
+        .with_context(|| messages.error_openbao_client_create_failed())?;
+    let auth = resolved
+        .runtime_auth
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("OpenBao auth is required"))?;
+    crate::commands::openbao_auth::authenticate_openbao_client(&mut client, auth, messages).await?;
+    let ca_bundle_pem = secrets::read_ca_bundle_pem(&client, &state.kv_mount, messages).await?;
     let wrap_ttl = resolve::effective_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref());
     let artifact_wrap_info = if let Some(ttl) = wrap_ttl {
-        let mut client = OpenBaoClient::new(&state.openbao_url)
-            .with_context(|| messages.error_openbao_client_create_failed())?;
-        let auth = resolved
-            .runtime_auth
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenBao auth is required"))?;
-        crate::commands::openbao_auth::authenticate_openbao_client(&mut client, auth, messages)
-            .await?;
         let secret_id_options = build_secret_id_options(resolved);
         let wrap_info = client
             .create_secret_id_wrap_only(&entry.approle.role_name, &secret_id_options, ttl)
@@ -463,6 +464,7 @@ async fn run_service_add_remote_idempotent(
         secrets_dir,
         entry,
         artifact_wrap_info.as_ref(),
+        &ca_bundle_pem,
         messages,
     )
     .await?;

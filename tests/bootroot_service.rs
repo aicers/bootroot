@@ -734,7 +734,7 @@ async fn test_app_add_remote_bootstrap_no_wrap_handoff_includes_secret_id() {
 }
 
 fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
-    assert_eq!(bootstrap["schema_version"], 1);
+    assert_eq!(bootstrap["schema_version"], 2);
     assert_eq!(bootstrap["service_name"], "edge-proxy");
     assert_eq!(bootstrap["kv_mount"], "secret");
     assert!(bootstrap["role_id_path"].is_string());
@@ -742,6 +742,7 @@ fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
     assert!(bootstrap["eab_file_path"].is_string());
     assert!(bootstrap["agent_config_path"].is_string());
     assert!(bootstrap["ca_bundle_path"].is_string());
+    assert!(bootstrap["ca_bundle_pem"].is_string());
     assert!(bootstrap["openbao_agent_config_path"].is_string());
     assert!(bootstrap["openbao_agent_template_path"].is_string());
     assert!(bootstrap["openbao_agent_token_path"].is_string());
