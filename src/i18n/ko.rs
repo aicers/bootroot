@@ -386,4 +386,5 @@ pub(super) static STRINGS: Strings = Strings {
     policy_label_disabled: "비활성화",
     policy_label_default_wrap_ttl: "{value} (기본값)",
     service_update_no_changes: "변경된 필드가 없습니다.",
+    rotate_sidecar_skip_remote: "- {service_name}: 원격 사이드카 건너뜀; OpenBao Agent가 {interval} 이내에 KV 폴링을 통해 새 HMAC를 가져옵니다",
 };

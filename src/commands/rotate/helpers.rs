@@ -240,6 +240,13 @@ pub(super) async fn restart_service_sidecar_agents(
     let mut agent_config_paths = std::collections::BTreeSet::new();
     for entry in ctx.state.services.values() {
         if !matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
+            println!(
+                "{}",
+                messages.rotate_sidecar_skip_remote(
+                    &entry.service_name,
+                    bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
+                )
+            );
             continue;
         }
         let container = openbao_agent_container_name(&entry.service_name);
@@ -254,6 +261,7 @@ pub(super) async fn restart_service_sidecar_agents(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::Path;
     use std::time::Duration;
 
@@ -261,6 +269,7 @@ mod tests {
 
     use super::super::test_support::test_messages;
     use super::*;
+    use crate::state::{DeployType, ServiceRoleEntry, StateFile};
 
     #[test]
     fn openbao_agent_container_name_uses_prefix() {
@@ -348,5 +357,83 @@ mod tests {
         .await
         .expect_err("should timeout when content never matches");
         assert!(err.to_string().contains("Timed out"));
+    }
+
+    fn make_service_entry(name: &str, delivery_mode: DeliveryMode) -> ServiceEntry {
+        ServiceEntry {
+            service_name: name.to_string(),
+            deploy_type: DeployType::Docker,
+            delivery_mode,
+            hostname: "h".to_string(),
+            domain: "d.com".to_string(),
+            agent_config_path: PathBuf::from("agent.hcl"),
+            cert_path: PathBuf::from("cert.pem"),
+            key_path: PathBuf::from("key.pem"),
+            instance_id: None,
+            container_name: None,
+            notes: None,
+            post_renew_hooks: vec![],
+            approle: ServiceRoleEntry {
+                role_name: "r".to_string(),
+                role_id: "id".to_string(),
+                secret_id_path: PathBuf::from("s"),
+                policy_name: "p".to_string(),
+                secret_id_ttl: None,
+                secret_id_wrap_ttl: None,
+            },
+        }
+    }
+
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn restart_service_sidecar_agents_skips_remote() {
+        use super::super::test_support::{
+            ScopedEnvVar, env_lock, path_with_prepend, write_fake_docker_script,
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).expect("create bin dir");
+        let docker_path = bin_dir.join("docker");
+        write_fake_docker_script(&docker_path);
+
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(super::super::test_support::TEST_DOCKER_ARGS_ENV, &args_log);
+
+        let mut services = BTreeMap::new();
+        services.insert(
+            "remote-svc".to_string(),
+            make_service_entry("remote-svc", DeliveryMode::RemoteBootstrap),
+        );
+
+        let ctx = super::super::RotateContext {
+            openbao_url: String::new(),
+            kv_mount: String::new(),
+            compose_file: PathBuf::new(),
+            state: StateFile {
+                openbao_url: String::new(),
+                kv_mount: String::new(),
+                secrets_dir: None,
+                policies: BTreeMap::new(),
+                approles: BTreeMap::new(),
+                services,
+            },
+            paths: super::super::StatePaths::new(dir.path().to_path_buf()),
+            state_dir: dir.path().to_path_buf(),
+        };
+
+        let messages = test_messages();
+        restart_service_sidecar_agents(&ctx, "new-hmac", &messages)
+            .await
+            .expect("should succeed without docker restart");
+
+        assert!(
+            !args_log.exists(),
+            "docker should not have been invoked for a remote service"
+        );
     }
 }

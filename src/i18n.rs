@@ -421,6 +421,7 @@ pub(crate) struct Strings {
     pub(crate) policy_label_disabled: &'static str,
     pub(crate) policy_label_default_wrap_ttl: &'static str,
     pub(crate) service_update_no_changes: &'static str,
+    pub(crate) rotate_sidecar_skip_remote: &'static str,
 }
 
 pub(crate) struct Messages {
