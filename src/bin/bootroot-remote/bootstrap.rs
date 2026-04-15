@@ -10,6 +10,42 @@ use super::validation::{
 };
 use super::{Locale, ResolvedBootstrapArgs, localized};
 
+/// Creates an [`OpenBaoClient`] for the given URL, anchoring TLS to the
+/// artifact-embedded CA bundle when the URL uses HTTPS.
+fn build_openbao_client(
+    openbao_url: &str,
+    ca_bundle_pem: Option<&str>,
+    lang: Locale,
+) -> Result<OpenBaoClient> {
+    if openbao_url.starts_with("https://") {
+        let pem = ca_bundle_pem.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                localized(
+                    lang,
+                    "HTTPS openbao_url requires ca_bundle_pem in the bootstrap artifact",
+                    "HTTPS openbao_url은 부트스트랩 아티팩트에 ca_bundle_pem이 필요합니다",
+                )
+            )
+        })?;
+        OpenBaoClient::with_pem_trust(openbao_url, pem, &[]).with_context(|| {
+            localized(
+                lang,
+                "Failed to build TLS client from artifact CA bundle",
+                "아티팩트 CA 번들로 TLS 클라이언트를 생성하지 못했습니다",
+            )
+        })
+    } else {
+        OpenBaoClient::new(openbao_url).with_context(|| {
+            localized(
+                lang,
+                "Failed to create OpenBao client",
+                "OpenBao 클라이언트를 생성하지 못했습니다",
+            )
+        })
+    }
+}
+
 /// Errors specific to wrap-token unwrapping.
 #[derive(Debug)]
 enum UnwrapError {
@@ -33,6 +69,27 @@ const OPENBAO_API_ERROR_PREFIX: &str = "OpenBao API error";
 pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> Result<i32> {
     validate_bootstrap_args(&args, lang)?;
 
+    // Write the artifact-embedded CA bundle to disk before any OpenBao
+    // call so that downstream consumers find the file even if bootstrap
+    // fails midway.
+    if let Some(pem) = &args.ca_bundle_pem {
+        write_secret_file(&args.ca_bundle_path, pem)
+            .await
+            .with_context(|| {
+                localized(
+                    lang,
+                    &format!(
+                        "Failed to write CA bundle to {}",
+                        args.ca_bundle_path.display()
+                    ),
+                    &format!(
+                        "CA 번들을 {}에 기록하지 못했습니다",
+                        args.ca_bundle_path.display()
+                    ),
+                )
+            })?;
+    }
+
     // When a wrap_token is present in the artifact, unwrap it to obtain
     // the secret_id and write it to the expected file path before login.
     if let Some(wrap_token) = &args.wrap_token {
@@ -42,6 +99,7 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
             args.wrap_expires_at.as_deref(),
             &args.secret_id_path,
             &args.service_name,
+            args.ca_bundle_pem.as_deref(),
             lang,
         )
         .await
@@ -82,13 +140,7 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
             )
         })?;
 
-    let mut client = OpenBaoClient::new(&args.openbao_url).with_context(|| {
-        localized(
-            lang,
-            "Failed to create OpenBao client",
-            "OpenBao 클라이언트를 생성하지 못했습니다",
-        )
-    })?;
+    let mut client = build_openbao_client(&args.openbao_url, args.ca_bundle_pem.as_deref(), lang)?;
     let token = client
         .login_approle(&role_id, &current_secret_id)
         .await
@@ -164,15 +216,10 @@ async fn unwrap_and_write_secret_id(
     wrap_expires_at: Option<&str>,
     secret_id_path: &std::path::Path,
     service_name: &str,
+    ca_bundle_pem: Option<&str>,
     lang: Locale,
 ) -> Result<()> {
-    let client = OpenBaoClient::new(openbao_url).with_context(|| {
-        localized(
-            lang,
-            "Failed to create OpenBao client for unwrap",
-            "언래핑을 위한 OpenBao 클라이언트를 생성하지 못했습니다",
-        )
-    })?;
+    let client = build_openbao_client(openbao_url, ca_bundle_pem, lang)?;
     match client.unwrap_secret_id(wrap_token).await {
         Ok(secret_id) => {
             write_secret_file(secret_id_path, &secret_id)
@@ -421,6 +468,7 @@ mod tests {
             profile_cert_path: None,
             profile_key_path: None,
             ca_bundle_path: PathBuf::new(),
+            ca_bundle_pem: None,
             post_renew_command: None,
             post_renew_arg: Vec::new(),
             post_renew_timeout_secs: None,

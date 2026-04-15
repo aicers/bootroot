@@ -41,6 +41,7 @@ struct RemoteBootstrapArtifact {
     eab_file_path: String,
     agent_config_path: String,
     ca_bundle_path: String,
+    ca_bundle_pem: String,
     openbao_agent_config_path: String,
     openbao_agent_template_path: String,
     openbao_agent_token_path: String,
@@ -105,6 +106,7 @@ fn build_artifact(
     instance_id: Option<&str>,
     post_renew_hooks: &[PostRenewHookEntry],
     wrap_info: Option<&ArtifactWrapInfo>,
+    ca_bundle_pem: &str,
 ) -> RemoteBootstrapArtifact {
     let secret_id_parent = secret_id_path.parent().unwrap_or(Path::new("."));
     let role_id_path = secret_id_parent.join(SERVICE_ROLE_ID_FILENAME);
@@ -117,7 +119,7 @@ fn build_artifact(
         remote_openbao_agent_paths(secret_id_path, service_name);
 
     RemoteBootstrapArtifact {
-        schema_version: 1,
+        schema_version: 2,
         openbao_url: openbao_url.to_string(),
         kv_mount: kv_mount.to_string(),
         service_name: service_name.to_string(),
@@ -126,6 +128,7 @@ fn build_artifact(
         eab_file_path: eab_path.display().to_string(),
         agent_config_path: agent_config_path.display().to_string(),
         ca_bundle_path: ca_bundle_path.display().to_string(),
+        ca_bundle_pem: ca_bundle_pem.to_string(),
         openbao_agent_config_path: openbao_agent_config_path.display().to_string(),
         openbao_agent_template_path: openbao_agent_template_path.display().to_string(),
         openbao_agent_token_path: openbao_agent_token_path.display().to_string(),
@@ -149,6 +152,7 @@ pub(super) async fn write_remote_bootstrap_artifact(
     resolved: &ResolvedServiceAdd,
     secret_id_path: &Path,
     wrap_info: Option<&ArtifactWrapInfo>,
+    ca_bundle_pem: &str,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
     let artifact = build_artifact(
@@ -164,6 +168,7 @@ pub(super) async fn write_remote_bootstrap_artifact(
         resolved.instance_id.as_deref(),
         &resolved.post_renew_hooks,
         wrap_info,
+        ca_bundle_pem,
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &resolved.service_name, &artifact, messages)
         .await
@@ -174,6 +179,7 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
     secrets_dir: &Path,
     entry: &ServiceEntry,
     wrap_info: Option<&ArtifactWrapInfo>,
+    ca_bundle_pem: &str,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
     let artifact = build_artifact(
@@ -189,6 +195,7 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
         entry.instance_id.as_deref(),
         &entry.post_renew_hooks,
         wrap_info,
+        ca_bundle_pem,
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &entry.service_name, &artifact, messages)
         .await
@@ -308,6 +315,8 @@ mod tests {
 
     use super::build_artifact;
 
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n";
+
     #[test]
     fn build_artifact_typical_case() {
         let artifact = build_artifact(
@@ -323,9 +332,10 @@ mod tests {
             Some("instance-42"),
             &[],
             None,
+            TEST_CA_PEM,
         );
 
-        assert_eq!(artifact.schema_version, 1);
+        assert_eq!(artifact.schema_version, 2);
         assert_eq!(artifact.openbao_url, "https://openbao.example.com:8200");
         assert_eq!(artifact.kv_mount, "secret");
         assert_eq!(artifact.service_name, "my-service");
@@ -377,6 +387,7 @@ mod tests {
             None,
             &[],
             None,
+            TEST_CA_PEM,
         );
 
         assert_eq!(artifact.profile_instance_id, "");
@@ -397,6 +408,7 @@ mod tests {
             None,
             &[],
             None,
+            TEST_CA_PEM,
         );
         let b = build_artifact(
             "https://ob",
@@ -411,6 +423,7 @@ mod tests {
             None,
             &[],
             None,
+            TEST_CA_PEM,
         );
 
         assert_ne!(a.role_id_path, b.role_id_path);
@@ -433,6 +446,7 @@ mod tests {
             None,
             &[],
             None,
+            TEST_CA_PEM,
         );
 
         // Path::new("secret_id").parent() returns Some(""), not None
@@ -455,6 +469,7 @@ mod tests {
             None,
             &[],
             None,
+            TEST_CA_PEM,
         );
 
         // Path::new("cert.pem").parent() returns Some(""), not None
@@ -484,6 +499,7 @@ mod tests {
             None,
             &hooks,
             None,
+            TEST_CA_PEM,
         );
 
         assert_eq!(artifact.post_renew_hooks.len(), 1);
@@ -514,6 +530,7 @@ mod tests {
             None,
             &hooks,
             None,
+            TEST_CA_PEM,
         );
         let cmd = super::render_remote_run_command_legacy(&artifact);
 
@@ -562,6 +579,7 @@ mod tests {
             None,
             &hooks,
             None,
+            TEST_CA_PEM,
         );
         let cmd = super::render_remote_run_command_legacy(&artifact);
 
@@ -590,6 +608,7 @@ mod tests {
             None,
             &[],
             None,
+            TEST_CA_PEM,
         );
         let cmd = super::render_remote_run_command_legacy(&artifact);
 
@@ -614,6 +633,7 @@ mod tests {
             Some(""),
             &[],
             None,
+            TEST_CA_PEM,
         );
         let with_none = build_artifact(
             "https://ob",
@@ -628,6 +648,7 @@ mod tests {
             None,
             &[],
             None,
+            TEST_CA_PEM,
         );
 
         assert_eq!(
@@ -670,6 +691,7 @@ mod tests {
             None,
             &[],
             Some(&wrap),
+            TEST_CA_PEM,
         );
 
         assert_eq!(artifact.wrap_token.as_deref(), Some("hvs.wrap-token-123"));
@@ -698,6 +720,7 @@ mod tests {
             None,
             &[],
             Some(&wrap),
+            TEST_CA_PEM,
         );
         let cmd = super::render_remote_run_command(&artifact);
 
@@ -726,6 +749,7 @@ mod tests {
             None,
             &[],
             None,
+            TEST_CA_PEM,
         );
         let cmd = super::render_remote_run_command(&artifact);
 

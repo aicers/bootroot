@@ -75,17 +75,54 @@ pub fn build_http_client(trust: &TrustSettings, insecure_mode: bool) -> Result<C
         .context("Failed to build trusted HTTP client")
 }
 
+/// Builds a [`reqwest::Client`] whose trust root is the given PEM-encoded
+/// CA bundle (in-memory, no file I/O), with optional SHA-256 certificate
+/// pinning.
+///
+/// This is the entry point for RN-side TLS bootstrap: the PEM content
+/// travels inside the bootstrap artifact and is used to verify the
+/// control-plane TLS certificate without relying on the system trust
+/// store.
+///
+/// When `pins` is non-empty the client enforces SHA-256 certificate
+/// pinning via the same [`PinnedCertVerifier`] path used by
+/// [`build_http_client`].
+///
+/// # Errors
+///
+/// Returns an error if the PEM content cannot be parsed or if the HTTP
+/// client fails to build.
+pub fn build_http_client_from_pem(pem_content: &str, pins: &[String]) -> Result<Client> {
+    install_crypto_provider();
+    let root_store = parse_pem_to_root_store(pem_content.as_bytes())?;
+    let pin_set: HashSet<String> = pins.iter().map(|p| p.to_ascii_lowercase()).collect();
+    let config = if pin_set.is_empty() {
+        ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    } else {
+        let verifier = WebPkiServerVerifier::builder(Arc::new(root_store.clone()))
+            .build()
+            .context("Failed to build TLS verifier")?;
+        let pinned = Arc::new(PinnedCertVerifier::new(verifier, pin_set));
+        let mut cfg = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        cfg.dangerous().set_certificate_verifier(pinned);
+        cfg
+    };
+    Client::builder()
+        .use_preconfigured_tls(config)
+        .build()
+        .context("Failed to build HTTP client from PEM bundle")
+}
+
 fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn load_ca_bundle(
-    path: &std::path::Path,
-    pins: &[String],
-) -> Result<(rustls::RootCertStore, HashSet<String>)> {
-    let contents = std::fs::read(path)
-        .with_context(|| format!("Failed to read CA bundle at {}", path.display()))?;
-    let mut remaining = contents.as_slice();
+fn parse_pem_to_root_store(pem_bytes: &[u8]) -> Result<rustls::RootCertStore> {
+    let mut remaining = pem_bytes;
     let mut certs = Vec::new();
     while !remaining.is_empty() {
         if remaining.iter().all(u8::is_ascii_whitespace) {
@@ -107,6 +144,16 @@ fn load_ca_bundle(
             .add(CertificateDer::from(cert))
             .context("Failed to add CA certificate")?;
     }
+    Ok(root_store)
+}
+
+fn load_ca_bundle(
+    path: &std::path::Path,
+    pins: &[String],
+) -> Result<(rustls::RootCertStore, HashSet<String>)> {
+    let contents = std::fs::read(path)
+        .with_context(|| format!("Failed to read CA bundle at {}", path.display()))?;
+    let root_store = parse_pem_to_root_store(&contents)?;
     let pins = pins
         .iter()
         .map(|value| value.to_ascii_lowercase())
@@ -463,5 +510,75 @@ mod tests {
         }
         let cert = params.self_signed(&key).expect("self-signed cert");
         CertificateDer::from(cert.der().to_vec())
+    }
+
+    fn generate_ca_pem() -> String {
+        use rcgen::CertificateParams;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Test CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).expect("self-signed cert");
+        cert.pem()
+    }
+
+    #[test]
+    fn parse_pem_to_root_store_accepts_valid_pem() {
+        let pem = generate_ca_pem();
+        let store = parse_pem_to_root_store(pem.as_bytes()).expect("valid PEM");
+        assert!(!store.is_empty());
+    }
+
+    #[test]
+    fn parse_pem_to_root_store_rejects_empty_input() {
+        let err = parse_pem_to_root_store(b"").expect_err("empty input");
+        assert!(
+            err.to_string().contains("no certificates"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_pem_to_root_store_rejects_non_pem_content() {
+        let err = parse_pem_to_root_store(b"not a PEM").expect_err("non-PEM");
+        assert!(
+            err.to_string().contains("Failed to parse"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_pem_to_root_store_skips_whitespace_only_trailing() {
+        let mut pem = generate_ca_pem();
+        pem.push_str("   \n  \n");
+        let store = parse_pem_to_root_store(pem.as_bytes()).expect("trailing whitespace");
+        assert!(!store.is_empty());
+    }
+
+    #[test]
+    fn build_http_client_from_pem_succeeds_with_valid_pem() {
+        let pem = generate_ca_pem();
+        let client = build_http_client_from_pem(&pem, &[]);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn build_http_client_from_pem_fails_with_empty_pem() {
+        let err = build_http_client_from_pem("", &[]).expect_err("empty PEM");
+        assert!(
+            err.to_string().contains("no certificates"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_http_client_from_pem_with_pins_succeeds() {
+        let pem = generate_ca_pem();
+        let pin = "aa".repeat(32);
+        let client = build_http_client_from_pem(&pem, &[pin]);
+        assert!(client.is_ok());
     }
 }

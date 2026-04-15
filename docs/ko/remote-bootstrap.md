@@ -109,7 +109,7 @@ scp -p \
   "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
 
 # 3. 부트스트랩 전 schema_version 검증
-if ! jq -e '.schema_version == 1' "$ARTIFACT" > /dev/null; then
+if ! jq -e '.schema_version == 2' "$ARTIFACT" > /dev/null; then
   echo "ERROR: $ARTIFACT 의 schema_version이 지원되지 않습니다" >&2
   exit 1
 fi
@@ -205,10 +205,10 @@ ExecStart=/usr/local/bin/bootroot-remote bootstrap \
     - name: schema_version 검증
       ansible.builtin.assert:
         that:
-          - artifact.schema_version == 1
+          - artifact.schema_version == 2
         fail_msg: >-
           지원되지 않는 schema_version {{ artifact.schema_version }};
-          이 플레이북은 버전 1만 지원합니다.
+          이 플레이북은 버전 2만 지원합니다.
 
     - name: 시크릿 디렉터리 생성
       ansible.builtin.file:
@@ -396,7 +396,7 @@ runcmd:
 아티팩트는 버전이 지정된 스키마를 따릅니다. 자동화에서는 파싱 전에
 `schema_version`을 확인해야 합니다.
 
-현재 버전: **1**
+현재 버전: **2**
 
 | 필드 | 타입 | 설명 | 사용처 |
 | --- | --- | --- | --- |
@@ -408,7 +408,8 @@ runcmd:
 | `secret_id_path` | `string` | 원격 호스트의 AppRole `secret_id` 파일 경로 | `--secret-id-path` |
 | `eab_file_path` | `string` | EAB 자격증명 JSON 파일 경로 | `--eab-file-path` |
 | `agent_config_path` | `string` | 원격 호스트의 `agent.toml` 경로 | `--agent-config-path` |
-| `ca_bundle_path` | `string` | CA trust bundle PEM 파일 경로 | `--ca-bundle-path` |
+| `ca_bundle_path` | `string` | 원격 호스트의 CA trust bundle PEM 파일 경로 | `--ca-bundle-path` |
+| `ca_bundle_pem` | `string` | 제어 노드 CA trust 앵커의 인라인 PEM 콘텐츠. 부트스트랩 시 `ca_bundle_path`에 기록됨. `openbao_url`이 HTTPS인 경우 시스템 trust store 대신 이 CA를 TLS trust 앵커로 사용. 공유 프리미티브 — http01 admin 클라이언트(#514)에서도 사용. | 내부 사용 (TLS trust) |
 | `openbao_agent_config_path` | `string` | OpenBao Agent 설정(HCL) 경로 | 내부 사용 |
 | `openbao_agent_template_path` | `string` | OpenBao Agent 템플릿 경로 | 내부 사용 |
 | `openbao_agent_token_path` | `string` | OpenBao Agent 토큰 파일 경로 | 내부 사용 |
@@ -424,6 +425,13 @@ runcmd:
 | `wrap_token` | `string?` | 응답 래핑된 `secret_id` 토큰 (`--no-wrap` 사용 시 생략). 민감 정보 — 자격 증명으로 취급하세요. | `bootroot-remote` 언래핑 경로 |
 | `wrap_expires_at` | `string?` | `wrap_token` 만료 시각 (RFC 3339 형식, 래핑 비활성화 시 생략). | `bootroot-remote` 언래핑 오류 분류 |
 
+### 버전 이력
+
+| 버전 | 변경사항 |
+| --- | --- |
+| 2 | 필수 필드 `ca_bundle_pem` 추가 (제어 노드 CA 앵커의 인라인 PEM). |
+| 1 | 초기 스키마. |
+
 ### 버전 관리 규칙
 
 - **호환성을 깨는 변경** (필드 삭제, 이름 변경, 타입 변경):
@@ -432,4 +440,5 @@ runcmd:
     증가 불필요. 기존 파서는 알 수 없는 키를 무시합니다.
 - **소비자 계약**: 필드에 접근하기 전에 `schema_version >= 1` 및
     `schema_version <= <지원 최대값>`을 확인하세요. 지원되지 않는 버전에서는
-    명시적으로 실패해야 합니다.
+    명시적으로 실패해야 합니다. `bootroot-remote`는 `--artifact` 사용 시
+    이 검사를 자동으로 수행합니다.
