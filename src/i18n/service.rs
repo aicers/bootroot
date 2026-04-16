@@ -832,6 +832,13 @@ impl Messages {
         )
     }
 
+    pub(crate) fn service_info_token_bound_cidrs(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_info_token_bound_cidrs,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn policy_label_inherit(&self) -> &'static str {
         self.strings().policy_label_inherit
     }

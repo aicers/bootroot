@@ -367,6 +367,7 @@ fn build_service_entry(
             policy_name: approle.policy_name,
             secret_id_ttl: resolved.secret_id_ttl.clone(),
             secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
+            token_bound_cidrs: resolved.token_bound_cidrs.clone(),
         },
     )
 }
@@ -398,6 +399,7 @@ fn build_secret_id_options(resolved: &ResolvedServiceAdd) -> SecretIdOptions {
         ttl: resolved.secret_id_ttl.clone(),
         num_uses: Some(0),
         metadata: None,
+        token_bound_cidrs: resolved.token_bound_cidrs.clone(),
     }
 }
 
@@ -508,8 +510,13 @@ pub(crate) fn run_service_info(args: &ServiceInfoArgs, messages: &Messages) -> R
 
 const INHERIT_SENTINEL: &str = "inherit";
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) -> Result<()> {
-    if args.secret_id_ttl.is_none() && args.secret_id_wrap_ttl.is_none() && !args.no_wrap {
+    if args.secret_id_ttl.is_none()
+        && args.secret_id_wrap_ttl.is_none()
+        && !args.no_wrap
+        && args.rn_cidrs.is_empty()
+    {
         anyhow::bail!(messages.error_service_update_no_flags());
     }
 
@@ -574,6 +581,31 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         }
     }
 
+    if !args.rn_cidrs.is_empty() {
+        resolve::validate_rn_cidrs(&args.rn_cidrs, messages)?;
+        let old_value = entry.approle.token_bound_cidrs.clone();
+        if args.rn_cidrs.len() == 1 && args.rn_cidrs.first().map(String::as_str) == Some("clear") {
+            entry.approle.token_bound_cidrs = None;
+        } else {
+            entry.approle.token_bound_cidrs = Some(args.rn_cidrs.clone());
+        }
+        if old_value != entry.approle.token_bound_cidrs {
+            let old_display = old_value.as_deref().map_or_else(
+                || messages.policy_label_inherit().to_string(),
+                |v| v.join(", "),
+            );
+            let new_display = entry.approle.token_bound_cidrs.as_deref().map_or_else(
+                || messages.policy_label_inherit().to_string(),
+                |v| v.join(", "),
+            );
+            changes.push(messages.service_update_field_changed(
+                "token_bound_cidrs",
+                &old_display,
+                &new_display,
+            ));
+        }
+    }
+
     if explicit_ttl_set {
         eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
     }
@@ -627,6 +659,7 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
             policy_name: approle::service_policy_name(&resolved.service_name),
             secret_id_ttl: resolved.secret_id_ttl.clone(),
             secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
+            token_bound_cidrs: resolved.token_bound_cidrs.clone(),
         },
     )
 }
@@ -649,6 +682,7 @@ fn non_policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) 
 fn policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
     entry.approle.secret_id_ttl == resolved.secret_id_ttl
         && entry.approle.secret_id_wrap_ttl == resolved.secret_id_wrap_ttl
+        && entry.approle.token_bound_cidrs == resolved.token_bound_cidrs
 }
 
 fn is_idempotent_remote_rerun(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
@@ -690,6 +724,7 @@ mod tests {
             post_renew_hooks: Vec::new(),
             secret_id_ttl: None,
             secret_id_wrap_ttl: None,
+            token_bound_cidrs: None,
         }
     }
 
@@ -718,6 +753,7 @@ mod tests {
             policy_name: "policy-a".to_string(),
             secret_id_ttl: None,
             secret_id_wrap_ttl: None,
+            token_bound_cidrs: None,
         };
         let entry = build_service_entry_from_role(&resolved, role);
 
@@ -761,6 +797,7 @@ mod tests {
             policy_name: "p".to_string(),
             secret_id_ttl: None,
             secret_id_wrap_ttl: None,
+            token_bound_cidrs: None,
         };
         let entry = build_service_entry_from_role(&resolved, role);
 
@@ -780,6 +817,7 @@ mod tests {
                 policy_name: "policy".to_string(),
                 secret_id_ttl: resolved.secret_id_ttl.clone(),
                 secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
+                token_bound_cidrs: resolved.token_bound_cidrs.clone(),
             },
         )
     }
@@ -928,5 +966,40 @@ mod tests {
     fn display_wrap_ttl_explicit_shows_value() {
         let messages = Messages::new("en").unwrap();
         assert_eq!(display_wrap_ttl(Some("10m"), &messages), "10m");
+    }
+
+    #[test]
+    fn build_secret_id_options_includes_token_bound_cidrs() {
+        let mut resolved = sample_resolved();
+        resolved.token_bound_cidrs = Some(vec!["10.0.0.0/24".to_string()]);
+
+        let opts = build_secret_id_options(&resolved);
+        assert_eq!(
+            opts.token_bound_cidrs.as_deref(),
+            Some(["10.0.0.0/24".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn build_secret_id_options_omits_cidrs_when_none() {
+        let resolved = sample_resolved();
+        let opts = build_secret_id_options(&resolved);
+        assert!(opts.token_bound_cidrs.is_none());
+    }
+
+    #[test]
+    fn policy_fields_match_differs_on_token_bound_cidrs() {
+        let resolved = sample_resolved();
+        let mut entry = sample_entry_from_resolved(&resolved);
+        entry.approle.token_bound_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
+        assert!(!policy_fields_match(&entry, &resolved));
+    }
+
+    #[test]
+    fn policy_fields_match_with_matching_cidrs() {
+        let mut resolved = sample_resolved();
+        resolved.token_bound_cidrs = Some(vec!["10.0.0.0/24".to_string()]);
+        let entry = sample_entry_from_resolved(&resolved);
+        assert!(policy_fields_match(&entry, &resolved));
     }
 }

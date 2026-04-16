@@ -114,6 +114,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and `certs/` directories, and brings up Docker Compose services.
 - Added `bootroot clean` for full teardown (containers, volumes, secrets,
   `.env`).
+- Added `--rn-cidrs` flag to `bootroot service add` and
+  `bootroot service update` for binding `secret_id` tokens to specific
+  client CIDR ranges via `token_bound_cidrs`. When provided, the CIDRs
+  are sent to OpenBao during `secret_id` creation and persisted in
+  `state.json` for use by `rotate approle-secret-id`. Use
+  `--rn-cidrs clear` in `service update` to remove an existing binding.
+  Omitting the flag preserves current behavior (no CIDR binding).
+- Added automatic OpenBao file audit backend during `bootroot init`.
+  The audit device writes to `/openbao/audit/audit.log` inside the
+  container (persisted via the `openbao-audit` Docker volume). The
+  backend is enabled idempotently via the OpenBao API; re-running
+  `init` on an already-audited instance is a no-op.
 - Added `bootroot openbao save-unseal-keys` and
   `bootroot openbao delete-unseal-keys` for managing unseal key files
   used by automatic unseal on `infra up`.

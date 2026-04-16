@@ -94,6 +94,8 @@ pub struct SecretIdOptions {
     pub num_uses: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_bound_cidrs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,6 +430,50 @@ impl OpenBaoClient {
             .await?;
         }
         Ok(())
+    }
+
+    /// Verifies that a file-based audit backend is enabled.
+    ///
+    /// Queries `sys/audit` and checks that at least one `file`-type
+    /// audit device is present. `OpenBao` >= 2.5 requires audit devices
+    /// to be declared in the server configuration file (`openbao.hcl`)
+    /// rather than enabled via the API.
+    ///
+    /// # Errors
+    /// Returns an error if the audit state cannot be queried or no
+    /// file audit backend is found.
+    pub async fn verify_audit_file(&self) -> Result<()> {
+        let response = self
+            .send_authed(Method::GET, "sys/audit", None)
+            .await
+            .context("Failed to query audit backends")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("OpenBao audit query failed ({status}): {body}");
+        }
+        let text = response
+            .text()
+            .await
+            .context("Failed to read audit response")?;
+        let has_file = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("data")?.as_object().cloned())
+            .is_some_and(|map| {
+                map.values().any(|entry| {
+                    entry
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|t| t == "file")
+                })
+            });
+        if has_file {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "no file audit backend found; add an audit stanza \
+             to openbao.hcl and restart the server"
+        );
     }
 
     /// Writes an ACL policy.
@@ -1131,6 +1177,7 @@ mod secret_id_options_tests {
             ttl: Some("30m".to_string()),
             num_uses: Some(5),
             metadata: Some(r#"{"source":"rotate"}"#.to_string()),
+            token_bound_cidrs: Some(vec!["10.0.0.0/24".to_string()]),
         };
         let json = serde_json::to_value(&opts).expect("serialize");
         assert_eq!(
@@ -1138,7 +1185,8 @@ mod secret_id_options_tests {
             serde_json::json!({
                 "ttl": "30m",
                 "num_uses": 5,
-                "metadata": "{\"source\":\"rotate\"}"
+                "metadata": "{\"source\":\"rotate\"}",
+                "token_bound_cidrs": ["10.0.0.0/24"]
             })
         );
     }
@@ -1149,12 +1197,14 @@ mod secret_id_options_tests {
             ttl: Some("1h".to_string()),
             num_uses: None,
             metadata: None,
+            token_bound_cidrs: None,
         };
         let json = serde_json::to_value(&opts).expect("serialize");
         let obj = json.as_object().expect("object");
         assert!(obj.contains_key("ttl"));
         assert!(!obj.contains_key("num_uses"));
         assert!(!obj.contains_key("metadata"));
+        assert!(!obj.contains_key("token_bound_cidrs"));
     }
 }
 

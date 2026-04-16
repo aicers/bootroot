@@ -583,6 +583,10 @@ bootroot status
   상속). 회전 주기의 최소 2배 이상이어야 합니다
 - `--secret-id-wrap-ttl`: `secret_id`에 대한 응답 래핑 TTL (기본값 `30m`)
 - `--no-wrap`: `secret_id` 응답 래핑 비활성화
+- `--rn-cidrs`: `secret_id` 토큰에 바인딩할 CIDR 범위 (반복 가능,
+  예: `--rn-cidrs 10.0.0.0/24 --rn-cidrs 192.168.1.0/24`).
+  설정 시 OpenBao는 지정된 범위 밖의 소스 IP에서의 인증을 거부합니다.
+  생략 시 기본 동작(CIDR 바인딩 없음)을 유지합니다
 
 이 값들은 `state.json`에 저장되며 `rotate approle-secret-id` 시 적용됩니다.
 `--no-wrap`과 `--secret-id-wrap-ttl`은 동일 필드를 제어합니다.
@@ -634,6 +638,8 @@ bootroot status
   복원하려면 `"inherit"` 사용)
 - `--no-wrap`: `secret_id`의 응답 래핑 비활성화
   (`--secret-id-wrap-ttl`과 상호 배타)
+- `--rn-cidrs`: `secret_id` 토큰에 바인딩할 CIDR 범위 (반복 가능).
+  기존 바인딩을 제거하려면 `--rn-cidrs clear` 사용
 
 ### 동작
 

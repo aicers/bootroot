@@ -122,6 +122,31 @@ pub(crate) async fn stub_openbao(server: &MockServer) {
     stub_seal_status(server).await;
     stub_kv_mount(server).await;
     stub_auth_backends(server).await;
+    stub_audit_backend(server).await;
+    stub_policies(server).await;
+    stub_approles(server).await;
+    stub_kv_secrets(server).await;
+}
+
+pub(crate) async fn stub_openbao_expect_audit(server: &MockServer) {
+    stub_health(server).await;
+    stub_init_status(server).await;
+    stub_seal_status(server).await;
+    stub_kv_mount(server).await;
+    stub_auth_backends(server).await;
+    stub_audit_backend_expected(server).await;
+    stub_policies(server).await;
+    stub_approles(server).await;
+    stub_kv_secrets(server).await;
+}
+
+pub(crate) async fn stub_openbao_audit_failure(server: &MockServer) {
+    stub_health(server).await;
+    stub_init_status(server).await;
+    stub_seal_status(server).await;
+    stub_kv_mount(server).await;
+    stub_auth_backends(server).await;
+    stub_audit_backend_failure(server).await;
     stub_policies(server).await;
     stub_approles(server).await;
     stub_kv_secrets(server).await;
@@ -133,6 +158,7 @@ pub(crate) async fn stub_openbao_with_write_failure(server: &MockServer, failing
     stub_seal_status(server).await;
     stub_kv_mount(server).await;
     stub_auth_backends(server).await;
+    stub_audit_backend(server).await;
     stub_policies(server).await;
     stub_approles(server).await;
     stub_kv_secrets_with_failure(server, failing_secret).await;
@@ -168,6 +194,7 @@ pub(crate) async fn stub_openbao_sealed(server: &MockServer) {
     stub_unseal_success(server).await;
     stub_kv_mount(server).await;
     stub_auth_backends(server).await;
+    stub_audit_backend(server).await;
     stub_policies(server).await;
     stub_approles(server).await;
     stub_kv_secrets(server).await;
@@ -302,6 +329,50 @@ async fn stub_auth_backends(server: &MockServer) {
         .and(path("/v1/sys/auth/approle"))
         .and(header("X-Vault-Token", ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+}
+
+async fn stub_audit_backend(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/audit"))
+        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "file/": {
+                    "type": "file",
+                    "options": { "file_path": "/openbao/audit/audit.log" }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_audit_backend_expected(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/audit"))
+        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "file/": {
+                    "type": "file",
+                    "options": { "file_path": "/openbao/audit/audit.log" }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+async fn stub_audit_backend_failure(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/audit"))
+        .and(header("X-Vault-Token", ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {}
+        })))
         .mount(server)
         .await;
 }

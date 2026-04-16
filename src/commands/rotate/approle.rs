@@ -39,6 +39,7 @@ pub(super) async fn rotate_approle_secret_id(
         ttl: entry.approle.secret_id_ttl.clone(),
         num_uses: Some(0),
         metadata: None,
+        token_bound_cidrs: entry.approle.token_bound_cidrs.clone(),
     };
     let wrap_ttl = effective_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref());
     let new_secret_id = match wrap_ttl {
@@ -58,10 +59,13 @@ pub(super) async fn rotate_approle_secret_id(
         write_secret_id_atomic(&entry.approle.secret_id_path, &new_secret_id, messages).await?;
         reload_openbao_agent(&entry, messages)?;
     }
-    client
-        .login_approle(&entry.approle.role_id, &new_secret_id)
-        .await
-        .with_context(|| messages.error_openbao_approle_login_failed())?;
+    let has_cidr_binding = entry.approle.token_bound_cidrs.is_some();
+    if !has_cidr_binding {
+        client
+            .login_approle(&entry.approle.role_id, &new_secret_id)
+            .await
+            .with_context(|| messages.error_openbao_approle_login_failed())?;
+    }
     if is_remote {
         write_remote_service_secret_id(
             client,
@@ -86,10 +90,12 @@ pub(super) async fn rotate_approle_secret_id(
     if !is_remote {
         println!("{}", messages.rotate_summary_reload_openbao_agent());
     }
-    println!(
-        "{}",
-        messages.rotate_summary_approle_login_ok(&args.service_name)
-    );
+    if !has_cidr_binding {
+        println!(
+            "{}",
+            messages.rotate_summary_approle_login_ok(&args.service_name)
+        );
+    }
     Ok(())
 }
 

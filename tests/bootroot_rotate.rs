@@ -303,6 +303,59 @@ async fn test_rotate_approle_secret_id_docker_restarts_agent() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_rotate_approle_secret_id_skips_login_when_cidr_bound() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let secret_path =
+        prepare_app_state_with_cidrs(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
+            .expect("prepare state");
+    fs::write(&secret_path, "old-secret").expect("seed secret_id");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let pkill_log = temp_dir.path().join("pkill.log");
+    write_fake_pkill(&bin_dir, &pkill_log).expect("write fake pkill");
+
+    stub_openbao_for_rotation_no_login(&openbao, "secret-cidr").await;
+
+    let path = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "approle-secret-id",
+            "--service-name",
+            SERVICE_NAME,
+        ])
+        .env("PATH", combined_path)
+        .env("PKILL_OUTPUT", &pkill_log)
+        .output()
+        .expect("run rotate approle-secret-id");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rotation should succeed without login; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("AppRole secret_id rotated"));
+    assert!(
+        !stdout.contains("AppRole login OK"),
+        "should not attempt login when token_bound_cidrs is set; stdout:\n{stdout}"
+    );
+
+    let updated = fs::read_to_string(&secret_path).expect("read secret_id");
+    assert_eq!(updated, "secret-cidr");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_rotate_approle_secret_id_missing_app_fails() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
@@ -1055,6 +1108,45 @@ fn prepare_app_state(
     Ok(root.join(secret_id_path))
 }
 
+fn prepare_app_state_with_cidrs(
+    root: &Path,
+    openbao_url: &str,
+    deploy_type: &str,
+    delivery_mode: &str,
+) -> anyhow::Result<PathBuf> {
+    write_state_file(root, openbao_url)?;
+    let state_path = root.join("state.json");
+    let contents = fs::read_to_string(&state_path).context("read state")?;
+    let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
+    let secret_id_path = PathBuf::from("secrets/services/edge-proxy/secret_id");
+    state["services"][SERVICE_NAME] = json!({
+        "service_name": SERVICE_NAME,
+        "deploy_type": deploy_type,
+        "delivery_mode": delivery_mode,
+        "hostname": "edge-node-01",
+        "domain": "trusted.domain",
+        "agent_config_path": "agent.toml",
+        "cert_path": "certs/edge-proxy.crt",
+        "key_path": "certs/edge-proxy.key",
+        "instance_id": "001",
+        "container_name": "edge-proxy",
+        "approle": {
+            "role_name": ROLE_NAME,
+            "role_id": ROLE_ID,
+            "secret_id_path": secret_id_path,
+            "policy_name": ROLE_NAME,
+            "secret_id_wrap_ttl": "0",
+            "token_bound_cidrs": ["10.0.0.0/24"]
+        }
+    });
+    fs::write(&state_path, serde_json::to_string_pretty(&state)?).context("write state")?;
+
+    let secret_dir = root.join("secrets").join("services").join(SERVICE_NAME);
+    fs::create_dir_all(&secret_dir).context("create secrets dir")?;
+    fs::write(root.join("agent.toml"), "# agent").context("write agent config")?;
+    Ok(root.join(secret_id_path))
+}
+
 fn prepare_mixed_service_state(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
     write_state_file(root, openbao_url)?;
     let state_path = root.join("state.json");
@@ -1170,6 +1262,37 @@ async fn stub_openbao_for_rotation(server: &MockServer, new_secret_id: &str) {
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
+}
+
+/// Stubs `OpenBao` for rotation without a login mock. If login is
+/// attempted the request will get no matching mock and return a 404,
+/// causing the test to fail — proving the CIDR-bound skip path works.
+async fn stub_openbao_for_rotation_no_login(server: &MockServer, new_secret_id: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": new_secret_id }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/role-id")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "role_id": ROLE_ID }
+        })))
+        .mount(server)
+        .await;
+
+    // No login mock: any login attempt will get a 404.
 }
 
 async fn stub_openbao_for_wrapped_rotation(server: &MockServer, new_secret_id: &str) {

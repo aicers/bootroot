@@ -14,7 +14,8 @@ mod unix_integration {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::support::{
-        ROOT_TOKEN, create_secrets_dir, expect_rollback_deletes, stub_openbao, stub_openbao_sealed,
+        ROOT_TOKEN, create_secrets_dir, expect_rollback_deletes, stub_openbao,
+        stub_openbao_audit_failure, stub_openbao_expect_audit, stub_openbao_sealed,
         stub_openbao_unseal_failure, stub_openbao_with_write_failure, write_dotenv_file,
         write_fake_docker, write_fake_docker_with_status, write_password_file,
     };
@@ -84,6 +85,102 @@ mod unix_integration {
         assert!(
             stdout.contains("bootroot init: summary"),
             "stdout was: {stdout}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_enables_audit_backend() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao_expect_audit(&server).await;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--root-token",
+                ROOT_TOKEN,
+                "--enable",
+                "auto-generate",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            anyhow::bail!("bootroot init failed: {stderr}");
+        }
+        // Audit mock expectations (expect(1)) are verified on MockServer drop.
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_fails_when_audit_backend_cannot_be_enabled() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao_audit_failure(&server).await;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--root-token",
+                ROOT_TOKEN,
+                "--enable",
+                "auto-generate",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path);
+        let output =
+            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+
+        assert!(
+            !output.status.success(),
+            "init must fail when audit backend cannot be enabled"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("audit"),
+            "stderr should mention audit failure: {stderr}"
         );
         Ok(())
     }

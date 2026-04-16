@@ -1,10 +1,16 @@
+use std::net::IpAddr;
+
 const DNS_LABEL_MAX_LEN: usize = 63;
+const IPV4_MAX_PREFIX: u8 = 32;
+const IPV6_MAX_PREFIX: u8 = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationError {
     Empty,
     InvalidDnsLabel,
     InvalidDomainName,
+    InvalidCidr,
+    CidrClearConflict,
     NonNumeric,
 }
 
@@ -49,6 +55,50 @@ pub fn validate_numeric_instance_id(value: &str) -> Result<(), ValidationError> 
     }
     if !value.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(ValidationError::NonNumeric);
+    }
+    Ok(())
+}
+
+/// Validates a single CIDR notation string (e.g. `10.0.0.0/24`, `fd00::/64`).
+///
+/// # Errors
+/// Returns an error when the value is not a valid CIDR block.
+pub fn validate_cidr(value: &str) -> Result<(), ValidationError> {
+    let Some((addr_str, prefix_str)) = value.split_once('/') else {
+        return Err(ValidationError::InvalidCidr);
+    };
+    let addr: IpAddr = addr_str.parse().map_err(|_| ValidationError::InvalidCidr)?;
+    let prefix: u8 = prefix_str
+        .parse()
+        .map_err(|_| ValidationError::InvalidCidr)?;
+    let max = match addr {
+        IpAddr::V4(_) => IPV4_MAX_PREFIX,
+        IpAddr::V6(_) => IPV6_MAX_PREFIX,
+    };
+    if prefix > max {
+        return Err(ValidationError::InvalidCidr);
+    }
+    Ok(())
+}
+
+/// Validates a list of CIDR values from `--rn-cidrs`.
+///
+/// # Errors
+/// Returns an error when any value is not a valid CIDR block, or when
+/// `"clear"` is mixed with real CIDR values.
+pub fn validate_cidr_list(values: &[String]) -> Result<(), ValidationError> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let has_clear = values.iter().any(|v| v == "clear");
+    if has_clear {
+        if values.len() > 1 {
+            return Err(ValidationError::CidrClearConflict);
+        }
+        return Ok(());
+    }
+    for v in values {
+        validate_cidr(v)?;
     }
     Ok(())
 }
@@ -144,5 +194,69 @@ mod tests {
             validate_numeric_instance_id("node-01"),
             Err(ValidationError::NonNumeric)
         );
+    }
+
+    #[test]
+    fn validate_cidr_accepts_valid_ipv4() {
+        assert_eq!(validate_cidr("10.0.0.0/24"), Ok(()));
+        assert_eq!(validate_cidr("192.168.1.0/32"), Ok(()));
+        assert_eq!(validate_cidr("0.0.0.0/0"), Ok(()));
+    }
+
+    #[test]
+    fn validate_cidr_accepts_valid_ipv6() {
+        assert_eq!(validate_cidr("fd00::/64"), Ok(()));
+        assert_eq!(validate_cidr("::1/128"), Ok(()));
+    }
+
+    #[test]
+    fn validate_cidr_rejects_invalid_values() {
+        for value in [
+            "not-a-cidr",
+            "10.0.0.0",
+            "10.0.0.0/33",
+            "fd00::/129",
+            "10.0.0.0/abc",
+            "/24",
+            "",
+        ] {
+            assert!(validate_cidr(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn validate_cidr_list_accepts_valid_list() {
+        let values = vec!["10.0.0.0/24".to_string(), "192.168.0.0/16".to_string()];
+        assert_eq!(validate_cidr_list(&values), Ok(()));
+    }
+
+    #[test]
+    fn validate_cidr_list_accepts_clear_alone() {
+        let values = vec!["clear".to_string()];
+        assert_eq!(validate_cidr_list(&values), Ok(()));
+    }
+
+    #[test]
+    fn validate_cidr_list_rejects_clear_with_cidrs() {
+        let values = vec!["clear".to_string(), "10.0.0.0/24".to_string()];
+        assert_eq!(
+            validate_cidr_list(&values),
+            Err(ValidationError::CidrClearConflict)
+        );
+    }
+
+    #[test]
+    fn validate_cidr_list_rejects_invalid_entry() {
+        let values = vec!["10.0.0.0/24".to_string(), "not-a-cidr".to_string()];
+        assert_eq!(
+            validate_cidr_list(&values),
+            Err(ValidationError::InvalidCidr)
+        );
+    }
+
+    #[test]
+    fn validate_cidr_list_accepts_empty() {
+        let values: Vec<String> = vec![];
+        assert_eq!(validate_cidr_list(&values), Ok(()));
     }
 }

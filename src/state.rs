@@ -101,6 +101,8 @@ pub(crate) struct ServiceRoleEntry {
     pub(crate) secret_id_ttl: Option<String>,
     #[serde(default)]
     pub(crate) secret_id_wrap_ttl: Option<String>,
+    #[serde(default)]
+    pub(crate) token_bound_cidrs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -257,6 +259,7 @@ mod tests {
                 policy_name: "p".to_string(),
                 secret_id_ttl: None,
                 secret_id_wrap_ttl: None,
+                token_bound_cidrs: None,
             },
         };
         let json = serde_json::to_string_pretty(&entry).expect("serialize");
@@ -307,11 +310,16 @@ mod tests {
             policy_name: "p".to_string(),
             secret_id_ttl: Some("1h".to_string()),
             secret_id_wrap_ttl: Some("0".to_string()),
+            token_bound_cidrs: Some(vec!["10.0.0.0/24".to_string()]),
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         let parsed: ServiceRoleEntry = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.secret_id_ttl.as_deref(), Some("1h"));
         assert_eq!(parsed.secret_id_wrap_ttl.as_deref(), Some("0"));
+        assert_eq!(
+            parsed.token_bound_cidrs.as_deref(),
+            Some(["10.0.0.0/24".to_string()].as_slice())
+        );
     }
 
     #[test]

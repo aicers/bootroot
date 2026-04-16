@@ -744,6 +744,10 @@ pub(crate) struct ServiceAddArgs {
     /// Disable response wrapping for the `secret_id`
     #[arg(long, conflicts_with = "secret_id_wrap_ttl")]
     pub(crate) no_wrap: bool,
+
+    /// CIDR ranges to bind the `secret_id` token to (repeatable, e.g. `--rn-cidrs 10.0.0.0/24`)
+    #[arg(long)]
+    pub(crate) rn_cidrs: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -772,6 +776,11 @@ pub(crate) struct ServiceUpdateArgs {
     /// Disable response wrapping for the `secret_id`
     #[arg(long, conflicts_with = "secret_id_wrap_ttl")]
     pub(crate) no_wrap: bool,
+
+    /// CIDR ranges to bind the `secret_id` token to (repeatable, e.g. `--rn-cidrs 10.0.0.0/24`).
+    /// Use "clear" to remove an existing binding
+    #[arg(long)]
+    pub(crate) rn_cidrs: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1359,5 +1368,73 @@ mod tests {
             "10m",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_rn_cidrs() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--rn-cidrs",
+            "10.0.0.0/24",
+            "--rn-cidrs",
+            "192.168.1.0/24",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert_eq!(args.rn_cidrs, vec!["10.0.0.0/24", "192.168.1.0/24"]);
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_rn_cidrs_empty_by_default() {
+        let cli = Cli::parse_from(["bootroot", "service", "add"]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert!(args.rn_cidrs.is_empty());
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_update_rn_cidrs() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--rn-cidrs",
+            "10.0.0.0/8",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Update(args)) => {
+                assert_eq!(args.rn_cidrs, vec!["10.0.0.0/8"]);
+            }
+            _ => panic!("expected service update"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_update_rn_cidrs_clear() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--rn-cidrs",
+            "clear",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Update(args)) => {
+                assert_eq!(args.rn_cidrs, vec!["clear"]);
+            }
+            _ => panic!("expected service update"),
+        }
     }
 }
