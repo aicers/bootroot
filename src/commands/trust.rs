@@ -79,8 +79,7 @@ pub(crate) fn update_rotation_state(
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     ));
     fs::write(&temp_path, json.as_bytes())
         .with_context(|| messages.error_write_file_failed(&temp_path.display().to_string()))?;

@@ -246,7 +246,7 @@ async fn write_remote_bootstrap_artifact_file(
 const ARTIFACT_PATH_PLACEHOLDER: &str = "<REMOTE_ARTIFACT_PATH>";
 
 fn render_remote_run_command(_artifact: &RemoteBootstrapArtifact) -> String {
-    format!("bootroot-remote bootstrap --artifact '{ARTIFACT_PATH_PLACEHOLDER}' --output json",)
+    format!("bootroot-remote bootstrap --artifact '{ARTIFACT_PATH_PLACEHOLDER}' --output json")
 }
 
 /// Escapes a string for embedding inside single quotes in a POSIX shell

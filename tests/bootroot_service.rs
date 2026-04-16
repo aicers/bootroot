@@ -2173,7 +2173,7 @@ fn test_service_update_noop_when_value_unchanged() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "stderr: {stderr}",);
+    assert!(output.status.success(), "stderr: {stderr}");
     assert!(
         stdout.contains("No fields changed"),
         "should report no changes when TTL is already set, got: {stdout}"
