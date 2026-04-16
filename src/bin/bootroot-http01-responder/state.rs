@@ -230,7 +230,7 @@ mod tests {
         let state = test_state();
         let token = "token-1".to_string();
         let key_auth = "token-1.key".to_string();
-        let expires_at = tokio::time::Instant::now() + Duration::from_secs(60);
+        let expires_at = tokio::time::Instant::now() + Duration::from_mins(1);
         {
             let mut tokens = state.tokens.write().await;
             tokens.insert(

@@ -93,13 +93,31 @@ pub fn build_http_client(trust: &TrustSettings, insecure_mode: bool) -> Result<C
 /// Returns an error if the PEM content cannot be parsed or if the HTTP
 /// client fails to build.
 pub fn build_http_client_from_pem(pem_content: &str, pins: &[String]) -> Result<Client> {
+    let config = build_client_config_from_pem(pem_content, pins)?;
+    Client::builder()
+        .use_preconfigured_tls(config)
+        .build()
+        .context("Failed to build HTTP client from PEM bundle")
+}
+
+/// Builds a [`ClientConfig`] whose trust root is the given PEM-encoded CA
+/// bundle (in-memory), with optional SHA-256 certificate pinning.
+///
+/// Callers that need to set additional [`reqwest::ClientBuilder`] options
+/// (e.g. timeout) can feed the returned config into
+/// [`reqwest::ClientBuilder::use_preconfigured_tls`].
+///
+/// # Errors
+///
+/// Returns an error if the PEM content cannot be parsed.
+pub fn build_client_config_from_pem(pem_content: &str, pins: &[String]) -> Result<ClientConfig> {
     install_crypto_provider();
     let root_store = parse_pem_to_root_store(pem_content.as_bytes())?;
     let pin_set: HashSet<String> = pins.iter().map(|p| p.to_ascii_lowercase()).collect();
-    let config = if pin_set.is_empty() {
-        ClientConfig::builder()
+    if pin_set.is_empty() {
+        Ok(ClientConfig::builder()
             .with_root_certificates(root_store)
-            .with_no_client_auth()
+            .with_no_client_auth())
     } else {
         let verifier = WebPkiServerVerifier::builder(Arc::new(root_store.clone()))
             .build()
@@ -109,12 +127,8 @@ pub fn build_http_client_from_pem(pem_content: &str, pins: &[String]) -> Result<
             .with_root_certificates(root_store)
             .with_no_client_auth();
         cfg.dangerous().set_certificate_verifier(pinned);
-        cfg
-    };
-    Client::builder()
-        .use_preconfigured_tls(config)
-        .build()
-        .context("Failed to build HTTP client from PEM bundle")
+        Ok(cfg)
+    }
 }
 
 fn install_crypto_provider() {

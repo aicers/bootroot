@@ -83,8 +83,7 @@ pub(super) fn temp_secret_path(path: &Path) -> PathBuf {
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_nanos());
     let file_name = path.file_name().map_or_else(
         || "secret_id".to_string(),
         |name| name.to_string_lossy().to_string(),

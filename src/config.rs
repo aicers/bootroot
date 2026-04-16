@@ -310,11 +310,8 @@ mod tests {
         assert!(settings.trust.trusted_ca_sha256.is_empty());
 
         let profile = &settings.profiles[0];
-        assert_eq!(profile.daemon.check_interval, Duration::from_secs(60 * 60));
-        assert_eq!(
-            profile.daemon.renew_before,
-            Duration::from_secs(16 * 60 * 60)
-        );
+        assert_eq!(profile.daemon.check_interval, Duration::from_hours(1));
+        assert_eq!(profile.daemon.renew_before, Duration::from_hours(16));
         assert_eq!(profile.daemon.check_jitter, Duration::from_secs(0));
         assert!(profile.hooks.post_renew.success.is_empty());
         assert!(profile.hooks.post_renew.failure.is_empty());

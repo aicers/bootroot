@@ -469,8 +469,8 @@ mod tests {
                 key: PathBuf::from("unused.key"),
             },
             daemon: DaemonRuntimeSettings {
-                check_interval: Duration::from_secs(60 * 60),
-                renew_before: Duration::from_secs(16 * 60 * 60),
+                check_interval: Duration::from_hours(1),
+                renew_before: Duration::from_hours(16),
                 check_jitter: Duration::from_secs(0),
             },
             retry: None,
@@ -596,7 +596,7 @@ mod tests {
         let cert_path = dir.path().join("missing.pem");
         let profile = build_profile(cert_path);
 
-        let renew = should_renew(&profile, Duration::from_secs(60))
+        let renew = should_renew(&profile, Duration::from_mins(1))
             .await
             .unwrap();
 
