@@ -28,8 +28,12 @@ use super::stepca_setup::{
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
-use crate::commands::guardrails::ensure_all_services_localhost_binding;
-use crate::commands::infra::{ensure_init_prereqs_ready, run_docker};
+use crate::commands::guardrails::{
+    client_url_from_bind_addr, ensure_all_services_localhost_binding,
+    validate_openbao_override_binding, validate_openbao_override_scope, validate_openbao_tls,
+};
+use crate::commands::infra::{ensure_init_prereqs_ready, has_openbao_bind_intent, run_docker};
+use crate::commands::init::OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -40,6 +44,13 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
 
     ensure_all_services_localhost_binding(&args.compose.compose_file, messages)?;
+
+    // Check whether a non-loopback OpenBao bind intent is stored in
+    // state.  TLS is validated inside `run_init_inner` (after
+    // `ensure_step_ca_initialized`) so that failures trigger rollback.
+    let state_path = StateFile::default_path();
+    let bind_intent = has_openbao_bind_intent(&state_path)?;
+
     // Only check openbao + postgres; step-ca may not be bootstrapped yet.
     ensure_init_prereqs_ready(&args.compose.compose_file, messages)?;
 
@@ -51,7 +62,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
         .with_context(|| messages.error_openbao_health_check_failed())?;
 
     let mut rollback = InitRollback::default();
-    let result = run_init_inner(&mut client, args, messages, &mut rollback).await;
+    let result = run_init_inner(&mut client, args, messages, &mut rollback, bind_intent).await;
 
     match result {
         Ok(summary) => {
@@ -99,6 +110,7 @@ async fn run_init_inner(
     args: &InitArgs,
     messages: &Messages,
     rollback: &mut InitRollback,
+    bind_intent: bool,
 ) -> Result<InitSummary> {
     let bootstrap = bootstrap_openbao(client, args, messages).await?;
     let overwrite_password = args.secrets_dir.secrets_dir.join("password.txt").exists();
@@ -254,8 +266,63 @@ async fn run_init_inner(
     .await?
     .unwrap_or(secrets.db_dsn);
 
+    // Validate TLS and apply the non-loopback compose override inside
+    // the rollback envelope so that failures trigger rollback.  TLS is
+    // validated here (not earlier) because the step-ca root CA cert is
+    // created by `ensure_step_ca_initialized` above.
+    //
+    // Validation is keyed off `StateFile` intent, not override file
+    // existence — a missing override with recorded intent is an error.
+    let effective_openbao_url = if bind_intent {
+        let state_path = StateFile::default_path();
+        let override_path = compose_dir
+            .join("secrets")
+            .join("openbao")
+            .join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
+        if !override_path.exists() {
+            anyhow::bail!(messages.error_openbao_override_file_missing());
+        }
+        let mut state = StateFile::load(&state_path)?;
+        let bind_addr = state
+            .openbao_bind_addr
+            .clone()
+            .expect("bind_intent is true so openbao_bind_addr must be Some");
+        validate_openbao_override_scope(&override_path, messages)?;
+        validate_openbao_override_binding(&override_path, &bind_addr, messages)?;
+        validate_openbao_tls(compose_dir, &args.secrets_dir.secrets_dir, messages)?;
+        let compose_str = args.compose.compose_file.to_string_lossy();
+        let override_str = override_path.to_string_lossy();
+        let up_args = [
+            "compose",
+            "-f",
+            &*compose_str,
+            "-f",
+            &*override_str,
+            "up",
+            "-d",
+            "openbao",
+        ];
+        run_docker(&up_args, "docker compose up -d openbao", messages)?;
+
+        // Persist the CN-side HTTPS URL now that TLS is validated
+        // and the non-loopback override is applied.  Always derive
+        // from bind_addr (which maps wildcards to loopback via
+        // `client_url_from_bind_addr`) so that local commands
+        // (auto-unseal, service, rotate) never depend on the
+        // external advertise address being hairpin-reachable.
+        // The advertise address is consumed separately by remote
+        // bootstrap artifact generation.
+        state.openbao_url = client_url_from_bind_addr(&bind_addr);
+        state
+            .save(&state_path)
+            .with_context(|| messages.error_serialize_state_failed())?;
+        state.openbao_url
+    } else {
+        args.openbao.openbao_url.clone()
+    };
+
     Ok(InitSummary {
-        openbao_url: args.openbao.openbao_url.clone(),
+        openbao_url: effective_openbao_url,
         kv_mount: args.openbao.kv_mount.clone(),
         secrets_dir: args.secrets_dir.secrets_dir.clone(),
         show_secrets: args.has_feature(InitFeature::ShowSecrets),
@@ -478,14 +545,38 @@ pub(super) fn write_state_file(
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
-    let state_path = StateFile::default_path();
-    let existing_services = if state_path.exists() {
-        StateFile::load(&state_path)
-            .map(|state| state.services)
-            .unwrap_or_default()
-    } else {
-        BTreeMap::new()
-    };
+    write_state_file_to(
+        &StateFile::default_path(),
+        openbao_url,
+        kv_mount,
+        approles,
+        secrets_dir,
+        messages,
+    )
+}
+
+/// Inner implementation that accepts an explicit state-file path for
+/// testability.
+fn write_state_file_to(
+    state_path: &Path,
+    openbao_url: &str,
+    kv_mount: &str,
+    approles: BTreeMap<String, String>,
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let (existing_services, existing_openbao_bind_addr, existing_openbao_advertise_addr) =
+        if state_path.exists() {
+            let state = StateFile::load(state_path)?;
+            (
+                state.services,
+                state.openbao_bind_addr,
+                state.openbao_advertise_addr,
+            )
+        } else {
+            (BTreeMap::new(), None, None)
+        };
+
     let policy_map = AppRoleLabel::policy_map();
     let state = StateFile {
         openbao_url: openbao_url.to_string(),
@@ -494,9 +585,74 @@ pub(super) fn write_state_file(
         policies: policy_map,
         approles,
         services: existing_services,
+        openbao_bind_addr: existing_openbao_bind_addr,
+        openbao_advertise_addr: existing_openbao_advertise_addr,
     };
     state
-        .save(&state_path)
+        .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `write_state_file_to` must propagate an error when an
+    /// existing state file is corrupted, not silently replace it with a
+    /// fresh state (which would erase stored `openbao_bind_addr`).
+    #[test]
+    fn write_state_file_errors_on_corrupted_state() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        std::fs::write(&state_path, "NOT VALID JSON").unwrap();
+        let result = write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &messages,
+        );
+        assert!(
+            result.is_err(),
+            "corrupted state file must be a hard error, not silently replaced"
+        );
+    }
+
+    /// `write_state_file_to` preserves `openbao_bind_addr` from an
+    /// existing, valid state file.
+    #[test]
+    fn write_state_file_preserves_bind_addr() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let existing = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
+            openbao_advertise_addr: None,
+        };
+        existing.save(&state_path).unwrap();
+        write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &messages,
+        )
+        .unwrap();
+        let reloaded = crate::state::StateFile::load(&state_path).unwrap();
+        assert_eq!(
+            reloaded.openbao_bind_addr.as_deref(),
+            Some("192.168.1.10:8200"),
+            "openbao_bind_addr must survive a state rewrite during init"
+        );
+    }
 }

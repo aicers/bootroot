@@ -33,6 +33,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added `--openbao-bind <IP>:<port>`, `--openbao-tls-required`,
+  `--openbao-bind-wildcard`, and `--openbao-advertise-addr <IP>:<port>`
+  flags to `bootroot infra install`. Operators can opt into non-loopback
+  OpenBao binding for multi-host deployments.
+  `--openbao-tls-required` acknowledges mandatory TLS enforcement;
+  `--openbao-bind-wildcard` is required for both IPv4 (`0.0.0.0`) and
+  IPv6 (`[::]`) wildcard addresses; `--openbao-advertise-addr` is
+  required for wildcard binds to specify a routable address for remote
+  bootstrap artifacts. The compose override is first applied by
+  `bootroot init` or `infra up` after TLS validation passes. The TLS
+  validator parses `tls_cert_file` and `tls_key_file` paths from
+  `openbao.hcl` and validates the files OpenBao is actually configured
+  to serve (not hardcoded defaults). The compose override is
+  scope-checked to reject tampered overrides that expose non-OpenBao
+  guarded services. Stored-intent revalidation on `infra up` and
+  `bootroot init` is keyed off `StateFile`, not override file
+  existence — a missing override with recorded intent is a hard error.
+  PostgreSQL stays loopback-only. (Part of #508)
 - Added `--artifact <path>` flag to `bootroot-remote bootstrap`. When
   provided, all required fields are loaded from the artifact JSON file,
   avoiding sensitive `wrap_token` exposure in shell command lines and

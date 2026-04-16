@@ -9,6 +9,7 @@ use crate::i18n::Messages;
 use crate::state::StateFile;
 
 const OPENBAO_AGENT_OVERRIDE: &str = "secrets/openbao/docker-compose.openbao-agent.override.yml";
+const OPENBAO_EXPOSED_OVERRIDE: &str = "secrets/openbao/docker-compose.openbao-exposed.yml";
 
 pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
     if !args.yes && !prompt_yes_no(messages.clean_confirm(), messages)? {
@@ -24,21 +25,21 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
         .unwrap_or(Path::new("."));
 
     let compose_str = args.compose_file.compose_file.to_string_lossy();
-    let mut down_args: Vec<&str> = vec![
-        "compose",
-        "-f",
-        &compose_str,
-        "down",
-        "-v",
-        "--remove-orphans",
-    ];
+    let mut down_args: Vec<&str> = vec!["compose", "-f", &compose_str];
 
-    let override_path = compose_dir.join(OPENBAO_AGENT_OVERRIDE);
-    let override_str = override_path.to_string_lossy();
-    if override_path.exists() {
-        down_args.insert(3, "-f");
-        down_args.insert(4, &override_str);
+    let agent_override_path = compose_dir.join(OPENBAO_AGENT_OVERRIDE);
+    let agent_override_str = agent_override_path.to_string_lossy();
+    if agent_override_path.exists() {
+        down_args.extend(["-f", &*agent_override_str]);
     }
+
+    let exposed_override_path = compose_dir.join(OPENBAO_EXPOSED_OVERRIDE);
+    let exposed_override_str = exposed_override_path.to_string_lossy();
+    if exposed_override_path.exists() {
+        down_args.extend(["-f", &*exposed_override_str]);
+    }
+
+    down_args.extend(["down", "-v", "--remove-orphans"]);
     run_docker(&down_args, "docker compose down", messages)?;
 
     remove_clean_artifacts(compose_dir, &StateFile::default_path(), messages)?;

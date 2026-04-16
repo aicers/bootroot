@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread
 toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-x509-parser = "0.18"
+x509-parser = { version = "0.18", features = ["verify"] }
 
 [dev-dependencies]
 libc = "0.2"

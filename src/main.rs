@@ -27,8 +27,8 @@ fn main() {
             .next()
             .map_or_else(|| "bootroot error".to_string(), ToString::to_string);
         eprintln!("{message}");
-        if let Some(detail) = err.chain().nth(1) {
-            eprintln!("{}", messages.error_details(&detail.to_string()));
+        for cause in err.chain().skip(1) {
+            eprintln!("{}", messages.error_details(&cause.to_string()));
         }
         std::process::exit(1);
     }

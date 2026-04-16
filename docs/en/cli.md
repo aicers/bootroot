@@ -122,12 +122,21 @@ setup instead of the CLI.
 - Container status/health summary
 - Completion message
 
+When a non-loopback OpenBao bind intent is stored in `state.json` (set by
+`infra install --openbao-bind`), `infra up` validates that TLS prerequisites
+are in place and automatically applies the compose override so OpenBao
+listens on the stored address.
+
 ### Failure conditions
 
 The command is considered failed when:
 
 - docker compose/pull failures
 - Missing or unhealthy containers
+- A non-loopback OpenBao bind intent is stored but TLS certificate/key or
+  `openbao.hcl` TLS configuration is missing
+- A non-loopback OpenBao bind intent is stored but the compose override
+  file is missing
 
 ### Examples
 
@@ -150,6 +159,29 @@ an already-configured environment.
 - `--image-archive-dir`: local image archive directory (optional)
 - `--restart-policy`: container restart policy (default `always`)
 - `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
+- `--openbao-bind <IP>:<port>`: bind OpenBao to a
+  non-loopback address for multi-host deployments (optional).
+  Records the bind intent in state and generates a compose
+  override file. The override is **not** applied during
+  `infra install`; it is first applied by `bootroot init` or
+  `infra up` after TLS is validated. Default remains
+  `127.0.0.1:8200`.
+- `--openbao-tls-required`: required acknowledgment flag when
+  `--openbao-bind` specifies a non-loopback address.
+  Confirms that TLS will be enforced before the non-loopback
+  port is published.
+- `--openbao-bind-wildcard`: required confirmation flag when
+  `--openbao-bind` uses a wildcard address (`0.0.0.0` or
+  `[::]`). Without this flag, wildcard binding is rejected.
+- `--openbao-advertise-addr <IP>:<port>`: required when
+  `--openbao-bind` uses a wildcard address. Specifies the
+  routable address that remote bootstrap artifacts will use
+  to reach OpenBao. Must be a specific IP (not wildcard or
+  loopback). Persisted in `state.json` as
+  `openbao_advertise_addr` at install time; the CN-side
+  `openbao_url` remains at the install-time loopback URL
+  until `bootroot init` rewrites it to the bind-derived
+  HTTPS URL after TLS validation.
 
 ### Outputs
 
@@ -157,6 +189,9 @@ an already-configured environment.
 - Created `secrets/` and `certs/` directories
 - Container status/health summary
 - Completion message
+- When `--openbao-bind` is used: compose override file at
+  `secrets/openbao/docker-compose.openbao-exposed.yml` and
+  bind intent recorded in `state.json`
 
 ### Failure conditions
 
@@ -164,11 +199,35 @@ The command is considered failed when:
 
 - docker compose build/pull failures
 - Missing or unhealthy containers
+- `--openbao-bind` format is invalid (must be `<IP>:<port>` with a
+  valid IP address)
+- `--openbao-bind` with a non-loopback address without
+  `--openbao-tls-required`
+- `--openbao-bind` with a wildcard address (`0.0.0.0` or `[::]`)
+  without `--openbao-bind-wildcard`
+- `--openbao-bind` with a wildcard address without
+  `--openbao-advertise-addr`
 
 ### Examples
 
 ```bash
 bootroot infra install
+```
+
+Multi-host deployment with a specific bind address:
+
+```bash
+bootroot infra install --openbao-bind 192.168.1.10:8200 --openbao-tls-required
+```
+
+Wildcard binding (requires explicit confirmation and an advertise address):
+
+```bash
+bootroot infra install \
+  --openbao-bind 0.0.0.0:8200 \
+  --openbao-tls-required \
+  --openbao-bind-wildcard \
+  --openbao-advertise-addr 192.168.1.10:8200
 ```
 
 ## bootroot init

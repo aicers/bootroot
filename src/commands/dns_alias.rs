@@ -225,6 +225,8 @@ mod tests {
             policies: BTreeMap::default(),
             approles: BTreeMap::default(),
             services: BTreeMap::default(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
         };
         state
             .services
