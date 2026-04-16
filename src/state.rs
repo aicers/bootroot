@@ -22,6 +22,10 @@ pub(crate) struct StateFile {
     pub(crate) approles: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) services: BTreeMap<String, ServiceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) openbao_bind_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) openbao_advertise_addr: Option<String>,
 }
 
 impl StateFile {
@@ -329,5 +333,54 @@ mod tests {
         }"#;
         let parsed: ServiceEntry = serde_json::from_str(json).expect("deserialize");
         assert!(parsed.post_renew_hooks.is_empty());
+    }
+
+    #[test]
+    fn state_file_without_openbao_bind_addr_deserializes_as_none() {
+        let json = r#"{
+            "openbao_url": "http://localhost:8200",
+            "kv_mount": "secret"
+        }"#;
+        let parsed: StateFile = serde_json::from_str(json).expect("deserialize");
+        assert!(parsed.openbao_bind_addr.is_none());
+    }
+
+    #[test]
+    fn state_file_with_openbao_bind_addr_round_trips() {
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
+            openbao_advertise_addr: None,
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let parsed: StateFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            parsed.openbao_bind_addr.as_deref(),
+            Some("192.168.1.10:8200")
+        );
+    }
+
+    #[test]
+    fn state_file_without_openbao_bind_addr_skips_field_in_json() {
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert!(
+            !json.contains("openbao_bind_addr"),
+            "None should be skipped"
+        );
     }
 }

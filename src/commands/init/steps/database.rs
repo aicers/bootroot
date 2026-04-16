@@ -148,14 +148,16 @@ fn build_admin_dsn_from_env() -> Option<String> {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(5432);
-    let db = env::var("POSTGRES_DB").unwrap_or_else(|_| "postgres".to_string());
+    // Always connect to the "postgres" database for admin operations.
+    // POSTGRES_DB names the application database that will be created,
+    // not the admin database used for provisioning.
     let sslmode = env::var("POSTGRES_SSLMODE").ok();
     Some(build_db_dsn(
         &user,
         &password,
         &host,
         port,
-        &db,
+        "postgres",
         sslmode.as_deref(),
     ))
 }

@@ -55,6 +55,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Free port 5432 (runner PostgreSQL)
+        run: sudo systemctl stop postgresql || true
+
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
 

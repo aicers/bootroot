@@ -421,6 +421,8 @@ mod tests {
                 policies: BTreeMap::new(),
                 approles: BTreeMap::new(),
                 services,
+                openbao_bind_addr: None,
+                openbao_advertise_addr: None,
             },
             paths: super::super::StatePaths::new(dir.path().to_path_buf()),
             state_dir: dir.path().to_path_buf(),

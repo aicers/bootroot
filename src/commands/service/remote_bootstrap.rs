@@ -11,6 +11,7 @@ use super::{
     OPENBAO_SERVICE_CONFIG_DIR, REMOTE_BOOTSTRAP_DIR, REMOTE_BOOTSTRAP_FILENAME,
     RemoteBootstrapResult, SERVICE_ROLE_ID_FILENAME,
 };
+use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::i18n::Messages;
 use crate::state::{PostRenewHookEntry, ServiceEntry, StateFile};
 
@@ -90,6 +91,19 @@ impl ArtifactWrapInfo {
     }
 }
 
+/// Returns the `OpenBao` URL to embed in remote bootstrap artifacts.
+///
+/// Prefers `openbao_advertise_addr` (set for wildcard binds) so that
+/// artifacts contain a routable address that remote nodes can reach.
+/// Falls back to `openbao_url` (the CN-side URL) for non-wildcard
+/// binds where the bind address is directly reachable.
+fn artifact_openbao_url(state: &StateFile) -> String {
+    state.openbao_advertise_addr.as_ref().map_or_else(
+        || state.openbao_url.clone(),
+        |addr| client_url_from_bind_addr(addr),
+    )
+}
+
 /// Builds a `RemoteBootstrapArtifact` from common inputs shared by both
 /// the initial service-add and the idempotent re-run paths.
 #[allow(clippy::too_many_arguments)] // mirrors the many fields of RemoteBootstrapArtifact
@@ -155,8 +169,9 @@ pub(super) async fn write_remote_bootstrap_artifact(
     ca_bundle_pem: &str,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
+    let artifact_url = artifact_openbao_url(state);
     let artifact = build_artifact(
-        &state.openbao_url,
+        &artifact_url,
         &state.kv_mount,
         &resolved.service_name,
         secret_id_path,
@@ -182,8 +197,9 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
     ca_bundle_pem: &str,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
+    let artifact_url = artifact_openbao_url(state);
     let artifact = build_artifact(
-        &state.openbao_url,
+        &artifact_url,
         &state.kv_mount,
         &entry.service_name,
         &entry.approle.secret_id_path,
@@ -760,6 +776,52 @@ mod tests {
         assert!(
             !cmd.contains("--openbao-url"),
             "should not contain legacy flags: {cmd}"
+        );
+    }
+
+    #[test]
+    fn artifact_url_prefers_advertise_addr() {
+        use std::collections::BTreeMap;
+
+        use crate::state::StateFile;
+
+        let state = StateFile {
+            openbao_url: "https://127.0.0.1:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: Some("0.0.0.0:8200".to_string()),
+            openbao_advertise_addr: Some("192.168.1.10:8200".to_string()),
+        };
+        assert_eq!(
+            super::artifact_openbao_url(&state),
+            "https://192.168.1.10:8200",
+            "artifact URL must use the advertise address for remote reachability"
+        );
+    }
+
+    #[test]
+    fn artifact_url_falls_back_to_openbao_url() {
+        use std::collections::BTreeMap;
+
+        use crate::state::StateFile;
+
+        let state = StateFile {
+            openbao_url: "https://10.0.0.5:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: Some("10.0.0.5:8200".to_string()),
+            openbao_advertise_addr: None,
+        };
+        assert_eq!(
+            super::artifact_openbao_url(&state),
+            "https://10.0.0.5:8200",
+            "without advertise addr, artifact URL must fall back to openbao_url"
         );
     }
 }

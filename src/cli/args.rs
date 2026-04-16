@@ -421,6 +421,28 @@ pub(crate) struct InfraInstallArgs {
     /// `OpenBao` API URL
     #[arg(long, default_value = DEFAULT_OPENBAO_URL)]
     pub(crate) openbao_url: String,
+
+    /// Bind `OpenBao` to a non-loopback address (requires TLS).
+    /// Format: `<IP>:<port>`, e.g. `192.168.1.10:8200`
+    #[arg(long)]
+    pub(crate) openbao_bind: Option<String>,
+
+    /// Acknowledge that TLS is mandatory for non-loopback `OpenBao` binding.
+    /// Required when `--openbao-bind` specifies a non-loopback address
+    #[arg(long)]
+    pub(crate) openbao_tls_required: bool,
+
+    /// Confirm intent to bind `OpenBao` to `0.0.0.0` (wildcard).
+    /// Required when `--openbao-bind` uses `0.0.0.0`
+    #[arg(long)]
+    pub(crate) openbao_bind_wildcard: bool,
+
+    /// Advertised `OpenBao` address for remote bootstrap artifacts.
+    /// Required when `--openbao-bind` uses a wildcard address (`0.0.0.0`
+    /// or `[::]`), because remote nodes cannot connect to a wildcard.
+    /// Must be a specific reachable IP:port (not wildcard or loopback).
+    #[arg(long)]
+    pub(crate) openbao_advertise_addr: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -957,6 +979,81 @@ mod tests {
         match cli.command {
             CliCommand::Infra(InfraCommand::Install(args)) => {
                 assert_eq!(args.services, vec!["openbao", "postgres"]);
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_infra_install_openbao_bind() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "infra",
+            "install",
+            "--openbao-bind",
+            "192.168.1.10:8200",
+        ]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert_eq!(args.openbao_bind.as_deref(), Some("192.168.1.10:8200"));
+                assert!(!args.openbao_bind_wildcard);
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_infra_install_openbao_bind_wildcard() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "infra",
+            "install",
+            "--openbao-bind",
+            "0.0.0.0:8200",
+            "--openbao-bind-wildcard",
+        ]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert_eq!(args.openbao_bind.as_deref(), Some("0.0.0.0:8200"));
+                assert!(args.openbao_bind_wildcard);
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_infra_install_default_no_openbao_bind() {
+        let cli = Cli::parse_from(["bootroot", "infra", "install"]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert!(args.openbao_bind.is_none());
+                assert!(!args.openbao_bind_wildcard);
+                assert!(args.openbao_advertise_addr.is_none());
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_infra_install_openbao_advertise_addr() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "infra",
+            "install",
+            "--openbao-bind",
+            "0.0.0.0:8200",
+            "--openbao-bind-wildcard",
+            "--openbao-advertise-addr",
+            "192.168.1.10:8200",
+        ]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert_eq!(args.openbao_bind.as_deref(), Some("0.0.0.0:8200"));
+                assert!(args.openbao_bind_wildcard);
+                assert_eq!(
+                    args.openbao_advertise_addr.as_deref(),
+                    Some("192.168.1.10:8200")
+                );
             }
             _ => panic!("expected infra install"),
         }

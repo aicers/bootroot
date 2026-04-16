@@ -329,7 +329,7 @@ pub(super) async fn write_ca_trust_fingerprints_with_retry(
     Ok(changed)
 }
 
-/// Parses an OpenBao-style duration string into seconds.
+/// Parses an `OpenBao`-style duration string into seconds.
 ///
 /// Accepts formats: `"30s"`, `"10m"`, `"24h"`, or bare seconds `"3600"`.
 fn parse_ttl_to_secs(ttl: &str) -> Option<u64> {

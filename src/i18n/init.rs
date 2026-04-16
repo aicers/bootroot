@@ -211,6 +211,77 @@ impl Messages {
     pub(crate) fn error_state_missing(&self) -> &'static str {
         self.strings().error_state_missing
     }
+
+    pub(crate) fn error_openbao_bind_wildcard_required(&self) -> &'static str {
+        self.strings().error_openbao_bind_wildcard_required
+    }
+
+    pub(crate) fn error_openbao_bind_tls_flag_required(&self) -> &'static str {
+        self.strings().error_openbao_bind_tls_flag_required
+    }
+
+    pub(crate) fn error_openbao_bind_tls_missing(&self, details: &str) -> String {
+        format_template(
+            self.strings().error_openbao_bind_tls_missing,
+            &[("details", details)],
+        )
+    }
+
+    pub(crate) fn error_openbao_bind_invalid_format(&self) -> &'static str {
+        self.strings().error_openbao_bind_invalid_format
+    }
+
+    pub(crate) fn error_openbao_bind_ipv6_requires_brackets(&self) -> &'static str {
+        self.strings().error_openbao_bind_ipv6_requires_brackets
+    }
+
+    pub(crate) fn error_openbao_advertise_addr_required(&self) -> &'static str {
+        self.strings().error_openbao_advertise_addr_required
+    }
+
+    pub(crate) fn error_openbao_advertise_addr_invalid(&self) -> &'static str {
+        self.strings().error_openbao_advertise_addr_invalid
+    }
+
+    pub(crate) fn error_openbao_advertise_addr_ipv6_requires_brackets(&self) -> &'static str {
+        self.strings()
+            .error_openbao_advertise_addr_ipv6_requires_brackets
+    }
+
+    pub(crate) fn error_openbao_advertise_addr_not_reachable(&self) -> &'static str {
+        self.strings().error_openbao_advertise_addr_not_reachable
+    }
+
+    pub(crate) fn error_openbao_advertise_addr_specific_bind_rejected(&self) -> &'static str {
+        self.strings()
+            .error_openbao_advertise_addr_specific_bind_rejected
+    }
+
+    pub(crate) fn error_openbao_override_file_missing(&self) -> &'static str {
+        self.strings().error_openbao_override_file_missing
+    }
+
+    pub(crate) fn error_openbao_override_binding_mismatch(
+        &self,
+        expected: &str,
+        actual: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_openbao_override_binding_mismatch,
+            &[("expected", expected), ("actual", actual)],
+        )
+    }
+
+    pub(crate) fn info_openbao_bind_intent_recorded(&self, addr: &str) -> String {
+        format_template(
+            self.strings().info_openbao_bind_intent_recorded,
+            &[("addr", addr)],
+        )
+    }
+
+    pub(crate) fn info_openbao_bind_intent_cleared(&self) -> &'static str {
+        self.strings().info_openbao_bind_intent_cleared
+    }
 }
 
 impl Messages {

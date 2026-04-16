@@ -37,6 +37,13 @@ pub(crate) const CA_CERTS_DIR: &str = "certs";
 pub(crate) const CA_ROOT_CERT_FILENAME: &str = "root_ca.crt";
 pub(crate) const CA_INTERMEDIATE_CERT_FILENAME: &str = "intermediate_ca.crt";
 
+pub(crate) const OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-exposed.yml";
+#[cfg(test)]
+pub(crate) const OPENBAO_TLS_CERT_PATH: &str = "openbao/tls/server.crt";
+#[cfg(test)]
+pub(crate) const OPENBAO_TLS_KEY_PATH: &str = "openbao/tls/server.key";
+pub(crate) const OPENBAO_HCL_PATH: &str = "openbao/openbao.hcl";
+
 pub(crate) mod openbao_constants {
     pub(crate) const INIT_SECRET_SHARES: u8 = 3;
     pub(crate) const INIT_SECRET_THRESHOLD: u8 = 2;
