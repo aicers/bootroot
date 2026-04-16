@@ -1444,6 +1444,19 @@ fn write_state_with_app_policy(
     secret_id_ttl: Option<&str>,
     secret_id_wrap_ttl: Option<&str>,
 ) {
+    write_state_with_app_full(root, secret_id_ttl, secret_id_wrap_ttl, None);
+}
+
+fn write_state_with_app_cidrs(root: &std::path::Path, cidrs: Option<&[&str]>) {
+    write_state_with_app_full(root, None, None, cidrs);
+}
+
+fn write_state_with_app_full(
+    root: &std::path::Path,
+    secret_id_ttl: Option<&str>,
+    secret_id_wrap_ttl: Option<&str>,
+    token_bound_cidrs: Option<&[&str]>,
+) {
     let state_path = root.join("state.json");
     let contents = fs::read_to_string(&state_path).expect("read state");
     let mut value: serde_json::Value = serde_json::from_str(&contents).expect("parse state");
@@ -1458,6 +1471,9 @@ fn write_state_with_app_policy(
     }
     if let Some(wrap_ttl) = secret_id_wrap_ttl {
         approle["secret_id_wrap_ttl"] = json!(wrap_ttl);
+    }
+    if let Some(cidrs) = token_bound_cidrs {
+        approle["token_bound_cidrs"] = json!(cidrs);
     }
     value["services"]["edge-proxy"] = json!({
         "service_name": "edge-proxy",
@@ -2181,6 +2197,108 @@ fn test_service_update_noop_when_value_unchanged() {
     assert!(
         stderr.contains("NOTE: Ensure the secret_id TTL is at least 2"),
         "should show rotation cadence hint even when value unchanged, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_update_rn_cidrs_clear_removes_bound_cidrs() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app_cidrs(temp_dir.path(), Some(&["10.0.0.0/24", "192.168.1.0/24"]));
+
+    // Verify CIDRs are set before update
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["services"]["edge-proxy"]["approle"]["token_bound_cidrs"].is_array(),
+        "token_bound_cidrs should be set before clear"
+    );
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--rn-cidrs",
+            "clear",
+        ])
+        .output()
+        .expect("run service update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("token_bound_cidrs"),
+        "should report token_bound_cidrs changed, got: {stdout}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["services"]["edge-proxy"]["approle"]["token_bound_cidrs"].is_null(),
+        "token_bound_cidrs should be cleared (null) after --rn-cidrs clear"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_add_rejects_rn_cidrs_clear() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--rn-cidrs",
+            "clear",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "service add --rn-cidrs clear should fail, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("clear"),
+        "error should mention 'clear', got: {stderr}"
     );
 }
 

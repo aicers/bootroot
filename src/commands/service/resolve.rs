@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use bootroot::input_validation::{
-    ValidationError, validate_dns_label, validate_domain_name, validate_numeric_instance_id,
+    ValidationError, validate_cidr_list, validate_dns_label, validate_domain_name,
+    validate_numeric_instance_id,
 };
 
 use crate::cli::args::{HookFailurePolicyArg, ReloadStyle, ServiceAddArgs};
@@ -33,8 +34,10 @@ pub(crate) struct ResolvedServiceAdd {
     pub(crate) post_renew_hooks: Vec<PostRenewHookEntry>,
     pub(crate) secret_id_ttl: Option<String>,
     pub(crate) secret_id_wrap_ttl: Option<String>,
+    pub(crate) token_bound_cidrs: Option<Vec<String>>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn resolve_service_add_args(
     args: &ServiceAddArgs,
     messages: &Messages,
@@ -131,6 +134,16 @@ pub(super) fn resolve_service_add_args(
         args.secret_id_wrap_ttl.clone()
     };
 
+    validate_rn_cidrs(&args.rn_cidrs, messages)?;
+    if args.rn_cidrs.len() == 1 && args.rn_cidrs.first().map(String::as_str) == Some("clear") {
+        anyhow::bail!(messages.error_rn_cidrs_clear_on_add());
+    }
+    let token_bound_cidrs = if args.rn_cidrs.is_empty() {
+        None
+    } else {
+        Some(args.rn_cidrs.clone())
+    };
+
     Ok(ResolvedServiceAdd {
         service_name,
         deploy_type,
@@ -147,6 +160,7 @@ pub(super) fn resolve_service_add_args(
         post_renew_hooks,
         secret_id_ttl: args.secret_id_ttl.clone(),
         secret_id_wrap_ttl,
+        token_bound_cidrs,
     })
 }
 
@@ -212,6 +226,8 @@ fn service_name_error(err: ValidationError, messages: &Messages) -> anyhow::Erro
         ValidationError::Empty => anyhow::anyhow!(messages.error_value_required()),
         ValidationError::InvalidDnsLabel
         | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_service_name_invalid()),
     }
 }
@@ -221,6 +237,8 @@ fn hostname_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
         ValidationError::Empty => anyhow::anyhow!(messages.error_value_required()),
         ValidationError::InvalidDnsLabel
         | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_hostname_invalid()),
     }
 }
@@ -230,6 +248,8 @@ fn domain_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
         ValidationError::Empty => anyhow::anyhow!(messages.error_value_required()),
         ValidationError::InvalidDnsLabel
         | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_domain_invalid()),
     }
 }
@@ -239,8 +259,27 @@ fn instance_id_error(err: ValidationError, messages: &Messages) -> anyhow::Error
         ValidationError::Empty => anyhow::anyhow!(messages.error_service_instance_id_required()),
         ValidationError::InvalidDnsLabel
         | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_instance_id_invalid()),
     }
+}
+
+pub(super) fn validate_rn_cidrs(values: &[String], messages: &Messages) -> Result<()> {
+    validate_cidr_list(values).map_err(|err| match err {
+        ValidationError::CidrClearConflict => {
+            anyhow::anyhow!(messages.error_rn_cidrs_clear_conflict())
+        }
+        ValidationError::InvalidCidr => {
+            let bad = values
+                .iter()
+                .find(|v| *v != "clear" && bootroot::input_validation::validate_cidr(v).is_err())
+                .map_or("", String::as_str);
+            anyhow::anyhow!(messages.error_rn_cidrs_invalid(bad))
+        }
+        _ => anyhow::anyhow!(messages.error_rn_cidrs_invalid("")),
+    })?;
+    Ok(())
 }
 
 fn parse_deploy_type(value: &str, messages: &Messages) -> Result<DeployType> {
@@ -418,6 +457,7 @@ mod tests {
             secret_id_ttl: None,
             secret_id_wrap_ttl: None,
             no_wrap: false,
+            rn_cidrs: Vec::new(),
         }
     }
 

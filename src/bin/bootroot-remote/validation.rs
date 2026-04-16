@@ -34,6 +34,8 @@ fn service_name_error(err: ValidationError, lang: Locale) -> anyhow::Error {
         ),
         ValidationError::InvalidDnsLabel
         | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric => anyhow::anyhow!(
             "{}",
             localized(
@@ -57,6 +59,8 @@ fn profile_hostname_error(err: ValidationError, lang: Locale) -> anyhow::Error {
         ),
         ValidationError::InvalidDnsLabel
         | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric => anyhow::anyhow!(
             "{}",
             localized(
@@ -80,6 +84,8 @@ fn agent_domain_error(err: ValidationError, lang: Locale) -> anyhow::Error {
         ),
         ValidationError::InvalidDnsLabel
         | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric => anyhow::anyhow!(
             "{}",
             localized(
@@ -96,6 +102,8 @@ fn profile_instance_id_error(err: ValidationError, lang: Locale) -> anyhow::Erro
         ValidationError::Empty
         | ValidationError::InvalidDnsLabel
         | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric => anyhow::anyhow!(
             "{}",
             localized(

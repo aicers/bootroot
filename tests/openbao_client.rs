@@ -537,3 +537,129 @@ async fn unwrap_secret_sends_correct_request() {
         .expect("unwrap_secret should succeed");
     assert_eq!(result.data.secret_id, "unwrapped-secret-id");
 }
+
+#[tokio::test]
+async fn verify_audit_file_fails_when_missing() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/audit"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let err = client
+        .verify_audit_file()
+        .await
+        .expect_err("verify_audit_file should fail when no audit backend exists");
+    assert!(
+        err.to_string().contains("no file audit backend found"),
+        "error should mention missing audit: {err}"
+    );
+}
+
+#[tokio::test]
+async fn verify_audit_file_succeeds_when_present() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/audit"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "file/": {
+                    "type": "file",
+                    "options": { "file_path": "/openbao/audit/audit.log" }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    client
+        .verify_audit_file()
+        .await
+        .expect("verify_audit_file should succeed when file backend is present");
+}
+
+#[tokio::test]
+async fn verify_audit_file_succeeds_at_custom_mount() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/audit"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "audit/": {
+                    "type": "file",
+                    "options": { "file_path": "/var/log/openbao/audit.log" }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    client
+        .verify_audit_file()
+        .await
+        .expect("verify_audit_file should detect file backend at custom mount");
+}
+
+#[tokio::test]
+async fn verify_audit_file_fails_on_empty_response() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/audit"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    client
+        .verify_audit_file()
+        .await
+        .expect_err("verify_audit_file should fail on empty response body");
+}
+
+#[tokio::test]
+async fn create_secret_id_with_token_bound_cidrs() {
+    use bootroot::openbao::SecretIdOptions;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/role/svc-role/secret-id"))
+        .and(header("X-Vault-Token", "root-token"))
+        .and(body_json(json!({
+            "num_uses": 0,
+            "token_bound_cidrs": ["10.0.0.0/24", "192.168.1.0/24"]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": "cidr-bound-secret" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+    let opts = SecretIdOptions {
+        num_uses: Some(0),
+        token_bound_cidrs: Some(vec![
+            "10.0.0.0/24".to_string(),
+            "192.168.1.0/24".to_string(),
+        ]),
+        ..Default::default()
+    };
+    let secret_id = client
+        .create_secret_id("svc-role", &opts)
+        .await
+        .expect("create_secret_id with CIDRs should succeed");
+    assert_eq!(secret_id, "cidr-bound-secret");
+}

@@ -148,6 +148,10 @@ pub(super) async fn configure_openbao(
         .ensure_approle_auth()
         .await
         .with_context(|| messages.error_openbao_approle_auth_failed())?;
+    client
+        .verify_audit_file()
+        .await
+        .with_context(|| messages.error_openbao_audit_setup_failed())?;
 
     let policies = build_policy_map(&args.openbao.kv_mount);
     for (name, policy) in &policies {

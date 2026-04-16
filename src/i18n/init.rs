@@ -28,6 +28,10 @@ impl Messages {
         self.strings().warning_openbao_sealed_non_interactive
     }
 
+    pub(crate) fn error_openbao_audit_setup_failed(&self) -> &'static str {
+        self.strings().error_openbao_audit_setup_failed
+    }
+
     pub(crate) fn warning_db_password_rotation_skipped(&self) -> &'static str {
         self.strings().warning_db_password_rotation_skipped
     }
@@ -55,6 +59,18 @@ impl Messages {
             self.strings().error_secret_id_ttl_invalid,
             &[("value", value)],
         )
+    }
+
+    pub(crate) fn error_rn_cidrs_invalid(&self, value: &str) -> String {
+        format_template(self.strings().error_rn_cidrs_invalid, &[("value", value)])
+    }
+
+    pub(crate) fn error_rn_cidrs_clear_conflict(&self) -> &'static str {
+        self.strings().error_rn_cidrs_clear_conflict
+    }
+
+    pub(crate) fn error_rn_cidrs_clear_on_add(&self) -> &'static str {
+        self.strings().error_rn_cidrs_clear_on_add
     }
 
     pub(crate) fn prompt_openbao_unseal_from_file_confirm(&self, value: &str) -> String {

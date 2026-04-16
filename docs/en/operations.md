@@ -89,6 +89,29 @@ bootroot monitoring status
 - Include KV v2 data in backup/snapshot policies.
 - Confirm reload/restart behavior for bootroot-agent/step-ca after rotations.
 
+### Audit logging
+
+A file-based audit backend is declared in `openbao/openbao.hcl` and
+enabled automatically when the OpenBao container starts. The audit log
+captures every OpenBao API request (authentication, secret reads/writes,
+policy changes) and is essential for post-incident investigation.
+
+`bootroot init` verifies that the audit backend is active. If no file
+audit device is found (e.g. the audit stanza was removed from
+`openbao.hcl`, or the `openbao-audit` volume is not mounted), init
+fails. Restore the audit configuration and re-run init.
+
+- **Log location (inside container):** `/openbao/audit/audit.log`
+- **Host access:** the log is persisted on the `openbao-audit` Docker
+  volume. Inspect it with
+  `docker compose exec openbao cat /openbao/audit/audit.log`.
+- **Rotation:** OpenBao does not rotate the audit log itself. Use an
+  external log rotation tool (e.g. `logrotate` on a bind-mount, or a
+  sidecar that tails the volume) and send `SIGHUP` to the OpenBao
+  process after rotation so it reopens the file handle.
+- **Verification:** confirm the audit device is active with
+  `docker compose exec openbao bao audit list`.
+
 ## Monitoring operations
 
 - Use `bootroot monitoring up --profile lan|public` to start monitoring.

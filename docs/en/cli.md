@@ -600,6 +600,11 @@ Per-issuance `secret_id` policy flags:
 - `--secret-id-wrap-ttl`: response-wrapping TTL for the `secret_id`
   (default `30m`)
 - `--no-wrap`: disable response wrapping for the `secret_id`
+- `--rn-cidrs`: CIDR ranges to bind the `secret_id` token to
+  (repeatable, e.g. `--rn-cidrs 10.0.0.0/24 --rn-cidrs 192.168.1.0/24`).
+  When set, OpenBao rejects authentication from source IPs outside the
+  specified ranges. Omitting the flag preserves the default (no CIDR
+  binding)
 
 These values are persisted in `state.json` and applied on
 `rotate approle-secret-id`. `--no-wrap` and `--secret-id-wrap-ttl` control
@@ -654,6 +659,8 @@ full `service add` flow. At least one policy flag is required.
   (use `"inherit"` to restore default wrapping behavior)
 - `--no-wrap`: disable response wrapping for the `secret_id`
   (conflicts with `--secret-id-wrap-ttl`)
+- `--rn-cidrs`: CIDR ranges to bind the `secret_id` token to
+  (repeatable). Use `--rn-cidrs clear` to remove an existing binding
 
 ### Behavior
 

@@ -24,5 +24,13 @@ telemetry {
   disable_hostname = true
 }
 
+audit {
+  type = "file"
+  path = "file"
+  options {
+    file_path = "/openbao/audit/audit.log"
+  }
+}
+
 disable_mlock = true
 ui = true

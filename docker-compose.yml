@@ -9,8 +9,12 @@ services:
       - "9101"
     volumes:
       - openbao-data:/openbao/file
+      - openbao-audit:/openbao/audit
       - ./openbao:/openbao/config:ro
-    command: ["server", "-config=/openbao/config/openbao.hcl"]
+    # The standard entrypoint chowns /openbao/config and /openbao/file but
+    # does not know about /openbao/audit.  Fix ownership before delegating
+    # to the original entrypoint so the openbao user can write audit logs.
+    entrypoint: ["sh", "-c", "chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit && exec docker-entrypoint.sh server -config=/openbao/config/openbao.hcl"]
 
   # PostgreSQL for step-ca. The port is exposed to the host so that
   # `bootroot rotate db` (which runs on the host) can connect directly.
@@ -151,6 +155,7 @@ services:
 
 volumes:
   openbao-data:
+  openbao-audit:
   postgres-data:
   prometheus-data:
   grafana-data:

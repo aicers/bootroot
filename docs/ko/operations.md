@@ -83,6 +83,29 @@ bootroot monitoring status
 - KV v2 경로를 백업/스냅샷 정책에 포함합니다.
 - 시크릿 회전 시 bootroot-agent/step-ca 재시작 또는 리로드 정책을 확인합니다.
 
+### 감사 로깅
+
+파일 기반 감사 백엔드는 `openbao/openbao.hcl`에 선언되어 있으며
+OpenBao 컨테이너 시작 시 자동으로 활성화됩니다. 감사 로그는 모든
+OpenBao API 요청(인증, 시크릿 읽기/쓰기, 정책 변경)을 기록하며,
+사후 조사에 필수적입니다.
+
+`bootroot init`은 감사 백엔드가 활성 상태인지 확인합니다. 파일 감사
+장치가 없는 경우(예: `openbao.hcl`에서 감사 스탠자가 제거되었거나
+`openbao-audit` 볼륨이 마운트되지 않은 경우) init은 실패합니다.
+감사 설정을 복원한 후 init을 다시 실행하세요.
+
+- **로그 위치 (컨테이너 내부):** `/openbao/audit/audit.log`
+- **호스트 접근:** 로그는 `openbao-audit` Docker 볼륨에 저장됩니다.
+  `docker compose exec openbao cat /openbao/audit/audit.log`으로
+  확인할 수 있습니다.
+- **로테이션:** OpenBao는 감사 로그를 자체적으로 로테이션하지 않습니다.
+  외부 로그 로테이션 도구(예: bind-mount의 `logrotate` 또는 볼륨을
+  tail하는 사이드카)를 사용하고, 로테이션 후 OpenBao 프로세스에
+  `SIGHUP`을 보내 파일 핸들을 다시 열도록 합니다.
+- **확인:** `docker compose exec openbao bao audit list`로 감사 장치가
+  활성 상태인지 확인합니다.
+
 ## 모니터링 운영
 
 - `bootroot monitoring up --profile lan|public`으로 모니터링 컨테이너를 기동합니다.

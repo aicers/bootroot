@@ -262,6 +262,12 @@ pub(crate) fn print_service_info_summary(entry: &ServiceEntry, messages: &Messag
         "{}",
         messages.service_info_secret_id_wrap_ttl(&wrap_ttl_display)
     );
+    if let Some(ref cidrs) = entry.approle.token_bound_cidrs {
+        println!(
+            "{}",
+            messages.service_info_token_bound_cidrs(&cidrs.join(", "))
+        );
+    }
     println!(
         "{}",
         messages.service_summary_openbao_path(&entry.service_name)
