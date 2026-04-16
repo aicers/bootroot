@@ -238,8 +238,14 @@ async fn run_init_inner(
     .await?;
     let compose_has_responder = compose_has_responder(&args.compose.compose_file, messages)?;
     let responder_url = resolve_responder_url(args, compose_has_responder);
-    let responder_check =
-        verify_responder(responder_url.as_deref(), args, messages, &secrets).await?;
+    let responder_check = verify_responder(
+        responder_url.as_deref(),
+        args,
+        messages,
+        &secrets,
+        &secrets_dir,
+    )
+    .await?;
     let eab_update = maybe_register_eab(client, args, messages, rollback, &secrets).await?;
     if let Some(eab) = eab_update {
         secrets.eab = Some(eab);

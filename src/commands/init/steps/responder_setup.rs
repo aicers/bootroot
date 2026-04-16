@@ -149,6 +149,7 @@ pub(super) async fn verify_responder(
     args: &InitArgs,
     messages: &Messages,
     secrets: &InitSecrets,
+    secrets_dir: &Path,
 ) -> Result<ResponderCheck> {
     if args.has_skip(InitSkipPhase::ResponderCheck) {
         return Ok(ResponderCheck::Skipped);
@@ -156,6 +157,21 @@ pub(super) async fn verify_responder(
     let Some(responder_url) = responder_url else {
         return Ok(ResponderCheck::Skipped);
     };
+    let ca_pem = if responder_url.starts_with("https://") {
+        Some(
+            super::ca_certs::compute_ca_bundle_pem(secrets_dir, messages)
+                .await
+                .context("Failed to read step-ca root for responder TLS verification")?,
+        )
+    } else {
+        None
+    };
+    let trust = ca_pem
+        .as_deref()
+        .map(|pem| responder_client::ResponderTrust {
+            ca_pem: pem,
+            ca_pins: &[],
+        });
     responder_client::register_http01_token_with(
         responder_url,
         &secrets.http_hmac,
@@ -163,6 +179,7 @@ pub(super) async fn verify_responder(
         "bootroot-init-check",
         "bootroot-init-check.key",
         DEFAULT_RESPONDER_TOKEN_TTL_SECS,
+        trust.as_ref(),
     )
     .await
     .with_context(|| messages.error_responder_check_failed())?;
