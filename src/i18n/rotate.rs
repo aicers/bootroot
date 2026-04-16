@@ -310,4 +310,11 @@ impl Messages {
             &[("phase", phase)],
         )
     }
+
+    pub(crate) fn rotate_sidecar_skip_remote(&self, service_name: &str, interval: &str) -> String {
+        format_template(
+            self.strings().rotate_sidecar_skip_remote,
+            &[("service_name", service_name), ("interval", interval)],
+        )
+    }
 }

@@ -386,4 +386,5 @@ pub(super) static STRINGS: Strings = Strings {
     policy_label_disabled: "disabled",
     policy_label_default_wrap_ttl: "{value} (default)",
     service_update_no_changes: "No fields changed.",
+    rotate_sidecar_skip_remote: "- {service_name}: remote sidecar skipped; OpenBao Agent will pick up the new HMAC via KV polling within {interval}",
 };
