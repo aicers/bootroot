@@ -30,6 +30,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Fixed `bootroot service add` (`local-file` mode) generating an agent config
   missing top-level `domain` and `[acme].http_responder_hmac`. The generated
   `agent.toml` is now ready to use without manual editing.
+- Fixed `bootroot init` failing with "Failed to set key file permissions /
+  Operation not permitted" when the step-ca compose service (running as
+  root) restarted into a freshly created `ca.json` and wrote DB state
+  files as root before `fix_secrets_permissions` could run. Init now
+  stops the compose step-ca service before bootstrapping and restarts it
+  after permissions are fixed and `ca.json` is patched.
 
 ### Added
 
