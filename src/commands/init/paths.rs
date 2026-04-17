@@ -147,8 +147,8 @@ mod tests {
             responder_dir.join("responder.toml"),
             "\
 hmac_secret = \"test\"
-tls_cert_path = \"/app/responder/tls/cert.pem\"
-tls_key_path = \"/app/responder/tls/key.pem\"
+tls_cert_path = \"/app/bootroot-http01/tls/server.crt\"
+tls_key_path = \"/app/bootroot-http01/tls/server.key\"
 ",
         )
         .unwrap();

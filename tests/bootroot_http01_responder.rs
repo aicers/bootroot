@@ -39,7 +39,7 @@ async fn test_http01_responder_serves_registered_token() {
     let mut responder = ResponderProcess::spawn(&config_path);
     let challenge_base_url = format!("http://{listen_addr}");
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url).await;
+    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     let response = register_token(
         &admin_base_url,
@@ -80,7 +80,7 @@ async fn test_http01_responder_clamps_requested_ttl_to_server_max() {
     let mut responder = ResponderProcess::spawn(&config_path);
     let challenge_base_url = format!("http://{listen_addr}");
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url).await;
+    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     let response = register_token(
         &admin_base_url,
@@ -119,7 +119,7 @@ async fn test_http01_responder_rate_limits_admin_registrations() {
     let mut responder = ResponderProcess::spawn(&config_path);
     let challenge_base_url = format!("http://{listen_addr}");
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url).await;
+    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     let first = register_token(
         &admin_base_url,
@@ -162,7 +162,7 @@ async fn test_http01_responder_rejects_large_admin_payloads() {
     let mut responder = ResponderProcess::spawn(&config_path);
     let challenge_base_url = format!("http://{listen_addr}");
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url).await;
+    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     let response = reqwest::Client::new()
         .post(format!("{admin_base_url}{ADMIN_PATH}"))
@@ -189,7 +189,7 @@ async fn test_http01_responder_reloads_hmac_secret_on_sighup() {
     let mut responder = ResponderProcess::spawn(&config_path);
     let challenge_base_url = format!("http://{listen_addr}");
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url).await;
+    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     write_responder_config(&config_path, &listen_addr, &admin_addr, "new-secret");
     send_sighup(responder.pid());
@@ -315,8 +315,13 @@ fn sign_request(
     (timestamp, signature)
 }
 
-async fn wait_for_ready(responder: &mut ResponderProcess, challenge_base_url: &str) {
-    let url = format!("{challenge_base_url}{CHALLENGE_PATH_PREFIX}/health-check");
+async fn wait_for_ready(
+    responder: &mut ResponderProcess,
+    challenge_base_url: &str,
+    admin_base_url: &str,
+) {
+    let challenge_url = format!("{challenge_base_url}{CHALLENGE_PATH_PREFIX}/health-check");
+    let admin_url = format!("{admin_base_url}{ADMIN_PATH}");
 
     for _ in 0..STARTUP_RETRIES {
         if let Some(status) = responder.try_wait() {
@@ -324,12 +329,18 @@ async fn wait_for_ready(responder: &mut ResponderProcess, challenge_base_url: &s
             panic!("responder exited early with {status}: {stderr}");
         }
 
-        match reqwest::get(&url).await {
-            Ok(response) if matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::OK) => {
-                return;
+        let challenge_ready = match reqwest::get(&challenge_url).await {
+            Ok(response) => {
+                matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::OK)
             }
-            Ok(_) | Err(_) => sleep(STARTUP_DELAY).await,
+            Err(_) => false,
+        };
+
+        if challenge_ready && reqwest::Client::new().get(&admin_url).send().await.is_ok() {
+            return;
         }
+
+        sleep(STARTUP_DELAY).await;
     }
 
     panic!("responder did not become ready");

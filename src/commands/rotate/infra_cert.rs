@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 
 use super::RotateContext;
 use super::helpers::{confirm_action, try_restart_container};
-use crate::commands::init::{OPENBAO_INFRA_CERT_KEY, reissue_openbao_tls_cert};
+use crate::commands::init::{
+    HTTP01_ADMIN_INFRA_CERT_KEY, OPENBAO_INFRA_CERT_KEY, reissue_http01_admin_tls_cert,
+    reissue_openbao_tls_cert,
+};
 use crate::i18n::Messages;
 use crate::state::{InfraCertEntry, ReloadStrategy};
 
@@ -69,9 +72,8 @@ pub(super) fn rotate_infra_certs(
 /// Dispatches certificate re-issuance by infra-cert key.
 ///
 /// Each infrastructure certificate type registers an arm here.
-/// Follow-up PRs (e.g. #515) add their handler without touching
-/// the rotation loop.  Unknown keys surface as errors through the
-/// standard rotation error path.
+/// Unknown keys surface as errors through the standard rotation
+/// error path.
 fn dispatch_reissue(
     name: &str,
     compose_dir: &Path,
@@ -83,6 +85,7 @@ fn dispatch_reissue(
         OPENBAO_INFRA_CERT_KEY => {
             reissue_openbao_tls_cert(compose_dir, secrets_dir, entry, messages)
         }
+        HTTP01_ADMIN_INFRA_CERT_KEY => reissue_http01_admin_tls_cert(secrets_dir, entry, messages),
         _ => bail!("Unknown infra cert key: {name}"),
     }
 }
@@ -94,6 +97,26 @@ fn execute_reload_strategy(strategy: &ReloadStrategy) -> Result<()> {
             try_restart_container(container_name)
                 .with_context(|| format!("Failed to restart container {container_name}"))?;
         }
+        ReloadStrategy::ContainerSignal {
+            container_name,
+            signal,
+        } => {
+            try_signal_container(container_name, signal)
+                .with_context(|| format!("Failed to signal container {container_name}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Sends a signal to a Docker container via `docker kill -s`.
+fn try_signal_container(container: &str, signal: &str) -> Result<()> {
+    let status = std::process::Command::new("docker")
+        .args(["kill", "-s", signal, container])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("container {container} not found or signal failed");
     }
     Ok(())
 }
@@ -112,7 +135,10 @@ mod tests {
         AuthMode, ComposeFileArgs, OpenBaoOverrideArgs, RotateArgs, RotateCommand,
         RotateInfraCertArgs, RuntimeAuthArgs, SecretsDirOverrideArgs,
     };
+    use crate::commands::constants::RESPONDER_SERVICE_NAME;
     use crate::commands::init::{
+        HTTP01_ADMIN_INFRA_CERT_KEY, HTTP01_ADMIN_TLS_CERT_REL_PATH,
+        HTTP01_ADMIN_TLS_DEFAULT_RENEW_BEFORE, HTTP01_ADMIN_TLS_KEY_REL_PATH,
         OPENBAO_CONTAINER_NAME, OPENBAO_INFRA_CERT_KEY, OPENBAO_TLS_CERT_PATH,
         OPENBAO_TLS_DEFAULT_RENEW_BEFORE, OPENBAO_TLS_KEY_PATH,
     };
@@ -189,6 +215,7 @@ mod tests {
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
             infra_certs,
         };
 
@@ -248,6 +275,129 @@ mod tests {
         assert!(
             !dir.path().join("state.json").exists(),
             "state must not be written to hardcoded state.json"
+        );
+    }
+
+    fn make_http01_admin_infra_entry(secrets_dir: &std::path::Path) -> InfraCertEntry {
+        InfraCertEntry {
+            cert_path: secrets_dir.join(HTTP01_ADMIN_TLS_CERT_REL_PATH),
+            key_path: secrets_dir.join(HTTP01_ADMIN_TLS_KEY_REL_PATH),
+            sans: vec![
+                "responder.internal".to_string(),
+                "localhost".to_string(),
+                RESPONDER_SERVICE_NAME.to_string(),
+            ],
+            renew_before: HTTP01_ADMIN_TLS_DEFAULT_RENEW_BEFORE.to_string(),
+            reload_strategy: ReloadStrategy::ContainerSignal {
+                container_name: RESPONDER_SERVICE_NAME.to_string(),
+                signal: "SIGHUP".to_string(),
+            },
+            issued_at: None,
+            expires_at: None,
+        }
+    }
+
+    /// Exercises `run_rotate(RotateCommand::InfraCert)` with an
+    /// HTTP-01 admin entry that uses `ContainerSignal` reload.
+    ///
+    /// Verifies the `dispatch_reissue` arm for
+    /// `HTTP01_ADMIN_INFRA_CERT_KEY` and the `execute_reload_strategy`
+    /// path for `ContainerSignal`.
+    #[test]
+    fn run_rotate_infra_cert_renews_http01_admin_tls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let messages = test_messages();
+
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("bin dir");
+        let docker_path = bin_dir.join("docker");
+        write_fake_docker_script(&docker_path);
+
+        let compose_dir = dir.path().join("compose");
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).expect("secrets dir");
+
+        // Pre-create cert/key files so `set_key_permissions_sync`
+        // succeeds after the fake docker "issues" the cert.
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
+        fs::create_dir_all(&tls_dir).expect("tls dir");
+        fs::write(tls_dir.join("server.crt"), "fake-cert").expect("write cert");
+        fs::write(tls_dir.join("server.key"), "fake-key").expect("write key");
+
+        let mut infra_certs = BTreeMap::new();
+        infra_certs.insert(
+            HTTP01_ADMIN_INFRA_CERT_KEY.to_string(),
+            make_http01_admin_infra_entry(&secrets_dir),
+        );
+
+        let state = StateFile {
+            openbao_url: "https://192.0.2.1:1".to_string(),
+            kv_mount: String::new(),
+            secrets_dir: Some(secrets_dir.clone()),
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+            http01_admin_advertise_addr: None,
+            infra_certs,
+        };
+
+        let state_file = dir.path().join("state.json");
+        state.save(&state_file).expect("write state");
+
+        let args = RotateArgs {
+            command: RotateCommand::InfraCert(RotateInfraCertArgs {}),
+            state_file: Some(state_file.clone()),
+            compose: ComposeFileArgs {
+                compose_file: compose_dir.join("docker-compose.yml"),
+            },
+            openbao: OpenBaoOverrideArgs {
+                openbao_url: None,
+                kv_mount: None,
+            },
+            secrets_dir: SecretsDirOverrideArgs {
+                secrets_dir: Some(secrets_dir),
+            },
+            runtime_auth: RuntimeAuthArgs {
+                auth_mode: AuthMode::Auto,
+                root_token: None,
+                approle_role_id: None,
+                approle_secret_id: None,
+                approle_role_id_file: None,
+                approle_secret_id_file: None,
+            },
+            yes: true,
+            show_secrets: false,
+        };
+
+        let args_log = dir.path().join("docker_args.log");
+
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(run_rotate(&args, &messages))
+            .expect("run_rotate(InfraCert) must succeed for http01 admin entry");
+
+        let reloaded = StateFile::load(&state_file).expect("state file must be readable");
+        let entry = reloaded
+            .infra_certs
+            .get(HTTP01_ADMIN_INFRA_CERT_KEY)
+            .expect("http01 admin entry must still exist");
+        assert!(
+            entry.issued_at.is_some(),
+            "issued_at must be updated after renewal"
+        );
+
+        // Verify the fake docker received a `kill -s SIGHUP` command
+        // (the ContainerSignal reload strategy).
+        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        assert!(
+            log.contains("kill") && log.contains("SIGHUP"),
+            "docker must have been called with kill -s SIGHUP, got: {log}"
         );
     }
 }

@@ -33,6 +33,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added automatic HTTP-01 admin API TLS certificate provisioning during
+  `bootroot init`. When `--http01-admin-bind` intent is recorded,
+  `bootroot init` issues a server certificate via the local step-ca,
+  writes `responder.toml` with TLS enabled, and applies the compose
+  override in a single restart — the admin API transitions from
+  loopback-only/plain-HTTP to non-loopback/TLS atomically. The
+  certificate is registered in `StateFile::infra_certs` for automated
+  renewal through the rotation pipeline via SIGHUP-based reload.
+  (Part of #515)
 - Added `agent-docker.hcl` generation to `bootroot service add`
   (local-file mode). The Docker variant uses the Docker-internal
   OpenBao address (`bootroot-openbao:8200`) and container-side paths under

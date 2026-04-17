@@ -108,6 +108,7 @@ pub(super) async fn write_responder_compose_override(
     compose_file: &Path,
     secrets_dir: &Path,
     config_path: &Path,
+    tls_enabled: bool,
     messages: &Messages,
 ) -> Result<Option<PathBuf>> {
     if !compose_has_responder(compose_file, messages)? {
@@ -125,12 +126,26 @@ pub(super) async fn write_responder_compose_override(
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("responder config has no file name"))?
         .to_string_lossy();
+
+    let tls_volume = if tls_enabled {
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
+        fs_util::ensure_secrets_dir(&tls_dir).await?;
+        let tls_dir = std::fs::canonicalize(&tls_dir)
+            .with_context(|| messages.error_resolve_path_failed(&tls_dir.display().to_string()))?;
+        format!(
+            "\n      - {}:/app/bootroot-http01/tls:ro",
+            tls_dir.display()
+        )
+    } else {
+        String::new()
+    };
+
     let contents = format!(
         r#"version: "3.8"
 services:
   {RESPONDER_SERVICE_NAME}:
     volumes:
-      - {dir}:/app/responder:ro
+      - {dir}:/app/responder:ro{tls_volume}
     command:
       - --config=/app/responder/{file_name}
 "#,
@@ -254,19 +269,19 @@ mod tests {
         let config = fs::read_to_string(&paths.config_path).unwrap();
 
         assert!(
-            template.contains("tls_cert_path = \"/app/responder/tls/cert.pem\""),
+            template.contains("tls_cert_path = \"/app/bootroot-http01/tls/server.crt\""),
             "template must include tls_cert_path: {template}"
         );
         assert!(
-            template.contains("tls_key_path = \"/app/responder/tls/key.pem\""),
+            template.contains("tls_key_path = \"/app/bootroot-http01/tls/server.key\""),
             "template must include tls_key_path: {template}"
         );
         assert!(
-            config.contains("tls_cert_path = \"/app/responder/tls/cert.pem\""),
+            config.contains("tls_cert_path = \"/app/bootroot-http01/tls/server.crt\""),
             "config must include tls_cert_path: {config}"
         );
         assert!(
-            config.contains("tls_key_path = \"/app/responder/tls/key.pem\""),
+            config.contains("tls_key_path = \"/app/bootroot-http01/tls/server.key\""),
             "config must include tls_key_path: {config}"
         );
     }
@@ -287,6 +302,7 @@ mod tests {
             &compose_file,
             &secrets_dir,
             &paths.config_path,
+            false,
             &messages,
         )
         .await
@@ -319,6 +335,7 @@ services:
             &compose_file,
             &secrets_dir,
             &paths.config_path,
+            false,
             &messages,
         )
         .await

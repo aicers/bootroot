@@ -13,6 +13,9 @@ use super::super::types::{
 use super::InitRollback;
 use super::RollbackFile;
 use super::database::{check_db_connectivity, resolve_db_dsn_for_init};
+use super::http01_admin_tls::{
+    build_http01_admin_tls_sans, issue_http01_admin_tls_cert, record_http01_admin_infra_cert,
+};
 use super::openbao_setup::{
     bootstrap_openbao, configure_openbao, setup_openbao_agents, validate_secret_id_ttl,
     write_ca_trust_fingerprints_with_retry,
@@ -33,16 +36,19 @@ use super::stepca_setup::{
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
+use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::guardrails::{
-    client_url_from_bind_addr, ensure_all_services_localhost_binding,
+    client_url_from_bind_addr, ensure_all_services_localhost_binding, validate_http01_admin_tls,
+    validate_http01_override_binding, validate_http01_override_scope,
     validate_openbao_override_binding, validate_openbao_override_scope, validate_openbao_tls,
 };
 use crate::commands::infra::{
     ensure_init_prereqs_ready, has_http01_admin_bind_intent, has_openbao_bind_intent, run_docker,
 };
 use crate::commands::init::{
-    OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH, OPENBAO_TLS_CERT_PATH,
-    OPENBAO_TLS_KEY_PATH,
+    HTTP01_ADMIN_TLS_CERT_REL_PATH, HTTP01_ADMIN_TLS_KEY_REL_PATH,
+    HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
+    OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_KEY_PATH, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
 };
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -211,7 +217,26 @@ async fn run_init_inner(
     }
     let stepca_templates =
         write_stepca_templates(&secrets_dir, &args.openbao.kv_mount, messages).await?;
-    let responder_tls_enabled = has_http01_admin_bind_intent(&StateFile::default_path())?;
+    let compose_has_responder = compose_has_responder(&args.compose.compose_file, messages)?;
+    let responder_tls_enabled =
+        compose_has_responder && has_http01_admin_bind_intent(&StateFile::default_path())?;
+    // Backup the responder config before writing the TLS-enabled
+    // version so that rollback can restore it and restart the
+    // responder on loopback without TLS.
+    if responder_tls_enabled {
+        let config_path = secrets_dir
+            .join(RESPONDER_CONFIG_DIR)
+            .join(RESPONDER_CONFIG_NAME);
+        rollback.responder_config_backup = Some(RollbackFile {
+            path: config_path.clone(),
+            original: if config_path.exists() {
+                Some(std::fs::read_to_string(&config_path)?)
+            } else {
+                None
+            },
+        });
+        rollback.compose_file = Some(args.compose.compose_file.clone());
+    }
     let responder_paths = write_responder_files(
         &secrets_dir,
         &args.openbao.kv_mount,
@@ -224,6 +249,7 @@ async fn run_init_inner(
         &args.compose.compose_file,
         &secrets_dir,
         &responder_paths.config_path,
+        responder_tls_enabled,
         messages,
     )
     .await?;
@@ -237,8 +263,66 @@ async fn run_init_inner(
         messages,
     )
     .await?;
+    // Issue the HTTP-01 admin TLS certificate before starting the
+    // responder so that cert files exist when TLS is enabled in the
+    // config.  When TLS is active, apply the config mount and the
+    // non-loopback port binding override in a single restart so that
+    // the admin API transitions from loopback-only/plain-HTTP to
+    // non-loopback/TLS atomically.
+    if responder_tls_enabled {
+        let state_path = StateFile::default_path();
+        let state = StateFile::load(&state_path)?;
+        let bind_addr = state
+            .http01_admin_bind_addr
+            .as_deref()
+            .expect("responder_tls_enabled implies http01_admin_bind_addr is Some");
+        let sans =
+            build_http01_admin_tls_sans(bind_addr, state.http01_admin_advertise_addr.as_deref());
+        let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
+        issue_http01_admin_tls_cert(&secrets_dir, &san_refs, messages)?;
+        // Track TLS artifacts for rollback cleanup.
+        rollback
+            .tls_artifacts
+            .push(secrets_dir.join(HTTP01_ADMIN_TLS_CERT_REL_PATH));
+        rollback
+            .tls_artifacts
+            .push(secrets_dir.join(HTTP01_ADMIN_TLS_KEY_REL_PATH));
+    }
     if let Some(override_path) = responder_compose_override.as_ref() {
-        apply_responder_compose_override(&args.compose.compose_file, override_path, messages)?;
+        if responder_tls_enabled {
+            // Track the config override so rollback can restart the
+            // responder with its config mount but without the exposed
+            // port override.
+            rollback.responder_compose_override = Some(override_path.clone());
+            let exposed_override = validate_http01_exposed_override_for_init(
+                compose_dir,
+                &StateFile::default_path(),
+                &secrets_dir,
+                messages,
+            )?;
+            let compose_str = args.compose.compose_file.to_string_lossy();
+            let config_override_str = override_path.to_string_lossy();
+            let exposed_override_str = exposed_override.to_string_lossy();
+            let up_args = [
+                "compose",
+                "-f",
+                &*compose_str,
+                "-f",
+                &*config_override_str,
+                "-f",
+                &*exposed_override_str,
+                "up",
+                "-d",
+                RESPONDER_SERVICE_NAME,
+            ];
+            run_docker(
+                &up_args,
+                "docker compose up -d responder (tls + exposed)",
+                messages,
+            )?;
+        } else {
+            apply_responder_compose_override(&args.compose.compose_file, override_path, messages)?;
+        }
     }
     let _trust_changed = write_ca_trust_fingerprints_with_retry(
         client,
@@ -248,7 +332,6 @@ async fn run_init_inner(
         messages,
     )
     .await?;
-    let compose_has_responder = compose_has_responder(&args.compose.compose_file, messages)?;
     let responder_url = resolve_responder_url(args, compose_has_responder)?;
     let responder_check = verify_responder(
         responder_url.as_deref(),
@@ -377,6 +460,26 @@ async fn run_init_inner(
     } else {
         args.openbao.openbao_url.clone()
     };
+
+    // Record the HTTP-01 admin TLS certificate in infra_certs so the
+    // rotation pipeline can renew it.  Deferred to after all fallible
+    // phases (DB password rotation, OpenBao TLS) so that a failure
+    // in those phases does not leave a stale entry that would trigger
+    // renewal against a rolled-back deployment.
+    if responder_tls_enabled {
+        let state_path = StateFile::default_path();
+        let mut state = StateFile::load(&state_path)?;
+        let bind_addr = state
+            .http01_admin_bind_addr
+            .clone()
+            .expect("responder_tls_enabled implies http01_admin_bind_addr is Some");
+        let sans =
+            build_http01_admin_tls_sans(&bind_addr, state.http01_admin_advertise_addr.as_deref());
+        record_http01_admin_infra_cert(&mut state, &secrets_dir, sans);
+        state
+            .save(&state_path)
+            .with_context(|| messages.error_serialize_state_failed())?;
+    }
 
     Ok(InitSummary {
         openbao_url: effective_openbao_url,
@@ -627,6 +730,7 @@ fn write_state_file_to(
         existing_openbao_bind_addr,
         existing_openbao_advertise_addr,
         existing_http01_admin_bind_addr,
+        existing_http01_admin_advertise_addr,
         existing_infra_certs,
     ) = if state_path.exists() {
         let state = StateFile::load(state_path)?;
@@ -635,10 +739,11 @@ fn write_state_file_to(
             state.openbao_bind_addr,
             state.openbao_advertise_addr,
             state.http01_admin_bind_addr,
+            state.http01_admin_advertise_addr,
             state.infra_certs,
         )
     } else {
-        (BTreeMap::new(), None, None, None, BTreeMap::new())
+        (BTreeMap::new(), None, None, None, None, BTreeMap::new())
     };
 
     let policy_map = AppRoleLabel::policy_map();
@@ -652,12 +757,42 @@ fn write_state_file_to(
         openbao_bind_addr: existing_openbao_bind_addr,
         openbao_advertise_addr: existing_openbao_advertise_addr,
         http01_admin_bind_addr: existing_http01_admin_bind_addr,
+        http01_admin_advertise_addr: existing_http01_admin_advertise_addr,
         infra_certs: existing_infra_certs,
     };
     state
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
+}
+
+/// Validates the HTTP-01 exposed compose override before applying it.
+///
+/// Mirrors the `OpenBao` override validation in the same init flow:
+/// fails early if the override file is missing or its binding does not
+/// match the state-recorded intent.
+fn validate_http01_exposed_override_for_init(
+    compose_dir: &Path,
+    state_path: &Path,
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<std::path::PathBuf> {
+    let override_path = compose_dir
+        .join("secrets")
+        .join("responder")
+        .join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
+    if !override_path.exists() {
+        anyhow::bail!(messages.error_http01_admin_override_file_missing());
+    }
+    let state = StateFile::load(state_path)?;
+    let bind_addr = state
+        .http01_admin_bind_addr
+        .as_deref()
+        .expect("caller verified responder_tls_enabled");
+    validate_http01_override_scope(&override_path, messages)?;
+    validate_http01_override_binding(&override_path, bind_addr, messages)?;
+    validate_http01_admin_tls(secrets_dir, messages)?;
+    Ok(override_path)
 }
 
 #[cfg(test)]
@@ -704,6 +839,7 @@ mod tests {
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         existing.save(&state_path).unwrap();
@@ -721,6 +857,129 @@ mod tests {
             reloaded.openbao_bind_addr.as_deref(),
             Some("192.168.1.10:8200"),
             "openbao_bind_addr must survive a state rewrite during init"
+        );
+    }
+
+    /// Regression: `validate_http01_exposed_override_for_init` must reject
+    /// a missing override file instead of letting docker compose fail with
+    /// an opaque error.
+    #[test]
+    fn validate_http01_override_rejects_missing_file() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let compose_dir = dir.path();
+        let state_path = compose_dir.join("state.json");
+        let state = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+            http01_admin_advertise_addr: None,
+            infra_certs: BTreeMap::new(),
+        };
+        state.save(&state_path).unwrap();
+        let result = validate_http01_exposed_override_for_init(
+            compose_dir,
+            &state_path,
+            &compose_dir.join("secrets"),
+            &messages,
+        );
+        assert!(
+            result.is_err(),
+            "missing override file must be a hard error"
+        );
+    }
+
+    /// Regression: `validate_http01_exposed_override_for_init` must reject
+    /// an override whose port binding does not match the state-recorded
+    /// bind intent.
+    #[test]
+    fn validate_http01_override_rejects_mismatched_binding() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let compose_dir = dir.path();
+        // Write override for one address.
+        crate::commands::guardrails::write_http01_exposed_override(
+            compose_dir,
+            "192.168.1.10:8080",
+            &messages,
+        )
+        .unwrap();
+        // Record a different bind intent in state.
+        let state_path = compose_dir.join("state.json");
+        let state = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: Some("10.0.0.5:8080".to_string()),
+            http01_admin_advertise_addr: None,
+            infra_certs: BTreeMap::new(),
+        };
+        state.save(&state_path).unwrap();
+        let result = validate_http01_exposed_override_for_init(
+            compose_dir,
+            &state_path,
+            &compose_dir.join("secrets"),
+            &messages,
+        );
+        assert!(
+            result.is_err(),
+            "mismatched override binding must be a hard error"
+        );
+    }
+
+    /// Regression: when the compose file does not contain the
+    /// `bootroot-http01` service but state records a bind intent,
+    /// `responder_tls_enabled` must be false so that init does not
+    /// issue a cert or register an infra-cert entry for a
+    /// nonexistent container.
+    #[test]
+    fn responder_tls_disabled_when_compose_lacks_responder() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        // Compose file without the responder service.
+        let compose_path = dir.path().join("docker-compose.yml");
+        std::fs::write(&compose_path, "services:\n  openbao:\n    image: openbao\n").unwrap();
+        // State file with bind intent recorded.
+        let state_path = dir.path().join("state.json");
+        let state = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+            http01_admin_advertise_addr: None,
+            infra_certs: BTreeMap::new(),
+        };
+        state.save(&state_path).unwrap();
+        let has_responder = compose_has_responder(&compose_path, &messages).unwrap();
+        let bind_intent = has_http01_admin_bind_intent(&state_path).unwrap();
+        let responder_tls_enabled = has_responder && bind_intent;
+        assert!(
+            !has_responder,
+            "compose without bootroot-http01 must report no responder"
+        );
+        assert!(
+            bind_intent,
+            "state with http01_admin_bind_addr must report bind intent"
+        );
+        assert!(
+            !responder_tls_enabled,
+            "responder TLS must be disabled when compose lacks the responder service"
         );
     }
 }

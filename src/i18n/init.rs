@@ -299,6 +299,10 @@ impl Messages {
         self.strings().info_openbao_bind_intent_cleared
     }
 
+    pub(crate) fn error_http01_admin_bind_requires_responder(&self) -> &'static str {
+        self.strings().error_http01_admin_bind_requires_responder
+    }
+
     pub(crate) fn error_http01_admin_bind_invalid_format(&self) -> &'static str {
         self.strings().error_http01_admin_bind_invalid_format
     }
@@ -314,6 +318,29 @@ impl Messages {
     pub(crate) fn error_http01_admin_bind_ipv6_requires_brackets(&self) -> &'static str {
         self.strings()
             .error_http01_admin_bind_ipv6_requires_brackets
+    }
+
+    pub(crate) fn error_http01_admin_advertise_addr_required(&self) -> &'static str {
+        self.strings().error_http01_admin_advertise_addr_required
+    }
+
+    pub(crate) fn error_http01_admin_advertise_addr_invalid(&self) -> &'static str {
+        self.strings().error_http01_admin_advertise_addr_invalid
+    }
+
+    pub(crate) fn error_http01_admin_advertise_addr_ipv6_requires_brackets(&self) -> &'static str {
+        self.strings()
+            .error_http01_admin_advertise_addr_ipv6_requires_brackets
+    }
+
+    pub(crate) fn error_http01_admin_advertise_addr_not_reachable(&self) -> &'static str {
+        self.strings()
+            .error_http01_admin_advertise_addr_not_reachable
+    }
+
+    pub(crate) fn error_http01_admin_advertise_addr_specific_bind_rejected(&self) -> &'static str {
+        self.strings()
+            .error_http01_admin_advertise_addr_specific_bind_rejected
     }
 
     pub(crate) fn info_http01_admin_bind_intent_recorded(&self, addr: &str) -> String {
@@ -370,6 +397,21 @@ impl Messages {
 
     pub(crate) fn error_openbao_hcl_write_failed(&self) -> &'static str {
         self.strings().error_openbao_hcl_write_failed
+    }
+
+    pub(crate) fn info_http01_admin_tls_reverted(&self) -> &'static str {
+        self.strings().info_http01_admin_tls_reverted
+    }
+
+    pub(crate) fn info_http01_admin_tls_provisioned(&self, path: &str) -> String {
+        format_template(
+            self.strings().info_http01_admin_tls_provisioned,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_http01_admin_tls_provision_failed(&self) -> &'static str {
+        self.strings().error_http01_admin_tls_provision_failed
     }
 }
 

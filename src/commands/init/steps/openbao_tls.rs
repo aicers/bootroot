@@ -397,6 +397,7 @@ mod tests {
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         let sans = vec!["openbao.internal".to_string(), "localhost".to_string()];
