@@ -857,4 +857,33 @@ impl Messages {
     pub(crate) fn service_update_no_changes(&self) -> &'static str {
         self.strings().service_update_no_changes
     }
+
+    pub(crate) fn error_service_agent_start_failed(&self) -> &'static str {
+        self.strings().error_service_agent_start_failed
+    }
+
+    pub(crate) fn error_service_not_docker(&self, value: &str) -> String {
+        format_template(self.strings().error_service_not_docker, &[("value", value)])
+    }
+
+    pub(crate) fn error_service_remote_bootstrap(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_service_remote_bootstrap,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_service_agent_config_missing(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_service_agent_config_missing,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_agent_start_completed(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_agent_start_completed,
+            &[("value", value)],
+        )
+    }
 }

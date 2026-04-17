@@ -425,4 +425,9 @@ pub(super) static STRINGS: Strings = Strings {
     error_infra_tls_renew_failed: "인프라 인증서 갱신에 실패했습니다: {name}",
     prompt_rotate_infra_tls: "인프라 인증서를 갱신하시겠습니까? [y/N]: ",
     rotate_infra_tls_no_entries: "state에 등록된 인프라 인증서가 없습니다",
+    error_service_agent_start_failed: "bootroot service agent start 실패",
+    error_service_not_docker: "서비스 배포 유형이 docker가 아닙니다: {value}",
+    error_service_remote_bootstrap: "서비스가 remote-bootstrap 전달 모드를 사용합니다. 로컬 사이드카 에이전트 시작은 지원되지 않습니다: {value}",
+    error_service_agent_config_missing: "Docker 에이전트 설정 파일을 찾을 수 없습니다: {value}",
+    service_agent_start_completed: "bootroot service agent start: bootroot-openbao-agent-{value} 시작됨",
 };

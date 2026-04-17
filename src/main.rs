@@ -8,7 +8,8 @@ mod state;
 use clap::Parser;
 
 use crate::cli::args::{
-    Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand, ServiceCommand,
+    Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand, ServiceAgentCommand,
+    ServiceCommand,
 };
 use crate::i18n::Messages;
 
@@ -95,6 +96,10 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
         CliCommand::Service(ServiceCommand::Update(args)) => {
             commands::service::run_service_update(&args, messages)
                 .with_context(|| messages.error_service_update_failed())?;
+        }
+        CliCommand::Service(ServiceCommand::Agent(ServiceAgentCommand::Start(args))) => {
+            commands::service::agent_start::run_service_agent_start(&args, messages)
+                .with_context(|| messages.error_service_agent_start_failed())?;
         }
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,

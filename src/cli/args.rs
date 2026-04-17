@@ -61,6 +61,22 @@ pub(crate) enum ServiceCommand {
     Add(Box<ServiceAddArgs>),
     Info(ServiceInfoArgs),
     Update(ServiceUpdateArgs),
+    #[command(subcommand)]
+    Agent(ServiceAgentCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ServiceAgentCommand {
+    Start(ServiceAgentStartArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ServiceAgentStartArgs {
+    /// Service name identifier
+    pub(crate) service_name: String,
+
+    #[command(flatten)]
+    pub(crate) compose_file: ComposeFileArgs,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1461,5 +1477,46 @@ mod tests {
             }
             _ => panic!("expected service update"),
         }
+    }
+
+    #[test]
+    fn test_cli_parses_service_agent_start() {
+        let cli = Cli::parse_from(["bootroot", "service", "agent", "start", "myapp"]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Agent(ServiceAgentCommand::Start(args))) => {
+                assert_eq!(args.service_name, "myapp");
+                assert_eq!(
+                    args.compose_file.compose_file,
+                    PathBuf::from("docker-compose.yml")
+                );
+            }
+            _ => panic!("expected service agent start"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_agent_start_custom_compose() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "agent",
+            "start",
+            "myapp",
+            "--compose-file",
+            "custom.yml",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Agent(ServiceAgentCommand::Start(args))) => {
+                assert_eq!(args.service_name, "myapp");
+                assert_eq!(args.compose_file.compose_file, PathBuf::from("custom.yml"));
+            }
+            _ => panic!("expected service agent start"),
+        }
+    }
+
+    #[test]
+    fn test_cli_service_agent_start_requires_service_name() {
+        let result = Cli::try_parse_from(["bootroot", "service", "agent", "start"]);
+        assert!(result.is_err(), "service-name should be required");
     }
 }

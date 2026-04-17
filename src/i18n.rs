@@ -460,6 +460,11 @@ pub(crate) struct Strings {
     pub(crate) error_infra_tls_renew_failed: &'static str,
     pub(crate) prompt_rotate_infra_tls: &'static str,
     pub(crate) rotate_infra_tls_no_entries: &'static str,
+    pub(crate) error_service_agent_start_failed: &'static str,
+    pub(crate) error_service_not_docker: &'static str,
+    pub(crate) error_service_remote_bootstrap: &'static str,
+    pub(crate) error_service_agent_config_missing: &'static str,
+    pub(crate) service_agent_start_completed: &'static str,
 }
 
 pub(crate) struct Messages {

@@ -425,4 +425,9 @@ pub(super) static STRINGS: Strings = Strings {
     error_infra_tls_renew_failed: "Failed to renew infrastructure certificate: {name}",
     prompt_rotate_infra_tls: "Renew infrastructure certificates? [y/N]: ",
     rotate_infra_tls_no_entries: "No infrastructure certificates registered in state",
+    error_service_agent_start_failed: "bootroot service agent start failed",
+    error_service_not_docker: "Service deploy type is not docker: {value}",
+    error_service_remote_bootstrap: "Service uses remote-bootstrap delivery; local sidecar agent start is not supported: {value}",
+    error_service_agent_config_missing: "Docker agent config not found: {value}",
+    service_agent_start_completed: "bootroot service agent start: started bootroot-openbao-agent-{value}",
 };

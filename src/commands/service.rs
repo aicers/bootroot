@@ -1,3 +1,4 @@
+pub(crate) mod agent_start;
 mod approle;
 mod local_config;
 mod remote_bootstrap;
