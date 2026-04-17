@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::constants::{DEFAULT_RESPONDER_ADMIN_URL, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME};
+use super::constants::{
+    DEFAULT_RESPONDER_ADMIN_URL, OPENBAO_CONTAINER_NAME, RESPONDER_CONFIG_DIR,
+    RESPONDER_CONFIG_NAME,
+};
 use crate::cli::args::InitArgs;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::guardrails::parse_hcl_string_value;
@@ -101,13 +104,33 @@ fn responder_tls_configured(secrets_dir: &Path) -> Result<bool> {
         && parse_hcl_string_value(&content, "tls_key_path").is_some())
 }
 
+/// Rewrites an `OpenBao` URL so that Docker-network containers can reach
+/// the server via its container name.
+///
+/// When `compose_has_openbao` is `true`, the host portion of `openbao_url`
+/// is unconditionally replaced with [`OPENBAO_CONTAINER_NAME`] while the
+/// scheme and port are preserved.  This covers loopback addresses
+/// (`localhost`, `127.0.0.1`) as well as specific bind IPs
+/// (`192.168.1.10`) that the host uses but that are unreachable from
+/// sibling containers on the Docker bridge network.
 pub(crate) fn resolve_openbao_agent_addr(openbao_url: &str, compose_has_openbao: bool) -> String {
     if !compose_has_openbao {
         return openbao_url.to_string();
     }
-    openbao_url
-        .replace("localhost", "openbao")
-        .replace("127.0.0.1", "openbao")
+    let Some((scheme, after_scheme)) = openbao_url.split_once("://") else {
+        return openbao_url.to_string();
+    };
+    // For IPv6 addresses like [::1]:8200 the port follows ']:', for
+    // IPv4 / hostnames like 192.168.1.10:8200 it follows ':'.
+    let port = if let Some(bracket_pos) = after_scheme.find(']') {
+        after_scheme.get(bracket_pos + 2..)
+    } else {
+        after_scheme.split_once(':').map(|(_, p)| p)
+    };
+    match port {
+        Some(p) => format!("{scheme}://{OPENBAO_CONTAINER_NAME}:{p}"),
+        None => format!("{scheme}://{OPENBAO_CONTAINER_NAME}"),
+    }
 }
 
 #[cfg(test)]

@@ -1316,6 +1316,7 @@ fn assert_state_contains_default_delivery_mode(root: &std::path::Path) {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str) {
     let openbao_service_dir = root
         .join("secrets")
@@ -1406,6 +1407,50 @@ fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str
         )),
         "agent.hcl should target a CA bundle output path"
     );
+
+    // Verify Docker sidecar agent config
+    let docker_hcl = openbao_service_dir.join("agent-docker.hcl");
+    assert!(docker_hcl.exists(), "agent-docker.hcl must be generated");
+    let docker_hcl_mode = fs::metadata(&docker_hcl)
+        .expect("docker hcl metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(docker_hcl_mode, 0o600, "agent-docker.hcl must be 0600");
+
+    let docker_hcl_contents = fs::read_to_string(&docker_hcl).expect("read agent-docker.hcl");
+    assert!(
+        docker_hcl_contents.contains("vault {"),
+        "agent-docker.hcl should contain vault block"
+    );
+    assert!(
+        docker_hcl_contents.contains(r#"address = "http://bootroot-openbao:"#),
+        "agent-docker.hcl should use Docker-internal address: {docker_hcl_contents}"
+    );
+    assert!(
+        docker_hcl_contents.contains("/openbao/secrets/"),
+        "agent-docker.hcl should use container-side paths: {docker_hcl_contents}"
+    );
+    assert!(
+        !docker_hcl_contents.contains("localhost"),
+        "agent-docker.hcl must not reference localhost: {docker_hcl_contents}"
+    );
+
+    // Verify CA bundle is pre-seeded in the credential directory at the
+    // same path the agent template renders to, so the sidecar can both
+    // bootstrap TLS and track live trust updates after the template runs.
+    let cred_dir = root.join("secrets").join("services").join(service_name);
+    let docker_ca = cred_dir.join("ca-bundle.pem");
+    assert!(
+        docker_ca.exists(),
+        "CA bundle must be pre-seeded for Docker sidecar TLS"
+    );
+    let docker_ca_mode = fs::metadata(&docker_ca)
+        .expect("docker ca metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(docker_ca_mode, 0o600, "Docker CA bundle must be 0600");
 }
 
 fn path_relative_to_root_or_self<'a>(

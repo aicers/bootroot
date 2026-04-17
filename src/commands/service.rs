@@ -27,6 +27,7 @@ pub(super) const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
 pub(super) const SERVICE_SECRET_ID_FILENAME: &str = "secret_id";
 pub(super) const OPENBAO_SERVICE_CONFIG_DIR: &str = "openbao/services";
 pub(super) const OPENBAO_AGENT_CONFIG_FILENAME: &str = "agent.hcl";
+pub(super) const OPENBAO_AGENT_DOCKER_CONFIG_FILENAME: &str = "agent-docker.hcl";
 pub(super) const OPENBAO_AGENT_TEMPLATE_FILENAME: &str = "agent.toml.ctmpl";
 pub(super) const OPENBAO_AGENT_CA_BUNDLE_TEMPLATE_FILENAME: &str = "ca-bundle.pem.ctmpl";
 pub(super) const OPENBAO_AGENT_TOKEN_FILENAME: &str = "token";
@@ -49,6 +50,7 @@ pub(super) struct ServiceAppRoleMaterialized {
 pub(super) struct LocalApplyResult {
     agent_config: String,
     openbao_agent_config: String,
+    openbao_agent_docker_config: String,
     openbao_agent_template: String,
 }
 
@@ -418,6 +420,7 @@ fn print_service_add_apply_summary(
             applied: applied.map(|result| ServiceAddAppliedPaths {
                 agent_config: &result.agent_config,
                 openbao_agent_config: &result.openbao_agent_config,
+                openbao_agent_docker_config: &result.openbao_agent_docker_config,
                 openbao_agent_template: &result.openbao_agent_template,
             }),
             remote: remote_bootstrap.map(|result| ServiceAddRemoteBootstrap {
