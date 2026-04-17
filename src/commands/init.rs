@@ -16,7 +16,9 @@ pub(crate) use constants::{
     OPENBAO_TLS_DEFAULT_NOT_AFTER, OPENBAO_TLS_DEFAULT_RENEW_BEFORE, OPENBAO_TLS_KEY_PATH,
     RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, SECRET_BYTES,
 };
-pub(crate) use paths::{compose_has_responder, resolve_openbao_agent_addr, to_container_path};
+pub(crate) use paths::{
+    compose_has_openbao, compose_has_responder, resolve_openbao_agent_addr, to_container_path,
+};
 pub(crate) use steps::openbao_tls::{reissue_openbao_tls_cert, write_openbao_hcl_plaintext};
 pub(crate) use steps::{
     compute_ca_bundle_pem, compute_ca_fingerprints, prompt_yes_no, read_ca_cert_fingerprint,
