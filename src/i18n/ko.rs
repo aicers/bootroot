@@ -406,4 +406,13 @@ pub(super) static STRINGS: Strings = Strings {
     error_openbao_override_binding_mismatch: "OpenBao compose 오버라이드 포트 매핑이 저장된 바인딩 의도와 일치하지 않습니다: 예상 {expected}, 발견 {actual}; infra install --openbao-bind를 다시 실행하여 재생성하세요",
     info_openbao_bind_intent_recorded: "OpenBao 비루프백 바인딩 의도 기록됨: {addr}",
     info_openbao_bind_intent_cleared: "이전 OpenBao 비루프백 바인딩 의도가 삭제되었습니다 (--openbao-bind 없이 재설치)",
+    error_http01_admin_bind_invalid_format: "--http01-admin-bind는 유효한 <IP>:<port> 주소여야 합니다",
+    error_http01_admin_bind_wildcard_required: "0.0.0.0 또는 [::]에 바인딩할 때 --http01-admin-bind-wildcard가 필요합니다",
+    error_http01_admin_bind_tls_flag_required: "--http01-admin-bind가 비루프백 주소를 지정할 때 --http01-admin-tls-required가 필요합니다",
+    error_http01_admin_bind_ipv6_requires_brackets: "--http01-admin-bind IPv6 주소는 대괄호로 묶어야 합니다, 예: [::1]:8080",
+    info_http01_admin_bind_intent_recorded: "HTTP-01 관리자 비루프백 바인딩 의도 기록됨: {addr}",
+    info_http01_admin_bind_intent_cleared: "이전 HTTP-01 관리자 비루프백 바인딩 의도가 삭제되었습니다 (--http01-admin-bind 없이 재설치)",
+    error_http01_admin_override_file_missing: "비루프백 HTTP-01 관리자 바인딩 의도가 상태에 기록되어 있지만 compose 오버라이드 파일이 없습니다; infra install --http01-admin-bind를 다시 실행하세요",
+    error_http01_admin_override_binding_mismatch: "HTTP-01 관리자 compose 오버라이드 포트 매핑이 저장된 바인딩 의도와 일치하지 않습니다: 예상 {expected}, 발견 {actual}; infra install --http01-admin-bind를 다시 실행하세요",
+    error_http01_admin_bind_tls_missing: "비루프백 바인딩에는 HTTP-01 관리자 API에 TLS가 필요하지만 TLS 전제 조건이 충족되지 않았습니다: {details}",
 };

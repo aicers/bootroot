@@ -298,6 +298,56 @@ impl Messages {
     pub(crate) fn info_openbao_bind_intent_cleared(&self) -> &'static str {
         self.strings().info_openbao_bind_intent_cleared
     }
+
+    pub(crate) fn error_http01_admin_bind_invalid_format(&self) -> &'static str {
+        self.strings().error_http01_admin_bind_invalid_format
+    }
+
+    pub(crate) fn error_http01_admin_bind_wildcard_required(&self) -> &'static str {
+        self.strings().error_http01_admin_bind_wildcard_required
+    }
+
+    pub(crate) fn error_http01_admin_bind_tls_flag_required(&self) -> &'static str {
+        self.strings().error_http01_admin_bind_tls_flag_required
+    }
+
+    pub(crate) fn error_http01_admin_bind_ipv6_requires_brackets(&self) -> &'static str {
+        self.strings()
+            .error_http01_admin_bind_ipv6_requires_brackets
+    }
+
+    pub(crate) fn info_http01_admin_bind_intent_recorded(&self, addr: &str) -> String {
+        format_template(
+            self.strings().info_http01_admin_bind_intent_recorded,
+            &[("addr", addr)],
+        )
+    }
+
+    pub(crate) fn info_http01_admin_bind_intent_cleared(&self) -> &'static str {
+        self.strings().info_http01_admin_bind_intent_cleared
+    }
+
+    pub(crate) fn error_http01_admin_override_file_missing(&self) -> &'static str {
+        self.strings().error_http01_admin_override_file_missing
+    }
+
+    pub(crate) fn error_http01_admin_override_binding_mismatch(
+        &self,
+        expected: &str,
+        actual: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_http01_admin_override_binding_mismatch,
+            &[("expected", expected), ("actual", actual)],
+        )
+    }
+
+    pub(crate) fn error_http01_admin_bind_tls_missing(&self, details: &str) -> String {
+        format_template(
+            self.strings().error_http01_admin_bind_tls_missing,
+            &[("details", details)],
+        )
+    }
 }
 
 impl Messages {

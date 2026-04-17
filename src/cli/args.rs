@@ -397,6 +397,9 @@ pub(crate) struct InfraUpArgs {
     pub(crate) openbao_unseal_from_file: Option<PathBuf>,
 }
 
+// Each boolean flag is a deliberate, independent opt-in confirmation
+// required by the guardrail checks (OpenBao bind + HTTP-01 admin bind).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug)]
 pub(crate) struct InfraInstallArgs {
     #[command(flatten)]
@@ -443,6 +446,21 @@ pub(crate) struct InfraInstallArgs {
     /// Must be a specific reachable IP:port (not wildcard or loopback).
     #[arg(long)]
     pub(crate) openbao_advertise_addr: Option<String>,
+
+    /// Bind the HTTP-01 admin API to a non-loopback address (requires TLS).
+    /// Format: `<IP>:<port>`, e.g. `192.168.1.10:8080`
+    #[arg(long)]
+    pub(crate) http01_admin_bind: Option<String>,
+
+    /// Acknowledge that TLS is mandatory for non-loopback HTTP-01 admin binding.
+    /// Required when `--http01-admin-bind` specifies a non-loopback address
+    #[arg(long)]
+    pub(crate) http01_admin_tls_required: bool,
+
+    /// Confirm intent to bind the HTTP-01 admin API to `0.0.0.0` (wildcard).
+    /// Required when `--http01-admin-bind` uses `0.0.0.0`
+    #[arg(long)]
+    pub(crate) http01_admin_bind_wildcard: bool,
 }
 
 #[derive(Args, Debug)]

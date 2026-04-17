@@ -406,4 +406,13 @@ pub(super) static STRINGS: Strings = Strings {
     error_openbao_override_binding_mismatch: "OpenBao compose override port mapping does not match stored bind intent: expected {expected}, found {actual}; re-run infra install --openbao-bind to regenerate",
     info_openbao_bind_intent_recorded: "OpenBao non-loopback bind intent recorded: {addr}",
     info_openbao_bind_intent_cleared: "Previous OpenBao non-loopback bind intent cleared (re-install without --openbao-bind)",
+    error_http01_admin_bind_invalid_format: "--http01-admin-bind must be a valid <IP>:<port> address",
+    error_http01_admin_bind_wildcard_required: "--http01-admin-bind-wildcard is required when binding to 0.0.0.0 or [::]",
+    error_http01_admin_bind_tls_flag_required: "--http01-admin-tls-required is required when --http01-admin-bind specifies a non-loopback address",
+    error_http01_admin_bind_ipv6_requires_brackets: "--http01-admin-bind IPv6 addresses must be bracketed, e.g. [::1]:8080",
+    info_http01_admin_bind_intent_recorded: "HTTP-01 admin non-loopback bind intent recorded: {addr}",
+    info_http01_admin_bind_intent_cleared: "Previous HTTP-01 admin non-loopback bind intent cleared (re-install without --http01-admin-bind)",
+    error_http01_admin_override_file_missing: "Non-loopback HTTP-01 admin bind intent is recorded in state but the compose override file is missing; re-run infra install --http01-admin-bind to regenerate it",
+    error_http01_admin_override_binding_mismatch: "HTTP-01 admin compose override port mapping does not match stored bind intent: expected {expected}, found {actual}; re-run infra install --http01-admin-bind to regenerate",
+    error_http01_admin_bind_tls_missing: "HTTP-01 admin API requires TLS for non-loopback binding but TLS prerequisites are not met: {details}",
 };

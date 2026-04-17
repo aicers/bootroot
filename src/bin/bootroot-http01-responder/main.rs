@@ -6,6 +6,7 @@ mod handlers;
 mod server;
 mod signature;
 mod state;
+mod tls;
 
 use anyhow::Result;
 use clap::Parser;

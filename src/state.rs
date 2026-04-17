@@ -26,6 +26,8 @@ pub(crate) struct StateFile {
     pub(crate) openbao_bind_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) openbao_advertise_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) http01_admin_bind_addr: Option<String>,
 }
 
 impl StateFile {
@@ -364,6 +366,7 @@ mod tests {
             services: BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let parsed: StateFile = serde_json::from_str(&json).expect("deserialize");
@@ -384,6 +387,7 @@ mod tests {
             services: BTreeMap::new(),
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         let json = serde_json::to_string(&state).expect("serialize");
         assert!(

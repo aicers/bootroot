@@ -92,6 +92,10 @@ impl ResponderState {
         }
     }
 
+    pub(super) async fn settings(&self) -> tokio::sync::RwLockReadGuard<'_, ResponderSettings> {
+        self.settings.read().await
+    }
+
     pub(super) async fn fetch_key_authorization(&self, token: &str) -> Option<String> {
         let mut tokens = self.tokens.write().await;
         if let Some(entry) = tokens.get(token) {
@@ -218,6 +222,8 @@ mod tests {
             admin_rate_limit_requests: DEFAULT_ADMIN_RATE_LIMIT_REQUESTS,
             admin_rate_limit_window_secs: DEFAULT_ADMIN_RATE_LIMIT_WINDOW_SECS,
             admin_body_limit_bytes: DEFAULT_ADMIN_BODY_LIMIT_BYTES,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 

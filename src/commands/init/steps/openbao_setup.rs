@@ -816,9 +816,10 @@ mod tests {
         let stepca_templates = write_stepca_templates(&secrets_dir, "secret", &messages)
             .await
             .unwrap();
-        let responder_paths = write_responder_files(&secrets_dir, "secret", "hmac-123", &messages)
-            .await
-            .unwrap();
+        let responder_paths =
+            write_responder_files(&secrets_dir, "secret", "hmac-123", false, &messages)
+                .await
+                .unwrap();
 
         let role_outputs = vec![
             AppRoleOutput {

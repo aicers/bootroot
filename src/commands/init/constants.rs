@@ -38,10 +38,13 @@ pub(crate) const CA_ROOT_CERT_FILENAME: &str = "root_ca.crt";
 pub(crate) const CA_INTERMEDIATE_CERT_FILENAME: &str = "intermediate_ca.crt";
 
 pub(crate) const OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-exposed.yml";
+pub(crate) const HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.http01-exposed.yml";
 #[cfg(test)]
 pub(crate) const OPENBAO_TLS_CERT_PATH: &str = "openbao/tls/server.crt";
 #[cfg(test)]
 pub(crate) const OPENBAO_TLS_KEY_PATH: &str = "openbao/tls/server.key";
+pub(crate) const RESPONDER_TLS_CERT_CONTAINER_PATH: &str = "/app/responder/tls/cert.pem";
+pub(crate) const RESPONDER_TLS_KEY_CONTAINER_PATH: &str = "/app/responder/tls/key.pem";
 pub(crate) const OPENBAO_HCL_PATH: &str = "openbao/openbao.hcl";
 
 pub(crate) mod openbao_constants {

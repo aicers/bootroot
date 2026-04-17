@@ -24,6 +24,8 @@ struct ResponderConfigOverrides {
     admin_rate_limit_requests: Option<u64>,
     admin_rate_limit_window_secs: Option<u64>,
     admin_body_limit_bytes: Option<u64>,
+    tls_cert_path: Option<String>,
+    tls_key_path: Option<String>,
 }
 
 #[tokio::test]
@@ -269,7 +271,7 @@ fn write_responder_config_with_overrides(
     secret: &str,
     overrides: &ResponderConfigOverrides,
 ) {
-    let contents = format!(
+    let mut contents = format!(
         "listen_addr = \"{listen_addr}\"\n\
 admin_addr = \"{admin_addr}\"\n\
 hmac_secret = \"{secret}\"\n\
@@ -286,6 +288,14 @@ admin_body_limit_bytes = {admin_body_limit_bytes}\n",
         admin_rate_limit_window_secs = overrides.admin_rate_limit_window_secs.unwrap_or(60),
         admin_body_limit_bytes = overrides.admin_body_limit_bytes.unwrap_or(8 * 1024),
     );
+    if let Some(ref cert_path) = overrides.tls_cert_path {
+        use std::fmt::Write;
+        writeln!(contents, "tls_cert_path = \"{cert_path}\"").expect("append tls_cert_path");
+    }
+    if let Some(ref key_path) = overrides.tls_key_path {
+        use std::fmt::Write;
+        writeln!(contents, "tls_key_path = \"{key_path}\"").expect("append tls_key_path");
+    }
     fs::write(config_path, contents).expect("write responder config");
 }
 
@@ -408,4 +418,255 @@ fn send_sighup(pid: u32) {
     // SAFETY: The pid comes from a live child process spawned by this test.
     let result = unsafe { libc::kill(pid, libc::SIGHUP) };
     assert_eq!(result, 0, "SIGHUP should be delivered");
+}
+
+// ---------------------------------------------------------------------------
+// TLS test helpers
+// ---------------------------------------------------------------------------
+
+struct CertPair {
+    cert: String,
+    key: String,
+    root: String,
+}
+
+fn generate_ca_signed_cert_pair(san: &str) -> CertPair {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(vec!["root.test".to_string()]).expect("ca params");
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "Test Root CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.clone().self_signed(&ca_key).expect("self signed");
+    let root_pem = ca_cert.pem();
+    let ca_issuer = Issuer::new(ca_params, ca_key);
+
+    let server_key = KeyPair::generate().expect("server key");
+    let mut server_params = CertificateParams::new(vec![san.to_string()]).expect("server params");
+    server_params
+        .distinguished_name
+        .push(DnType::CommonName, san);
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_issuer)
+        .expect("signed");
+
+    CertPair {
+        cert: server_cert.pem(),
+        key: server_key.serialize_pem(),
+        root: root_pem,
+    }
+}
+
+fn build_tls_client(root_pem: &str) -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let root_store = {
+        let mut store = rustls::RootCertStore::empty();
+        let certs: Vec<_> =
+            rustls_pemfile::certs(&mut std::io::BufReader::new(root_pem.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("parse root PEM");
+        for cert in certs {
+            store.add(cert).expect("add root cert");
+        }
+        store
+    };
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls_config)
+        .resolve(
+            "localhost",
+            "127.0.0.1:0".parse().expect("parse socket addr"),
+        )
+        .build()
+        .expect("build TLS client")
+}
+
+async fn wait_for_tls_ready(
+    responder: &mut ResponderProcess,
+    admin_url: &str,
+    client: &reqwest::Client,
+) {
+    for _ in 0..STARTUP_RETRIES {
+        if let Some(status) = responder.try_wait() {
+            let stderr = responder.take_stderr();
+            panic!("responder exited early with {status}: {stderr}");
+        }
+
+        match client.get(format!("{admin_url}{ADMIN_PATH}")).send().await {
+            Ok(_) => return,
+            Err(_) => sleep(STARTUP_DELAY).await,
+        }
+    }
+    panic!("TLS responder did not become ready");
+}
+
+async fn register_token_with_client(
+    client: &reqwest::Client,
+    admin_base_url: &str,
+    secret: &str,
+    token: &str,
+    key_authorization: &str,
+    ttl_secs: u64,
+) -> reqwest::Response {
+    let (timestamp, signature) = sign_request(secret, token, key_authorization, ttl_secs);
+
+    client
+        .post(format!("{admin_base_url}{ADMIN_PATH}"))
+        .header(HEADER_TIMESTAMP, timestamp.to_string())
+        .header(HEADER_SIGNATURE, signature)
+        .json(&json!({
+            "token": token,
+            "key_authorization": key_authorization,
+            "ttl_secs": ttl_secs
+        }))
+        .send()
+        .await
+        .expect("send register request")
+}
+
+// ---------------------------------------------------------------------------
+// TLS integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_http01_responder_serves_admin_api_over_tls() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let listen_addr = reserve_socket_addr();
+    let admin_addr = reserve_socket_addr();
+
+    let pair = generate_ca_signed_cert_pair("localhost");
+    let cert_path = temp_dir.path().join("cert.pem");
+    let key_path = temp_dir.path().join("key.pem");
+    fs::write(&cert_path, &pair.cert).expect("write cert");
+    fs::write(&key_path, &pair.key).expect("write key");
+
+    let config_path = temp_dir.path().join("responder.toml");
+    write_responder_config_with_overrides(
+        &config_path,
+        &listen_addr,
+        &admin_addr,
+        "tls-secret",
+        &ResponderConfigOverrides {
+            tls_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+            tls_key_path: Some(key_path.to_string_lossy().into_owned()),
+            ..ResponderConfigOverrides::default()
+        },
+    );
+
+    let mut responder = ResponderProcess::spawn(&config_path);
+    let admin_base_url = format!(
+        "https://localhost:{}",
+        admin_addr.split(':').next_back().unwrap()
+    );
+    let client = build_tls_client(&pair.root);
+
+    wait_for_tls_ready(&mut responder, &admin_base_url, &client).await;
+
+    let response = register_token_with_client(
+        &client,
+        &admin_base_url,
+        "tls-secret",
+        "tls-token",
+        "tls-token.key",
+        TEST_TTL_SECS,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let challenge_base_url = format!("http://{listen_addr}");
+    let challenge = fetch_challenge(&challenge_base_url, "tls-token").await;
+    assert_eq!(challenge.status(), StatusCode::OK);
+    assert_eq!(
+        challenge.text().await.expect("read challenge response"),
+        "tls-token.key"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_http01_responder_reloads_tls_cert_on_sighup() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let listen_addr = reserve_socket_addr();
+    let admin_addr = reserve_socket_addr();
+
+    let pair1 = generate_ca_signed_cert_pair("localhost");
+    let cert_path = temp_dir.path().join("cert.pem");
+    let key_path = temp_dir.path().join("key.pem");
+    fs::write(&cert_path, &pair1.cert).expect("write cert");
+    fs::write(&key_path, &pair1.key).expect("write key");
+
+    let config_path = temp_dir.path().join("responder.toml");
+    write_responder_config_with_overrides(
+        &config_path,
+        &listen_addr,
+        &admin_addr,
+        "reload-secret",
+        &ResponderConfigOverrides {
+            tls_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+            tls_key_path: Some(key_path.to_string_lossy().into_owned()),
+            ..ResponderConfigOverrides::default()
+        },
+    );
+
+    let mut responder = ResponderProcess::spawn(&config_path);
+    let admin_port = admin_addr.split(':').next_back().unwrap();
+    let admin_base_url = format!("https://localhost:{admin_port}");
+    let client1 = build_tls_client(&pair1.root);
+
+    wait_for_tls_ready(&mut responder, &admin_base_url, &client1).await;
+
+    // Swap cert+key on disk with a cert from a different CA.
+    let pair2 = generate_ca_signed_cert_pair("localhost");
+    fs::write(&cert_path, &pair2.cert).expect("write new cert");
+    fs::write(&key_path, &pair2.key).expect("write new key");
+
+    send_sighup(responder.pid());
+
+    // Build a client that trusts the new CA.
+    let client2 = build_tls_client(&pair2.root);
+
+    // Poll until the responder picks up the new cert.  The client trusts
+    // only the new CA, so connection errors are expected until the resolver
+    // swaps.
+    let mut swapped = false;
+    for _ in 0..STARTUP_RETRIES {
+        if let Some(status) = responder.try_wait() {
+            let stderr = responder.take_stderr();
+            panic!("responder exited during reload with {status}: {stderr}");
+        }
+
+        let (timestamp, signature) = sign_request(
+            "reload-secret",
+            "reload-tok",
+            "reload-tok.key",
+            TEST_TTL_SECS,
+        );
+        let result = client2
+            .post(format!("{admin_base_url}{ADMIN_PATH}"))
+            .header(HEADER_TIMESTAMP, timestamp.to_string())
+            .header(HEADER_SIGNATURE, &signature)
+            .json(&json!({
+                "token": "reload-tok",
+                "key_authorization": "reload-tok.key",
+                "ttl_secs": TEST_TTL_SECS
+            }))
+            .send()
+            .await;
+        match result {
+            Ok(r) if r.status() == StatusCode::OK => {
+                swapped = true;
+                break;
+            }
+            _ => sleep(STARTUP_DELAY).await,
+        }
+    }
+    assert!(
+        swapped,
+        "responder did not pick up the new TLS cert after SIGHUP"
+    );
 }
