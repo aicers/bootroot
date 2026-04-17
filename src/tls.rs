@@ -85,7 +85,7 @@ pub fn build_http_client(trust: &TrustSettings, insecure_mode: bool) -> Result<C
 /// store.
 ///
 /// When `pins` is non-empty the client enforces SHA-256 certificate
-/// pinning via the same [`PinnedCertVerifier`] path used by
+/// pinning via the same `PinnedCertVerifier` path used by
 /// [`build_http_client`].
 ///
 /// # Errors

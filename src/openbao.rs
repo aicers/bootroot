@@ -725,7 +725,7 @@ impl OpenBaoClient {
     /// Sends an authenticated POST with `X-Vault-Wrap-TTL` and returns
     /// the response-wrapping metadata.
     ///
-    /// This is a convenience wrapper around [`Self::post_json`] that
+    /// This is a convenience wrapper around `Self::post_json` that
     /// sets the wrap-TTL header and extracts the `wrap_info` envelope.
     ///
     /// # Errors
