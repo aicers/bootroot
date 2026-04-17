@@ -14,12 +14,19 @@ use super::resolve::ResolvedServiceAdd;
 use super::{
     LocalApplyResult, MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX,
     OPENBAO_AGENT_CA_BUNDLE_TEMPLATE_FILENAME, OPENBAO_AGENT_CONFIG_FILENAME,
-    OPENBAO_AGENT_TEMPLATE_FILENAME, OPENBAO_AGENT_TOKEN_FILENAME, OPENBAO_SERVICE_CONFIG_DIR,
-    SERVICE_ROLE_ID_FILENAME, ServiceSyncMaterial,
+    OPENBAO_AGENT_DOCKER_CONFIG_FILENAME, OPENBAO_AGENT_TEMPLATE_FILENAME,
+    OPENBAO_AGENT_TOKEN_FILENAME, OPENBAO_SERVICE_CONFIG_DIR, SERVICE_ROLE_ID_FILENAME,
+    ServiceSyncMaterial,
 };
+use crate::commands::init::{resolve_openbao_agent_addr, to_container_path};
 use crate::i18n::Messages;
 use crate::state::PostRenewHookEntry;
 
+/// Mount point inside service sidecar containers where the host
+/// `secrets_dir` is bind-mounted.
+const SIDECAR_CONTAINER_MOUNT: &str = "/openbao/secrets";
+
+#[allow(clippy::too_many_lines)]
 pub(super) async fn apply_local_service_configs(
     secrets_dir: &Path,
     resolved: &ResolvedServiceAdd,
@@ -53,6 +60,17 @@ pub(super) async fn apply_local_service_configs(
     let acme_updates = vec![("http_responder_hmac", sync_material.responder_hmac.clone())];
     next = bootroot::toml_util::upsert_section_keys(&next, "acme", &acme_updates)?;
     write_local_ca_bundle(&ca_bundle_path, &sync_material.ca_bundle_pem, messages).await?;
+    let svc_cred_dir = secret_id_path.parent().unwrap_or(secrets_dir);
+    // Pre-seed the same ca-bundle.pem path that the agent template
+    // renders to, so the sidecar can verify TLS on first boot and
+    // then track live trust updates from KV after the template runs.
+    let docker_ca_bundle_path = svc_cred_dir.join(DOCKER_RENDERED_CA_BUNDLE);
+    write_local_ca_bundle(
+        &docker_ca_bundle_path,
+        &sync_material.ca_bundle_pem,
+        messages,
+    )
+    .await?;
     fs::write(&resolved.agent_config, &next)
         .await
         .with_context(|| {
@@ -120,9 +138,27 @@ pub(super) async fn apply_local_service_configs(
         })?;
     fs_util::set_key_permissions(&agent_config_path).await?;
 
+    let docker_config_path = openbao_service_dir.join(OPENBAO_AGENT_DOCKER_CONFIG_FILENAME);
+    let docker_hcl = render_docker_agent_config(&DockerAgentConfigInputs {
+        secrets_dir,
+        openbao_url,
+        role_id_path: &role_id_path,
+        secret_id_path,
+        token_path: &token_path,
+        agent_template_path: &template_path,
+        ca_bundle_template_path: &bundle_template_path,
+    })?;
+    fs::write(&docker_config_path, docker_hcl)
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&docker_config_path.display().to_string())
+        })?;
+    fs_util::set_key_permissions(&docker_config_path).await?;
+
     Ok(LocalApplyResult {
         agent_config: resolved.agent_config.display().to_string(),
         openbao_agent_config: agent_config_path.display().to_string(),
+        openbao_agent_docker_config: docker_config_path.display().to_string(),
         openbao_agent_template: template_path.display().to_string(),
     })
 }
@@ -213,15 +249,106 @@ fn render_openbao_agent_config(
     let role_id = role_id_path.display().to_string();
     let secret_id = secret_id_path.display().to_string();
     let token = token_path.display().to_string();
-    bootroot::openbao::build_agent_config(
-        openbao_url,
-        &role_id,
-        &secret_id,
-        &token,
-        Some("auth/approle"),
-        bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
+    bootroot::openbao::build_agent_config(&bootroot::openbao::AgentConfigParams {
+        openbao_addr: openbao_url,
+        role_id_path: &role_id,
+        secret_id_path: &secret_id,
+        token_path: &token,
+        mount_path: Some("auth/approle"),
+        render_interval: bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
         templates,
-    )
+        ca_cert: None,
+    })
+}
+
+/// Name used for the rendered agent config inside the Docker container.
+const DOCKER_RENDERED_AGENT_CONFIG: &str = "agent.toml";
+
+/// Name used for the rendered CA bundle inside the Docker container.
+const DOCKER_RENDERED_CA_BUNDLE: &str = "ca-bundle.pem";
+
+/// Inputs for [`render_docker_agent_config`].
+struct DockerAgentConfigInputs<'a> {
+    secrets_dir: &'a Path,
+    openbao_url: &'a str,
+    role_id_path: &'a Path,
+    secret_id_path: &'a Path,
+    token_path: &'a Path,
+    agent_template_path: &'a Path,
+    ca_bundle_template_path: &'a Path,
+}
+
+/// Renders an `OpenBao` agent config for use inside a Docker sidecar
+/// container.  Translates all host paths to their container-side
+/// equivalents under [`SIDECAR_CONTAINER_MOUNT`] and replaces the
+/// `OpenBao` address with the Docker-internal hostname.
+///
+/// Template sources (`.ctmpl` files) are mapped via [`to_container_path`]
+/// since they reside under `secrets_dir`.  Template destinations are
+/// placed at well-known names inside the service's `OpenBao` directory
+/// within the container mount, because the host-side destinations may
+/// be outside `secrets_dir`.
+///
+/// When the `openbao_url` scheme is `https`, includes the `ca_cert`
+/// field pointing to the same container-side CA bundle that the agent
+/// template renders.  The caller pre-seeds this file during
+/// `service add` so the agent can verify TLS on its very first
+/// connection; subsequent template renders then keep the file in sync
+/// with the live trust bundle from KV.
+fn render_docker_agent_config(inputs: &DockerAgentConfigInputs<'_>) -> Result<String> {
+    let sd = inputs.secrets_dir;
+    let docker_addr = resolve_openbao_agent_addr(inputs.openbao_url, true);
+    let role_id = to_container_path(sd, inputs.role_id_path, SIDECAR_CONTAINER_MOUNT)?;
+    let secret_id = to_container_path(sd, inputs.secret_id_path, SIDECAR_CONTAINER_MOUNT)?;
+    let token = to_container_path(sd, inputs.token_path, SIDECAR_CONTAINER_MOUNT)?;
+
+    let tpl_source = to_container_path(sd, inputs.agent_template_path, SIDECAR_CONTAINER_MOUNT)?;
+    // Render destinations: the per-service credential directory
+    // (<secrets_dir>/services/<svc>/) so the service can access
+    // rendered output via the shared secrets_dir bind-mount.
+    let svc_cred_dir = inputs.secret_id_path.parent().unwrap_or(inputs.secrets_dir);
+    let tpl_dest = to_container_path(
+        sd,
+        &svc_cred_dir.join(DOCKER_RENDERED_AGENT_CONFIG),
+        SIDECAR_CONTAINER_MOUNT,
+    )?;
+    let ca_tpl_source =
+        to_container_path(sd, inputs.ca_bundle_template_path, SIDECAR_CONTAINER_MOUNT)?;
+    let ca_tpl_dest = to_container_path(
+        sd,
+        &svc_cred_dir.join(DOCKER_RENDERED_CA_BUNDLE),
+        SIDECAR_CONTAINER_MOUNT,
+    )?;
+
+    // Point ca_cert at the same path the CA bundle template renders
+    // to.  The caller pre-seeds this file during `service add`, so
+    // the agent can verify TLS on its very first connection.  Once the
+    // agent renders the template, the file is overwritten with the
+    // live bundle from KV, keeping trust in sync across CA rotations.
+    let ca_cert = if docker_addr.starts_with("https://") {
+        Some(ca_tpl_dest.clone())
+    } else {
+        None
+    };
+
+    let templates = [(tpl_source, tpl_dest), (ca_tpl_source, ca_tpl_dest)];
+    let tpl_refs: Vec<(&str, &str)> = templates
+        .iter()
+        .map(|(s, d)| (s.as_str(), d.as_str()))
+        .collect();
+
+    Ok(bootroot::openbao::build_agent_config(
+        &bootroot::openbao::AgentConfigParams {
+            openbao_addr: &docker_addr,
+            role_id_path: &role_id,
+            secret_id_path: &secret_id,
+            token_path: &token,
+            mount_path: Some("auth/approle"),
+            render_interval: bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
+            templates: &tpl_refs,
+            ca_cert: ca_cert.as_deref(),
+        },
+    ))
 }
 
 fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> String {
@@ -575,5 +702,158 @@ mod tests {
         let args = hook["args"].as_array().expect("args must be an array");
         assert_eq!(args.get(0).unwrap().as_str().unwrap(), "line1\tline2");
         assert_eq!(args.get(1).unwrap().as_str().unwrap(), "back\\slash");
+    }
+
+    #[test]
+    fn docker_config_uses_container_paths_and_openbao_hostname() {
+        let secrets_dir = Path::new("/project/secrets");
+        let svc_dir = secrets_dir.join("openbao/services/edge");
+        let cred_dir = secrets_dir.join("services/edge");
+        let hcl = render_docker_agent_config(&DockerAgentConfigInputs {
+            secrets_dir,
+            openbao_url: "http://localhost:8200",
+            role_id_path: &cred_dir.join("role_id"),
+            secret_id_path: &cred_dir.join("secret_id"),
+            token_path: &svc_dir.join("token"),
+            agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
+            ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+        })
+        .unwrap();
+
+        assert!(
+            hcl.contains(r#"address = "http://bootroot-openbao:8200""#),
+            "must use Docker-internal address"
+        );
+        assert!(
+            hcl.contains("/openbao/secrets/services/edge/role_id"),
+            "role_id must be container path"
+        );
+        assert!(
+            hcl.contains("/openbao/secrets/services/edge/secret_id"),
+            "secret_id must be container path"
+        );
+        assert!(
+            hcl.contains("/openbao/secrets/openbao/services/edge/token"),
+            "token must be container path"
+        );
+        assert!(
+            hcl.contains("/openbao/secrets/openbao/services/edge/agent.toml.ctmpl"),
+            "template source must be container path"
+        );
+        assert!(
+            hcl.contains("/openbao/secrets/services/edge/agent.toml"),
+            "template dest must be container path"
+        );
+        assert!(
+            hcl.contains("/openbao/secrets/openbao/services/edge/ca-bundle.pem.ctmpl"),
+            "ca bundle template source must be container path"
+        );
+        assert!(
+            hcl.contains("/openbao/secrets/services/edge/ca-bundle.pem"),
+            "ca bundle dest must be container path"
+        );
+        assert!(
+            !hcl.contains("ca_cert"),
+            "http address must not include ca_cert"
+        );
+    }
+
+    #[test]
+    fn docker_config_includes_ca_cert_when_tls_enabled() {
+        let secrets_dir = Path::new("/project/secrets");
+        let svc_dir = secrets_dir.join("openbao/services/edge");
+        let cred_dir = secrets_dir.join("services/edge");
+        let hcl = render_docker_agent_config(&DockerAgentConfigInputs {
+            secrets_dir,
+            openbao_url: "https://localhost:8200",
+            role_id_path: &cred_dir.join("role_id"),
+            secret_id_path: &cred_dir.join("secret_id"),
+            token_path: &svc_dir.join("token"),
+            agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
+            ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+        })
+        .unwrap();
+
+        assert!(
+            hcl.contains(r#"address = "https://bootroot-openbao:8200""#),
+            "must use https Docker-internal address"
+        );
+        assert!(
+            hcl.contains(r#"ca_cert = "/openbao/secrets/services/edge/ca-bundle.pem""#),
+            "ca_cert must point at template-rendered bundle for live trust updates"
+        );
+    }
+
+    #[test]
+    fn docker_config_omits_ca_cert_when_http() {
+        let secrets_dir = Path::new("/project/secrets");
+        let svc_dir = secrets_dir.join("openbao/services/edge");
+        let cred_dir = secrets_dir.join("services/edge");
+        let hcl = render_docker_agent_config(&DockerAgentConfigInputs {
+            secrets_dir,
+            openbao_url: "http://127.0.0.1:8200",
+            role_id_path: &cred_dir.join("role_id"),
+            secret_id_path: &cred_dir.join("secret_id"),
+            token_path: &svc_dir.join("token"),
+            agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
+            ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+        })
+        .unwrap();
+
+        assert!(
+            hcl.contains(r#"address = "http://bootroot-openbao:8200""#),
+            "127.0.0.1 must be replaced with bootroot-openbao"
+        );
+        assert!(!hcl.contains("ca_cert"), "http must not include ca_cert");
+    }
+
+    #[test]
+    fn docker_config_rewrites_specific_ip_to_container_name() {
+        let secrets_dir = Path::new("/project/secrets");
+        let svc_dir = secrets_dir.join("openbao/services/edge");
+        let cred_dir = secrets_dir.join("services/edge");
+        let hcl = render_docker_agent_config(&DockerAgentConfigInputs {
+            secrets_dir,
+            openbao_url: "https://192.168.1.10:8200",
+            role_id_path: &cred_dir.join("role_id"),
+            secret_id_path: &cred_dir.join("secret_id"),
+            token_path: &svc_dir.join("token"),
+            agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
+            ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+        })
+        .unwrap();
+
+        assert!(
+            hcl.contains(r#"address = "https://bootroot-openbao:8200""#),
+            "specific IP must be replaced with Docker-internal hostname"
+        );
+        assert!(
+            hcl.contains(r#"ca_cert = "/openbao/secrets/services/edge/ca-bundle.pem""#),
+            "https with specific IP must use template-rendered ca_cert"
+        );
+    }
+
+    #[test]
+    fn host_agent_config_unchanged_by_docker_additions() {
+        let hcl = render_openbao_agent_config(
+            "http://localhost:8200",
+            Path::new("/secrets/services/edge/role_id"),
+            Path::new("/secrets/services/edge/secret_id"),
+            Path::new("/secrets/openbao/services/edge/token"),
+            &[("/tpl.ctmpl", "/out.toml")],
+        );
+
+        assert!(
+            hcl.contains(r#"address = "http://localhost:8200""#),
+            "host config must keep original address"
+        );
+        assert!(
+            hcl.contains(r#"role_id_file_path = "/secrets/services/edge/role_id""#),
+            "host config must keep host paths"
+        );
+        assert!(
+            !hcl.contains("ca_cert"),
+            "host config must not include ca_cert"
+        );
     }
 }

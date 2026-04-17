@@ -23,6 +23,7 @@ pub(crate) struct ServiceAddPlan<'a> {
 pub(crate) struct ServiceAddAppliedPaths<'a> {
     pub(crate) agent_config: &'a str,
     pub(crate) openbao_agent_config: &'a str,
+    pub(crate) openbao_agent_docker_config: &'a str,
     pub(crate) openbao_agent_template: &'a str,
 }
 
@@ -121,6 +122,10 @@ fn print_local_apply_summary(paths: &ServiceAddAppliedPaths<'_>, messages: &Mess
     println!(
         "{}",
         messages.service_summary_auto_applied_openbao_config(paths.openbao_agent_config)
+    );
+    println!(
+        "{}",
+        messages.service_summary_auto_applied_openbao_config(paths.openbao_agent_docker_config)
     );
     println!(
         "{}",

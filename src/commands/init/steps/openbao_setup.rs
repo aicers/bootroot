@@ -680,15 +680,16 @@ fn build_openbao_agent_config(
         .iter()
         .map(|(s, d)| (s.as_str(), d.as_str()))
         .collect();
-    bootroot::openbao::build_agent_config(
+    bootroot::openbao::build_agent_config(&bootroot::openbao::AgentConfigParams {
         openbao_addr,
         role_id_path,
         secret_id_path,
-        INIT_AGENT_TOKEN_PATH,
-        None,
-        bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
-        &tpl_refs,
-    )
+        token_path: INIT_AGENT_TOKEN_PATH,
+        mount_path: None,
+        render_interval: bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
+        templates: &tpl_refs,
+        ca_cert: None,
+    })
 }
 
 async fn write_openbao_agent_compose_override(
@@ -893,13 +894,25 @@ services:
     #[test]
     fn test_resolve_openbao_agent_addr_replaces_localhost() {
         let addr = resolve_openbao_agent_addr("http://localhost:8200", true);
-        assert_eq!(addr, "http://openbao:8200");
+        assert_eq!(addr, "http://bootroot-openbao:8200");
     }
 
     #[test]
-    fn test_resolve_openbao_agent_addr_keeps_remote() {
-        let addr = resolve_openbao_agent_addr("http://openbao:8200", true);
-        assert_eq!(addr, "http://openbao:8200");
+    fn test_resolve_openbao_agent_addr_replaces_specific_ip() {
+        let addr = resolve_openbao_agent_addr("https://192.168.1.10:8200", true);
+        assert_eq!(addr, "https://bootroot-openbao:8200");
+    }
+
+    #[test]
+    fn test_resolve_openbao_agent_addr_replaces_fqdn() {
+        let addr = resolve_openbao_agent_addr("http://openbao.example.com:8200", true);
+        assert_eq!(addr, "http://bootroot-openbao:8200");
+    }
+
+    #[test]
+    fn test_resolve_openbao_agent_addr_preserves_when_no_compose() {
+        let addr = resolve_openbao_agent_addr("https://192.168.1.10:8200", false);
+        assert_eq!(addr, "https://192.168.1.10:8200");
     }
 
     #[test]

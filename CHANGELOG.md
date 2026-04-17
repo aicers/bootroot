@@ -33,6 +33,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added `agent-docker.hcl` generation to `bootroot service add`
+  (local-file mode). The Docker variant uses the Docker-internal
+  OpenBao address (`bootroot-openbao:8200`) and container-side paths under
+  `/openbao/secrets/`. When TLS is enabled (`https`), the config
+  includes a `ca_cert` field pointing to a pre-seeded bootstrap CA
+  bundle so the sidecar agent can verify the OpenBao server on first
+  startup. The existing `agent.hcl` output is unchanged. (Part of
+  #518)
 - Added `--openbao-bind <IP>:<port>`, `--openbao-tls-required`,
   `--openbao-bind-wildcard`, and `--openbao-advertise-addr <IP>:<port>`
   flags to `bootroot infra install`. Operators can opt into non-loopback

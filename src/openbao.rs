@@ -952,34 +952,46 @@ impl OpenBaoClient {
 /// Interval at which the `OpenBao` agent re-renders static secrets.
 pub const STATIC_SECRET_RENDER_INTERVAL: &str = "30s";
 
+/// Parameters for [`build_agent_config`].
+pub struct AgentConfigParams<'a> {
+    /// Vault/`OpenBao` server address.
+    pub openbao_addr: &'a str,
+    /// Path to the `AppRole` role-ID file.
+    pub role_id_path: &'a str,
+    /// Path to the `AppRole` secret-ID file.
+    pub secret_id_path: &'a str,
+    /// Path where the agent writes its token.
+    pub token_path: &'a str,
+    /// Optional auth mount path (e.g. `"auth/approle"`).
+    pub mount_path: Option<&'a str>,
+    /// Value for `static_secret_render_interval`.
+    pub render_interval: &'a str,
+    /// `(source, destination)` pairs for template blocks.
+    pub templates: &'a [(&'a str, &'a str)],
+    /// Optional path to a CA certificate bundle for TLS verification of
+    /// the `OpenBao` server.
+    pub ca_cert: Option<&'a str>,
+}
+
 /// Builds an `OpenBao` agent HCL configuration string.
-///
-/// # Arguments
-///
-/// * `openbao_addr` – Vault/`OpenBao` server address.
-/// * `role_id_path` – Path to the `AppRole` role-ID file.
-/// * `secret_id_path` – Path to the `AppRole` secret-ID file.
-/// * `token_path` – Path where the agent writes its token.
-/// * `mount_path` – Optional auth mount path (e.g. `"auth/approle"`).
-/// * `render_interval` – Value for `static_secret_render_interval`.
-/// * `templates` – `(source, destination)` pairs for template blocks.
 #[must_use]
-pub fn build_agent_config(
-    openbao_addr: &str,
-    role_id_path: &str,
-    secret_id_path: &str,
-    token_path: &str,
-    mount_path: Option<&str>,
-    render_interval: &str,
-    templates: &[(&str, &str)],
-) -> String {
-    let mount_line = match mount_path {
+pub fn build_agent_config(params: &AgentConfigParams<'_>) -> String {
+    let mount_line = match params.mount_path {
         Some(mp) => format!("\n    mount_path = \"{mp}\""),
         None => String::new(),
     };
+    let tls_line = match params.ca_cert {
+        Some(path) => format!("\n  ca_cert = \"{path}\""),
+        None => String::new(),
+    };
+    let openbao_addr = params.openbao_addr;
+    let role_id_path = params.role_id_path;
+    let secret_id_path = params.secret_id_path;
+    let token_path = params.token_path;
+    let render_interval = params.render_interval;
     let mut config = format!(
         r#"vault {{
-  address = "{openbao_addr}"
+  address = "{openbao_addr}"{tls_line}
 }}
 
 auto_auth {{
@@ -1002,7 +1014,7 @@ template_config {{
 }}
 "#
     );
-    for (source_path, destination_path) in templates {
+    for (source_path, destination_path) in params.templates {
         write!(
             &mut config,
             r#"
@@ -1214,49 +1226,84 @@ mod agent_config_tests {
 
     #[test]
     fn without_mount_path() {
-        let hcl = build_agent_config(
-            "http://openbao:8200",
-            "/role_id",
-            "/secret_id",
-            "/token",
-            None,
-            "30s",
-            &[("/tpl.ctmpl", "/out.toml")],
-        );
+        let hcl = build_agent_config(&AgentConfigParams {
+            openbao_addr: "http://openbao:8200",
+            role_id_path: "/role_id",
+            secret_id_path: "/secret_id",
+            token_path: "/token",
+            mount_path: None,
+            render_interval: "30s",
+            templates: &[("/tpl.ctmpl", "/out.toml")],
+            ca_cert: None,
+        });
         assert!(hcl.contains(r#"address = "http://openbao:8200""#));
         assert!(hcl.contains("role_id_file_path = \"/role_id\""));
         assert!(!hcl.contains("mount_path"));
+        assert!(!hcl.contains("ca_cert"));
         assert!(hcl.contains(r#"static_secret_render_interval = "30s""#));
         assert!(hcl.contains(r#"source = "/tpl.ctmpl""#));
     }
 
     #[test]
     fn with_mount_path() {
-        let hcl = build_agent_config(
-            "http://openbao:8200",
-            "/role_id",
-            "/secret_id",
-            "/token",
-            Some("auth/approle"),
-            "30s",
-            &[("/tpl.ctmpl", "/out.toml")],
-        );
+        let hcl = build_agent_config(&AgentConfigParams {
+            openbao_addr: "http://openbao:8200",
+            role_id_path: "/role_id",
+            secret_id_path: "/secret_id",
+            token_path: "/token",
+            mount_path: Some("auth/approle"),
+            render_interval: "30s",
+            templates: &[("/tpl.ctmpl", "/out.toml")],
+            ca_cert: None,
+        });
         assert!(hcl.contains(r#"mount_path = "auth/approle""#));
     }
 
     #[test]
     fn multiple_templates() {
-        let hcl = build_agent_config(
-            "http://openbao:8200",
-            "/role_id",
-            "/secret_id",
-            "/token",
-            None,
-            "30s",
-            &[("/a.ctmpl", "/a.out"), ("/b.ctmpl", "/b.out")],
-        );
+        let hcl = build_agent_config(&AgentConfigParams {
+            openbao_addr: "http://openbao:8200",
+            role_id_path: "/role_id",
+            secret_id_path: "/secret_id",
+            token_path: "/token",
+            mount_path: None,
+            render_interval: "30s",
+            templates: &[("/a.ctmpl", "/a.out"), ("/b.ctmpl", "/b.out")],
+            ca_cert: None,
+        });
         assert!(hcl.contains(r#"source = "/a.ctmpl""#));
         assert!(hcl.contains(r#"source = "/b.ctmpl""#));
+    }
+
+    #[test]
+    fn with_ca_cert() {
+        let hcl = build_agent_config(&AgentConfigParams {
+            openbao_addr: "https://openbao:8200",
+            role_id_path: "/role_id",
+            secret_id_path: "/secret_id",
+            token_path: "/token",
+            mount_path: Some("auth/approle"),
+            render_interval: "30s",
+            templates: &[("/tpl.ctmpl", "/out.toml")],
+            ca_cert: Some("/certs/ca-bundle.pem"),
+        });
+        assert!(hcl.contains(r#"address = "https://openbao:8200""#));
+        assert!(hcl.contains(r#"ca_cert = "/certs/ca-bundle.pem""#));
+    }
+
+    #[test]
+    fn without_ca_cert() {
+        let hcl = build_agent_config(&AgentConfigParams {
+            openbao_addr: "http://openbao:8200",
+            role_id_path: "/role_id",
+            secret_id_path: "/secret_id",
+            token_path: "/token",
+            mount_path: None,
+            render_interval: "30s",
+            templates: &[("/tpl.ctmpl", "/out.toml")],
+            ca_cert: None,
+        });
+        assert!(!hcl.contains("ca_cert"));
     }
 }
 
