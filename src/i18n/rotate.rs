@@ -317,4 +317,30 @@ impl Messages {
             &[("service_name", service_name), ("interval", interval)],
         )
     }
+
+    pub(crate) fn info_infra_tls_renewed(&self, name: &str) -> String {
+        format_template(self.strings().info_infra_tls_renewed, &[("name", name)])
+    }
+
+    pub(crate) fn info_infra_tls_reload(&self, strategy: &str) -> String {
+        format_template(
+            self.strings().info_infra_tls_reload,
+            &[("strategy", strategy)],
+        )
+    }
+
+    pub(crate) fn error_infra_tls_renew_failed(&self, name: &str) -> String {
+        format_template(
+            self.strings().error_infra_tls_renew_failed,
+            &[("name", name)],
+        )
+    }
+
+    pub(crate) fn prompt_rotate_infra_tls(&self) -> &'static str {
+        self.strings().prompt_rotate_infra_tls
+    }
+
+    pub(crate) fn rotate_infra_tls_no_entries(&self) -> &'static str {
+        self.strings().rotate_infra_tls_no_entries
+    }
 }

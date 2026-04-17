@@ -450,6 +450,16 @@ pub(crate) struct Strings {
     pub(crate) error_http01_admin_override_file_missing: &'static str,
     pub(crate) error_http01_admin_override_binding_mismatch: &'static str,
     pub(crate) error_http01_admin_bind_tls_missing: &'static str,
+    pub(crate) info_openbao_tls_provisioned: &'static str,
+    pub(crate) info_openbao_hcl_tls_written: &'static str,
+    pub(crate) info_openbao_hcl_tls_reverted: &'static str,
+    pub(crate) error_openbao_tls_provision_failed: &'static str,
+    pub(crate) error_openbao_hcl_write_failed: &'static str,
+    pub(crate) info_infra_tls_renewed: &'static str,
+    pub(crate) info_infra_tls_reload: &'static str,
+    pub(crate) error_infra_tls_renew_failed: &'static str,
+    pub(crate) prompt_rotate_infra_tls: &'static str,
+    pub(crate) rotate_infra_tls_no_entries: &'static str,
 }
 
 pub(crate) struct Messages {

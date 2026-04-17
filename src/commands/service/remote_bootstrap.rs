@@ -795,6 +795,7 @@ mod tests {
             openbao_bind_addr: Some("0.0.0.0:8200".to_string()),
             openbao_advertise_addr: Some("192.168.1.10:8200".to_string()),
             http01_admin_bind_addr: None,
+            infra_certs: BTreeMap::new(),
         };
         assert_eq!(
             super::artifact_openbao_url(&state),
@@ -819,6 +820,7 @@ mod tests {
             openbao_bind_addr: Some("10.0.0.5:8200".to_string()),
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            infra_certs: BTreeMap::new(),
         };
         assert_eq!(
             super::artifact_openbao_url(&state),

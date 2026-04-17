@@ -10,6 +10,46 @@ const DEFAULT_SECRETS_DIR: &str = "secrets";
 const DEFAULT_STATE_FILE: &str = "state.json";
 pub(crate) const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
+/// Describes how to reload a service after its infrastructure certificate
+/// is renewed.  Keyed by a stable discriminator so the rotation loop can
+/// dispatch without hard-coding service names.
+///
+/// New variants (e.g. `Signal`, `RestartListener`) can be added by
+/// follow-up PRs (see #515) without a schema revision — `serde`'s
+/// internally-tagged representation handles forward compatibility.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub(crate) enum ReloadStrategy {
+    /// Restarts the named Docker container via `docker restart`.
+    ContainerRestart { container_name: String },
+}
+
+impl fmt::Display for ReloadStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContainerRestart { container_name } => {
+                write!(f, "container_restart({container_name})")
+            }
+        }
+    }
+}
+
+/// Tracks a bootroot-managed infrastructure certificate (e.g. `OpenBao`
+/// server TLS, http01 admin TLS).  Stored in `StateFile::infra_certs`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct InfraCertEntry {
+    pub(crate) cert_path: PathBuf,
+    pub(crate) key_path: PathBuf,
+    pub(crate) sans: Vec<String>,
+    /// Duration before expiry at which renewal should trigger (e.g. "720h").
+    pub(crate) renew_before: String,
+    pub(crate) reload_strategy: ReloadStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) issued_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct StateFile {
     pub(crate) openbao_url: String,
@@ -28,6 +68,8 @@ pub(crate) struct StateFile {
     pub(crate) openbao_advertise_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) http01_admin_bind_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) infra_certs: BTreeMap<String, InfraCertEntry>,
 }
 
 impl StateFile {
@@ -367,6 +409,7 @@ mod tests {
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            infra_certs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let parsed: StateFile = serde_json::from_str(&json).expect("deserialize");
@@ -388,11 +431,111 @@ mod tests {
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            infra_certs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
         assert!(
             !json.contains("openbao_bind_addr"),
             "None should be skipped"
         );
+    }
+
+    #[test]
+    fn state_file_without_infra_certs_deserializes_as_empty() {
+        let json = r#"{
+            "openbao_url": "http://localhost:8200",
+            "kv_mount": "secret"
+        }"#;
+        let parsed: StateFile = serde_json::from_str(json).expect("deserialize");
+        assert!(parsed.infra_certs.is_empty());
+    }
+
+    #[test]
+    fn state_file_empty_infra_certs_skips_field_in_json() {
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
+            infra_certs: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert!(
+            !json.contains("infra_certs"),
+            "empty infra_certs should be skipped"
+        );
+    }
+
+    #[test]
+    fn infra_cert_entry_round_trips_json() {
+        let entry = InfraCertEntry {
+            cert_path: PathBuf::from("openbao/tls/server.crt"),
+            key_path: PathBuf::from("openbao/tls/server.key"),
+            sans: vec!["openbao.internal".to_string(), "localhost".to_string()],
+            renew_before: "720h".to_string(),
+            reload_strategy: ReloadStrategy::ContainerRestart {
+                container_name: "bootroot-openbao".to_string(),
+            },
+            issued_at: Some("2026-01-01T00:00:00Z".to_string()),
+            expires_at: None,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let parsed: InfraCertEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.renew_before, "720h");
+        assert_eq!(
+            parsed.reload_strategy,
+            ReloadStrategy::ContainerRestart {
+                container_name: "bootroot-openbao".to_string(),
+            }
+        );
+        assert_eq!(parsed.sans.len(), 2);
+    }
+
+    #[test]
+    fn state_file_with_infra_certs_round_trips() {
+        let mut infra_certs = BTreeMap::new();
+        infra_certs.insert(
+            "openbao".to_string(),
+            InfraCertEntry {
+                cert_path: PathBuf::from("openbao/tls/server.crt"),
+                key_path: PathBuf::from("openbao/tls/server.key"),
+                sans: vec!["openbao.internal".to_string()],
+                renew_before: "720h".to_string(),
+                reload_strategy: ReloadStrategy::ContainerRestart {
+                    container_name: "bootroot-openbao".to_string(),
+                },
+                issued_at: None,
+                expires_at: None,
+            },
+        );
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
+            infra_certs,
+        };
+        let json = serde_json::to_string_pretty(&state).expect("serialize");
+        let parsed: StateFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.infra_certs.len(), 1);
+        assert!(parsed.infra_certs.contains_key("openbao"));
+    }
+
+    #[test]
+    fn reload_strategy_display_container_restart() {
+        let strategy = ReloadStrategy::ContainerRestart {
+            container_name: "bootroot-openbao".to_string(),
+        };
+        assert_eq!(strategy.to_string(), "container_restart(bootroot-openbao)");
     }
 }
