@@ -228,6 +228,7 @@ mod tests {
             services: BTreeMap::default(),
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state
             .services

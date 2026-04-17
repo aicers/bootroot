@@ -42,6 +42,10 @@ pub(super) struct ResponderSettings {
     pub(super) admin_rate_limit_requests: u64,
     pub(super) admin_rate_limit_window_secs: u64,
     pub(super) admin_body_limit_bytes: u64,
+    #[serde(default)]
+    pub(super) tls_cert_path: Option<String>,
+    #[serde(default)]
+    pub(super) tls_key_path: Option<String>,
 }
 
 impl ResponderSettings {
@@ -112,7 +116,28 @@ impl ResponderSettings {
         }
         validate_socket_addr(&self.listen_addr, "listen_addr")?;
         validate_socket_addr(&self.admin_addr, "admin_addr")?;
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(cert), Some(key)) => {
+                if cert.trim().is_empty() {
+                    anyhow::bail!("tls_cert_path must not be empty when set");
+                }
+                if key.trim().is_empty() {
+                    anyhow::bail!("tls_key_path must not be empty when set");
+                }
+            }
+            (Some(_), None) => {
+                anyhow::bail!("tls_key_path is required when tls_cert_path is set");
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("tls_cert_path is required when tls_key_path is set");
+            }
+            (None, None) => {}
+        }
         Ok(())
+    }
+
+    pub(super) fn tls_enabled(&self) -> bool {
+        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
     }
 
     pub(super) fn build_hmac_signer(&self) -> Http01HmacSigner {
@@ -126,12 +151,28 @@ pub(super) fn load_settings(config_path: Option<&Path>) -> Result<ResponderSetti
     Ok(settings)
 }
 
+/// Reloads settings from disk and applies them to the running state.
+///
+/// Rejects transport-mode changes (plain HTTP ↔ TLS) because the
+/// listener mode is fixed at startup.  A mode flip requires a process
+/// restart; accepting it silently would leave the running listener out
+/// of sync with the in-memory settings.
 pub(super) async fn reload_settings(
     state: &ResponderState,
     config_path: Option<&Path>,
 ) -> Result<()> {
-    let settings = load_settings(config_path)?;
-    state.update_settings(settings).await;
+    let new_settings = load_settings(config_path)?;
+    let current_tls = state.settings().await.tls_enabled();
+    let new_tls = new_settings.tls_enabled();
+    if current_tls != new_tls {
+        anyhow::bail!(
+            "transport mode change (TLS {} \u{2192} {}) requires a process restart; \
+             keeping current settings",
+            if current_tls { "enabled" } else { "disabled" },
+            if new_tls { "enabled" } else { "disabled" },
+        );
+    }
+    state.update_settings(new_settings).await;
     Ok(())
 }
 
@@ -158,6 +199,8 @@ mod tests {
             admin_rate_limit_requests: DEFAULT_ADMIN_RATE_LIMIT_REQUESTS,
             admin_rate_limit_window_secs: DEFAULT_ADMIN_RATE_LIMIT_WINDOW_SECS,
             admin_body_limit_bytes: DEFAULT_ADMIN_BODY_LIMIT_BYTES,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 
@@ -195,6 +238,64 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_cert_without_key() {
+        let mut settings = test_settings();
+        settings.tls_cert_path = Some("/path/to/cert.pem".to_string());
+
+        let err = settings
+            .validate()
+            .expect_err("cert without key must be rejected");
+        assert!(err.to_string().contains("tls_key_path"));
+    }
+
+    #[test]
+    fn test_validate_rejects_key_without_cert() {
+        let mut settings = test_settings();
+        settings.tls_key_path = Some("/path/to/key.pem".to_string());
+
+        let err = settings
+            .validate()
+            .expect_err("key without cert must be rejected");
+        assert!(err.to_string().contains("tls_cert_path"));
+    }
+
+    #[test]
+    fn test_validate_accepts_both_tls_paths() {
+        let mut settings = test_settings();
+        settings.tls_cert_path = Some("/path/to/cert.pem".to_string());
+        settings.tls_key_path = Some("/path/to/key.pem".to_string());
+        settings
+            .validate()
+            .expect("both TLS paths must be accepted");
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_tls_cert_path() {
+        let mut settings = test_settings();
+        settings.tls_cert_path = Some("  ".to_string());
+        settings.tls_key_path = Some("/path/to/key.pem".to_string());
+
+        let err = settings
+            .validate()
+            .expect_err("empty cert path must be rejected");
+        assert!(err.to_string().contains("tls_cert_path"));
+    }
+
+    #[test]
+    fn test_tls_enabled_returns_false_by_default() {
+        let settings = test_settings();
+        assert!(!settings.tls_enabled());
+    }
+
+    #[test]
+    fn test_tls_enabled_returns_true_when_configured() {
+        let mut settings = test_settings();
+        settings.tls_cert_path = Some("/cert.pem".to_string());
+        settings.tls_key_path = Some("/key.pem".to_string());
+        assert!(settings.tls_enabled());
+    }
+
+    #[test]
     fn test_validate_rejects_zero_admin_body_limit() {
         let mut settings = test_settings();
         settings.admin_body_limit_bytes = 0;
@@ -203,5 +304,48 @@ mod tests {
             .validate()
             .expect_err("zero admin body limit must be rejected");
         assert!(err.to_string().contains("admin_body_limit_bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_reload_rejects_enabling_tls_at_runtime() {
+        let state = super::super::state::ResponderState::shared(test_settings());
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("responder.toml");
+        std::fs::write(
+            &config_path,
+            "\
+hmac_secret = \"test-secret\"
+tls_cert_path = \"/cert.pem\"
+tls_key_path = \"/key.pem\"
+",
+        )
+        .unwrap();
+
+        let err = reload_settings(&state, Some(&config_path))
+            .await
+            .expect_err("enabling TLS at runtime must be rejected");
+        assert!(
+            err.to_string().contains("transport mode change"),
+            "error must mention transport mode change: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reload_rejects_disabling_tls_at_runtime() {
+        let mut tls_settings = test_settings();
+        tls_settings.tls_cert_path = Some("/cert.pem".to_string());
+        tls_settings.tls_key_path = Some("/key.pem".to_string());
+        let state = super::super::state::ResponderState::shared(tls_settings);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("responder.toml");
+        std::fs::write(&config_path, "hmac_secret = \"test-secret\"\n").unwrap();
+
+        let err = reload_settings(&state, Some(&config_path))
+            .await
+            .expect_err("disabling TLS at runtime must be rejected");
+        assert!(
+            err.to_string().contains("transport mode change"),
+            "error must mention transport mode change: {err}"
+        );
     }
 }

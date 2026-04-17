@@ -11,11 +11,15 @@ use crate::commands::dns_alias::replay_dns_aliases;
 use crate::commands::dotenv::write_dotenv;
 use crate::commands::guardrails::{
     client_url_from_bind_addr, ensure_all_services_localhost_binding, is_loopback_bind,
-    is_wildcard_bind, reject_advertise_addr_for_specific_bind, validate_openbao_advertise_addr,
-    validate_openbao_bind, validate_openbao_override_binding, validate_openbao_override_scope,
-    validate_openbao_tls, write_openbao_exposed_override,
+    is_wildcard_bind, reject_advertise_addr_for_specific_bind, validate_http01_admin_bind,
+    validate_http01_admin_tls, validate_http01_override_binding, validate_http01_override_scope,
+    validate_openbao_advertise_addr, validate_openbao_bind, validate_openbao_override_binding,
+    validate_openbao_override_scope, validate_openbao_tls, write_http01_exposed_override,
+    write_openbao_exposed_override,
 };
-use crate::commands::init::{DEFAULT_KV_MOUNT, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME};
+use crate::commands::init::{
+    DEFAULT_KV_MOUNT, HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME,
+};
 use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unseal_keys_from_file};
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -37,6 +41,7 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
         .unwrap_or(Path::new("."));
     let state_path = StateFile::default_path();
     let openbao_override = resolve_openbao_exposed_override(&state_path, compose_dir, messages)?;
+    let http01_override = resolve_http01_exposed_override(&state_path, compose_dir, messages)?;
 
     // Derive the effective OpenBao URL.  When the non-loopback override
     // is active, OpenBao listens on the bind address with TLS, so the
@@ -68,11 +73,17 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
         run_docker(&pull_args, "docker compose pull", messages)?;
     }
 
-    let override_str = openbao_override
+    let openbao_override_str = openbao_override
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let http01_override_str = http01_override
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
     let mut up_args: Vec<&str> = vec!["compose", "-f", &compose_str];
-    if let Some(ref s) = override_str {
+    if let Some(ref s) = openbao_override_str {
+        up_args.extend(["-f", s.as_str()]);
+    }
+    if let Some(ref s) = http01_override_str {
         up_args.extend(["-f", s.as_str()]);
     }
     up_args.extend(["up", "-d"]);
@@ -204,6 +215,32 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         println!("{}", messages.info_openbao_bind_intent_recorded(bind_addr));
     } else {
         clear_openbao_bind_intent(compose_dir, &args.openbao_url, messages)?;
+    }
+
+    // Validate and resolve HTTP-01 admin non-loopback bind intent.
+    let http01_admin_bind = if let Some(ref bind_addr) = args.http01_admin_bind {
+        validate_http01_admin_bind(bind_addr, args.http01_admin_bind_wildcard, messages)?;
+        if is_loopback_bind(bind_addr) {
+            None
+        } else {
+            if !args.http01_admin_tls_required {
+                anyhow::bail!(messages.error_http01_admin_bind_tls_flag_required());
+            }
+            Some(bind_addr.clone())
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref bind_addr) = http01_admin_bind {
+        write_http01_exposed_override(compose_dir, bind_addr, messages)?;
+        save_http01_admin_bind_intent(bind_addr, &args.openbao_url, messages)?;
+        println!(
+            "{}",
+            messages.info_http01_admin_bind_intent_recorded(bind_addr)
+        );
+    } else {
+        clear_http01_admin_bind_intent(compose_dir, messages)?;
     }
 
     // Docker Compose reads .env from the compose file's directory.
@@ -472,6 +509,38 @@ pub(crate) fn resolve_openbao_exposed_override(
     Ok(Some(override_path))
 }
 
+/// Resolves the HTTP-01 admin exposed compose override path if a
+/// non-loopback bind intent is stored in `StateFile`.
+///
+/// Validates TLS before returning the override path.  Returns `None`
+/// when no non-loopback intent is stored.  Returns a hard error when
+/// the stored intent exists but the override file is missing or TLS
+/// prerequisites are not met.
+pub(crate) fn resolve_http01_exposed_override(
+    state_path: &Path,
+    compose_dir: &Path,
+    messages: &Messages,
+) -> Result<Option<std::path::PathBuf>> {
+    if !state_path.exists() {
+        return Ok(None);
+    }
+    let state = StateFile::load(state_path)?;
+    let Some(bind_addr) = state.http01_admin_bind_addr.as_deref() else {
+        return Ok(None);
+    };
+    let override_path = compose_dir
+        .join("secrets")
+        .join("responder")
+        .join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
+    if !override_path.exists() {
+        anyhow::bail!(messages.error_http01_admin_override_file_missing());
+    }
+    validate_http01_override_scope(&override_path, messages)?;
+    validate_http01_override_binding(&override_path, bind_addr, messages)?;
+    validate_http01_admin_tls(state.secrets_dir(), messages)?;
+    Ok(Some(override_path))
+}
+
 /// Derives the effective `OpenBao` URL from a stored non-loopback bind
 /// address.
 ///
@@ -560,6 +629,7 @@ fn save_openbao_bind_intent_to(
             services: BTreeMap::new(),
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         }
     };
     // Always reset openbao_url to the install-time loopback URL so that a
@@ -629,6 +699,89 @@ fn clear_openbao_bind_intent_to(
     }
     println!("{}", messages.info_openbao_bind_intent_cleared());
     Ok(())
+}
+
+/// Persists the HTTP-01 admin non-loopback bind address to `StateFile`.
+fn save_http01_admin_bind_intent(
+    bind_addr: &str,
+    openbao_url: &str,
+    messages: &Messages,
+) -> Result<()> {
+    save_http01_admin_bind_intent_to(&StateFile::default_path(), bind_addr, openbao_url, messages)
+}
+
+fn save_http01_admin_bind_intent_to(
+    state_path: &Path,
+    bind_addr: &str,
+    openbao_url: &str,
+    messages: &Messages,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let mut state = if state_path.exists() {
+        StateFile::load(state_path)?
+    } else {
+        StateFile {
+            openbao_url: openbao_url.to_string(),
+            kv_mount: DEFAULT_KV_MOUNT.to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
+        }
+    };
+    state.http01_admin_bind_addr = Some(bind_addr.to_string());
+    state
+        .save(state_path)
+        .with_context(|| messages.error_serialize_state_failed())?;
+    Ok(())
+}
+
+/// Clears a previously stored HTTP-01 admin non-loopback bind intent.
+fn clear_http01_admin_bind_intent(compose_dir: &Path, messages: &Messages) -> Result<()> {
+    clear_http01_admin_bind_intent_to(&StateFile::default_path(), compose_dir, messages)
+}
+
+fn clear_http01_admin_bind_intent_to(
+    state_path: &Path,
+    compose_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    if !state_path.exists() {
+        return Ok(());
+    }
+    let mut state = StateFile::load(state_path)?;
+    if state.http01_admin_bind_addr.is_none() {
+        return Ok(());
+    }
+    state.http01_admin_bind_addr = None;
+    state
+        .save(state_path)
+        .with_context(|| messages.error_serialize_state_failed())?;
+    let override_path = compose_dir
+        .join("secrets")
+        .join("responder")
+        .join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
+    if override_path.exists() {
+        std::fs::remove_file(&override_path).with_context(|| {
+            messages.error_remove_file_failed(&override_path.display().to_string())
+        })?;
+    }
+    println!("{}", messages.info_http01_admin_bind_intent_cleared());
+    Ok(())
+}
+
+/// Returns whether `StateFile` contains a non-loopback HTTP-01 admin bind
+/// intent.
+pub(crate) fn has_http01_admin_bind_intent(state_path: &Path) -> Result<bool> {
+    if !state_path.exists() {
+        return Ok(false);
+    }
+    let state = StateFile::load(state_path)?;
+    Ok(state.http01_admin_bind_addr.is_some())
 }
 
 pub(crate) fn default_infra_services() -> Vec<String> {
@@ -880,6 +1033,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         let result = resolve_openbao_exposed_override(&state_path, dir.path(), &messages);
@@ -907,6 +1061,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         assert!(find_openbao_exposed_override(&state_path, dir.path()).is_none());
@@ -926,6 +1081,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         write_openbao_exposed_override(dir.path(), "192.168.1.10:8200", &messages).unwrap();
@@ -946,6 +1102,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         // No override file generated — resolve must error, not silently skip.
@@ -1014,6 +1171,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         // Override file must exist for resolve to reach TLS validation.
@@ -1044,6 +1202,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
 
@@ -1173,6 +1332,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         save_openbao_bind_intent_to(
@@ -1209,6 +1369,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         save_openbao_bind_intent_to(
@@ -1244,6 +1405,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("openbao");
@@ -1280,6 +1442,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
 
@@ -1326,6 +1489,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("openbao");
@@ -1368,6 +1532,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         // Write an override with a widened wildcard binding.
@@ -1409,6 +1574,7 @@ services:
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -1428,6 +1594,7 @@ services:
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         assert!(effective_openbao_url_from_state(&state_path).is_none());
@@ -1455,6 +1622,7 @@ services:
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("[fd12::1]:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -1477,6 +1645,7 @@ services:
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("0.0.0.0:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -1498,6 +1667,7 @@ services:
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("[::]:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -1521,6 +1691,7 @@ services:
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("0.0.0.0:8200".to_string()),
             openbao_advertise_addr: Some("192.168.1.10:8200".to_string()),
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -1572,6 +1743,7 @@ services:
             services: std::collections::BTreeMap::new(),
             openbao_bind_addr: Some("0.0.0.0:8200".to_string()),
             openbao_advertise_addr: Some("192.168.1.10:8200".to_string()),
+            http01_admin_bind_addr: None,
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("openbao");
@@ -1591,5 +1763,311 @@ services:
             reloaded.openbao_advertise_addr.is_none(),
             "advertise addr must be cleared alongside bind addr"
         );
+    }
+
+    // --- HTTP-01 admin bind intent tests ---
+
+    #[test]
+    fn save_http01_bind_intent_succeeds_without_existing_state() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        save_http01_admin_bind_intent_to(
+            &state_path,
+            "192.168.1.10:8080",
+            "http://localhost:8200",
+            &messages,
+        )
+        .unwrap();
+        let state = StateFile::load(&state_path).unwrap();
+        assert_eq!(
+            state.http01_admin_bind_addr.as_deref(),
+            Some("192.168.1.10:8080")
+        );
+    }
+
+    #[test]
+    fn save_http01_bind_intent_preserves_existing_state() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: std::collections::BTreeMap::from([("svc".to_string(), "pol".to_string())]),
+            approles: std::collections::BTreeMap::new(),
+            services: std::collections::BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
+        };
+        state.save(&state_path).unwrap();
+        save_http01_admin_bind_intent_to(
+            &state_path,
+            "10.0.0.5:8080",
+            "http://localhost:8200",
+            &messages,
+        )
+        .unwrap();
+        let reloaded = StateFile::load(&state_path).unwrap();
+        assert_eq!(
+            reloaded.http01_admin_bind_addr.as_deref(),
+            Some("10.0.0.5:8080")
+        );
+        assert!(
+            reloaded.policies.contains_key("svc"),
+            "existing state fields must be preserved"
+        );
+    }
+
+    #[test]
+    fn save_http01_bind_intent_errors_on_malformed_state() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        std::fs::write(&state_path, "NOT VALID JSON").unwrap();
+        let result = save_http01_admin_bind_intent_to(
+            &state_path,
+            "192.168.1.10:8080",
+            "http://localhost:8200",
+            &messages,
+        );
+        assert!(result.is_err(), "malformed state file must be a hard error");
+    }
+
+    #[test]
+    fn clear_http01_bind_intent_removes_state_and_override() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: std::collections::BTreeMap::new(),
+            approles: std::collections::BTreeMap::new(),
+            services: std::collections::BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+        };
+        state.save(&state_path).unwrap();
+        let override_dir = dir.path().join("secrets").join("responder");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        let override_path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
+        std::fs::write(&override_path, "placeholder").unwrap();
+
+        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+
+        let reloaded = StateFile::load(&state_path).unwrap();
+        assert!(
+            reloaded.http01_admin_bind_addr.is_none(),
+            "bind intent must be cleared from state"
+        );
+        assert!(
+            !override_path.exists(),
+            "compose override file must be removed"
+        );
+    }
+
+    #[test]
+    fn clear_http01_bind_intent_noop_without_state_file() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+        assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn has_http01_admin_bind_intent_returns_false_without_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        assert!(!has_http01_admin_bind_intent(&state_path).unwrap());
+    }
+
+    #[test]
+    fn has_http01_admin_bind_intent_returns_true_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: std::collections::BTreeMap::new(),
+            approles: std::collections::BTreeMap::new(),
+            services: std::collections::BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+        };
+        state.save(&state_path).unwrap();
+        assert!(has_http01_admin_bind_intent(&state_path).unwrap());
+    }
+
+    #[test]
+    fn has_http01_admin_bind_intent_errors_on_corrupted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        std::fs::write(&state_path, "NOT VALID JSON").unwrap();
+        assert!(
+            has_http01_admin_bind_intent(&state_path).is_err(),
+            "corrupted state must be a hard error"
+        );
+    }
+
+    #[test]
+    fn resolve_http01_override_returns_none_when_no_state_file() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let result = resolve_http01_exposed_override(&state_path, dir.path(), &messages);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_http01_override_returns_none_when_no_bind_addr() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: std::collections::BTreeMap::new(),
+            approles: std::collections::BTreeMap::new(),
+            services: std::collections::BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
+        };
+        state.save(&state_path).unwrap();
+        let result = resolve_http01_exposed_override(&state_path, dir.path(), &messages);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_http01_override_errors_when_bind_addr_set_but_override_missing() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: std::collections::BTreeMap::new(),
+            approles: std::collections::BTreeMap::new(),
+            services: std::collections::BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+        };
+        state.save(&state_path).unwrap();
+        let result = resolve_http01_exposed_override(&state_path, dir.path(), &messages);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("override") && err.contains("missing"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_http01_override_returns_path_when_tls_and_override_present() {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+        use crate::commands::guardrails::write_http01_exposed_override;
+        use crate::commands::init::{
+            CA_CERTS_DIR, CA_ROOT_CERT_FILENAME, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
+        };
+
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: Some(dir.path().join("secrets")),
+            policies: std::collections::BTreeMap::new(),
+            approles: std::collections::BTreeMap::new(),
+            services: std::collections::BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+        };
+        state.save(&state_path).unwrap();
+
+        // Generate a proper CA-signed server certificate.
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["root.test".to_string()]).unwrap();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Bootroot Root CA");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.clone().self_signed(&ca_key).unwrap();
+        let ca_issuer = Issuer::new(ca_params, ca_key);
+
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(vec!["server.test".to_string()]).unwrap();
+        server_params
+            .distinguished_name
+            .push(DnType::CommonName, "server.test");
+        let server_cert = server_params.signed_by(&server_key, &ca_issuer).unwrap();
+
+        // Create TLS prerequisites with real certs.
+        let responder_dir = dir.path().join("secrets").join(RESPONDER_CONFIG_DIR);
+        let tls_dir = responder_dir.join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("cert.pem"), server_cert.pem()).unwrap();
+        std::fs::write(tls_dir.join("key.pem"), server_key.serialize_pem()).unwrap();
+
+        // Write responder.toml with TLS paths.
+        std::fs::write(
+            responder_dir.join(RESPONDER_CONFIG_NAME),
+            "\
+hmac_secret = \"test\"
+tls_cert_path = \"/app/responder/tls/cert.pem\"
+tls_key_path = \"/app/responder/tls/key.pem\"
+",
+        )
+        .unwrap();
+
+        // Write step-ca root CA cert.
+        let certs_dir = dir.path().join("secrets").join(CA_CERTS_DIR);
+        std::fs::create_dir_all(&certs_dir).unwrap();
+        std::fs::write(certs_dir.join(CA_ROOT_CERT_FILENAME), ca_cert.pem()).unwrap();
+
+        // Create the override file.
+        write_http01_exposed_override(dir.path(), "192.168.1.10:8080", &messages).unwrap();
+
+        let result = resolve_http01_exposed_override(&state_path, dir.path(), &messages);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn resolve_http01_override_errors_when_tls_missing() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: std::collections::BTreeMap::new(),
+            approles: std::collections::BTreeMap::new(),
+            services: std::collections::BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+        };
+        state.save(&state_path).unwrap();
+        // Override file must exist for resolve to reach TLS validation.
+        write_http01_exposed_override(dir.path(), "192.168.1.10:8080", &messages).unwrap();
+        let result = resolve_http01_exposed_override(&state_path, dir.path(), &messages);
+        assert!(result.is_err());
     }
 }

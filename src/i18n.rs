@@ -441,6 +441,15 @@ pub(crate) struct Strings {
     pub(crate) error_openbao_override_binding_mismatch: &'static str,
     pub(crate) info_openbao_bind_intent_recorded: &'static str,
     pub(crate) info_openbao_bind_intent_cleared: &'static str,
+    pub(crate) error_http01_admin_bind_invalid_format: &'static str,
+    pub(crate) error_http01_admin_bind_wildcard_required: &'static str,
+    pub(crate) error_http01_admin_bind_tls_flag_required: &'static str,
+    pub(crate) error_http01_admin_bind_ipv6_requires_brackets: &'static str,
+    pub(crate) info_http01_admin_bind_intent_recorded: &'static str,
+    pub(crate) info_http01_admin_bind_intent_cleared: &'static str,
+    pub(crate) error_http01_admin_override_file_missing: &'static str,
+    pub(crate) error_http01_admin_override_binding_mismatch: &'static str,
+    pub(crate) error_http01_admin_bind_tls_missing: &'static str,
 }
 
 pub(crate) struct Messages {

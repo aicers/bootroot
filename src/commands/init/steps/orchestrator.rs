@@ -32,7 +32,9 @@ use crate::commands::guardrails::{
     client_url_from_bind_addr, ensure_all_services_localhost_binding,
     validate_openbao_override_binding, validate_openbao_override_scope, validate_openbao_tls,
 };
-use crate::commands::infra::{ensure_init_prereqs_ready, has_openbao_bind_intent, run_docker};
+use crate::commands::infra::{
+    ensure_init_prereqs_ready, has_http01_admin_bind_intent, has_openbao_bind_intent, run_docker,
+};
 use crate::commands::init::OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME;
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -201,10 +203,12 @@ async fn run_init_inner(
     }
     let stepca_templates =
         write_stepca_templates(&secrets_dir, &args.openbao.kv_mount, messages).await?;
+    let responder_tls_enabled = has_http01_admin_bind_intent(&StateFile::default_path())?;
     let responder_paths = write_responder_files(
         &secrets_dir,
         &args.openbao.kv_mount,
         &secrets.http_hmac,
+        responder_tls_enabled,
         messages,
     )
     .await?;
@@ -237,7 +241,7 @@ async fn run_init_inner(
     )
     .await?;
     let compose_has_responder = compose_has_responder(&args.compose.compose_file, messages)?;
-    let responder_url = resolve_responder_url(args, compose_has_responder);
+    let responder_url = resolve_responder_url(args, compose_has_responder)?;
     let responder_check = verify_responder(
         responder_url.as_deref(),
         args,
@@ -571,17 +575,22 @@ fn write_state_file_to(
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
-    let (existing_services, existing_openbao_bind_addr, existing_openbao_advertise_addr) =
-        if state_path.exists() {
-            let state = StateFile::load(state_path)?;
-            (
-                state.services,
-                state.openbao_bind_addr,
-                state.openbao_advertise_addr,
-            )
-        } else {
-            (BTreeMap::new(), None, None)
-        };
+    let (
+        existing_services,
+        existing_openbao_bind_addr,
+        existing_openbao_advertise_addr,
+        existing_http01_admin_bind_addr,
+    ) = if state_path.exists() {
+        let state = StateFile::load(state_path)?;
+        (
+            state.services,
+            state.openbao_bind_addr,
+            state.openbao_advertise_addr,
+            state.http01_admin_bind_addr,
+        )
+    } else {
+        (BTreeMap::new(), None, None, None)
+    };
 
     let policy_map = AppRoleLabel::policy_map();
     let state = StateFile {
@@ -593,6 +602,7 @@ fn write_state_file_to(
         services: existing_services,
         openbao_bind_addr: existing_openbao_bind_addr,
         openbao_advertise_addr: existing_openbao_advertise_addr,
+        http01_admin_bind_addr: existing_http01_admin_bind_addr,
     };
     state
         .save(state_path)
@@ -643,6 +653,7 @@ mod tests {
             services: BTreeMap::new(),
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
         };
         existing.save(&state_path).unwrap();
         write_state_file_to(

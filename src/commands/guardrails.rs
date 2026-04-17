@@ -7,7 +7,8 @@ use x509_parser::pem::parse_x509_pem;
 
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME,
-    OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
+    HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
+    RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
 };
 use crate::i18n::Messages;
 
@@ -22,6 +23,10 @@ const GUARDED_SERVICES: [&str; 3] = ["postgres:", "openbao:", "bootroot-http01:"
 /// Container mount prefix for the `OpenBao` config directory.
 /// Per `docker-compose.yml`: `./openbao:/openbao/config:ro`
 const OPENBAO_CONTAINER_CONFIG_PREFIX: &str = "/openbao/config/";
+
+/// Container mount prefix for the responder config directory.
+/// Per compose override: `{secrets_dir}/responder:/app/responder:ro`
+const RESPONDER_CONTAINER_CONFIG_PREFIX: &str = "/app/responder/";
 
 /// Default `OpenBao` API port used to identify the API listener block.
 const OPENBAO_API_PORT: &str = ":8200";
@@ -228,6 +233,131 @@ pub(crate) fn client_url_from_bind_addr(bind_addr: &str) -> String {
     format!("https://{client_ip}:{port}")
 }
 
+/// Validates the `--http01-admin-bind` CLI flag value.
+///
+/// Reuses the same IP:port format and wildcard rules as `OpenBao` binding.
+///
+/// # Errors
+///
+/// Returns an error when the format is invalid or `0.0.0.0` is used
+/// without `--http01-admin-bind-wildcard`.
+pub(crate) fn validate_http01_admin_bind(
+    bind_addr: &str,
+    wildcard_confirmed: bool,
+    messages: &Messages,
+) -> Result<()> {
+    let Some((ip_raw, port_str)) = bind_addr.rsplit_once(':') else {
+        anyhow::bail!(messages.error_http01_admin_bind_invalid_format());
+    };
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!(messages.error_http01_admin_bind_invalid_format()))?;
+    if port == 0 {
+        anyhow::bail!(messages.error_http01_admin_bind_invalid_format());
+    }
+    if ip_raw.is_empty() {
+        anyhow::bail!(messages.error_http01_admin_bind_invalid_format());
+    }
+    if ip_raw.contains(':') && !(ip_raw.starts_with('[') && ip_raw.ends_with(']')) {
+        anyhow::bail!(messages.error_http01_admin_bind_ipv6_requires_brackets());
+    }
+    let ip_str = ip_raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(ip_raw);
+    let ip: IpAddr = ip_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!(messages.error_http01_admin_bind_invalid_format()))?;
+    if ip.is_unspecified() && !wildcard_confirmed {
+        anyhow::bail!(messages.error_http01_admin_bind_wildcard_required());
+    }
+    Ok(())
+}
+
+/// Generates the compose override file that exposes the HTTP-01 admin API
+/// on a non-loopback address.
+///
+/// # Errors
+///
+/// Returns an error if the override file cannot be written.
+pub(crate) fn write_http01_exposed_override(
+    compose_dir: &Path,
+    bind_addr: &str,
+    messages: &Messages,
+) -> Result<PathBuf> {
+    let override_dir = compose_dir.join("secrets").join("responder");
+    if !override_dir.exists() {
+        fs::create_dir_all(&override_dir).with_context(|| {
+            messages.error_write_file_failed(&override_dir.display().to_string())
+        })?;
+    }
+    let override_path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
+    let content = format!(
+        "\
+services:
+  bootroot-http01:
+    ports: !reset
+      - \"{bind_addr}:8080\"
+"
+    );
+    fs::write(&override_path, content)
+        .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+    Ok(override_path)
+}
+
+/// Validates that the HTTP-01 admin compose override port mapping matches
+/// the bind address stored in `StateFile`.
+///
+/// # Errors
+///
+/// Returns an error when the override contains no responder port mapping,
+/// more than one mapping, or a mapping that does not match the expected
+/// `{bind_addr}:8080` value.
+pub(crate) fn validate_http01_override_binding(
+    override_path: &Path,
+    expected_bind_addr: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let content = fs::read_to_string(override_path)
+        .with_context(|| messages.error_read_file_failed(&override_path.display().to_string()))?;
+    let mappings = collect_port_mappings_for_service(&content, "bootroot-http01:");
+    let expected = format!("{expected_bind_addr}:8080");
+    if mappings.len() != 1 || mappings.first().map(String::as_str) != Some(expected.as_str()) {
+        let actual = if mappings.is_empty() {
+            "(none)".to_string()
+        } else {
+            mappings.join(", ")
+        };
+        anyhow::bail!(messages.error_http01_admin_override_binding_mismatch(&expected, &actual));
+    }
+    Ok(())
+}
+
+/// Validates that the HTTP-01 admin compose override does not introduce
+/// non-loopback port bindings for services other than `bootroot-http01`.
+///
+/// # Errors
+///
+/// Returns an error naming the first non-responder service that publishes
+/// a non-loopback port.
+pub(crate) fn validate_http01_override_scope(
+    override_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let content = fs::read_to_string(override_path)
+        .with_context(|| messages.error_read_file_failed(&override_path.display().to_string()))?;
+    for service in GUARDED_SERVICES {
+        if service == "bootroot-http01:" {
+            continue;
+        }
+        if has_unsafe_port_binding_for_service(&content, service) {
+            let name = service.trim_end_matches(':');
+            anyhow::bail!(messages.error_service_port_binding_unsafe(name));
+        }
+    }
+    Ok(())
+}
+
 /// Validates that `OpenBao` TLS is configured for non-loopback binding.
 ///
 /// Parses `tls_cert_file` and `tls_key_file` from `openbao.hcl` to
@@ -330,6 +460,116 @@ pub(crate) fn validate_openbao_tls(
     Ok(())
 }
 
+/// Validates that HTTP-01 admin API TLS is configured for non-loopback
+/// binding.
+///
+/// Reads `responder.toml` from the secrets directory and checks that
+/// `tls_cert_path` and `tls_key_path` are configured, that the
+/// referenced cert/key files are readable on the host, and that the
+/// server certificate chains to the local step-ca root.
+///
+/// # Errors
+///
+/// Returns an error describing which TLS prerequisites are missing.
+pub(crate) fn validate_http01_admin_tls(secrets_dir: &Path, messages: &Messages) -> Result<()> {
+    let responder_config_path = secrets_dir
+        .join(RESPONDER_CONFIG_DIR)
+        .join(RESPONDER_CONFIG_NAME);
+    let mut issues = Vec::new();
+
+    let config_content = if responder_config_path.exists() {
+        Some(fs::read_to_string(&responder_config_path).with_context(|| {
+            messages.error_read_file_failed(&responder_config_path.display().to_string())
+        })?)
+    } else {
+        issues.push(format!(
+            "responder config not found: {}",
+            responder_config_path.display()
+        ));
+        None
+    };
+
+    let mut cert_host_path: Option<PathBuf> = None;
+    let mut key_host_path: Option<PathBuf> = None;
+
+    if let Some(ref content) = config_content {
+        // `parse_hcl_string_value` works for flat TOML `key = "value"`
+        // lines because HCL and TOML share the same assignment syntax
+        // and `#` comment marker.
+        match parse_hcl_string_value(content, "tls_cert_path") {
+            Some(cp) => match resolve_responder_container_path(cp, secrets_dir) {
+                Some(hp) => cert_host_path = Some(hp),
+                None => issues.push(format!(
+                    "tls_cert_path container path cannot be resolved to host: {cp}"
+                )),
+            },
+            None => issues.push("responder.toml does not set tls_cert_path".to_string()),
+        }
+
+        match parse_hcl_string_value(content, "tls_key_path") {
+            Some(kp) => match resolve_responder_container_path(kp, secrets_dir) {
+                Some(hp) => key_host_path = Some(hp),
+                None => issues.push(format!(
+                    "tls_key_path container path cannot be resolved to host: {kp}"
+                )),
+            },
+            None => issues.push("responder.toml does not set tls_key_path".to_string()),
+        }
+    }
+
+    let cert_bytes = if let Some(ref path) = cert_host_path {
+        if let Ok(bytes) = fs::read(path) {
+            Some(bytes)
+        } else {
+            issues.push(format!(
+                "cert not found or not readable: {}",
+                path.display()
+            ));
+            None
+        }
+    } else {
+        None
+    };
+    let key_bytes = if let Some(ref path) = key_host_path {
+        if let Ok(bytes) = fs::read(path) {
+            Some(bytes)
+        } else {
+            issues.push(format!("key not found or not readable: {}", path.display()));
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref cert_bytes) = cert_bytes
+        && let Err(chain_err) = validate_cert_chain_to_stepca_root(secrets_dir, cert_bytes)
+    {
+        issues.push(format!("certificate chain validation failed: {chain_err}"));
+    }
+
+    if let (Some(cb), Some(kb)) = (&cert_bytes, &key_bytes)
+        && let Err(load_err) = validate_tls_key_material(cb, kb)
+    {
+        issues.push(format!("TLS key material not loadable: {load_err}"));
+    }
+
+    if !issues.is_empty() {
+        anyhow::bail!(messages.error_http01_admin_bind_tls_missing(&issues.join("; ")));
+    }
+    Ok(())
+}
+
+/// Maps a responder container path to a host path.
+///
+/// Uses the volume mount convention `{secrets_dir}/responder:/app/responder:ro`
+/// to resolve container paths (e.g. `/app/responder/tls/cert.pem`) to
+/// host paths (e.g. `{secrets_dir}/responder/tls/cert.pem`).
+fn resolve_responder_container_path(container_path: &str, secrets_dir: &Path) -> Option<PathBuf> {
+    container_path
+        .strip_prefix(RESPONDER_CONTAINER_CONFIG_PREFIX)
+        .map(|relative| secrets_dir.join("responder").join(relative))
+}
+
 /// Strips a trailing HCL comment (`#` or `//`) from a line, preserving
 /// comment markers that appear inside double-quoted strings.
 fn strip_hcl_line_comment(line: &str) -> &str {
@@ -393,7 +633,7 @@ fn has_tls_disabled(hcl_content: &str) -> bool {
 ///
 /// Returns the first unquoted value matching `key = "value"`, ignoring
 /// trailing comments and requiring whole-key matches.
-fn parse_hcl_string_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn parse_hcl_string_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') || trimmed.starts_with("//") {
@@ -493,6 +733,79 @@ fn resolve_container_path_to_host(container_path: &str, compose_dir: &Path) -> O
     container_path
         .strip_prefix(OPENBAO_CONTAINER_CONFIG_PREFIX)
         .map(|relative| compose_dir.join("openbao").join(relative))
+}
+
+/// Validates that the cert and key PEM bytes can be parsed and loaded as
+/// a `rustls` `CertifiedKey`, and that the private key matches the leaf
+/// certificate.
+///
+/// Mirrors the same load path the responder uses at startup
+/// (`load_certified_key` in the responder's `tls` module), so a failure
+/// here means the responder would also fail to start.
+fn validate_tls_key_material(cert_bytes: &[u8], key_bytes: &[u8]) -> Result<()> {
+    use std::io::BufReader;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_bytes))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse PEM certificates")?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in cert file");
+    }
+
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes))
+        .context("failed to parse PEM private key")?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in key file"))?;
+
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| anyhow::anyhow!("unsupported private key type: {e}"))?;
+
+    verify_cert_key_match(certs.first().expect("non-empty certs"), &*signing_key)?;
+
+    Ok(())
+}
+
+/// Verifies that a private key matches the leaf certificate by signing a
+/// test payload and verifying the signature against the certificate's
+/// public key.
+fn verify_cert_key_match(
+    leaf_cert: &rustls::pki_types::CertificateDer<'_>,
+    signing_key: &dyn rustls::sign::SigningKey,
+) -> Result<()> {
+    let schemes = [
+        rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+        rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+        rustls::SignatureScheme::RSA_PSS_SHA256,
+        rustls::SignatureScheme::ED25519,
+    ];
+    let signer = signing_key
+        .choose_scheme(&schemes)
+        .ok_or_else(|| anyhow::anyhow!("no supported signature scheme for cert/key match"))?;
+    let scheme = signer.scheme();
+
+    let test_message = b"bootroot-cert-key-match-check";
+    let signature = signer
+        .sign(test_message)
+        .map_err(|e| anyhow::anyhow!("test signature for cert/key match failed: {e}"))?;
+
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf_cert.as_ref())
+        .map_err(|e| anyhow::anyhow!("parse leaf certificate for key match: {e}"))?;
+    let public_key_bytes: &[u8] = cert.public_key().subject_public_key.as_ref();
+
+    let ring_alg: &dyn ring::signature::VerificationAlgorithm = match scheme {
+        rustls::SignatureScheme::ECDSA_NISTP256_SHA256 => &ring::signature::ECDSA_P256_SHA256_ASN1,
+        rustls::SignatureScheme::ECDSA_NISTP384_SHA384 => &ring::signature::ECDSA_P384_SHA384_ASN1,
+        rustls::SignatureScheme::RSA_PSS_SHA256 => &ring::signature::RSA_PSS_2048_8192_SHA256,
+        rustls::SignatureScheme::ED25519 => &ring::signature::ED25519,
+        other => anyhow::bail!("unsupported scheme for cert/key match: {other:?}"),
+    };
+    let verifier = ring::signature::UnparsedPublicKey::new(ring_alg, public_key_bytes);
+    verifier
+        .verify(test_message, &signature)
+        .map_err(|_| anyhow::anyhow!("private key does not match the leaf certificate"))?;
+
+    Ok(())
 }
 
 /// Validates that the server certificate chains to the local step-ca root.
@@ -1986,5 +2299,358 @@ listener "tcp" {
             )
             .is_err()
         );
+    }
+
+    // --- HTTP-01 admin bind validation ---
+
+    #[test]
+    fn validate_http01_admin_bind_accepts_specific_ip() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_bind("192.168.1.10:8080", false, &messages).is_ok());
+    }
+
+    #[test]
+    fn validate_http01_admin_bind_rejects_missing_port() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_bind("192.168.1.10", false, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_http01_admin_bind_rejects_port_zero() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_bind("192.168.1.10:0", false, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_http01_admin_bind_rejects_wildcard_without_flag() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_bind("0.0.0.0:8080", false, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_http01_admin_bind_accepts_wildcard_with_flag() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_bind("0.0.0.0:8080", true, &messages).is_ok());
+    }
+
+    #[test]
+    fn validate_http01_admin_bind_rejects_bare_ipv6() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_bind("::1:8080", false, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_http01_admin_bind_accepts_bracketed_ipv6() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_bind("[::1]:8080", false, &messages).is_ok());
+    }
+
+    // --- HTTP-01 override writing and validation ---
+
+    #[test]
+    fn write_http01_override_creates_file() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_http01_exposed_override(dir.path(), "192.168.1.10:8080", &messages).unwrap();
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("192.168.1.10:8080:8080"));
+        assert!(content.contains("bootroot-http01"));
+    }
+
+    #[test]
+    fn validate_http01_override_binding_accepts_matching_addr() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_http01_exposed_override(dir.path(), "192.168.1.10:8080", &messages).unwrap();
+        assert!(validate_http01_override_binding(&path, "192.168.1.10:8080", &messages).is_ok());
+    }
+
+    #[test]
+    fn validate_http01_override_binding_rejects_mismatched_addr() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_http01_exposed_override(dir.path(), "192.168.1.10:8080", &messages).unwrap();
+        let result = validate_http01_override_binding(&path, "10.0.0.5:8080", &messages);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_http01_override_scope_rejects_extra_services() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let override_dir = dir.path().join("secrets").join("responder");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        let path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
+        std::fs::write(
+            &path,
+            "\
+services:
+  bootroot-http01:
+    ports: !reset
+      - \"192.168.1.10:8080:8080\"
+  openbao:
+    ports:
+      - \"0.0.0.0:8200:8200\"
+",
+        )
+        .unwrap();
+        assert!(validate_http01_override_scope(&path, &messages).is_err());
+    }
+
+    // --- HTTP-01 admin TLS validation ---
+
+    #[test]
+    fn validate_http01_admin_tls_fails_without_config() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        let result = validate_http01_admin_tls(&secrets_dir, &messages);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("responder config not found"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_http01_admin_tls_fails_without_tls_paths() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let responder_dir = secrets_dir.join("responder");
+        std::fs::create_dir_all(&responder_dir).unwrap();
+        std::fs::write(
+            responder_dir.join("responder.toml"),
+            "hmac_secret = \"test\"\n",
+        )
+        .unwrap();
+        let result = validate_http01_admin_tls(&secrets_dir, &messages);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("tls_cert_path"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_http01_admin_tls_fails_with_missing_cert_files() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let responder_dir = secrets_dir.join("responder");
+        std::fs::create_dir_all(&responder_dir).unwrap();
+        std::fs::write(
+            responder_dir.join("responder.toml"),
+            "\
+hmac_secret = \"test\"
+tls_cert_path = \"/app/responder/tls/cert.pem\"
+tls_key_path = \"/app/responder/tls/key.pem\"
+",
+        )
+        .unwrap();
+        let result = validate_http01_admin_tls(&secrets_dir, &messages);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cert not found"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_http01_admin_tls_passes_with_valid_certs() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let responder_dir = secrets_dir.join("responder");
+        let tls_dir = responder_dir.join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+
+        let (server_pem, server_key_pem, root_pem) = gen_ca_signed_cert_pair();
+        std::fs::write(tls_dir.join("cert.pem"), &server_pem).unwrap();
+        std::fs::write(tls_dir.join("key.pem"), &server_key_pem).unwrap();
+
+        let certs_dir = secrets_dir.join("certs");
+        std::fs::create_dir_all(&certs_dir).unwrap();
+        std::fs::write(certs_dir.join("root_ca.crt"), &root_pem).unwrap();
+
+        std::fs::write(
+            responder_dir.join("responder.toml"),
+            "\
+hmac_secret = \"test\"
+tls_cert_path = \"/app/responder/tls/cert.pem\"
+tls_key_path = \"/app/responder/tls/key.pem\"
+",
+        )
+        .unwrap();
+        assert!(validate_http01_admin_tls(&secrets_dir, &messages).is_ok());
+    }
+
+    #[test]
+    fn validate_http01_admin_tls_fails_with_cert_from_wrong_ca() {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let responder_dir = secrets_dir.join("responder");
+        let tls_dir = responder_dir.join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+
+        // Generate a CA and its root cert for the step-ca trust anchor.
+        let real_ca_key = KeyPair::generate().unwrap();
+        let mut real_ca_params = CertificateParams::new(vec!["root.test".to_string()]).unwrap();
+        real_ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Bootroot Root CA");
+        real_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let real_ca_cert = real_ca_params.self_signed(&real_ca_key).unwrap();
+
+        // Generate a server cert from a DIFFERENT CA (not the step-ca root).
+        let wrong_ca_key = KeyPair::generate().unwrap();
+        let mut wrong_ca_params = CertificateParams::new(vec!["wrong.test".to_string()]).unwrap();
+        wrong_ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Wrong CA");
+        wrong_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let _wrong_ca_cert = wrong_ca_params.clone().self_signed(&wrong_ca_key).unwrap();
+        let wrong_ca_issuer = Issuer::new(wrong_ca_params, wrong_ca_key);
+
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(vec!["server.test".to_string()]).unwrap();
+        server_params
+            .distinguished_name
+            .push(DnType::CommonName, "server.test");
+        let server_cert = server_params
+            .signed_by(&server_key, &wrong_ca_issuer)
+            .unwrap();
+
+        std::fs::write(tls_dir.join("cert.pem"), server_cert.pem()).unwrap();
+        std::fs::write(tls_dir.join("key.pem"), server_key.serialize_pem()).unwrap();
+
+        // Write step-ca root CA cert (the real one).
+        let certs_dir = secrets_dir.join("certs");
+        std::fs::create_dir_all(&certs_dir).unwrap();
+        std::fs::write(certs_dir.join("root_ca.crt"), real_ca_cert.pem()).unwrap();
+
+        std::fs::write(
+            responder_dir.join("responder.toml"),
+            "\
+hmac_secret = \"test\"
+tls_cert_path = \"/app/responder/tls/cert.pem\"
+tls_key_path = \"/app/responder/tls/key.pem\"
+",
+        )
+        .unwrap();
+
+        let result = validate_http01_admin_tls(&secrets_dir, &messages);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("chain validation failed"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_http01_admin_tls_fails_with_garbage_key_material() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let responder_dir = secrets_dir.join("responder");
+        let tls_dir = responder_dir.join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+
+        let (server_pem, _, root_pem) = gen_ca_signed_cert_pair();
+        std::fs::write(tls_dir.join("cert.pem"), &server_pem).unwrap();
+        std::fs::write(tls_dir.join("key.pem"), b"NOT A VALID PEM KEY").unwrap();
+
+        let certs_dir = secrets_dir.join("certs");
+        std::fs::create_dir_all(&certs_dir).unwrap();
+        std::fs::write(certs_dir.join("root_ca.crt"), &root_pem).unwrap();
+
+        std::fs::write(
+            responder_dir.join("responder.toml"),
+            "\
+hmac_secret = \"test\"
+tls_cert_path = \"/app/responder/tls/cert.pem\"
+tls_key_path = \"/app/responder/tls/key.pem\"
+",
+        )
+        .unwrap();
+        let result = validate_http01_admin_tls(&secrets_dir, &messages);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("TLS key material not loadable"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_http01_admin_tls_fails_with_mismatched_cert_and_key() {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let responder_dir = secrets_dir.join("responder");
+        let tls_dir = responder_dir.join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+
+        // Generate a CA and a server cert signed by it.
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["root.test".to_string()]).unwrap();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Bootroot Root CA");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.clone().self_signed(&ca_key).unwrap();
+        let ca_issuer = Issuer::new(ca_params, ca_key);
+
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(vec!["server.test".to_string()]).unwrap();
+        server_params
+            .distinguished_name
+            .push(DnType::CommonName, "server.test");
+        let server_cert = server_params.signed_by(&server_key, &ca_issuer).unwrap();
+
+        // Generate a DIFFERENT key that does NOT match the cert.
+        let wrong_key = KeyPair::generate().unwrap();
+
+        std::fs::write(tls_dir.join("cert.pem"), server_cert.pem()).unwrap();
+        std::fs::write(tls_dir.join("key.pem"), wrong_key.serialize_pem()).unwrap();
+
+        let certs_dir = secrets_dir.join("certs");
+        std::fs::create_dir_all(&certs_dir).unwrap();
+        std::fs::write(certs_dir.join("root_ca.crt"), ca_cert.pem()).unwrap();
+
+        std::fs::write(
+            responder_dir.join("responder.toml"),
+            "\
+hmac_secret = \"test\"
+tls_cert_path = \"/app/responder/tls/cert.pem\"
+tls_key_path = \"/app/responder/tls/key.pem\"
+",
+        )
+        .unwrap();
+        let result = validate_http01_admin_tls(&secrets_dir, &messages);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("does not match the leaf certificate"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_responder_container_path_strips_prefix() {
+        let secrets = Path::new("/tmp/secrets");
+        let result = resolve_responder_container_path("/app/responder/tls/cert.pem", secrets);
+        assert_eq!(
+            result,
+            Some(PathBuf::from("/tmp/secrets/responder/tls/cert.pem"))
+        );
+    }
+
+    #[test]
+    fn resolve_responder_container_path_returns_none_for_other_prefix() {
+        let secrets = Path::new("/tmp/secrets");
+        assert!(resolve_responder_container_path("/other/path", secrets).is_none());
     }
 }

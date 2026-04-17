@@ -8,6 +8,7 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 config = { version = "0.15", default-features = false, features = ["toml"] }
+http = "1"
 humantime = "2"
 poem = "3"
 postgres = "0.19"
@@ -18,11 +19,13 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
+tokio-rustls = "0.26"
 toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -31,7 +34,6 @@ x509-parser = { version = "0.18", features = ["verify"] }
 [dev-dependencies]
 libc = "0.2"
 tempfile = "3"
-tokio-rustls = "0.26"
 wiremock = "0.6"
 
 [lints.clippy]

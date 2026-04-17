@@ -8,6 +8,7 @@ use super::super::constants::openbao_constants::PATH_RESPONDER_HMAC;
 use super::super::constants::{
     DEFAULT_RESPONDER_TOKEN_TTL_SECS, RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR,
     RESPONDER_CONFIG_NAME, RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME,
+    RESPONDER_TLS_CERT_CONTAINER_PATH, RESPONDER_TLS_KEY_CONTAINER_PATH,
 };
 use super::super::paths::{ResponderPaths, compose_has_responder};
 use super::super::types::ResponderCheck;
@@ -21,6 +22,7 @@ pub(super) async fn write_responder_files(
     secrets_dir: &Path,
     kv_mount: &str,
     hmac: &str,
+    tls_enabled: bool,
     messages: &Messages,
 ) -> Result<ResponderPaths> {
     let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
@@ -29,14 +31,14 @@ pub(super) async fn write_responder_files(
     fs_util::ensure_secrets_dir(&responder_dir).await?;
 
     let template_path = templates_dir.join(RESPONDER_TEMPLATE_NAME);
-    let template = build_responder_template(kv_mount);
+    let template = build_responder_template(kv_mount, tls_enabled);
     tokio::fs::write(&template_path, template)
         .await
         .with_context(|| messages.error_write_file_failed(&template_path.display().to_string()))?;
     fs_util::set_key_permissions(&template_path).await?;
 
     let config_path = responder_dir.join(RESPONDER_CONFIG_NAME);
-    let config = build_responder_config(hmac);
+    let config = build_responder_config(hmac, tls_enabled);
     tokio::fs::write(&config_path, config)
         .await
         .with_context(|| messages.error_write_file_failed(&config_path.display().to_string()))?;
@@ -48,8 +50,10 @@ pub(super) async fn write_responder_files(
     })
 }
 
-fn build_responder_template(kv_mount: &str) -> String {
-    format!(
+fn build_responder_template(kv_mount: &str, tls_enabled: bool) -> String {
+    use std::fmt::Write;
+
+    let mut config = format!(
         r#"# HTTP-01 responder config (OpenBao Agent template)
 
 listen_addr = "0.0.0.0:80"
@@ -63,11 +67,20 @@ admin_rate_limit_requests = 300
 admin_rate_limit_window_secs = 60
 admin_body_limit_bytes = 8192
 "#
-    )
+    );
+    if tls_enabled {
+        let _ = write!(
+            config,
+            "tls_cert_path = \"{RESPONDER_TLS_CERT_CONTAINER_PATH}\"\ntls_key_path = \"{RESPONDER_TLS_KEY_CONTAINER_PATH}\"\n"
+        );
+    }
+    config
 }
 
-fn build_responder_config(hmac: &str) -> String {
-    format!(
+fn build_responder_config(hmac: &str, tls_enabled: bool) -> String {
+    use std::fmt::Write;
+
+    let mut config = format!(
         r#"# HTTP-01 responder config (rendered)
 
 listen_addr = "0.0.0.0:80"
@@ -81,7 +94,14 @@ admin_rate_limit_requests = 300
 admin_rate_limit_window_secs = 60
 admin_body_limit_bytes = 8192
 "#
-    )
+    );
+    if tls_enabled {
+        let _ = write!(
+            config,
+            "tls_cert_path = \"{RESPONDER_TLS_CERT_CONTAINER_PATH}\"\ntls_key_path = \"{RESPONDER_TLS_KEY_CONTAINER_PATH}\"\n"
+        );
+    }
+    config
 }
 
 pub(super) async fn write_responder_compose_override(
@@ -203,7 +223,7 @@ mod tests {
         let secrets_dir = temp_dir.path().join("secrets");
 
         let messages = test_messages();
-        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", &messages)
+        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", false, &messages)
             .await
             .unwrap();
         let template = fs::read_to_string(&paths.template_path).unwrap();
@@ -213,10 +233,42 @@ mod tests {
         assert!(template.contains("max_token_ttl_secs = 900"));
         assert!(template.contains("admin_rate_limit_requests = 300"));
         assert!(template.contains("admin_body_limit_bytes = 8192"));
+        assert!(!template.contains("tls_cert_path"));
         assert!(config.contains("hmac-123"));
         assert!(config.contains("max_token_ttl_secs = 900"));
         assert!(config.contains("admin_rate_limit_requests = 300"));
         assert!(config.contains("admin_body_limit_bytes = 8192"));
+        assert!(!config.contains("tls_cert_path"));
+    }
+
+    #[tokio::test]
+    async fn test_write_responder_files_includes_tls_paths_when_enabled() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        let messages = test_messages();
+        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", true, &messages)
+            .await
+            .unwrap();
+        let template = fs::read_to_string(&paths.template_path).unwrap();
+        let config = fs::read_to_string(&paths.config_path).unwrap();
+
+        assert!(
+            template.contains("tls_cert_path = \"/app/responder/tls/cert.pem\""),
+            "template must include tls_cert_path: {template}"
+        );
+        assert!(
+            template.contains("tls_key_path = \"/app/responder/tls/key.pem\""),
+            "template must include tls_key_path: {template}"
+        );
+        assert!(
+            config.contains("tls_cert_path = \"/app/responder/tls/cert.pem\""),
+            "config must include tls_cert_path: {config}"
+        );
+        assert!(
+            config.contains("tls_key_path = \"/app/responder/tls/key.pem\""),
+            "config must include tls_key_path: {config}"
+        );
     }
 
     #[tokio::test]
@@ -227,7 +279,7 @@ mod tests {
 
         let secrets_dir = temp_dir.path().join("secrets");
         let messages = test_messages();
-        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", &messages)
+        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", false, &messages)
             .await
             .unwrap();
 
@@ -259,7 +311,7 @@ services:
 
         let secrets_dir = temp_dir.path().join("secrets");
         let messages = test_messages();
-        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", &messages)
+        let paths = write_responder_files(&secrets_dir, "secret", "hmac-123", false, &messages)
             .await
             .unwrap();
 
@@ -297,7 +349,8 @@ services:
         let compose_has_responder =
             compose_has_responder(&args.compose.compose_file, &test_messages())
                 .expect("compose check");
-        let responder_url = resolve_responder_url(&args, compose_has_responder);
+        let responder_url =
+            resolve_responder_url(&args, compose_has_responder).expect("resolve responder url");
         assert!(responder_url.is_none());
     }
 
@@ -320,7 +373,8 @@ services:
         let compose_has_responder =
             compose_has_responder(&args.compose.compose_file, &test_messages())
                 .expect("compose check");
-        let responder_url = resolve_responder_url(&args, compose_has_responder);
+        let responder_url =
+            resolve_responder_url(&args, compose_has_responder).expect("resolve responder url");
         assert_eq!(responder_url.as_deref(), Some(DEFAULT_RESPONDER_ADMIN_URL));
     }
 }
