@@ -484,6 +484,13 @@ pub(crate) struct InfraInstallArgs {
     /// Required when `--http01-admin-bind` uses `0.0.0.0`
     #[arg(long)]
     pub(crate) http01_admin_bind_wildcard: bool,
+
+    /// Advertised HTTP-01 admin API address for TLS certificate SANs.
+    /// Required when `--http01-admin-bind` uses a wildcard address (`0.0.0.0`
+    /// or `[::]`), because clients cannot connect to a wildcard.
+    /// Must be a specific reachable IP:port (not wildcard or loopback).
+    #[arg(long)]
+    pub(crate) http01_admin_advertise_addr: Option<String>,
 }
 
 #[derive(Args, Debug)]

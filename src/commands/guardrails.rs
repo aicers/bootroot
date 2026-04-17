@@ -28,6 +28,10 @@ const OPENBAO_CONTAINER_CONFIG_PREFIX: &str = "/openbao/config/";
 /// Per compose override: `{secrets_dir}/responder:/app/responder:ro`
 const RESPONDER_CONTAINER_CONFIG_PREFIX: &str = "/app/responder/";
 
+/// Container mount prefix for the HTTP-01 admin TLS directory.
+/// Per compose override: `{secrets_dir}/bootroot-http01/tls:/app/bootroot-http01/tls:ro`
+const HTTP01_TLS_CONTAINER_PREFIX: &str = "/app/bootroot-http01/";
+
 /// Default `OpenBao` API port used to identify the API listener block.
 const OPENBAO_API_PORT: &str = ":8200";
 
@@ -270,6 +274,62 @@ pub(crate) fn validate_http01_admin_bind(
         .map_err(|_| anyhow::anyhow!(messages.error_http01_admin_bind_invalid_format()))?;
     if ip.is_unspecified() && !wildcard_confirmed {
         anyhow::bail!(messages.error_http01_admin_bind_wildcard_required());
+    }
+    Ok(())
+}
+
+/// Validates the HTTP-01 admin advertise address format.
+///
+/// Rejects wildcard, loopback, malformed, and port-zero values because
+/// clients need to reach this address.
+///
+/// # Errors
+///
+/// Returns an error when the format is invalid or the address is
+/// wildcard / loopback.
+pub(crate) fn validate_http01_admin_advertise_addr(addr: &str, messages: &Messages) -> Result<()> {
+    let Some((ip_raw, port_str)) = addr.rsplit_once(':') else {
+        anyhow::bail!(messages.error_http01_admin_advertise_addr_invalid());
+    };
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!(messages.error_http01_admin_advertise_addr_invalid()))?;
+    if port == 0 {
+        anyhow::bail!(messages.error_http01_admin_advertise_addr_invalid());
+    }
+    if ip_raw.is_empty() {
+        anyhow::bail!(messages.error_http01_admin_advertise_addr_invalid());
+    }
+    if ip_raw.contains(':') && !(ip_raw.starts_with('[') && ip_raw.ends_with(']')) {
+        anyhow::bail!(messages.error_http01_admin_advertise_addr_ipv6_requires_brackets());
+    }
+    let ip_str = ip_raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(ip_raw);
+    let ip: IpAddr = ip_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!(messages.error_http01_admin_advertise_addr_invalid()))?;
+    if ip.is_unspecified() || ip.is_loopback() {
+        anyhow::bail!(messages.error_http01_admin_advertise_addr_not_reachable());
+    }
+    Ok(())
+}
+
+/// Rejects `--http01-admin-advertise-addr` when the bind address is a
+/// specific IP rather than a wildcard.
+///
+/// # Errors
+///
+/// Returns an error when `advertise_addr` is `Some` and `bind_addr` is
+/// not a wildcard.
+pub(crate) fn reject_http01_admin_advertise_addr_for_specific_bind(
+    bind_addr: &str,
+    advertise_addr: Option<&str>,
+    messages: &Messages,
+) -> Result<()> {
+    if !is_wildcard_bind(bind_addr) && advertise_addr.is_some() {
+        anyhow::bail!(messages.error_http01_admin_advertise_addr_specific_bind_rejected());
     }
     Ok(())
 }
@@ -561,13 +621,18 @@ pub(crate) fn validate_http01_admin_tls(secrets_dir: &Path, messages: &Messages)
 
 /// Maps a responder container path to a host path.
 ///
-/// Uses the volume mount convention `{secrets_dir}/responder:/app/responder:ro`
-/// to resolve container paths (e.g. `/app/responder/tls/cert.pem`) to
-/// host paths (e.g. `{secrets_dir}/responder/tls/cert.pem`).
+/// Handles two volume mount conventions:
+/// - `{secrets_dir}/responder:/app/responder:ro` for config files
+/// - `{secrets_dir}/bootroot-http01:/app/bootroot-http01:ro` for TLS certs
 fn resolve_responder_container_path(container_path: &str, secrets_dir: &Path) -> Option<PathBuf> {
     container_path
         .strip_prefix(RESPONDER_CONTAINER_CONFIG_PREFIX)
         .map(|relative| secrets_dir.join("responder").join(relative))
+        .or_else(|| {
+            container_path
+                .strip_prefix(HTTP01_TLS_CONTAINER_PREFIX)
+                .map(|relative| secrets_dir.join("bootroot-http01").join(relative))
+        })
 }
 
 /// Strips a trailing HCL comment (`#` or `//`) from a line, preserving
@@ -2345,6 +2410,84 @@ listener "tcp" {
         assert!(validate_http01_admin_bind("[::1]:8080", false, &messages).is_ok());
     }
 
+    // --- HTTP-01 admin advertise-addr validation ---
+
+    #[test]
+    fn validate_http01_admin_advertise_addr_accepts_specific_ip() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_advertise_addr("192.168.1.10:8080", &messages).is_ok());
+        assert!(validate_http01_admin_advertise_addr("[fd12::1]:8080", &messages).is_ok());
+    }
+
+    #[test]
+    fn validate_http01_admin_advertise_addr_rejects_wildcard() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_advertise_addr("0.0.0.0:8080", &messages).is_err());
+        assert!(validate_http01_admin_advertise_addr("[::]:8080", &messages).is_err());
+    }
+
+    #[test]
+    fn validate_http01_admin_advertise_addr_rejects_loopback() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_advertise_addr("127.0.0.1:8080", &messages).is_err());
+        assert!(validate_http01_admin_advertise_addr("[::1]:8080", &messages).is_err());
+    }
+
+    #[test]
+    fn validate_http01_admin_advertise_addr_rejects_malformed() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_advertise_addr("not-an-addr", &messages).is_err());
+        assert!(validate_http01_admin_advertise_addr(":8080", &messages).is_err());
+        assert!(validate_http01_admin_advertise_addr("192.168.1.10:", &messages).is_err());
+    }
+
+    #[test]
+    fn validate_http01_admin_advertise_addr_rejects_port_zero() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_advertise_addr("192.168.1.10:0", &messages).is_err());
+    }
+
+    #[test]
+    fn validate_http01_admin_advertise_addr_rejects_bare_ipv6() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_http01_admin_advertise_addr("fd12::1:8080", &messages).is_err());
+    }
+
+    #[test]
+    fn reject_http01_admin_advertise_addr_for_specific_ip_bind() {
+        let messages = crate::i18n::test_messages();
+        assert!(
+            reject_http01_admin_advertise_addr_for_specific_bind(
+                "192.168.1.10:8080",
+                Some("10.0.0.5:8080"),
+                &messages,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn allow_http01_admin_advertise_addr_for_wildcard_bind() {
+        let messages = crate::i18n::test_messages();
+        assert!(
+            reject_http01_admin_advertise_addr_for_specific_bind(
+                "0.0.0.0:8080",
+                Some("10.0.0.5:8080"),
+                &messages,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn allow_no_http01_admin_advertise_addr_for_specific_bind() {
+        let messages = crate::i18n::test_messages();
+        assert!(
+            reject_http01_admin_advertise_addr_for_specific_bind("10.0.0.5:8080", None, &messages,)
+                .is_ok()
+        );
+    }
+
     // --- HTTP-01 override writing and validation ---
 
     #[test]
@@ -2444,8 +2587,8 @@ services:
             responder_dir.join("responder.toml"),
             "\
 hmac_secret = \"test\"
-tls_cert_path = \"/app/responder/tls/cert.pem\"
-tls_key_path = \"/app/responder/tls/key.pem\"
+tls_cert_path = \"/app/bootroot-http01/tls/server.crt\"
+tls_key_path = \"/app/bootroot-http01/tls/server.key\"
 ",
         )
         .unwrap();
@@ -2461,12 +2604,13 @@ tls_key_path = \"/app/responder/tls/key.pem\"
         let dir = tempfile::tempdir().unwrap();
         let secrets_dir = dir.path().join("secrets");
         let responder_dir = secrets_dir.join("responder");
-        let tls_dir = responder_dir.join("tls");
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
         std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::create_dir_all(&responder_dir).unwrap();
 
         let (server_pem, server_key_pem, root_pem) = gen_ca_signed_cert_pair();
-        std::fs::write(tls_dir.join("cert.pem"), &server_pem).unwrap();
-        std::fs::write(tls_dir.join("key.pem"), &server_key_pem).unwrap();
+        std::fs::write(tls_dir.join("server.crt"), &server_pem).unwrap();
+        std::fs::write(tls_dir.join("server.key"), &server_key_pem).unwrap();
 
         let certs_dir = secrets_dir.join("certs");
         std::fs::create_dir_all(&certs_dir).unwrap();
@@ -2476,8 +2620,8 @@ tls_key_path = \"/app/responder/tls/key.pem\"
             responder_dir.join("responder.toml"),
             "\
 hmac_secret = \"test\"
-tls_cert_path = \"/app/responder/tls/cert.pem\"
-tls_key_path = \"/app/responder/tls/key.pem\"
+tls_cert_path = \"/app/bootroot-http01/tls/server.crt\"
+tls_key_path = \"/app/bootroot-http01/tls/server.key\"
 ",
         )
         .unwrap();
@@ -2492,8 +2636,9 @@ tls_key_path = \"/app/responder/tls/key.pem\"
         let dir = tempfile::tempdir().unwrap();
         let secrets_dir = dir.path().join("secrets");
         let responder_dir = secrets_dir.join("responder");
-        let tls_dir = responder_dir.join("tls");
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
         std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::create_dir_all(&responder_dir).unwrap();
 
         // Generate a CA and its root cert for the step-ca trust anchor.
         let real_ca_key = KeyPair::generate().unwrap();
@@ -2523,8 +2668,8 @@ tls_key_path = \"/app/responder/tls/key.pem\"
             .signed_by(&server_key, &wrong_ca_issuer)
             .unwrap();
 
-        std::fs::write(tls_dir.join("cert.pem"), server_cert.pem()).unwrap();
-        std::fs::write(tls_dir.join("key.pem"), server_key.serialize_pem()).unwrap();
+        std::fs::write(tls_dir.join("server.crt"), server_cert.pem()).unwrap();
+        std::fs::write(tls_dir.join("server.key"), server_key.serialize_pem()).unwrap();
 
         // Write step-ca root CA cert (the real one).
         let certs_dir = secrets_dir.join("certs");
@@ -2535,8 +2680,8 @@ tls_key_path = \"/app/responder/tls/key.pem\"
             responder_dir.join("responder.toml"),
             "\
 hmac_secret = \"test\"
-tls_cert_path = \"/app/responder/tls/cert.pem\"
-tls_key_path = \"/app/responder/tls/key.pem\"
+tls_cert_path = \"/app/bootroot-http01/tls/server.crt\"
+tls_key_path = \"/app/bootroot-http01/tls/server.key\"
 ",
         )
         .unwrap();
@@ -2553,12 +2698,13 @@ tls_key_path = \"/app/responder/tls/key.pem\"
         let dir = tempfile::tempdir().unwrap();
         let secrets_dir = dir.path().join("secrets");
         let responder_dir = secrets_dir.join("responder");
-        let tls_dir = responder_dir.join("tls");
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
         std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::create_dir_all(&responder_dir).unwrap();
 
         let (server_pem, _, root_pem) = gen_ca_signed_cert_pair();
-        std::fs::write(tls_dir.join("cert.pem"), &server_pem).unwrap();
-        std::fs::write(tls_dir.join("key.pem"), b"NOT A VALID PEM KEY").unwrap();
+        std::fs::write(tls_dir.join("server.crt"), &server_pem).unwrap();
+        std::fs::write(tls_dir.join("server.key"), b"NOT A VALID PEM KEY").unwrap();
 
         let certs_dir = secrets_dir.join("certs");
         std::fs::create_dir_all(&certs_dir).unwrap();
@@ -2568,8 +2714,8 @@ tls_key_path = \"/app/responder/tls/key.pem\"
             responder_dir.join("responder.toml"),
             "\
 hmac_secret = \"test\"
-tls_cert_path = \"/app/responder/tls/cert.pem\"
-tls_key_path = \"/app/responder/tls/key.pem\"
+tls_cert_path = \"/app/bootroot-http01/tls/server.crt\"
+tls_key_path = \"/app/bootroot-http01/tls/server.key\"
 ",
         )
         .unwrap();
@@ -2590,8 +2736,9 @@ tls_key_path = \"/app/responder/tls/key.pem\"
         let dir = tempfile::tempdir().unwrap();
         let secrets_dir = dir.path().join("secrets");
         let responder_dir = secrets_dir.join("responder");
-        let tls_dir = responder_dir.join("tls");
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
         std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::create_dir_all(&responder_dir).unwrap();
 
         // Generate a CA and a server cert signed by it.
         let ca_key = KeyPair::generate().unwrap();
@@ -2613,8 +2760,8 @@ tls_key_path = \"/app/responder/tls/key.pem\"
         // Generate a DIFFERENT key that does NOT match the cert.
         let wrong_key = KeyPair::generate().unwrap();
 
-        std::fs::write(tls_dir.join("cert.pem"), server_cert.pem()).unwrap();
-        std::fs::write(tls_dir.join("key.pem"), wrong_key.serialize_pem()).unwrap();
+        std::fs::write(tls_dir.join("server.crt"), server_cert.pem()).unwrap();
+        std::fs::write(tls_dir.join("server.key"), wrong_key.serialize_pem()).unwrap();
 
         let certs_dir = secrets_dir.join("certs");
         std::fs::create_dir_all(&certs_dir).unwrap();
@@ -2624,8 +2771,8 @@ tls_key_path = \"/app/responder/tls/key.pem\"
             responder_dir.join("responder.toml"),
             "\
 hmac_secret = \"test\"
-tls_cert_path = \"/app/responder/tls/cert.pem\"
-tls_key_path = \"/app/responder/tls/key.pem\"
+tls_cert_path = \"/app/bootroot-http01/tls/server.crt\"
+tls_key_path = \"/app/bootroot-http01/tls/server.key\"
 ",
         )
         .unwrap();
@@ -2639,12 +2786,23 @@ tls_key_path = \"/app/responder/tls/key.pem\"
     }
 
     #[test]
-    fn resolve_responder_container_path_strips_prefix() {
+    fn resolve_responder_container_path_strips_config_prefix() {
         let secrets = Path::new("/tmp/secrets");
-        let result = resolve_responder_container_path("/app/responder/tls/cert.pem", secrets);
+        let result = resolve_responder_container_path("/app/responder/responder.toml", secrets);
         assert_eq!(
             result,
-            Some(PathBuf::from("/tmp/secrets/responder/tls/cert.pem"))
+            Some(PathBuf::from("/tmp/secrets/responder/responder.toml"))
+        );
+    }
+
+    #[test]
+    fn resolve_responder_container_path_strips_http01_tls_prefix() {
+        let secrets = Path::new("/tmp/secrets");
+        let result =
+            resolve_responder_container_path("/app/bootroot-http01/tls/server.crt", secrets);
+        assert_eq!(
+            result,
+            Some(PathBuf::from("/tmp/secrets/bootroot-http01/tls/server.crt"))
         );
     }
 

@@ -14,14 +14,18 @@ pub(crate) const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 /// is renewed.  Keyed by a stable discriminator so the rotation loop can
 /// dispatch without hard-coding service names.
 ///
-/// New variants (e.g. `Signal`, `RestartListener`) can be added by
-/// follow-up PRs (see #515) without a schema revision — `serde`'s
+/// New variants can be added without a schema revision — `serde`'s
 /// internally-tagged representation handles forward compatibility.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub(crate) enum ReloadStrategy {
     /// Restarts the named Docker container via `docker restart`.
     ContainerRestart { container_name: String },
+    /// Sends a signal to the named Docker container via `docker kill -s`.
+    ContainerSignal {
+        container_name: String,
+        signal: String,
+    },
 }
 
 impl fmt::Display for ReloadStrategy {
@@ -29,6 +33,12 @@ impl fmt::Display for ReloadStrategy {
         match self {
             Self::ContainerRestart { container_name } => {
                 write!(f, "container_restart({container_name})")
+            }
+            Self::ContainerSignal {
+                container_name,
+                signal,
+            } => {
+                write!(f, "container_signal({container_name}, {signal})")
             }
         }
     }
@@ -68,6 +78,8 @@ pub(crate) struct StateFile {
     pub(crate) openbao_advertise_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) http01_admin_bind_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) http01_admin_advertise_addr: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) infra_certs: BTreeMap<String, InfraCertEntry>,
 }
@@ -409,6 +421,7 @@ mod tests {
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -431,6 +444,7 @@ mod tests {
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -462,6 +476,7 @@ mod tests {
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -523,6 +538,7 @@ mod tests {
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
             infra_certs,
         };
         let json = serde_json::to_string_pretty(&state).expect("serialize");
@@ -537,5 +553,28 @@ mod tests {
             container_name: "bootroot-openbao".to_string(),
         };
         assert_eq!(strategy.to_string(), "container_restart(bootroot-openbao)");
+    }
+
+    #[test]
+    fn reload_strategy_display_container_signal() {
+        let strategy = ReloadStrategy::ContainerSignal {
+            container_name: "bootroot-http01".to_string(),
+            signal: "SIGHUP".to_string(),
+        };
+        assert_eq!(
+            strategy.to_string(),
+            "container_signal(bootroot-http01, SIGHUP)"
+        );
+    }
+
+    #[test]
+    fn reload_strategy_container_signal_round_trips_json() {
+        let strategy = ReloadStrategy::ContainerSignal {
+            container_name: "bootroot-http01".to_string(),
+            signal: "SIGHUP".to_string(),
+        };
+        let json = serde_json::to_string(&strategy).expect("serialize");
+        let parsed: ReloadStrategy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, strategy);
     }
 }

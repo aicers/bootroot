@@ -1,5 +1,6 @@
 mod ca_certs;
 mod database;
+pub(crate) mod http01_admin_tls;
 mod openbao_setup;
 pub(crate) mod openbao_tls;
 mod orchestrator;
@@ -57,6 +58,11 @@ pub(super) struct InitRollback {
     pub(super) hcl_backup: Option<RollbackFile>,
     pub(super) tls_artifacts: Vec<PathBuf>,
     pub(super) compose_file: Option<PathBuf>,
+    /// Responder config backup for rolling back TLS-enabled config.
+    pub(super) responder_config_backup: Option<RollbackFile>,
+    /// Responder config compose override for restarting without the
+    /// exposed port binding during rollback.
+    pub(super) responder_compose_override: Option<PathBuf>,
 }
 
 impl InitRollback {
@@ -99,6 +105,40 @@ impl InitRollback {
                 messages,
             ) {
                 eprintln!("Rollback: failed to recreate OpenBao: {err}");
+            }
+        }
+
+        // Restore the responder config (removing TLS fields) and
+        // restart the container with only the config override (no
+        // exposed port override) so the admin API returns to
+        // loopback-only / plain-HTTP.
+        if let Some(file) = &self.responder_config_backup
+            && let Err(err) = rollback_file(file, messages)
+        {
+            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
+        }
+        if self.responder_config_backup.is_some()
+            && let Some(compose_file) = &self.compose_file
+        {
+            // Only include the config override when a pre-existing
+            // config was restored.  On fresh install (original was
+            // None) `rollback_file` removed the file, so the
+            // override's `--config=` flag would point at a missing
+            // file.  Omitting the override returns the responder to
+            // its pre-init state (base compose only).
+            let config_override = self
+                .responder_config_backup
+                .as_ref()
+                .filter(|f| f.original.is_some())
+                .and(self.responder_compose_override.as_deref());
+            let args = rollback_responder_docker_args(compose_file, config_override);
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(err) = crate::commands::infra::run_docker(
+                &arg_refs,
+                "docker compose up -d responder (rollback)",
+                messages,
+            ) {
+                eprintln!("Rollback: failed to recreate responder: {err}");
             }
         }
 
@@ -149,6 +189,31 @@ fn rollback_openbao_docker_args(compose_file: &std::path::Path) -> Vec<String> {
         "-d".to_string(),
         "openbao".to_string(),
     ]
+}
+
+/// Builds the Docker Compose arguments for undoing the responder TLS
+/// exposure during rollback.
+///
+/// Includes the config override (if present) so the responder keeps
+/// its volume mount, but omits the exposed port override so the
+/// container reverts to loopback-only binding.
+fn rollback_responder_docker_args(
+    compose_file: &std::path::Path,
+    config_override: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "compose".to_string(),
+        "-f".to_string(),
+        compose_file.to_string_lossy().into_owned(),
+    ];
+    if let Some(override_path) = config_override {
+        args.push("-f".to_string());
+        args.push(override_path.to_string_lossy().into_owned());
+    }
+    args.push("up".to_string());
+    args.push("-d".to_string());
+    args.push(crate::commands::constants::RESPONDER_SERVICE_NAME.to_string());
+    args
 }
 
 fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
@@ -307,6 +372,77 @@ mod rollback_tests {
             args.last().map(String::as_str),
             Some("openbao"),
             "rollback must target only the openbao service"
+        );
+    }
+
+    /// Regression: on fresh install (original config absent), rollback
+    /// must omit the config override from the docker-compose args so
+    /// the responder is restarted from the base compose config only.
+    /// Passing the override when the config file was removed would
+    /// start the container with `--config=` pointing at a missing file.
+    #[test]
+    fn rollback_responder_omits_config_override_on_fresh_install() {
+        use std::path::PathBuf;
+
+        let compose = PathBuf::from("docker-compose.yml");
+        let override_path = PathBuf::from("secrets/responder/override.yml");
+
+        // Simulate fresh install: original is None, override exists.
+        let rollback = InitRollback {
+            responder_config_backup: Some(RollbackFile {
+                path: PathBuf::from("secrets/responder/responder.toml"),
+                original: None,
+            }),
+            compose_file: Some(compose.clone()),
+            responder_compose_override: Some(override_path.clone()),
+            ..Default::default()
+        };
+
+        // The rollback logic should NOT pass the config override when
+        // original is None.
+        let config_override = rollback
+            .responder_config_backup
+            .as_ref()
+            .filter(|f| f.original.is_some())
+            .and(rollback.responder_compose_override.as_deref());
+        let args = super::rollback_responder_docker_args(&compose, config_override);
+
+        assert!(
+            !args.iter().any(|a| a.ends_with("override.yml")),
+            "rollback must omit config override on fresh install (original absent): {args:?}"
+        );
+    }
+
+    /// When a pre-existing responder config was backed up, rollback
+    /// must include the config override so the restored config is
+    /// mounted into the container.
+    #[test]
+    fn rollback_responder_includes_config_override_when_original_exists() {
+        use std::path::PathBuf;
+
+        let compose = PathBuf::from("docker-compose.yml");
+        let override_path = PathBuf::from("secrets/responder/override.yml");
+
+        let rollback = InitRollback {
+            responder_config_backup: Some(RollbackFile {
+                path: PathBuf::from("secrets/responder/responder.toml"),
+                original: Some("admin_addr = ...".to_string()),
+            }),
+            compose_file: Some(compose.clone()),
+            responder_compose_override: Some(override_path.clone()),
+            ..Default::default()
+        };
+
+        let config_override = rollback
+            .responder_config_backup
+            .as_ref()
+            .filter(|f| f.original.is_some())
+            .and(rollback.responder_compose_override.as_deref());
+        let args = super::rollback_responder_docker_args(&compose, config_override);
+
+        assert!(
+            args.iter().any(|a| a.ends_with("override.yml")),
+            "rollback must include config override when original config existed: {args:?}"
         );
     }
 }
