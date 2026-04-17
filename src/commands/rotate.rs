@@ -3,6 +3,7 @@ mod ca;
 mod db;
 mod eab;
 mod helpers;
+mod infra_cert;
 mod openbao_recovery;
 mod responder_hmac;
 mod stepca_password;
@@ -112,8 +113,10 @@ pub(super) struct RotateContext {
     pub(super) state: StateFile,
     pub(super) paths: StatePaths,
     pub(super) state_dir: PathBuf,
+    pub(super) state_file: PathBuf,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result<()> {
     let state_path = args
         .state_file
@@ -144,7 +147,6 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
     let state_dir = state_path
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let runtime_auth = resolve_runtime_auth(&args.runtime_auth, true, messages)?;
     let mut ctx = RotateContext {
         openbao_url,
         kv_mount,
@@ -152,7 +154,16 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         state,
         paths,
         state_dir,
+        state_file: state_path,
     };
+
+    // InfraCert operates on local files and Docker only — it must not
+    // require an OpenBao connection so it can fix a broken/expired cert.
+    if let RotateCommand::InfraCert(_) = &args.command {
+        return infra_cert::rotate_infra_certs(&mut ctx, args.yes, messages);
+    }
+
+    let runtime_auth = resolve_runtime_auth(&args.runtime_auth, true, messages)?;
     let mut client = OpenBaoClient::new(&ctx.openbao_url)
         .with_context(|| messages.error_openbao_client_create_failed())?;
     authenticate_openbao_client(&mut client, &runtime_auth, messages).await?;
@@ -208,6 +219,9 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         }
         RotateCommand::CaKey(step_args) => {
             ca::rotate_ca_key(&mut ctx, &client, step_args, args.yes, messages).await?;
+        }
+        RotateCommand::InfraCert(_) => {
+            unreachable!("InfraCert is handled before OpenBao client bootstrap")
         }
     }
 

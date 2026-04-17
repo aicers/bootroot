@@ -1,6 +1,7 @@
 mod ca_certs;
 mod database;
 mod openbao_setup;
+pub(crate) mod openbao_tls;
 mod orchestrator;
 mod prompts;
 mod responder_setup;
@@ -53,6 +54,9 @@ pub(super) struct InitRollback {
     pub(super) written_kv_paths: Vec<String>,
     pub(super) password_backup: Option<RollbackFile>,
     pub(super) ca_json_backup: Option<RollbackFile>,
+    pub(super) hcl_backup: Option<RollbackFile>,
+    pub(super) tls_artifacts: Vec<PathBuf>,
+    pub(super) compose_file: Option<PathBuf>,
 }
 
 impl InitRollback {
@@ -62,6 +66,42 @@ impl InitRollback {
         kv_mount: &str,
         messages: &Messages,
     ) {
+        // Restore the HCL and remove TLS artifacts before OpenBao API
+        // calls so that a container restart switches OpenBao back to
+        // HTTP, letting the original HTTP client reach it for cleanup.
+        if let Some(file) = &self.hcl_backup
+            && let Err(err) = rollback_file(file, messages)
+        {
+            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
+        }
+        for artifact in &self.tls_artifacts {
+            if artifact.exists()
+                && let Err(err) = std::fs::remove_file(artifact)
+            {
+                eprintln!("Rollback: failed to remove {}: {err}", artifact.display());
+            }
+        }
+        if self.hcl_backup.is_some()
+            && let Some(compose_file) = &self.compose_file
+        {
+            // Use `up -d` (not `restart`) so Docker Compose recreates
+            // the container from the base compose config alone, removing
+            // any non-loopback port mapping the override introduced.
+            // `restart` only stops/starts the existing container and
+            // preserves port bindings from the applied override, which
+            // would leave OpenBao on plaintext HTTP at a non-loopback
+            // address.
+            let args = rollback_openbao_docker_args(compose_file);
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(err) = crate::commands::infra::run_docker(
+                &arg_refs,
+                "docker compose up -d openbao (rollback)",
+                messages,
+            ) {
+                eprintln!("Rollback: failed to recreate OpenBao: {err}");
+            }
+        }
+
         for path in &self.written_kv_paths {
             if let Err(err) = client.delete_kv(kv_mount, path).await {
                 eprintln!(
@@ -93,6 +133,24 @@ impl InitRollback {
     }
 }
 
+/// Builds the Docker Compose arguments for undoing the TLS override
+/// during rollback.
+///
+/// Returns `["compose", "-f", <compose_file>, "up", "-d", "openbao"]`
+/// so that the container is recreated from the base compose config
+/// (without the non-loopback override), ensuring the external port
+/// mapping is removed.
+fn rollback_openbao_docker_args(compose_file: &std::path::Path) -> Vec<String> {
+    vec![
+        "compose".to_string(),
+        "-f".to_string(),
+        compose_file.to_string_lossy().into_owned(),
+        "up".to_string(),
+        "-d".to_string(),
+        "openbao".to_string(),
+    ]
+}
+
 fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
     if let Some(contents) = &file.original {
         std::fs::write(&file.path, contents).with_context(|| {
@@ -103,6 +161,154 @@ fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
             .with_context(|| messages.error_remove_file_failed(&file.path.display().to_string()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use bootroot::openbao::OpenBaoClient;
+
+    use super::{InitRollback, RollbackFile};
+
+    /// Regression: rollback after a TLS rewrite must restore
+    /// `openbao.hcl` to its original plaintext content and remove the
+    /// TLS certificate and key artifacts.  Without this, a failure
+    /// between `write_openbao_hcl_with_tls()` and `state.save()` would
+    /// leave the worktree in a stale TLS-enabled state that the next
+    /// `bootroot init` cannot recover from.
+    #[tokio::test]
+    async fn rollback_restores_hcl_and_removes_tls_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+
+        // Simulate the pre-TLS plaintext HCL.
+        let openbao_dir = dir.path().join("openbao");
+        std::fs::create_dir_all(&openbao_dir).unwrap();
+        let hcl_path = openbao_dir.join("openbao.hcl");
+        let plaintext_hcl = "tls_disable = 1\n";
+        std::fs::write(&hcl_path, plaintext_hcl).unwrap();
+
+        // Simulate TLS artifacts that would be created by
+        // `issue_openbao_tls_cert`.
+        let tls_dir = openbao_dir.join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        let cert_path = tls_dir.join("server.crt");
+        let key_path = tls_dir.join("server.key");
+        std::fs::write(&cert_path, "CERT").unwrap();
+        std::fs::write(&key_path, "KEY").unwrap();
+
+        // Overwrite HCL with TLS content (simulating the write that
+        // would have happened before the failure).
+        std::fs::write(&hcl_path, "tls_cert_file = ...\n").unwrap();
+
+        let rollback = InitRollback {
+            hcl_backup: Some(RollbackFile {
+                path: hcl_path.clone(),
+                original: Some(plaintext_hcl.to_string()),
+            }),
+            tls_artifacts: vec![cert_path.clone(), key_path.clone()],
+            // No compose_file — skips the container restart in tests.
+            compose_file: None,
+            ..Default::default()
+        };
+
+        // A dummy client that won't be called (no KV/AppRole entries).
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        // HCL must be restored to plaintext.
+        let restored = std::fs::read_to_string(&hcl_path).unwrap();
+        assert_eq!(
+            restored, plaintext_hcl,
+            "openbao.hcl must be restored to plaintext after rollback"
+        );
+
+        // TLS artifacts must be removed.
+        assert!(
+            !cert_path.exists(),
+            "TLS cert must be removed after rollback"
+        );
+        assert!(!key_path.exists(), "TLS key must be removed after rollback");
+    }
+
+    /// Rollback with `hcl_backup` that has `original: None` removes the
+    /// HCL file entirely (it did not exist before init created it).
+    #[tokio::test]
+    async fn rollback_removes_hcl_when_original_was_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+
+        let hcl_path = dir.path().join("openbao").join("openbao.hcl");
+        std::fs::create_dir_all(hcl_path.parent().unwrap()).unwrap();
+        std::fs::write(&hcl_path, "tls_cert_file = ...\n").unwrap();
+
+        let rollback = InitRollback {
+            hcl_backup: Some(RollbackFile {
+                path: hcl_path.clone(),
+                original: None,
+            }),
+            tls_artifacts: Vec::new(),
+            compose_file: None,
+            ..Default::default()
+        };
+
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        assert!(
+            !hcl_path.exists(),
+            "HCL file must be removed when original was absent"
+        );
+    }
+
+    /// When no TLS rollback fields are populated (loopback-only init),
+    /// rollback must not touch HCL or TLS files.
+    #[tokio::test]
+    async fn rollback_noop_without_tls_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+
+        // Create an unrelated file to ensure rollback doesn't
+        // accidentally delete it.
+        let unrelated = dir.path().join("other.txt");
+        std::fs::write(&unrelated, "keep").unwrap();
+
+        let rollback = InitRollback::default();
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        assert!(
+            unrelated.exists(),
+            "unrelated files must survive a no-op TLS rollback"
+        );
+    }
+
+    /// Regression: rollback must recreate the `OpenBao` container with
+    /// `up -d` (not `restart`) so that Docker Compose applies the base
+    /// compose config without the non-loopback override.  `restart`
+    /// only stops/starts the existing container, preserving the port
+    /// bindings from the applied override — which would leave `OpenBao`
+    /// reachable on plaintext HTTP at the non-loopback address.
+    #[test]
+    fn rollback_uses_up_not_restart_to_remove_override() {
+        use std::path::PathBuf;
+
+        let compose = PathBuf::from("docker-compose.yml");
+        let args = super::rollback_openbao_docker_args(&compose);
+
+        assert!(
+            args.contains(&"up".to_string()) && args.contains(&"-d".to_string()),
+            "rollback must use `up -d` to recreate the container: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "restart"),
+            "rollback must not use `restart` — it preserves override port bindings: {args:?}"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("openbao"),
+            "rollback must target only the openbao service"
+        );
+    }
 }
 
 #[cfg(test)]

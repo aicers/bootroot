@@ -11,10 +11,15 @@ use super::super::types::{
     AppRoleLabel, DbCheckStatus, InitPlan, InitSummary, OpenBaoConfigResult,
 };
 use super::InitRollback;
+use super::RollbackFile;
 use super::database::{check_db_connectivity, resolve_db_dsn_for_init};
 use super::openbao_setup::{
     bootstrap_openbao, configure_openbao, setup_openbao_agents, validate_secret_id_ttl,
     write_ca_trust_fingerprints_with_retry,
+};
+use super::openbao_tls::{
+    build_openbao_tls_sans, issue_openbao_tls_cert, record_openbao_infra_cert,
+    write_openbao_hcl_with_tls,
 };
 use super::prompts::confirm_overwrite;
 use super::responder_setup::{
@@ -35,7 +40,10 @@ use crate::commands::guardrails::{
 use crate::commands::infra::{
     ensure_init_prereqs_ready, has_http01_admin_bind_intent, has_openbao_bind_intent, run_docker,
 };
-use crate::commands::init::OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME;
+use crate::commands::init::{
+    OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH, OPENBAO_TLS_CERT_PATH,
+    OPENBAO_TLS_KEY_PATH,
+};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -276,10 +284,11 @@ async fn run_init_inner(
     .await?
     .unwrap_or(secrets.db_dsn);
 
-    // Validate TLS and apply the non-loopback compose override inside
-    // the rollback envelope so that failures trigger rollback.  TLS is
-    // validated here (not earlier) because the step-ca root CA cert is
-    // created by `ensure_step_ca_initialized` above.
+    // Issue the OpenBao TLS certificate, write the TLS-enabled HCL,
+    // validate TLS, and apply the non-loopback compose override —
+    // all inside the rollback envelope so that failures trigger
+    // rollback.  The cert is issued here (not earlier) because
+    // `ensure_step_ca_initialized` creates the CA keys above.
     //
     // Validation is keyed off `StateFile` intent, not override file
     // existence — a missing override with recorded intent is an error.
@@ -297,6 +306,44 @@ async fn run_init_inner(
             .openbao_bind_addr
             .clone()
             .expect("bind_intent is true so openbao_bind_addr must be Some");
+
+        // Backup openbao.hcl and record the compose file so that
+        // rollback can restore plaintext HCL and restart OpenBao.
+        let hcl_path = compose_dir.join(OPENBAO_HCL_PATH);
+        rollback.hcl_backup = Some(RollbackFile {
+            path: hcl_path.clone(),
+            original: if hcl_path.exists() {
+                Some(std::fs::read_to_string(&hcl_path)?)
+            } else {
+                None
+            },
+        });
+        rollback.compose_file = Some(args.compose.compose_file.clone());
+
+        // Issue the TLS server certificate and rewrite openbao.hcl.
+        let sans = build_openbao_tls_sans(&bind_addr, state.openbao_advertise_addr.as_deref());
+        let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
+        issue_openbao_tls_cert(
+            compose_dir,
+            &args.secrets_dir.secrets_dir,
+            &san_refs,
+            messages,
+        )?;
+
+        // Track TLS artifacts for rollback cleanup.
+        rollback
+            .tls_artifacts
+            .push(compose_dir.join(OPENBAO_TLS_CERT_PATH));
+        rollback
+            .tls_artifacts
+            .push(compose_dir.join(OPENBAO_TLS_KEY_PATH));
+
+        write_openbao_hcl_with_tls(compose_dir, messages)?;
+
+        // Record the infra cert entry in state so the rotation
+        // pipeline can renew it.
+        record_openbao_infra_cert(&mut state, compose_dir, sans);
+
         validate_openbao_override_scope(&override_path, messages)?;
         validate_openbao_override_binding(&override_path, &bind_addr, messages)?;
         validate_openbao_tls(compose_dir, &args.secrets_dir.secrets_dir, messages)?;
@@ -314,14 +361,14 @@ async fn run_init_inner(
         ];
         run_docker(&up_args, "docker compose up -d openbao", messages)?;
 
-        // Persist the CN-side HTTPS URL now that TLS is validated
-        // and the non-loopback override is applied.  Always derive
-        // from bind_addr (which maps wildcards to loopback via
-        // `client_url_from_bind_addr`) so that local commands
-        // (auto-unseal, service, rotate) never depend on the
-        // external advertise address being hairpin-reachable.
-        // The advertise address is consumed separately by remote
-        // bootstrap artifact generation.
+        // Persist the CN-side HTTPS URL and infra_certs entry now
+        // that TLS is validated and the non-loopback override is
+        // applied.  Always derive from bind_addr (which maps
+        // wildcards to loopback via `client_url_from_bind_addr`)
+        // so that local commands (auto-unseal, service, rotate)
+        // never depend on the external advertise address being
+        // hairpin-reachable.  The advertise address is consumed
+        // separately by remote bootstrap artifact generation.
         state.openbao_url = client_url_from_bind_addr(&bind_addr);
         state
             .save(&state_path)
@@ -580,6 +627,7 @@ fn write_state_file_to(
         existing_openbao_bind_addr,
         existing_openbao_advertise_addr,
         existing_http01_admin_bind_addr,
+        existing_infra_certs,
     ) = if state_path.exists() {
         let state = StateFile::load(state_path)?;
         (
@@ -587,9 +635,10 @@ fn write_state_file_to(
             state.openbao_bind_addr,
             state.openbao_advertise_addr,
             state.http01_admin_bind_addr,
+            state.infra_certs,
         )
     } else {
-        (BTreeMap::new(), None, None, None)
+        (BTreeMap::new(), None, None, None, BTreeMap::new())
     };
 
     let policy_map = AppRoleLabel::policy_map();
@@ -603,6 +652,7 @@ fn write_state_file_to(
         openbao_bind_addr: existing_openbao_bind_addr,
         openbao_advertise_addr: existing_openbao_advertise_addr,
         http01_admin_bind_addr: existing_http01_admin_bind_addr,
+        infra_certs: existing_infra_certs,
     };
     state
         .save(state_path)
@@ -654,6 +704,7 @@ mod tests {
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            infra_certs: BTreeMap::new(),
         };
         existing.save(&state_path).unwrap();
         write_state_file_to(

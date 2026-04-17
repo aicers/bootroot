@@ -348,6 +348,29 @@ impl Messages {
             &[("details", details)],
         )
     }
+
+    pub(crate) fn info_openbao_tls_provisioned(&self, path: &str) -> String {
+        format_template(
+            self.strings().info_openbao_tls_provisioned,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn info_openbao_hcl_tls_written(&self) -> &'static str {
+        self.strings().info_openbao_hcl_tls_written
+    }
+
+    pub(crate) fn info_openbao_hcl_tls_reverted(&self) -> &'static str {
+        self.strings().info_openbao_hcl_tls_reverted
+    }
+
+    pub(crate) fn error_openbao_tls_provision_failed(&self) -> &'static str {
+        self.strings().error_openbao_tls_provision_failed
+    }
+
+    pub(crate) fn error_openbao_hcl_write_failed(&self) -> &'static str {
+        self.strings().error_openbao_hcl_write_failed
+    }
 }
 
 impl Messages {

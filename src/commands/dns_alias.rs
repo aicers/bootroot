@@ -229,6 +229,7 @@ mod tests {
             openbao_bind_addr: None,
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
+            infra_certs: BTreeMap::new(),
         };
         state
             .services

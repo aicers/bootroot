@@ -244,7 +244,14 @@ pub(crate) enum RotateCommand {
     ForceReissue(RotateForceReissueArgs),
     #[command(name = "ca-key")]
     CaKey(RotateCaKeyArgs),
+    /// Renews infrastructure TLS certificates (e.g. `OpenBao` server cert)
+    /// registered in `state.json` `infra_certs`.
+    #[command(name = "infra-cert")]
+    InfraCert(RotateInfraCertArgs),
 }
+
+#[derive(Args, Debug)]
+pub(crate) struct RotateInfraCertArgs {}
 
 #[derive(Args, Debug)]
 pub(crate) struct RotateStepcaPasswordArgs {

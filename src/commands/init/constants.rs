@@ -39,13 +39,18 @@ pub(crate) const CA_INTERMEDIATE_CERT_FILENAME: &str = "intermediate_ca.crt";
 
 pub(crate) const OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-exposed.yml";
 pub(crate) const HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.http01-exposed.yml";
-#[cfg(test)]
+
 pub(crate) const OPENBAO_TLS_CERT_PATH: &str = "openbao/tls/server.crt";
-#[cfg(test)]
 pub(crate) const OPENBAO_TLS_KEY_PATH: &str = "openbao/tls/server.key";
 pub(crate) const RESPONDER_TLS_CERT_CONTAINER_PATH: &str = "/app/responder/tls/cert.pem";
 pub(crate) const RESPONDER_TLS_KEY_CONTAINER_PATH: &str = "/app/responder/tls/key.pem";
+pub(crate) const OPENBAO_TLS_CONTAINER_CERT_PATH: &str = "/openbao/config/tls/server.crt";
+pub(crate) const OPENBAO_TLS_CONTAINER_KEY_PATH: &str = "/openbao/config/tls/server.key";
 pub(crate) const OPENBAO_HCL_PATH: &str = "openbao/openbao.hcl";
+pub(crate) const OPENBAO_CONTAINER_NAME: &str = "bootroot-openbao";
+pub(crate) const OPENBAO_INFRA_CERT_KEY: &str = "openbao";
+pub(crate) const OPENBAO_TLS_DEFAULT_NOT_AFTER: &str = "8760h";
+pub(crate) const OPENBAO_TLS_DEFAULT_RENEW_BEFORE: &str = "720h";
 
 pub(crate) mod openbao_constants {
     pub(crate) const INIT_SECRET_SHARES: u8 = 3;
