@@ -198,6 +198,20 @@ async fn run_init_inner(
     // and keys inside secrets/config/ and secrets/secrets/.  Must run
     // before update_ca_json_with_backup and write_stepca_templates, which
     // both read ca.json.
+    //
+    // The compose step-ca service runs as root (the custom Dockerfile
+    // does not set USER) and has `restart: always`.  Once ca.json
+    // appears, the service's next restart attempt succeeds and may
+    // create files (e.g. DB state) as root inside the secrets mount.
+    // If that happens before `fix_secrets_permissions` runs, the
+    // chmod fails with EPERM.  Stop the compose service before init
+    // to close the race; it is restarted after ca.json is patched.
+    let will_init_stepca = !secrets_dir.join("config").join("ca.json").exists();
+    if will_init_stepca {
+        let compose_str = args.compose.compose_file.to_string_lossy();
+        let stop_args = ["compose", "-f", &*compose_str, "stop", "step-ca"];
+        let _ = run_docker(&stop_args, "docker compose stop step-ca", messages);
+    }
     let step_ca_result = ensure_step_ca_initialized(&secrets_dir, messages)?;
     if step_ca_result == super::super::types::StepCaInitResult::Initialized {
         // Fix ownership: step-ca init may create files with different
