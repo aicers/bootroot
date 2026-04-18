@@ -108,16 +108,14 @@ async fn wait_for_shutdown(
     loop {
         tokio::select! {
             result = &mut *challenge => {
-                log_server_exit("Challenge", result);
-                break;
+                return handle_server_exit("Challenge", result);
             }
             result = &mut *admin => {
-                log_server_exit("Admin", result);
-                break;
+                return handle_server_exit("Admin", result);
             }
             _ = tokio::signal::ctrl_c() => {
                 warn!("Shutdown signal received");
-                break;
+                return Ok(());
             }
             () = reload_signal.recv() => {
                 match reload_settings(state, config_path).await {
@@ -130,8 +128,6 @@ async fn wait_for_shutdown(
             }
         }
     }
-
-    Ok(())
 }
 
 async fn reload_tls_certs(state: &ResponderState, resolver: &Arc<ReloadableCertResolver>) {
@@ -161,11 +157,23 @@ fn parse_socket_addr(value: &str, field_name: &str) -> Result<SocketAddr> {
         .with_context(|| format!("Failed to parse {field_name} {value}"))
 }
 
-fn log_server_exit(name: &str, result: std::result::Result<std::io::Result<()>, JoinError>) {
+fn handle_server_exit(
+    name: &str,
+    result: std::result::Result<std::io::Result<()>, JoinError>,
+) -> Result<()> {
     match result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => error!("{name} server failed: {err}"),
-        Err(err) => error!("{name} server task failed: {err}"),
+        Ok(Ok(())) => {
+            warn!("{name} server exited cleanly");
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            error!("{name} server failed: {err}");
+            Err(anyhow::Error::from(err).context(format!("{name} server failed")))
+        }
+        Err(err) => {
+            error!("{name} server task failed: {err}");
+            Err(anyhow::Error::from(err).context(format!("{name} server task failed")))
+        }
     }
 }
 
