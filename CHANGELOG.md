@@ -39,6 +39,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added `tests/e2e_multi_host_tls_real_daemon.rs`, a real-daemon-backed
+  multi-host TLS E2E suite covering the three scenarios from #521 (happy
+  path, system-trust rejection, pin-enforced rejection) against a
+  fully-provisioned, TLS-enabled `openbao` daemon in Docker. The RN side
+  consumes a production-style `bootstrap.json` artifact that carries a
+  response-wrapped `secret_id`, exercising the full unwrap/login/KV/trust
+  pull over TLS plus an HTTP-01 admin registration and public challenge
+  fetch. Tests skip gracefully on hosts without Docker. CI pre-pulls
+  `openbao/openbao:latest` in `test-core`. (Closes #534, part of #507)
 - Added automatic HTTP-01 admin API TLS certificate provisioning during
   `bootroot init`. When `--http01-admin-bind` intent is recorded,
   `bootroot init` issues a server certificate via the local step-ca,
