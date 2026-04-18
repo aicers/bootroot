@@ -1,3 +1,4 @@
+pub(crate) mod ca;
 pub(crate) mod clean;
 pub(crate) mod constants;
 pub(crate) mod dns_alias;

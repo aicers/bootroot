@@ -1,6 +1,44 @@
-use anyhow::Result;
+use std::time::Duration;
 
+use anyhow::{Context, Result};
+
+use super::defaults::default_renew_before;
 use super::{DaemonProfileSettings, HookCommand, Settings, TrustSettings};
+
+/// Validates that `cert_duration` is strictly greater than the default
+/// daemon `renew_before` interval.
+///
+/// Used at `bootroot init` time, where `agent.toml` is not available on
+/// the control plane, so the default `renew_before` (16h) is used as a
+/// conservative proxy.
+///
+/// # Errors
+///
+/// Returns an error if `cert_duration` cannot be parsed as a duration
+/// or is not strictly greater than the default `renew_before`.
+pub fn validate_cert_duration_vs_default_renew_before(cert_duration: &str) -> Result<()> {
+    let duration = humantime::parse_duration(cert_duration.trim())
+        .with_context(|| format!("invalid cert-duration: {cert_duration}"))?;
+    let renew_before = default_renew_before();
+    if duration <= renew_before {
+        anyhow::bail!(
+            "cert-duration ({cert_duration}) must exceed the default renew_before ({}); \
+             otherwise the daemon will flag every newly issued certificate for immediate renewal",
+            humantime::format_duration(renew_before)
+        );
+    }
+    Ok(())
+}
+
+/// Parses a duration string as accepted by `defaultTLSCertDuration`.
+///
+/// # Errors
+///
+/// Returns an error if the value cannot be parsed as a duration.
+pub fn parse_cert_duration(value: &str) -> Result<Duration> {
+    humantime::parse_duration(value.trim())
+        .with_context(|| format!("invalid cert-duration: {value}"))
+}
 
 pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
     if settings.domain.trim().is_empty() {
@@ -159,4 +197,28 @@ fn validate_retry_settings(backoff_secs: &[u64], label: &str) -> Result<()> {
         anyhow::bail!("{label} values must be greater than 0");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cert_duration_accepts_value_greater_than_default_renew_before() {
+        // default renew_before is 16h; 24h is the step-ca default
+        assert!(validate_cert_duration_vs_default_renew_before("24h").is_ok());
+        assert!(validate_cert_duration_vs_default_renew_before("48h").is_ok());
+    }
+
+    #[test]
+    fn cert_duration_rejects_value_less_than_or_equal_to_renew_before() {
+        assert!(validate_cert_duration_vs_default_renew_before("16h").is_err());
+        assert!(validate_cert_duration_vs_default_renew_before("8h").is_err());
+    }
+
+    #[test]
+    fn cert_duration_rejects_invalid_value() {
+        assert!(validate_cert_duration_vs_default_renew_before("bogus").is_err());
+        assert!(validate_cert_duration_vs_default_renew_before("").is_err());
+    }
 }

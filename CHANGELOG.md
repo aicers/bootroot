@@ -39,6 +39,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added `--cert-duration` to `bootroot init` (default `24h`) and a new
+  `bootroot ca` subcommand group (`ca update`, `ca restart`) for
+  configuring step-ca's `defaultTLSCertDuration`. `init` embeds the
+  value as a literal into the ACME provisioner's `claims` block in
+  `ca.json.ctmpl` so it survives OpenBao Agent render cycles, and
+  validates that the value exceeds the daemon's default
+  `renew_before` (16h) to avoid flagging every newly issued
+  certificate for immediate renewal. `ca update` patches both
+  `ca.json.ctmpl` and `ca.json` after initial setup; `ca restart`
+  restarts only the `step-ca` compose service so the new value takes
+  effect. (Closes #516)
 - Added `tests/e2e_multi_host_tls_real_daemon.rs`, a real-daemon-backed
   multi-host TLS E2E suite covering the three scenarios from #521 (happy
   path, system-trust rejection, pin-enforced rejection) against a

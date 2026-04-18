@@ -280,6 +280,16 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--responder-timeout-secs`: responder timeout (seconds, default `5`)
 - `--stepca-url`: step-ca URL (default `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
+- `--cert-duration`: `defaultTLSCertDuration` embedded in the ACME
+  provisioner named by `--stepca-provisioner` in `ca.json` /
+  `ca.json.ctmpl` (default `24h`, matches step-ca's own default). The
+  value is written as a literal in `ca.json.ctmpl` so it survives
+  OpenBao Agent render cycles. Must be strictly greater than the
+  daemon's `renew_before` (default `16h`); otherwise every newly
+  issued certificate is flagged for immediate renewal and init fails
+  validation. To change this value after init, use
+  `bootroot ca update --cert-duration <value>` followed by
+  `bootroot ca restart`.
 - `--secret-id-ttl`: role-level `secret_id` TTL for AppRole roles
   created during init (default `24h`). Set this to at least 2× your
   planned rotation interval so that a missed run does not expire
@@ -1071,6 +1081,61 @@ Notes:
 
 - This command auto-detects the running profile(s). It does not accept
   `--profile`.
+
+## bootroot ca update
+
+Updates `defaultTLSCertDuration` on the step-ca ACME provisioner after
+initial setup. Patches both `ca.json.ctmpl` (so the new value survives
+future OpenBao Agent render cycles) and `ca.json` (so the new value is
+in place before the next render cycle).
+
+### Inputs
+
+- `--secrets-dir`: secrets directory (default `secrets`)
+- `--stepca-provisioner`: ACME provisioner name whose
+  `claims.defaultTLSCertDuration` is updated (default `acme`)
+- `--cert-duration`: new `defaultTLSCertDuration` value
+  (e.g., `24h`, `48h`). Required.
+
+  `cert-duration` must exceed the `renew_before` value configured in
+  `agent.toml` on each agent host; otherwise newly issued certificates
+  will be flagged for immediate renewal. The control plane does not
+  have access to `agent.toml`, so this cross-validation is not
+  performed here — operators are responsible for ensuring consistency.
+
+### Behavior
+
+- Parses and validates the new duration value.
+- Writes `claims.defaultTLSCertDuration` onto the ACME provisioner
+  named by `--stepca-provisioner` in both `ca.json.ctmpl` and
+  `ca.json`. Fails if no ACME provisioner with that name exists.
+- Prints a notice that `bootroot ca restart` must be run for step-ca
+  to pick up the change.
+
+### Examples
+
+```bash
+bootroot ca update --cert-duration 48h
+bootroot ca restart
+```
+
+## bootroot ca restart
+
+Restarts the step-ca container via Docker Compose so it picks up the
+updated `ca.json`. Only the `step-ca` service is restarted; the rest
+of the stack is left untouched. After triggering the restart, polls
+the container status and returns an error if `step-ca` does not reach
+`running` state within 30 seconds.
+
+### Inputs
+
+- `--compose-file`: compose file path (default `docker-compose.yml`)
+
+### Examples
+
+```bash
+bootroot ca restart
+```
 
 ## bootroot clean
 

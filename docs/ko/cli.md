@@ -271,6 +271,15 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--responder-timeout-secs`: responder 요청 타임아웃(초, 기본값 `5`)
 - `--stepca-url`: step-ca URL (기본값 `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner 이름 (기본값 `acme`)
+- `--cert-duration`: `ca.json` / `ca.json.ctmpl`에서
+  `--stepca-provisioner`가 가리키는 ACME provisioner에 삽입되는
+  `defaultTLSCertDuration` 값 (기본값 `24h`, step-ca의 기본값과
+  동일). 값은 `ca.json.ctmpl`에 리터럴로 저장되어 OpenBao Agent 렌더
+  주기를 거쳐도 유지됩니다. 데몬의 `renew_before`(기본값 `16h`)보다
+  엄격히 커야 하며, 그렇지 않으면 새로 발급된 모든 인증서가 즉시 갱신
+  대상으로 표시되어 init이 검증 단계에서 실패합니다. 초기화 이후 이 값을
+  변경하려면 `bootroot ca update --cert-duration <값>` 실행 후
+  `bootroot ca restart`를 실행하세요.
 - `--secret-id-ttl`: 초기화 중 생성되는 AppRole 역할의 역할 수준
   `secret_id` TTL (기본값 `24h`). 계획된 회전 주기의 최소 2배 이상으로
   설정하여 누락된 실행이 자격증명을 만료시키지 않도록 하세요. `24h`는
@@ -1035,6 +1044,60 @@ OpenBao KV: `bootroot/responder/hmac`
 비고:
 
 - 실행 중인 프로필을 자동 감지합니다. `--profile`은 받지 않습니다.
+
+## bootroot ca update
+
+초기 설치 이후 step-ca ACME provisioner의 `defaultTLSCertDuration`
+값을 변경합니다. `ca.json.ctmpl`(이후 OpenBao Agent 렌더 주기에도
+유지되도록)과 `ca.json`(다음 렌더 전까지 즉시 반영되도록)을 모두
+패치합니다.
+
+### 입력
+
+- `--secrets-dir`: 시크릿 디렉터리 (기본값 `secrets`)
+- `--stepca-provisioner`: 대상 ACME provisioner 이름
+  (기본값 `acme`)
+- `--cert-duration`: 새 `defaultTLSCertDuration` 값
+  (예: `24h`, `48h`). 필수.
+
+  `cert-duration`은 각 agent 호스트의 `agent.toml`에 설정된
+  `renew_before`보다 커야 하며, 그렇지 않으면 새로 발급된 인증서가 즉시
+  갱신 대상으로 표시됩니다. 제어 노드는 `agent.toml`을 참조할 수 없으므로
+  이 교차 검증은 수행하지 않으며, 값의 일관성 보장은 운영자의 책임입니다.
+
+### 동작
+
+- 입력 값을 파싱/검증합니다.
+- `--stepca-provisioner`로 지정된 이름의 ACME provisioner에만
+  `ca.json.ctmpl`과 `ca.json` 양쪽에서 `claims.defaultTLSCertDuration`을
+  기록합니다. 동일한 이름의 ACME provisioner가 없으면 실패합니다.
+- 변경을 step-ca가 반영하려면 `bootroot ca restart`를 실행해야
+  함을 안내합니다.
+
+### 예시
+
+```bash
+bootroot ca update --cert-duration 48h
+bootroot ca restart
+```
+
+## bootroot ca restart
+
+Docker Compose를 통해 step-ca 컨테이너를 재시작해 업데이트된
+`ca.json`이 반영되도록 합니다. `step-ca` 서비스만 재시작하고 다른
+스택 구성 요소에는 영향을 주지 않습니다. 재시작 이후 컨테이너 상태를
+폴링하며, 30초 이내에 `running` 상태로 복귀하지 않으면 오류를
+반환합니다.
+
+### 입력
+
+- `--compose-file`: compose 파일 경로 (기본값 `docker-compose.yml`)
+
+### 예시
+
+```bash
+bootroot ca restart
+```
 
 ## bootroot clean
 

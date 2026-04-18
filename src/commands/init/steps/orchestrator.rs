@@ -57,6 +57,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     if let Some(warning) = validate_secret_id_ttl(&args.secret_id_ttl, messages)? {
         eprintln!("{warning}");
     }
+    bootroot::config::validate_cert_duration_vs_default_renew_before(&args.cert_duration)?;
     eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
 
     ensure_all_services_localhost_binding(&args.compose.compose_file, messages)?;
@@ -219,8 +220,16 @@ async fn run_init_inner(
         fix_secrets_permissions(&secrets_dir).await?;
     }
 
-    rollback.ca_json_backup =
-        Some(update_ca_json_with_backup(&secrets_dir, &secrets.db_dsn, messages).await?);
+    rollback.ca_json_backup = Some(
+        update_ca_json_with_backup(
+            &secrets_dir,
+            &secrets.db_dsn,
+            &args.cert_duration,
+            &args.stepca_provisioner,
+            messages,
+        )
+        .await?,
+    );
 
     if step_ca_result == super::super::types::StepCaInitResult::Initialized {
         // Restart step-ca after ca.json is patched with the DB DSN so it
@@ -229,8 +238,14 @@ async fn run_init_inner(
         let restart_args = ["compose", "-f", &*compose_str, "restart", "step-ca"];
         let _ = run_docker(&restart_args, "docker compose restart step-ca", messages);
     }
-    let stepca_templates =
-        write_stepca_templates(&secrets_dir, &args.openbao.kv_mount, messages).await?;
+    let stepca_templates = write_stepca_templates(
+        &secrets_dir,
+        &args.openbao.kv_mount,
+        &args.cert_duration,
+        &args.stepca_provisioner,
+        messages,
+    )
+    .await?;
     let compose_has_responder = compose_has_responder(&args.compose.compose_file, messages)?;
     let responder_tls_enabled =
         compose_has_responder && has_http01_admin_bind_intent(&StateFile::default_path())?;
