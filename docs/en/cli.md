@@ -816,7 +816,12 @@ Per subcommand:
 
 #### `rotate db`
 
-- `--db-admin-dsn`: DB admin DSN (env `BOOTROOT_DB_ADMIN_DSN`)
+- `--db-admin-dsn`: DB admin DSN (env `BOOTROOT_DB_ADMIN_DSN`). Optional
+  when `ca.json` is present (auto-populated by `bootroot init --enable
+  db-provision`); bootroot reads the current admin DSN from
+  `ca.json`'s `db.dataSource` field. Pass the flag explicitly to
+  override, or provide it when `ca.json` is absent and the command would
+  otherwise prompt interactively.
 - `--db-password`: new DB password
   (optional, auto-generated if omitted, env `BOOTROOT_DB_PASSWORD`)
 - `--db-timeout-secs`: DB timeout in seconds (default `2`)
