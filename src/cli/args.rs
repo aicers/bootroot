@@ -4,8 +4,8 @@ use clap::{ArgGroup, ValueEnum};
 use clap::{Args, Parser, Subcommand};
 
 use crate::commands::init::{
-    DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL, DEFAULT_SECRETS_DIR,
-    DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL, SECRET_ID_TTL,
+    DEFAULT_CERT_DURATION, DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL,
+    DEFAULT_SECRETS_DIR, DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL, SECRET_ID_TTL,
 };
 use crate::state::{DeliveryMode, DeployType, HookFailurePolicyEntry};
 
@@ -35,6 +35,45 @@ pub(crate) enum CliCommand {
     Clean(CleanArgs),
     #[command(subcommand)]
     Openbao(OpenbaoCommand),
+    #[command(subcommand)]
+    Ca(CaCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum CaCommand {
+    /// Updates step-ca `defaultTLSCertDuration`.
+    ///
+    /// `cert-duration` must exceed the `renew_before` value configured
+    /// in `agent.toml` on each agent host; otherwise newly issued
+    /// certificates will be flagged for immediate renewal.
+    Update(CaUpdateArgs),
+    /// Restarts the step-ca container so it picks up a configuration
+    /// change such as a new `defaultTLSCertDuration`.
+    Restart(CaRestartArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CaUpdateArgs {
+    #[command(flatten)]
+    pub(crate) secrets_dir: SecretsDirArgs,
+
+    /// step-ca ACME provisioner name whose `claims.defaultTLSCertDuration`
+    /// is updated
+    #[arg(long, default_value = DEFAULT_STEPCA_PROVISIONER)]
+    pub(crate) stepca_provisioner: String,
+
+    /// New `defaultTLSCertDuration` value (e.g. `24h`, `48h`).
+    ///
+    /// Must exceed the `renew_before` value configured in `agent.toml`
+    /// on each agent host.
+    #[arg(long)]
+    pub(crate) cert_duration: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CaRestartArgs {
+    #[command(flatten)]
+    pub(crate) compose_file: ComposeFileArgs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -668,6 +707,14 @@ pub(crate) struct InitArgs {
     #[arg(long, default_value = DEFAULT_STEPCA_PROVISIONER)]
     pub(crate) stepca_provisioner: String,
 
+    /// `defaultTLSCertDuration` embedded in the ACME provisioner of
+    /// `ca.json` / `ca.json.ctmpl` (e.g. `24h`, `48h`).
+    ///
+    /// Must be greater than the daemon's `renew_before` value — otherwise
+    /// every newly issued certificate is flagged for immediate renewal
+    #[arg(long, default_value = DEFAULT_CERT_DURATION)]
+    pub(crate) cert_duration: String,
+
     /// ACME EAB key ID (optional)
     #[arg(long, env = "EAB_KID")]
     pub(crate) eab_kid: Option<String>,
@@ -1011,6 +1058,60 @@ mod tests {
             }
             _ => panic!("expected service add"),
         }
+    }
+
+    #[test]
+    fn test_cli_parses_init_cert_duration_default() {
+        let cli = Cli::parse_from(["bootroot", "init"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert_eq!(args.cert_duration, "24h");
+            }
+            _ => panic!("expected init"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_init_cert_duration_override() {
+        let cli = Cli::parse_from(["bootroot", "init", "--cert-duration", "48h"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert_eq!(args.cert_duration, "48h");
+            }
+            _ => panic!("expected init"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_ca_update() {
+        let cli = Cli::parse_from(["bootroot", "ca", "update", "--cert-duration", "48h"]);
+        match cli.command {
+            CliCommand::Ca(CaCommand::Update(args)) => {
+                assert_eq!(args.cert_duration, "48h");
+                assert_eq!(args.stepca_provisioner, "acme");
+            }
+            _ => panic!("expected ca update"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_ca_restart() {
+        let cli = Cli::parse_from(["bootroot", "ca", "restart"]);
+        match cli.command {
+            CliCommand::Ca(CaCommand::Restart(args)) => {
+                assert_eq!(
+                    args.compose_file.compose_file,
+                    PathBuf::from("docker-compose.yml")
+                );
+            }
+            _ => panic!("expected ca restart"),
+        }
+    }
+
+    #[test]
+    fn test_cli_ca_update_requires_cert_duration() {
+        let result = Cli::try_parse_from(["bootroot", "ca", "update"]);
+        assert!(result.is_err(), "cert-duration should be required");
     }
 
     #[test]

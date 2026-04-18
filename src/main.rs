@@ -8,8 +8,8 @@ mod state;
 use clap::Parser;
 
 use crate::cli::args::{
-    Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand, ServiceAgentCommand,
-    ServiceCommand,
+    CaCommand, Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand,
+    ServiceAgentCommand, ServiceCommand,
 };
 use crate::i18n::Messages;
 
@@ -120,6 +120,14 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
         CliCommand::Openbao(OpenbaoCommand::DeleteUnsealKeys(args)) => {
             commands::openbao_unseal::delete_unseal_keys(&args.secrets_dir, messages)
                 .with_context(|| messages.error_openbao_delete_unseal_keys_failed())?;
+        }
+        CliCommand::Ca(CaCommand::Update(args)) => {
+            commands::ca::run_ca_update(&args, messages)
+                .with_context(|| "ca update failed".to_string())?;
+        }
+        CliCommand::Ca(CaCommand::Restart(args)) => {
+            commands::ca::run_ca_restart(&args, messages)
+                .with_context(|| "ca restart failed".to_string())?;
         }
     }
     Ok(())

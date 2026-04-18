@@ -72,7 +72,10 @@ pub(crate) fn create_secrets_dir(root: &Path) -> Result<PathBuf> {
     fs::create_dir_all(secrets_dir.join("secrets")).context("Failed to create secrets key dir")?;
     fs::write(
         secrets_dir.join("config").join("ca.json"),
-        r#"{"db":{"type":"","dataSource":""}}"#,
+        r#"{
+            "authority":{"provisioners":[{"type":"ACME","name":"acme"}]},
+            "db":{"type":"","dataSource":""}
+        }"#,
     )
     .context("Failed to write ca.json")?;
     fs::write(secrets_dir.join("secrets").join("root_ca_key"), "")

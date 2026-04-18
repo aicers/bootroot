@@ -5,7 +5,19 @@ pub(crate) const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
 pub(crate) const DEFAULT_STEPCA_URL: &str = "https://localhost:9000";
 pub(crate) const DEFAULT_STEPCA_PROVISIONER: &str = "acme";
 
+/// Default `defaultTLSCertDuration` embedded in the ACME provisioner
+/// of `ca.json` / `ca.json.ctmpl`. Matches step-ca's own default.
+pub(crate) const DEFAULT_CERT_DURATION: &str = "24h";
+
 pub(crate) const DEFAULT_CA_NAME: &str = "Bootroot CA";
+/// JWK admin provisioner name passed to `step ca init --provisioner`.
+///
+/// `step ca init --acme` creates a JWK admin provisioner with this
+/// name and an additional ACME provisioner with the hardcoded name
+/// `acme` (or `acme-1` if the JWK admin already uses `acme`). Keeping
+/// the JWK admin distinct from `DEFAULT_STEPCA_PROVISIONER` ensures
+/// the ACME provisioner created by step-ca matches the name the
+/// patcher looks up.
 pub(crate) const DEFAULT_CA_PROVISIONER: &str = "admin";
 pub(crate) const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca,stepca.internal";
 pub(crate) const DEFAULT_CA_ADDRESS: &str = ":9000";

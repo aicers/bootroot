@@ -493,7 +493,7 @@ run_bootstrap_chain() {
     --summary-json "$INIT_SUMMARY_JSON" \
     --enable auto-generate,show-secrets,db-provision \
     --stepca-url "$STEPCA_EAB_URL" \
-    --stepca-provisioner "admin" \
+    --stepca-provisioner "acme" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \
     --eab-kid "dev-kid" \

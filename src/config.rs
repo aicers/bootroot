@@ -8,6 +8,8 @@ use serde::Deserialize;
 mod defaults;
 mod validation;
 
+pub use validation::{parse_cert_duration, validate_cert_duration_vs_default_renew_before};
+
 /// CLI-provided overrides that must survive config reloads in daemon mode.
 ///
 /// Fields mirror the subset of [`crate::Args`] that [`Settings::merge_with_args`]

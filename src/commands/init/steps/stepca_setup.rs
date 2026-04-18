@@ -19,6 +19,8 @@ use crate::i18n::Messages;
 pub(super) async fn write_stepca_templates(
     secrets_dir: &Path,
     kv_mount: &str,
+    cert_duration: &str,
+    provisioner: &str,
     messages: &Messages,
 ) -> Result<StepCaTemplatePaths> {
     let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
@@ -37,7 +39,13 @@ pub(super) async fn write_stepca_templates(
     let ca_json_contents = tokio::fs::read_to_string(&ca_json_path)
         .await
         .with_context(|| messages.error_read_file_failed(&ca_json_path.display().to_string()))?;
-    let ca_json_template = build_ca_json_template(&ca_json_contents, kv_mount, messages)?;
+    let ca_json_template = build_ca_json_template(
+        &ca_json_contents,
+        kv_mount,
+        cert_duration,
+        provisioner,
+        messages,
+    )?;
     let ca_json_template_path = templates_dir.join(STEPCA_CA_JSON_TEMPLATE_NAME);
     tokio::fs::write(&ca_json_template_path, ca_json_template)
         .await
@@ -58,7 +66,13 @@ fn build_password_template(kv_mount: &str) -> String {
     )
 }
 
-fn build_ca_json_template(contents: &str, kv_mount: &str, messages: &Messages) -> Result<String> {
+fn build_ca_json_template(
+    contents: &str,
+    kv_mount: &str,
+    cert_duration: &str,
+    provisioner: &str,
+    messages: &Messages,
+) -> Result<String> {
     const PLACEHOLDER: &str = "__BOOTROOT_CTMPL_DB__";
 
     let mut value: serde_json::Value =
@@ -71,6 +85,13 @@ fn build_ca_json_template(contents: &str, kv_mount: &str, messages: &Messages) -
         .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
     *data_source = serde_json::Value::String(PLACEHOLDER.to_string());
 
+    if !set_acme_cert_duration(&mut value, cert_duration, Some(provisioner)) {
+        anyhow::bail!(
+            "ca.json does not contain an ACME provisioner named {provisioner:?} — \
+             cannot set defaultTLSCertDuration in template"
+        );
+    }
+
     let serialized =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
 
@@ -82,6 +103,75 @@ fn build_ca_json_template(contents: &str, kv_mount: &str, messages: &Messages) -
         "\"{{{{ with secret \"{kv_mount}/data/{PATH_STEPCA_DB}\" }}}}{{{{ .Data.data.value }}}}{{{{ end }}}}\""
     );
     Ok(serialized.replace(&format!("\"{PLACEHOLDER}\""), &directive))
+}
+
+/// Sets `claims.defaultTLSCertDuration` on ACME provisioners in the
+/// parsed ca.json value.
+///
+/// When `provisioner_name` is `Some`, only the ACME provisioner whose
+/// `name` matches is patched. When `None`, every ACME provisioner is
+/// patched.
+///
+/// Accepts both the on-disk shape (`authority.provisioners`) and the
+/// flat `provisioners` shape emitted by older `step ca init` builds.
+pub(crate) fn set_acme_cert_duration(
+    value: &mut serde_json::Value,
+    cert_duration: &str,
+    provisioner_name: Option<&str>,
+) -> bool {
+    let Some(provisioners) = locate_provisioners_mut(value) else {
+        return false;
+    };
+    let mut patched = false;
+    for provisioner in provisioners {
+        if !is_acme_provisioner(provisioner) {
+            continue;
+        }
+        if let Some(name) = provisioner_name
+            && !provisioner_name_matches(provisioner, name)
+        {
+            continue;
+        }
+        let claims = provisioner
+            .as_object_mut()
+            .expect("is_acme_provisioner guarantees object")
+            .entry("claims".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(obj) = claims.as_object_mut() {
+            obj.insert(
+                "defaultTLSCertDuration".to_string(),
+                serde_json::Value::String(cert_duration.to_string()),
+            );
+            patched = true;
+        }
+    }
+    patched
+}
+
+fn provisioner_name_matches(provisioner: &serde_json::Value, name: &str) -> bool {
+    provisioner
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|n| n == name)
+}
+
+fn locate_provisioners_mut(value: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
+    if value.get("authority").is_some() {
+        return value
+            .get_mut("authority")
+            .and_then(|authority| authority.get_mut("provisioners"))
+            .and_then(serde_json::Value::as_array_mut);
+    }
+    value
+        .get_mut("provisioners")
+        .and_then(serde_json::Value::as_array_mut)
+}
+
+fn is_acme_provisioner(provisioner: &serde_json::Value) -> bool {
+    provisioner
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case("ACME"))
 }
 
 pub(super) async fn write_password_file_with_backup(
@@ -113,6 +203,8 @@ pub(super) async fn write_password_file_with_backup(
 pub(super) async fn update_ca_json_with_backup(
     secrets_dir: &Path,
     db_dsn: &str,
+    cert_duration: &str,
+    provisioner: &str,
     messages: &Messages,
 ) -> Result<RollbackFile> {
     let path = secrets_dir.join("config").join("ca.json");
@@ -123,6 +215,12 @@ pub(super) async fn update_ca_json_with_backup(
         serde_json::from_str(&contents).context(messages.error_parse_ca_json_failed())?;
     value["db"]["type"] = serde_json::Value::String("postgresql".to_string());
     value["db"]["dataSource"] = serde_json::Value::String(db_dsn.to_string());
+    if !set_acme_cert_duration(&mut value, cert_duration, Some(provisioner)) {
+        anyhow::bail!(
+            "ca.json does not contain an ACME provisioner named {provisioner:?} — \
+             cannot set defaultTLSCertDuration"
+        );
+    }
     let updated =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
     tokio::fs::write(&path, updated)
@@ -202,12 +300,15 @@ mod tests {
         fs::create_dir_all(secrets_dir.join("config")).unwrap();
         fs::write(
             secrets_dir.join("config").join("ca.json"),
-            r#"{"db":{"type":"postgresql","dataSource":"old"}}"#,
+            r#"{
+                "authority":{"provisioners":[{"type":"ACME","name":"acme"}]},
+                "db":{"type":"postgresql","dataSource":"old"}
+            }"#,
         )
         .unwrap();
 
         let messages = test_messages();
-        let paths = write_stepca_templates(&secrets_dir, "secret", &messages)
+        let paths = write_stepca_templates(&secrets_dir, "secret", "48h", "acme", &messages)
             .await
             .unwrap();
         let password_template = fs::read_to_string(&paths.password_template_path).unwrap();
@@ -215,6 +316,64 @@ mod tests {
 
         assert!(password_template.contains("secret/data/bootroot/stepca/password"));
         assert!(ca_json_template.contains("secret/data/bootroot/stepca/db"));
+    }
+
+    #[test]
+    fn test_set_acme_cert_duration_patches_nested_provisioner() {
+        let mut value: serde_json::Value = serde_json::from_str(
+            r#"{"authority":{"provisioners":[{"type":"ACME","name":"acme"}]}}"#,
+        )
+        .unwrap();
+        let patched = set_acme_cert_duration(&mut value, "48h", None);
+        assert!(patched);
+        let duration = value["authority"]["provisioners"][0]["claims"]["defaultTLSCertDuration"]
+            .as_str()
+            .unwrap();
+        assert_eq!(duration, "48h");
+    }
+
+    #[test]
+    fn test_set_acme_cert_duration_skips_non_acme() {
+        let mut value: serde_json::Value = serde_json::from_str(
+            r#"{"authority":{"provisioners":[{"type":"JWK","name":"admin"}]}}"#,
+        )
+        .unwrap();
+        let patched = set_acme_cert_duration(&mut value, "48h", None);
+        assert!(!patched);
+    }
+
+    #[test]
+    fn test_set_acme_cert_duration_matches_by_name() {
+        let mut value: serde_json::Value = serde_json::from_str(
+            r#"{"authority":{"provisioners":[
+                {"type":"ACME","name":"acme"},
+                {"type":"ACME","name":"staging"}
+            ]}}"#,
+        )
+        .unwrap();
+        let patched = set_acme_cert_duration(&mut value, "72h", Some("staging"));
+        assert!(patched);
+        assert!(
+            value["authority"]["provisioners"][0]
+                .get("claims")
+                .is_none()
+        );
+        assert_eq!(
+            value["authority"]["provisioners"][1]["claims"]["defaultTLSCertDuration"]
+                .as_str()
+                .unwrap(),
+            "72h"
+        );
+    }
+
+    #[test]
+    fn test_set_acme_cert_duration_name_filter_misses_return_false() {
+        let mut value: serde_json::Value = serde_json::from_str(
+            r#"{"authority":{"provisioners":[{"type":"ACME","name":"acme"}]}}"#,
+        )
+        .unwrap();
+        let patched = set_acme_cert_duration(&mut value, "48h", Some("nonexistent"));
+        assert!(!patched);
     }
 
     #[test]

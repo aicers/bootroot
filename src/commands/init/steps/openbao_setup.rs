@@ -809,14 +809,18 @@ mod tests {
         fs::create_dir_all(secrets_dir.join("config")).unwrap();
         fs::write(
             secrets_dir.join("config").join("ca.json"),
-            r#"{"db":{"type":"postgresql","dataSource":"old"}}"#,
+            r#"{
+                "authority":{"provisioners":[{"type":"ACME","name":"acme"}]},
+                "db":{"type":"postgresql","dataSource":"old"}
+            }"#,
         )
         .unwrap();
 
         let messages = test_messages();
-        let stepca_templates = write_stepca_templates(&secrets_dir, "secret", &messages)
-            .await
-            .unwrap();
+        let stepca_templates =
+            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &messages)
+                .await
+                .unwrap();
         let responder_paths =
             write_responder_files(&secrets_dir, "secret", "hmac-123", false, &messages)
                 .await
