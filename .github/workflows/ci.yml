@@ -134,6 +134,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # --- Unit Testing ---
+      - name: Pre-pull openbao image for real-daemon TLS E2E
+        run: docker pull openbao/openbao:latest
+
       - name: Run Unit Tests
         run: cargo test
 
