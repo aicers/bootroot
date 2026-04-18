@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+
+# shellcheck source=lib/audit-log.sh
+. "$SCRIPT_DIR/lib/audit-log.sh"
 
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-remote-lifecycle-$(date +%s)}"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
@@ -623,6 +627,9 @@ main() {
   run_verify_pair "after-responder-hmac"
   assert_fingerprint_changed "$SERVICE_NAME" "after-trust-sync" "after-responder-hmac"
   assert_fingerprint_changed "$SERVICE_NAME_2" "after-trust-sync" "after-responder-hmac"
+
+  log_phase "assert-openbao-audit-log"
+  assert_openbao_audit_log
 }
 
 main "$@"
