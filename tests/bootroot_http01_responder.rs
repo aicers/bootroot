@@ -16,6 +16,11 @@ const CHALLENGE_PATH_PREFIX: &str = "/.well-known/acme-challenge";
 const STARTUP_RETRIES: usize = 50;
 const STARTUP_DELAY: Duration = Duration::from_millis(100);
 const TEST_TTL_SECS: u64 = 60;
+/// Number of attempts to spawn the responder when a concurrent host process
+/// claims one of the reserved ephemeral ports in the window between
+/// `reserve_socket_addr` dropping its listener and the responder child
+/// re-binding the same address.
+const RESPONDER_BIND_ATTEMPTS: u32 = 4;
 
 #[derive(Default)]
 struct ResponderConfigOverrides {
@@ -31,15 +36,14 @@ struct ResponderConfigOverrides {
 #[tokio::test]
 async fn test_http01_responder_serves_registered_token() {
     let temp_dir = tempdir().expect("create temp dir");
-    let listen_addr = reserve_socket_addr();
-    let admin_addr = reserve_socket_addr();
     let config_path = temp_dir.path().join("responder.toml");
-    write_responder_config(&config_path, &listen_addr, &admin_addr, "initial-secret");
-
-    let mut responder = ResponderProcess::spawn(&config_path);
+    let (_responder, listen_addr, admin_addr) =
+        spawn_responder_retrying(&config_path, |path, listen, admin| {
+            write_responder_config(path, listen, admin, "initial-secret");
+        })
+        .await;
     let challenge_base_url = format!("http://{listen_addr}");
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     let response = register_token(
         &admin_base_url,
@@ -62,25 +66,25 @@ async fn test_http01_responder_serves_registered_token() {
 #[tokio::test]
 async fn test_http01_responder_clamps_requested_ttl_to_server_max() {
     let temp_dir = tempdir().expect("create temp dir");
-    let listen_addr = reserve_socket_addr();
-    let admin_addr = reserve_socket_addr();
     let config_path = temp_dir.path().join("responder.toml");
-    write_responder_config_with_overrides(
-        &config_path,
-        &listen_addr,
-        &admin_addr,
-        "initial-secret",
-        &ResponderConfigOverrides {
-            token_ttl_secs: Some(1),
-            max_token_ttl_secs: Some(1),
-            ..ResponderConfigOverrides::default()
-        },
-    );
-
-    let mut responder = ResponderProcess::spawn(&config_path);
+    let overrides = ResponderConfigOverrides {
+        token_ttl_secs: Some(1),
+        max_token_ttl_secs: Some(1),
+        ..ResponderConfigOverrides::default()
+    };
+    let (_responder, listen_addr, admin_addr) =
+        spawn_responder_retrying(&config_path, |path, listen, admin| {
+            write_responder_config_with_overrides(
+                path,
+                listen,
+                admin,
+                "initial-secret",
+                &overrides,
+            );
+        })
+        .await;
     let challenge_base_url = format!("http://{listen_addr}");
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     let response = register_token(
         &admin_base_url,
@@ -101,25 +105,24 @@ async fn test_http01_responder_clamps_requested_ttl_to_server_max() {
 #[tokio::test]
 async fn test_http01_responder_rate_limits_admin_registrations() {
     let temp_dir = tempdir().expect("create temp dir");
-    let listen_addr = reserve_socket_addr();
-    let admin_addr = reserve_socket_addr();
     let config_path = temp_dir.path().join("responder.toml");
-    write_responder_config_with_overrides(
-        &config_path,
-        &listen_addr,
-        &admin_addr,
-        "initial-secret",
-        &ResponderConfigOverrides {
-            admin_rate_limit_requests: Some(1),
-            admin_rate_limit_window_secs: Some(60),
-            ..ResponderConfigOverrides::default()
-        },
-    );
-
-    let mut responder = ResponderProcess::spawn(&config_path);
-    let challenge_base_url = format!("http://{listen_addr}");
+    let overrides = ResponderConfigOverrides {
+        admin_rate_limit_requests: Some(1),
+        admin_rate_limit_window_secs: Some(60),
+        ..ResponderConfigOverrides::default()
+    };
+    let (_responder, _listen_addr, admin_addr) =
+        spawn_responder_retrying(&config_path, |path, listen, admin| {
+            write_responder_config_with_overrides(
+                path,
+                listen,
+                admin,
+                "initial-secret",
+                &overrides,
+            );
+        })
+        .await;
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     let first = register_token(
         &admin_base_url,
@@ -145,24 +148,23 @@ async fn test_http01_responder_rate_limits_admin_registrations() {
 #[tokio::test]
 async fn test_http01_responder_rejects_large_admin_payloads() {
     let temp_dir = tempdir().expect("create temp dir");
-    let listen_addr = reserve_socket_addr();
-    let admin_addr = reserve_socket_addr();
     let config_path = temp_dir.path().join("responder.toml");
-    write_responder_config_with_overrides(
-        &config_path,
-        &listen_addr,
-        &admin_addr,
-        "initial-secret",
-        &ResponderConfigOverrides {
-            admin_body_limit_bytes: Some(64),
-            ..ResponderConfigOverrides::default()
-        },
-    );
-
-    let mut responder = ResponderProcess::spawn(&config_path);
-    let challenge_base_url = format!("http://{listen_addr}");
+    let overrides = ResponderConfigOverrides {
+        admin_body_limit_bytes: Some(64),
+        ..ResponderConfigOverrides::default()
+    };
+    let (_responder, _listen_addr, admin_addr) =
+        spawn_responder_retrying(&config_path, |path, listen, admin| {
+            write_responder_config_with_overrides(
+                path,
+                listen,
+                admin,
+                "initial-secret",
+                &overrides,
+            );
+        })
+        .await;
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     let response = reqwest::Client::new()
         .post(format!("{admin_base_url}{ADMIN_PATH}"))
@@ -181,15 +183,14 @@ async fn test_http01_responder_rejects_large_admin_payloads() {
 #[tokio::test]
 async fn test_http01_responder_reloads_hmac_secret_on_sighup() {
     let temp_dir = tempdir().expect("create temp dir");
-    let listen_addr = reserve_socket_addr();
-    let admin_addr = reserve_socket_addr();
     let config_path = temp_dir.path().join("responder.toml");
-    write_responder_config(&config_path, &listen_addr, &admin_addr, "old-secret");
-
-    let mut responder = ResponderProcess::spawn(&config_path);
+    let (mut responder, listen_addr, admin_addr) =
+        spawn_responder_retrying(&config_path, |path, listen, admin| {
+            write_responder_config(path, listen, admin, "old-secret");
+        })
+        .await;
     let challenge_base_url = format!("http://{listen_addr}");
     let admin_base_url = format!("http://{admin_addr}");
-    wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await;
 
     write_responder_config(&config_path, &listen_addr, &admin_addr, "new-secret");
     send_sighup(responder.pid());
@@ -315,18 +316,44 @@ fn sign_request(
     (timestamp, signature)
 }
 
-async fn wait_for_ready(
+/// Outcome of waiting for the spawned responder to become ready.
+enum ReadyOutcome {
+    Ready,
+    /// The responder exited during startup because one of its listen
+    /// sockets was already bound by another process.  The caller should
+    /// reserve fresh ports and respawn.
+    BindConflict(String),
+    Failure(String),
+}
+
+fn is_bind_conflict(stderr: &str) -> bool {
+    // Covers messages rendered by tokio/std for EADDRINUSE on macOS (os
+    // error 48) and Linux (os error 98), as well as the text poem emits
+    // when the bound listener's accept loop dies.
+    stderr.contains("Address already in use")
+        || stderr.contains("address in use")
+        || stderr.contains("EADDRINUSE")
+        || stderr.contains("os error 48")
+        || stderr.contains("os error 98")
+}
+
+async fn try_wait_for_ready(
     responder: &mut ResponderProcess,
     challenge_base_url: &str,
     admin_base_url: &str,
-) {
+) -> ReadyOutcome {
     let challenge_url = format!("{challenge_base_url}{CHALLENGE_PATH_PREFIX}/health-check");
     let admin_url = format!("{admin_base_url}{ADMIN_PATH}");
 
     for _ in 0..STARTUP_RETRIES {
         if let Some(status) = responder.try_wait() {
             let stderr = responder.take_stderr();
-            panic!("responder exited early with {status}: {stderr}");
+            if is_bind_conflict(&stderr) {
+                return ReadyOutcome::BindConflict(stderr);
+            }
+            return ReadyOutcome::Failure(format!(
+                "responder exited early with {status}: {stderr}"
+            ));
         }
 
         let challenge_ready = match reqwest::get(&challenge_url).await {
@@ -337,13 +364,51 @@ async fn wait_for_ready(
         };
 
         if challenge_ready && reqwest::Client::new().get(&admin_url).send().await.is_ok() {
-            return;
+            return ReadyOutcome::Ready;
         }
 
         sleep(STARTUP_DELAY).await;
     }
 
-    panic!("responder did not become ready");
+    ReadyOutcome::Failure("responder did not become ready".to_string())
+}
+
+/// Reserves fresh ports, writes the responder config with the provided
+/// `config_writer` closure, spawns the responder, and waits for it to
+/// become ready.  Retries on bind conflict so that a concurrent host
+/// process stealing a reserved port does not flake the test under CI
+/// parallel load.
+async fn spawn_responder_retrying<F>(
+    config_path: &Path,
+    config_writer: F,
+) -> (ResponderProcess, String, String)
+where
+    F: Fn(&Path, &str, &str),
+{
+    let mut last_failure = String::new();
+    for attempt in 0..RESPONDER_BIND_ATTEMPTS {
+        let listen_addr = reserve_socket_addr();
+        let admin_addr = reserve_socket_addr();
+        config_writer(config_path, &listen_addr, &admin_addr);
+        let mut responder = ResponderProcess::spawn(config_path);
+        let challenge_base_url = format!("http://{listen_addr}");
+        let admin_base_url = format!("http://{admin_addr}");
+        match try_wait_for_ready(&mut responder, &challenge_base_url, &admin_base_url).await {
+            ReadyOutcome::Ready => return (responder, listen_addr, admin_addr),
+            ReadyOutcome::BindConflict(stderr) => {
+                eprintln!(
+                    "responder bind conflict on attempt {} of {RESPONDER_BIND_ATTEMPTS}: {stderr}",
+                    attempt + 1,
+                );
+                last_failure = stderr;
+            }
+            ReadyOutcome::Failure(msg) => panic!("{msg}"),
+        }
+    }
+    panic!(
+        "responder failed to bind a reserved port after {RESPONDER_BIND_ATTEMPTS} attempts: \
+         {last_failure}"
+    );
 }
 
 async fn register_token(
@@ -496,23 +561,69 @@ fn build_tls_client(root_pem: &str) -> reqwest::Client {
         .expect("build TLS client")
 }
 
-async fn wait_for_tls_ready(
+async fn try_wait_for_tls_ready(
     responder: &mut ResponderProcess,
     admin_url: &str,
     client: &reqwest::Client,
-) {
+) -> ReadyOutcome {
     for _ in 0..STARTUP_RETRIES {
         if let Some(status) = responder.try_wait() {
             let stderr = responder.take_stderr();
-            panic!("responder exited early with {status}: {stderr}");
+            if is_bind_conflict(&stderr) {
+                return ReadyOutcome::BindConflict(stderr);
+            }
+            return ReadyOutcome::Failure(format!(
+                "responder exited early with {status}: {stderr}"
+            ));
         }
 
         match client.get(format!("{admin_url}{ADMIN_PATH}")).send().await {
-            Ok(_) => return,
+            Ok(_) => return ReadyOutcome::Ready,
             Err(_) => sleep(STARTUP_DELAY).await,
         }
     }
-    panic!("TLS responder did not become ready");
+    ReadyOutcome::Failure("TLS responder did not become ready".to_string())
+}
+
+/// TLS variant of `spawn_responder_retrying`.  Reserves fresh ports,
+/// writes the responder config, spawns the responder, and probes the
+/// TLS admin endpoint with `client` until it accepts connections.
+/// Retries on bind conflict.
+async fn spawn_responder_tls_retrying<F>(
+    config_path: &Path,
+    client: &reqwest::Client,
+    config_writer: F,
+) -> (ResponderProcess, String, String, String)
+where
+    F: Fn(&Path, &str, &str),
+{
+    let mut last_failure = String::new();
+    for attempt in 0..RESPONDER_BIND_ATTEMPTS {
+        let listen_addr = reserve_socket_addr();
+        let admin_addr = reserve_socket_addr();
+        config_writer(config_path, &listen_addr, &admin_addr);
+        let mut responder = ResponderProcess::spawn(config_path);
+        let admin_port = admin_addr
+            .split(':')
+            .next_back()
+            .expect("admin port present");
+        let admin_base_url = format!("https://localhost:{admin_port}");
+        match try_wait_for_tls_ready(&mut responder, &admin_base_url, client).await {
+            ReadyOutcome::Ready => return (responder, listen_addr, admin_addr, admin_base_url),
+            ReadyOutcome::BindConflict(stderr) => {
+                eprintln!(
+                    "responder bind conflict on attempt {} of {RESPONDER_BIND_ATTEMPTS}: {stderr}",
+                    attempt + 1,
+                );
+                last_failure = stderr;
+            }
+            ReadyOutcome::Failure(msg) => panic!("{msg}"),
+        }
+    }
+    panic!(
+        "responder failed to bind a reserved port after {RESPONDER_BIND_ATTEMPTS} attempts: \
+         {last_failure}"
+    );
 }
 
 async fn register_token_with_client(
@@ -547,9 +658,6 @@ async fn register_token_with_client(
 #[tokio::test]
 async fn test_http01_responder_serves_admin_api_over_tls() {
     let temp_dir = tempdir().expect("create temp dir");
-    let listen_addr = reserve_socket_addr();
-    let admin_addr = reserve_socket_addr();
-
     let pair = generate_ca_signed_cert_pair("localhost");
     let cert_path = temp_dir.path().join("cert.pem");
     let key_path = temp_dir.path().join("key.pem");
@@ -557,26 +665,17 @@ async fn test_http01_responder_serves_admin_api_over_tls() {
     fs::write(&key_path, &pair.key).expect("write key");
 
     let config_path = temp_dir.path().join("responder.toml");
-    write_responder_config_with_overrides(
-        &config_path,
-        &listen_addr,
-        &admin_addr,
-        "tls-secret",
-        &ResponderConfigOverrides {
-            tls_cert_path: Some(cert_path.to_string_lossy().into_owned()),
-            tls_key_path: Some(key_path.to_string_lossy().into_owned()),
-            ..ResponderConfigOverrides::default()
-        },
-    );
-
-    let mut responder = ResponderProcess::spawn(&config_path);
-    let admin_base_url = format!(
-        "https://localhost:{}",
-        admin_addr.split(':').next_back().unwrap()
-    );
+    let overrides = ResponderConfigOverrides {
+        tls_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+        tls_key_path: Some(key_path.to_string_lossy().into_owned()),
+        ..ResponderConfigOverrides::default()
+    };
     let client = build_tls_client(&pair.root);
-
-    wait_for_tls_ready(&mut responder, &admin_base_url, &client).await;
+    let (_responder, listen_addr, _admin_addr, admin_base_url) =
+        spawn_responder_tls_retrying(&config_path, &client, |path, listen, admin| {
+            write_responder_config_with_overrides(path, listen, admin, "tls-secret", &overrides);
+        })
+        .await;
 
     let response = register_token_with_client(
         &client,
@@ -602,9 +701,6 @@ async fn test_http01_responder_serves_admin_api_over_tls() {
 #[tokio::test]
 async fn test_http01_responder_reloads_tls_cert_on_sighup() {
     let temp_dir = tempdir().expect("create temp dir");
-    let listen_addr = reserve_socket_addr();
-    let admin_addr = reserve_socket_addr();
-
     let pair1 = generate_ca_signed_cert_pair("localhost");
     let cert_path = temp_dir.path().join("cert.pem");
     let key_path = temp_dir.path().join("key.pem");
@@ -612,24 +708,17 @@ async fn test_http01_responder_reloads_tls_cert_on_sighup() {
     fs::write(&key_path, &pair1.key).expect("write key");
 
     let config_path = temp_dir.path().join("responder.toml");
-    write_responder_config_with_overrides(
-        &config_path,
-        &listen_addr,
-        &admin_addr,
-        "reload-secret",
-        &ResponderConfigOverrides {
-            tls_cert_path: Some(cert_path.to_string_lossy().into_owned()),
-            tls_key_path: Some(key_path.to_string_lossy().into_owned()),
-            ..ResponderConfigOverrides::default()
-        },
-    );
-
-    let mut responder = ResponderProcess::spawn(&config_path);
-    let admin_port = admin_addr.split(':').next_back().unwrap();
-    let admin_base_url = format!("https://localhost:{admin_port}");
+    let overrides = ResponderConfigOverrides {
+        tls_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+        tls_key_path: Some(key_path.to_string_lossy().into_owned()),
+        ..ResponderConfigOverrides::default()
+    };
     let client1 = build_tls_client(&pair1.root);
-
-    wait_for_tls_ready(&mut responder, &admin_base_url, &client1).await;
+    let (mut responder, _listen_addr, _admin_addr, admin_base_url) =
+        spawn_responder_tls_retrying(&config_path, &client1, |path, listen, admin| {
+            write_responder_config_with_overrides(path, listen, admin, "reload-secret", &overrides);
+        })
+        .await;
 
     // Swap cert+key on disk with a cert from a different CA.
     let pair2 = generate_ca_signed_cert_pair("localhost");
