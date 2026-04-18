@@ -792,7 +792,12 @@ OpenBao와 통신해 값을 갱신합니다.
 
 #### `rotate db`
 
-- `--db-admin-dsn`: DB 관리자 DSN (환경 변수 `BOOTROOT_DB_ADMIN_DSN`)
+- `--db-admin-dsn`: DB 관리자 DSN (환경 변수 `BOOTROOT_DB_ADMIN_DSN`).
+  `ca.json`이 있으면(즉, `bootroot init --enable db-provision`으로 생성된
+  경우) 선택 사항입니다. bootroot가 `ca.json`의 `db.dataSource` 필드에서
+  현재 관리자 DSN을 자동으로 읽어옵니다. 값을 재정의하려면 플래그를 명시적
+  으로 지정하고, `ca.json`이 없고 대화형 프롬프트를 피하고 싶을 때도 직접
+  지정하세요.
 - `--db-password`: 새 DB 비밀번호
   (선택, 미지정 시 자동 생성, 환경 변수: `BOOTROOT_DB_PASSWORD`)
 - `--db-timeout-secs`: DB 점검 타임아웃(초, 기본값 `2`)

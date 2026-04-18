@@ -166,6 +166,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- `bootroot rotate db` now auto-reads the current PostgreSQL admin DSN
+  from `ca.json`'s `db.dataSource` field when `--db-admin-dsn` is
+  omitted. Previously operators had to copy the DSN out of `ca.json`
+  manually because the password in `.env`'s `POSTGRES_PASSWORD` diverges
+  from the live credential after `init --enable db-provision`. The flag
+  still overrides the discovered value when explicitly provided, and the
+  command falls through to the interactive prompt only when `ca.json` is
+  absent. A present-but-broken `ca.json` now fails fast instead of
+  prompting for a DSN that would likely be wrong. (Closes #517)
 - Added rotation cadence guidance to `service add`, `service update`,
   and `init` CLI output. `init` always prints the rotation-cadence
   note; `service add` and `service update` print it when

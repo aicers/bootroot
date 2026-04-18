@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::time::Duration;
 
@@ -27,7 +28,8 @@ pub(super) async fn rotate_db(
     confirm_action(messages.prompt_rotate_db(), auto_confirm, messages)?;
     ensure_postgres_localhost_binding(&ctx.compose_file, messages)?;
 
-    let admin_dsn = resolve_db_admin_dsn(args, messages)?;
+    let ca_json_path = ctx.paths.ca_json();
+    let admin_dsn = resolve_db_admin_dsn(args, &ca_json_path, messages)?;
     let admin = db::parse_db_dsn(&admin_dsn).with_context(|| messages.error_invalid_db_dsn())?;
     ensure_single_host_db_host(&admin.host, messages)?;
     let db_password = match &args.password {
@@ -35,7 +37,6 @@ pub(super) async fn rotate_db(
         None => bootroot::utils::generate_secret(SECRET_BYTES)
             .with_context(|| messages.error_generate_secret_failed())?,
     };
-    let ca_json_path = ctx.paths.ca_json();
     let current_dsn = read_ca_json_dsn(&ca_json_path, messages)?;
     let parsed = db::parse_db_dsn(&current_dsn).with_context(|| messages.error_invalid_db_dsn())?;
     ensure_single_host_db_host(&parsed.host, messages)?;
@@ -91,9 +92,22 @@ pub(super) async fn rotate_db(
     Ok(())
 }
 
-fn resolve_db_admin_dsn(args: &RotateDbArgs, messages: &Messages) -> Result<String> {
+fn resolve_db_admin_dsn(
+    args: &RotateDbArgs,
+    ca_json_path: &Path,
+    messages: &Messages,
+) -> Result<String> {
     if let Some(value) = &args.admin_dsn.admin_dsn {
         return Ok(value.clone());
+    }
+    // Only fall through to the interactive prompt when ca.json is
+    // definitively absent. Any other I/O failure (permission denied,
+    // unreadable parent, malformed contents, missing fields) is surfaced
+    // as a hard error so a broken environment does not silently prompt
+    // for a DSN that would likely be wrong — and cannot trigger the
+    // non-interactive EOF loop in `Prompt::prompt_with_validation`.
+    if let Some(dsn) = read_ca_json_dsn_if_present(ca_json_path, messages)? {
+        return Ok(dsn);
     }
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout();
@@ -103,11 +117,24 @@ fn resolve_db_admin_dsn(args: &RotateDbArgs, messages: &Messages) -> Result<Stri
     })
 }
 
+fn read_ca_json_dsn_if_present(path: &Path, messages: &Messages) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => parse_ca_json_dsn(&contents, messages).map(Some),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow::Error::new(err)
+            .context(messages.error_read_file_failed(&path.display().to_string()))),
+    }
+}
+
 fn read_ca_json_dsn(path: &Path, messages: &Messages) -> Result<String> {
     let contents = fs::read_to_string(path)
         .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+    parse_ca_json_dsn(&contents, messages)
+}
+
+fn parse_ca_json_dsn(contents: &str, messages: &Messages) -> Result<String> {
     let value: serde_json::Value =
-        serde_json::from_str(&contents).context(messages.error_parse_ca_json_failed())?;
+        serde_json::from_str(contents).context(messages.error_parse_ca_json_failed())?;
     let db = value
         .get("db")
         .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
@@ -131,6 +158,13 @@ mod tests {
     #[test]
     fn resolve_db_admin_dsn_uses_cli_arg() {
         let messages = test_messages();
+        let dir = tempdir().expect("tempdir");
+        let ca_json = dir.path().join("ca.json");
+        fs::write(
+            &ca_json,
+            r#"{"db":{"type":"postgresql","dataSource":"postgresql://step:other@postgres:5432/stepca"}}"#,
+        )
+        .expect("write ca.json");
         let args = RotateDbArgs {
             admin_dsn: DbAdminDsnArgs {
                 admin_dsn: Some("postgresql://admin:pass@127.0.0.1:15432/postgres".to_string()),
@@ -138,8 +172,95 @@ mod tests {
             password: None,
             timeout: DbTimeoutArgs { timeout_secs: 30 },
         };
-        let resolved = resolve_db_admin_dsn(&args, &messages).expect("resolve dsn");
+        let resolved = resolve_db_admin_dsn(&args, &ca_json, &messages).expect("resolve dsn");
         assert_eq!(resolved, "postgresql://admin:pass@127.0.0.1:15432/postgres");
+    }
+
+    #[test]
+    fn resolve_db_admin_dsn_reads_from_ca_json_when_flag_absent() {
+        let messages = test_messages();
+        let dir = tempdir().expect("tempdir");
+        let ca_json = dir.path().join("ca.json");
+        fs::write(
+            &ca_json,
+            r#"{"db":{"type":"postgresql","dataSource":"postgresql://step:current@postgres:5432/stepca?sslmode=disable"}}"#,
+        )
+        .expect("write ca.json");
+        let args = RotateDbArgs {
+            admin_dsn: DbAdminDsnArgs { admin_dsn: None },
+            password: None,
+            timeout: DbTimeoutArgs { timeout_secs: 30 },
+        };
+        let resolved = resolve_db_admin_dsn(&args, &ca_json, &messages).expect("resolve dsn");
+        assert_eq!(
+            resolved,
+            "postgresql://step:current@postgres:5432/stepca?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn resolve_db_admin_dsn_errors_when_ca_json_malformed() {
+        let messages = test_messages();
+        let dir = tempdir().expect("tempdir");
+        let ca_json = dir.path().join("ca.json");
+        fs::write(&ca_json, "not valid json").expect("write ca.json");
+        let args = RotateDbArgs {
+            admin_dsn: DbAdminDsnArgs { admin_dsn: None },
+            password: None,
+            timeout: DbTimeoutArgs { timeout_secs: 30 },
+        };
+        let err = resolve_db_admin_dsn(&args, &ca_json, &messages)
+            .expect_err("expected error on malformed ca.json");
+        assert!(
+            err.to_string().contains("ca.json")
+                || err
+                    .chain()
+                    .any(|cause| cause.to_string().contains("ca.json"))
+        );
+    }
+
+    #[test]
+    fn resolve_db_admin_dsn_errors_when_ca_json_unreadable() {
+        // Regression test for the `exists()` vs. `NotFound` distinction:
+        // a present-but-unreadable ca.json must surface as a hard error
+        // rather than falling through to the interactive prompt. We
+        // simulate an I/O failure other than NotFound by pointing at a
+        // directory entry, which makes `read_to_string` fail without
+        // returning `ErrorKind::NotFound`.
+        let messages = test_messages();
+        let dir = tempdir().expect("tempdir");
+        let ca_json = dir.path().join("ca.json");
+        fs::create_dir(&ca_json).expect("create ca.json as directory");
+        let args = RotateDbArgs {
+            admin_dsn: DbAdminDsnArgs { admin_dsn: None },
+            password: None,
+            timeout: DbTimeoutArgs { timeout_secs: 30 },
+        };
+        let err = resolve_db_admin_dsn(&args, &ca_json, &messages)
+            .expect_err("expected error when ca.json is unreadable");
+        assert!(
+            err.to_string().contains("ca.json")
+                || err
+                    .chain()
+                    .any(|cause| cause.to_string().contains("ca.json")),
+            "error should mention ca.json: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_db_admin_dsn_errors_when_ca_json_missing_data_source() {
+        let messages = test_messages();
+        let dir = tempdir().expect("tempdir");
+        let ca_json = dir.path().join("ca.json");
+        fs::write(&ca_json, r#"{"db":{"type":"postgresql"}}"#).expect("write ca.json");
+        let args = RotateDbArgs {
+            admin_dsn: DbAdminDsnArgs { admin_dsn: None },
+            password: None,
+            timeout: DbTimeoutArgs { timeout_secs: 30 },
+        };
+        let err = resolve_db_admin_dsn(&args, &ca_json, &messages)
+            .expect_err("expected error when dataSource missing");
+        assert!(err.to_string().contains("ca.json"));
     }
 
     #[test]
