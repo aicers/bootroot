@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+
+# shellcheck source=lib/audit-log.sh
+. "$SCRIPT_DIR/lib/audit-log.sh"
 
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-local-lifecycle-$(date +%s)}"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
@@ -798,6 +802,10 @@ main() {
 
   run_verify_pair "initial"
   run_rotations_with_verification
+
+  log_phase "assert-openbao-audit-log"
+  assert_openbao_audit_log
+
   write_manifest
 }
 
