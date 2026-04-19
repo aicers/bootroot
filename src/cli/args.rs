@@ -556,7 +556,7 @@ pub(crate) struct OpenbaoDeleteUnsealKeysArgs {
     pub(crate) secrets_dir: PathBuf,
 }
 
-#[derive(ValueEnum, Debug, Clone, Copy)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MonitoringProfile {
     Lan,
     Public,
