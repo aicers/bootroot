@@ -661,7 +661,12 @@ async fn maybe_rotate_env_db_password(
         return Ok(None);
     }
 
-    let new_dsn = bootroot::db::build_db_dsn(
+    // Rebuild from the parsed fields so the new password takes effect, then
+    // force the host/port pair back to the compose-internal values. Routing
+    // through `for_compose_runtime` holds the "step-ca DSN stored in KV is
+    // always compose-internal" invariant regardless of whether the
+    // previously-stored DSN was correct.
+    let rebuilt_dsn = bootroot::db::build_db_dsn(
         &parsed.user,
         &new_password,
         &parsed.host,
@@ -669,6 +674,10 @@ async fn maybe_rotate_env_db_password(
         &parsed.database,
         parsed.sslmode.as_deref(),
     );
+    let Ok(new_dsn) = bootroot::db::for_compose_runtime(&rebuilt_dsn) else {
+        eprintln!("{}", messages.warning_db_password_rotation_skipped());
+        return Ok(None);
+    };
 
     // Write new DSN to OpenBao KV.
     client

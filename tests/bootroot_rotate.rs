@@ -1964,9 +1964,12 @@ async fn test_rotate_db_writes_kv_and_restarts_stepca() {
     let docker_log = temp_dir.path().join("docker.log");
     write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
 
-    // The new DSN that `rotate_db` will build after provisioning.
+    // The new DSN that `rotate_db` will build after provisioning. The rotate
+    // path routes the stored step-ca DSN through `for_compose_runtime`, so
+    // host/port flip to the compose-internal pair (`postgres:5432`)
+    // regardless of the admin/current DSN's host-side host/port.
     let expected_new_dsn =
-        format!("postgresql://step:new-db-pass-123@127.0.0.1:{pg_port}/stepca?sslmode=disable");
+        "postgresql://step:new-db-pass-123@postgres:5432/stepca?sslmode=disable".to_string();
 
     stub_openbao_for_db_rotation(&openbao, &expected_new_dsn).await;
 
@@ -2045,6 +2048,119 @@ async fn test_rotate_db_writes_kv_and_restarts_stepca() {
     assert!(
         rendered.contains("new-db-pass-123"),
         "ca.json should contain the new password:\n{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_db_self_heals_corrupted_compose_port() {
+    // Regression for issue #542 Symptom 1: a step-ca DSN previously
+    // written to KV / ca.json with a non-canonical (host, port) pair
+    // (e.g. `postgres:5433`) must be rewritten back to the canonical
+    // compose pair (`postgres:5432`) on the next `rotate db`. The fix is
+    // that `rotate db` routes the rebuilt new DSN through
+    // `for_compose_runtime` before writing, so the invariant holds
+    // regardless of what the previously-stored value was.
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    let (pg_port, _pg_handle) = start_mock_postgres();
+
+    let admin_dsn =
+        format!("postgresql://admin:adminpass@127.0.0.1:{pg_port}/postgres?sslmode=disable");
+    // Corrupted current DSN: compose-internal host paired with the
+    // host-side published port. Represents what Symptom 1 stored.
+    let current_dsn = "postgresql://step:old-pass@postgres:5433/stepca?sslmode=disable";
+
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    let secrets_dir = temp_dir.path().join("secrets");
+    fs::create_dir_all(secrets_dir.join("config")).expect("create config dir");
+    fs::write(
+        secrets_dir.join("config").join("ca.json"),
+        serde_json::to_string(&json!({
+            "db": {
+                "type": "postgresql",
+                "dataSource": current_dsn
+            }
+        }))
+        .expect("serialize ca.json"),
+    )
+    .expect("write ca.json");
+
+    let compose_file = temp_dir.path().join("docker-compose.yml");
+    fs::write(&compose_file, "services: {}\n").expect("write compose file");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+
+    // After rotation, the step-ca DSN must be the canonical compose pair
+    // — *not* `postgres:5433` (the corrupted input).
+    let expected_new_dsn =
+        "postgresql://step:new-db-pass-123@postgres:5432/stepca?sslmode=disable".to_string();
+
+    stub_openbao_for_db_rotation(&openbao, &expected_new_dsn).await;
+
+    let path_env = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path_env);
+    let render_source = secrets_dir.join("config").join("ca.json.new");
+    fs::write(
+        &render_source,
+        serde_json::to_string(&json!({
+            "db": {
+                "type": "postgresql",
+                "dataSource": expected_new_dsn
+            }
+        }))
+        .expect("serialize new ca.json"),
+    )
+    .expect("write ca.json.new");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--compose-file",
+            compose_file.to_string_lossy().as_ref(),
+            "--yes",
+            "db",
+            "--db-admin-dsn",
+            &admin_dsn,
+            "--db-password",
+            "new-db-pass-123",
+        ])
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
+        .env("RENDER_SOURCE", &render_source)
+        .env("RENDER_TARGET", secrets_dir.join("config").join("ca.json"))
+        .output()
+        .expect("run rotate db");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The wiremock stub only matches the canonical compose DSN. If the
+    // corrupted port had leaked through, the KV POST would 404 and
+    // `rotate db` would fail. A successful exit status plus the rendered
+    // ca.json containing `postgres:5432` confirms the self-heal.
+    let rendered = fs::read_to_string(secrets_dir.join("config").join("ca.json"))
+        .expect("read rendered ca.json");
+    assert!(
+        rendered.contains("postgres:5432"),
+        "rendered ca.json should self-heal to postgres:5432:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("postgres:5433"),
+        "rendered ca.json must not preserve the corrupted port:\n{rendered}"
     );
 }
 

@@ -22,6 +22,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot init` storing the host-side PostgreSQL port in the
+  step-ca DSN written to OpenBao KV / `ca.json` when
+  `POSTGRES_HOST_PORT` differed from `5432`, and fixed `bootroot rotate
+  db` reading that compose-internal DSN back verbatim so the host-side
+  command could not resolve `postgres:5432`. A single DSN translation
+  layer (`bootroot::db::for_compose_runtime` /
+  `bootroot::db::for_host_runtime`) now owns the host/port rewrite at
+  every step-ca DSN read/write site, and `rotate db` self-heals a
+  previously-corrupted stored DSN on the next rotation. Only `sslmode`
+  is preserved across translation; other query parameters are dropped.
+  (Closes #542)
 - Fixed daemon-mode retries silently dropping CLI overrides (`--email`,
   `--ca-url`, `--http-responder-url`, `--http-responder-hmac`). The retry
   path reloaded the config file from disk without re-applying CLI-provided

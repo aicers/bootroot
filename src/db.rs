@@ -1,8 +1,23 @@
 use std::net::ToSocketAddrs;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use postgres::NoTls;
+
+/// Hostname that step-ca uses to reach `PostgreSQL` from inside the compose
+/// network.
+pub const DB_COMPOSE_HOST: &str = "postgres";
+/// Port `PostgreSQL` listens on inside the compose network. Independent of
+/// `POSTGRES_HOST_PORT`, which is strictly the host-side published port.
+pub const DB_COMPOSE_PORT: u16 = 5432;
+/// Hostname host-side tooling uses to reach the `PostgreSQL` container through
+/// its published port mapping.
+pub const DB_HOST_RUNTIME_HOST: &str = "127.0.0.1";
+/// Fallback port for host-side resolution when `POSTGRES_HOST_PORT` is unset.
+pub const DEFAULT_POSTGRES_HOST_PORT: u16 = 5432;
+/// Environment variable that controls the host-side published port.
+pub const POSTGRES_HOST_PORT_ENV: &str = "POSTGRES_HOST_PORT";
 
 #[derive(Debug, Clone)]
 pub struct DbDsn {
@@ -80,6 +95,123 @@ pub fn build_db_dsn(
 ) -> String {
     let sslmode = sslmode.unwrap_or("disable");
     format!("postgresql://{user}:{password}@{host}:{port}/{database}?sslmode={sslmode}")
+}
+
+/// Translates a DSN into its compose-internal form.
+///
+/// Rewrites the host to [`DB_COMPOSE_HOST`] and the port to
+/// [`DB_COMPOSE_PORT`] so step-ca (running inside the compose network) can
+/// reach `PostgreSQL` regardless of the host-side published port.
+///
+/// Preserves user, password, database, and the `sslmode` query parameter.
+/// Other query parameters are dropped — see [`parse_db_dsn`] /
+/// [`build_db_dsn`].
+///
+/// # Errors
+///
+/// Returns an error when the DSN is malformed.
+pub fn for_compose_runtime(dsn: &str) -> Result<String> {
+    let parsed = parse_db_dsn(dsn)?;
+    Ok(build_db_dsn(
+        &parsed.user,
+        &parsed.password,
+        DB_COMPOSE_HOST,
+        DB_COMPOSE_PORT,
+        &parsed.database,
+        parsed.sslmode.as_deref(),
+    ))
+}
+
+/// Translates a DSN into its host-side form.
+///
+/// Rewrites the host to [`DB_HOST_RUNTIME_HOST`] and the port to the value
+/// resolved by [`resolve_postgres_host_port`] (process env
+/// `POSTGRES_HOST_PORT`, else `compose_dir/.env`, else
+/// [`DEFAULT_POSTGRES_HOST_PORT`]).
+///
+/// Preserves user, password, database, and the `sslmode` query parameter.
+/// Other query parameters are dropped — see [`parse_db_dsn`] /
+/// [`build_db_dsn`].
+///
+/// # Errors
+///
+/// Returns an error when the DSN is malformed.
+pub fn for_host_runtime(dsn: &str, compose_dir: &Path) -> Result<String> {
+    let port = resolve_postgres_host_port(compose_dir);
+    for_host_runtime_with_port(dsn, port)
+}
+
+/// Variant of [`for_host_runtime`] that accepts an explicit port so tests can
+/// stub out the env/`.env` resolution without touching process state.
+///
+/// # Errors
+///
+/// Returns an error when the DSN is malformed.
+pub fn for_host_runtime_with_port(dsn: &str, port: u16) -> Result<String> {
+    let parsed = parse_db_dsn(dsn)?;
+    Ok(build_db_dsn(
+        &parsed.user,
+        &parsed.password,
+        DB_HOST_RUNTIME_HOST,
+        port,
+        &parsed.database,
+        parsed.sslmode.as_deref(),
+    ))
+}
+
+/// Resolves the host-side `PostgreSQL` port with the same precedence Docker
+/// Compose uses for `${POSTGRES_HOST_PORT:-5432}` in the compose file port
+/// mapping:
+///
+/// 1. process environment `POSTGRES_HOST_PORT` (non-empty), else
+/// 2. `POSTGRES_HOST_PORT` from `compose_dir/.env`, else
+/// 3. [`DEFAULT_POSTGRES_HOST_PORT`].
+///
+/// A present-but-unparseable value falls through to the next source rather
+/// than erroring — the caller is translating a DSN, not validating the
+/// environment.
+#[must_use]
+pub fn resolve_postgres_host_port(compose_dir: &Path) -> u16 {
+    if let Ok(value) = std::env::var(POSTGRES_HOST_PORT_ENV)
+        && !value.is_empty()
+        && let Ok(port) = value.parse::<u16>()
+    {
+        return port;
+    }
+    if let Some(port) = read_env_file_value(compose_dir, POSTGRES_HOST_PORT_ENV)
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        return port;
+    }
+    DEFAULT_POSTGRES_HOST_PORT
+}
+
+fn read_env_file_value(compose_dir: &Path, key: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(compose_dir.join(".env")).ok()?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (k, v) = trimmed.split_once('=')?;
+        if k.trim() != key {
+            continue;
+        }
+        let value = v.trim();
+        let stripped = if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        };
+        if stripped.is_empty() {
+            return None;
+        }
+        return Some(stripped.to_string());
+    }
+    None
 }
 
 /// Validates that a DB identifier is safe to embed in SQL.
@@ -400,5 +532,132 @@ mod tests {
         let sql = create_role_with_password_sql(&quote_ident("step"), &quote_literal("pass'word"));
         assert_eq!(sql, "CREATE ROLE \"step\" WITH LOGIN PASSWORD 'pass''word'");
         assert!(!sql.contains("$1"));
+    }
+
+    #[test]
+    fn for_compose_runtime_rewrites_host_and_port() {
+        let dsn = "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=disable";
+        let translated = for_compose_runtime(dsn).unwrap();
+        assert_eq!(
+            translated,
+            "postgresql://step:pw@postgres:5432/stepca?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn for_compose_runtime_self_heals_corrupted_compose_port() {
+        // Regression for Symptom 1: a previously-corrupted DSN that stored
+        // the host-side port alongside the compose-internal host must be
+        // rewritten back to the canonical compose pair on the next write.
+        let dsn = "postgresql://step:pw@postgres:5433/stepca?sslmode=disable";
+        let translated = for_compose_runtime(dsn).unwrap();
+        assert_eq!(
+            translated,
+            "postgresql://step:pw@postgres:5432/stepca?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn for_compose_runtime_preserves_sslmode() {
+        let dsn = "postgresql://step:pw@localhost:5432/stepca?sslmode=require";
+        let translated = for_compose_runtime(dsn).unwrap();
+        assert!(translated.ends_with("sslmode=require"));
+    }
+
+    #[test]
+    fn for_host_runtime_rewrites_host_and_port() {
+        let dsn = "postgresql://step:pw@postgres:5432/stepca?sslmode=disable";
+        let translated = for_host_runtime_with_port(dsn, 5433).unwrap();
+        assert_eq!(
+            translated,
+            "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn host_compose_round_trip_with_env_file() {
+        // Round-trip symmetry: host -> compose -> host returns the original
+        // (host, port) pair, with compose_dir/.env providing
+        // POSTGRES_HOST_PORT.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "POSTGRES_HOST_PORT=5433\n").expect("write .env");
+        // Ensure process env does not override the file value.
+        let _guard = env_port_guard();
+        let host_dsn = "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=disable";
+        let compose = for_compose_runtime(host_dsn).unwrap();
+        assert_eq!(
+            compose,
+            "postgresql://step:pw@postgres:5432/stepca?sslmode=disable"
+        );
+        let round_trip = for_host_runtime(&compose, dir.path()).unwrap();
+        assert_eq!(round_trip, host_dsn);
+    }
+
+    #[test]
+    fn resolve_postgres_host_port_prefers_process_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "POSTGRES_HOST_PORT=9999\n").expect("write .env");
+        let _guard = env_port_guard();
+        // SAFETY: `env_port_guard` serializes POSTGRES_HOST_PORT access and
+        // restores the value on drop.
+        unsafe {
+            std::env::set_var(POSTGRES_HOST_PORT_ENV, "7777");
+        }
+        assert_eq!(resolve_postgres_host_port(dir.path()), 7777);
+    }
+
+    #[test]
+    fn resolve_postgres_host_port_defaults_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = env_port_guard();
+        assert_eq!(resolve_postgres_host_port(dir.path()), 5432);
+    }
+
+    #[test]
+    fn resolve_postgres_host_port_reads_env_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".env"),
+            "# comment\nOTHER=1\nPOSTGRES_HOST_PORT=\"5433\"\n",
+        )
+        .expect("write .env");
+        let _guard = env_port_guard();
+        assert_eq!(resolve_postgres_host_port(dir.path()), 5433);
+    }
+
+    /// Guards `POSTGRES_HOST_PORT` across tests that read/write process env.
+    struct EnvPortGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvPortGuard {
+        fn drop(&mut self) {
+            // SAFETY: restored inside the shared mutex held by `_lock`.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(POSTGRES_HOST_PORT_ENV, value),
+                    None => std::env::remove_var(POSTGRES_HOST_PORT_ENV),
+                }
+            }
+        }
+    }
+
+    fn env_port_guard() -> EnvPortGuard {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var(POSTGRES_HOST_PORT_ENV).ok();
+        // SAFETY: removal is serialized by the mutex above.
+        unsafe {
+            std::env::remove_var(POSTGRES_HOST_PORT_ENV);
+        }
+        EnvPortGuard {
+            _lock: lock,
+            previous,
+        }
     }
 }

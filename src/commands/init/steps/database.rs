@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bootroot::db::{
-    DbDsn, build_db_dsn, check_auth_sync, check_tcp, parse_db_dsn, provision_db_sync,
-    validate_db_identifier,
+    DB_COMPOSE_HOST, DbDsn, build_db_dsn, check_auth_sync, check_tcp, for_compose_runtime,
+    parse_db_dsn, provision_db_sync, validate_db_identifier,
 };
 
 use super::super::constants::{DEFAULT_DB_NAME, DEFAULT_DB_USER, SECRET_BYTES};
@@ -13,8 +13,6 @@ use super::prompts::{prompt_text, prompt_text_with_default};
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::commands::guardrails::is_single_host_db_host;
 use crate::i18n::Messages;
-
-const DB_COMPOSE_HOST: &str = "postgres";
 
 pub(super) async fn resolve_db_dsn_for_init(
     args: &InitArgs,
@@ -27,15 +25,17 @@ pub(super) async fn resolve_db_dsn_for_init(
         let inputs = resolve_db_provision_inputs(args, messages)?;
         let admin = parse_db_dsn(&inputs.admin_dsn)
             .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-        let effective_host = normalize_db_host_for_compose_runtime(&admin.host, messages)?;
-        let dsn = build_db_dsn(
+        ensure_db_host_reachable_from_compose(&admin.host, messages)?;
+        let host_side_dsn = build_db_dsn(
             &inputs.db_user,
             &inputs.db_password,
-            &effective_host,
+            &admin.host,
             admin.port,
             &inputs.db_name,
             admin.sslmode.as_deref(),
         );
+        let dsn = for_compose_runtime(&host_side_dsn)
+            .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
         let timeout = Duration::from_secs(args.db_timeout.timeout_secs);
         tokio::task::spawn_blocking(move || {
             provision_db_sync(
@@ -52,31 +52,21 @@ pub(super) async fn resolve_db_dsn_for_init(
             dsn,
             DbDsnNormalization {
                 original_host: admin.host,
-                effective_host,
+                effective_host: DB_COMPOSE_HOST.to_string(),
             },
         ));
     }
     let dsn = resolve_db_dsn(args, messages)?;
     let parsed =
         parse_db_dsn(&dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-    let effective_host = normalize_db_host_for_compose_runtime(&parsed.host, messages)?;
-    let effective_dsn = if parsed.host == effective_host {
-        dsn
-    } else {
-        build_db_dsn(
-            &parsed.user,
-            &parsed.password,
-            &effective_host,
-            parsed.port,
-            &parsed.database,
-            parsed.sslmode.as_deref(),
-        )
-    };
+    ensure_db_host_reachable_from_compose(&parsed.host, messages)?;
+    let effective_dsn =
+        for_compose_runtime(&dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
     Ok((
         effective_dsn,
         DbDsnNormalization {
             original_host: parsed.host,
-            effective_host,
+            effective_host: DB_COMPOSE_HOST.to_string(),
         },
     ))
 }
@@ -206,15 +196,9 @@ pub(super) async fn check_db_connectivity(
     Ok(())
 }
 
-fn normalize_db_host_for_compose_runtime(host: &str, messages: &Messages) -> Result<String> {
-    if host.eq_ignore_ascii_case(DB_COMPOSE_HOST) {
-        return Ok(DB_COMPOSE_HOST.to_string());
-    }
-    if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
-        return Ok(DB_COMPOSE_HOST.to_string());
-    }
+fn ensure_db_host_reachable_from_compose(host: &str, messages: &Messages) -> Result<()> {
     if is_single_host_db_host(host) {
-        return Ok(host.to_string());
+        return Ok(());
     }
     anyhow::bail!(messages.error_db_host_compose_runtime(host, DB_COMPOSE_HOST));
 }
@@ -291,16 +275,41 @@ mod tests {
             .expect("runtime")
             .block_on(resolve_db_dsn_for_init(&args, &test_messages()))
             .expect("dsn should resolve");
-        assert_eq!(dsn, "postgresql://user:pass@postgres:5432/stepca");
+        assert_eq!(
+            dsn,
+            "postgresql://user:pass@postgres:5432/stepca?sslmode=disable"
+        );
         assert_eq!(normalization.original_host, "postgres");
         assert_eq!(normalization.effective_host, "postgres");
     }
 
     #[test]
-    fn test_normalize_db_host_for_compose_runtime_localhost() {
-        let normalized =
-            normalize_db_host_for_compose_runtime("127.0.0.1", &test_messages()).unwrap();
-        assert_eq!(normalized, "postgres");
+    fn test_resolve_db_dsn_for_init_rewrites_host_port() {
+        // Regression for Symptom 1: a host-side DSN with a non-5432 port
+        // (POSTGRES_HOST_PORT territory) must not leak into the stored
+        // compose-internal DSN. Both host and port flip to the compose
+        // pair.
+        let _guard = env_lock();
+        let mut args = default_init_args();
+        args.db_dsn = Some("postgresql://user:pass@127.0.0.1:5433/stepca".to_string());
+
+        let (dsn, normalization) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(resolve_db_dsn_for_init(&args, &test_messages()))
+            .expect("dsn should resolve");
+        assert_eq!(
+            dsn,
+            "postgresql://user:pass@postgres:5432/stepca?sslmode=disable"
+        );
+        assert_eq!(normalization.original_host, "127.0.0.1");
+        assert_eq!(normalization.effective_host, "postgres");
+    }
+
+    #[test]
+    fn test_ensure_db_host_reachable_from_compose_accepts_local() {
+        ensure_db_host_reachable_from_compose("127.0.0.1", &test_messages()).unwrap();
+        ensure_db_host_reachable_from_compose("localhost", &test_messages()).unwrap();
+        ensure_db_host_reachable_from_compose("postgres", &test_messages()).unwrap();
     }
 
     #[test]
