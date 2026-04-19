@@ -898,6 +898,11 @@ pub(crate) struct VerifyArgs {
 
     #[command(flatten)]
     pub(crate) db_timeout: DbTimeoutArgs,
+
+    /// Compose file whose sibling `.env` provides `POSTGRES_HOST_PORT` for
+    /// host-side DSN translation when `--db-check` is set.
+    #[command(flatten)]
+    pub(crate) compose_file: ComposeFileArgs,
 }
 
 #[cfg(test)]

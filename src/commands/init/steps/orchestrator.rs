@@ -661,7 +661,12 @@ async fn maybe_rotate_env_db_password(
         return Ok(None);
     }
 
-    let new_dsn = bootroot::db::build_db_dsn(
+    // Rebuild with the new password then route through `for_compose_runtime`
+    // so this write site shares the single translation layer with `init`'s
+    // initial DSN build and `rotate db`'s rebuilt DSN. Routing through the
+    // helper also self-heals a previously-corrupted stored DSN regardless of
+    // whether the prior write was correct.
+    let rebuilt_dsn = bootroot::db::build_db_dsn(
         &parsed.user,
         &new_password,
         &parsed.host,
@@ -669,6 +674,8 @@ async fn maybe_rotate_env_db_password(
         &parsed.database,
         parsed.sslmode.as_deref(),
     );
+    let new_dsn = bootroot::db::for_compose_runtime(&rebuilt_dsn)
+        .with_context(|| messages.error_invalid_db_dsn())?;
 
     // Write new DSN to OpenBao KV.
     client

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bootroot::db;
+use bootroot::db::{self, for_compose_runtime, for_host_runtime};
 use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{
@@ -29,7 +29,12 @@ pub(super) async fn rotate_db(
     ensure_postgres_localhost_binding(&ctx.compose_file, messages)?;
 
     let ca_json_path = ctx.paths.ca_json();
-    let admin_dsn = resolve_db_admin_dsn(args, &ca_json_path, messages)?;
+    let compose_dir = ctx
+        .compose_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let admin_dsn = resolve_db_admin_dsn(args, &ca_json_path, &compose_dir, messages)?;
     let admin = db::parse_db_dsn(&admin_dsn).with_context(|| messages.error_invalid_db_dsn())?;
     ensure_single_host_db_host(&admin.host, messages)?;
     let db_password = match &args.password {
@@ -61,7 +66,11 @@ pub(super) async fn rotate_db(
     .await
     .context("DB provisioning task panicked")?
     .with_context(|| messages.error_db_provision_task_failed())?;
-    let new_dsn = db::build_db_dsn(
+    // Rebuild with the new password then force the stored DSN back to its
+    // compose-internal form. Routing through `for_compose_runtime` also
+    // self-heals a DSN that was previously written with a bad host/port
+    // pair (e.g. `postgres:5433` from Symptom 1 of issue #542).
+    let rebuilt_dsn = db::build_db_dsn(
         &parsed.user,
         &db_password,
         &parsed.host,
@@ -69,6 +78,8 @@ pub(super) async fn rotate_db(
         &parsed.database,
         parsed.sslmode.as_deref(),
     );
+    let new_dsn =
+        for_compose_runtime(&rebuilt_dsn).with_context(|| messages.error_invalid_db_dsn())?;
 
     client
         .write_kv(
@@ -95,8 +106,12 @@ pub(super) async fn rotate_db(
 fn resolve_db_admin_dsn(
     args: &RotateDbArgs,
     ca_json_path: &Path,
+    compose_dir: &Path,
     messages: &Messages,
 ) -> Result<String> {
+    // `--db-admin-dsn` is an override for operators with non-standard
+    // topologies. Its value is used verbatim and bypasses the host-side
+    // translation below.
     if let Some(value) = &args.admin_dsn.admin_dsn {
         return Ok(value.clone());
     }
@@ -107,7 +122,11 @@ fn resolve_db_admin_dsn(
     // for a DSN that would likely be wrong — and cannot trigger the
     // non-interactive EOF loop in `Prompt::prompt_with_validation`.
     if let Some(dsn) = read_ca_json_dsn_if_present(ca_json_path, messages)? {
-        return Ok(dsn);
+        // The ca.json DSN is compose-internal (host `postgres`, port
+        // `5432`). `rotate db` runs on the host, so translate it back to
+        // the host-side pair before use.
+        return for_host_runtime(&dsn, compose_dir)
+            .with_context(|| messages.error_invalid_db_dsn());
     }
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout();
@@ -151,7 +170,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::super::test_support::test_messages;
+    use super::super::test_support::{ScopedEnvVar, env_lock, test_messages};
     use super::*;
     use crate::cli::args::{DbAdminDsnArgs, DbTimeoutArgs};
 
@@ -172,12 +191,43 @@ mod tests {
             password: None,
             timeout: DbTimeoutArgs { timeout_secs: 30 },
         };
-        let resolved = resolve_db_admin_dsn(&args, &ca_json, &messages).expect("resolve dsn");
+        let resolved =
+            resolve_db_admin_dsn(&args, &ca_json, dir.path(), &messages).expect("resolve dsn");
         assert_eq!(resolved, "postgresql://admin:pass@127.0.0.1:15432/postgres");
     }
 
     #[test]
     fn resolve_db_admin_dsn_reads_from_ca_json_when_flag_absent() {
+        let _lock = env_lock();
+        // Port resolution walks process env first; clear it so the `.env`
+        // file in `compose_dir` is authoritative for this assertion.
+        let _port_guard = ScopedEnvVar::set("POSTGRES_HOST_PORT", "");
+        let messages = test_messages();
+        let dir = tempdir().expect("tempdir");
+        let ca_json = dir.path().join("ca.json");
+        fs::write(
+            &ca_json,
+            r#"{"db":{"type":"postgresql","dataSource":"postgresql://step:current@postgres:5432/stepca?sslmode=disable"}}"#,
+        )
+        .expect("write ca.json");
+        fs::write(dir.path().join(".env"), "POSTGRES_HOST_PORT=5433\n").expect("write .env");
+        let args = RotateDbArgs {
+            admin_dsn: DbAdminDsnArgs { admin_dsn: None },
+            password: None,
+            timeout: DbTimeoutArgs { timeout_secs: 30 },
+        };
+        let resolved =
+            resolve_db_admin_dsn(&args, &ca_json, dir.path(), &messages).expect("resolve dsn");
+        assert_eq!(
+            resolved,
+            "postgresql://step:current@127.0.0.1:5433/stepca?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn resolve_db_admin_dsn_defaults_host_port_when_env_absent() {
+        let _lock = env_lock();
+        let _port_guard = ScopedEnvVar::set("POSTGRES_HOST_PORT", "");
         let messages = test_messages();
         let dir = tempdir().expect("tempdir");
         let ca_json = dir.path().join("ca.json");
@@ -191,10 +241,11 @@ mod tests {
             password: None,
             timeout: DbTimeoutArgs { timeout_secs: 30 },
         };
-        let resolved = resolve_db_admin_dsn(&args, &ca_json, &messages).expect("resolve dsn");
+        let resolved =
+            resolve_db_admin_dsn(&args, &ca_json, dir.path(), &messages).expect("resolve dsn");
         assert_eq!(
             resolved,
-            "postgresql://step:current@postgres:5432/stepca?sslmode=disable"
+            "postgresql://step:current@127.0.0.1:5432/stepca?sslmode=disable"
         );
     }
 
@@ -209,7 +260,7 @@ mod tests {
             password: None,
             timeout: DbTimeoutArgs { timeout_secs: 30 },
         };
-        let err = resolve_db_admin_dsn(&args, &ca_json, &messages)
+        let err = resolve_db_admin_dsn(&args, &ca_json, dir.path(), &messages)
             .expect_err("expected error on malformed ca.json");
         assert!(
             err.to_string().contains("ca.json")
@@ -236,7 +287,7 @@ mod tests {
             password: None,
             timeout: DbTimeoutArgs { timeout_secs: 30 },
         };
-        let err = resolve_db_admin_dsn(&args, &ca_json, &messages)
+        let err = resolve_db_admin_dsn(&args, &ca_json, dir.path(), &messages)
             .expect_err("expected error when ca.json is unreadable");
         assert!(
             err.to_string().contains("ca.json")
@@ -258,7 +309,7 @@ mod tests {
             password: None,
             timeout: DbTimeoutArgs { timeout_secs: 30 },
         };
-        let err = resolve_db_admin_dsn(&args, &ca_json, &messages)
+        let err = resolve_db_admin_dsn(&args, &ca_json, dir.path(), &messages)
             .expect_err("expected error when dataSource missing");
         assert!(err.to_string().contains("ca.json"));
     }
