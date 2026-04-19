@@ -43,6 +43,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   containing the running `bootroot` executable, and finally `$PATH`.
   When none resolve, the error message names every candidate that was
   tried. (Closes #553)
+- Fixed `bootroot rotate openbao-recovery --rotate-unseal-keys` failing
+  against OpenBao 2.5.x with `405 Method Not Allowed` /
+  `unsupported operation`. The legacy unauthenticated `sys/rekey/*`
+  endpoints were deprecated in OpenBao 2.4 and disabled by default in
+  2.5 (`disable_unauthed_rekey_endpoints = true`). The unseal-key
+  rotation flow now uses the authenticated `POST /sys/rotate/root/init`
+  and `POST /sys/rotate/root/update` endpoints (with the `data`-wrapped
+  response envelope) and is no longer vulnerable to the
+  unauthenticated-cancel attack documented in the upstream deprecation
+  notice. (Closes #556)
 - Fixed daemon-mode retries silently dropping CLI overrides (`--email`,
   `--ca-url`, `--http-responder-url`, `--http-responder-hmac`). The retry
   path reloaded the config file from disk without re-applying CLI-provided

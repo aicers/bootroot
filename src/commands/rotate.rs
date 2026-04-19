@@ -31,8 +31,8 @@ pub(super) const RENDERED_FILE_TIMEOUT: Duration = Duration::from_mins(1);
 pub(super) const BOOTROOT_AGENT_CONTAINER_PREFIX: &str = "bootroot-agent";
 pub(super) const OPENBAO_RECOVERY_SCOPE_UNSEAL_KEYS: &str = "unseal-keys";
 pub(super) const OPENBAO_RECOVERY_SCOPE_ROOT_TOKEN: &str = "root-token";
-pub(super) const OPENBAO_REKEY_INCOMPLETE_ERROR: &str =
-    "OpenBao rekey did not complete; verify unseal keys and retry";
+pub(super) const OPENBAO_ROOT_ROTATION_INCOMPLETE_ERROR: &str =
+    "OpenBao root-key rotation did not complete; verify unseal keys and retry";
 
 #[derive(Debug, Clone)]
 pub(super) struct StatePaths {

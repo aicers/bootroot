@@ -897,7 +897,8 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 OpenBao 복구 자격증명을 수동으로 회전합니다. 이 작업은 자동 실행되지
 않으며 운영자가 명시적으로 실행해야 합니다.
 
-- `--rotate-unseal-keys`: rekey를 통해 언실 키 회전
+- `--rotate-unseal-keys`: 인증된 루트 키 회전 API(`sys/rotate/root`)로
+  언실 키 회전
 - `--rotate-root-token`: 새 루트 토큰 생성
 - `--unseal-key`: 기존 언실 키(반복 지정 가능)
 - `--unseal-key-file`: 기존 언실 키 파일(줄바꿈 구분)
@@ -984,7 +985,7 @@ OpenBao KV: `bootroot/responder/hmac`
 - DB 회전 시 관리자 DSN 누락 또는 DB 프로비저닝 실패
 - EAB 발급 요청 실패
 - responder 설정 파일 쓰기 실패 또는 리로드 실패
-- OpenBao 복구 자격증명(rekey/루트 토큰) 회전 실패
+- OpenBao 복구 자격증명(언실 키/루트 토큰) 회전 실패
 - AppRole 대상 서비스 미등록 또는 secret_id 갱신 실패
 
 ## bootroot monitoring

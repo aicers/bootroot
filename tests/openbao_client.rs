@@ -1,4 +1,7 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bootroot::openbao::{KvMountStatus, OpenBaoClient, WrapInfo};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -7,6 +10,18 @@ fn client_with_token(server: &MockServer) -> OpenBaoClient {
     let mut client = OpenBaoClient::new(&server.uri()).expect("client init should succeed");
     client.set_token("root-token".to_string());
     client
+}
+
+/// Returns a freshly generated random token for test-only fields the
+/// server treats as opaque (nonces, unseal-share placeholders). Uses a
+/// cryptographically secure RNG so `CodeQL` does not flag the value as a
+/// hard-coded cryptographic input.
+fn unique_test_token() -> String {
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 16];
+    rng.fill(&mut bytes)
+        .expect("system RNG must produce random bytes in tests");
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 #[tokio::test]
@@ -364,54 +379,61 @@ async fn is_initialized_errors_on_malformed_body() {
 }
 
 #[tokio::test]
-async fn start_rekey_uses_sys_rekey_init_path() {
+async fn start_root_rotation_uses_sys_rotate_root_init_path() {
     let server = MockServer::start().await;
+    let nonce = unique_test_token();
 
-    Mock::given(method("PUT"))
-        .and(path("/v1/sys/rekey/init"))
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/rotate/root/init"))
         .and(header("X-Vault-Token", "root-token"))
         .and(body_json(json!({
             "secret_shares": 5,
             "secret_threshold": 3
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "nonce": "nonce-1",
-            "progress": 0
+            "data": {
+                "nonce": nonce,
+                "progress": 0
+            }
         })))
         .mount(&server)
         .await;
 
     let client = client_with_token(&server);
     let response = client
-        .start_rekey(5, 3)
+        .start_root_rotation(5, 3)
         .await
-        .expect("start_rekey should succeed");
-    assert_eq!(response.nonce, "nonce-1");
+        .expect("start_root_rotation should succeed");
+    assert_eq!(response.nonce, nonce);
 }
 
 #[tokio::test]
-async fn submit_rekey_share_uses_sys_rekey_update_path() {
+async fn submit_root_rotation_share_uses_sys_rotate_root_update_path() {
     let server = MockServer::start().await;
+    let nonce = unique_test_token();
+    let unseal_share = unique_test_token();
 
-    Mock::given(method("PUT"))
-        .and(path("/v1/sys/rekey/update"))
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/rotate/root/update"))
         .and(header("X-Vault-Token", "root-token"))
         .and(body_json(json!({
-            "nonce": "nonce-1",
-            "key": "old-unseal-key"
+            "nonce": nonce,
+            "key": unseal_share
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "complete": true,
-            "keys": ["new-unseal-1", "new-unseal-2", "new-unseal-3"]
+            "data": {
+                "complete": true,
+                "keys": ["new-unseal-1", "new-unseal-2", "new-unseal-3"]
+            }
         })))
         .mount(&server)
         .await;
 
     let client = client_with_token(&server);
     let response = client
-        .submit_rekey_share("nonce-1", "old-unseal-key")
+        .submit_root_rotation_share(&nonce, &unseal_share)
         .await
-        .expect("submit_rekey_share should succeed");
+        .expect("submit_root_rotation_share should succeed");
     assert!(response.complete);
     assert_eq!(
         response.keys,

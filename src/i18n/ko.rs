@@ -298,7 +298,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_summary_openbao_recovery_next_steps: "- 다음 단계: 새 자격증명을 안전하게 보관하고, 기존 루트 토큰이 유효하면 폐기한 뒤 OpenBao 상태를 확인하세요",
     prompt_rotate_openbao_recovery: "OpenBao 복구 자격증명({value})을 회전할까요? AppRole + SecretID는 변경되지 않습니다. [y/N]",
     error_openbao_recovery_target_required: "최소 하나의 대상을 지정하세요: --rotate-unseal-keys 또는 --rotate-root-token",
-    error_openbao_recovery_unseal_keys_required: "rekey를 위해 기존 언실 키가 최소 {value}개 필요합니다",
+    error_openbao_recovery_unseal_keys_required: "루트 키 회전을 위해 기존 언실 키가 최소 {value}개 필요합니다",
     prompt_rotate_trust_sync: "CA trust 데이터를 OpenBao에 동기화하고 서비스를 갱신할까요? [y/N]",
     prompt_rotate_force_reissue: "{service_name} 인증서를 삭제하고 재발급을 시작할까요? [y/N]",
     rotate_summary_trust_sync_global: "- CA trust 갱신: {value}",
