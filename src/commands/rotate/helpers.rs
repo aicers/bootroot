@@ -191,6 +191,9 @@ pub(super) fn signal_bootroot_agent(entry: &ServiceEntry, messages: &Messages) -
                 .as_deref()
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| anyhow::anyhow!(messages.error_service_container_name_required()))?;
+            if !docker_container_exists(container, messages)? {
+                anyhow::bail!(messages.error_bootroot_agent_container_missing(container));
+            }
             run_docker(
                 &["restart", container],
                 "docker restart bootroot-agent",
@@ -199,6 +202,16 @@ pub(super) fn signal_bootroot_agent(entry: &ServiceEntry, messages: &Messages) -
         }
         crate::state::DeployType::Daemon => signal_bootroot_agent_daemon(entry, messages),
     }
+}
+
+fn docker_container_exists(container: &str, messages: &Messages) -> Result<bool> {
+    let status = std::process::Command::new("docker")
+        .args(["container", "inspect", container])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| messages.error_command_run_failed("docker container inspect"))?;
+    Ok(status.success())
 }
 
 #[cfg(unix)]
@@ -480,5 +493,48 @@ mod tests {
         let err = signal_bootroot_agent(&entry, &test_messages())
             .expect_err("missing container_name must fail fast");
         assert!(err.to_string().contains("container_name"));
+    }
+
+    #[test]
+    fn signal_bootroot_agent_docker_reports_missing_container_with_hint() {
+        use super::super::test_support::{
+            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, TEST_DOCKER_EXIT_ENV, env_lock, path_with_prepend,
+            write_fake_docker_script,
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).expect("create bin dir");
+        let docker_path = bin_dir.join("docker");
+        write_fake_docker_script(&docker_path);
+
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        let _exit = ScopedEnvVar::set(TEST_DOCKER_EXIT_ENV, "1");
+
+        let mut entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
+        entry.container_name = Some("my-nginx".to_string());
+
+        let err = signal_bootroot_agent(&entry, &test_messages())
+            .expect_err("missing container must fail with tailored hint");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-nginx"),
+            "error should reference the missing container: {msg}"
+        );
+        assert!(
+            msg.contains("docker run -d") && msg.contains("--restart unless-stopped"),
+            "error should recommend recreating the sidecar as a long-running daemon: {msg}"
+        );
+
+        let logged = std::fs::read_to_string(&args_log).expect("read logged args");
+        let args: Vec<&str> = logged.lines().collect();
+        assert_eq!(
+            args,
+            vec!["container", "inspect", "my-nginx"],
+            "rotate must stop at the pre-flight inspect and not invoke docker restart"
+        );
     }
 }

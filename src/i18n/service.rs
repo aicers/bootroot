@@ -316,6 +316,13 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_bootroot_agent_container_missing(&self, container: &str) -> String {
+        format_template(
+            self.strings().error_bootroot_agent_container_missing,
+            &[("container", container)],
+        )
+    }
+
     pub(crate) fn error_secrets_dir_resolve_failed(&self) -> &'static str {
         self.strings().error_secrets_dir_resolve_failed
     }

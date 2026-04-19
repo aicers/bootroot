@@ -29,7 +29,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   hardcoded `bootroot-agent-<service>` prefix, and the `service add`
   docker snippet recommends a long-running daemon container
   (`docker run -d --restart unless-stopped`, without `--oneshot`) so
-  `docker restart` is a meaningful signal-renewal action. (Closes #552)
+  `docker restart` is a meaningful signal-renewal action. Services
+  that were registered before this fix and created a one-shot sidecar
+  (the old `docker run --rm ... --oneshot` snippet) will see a
+  dedicated error at rotate time naming the missing container and
+  pointing operators at the new long-running snippet; see
+  `docs/en/operations.md` for migration steps. (Closes #552)
 - Fixed `bootroot init` storing the host-side PostgreSQL port in the
   step-ca DSN written to OpenBao KV / `ca.json` when
   `POSTGRES_HOST_PORT` differed from `5432`, and fixed `bootroot rotate

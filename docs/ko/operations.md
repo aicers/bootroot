@@ -394,3 +394,37 @@ bootroot rotate force-reissue --service-name edge-proxy --yes
 로컬 서비스(daemon/docker)의 경우 파일 삭제 후 bootroot-agent에 시그널을
 보냅니다. 원격 서비스의 경우 서비스 머신에서 `bootroot-remote bootstrap`을
 실행하라는 안내를 출력합니다.
+
+## 기존 도커 배포 서비스를 장기 실행 사이드카로 마이그레이션
+
+이슈 #552 수정 전에 `bootroot service add --deploy-type docker`가 출력하던
+사이드카 스니펫은 bootroot-agent를 일회성 컨테이너
+(`docker run --rm ... bootroot-agent --config /app/agent.toml --oneshot`)로
+실행했습니다. 이 컨테이너는 초기 발급 직후 종료되므로, 해당 설정으로
+등록된 서비스는 `bootroot rotate ca-key` Phase 5에서 `docker restart`할
+컨테이너가 존재하지 않아 `No such container: <container_name>` 오류로
+실패합니다.
+
+`state.json`에 기록된 `--container-name`을 유지한 채, 사이드카를 장기 실행
+데몬으로 재생성하세요:
+
+```bash
+# 과거 일회성 사이드카가 남아 있다면 먼저 제거합니다.
+docker rm -f <container_name> 2>/dev/null || true
+
+# state.json 변경 없이 현재 권장 스니펫만 출력합니다.
+bootroot service add --print-only \
+  --deploy-type docker \
+  --service-name <service> \
+  --container-name <container_name> \
+  ... (기존 등록과 동일한 나머지 플래그) ...
+```
+
+출력된 `docker run -d --restart unless-stopped ...` 명령을 실행하면 호스트
+재부팅 후에도 컨테이너가 `Up` 상태로 유지되고, `bootroot rotate ca-key`
+Phase 5가 호출하는 `docker restart <container_name>`이 의미 있는 시그널-
+갱신 동작이 됩니다.
+
+마이그레이션 없이 회전을 먼저 실행하면, Phase 5가 사라진 컨테이너 이름을
+표시하고 위 절차를 안내하는 전용 오류 메시지로 즉시 중단됩니다(이전의
+`exit status: 1`과 달리 원인이 명확히 드러납니다).
