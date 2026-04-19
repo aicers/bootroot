@@ -1111,11 +1111,12 @@ in place before the next render cycle).
 - `--cert-duration`: new `defaultTLSCertDuration` value
   (e.g., `24h`, `48h`). Required.
 
-  `cert-duration` must exceed the `renew_before` value configured in
-  `agent.toml` on each agent host; otherwise newly issued certificates
-  will be flagged for immediate renewal. The control plane does not
-  have access to `agent.toml`, so this cross-validation is not
-  performed here — operators are responsible for ensuring consistency.
+  `cert-duration` must be strictly greater than the daemon's default
+  `renew_before` (16h); otherwise every newly issued certificate is
+  flagged for immediate renewal and the command fails validation. This
+  is the same conservative guardrail `bootroot init` applies. The
+  control plane does not read `agent.toml`, so per-agent
+  `renew_before` consistency remains the operator's responsibility.
 
 ### Behavior
 
