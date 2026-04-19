@@ -365,6 +365,16 @@ fn resolve_reload_preset(
             let name = target.ok_or_else(|| {
                 anyhow::anyhow!("--reload-style sighup requires --reload-target <process-name>")
             })?;
+            if name.contains('/') {
+                anyhow::bail!(
+                    "--reload-target for sighup preset must be a process name, not a path.\n\
+                     Got: {name}\n\
+                     For path-based matching, use the low-level flags:\n    \
+                     --post-renew-command pkill \\\n    \
+                     --post-renew-arg -HUP --post-renew-arg -f \\\n    \
+                     --post-renew-arg <your-path>"
+                );
+            }
             Ok(vec![PostRenewHookEntry {
                 command: "pkill".to_string(),
                 args: vec!["-HUP".to_string(), name.to_string()],
@@ -559,6 +569,42 @@ mod tests {
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].command, "pkill");
         assert_eq!(hooks[0].args, vec!["-HUP", "myproc"]);
+    }
+
+    #[test]
+    fn resolve_hooks_sighup_preset_rejects_path_like_target() {
+        let mut args = empty_args();
+        args.reload_style = Some(ReloadStyle::Sighup);
+        args.reload_target = Some("review/target/release/review".to_string());
+
+        let err = resolve_post_renew_hooks(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be a process name, not a path"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("review/target/release/review"),
+            "error should echo offending value: {msg}"
+        );
+        assert!(
+            msg.contains("--post-renew-arg -f"),
+            "error should point to low-level fallback: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_hooks_sighup_preset_rejects_absolute_path_target() {
+        let mut args = empty_args();
+        args.reload_style = Some(ReloadStyle::Sighup);
+        args.reload_target = Some("/usr/local/bin/myapp".to_string());
+
+        let err = resolve_post_renew_hooks(&args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be a process name, not a path"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

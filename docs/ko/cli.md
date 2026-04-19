@@ -572,6 +572,20 @@ bootroot status
 - `docker-restart` + 대상 `my-container` — `docker restart my-container`
 - `none` — 훅 없음
 
+`sighup` 프리셋의 `--reload-target`은 일반 프로세스 이름이어야 합니다
+(`comm` 필드, 즉 `argv[0]`의 basename에 매칭되며 Linux에서는
+15자로 잘립니다). 프리셋은 `-f` 없이 `pkill -HUP <name>`을
+실행하므로 `/`가 포함된 경로 형태의 값은 `service add` 단계에서
+거부됩니다. 그렇지 않으면 런타임에 매칭이 조용히 실패합니다.
+경로 기반 매칭이 필요하면 저수준 플래그로 `pkill -f`를
+명시적으로 사용해야 합니다:
+
+```text
+--post-renew-command pkill \
+--post-renew-arg -HUP --post-renew-arg -f \
+--post-renew-arg <your-path>
+```
+
 갱신 후 훅 플래그(저수준):
 
 - `--post-renew-command`: 갱신 성공 후 실행할 훅 명령
