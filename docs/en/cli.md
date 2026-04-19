@@ -596,7 +596,7 @@ preset invokes `pkill -HUP <name>` without `-f` and would
 otherwise silently fail to match. For path-based matching, use
 the low-level flags to opt into `pkill -f` explicitly:
 
-```
+```text
 --post-renew-command pkill \
 --post-renew-arg -HUP --post-renew-arg -f \
 --post-renew-arg <your-path>

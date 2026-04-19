@@ -580,7 +580,7 @@ bootroot status
 경로 기반 매칭이 필요하면 저수준 플래그로 `pkill -f`를
 명시적으로 사용해야 합니다:
 
-```
+```text
 --post-renew-command pkill \
 --post-renew-arg -HUP --post-renew-arg -f \
 --post-renew-arg <your-path>
