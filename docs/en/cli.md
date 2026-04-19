@@ -588,6 +588,20 @@ entries in the generated `agent.toml` profile:
 - `docker-restart` + target `my-container` — `docker restart my-container`
 - `none` — no hook
 
+For the `sighup` preset, `--reload-target` must be a plain process
+name (matched against `comm`, i.e. the basename of `argv[0]`;
+Linux truncates `comm` to 15 characters). Path-like targets
+containing `/` are rejected at `service add` time because the
+preset invokes `pkill -HUP <name>` without `-f` and would
+otherwise silently fail to match. For path-based matching, use
+the low-level flags to opt into `pkill -f` explicitly:
+
+```
+--post-renew-command pkill \
+--post-renew-arg -HUP --post-renew-arg -f \
+--post-renew-arg <your-path>
+```
+
 Post-renew hook flags (low-level):
 
 - `--post-renew-command`: hook command to run after successful renewal
