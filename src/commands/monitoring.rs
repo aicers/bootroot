@@ -100,10 +100,7 @@ pub(crate) fn run_monitoring_status(
         let url = grafana_url(profile);
         println!("{}", messages.monitoring_status_grafana_url(&url));
 
-        let grafana_service = match profile {
-            MonitoringProfile::Lan => "grafana",
-            MonitoringProfile::Public => "grafana-public",
-        };
+        let grafana_service = profile_grafana_service(profile);
         let grafana_status = readiness
             .iter()
             .find(|entry| entry.service == grafana_service)
@@ -134,10 +131,7 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
     let mut grafana_volumes = Vec::new();
     if args.reset_grafana_admin_password {
         for profile in &profiles {
-            let grafana_service = match profile {
-                MonitoringProfile::Lan => "grafana",
-                MonitoringProfile::Public => "grafana-public",
-            };
+            let grafana_service = profile_grafana_service(*profile);
             let profile_str = profile.to_string();
             let grafana_container_id = docker_compose_output(
                 &args.compose_file.compose_file,
@@ -206,35 +200,48 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
 }
 
 fn monitoring_services(profile: MonitoringProfile) -> Vec<String> {
-    let grafana_service = match profile {
+    vec![
+        "prometheus".to_string(),
+        profile_grafana_service(profile).to_string(),
+    ]
+}
+
+fn profile_grafana_service(profile: MonitoringProfile) -> &'static str {
+    match profile {
         MonitoringProfile::Lan => "grafana",
         MonitoringProfile::Public => "grafana-public",
-    };
-    vec!["prometheus".to_string(), grafana_service.to_string()]
+    }
 }
 
 fn detect_running_profiles(
     compose_file: &Path,
     messages: &Messages,
 ) -> Result<Vec<MonitoringProfile>> {
+    detect_running_profiles_with(|profile, service| {
+        let profile_str = profile.to_string();
+        let container_id = docker_compose_output(
+            compose_file,
+            Some(&profile_str),
+            &["ps", "-q", service],
+            messages,
+        )?;
+        Ok(!container_id.trim().is_empty())
+    })
+}
+
+// Core of profile detection, factored out to accept an injected
+// "is this service running?" predicate so unit tests can exercise the
+// loop without invoking `docker compose`. The predicate is deliberately
+// called only with the profile-unique Grafana service so the detection
+// cannot be confused by services shared across profiles (`prometheus`).
+fn detect_running_profiles_with<F>(mut is_running: F) -> Result<Vec<MonitoringProfile>>
+where
+    F: FnMut(MonitoringProfile, &str) -> Result<bool>,
+{
     let mut profiles = Vec::new();
     for profile in [MonitoringProfile::Lan, MonitoringProfile::Public] {
-        let services = monitoring_services(profile);
-        let profile_str = profile.to_string();
-        let mut any_running = false;
-        for service in &services {
-            let container_id = docker_compose_output(
-                compose_file,
-                Some(&profile_str),
-                &["ps", "-q", service],
-                messages,
-            )?;
-            if !container_id.trim().is_empty() {
-                any_running = true;
-                break;
-            }
-        }
-        if any_running {
+        let grafana_service = profile_grafana_service(profile);
+        if is_running(profile, grafana_service)? {
             profiles.push(profile);
         }
     }
@@ -401,4 +408,111 @@ fn run_docker_with_env(
         anyhow::bail!(messages.error_command_failed_status(context, &status.to_string()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_grafana_service_is_profile_specific() {
+        // Regression test for #557: profile detection must key off a
+        // profile-unique service so a `lan`-only stack is not classified
+        // as `public` (prometheus is shared across both profiles).
+        assert_eq!(profile_grafana_service(MonitoringProfile::Lan), "grafana");
+        assert_eq!(
+            profile_grafana_service(MonitoringProfile::Public),
+            "grafana-public"
+        );
+        assert_ne!(
+            profile_grafana_service(MonitoringProfile::Lan),
+            profile_grafana_service(MonitoringProfile::Public)
+        );
+    }
+
+    #[test]
+    fn monitoring_services_lists_prometheus_and_profile_grafana() {
+        assert_eq!(
+            monitoring_services(MonitoringProfile::Lan),
+            vec!["prometheus".to_string(), "grafana".to_string()]
+        );
+        assert_eq!(
+            monitoring_services(MonitoringProfile::Public),
+            vec!["prometheus".to_string(), "grafana-public".to_string()]
+        );
+    }
+
+    // Returns a predicate for `detect_running_profiles_with` that
+    // reports only the given services as running. Also records every
+    // `(profile, service)` pair the predicate is asked about so tests
+    // can assert which services drove the decision.
+    fn running_predicate<'a>(
+        running: &[&'static str],
+        queried: &'a std::cell::RefCell<Vec<(MonitoringProfile, String)>>,
+    ) -> impl FnMut(MonitoringProfile, &str) -> Result<bool> + 'a {
+        let running: Vec<&'static str> = running.to_vec();
+        move |profile, service| {
+            queried.borrow_mut().push((profile, service.to_string()));
+            Ok(running.contains(&service))
+        }
+    }
+
+    #[test]
+    fn detect_running_profiles_lan_only_does_not_classify_public() {
+        // Regression test for #557: when only the `lan` Grafana is up,
+        // detection must return `[Lan]`. Before the fix, shared
+        // `prometheus` caused `public` to be detected as well.
+        let queried = std::cell::RefCell::new(Vec::new());
+        let profiles =
+            detect_running_profiles_with(running_predicate(&["grafana"], &queried)).unwrap();
+        assert_eq!(profiles, vec![MonitoringProfile::Lan]);
+    }
+
+    #[test]
+    fn detect_running_profiles_public_only_does_not_classify_lan() {
+        let queried = std::cell::RefCell::new(Vec::new());
+        let profiles =
+            detect_running_profiles_with(running_predicate(&["grafana-public"], &queried)).unwrap();
+        assert_eq!(profiles, vec![MonitoringProfile::Public]);
+    }
+
+    #[test]
+    fn detect_running_profiles_empty_when_no_grafana() {
+        let queried = std::cell::RefCell::new(Vec::new());
+        let profiles = detect_running_profiles_with(running_predicate(&[], &queried)).unwrap();
+        assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn detect_running_profiles_returns_both_when_both_grafanas_running() {
+        let queried = std::cell::RefCell::new(Vec::new());
+        let profiles = detect_running_profiles_with(running_predicate(
+            &["grafana", "grafana-public"],
+            &queried,
+        ))
+        .unwrap();
+        assert_eq!(
+            profiles,
+            vec![MonitoringProfile::Lan, MonitoringProfile::Public]
+        );
+    }
+
+    #[test]
+    fn detect_running_profiles_queries_profile_unique_grafana_only() {
+        // The detection loop must never consult `prometheus` (shared
+        // across profiles) — only the profile-unique Grafana service.
+        // A regression to the old "any listed service" behaviour would
+        // show up as `prometheus` appearing in the query log.
+        let queried = std::cell::RefCell::new(Vec::new());
+        let _ = detect_running_profiles_with(running_predicate(&["grafana"], &queried)).unwrap();
+        let queried = queried.into_inner();
+        assert_eq!(
+            queried,
+            vec![
+                (MonitoringProfile::Lan, "grafana".to_string()),
+                (MonitoringProfile::Public, "grafana-public".to_string()),
+            ]
+        );
+        assert!(queried.iter().all(|(_, service)| service != "prometheus"));
+    }
 }
