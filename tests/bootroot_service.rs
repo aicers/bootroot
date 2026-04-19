@@ -927,13 +927,17 @@ async fn test_app_add_local_file_sets_verify_prerequisites() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake bootroot-agent");
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let path = format!("{}:{current_path}", bin_dir.display());
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let verify_output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", path)
-        .args(["verify", "--service-name", "edge-proxy"])
+        .args([
+            "verify",
+            "--service-name",
+            "edge-proxy",
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
+        ])
         .output()
         .expect("run verify");
     let stdout = String::from_utf8_lossy(&verify_output.stdout);

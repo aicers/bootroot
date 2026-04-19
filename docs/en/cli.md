@@ -750,6 +750,9 @@ for those flags.
 
 - `--service-name`: service name identifier
 - `--agent-config`: bootroot-agent config path override (optional)
+- `--agent-binary`: path to the `bootroot-agent` binary (optional; when
+  omitted, bootroot first tries the directory containing the running
+  `bootroot` binary, then falls back to `$PATH`)
 - `--db-check`: verify DB connectivity and auth using ca.json DSN
 - `--db-timeout-secs`: DB connectivity timeout (seconds, default `2`)
 

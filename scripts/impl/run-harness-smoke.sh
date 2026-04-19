@@ -197,11 +197,11 @@ PY
 run_verify() {
   (
     cd "$WORK_DIR"
-    PATH="$WORK_DIR/bin:$PATH" \
-      "$BOOTROOT_BIN" verify \
-        --service-name "$SERVICE_NAME" \
-        --agent-config "agent.toml" \
-        >/dev/null
+    "$BOOTROOT_BIN" verify \
+      --service-name "$SERVICE_NAME" \
+      --agent-config "agent.toml" \
+      --agent-binary "$WORK_DIR/bin/bootroot-agent" \
+      >/dev/null
   )
 }
 

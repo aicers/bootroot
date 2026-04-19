@@ -726,6 +726,9 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 서비스 
 
 - `--service-name`: 서비스 이름 식별자
 - `--agent-config`: bootroot-agent 설정 경로 (선택, 기본은 등록된 값)
+- `--agent-binary`: `bootroot-agent` 바이너리 경로 (선택). 지정하지 않으면
+  실행 중인 `bootroot` 바이너리와 같은 디렉터리를 먼저 탐색하고,
+  없으면 `$PATH`에서 찾습니다.
 - `--db-check`: ca.json DSN으로 DB 연결/인증 점검
 - `--db-timeout-secs`: DB 연결 타임아웃(초, 기본값 `2`)
 

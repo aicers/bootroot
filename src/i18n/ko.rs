@@ -139,6 +139,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_docker_compose_failed: "docker compose 실패: {value}",
     error_docker_command_failed: "docker 명령 실패: {value}",
     error_bootroot_agent_run_failed: "bootroot-agent 실행 실패",
+    error_bootroot_agent_not_found: "bootroot-agent 바이너리를 찾을 수 없습니다. 시도한 경로: {candidates}",
     error_secrets_dir_resolve_failed: "secrets dir 확인 실패",
     error_parse_ca_json_failed: "ca.json 파싱 실패",
     error_serialize_ca_json_failed: "ca.json 직렬화 실패",

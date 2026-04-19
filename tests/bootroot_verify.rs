@@ -32,19 +32,18 @@ fn test_verify_success() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
         .args([
             "verify",
             "--service-name",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
         ])
         .output()
         .expect("run verify");
@@ -75,19 +74,18 @@ fn test_verify_docker_success() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
         .args([
             "verify",
             "--service-name",
             "web-app",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
         ])
         .output()
         .expect("run verify");
@@ -116,19 +114,18 @@ fn test_verify_san_mismatch_fails() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
         .args([
             "verify",
             "--service-name",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
         ])
         .output()
         .expect("run verify");
@@ -160,14 +157,15 @@ fn test_verify_prompts_for_service_name() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
-        .args(["verify"])
+        .args([
+            "verify",
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -210,14 +208,15 @@ fn test_verify_reprompts_on_empty_service_name() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
-        .args(["verify"])
+        .args([
+            "verify",
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -271,13 +270,10 @@ fn test_verify_db_check_reports_auth_failure() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
         .env_remove("POSTGRES_HOST_PORT")
         .args([
             "verify",
@@ -285,6 +281,8 @@ fn test_verify_db_check_reports_auth_failure() {
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
             "--db-check",
         ])
         .output()
@@ -339,13 +337,10 @@ fn test_verify_db_check_translates_compose_dsn_via_process_env() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
         .env("POSTGRES_HOST_PORT", port.to_string())
         .args([
             "verify",
@@ -353,6 +348,8 @@ fn test_verify_db_check_translates_compose_dsn_via_process_env() {
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
             "--db-check",
         ])
         .output()
@@ -392,19 +389,18 @@ fn test_verify_missing_cert_fails() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
         .args([
             "verify",
             "--service-name",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
         ])
         .output()
         .expect("run verify");
@@ -432,19 +428,18 @@ fn test_verify_empty_cert_fails() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
         .args([
             "verify",
             "--service-name",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
         ])
         .output()
         .expect("run verify");
@@ -473,19 +468,18 @@ fn test_verify_empty_key_fails_docker() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
         .args([
             "verify",
             "--service-name",
             "web-app",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
         ])
         .output()
         .expect("run verify");
@@ -493,6 +487,66 @@ fn test_verify_empty_key_fails_docker() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(stderr.contains("Key file is empty"));
+}
+
+#[test]
+fn test_verify_resolves_sibling_agent_without_path_or_flag() {
+    // Regression test for the install-layout scenario: operators run a
+    // `bootroot` binary that ships next to `bootroot-agent` but neither
+    // the directory is on $PATH nor `--agent-binary` is supplied.
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    write_cert_with_dns(
+        &cert_path,
+        &key_path,
+        "001.edge-proxy.edge-node-01.trusted.domain",
+    )
+    .expect("write cert");
+
+    write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    // Copy the real bootroot binary next to a fake bootroot-agent so that
+    // the copy's current_exe() resolves to the install-layout directory.
+    let install_dir = temp_dir.path().join("install");
+    fs::create_dir_all(&install_dir).expect("create install dir");
+    let bootroot_copy = install_dir.join("bootroot");
+    fs::copy(env!("CARGO_BIN_EXE_bootroot"), &bootroot_copy).expect("copy bootroot");
+    let mut perms = fs::metadata(&bootroot_copy)
+        .expect("stat bootroot copy")
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&bootroot_copy, perms).expect("chmod bootroot copy");
+    write_fake_bootroot_agent(&install_dir, 0).expect("write fake agent");
+
+    // Scrub PATH so only the sibling fallback can succeed.
+    let empty_path = temp_dir.path().join("empty-path");
+    fs::create_dir_all(&empty_path).expect("create empty PATH dir");
+
+    let output = std::process::Command::new(&bootroot_copy)
+        .current_dir(temp_dir.path())
+        .env("PATH", &empty_path)
+        .args([
+            "verify",
+            "--service-name",
+            "edge-proxy",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run verify");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("bootroot verify: summary"));
+    assert!(stdout.contains("- service name: edge-proxy"));
+    assert!(stdout.contains("- result: ok"));
 }
 
 #[test]
@@ -517,19 +571,18 @@ fn test_verify_agent_failure_reports_error() {
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     write_fake_bootroot_agent(&bin_dir, 1).expect("write fake agent");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}", bin_dir.display(), path);
+    let agent_binary = bin_dir.join("bootroot-agent");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .env("PATH", combined_path)
         .args([
             "verify",
             "--service-name",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
         ])
         .output()
         .expect("run verify");
