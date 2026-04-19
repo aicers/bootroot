@@ -1060,10 +1060,12 @@ OpenBao KV: `bootroot/responder/hmac`
 - `--cert-duration`: 새 `defaultTLSCertDuration` 값
   (예: `24h`, `48h`). 필수.
 
-  `cert-duration`은 각 agent 호스트의 `agent.toml`에 설정된
-  `renew_before`보다 커야 하며, 그렇지 않으면 새로 발급된 인증서가 즉시
-  갱신 대상으로 표시됩니다. 제어 노드는 `agent.toml`을 참조할 수 없으므로
-  이 교차 검증은 수행하지 않으며, 값의 일관성 보장은 운영자의 책임입니다.
+  `cert-duration`은 데몬의 기본 `renew_before`(16h)보다 엄격히 커야
+  하며, 그렇지 않으면 새로 발급된 모든 인증서가 즉시 갱신 대상으로
+  표시되고 명령이 검증에 실패합니다. `bootroot init`이 적용하는 것과
+  동일한 보수적 가드레일입니다. 제어 노드는 `agent.toml`을 참조하지
+  않으므로, 각 agent의 `renew_before`와의 정합성 보장은 여전히
+  운영자의 책임입니다.
 
 ### 동작
 

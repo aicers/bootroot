@@ -19,7 +19,7 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) fn run_ca_update(args: &CaUpdateArgs, messages: &Messages) -> Result<()> {
-    bootroot::config::parse_cert_duration(&args.cert_duration)?;
+    bootroot::config::validate_cert_duration_vs_default_renew_before(&args.cert_duration)?;
 
     let secrets_dir = &args.secrets_dir.secrets_dir;
     let ca_json_path = secrets_dir.join("config").join("ca.json");
@@ -184,9 +184,42 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::cli::args::SecretsDirArgs;
 
     fn test_messages() -> Messages {
         crate::i18n::test_messages()
+    }
+
+    fn ca_update_args(secrets_dir: std::path::PathBuf, cert_duration: &str) -> CaUpdateArgs {
+        CaUpdateArgs {
+            secrets_dir: SecretsDirArgs { secrets_dir },
+            stepca_provisioner: "acme".to_string(),
+            cert_duration: cert_duration.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_run_ca_update_rejects_duration_below_default_renew_before() {
+        let dir = tempdir().unwrap();
+        // Files intentionally not created: validation must fail before any I/O.
+        let args = ca_update_args(dir.path().to_path_buf(), "1m");
+        let err = run_ca_update(&args, &test_messages()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must exceed the default renew_before"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_run_ca_update_rejects_duration_equal_to_default_renew_before() {
+        let dir = tempdir().unwrap();
+        let args = ca_update_args(dir.path().to_path_buf(), "16h");
+        let err = run_ca_update(&args, &test_messages()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must exceed the default renew_before")
+        );
     }
 
     fn sample_ctmpl() -> String {

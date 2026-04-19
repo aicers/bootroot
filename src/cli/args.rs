@@ -43,9 +43,11 @@ pub(crate) enum CliCommand {
 pub(crate) enum CaCommand {
     /// Updates step-ca `defaultTLSCertDuration`.
     ///
-    /// `cert-duration` must exceed the `renew_before` value configured
-    /// in `agent.toml` on each agent host; otherwise newly issued
-    /// certificates will be flagged for immediate renewal.
+    /// `cert-duration` must be strictly greater than the daemon's
+    /// default `renew_before` (16h) — the same conservative guardrail
+    /// `bootroot init` applies. The control plane does not read
+    /// `agent.toml`; ensuring per-agent `renew_before` consistency
+    /// remains the operator's responsibility.
     Update(CaUpdateArgs),
     /// Restarts the step-ca container so it picks up a configuration
     /// change such as a new `defaultTLSCertDuration`.
@@ -64,8 +66,10 @@ pub(crate) struct CaUpdateArgs {
 
     /// New `defaultTLSCertDuration` value (e.g. `24h`, `48h`).
     ///
-    /// Must exceed the `renew_before` value configured in `agent.toml`
-    /// on each agent host.
+    /// Must be strictly greater than the daemon's default
+    /// `renew_before` (16h) — otherwise every newly issued certificate
+    /// is flagged for immediate renewal. Per-agent `renew_before`
+    /// consistency is the operator's responsibility.
     #[arg(long)]
     pub(crate) cert_duration: String,
 }
