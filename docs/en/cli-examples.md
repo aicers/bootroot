@@ -461,8 +461,9 @@ docker run --rm \
 ```
 
 ```bash
-docker run --rm \
+docker run -d \
   --name web-app \
+  --restart unless-stopped \
   -v /srv/bootroot/agent.toml:/app/agent.toml:ro \
   -v /srv/bootroot/certs:/app/certs \
   <bootroot-agent-image> \

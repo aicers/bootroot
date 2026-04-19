@@ -22,6 +22,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate ca-key` Phase 5 failing against services
+  registered with `--deploy-type docker` and a custom
+  `--container-name`. The restart target now reads
+  `entry.container_name` from `state.json` rather than assuming a
+  hardcoded `bootroot-agent-<service>` prefix, and the `service add`
+  docker snippet recommends a long-running daemon container
+  (`docker run -d --restart unless-stopped`, without `--oneshot`) so
+  `docker restart` is a meaningful signal-renewal action. (Closes #552)
 - Fixed `bootroot init` storing the host-side PostgreSQL port in the
   step-ca DSN written to OpenBao KV / `ca.json` when
   `POSTGRES_HOST_PORT` differed from `5432`, and fixed `bootroot rotate

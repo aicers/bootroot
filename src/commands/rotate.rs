@@ -28,7 +28,6 @@ pub(super) const ROOT_CA_COMMON_NAME: &str = "Bootroot Root CA";
 pub(super) const INTERMEDIATE_CA_COMMON_NAME: &str = "Bootroot Intermediate CA";
 pub(super) const RENDERED_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const RENDERED_FILE_TIMEOUT: Duration = Duration::from_mins(1);
-pub(super) const BOOTROOT_AGENT_CONTAINER_PREFIX: &str = "bootroot-agent";
 pub(super) const OPENBAO_RECOVERY_SCOPE_UNSEAL_KEYS: &str = "unseal-keys";
 pub(super) const OPENBAO_RECOVERY_SCOPE_ROOT_TOKEN: &str = "root-token";
 pub(super) const OPENBAO_ROOT_ROTATION_INCOMPLETE_ERROR: &str =

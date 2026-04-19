@@ -433,8 +433,9 @@ fn print_docker_snippet(entry: &ServiceEntry, messages: &Messages) {
         .parent()
         .unwrap_or(std::path::Path::new("."));
     println!("{}", messages.service_snippet_docker_title());
-    println!("docker run --rm \\");
+    println!("docker run -d \\");
     println!("  --name {container} \\");
+    println!("  --restart unless-stopped \\");
     println!("  -v {config_path}:/app/agent.toml:ro \\");
     // codeql[rust/cleartext-logging]: output is a filesystem path used in a run snippet.
     println!(
@@ -442,7 +443,7 @@ fn print_docker_snippet(entry: &ServiceEntry, messages: &Messages) {
         cert_dir = cert_parent.display()
     );
     println!("  <bootroot-agent-image> \\");
-    println!("  bootroot-agent --config /app/agent.toml --oneshot");
+    println!("  bootroot-agent --config /app/agent.toml");
 }
 
 fn print_trust_snippet(entry: &ServiceEntry, trusted: &[String], messages: &Messages) {

@@ -186,13 +186,13 @@ fn reload_openbao_agent_daemon(_entry: &ServiceEntry, messages: &Messages) -> Re
 pub(super) fn signal_bootroot_agent(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     match entry.deploy_type {
         crate::state::DeployType::Docker => {
-            let container = format!(
-                "{}-{}",
-                super::BOOTROOT_AGENT_CONTAINER_PREFIX,
-                entry.service_name
-            );
+            let container = entry
+                .container_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!(messages.error_service_container_name_required()))?;
             run_docker(
-                &["restart", &container],
+                &["restart", container],
                 "docker restart bootroot-agent",
                 messages,
             )
@@ -441,5 +441,44 @@ mod tests {
             !args_log.exists(),
             "docker should not have been invoked for a remote service"
         );
+    }
+
+    #[test]
+    fn signal_bootroot_agent_docker_uses_entry_container_name() {
+        use super::super::test_support::{
+            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
+            write_fake_docker_script,
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).expect("create bin dir");
+        let docker_path = bin_dir.join("docker");
+        write_fake_docker_script(&docker_path);
+
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let mut entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
+        entry.container_name = Some("my-nginx".to_string());
+
+        signal_bootroot_agent(&entry, &test_messages())
+            .expect("should invoke docker restart against entry.container_name");
+
+        let logged = std::fs::read_to_string(&args_log).expect("read logged args");
+        let args: Vec<&str> = logged.lines().collect();
+        assert_eq!(args, vec!["restart", "my-nginx"]);
+    }
+
+    #[test]
+    fn signal_bootroot_agent_docker_requires_container_name() {
+        let entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
+        assert!(entry.container_name.is_none());
+
+        let err = signal_bootroot_agent(&entry, &test_messages())
+            .expect_err("missing container_name must fail fast");
+        assert!(err.to_string().contains("container_name"));
     }
 }
