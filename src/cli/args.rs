@@ -116,6 +116,7 @@ pub(crate) enum ServiceAgentCommand {
 #[derive(Args, Debug)]
 pub(crate) struct ServiceAgentStartArgs {
     /// Service name identifier
+    #[arg(long)]
     pub(crate) service_name: String,
 
     #[command(flatten)]
@@ -892,6 +893,10 @@ pub(crate) struct VerifyArgs {
     #[arg(long)]
     pub(crate) agent_config: Option<PathBuf>,
 
+    /// Path to the bootroot-agent binary (overrides auto-discovery)
+    #[arg(long)]
+    pub(crate) agent_binary: Option<PathBuf>,
+
     /// Verify DB connectivity and auth using ca.json DSN
     #[arg(long)]
     pub(crate) db_check: bool,
@@ -1598,7 +1603,14 @@ mod tests {
 
     #[test]
     fn test_cli_parses_service_agent_start() {
-        let cli = Cli::parse_from(["bootroot", "service", "agent", "start", "myapp"]);
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "agent",
+            "start",
+            "--service-name",
+            "myapp",
+        ]);
         match cli.command {
             CliCommand::Service(ServiceCommand::Agent(ServiceAgentCommand::Start(args))) => {
                 assert_eq!(args.service_name, "myapp");
@@ -1618,6 +1630,7 @@ mod tests {
             "service",
             "agent",
             "start",
+            "--service-name",
             "myapp",
             "--compose-file",
             "custom.yml",
@@ -1635,5 +1648,14 @@ mod tests {
     fn test_cli_service_agent_start_requires_service_name() {
         let result = Cli::try_parse_from(["bootroot", "service", "agent", "start"]);
         assert!(result.is_err(), "service-name should be required");
+    }
+
+    #[test]
+    fn test_cli_service_agent_start_rejects_positional() {
+        let result = Cli::try_parse_from(["bootroot", "service", "agent", "start", "myapp"]);
+        assert!(
+            result.is_err(),
+            "positional service name should be rejected"
+        );
     }
 }

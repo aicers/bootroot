@@ -344,17 +344,17 @@ fn write_fake_bootroot_agent(service_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn run_verify(service_dir: &Path) -> anyhow::Result<()> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{path}", service_dir.join("bin").display());
+    let agent_binary = service_dir.join("bin").join("bootroot-agent");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(service_dir)
-        .env("PATH", combined_path)
         .args([
             "verify",
             "--service-name",
             SERVICE_NAME,
             "--agent-config",
             service_dir.join("agent.toml").to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
         ])
         .output()
         .context("run verify")?;

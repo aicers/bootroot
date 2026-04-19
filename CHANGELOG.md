@@ -37,6 +37,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `POSTGRES_HOST_PORT` for the host-side translation. Only `sslmode`
   is preserved across translation; other query parameters are
   dropped. (Closes #542)
+- Fixed `bootroot verify` failing with "No such file or directory" when
+  `bootroot-agent` was not on `$PATH`. Verify now resolves the agent
+  binary by checking `--agent-binary <path>` first, then the directory
+  containing the running `bootroot` executable, and finally `$PATH`.
+  When none resolve, the error message names every candidate that was
+  tried. (Closes #553)
 - Fixed daemon-mode retries silently dropping CLI overrides (`--email`,
   `--ca-url`, `--http-responder-url`, `--http-responder-hmac`). The retry
   path reloaded the config file from disk without re-applying CLI-provided
@@ -192,6 +198,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Changed `bootroot service agent start` to take `--service-name <NAME>`
+  instead of a positional `<SERVICE_NAME>` argument, matching the other
+  per-service subcommands (`service add`, `service info`, `service update`).
+  The positional form is no longer accepted. (Closes #553)
 - `bootroot rotate db` now auto-reads the current PostgreSQL admin DSN
   from `ca.json`'s `db.dataSource` field when `--db-admin-dsn` is
   omitted. Previously operators had to copy the DSN out of `ca.json`

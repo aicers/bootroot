@@ -304,10 +304,10 @@ run_verify_all() {
     log_phase "verify" "$node" "$service" "$cycle" "$item"
     (
       cd "$work_dir"
-      PATH="$work_dir/bin:$PATH" \
       "$BOOTROOT_BIN" verify \
         --service-name "$service" \
         --agent-config "$agent_config_path" \
+        --agent-binary "$work_dir/bin/bootroot-agent" \
         >/dev/null
     )
   done <"$SERVICES_TSV"

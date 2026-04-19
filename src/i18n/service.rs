@@ -309,6 +309,13 @@ impl Messages {
         self.strings().error_bootroot_agent_run_failed
     }
 
+    pub(crate) fn error_bootroot_agent_not_found(&self, candidates: &str) -> String {
+        format_template(
+            self.strings().error_bootroot_agent_not_found,
+            &[("candidates", candidates)],
+        )
+    }
+
     pub(crate) fn error_secrets_dir_resolve_failed(&self) -> &'static str {
         self.strings().error_secrets_dir_resolve_failed
     }

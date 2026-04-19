@@ -499,17 +499,17 @@ fn run_rotate_secret_id_with_output(root: &Path, openbao_url: &str) -> std::proc
 }
 
 fn run_verify(root: &Path, agent_config: &Path) -> anyhow::Result<()> {
-    let path_env = env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{path_env}", root.join("bin").display());
+    let agent_binary = root.join("bin").join("bootroot-agent");
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(root)
-        .env("PATH", combined_path)
         .args([
             "verify",
             "--service-name",
             SERVICE_NAME,
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
         ])
         .output()
         .context("run verify")?;

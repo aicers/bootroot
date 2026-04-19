@@ -416,10 +416,8 @@ verify_with_retry() {
   local service="$1"
   local agent_config="$2"
   local attempt
-  local agent_bin_dir
-  agent_bin_dir="$(dirname "$BOOTROOT_AGENT_BIN")"
   for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
-    if PATH="${agent_bin_dir}:$PATH" run_bootroot_control verify --service-name "$service" --agent-config "$agent_config" >>"$RUN_LOG" 2>&1; then
+    if run_bootroot_control verify --service-name "$service" --agent-config "$agent_config" --agent-binary "$BOOTROOT_AGENT_BIN" >>"$RUN_LOG" 2>&1; then
       return 0
     fi
     if [ "$attempt" -eq "$VERIFY_ATTEMPTS" ]; then

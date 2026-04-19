@@ -179,6 +179,7 @@ pub(crate) struct Strings {
     pub(crate) error_docker_compose_failed: &'static str,
     pub(crate) error_docker_command_failed: &'static str,
     pub(crate) error_bootroot_agent_run_failed: &'static str,
+    pub(crate) error_bootroot_agent_not_found: &'static str,
     pub(crate) error_secrets_dir_resolve_failed: &'static str,
     pub(crate) error_rendered_file_timeout: &'static str,
     pub(crate) error_parse_ca_json_failed: &'static str,
