@@ -255,8 +255,18 @@ fn test_verify_db_check_reports_auth_failure() {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
     let port = listener.local_addr().expect("local addr").port();
-    let dsn = format!("postgresql://user:pass@127.0.0.1:{port}/stepca?sslmode=disable");
-    write_ca_json_with_dsn(temp_dir.path(), &dsn).expect("write ca.json");
+    // Representative of what `init` / `rotate db` now persist after the
+    // PostgreSQL DSN translation layer: a compose-internal DSN (host
+    // `postgres`, port `5432`). `verify --db-check` must translate this
+    // back to the host-side pair before connecting; the `.env` file next
+    // to the (default) compose file supplies `POSTGRES_HOST_PORT`.
+    let stored_dsn = "postgresql://user:pass@postgres:5432/stepca?sslmode=disable";
+    write_ca_json_with_dsn(temp_dir.path(), stored_dsn).expect("write ca.json");
+    fs::write(
+        temp_dir.path().join(".env"),
+        format!("POSTGRES_HOST_PORT={port}\n"),
+    )
+    .expect("write .env");
 
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
@@ -268,6 +278,7 @@ fn test_verify_db_check_reports_auth_failure() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
         .env("PATH", combined_path)
+        .env_remove("POSTGRES_HOST_PORT")
         .args([
             "verify",
             "--service-name",
@@ -282,6 +293,86 @@ fn test_verify_db_check_reports_auth_failure() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(stderr.contains("bootroot verify failed"));
+    // Translation must reach the bound listener on 127.0.0.1:<port> rather
+    // than failing earlier on `postgres` name resolution. Auth then fails
+    // because the listener does not speak the PostgreSQL protocol.
+    assert!(
+        stderr.contains("DB authentication check failed"),
+        "expected auth failure (translation reached host-side listener), got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_verify_db_check_translates_compose_dsn_via_process_env() {
+    // Regression for issue #542 reviewer feedback: starting from a
+    // compose-internal `ca.json` DSN (what `init` / `rotate db` persist
+    // post-fix), `verify --db-check` must route through `for_host_runtime`
+    // so it never tries to resolve `postgres` from the host. This case
+    // exercises the process-env precedence in `resolve_postgres_host_port`
+    // — `POSTGRES_HOST_PORT` set on the spawned process must win over any
+    // `.env` file lookup.
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    write_cert_with_dns(
+        &cert_path,
+        &key_path,
+        "001.edge-proxy.edge-node-01.trusted.domain",
+    )
+    .expect("write cert");
+
+    write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let stored_dsn = "postgresql://user:pass@postgres:5432/stepca?sslmode=disable";
+    write_ca_json_with_dsn(temp_dir.path(), stored_dsn).expect("write ca.json");
+    // A misleading `.env` would win over default-5432 fallback; assert the
+    // process-env override beats it.
+    fs::write(temp_dir.path().join(".env"), "POSTGRES_HOST_PORT=1\n").expect("write .env");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_fake_bootroot_agent(&bin_dir, 0).expect("write fake agent");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", combined_path)
+        .env("POSTGRES_HOST_PORT", port.to_string())
+        .args([
+            "verify",
+            "--service-name",
+            "edge-proxy",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--db-check",
+        ])
+        .output()
+        .expect("run verify");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    // Auth failure (not name resolution failure) proves translation
+    // produced 127.0.0.1:<port> — the bound listener was reached, but it
+    // does not speak the PostgreSQL protocol.
+    assert!(
+        stderr.contains("DB authentication check failed"),
+        "expected auth failure (translation reached host-side listener), got stderr: {stderr}"
+    );
+    // A leak of the raw compose DSN would surface as a name-resolution
+    // error referencing `postgres`.
+    assert!(
+        !stderr.contains("Failed to resolve postgres"),
+        "compose hostname leaked into host-side resolution, stderr: {stderr}"
+    );
 }
 
 #[test]

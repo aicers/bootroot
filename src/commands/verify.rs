@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use bootroot::db::{check_auth_sync, check_tcp_sync, parse_db_dsn};
+use bootroot::db::{check_auth_sync, check_tcp_sync, for_host_runtime, parse_db_dsn};
 
 use crate::cli::args::VerifyArgs;
 use crate::cli::output::print_verify_plan;
@@ -59,7 +59,13 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
     verify_cert_san(entry, messages)?;
 
     if args.db_check {
-        verify_db_connectivity(&state, args.db_timeout.timeout_secs, messages)?;
+        let compose_dir = args
+            .compose_file
+            .compose_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        verify_db_connectivity(&state, &compose_dir, args.db_timeout.timeout_secs, messages)?;
     }
 
     println!("{}", messages.verify_summary_title());
@@ -83,7 +89,12 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
     Ok(())
 }
 
-fn verify_db_connectivity(state: &StateFile, timeout_secs: u64, messages: &Messages) -> Result<()> {
+fn verify_db_connectivity(
+    state: &StateFile,
+    compose_dir: &Path,
+    timeout_secs: u64,
+    messages: &Messages,
+) -> Result<()> {
     let secrets_dir = state
         .secrets_dir()
         .canonicalize()
@@ -97,10 +108,16 @@ fn verify_db_connectivity(state: &StateFile, timeout_secs: u64, messages: &Messa
     if db_type != "postgresql" {
         anyhow::bail!(messages.error_db_type_unsupported());
     }
-    let dsn = value["db"]["dataSource"]
+    let stored_dsn = value["db"]["dataSource"]
         .as_str()
         .unwrap_or_default()
         .to_string();
+    // ca.json holds the compose-internal DSN (host `postgres`, port `5432`).
+    // `verify --db-check` runs on the host, so translate to the host-side
+    // pair before any TCP / auth check — otherwise host name resolution
+    // fails and `POSTGRES_HOST_PORT` is silently ignored.
+    let dsn = for_host_runtime(&stored_dsn, compose_dir)
+        .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
     let parsed =
         parse_db_dsn(&dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
     let timeout = std::time::Duration::from_secs(timeout_secs);
