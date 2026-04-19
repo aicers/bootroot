@@ -298,7 +298,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_summary_openbao_recovery_next_steps: "- next steps: store new credentials securely, revoke old root token if still valid, and validate OpenBao health",
     prompt_rotate_openbao_recovery: "Rotate OpenBao recovery credentials ({value})? AppRole + SecretID will remain unchanged. [y/N]",
     error_openbao_recovery_target_required: "Specify at least one target: --rotate-unseal-keys and/or --rotate-root-token",
-    error_openbao_recovery_unseal_keys_required: "At least {value} existing unseal keys are required for rekey",
+    error_openbao_recovery_unseal_keys_required: "At least {value} existing unseal keys are required for root-key rotation",
     prompt_rotate_trust_sync: "Sync CA trust data to OpenBao and update services? [y/N]",
     prompt_rotate_force_reissue: "Delete certificates for {service_name} and trigger reissuance? [y/N]",
     rotate_summary_trust_sync_global: "- CA trust updated: {value}",

@@ -932,11 +932,11 @@ async fn test_rotate_openbao_recovery_unseal_keys_fails_when_openbao_sealed() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_rotate_openbao_recovery_unseal_keys_fails_when_rekey_not_complete() {
+async fn test_rotate_openbao_recovery_unseal_keys_fails_when_rotation_not_complete() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
     write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
-    stub_openbao_for_recovery_rekey_incomplete(&openbao).await;
+    stub_openbao_for_recovery_root_rotation_incomplete(&openbao).await;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -957,11 +957,11 @@ async fn test_rotate_openbao_recovery_unseal_keys_fails_when_rekey_not_complete(
             "old-unseal-3",
         ])
         .output()
-        .expect("run rotate openbao-recovery rekey incomplete");
+        .expect("run rotate openbao-recovery root rotation incomplete");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "stderr:\n{stderr}");
-    assert!(stderr.contains("rekey did not complete"));
+    assert!(stderr.contains("root-key rotation did not complete"));
 }
 
 #[cfg(unix)]
@@ -970,7 +970,7 @@ async fn test_rotate_openbao_recovery_unseal_keys_requires_enough_keys_in_yes_mo
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
     write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
-    stub_openbao_for_recovery_rekey_ready(&openbao).await;
+    stub_openbao_for_recovery_root_rotation_ready(&openbao).await;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -993,7 +993,7 @@ async fn test_rotate_openbao_recovery_unseal_keys_requires_enough_keys_in_yes_mo
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "stderr:\n{stderr}");
-    assert!(stderr.contains("At least 3 existing unseal keys are required for rekey"));
+    assert!(stderr.contains("At least 3 existing unseal keys are required for root-key rotation"));
 }
 
 #[cfg(unix)]
@@ -1538,62 +1538,66 @@ async fn stub_openbao_for_recovery_root_token_rotation(server: &MockServer) {
 async fn stub_openbao_for_recovery_combined_rotation(server: &MockServer) {
     stub_openbao_for_recovery_root_token_rotation(server).await;
 
-    Mock::given(method("PUT"))
-        .and(path("/v1/sys/rekey/init"))
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/rotate/root/init"))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .and(body_json(json!({
             "secret_shares": 5,
             "secret_threshold": 3
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "nonce": "nonce-1",
-            "progress": 0
+            "data": {
+                "nonce": "nonce-1",
+                "progress": 0
+            }
         })))
         .mount(server)
         .await;
 
-    Mock::given(method("PUT"))
-        .and(path("/v1/sys/rekey/update"))
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/rotate/root/update"))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .and(body_json(json!({
             "nonce": "nonce-1",
             "key": "old-unseal-1"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "complete": false
+            "data": { "complete": false }
         })))
         .mount(server)
         .await;
 
-    Mock::given(method("PUT"))
-        .and(path("/v1/sys/rekey/update"))
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/rotate/root/update"))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .and(body_json(json!({
             "nonce": "nonce-1",
             "key": "old-unseal-2"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "complete": false
+            "data": { "complete": false }
         })))
         .mount(server)
         .await;
 
-    Mock::given(method("PUT"))
-        .and(path("/v1/sys/rekey/update"))
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/rotate/root/update"))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .and(body_json(json!({
             "nonce": "nonce-1",
             "key": "old-unseal-3"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "complete": true,
-            "keys": [
-                "new-unseal-1",
-                "new-unseal-2",
-                "new-unseal-3",
-                "new-unseal-4",
-                "new-unseal-5"
-            ]
+            "data": {
+                "complete": true,
+                "keys": [
+                    "new-unseal-1",
+                    "new-unseal-2",
+                    "new-unseal-3",
+                    "new-unseal-4",
+                    "new-unseal-5"
+                ]
+            }
         })))
         .mount(server)
         .await;
@@ -1617,7 +1621,7 @@ async fn stub_openbao_for_recovery_sealed(server: &MockServer) {
         .await;
 }
 
-async fn stub_openbao_for_recovery_rekey_ready(server: &MockServer) {
+async fn stub_openbao_for_recovery_root_rotation_ready(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
         .respond_with(ResponseTemplate::new(200))
@@ -1635,33 +1639,35 @@ async fn stub_openbao_for_recovery_rekey_ready(server: &MockServer) {
         .await;
 }
 
-async fn stub_openbao_for_recovery_rekey_incomplete(server: &MockServer) {
-    stub_openbao_for_recovery_rekey_ready(server).await;
+async fn stub_openbao_for_recovery_root_rotation_incomplete(server: &MockServer) {
+    stub_openbao_for_recovery_root_rotation_ready(server).await;
 
-    Mock::given(method("PUT"))
-        .and(path("/v1/sys/rekey/init"))
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/rotate/root/init"))
         .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .and(body_json(json!({
             "secret_shares": 5,
             "secret_threshold": 3
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "nonce": "nonce-incomplete",
-            "progress": 0
+            "data": {
+                "nonce": "nonce-incomplete",
+                "progress": 0
+            }
         })))
         .mount(server)
         .await;
 
     for key in ["old-unseal-1", "old-unseal-2", "old-unseal-3"] {
-        Mock::given(method("PUT"))
-            .and(path("/v1/sys/rekey/update"))
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/rotate/root/update"))
             .and(header("X-Vault-Token", support::ROOT_TOKEN))
             .and(body_json(json!({
                 "nonce": "nonce-incomplete",
                 "key": key
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "complete": false
+                "data": { "complete": false }
             })))
             .mount(server)
             .await;

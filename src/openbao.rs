@@ -134,17 +134,22 @@ struct WrappedResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RekeyInitResponse {
+pub struct RootRotationInitResponse {
     pub nonce: String,
     #[serde(default)]
     pub progress: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RekeyUpdateResponse {
+pub struct RootRotationUpdateResponse {
     pub complete: bool,
     #[serde(default)]
     pub keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataEnvelope<T> {
+    data: T,
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,41 +309,59 @@ impl OpenBaoClient {
         Self::parse_response(response).await
     }
 
-    /// Starts unseal key rekey with the given share and threshold values.
+    /// Starts a Shamir root-key rotation with the given share and
+    /// threshold values via `POST /sys/rotate/root/init`.
     ///
     /// # Errors
-    /// Returns an error if the rekey init request fails.
-    pub async fn start_rekey(&self, shares: u32, threshold: u32) -> Result<RekeyInitResponse> {
+    /// Returns an error if the rotation init request fails.
+    pub async fn start_root_rotation(
+        &self,
+        shares: u32,
+        threshold: u32,
+    ) -> Result<RootRotationInitResponse> {
         #[derive(Serialize)]
-        struct RekeyInitRequest {
+        struct RootRotationInitRequest {
             secret_shares: u32,
             secret_threshold: u32,
         }
 
-        self.put_json(
-            "sys/rekey/init",
-            &RekeyInitRequest {
-                secret_shares: shares,
-                secret_threshold: threshold,
-            },
-            None,
-        )
-        .await
+        let envelope: DataEnvelope<RootRotationInitResponse> = self
+            .post_json(
+                "sys/rotate/root/init",
+                &RootRotationInitRequest {
+                    secret_shares: shares,
+                    secret_threshold: threshold,
+                },
+                None,
+            )
+            .await?;
+        Ok(envelope.data)
     }
 
-    /// Submits one existing unseal key for an in-progress rekey operation.
+    /// Submits one existing unseal key for an in-progress root-key
+    /// rotation via `POST /sys/rotate/root/update`.
     ///
     /// # Errors
-    /// Returns an error if the rekey update request fails.
-    pub async fn submit_rekey_share(&self, nonce: &str, key: &str) -> Result<RekeyUpdateResponse> {
+    /// Returns an error if the rotation update request fails.
+    pub async fn submit_root_rotation_share(
+        &self,
+        nonce: &str,
+        key: &str,
+    ) -> Result<RootRotationUpdateResponse> {
         #[derive(Serialize)]
-        struct RekeyUpdateRequest<'a> {
+        struct RootRotationUpdateRequest<'a> {
             nonce: &'a str,
             key: &'a str,
         }
 
-        self.put_json("sys/rekey/update", &RekeyUpdateRequest { nonce, key }, None)
-            .await
+        let envelope: DataEnvelope<RootRotationUpdateResponse> = self
+            .post_json(
+                "sys/rotate/root/update",
+                &RootRotationUpdateRequest { nonce, key },
+                None,
+            )
+            .await?;
+        Ok(envelope.data)
     }
 
     /// Creates a new root-policy token.
@@ -907,20 +930,6 @@ impl OpenBaoClient {
             .with_context(|| format!("OpenBao response failed: {path}"))
     }
 
-    async fn put_json<T: Serialize, R: DeserializeOwned>(
-        &self,
-        path: &str,
-        body: &T,
-        wrap_ttl: Option<&str>,
-    ) -> Result<R> {
-        let response = self
-            .send_authed_json(Method::PUT, path, body, wrap_ttl)
-            .await?;
-        Self::parse_response(response)
-            .await
-            .with_context(|| format!("OpenBao response parse failed: {path}"))
-    }
-
     async fn parse_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
         let status = response.status();
         let text = response
@@ -1071,39 +1080,6 @@ mod wrap_tests {
             .expect("get_json with wrap_ttl should succeed");
         assert_eq!(info.wrap_info.token, "wrap-get-token");
         assert_eq!(info.wrap_info.ttl, 90);
-    }
-
-    #[tokio::test]
-    async fn put_json_sends_wrap_ttl_header() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("PUT"))
-            .and(path("/v1/sys/rekey/init"))
-            .and(header("X-Vault-Token", "root-token"))
-            .and(header("X-Vault-Wrap-TTL", "30s"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "wrap_info": {
-                    "token": "wrap-put-token",
-                    "ttl": 30,
-                    "creation_time": "2026-04-12T00:00:00Z",
-                    "creation_path": "sys/rekey/init"
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = client_with_token(&server);
-        let info: WrappedResponse = client
-            .put_json(
-                "sys/rekey/init",
-                &json!({"secret_shares": 5, "secret_threshold": 3}),
-                Some("30s"),
-            )
-            .await
-            .expect("put_json with wrap_ttl should succeed");
-        assert_eq!(info.wrap_info.token, "wrap-put-token");
-        assert_eq!(info.wrap_info.ttl, 30);
     }
 
     #[tokio::test]

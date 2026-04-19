@@ -7,7 +7,7 @@ use bootroot::openbao::OpenBaoClient;
 use super::helpers::{confirm_action, ensure_non_empty};
 use super::{
     OPENBAO_RECOVERY_SCOPE_ROOT_TOKEN, OPENBAO_RECOVERY_SCOPE_UNSEAL_KEYS,
-    OPENBAO_REKEY_INCOMPLETE_ERROR,
+    OPENBAO_ROOT_ROTATION_INCOMPLETE_ERROR,
 };
 use crate::cli::args::RotateOpenBaoRecoveryArgs;
 use crate::cli::output::display_secret;
@@ -129,21 +129,21 @@ async fn rotate_openbao_unseal_keys(
         anyhow::bail!(messages.error_openbao_recovery_unseal_keys_required(&required.to_string()));
     }
 
-    let rekey_init = client
-        .start_rekey(shares, threshold)
+    let rotation_init = client
+        .start_root_rotation(shares, threshold)
         .await
-        .context("OpenBao rekey init request failed")?;
+        .context("OpenBao root rotation init request failed")?;
     for key in keys.iter().take(required) {
         let update = client
-            .submit_rekey_share(&rekey_init.nonce, key)
+            .submit_root_rotation_share(&rotation_init.nonce, key)
             .await
-            .context("OpenBao rekey update request failed")?;
+            .context("OpenBao root rotation update request failed")?;
         if update.complete && !update.keys.is_empty() {
             return Ok(update.keys);
         }
     }
 
-    anyhow::bail!(OPENBAO_REKEY_INCOMPLETE_ERROR);
+    anyhow::bail!(OPENBAO_ROOT_ROTATION_INCOMPLETE_ERROR);
 }
 
 fn print_openbao_recovery_stdout(

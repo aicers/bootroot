@@ -928,7 +928,8 @@ Inputs:
 Manually rotates OpenBao recovery credentials. This operation is explicit
 operator action only and does not run automatically.
 
-- `--rotate-unseal-keys`: rotate unseal keys via rekey
+- `--rotate-unseal-keys`: rotate unseal keys via the authenticated
+  root-key rotation API (`sys/rotate/root`)
 - `--rotate-root-token`: create a new root token
 - `--unseal-key`: existing unseal key (repeatable)
 - `--unseal-key-file`: file containing existing unseal keys (one per line)
@@ -1016,7 +1017,7 @@ The command is considered failed when:
 - DB rotation is missing admin DSN or provisioning fails
 - EAB issuance request fails
 - responder config write fails or reload fails
-- OpenBao recovery rekey/root-token rotation fails
+- OpenBao recovery unseal-key/root-token rotation fails
 - AppRole target is missing or secret_id update fails
 
 ## bootroot monitoring

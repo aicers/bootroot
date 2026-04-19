@@ -361,7 +361,7 @@ pub(crate) struct RotateResponderHmacArgs {
     )
 )]
 pub(crate) struct RotateOpenBaoRecoveryArgs {
-    /// Rotates unseal keys via rekey.
+    /// Rotates unseal keys via the authenticated root-key rotation API.
     ///
     /// Requires existing unseal keys. Provide at least the configured unseal
     /// threshold number of key shares. If those keys are lost, this rotation
