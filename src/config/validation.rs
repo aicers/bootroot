@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::defaults::default_renew_before;
-use super::{DaemonProfileSettings, HookCommand, Settings, TrustSettings};
+use super::{DaemonProfileSettings, HookCommand, OpenBaoSettings, Settings, TrustSettings};
 
 /// Validates that `cert_duration` is strictly greater than the default
 /// daemon `renew_before` interval.
@@ -93,6 +93,55 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
     }
     for profile in &settings.profiles {
         validate_profile(profile)?;
+    }
+    if let Some(openbao) = &settings.openbao {
+        validate_openbao_settings(openbao)?;
+    }
+    Ok(())
+}
+
+fn validate_openbao_settings(settings: &OpenBaoSettings) -> Result<()> {
+    if settings.url.trim().is_empty() {
+        anyhow::bail!("openbao.url must not be empty");
+    }
+    if settings.kv_mount.trim().is_empty() {
+        anyhow::bail!("openbao.kv_mount must not be empty");
+    }
+    if settings.role_id_path.as_os_str().is_empty() {
+        anyhow::bail!("openbao.role_id_path must not be empty");
+    }
+    if settings.secret_id_path.as_os_str().is_empty() {
+        anyhow::bail!("openbao.secret_id_path must not be empty");
+    }
+    if settings.fast_poll_interval < Duration::from_secs(1) {
+        anyhow::bail!("openbao.fast_poll_interval must be at least 1 second");
+    }
+    if settings.url.starts_with("https://") && settings.ca_bundle_path.is_none() {
+        anyhow::bail!("openbao.ca_bundle_path must be set when openbao.url uses https://");
+    }
+    if let Some(path) = &settings.ca_bundle_path
+        && path.as_os_str().is_empty()
+    {
+        anyhow::bail!("openbao.ca_bundle_path must not be empty");
+    }
+    if settings.state_path.as_os_str().is_empty() {
+        anyhow::bail!("openbao.state_path must not be empty");
+    }
+    if !settings.state_path.is_absolute() {
+        // A relative state_path is resolved against the agent process
+        // cwd, which is not contracted to be stable or writable under
+        // systemd-style supervisors. If the cwd changes between
+        // restarts, the persisted `last_reissue_seen_version` /
+        // `in_flight_renewals` / `pending_completion_writes` map is
+        // lost, defeating duplicate-suppression and completion-retry.
+        // `bootroot-remote bootstrap` auto-provisions an absolute path
+        // adjacent to `agent.toml`; operator-written configs must do
+        // the same.
+        anyhow::bail!(
+            "openbao.state_path must be an absolute path ({} is relative); \
+             rerun `bootroot-remote bootstrap` or set an absolute path explicitly",
+            settings.state_path.display()
+        );
     }
     Ok(())
 }

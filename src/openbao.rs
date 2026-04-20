@@ -152,6 +152,31 @@ struct DataEnvelope<T> {
     data: T,
 }
 
+/// Versioned KV v2 read result.
+#[derive(Debug, Clone)]
+pub struct KvReadWithVersion {
+    /// The secret data body (`data.data` in the `OpenBao` envelope).
+    pub data: serde_json::Value,
+    /// The KV v2 version number of this read (`data.metadata.version`).
+    pub version: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct KvVersionedResponse {
+    data: KvVersionedResponseData,
+}
+
+#[derive(Debug, Deserialize)]
+struct KvVersionedResponseData {
+    data: serde_json::Value,
+    metadata: KvVersionedResponseMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct KvVersionedResponseMetadata {
+    version: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct TokenCreateResponse {
     auth: AppRoleAuth,
@@ -691,6 +716,65 @@ impl OpenBaoClient {
             .await
     }
 
+    /// Writes a KV v2 secret and returns the version assigned by this
+    /// write, parsed from the POST response body.
+    ///
+    /// `OpenBao`'s `POST /v1/<mount>/data/<path>` returns
+    /// `{"data": {"version": N, ...}}`, where `N` is the version number
+    /// this write produced. Callers that need to pin on "the version I
+    /// just wrote" (e.g. `rotate force-reissue --wait`) must use this
+    /// method rather than a follow-up GET, because another writer — for
+    /// example the remote agent's completion write — can advance the
+    /// KV metadata version between the POST and the GET and make the
+    /// readback report a newer, unrelated version.
+    ///
+    /// Returns `Ok(None)` only when the response body has no
+    /// `data.version` field (older `OpenBao`, or response stripped by a
+    /// proxy); callers should treat that case as "version unknown" and
+    /// fall back to timestamp-based comparison.
+    ///
+    /// # Errors
+    /// Returns an error if the write request fails or the response body
+    /// is not valid JSON.
+    pub async fn write_kv_with_version(
+        &self,
+        mount: &str,
+        path: &str,
+        data: serde_json::Value,
+    ) -> Result<Option<u64>> {
+        #[derive(Serialize)]
+        struct KvRequest {
+            data: serde_json::Value,
+        }
+        #[derive(Deserialize)]
+        struct KvWriteResponse {
+            data: KvWriteResponseData,
+        }
+        #[derive(Deserialize)]
+        struct KvWriteResponseData {
+            #[serde(default)]
+            version: Option<u64>,
+        }
+        let full_path = format!("{mount}/data/{path}");
+        let response = self
+            .send_authed_json(Method::POST, &full_path, &KvRequest { data }, None)
+            .await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        if !status.is_success() {
+            anyhow::bail!("OpenBao API error ({status}): {text}");
+        }
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed: KvWriteResponse =
+            serde_json::from_str(&text).context("Failed to parse OpenBao KV write response")?;
+        Ok(parsed.data.version)
+    }
+
     /// Reads a KV v2 secret.
     ///
     /// # Errors
@@ -707,6 +791,65 @@ impl OpenBaoClient {
         self.get_json::<KvResponse>(&format!("{mount}/data/{path}"), true, None)
             .await
             .map(|response| response.data.data)
+    }
+
+    /// Reads a KV v2 secret together with its version metadata.
+    ///
+    /// The `version` field is the monotonically-increasing KV v2 revision
+    /// number, which callers can use as an authoritative "has this changed"
+    /// signal without depending on wall-clock timestamps.
+    ///
+    /// # Errors
+    /// Returns an error if the read request fails or the response payload
+    /// lacks the expected `metadata.version` field.
+    pub async fn read_kv_with_version(&self, mount: &str, path: &str) -> Result<KvReadWithVersion> {
+        let full_path = format!("{mount}/data/{path}");
+        let response = self.send_authed(Method::GET, &full_path, None).await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        if !status.is_success() {
+            anyhow::bail!("OpenBao API error ({status}): {text}");
+        }
+        let parsed: KvVersionedResponse =
+            serde_json::from_str(&text).context("Failed to parse OpenBao KV response")?;
+        Ok(KvReadWithVersion {
+            data: parsed.data.data,
+            version: parsed.data.metadata.version,
+        })
+    }
+
+    /// Reads a KV v2 secret with version metadata, treating a missing
+    /// entry as `Ok(None)`.
+    ///
+    /// # Errors
+    /// Returns an error for anything other than a clean not-found.
+    pub async fn try_read_kv_with_version(
+        &self,
+        mount: &str,
+        path: &str,
+    ) -> Result<Option<KvReadWithVersion>> {
+        let full_path = format!("{mount}/data/{path}");
+        let response = self.send_authed(Method::GET, &full_path, None).await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        if is_not_found(status, &text) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            anyhow::bail!("OpenBao API error ({status}): {text}");
+        }
+        let parsed: KvVersionedResponse =
+            serde_json::from_str(&text).context("Failed to parse OpenBao KV response")?;
+        Ok(Some(KvReadWithVersion {
+            data: parsed.data.data,
+            version: parsed.data.metadata.version,
+        }))
     }
 
     /// Reads a KV v2 secret, treating a missing entry as `Ok(None)`.

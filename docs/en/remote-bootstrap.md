@@ -341,6 +341,111 @@ this as a **potential security incident**.
 4. Ship the artifact and run `bootroot-remote bootstrap` on the remote
    host.
 
+## Force-reissue (control plane → remote agent)
+
+The control plane has no push channel into the remote host, so
+`bootroot rotate force-reissue` cannot delete the remote's cert files
+directly. Instead, for `--delivery-mode remote-bootstrap` services, the
+command writes a versioned reissue request to OpenBao KV at
+`{kv_mount}/data/bootroot/services/<service>/reissue`:
+
+```json
+{
+  "requested_at": "2026-04-19T12:34:56Z",
+  "requester": "<operator label>"
+}
+```
+
+The remote `bootroot-agent` consumes the request through a fast-poll
+loop that authenticates via AppRole and polls each registered service's
+reissue path on `fast_poll_interval` (default `30s`). Whenever the KV
+v2 version is newer than the version the agent last applied (tracked
+per-service in `state_path`), the agent triggers an immediate ACME
+renewal and writes back `completed_at` and `completed_version` so the
+control plane can observe end-to-end latency.
+
+The loop is driven by the `[openbao]` section of `agent.toml`. This
+section is **required** on every remote-bootstrap host: without it the
+agent has no consumer for the control plane's KV request, and a
+`force-reissue` would sit queued until the certificate neared natural
+expiry. `bootroot-remote bootstrap` auto-populates the connection
+fields (`url`, `kv_mount`, `role_id_path`, `secret_id_path`,
+`ca_bundle_path`) on every run, so operators do not normally edit it
+by hand. If a legacy remote upgrades bootroot without rerunning
+`bootroot-remote bootstrap`, the section will be absent and
+`force-reissue` requests will not be observed until the next bootstrap
+populates it.
+
+```toml
+# agent.toml — auto-populated by `bootroot-remote bootstrap`
+[openbao]
+url = "https://openbao.internal:8200"
+kv_mount = "secret"
+role_id_path = "/etc/bootroot/role_id"
+secret_id_path = "/etc/bootroot/secret_id"
+ca_bundle_path = "/etc/bootroot/ca-bundle.pem"   # required for https://
+fast_poll_interval = "30s"                        # optional; default 30s
+state_path = "/etc/bootroot/bootroot-agent-state.json" # provisioned by bootstrap
+```
+
+`state_path` holds the agent's `last_reissue_seen_version`,
+`in_flight_renewals`, and `pending_completion_writes` maps across
+restarts — the state this feature relies on to avoid duplicate
+renewals and to retry completion acknowledgements. Bootstrap
+provisions it to an absolute path adjacent to `agent.toml` whenever
+the current value is missing *or relative*, so the fast-poll state
+does not end up at a cwd-relative location under a systemd-style
+supervisor (where cwd is not contractually writable or stable).
+Rerunning `bootroot-remote bootstrap` therefore repairs a legacy
+config whose `state_path` was the in-tree relative default, matching
+the remediation hint that config validation prints on startup.
+Operators can override with any absolute path; subsequent bootstrap
+reruns preserve a custom absolute value. Config validation
+additionally rejects a relative `state_path` (including the case
+where it is omitted entirely and falls through to an in-tree
+default), so a misconfiguration is caught at `bootroot-agent`
+startup instead of silently running with a fragile state file.
+
+This mechanism uses the same AppRole credentials the remote agent
+already has, adds one KV read per service per `fast_poll_interval`, and
+shrinks worst-case force-reissue latency from one `check_interval`
+(default 1h) to roughly one fast-poll interval.
+
+Operators can pass `--wait` (and optionally `--wait-timeout`) on
+`bootroot rotate force-reissue` to block until the remote agent reports
+completion. A `--wait` timeout is not an error — the request stays
+queued and is applied on the next fast-poll tick.
+
+When a remote host runs multiple `[[profiles]]` for the same
+`service_name` (e.g. several instances of one service on the same
+machine), each fast-poll tick fans the renewal trigger out across
+every matching profile before marking the KV version consumed, so a
+single force-reissue rotates every instance. If any profile in the
+fan-out fails, the profiles that already succeeded for that request
+are recorded as per-service `in_flight_renewals` progress in
+`state_path`. The next tick retries *only* the failed sibling(s)
+against the same KV version — the profiles that already renewed are
+skipped and are not forced through a second renewal. The version is
+marked consumed only once every profile has succeeded; stale
+per-profile progress is dropped automatically when a newer reissue
+request supersedes it or when the request disappears from KV.
+
+Operators who want to pin `--wait` to a specific KV version should
+rely on the version returned by the publish POST: `rotate force-reissue`
+captures it directly from the write response rather than doing a
+follow-up GET, so the agent's own completion write cannot advance
+the metadata version in the interim and cause `--wait` to hang.
+
+If the remote agent renews the certificate but the subsequent write
+of `completed_at` back to OpenBao fails (transient KV outage, network
+blip, etc.), it persists a `pending_completion_writes` entry in
+`state_path` and retries just the completion write on the next tick.
+This avoids leaving `bootroot rotate force-reissue --wait` stuck
+without an acknowledgement after the certificate has actually been
+rotated. Pending entries are dropped automatically when a newer
+reissue request supersedes them or when the request is removed from
+KV entirely.
+
 ## Idempotent service add rerun
 
 Re-running `bootroot service add` on an existing `remote-bootstrap`

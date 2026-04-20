@@ -500,6 +500,11 @@ bootroot rotate trust-sync
 
 # 특정 서비스의 인증서 강제 재발급
 bootroot rotate force-reissue --service-name edge-proxy
+
+# remote-bootstrap 서비스를 강제 재발급하고 원격 agent가 반영할 때까지
+# 대기(OpenBao reissue KV 경로의 completed_at 폴링).
+bootroot rotate force-reissue \
+  --service-name edge-remote --wait --wait-timeout 90s
 ```
 
 OpenBao 복구 자격증명 수동 회전(언실 키 + 루트 토큰):

@@ -512,8 +512,9 @@ pub(super) async fn rotate_trust_sync(
     Ok(())
 }
 
-pub(super) fn rotate_force_reissue(
+pub(super) async fn rotate_force_reissue(
     ctx: &mut RotateContext,
+    client: &OpenBaoClient,
     args: &RotateForceReissueArgs,
     auto_confirm: bool,
     messages: &Messages,
@@ -525,11 +526,16 @@ pub(super) fn rotate_force_reissue(
         .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?
         .clone();
 
-    confirm_action(
-        &messages.prompt_rotate_force_reissue(&args.service_name),
-        auto_confirm,
-        messages,
-    )?;
+    let prompt = if matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap) {
+        messages.prompt_rotate_force_reissue_remote(&args.service_name)
+    } else {
+        messages.prompt_rotate_force_reissue(&args.service_name)
+    };
+    confirm_action(&prompt, auto_confirm, messages)?;
+
+    if matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap) {
+        return rotate_force_reissue_remote(ctx, client, args, messages).await;
+    }
 
     let cert_path = &entry.cert_path;
     let key_path = &entry.key_path;
@@ -545,20 +551,215 @@ pub(super) fn rotate_force_reissue(
             &key_path.display().to_string(),
         )
     );
-
-    if matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
-        signal_bootroot_agent(&entry, messages)?;
-        println!(
-            "{}",
-            messages.rotate_summary_force_reissue_local_signal(&args.service_name)
-        );
-    } else {
-        println!(
-            "{}",
-            messages.rotate_summary_force_reissue_remote_hint(&args.service_name)
-        );
-    }
+    signal_bootroot_agent(&entry, messages)?;
+    println!(
+        "{}",
+        messages.rotate_summary_force_reissue_local_signal(&args.service_name)
+    );
     Ok(())
+}
+
+async fn rotate_force_reissue_remote(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    args: &RotateForceReissueArgs,
+    messages: &Messages,
+) -> Result<()> {
+    use bootroot::trust_bootstrap::{
+        REISSUE_REQUESTED_AT_KEY, REISSUE_REQUESTER_KEY, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX,
+    };
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let wait_timeout = humantime::parse_duration(&args.wait_timeout)
+        .with_context(|| format!("invalid --wait-timeout value: {}", args.wait_timeout))?;
+
+    let requester = args
+        .requester
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let requested_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("Failed to format requested_at timestamp")?;
+
+    let kv_path = format!(
+        "{SERVICE_KV_BASE}/{}/{SERVICE_REISSUE_KV_SUFFIX}",
+        args.service_name
+    );
+
+    // Capture the version assigned by *this* POST directly from the
+    // response body. A follow-up GET would race with the agent's own
+    // completion write: if the agent observes, renews, and writes back
+    // before the CLI's readback, the GET would report version N+1 and
+    // `--wait` would then compare `completed_version (N) >= N+1` and
+    // hang forever.
+    let request_version = client
+        .write_kv_with_version(
+            &ctx.kv_mount,
+            &kv_path,
+            serde_json::json!({
+                REISSUE_REQUESTED_AT_KEY: requested_at,
+                REISSUE_REQUESTER_KEY: requester,
+            }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
+
+    println!("{}", messages.rotate_summary_title());
+    println!(
+        "{}",
+        messages.rotate_summary_force_reissue_requested(&args.service_name, &requested_at)
+    );
+    println!(
+        "{}",
+        messages.rotate_summary_force_reissue_will_apply(&args.service_name)
+    );
+
+    if !args.wait {
+        return Ok(());
+    }
+
+    match wait_for_remote_completion(
+        client,
+        &ctx.kv_mount,
+        &kv_path,
+        request_version,
+        &requested_at,
+        wait_timeout,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            // Prefer the `requested_at` stored in the KV payload over
+            // the local variable: the KV read is the authoritative
+            // source of what the agent applied, and it keeps the
+            // elapsed calculation coherent if a subsequent forced
+            // reissue wrote a newer request while --wait was polling.
+            let requested_for_elapsed = outcome.requested_at.as_deref().unwrap_or(&requested_at);
+            let elapsed = format_reissue_elapsed(requested_for_elapsed, &outcome.completed_at);
+            println!(
+                "{}",
+                messages.rotate_summary_force_reissue_completed(
+                    &args.service_name,
+                    &outcome.completed_at,
+                    &elapsed,
+                )
+            );
+            Ok(())
+        }
+        Err(WaitError::Timeout) => {
+            println!(
+                "{}",
+                messages.rotate_summary_force_reissue_wait_timeout(
+                    &args.service_name,
+                    &args.wait_timeout,
+                )
+            );
+            Ok(())
+        }
+        Err(WaitError::Other(err)) => Err(err),
+    }
+}
+
+enum WaitError {
+    Timeout,
+    Other(anyhow::Error),
+}
+
+struct WaitOutcome {
+    completed_at: String,
+    requested_at: Option<String>,
+}
+
+/// Formats the end-to-end latency between `requested_at` and
+/// `completed_at` (both RFC3339) as a human-readable duration. Falls
+/// back to "unknown" when either timestamp cannot be parsed or the
+/// completion precedes the request (host-clock skew), so the operator
+/// still gets a completion confirmation without a misleading negative
+/// or wildly out-of-range duration.
+fn format_reissue_elapsed(requested_at: &str, completed_at: &str) -> String {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let Ok(requested) = OffsetDateTime::parse(requested_at, &Rfc3339) else {
+        return "unknown".to_string();
+    };
+    let Ok(completed) = OffsetDateTime::parse(completed_at, &Rfc3339) else {
+        return "unknown".to_string();
+    };
+    let diff = completed - requested;
+    let secs = diff.whole_seconds();
+    if secs < 0 {
+        return "unknown".to_string();
+    }
+    let Ok(secs_u64) = u64::try_from(secs) else {
+        return "unknown".to_string();
+    };
+    humantime::format_duration(std::time::Duration::from_secs(secs_u64)).to_string()
+}
+
+async fn wait_for_remote_completion(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    kv_path: &str,
+    request_version: Option<u64>,
+    requested_at: &str,
+    wait_timeout: std::time::Duration,
+) -> std::result::Result<WaitOutcome, WaitError> {
+    use bootroot::trust_bootstrap::{
+        REISSUE_COMPLETED_AT_KEY, REISSUE_COMPLETED_VERSION_KEY, REISSUE_REQUESTED_AT_KEY,
+    };
+
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let deadline = tokio::time::Instant::now() + wait_timeout;
+    loop {
+        match client.try_read_kv_with_version(kv_mount, kv_path).await {
+            Ok(Some(read)) => {
+                if let Some(obj) = read.data.as_object() {
+                    let completed_version = obj
+                        .get(REISSUE_COMPLETED_VERSION_KEY)
+                        .and_then(serde_json::Value::as_u64);
+                    let completed_at = obj
+                        .get(REISSUE_COMPLETED_AT_KEY)
+                        .and_then(serde_json::Value::as_str);
+                    let payload_requested_at = obj
+                        .get(REISSUE_REQUESTED_AT_KEY)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    if let (Some(completed_at), Some(completed_version)) =
+                        (completed_at, completed_version)
+                    {
+                        let matches_request =
+                            request_version.is_none_or(|requested| completed_version >= requested);
+                        if matches_request {
+                            return Ok(WaitOutcome {
+                                completed_at: completed_at.to_string(),
+                                requested_at: payload_requested_at,
+                            });
+                        }
+                    } else if let Some(completed_at) = completed_at
+                        && request_version.is_none()
+                        && completed_at >= requested_at
+                    {
+                        return Ok(WaitOutcome {
+                            completed_at: completed_at.to_string(),
+                            requested_at: payload_requested_at,
+                        });
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => return Err(WaitError::Other(err)),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(WaitError::Timeout);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +770,30 @@ mod tests {
 
     use super::super::test_support::test_messages;
     use super::*;
+
+    #[test]
+    fn format_reissue_elapsed_reports_seconds_difference() {
+        let elapsed = format_reissue_elapsed("2026-04-19T12:34:56Z", "2026-04-19T12:35:10Z");
+        assert_eq!(elapsed, "14s");
+    }
+
+    #[test]
+    fn format_reissue_elapsed_handles_multi_minute_gap() {
+        let elapsed = format_reissue_elapsed("2026-04-19T12:30:00Z", "2026-04-19T12:32:07Z");
+        assert_eq!(elapsed, "2m 7s");
+    }
+
+    #[test]
+    fn format_reissue_elapsed_returns_unknown_on_parse_failure() {
+        let elapsed = format_reissue_elapsed("not-a-timestamp", "2026-04-19T12:35:10Z");
+        assert_eq!(elapsed, "unknown");
+    }
+
+    #[test]
+    fn format_reissue_elapsed_returns_unknown_when_completion_precedes_request() {
+        let elapsed = format_reissue_elapsed("2026-04-19T12:35:10Z", "2026-04-19T12:34:56Z");
+        assert_eq!(elapsed, "unknown");
+    }
 
     #[test]
     fn cert_issued_by_self_signed_matches() {

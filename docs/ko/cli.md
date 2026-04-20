@@ -841,12 +841,42 @@ CA 번들 PEM을 디스크에 기록합니다.
 
 #### `rotate force-reissue`
 
-서비스의 cert/key 파일을 삭제해 bootroot-agent가 인증서를 재발급하도록
-합니다. 로컬(daemon) 서비스의 경우 bootroot-agent 프로세스에 SIGHUP을
-보냅니다. Docker 서비스의 경우 컨테이너를 재시작합니다. 원격 서비스의 경우
-`bootroot-remote bootstrap` 실행을 안내합니다.
+서비스의 인증서를 즉시 재발급하도록 트리거합니다.
+
+로컬(daemon) 및 Docker 서비스의 경우 기록된 cert/key 파일을 삭제하고
+bootroot-agent에 SIGHUP 또는 컨테이너 재시작 신호를 보내 다음 루프
+틱에서 재발급을 수행합니다.
+
+`--delivery-mode remote-bootstrap` 서비스의 경우 제어 플레인에는 원격
+호스트로의 푸시 채널이 없어 cert 파일을 원격에서 삭제할 수 없습니다.
+대신 OpenBao의 `{kv_mount}/data/bootroot/services/<service>/reissue`
+경로에 `requested_at` 및 `requester` 필드를 포함한 버전 관리된 재발급
+요청을 기록합니다. 원격 bootroot-agent에는 `agent.toml`의 `[openbao]`
+섹션이 **필수**이며(`bootroot-remote bootstrap`이 매 실행마다 자동으로
+주입합니다), `fast_poll_interval`(기본 30초) 주기로 이 경로를 폴링합니다.
+마지막으로 적용한 버전보다 새로운 KV v2 버전을 발견하면 즉시 ACME 갱신을
+트리거하고, 성공 시 `completed_at` 및 `completed_version`을 다시 기록해
+제어 플레인이 종단 간 지연을 관측할 수 있게 합니다.
+
+입력:
 
 - `--service-name`: 대상 서비스 이름
+- `--requester`: 재발급 KV 페이로드에 기록할 운영자 라벨(선택). 지정하지
+  않으면 `$USER` / `$LOGNAME`을 사용하며, 둘 다 없으면 `unknown`이
+  사용됩니다.
+- `--wait`: remote-bootstrap 서비스에만 의미가 있습니다. 동일한 KV
+  경로의 `completed_at`을 폴링해 원격 agent가 완료를 보고할 때까지(또는
+  타임아웃까지) 대기합니다. 성공 시 요약 줄에는 종단 간 지연
+  (`completed_at - requested_at`, KV 페이로드에서 읽어옴)이 사람이 읽기
+  쉬운 형식으로 함께 출력되므로 운영자가 타임스탬프를 직접 빼지 않아도
+  됩니다.
+- `--wait-timeout`: `--wait`가 설정된 경우 최대 대기 시간. humantime
+  형식(예: `90s`, `2m`)을 사용합니다. 기본값 `2m`.
+
+`--wait` 없이 실행하면 KV 쓰기 직후 즉시 반환합니다. 원격 agent는 다음
+fast-poll 틱에서 약 1주기 이내에 재발급을 반영합니다. `--wait`
+타임아웃은 오류가 아닙니다: 요청은 큐에 남아 있으므로 agent는 다음
+폴링에서 여전히 처리합니다.
 
 #### `rotate ca-key`
 
@@ -868,7 +898,9 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 - Phase 4 — step-ca 재시작: step-ca 컨테이너를 재시작해 새 키 쌍 적용
 - Phase 5 — 재발급: 서비스 cert/key 삭제 후 bootroot-agent에 시그널
   (daemon은 SIGHUP, Docker는 컨테이너 재시작)을 보내 새 CA로 재발급 유도.
-  원격 서비스는 안내 메시지 출력
+  remote-bootstrap 서비스의 경우 버전 관리된 재발급 요청을 OpenBao KV에
+  기록하며, 원격 agent가 fast-poll 주기에 이를 처리합니다(`rotate
+  force-reissue` 참고)
 - Phase 6 — trust 확정: 최종 trust(신규 fingerprint만)를 OpenBao에 기록해
   기존 fingerprint 제거
 - Phase 7 — 정리: `rotation-state.json` 삭제, 선택적으로 백업 파일 제거

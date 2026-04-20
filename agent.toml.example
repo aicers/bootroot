@@ -100,3 +100,38 @@ backoff_secs = [5, 10, 30]
 # [profiles.eab]
 # kid = "your-key-id"
 # hmac = "your-hmac-key"
+
+# OpenBao client settings used by the remote-bootstrap force-reissue
+# fast-poll loop.  Required on service hosts running with
+# --delivery-mode remote-bootstrap: without it the agent has no consumer
+# for `bootroot rotate force-reissue` requests, so certificates would only
+# reissue on the next check_interval tick.
+#
+# The connection fields (url, kv_mount, role_id_path, secret_id_path,
+# ca_bundle_path) are auto-provisioned by `bootroot-remote bootstrap`
+# on every run and do not need to be hand-edited.  An absolute
+# `state_path` adjacent to this file is also provisioned on the first
+# bootstrap that lands the section, so fast-poll state survives
+# restarts under systemd-style supervisors whose cwd is not guaranteed
+# to be writable or stable.  Operator-tuned fast_poll_interval /
+# state_path entries are preserved across reruns.
+# When configured, bootroot-agent authenticates to OpenBao directly via
+# AppRole and polls each profile's reissue KV path on the configured
+# fast_poll_interval, so force-reissue requests are picked up within tens
+# of seconds rather than waiting for the next check_interval tick.
+# [openbao]
+# url = "https://openbao.internal:8200"
+# kv_mount = "secret"
+# role_id_path = "/etc/bootroot/role_id"
+# secret_id_path = "/etc/bootroot/secret_id"
+# # Required when url uses https://
+# ca_bundle_path = "/etc/bootroot/ca-bundle.pem"
+# # Poll cadence; defaults to 30s
+# fast_poll_interval = "30s"
+# # Persists `last_reissue_seen_version` across restarts.  Must be an
+# # absolute path — config validation rejects a cwd-relative value
+# # because agent process cwd is not contracted to be writable or
+# # stable under systemd-style supervisors.  Bootstrap provisions an
+# # absolute path next to this file when missing; set explicitly to
+# # pin a custom location (e.g. /var/lib/bootroot/...).
+# state_path = "/var/lib/bootroot/agent-state.json"

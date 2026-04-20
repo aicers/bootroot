@@ -867,12 +867,43 @@ No additional arguments.
 
 #### `rotate force-reissue`
 
-Deletes a service's cert/key files to trigger bootroot-agent to reissue
-certificates. For local (daemon) services, sends SIGHUP to the
-bootroot-agent process. For Docker services, restarts the container. For
-remote services, prints a hint to run `bootroot-remote bootstrap`.
+Triggers an immediate certificate reissue for a service.
+
+For local (daemon) and Docker services, deletes the recorded cert/key
+files and sends SIGHUP / restarts the container so bootroot-agent reissues
+on the next loop tick.
+
+For `--delivery-mode remote-bootstrap` services, the control plane has no
+push channel into the remote host, so cert files cannot be deleted
+remotely. Instead the command writes a versioned reissue request to
+`{kv_mount}/data/bootroot/services/<service>/reissue` in OpenBao with
+`requested_at` and `requester` fields. The remote bootroot-agent requires
+the `[openbao]` section in its `agent.toml` — `bootroot-remote bootstrap`
+auto-provisions it on every run — and polls this path on its
+`fast_poll_interval` (default 30s). When it observes a KV v2 version
+newer than the one it last applied it triggers an immediate ACME
+renewal, and after success writes back `completed_at` and
+`completed_version` so the control plane can observe end-to-end latency.
+
+Inputs:
 
 - `--service-name`: target service name
+- `--requester`: optional operator label written to the reissue KV
+  payload for observability. Defaults to `$USER` / `$LOGNAME`, or
+  `unknown` when neither is set.
+- `--wait`: only meaningful for remote-bootstrap services; polls
+  `completed_at` on the same KV path until the remote agent reports
+  completion (or the timeout expires). On success the summary line
+  also reports the end-to-end latency (`completed_at - requested_at`,
+  read from the KV payload) in a human-readable form so the operator
+  does not need to subtract timestamps manually.
+- `--wait-timeout`: maximum time to wait when `--wait` is set. Accepts
+  humantime durations (e.g. `90s`, `2m`). Default `2m`.
+
+Without `--wait` the command returns immediately after the KV write; the
+remote agent will apply the reissue within ~one fast-poll interval of its
+next tick. A `--wait` timeout is not an error: the request stays queued
+and the agent still picks it up on its next poll.
 
 #### `rotate ca-key`
 
@@ -897,7 +928,9 @@ Phases:
   new key pair
 - Phase 5 — Re-issue: delete service cert/key files and signal
   bootroot-agent (SIGHUP for daemon, container restart for Docker) to
-  trigger re-issuance with the new CA. Remote services print a hint instead
+  trigger re-issuance with the new CA. Remote-bootstrap services publish
+  a versioned reissue request to OpenBao KV instead; remote agents pick
+  it up on their fast-poll interval (see `rotate force-reissue`)
 - Phase 6 — Finalize trust: write final trust (new fingerprints only) to
   OpenBao, removing old fingerprints
 - Phase 7 — Cleanup: delete `rotation-state.json` and optionally remove

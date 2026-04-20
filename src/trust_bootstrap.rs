@@ -13,6 +13,22 @@ pub const TRUSTED_CA_KEY: &str = "trusted_ca_sha256";
 pub const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
 pub const CA_BUNDLE_PATH_KEY: &str = "ca_bundle_path";
 
+/// KV v2 path suffix carrying the force-reissue request for a service.
+///
+/// Full path: `{kv_mount}/data/bootroot/services/<service>/reissue`.
+/// The control plane writes this on `rotate force-reissue` for
+/// remote-bootstrap services, and the remote `bootroot-agent` polls it on
+/// its fast-poll interval to trigger an immediate renewal.
+pub const SERVICE_REISSUE_KV_SUFFIX: &str = "reissue";
+/// Payload field holding the RFC3339 UTC timestamp of the request.
+pub const REISSUE_REQUESTED_AT_KEY: &str = "requested_at";
+/// Payload field describing who issued the request (operator label).
+pub const REISSUE_REQUESTER_KEY: &str = "requester";
+/// Payload field written back by the agent once renewal completes.
+pub const REISSUE_COMPLETED_AT_KEY: &str = "completed_at";
+/// Payload field written back by the agent with the applied version.
+pub const REISSUE_COMPLETED_VERSION_KEY: &str = "completed_version";
+
 const ACME_SECTION_NAME: &str = "acme";
 const TRUST_SECTION_NAME: &str = "trust";
 const EAB_SECTION_NAME: &str = "eab";

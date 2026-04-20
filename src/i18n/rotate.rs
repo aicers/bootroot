@@ -105,6 +105,13 @@ impl Messages {
         )
     }
 
+    pub(crate) fn prompt_rotate_force_reissue_remote(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().prompt_rotate_force_reissue_remote,
+            &[("service_name", service_name)],
+        )
+    }
+
     pub(crate) fn rotate_summary_trust_sync_global(&self, value: &str) -> String {
         format_template(
             self.strings().rotate_summary_trust_sync_global,
@@ -142,10 +149,54 @@ impl Messages {
         )
     }
 
-    pub(crate) fn rotate_summary_force_reissue_remote_hint(&self, service_name: &str) -> String {
+    pub(crate) fn rotate_summary_force_reissue_requested(
+        &self,
+        service_name: &str,
+        requested_at: &str,
+    ) -> String {
         format_template(
-            self.strings().rotate_summary_force_reissue_remote_hint,
+            self.strings().rotate_summary_force_reissue_requested,
+            &[
+                ("service_name", service_name),
+                ("requested_at", requested_at),
+            ],
+        )
+    }
+
+    pub(crate) fn rotate_summary_force_reissue_will_apply(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_force_reissue_will_apply,
             &[("service_name", service_name)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_force_reissue_completed(
+        &self,
+        service_name: &str,
+        completed_at: &str,
+        elapsed: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_summary_force_reissue_completed,
+            &[
+                ("service_name", service_name),
+                ("completed_at", completed_at),
+                ("elapsed", elapsed),
+            ],
+        )
+    }
+
+    pub(crate) fn rotate_summary_force_reissue_wait_timeout(
+        &self,
+        service_name: &str,
+        wait_timeout: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_summary_force_reissue_wait_timeout,
+            &[
+                ("service_name", service_name),
+                ("wait_timeout", wait_timeout),
+            ],
         )
     }
 

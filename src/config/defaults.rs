@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use config::{ConfigBuilder, ConfigError, builder::DefaultState};
@@ -20,6 +21,9 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
 const DEFAULT_RETRY_BACKOFF_SECS: [u64; 4] = [5, 10, 30, 60];
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_CONCURRENT_ISSUANCES: u64 = 3;
+const DEFAULT_FAST_POLL_INTERVAL_SECS: u64 = 30;
+const DEFAULT_KV_MOUNT: &str = "secret";
+const DEFAULT_FAST_POLL_STATE_PATH: &str = "bootroot-agent-state.json";
 
 pub(crate) fn apply_defaults(
     builder: ConfigBuilder<DefaultState>,
@@ -77,4 +81,16 @@ pub(crate) fn default_check_jitter() -> Duration {
 
 pub(crate) fn default_max_concurrent_issuances() -> u64 {
     DEFAULT_MAX_CONCURRENT_ISSUANCES
+}
+
+pub(crate) fn default_fast_poll_interval() -> Duration {
+    Duration::from_secs(DEFAULT_FAST_POLL_INTERVAL_SECS)
+}
+
+pub(crate) fn default_kv_mount() -> String {
+    DEFAULT_KV_MOUNT.to_string()
+}
+
+pub(crate) fn default_fast_poll_state_path() -> PathBuf {
+    PathBuf::from(DEFAULT_FAST_POLL_STATE_PATH)
 }

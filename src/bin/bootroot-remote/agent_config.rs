@@ -124,6 +124,18 @@ pub(super) async fn apply_agent_config_updates(
                 );
             }
         };
+    let openbao_pairs = build_openbao_updates(args, &trust_updated);
+    let openbao_updated =
+        match bootroot::toml_util::upsert_section_keys(&trust_updated, "openbao", &openbao_pairs) {
+            Ok(output) => output,
+            Err(err) => {
+                let msg = format!("agent config TOML parse error: {err}");
+                return (
+                    ApplyItemSummary::failed(msg.clone()),
+                    ApplyItemSummary::failed(msg),
+                );
+            }
+        };
     let profile_block = render_managed_profile_block(
         &args.service_name,
         args.profile_instance_id
@@ -135,11 +147,11 @@ pub(super) async fn apply_agent_config_updates(
     );
     let profile_block = inject_hooks_into_profile_block(&profile_block, args);
     let with_profile =
-        upsert_managed_profile_block(&trust_updated, &args.service_name, &profile_block);
+        upsert_managed_profile_block(&openbao_updated, &args.service_name, &profile_block);
 
     let responder_changed = hmac_updated != override_applied;
     let trust_changed = trust_updated != hmac_updated;
-    let profile_changed = with_profile != trust_updated;
+    let profile_changed = with_profile != openbao_updated;
 
     let mut responder_hmac_status = ApplyItemSummary::applied(if responder_changed {
         ApplyStatus::Applied
@@ -352,6 +364,80 @@ fn build_trust_updates(
     build_shared_trust_updates(fingerprints, ca_bundle_path)
 }
 
+/// Builds the `[openbao]` key-value pairs that `bootroot-remote bootstrap`
+/// upserts into `agent.toml`. This provisions the fast-poll loop on every
+/// remote-bootstrap host so `bootroot rotate force-reissue` has a
+/// guaranteed consumer — otherwise the control-plane KV write would land
+/// in a section nobody reads. Connection-level fields are always
+/// refreshed. A stable absolute `state_path` adjacent to `agent.toml` is
+/// provisioned only when the operator has not already set one — the
+/// in-tree default is a bare relative filename resolved against the
+/// agent process cwd, which is unsafe under systemd-style supervisors
+/// where the cwd can change or be unwritable. Operator-tuned
+/// `fast_poll_interval` or `state_path` entries are preserved.
+fn build_openbao_updates(
+    args: &ResolvedBootstrapArgs,
+    current_contents: &str,
+) -> Vec<(&'static str, String)> {
+    let mut pairs = vec![
+        ("url", args.openbao_url.clone()),
+        ("kv_mount", args.kv_mount.clone()),
+        ("role_id_path", args.role_id_path.display().to_string()),
+        ("secret_id_path", args.secret_id_path.display().to_string()),
+        ("ca_bundle_path", args.ca_bundle_path.display().to_string()),
+    ];
+    // Provision an absolute `state_path` when either (a) the key is
+    // missing, or (b) the existing value is relative. Case (b) catches
+    // legacy configs (written before bootstrap provisioned the key) and
+    // operator-edited configs that accidentally left the default
+    // relative filename in place — rerunning `bootroot-remote bootstrap`
+    // must be able to repair them, otherwise the validation hint
+    // pointing operators at bootstrap would be misleading.
+    if needs_absolute_state_path_provisioning(current_contents)
+        && let Some(path) = default_state_path_for(args)
+    {
+        pairs.push(("state_path", path));
+    }
+    pairs
+}
+
+fn needs_absolute_state_path_provisioning(contents: &str) -> bool {
+    let Ok(doc) = contents.parse::<toml_edit::DocumentMut>() else {
+        return true;
+    };
+    let Some(table) = doc.get("openbao").and_then(toml_edit::Item::as_table) else {
+        return true;
+    };
+    let Some(item) = table.get("state_path") else {
+        return true;
+    };
+    let Some(value) = item.as_str() else {
+        // A non-string `state_path` is malformed; overwrite with the
+        // provisioned absolute default rather than leaving it invalid.
+        return true;
+    };
+    !Path::new(value).is_absolute()
+}
+
+/// Returns an absolute `state_path` adjacent to `agent.toml` when the
+/// agent config path is absolute, or `None` when it is relative. A
+/// relative agent config path would yield an equally-cwd-dependent
+/// state path, which is exactly what this provisioning is meant to
+/// avoid; leaving `state_path` unset lets the existing validation
+/// surface the issue instead of silently entrenching a fragile path.
+fn default_state_path_for(args: &ResolvedBootstrapArgs) -> Option<String> {
+    let parent = args.agent_config_path.parent()?;
+    if !parent.is_absolute() {
+        return None;
+    }
+    Some(
+        parent
+            .join("bootroot-agent-state.json")
+            .display()
+            .to_string(),
+    )
+}
+
 async fn write_openbao_agent_artifacts(
     args: &ResolvedBootstrapArgs,
     agent_template: &str,
@@ -517,6 +603,203 @@ mod tests {
             wrap_token: None,
             wrap_expires_at: None,
         }
+    }
+
+    #[test]
+    fn build_openbao_updates_covers_connection_fields() {
+        let args = test_bootstrap_args();
+        let pairs = build_openbao_updates(&args, "");
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "url",
+                "kv_mount",
+                "role_id_path",
+                "secret_id_path",
+                "ca_bundle_path",
+                "state_path",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_openbao_updates_render_upserts_into_empty_config() {
+        let args = test_bootstrap_args();
+        let pairs = build_openbao_updates(&args, "");
+        let output = bootroot::toml_util::upsert_section_keys("", "openbao", &pairs).unwrap();
+        assert!(output.contains("[openbao]"), "{output}");
+        assert!(
+            output.contains("url = \"https://localhost:8200\""),
+            "{output}"
+        );
+        assert!(output.contains("kv_mount = \"secret\""), "{output}");
+        assert!(
+            output.contains("role_id_path = \"/tmp/role_id\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("secret_id_path = \"/tmp/secrets/services/edge-proxy/secret_id\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("ca_bundle_path = \"/tmp/ca-bundle.pem\""),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn build_openbao_updates_provisions_absolute_state_path_when_missing() {
+        // Agent config has [openbao] but no state_path — bootstrap must
+        // provision an absolute path adjacent to agent.toml so the
+        // fast-poll restart-persistence guarantee does not depend on
+        // the agent process cwd. This is the no-state_path case
+        // flagged in Round 5 review.
+        let args = test_bootstrap_args();
+        let input = "[openbao]\nurl = \"https://stale:8200\"\n";
+        let pairs = build_openbao_updates(&args, input);
+        let state_path_pair = pairs
+            .iter()
+            .find(|(k, _)| *k == "state_path")
+            .expect("state_path must be provisioned when missing");
+        let rendered = &state_path_pair.1;
+        assert!(
+            std::path::Path::new(rendered).is_absolute(),
+            "state_path should be absolute: {rendered}"
+        );
+        assert_eq!(rendered, "/tmp/bootroot-agent-state.json");
+
+        let output = bootroot::toml_util::upsert_section_keys(input, "openbao", &pairs).unwrap();
+        assert!(
+            output.contains("state_path = \"/tmp/bootroot-agent-state.json\""),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn build_openbao_updates_skips_state_path_when_agent_config_relative() {
+        // If agent_config_path is relative, derive-and-provision would
+        // produce a cwd-relative state_path, which is the failure mode
+        // we're avoiding. Leave state_path unset so validation surfaces
+        // the issue rather than entrenching a fragile path.
+        let mut args = test_bootstrap_args();
+        args.agent_config_path = PathBuf::from("agent.toml");
+        let pairs = build_openbao_updates(&args, "");
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert!(
+            !keys.contains(&"state_path"),
+            "state_path must not be provisioned when agent_config_path is relative: {keys:?}"
+        );
+    }
+
+    /// End-to-end regression test for Round 6: a bootstrap run where
+    /// `agent_config_path` is relative must not produce a valid config.
+    /// `build_openbao_updates` deliberately skips provisioning
+    /// `state_path` in that case to avoid entrenching a cwd-relative
+    /// path; the config layer then falls back to a cwd-relative default,
+    /// which `validate_openbao_settings` must reject. Before the
+    /// validation guardrail, the resulting config would load and run
+    /// with an unsafe state file.
+    #[test]
+    fn config_built_from_relative_agent_config_path_fails_validation() {
+        let mut args = test_bootstrap_args();
+        args.agent_config_path = PathBuf::from("agent.toml");
+        // Round out the remaining required-field surface so the only
+        // thing under test is the state_path absolute-path invariant.
+        let pairs = build_openbao_updates(&args, "");
+        let rendered = bootroot::toml_util::upsert_section_keys("", "openbao", &pairs).unwrap();
+        assert!(
+            !rendered.contains("state_path"),
+            "bootstrap must skip state_path when agent_config_path is relative: {rendered}"
+        );
+
+        let config = format!(
+            r#"
+            domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
+
+            [[profiles]]
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+
+            [profiles.paths]
+            cert = "certs/edge-proxy-a.pem"
+            key = "certs/edge-proxy-a.key"
+
+            {rendered}
+            "#
+        );
+
+        let tmp = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        std::fs::write(tmp.path(), config).unwrap();
+        let settings = bootroot::config::Settings::new(Some(tmp.path().to_path_buf())).unwrap();
+        let err = settings
+            .validate()
+            .expect_err("validation must reject cwd-relative state_path");
+        let msg = err.to_string();
+        assert!(msg.contains("openbao.state_path"), "{msg}");
+        assert!(msg.contains("absolute"), "{msg}");
+    }
+
+    #[test]
+    fn build_openbao_updates_preserves_operator_tuned_keys() {
+        let args = test_bootstrap_args();
+        let input = "[openbao]\n\
+            url = \"https://stale:8200\"\n\
+            fast_poll_interval = \"5s\"\n\
+            state_path = \"/var/lib/bootroot/custom-state.json\"\n";
+        let output = bootroot::toml_util::upsert_section_keys(
+            input,
+            "openbao",
+            &build_openbao_updates(&args, input),
+        )
+        .unwrap();
+        // Connection fields are overwritten with fresh bootstrap values.
+        assert!(
+            output.contains("url = \"https://localhost:8200\""),
+            "{output}"
+        );
+        // Operator-tuned keys stay untouched.
+        assert!(output.contains("fast_poll_interval = \"5s\""), "{output}");
+        assert!(
+            output.contains("state_path = \"/var/lib/bootroot/custom-state.json\""),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn build_openbao_updates_repairs_relative_state_path() {
+        // Round 8 regression: a legacy config may already carry a
+        // relative `state_path` (e.g. the in-tree default filename, or
+        // an operator edit). Rerunning `bootroot-remote bootstrap` must
+        // repair it in place, otherwise the validation hint pointing
+        // operators at bootstrap is misleading.
+        let args = test_bootstrap_args();
+        let input = "[openbao]\n\
+            url = \"https://stale:8200\"\n\
+            state_path = \"bootroot-agent-state.json\"\n";
+        let pairs = build_openbao_updates(&args, input);
+        let state_path_pair = pairs
+            .iter()
+            .find(|(k, _)| *k == "state_path")
+            .expect("state_path must be repaired when existing value is relative");
+        assert!(
+            std::path::Path::new(&state_path_pair.1).is_absolute(),
+            "state_path should be absolute after repair: {}",
+            state_path_pair.1
+        );
+        let output = bootroot::toml_util::upsert_section_keys(input, "openbao", &pairs).unwrap();
+        assert!(
+            output.contains("state_path = \"/tmp/bootroot-agent-state.json\""),
+            "{output}"
+        );
+        assert!(
+            !output.contains("state_path = \"bootroot-agent-state.json\""),
+            "relative value must be replaced, not kept alongside the absolute one: {output}"
+        );
     }
 
     #[test]
