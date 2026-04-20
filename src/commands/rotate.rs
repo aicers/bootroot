@@ -240,6 +240,7 @@ pub(super) mod test_support {
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     pub(super) const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
     pub(super) const TEST_DOCKER_EXIT_ENV: &str = "BOOTROOT_TEST_DOCKER_EXIT";
+    pub(super) const TEST_DOCKER_STDERR_ENV: &str = "BOOTROOT_TEST_DOCKER_STDERR";
 
     pub(super) struct ScopedEnvVar {
         key: &'static str,
@@ -280,6 +281,9 @@ pub(super) mod test_support {
         let script = r#"#!/bin/sh
 set -eu
 printf '%s\n' "$@" > "${BOOTROOT_TEST_DOCKER_ARGS:?missing log path}"
+if [ -n "${BOOTROOT_TEST_DOCKER_STDERR:-}" ]; then
+  printf '%s' "${BOOTROOT_TEST_DOCKER_STDERR}" 1>&2
+fi
 if [ -n "${BOOTROOT_TEST_DOCKER_EXIT:-}" ]; then
   exit "${BOOTROOT_TEST_DOCKER_EXIT}"
 fi

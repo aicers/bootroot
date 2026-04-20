@@ -34,7 +34,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   (the old `docker run --rm ... --oneshot` snippet) will see a
   dedicated error at rotate time naming the missing container and
   pointing operators at the new long-running snippet; see
-  `docs/en/operations.md` for migration steps. (Closes #552)
+  `docs/en/operations.md` for migration steps. The pre-flight
+  `docker container inspect` captures stderr and only maps the
+  specific "No such container/object" response to the migration
+  hint; other inspect failures (e.g. daemon unreachable, permission
+  denied) surface verbatim as `docker command failed: …` so the
+  real problem is not masked. (Closes #552)
 - Fixed `bootroot init` storing the host-side PostgreSQL port in the
   step-ca DSN written to OpenBao KV / `ca.json` when
   `POSTGRES_HOST_PORT` differed from `5432`, and fixed `bootroot rotate

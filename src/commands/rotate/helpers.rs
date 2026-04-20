@@ -191,27 +191,51 @@ pub(super) fn signal_bootroot_agent(entry: &ServiceEntry, messages: &Messages) -
                 .as_deref()
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| anyhow::anyhow!(messages.error_service_container_name_required()))?;
-            if !docker_container_exists(container, messages)? {
-                anyhow::bail!(messages.error_bootroot_agent_container_missing(container));
+            match inspect_docker_container(container, messages)? {
+                DockerInspectOutcome::Found => run_docker(
+                    &["restart", container],
+                    "docker restart bootroot-agent",
+                    messages,
+                ),
+                DockerInspectOutcome::Missing => {
+                    anyhow::bail!(messages.error_bootroot_agent_container_missing(container))
+                }
             }
-            run_docker(
-                &["restart", container],
-                "docker restart bootroot-agent",
-                messages,
-            )
         }
         crate::state::DeployType::Daemon => signal_bootroot_agent_daemon(entry, messages),
     }
 }
 
-fn docker_container_exists(container: &str, messages: &Messages) -> Result<bool> {
-    let status = std::process::Command::new("docker")
+#[derive(Debug, PartialEq, Eq)]
+enum DockerInspectOutcome {
+    Found,
+    Missing,
+}
+
+fn inspect_docker_container(container: &str, messages: &Messages) -> Result<DockerInspectOutcome> {
+    let output = std::process::Command::new("docker")
         .args(["container", "inspect", container])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .with_context(|| messages.error_command_run_failed("docker container inspect"))?;
-    Ok(status.success())
+    if output.status.success() {
+        return Ok(DockerInspectOutcome::Found);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_no_such_container_stderr(&stderr) {
+        return Ok(DockerInspectOutcome::Missing);
+    }
+    anyhow::bail!(messages.error_docker_command_failed(stderr.trim()));
+}
+
+// Docker reports an absent container with either
+// "Error response from daemon: No such container: <name>" or
+// "Error: No such object: <name>"; any other stderr (daemon not reachable,
+// permission denied, TLS errors, …) is an unrelated failure that must
+// surface to the operator unchanged instead of being misattributed to the
+// #552 one-shot migration path.
+fn is_no_such_container_stderr(stderr: &str) -> bool {
+    stderr.contains("No such container") || stderr.contains("No such object")
 }
 
 #[cfg(unix)]
@@ -498,8 +522,8 @@ mod tests {
     #[test]
     fn signal_bootroot_agent_docker_reports_missing_container_with_hint() {
         use super::super::test_support::{
-            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, TEST_DOCKER_EXIT_ENV, env_lock, path_with_prepend,
-            write_fake_docker_script,
+            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, TEST_DOCKER_EXIT_ENV, TEST_DOCKER_STDERR_ENV,
+            env_lock, path_with_prepend, write_fake_docker_script,
         };
 
         let dir = tempdir().expect("tempdir");
@@ -513,6 +537,10 @@ mod tests {
         let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
         let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
         let _exit = ScopedEnvVar::set(TEST_DOCKER_EXIT_ENV, "1");
+        let _stderr = ScopedEnvVar::set(
+            TEST_DOCKER_STDERR_ENV,
+            "Error response from daemon: No such container: my-nginx\n",
+        );
 
         let mut entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
         entry.container_name = Some("my-nginx".to_string());
@@ -536,5 +564,70 @@ mod tests {
             vec!["container", "inspect", "my-nginx"],
             "rotate must stop at the pre-flight inspect and not invoke docker restart"
         );
+    }
+
+    #[test]
+    fn signal_bootroot_agent_docker_surfaces_non_absence_inspect_failure() {
+        use super::super::test_support::{
+            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, TEST_DOCKER_EXIT_ENV, TEST_DOCKER_STDERR_ENV,
+            env_lock, path_with_prepend, write_fake_docker_script,
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).expect("create bin dir");
+        let docker_path = bin_dir.join("docker");
+        write_fake_docker_script(&docker_path);
+
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        let _exit = ScopedEnvVar::set(TEST_DOCKER_EXIT_ENV, "1");
+        let daemon_stderr = "Cannot connect to the Docker daemon at \
+                             unix:///var/run/docker.sock. Is the docker daemon running?";
+        let _stderr = ScopedEnvVar::set(TEST_DOCKER_STDERR_ENV, daemon_stderr);
+
+        let mut entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
+        entry.container_name = Some("my-nginx".to_string());
+
+        let err = signal_bootroot_agent(&entry, &test_messages())
+            .expect_err("non-absence inspect failures must propagate verbatim");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cannot connect to the Docker daemon"),
+            "error should preserve docker's own stderr: {msg}"
+        );
+        assert!(
+            !msg.contains("docker run -d"),
+            "must not recommend the #552 migration hint for unrelated docker failures: {msg}"
+        );
+        assert!(
+            !msg.contains("one-shot") && !msg.contains("bootroot-agent docker container not found"),
+            "must not use the missing-container i18n template for unrelated docker failures: {msg}"
+        );
+
+        let logged = std::fs::read_to_string(&args_log).expect("read logged args");
+        let args: Vec<&str> = logged.lines().collect();
+        assert_eq!(
+            args,
+            vec!["container", "inspect", "my-nginx"],
+            "rotate must stop at the pre-flight inspect"
+        );
+    }
+
+    #[test]
+    fn is_no_such_container_stderr_recognizes_known_absence_messages() {
+        assert!(is_no_such_container_stderr(
+            "Error response from daemon: No such container: foo\n"
+        ));
+        assert!(is_no_such_container_stderr("Error: No such object: foo\n"));
+        assert!(!is_no_such_container_stderr(
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+        ));
+        assert!(!is_no_such_container_stderr(
+            "permission denied while trying to connect to the Docker daemon socket"
+        ));
+        assert!(!is_no_such_container_stderr(""));
     }
 }
