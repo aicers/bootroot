@@ -58,7 +58,20 @@ async fn read_service_sync_material(
     kv_mount: &str,
     messages: &Messages,
 ) -> Result<ServiceSyncMaterial> {
-    let eab = client.read_kv(kv_mount, PATH_AGENT_EAB).await.ok();
+    // The control-node EAB KV entry is optional: it only exists when the
+    // operator explicitly provided EAB credentials. `try_read_kv` returns
+    // `Ok(None)` for a genuine 404 and surfaces every other failure
+    // (transport, 5xx, malformed payload) so a transient OpenBao outage
+    // cannot silently strip EAB from a newly added service.
+    let eab = client
+        .try_read_kv(kv_mount, PATH_AGENT_EAB)
+        .await
+        .with_context(|| {
+            format!(
+                "{} ({PATH_AGENT_EAB})",
+                messages.error_openbao_kv_read_failed()
+            )
+        })?;
     let responder_hmac = client
         .read_kv(kv_mount, PATH_RESPONDER_HMAC)
         .await

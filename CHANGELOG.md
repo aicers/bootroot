@@ -30,7 +30,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `OpenBaoClient::try_read_kv`. Transport errors, 5xx responses, and
   other unexpected failures still surface as bootstrap failures so a
   transient OpenBao outage cannot silently demote EAB to `skipped`.
-  (Closes #550)
+  The narrow semantics also apply to `bootroot service add` when it
+  reads the control-node EAB entry, so a transient OpenBao outage
+  cannot silently strip EAB from a newly added service. When the KV
+  entry is absent, `bootroot-remote bootstrap` also removes any
+  stale `eab.json` left on the target host, preventing
+  `bootroot-agent --eab-file` from forwarding credentials the
+  operator has since cleared. (Closes #550)
 - Removed `--secret-id-num-uses` from `bootroot service add` and from
   `rotate approle-secret-id` policy state. Service SecretIDs are now
   always issued with unlimited uses (`num_uses = 0`). The lower-level

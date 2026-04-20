@@ -268,6 +268,70 @@ async fn test_bootroot_remote_skips_eab_when_kv_entry_has_empty_values() {
 }
 
 #[tokio::test]
+async fn test_bootroot_remote_removes_stale_eab_file_when_kv_entry_missing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let role_id_path = temp_dir.path().join("secrets").join("role_id");
+    let secret_id_path = temp_dir.path().join("secrets").join("secret_id");
+    let eab_file_path = temp_dir.path().join("secrets").join("eab.json");
+    let ca_bundle_path = temp_dir.path().join("certs").join("ca-bundle.pem");
+    let agent_config_path = temp_dir.path().join("agent.toml");
+
+    fs::create_dir_all(role_id_path.parent().expect("role_id parent")).expect("create secrets dir");
+    fs::write(&role_id_path, "role-edge-proxy\n").expect("write role_id");
+    fs::write(&secret_id_path, "old-secret\n").expect("write secret_id");
+    fs::write(
+        &eab_file_path,
+        "{\n  \"kid\": \"stale-kid\",\n  \"hmac\": \"stale-hmac\"\n}\n",
+    )
+    .expect("write stale eab file");
+    fs::write(
+        &agent_config_path,
+        "[acme]\nhttp_responder_hmac = \"old\"\n[trust]\nca_bundle_path = \"old.pem\"\ntrusted_ca_sha256 = [\"0\" ]\n",
+    )
+    .expect("write agent config");
+
+    let server = MockServer::start().await;
+    stub_openbao_remote_sync_without_eab_kv(&server).await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .args([
+            "bootstrap",
+            "--openbao-url",
+            &server.uri(),
+            "--kv-mount",
+            "secret",
+            "--service-name",
+            "edge-proxy",
+            "--role-id-path",
+            role_id_path.to_string_lossy().as_ref(),
+            "--secret-id-path",
+            secret_id_path.to_string_lossy().as_ref(),
+            "--eab-file-path",
+            eab_file_path.to_string_lossy().as_ref(),
+            "--agent-config-path",
+            agent_config_path.to_string_lossy().as_ref(),
+            "--ca-bundle-path",
+            ca_bundle_path.to_string_lossy().as_ref(),
+            "--profile-instance-id",
+            "001",
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("run bootroot-remote");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse json summary");
+    assert_eq!(summary["eab"]["status"], "applied");
+    assert!(
+        !eab_file_path.exists(),
+        "stale eab file should be removed when KV entry is missing",
+    );
+}
+
+#[tokio::test]
 async fn test_bootroot_remote_fails_when_trust_fingerprints_missing() {
     let temp_dir = tempdir().expect("create temp dir");
     let role_id_path = temp_dir.path().join("secrets").join("role_id");

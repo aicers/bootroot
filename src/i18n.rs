@@ -384,7 +384,6 @@ pub(crate) struct Strings {
     pub(crate) next_steps_openbao_agent_override: &'static str,
     pub(crate) next_steps_reload_services: &'static str,
     pub(crate) next_steps_run_status: &'static str,
-    pub(crate) next_steps_eab_issue: &'static str,
     pub(crate) next_steps_eab_hint: &'static str,
     pub(crate) infra_install_completed: &'static str,
     pub(crate) infra_install_env_written: &'static str,

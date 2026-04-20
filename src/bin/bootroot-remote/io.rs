@@ -150,6 +150,21 @@ pub(super) async fn write_eab_file(path: &Path, kid: &str, hmac: &str) -> Result
     write_secret_file(path, &payload).await
 }
 
+/// Removes a stale EAB file that was written by a previous bootstrap so
+/// that `bootroot-agent --eab-file` cannot pick up credentials the
+/// operator has since cleared from `OpenBao`. Returns [`ApplyStatus::Applied`]
+/// when the file existed and was removed and [`ApplyStatus::Skipped`] when
+/// the file was already absent.
+pub(super) async fn remove_eab_file(path: &Path) -> Result<ApplyStatus> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(ApplyStatus::Applied),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ApplyStatus::Skipped),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to remove stale EAB file: {}", path.display()))
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PulledSecrets {
     pub(super) secret_id: String,

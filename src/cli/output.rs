@@ -649,7 +649,6 @@ fn print_next_steps(summary: &InitSummary, messages: &Messages) {
     println!("{}", messages.next_steps_reload_services());
     println!("{}", messages.next_steps_run_status());
     if summary.eab.is_none() {
-        println!("{}", messages.next_steps_eab_issue());
         println!(
             "{}",
             messages.next_steps_eab_hint(crate::commands::init::PATH_AGENT_EAB)

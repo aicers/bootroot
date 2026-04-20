@@ -577,10 +577,6 @@ impl Messages {
         self.strings().next_steps_run_status
     }
 
-    pub(crate) fn next_steps_eab_issue(&self) -> &'static str {
-        self.strings().next_steps_eab_issue
-    }
-
     pub(crate) fn next_steps_eab_hint(&self, path: &str) -> String {
         format_template(self.strings().next_steps_eab_hint, &[("path", path)])
     }
