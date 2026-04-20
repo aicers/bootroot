@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::warn;
@@ -11,55 +10,6 @@ pub struct EabCredentials {
     pub kid: String,
     #[serde(alias = "key")]
     pub hmac: String,
-}
-
-#[derive(Deserialize)]
-struct EabAutoResponse {
-    #[serde(alias = "keyId", alias = "kid")]
-    kid: String,
-    #[serde(alias = "hmacKey", alias = "hmac")]
-    hmac: String,
-}
-
-/// Issues EAB credentials via the step-ca ACME EAB endpoint.
-///
-/// Attempts POST first; falls back to GET on `405 Method Not Allowed`.
-///
-/// # Errors
-///
-/// Returns an error if the HTTP request fails or the response cannot
-/// be parsed.
-pub async fn issue_eab_via_stepca(
-    stepca_url: &str,
-    provisioner: &str,
-    eab_path: &str,
-) -> anyhow::Result<EabCredentials> {
-    let base = stepca_url.trim_end_matches('/');
-    let provisioner = provisioner.trim();
-    let endpoint = format!("{base}/acme/{provisioner}/{eab_path}");
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(&endpoint)
-        .send()
-        .await
-        .context("EAB request failed")?;
-    let response = if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-        client
-            .get(&endpoint)
-            .send()
-            .await
-            .context("EAB request failed")?
-    } else {
-        response
-    };
-    let response = response.error_for_status().context("EAB request failed")?;
-
-    let payload: EabAutoResponse = response.json().await.context("EAB response parse failed")?;
-    Ok(EabCredentials {
-        kid: payload.kid,
-        hmac: payload.hmac,
-    })
 }
 
 /// Loads EAB credentials from CLI arguments or a JSON file.

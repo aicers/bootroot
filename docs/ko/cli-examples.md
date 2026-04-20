@@ -475,14 +475,16 @@ Certificate issued successfully.
 
 ## 7) 시크릿 회전(예시)
 
-bootroot의 `rotate`는 **시크릿 회전**(step-ca 비밀번호, EAB, DB, HMAC, AppRole)을
-수행합니다. **인증서 갱신**은 `bootroot-agent`가 처리합니다.
+bootroot의 `rotate`는 **시크릿 회전**(step-ca 비밀번호, DB, HMAC, AppRole)을
+수행합니다. **인증서 갱신**은 `bootroot-agent`가 처리합니다. EAB 자격증명은
+bootroot가 회전하지 않습니다. 번들된 OSS step-ca는 EAB를 지원하지 않으며,
+EAB를 지원하는 CA를 사용할 때는 운영자가 OpenBao KV에 직접 새 자격증명을
+기록합니다.
 
 모든 시크릿을 갱신하는 예:
 
 ```bash
 bootroot rotate stepca-password
-bootroot rotate eab
 bootroot rotate db \
   --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
 bootroot rotate responder-hmac
@@ -551,7 +553,6 @@ bootroot rotate force-reissue --service-name web-app
 set -euo pipefail
 
 bootroot rotate stepca-password --yes
-bootroot rotate eab --yes
 bootroot rotate db --yes \
   --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
 bootroot rotate responder-hmac --yes

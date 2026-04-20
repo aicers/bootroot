@@ -2,7 +2,6 @@ pub(crate) const DEFAULT_OPENBAO_URL: &str = "http://localhost:8200";
 pub(crate) const DEFAULT_KV_MOUNT: &str = "secret";
 pub(crate) const DEFAULT_SECRETS_DIR: &str = "secrets";
 pub(crate) const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
-pub(crate) const DEFAULT_STEPCA_URL: &str = "https://localhost:9000";
 pub(crate) const DEFAULT_STEPCA_PROVISIONER: &str = "acme";
 
 /// Default `defaultTLSCertDuration` embedded in the ACME provisioner
@@ -42,7 +41,6 @@ pub(crate) const OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME: &str =
     "docker-compose.openbao-agent.override.yml";
 pub(crate) const OPENBAO_AGENT_STEPCA_SERVICE: &str = "openbao-agent-stepca";
 pub(crate) const OPENBAO_AGENT_RESPONDER_SERVICE: &str = "openbao-agent-responder";
-pub(crate) const DEFAULT_EAB_ENDPOINT_PATH: &str = "eab";
 pub(crate) const DEFAULT_DB_USER: &str = "stepca";
 pub(crate) const DEFAULT_DB_NAME: &str = "stepca";
 pub(crate) const CA_CERTS_DIR: &str = "certs";

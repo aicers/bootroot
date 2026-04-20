@@ -57,7 +57,6 @@ STEPCA_HOST_NAME="stepca.internal"
 RESPONDER_HOST_NAME="responder.internal"
 
 STEPCA_SERVER_URL=""
-STEPCA_EAB_URL=""
 RESPONDER_URL=""
 RUNTIME_SERVICE_ADD_ROLE_ID=""
 RUNTIME_SERVICE_ADD_SECRET_ID=""
@@ -279,12 +278,10 @@ configure_resolution_mode() {
       add_hosts_entry "$STEPCA_HOST_IP" "$STEPCA_HOST_NAME"
       add_hosts_entry "$RESPONDER_HOST_IP" "$RESPONDER_HOST_NAME"
       STEPCA_SERVER_URL="https://${STEPCA_HOST_NAME}:9000/acme/acme/directory"
-      STEPCA_EAB_URL="https://${STEPCA_HOST_NAME}:9000"
       RESPONDER_URL="http://${RESPONDER_HOST_NAME}:8080"
       ;;
     no-hosts)
       STEPCA_SERVER_URL="https://localhost:9000/acme/acme/directory"
-      STEPCA_EAB_URL="https://localhost:9000"
       RESPONDER_URL="http://${RESPONDER_HOST_IP}:8080"
       ;;
     *)
@@ -349,7 +346,6 @@ run_bootstrap_chain() {
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$INIT_SUMMARY_JSON" \
     --enable auto-generate,show-secrets,db-provision \
-    --stepca-url "$STEPCA_EAB_URL" \
     --stepca-provisioner "acme" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \

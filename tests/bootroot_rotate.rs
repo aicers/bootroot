@@ -16,7 +16,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod support;
 
 const SERVICE_NAME: &str = "edge-proxy";
-const SECONDARY_SERVICE_NAME: &str = "edge-alt";
 const ROLE_NAME: &str = "bootroot-service-edge-proxy";
 const ROLE_ID: &str = "role-edge-proxy";
 
@@ -433,47 +432,6 @@ async fn test_rotate_approle_secret_id_remote_sets_pending_status() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_rotate_eab_remote_sets_pending_status() {
-    let temp_dir = tempdir().expect("create temp dir");
-    let openbao = MockServer::start().await;
-    let _secret_path = prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
-
-    stub_openbao_for_eab_rotation(&openbao).await;
-
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
-        .current_dir(temp_dir.path())
-        .args([
-            "rotate",
-            "--openbao-url",
-            &openbao.uri(),
-            "--root-token",
-            support::ROOT_TOKEN,
-            "--yes",
-            "eab",
-            "--stepca-url",
-            &openbao.uri(),
-            "--stepca-provisioner",
-            "acme",
-        ])
-        .output()
-        .expect("run rotate eab");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn test_rotate_responder_hmac_remote_sets_pending_status() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
@@ -689,45 +647,6 @@ async fn test_rotate_responder_hmac_approle_permission_denied_fails() {
     assert!(!output.status.success(), "stderr:\n{stderr}");
     assert!(stderr.contains("bootroot rotate failed"));
     assert!(stderr.contains("OpenBao KV secret write failed"));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn test_rotate_eab_marks_remote_pending_and_updates_local_service() {
-    let temp_dir = tempdir().expect("create temp dir");
-    let openbao = MockServer::start().await;
-    prepare_mixed_service_state(temp_dir.path(), &openbao.uri()).expect("prepare mixed state");
-    stub_openbao_for_eab_rotation(&openbao).await;
-
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
-        .current_dir(temp_dir.path())
-        .args([
-            "rotate",
-            "--openbao-url",
-            &openbao.uri(),
-            "--root-token",
-            support::ROOT_TOKEN,
-            "--yes",
-            "eab",
-            "--stepca-url",
-            &openbao.uri(),
-            "--stepca-provisioner",
-            "acme",
-        ])
-        .output()
-        .expect("run rotate eab");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    // EAB kid/hmac from mock are "new-kid" and "new-hmac"; both should be masked.
-    assert!(
-        !stdout.contains("- EAB HMAC: new-hmac"),
-        "EAB HMAC should be masked without --show-secrets:\n{stdout}"
-    );
 }
 
 #[cfg(unix)]
@@ -1147,59 +1066,6 @@ fn prepare_app_state_with_cidrs(
     Ok(root.join(secret_id_path))
 }
 
-fn prepare_mixed_service_state(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
-    write_state_file(root, openbao_url)?;
-    let state_path = root.join("state.json");
-    let contents = fs::read_to_string(&state_path).context("read state")?;
-    let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
-    state["services"][SERVICE_NAME] = json!({
-        "service_name": SERVICE_NAME,
-        "deploy_type": "daemon",
-        "delivery_mode": "remote-bootstrap",
-        "hostname": "edge-node-01",
-        "domain": "trusted.domain",
-        "agent_config_path": "agent.toml",
-        "cert_path": "certs/edge-proxy.crt",
-        "key_path": "certs/edge-proxy.key",
-        "instance_id": "001",
-        "container_name": "edge-proxy",
-        "approle": {
-            "role_name": ROLE_NAME,
-            "role_id": ROLE_ID,
-            "secret_id_path": "secrets/services/edge-proxy/secret_id",
-            "policy_name": ROLE_NAME,
-            "secret_id_wrap_ttl": "0"
-        }
-    });
-    state["services"][SECONDARY_SERVICE_NAME] = json!({
-        "service_name": SECONDARY_SERVICE_NAME,
-        "deploy_type": "daemon",
-        "delivery_mode": "local-file",
-        "hostname": "edge-node-02",
-        "domain": "trusted.domain",
-        "agent_config_path": "agent-local.toml",
-        "cert_path": "certs/edge-alt.crt",
-        "key_path": "certs/edge-alt.key",
-        "instance_id": "002",
-        "container_name": "edge-alt",
-        "approle": {
-            "role_name": "bootroot-service-edge-alt",
-            "role_id": "role-edge-alt",
-            "secret_id_path": "secrets/services/edge-alt/secret_id",
-            "policy_name": "bootroot-service-edge-alt",
-            "secret_id_wrap_ttl": "0"
-        }
-    });
-    fs::write(&state_path, serde_json::to_string_pretty(&state)?).context("write state")?;
-    fs::write(root.join("agent.toml"), "# remote agent").context("write remote agent config")?;
-    fs::write(
-        root.join("agent-local.toml"),
-        "[profiles]\nservice_name = \"edge-alt\"\n",
-    )
-    .context("write local agent config")?;
-    Ok(())
-}
-
 fn write_state_file(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
     let state = json!({
         "openbao_url": openbao_url,
@@ -1377,54 +1243,6 @@ async fn stub_openbao_for_stepca_password_rotation(server: &MockServer, expected
                 "value": expected_password
             }
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(server)
-        .await;
-}
-
-async fn stub_openbao_for_eab_rotation(server: &MockServer) {
-    Mock::given(method("GET"))
-        .and(path("/v1/sys/health"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/acme/acme/eab"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "kid": "new-kid",
-            "hmac": "new-hmac"
-        })))
-        .mount(server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/secret/data/bootroot/agent/eab"))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
-        .and(body_json(json!({
-            "data": {
-                "kid": "new-kid",
-                "hmac": "new-hmac"
-            }
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path(format!(
-            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/eab"
-        )))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path(format!(
-            "/v1/secret/data/bootroot/services/{SECONDARY_SERVICE_NAME}/eab"
-        )))
-        .and(header("X-Vault-Token", support::ROOT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)
         .await;

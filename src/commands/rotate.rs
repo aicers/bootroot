@@ -1,7 +1,6 @@
 mod approle;
 mod ca;
 mod db;
-mod eab;
 mod helpers;
 mod infra_cert;
 mod openbao_recovery;
@@ -175,17 +174,6 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         RotateCommand::StepcaPassword(step_args) => {
             stepca_password::rotate_stepca_password(
                 &mut ctx, &client, step_args, args.yes, messages,
-            )
-            .await?;
-        }
-        RotateCommand::Eab(step_args) => {
-            eab::rotate_eab(
-                &mut ctx,
-                &client,
-                step_args,
-                args.yes,
-                args.show_secrets,
-                messages,
             )
             .await?;
         }

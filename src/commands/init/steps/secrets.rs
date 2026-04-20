@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
+use super::super::constants::SECRET_BYTES;
 use super::super::constants::openbao_constants::PATH_AGENT_EAB;
-use super::super::constants::{DEFAULT_EAB_ENDPOINT_PATH, SECRET_BYTES};
 use super::super::types::EabCredentials;
 use super::prompts::{prompt_text, prompt_yes_no};
 use super::{InitRollback, InitSecrets};
@@ -73,36 +73,8 @@ pub(super) async fn maybe_register_eab(
     if secrets.eab.is_some() {
         return Ok(None);
     }
-    if args.has_feature(InitFeature::EabAuto) {
-        let credentials = issue_eab_via_stepca(args, messages)
-            .await
-            .with_context(|| messages.error_eab_auto_failed())?;
-        register_eab_secret(
-            client,
-            &args.openbao.kv_mount,
-            rollback,
-            &credentials,
-            messages,
-        )
-        .await?;
-        return Ok(Some(credentials));
-    }
     if !prompt_yes_no(messages.prompt_eab_register_now(), messages)? {
         return Ok(None);
-    }
-    if prompt_yes_no(messages.prompt_eab_auto_now(), messages)? {
-        let credentials = issue_eab_via_stepca(args, messages)
-            .await
-            .with_context(|| messages.error_eab_auto_failed())?;
-        register_eab_secret(
-            client,
-            &args.openbao.kv_mount,
-            rollback,
-            &credentials,
-            messages,
-        )
-        .await?;
-        return Ok(Some(credentials));
     }
     println!("{}", messages.eab_prompt_instructions());
     let kid = prompt_text(messages.prompt_eab_kid(), messages)?;
@@ -142,16 +114,6 @@ async fn register_eab_secret(
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
     Ok(())
-}
-
-async fn issue_eab_via_stepca(args: &InitArgs, messages: &Messages) -> Result<EabCredentials> {
-    bootroot::eab::issue_eab_via_stepca(
-        &args.stepca_url,
-        &args.stepca_provisioner,
-        DEFAULT_EAB_ENDPOINT_PATH,
-    )
-    .await
-    .with_context(|| messages.error_eab_auto_failed())
 }
 
 #[cfg(test)]

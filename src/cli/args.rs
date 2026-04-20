@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::commands::init::{
     DEFAULT_CERT_DURATION, DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL,
-    DEFAULT_SECRETS_DIR, DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL, SECRET_ID_TTL,
+    DEFAULT_SECRETS_DIR, DEFAULT_STEPCA_PROVISIONER, SECRET_ID_TTL,
 };
 use crate::state::{DeliveryMode, DeployType, HookFailurePolicyEntry};
 
@@ -281,7 +281,6 @@ pub(crate) struct RotateArgs {
 #[derive(Subcommand, Debug)]
 pub(crate) enum RotateCommand {
     StepcaPassword(RotateStepcaPasswordArgs),
-    Eab(RotateEabArgs),
     Db(RotateDbArgs),
     ResponderHmac(RotateResponderHmacArgs),
     /// Rotates `OpenBao` recovery credentials manually.
@@ -318,17 +317,6 @@ pub(crate) struct RotateStepcaPasswordArgs {
     /// New step-ca key password
     #[arg(long)]
     pub(crate) new_password: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct RotateEabArgs {
-    /// step-ca URL for EAB issuance
-    #[arg(long, default_value = DEFAULT_STEPCA_URL)]
-    pub(crate) stepca_url: String,
-
-    /// step-ca ACME provisioner name
-    #[arg(long, default_value = DEFAULT_STEPCA_PROVISIONER)]
-    pub(crate) stepca_provisioner: String,
 }
 
 #[derive(Args, Debug)]
@@ -616,8 +604,6 @@ pub(crate) enum InitFeature {
     DbProvision,
     /// Validate DB DSN connectivity and auth
     DbCheck,
-    /// Auto-issue ACME EAB via step-ca
-    EabAuto,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -703,10 +689,6 @@ pub(crate) struct InitArgs {
     /// HTTP-01 responder request timeout (seconds)
     #[arg(long, default_value_t = 5)]
     pub(crate) responder_timeout_secs: u64,
-
-    /// step-ca URL for EAB issuance
-    #[arg(long, default_value = DEFAULT_STEPCA_URL)]
-    pub(crate) stepca_url: String,
 
     /// step-ca ACME provisioner name
     #[arg(long, default_value = DEFAULT_STEPCA_PROVISIONER)]

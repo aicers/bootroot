@@ -52,7 +52,6 @@ REMOTE_CERTS_DIR="$REMOTE_DIR/certs"
 STEPCA_HOST_IP="127.0.0.1"
 RESPONDER_HOST_IP="127.0.0.1"
 STEPCA_SERVER_URL="https://localhost:9000/acme/acme/directory"
-STEPCA_EAB_URL="https://localhost:9000"
 RESPONDER_URL="http://${RESPONDER_HOST_IP}:8080"
 
 RUNTIME_SERVICE_ADD_ROLE_ID=""
@@ -492,7 +491,6 @@ run_bootstrap_chain() {
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$INIT_SUMMARY_JSON" \
     --enable auto-generate,show-secrets,db-provision \
-    --stepca-url "$STEPCA_EAB_URL" \
     --stepca-provisioner "acme" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \

@@ -14,6 +14,35 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Removed
 
+- Removed ACME EAB auto-issuance and bootroot-side enforcement because
+  the bundled OSS step-ca does not support EAB (EAB is a commercial
+  Smallstep-only feature). The `bootroot rotate eab` subcommand, the
+  `--enable eab-auto` flag on `bootroot init`, the auto-created empty
+  EAB KV entries written during `service add`, and the mandatory EAB
+  check in `bootroot-remote bootstrap` are gone. The operator-provided
+  pass-through is kept: `--eab-kid` / `--eab-hmac` on `bootroot init`,
+  `--eab-file-path` on `bootroot-remote bootstrap`, and `--eab-kid` /
+  `--eab-hmac` / `--eab-file` on `bootroot-agent`. When credentials are
+  present they are forwarded to the ACME `newAccount` request (RFC
+  8555); when absent the `eab` apply step reports `applied` if a stale
+  `eab.json` from a prior bootstrap had to be removed and `skipped`
+  when no file existed to begin with. A present-but-malformed EAB KV
+  entry (e.g., a non-string `kid` or `hmac`) fails the bootstrap
+  loudly rather than being silently demoted to "absent".
+  Missing-entry detection is narrow: only a `404 Not Found`
+  from OpenBao is treated as "no EAB configured" via the new
+  `OpenBaoClient::try_read_kv`. Transport errors, 5xx responses, and
+  other unexpected failures still surface as bootstrap failures so a
+  transient OpenBao outage cannot silently demote EAB to `skipped`.
+  The narrow semantics also apply to `bootroot service add` when it
+  reads the control-node EAB entry, so a transient OpenBao outage
+  cannot silently strip EAB from a newly added service. When the KV
+  entry is absent, `bootroot-remote bootstrap` also removes any
+  stale `eab.json` left on the target host, preventing
+  `bootroot-agent --eab-file` from forwarding credentials the
+  operator has since cleared. The `--stepca-url` flag on `bootroot
+  init` is also gone: it only fed the deleted auto-issuance code
+  path and had no other consumer. (Closes #550)
 - Removed `--secret-id-num-uses` from `bootroot service add` and from
   `rotate approle-secret-id` policy state. Service SecretIDs are now
   always issued with unlimited uses (`num_uses = 0`). The lower-level

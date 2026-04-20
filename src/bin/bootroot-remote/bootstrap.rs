@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
 use super::agent_config::apply_agent_config_updates;
-use super::io::{pull_secrets, read_secret_file, write_eab_file, write_secret_file};
+use super::io::{
+    pull_secrets, read_secret_file, remove_eab_file, write_eab_file, write_secret_file,
+};
 use super::summary::{ApplyItemSummary, ApplySummary, merge_apply_status, print_summary};
 use super::validation::{
     validate_agent_domain, validate_profile_hostname, validate_profile_instance_id,
@@ -162,15 +164,28 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
             &format!("secret_id 반영 실패: {err}"),
         )),
     };
-    let eab_status =
-        match write_eab_file(&args.eab_file_path, &pulled.eab_kid, &pulled.eab_hmac).await {
+    let eab_status = match (pulled.eab_kid.as_deref(), pulled.eab_hmac.as_deref()) {
+        (Some(kid), Some(hmac)) => match write_eab_file(&args.eab_file_path, kid, hmac).await {
             Ok(status) => ApplyItemSummary::applied(status),
             Err(err) => ApplyItemSummary::failed(localized(
                 lang,
                 &format!("eab apply failed: {err}"),
                 &format!("eab 반영 실패: {err}"),
             )),
-        };
+        },
+        // Absent EAB in KV means the ACME account uses open enrollment.
+        // Remove any stale eab.json left by a prior bootstrap so
+        // `bootroot-agent --eab-file` cannot silently forward obsolete
+        // credentials after the operator has cleared them.
+        _ => match remove_eab_file(&args.eab_file_path).await {
+            Ok(status) => ApplyItemSummary::applied(status),
+            Err(err) => ApplyItemSummary::failed(localized(
+                lang,
+                &format!("eab clear failed: {err}"),
+                &format!("eab 제거 실패: {err}"),
+            )),
+        },
+    };
 
     let (responder_hmac_status, mut trust_sync_status) =
         apply_agent_config_updates(&args, &pulled, lang).await;

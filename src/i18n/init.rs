@@ -200,10 +200,6 @@ impl Messages {
         self.strings().eab_prompt_instructions
     }
 
-    pub(crate) fn prompt_eab_auto_now(&self) -> &'static str {
-        self.strings().prompt_eab_auto_now
-    }
-
     pub(crate) fn prompt_eab_kid(&self) -> &'static str {
         self.strings().prompt_eab_kid
     }
@@ -218,10 +214,6 @@ impl Messages {
 
     pub(crate) fn error_responder_check_failed(&self) -> &'static str {
         self.strings().error_responder_check_failed
-    }
-
-    pub(crate) fn error_eab_auto_failed(&self) -> &'static str {
-        self.strings().error_eab_auto_failed
     }
 
     pub(crate) fn error_state_missing(&self) -> &'static str {
@@ -583,10 +575,6 @@ impl Messages {
 
     pub(crate) fn next_steps_run_status(&self) -> &'static str {
         self.strings().next_steps_run_status
-    }
-
-    pub(crate) fn next_steps_eab_issue(&self) -> &'static str {
-        self.strings().next_steps_eab_issue
     }
 
     pub(crate) fn next_steps_eab_hint(&self, path: &str) -> String {

@@ -94,6 +94,7 @@ pub(super) async fn run_apply_secret_id(args: ApplySecretIdArgs, lang: Locale) -
             let label = match status {
                 ApplyStatus::Applied => "applied",
                 ApplyStatus::Unchanged => "unchanged",
+                ApplyStatus::Skipped => "skipped",
                 ApplyStatus::Failed => "failed",
             };
             println!(
