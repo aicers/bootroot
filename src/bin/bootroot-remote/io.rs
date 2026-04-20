@@ -178,10 +178,21 @@ pub(super) async fn pull_secrets(
             )
         })?;
     // The EAB KV entry is optional: it is only populated when the
-    // operator has provided EAB credentials. A missing entry means the
-    // ACME CA does not require EAB for this account, so we must not
-    // treat the read error as fatal.
-    let eab_data = client.read_kv(mount, &format!("{base}/eab")).await.ok();
+    // operator has provided EAB credentials. A missing entry (404)
+    // means the ACME CA does not require EAB for this account, so it
+    // must not be fatal. Transport or 5xx errors still propagate —
+    // otherwise a transient OpenBao outage would silently demote EAB
+    // to "skipped" instead of failing the bootstrap.
+    let eab_data = client
+        .try_read_kv(mount, &format!("{base}/eab"))
+        .await
+        .with_context(|| {
+            localized(
+                lang,
+                "Failed to read service EAB from OpenBao",
+                "OpenBao에서 서비스 EAB를 읽지 못했습니다",
+            )
+        })?;
     let hmac_data = client
         .read_kv(mount, &format!("{base}/http_responder_hmac"))
         .await

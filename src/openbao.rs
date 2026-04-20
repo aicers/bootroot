@@ -709,6 +709,46 @@ impl OpenBaoClient {
             .map(|response| response.data.data)
     }
 
+    /// Reads a KV v2 secret, treating a missing entry as `Ok(None)`.
+    ///
+    /// Returns `Ok(None)` when the resource is absent (HTTP 404 or the
+    /// equivalent `No secret engine mount` 400 response). Any other
+    /// failure — transport errors, 5xx responses, malformed payloads —
+    /// is propagated as `Err`, matching the semantics of [`read_kv`].
+    ///
+    /// # Errors
+    /// Returns an error for anything other than a clean not-found.
+    pub async fn try_read_kv(
+        &self,
+        mount: &str,
+        path: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        #[derive(Deserialize)]
+        struct KvResponse {
+            data: KvResponseData,
+        }
+        #[derive(Deserialize)]
+        struct KvResponseData {
+            data: serde_json::Value,
+        }
+        let full_path = format!("{mount}/data/{path}");
+        let response = self.send_authed(Method::GET, &full_path, None).await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        if is_not_found(status, &text) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            anyhow::bail!("OpenBao API error ({status}): {text}");
+        }
+        let parsed: KvResponse =
+            serde_json::from_str(&text).context("Failed to parse OpenBao response")?;
+        Ok(Some(parsed.data.data))
+    }
+
     /// Checks if a KV v2 secret exists.
     ///
     /// # Errors

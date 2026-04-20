@@ -25,7 +25,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `--eab-hmac` / `--eab-file` on `bootroot-agent`. When credentials are
   present they are forwarded to the ACME `newAccount` request (RFC
   8555); when absent the `eab` apply step reports `skipped` and no file
-  is written. (Closes #550)
+  is written. Missing-entry detection is narrow: only a `404 Not Found`
+  from OpenBao is treated as "no EAB configured" via the new
+  `OpenBaoClient::try_read_kv`. Transport errors, 5xx responses, and
+  other unexpected failures still surface as bootstrap failures so a
+  transient OpenBao outage cannot silently demote EAB to `skipped`.
+  (Closes #550)
 - Removed `--secret-id-num-uses` from `bootroot service add` and from
   `rotate approle-secret-id` policy state. Service SecretIDs are now
   always issued with unlimited uses (`num_uses = 0`). The lower-level
