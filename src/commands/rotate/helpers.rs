@@ -94,7 +94,7 @@ pub(super) fn temp_secret_path(path: &Path) -> PathBuf {
 
 pub(super) fn restart_container(container: &str, messages: &Messages) -> Result<()> {
     let args = ["restart", container];
-    run_docker(&args, "docker restart", messages)
+    run_docker(&args, &format!("docker restart {container}"), messages)
 }
 
 pub(super) fn restart_compose_service(
@@ -192,11 +192,7 @@ pub(super) fn signal_bootroot_agent(entry: &ServiceEntry, messages: &Messages) -
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| anyhow::anyhow!(messages.error_service_container_name_required()))?;
             match inspect_docker_container(container, messages)? {
-                DockerInspectOutcome::Found => run_docker(
-                    &["restart", container],
-                    "docker restart bootroot-agent",
-                    messages,
-                ),
+                DockerInspectOutcome::Found => restart_container(container, messages),
                 DockerInspectOutcome::Missing => {
                     anyhow::bail!(messages.error_bootroot_agent_container_missing(container))
                 }
@@ -629,5 +625,54 @@ mod tests {
             "permission denied while trying to connect to the Docker daemon socket"
         ));
         assert!(!is_no_such_container_stderr(""));
+    }
+
+    #[test]
+    fn signal_bootroot_agent_docker_restart_failure_names_container() {
+        use super::super::test_support::{
+            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
+        };
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).expect("create bin dir");
+        let docker_path = bin_dir.join("docker");
+        // Succeed on `container inspect`, fail on `restart` so the error
+        // context (which must name the actual container) is the one the
+        // operator sees.
+        let script = r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" >> "${BOOTROOT_TEST_DOCKER_ARGS:?missing log path}"
+if [ "$1" = "restart" ]; then
+  exit 1
+fi
+exit 0
+"#;
+        std::fs::write(&docker_path, script).expect("write fake docker");
+        #[cfg(unix)]
+        std::fs::set_permissions(&docker_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake docker");
+
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let mut entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
+        entry.container_name = Some("my-nginx".to_string());
+
+        let err = signal_bootroot_agent(&entry, &test_messages())
+            .expect_err("docker restart failure must propagate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-nginx"),
+            "restart failure must name the actual container, got: {msg}"
+        );
+        assert!(
+            !msg.contains("bootroot-agent"),
+            "restart failure must not reference the removed hardcoded prefix, got: {msg}"
+        );
     }
 }

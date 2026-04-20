@@ -39,7 +39,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   specific "No such container/object" response to the migration
   hint; other inspect failures (e.g. daemon unreachable, permission
   denied) surface verbatim as `docker command failed: …` so the
-  real problem is not masked. (Closes #552)
+  real problem is not masked. If the actual `docker restart` itself
+  fails after the inspect succeeds, the error now names the real
+  container (e.g. `docker restart my-nginx failed with status: …`)
+  instead of the removed hardcoded `bootroot-agent` label, so
+  operators can identify the signaled container from the failure
+  output. (Closes #552)
 - Fixed `bootroot init` storing the host-side PostgreSQL port in the
   step-ca DSN written to OpenBao KV / `ca.json` when
   `POSTGRES_HOST_PORT` differed from `5432`, and fixed `bootroot rotate
