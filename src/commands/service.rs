@@ -39,6 +39,28 @@ pub(super) const MANAGED_PROFILE_END_PREFIX: &str = "# END bootroot managed prof
 pub(super) const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
 pub(super) const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 pub(super) const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
+
+/// Resolves an operator-supplied ACME account email to the concrete
+/// value embedded in the `agent.toml` baseline / the remote-bootstrap
+/// artifact.  Falls back to [`DEFAULT_AGENT_EMAIL`] when the operator
+/// did not pass `--agent-email` on `service add`.
+pub(super) fn effective_agent_email(value: Option<&str>) -> &str {
+    value.unwrap_or(DEFAULT_AGENT_EMAIL)
+}
+
+/// Resolves an operator-supplied ACME directory URL to the concrete
+/// value embedded in the baseline.  Falls back to
+/// [`DEFAULT_AGENT_SERVER`].
+pub(super) fn effective_agent_server(value: Option<&str>) -> &str {
+    value.unwrap_or(DEFAULT_AGENT_SERVER)
+}
+
+/// Resolves an operator-supplied HTTP-01 responder admin URL to the
+/// concrete value embedded in the baseline.  Falls back to
+/// [`DEFAULT_AGENT_RESPONDER_URL`].
+pub(super) fn effective_agent_responder_url(value: Option<&str>) -> &str {
+    value.unwrap_or(DEFAULT_AGENT_RESPONDER_URL)
+}
 pub(super) use bootroot::trust_bootstrap::CA_BUNDLE_PEM_KEY as SERVICE_CA_BUNDLE_PEM_KEY;
 
 pub(super) struct ServiceAppRoleMaterialized {
@@ -353,6 +375,9 @@ fn build_service_entry_from_role(
         notes: resolved.notes.clone(),
         post_renew_hooks: resolved.post_renew_hooks.clone(),
         approle,
+        agent_email: resolved.agent_email.clone(),
+        agent_server: resolved.agent_server.clone(),
+        agent_responder_url: resolved.agent_responder_url.clone(),
     }
 }
 
@@ -681,6 +706,9 @@ fn non_policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) 
         && entry.container_name == resolved.container_name
         && entry.notes == resolved.notes
         && entry.post_renew_hooks == resolved.post_renew_hooks
+        && entry.agent_email == resolved.agent_email
+        && entry.agent_server == resolved.agent_server
+        && entry.agent_responder_url == resolved.agent_responder_url
 }
 
 fn policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
@@ -729,6 +757,9 @@ mod tests {
             secret_id_ttl: None,
             secret_id_wrap_ttl: None,
             token_bound_cidrs: None,
+            agent_email: None,
+            agent_server: None,
+            agent_responder_url: None,
         }
     }
 
@@ -745,6 +776,9 @@ mod tests {
         assert_eq!(entry.container_name, resolved.container_name);
         assert_eq!(entry.notes, resolved.notes);
         assert_eq!(entry.post_renew_hooks, resolved.post_renew_hooks);
+        assert_eq!(entry.agent_email, resolved.agent_email);
+        assert_eq!(entry.agent_server, resolved.agent_server);
+        assert_eq!(entry.agent_responder_url, resolved.agent_responder_url);
     }
 
     #[test]
@@ -913,6 +947,53 @@ mod tests {
         let mut entry = sample_entry_from_resolved(&resolved);
         entry.approle.secret_id_wrap_ttl = Some("0".to_string());
         assert!(!is_idempotent_remote_rerun(&entry, &resolved));
+    }
+
+    /// Guards the Round 3 regression from issue #549: the stored
+    /// `agent_*` values on `ServiceEntry` are the source of truth for
+    /// `remote-bootstrap` reruns.  A rerun that would silently flip the
+    /// persisted topology — either dropping an operator's previous
+    /// override (stored `Some(X)` vs. new `None`) or introducing a new
+    /// one (stored `None` vs. new `Some(Y)`), or simply disagreeing
+    /// (stored `Some(X)` vs. new `Some(Y)`) — must not be treated as
+    /// idempotent.  `run_service_add` then falls through to the
+    /// `error_service_duplicate` bail, so the operator has to remove
+    /// and re-add the service rather than racing a silent `.ctmpl`
+    /// re-render over an inconsistent definition.
+    #[test]
+    fn is_idempotent_remote_rerun_false_when_agent_overrides_differ() {
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        // Baseline: both sides have `None` (operator never supplied
+        // `--agent-*`).  This is the idempotent case.
+        let baseline_entry = sample_entry_from_resolved(&resolved);
+        assert!(is_idempotent_remote_rerun(&baseline_entry, &resolved));
+
+        // Entry stored an explicit override; rerun omits the flag
+        // (resolved.agent_server == None).  Must NOT be idempotent.
+        let mut entry_with_override = sample_entry_from_resolved(&resolved);
+        entry_with_override.agent_server =
+            Some("https://step-ca.example.org:9443/acme/acme/directory".to_string());
+        assert!(!is_idempotent_remote_rerun(&entry_with_override, &resolved));
+
+        // Entry stored no override; rerun introduces one.  Must NOT be
+        // idempotent — would silently change the generated artifact.
+        let mut resolved_with_override = sample_resolved();
+        resolved_with_override.delivery_mode = DeliveryMode::RemoteBootstrap;
+        resolved_with_override.agent_responder_url =
+            Some("http://responder.internal:18080".to_string());
+        assert!(!is_idempotent_remote_rerun(
+            &baseline_entry,
+            &resolved_with_override
+        ));
+
+        // Entry and rerun both have overrides, but they disagree.
+        let mut entry_a = sample_entry_from_resolved(&resolved);
+        entry_a.agent_email = Some("ops@example.org".to_string());
+        let mut resolved_b = sample_resolved();
+        resolved_b.delivery_mode = DeliveryMode::RemoteBootstrap;
+        resolved_b.agent_email = Some("other@example.org".to_string());
+        assert!(!is_idempotent_remote_rerun(&entry_a, &resolved_b));
     }
 
     #[test]

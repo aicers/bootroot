@@ -35,6 +35,20 @@ pub(crate) struct ResolvedServiceAdd {
     pub(crate) secret_id_ttl: Option<String>,
     pub(crate) secret_id_wrap_ttl: Option<String>,
     pub(crate) token_bound_cidrs: Option<Vec<String>>,
+    /// Operator-supplied ACME account email.  `None` means
+    /// `--agent-email` was not provided on `service add`; renderers
+    /// fall back to [`DEFAULT_AGENT_EMAIL`].  Preserved as `Option`
+    /// so that idempotent remote reruns can distinguish an explicit
+    /// operator value from the compose-topology default.
+    pub(crate) agent_email: Option<String>,
+    /// Operator-supplied ACME directory URL.  `None` means
+    /// `--agent-server` was not provided; renderers fall back to
+    /// [`DEFAULT_AGENT_SERVER`].
+    pub(crate) agent_server: Option<String>,
+    /// Operator-supplied HTTP-01 responder admin URL.  `None` means
+    /// `--agent-responder-url` was not provided; renderers fall back
+    /// to [`DEFAULT_AGENT_RESPONDER_URL`].
+    pub(crate) agent_responder_url: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -144,6 +158,10 @@ pub(super) fn resolve_service_add_args(
         Some(args.rn_cidrs.clone())
     };
 
+    let agent_email = args.agent_email.clone();
+    let agent_server = args.agent_server.clone();
+    let agent_responder_url = args.agent_responder_url.clone();
+
     Ok(ResolvedServiceAdd {
         service_name,
         deploy_type,
@@ -161,6 +179,9 @@ pub(super) fn resolve_service_add_args(
         secret_id_ttl: args.secret_id_ttl.clone(),
         secret_id_wrap_ttl,
         token_bound_cidrs,
+        agent_email,
+        agent_server,
+        agent_responder_url,
     })
 }
 
@@ -449,6 +470,9 @@ mod tests {
             key_path: None,
             instance_id: None,
             container_name: None,
+            agent_email: None,
+            agent_server: None,
+            agent_responder_url: None,
             runtime_auth: RuntimeAuthArgs {
                 auth_mode: AuthMode::Auto,
                 root_token: None,

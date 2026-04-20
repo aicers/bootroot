@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::toml_util::toml_encode_string;
 use bootroot::trust_bootstrap::{
-    build_ca_bundle_ctmpl, build_managed_agent_ctmpl, build_trust_updates,
+    AgentConfigBaselineParams, apply_agent_config_baseline_defaults, build_ca_bundle_ctmpl,
+    build_managed_agent_ctmpl, build_trust_updates,
     render_managed_profile_block as render_managed_profile, upsert_managed_profile_block,
 };
 use tokio::fs;
@@ -16,7 +17,8 @@ use super::{
     OPENBAO_AGENT_CA_BUNDLE_TEMPLATE_FILENAME, OPENBAO_AGENT_CONFIG_FILENAME,
     OPENBAO_AGENT_DOCKER_CONFIG_FILENAME, OPENBAO_AGENT_TEMPLATE_FILENAME,
     OPENBAO_AGENT_TOKEN_FILENAME, OPENBAO_SERVICE_CONFIG_DIR, SERVICE_ROLE_ID_FILENAME,
-    ServiceSyncMaterial,
+    ServiceSyncMaterial, effective_agent_email, effective_agent_responder_url,
+    effective_agent_server,
 };
 use crate::commands::init::{resolve_openbao_agent_addr, to_container_path};
 use crate::i18n::Messages;
@@ -62,7 +64,41 @@ pub(super) async fn apply_local_service_configs(
     } else {
         String::new()
     };
-    let with_profile = upsert_managed_profile(&current, &resolved.service_name, &profile);
+    // Backfill any baseline fields missing from the operator-facing
+    // `agent.toml` — both for a fresh file and for an existing file that
+    // lacks `email` / `server` / `[acme].http_responder_url` or the
+    // retry/timeout tunables.  Without this, #549 recurs when the KV
+    // re-render loses those fields.  `insert_missing_*` preserves any
+    // value the operator already set.
+    let mut next = apply_agent_config_baseline_defaults(
+        &current,
+        &AgentConfigBaselineParams {
+            email: effective_agent_email(resolved.agent_email.as_deref()),
+            server: effective_agent_server(resolved.agent_server.as_deref()),
+            domain: &resolved.domain,
+            http_responder_url: effective_agent_responder_url(
+                resolved.agent_responder_url.as_deref(),
+            ),
+        },
+    )?;
+    // Explicit `--agent-*` overrides take precedence over whatever was
+    // in the pre-existing file, so operators can re-bake a changed ACME
+    // topology without hand-editing.
+    if let Some(email) = resolved.agent_email.as_deref() {
+        next = bootroot::toml_util::upsert_top_level_keys(&next, &[("email", email.to_string())])?;
+    }
+    if let Some(server) = resolved.agent_server.as_deref() {
+        next =
+            bootroot::toml_util::upsert_top_level_keys(&next, &[("server", server.to_string())])?;
+    }
+    if let Some(responder_url) = resolved.agent_responder_url.as_deref() {
+        next = bootroot::toml_util::upsert_section_keys(
+            &next,
+            "acme",
+            &[("http_responder_url", responder_url.to_string())],
+        )?;
+    }
+    let with_profile = upsert_managed_profile(&next, &resolved.service_name, &profile);
     let mut next = with_profile;
     let trust_updates = build_trust_updates(&sync_material.trusted_ca_sha256, &ca_bundle_path);
     next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates)?;
@@ -411,7 +447,10 @@ fn build_ca_bundle_ctmpl_content(kv_mount: &str, service_name: &str) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use bootroot::trust_bootstrap::render_agent_config_baseline;
+
     use super::super::resolve::ResolvedServiceAdd;
+    use super::super::{DEFAULT_AGENT_EMAIL, DEFAULT_AGENT_RESPONDER_URL, DEFAULT_AGENT_SERVER};
     use super::*;
     use crate::commands::constants::CA_TRUST_KEY;
     use crate::state::{DeliveryMode, DeployType};
@@ -434,6 +473,9 @@ mod tests {
             secret_id_ttl: None,
             secret_id_wrap_ttl: None,
             token_bound_cidrs: None,
+            agent_email: None,
+            agent_server: None,
+            agent_responder_url: None,
         }
     }
 
@@ -545,6 +587,305 @@ mod tests {
         assert!(output.contains("server = \"https://localhost\""));
         assert!(output.contains("[[profiles]]"));
         assert!(output.contains("service_name = \"edge-proxy\""));
+    }
+
+    /// Exercises the fresh-file path of [`apply_local_service_configs`]:
+    /// seeds the managed-profile upserts over the shared baseline and
+    /// confirms the resulting `.ctmpl` preserves every field an operator
+    /// might need to customise.  Guards against the regression in #549
+    /// where rotation re-renders overwrote hand-edited `server` /
+    /// `http_responder_url` lines because the template lacked them.
+    #[test]
+    fn test_fresh_agent_config_ctmpl_carries_full_baseline() {
+        let args = test_resolved();
+        let baseline = render_agent_config_baseline(&AgentConfigBaselineParams {
+            email: DEFAULT_AGENT_EMAIL,
+            server: DEFAULT_AGENT_SERVER,
+            domain: &args.domain,
+            http_responder_url: DEFAULT_AGENT_RESPONDER_URL,
+        });
+        let profile = render_managed_profile_block(&args);
+        let with_profile = upsert_managed_profile(&baseline, "edge-proxy", &profile);
+        let trust_updates =
+            build_trust_updates(&["a".repeat(64)], Path::new("certs/ca-bundle.pem"));
+        let with_trust =
+            bootroot::toml_util::upsert_section_keys(&with_profile, "trust", &trust_updates)
+                .unwrap();
+        let domain_updates = vec![("domain", args.domain.clone())];
+        let with_domain =
+            bootroot::toml_util::upsert_top_level_keys(&with_trust, &domain_updates).unwrap();
+        let acme_updates = vec![("http_responder_hmac", "hmac-val".to_string())];
+        let rendered =
+            bootroot::toml_util::upsert_section_keys(&with_domain, "acme", &acme_updates).unwrap();
+
+        let ctmpl = build_ctmpl_content(&rendered, "secret", "edge-proxy");
+
+        assert!(
+            ctmpl.contains(&format!("email = \"{DEFAULT_AGENT_EMAIL}\"")),
+            "ctmpl must embed email so rotation preserves it: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains(&format!("server = \"{DEFAULT_AGENT_SERVER}\"")),
+            "ctmpl must embed server so rotation preserves it: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains(&format!(
+                "http_responder_url = \"{DEFAULT_AGENT_RESPONDER_URL}\""
+            )),
+            "ctmpl must embed http_responder_url so rotation preserves it: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains("directory_fetch_attempts = 10"),
+            "ctmpl must preserve [acme] retry tunables: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains("http_responder_timeout_secs = 5"),
+            "ctmpl must preserve [acme] timeout tunables: {ctmpl}"
+        );
+    }
+
+    /// Proves the `--agent-server` / `--agent-responder-url` /
+    /// `--agent-email` overrides flow end-to-end into the rendered
+    /// `.ctmpl`.  Issue #549 was filed because on non-default
+    /// topologies the baseline contained localhost defaults and the
+    /// operator's hand-edits were clobbered on the next rotation;
+    /// this test asserts that a caller-supplied non-default topology
+    /// survives through to the template the sidecar re-renders from.
+    #[test]
+    fn test_fresh_agent_config_ctmpl_embeds_non_default_topology_values() {
+        const NON_DEFAULT_EMAIL: &str = "ops@example.org";
+        const NON_DEFAULT_SERVER: &str = "https://step-ca.example.org:9443/acme/acme/directory";
+        const NON_DEFAULT_RESPONDER: &str = "http://responder.internal:18080";
+
+        let mut args = test_resolved();
+        args.agent_email = Some(NON_DEFAULT_EMAIL.to_string());
+        args.agent_server = Some(NON_DEFAULT_SERVER.to_string());
+        args.agent_responder_url = Some(NON_DEFAULT_RESPONDER.to_string());
+
+        let baseline = render_agent_config_baseline(&AgentConfigBaselineParams {
+            email: effective_agent_email(args.agent_email.as_deref()),
+            server: effective_agent_server(args.agent_server.as_deref()),
+            domain: &args.domain,
+            http_responder_url: effective_agent_responder_url(args.agent_responder_url.as_deref()),
+        });
+        let profile = render_managed_profile_block(&args);
+        let with_profile = upsert_managed_profile(&baseline, "edge-proxy", &profile);
+        let trust_updates =
+            build_trust_updates(&["a".repeat(64)], Path::new("certs/ca-bundle.pem"));
+        let with_trust =
+            bootroot::toml_util::upsert_section_keys(&with_profile, "trust", &trust_updates)
+                .unwrap();
+        let domain_updates = vec![("domain", args.domain.clone())];
+        let with_domain =
+            bootroot::toml_util::upsert_top_level_keys(&with_trust, &domain_updates).unwrap();
+        let acme_updates = vec![("http_responder_hmac", "hmac-val".to_string())];
+        let rendered =
+            bootroot::toml_util::upsert_section_keys(&with_domain, "acme", &acme_updates).unwrap();
+
+        let ctmpl = build_ctmpl_content(&rendered, "secret", "edge-proxy");
+
+        assert!(
+            ctmpl.contains(&format!("email = \"{NON_DEFAULT_EMAIL}\"")),
+            "ctmpl must carry caller-supplied email so rotation preserves it: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains(&format!("server = \"{NON_DEFAULT_SERVER}\"")),
+            "ctmpl must carry caller-supplied server so rotation preserves it: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains(&format!("http_responder_url = \"{NON_DEFAULT_RESPONDER}\"")),
+            "ctmpl must carry caller-supplied responder so rotation preserves it: {ctmpl}"
+        );
+        assert!(
+            !ctmpl.contains(DEFAULT_AGENT_SERVER),
+            "ctmpl must not fall back to the built-in localhost server default: {ctmpl}"
+        );
+        assert!(
+            !ctmpl.contains(DEFAULT_AGENT_RESPONDER_URL),
+            "ctmpl must not fall back to the built-in localhost responder default: {ctmpl}"
+        );
+    }
+
+    /// Regression for the Round 4 review: when `--agent-config` points
+    /// at a pre-existing `agent.toml` that is missing `server` /
+    /// `http_responder_url`, the `--agent-server` / `--agent-responder-url`
+    /// flags must still land in the generated `.ctmpl`.  Before the fix,
+    /// the existing-file branch skipped the baseline seeding entirely
+    /// and only upserted `domain` / `[trust]` / `http_responder_hmac`,
+    /// silently dropping the topology flags on the floor.
+    #[test]
+    fn test_existing_agent_config_ctmpl_backfills_missing_fields_from_overrides() {
+        const NON_DEFAULT_EMAIL: &str = "ops@example.org";
+        const NON_DEFAULT_SERVER: &str = "https://step-ca.example.org:9443/acme/acme/directory";
+        const NON_DEFAULT_RESPONDER: &str = "http://responder.internal:18080";
+
+        // Pre-existing agent.toml that an operator had in place before
+        // running `service add`, lacking email/server/http_responder_url
+        // entirely.  Only `domain` and an `[acme]` section exist.
+        let pre_existing =
+            "domain = \"legacy.domain\"\n\n[acme]\nhttp_responder_hmac = \"legacy-hmac\"\n";
+
+        let mut args = test_resolved();
+        args.domain = "trusted.domain".to_string();
+        args.agent_email = Some(NON_DEFAULT_EMAIL.to_string());
+        args.agent_server = Some(NON_DEFAULT_SERVER.to_string());
+        args.agent_responder_url = Some(NON_DEFAULT_RESPONDER.to_string());
+
+        // Mirror apply_local_service_configs's pipeline for the
+        // existing-file path.  `apply_agent_config_baseline_defaults`
+        // backfills any missing baseline keys; the explicit `if let
+        // Some(..)` upserts replicate the CLI-override branch that
+        // ensures operator flags always take effect even if the file
+        // already had a value.
+        let mut next = apply_agent_config_baseline_defaults(
+            pre_existing,
+            &AgentConfigBaselineParams {
+                email: effective_agent_email(args.agent_email.as_deref()),
+                server: effective_agent_server(args.agent_server.as_deref()),
+                domain: &args.domain,
+                http_responder_url: effective_agent_responder_url(
+                    args.agent_responder_url.as_deref(),
+                ),
+            },
+        )
+        .unwrap();
+        if let Some(email) = args.agent_email.as_deref() {
+            next =
+                bootroot::toml_util::upsert_top_level_keys(&next, &[("email", email.to_string())])
+                    .unwrap();
+        }
+        if let Some(server) = args.agent_server.as_deref() {
+            next = bootroot::toml_util::upsert_top_level_keys(
+                &next,
+                &[("server", server.to_string())],
+            )
+            .unwrap();
+        }
+        if let Some(responder_url) = args.agent_responder_url.as_deref() {
+            next = bootroot::toml_util::upsert_section_keys(
+                &next,
+                "acme",
+                &[("http_responder_url", responder_url.to_string())],
+            )
+            .unwrap();
+        }
+        let profile = render_managed_profile_block(&args);
+        next = upsert_managed_profile(&next, "edge-proxy", &profile);
+        let trust_updates =
+            build_trust_updates(&["a".repeat(64)], Path::new("certs/ca-bundle.pem"));
+        next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates).unwrap();
+        let domain_updates = vec![("domain", args.domain.clone())];
+        next = bootroot::toml_util::upsert_top_level_keys(&next, &domain_updates).unwrap();
+        let acme_updates = vec![("http_responder_hmac", "hmac-val".to_string())];
+        next = bootroot::toml_util::upsert_section_keys(&next, "acme", &acme_updates).unwrap();
+
+        let ctmpl = build_ctmpl_content(&next, "secret", "edge-proxy");
+
+        assert!(
+            ctmpl.contains(&format!("email = \"{NON_DEFAULT_EMAIL}\"")),
+            "ctmpl must backfill caller-supplied email into pre-existing file: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains(&format!("server = \"{NON_DEFAULT_SERVER}\"")),
+            "ctmpl must backfill caller-supplied server into pre-existing file: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains(&format!("http_responder_url = \"{NON_DEFAULT_RESPONDER}\"")),
+            "ctmpl must backfill caller-supplied responder into pre-existing file: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains("directory_fetch_attempts = 10"),
+            "ctmpl must backfill [acme] retry tunables into pre-existing file: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains("http_responder_timeout_secs = 5"),
+            "ctmpl must backfill [acme] timeout tunables into pre-existing file: {ctmpl}"
+        );
+        assert!(
+            !ctmpl.contains(DEFAULT_AGENT_SERVER),
+            "ctmpl must not fall back to the built-in localhost server default: {ctmpl}"
+        );
+        assert!(
+            !ctmpl.contains(DEFAULT_AGENT_RESPONDER_URL),
+            "ctmpl must not fall back to the built-in localhost responder default: {ctmpl}"
+        );
+        assert!(
+            !ctmpl.contains("legacy-hmac"),
+            "ctmpl must replace hmac via KV template: {ctmpl}"
+        );
+    }
+
+    /// Complements the override test by proving that when the operator
+    /// supplies NO `--agent-*` flags but points at a pre-existing
+    /// `agent.toml` that already carries customised `email` / `server` /
+    /// `http_responder_url` values, those operator-customised values
+    /// survive the service-add pass unchanged (i.e. the new backfill
+    /// path does not clobber them with `DEFAULT_AGENT_*`).
+    #[test]
+    fn test_existing_agent_config_preserves_operator_customised_topology() {
+        const OPERATOR_EMAIL: &str = "admin@acme.example";
+        const OPERATOR_SERVER: &str = "https://step-ca.acme.example:8443/acme/acme/directory";
+        const OPERATOR_RESPONDER: &str = "http://responder.acme.example:7000";
+
+        let pre_existing = format!(
+            "email = \"{OPERATOR_EMAIL}\"\n\
+             server = \"{OPERATOR_SERVER}\"\n\
+             domain = \"trusted.domain\"\n\n\
+             [acme]\n\
+             http_responder_url = \"{OPERATOR_RESPONDER}\"\n\
+             http_responder_hmac = \"legacy-hmac\"\n"
+        );
+
+        let args = test_resolved();
+
+        let mut next = apply_agent_config_baseline_defaults(
+            &pre_existing,
+            &AgentConfigBaselineParams {
+                email: effective_agent_email(args.agent_email.as_deref()),
+                server: effective_agent_server(args.agent_server.as_deref()),
+                domain: &args.domain,
+                http_responder_url: effective_agent_responder_url(
+                    args.agent_responder_url.as_deref(),
+                ),
+            },
+        )
+        .unwrap();
+        let profile = render_managed_profile_block(&args);
+        next = upsert_managed_profile(&next, "edge-proxy", &profile);
+        let trust_updates =
+            build_trust_updates(&["a".repeat(64)], Path::new("certs/ca-bundle.pem"));
+        next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates).unwrap();
+        let domain_updates = vec![("domain", args.domain.clone())];
+        next = bootroot::toml_util::upsert_top_level_keys(&next, &domain_updates).unwrap();
+        let acme_updates = vec![("http_responder_hmac", "hmac-val".to_string())];
+        next = bootroot::toml_util::upsert_section_keys(&next, "acme", &acme_updates).unwrap();
+
+        let ctmpl = build_ctmpl_content(&next, "secret", "edge-proxy");
+
+        assert!(
+            ctmpl.contains(&format!("email = \"{OPERATOR_EMAIL}\"")),
+            "ctmpl must preserve operator email: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains(&format!("server = \"{OPERATOR_SERVER}\"")),
+            "ctmpl must preserve operator server: {ctmpl}"
+        );
+        assert!(
+            ctmpl.contains(&format!("http_responder_url = \"{OPERATOR_RESPONDER}\"")),
+            "ctmpl must preserve operator responder: {ctmpl}"
+        );
+        assert!(
+            !ctmpl.contains(DEFAULT_AGENT_EMAIL),
+            "ctmpl must not clobber operator email with the localhost default: {ctmpl}"
+        );
+        assert!(
+            !ctmpl.contains(DEFAULT_AGENT_SERVER),
+            "ctmpl must not clobber operator server with the localhost default: {ctmpl}"
+        );
+        assert!(
+            !ctmpl.contains(DEFAULT_AGENT_RESPONDER_URL),
+            "ctmpl must not clobber operator responder with the localhost default: {ctmpl}"
+        );
     }
 
     #[test]

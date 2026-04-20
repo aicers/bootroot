@@ -1229,10 +1229,24 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
     - `--profile-hostname`: `localhost`
   - `bootroot service add`가 출력하는 `원격 실행 명령 템플릿`은 `--artifact`
     플래그를 사용합니다. `--agent-server`, `--agent-responder-url` 값은
-    명령줄이 아닌 아티팩트에 포함됩니다. localhost 기본값은 동일 호스트
-    배치에서만 맞으며, 별도 서비스 머신에서는 아티팩트 전송 전에
+    명령줄이 아닌 아티팩트에 포함됩니다. `--delivery-mode local-file`과
+    `--delivery-mode remote-bootstrap` 모두에서 `bootroot service add`에
+    `--agent-email`, `--agent-server`, `--agent-responder-url` 플래그를
+    전달하면 non-default 토폴로지 값을 service-add 시점에 아티팩트에
+    새길 수 있습니다. 플래그를 생략하면 localhost compose 기본값이 사용되며,
+    이는 동일 호스트 배치에서만 맞습니다. 별도 서비스 머신에서는
+    service-add 시점에 override를 전달하거나 아티팩트 전송 전에
     `bootstrap.json`을 편집하여 `stepca.internal`,
     `responder.internal` 같은 원격 접근 가능 엔드포인트로 교체해야 합니다.
+  - `--delivery-mode remote-bootstrap`에서는 해석된 `--agent-email` /
+    `--agent-server` / `--agent-responder-url` 값이 `state.json`의
+    서비스 엔트리에 저장됩니다. 동일한 서비스 이름과 동일한 나머지
+    플래그로 `bootroot service add`를 다시 실행하는 idempotent 재실행은
+    저장된 값으로 `bootstrap.json`을 재생성하므로, 매번 플래그를
+    다시 지정할 필요가 없습니다. 세 플래그 중 하나라도 다른 값으로
+    재실행하면 생성된 아티팩트가 저장된 정의에서 조용히 벗어나는
+    대신 중복으로 거부됩니다. 토폴로지를 변경하려면 서비스를
+    삭제한 뒤 다시 추가하세요.
 - `--ca-bundle-path`: 관리되는 step-ca trust bundle을 쓸 출력 경로.
   `--artifact` 미지정 시 필수.
 - 갱신 후 훅 플래그: `--reload-style`,
@@ -1245,6 +1259,15 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 
 `agent.toml`이 아직 없으면 bootstrap 단계에서 baseline을 생성한 뒤, 서비스용
 관리 대상 프로필 블록을 갱신(없으면 추가)합니다.
+
+원격 대상에 `agent.toml`이 이미 존재하지만 baseline 키(예: `email`,
+`server`, `[acme].http_responder_url`)가 누락된 경우, bootstrap은
+운영자가 커스터마이즈한 값을 덮어쓰지 않고 누락된 키만 채워 넣습니다.
+아티팩트가 `--agent-email` / `--agent-server` / `--agent-responder-url`
+오버라이드를 명시적으로 전달했다면(상위 `bootroot service add` 호출에서
+전파된 값) 해당 값은 파일의 기존 값 위로 upsert되므로, KV 재렌더 루프가
+운영자가 의도한 ACME 토폴로지를 bootroot-agent 내장 기본값으로 되돌리는
+현상이 더 이상 발생하지 않습니다.
 
 ### `bootroot-remote apply-secret-id`
 

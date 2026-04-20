@@ -777,7 +777,7 @@ fn bootstrap_artifact(
         .join("services")
         .join(SERVICE_NAME);
     json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "openbao_url": openbao_url,
         "kv_mount": KV_MOUNT,
         "service_name": SERVICE_NAME,

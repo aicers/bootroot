@@ -199,6 +199,9 @@ mod tests {
                 secret_id_wrap_ttl: None,
                 token_bound_cidrs: None,
             },
+            agent_email: None,
+            agent_server: None,
+            agent_responder_url: None,
         }
     }
 

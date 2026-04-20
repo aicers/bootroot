@@ -125,6 +125,68 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Fixed `bootroot service add` (`local-file` mode) generating an agent config
   missing top-level `domain` and `[acme].http_responder_hmac`. The generated
   `agent.toml` is now ready to use without manual editing.
+- Fixed `bootroot service add` (`local-file` mode) emitting an `agent.toml.ctmpl`
+  that omitted `server` (ACME directory URL), `email`, `[acme].http_responder_url`,
+  and the `[acme]` retry/timeout tunables. Operators on non-default topologies
+  had to hand-edit the rendered `agent.toml` to add those fields, only to have
+  the next KV-driven re-render (e.g. `rotate responder-hmac`) silently overwrite
+  the edits. The local-file renderer now delegates to a new shared
+  `render_agent_config_baseline` helper in `bootroot::trust_bootstrap`, so the
+  fresh template carries every field the remote-bootstrap variant emits and
+  re-renders preserve initial configuration instead of falling back to
+  `bootroot-agent`'s compiled-in defaults. `bootroot service add` also accepts
+  `--agent-email`, `--agent-server`, and `--agent-responder-url` — mirroring the
+  escape hatch `bootroot-remote bootstrap` has long provided — so operators on
+  step-ca or responder endpoints other than the bundled-compose defaults can
+  bake their real topology into the template at service-add time, instead of
+  hand-editing the rendered `agent.toml` and watching the next rotation clobber
+  those edits. The same flags now also flow into `--delivery-mode
+  remote-bootstrap` artifacts (the `agent_email` / `agent_server` /
+  `agent_responder_url` fields of `bootstrap.json`), so the remote-bootstrap CLI
+  surface no longer silently ignores them and the downstream
+  `bootroot-remote bootstrap` run receives the operator's real values instead of
+  the localhost compose defaults. The resolved `--agent-email` /
+  `--agent-server` / `--agent-responder-url` values are now persisted on the
+  `ServiceEntry` in `state.json` and are included in the
+  `remote-bootstrap` idempotence comparison, so an idempotent rerun of
+  `bootroot service add --delivery-mode remote-bootstrap ...` regenerates
+  `bootstrap.json` from the persisted values — a rerun that omits the flag
+  no longer silently reverts the artifact to the compose-topology localhost
+  default, and a rerun that passes a different value is rejected as a
+  duplicate instead of silently drifting the artifact away from the
+  stored definition. On the local-file path, the baseline fields and
+  `--agent-*` override flags also now apply when `--agent-config`
+  points at a pre-existing `agent.toml` that is missing the topology
+  fields — previously the existing-file branch read the file verbatim,
+  so operators who started from a hand-edited file still got a
+  `.ctmpl` that omitted `server` / `http_responder_url` and silently
+  ignored the override flags. A new
+  `trust_bootstrap::apply_agent_config_baseline_defaults` helper
+  backfills only missing baseline keys (via new
+  `toml_util::insert_missing_top_level_keys` /
+  `insert_missing_section_keys` helpers) so operator-customised values
+  in a pre-existing file survive untouched, while explicit
+  `--agent-email` / `--agent-server` / `--agent-responder-url` values
+  take precedence via a subsequent upsert. `bootroot-remote bootstrap`
+  now applies the same baseline backfill and artifact-carried override
+  treatment when the remote target already has an `agent.toml`:
+  previously its existing-file branch read the file verbatim and only
+  upserted `[trust]` / `acme.http_responder_hmac` / the managed
+  profile, silently dropping the artifact's `agent_email` /
+  `agent_server` / `agent_responder_url` values whenever the remote
+  file was missing those keys. The updated renderer inserts any missing
+  baseline keys and then upserts the artifact overrides (propagated from
+  the upstream `bootroot service add --agent-*` flags), so the re-render
+  loop stops reverting to bootroot-agent's compiled-in defaults on
+  remote targets too. The `RemoteBootstrapArtifact` fields
+  `agent_email` / `agent_server` / `agent_responder_url` are now
+  serialized as optional keys (omitted when `bootroot service add` saw
+  no `--agent-*` flags), so a downstream `bootroot-remote bootstrap`
+  can distinguish "no explicit override" (preserve pre-existing remote
+  values, backfill only) from "explicit override" (clobber). Without
+  this signal the override path silently clobbered operator-customised
+  remote `agent.toml` entries back to the localhost defaults whenever
+  the artifact was produced without `--agent-*` flags. (Closes #549)
 - Fixed `bootroot init` failing with "Failed to set key file permissions /
   Operation not permitted" when the step-ca compose service (running as
   root) restarted into a freshly created `ca.json` and wrote DB state

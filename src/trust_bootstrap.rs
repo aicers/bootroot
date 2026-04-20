@@ -1,5 +1,9 @@
 use std::path::Path;
 
+use anyhow::Result;
+
+use crate::toml_util;
+
 pub const SERVICE_KV_BASE: &str = "bootroot/services";
 pub const SECRET_ID_KEY: &str = "secret_id";
 pub const HMAC_KEY: &str = "hmac";
@@ -14,6 +18,91 @@ const TRUST_SECTION_NAME: &str = "trust";
 const EAB_SECTION_NAME: &str = "eab";
 const PROFILE_EAB_SECTION_NAME: &str = "profiles.eab";
 const HTTP_RESPONDER_HMAC_KEY: &str = "http_responder_hmac";
+
+/// Parameters for [`render_agent_config_baseline`].
+pub struct AgentConfigBaselineParams<'a> {
+    pub email: &'a str,
+    pub server: &'a str,
+    pub domain: &'a str,
+    pub http_responder_url: &'a str,
+}
+
+/// Renders the baseline `agent.toml` content for a freshly provisioned
+/// service: `email`, `server`, `domain`, and the full `[acme]` section
+/// including `http_responder_url` plus retry/timeout tunables.
+///
+/// Both the local-file and remote-bootstrap service-add paths feed this
+/// into their managed-profile upserts so the generated `.ctmpl` carries
+/// every field operators commonly need to customise.  Without the
+/// baseline, re-renders on KV rotation reset the file to
+/// `bootroot-agent`'s compiled-in defaults, silently overwriting
+/// operator edits to `server` or `[acme].http_responder_url`.
+#[must_use]
+pub fn render_agent_config_baseline(params: &AgentConfigBaselineParams<'_>) -> String {
+    format!(
+        "email = \"{email}\"\n\
+server = \"{server}\"\n\
+domain = \"{domain}\"\n\n\
+[acme]\n\
+directory_fetch_attempts = 10\n\
+directory_fetch_base_delay_secs = 1\n\
+directory_fetch_max_delay_secs = 10\n\
+poll_attempts = 15\n\
+poll_interval_secs = 2\n\
+http_responder_url = \"{responder_url}\"\n\
+http_responder_hmac = \"\"\n\
+http_responder_timeout_secs = 5\n\
+http_responder_token_ttl_secs = 300\n",
+        email = params.email,
+        server = params.server,
+        domain = params.domain,
+        responder_url = params.http_responder_url,
+    )
+}
+
+/// Backfills any missing baseline fields from [`render_agent_config_baseline`]
+/// into `contents` without clobbering operator-customised values.
+///
+/// Used by the local-file `service add` path to fix #549 for both fresh
+/// and pre-existing `agent.toml` files: any field missing from the file
+/// (for example `email`, `server`, `[acme].http_responder_url`, or the
+/// retry/timeout tunables) is inserted so the sidecar's re-render from
+/// the generated `.ctmpl` does not silently revert to bootroot-agent's
+/// compiled-in defaults.  Existing keys are left alone so this is safe
+/// to apply to an operator-edited file.
+///
+/// # Errors
+///
+/// Returns an error if `contents` is not valid TOML.
+pub fn apply_agent_config_baseline_defaults(
+    contents: &str,
+    params: &AgentConfigBaselineParams<'_>,
+) -> Result<String> {
+    let mut next = toml_util::insert_missing_top_level_keys(
+        contents,
+        &[
+            ("email", params.email.to_string()),
+            ("server", params.server.to_string()),
+            ("domain", params.domain.to_string()),
+        ],
+    )?;
+    next = toml_util::insert_missing_section_keys(
+        &next,
+        ACME_SECTION_NAME,
+        &[
+            ("directory_fetch_attempts", "10".to_string()),
+            ("directory_fetch_base_delay_secs", "1".to_string()),
+            ("directory_fetch_max_delay_secs", "10".to_string()),
+            ("poll_attempts", "15".to_string()),
+            ("poll_interval_secs", "2".to_string()),
+            ("http_responder_url", params.http_responder_url.to_string()),
+            (HTTP_RESPONDER_HMAC_KEY, String::new()),
+            ("http_responder_timeout_secs", "5".to_string()),
+            ("http_responder_token_ttl_secs", "300".to_string()),
+        ],
+    )?;
+    Ok(next)
+}
 
 /// Renders a managed profile block for `agent.toml`.
 #[must_use]
@@ -265,6 +354,29 @@ mod tests {
         assert!(output.contains("trusted_ca_sha256 = {{ .Data.data.trusted_ca_sha256 | toJSON }}"));
         assert!(output.contains("[profiles.eab]"));
         assert!(!output.contains("\"old-hmac\""));
+    }
+
+    #[test]
+    fn render_agent_config_baseline_includes_all_documented_fields() {
+        let output = render_agent_config_baseline(&AgentConfigBaselineParams {
+            email: "admin@example.com",
+            server: "https://step-ca.example.com:9000/acme/acme/directory",
+            domain: "test.local",
+            http_responder_url: "http://responder.example.com:8080",
+        });
+
+        assert!(output.contains("email = \"admin@example.com\""));
+        assert!(
+            output.contains("server = \"https://step-ca.example.com:9000/acme/acme/directory\"")
+        );
+        assert!(output.contains("domain = \"test.local\""));
+        assert!(output.contains("[acme]"));
+        assert!(output.contains("http_responder_url = \"http://responder.example.com:8080\""));
+        assert!(output.contains("http_responder_hmac = \"\""));
+        assert!(output.contains("directory_fetch_attempts = 10"));
+        assert!(output.contains("poll_attempts = 15"));
+        assert!(output.contains("http_responder_timeout_secs = 5"));
+        assert!(output.contains("http_responder_token_ttl_secs = 300"));
     }
 
     #[test]

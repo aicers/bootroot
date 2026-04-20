@@ -783,6 +783,28 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long)]
     pub(crate) container_name: Option<String>,
 
+    /// ACME account email persisted into the rendered `agent.toml`
+    /// baseline.  Defaults to the compose-topology placeholder when
+    /// omitted; override on non-default deployments so KV-driven
+    /// re-renders do not revert operator edits.
+    #[arg(long)]
+    pub(crate) agent_email: Option<String>,
+
+    /// ACME directory URL persisted into the rendered `agent.toml`
+    /// baseline (`server` field).  Defaults to the compose-topology
+    /// step-ca URL when omitted; override on non-default deployments
+    /// so KV-driven re-renders do not revert operator edits.
+    #[arg(long)]
+    pub(crate) agent_server: Option<String>,
+
+    /// HTTP-01 responder admin URL persisted into the rendered
+    /// `agent.toml` baseline (`[acme].http_responder_url`).  Defaults
+    /// to the compose-topology loopback URL when omitted; override on
+    /// non-default deployments so KV-driven re-renders do not revert
+    /// operator edits.
+    #[arg(long)]
+    pub(crate) agent_responder_url: Option<String>,
+
     #[command(flatten)]
     pub(crate) runtime_auth: RuntimeAuthArgs,
 

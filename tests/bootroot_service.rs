@@ -736,7 +736,7 @@ async fn test_app_add_remote_bootstrap_no_wrap_handoff_includes_secret_id() {
 }
 
 fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
-    assert_eq!(bootstrap["schema_version"], 2);
+    assert_eq!(bootstrap["schema_version"], 3);
     assert_eq!(bootstrap["service_name"], "edge-proxy");
     assert_eq!(bootstrap["kv_mount"], "secret");
     assert!(bootstrap["role_id_path"].is_string());
@@ -748,13 +748,19 @@ fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
     assert!(bootstrap["openbao_agent_config_path"].is_string());
     assert!(bootstrap["openbao_agent_template_path"].is_string());
     assert!(bootstrap["openbao_agent_token_path"].is_string());
-    assert_eq!(bootstrap["agent_email"], "admin@example.com");
-    assert_eq!(
-        bootstrap["agent_server"],
-        "https://localhost:9000/acme/acme/directory"
+    assert!(
+        bootstrap.get("agent_email").is_none(),
+        "agent_email must be omitted when no --agent-email override was supplied"
+    );
+    assert!(
+        bootstrap.get("agent_server").is_none(),
+        "agent_server must be omitted when no --agent-server override was supplied"
     );
     assert_eq!(bootstrap["agent_domain"], "trusted.domain");
-    assert_eq!(bootstrap["agent_responder_url"], "http://127.0.0.1:8080");
+    assert!(
+        bootstrap.get("agent_responder_url").is_none(),
+        "agent_responder_url must be omitted when no --agent-responder-url override was supplied"
+    );
     assert_eq!(bootstrap["profile_hostname"], "edge-node-01");
     assert_eq!(bootstrap["profile_instance_id"], "001");
     assert!(bootstrap["profile_cert_path"].is_string());

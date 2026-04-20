@@ -183,6 +183,14 @@ struct ResolvedBootstrapArgs {
     agent_server: String,
     agent_domain: String,
     agent_responder_url: String,
+    /// Operator-supplied override for `email`, carried through from the
+    /// upstream `bootroot service add --agent-email` via the artifact.
+    /// `Some` means an explicit override was persisted during service-add;
+    /// `None` means the field came from the CLI default and should only
+    /// backfill missing keys rather than clobber operator-customised ones.
+    agent_email_override: Option<String>,
+    agent_server_override: Option<String>,
+    agent_responder_url_override: Option<String>,
     profile_hostname: String,
     profile_instance_id: Option<String>,
     profile_cert_path: Option<PathBuf>,
@@ -280,7 +288,7 @@ async fn run(args: Args, lang: Locale) -> Result<i32> {
 const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// Highest `schema_version` that this binary understands.
-const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 2;
+const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 3;
 
 /// Minimal header used for the first stage of artifact parsing so that
 /// `schema_version` can be validated before attempting full deserialization.
@@ -429,21 +437,19 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         .as_ref()
         .map(|a| a.kv_mount.clone())
         .unwrap_or(args.kv_mount);
-    let agent_email = artifact
+    let agent_email_override = artifact.as_ref().and_then(|a| a.agent_email.clone());
+    let agent_server_override = artifact.as_ref().and_then(|a| a.agent_server.clone());
+    let agent_responder_url_override = artifact
         .as_ref()
-        .and_then(|a| a.agent_email.clone())
-        .unwrap_or(args.agent_email);
-    let agent_server = artifact
-        .as_ref()
-        .and_then(|a| a.agent_server.clone())
-        .unwrap_or(args.agent_server);
+        .and_then(|a| a.agent_responder_url.clone());
+    let agent_email = agent_email_override.clone().unwrap_or(args.agent_email);
+    let agent_server = agent_server_override.clone().unwrap_or(args.agent_server);
     let agent_domain = artifact
         .as_ref()
         .and_then(|a| a.agent_domain.clone())
         .unwrap_or(args.agent_domain);
-    let agent_responder_url = artifact
-        .as_ref()
-        .and_then(|a| a.agent_responder_url.clone())
+    let agent_responder_url = agent_responder_url_override
+        .clone()
         .unwrap_or(args.agent_responder_url);
     let profile_hostname = artifact
         .as_ref()
@@ -506,6 +512,9 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         agent_server,
         agent_domain,
         agent_responder_url,
+        agent_email_override,
+        agent_server_override,
+        agent_responder_url_override,
         profile_hostname,
         profile_instance_id,
         profile_cert_path,
@@ -835,15 +844,115 @@ mod tests {
         assert_rejects_schema_version(&artifact_json, 0).await;
     }
 
+    /// Round 6 regression: an artifact produced by `bootroot service add`
+    /// without `--agent-*` flags must NOT populate `agent_*_override` on
+    /// `ResolvedBootstrapArgs`.  The artifact omits the `agent_email` /
+    /// `agent_server` / `agent_responder_url` keys entirely (serde
+    /// `skip_serializing_if = "Option::is_none"`), which parses as
+    /// `#[serde(default)] Option::None`, preserving the "no explicit
+    /// override" signal so the downstream `apply_agent_config_updates`
+    /// path takes the backfill-only branch against a pre-existing remote
+    /// `agent.toml` instead of clobbering operator values with the
+    /// localhost defaults.
+    #[tokio::test]
+    async fn resolve_bootstrap_args_no_override_keeps_override_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact_json = serde_json::json!({
+            "schema_version": 3,
+            "openbao_url": "https://ob:8200",
+            "kv_mount": "kv",
+            "service_name": "svc",
+            "role_id_path": "/r",
+            "secret_id_path": "/s",
+            "eab_file_path": "/e",
+            "agent_config_path": "/a",
+            "agent_domain": "example.com",
+            "ca_bundle_path": "/ca",
+            // agent_email / agent_server / agent_responder_url intentionally
+            // omitted — matches the shape produced by `bootroot service add`
+            // when no `--agent-*` flags were supplied.
+        });
+        let artifact_path = write_artifact_file(dir.path(), &artifact_json.to_string());
+        let args = default_bootstrap_args(artifact_path);
+
+        let resolved = resolve_bootstrap_args(args).await.expect("resolve");
+
+        assert!(
+            resolved.agent_email_override.is_none(),
+            "agent_email_override must stay None when artifact omits the key"
+        );
+        assert!(
+            resolved.agent_server_override.is_none(),
+            "agent_server_override must stay None when artifact omits the key"
+        );
+        assert!(
+            resolved.agent_responder_url_override.is_none(),
+            "agent_responder_url_override must stay None when artifact omits the key"
+        );
+        // Baseline fields for fresh-file rendering fall back to CLI
+        // defaults, matching the "no override" intent.
+        assert_eq!(resolved.agent_email, DEFAULT_AGENT_EMAIL);
+        assert_eq!(resolved.agent_server, DEFAULT_AGENT_SERVER);
+        assert_eq!(resolved.agent_responder_url, DEFAULT_AGENT_RESPONDER_URL);
+    }
+
+    /// Round 6 companion: when the artifact DOES carry explicit
+    /// overrides (the upstream `service add` passed `--agent-*`), those
+    /// values must land on `agent_*_override` so the downstream path
+    /// knows to clobber pre-existing remote values.
+    #[tokio::test]
+    async fn resolve_bootstrap_args_override_propagates_from_artifact() {
+        const OVERRIDE_EMAIL: &str = "ops@example.org";
+        const OVERRIDE_SERVER: &str = "https://step-ca.example.org:9443/acme/acme/directory";
+        const OVERRIDE_RESPONDER: &str = "http://responder.internal:18080";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact_json = serde_json::json!({
+            "schema_version": 3,
+            "openbao_url": "https://ob:8200",
+            "kv_mount": "kv",
+            "service_name": "svc",
+            "role_id_path": "/r",
+            "secret_id_path": "/s",
+            "eab_file_path": "/e",
+            "agent_config_path": "/a",
+            "agent_email": OVERRIDE_EMAIL,
+            "agent_server": OVERRIDE_SERVER,
+            "agent_domain": "example.org",
+            "agent_responder_url": OVERRIDE_RESPONDER,
+            "ca_bundle_path": "/ca",
+        });
+        let artifact_path = write_artifact_file(dir.path(), &artifact_json.to_string());
+        let args = default_bootstrap_args(artifact_path);
+
+        let resolved = resolve_bootstrap_args(args).await.expect("resolve");
+
+        assert_eq!(
+            resolved.agent_email_override.as_deref(),
+            Some(OVERRIDE_EMAIL)
+        );
+        assert_eq!(
+            resolved.agent_server_override.as_deref(),
+            Some(OVERRIDE_SERVER),
+        );
+        assert_eq!(
+            resolved.agent_responder_url_override.as_deref(),
+            Some(OVERRIDE_RESPONDER),
+        );
+        assert_eq!(resolved.agent_email, OVERRIDE_EMAIL);
+        assert_eq!(resolved.agent_server, OVERRIDE_SERVER);
+        assert_eq!(resolved.agent_responder_url, OVERRIDE_RESPONDER);
+    }
+
     #[tokio::test]
     async fn resolve_bootstrap_args_rejects_future_schema_with_unknown_fields() {
-        // A future v3 artifact that has completely different fields.  Without
+        // A future v4 artifact that has completely different fields.  Without
         // two-stage parsing, serde would fail with a confusing missing-field
         // error instead of the explicit version rejection.
         let artifact_json = serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "completely_new_field": true,
         });
-        assert_rejects_schema_version(&artifact_json, 3).await;
+        assert_rejects_schema_version(&artifact_json, 4).await;
     }
 }

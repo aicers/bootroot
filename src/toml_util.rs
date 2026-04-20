@@ -46,6 +46,59 @@ pub fn upsert_section_keys(
     Ok(doc.to_string())
 }
 
+/// Inserts top-level key-value pairs only when the key is missing.
+///
+/// Unlike [`upsert_top_level_keys`], pre-existing operator-customised
+/// values are preserved.  Use this to backfill baseline fields (for
+/// example `email` / `server`) into an `agent.toml` the operator
+/// pointed `--agent-config` at, without clobbering values the operator
+/// already set.
+///
+/// # Errors
+///
+/// Returns an error if `contents` is not valid TOML.
+pub fn insert_missing_top_level_keys(contents: &str, pairs: &[(&str, String)]) -> Result<String> {
+    let mut doc: DocumentMut = contents.parse().context("failed to parse TOML content")?;
+    for (key, raw) in pairs {
+        if doc.get(key).is_none() {
+            doc[key] = Item::Value(parse_value(raw));
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Inserts section key-value pairs only when the key is missing within
+/// the section (creating the section if needed).
+///
+/// Same rationale as [`insert_missing_top_level_keys`]: lets us backfill
+/// a full baseline `[acme]` block into a pre-existing `agent.toml`
+/// without overwriting operator-customised values.
+///
+/// # Errors
+///
+/// Returns an error if `contents` is not valid TOML.
+pub fn insert_missing_section_keys(
+    contents: &str,
+    section: &str,
+    pairs: &[(&str, String)],
+) -> Result<String> {
+    let mut doc: DocumentMut = contents.parse().context("failed to parse TOML content")?;
+
+    if doc.get(section).is_none() {
+        doc[section] = Item::Table(toml_edit::Table::new());
+    }
+
+    if let Some(table) = doc[section].as_table_mut() {
+        for (key, raw) in pairs {
+            if table.get(key).is_none() {
+                table[key] = Item::Value(parse_value(raw));
+            }
+        }
+    }
+
+    Ok(doc.to_string())
+}
+
 /// Removes one or more TOML sections by name.
 ///
 /// Handles both top-level (`"eab"`) and dotted (`"profiles.eab"`)
