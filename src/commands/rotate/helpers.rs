@@ -629,11 +629,12 @@ mod tests {
 
     #[test]
     fn signal_bootroot_agent_docker_restart_failure_names_container() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
         use super::super::test_support::{
             ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
         };
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().expect("tempdir");
         let bin_dir = dir.path().join("bin");
