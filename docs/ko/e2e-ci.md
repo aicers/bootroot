@@ -220,7 +220,7 @@ sudo -n cp "$tmp_file" /etc/hosts
 목적:
 
 - remote-bootstrap 온보딩과 일회성 bootstrap 반영 방식 검증
-- `eab`, `trust_sync`, `responder_hmac` 항목의 bootstrap 기반 반영 검증
+- `trust_sync`, `responder_hmac` 항목의 bootstrap 기반 반영 검증
 - `secret_id` 회전 전달 검증 (운영 환경에서는
   `bootroot-remote apply-secret-id`를 사용하고, E2E 테스트에서는 이전
   `secret_id`가 테스트 기간 동안 유효하므로 `bootstrap`을 일괄 사용)
@@ -237,7 +237,6 @@ sudo -n cp "$tmp_file" /etc/hosts
 5. `verify-initial`: remote node에서 인증서 발급/검증
 6. 회전 + bootstrap 재반영 + verify 반복:
    `rotate-secret-id` -> `bootstrap` -> `verify-after-secret-id`,
-   `rotate-eab` -> `bootstrap` -> `verify-after-eab`,
    `rotate-trust-sync` -> `bootstrap` -> `verify-after-trust-sync`,
    `rotate-responder-hmac` -> `bootstrap` -> `verify-after-responder-hmac`
 7. 각 검증 단계 사이 인증서 fingerprint 변경 여부 확인
@@ -563,13 +562,15 @@ E2E에서 OpenBao 언실/런타임 인증 사용 방식:
 검증 항목(서비스별):
 
 - `secret_id`
-- `eab`
+- `eab` (운영자가 EAB 자격증명을 프로비저닝하지 않은 경우 `skipped`로
+  보고됩니다. 번들된 OSS step-ca 구성에서는 이것이 기본 동작입니다.)
 - `responder_hmac`
 - `trust_sync`
 
 판정 규칙:
 
-- 모든 bootstrap 항목이 summary 출력에서 `applied` 상태여야 함
+- 필수 bootstrap 항목은 summary 출력에서 `applied`, `unchanged`, 또는
+  `skipped`(EAB만) 중 하나여야 함
 - 회전 후 재반영이 정상 완료되어야 함 (E2E에서는 `bootstrap` 사용,
   운영 환경에서 `secret_id` 단독 회전 시에는 `apply-secret-id` 사용)
 - 하나라도 `failed`이면 해당 단계를 실패로 처리함

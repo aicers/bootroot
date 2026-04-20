@@ -281,7 +281,6 @@ pub(crate) struct RotateArgs {
 #[derive(Subcommand, Debug)]
 pub(crate) enum RotateCommand {
     StepcaPassword(RotateStepcaPasswordArgs),
-    Eab(RotateEabArgs),
     Db(RotateDbArgs),
     ResponderHmac(RotateResponderHmacArgs),
     /// Rotates `OpenBao` recovery credentials manually.
@@ -318,17 +317,6 @@ pub(crate) struct RotateStepcaPasswordArgs {
     /// New step-ca key password
     #[arg(long)]
     pub(crate) new_password: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct RotateEabArgs {
-    /// step-ca URL for EAB issuance
-    #[arg(long, default_value = DEFAULT_STEPCA_URL)]
-    pub(crate) stepca_url: String,
-
-    /// step-ca ACME provisioner name
-    #[arg(long, default_value = DEFAULT_STEPCA_PROVISIONER)]
-    pub(crate) stepca_provisioner: String,
 }
 
 #[derive(Args, Debug)]
@@ -616,8 +604,6 @@ pub(crate) enum InitFeature {
     DbProvision,
     /// Validate DB DSN connectivity and auth
     DbCheck,
-    /// Auto-issue ACME EAB via step-ca
-    EabAuto,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

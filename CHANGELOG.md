@@ -14,6 +14,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Removed
 
+- Removed ACME EAB auto-issuance and bootroot-side enforcement because
+  the bundled OSS step-ca does not support EAB (EAB is a commercial
+  Smallstep-only feature). The `bootroot rotate eab` subcommand, the
+  `--enable eab-auto` flag on `bootroot init`, the auto-created empty
+  EAB KV entries written during `service add`, and the mandatory EAB
+  check in `bootroot-remote bootstrap` are gone. The operator-provided
+  pass-through is kept: `--eab-kid` / `--eab-hmac` on `bootroot init`,
+  `--eab-file-path` on `bootroot-remote bootstrap`, and `--eab-kid` /
+  `--eab-hmac` / `--eab-file` on `bootroot-agent`. When credentials are
+  present they are forwarded to the ACME `newAccount` request (RFC
+  8555); when absent the `eab` apply step reports `skipped` and no file
+  is written. (Closes #550)
 - Removed `--secret-id-num-uses` from `bootroot service add` and from
   `rotate approle-secret-id` policy state. Service SecretIDs are now
   always issued with unlimited uses (`num_uses = 0`). The lower-level

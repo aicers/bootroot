@@ -422,10 +422,6 @@ impl Messages {
         self.strings().prompt_rotate_stepca_password
     }
 
-    pub(crate) fn prompt_rotate_eab(&self) -> &'static str {
-        self.strings().prompt_rotate_eab
-    }
-
     pub(crate) fn prompt_rotate_db(&self) -> &'static str {
         self.strings().prompt_rotate_db
     }

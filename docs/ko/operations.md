@@ -259,7 +259,8 @@ bootstrap + 명시적 secret_id handoff입니다.
 
 - OpenBao 엔드포인트, KV 마운트
 - 서비스 이름, AppRole 파일 경로(`role_id`, `secret_id`)
-- EAB 파일 경로, `agent.toml` 경로
+- EAB 파일 경로(ACME CA가 EAB를 요구할 때만 사용하며, OpenBao KV에 EAB
+  자격증명이 없으면 bootroot가 해당 단계를 건너뜁니다), `agent.toml` 경로
 - 프로필 식별/경로 입력(hostname, instance_id, cert/key 경로)
 - 관리되는 step-ca trust bundle을 쓸 CA 번들 출력 경로
 

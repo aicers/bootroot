@@ -244,8 +244,7 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--secrets-dir`: secrets directory (default `secrets`)
 - `--compose-file`: compose file used for infra checks (default `docker-compose.yml`)
 - `--enable <feature,...>`: enable optional features (comma-separated).
-  Values: `auto-generate`, `show-secrets`, `db-provision`, `db-check`,
-  `eab-auto`
+  Values: `auto-generate`, `show-secrets`, `db-provision`, `db-check`
 - `--skip <phase,...>`: skip optional phases (comma-separated).
   Values: `responder-check`
 - `--summary-json`: write init summary as machine-readable JSON
@@ -302,7 +301,11 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   `bootroot service update --secret-id-ttl`.
   See [Operations > SecretID TTL and rotation cadence](operations.md#secretid-ttl-and-rotation-cadence).
 - `--eab-kid`, `--eab-hmac`: manual EAB input
-  (environment variables: `EAB_KID`, `EAB_HMAC`)
+  (environment variables: `EAB_KID`, `EAB_HMAC`). Bootroot forwards these
+  values to the ACME `newAccount` request when both are provided; it does
+  not provision or validate them. The bundled OSS step-ca does not support
+  EAB, so these flags apply only when targeting an EAB-capable CA (for
+  example, a commercial Smallstep Certificate Manager deployment).
 
 DB DSN host handling:
 
@@ -389,7 +392,7 @@ The command is considered failed when:
 ### Examples
 
 ```bash
-bootroot init --enable auto-generate,eab-auto --responder-url http://localhost:8080
+bootroot init --enable auto-generate --responder-url http://localhost:8080
 ```
 
 ## bootroot status
@@ -783,7 +786,6 @@ updates values through OpenBao.
 Supported subcommands:
 
 - `rotate stepca-password`
-- `rotate eab`
 - `rotate db`
 - `rotate responder-hmac`
 - `rotate approle-secret-id`
@@ -820,8 +822,8 @@ Output behavior:
 
 - By default, rotate subcommands mask secret-bearing stdout fields.
 - Use `--show-secrets` only when plaintext stdout is intentionally required.
-- This affects secret-bearing summary output such as EAB credentials, root
-  tokens, and unseal keys.
+- This affects secret-bearing summary output such as root tokens and unseal
+  keys.
 - For `rotate openbao-recovery`, `--output` is separate from stdout masking:
   it writes plaintext credentials to the destination file while stdout prints
   only the summary and output path.
@@ -834,12 +836,6 @@ Per subcommand:
 - implementation note: bootroot runs `step crypto change-pass` with `-f`
   (`--force`) to avoid interactive overwrite prompts in non-interactive Docker
   environments.
-
-#### `rotate eab`
-
-- `--stepca-url`: step-ca URL (default `https://localhost:9000`)
-- `--stepca-provisioner`: ACME provisioner name (default `acme`)
-- stdout summary masks EAB `kid` / `hmac` unless `--show-secrets` is set
 
 #### `rotate db`
 
@@ -1015,7 +1011,6 @@ The command is considered failed when:
 - runtime auth is missing or invalid (root token or AppRole)
 - step-ca password rotation cannot find required key/password files
 - DB rotation is missing admin DSN or provisioning fails
-- EAB issuance request fails
 - responder config write fails or reload fails
 - OpenBao recovery unseal-key/root-token rotation fails
 - AppRole target is missing or secret_id update fails

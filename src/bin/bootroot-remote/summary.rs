@@ -8,6 +8,7 @@ use super::{Locale, redacted_error_label, summary_header};
 pub(super) enum ApplyStatus {
     Applied,
     Unchanged,
+    Skipped,
     Failed,
 }
 
@@ -72,13 +73,17 @@ pub(super) fn merge_apply_status(
     if matches!(current.status, ApplyStatus::Applied) || matches!(next, ApplyStatus::Applied) {
         return ApplyItemSummary::applied(ApplyStatus::Applied);
     }
-    ApplyItemSummary::applied(ApplyStatus::Unchanged)
+    if matches!(current.status, ApplyStatus::Unchanged) || matches!(next, ApplyStatus::Unchanged) {
+        return ApplyItemSummary::applied(ApplyStatus::Unchanged);
+    }
+    ApplyItemSummary::applied(ApplyStatus::Skipped)
 }
 
 pub(super) fn status_to_str(status: ApplyStatus) -> &'static str {
     match status {
         ApplyStatus::Applied => "applied",
         ApplyStatus::Unchanged => "unchanged",
+        ApplyStatus::Skipped => "skipped",
         ApplyStatus::Failed => "failed",
     }
 }
@@ -135,5 +140,26 @@ mod tests {
         let current = ApplyItemSummary::failed("failed".to_string());
         let merged = merge_apply_status(current, ApplyStatus::Applied, None);
         assert!(matches!(merged.status, ApplyStatus::Failed));
+    }
+
+    #[test]
+    fn merge_apply_status_returns_skipped_when_both_sides_skipped() {
+        let current = ApplyItemSummary::applied(ApplyStatus::Skipped);
+        let merged = merge_apply_status(current, ApplyStatus::Skipped, None);
+        assert!(matches!(merged.status, ApplyStatus::Skipped));
+    }
+
+    #[test]
+    fn merge_apply_status_prefers_unchanged_over_skipped() {
+        let current = ApplyItemSummary::applied(ApplyStatus::Skipped);
+        let merged = merge_apply_status(current, ApplyStatus::Unchanged, None);
+        assert!(matches!(merged.status, ApplyStatus::Unchanged));
+    }
+
+    #[test]
+    fn merge_apply_status_prefers_applied_over_skipped() {
+        let current = ApplyItemSummary::applied(ApplyStatus::Skipped);
+        let merged = merge_apply_status(current, ApplyStatus::Applied, None);
+        assert!(matches!(merged.status, ApplyStatus::Applied));
     }
 }

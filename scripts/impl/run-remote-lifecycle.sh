@@ -516,16 +516,6 @@ run_rotation_secret_id() {
     --service-name "$SERVICE_NAME_2" >>"$RUN_LOG" 2>&1
 }
 
-run_rotation_eab() {
-  log_phase "rotate-eab"
-  local kid hmac payload
-  kid="remote-kid-$(date +%s)"
-  hmac="remote-hmac-$(date +%s)"
-  payload="$(jq -n --arg kid "$kid" --arg hmac "$hmac" '{data:{kid:$kid,hmac:$hmac}}')"
-  openbao_write_service_kv "$SERVICE_KV_PATH_BASE" "eab" "$payload"
-  openbao_write_service_kv "$SERVICE_KV_PATH_BASE_2" "eab" "$payload"
-}
-
 run_rotation_trust_sync() {
   log_phase "rotate-trust-sync"
   local current_trust_json extra_fingerprint ca_bundle_pem payload
@@ -596,16 +586,6 @@ main() {
   assert_fingerprint_changed "$SERVICE_NAME" "initial" "after-secret-id"
   assert_fingerprint_changed "$SERVICE_NAME_2" "initial" "after-secret-id"
 
-  run_rotation_eab
-  log_phase "bootstrap-after-eab"
-  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
-  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
-  force_reissue_remote_service "$SERVICE_NAME"
-  force_reissue_remote_service "$SERVICE_NAME_2"
-  run_verify_pair "after-eab"
-  assert_fingerprint_changed "$SERVICE_NAME" "after-secret-id" "after-eab"
-  assert_fingerprint_changed "$SERVICE_NAME_2" "after-secret-id" "after-eab"
-
   run_rotation_trust_sync
   log_phase "bootstrap-after-trust-sync"
   run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
@@ -613,8 +593,8 @@ main() {
   force_reissue_remote_service "$SERVICE_NAME"
   force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-trust-sync"
-  assert_fingerprint_changed "$SERVICE_NAME" "after-eab" "after-trust-sync"
-  assert_fingerprint_changed "$SERVICE_NAME_2" "after-eab" "after-trust-sync"
+  assert_fingerprint_changed "$SERVICE_NAME" "after-secret-id" "after-trust-sync"
+  assert_fingerprint_changed "$SERVICE_NAME_2" "after-secret-id" "after-trust-sync"
 
   run_rotation_responder_hmac
   log_phase "bootstrap-after-responder-hmac"

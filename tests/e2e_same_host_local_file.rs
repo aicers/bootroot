@@ -162,13 +162,12 @@ async fn test_same_host_local_rotation_sequence_keeps_service_operational() {
     write_state_file(temp.path(), &server.uri()).expect("write state");
     let files = init_service_files(temp.path()).expect("init service files");
     run_service_add_local(temp.path(), &server.uri(), &files).expect("service add local");
-    stub_rotate_sequence_openbao(&server, "secret-rotated", "eab-kid-2", "eab-hmac-2").await;
+    stub_rotate_sequence_openbao(&server, "secret-rotated").await;
     fs::write(temp.path().join("docker-compose.yml"), "services: {}\n").expect("write compose");
     write_fake_pkill(temp.path(), 0).expect("write fake pkill");
     write_service_cert(&files.cert_path, &files.key_path).expect("write cert");
     write_fake_bootroot_agent(temp.path(), 0).expect("write fake bootroot-agent");
 
-    run_rotate_eab(temp.path(), &server.uri()).expect("rotate eab");
     run_rotate_responder_hmac(temp.path(), &server.uri(), "hmac-updated").expect("rotate hmac");
     let rotate_secret = run_rotate_secret_id_with_output(temp.path(), &server.uri());
     assert!(
@@ -188,16 +187,8 @@ async fn test_same_host_local_rotation_sequence_keeps_service_operational() {
     // Simulate OBA sidecar rendering agent.toml from ctmpl with rotated KV
     // values. In production the sidecar polls KV via static_secret_render_interval
     // and re-renders the template; here we write the expected output directly.
-    simulate_oba_sidecar_render(
-        &files.agent_config,
-        "eab-kid-2",
-        "eab-hmac-2",
-        "hmac-updated",
-    );
+    simulate_oba_sidecar_render(&files.agent_config, "hmac-updated");
     let agent_contents = fs::read_to_string(&files.agent_config).expect("read agent.toml");
-    assert!(agent_contents.contains("[eab]"));
-    assert!(agent_contents.contains("kid = \"eab-kid-2\""));
-    assert!(agent_contents.contains("hmac = \"eab-hmac-2\""));
     assert!(agent_contents.contains("http_responder_hmac = \"hmac-updated\""));
 
     run_verify(temp.path(), &files.agent_config).expect("verify after rotations");
@@ -373,37 +364,6 @@ fn run_service_add_local(
     if !output.status.success() {
         anyhow::bail!(
             "service add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
-}
-
-fn run_rotate_eab(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
-        .current_dir(root)
-        .args([
-            "rotate",
-            "--openbao-url",
-            openbao_url,
-            "--auth-mode",
-            "approle",
-            "--approle-role-id",
-            RUNTIME_ROTATE_ROLE_ID,
-            "--approle-secret-id",
-            RUNTIME_ROTATE_SECRET_ID,
-            "--yes",
-            "eab",
-            "--stepca-url",
-            openbao_url,
-            "--stepca-provisioner",
-            "acme",
-        ])
-        .output()
-        .context("run rotate eab")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "rotate eab failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -607,15 +567,11 @@ fn write_render_map(
     Ok(map_dir)
 }
 
-fn simulate_oba_sidecar_render(agent_config: &Path, eab_kid: &str, eab_hmac: &str, hmac: &str) {
+fn simulate_oba_sidecar_render(agent_config: &Path, hmac: &str) {
     let rendered = format!(
         "\
 [acme]
 http_responder_hmac = \"{hmac}\"
-
-[eab]
-kid = \"{eab_kid}\"
-hmac = \"{eab_hmac}\"
 "
     );
     fs::write(agent_config, rendered).expect("simulate OBA sidecar render");
@@ -775,42 +731,11 @@ async fn stub_service_kv_sync(server: &MockServer) {
         .await;
 }
 
-async fn stub_rotate_sequence_openbao(
-    server: &MockServer,
-    secret_id: &str,
-    eab_kid: &str,
-    eab_hmac: &str,
-) {
+async fn stub_rotate_sequence_openbao(server: &MockServer, secret_id: &str) {
     stub_secret_id_rotation_openbao(server, secret_id).await;
 
     Mock::given(method("POST"))
-        .and(path("/acme/acme/eab"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "kid": eab_kid,
-            "hmac": eab_hmac
-        })))
-        .mount(server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/secret/data/bootroot/agent/eab"))
-        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(server)
-        .await;
-
-    Mock::given(method("POST"))
         .and(path("/v1/secret/data/bootroot/responder/hmac"))
-        .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(server)
-        .await;
-
-    // Per-service KV writes for rotation
-    Mock::given(method("POST"))
-        .and(path(format!(
-            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/eab"
-        )))
         .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)

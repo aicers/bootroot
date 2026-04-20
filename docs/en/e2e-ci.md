@@ -224,8 +224,10 @@ Configuration:
 Purpose:
 
 - Validate remote-bootstrap onboarding and one-shot bootstrap apply mode
-- Validate bootstrap-driven updates for
-  `eab`, `trust_sync`, `responder_hmac`
+- Validate bootstrap-driven updates for `eab`, `trust_sync`, `responder_hmac`
+  (the `eab` item covers the operator-provided pass-through: the harness
+  writes EAB credentials to OpenBao KV directly and verifies that
+  `bootroot-remote bootstrap` applies them)
 - Validate `secret_id` rotation delivery (in production, operators use
   `bootroot-remote apply-secret-id`; the E2E test uses `bootstrap` for
   uniformity since the old `secret_id` is still valid during the test window)
@@ -242,7 +244,6 @@ Execution steps:
 5. `verify-initial`: issue/verify certificates on remote node
 6. Rotation + bootstrap re-apply + verify cycles:
    `rotate-secret-id` -> `bootstrap` -> `verify-after-secret-id`,
-   `rotate-eab` -> `bootstrap` -> `verify-after-eab`,
    `rotate-trust-sync` -> `bootstrap` -> `verify-after-trust-sync`,
    `rotate-responder-hmac` -> `bootstrap` -> `verify-after-responder-hmac`
 7. Confirm certificate fingerprint changes between each verification snapshot
@@ -569,13 +570,15 @@ Verification flow:
 Per-service verification items:
 
 - `secret_id`
-- `eab`
+- `eab` (reports `skipped` when the operator has not provisioned EAB
+  credentials, which is the default for the bundled OSS step-ca topology)
 - `responder_hmac`
 - `trust_sync`
 
 Pass/fail rules:
 
-- all bootstrap items must show `applied` in the summary output
+- each required bootstrap item must show `applied`, `unchanged`, or
+  `skipped` (EAB only) in the summary output
 - after rotation, re-apply must complete successfully (`bootstrap` in
   E2E; `apply-secret-id` for `secret_id`-only rotation in production)
 - if any item shows `failed`, the phase fails

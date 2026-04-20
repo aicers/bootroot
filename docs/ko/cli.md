@@ -238,8 +238,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--secrets-dir`: 시크릿 디렉터리 (기본값 `secrets`)
 - `--compose-file`: infra 상태 점검용 compose 파일 (기본값 `docker-compose.yml`)
 - `--enable <feature,...>`: 선택 기능 활성화(쉼표 구분).
-  값: `auto-generate`, `show-secrets`, `db-provision`, `db-check`,
-  `eab-auto`
+  값: `auto-generate`, `show-secrets`, `db-provision`, `db-check`
 - `--skip <phase,...>`: 선택 단계 건너뛰기(쉼표 구분).
   값: `responder-check`
 - `--summary-json`: init 요약을 머신 파싱용 JSON 파일로 저장
@@ -292,7 +291,11 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   [운영 > SecretID TTL과 회전 주기](operations.md#secretid-ttl)를
   참고하세요.
 - `--eab-kid`, `--eab-hmac`: 수동 EAB 입력
-  (환경 변수: `EAB_KID`, `EAB_HMAC`)
+  (환경 변수: `EAB_KID`, `EAB_HMAC`). 두 값이 모두 제공되면 bootroot가
+  ACME `newAccount` 요청에 그대로 전달합니다. bootroot는 EAB를
+  프로비저닝하거나 검증하지 않습니다. 번들된 OSS step-ca는 EAB를
+  지원하지 않으므로, 상용 Smallstep Certificate Manager 등 EAB 지원
+  CA를 사용할 때만 필요합니다.
 
 DB DSN host 처리 규칙:
 
@@ -379,7 +382,7 @@ OpenBao와 step-ca/responder가 서로 다른 머신에 배치되면, 이 섹션
 ### 예시
 
 ```bash
-bootroot init --enable auto-generate,eab-auto --responder-url http://localhost:8080
+bootroot init --enable auto-generate --responder-url http://localhost:8080
 ```
 
 ## bootroot status
@@ -759,7 +762,6 @@ OpenBao와 통신해 값을 갱신합니다.
 지원 서브커맨드:
 
 - `rotate stepca-password`
-- `rotate eab`
 - `rotate db`
 - `rotate responder-hmac`
 - `rotate approle-secret-id`
@@ -795,7 +797,7 @@ OpenBao와 통신해 값을 갱신합니다.
 
 - 기본값으로 rotate 서브커맨드의 민감한 stdout 필드는 마스킹됩니다.
 - 평문 stdout이 정말 필요한 경우에만 `--show-secrets`를 사용하세요.
-- 이 동작은 EAB 자격증명, root token, unseal keys 같은 요약 출력에 적용됩니다.
+- 이 동작은 root token, unseal keys 같은 요약 출력에 적용됩니다.
 - `rotate openbao-recovery`의 `--output`은 stdout 마스킹과 별개입니다.
   자격증명 평문은 지정한 파일에 기록하고, stdout에는 요약과 출력 경로만
   표시합니다.
@@ -808,13 +810,6 @@ OpenBao와 통신해 값을 갱신합니다.
 - 구현 참고: bootroot는 비대화형 Docker 환경에서 overwrite 확인 프롬프트로
   인한 실패를 막기 위해 `step crypto change-pass`를 `-f`(`--force`)와 함께
   실행합니다.
-
-#### `rotate eab`
-
-- `--stepca-url`: step-ca URL (기본값 `https://localhost:9000`)
-- `--stepca-provisioner`: ACME 프로비저너 이름 (기본값 `acme`)
-- stdout 요약의 EAB `kid` / `hmac`는 `--show-secrets`를 주지 않으면
-  마스킹됩니다
 
 #### `rotate db`
 
@@ -983,7 +978,6 @@ OpenBao KV: `bootroot/responder/hmac`
 - 런타임 인증 누락 또는 인증 실패(root token 또는 AppRole)
 - step-ca 비밀번호 회전 시 키/비밀번호 파일 누락
 - DB 회전 시 관리자 DSN 누락 또는 DB 프로비저닝 실패
-- EAB 발급 요청 실패
 - responder 설정 파일 쓰기 실패 또는 리로드 실패
 - OpenBao 복구 자격증명(언실 키/루트 토큰) 회전 실패
 - AppRole 대상 서비스 미등록 또는 secret_id 갱신 실패

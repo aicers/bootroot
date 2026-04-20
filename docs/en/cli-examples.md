@@ -479,15 +479,16 @@ Certificate issued successfully.
 
 ## 7) Secret rotation (examples)
 
-bootroot provides rotation commands for **secrets** (step-ca password, EAB,
+bootroot provides rotation commands for **secrets** (step-ca password,
 DB credentials, HMAC, AppRole). **Certificate renewal** is handled by
-`bootroot-agent`.
+`bootroot-agent`. EAB credentials are not rotated by bootroot: the
+bundled OSS step-ca does not support EAB, and for EAB-capable CAs the
+operator re-provisions credentials in OpenBao KV directly.
 
 Example that rotates all secrets:
 
 ```bash
 bootroot rotate stepca-password
-bootroot rotate eab
 bootroot rotate db \
   --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
 bootroot rotate responder-hmac
@@ -556,7 +557,6 @@ Scheduled execution (cron example, script to run all rotations):
 set -euo pipefail
 
 bootroot rotate stepca-password --yes
-bootroot rotate eab --yes
 bootroot rotate db --yes \
   --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
 bootroot rotate responder-hmac --yes

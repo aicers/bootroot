@@ -376,7 +376,7 @@ runcmd:
 
 | 엔드포인트 | 프로토콜 | 용도 |
 | --- | --- | --- |
-| OpenBao API (`--openbao-url`) | HTTPS | 부트스트랩 시 시크릿(EAB, 리스폰더 HMAC, trust 번들) pull |
+| OpenBao API (`--openbao-url`) | HTTPS | 부트스트랩 시 시크릿(`secret_id`, 리스폰더 HMAC, trust 번들, EAB가 설정된 경우에만 포함) pull |
 | step-ca ACME 디렉터리 (`--agent-server`) | HTTPS | `bootroot-agent`에 의한 인증서 발급 및 갱신 |
 | HTTP-01 리스폰더 (`--agent-responder-url`) | HTTP | 도메인 검증을 위한 ACME 챌린지 토큰 게시 |
 
@@ -406,7 +406,7 @@ runcmd:
 | `service_name` | `string` | 등록된 서비스 이름 | `--service-name` |
 | `role_id_path` | `string` | 원격 호스트의 AppRole `role_id` 파일 경로 | `--role-id-path` |
 | `secret_id_path` | `string` | 원격 호스트의 AppRole `secret_id` 파일 경로 | `--secret-id-path` |
-| `eab_file_path` | `string` | EAB 자격증명 JSON 파일 경로 | `--eab-file-path` |
+| `eab_file_path` | `string` | EAB 자격증명 JSON 파일 경로. 운영자가 OpenBao KV에 EAB 자격증명을 프로비저닝한 경우에만 bootroot가 이 파일을 기록합니다. 그렇지 않으면 eab 반영 단계가 `skipped`로 보고되고 파일은 기록되지 않습니다. | `--eab-file-path` |
 | `agent_config_path` | `string` | 원격 호스트의 `agent.toml` 경로 | `--agent-config-path` |
 | `ca_bundle_path` | `string` | 원격 호스트의 CA trust bundle PEM 파일 경로 | `--ca-bundle-path` |
 | `ca_bundle_pem` | `string` | 제어 노드 CA trust 앵커의 인라인 PEM 콘텐츠. 부트스트랩 시 `ca_bundle_path`에 기록됨. `openbao_url`이 HTTPS인 경우 시스템 trust store 대신 이 CA를 TLS trust 앵커로 사용. 공유 프리미티브 — http01 admin 클라이언트(#514)에서도 사용. | 내부 사용 (TLS trust) |

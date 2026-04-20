@@ -386,7 +386,7 @@ The remote host must have network connectivity to the following endpoints:
 
 | Endpoint | Protocol | Purpose |
 | --- | --- | --- |
-| OpenBao API (`--openbao-url`) | HTTPS | Pull secrets (EAB, responder HMAC, trust bundle) during bootstrap |
+| OpenBao API (`--openbao-url`) | HTTPS | Pull secrets (`secret_id`, responder HMAC, trust bundle, and EAB when present) during bootstrap |
 | step-ca ACME directory (`--agent-server`) | HTTPS | Certificate issuance and renewal by `bootroot-agent` |
 | HTTP-01 responder (`--agent-responder-url`) | HTTP | Publish ACME challenge tokens for domain validation |
 
@@ -417,7 +417,7 @@ Current version: **2**
 | `service_name` | `string` | Registered service name | `--service-name` |
 | `role_id_path` | `string` | Path to AppRole `role_id` file on the remote host | `--role-id-path` |
 | `secret_id_path` | `string` | Path to AppRole `secret_id` file on the remote host | `--secret-id-path` |
-| `eab_file_path` | `string` | Path to EAB credentials JSON file | `--eab-file-path` |
+| `eab_file_path` | `string` | Path to EAB credentials JSON file. Bootroot writes this file only when the operator has provisioned EAB credentials in OpenBao KV; otherwise the eab apply step reports `skipped` and no file is written. | `--eab-file-path` |
 | `agent_config_path` | `string` | Path to `agent.toml` on the remote host | `--agent-config-path` |
 | `ca_bundle_path` | `string` | Path to CA trust bundle PEM file on the remote host | `--ca-bundle-path` |
 | `ca_bundle_pem` | `string` | Inline PEM content of the control-plane CA trust anchor. Written to `ca_bundle_path` during bootstrap. When `openbao_url` uses HTTPS, this CA is used as the TLS trust anchor instead of the system trust store. Shared primitive — also consumed by the http01 admin client (#514). | Internal (TLS trust) |

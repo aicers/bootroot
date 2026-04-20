@@ -147,6 +147,127 @@ async fn test_bootroot_remote_is_idempotent_on_second_run() {
 }
 
 #[tokio::test]
+async fn test_bootroot_remote_skips_eab_when_kv_entry_missing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let role_id_path = temp_dir.path().join("secrets").join("role_id");
+    let secret_id_path = temp_dir.path().join("secrets").join("secret_id");
+    let eab_file_path = temp_dir.path().join("secrets").join("eab.json");
+    let ca_bundle_path = temp_dir.path().join("certs").join("ca-bundle.pem");
+    let agent_config_path = temp_dir.path().join("agent.toml");
+
+    fs::create_dir_all(role_id_path.parent().expect("role_id parent")).expect("create secrets dir");
+    fs::write(&role_id_path, "role-edge-proxy\n").expect("write role_id");
+    fs::write(&secret_id_path, "old-secret\n").expect("write secret_id");
+    fs::write(
+        &agent_config_path,
+        "[acme]\nhttp_responder_hmac = \"old\"\n[trust]\nca_bundle_path = \"old.pem\"\ntrusted_ca_sha256 = [\"0\" ]\n",
+    )
+    .expect("write agent config");
+
+    let server = MockServer::start().await;
+    stub_openbao_remote_sync_without_eab_kv(&server).await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .args([
+            "bootstrap",
+            "--openbao-url",
+            &server.uri(),
+            "--kv-mount",
+            "secret",
+            "--service-name",
+            "edge-proxy",
+            "--role-id-path",
+            role_id_path.to_string_lossy().as_ref(),
+            "--secret-id-path",
+            secret_id_path.to_string_lossy().as_ref(),
+            "--eab-file-path",
+            eab_file_path.to_string_lossy().as_ref(),
+            "--agent-config-path",
+            agent_config_path.to_string_lossy().as_ref(),
+            "--ca-bundle-path",
+            ca_bundle_path.to_string_lossy().as_ref(),
+            "--profile-instance-id",
+            "001",
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("run bootroot-remote");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse json summary");
+    assert_eq!(summary["secret_id"]["status"], "applied");
+    assert_eq!(summary["eab"]["status"], "skipped");
+    assert_eq!(summary["responder_hmac"]["status"], "applied");
+    assert_eq!(summary["trust_sync"]["status"], "applied");
+    assert!(
+        !eab_file_path.exists(),
+        "eab file should not be written when no credentials are provisioned",
+    );
+}
+
+#[tokio::test]
+async fn test_bootroot_remote_skips_eab_when_kv_entry_has_empty_values() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let role_id_path = temp_dir.path().join("secrets").join("role_id");
+    let secret_id_path = temp_dir.path().join("secrets").join("secret_id");
+    let eab_file_path = temp_dir.path().join("secrets").join("eab.json");
+    let ca_bundle_path = temp_dir.path().join("certs").join("ca-bundle.pem");
+    let agent_config_path = temp_dir.path().join("agent.toml");
+
+    fs::create_dir_all(role_id_path.parent().expect("role_id parent")).expect("create secrets dir");
+    fs::write(&role_id_path, "role-edge-proxy\n").expect("write role_id");
+    fs::write(&secret_id_path, "old-secret\n").expect("write secret_id");
+    fs::write(
+        &agent_config_path,
+        "[acme]\nhttp_responder_hmac = \"old\"\n[trust]\nca_bundle_path = \"old.pem\"\ntrusted_ca_sha256 = [\"0\" ]\n",
+    )
+    .expect("write agent config");
+
+    let server = MockServer::start().await;
+    stub_openbao_remote_sync_with_empty_eab_kv(&server).await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .args([
+            "bootstrap",
+            "--openbao-url",
+            &server.uri(),
+            "--kv-mount",
+            "secret",
+            "--service-name",
+            "edge-proxy",
+            "--role-id-path",
+            role_id_path.to_string_lossy().as_ref(),
+            "--secret-id-path",
+            secret_id_path.to_string_lossy().as_ref(),
+            "--eab-file-path",
+            eab_file_path.to_string_lossy().as_ref(),
+            "--agent-config-path",
+            agent_config_path.to_string_lossy().as_ref(),
+            "--ca-bundle-path",
+            ca_bundle_path.to_string_lossy().as_ref(),
+            "--profile-instance-id",
+            "001",
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("run bootroot-remote");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse json summary");
+    assert_eq!(summary["eab"]["status"], "skipped");
+    assert!(
+        !eab_file_path.exists(),
+        "eab file should not be written when kid/hmac are empty",
+    );
+}
+
+#[tokio::test]
 async fn test_bootroot_remote_fails_when_trust_fingerprints_missing() {
     let temp_dir = tempdir().expect("create temp dir");
     let role_id_path = temp_dir.path().join("secrets").join("role_id");
@@ -456,6 +577,89 @@ async fn stub_openbao_remote_sync_without_bundle(server: &MockServer) {
         }),
     )
     .await;
+}
+
+async fn stub_openbao_remote_sync_without_eab_kv(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "remote-token" }
+        })))
+        .mount(server)
+        .await;
+    stub_shared_service_payloads_without_eab(
+        server,
+        json!({
+            "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
+            "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nREMOTE\n-----END CERTIFICATE-----"
+        }),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/eab"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(server)
+        .await;
+}
+
+async fn stub_openbao_remote_sync_with_empty_eab_kv(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "remote-token" }
+        })))
+        .mount(server)
+        .await;
+    stub_shared_service_payloads_without_eab(
+        server,
+        json!({
+            "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
+            "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nREMOTE\n-----END CERTIFICATE-----"
+        }),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/eab"))
+        .and(header("X-Vault-Token", "remote-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "kid": "", "hmac": "" } }
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_shared_service_payloads_without_eab(
+    server: &MockServer,
+    trust_payload: serde_json::Value,
+) {
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/secret/data/bootroot/services/edge-proxy/secret_id",
+        ))
+        .and(header("X-Vault-Token", "remote-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "secret_id": "new-secret-id" } }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/secret/data/bootroot/services/edge-proxy/http_responder_hmac",
+        ))
+        .and(header("X-Vault-Token", "remote-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "hmac": "responder-hmac-1" } }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/trust"))
+        .and(header("X-Vault-Token", "remote-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": trust_payload }
+        })))
+        .mount(server)
+        .await;
 }
 
 async fn stub_shared_service_payloads(server: &MockServer, trust_payload: serde_json::Value) {

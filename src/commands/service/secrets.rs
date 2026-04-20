@@ -126,19 +126,21 @@ async fn write_service_kv_secrets(
     messages: &Messages,
 ) -> Result<()> {
     let base = format!("{SERVICE_KV_BASE}/{service_name}");
-    let eab_kid = material.eab_kid.as_deref().unwrap_or("");
-    let eab_hmac = material.eab_hmac.as_deref().unwrap_or("");
-    client
-        .write_kv(
-            kv_mount,
-            &format!("{base}/eab"),
-            serde_json::json!({
-                SERVICE_EAB_KID_KEY: eab_kid,
-                SERVICE_EAB_HMAC_KEY: eab_hmac,
-            }),
-        )
-        .await
-        .with_context(|| messages.error_openbao_kv_write_failed())?;
+    if let (Some(eab_kid), Some(eab_hmac)) =
+        (material.eab_kid.as_deref(), material.eab_hmac.as_deref())
+    {
+        client
+            .write_kv(
+                kv_mount,
+                &format!("{base}/eab"),
+                serde_json::json!({
+                    SERVICE_EAB_KID_KEY: eab_kid,
+                    SERVICE_EAB_HMAC_KEY: eab_hmac,
+                }),
+            )
+            .await
+            .with_context(|| messages.error_openbao_kv_write_failed())?;
+    }
     client
         .write_kv(
             kv_mount,

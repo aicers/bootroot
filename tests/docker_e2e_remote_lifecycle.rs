@@ -51,9 +51,6 @@ mod unix_integration {
         assert!(phase_contents.contains("\"phase\":\"rotate-secret-id\""));
         assert!(phase_contents.contains("\"phase\":\"bootstrap-after-secret-id\""));
         assert!(phase_contents.contains("\"phase\":\"verify-after-secret-id\""));
-        assert!(phase_contents.contains("\"phase\":\"rotate-eab\""));
-        assert!(phase_contents.contains("\"phase\":\"bootstrap-after-eab\""));
-        assert!(phase_contents.contains("\"phase\":\"verify-after-eab\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-trust-sync\""));
         assert!(phase_contents.contains("\"phase\":\"bootstrap-after-trust-sync\""));
         assert!(phase_contents.contains("\"phase\":\"verify-after-trust-sync\""));
@@ -63,12 +60,10 @@ mod unix_integration {
 
         let initial = cert_meta.join("edge-proxy-initial.txt");
         let after_secret_id = cert_meta.join("edge-proxy-after-secret-id.txt");
-        let after_eab = cert_meta.join("edge-proxy-after-eab.txt");
         let after_trust_sync = cert_meta.join("edge-proxy-after-trust-sync.txt");
         let after_hmac = cert_meta.join("edge-proxy-after-responder-hmac.txt");
         assert!(initial.exists());
         assert!(after_secret_id.exists());
-        assert!(after_eab.exists());
         assert!(after_trust_sync.exists());
         assert!(after_hmac.exists());
 

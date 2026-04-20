@@ -46,6 +46,21 @@ pub(super) fn read_required_string(
     )
 }
 
+/// Reads an optional string from the KV payload. Returns `None` when
+/// no matching key exists or every candidate value trims to an empty
+/// string. Unlike [`read_required_string`], absence is not an error.
+pub(super) fn read_optional_string(data: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = data.get(key).and_then(serde_json::Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub(super) fn read_required_fingerprints(
     data: &serde_json::Value,
     lang: Locale,
@@ -138,8 +153,8 @@ pub(super) async fn write_eab_file(path: &Path, kid: &str, hmac: &str) -> Result
 #[derive(Debug)]
 pub(super) struct PulledSecrets {
     pub(super) secret_id: String,
-    pub(super) eab_kid: String,
-    pub(super) eab_hmac: String,
+    pub(super) eab_kid: Option<String>,
+    pub(super) eab_hmac: Option<String>,
     pub(super) responder_hmac: String,
     pub(super) trusted_ca_sha256: Vec<String>,
     pub(super) ca_bundle_pem: String,
@@ -162,16 +177,11 @@ pub(super) async fn pull_secrets(
                 "OpenBao에서 서비스 secret_id를 읽지 못했습니다",
             )
         })?;
-    let eab_data = client
-        .read_kv(mount, &format!("{base}/eab"))
-        .await
-        .with_context(|| {
-            localized(
-                lang,
-                "Failed to read service eab from OpenBao",
-                "OpenBao에서 서비스 eab를 읽지 못했습니다",
-            )
-        })?;
+    // The EAB KV entry is optional: it is only populated when the
+    // operator has provided EAB credentials. A missing entry means the
+    // ACME CA does not require EAB for this account, so we must not
+    // treat the read error as fatal.
+    let eab_data = client.read_kv(mount, &format!("{base}/eab")).await.ok();
     let hmac_data = client
         .read_kv(mount, &format!("{base}/http_responder_hmac"))
         .await
@@ -194,8 +204,14 @@ pub(super) async fn pull_secrets(
         })?;
 
     let secret_id = read_required_string(&secret_id_data, &[super::SECRET_ID_KEY, "value"], lang)?;
-    let eab_kid = read_required_string(&eab_data, &[super::EAB_KID_KEY], lang)?;
-    let eab_hmac = read_required_string(&eab_data, &[super::EAB_HMAC_KEY], lang)?;
+    let (eab_kid, eab_hmac) = eab_data
+        .as_ref()
+        .and_then(|data| {
+            let kid = read_optional_string(data, &[super::EAB_KID_KEY])?;
+            let hmac = read_optional_string(data, &[super::EAB_HMAC_KEY])?;
+            Some((kid, hmac))
+        })
+        .map_or((None, None), |(kid, hmac)| (Some(kid), Some(hmac)));
     let responder_hmac =
         read_required_string(&hmac_data, &[super::HMAC_KEY, "http_responder_hmac"], lang)?;
     let trusted_ca_sha256 = read_required_fingerprints(&trust_data, lang)?;
@@ -228,6 +244,45 @@ mod tests {
         let parsed =
             read_required_fingerprints(&data, Locale::En).expect("parse trust fingerprints");
         assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn read_optional_string_returns_trimmed_value_when_present() {
+        let data = serde_json::json!({ "kid": "  abc  " });
+        assert_eq!(
+            read_optional_string(&data, &["kid"]).as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn read_optional_string_returns_none_when_key_missing() {
+        let data = serde_json::json!({ "other": "value" });
+        assert!(read_optional_string(&data, &["kid"]).is_none());
+    }
+
+    #[test]
+    fn read_optional_string_returns_none_when_value_empty_or_whitespace() {
+        let empty = serde_json::json!({ "kid": "" });
+        assert!(read_optional_string(&empty, &["kid"]).is_none());
+
+        let whitespace = serde_json::json!({ "kid": "   " });
+        assert!(read_optional_string(&whitespace, &["kid"]).is_none());
+    }
+
+    #[test]
+    fn read_optional_string_falls_back_to_later_keys() {
+        let data = serde_json::json!({ "alt": "value" });
+        assert_eq!(
+            read_optional_string(&data, &["primary", "alt"]).as_deref(),
+            Some("value"),
+        );
+    }
+
+    #[test]
+    fn read_optional_string_skips_non_string_values() {
+        let data = serde_json::json!({ "kid": 42 });
+        assert!(read_optional_string(&data, &["kid"]).is_none());
     }
 
     #[cfg(unix)]
