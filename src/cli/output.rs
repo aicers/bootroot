@@ -3,7 +3,7 @@ use crate::commands::service::{display_policy_value, display_wrap_ttl};
 use crate::i18n::{
     Messages, ServiceNextStepsDaemon, ServiceNextStepsDocker, ServiceOpenBaoAgentSteps,
 };
-use crate::state::{DeployType, PostRenewHookEntry, ServiceEntry};
+use crate::state::{DeliveryMode, DeployType, PostRenewHookEntry, ServiceEntry};
 
 pub(crate) struct ServiceAddPlan<'a> {
     pub(crate) service_name: &'a str,
@@ -384,18 +384,25 @@ fn print_service_openbao_agent_steps(
         "{}",
         messages.service_next_steps_openbao_agent_permissions(&openbao_steps)
     );
-    match entry.deploy_type {
-        DeployType::Daemon => {
-            println!(
-                "{}",
-                messages.service_next_steps_openbao_agent_daemon_run(&openbao_steps)
-            );
-        }
-        DeployType::Docker => {
-            println!(
-                "{}",
-                messages.service_next_steps_openbao_agent_docker_run(&openbao_steps)
-            );
+    if matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
+        println!(
+            "{}",
+            messages.service_next_steps_openbao_agent_bootroot_start(&openbao_steps)
+        );
+    } else {
+        match entry.deploy_type {
+            DeployType::Daemon => {
+                println!(
+                    "{}",
+                    messages.service_next_steps_openbao_agent_daemon_run(&openbao_steps)
+                );
+            }
+            DeployType::Docker => {
+                println!(
+                    "{}",
+                    messages.service_next_steps_openbao_agent_docker_run(&openbao_steps)
+                );
+            }
         }
     }
 }

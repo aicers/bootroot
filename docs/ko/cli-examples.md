@@ -163,8 +163,11 @@ bootroot 서비스 추가: 계획
     - secret_id file: secrets/services/edge-proxy/secret_id
     - ensure secrets/services/edge-proxy is 0700 and
       role_id/secret_id files are 0600
-    - run the app-specific OpenBao Agent on the host with
-      secrets/openbao/services/edge-proxy/agent.hcl
+    - 관리형 사이드카를 시작하세요:
+      bootroot service agent start --service-name edge-proxy
+      (bootroot rotate가 사이드카에 신호를 보내려면 필요합니다.
+      호스트에서 `bao agent -config=secrets/openbao/services/edge-proxy/agent.hcl`을
+      실행하는 방법도 대체로 사용할 수 있습니다)
   - /etc/bootroot/agent.toml에 프로필(instance_id=001,
     hostname=edge-node-01, domain=trusted.domain,
     cert=/etc/bootroot/certs/edge-proxy.crt,

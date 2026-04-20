@@ -166,8 +166,11 @@ next steps:
     - secret_id file: secrets/services/edge-proxy/secret_id
     - ensure secrets/services/edge-proxy is 0700 and
       role_id/secret_id files are 0600
-    - run the service-specific OpenBao Agent on the host with
-      secrets/openbao/services/edge-proxy/agent.hcl
+    - start the managed sidecar with:
+      bootroot service agent start --service-name edge-proxy
+      (required so `bootroot rotate` can signal the sidecar; the host
+      `bao agent -config=secrets/openbao/services/edge-proxy/agent.hcl`
+      remains available as an alternative)
   - Add profile for edge-proxy (instance_id=001, hostname=edge-node-01,
     domain=trusted.domain, cert=/etc/bootroot/certs/edge-proxy.crt,
     key=/etc/bootroot/certs/edge-proxy.key) to /etc/bootroot/agent.toml
