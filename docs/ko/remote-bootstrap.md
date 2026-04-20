@@ -406,7 +406,7 @@ runcmd:
 | `service_name` | `string` | 등록된 서비스 이름 | `--service-name` |
 | `role_id_path` | `string` | 원격 호스트의 AppRole `role_id` 파일 경로 | `--role-id-path` |
 | `secret_id_path` | `string` | 원격 호스트의 AppRole `secret_id` 파일 경로 | `--secret-id-path` |
-| `eab_file_path` | `string` | EAB 자격증명 JSON 파일 경로. 운영자가 OpenBao KV에 EAB 자격증명을 프로비저닝한 경우에만 bootroot가 이 파일을 기록합니다. 그렇지 않으면 eab 반영 단계가 `skipped`로 보고되고 파일은 기록되지 않습니다. | `--eab-file-path` |
+| `eab_file_path` | `string` | EAB 자격증명 JSON 파일 경로. 운영자가 OpenBao KV에 EAB 자격증명을 프로비저닝한 경우에만 bootroot가 이 파일을 기록합니다. KV 항목이 없는 경우 bootroot는 이전 부트스트랩이 남긴 오래된 `eab.json`을 제거하여 `bootroot-agent --eab-file`이 폐기된 자격증명을 전달하지 못하도록 합니다. 이때 eab 반영 단계는 오래된 파일을 제거한 경우 `applied`로, 애초에 파일이 없었던 경우 `skipped`로 보고합니다. | `--eab-file-path` |
 | `agent_config_path` | `string` | 원격 호스트의 `agent.toml` 경로 | `--agent-config-path` |
 | `ca_bundle_path` | `string` | 원격 호스트의 CA trust bundle PEM 파일 경로 | `--ca-bundle-path` |
 | `ca_bundle_pem` | `string` | 제어 노드 CA trust 앵커의 인라인 PEM 콘텐츠. 부트스트랩 시 `ca_bundle_path`에 기록됨. `openbao_url`이 HTTPS인 경우 시스템 trust store 대신 이 CA를 TLS trust 앵커로 사용. 공유 프리미티브 — http01 admin 클라이언트(#514)에서도 사용. | 내부 사용 (TLS trust) |

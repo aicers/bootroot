@@ -46,19 +46,37 @@ pub(super) fn read_required_string(
     )
 }
 
-/// Reads an optional string from the KV payload. Returns `None` when
-/// no matching key exists or every candidate value trims to an empty
-/// string. Unlike [`read_required_string`], absence is not an error.
-pub(super) fn read_optional_string(data: &serde_json::Value, keys: &[&str]) -> Option<String> {
+/// Reads an optional string from the KV payload. Returns `Ok(None)`
+/// when no matching key exists or every candidate value trims to an
+/// empty string. Unlike [`read_required_string`], absence is not an
+/// error. A present-but-non-string value (e.g., number, array, bool)
+/// is treated as malformed operator-provided data and fails loudly so
+/// a typo cannot silently demote the field to "absent".
+pub(super) fn read_optional_string(
+    data: &serde_json::Value,
+    keys: &[&str],
+    lang: Locale,
+) -> Result<Option<String>> {
     for key in keys {
-        if let Some(value) = data.get(key).and_then(serde_json::Value::as_str) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+        let Some(value) = data.get(key) else {
+            continue;
+        };
+        let string = value.as_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                localized(
+                    lang,
+                    &format!("Expected string value for optional key: {key}"),
+                    &format!("선택적 키 값이 문자열이 아닙니다: {key}"),
+                )
+            )
+        })?;
+        let trimmed = string.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
         }
     }
-    None
+    Ok(None)
 }
 
 pub(super) fn read_required_fingerprints(
@@ -230,14 +248,20 @@ pub(super) async fn pull_secrets(
         })?;
 
     let secret_id = read_required_string(&secret_id_data, &[super::SECRET_ID_KEY, "value"], lang)?;
-    let (eab_kid, eab_hmac) = eab_data
-        .as_ref()
-        .and_then(|data| {
-            let kid = read_optional_string(data, &[super::EAB_KID_KEY])?;
-            let hmac = read_optional_string(data, &[super::EAB_HMAC_KEY])?;
-            Some((kid, hmac))
-        })
-        .map_or((None, None), |(kid, hmac)| (Some(kid), Some(hmac)));
+    let (eab_kid, eab_hmac) = match eab_data.as_ref() {
+        Some(data) => {
+            let kid = read_optional_string(data, &[super::EAB_KID_KEY], lang)?;
+            let hmac = read_optional_string(data, &[super::EAB_HMAC_KEY], lang)?;
+            // Preserve the "both-or-neither" semantics: a half-populated
+            // EAB entry is treated the same as absent so the caller
+            // cannot accidentally forward a `kid` without its `hmac`.
+            match (kid, hmac) {
+                (Some(k), Some(h)) => (Some(k), Some(h)),
+                _ => (None, None),
+            }
+        }
+        None => (None, None),
+    };
     let responder_hmac =
         read_required_string(&hmac_data, &[super::HMAC_KEY, "http_responder_hmac"], lang)?;
     let trusted_ca_sha256 = read_required_fingerprints(&trust_data, lang)?;
@@ -275,40 +299,53 @@ mod tests {
     #[test]
     fn read_optional_string_returns_trimmed_value_when_present() {
         let data = serde_json::json!({ "kid": "  abc  " });
-        assert_eq!(
-            read_optional_string(&data, &["kid"]).as_deref(),
-            Some("abc")
-        );
+        let parsed = read_optional_string(&data, &["kid"], Locale::En).expect("parse kid");
+        assert_eq!(parsed.as_deref(), Some("abc"));
     }
 
     #[test]
     fn read_optional_string_returns_none_when_key_missing() {
         let data = serde_json::json!({ "other": "value" });
-        assert!(read_optional_string(&data, &["kid"]).is_none());
+        let parsed =
+            read_optional_string(&data, &["kid"], Locale::En).expect("missing key is not an error");
+        assert!(parsed.is_none());
     }
 
     #[test]
     fn read_optional_string_returns_none_when_value_empty_or_whitespace() {
         let empty = serde_json::json!({ "kid": "" });
-        assert!(read_optional_string(&empty, &["kid"]).is_none());
+        let parsed =
+            read_optional_string(&empty, &["kid"], Locale::En).expect("empty value is absence");
+        assert!(parsed.is_none());
 
         let whitespace = serde_json::json!({ "kid": "   " });
-        assert!(read_optional_string(&whitespace, &["kid"]).is_none());
+        let parsed = read_optional_string(&whitespace, &["kid"], Locale::En)
+            .expect("whitespace value is absence");
+        assert!(parsed.is_none());
     }
 
     #[test]
     fn read_optional_string_falls_back_to_later_keys() {
         let data = serde_json::json!({ "alt": "value" });
-        assert_eq!(
-            read_optional_string(&data, &["primary", "alt"]).as_deref(),
-            Some("value"),
-        );
+        let parsed = read_optional_string(&data, &["primary", "alt"], Locale::En)
+            .expect("fallback to alt key");
+        assert_eq!(parsed.as_deref(), Some("value"));
     }
 
     #[test]
-    fn read_optional_string_skips_non_string_values() {
+    fn read_optional_string_fails_on_non_string_values() {
         let data = serde_json::json!({ "kid": 42 });
-        assert!(read_optional_string(&data, &["kid"]).is_none());
+        let err = read_optional_string(&data, &["kid"], Locale::En)
+            .expect_err("numeric kid must fail loudly");
+        assert!(err.to_string().contains("kid"));
+    }
+
+    #[test]
+    fn read_optional_string_fails_on_null_values() {
+        let data = serde_json::json!({ "kid": serde_json::Value::Null });
+        let err = read_optional_string(&data, &["kid"], Locale::En)
+            .expect_err("null kid must fail loudly");
+        assert!(err.to_string().contains("kid"));
     }
 
     #[cfg(unix)]

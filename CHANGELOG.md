@@ -24,8 +24,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `--eab-file-path` on `bootroot-remote bootstrap`, and `--eab-kid` /
   `--eab-hmac` / `--eab-file` on `bootroot-agent`. When credentials are
   present they are forwarded to the ACME `newAccount` request (RFC
-  8555); when absent the `eab` apply step reports `skipped` and no file
-  is written. Missing-entry detection is narrow: only a `404 Not Found`
+  8555); when absent the `eab` apply step reports `applied` if a stale
+  `eab.json` from a prior bootstrap had to be removed and `skipped`
+  when no file existed to begin with. A present-but-malformed EAB KV
+  entry (e.g., a non-string `kid` or `hmac`) fails the bootstrap
+  loudly rather than being silently demoted to "absent".
+  Missing-entry detection is narrow: only a `404 Not Found`
   from OpenBao is treated as "no EAB configured" via the new
   `OpenBaoClient::try_read_kv`. Transport errors, 5xx responses, and
   other unexpected failures still surface as bootstrap failures so a
