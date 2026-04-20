@@ -131,6 +131,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   files as root before `fix_secrets_permissions` could run. Init now
   stops the compose step-ca service before bootstrapping and restarts it
   after permissions are fixed and `ca.json` is patched.
+- Fixed `bootroot-remote bootstrap` emitting an `agent.hcl` that had
+  drifted from the `bootroot service add` (`local-file` mode) variant.
+  The remote renderer now delegates to the shared
+  `bootroot::openbao::build_agent_config` primitive, so the HCL always
+  sets `remove_secret_id_file_after_reading = false` (preventing the
+  OpenBao agent from deleting the `secret_id` file on first read and
+  breaking subsequent restarts) and always emits both `template` blocks
+  — one for `agent.toml.ctmpl` and one for `ca-bundle.pem.ctmpl` — so a
+  control-plane CA rotation is picked up on remote hosts instead of
+  leaving them pinned to the bootstrap-time bundle. A regression test
+  pins the remote renderer output to the shared primitive so future
+  option additions on one side cannot silently drop from the other.
+  (Closes #547)
 
 ### Added
 
