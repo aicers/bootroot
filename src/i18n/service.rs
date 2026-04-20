@@ -786,6 +786,20 @@ impl Messages {
         )
     }
 
+    pub(crate) fn service_next_steps_openbao_agent_bootroot_start(
+        &self,
+        data: &ServiceOpenBaoAgentSteps<'_>,
+    ) -> String {
+        format_template(
+            self.strings()
+                .service_next_steps_openbao_agent_bootroot_start,
+            &[
+                ("service_name", data.service_name),
+                ("config_path", data.config_path),
+            ],
+        )
+    }
+
     pub(crate) fn service_snippet_daemon_title(&self) -> &'static str {
         self.strings().service_snippet_daemon_title
     }
@@ -874,10 +888,6 @@ impl Messages {
 
     pub(crate) fn error_service_agent_start_failed(&self) -> &'static str {
         self.strings().error_service_agent_start_failed
-    }
-
-    pub(crate) fn error_service_not_docker(&self, value: &str) -> String {
-        format_template(self.strings().error_service_not_docker, &[("value", value)])
     }
 
     pub(crate) fn error_service_remote_bootstrap(&self, value: &str) -> String {

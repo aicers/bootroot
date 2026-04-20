@@ -22,6 +22,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate` (responder-hmac, approle-secret-id, db,
+  stepca-password) timing out for services registered with
+  `--deploy-type daemon --delivery-mode local-file`. `service add` now
+  emits sidecar template destinations that point at the host-side
+  `agent_config_path` and CA bundle the daemon actually reads, and
+  `bootroot service agent start --service-name <name>` now supports
+  daemon services by bind-mounting those host directories into the
+  sidecar container (`bootroot-openbao-agent-<service>`) that rotate
+  signals. The `service add` summary now points daemon + local-file
+  operators at `bootroot service agent start`; the host-run
+  `bao agent -config=<openbao_agent_hcl_path>` remains available as
+  an alternative. (Closes #541)
 - Fixed `bootroot rotate ca-key` Phase 5 failing against services
   registered with `--deploy-type docker` and a custom
   `--container-name`. The restart target now reads

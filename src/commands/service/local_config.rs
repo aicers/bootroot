@@ -20,11 +20,22 @@ use super::{
 };
 use crate::commands::init::{resolve_openbao_agent_addr, to_container_path};
 use crate::i18n::Messages;
-use crate::state::PostRenewHookEntry;
+use crate::state::{DeployType, PostRenewHookEntry};
 
 /// Mount point inside service sidecar containers where the host
 /// `secrets_dir` is bind-mounted.
 const SIDECAR_CONTAINER_MOUNT: &str = "/openbao/secrets";
+
+/// Mount point inside daemon-mode sidecar containers where the host
+/// parent directory of `agent_config_path` is bind-mounted.  Used to
+/// land the rendered `agent.toml` directly at the host path the
+/// bootroot-agent daemon is configured to read.
+pub(super) const SIDECAR_DAEMON_CONFIG_MOUNT: &str = "/sidecar-config";
+
+/// Mount point inside daemon-mode sidecar containers where the host
+/// parent directory of the daemon's certificates / CA bundle is
+/// bind-mounted.
+pub(super) const SIDECAR_DAEMON_CERTS_MOUNT: &str = "/sidecar-certs";
 
 #[allow(clippy::too_many_lines)]
 pub(super) async fn apply_local_service_configs(
@@ -147,6 +158,9 @@ pub(super) async fn apply_local_service_configs(
         token_path: &token_path,
         agent_template_path: &template_path,
         ca_bundle_template_path: &bundle_template_path,
+        deploy_type: resolved.deploy_type,
+        host_agent_config_path: &resolved.agent_config,
+        host_ca_bundle_path: &ca_bundle_path,
     })?;
     fs::write(&docker_config_path, docker_hcl)
         .await
@@ -265,7 +279,7 @@ fn render_openbao_agent_config(
 const DOCKER_RENDERED_AGENT_CONFIG: &str = "agent.toml";
 
 /// Name used for the rendered CA bundle inside the Docker container.
-const DOCKER_RENDERED_CA_BUNDLE: &str = "ca-bundle.pem";
+pub(super) const DOCKER_RENDERED_CA_BUNDLE: &str = "ca-bundle.pem";
 
 /// Inputs for [`render_docker_agent_config`].
 struct DockerAgentConfigInputs<'a> {
@@ -276,6 +290,16 @@ struct DockerAgentConfigInputs<'a> {
     token_path: &'a Path,
     agent_template_path: &'a Path,
     ca_bundle_template_path: &'a Path,
+    deploy_type: DeployType,
+    /// Host-side path the operator supplied via `--agent-config`.  For
+    /// `DeployType::Daemon`, the sidecar is instructed to render the
+    /// agent config file directly to this path via a dedicated
+    /// bind-mount, so that `bootroot-agent` and `rotate` both see the
+    /// same file.
+    host_agent_config_path: &'a Path,
+    /// Host-side path where the daemon's CA bundle lives (sits next to
+    /// `cert_path`).  Same rationale as `host_agent_config_path`.
+    host_ca_bundle_path: &'a Path,
 }
 
 /// Renders an `OpenBao` agent config for use inside a Docker sidecar
@@ -284,10 +308,17 @@ struct DockerAgentConfigInputs<'a> {
 /// `OpenBao` address with the Docker-internal hostname.
 ///
 /// Template sources (`.ctmpl` files) are mapped via [`to_container_path`]
-/// since they reside under `secrets_dir`.  Template destinations are
-/// placed at well-known names inside the service's `OpenBao` directory
-/// within the container mount, because the host-side destinations may
-/// be outside `secrets_dir`.
+/// since they reside under `secrets_dir`.  Template destinations
+/// depend on `deploy_type`:
+/// - `DeployType::Docker`: the sidecar and the service container share
+///   the `secrets_dir` bind-mount, so rendered files are placed at
+///   well-known names inside the service's credential directory.
+/// - `DeployType::Daemon`: the host-side `agent_config_path` typically
+///   sits outside `secrets_dir`; the sidecar gets dedicated bind-mounts
+///   ([`SIDECAR_DAEMON_CONFIG_MOUNT`] and [`SIDECAR_DAEMON_CERTS_MOUNT`])
+///   onto that path's parent and the CA bundle's parent, so rendered
+///   files land exactly at the host paths that `bootroot-agent` reads
+///   and that `rotate` waits on.
 ///
 /// When the `openbao_url` scheme is `https`, includes the `ca_cert`
 /// field pointing to the same container-side CA bundle that the agent
@@ -303,22 +334,39 @@ fn render_docker_agent_config(inputs: &DockerAgentConfigInputs<'_>) -> Result<St
     let token = to_container_path(sd, inputs.token_path, SIDECAR_CONTAINER_MOUNT)?;
 
     let tpl_source = to_container_path(sd, inputs.agent_template_path, SIDECAR_CONTAINER_MOUNT)?;
-    // Render destinations: the per-service credential directory
-    // (<secrets_dir>/services/<svc>/) so the service can access
-    // rendered output via the shared secrets_dir bind-mount.
-    let svc_cred_dir = inputs.secret_id_path.parent().unwrap_or(inputs.secrets_dir);
-    let tpl_dest = to_container_path(
-        sd,
-        &svc_cred_dir.join(DOCKER_RENDERED_AGENT_CONFIG),
-        SIDECAR_CONTAINER_MOUNT,
-    )?;
     let ca_tpl_source =
         to_container_path(sd, inputs.ca_bundle_template_path, SIDECAR_CONTAINER_MOUNT)?;
-    let ca_tpl_dest = to_container_path(
-        sd,
-        &svc_cred_dir.join(DOCKER_RENDERED_CA_BUNDLE),
-        SIDECAR_CONTAINER_MOUNT,
-    )?;
+
+    let (tpl_dest, ca_tpl_dest) = match inputs.deploy_type {
+        DeployType::Docker => {
+            let svc_cred_dir = inputs.secret_id_path.parent().unwrap_or(inputs.secrets_dir);
+            let tpl_dest = to_container_path(
+                sd,
+                &svc_cred_dir.join(DOCKER_RENDERED_AGENT_CONFIG),
+                SIDECAR_CONTAINER_MOUNT,
+            )?;
+            let ca_tpl_dest = to_container_path(
+                sd,
+                &svc_cred_dir.join(DOCKER_RENDERED_CA_BUNDLE),
+                SIDECAR_CONTAINER_MOUNT,
+            )?;
+            (tpl_dest, ca_tpl_dest)
+        }
+        DeployType::Daemon => {
+            let cfg_name = inputs.host_agent_config_path.file_name().map_or_else(
+                || DOCKER_RENDERED_AGENT_CONFIG.to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let ca_name = inputs.host_ca_bundle_path.file_name().map_or_else(
+                || DOCKER_RENDERED_CA_BUNDLE.to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            (
+                format!("{SIDECAR_DAEMON_CONFIG_MOUNT}/{cfg_name}"),
+                format!("{SIDECAR_DAEMON_CERTS_MOUNT}/{ca_name}"),
+            )
+        }
+    };
 
     // Point ca_cert at the same path the CA bundle template renders
     // to.  The caller pre-seeds this file during `service add`, so
@@ -717,6 +765,9 @@ mod tests {
             token_path: &svc_dir.join("token"),
             agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
             ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+            deploy_type: DeployType::Docker,
+            host_agent_config_path: Path::new("agent.toml"),
+            host_ca_bundle_path: Path::new("ca-bundle.pem"),
         })
         .unwrap();
 
@@ -771,6 +822,9 @@ mod tests {
             token_path: &svc_dir.join("token"),
             agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
             ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+            deploy_type: DeployType::Docker,
+            host_agent_config_path: Path::new("agent.toml"),
+            host_ca_bundle_path: Path::new("ca-bundle.pem"),
         })
         .unwrap();
 
@@ -797,6 +851,9 @@ mod tests {
             token_path: &svc_dir.join("token"),
             agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
             ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+            deploy_type: DeployType::Docker,
+            host_agent_config_path: Path::new("agent.toml"),
+            host_ca_bundle_path: Path::new("ca-bundle.pem"),
         })
         .unwrap();
 
@@ -820,6 +877,9 @@ mod tests {
             token_path: &svc_dir.join("token"),
             agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
             ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+            deploy_type: DeployType::Docker,
+            host_agent_config_path: Path::new("agent.toml"),
+            host_ca_bundle_path: Path::new("ca-bundle.pem"),
         })
         .unwrap();
 
@@ -830,6 +890,70 @@ mod tests {
         assert!(
             hcl.contains(r#"ca_cert = "/openbao/secrets/services/edge/ca-bundle.pem""#),
             "https with specific IP must use template-rendered ca_cert"
+        );
+    }
+
+    #[test]
+    fn docker_config_daemon_targets_host_paths_via_sidecar_mounts() {
+        let secrets_dir = Path::new("/project/secrets");
+        let svc_dir = secrets_dir.join("openbao/services/review");
+        let cred_dir = secrets_dir.join("services/review");
+        let hcl = render_docker_agent_config(&DockerAgentConfigInputs {
+            secrets_dir,
+            openbao_url: "http://localhost:8200",
+            role_id_path: &cred_dir.join("role_id"),
+            secret_id_path: &cred_dir.join("secret_id"),
+            token_path: &svc_dir.join("token"),
+            agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
+            ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+            deploy_type: DeployType::Daemon,
+            host_agent_config_path: Path::new("/abs/config/review-agent.toml"),
+            host_ca_bundle_path: Path::new("/abs/certs/ca-bundle.pem"),
+        })
+        .unwrap();
+
+        assert!(
+            hcl.contains(&format!(
+                "destination = \"{SIDECAR_DAEMON_CONFIG_MOUNT}/review-agent.toml\""
+            )),
+            "daemon agent.toml must render through {SIDECAR_DAEMON_CONFIG_MOUNT}"
+        );
+        assert!(
+            hcl.contains(&format!(
+                "destination = \"{SIDECAR_DAEMON_CERTS_MOUNT}/ca-bundle.pem\""
+            )),
+            "daemon ca-bundle.pem must render through {SIDECAR_DAEMON_CERTS_MOUNT}"
+        );
+        assert!(
+            !hcl.contains("/openbao/secrets/services/review/agent.toml"),
+            "daemon deploy must not reuse the docker credential-dir destination"
+        );
+    }
+
+    #[test]
+    fn docker_config_daemon_ca_cert_points_at_sidecar_mount_when_https() {
+        let secrets_dir = Path::new("/project/secrets");
+        let svc_dir = secrets_dir.join("openbao/services/review");
+        let cred_dir = secrets_dir.join("services/review");
+        let hcl = render_docker_agent_config(&DockerAgentConfigInputs {
+            secrets_dir,
+            openbao_url: "https://localhost:8200",
+            role_id_path: &cred_dir.join("role_id"),
+            secret_id_path: &cred_dir.join("secret_id"),
+            token_path: &svc_dir.join("token"),
+            agent_template_path: &svc_dir.join("agent.toml.ctmpl"),
+            ca_bundle_template_path: &svc_dir.join("ca-bundle.pem.ctmpl"),
+            deploy_type: DeployType::Daemon,
+            host_agent_config_path: Path::new("/abs/config/review-agent.toml"),
+            host_ca_bundle_path: Path::new("/abs/certs/ca-bundle.pem"),
+        })
+        .unwrap();
+
+        assert!(
+            hcl.contains(&format!(
+                "ca_cert = \"{SIDECAR_DAEMON_CERTS_MOUNT}/ca-bundle.pem\""
+            )),
+            "daemon https must point ca_cert at the bind-mounted bundle"
         );
     }
 
