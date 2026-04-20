@@ -277,7 +277,6 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--responder-url`: HTTP-01 responder admin URL (optional, environment
   variable: `HTTP01_RESPONDER_URL`)
 - `--responder-timeout-secs`: responder timeout (seconds, default `5`)
-- `--stepca-url`: step-ca URL (default `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
 - `--cert-duration`: `defaultTLSCertDuration` embedded in the ACME
   provisioner named by `--stepca-provisioner` in `ca.json` /

@@ -268,7 +268,6 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--http-hmac`: HTTP-01 responder HMAC (환경 변수: `HTTP01_HMAC`)
 - `--responder-url`: HTTP-01 responder 관리자 URL (선택, 환경 변수: `HTTP01_RESPONDER_URL`)
 - `--responder-timeout-secs`: responder 요청 타임아웃(초, 기본값 `5`)
-- `--stepca-url`: step-ca URL (기본값 `https://localhost:9000`)
 - `--stepca-provisioner`: step-ca ACME provisioner 이름 (기본값 `acme`)
 - `--cert-duration`: `ca.json` / `ca.json.ctmpl`에서
   `--stepca-provisioner`가 가리키는 ACME provisioner에 삽입되는

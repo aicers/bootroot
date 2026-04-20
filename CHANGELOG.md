@@ -36,7 +36,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   entry is absent, `bootroot-remote bootstrap` also removes any
   stale `eab.json` left on the target host, preventing
   `bootroot-agent --eab-file` from forwarding credentials the
-  operator has since cleared. (Closes #550)
+  operator has since cleared. The `--stepca-url` flag on `bootroot
+  init` is also gone: it only fed the deleted auto-issuance code
+  path and had no other consumer. (Closes #550)
 - Removed `--secret-id-num-uses` from `bootroot service add` and from
   `rotate approle-secret-id` policy state. Service SecretIDs are now
   always issued with unlimited uses (`num_uses = 0`). The lower-level

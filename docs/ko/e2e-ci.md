@@ -134,7 +134,6 @@ BOOTROOT_LANG=en printf "y\n" | bootroot init \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets,db-provision \
-  --stepca-url "$STEPCA_EAB_URL" \
   --db-user "step" \
   --db-name "stepca" \
   --responder-url "$RESPONDER_URL"

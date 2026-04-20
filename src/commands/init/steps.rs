@@ -453,9 +453,7 @@ pub(super) mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use super::super::constants::openbao_constants::SECRET_ID_TTL;
-    use super::super::constants::{
-        DEFAULT_CERT_DURATION, DEFAULT_STEPCA_PROVISIONER, DEFAULT_STEPCA_URL,
-    };
+    use super::super::constants::{DEFAULT_CERT_DURATION, DEFAULT_STEPCA_PROVISIONER};
     use crate::cli::args::InitArgs;
     pub(in crate::commands::init::steps) use crate::i18n::test_messages;
 
@@ -497,7 +495,6 @@ pub(super) mod test_support {
             http_hmac: None,
             responder_url: None,
             responder_timeout_secs: 5,
-            stepca_url: DEFAULT_STEPCA_URL.to_string(),
             stepca_provisioner: DEFAULT_STEPCA_PROVISIONER.to_string(),
             cert_duration: DEFAULT_CERT_DURATION.to_string(),
             eab_kid: None,

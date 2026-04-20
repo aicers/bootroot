@@ -2,7 +2,6 @@ pub(crate) const DEFAULT_OPENBAO_URL: &str = "http://localhost:8200";
 pub(crate) const DEFAULT_KV_MOUNT: &str = "secret";
 pub(crate) const DEFAULT_SECRETS_DIR: &str = "secrets";
 pub(crate) const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
-pub(crate) const DEFAULT_STEPCA_URL: &str = "https://localhost:9000";
 pub(crate) const DEFAULT_STEPCA_PROVISIONER: &str = "acme";
 
 /// Default `defaultTLSCertDuration` embedded in the ACME provisioner
