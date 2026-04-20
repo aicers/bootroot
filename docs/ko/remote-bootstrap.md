@@ -336,6 +336,105 @@ runcmd:
 4. 아티팩트를 전송하고 원격 호스트에서 `bootroot-remote bootstrap`을
    실행합니다.
 
+## 강제 재발급(제어 플레인 → 원격 agent)
+
+제어 플레인에는 원격 호스트로의 푸시 채널이 없으므로
+`bootroot rotate force-reissue`가 원격의 cert 파일을 직접 삭제할 수
+없습니다. 대신 `--delivery-mode remote-bootstrap` 서비스의 경우 명령은
+OpenBao KV `{kv_mount}/data/bootroot/services/<service>/reissue`
+경로에 버전 관리된 재발급 요청을 기록합니다:
+
+```json
+{
+  "requested_at": "2026-04-19T12:34:56Z",
+  "requester": "<운영자 라벨>"
+}
+```
+
+원격 `bootroot-agent`는 AppRole로 인증한 뒤 등록된 각 서비스의
+재발급 경로를 `fast_poll_interval`(기본 `30s`) 주기로 폴링하는
+fast-poll 루프로 요청을 소비합니다. agent가 마지막으로 적용한
+버전(`state_path`에 서비스별로 기록)보다 KV v2 버전이 새로워질
+때마다 즉시 ACME 갱신을 트리거하고, `completed_at` 및
+`completed_version`을 다시 기록해 제어 플레인이 종단 간 지연을
+관측할 수 있게 합니다.
+
+이 루프는 `agent.toml`의 `[openbao]` 섹션으로 구동됩니다. 해당
+섹션은 모든 remote-bootstrap 호스트에서 **필수**입니다 — 섹션이
+없으면 agent는 제어 플레인 KV 요청을 읽을 소비자가 존재하지 않아
+`force-reissue`는 인증서가 자연 만료에 가까워질 때까지 큐에
+남습니다. `bootroot-remote bootstrap`은 실행할 때마다 연결 필드
+(`url`, `kv_mount`, `role_id_path`, `secret_id_path`,
+`ca_bundle_path`)를 자동으로 기록하므로 운영자가 직접 편집할 필요는
+없습니다. 레거시 원격 호스트가 `bootroot-remote bootstrap`을 다시
+실행하지 않은 상태로 bootroot를 업그레이드한 경우 섹션이 비어 있을 수
+있으며, 다음 번 bootstrap이 섹션을 채울 때까지 `force-reissue` 요청은
+관측되지 않습니다.
+
+```toml
+# agent.toml — `bootroot-remote bootstrap`이 자동 반영
+[openbao]
+url = "https://openbao.internal:8200"
+kv_mount = "secret"
+role_id_path = "/etc/bootroot/role_id"
+secret_id_path = "/etc/bootroot/secret_id"
+ca_bundle_path = "/etc/bootroot/ca-bundle.pem"   # https://에는 필수
+fast_poll_interval = "30s"                        # 선택; 기본 30s
+state_path = "/etc/bootroot/bootroot-agent-state.json" # bootstrap이 기본 제공
+```
+
+`state_path`는 재시작 간에 에이전트의
+`last_reissue_seen_version`, `in_flight_renewals`,
+`pending_completion_writes` 맵을 보존합니다 — 중복 갱신을 피하고 완료
+확인을 재시도하기 위해 이 기능이 의존하는 상태입니다. 현재 값이
+없거나 *상대 경로*인 경우 bootstrap이 `agent.toml` 옆의 절대 경로로
+갱신하므로, systemd 스타일 supervisor(쓰기 가능/안정적인 cwd를
+보장하지 않는 환경)에서도 fast-poll 상태가 cwd 상대 경로에 저장되지
+않습니다. 따라서 내장 기본값(상대 경로)이 저장된 기존 구성은
+`bootroot-remote bootstrap`을 다시 실행하면 수리되며, 이는 구성 검증이
+실패 시 출력하는 권고 문구와 일치합니다. 운영자는 원하는 절대 경로로
+덮어쓸 수 있으며, 이후 bootstrap 재실행은 사용자가 지정한 절대 경로
+값을 보존합니다. 구성 검증은 상대 경로 `state_path`(값이 생략되어
+내장 기본값으로 채워지는 경우 포함)도 거부하므로, 설정 오류가 운영
+중에 조용히 취약한 상태 파일을 사용하는 대신 `bootroot-agent` 시작
+시점에 드러납니다.
+
+이 메커니즘은 원격 agent가 이미 보유한 동일 AppRole 자격증명을
+재사용하고, 서비스당 `fast_poll_interval`마다 KV 읽기 1회를 추가하며,
+remote-bootstrap 서비스의 최악의 force-reissue 지연을 1
+`check_interval`(기본 1시간)에서 약 1 fast-poll 주기로 단축합니다.
+
+운영자는 `bootroot rotate force-reissue`에 `--wait`(및 선택적으로
+`--wait-timeout`)을 지정해 원격 agent가 완료를 보고할 때까지 차단할 수
+있습니다. `--wait` 타임아웃은 오류가 아닙니다 — 요청은 큐에 남아 있으며
+다음 fast-poll 틱에서 적용됩니다.
+
+원격 호스트에 동일한 `service_name`을 가진 여러 `[[profiles]]`가 있을
+경우(같은 머신에서 한 서비스를 여러 인스턴스로 운영하는 경우 등),
+fast-poll 틱은 KV 버전을 소비된 것으로 표시하기 전에 일치하는 모든
+프로파일에 갱신 트리거를 펼쳐 보냅니다. 따라서 단일 force-reissue가
+모든 인스턴스를 회전합니다. 펼쳐 보낸 프로파일 중 하나라도 실패하면,
+같은 요청에 대해 이미 성공한 프로파일은 `state_path`의 서비스별
+`in_flight_renewals` 진행 상황으로 기록됩니다. 다음 틱은 동일한 KV
+버전에 대해 실패한 형제 프로파일*만* 재시도하며, 이미 갱신된 프로파일은
+건너뛰고 두 번째 강제 갱신을 받지 않습니다. 버전은 모든 프로파일이
+성공한 뒤에만 소비된 것으로 표시되고, 더 새로운 재발급 요청이
+덮어쓰거나 요청이 KV에서 사라지면 낡은 프로파일 진행 상태는 자동으로
+정리됩니다.
+
+`--wait`가 특정 KV 버전에 고정되길 원하는 운영자를 위해
+`rotate force-reissue`는 발행 POST의 응답에서 버전을 직접 캡처합니다.
+이후 GET에 의존하지 않기 때문에 원격 agent의 완료 기록이 그 사이에
+메타데이터 버전을 증가시켜도 `--wait`가 무한 대기하지 않습니다.
+
+원격 agent가 인증서를 갱신했지만 이어지는 `completed_at`의 OpenBao
+재기록이 실패한 경우(일시적인 KV 장애, 네트워크 끊김 등), agent는
+`state_path`에 `pending_completion_writes` 항목을 영속화하고 다음
+틱에서 완료 기록만 재시도합니다. 이로써 인증서가 실제로 회전된
+이후에도 `bootroot rotate force-reissue --wait`가 확인을 받지 못한
+채 멈추는 상황을 방지합니다. 더 새로운 재발급 요청이 덮어쓰거나 KV에서
+요청 자체가 제거되면 미해결 항목은 자동으로 정리됩니다.
+
 ## 멱등 service add 재실행
 
 기존 `remote-bootstrap` 서비스에 동일한 인자로 `bootroot service add`를

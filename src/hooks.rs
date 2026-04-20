@@ -342,6 +342,7 @@ mod tests {
                 max_concurrent_issuances: 1,
             },
             profiles: vec![profile.clone()],
+            openbao: None,
         };
 
         (settings, profile)

@@ -1668,7 +1668,7 @@ async fn test_rotate_force_reissue_deletes_cert_and_key() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_rotate_force_reissue_remote_prints_hint() {
+async fn test_rotate_force_reissue_remote_writes_reissue_kv() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
     let _secret_path = prepare_app_state(
@@ -1682,6 +1682,33 @@ async fn test_rotate_force_reissue_remote_prints_hint() {
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
         .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    // Remote-bootstrap force-reissue publishes the request to OpenBao KV.
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/reissue"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "version": 3 }
+        })))
+        .mount(&openbao)
+        .await;
+
+    // The CLI also reads back to obtain the version for --wait bookkeeping.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/reissue"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "data": { "requested_at": "2026-04-19T12:34:56Z", "requester": "ci" },
+                "metadata": { "version": 3 }
+            }
+        })))
         .mount(&openbao)
         .await;
 
@@ -1707,7 +1734,109 @@ async fn test_rotate_force_reissue_remote_prints_hint() {
         output.status.success(),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(stdout.contains("bootroot-remote bootstrap"));
+    assert!(
+        stdout.contains("reissue requested at"),
+        "expected reissue-requested summary line in stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("will apply"),
+        "expected will-apply hint in stdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_force_reissue_remote_wait_reports_completion() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let _secret_path = prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    // The POST that publishes the request gets version 3 assigned; the
+    // CLI must pin on that, NOT on a later GET. We then model the real
+    // sequence where the agent's completion write advances the secret
+    // metadata version to 4 while the payload carries
+    // `completed_version = 3` (the request it applied).
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/reissue"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "version": 3 }
+        })))
+        .mount(&openbao)
+        .await;
+
+    // Stub the GET so metadata.version has already advanced past the
+    // request version (agent wrote completion). The CLI must still
+    // resolve `--wait` because `completed_version (3) >= request (3)`.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/reissue"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "data": {
+                    "requested_at": "2026-04-19T12:34:56Z",
+                    "requester": "ci",
+                    "completed_at": "2026-04-19T12:35:10Z",
+                    "completed_version": 3
+                },
+                "metadata": { "version": 4 }
+            }
+        })))
+        .mount(&openbao)
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "force-reissue",
+            "--service-name",
+            SERVICE_NAME,
+            "--wait",
+            "--wait-timeout",
+            "10s",
+        ])
+        .output()
+        .expect("run rotate force-reissue --wait");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("reported completion at 2026-04-19T12:35:10Z"),
+        "expected completion line in stdout:\n{stdout}"
+    );
+    // 12:34:56 -> 12:35:10 = 14s; the end-to-end latency must surface
+    // on the same line so the operator does not have to subtract
+    // timestamps manually (issue #548).
+    assert!(
+        stdout.contains("end-to-end latency: 14s"),
+        "expected end-to-end latency in stdout:\n{stdout}"
+    );
 }
 
 #[cfg(unix)]

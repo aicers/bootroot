@@ -202,7 +202,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
             ca::rotate_trust_sync(&mut ctx, &client, args.yes, messages).await?;
         }
         RotateCommand::ForceReissue(step_args) => {
-            ca::rotate_force_reissue(&mut ctx, step_args, args.yes, messages)?;
+            ca::rotate_force_reissue(&mut ctx, &client, step_args, args.yes, messages).await?;
         }
         RotateCommand::CaKey(step_args) => {
             ca::rotate_ca_key(&mut ctx, &client, step_args, args.yes, messages).await?;

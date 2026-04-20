@@ -48,6 +48,42 @@ pub struct Settings {
     pub scheduler: SchedulerSettings,
     #[serde(default)]
     pub profiles: Vec<DaemonProfileSettings>,
+    /// Optional `OpenBao` client configuration. When present, the daemon
+    /// spawns a fast-poll task that watches for `rotate force-reissue`
+    /// requests on the KV v2 `reissue` path for each registered service.
+    #[serde(default)]
+    pub openbao: Option<OpenBaoSettings>,
+}
+
+/// `OpenBao` connection settings for the remote-agent fast-poll loop.
+///
+/// The remote `bootroot-agent` authenticates directly via `AppRole` and
+/// polls `{kv_mount}/data/bootroot/services/<service>/reissue` on the
+/// configured `fast_poll_interval` to pick up force-reissue requests
+/// issued by the control plane.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OpenBaoSettings {
+    pub url: String,
+    #[serde(default = "defaults::default_kv_mount")]
+    pub kv_mount: String,
+    pub role_id_path: PathBuf,
+    pub secret_id_path: PathBuf,
+    #[serde(default)]
+    pub ca_bundle_path: Option<PathBuf>,
+    #[serde(
+        default = "defaults::default_fast_poll_interval",
+        with = "duration_serde"
+    )]
+    pub fast_poll_interval: Duration,
+    /// On-disk path where the agent persists its `last_reissue_seen_version`,
+    /// `in_flight_renewals`, and `pending_completion_writes` maps across
+    /// restarts. Must be absolute — a cwd-relative path is rejected by
+    /// validation because the agent process cwd is not contracted to be
+    /// stable or writable under systemd-style supervisors.
+    /// `bootroot-remote bootstrap` auto-provisions an absolute path
+    /// adjacent to `agent.toml`.
+    #[serde(default = "defaults::default_fast_poll_state_path")]
+    pub state_path: PathBuf,
 }
 
 #[must_use]
@@ -684,5 +720,125 @@ mod tests {
 
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("profiles.retry.backoff_secs"));
+    }
+
+    /// Regression test: an `[openbao]` section whose `state_path` is
+    /// relative (including the in-tree default `bootroot-agent-state.json`)
+    /// must fail validation. This is the same restart-persistence hazard
+    /// called out in Round 5 — under a systemd-style supervisor the
+    /// agent process cwd is not contracted to be stable or writable, so
+    /// a cwd-relative state file can be silently lost across restarts.
+    #[test]
+    fn validate_rejects_relative_openbao_state_path() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+            domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
+
+            [[profiles]]
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+
+            [profiles.paths]
+            cert = "certs/edge-proxy-a.pem"
+            key = "certs/edge-proxy-a.key"
+
+            [openbao]
+            url = "http://openbao:8200"
+            role_id_path = "/etc/bootroot/role_id"
+            secret_id_path = "/etc/bootroot/secret_id"
+            state_path = "bootroot-agent-state.json"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        let err = settings.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("openbao.state_path"), "{msg}");
+        assert!(msg.contains("absolute"), "{msg}");
+    }
+
+    /// When `[openbao]` is present but `state_path` is omitted entirely,
+    /// the parser fills in the in-tree default (a bare relative
+    /// filename). Validation must still reject it — i.e. an omitted
+    /// `state_path` surfaces the same error rather than silently
+    /// entrenching a cwd-relative path. This mirrors the scenario where
+    /// `bootroot-remote bootstrap` ran with a relative `agent_config_path`
+    /// and therefore skipped provisioning `state_path`.
+    #[test]
+    fn validate_rejects_omitted_openbao_state_path_via_default() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+            domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
+
+            [[profiles]]
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+
+            [profiles.paths]
+            cert = "certs/edge-proxy-a.pem"
+            key = "certs/edge-proxy-a.key"
+
+            [openbao]
+            url = "http://openbao:8200"
+            role_id_path = "/etc/bootroot/role_id"
+            secret_id_path = "/etc/bootroot/secret_id"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("openbao.state_path"));
+    }
+
+    /// Accepts the common case where `[openbao]` carries an absolute
+    /// `state_path` — this is what `bootroot-remote bootstrap`
+    /// auto-provisions when `agent_config_path` is absolute.
+    #[test]
+    fn validate_accepts_absolute_openbao_state_path() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+            domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
+
+            [[profiles]]
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+
+            [profiles.paths]
+            cert = "certs/edge-proxy-a.pem"
+            key = "certs/edge-proxy-a.key"
+
+            [openbao]
+            url = "http://openbao:8200"
+            role_id_path = "/etc/bootroot/role_id"
+            secret_id_path = "/etc/bootroot/secret_id"
+            state_path = "/var/lib/bootroot/bootroot-agent-state.json"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings
+            .validate()
+            .expect("absolute state_path must validate");
     }
 }

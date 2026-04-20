@@ -502,6 +502,11 @@ bootroot rotate trust-sync
 
 # Force certificate reissue for a specific service
 bootroot rotate force-reissue --service-name edge-proxy
+
+# Force reissue for a remote-bootstrap service and wait for the remote
+# agent to apply it (polls completed_at on the OpenBao reissue KV path).
+bootroot rotate force-reissue \
+  --service-name edge-remote --wait --wait-timeout 90s
 ```
 
 Rotate OpenBao recovery credentials manually (unseal keys + root token):

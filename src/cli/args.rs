@@ -395,6 +395,26 @@ pub(crate) struct RotateForceReissueArgs {
     /// Service name to force-reissue certificates for
     #[arg(long)]
     pub(crate) service_name: String,
+
+    /// Optional label describing the operator that requested the reissue.
+    ///
+    /// Written to the remote-bootstrap KV payload under `requester` for
+    /// observability. When omitted, the control-plane user name (or a
+    /// conservative fallback) is used.
+    #[arg(long)]
+    pub(crate) requester: Option<String>,
+
+    /// Wait for the remote agent to apply the reissue before returning.
+    ///
+    /// Only meaningful for `--delivery-mode remote-bootstrap` services:
+    /// polls the `completed_at` field on the same KV path until the
+    /// remote bootroot-agent picks up the request and reports completion.
+    #[arg(long)]
+    pub(crate) wait: bool,
+
+    /// Maximum time to wait when `--wait` is set (e.g. "2m", "90s").
+    #[arg(long, default_value = "2m")]
+    pub(crate) wait_timeout: String,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

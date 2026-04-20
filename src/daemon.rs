@@ -1,12 +1,13 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Mutex as TokioMutex, Semaphore, watch};
 use tracing::{error, info};
 
-use crate::{acme, config, eab, hooks, profile, utils};
+use crate::{acme, config, eab, fast_poll, hooks, profile, utils};
 
 const DEFAULT_AGENT_CONFIG_PATH: &str = "agent.toml";
 
@@ -15,6 +16,49 @@ struct IssuanceRuntime {
     config_path: PathBuf,
     insecure_mode: bool,
     cli_overrides: config::CliOverrides,
+}
+
+/// Per-profile single-flight registry.
+///
+/// Serialises issuance for a given profile across the periodic check loop
+/// and the fast-poll force-reissue path. Without this the two triggers
+/// could both observe an old certificate on disk and race to the ACME
+/// server: the fast-poll path acquires the shared concurrency semaphore
+/// and starts issuing, while a periodic tick that lands around the same
+/// moment sees the pre-rotation cert via `should_renew()`, concludes
+/// "needs renewal", and queues a second issuance once a semaphore permit
+/// frees up. The lock is held across the whole decision-and-issue span
+/// so the periodic path re-reads the cert *after* acquisition and sees
+/// the freshly-rotated copy a force-reissue has already written.
+pub(crate) struct ProfileLocks {
+    map: StdMutex<BTreeMap<String, Arc<TokioMutex<()>>>>,
+}
+
+impl ProfileLocks {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: StdMutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Returns the per-profile mutex, creating it on first access.
+    pub(crate) fn for_profile(&self, profile_label: &str) -> Arc<TokioMutex<()>> {
+        let mut guard = self
+            .map
+            .lock()
+            .expect("ProfileLocks registry mutex poisoned");
+        Arc::clone(
+            guard
+                .entry(profile_label.to_string())
+                .or_insert_with(|| Arc::new(TokioMutex::new(()))),
+        )
+    }
+}
+
+impl Default for ProfileLocks {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Runs the agent daemon loop for all profiles.
@@ -30,6 +74,7 @@ pub(crate) async fn run_daemon(
 ) -> anyhow::Result<()> {
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let profile_locks = Arc::new(ProfileLocks::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let runtime = IssuanceRuntime {
         config_path: resolve_config_path(config_path.as_deref()),
@@ -48,6 +93,7 @@ pub(crate) async fn run_daemon(
     for profile in settings.profiles.clone() {
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
+        let profile_locks = Arc::clone(&profile_locks);
         let shutdown_rx = shutdown_rx.clone();
         let default_eab = default_eab.clone();
         let runtime = runtime.clone();
@@ -58,8 +104,48 @@ pub(crate) async fn run_daemon(
                 profile,
                 default_eab,
                 semaphore,
+                profile_locks,
                 shutdown_rx,
                 runtime,
+            )
+            .await
+        }));
+    }
+
+    if settings.openbao.is_some() {
+        let settings_for_loop = Arc::clone(&settings);
+        let settings_for_renew = Arc::clone(&settings);
+        let default_eab_for_fast = default_eab.clone();
+        let semaphore_for_fast = Arc::clone(&semaphore);
+        let profile_locks_for_fast = Arc::clone(&profile_locks);
+        let shutdown_rx_fast = shutdown_rx.clone();
+        let runtime_for_renew = runtime.clone();
+        handles.push(tokio::spawn(async move {
+            let renew = move |profile: config::DaemonProfileSettings,
+                              default_eab: Option<eab::EabCredentials>,
+                              semaphore: Arc<Semaphore>|
+                  -> fast_poll::BoxRenew {
+                let settings = Arc::clone(&settings_for_renew);
+                let profile_locks = Arc::clone(&profile_locks_for_fast);
+                let runtime = runtime_for_renew.clone();
+                Box::pin(async move {
+                    force_renew_profile(
+                        &settings,
+                        &profile,
+                        default_eab,
+                        semaphore,
+                        &profile_locks,
+                        &runtime,
+                    )
+                    .await
+                })
+            };
+            fast_poll::run_fast_poll_loop(
+                settings_for_loop,
+                default_eab_for_fast,
+                semaphore_for_fast,
+                shutdown_rx_fast,
+                renew,
             )
             .await
         }));
@@ -74,6 +160,7 @@ async fn run_profile_daemon(
     profile: config::DaemonProfileSettings,
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
+    profile_locks: Arc<ProfileLocks>,
     mut shutdown: watch::Receiver<bool>,
     runtime: IssuanceRuntime,
 ) -> anyhow::Result<()> {
@@ -115,8 +202,8 @@ async fn run_profile_daemon(
                     &profile,
                     default_eab.clone(),
                     Arc::clone(&semaphore),
+                    &profile_locks,
                     renew_before,
-                    &profile_label,
                     &runtime,
                 )
                 .await?;
@@ -367,16 +454,62 @@ pub(crate) fn parse_cert_not_after(cert_bytes: &[u8]) -> anyhow::Result<time::Of
     Ok(cert.validity().not_after.to_datetime())
 }
 
+/// Renews a profile unconditionally, bypassing the `should_renew` expiry
+/// check used by the periodic loop. Used by the fast-poll force-reissue
+/// path: an operator-initiated reissue must actually rotate the cert
+/// even when it is nowhere near expiry.
+///
+/// Acquires the per-profile lock *before* the shared concurrency
+/// semaphore so a concurrent periodic tick on the same profile cannot
+/// sneak a second issuance in once this function releases its permit
+/// but before the rotated cert lands on disk.
+async fn force_renew_profile(
+    settings: &config::Settings,
+    profile: &config::DaemonProfileSettings,
+    default_eab: Option<eab::EabCredentials>,
+    semaphore: Arc<Semaphore>,
+    profile_locks: &ProfileLocks,
+    runtime: &IssuanceRuntime,
+) -> anyhow::Result<()> {
+    let profile_label = config::profile_domain(settings, profile);
+    let lock = profile_locks.for_profile(&profile_label);
+    let _profile_guard = lock.lock().await;
+    info!(
+        "Profile '{}' force-reissue requested. Starting ACME issuance...",
+        profile_label
+    );
+    let _permit = semaphore.acquire().await?;
+    let profile_eab = profile::resolve_profile_eab(profile, default_eab);
+    let result = issue_with_retry(settings, profile, profile_eab, runtime).await;
+    if let Err(err) = &result {
+        error!(
+            "Profile '{}' force-reissue failed after retries: {err}",
+            profile_label
+        );
+    }
+    handle_issuance_result(&result, settings, profile, &profile_label).await?;
+    result
+}
+
 async fn check_and_renew_profile(
     settings: &config::Settings,
     profile: &config::DaemonProfileSettings,
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
+    profile_locks: &ProfileLocks,
     renew_before: Duration,
-    profile_label: &str,
     runtime: &IssuanceRuntime,
 ) -> anyhow::Result<()> {
+    let profile_label = config::profile_domain(settings, profile);
     tracing::debug!("Profile '{}' checking renewal status...", profile_label);
+
+    // Hold the per-profile lock across the decision *and* issuance so a
+    // fast-poll force-reissue that is already in flight serialises with
+    // this tick. When that force-reissue is the one that landed first,
+    // `should_renew` re-reads the rotated cert once we acquire the lock
+    // and returns false, skipping a redundant second issuance.
+    let lock = profile_locks.for_profile(&profile_label);
+    let _profile_guard = lock.lock().await;
 
     let needs_renewal = match should_renew(profile, renew_before).await {
         Ok(val) => val,
@@ -404,7 +537,7 @@ async fn check_and_renew_profile(
             profile_label
         );
     }
-    handle_issuance_result(&result, settings, profile, profile_label).await?;
+    handle_issuance_result(&result, settings, profile, &profile_label).await?;
     Ok(())
 }
 
@@ -504,6 +637,7 @@ mod tests {
                 max_concurrent_issuances: 1,
             },
             profiles: Vec::new(),
+            openbao: None,
         }
     }
 
@@ -771,5 +905,143 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("first failure"));
+    }
+
+    #[tokio::test]
+    async fn profile_locks_serialise_same_profile() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let locks = Arc::new(ProfileLocks::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let profile = "edge-proxy";
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let locks = Arc::clone(&locks);
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            handles.push(tokio::spawn(async move {
+                let lock = locks.for_profile(profile);
+                let _guard = lock.lock().await;
+                let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn profile_locks_allow_different_profiles_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let locks = Arc::new(ProfileLocks::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let locks = Arc::clone(&locks);
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            let label = format!("profile-{i}");
+            handles.push(tokio::spawn(async move {
+                let lock = locks.for_profile(&label);
+                let _guard = lock.lock().await;
+                let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert!(max_in_flight.load(Ordering::SeqCst) >= 2);
+    }
+
+    // Reviewer round 10: when the fast-poll force-reissue path is renewing
+    // a profile at the same moment a periodic `check_interval` tick fires,
+    // the old code let both paths issue — the periodic path decided
+    // "needs renewal" from the pre-rotation cert on disk before acquiring
+    // the shared semaphore. The per-profile lock now forces the periodic
+    // tick to wait for the in-flight force-reissue, re-read the rotated
+    // cert, and skip the redundant issuance.
+    #[tokio::test]
+    async fn profile_lock_blocks_double_issuance_when_force_and_periodic_race() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        // Initial cert is close enough to expiry that `should_renew`
+        // would fire if called right now.
+        write_cert(
+            &cert_path,
+            time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        );
+        let profile = build_profile(cert_path.clone());
+        let profile_label = config::profile_domain(&build_settings(vec![]), &profile);
+        let renew_before = Duration::from_secs(THIRTY_DAYS_SECS);
+
+        let locks = Arc::new(ProfileLocks::new());
+        let issue_count = Arc::new(AtomicUsize::new(0));
+
+        // Force path: grab the lock first, pretend to issue (we rotate
+        // the cert on disk by writing a fresh one), then release.
+        let force = {
+            let locks = Arc::clone(&locks);
+            let issue_count = Arc::clone(&issue_count);
+            let profile_label = profile_label.clone();
+            let cert_path = cert_path.clone();
+            tokio::spawn(async move {
+                let lock = locks.for_profile(&profile_label);
+                let _guard = lock.lock().await;
+                // Ensure the periodic task has time to queue behind us.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                write_cert(
+                    &cert_path,
+                    time::OffsetDateTime::now_utc() + time::Duration::days(90),
+                );
+                issue_count.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+
+        // Periodic path: runs the same lock-then-check-then-issue flow
+        // used by `check_and_renew_profile`. It must observe the rotated
+        // cert once the force path releases and skip issuance.
+        let periodic = {
+            let locks = Arc::clone(&locks);
+            let issue_count = Arc::clone(&issue_count);
+            let profile_label = profile_label.clone();
+            let profile = profile.clone();
+            tokio::spawn(async move {
+                // Give the force task a head start on grabbing the lock.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let lock = locks.for_profile(&profile_label);
+                let _guard = lock.lock().await;
+                let needs = should_renew(&profile, renew_before)
+                    .await
+                    .expect("should_renew reads the cert");
+                if needs {
+                    issue_count.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        force.await.unwrap();
+        periodic.await.unwrap();
+
+        assert_eq!(
+            issue_count.load(Ordering::SeqCst),
+            1,
+            "only the force path should have issued; periodic must observe the rotated cert under the lock and skip",
+        );
     }
 }

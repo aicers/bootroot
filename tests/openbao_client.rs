@@ -107,6 +107,122 @@ async fn read_kv_returns_data() {
 }
 
 #[tokio::test]
+async fn read_kv_with_version_returns_data_and_version() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/reissue"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "data": {
+                    "requested_at": "2026-04-19T12:34:56Z",
+                    "requester": "alice",
+                },
+                "metadata": { "version": 7 }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+
+    let result = client
+        .read_kv_with_version("secret", "bootroot/services/edge-proxy/reissue")
+        .await
+        .expect("read_kv_with_version should succeed");
+    assert_eq!(result.version, 7);
+    assert_eq!(
+        result.data,
+        json!({
+            "requested_at": "2026-04-19T12:34:56Z",
+            "requester": "alice",
+        })
+    );
+}
+
+#[tokio::test]
+async fn write_kv_with_version_returns_assigned_version() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/reissue"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "created_time": "2026-04-19T12:34:56Z",
+                "custom_metadata": null,
+                "deletion_time": "",
+                "destroyed": false,
+                "version": 9
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+
+    let version = client
+        .write_kv_with_version(
+            "secret",
+            "bootroot/services/edge-proxy/reissue",
+            json!({
+                "requested_at": "2026-04-19T12:34:56Z",
+                "requester": "alice",
+            }),
+        )
+        .await
+        .expect("write_kv_with_version should succeed");
+    assert_eq!(version, Some(9));
+}
+
+#[tokio::test]
+async fn write_kv_with_version_handles_missing_version_field() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/reissue"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {}
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+
+    let version = client
+        .write_kv_with_version(
+            "secret",
+            "bootroot/services/edge-proxy/reissue",
+            json!({ "requested_at": "2026-04-19T12:34:56Z" }),
+        )
+        .await
+        .expect("write_kv_with_version should succeed");
+    assert!(version.is_none());
+}
+
+#[tokio::test]
+async fn try_read_kv_with_version_treats_404_as_none() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/reissue"))
+        .and(header("X-Vault-Token", "root-token"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let client = client_with_token(&server);
+
+    let result = client
+        .try_read_kv_with_version("secret", "bootroot/services/edge-proxy/reissue")
+        .await
+        .expect("try_read_kv_with_version should treat 404 as None");
+    assert!(result.is_none());
+}
+
+#[tokio::test]
 async fn policy_exists_returns_false_on_404() {
     let server = MockServer::start().await;
 

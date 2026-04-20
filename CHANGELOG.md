@@ -122,6 +122,87 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot rotate force-reissue` for `--delivery-mode remote-bootstrap`
+  services now publishes a versioned reissue request to OpenBao KV at
+  `{kv_mount}/data/bootroot/services/<service>/reissue` with
+  `requested_at` and `requester` fields, instead of just printing a hint
+  to run `bootroot-remote bootstrap` on the service host. The new
+  `--wait` / `--wait-timeout` flags poll `completed_at` on the same KV
+  path so the operator can observe end-to-end latency, and `--requester`
+  overrides the operator label written into the payload. The `--wait`
+  success line also reports the computed end-to-end latency
+  (`completed_at - requested_at`, pulled from the KV payload so it
+  reflects what was actually committed) in a human-readable form so
+  the operator does not have to subtract timestamps manually. Closes
+  #548.
+- `bootroot-agent` learns a required `[openbao]` section in
+  `agent.toml` that drives the fast-poll loop. `bootroot-remote
+  bootstrap` now auto-populates the connection fields (`url`,
+  `kv_mount`, `role_id_path`, `secret_id_path`, `ca_bundle_path`) on
+  every run so the control-plane KV request has a guaranteed consumer
+  on every remote-bootstrap host; operator-tuned `fast_poll_interval`
+  or `state_path` keys in an existing section are preserved.
+  `state_path` is additionally provisioned as an absolute path
+  adjacent to `agent.toml` whenever the current value is missing or
+  relative, so the fast-poll restart-persistence state does not end up
+  at a cwd-relative location under systemd-style supervisors where
+  the working directory may change between runs or be unwritable.
+  Rerunning `bootroot-remote bootstrap` therefore repairs a legacy
+  config whose `state_path` was the in-tree relative default, matching
+  the remediation hint that config validation prints. Config validation
+  also rejects a cwd-relative `openbao.state_path` (and the now-
+  cosmetic in-tree default when no value is set), so the hazard is
+  caught whether `state_path` came from an operator-written config or
+  from a bootstrap run where `--agent-config-path` was itself relative
+  and bootstrap therefore declined to provision a same-cwd state path.
+  When
+  configured, the agent
+  authenticates via AppRole and polls each registered service's reissue
+  KV path on `fast_poll_interval` (default `30s`), triggering an
+  immediate ACME renewal whenever it observes a KV v2 version newer than
+  the one it last applied. After a successful renewal the agent writes
+  back `completed_at` / `completed_version` and persists
+  `last_reissue_seen_version` per service in `state_path` so requests
+  are not re-fired across restarts. When a single host runs multiple
+  `[[profiles]]` for the same `service_name`, the fast-poll tick now
+  fans the renewal trigger out to every matching profile before
+  marking the version consumed, so a service-scoped force-reissue
+  rotates every instance instead of only the first profile observed.
+  When the fan-out does not finish in one tick (a sibling profile's
+  renewal fails), the profiles that already succeeded are recorded as
+  per-service `in_flight_renewals` progress in `state_path`; the next
+  tick retries only the failed sibling(s) against the same KV version
+  and does not force a second renewal on the profiles that already
+  ran. When a renewal succeeds but the completion write back to KV
+  fails, the agent persists a `pending_completion_writes` entry in
+  `state_path` and retries just the write on the next tick — so a
+  transient OpenBao outage will not leave `bootroot rotate
+  force-reissue --wait` stuck without an acknowledgement after the
+  certificate has actually been rotated. `rotate force-reissue` now
+  pins its `--wait` comparison on the version returned by the publish
+  POST (via the new `OpenBaoClient::write_kv_with_version` helper)
+  instead of a follow-up GET, so the agent's own completion write
+  cannot advance the metadata version between the two reads and
+  strand the waiter. On the agent side, `evaluate_observation` now
+  treats any payload carrying `completed_version` as an already-
+  serviced request rather than a new one, so the agent's own
+  completion ack (which bumps KV metadata from `N` to `N+1` but
+  carries `completed_version = N`) cannot be mistaken for an
+  operator request and re-trigger a forced renewal on every
+  subsequent fast-poll tick. The relogin heuristic that rearms
+  `AppRole` login after an auth-related `ReadError` also matches the
+  "`OpenBao token is not set`" error the client emits when no login has
+  succeeded yet, so a transient startup login failure is retried on the
+  next tick instead of leaving fast-poll permanently dead until the
+  process restarts. The fast-poll force-reissue and the ordinary
+  `check_interval` renewal paths now serialise per profile behind a
+  single-flight lock held across both the `should_renew` decision and
+  the ACME issuance, so a periodic tick that lands while a forced
+  reissue is already in flight re-reads the rotated cert once the lock
+  releases and skips the redundant second issuance instead of driving a
+  parallel ACME handshake through a spare semaphore permit. Shrinks the
+  worst-case force-reissue latency for remote-bootstrap services from
+  one `check_interval` (default 1h) to roughly one fast-poll interval.
 - Added `--cert-duration` to `bootroot init` (default `24h`) and a new
   `bootroot ca` subcommand group (`ca update`, `ca restart`) for
   configuring step-ca's `defaultTLSCertDuration`. `init` embeds the

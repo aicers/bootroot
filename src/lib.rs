@@ -18,6 +18,7 @@ pub mod trust_bootstrap;
 pub mod utils;
 
 mod daemon;
+mod fast_poll;
 
 pub use agent_args::Args;
 

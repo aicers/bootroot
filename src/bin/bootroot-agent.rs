@@ -175,6 +175,7 @@ mod tests {
                 max_concurrent_issuances: 3,
             },
             profiles,
+            openbao: None,
         }
     }
 
