@@ -718,11 +718,7 @@ impl OpenBaoClient {
     ///
     /// # Errors
     /// Returns an error for anything other than a clean not-found.
-    pub async fn try_read_kv(
-        &self,
-        mount: &str,
-        path: &str,
-    ) -> Result<Option<serde_json::Value>> {
+    pub async fn try_read_kv(&self, mount: &str, path: &str) -> Result<Option<serde_json::Value>> {
         #[derive(Deserialize)]
         struct KvResponse {
             data: KvResponseData,
