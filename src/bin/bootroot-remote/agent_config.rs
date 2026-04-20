@@ -5,8 +5,8 @@ use anyhow::Result;
 use bootroot::fs_util;
 use bootroot::openbao::{AgentConfigParams, STATIC_SECRET_RENDER_INTERVAL, build_agent_config};
 use bootroot::trust_bootstrap::{
-    build_ca_bundle_ctmpl, build_managed_agent_ctmpl,
-    build_trust_updates as build_shared_trust_updates,
+    AgentConfigBaselineParams, apply_agent_config_baseline_defaults, build_ca_bundle_ctmpl,
+    build_managed_agent_ctmpl, build_trust_updates as build_shared_trust_updates,
     render_managed_profile_block as render_profile,
     upsert_managed_profile_block as upsert_shared_managed_profile_block,
 };
@@ -35,9 +35,7 @@ pub(super) async fn apply_agent_config_updates(
     let profile_paths = resolve_profile_paths(args);
     let agent_config = match fs::read_to_string(&args.agent_config_path).await {
         Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            render_agent_config_baseline(args)
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => {
             let message = localized(
                 lang,
@@ -56,9 +54,55 @@ pub(super) async fn apply_agent_config_updates(
             );
         }
     };
+    // Backfill any baseline fields missing from a pre-existing agent.toml
+    // (and seed a fresh file from the same baseline).  Without this step,
+    // an operator who passed `--agent-server` / `--agent-responder-url`
+    // at service-add time would see those artifact values silently
+    // dropped whenever the remote target already had an agent.toml that
+    // lacked those fields — the original #549 footgun, re-exposed on the
+    // remote-bootstrap path.
+    let baseline_applied = match apply_agent_config_baseline_defaults(
+        &agent_config,
+        &AgentConfigBaselineParams {
+            email: &args.agent_email,
+            server: &args.agent_server,
+            domain: &args.agent_domain,
+            http_responder_url: &args.agent_responder_url,
+        },
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            let msg = format!("agent config TOML parse error: {err}");
+            return (
+                ApplyItemSummary::failed(msg.clone()),
+                ApplyItemSummary::failed(msg),
+            );
+        }
+    };
+    // Explicit overrides carried through from the upstream
+    // `bootroot service add --agent-*` flags win over any value already
+    // in the pre-existing file, so operators can re-bake a changed ACME
+    // topology from state without hand-editing the target.  When the
+    // artifact did not carry an override (direct-CLI path or no flag at
+    // service-add time), we leave the pre-existing value alone.
+    let override_applied = match apply_agent_overrides(
+        &baseline_applied,
+        args.agent_email_override.as_deref(),
+        args.agent_server_override.as_deref(),
+        args.agent_responder_url_override.as_deref(),
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            let msg = format!("agent config TOML parse error: {err}");
+            return (
+                ApplyItemSummary::failed(msg.clone()),
+                ApplyItemSummary::failed(msg),
+            );
+        }
+    };
     let acme_pairs = vec![("http_responder_hmac", pulled.responder_hmac.clone())];
     let hmac_updated =
-        match bootroot::toml_util::upsert_section_keys(&agent_config, "acme", &acme_pairs) {
+        match bootroot::toml_util::upsert_section_keys(&override_applied, "acme", &acme_pairs) {
             Ok(output) => output,
             Err(err) => {
                 let msg = format!("agent config TOML parse error: {err}");
@@ -93,7 +137,7 @@ pub(super) async fn apply_agent_config_updates(
     let with_profile =
         upsert_managed_profile_block(&trust_updated, &args.service_name, &profile_block);
 
-    let responder_changed = hmac_updated != agent_config;
+    let responder_changed = hmac_updated != override_applied;
     let trust_changed = trust_updated != hmac_updated;
     let profile_changed = with_profile != trust_updated;
 
@@ -245,26 +289,28 @@ fn inject_hooks_into_profile_block(block: &str, args: &ResolvedBootstrapArgs) ->
     }
 }
 
-fn render_agent_config_baseline(args: &ResolvedBootstrapArgs) -> String {
-    format!(
-        "email = \"{email}\"\n\
-server = \"{server}\"\n\
-domain = \"{domain}\"\n\n\
-[acme]\n\
-directory_fetch_attempts = 10\n\
-directory_fetch_base_delay_secs = 1\n\
-directory_fetch_max_delay_secs = 10\n\
-poll_attempts = 15\n\
-poll_interval_secs = 2\n\
-http_responder_url = \"{responder_url}\"\n\
-http_responder_hmac = \"\"\n\
-http_responder_timeout_secs = 5\n\
-http_responder_token_ttl_secs = 300\n",
-        email = args.agent_email,
-        server = args.agent_server,
-        domain = args.agent_domain,
-        responder_url = args.agent_responder_url,
-    )
+fn apply_agent_overrides(
+    contents: &str,
+    email: Option<&str>,
+    server: Option<&str>,
+    http_responder_url: Option<&str>,
+) -> Result<String> {
+    let mut next = contents.to_string();
+    if let Some(email) = email {
+        next = bootroot::toml_util::upsert_top_level_keys(&next, &[("email", email.to_string())])?;
+    }
+    if let Some(server) = server {
+        next =
+            bootroot::toml_util::upsert_top_level_keys(&next, &[("server", server.to_string())])?;
+    }
+    if let Some(responder_url) = http_responder_url {
+        next = bootroot::toml_util::upsert_section_keys(
+            &next,
+            "acme",
+            &[("http_responder_url", responder_url.to_string())],
+        )?;
+    }
+    Ok(next)
 }
 
 fn render_managed_profile_block(
@@ -454,6 +500,9 @@ mod tests {
             agent_server: "https://localhost:9443".to_string(),
             agent_domain: "example.com".to_string(),
             agent_responder_url: "http://localhost:8080".to_string(),
+            agent_email_override: None,
+            agent_server_override: None,
+            agent_responder_url_override: None,
             profile_hostname: "localhost".to_string(),
             profile_instance_id: Some("001".to_string()),
             profile_cert_path: None,
@@ -608,6 +657,151 @@ mod tests {
         assert_eq!(
             remote, canonical,
             "remote-bootstrap HCL must equal the shared primitive output for the same input"
+        );
+    }
+
+    /// Regression for the Round 5 review: when `bootroot-remote bootstrap`
+    /// runs against a remote target whose pre-existing `agent.toml` is
+    /// missing `email` / `server` / `[acme].http_responder_url`, the
+    /// artifact-carried override values (persisted by the upstream
+    /// `bootroot service add --agent-*` invocation) must be baked into
+    /// the rendered output so the KV re-render loop stops reverting to
+    /// bootroot-agent's compiled-in defaults.  Before the fix, the
+    /// existing-file branch read the file verbatim and only upserted
+    /// `[trust]` / `acme.http_responder_hmac` / the managed profile.
+    #[test]
+    fn existing_agent_config_backfills_overrides_from_artifact() {
+        const OVERRIDE_EMAIL: &str = "ops@example.org";
+        const OVERRIDE_SERVER: &str = "https://step-ca.example.org:9443/acme/acme/directory";
+        const OVERRIDE_RESPONDER: &str = "http://responder.internal:18080";
+
+        // Pre-existing `agent.toml` on a remote target that lacks the
+        // topology fields — mirrors what an operator would see after
+        // running an older bootroot that did not seed the baseline.
+        let pre_existing =
+            "domain = \"legacy.domain\"\n\n[acme]\nhttp_responder_hmac = \"legacy-hmac\"\n";
+
+        let mut args = test_bootstrap_args();
+        args.agent_email = OVERRIDE_EMAIL.to_string();
+        args.agent_server = OVERRIDE_SERVER.to_string();
+        args.agent_responder_url = OVERRIDE_RESPONDER.to_string();
+        args.agent_email_override = Some(OVERRIDE_EMAIL.to_string());
+        args.agent_server_override = Some(OVERRIDE_SERVER.to_string());
+        args.agent_responder_url_override = Some(OVERRIDE_RESPONDER.to_string());
+
+        // Mirror the in-memory mutation pipeline of
+        // `apply_agent_config_updates` (the I/O parts are factored out
+        // so this pure test remains stable across sidecar rewrites).
+        let backfilled = apply_agent_config_baseline_defaults(
+            pre_existing,
+            &AgentConfigBaselineParams {
+                email: &args.agent_email,
+                server: &args.agent_server,
+                domain: &args.agent_domain,
+                http_responder_url: &args.agent_responder_url,
+            },
+        )
+        .unwrap();
+        let overridden = apply_agent_overrides(
+            &backfilled,
+            args.agent_email_override.as_deref(),
+            args.agent_server_override.as_deref(),
+            args.agent_responder_url_override.as_deref(),
+        )
+        .unwrap();
+        let with_hmac = bootroot::toml_util::upsert_section_keys(
+            &overridden,
+            "acme",
+            &[("http_responder_hmac", "new-hmac".to_string())],
+        )
+        .unwrap();
+
+        assert!(
+            with_hmac.contains(&format!("email = \"{OVERRIDE_EMAIL}\"")),
+            "existing agent.toml must pick up artifact email: {with_hmac}"
+        );
+        assert!(
+            with_hmac.contains(&format!("server = \"{OVERRIDE_SERVER}\"")),
+            "existing agent.toml must pick up artifact server: {with_hmac}"
+        );
+        assert!(
+            with_hmac.contains(&format!("http_responder_url = \"{OVERRIDE_RESPONDER}\"")),
+            "existing agent.toml must pick up artifact responder: {with_hmac}"
+        );
+        assert!(
+            with_hmac.contains("directory_fetch_attempts = 10"),
+            "existing agent.toml must backfill [acme] retry tunables: {with_hmac}"
+        );
+        assert!(
+            with_hmac.contains("http_responder_timeout_secs = 5"),
+            "existing agent.toml must backfill [acme] timeout tunables: {with_hmac}"
+        );
+        assert!(
+            !with_hmac.contains("legacy-hmac"),
+            "hmac must be rotated by the upsert: {with_hmac}"
+        );
+    }
+
+    /// Companion regression for Round 5: when no override flows in from
+    /// the artifact (`agent_*_override == None`, e.g. the upstream
+    /// service-add did not pass `--agent-*`), operator-customised
+    /// `server` / `email` / `http_responder_url` values in the existing
+    /// `agent.toml` must survive untouched — the backfill path is
+    /// "insert if missing", never "clobber".
+    #[test]
+    fn existing_agent_config_preserves_operator_values_when_no_override() {
+        const OPERATOR_EMAIL: &str = "admin@acme.example";
+        const OPERATOR_SERVER: &str = "https://step-ca.acme.example:8443/acme/acme/directory";
+        const OPERATOR_RESPONDER: &str = "http://responder.acme.example:7000";
+
+        let pre_existing = format!(
+            "email = \"{OPERATOR_EMAIL}\"\n\
+             server = \"{OPERATOR_SERVER}\"\n\
+             domain = \"trusted.domain\"\n\n\
+             [acme]\n\
+             http_responder_url = \"{OPERATOR_RESPONDER}\"\n\
+             http_responder_hmac = \"legacy-hmac\"\n"
+        );
+
+        let args = test_bootstrap_args();
+        assert!(
+            args.agent_email_override.is_none(),
+            "test precondition: default args have no override"
+        );
+
+        let backfilled = apply_agent_config_baseline_defaults(
+            &pre_existing,
+            &AgentConfigBaselineParams {
+                email: &args.agent_email,
+                server: &args.agent_server,
+                domain: &args.agent_domain,
+                http_responder_url: &args.agent_responder_url,
+            },
+        )
+        .unwrap();
+        let overridden = apply_agent_overrides(
+            &backfilled,
+            args.agent_email_override.as_deref(),
+            args.agent_server_override.as_deref(),
+            args.agent_responder_url_override.as_deref(),
+        )
+        .unwrap();
+
+        assert!(
+            overridden.contains(&format!("email = \"{OPERATOR_EMAIL}\"")),
+            "operator email must survive backfill: {overridden}"
+        );
+        assert!(
+            overridden.contains(&format!("server = \"{OPERATOR_SERVER}\"")),
+            "operator server must survive backfill: {overridden}"
+        );
+        assert!(
+            overridden.contains(&format!("http_responder_url = \"{OPERATOR_RESPONDER}\"")),
+            "operator responder must survive backfill: {overridden}"
+        );
+        assert!(
+            !overridden.contains(&args.agent_server),
+            "backfill must not introduce the localhost default server: {overridden}"
         );
     }
 }

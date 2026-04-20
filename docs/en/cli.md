@@ -1271,11 +1271,26 @@ Key inputs:
     - `--profile-hostname`: `localhost`
   - `bootroot service add` prints a `remote run command template` that uses
     the `--artifact` flag. The `--agent-server` and `--agent-responder-url`
-    values are baked into the artifact, not passed on the command line. The
-    localhost defaults are only correct for same-host setups; on a separate
-    service machine, edit `bootstrap.json` and replace them with
-    remote-reachable endpoints (e.g., `stepca.internal`,
-    `responder.internal`) before transferring the artifact.
+    values are baked into the artifact, not passed on the command line. Pass
+    `--agent-email`, `--agent-server`, and `--agent-responder-url` to
+    `bootroot service add` (under both `--delivery-mode local-file` and
+    `--delivery-mode remote-bootstrap`) to bake non-default topology values
+    into the artifact at service-add time. If those flags are omitted the
+    localhost compose defaults are used, which are only correct for same-host
+    setups; on a separate service machine, either supply the overrides at
+    service-add time or edit `bootstrap.json` to replace them with
+    remote-reachable endpoints (e.g., `stepca.internal`, `responder.internal`)
+    before transferring the artifact.
+  - Under `--delivery-mode remote-bootstrap`, the resolved
+    `--agent-email` / `--agent-server` / `--agent-responder-url` values
+    are persisted on the service entry in `state.json`. An idempotent
+    rerun of `bootroot service add` (same service name, same other
+    flags) regenerates `bootstrap.json` from the stored values — you do
+    not have to restate the flags each time. If you rerun with a
+    different value in any of those three flags, the rerun is rejected
+    as a duplicate rather than silently flipping the generated artifact
+    away from the stored definition; remove and re-add the service to
+    change topology.
 - `--ca-bundle-path`: required output path for the managed step-ca trust
   bundle. Required unless `--artifact` is provided.
 - post-renew hook flags: `--reload-style`,
@@ -1288,6 +1303,16 @@ Key inputs:
 
 If `agent.toml` does not exist yet, bootstrap creates a baseline config and
 then updates (or creates) a managed profile block for the service.
+
+If `agent.toml` already exists on the remote target but is missing
+baseline keys (for example `email`, `server`, or
+`[acme].http_responder_url`), bootstrap backfills those keys without
+clobbering operator-customised values. When the artifact carries
+explicit `--agent-email` / `--agent-server` / `--agent-responder-url`
+overrides (propagated from the upstream `bootroot service add`), those
+values are then upserted over any pre-existing values in the file so
+the KV re-render loop stops reverting the operator's intended ACME
+topology to bootroot-agent's compiled-in defaults.
 
 ### `bootroot-remote apply-secret-id`
 

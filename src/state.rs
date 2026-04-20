@@ -131,6 +131,25 @@ pub(crate) struct ServiceEntry {
     #[serde(default)]
     pub(crate) post_renew_hooks: Vec<PostRenewHookEntry>,
     pub(crate) approle: ServiceRoleEntry,
+    /// Operator-supplied ACME account email passed via
+    /// `--agent-email` on `service add`.  `None` means the flag was
+    /// omitted and renderers use the compose-topology default.
+    /// Persisted so that idempotent `remote-bootstrap` reruns
+    /// re-emit the operator's original topology instead of silently
+    /// reverting to the localhost default when the flag is not
+    /// repeated on the rerun.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_email: Option<String>,
+    /// Operator-supplied ACME directory URL passed via
+    /// `--agent-server` on `service add`.  Same persistence rationale
+    /// as [`ServiceEntry::agent_email`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_server: Option<String>,
+    /// Operator-supplied HTTP-01 responder admin URL passed via
+    /// `--agent-responder-url` on `service add`.  Same persistence
+    /// rationale as [`ServiceEntry::agent_email`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_responder_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -317,6 +336,9 @@ mod tests {
                 secret_id_wrap_ttl: None,
                 token_bound_cidrs: None,
             },
+            agent_email: None,
+            agent_server: None,
+            agent_responder_url: None,
         };
         let json = serde_json::to_string_pretty(&entry).expect("serialize");
         let parsed: ServiceEntry = serde_json::from_str(&json).expect("deserialize");

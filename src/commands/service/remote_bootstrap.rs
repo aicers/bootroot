@@ -6,7 +6,6 @@ use tokio::fs;
 
 use super::resolve::ResolvedServiceAdd;
 use super::{
-    DEFAULT_AGENT_EMAIL, DEFAULT_AGENT_RESPONDER_URL, DEFAULT_AGENT_SERVER,
     OPENBAO_AGENT_CONFIG_FILENAME, OPENBAO_AGENT_TEMPLATE_FILENAME, OPENBAO_AGENT_TOKEN_FILENAME,
     OPENBAO_SERVICE_CONFIG_DIR, REMOTE_BOOTSTRAP_DIR, REMOTE_BOOTSTRAP_FILENAME,
     RemoteBootstrapResult, SERVICE_ROLE_ID_FILENAME,
@@ -46,10 +45,19 @@ struct RemoteBootstrapArtifact {
     openbao_agent_config_path: String,
     openbao_agent_template_path: String,
     openbao_agent_token_path: String,
-    agent_email: String,
-    agent_server: String,
+    /// Operator-supplied override for `email`, carried from
+    /// `bootroot service add --agent-email` so that `bootroot-remote
+    /// bootstrap` can distinguish "explicit override, clobber remote
+    /// value" from "no override, preserve remote operator value".
+    /// `None` is serialized as a missing key so the downstream parser's
+    /// `#[serde(default)]` yields `Option::None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_server: Option<String>,
     agent_domain: String,
-    agent_responder_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_responder_url: Option<String>,
     profile_hostname: String,
     profile_instance_id: String,
     profile_cert_path: String,
@@ -121,6 +129,9 @@ fn build_artifact(
     post_renew_hooks: &[PostRenewHookEntry],
     wrap_info: Option<&ArtifactWrapInfo>,
     ca_bundle_pem: &str,
+    agent_email: Option<&str>,
+    agent_server: Option<&str>,
+    agent_responder_url: Option<&str>,
 ) -> RemoteBootstrapArtifact {
     let secret_id_parent = secret_id_path.parent().unwrap_or(Path::new("."));
     let role_id_path = secret_id_parent.join(SERVICE_ROLE_ID_FILENAME);
@@ -133,7 +144,7 @@ fn build_artifact(
         remote_openbao_agent_paths(secret_id_path, service_name);
 
     RemoteBootstrapArtifact {
-        schema_version: 2,
+        schema_version: 3,
         openbao_url: openbao_url.to_string(),
         kv_mount: kv_mount.to_string(),
         service_name: service_name.to_string(),
@@ -146,10 +157,10 @@ fn build_artifact(
         openbao_agent_config_path: openbao_agent_config_path.display().to_string(),
         openbao_agent_template_path: openbao_agent_template_path.display().to_string(),
         openbao_agent_token_path: openbao_agent_token_path.display().to_string(),
-        agent_email: DEFAULT_AGENT_EMAIL.to_string(),
-        agent_server: DEFAULT_AGENT_SERVER.to_string(),
+        agent_email: agent_email.map(str::to_string),
+        agent_server: agent_server.map(str::to_string),
         agent_domain: domain.to_string(),
-        agent_responder_url: DEFAULT_AGENT_RESPONDER_URL.to_string(),
+        agent_responder_url: agent_responder_url.map(str::to_string),
         profile_hostname: hostname.to_string(),
         profile_instance_id: instance_id.unwrap_or_default().to_string(),
         profile_cert_path: cert_path.display().to_string(),
@@ -184,6 +195,9 @@ pub(super) async fn write_remote_bootstrap_artifact(
         &resolved.post_renew_hooks,
         wrap_info,
         ca_bundle_pem,
+        resolved.agent_email.as_deref(),
+        resolved.agent_server.as_deref(),
+        resolved.agent_responder_url.as_deref(),
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &resolved.service_name, &artifact, messages)
         .await
@@ -212,6 +226,9 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
         &entry.post_renew_hooks,
         wrap_info,
         ca_bundle_pem,
+        entry.agent_email.as_deref(),
+        entry.agent_server.as_deref(),
+        entry.agent_responder_url.as_deref(),
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &entry.service_name, &artifact, messages)
         .await
@@ -272,10 +289,10 @@ fn render_remote_run_command_legacy(artifact: &RemoteBootstrapArtifact) -> Strin
         artifact.secret_id_path,
         artifact.eab_file_path,
         artifact.agent_config_path,
-        artifact.agent_email,
-        artifact.agent_server,
+        artifact.agent_email.as_deref().unwrap_or(""),
+        artifact.agent_server.as_deref().unwrap_or(""),
         artifact.agent_domain,
-        artifact.agent_responder_url,
+        artifact.agent_responder_url.as_deref().unwrap_or(""),
         artifact.profile_hostname,
         artifact.profile_instance_id,
         artifact.profile_cert_path,
@@ -332,6 +349,9 @@ mod tests {
     use super::build_artifact;
 
     const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n";
+    const TEST_AGENT_EMAIL: &str = "test@example.com";
+    const TEST_AGENT_SERVER: &str = "https://step-ca.test:9000/acme/acme/directory";
+    const TEST_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
 
     #[test]
     fn build_artifact_typical_case() {
@@ -349,9 +369,12 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
 
-        assert_eq!(artifact.schema_version, 2);
+        assert_eq!(artifact.schema_version, 3);
         assert_eq!(artifact.openbao_url, "https://openbao.example.com:8200");
         assert_eq!(artifact.kv_mount, "secret");
         assert_eq!(artifact.service_name, "my-service");
@@ -382,10 +405,111 @@ mod tests {
             "/secrets/openbao/services/my-service/token"
         );
         assert_eq!(artifact.agent_domain, "example.com");
+        assert_eq!(artifact.agent_email.as_deref(), Some(TEST_AGENT_EMAIL));
+        assert_eq!(artifact.agent_server.as_deref(), Some(TEST_AGENT_SERVER));
+        assert_eq!(
+            artifact.agent_responder_url.as_deref(),
+            Some(TEST_AGENT_RESPONDER_URL)
+        );
         assert_eq!(artifact.profile_hostname, "host1");
         assert_eq!(artifact.profile_instance_id, "instance-42");
         assert_eq!(artifact.profile_cert_path, "/certs/my-service/cert.pem");
         assert_eq!(artifact.profile_key_path, "/certs/my-service/key.pem");
+    }
+
+    /// Locks in that operator-supplied `--agent-email` /
+    /// `--agent-server` / `--agent-responder-url` values flow through
+    /// to the remote-bootstrap artifact instead of getting clobbered
+    /// by the compose-topology defaults.  Regression guard for
+    /// issue #549 on the `remote-bootstrap` delivery path.
+    #[test]
+    fn build_artifact_embeds_non_default_agent_overrides() {
+        const OVERRIDE_EMAIL: &str = "ops@example.org";
+        const OVERRIDE_SERVER: &str = "https://step-ca.example.org:9443/acme/acme/directory";
+        const OVERRIDE_RESPONDER: &str = "http://responder.internal:18080";
+
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "example.org",
+            "h",
+            None,
+            &[],
+            None,
+            TEST_CA_PEM,
+            Some(OVERRIDE_EMAIL),
+            Some(OVERRIDE_SERVER),
+            Some(OVERRIDE_RESPONDER),
+        );
+
+        assert_eq!(artifact.agent_email.as_deref(), Some(OVERRIDE_EMAIL));
+        assert_eq!(artifact.agent_server.as_deref(), Some(OVERRIDE_SERVER));
+        assert_eq!(
+            artifact.agent_responder_url.as_deref(),
+            Some(OVERRIDE_RESPONDER)
+        );
+        // The compose-topology localhost defaults must NOT leak
+        // through when the operator supplied overrides.
+        assert_ne!(
+            artifact.agent_server.as_deref(),
+            Some(super::super::DEFAULT_AGENT_SERVER)
+        );
+        assert_ne!(
+            artifact.agent_responder_url.as_deref(),
+            Some(super::super::DEFAULT_AGENT_RESPONDER_URL)
+        );
+    }
+
+    /// Pins down that when `bootroot service add` did not receive any
+    /// `--agent-*` overrides (i.e. `resolved.agent_* == None`), the
+    /// generated artifact omits the `agent_email` / `agent_server` /
+    /// `agent_responder_url` keys rather than serializing the compiled-in
+    /// localhost defaults.  This preserves the "no explicit override"
+    /// signal so that `bootroot-remote bootstrap` can take the
+    /// backfill-only path against a pre-existing remote `agent.toml`.
+    #[test]
+    fn build_artifact_omits_agent_keys_when_no_override() {
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "example.org",
+            "h",
+            None,
+            &[],
+            None,
+            TEST_CA_PEM,
+            None,
+            None,
+            None,
+        );
+
+        assert!(artifact.agent_email.is_none());
+        assert!(artifact.agent_server.is_none());
+        assert!(artifact.agent_responder_url.is_none());
+
+        let serialized = serde_json::to_string(&artifact).unwrap();
+        assert!(
+            !serialized.contains("\"agent_email\""),
+            "agent_email must be omitted from serialized artifact: {serialized}"
+        );
+        assert!(
+            !serialized.contains("\"agent_server\""),
+            "agent_server must be omitted from serialized artifact: {serialized}"
+        );
+        assert!(
+            !serialized.contains("\"agent_responder_url\""),
+            "agent_responder_url must be omitted from serialized artifact: {serialized}"
+        );
     }
 
     #[test]
@@ -404,6 +528,9 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
 
         assert_eq!(artifact.profile_instance_id, "");
@@ -425,6 +552,9 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
         let b = build_artifact(
             "https://ob",
@@ -440,6 +570,9 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
 
         assert_ne!(a.role_id_path, b.role_id_path);
@@ -463,6 +596,9 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
 
         // Path::new("secret_id").parent() returns Some(""), not None
@@ -486,6 +622,9 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
 
         // Path::new("cert.pem").parent() returns Some(""), not None
@@ -516,6 +655,9 @@ mod tests {
             &hooks,
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
 
         assert_eq!(artifact.post_renew_hooks.len(), 1);
@@ -547,6 +689,9 @@ mod tests {
             &hooks,
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
         let cmd = super::render_remote_run_command_legacy(&artifact);
 
@@ -596,6 +741,9 @@ mod tests {
             &hooks,
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
         let cmd = super::render_remote_run_command_legacy(&artifact);
 
@@ -625,6 +773,9 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
         let cmd = super::render_remote_run_command_legacy(&artifact);
 
@@ -650,6 +801,9 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
         let with_none = build_artifact(
             "https://ob",
@@ -665,6 +819,9 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
 
         assert_eq!(
@@ -708,6 +865,9 @@ mod tests {
             &[],
             Some(&wrap),
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
 
         assert_eq!(artifact.wrap_token.as_deref(), Some("hvs.wrap-token-123"));
@@ -737,6 +897,9 @@ mod tests {
             &[],
             Some(&wrap),
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
         let cmd = super::render_remote_run_command(&artifact);
 
@@ -766,6 +929,9 @@ mod tests {
             &[],
             None,
             TEST_CA_PEM,
+            Some(TEST_AGENT_EMAIL),
+            Some(TEST_AGENT_SERVER),
+            Some(TEST_AGENT_RESPONDER_URL),
         );
         let cmd = super::render_remote_run_command(&artifact);
 
