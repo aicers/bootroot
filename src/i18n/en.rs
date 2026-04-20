@@ -140,6 +140,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_docker_command_failed: "docker command failed: {value}",
     error_bootroot_agent_run_failed: "Failed to run bootroot-agent",
     error_bootroot_agent_not_found: "bootroot-agent binary not found. Tried: {candidates}",
+    error_bootroot_agent_container_missing: "bootroot-agent docker container not found: {container}. If this service was registered before issue #552 was fixed, the sidecar was likely a one-shot container that exited after initial issuance. Recreate it as a long-running daemon named `{container}` using the snippet printed by `bootroot service add --print-only --deploy-type docker --container-name {container} ...` (docker run -d --restart unless-stopped, no --oneshot), then retry `bootroot rotate ca-key`.",
     error_secrets_dir_resolve_failed: "Failed to resolve secrets dir",
     error_parse_ca_json_failed: "Failed to parse ca.json",
     error_serialize_ca_json_failed: "Failed to serialize ca.json",

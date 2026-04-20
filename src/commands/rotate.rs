@@ -28,7 +28,6 @@ pub(super) const ROOT_CA_COMMON_NAME: &str = "Bootroot Root CA";
 pub(super) const INTERMEDIATE_CA_COMMON_NAME: &str = "Bootroot Intermediate CA";
 pub(super) const RENDERED_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const RENDERED_FILE_TIMEOUT: Duration = Duration::from_mins(1);
-pub(super) const BOOTROOT_AGENT_CONTAINER_PREFIX: &str = "bootroot-agent";
 pub(super) const OPENBAO_RECOVERY_SCOPE_UNSEAL_KEYS: &str = "unseal-keys";
 pub(super) const OPENBAO_RECOVERY_SCOPE_ROOT_TOKEN: &str = "root-token";
 pub(super) const OPENBAO_ROOT_ROTATION_INCOMPLETE_ERROR: &str =
@@ -241,6 +240,7 @@ pub(super) mod test_support {
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     pub(super) const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
     pub(super) const TEST_DOCKER_EXIT_ENV: &str = "BOOTROOT_TEST_DOCKER_EXIT";
+    pub(super) const TEST_DOCKER_STDERR_ENV: &str = "BOOTROOT_TEST_DOCKER_STDERR";
 
     pub(super) struct ScopedEnvVar {
         key: &'static str,
@@ -281,6 +281,9 @@ pub(super) mod test_support {
         let script = r#"#!/bin/sh
 set -eu
 printf '%s\n' "$@" > "${BOOTROOT_TEST_DOCKER_ARGS:?missing log path}"
+if [ -n "${BOOTROOT_TEST_DOCKER_STDERR:-}" ]; then
+  printf '%s' "${BOOTROOT_TEST_DOCKER_STDERR}" 1>&2
+fi
 if [ -n "${BOOTROOT_TEST_DOCKER_EXIT:-}" ]; then
   exit "${BOOTROOT_TEST_DOCKER_EXIT}"
 fi

@@ -140,6 +140,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_docker_command_failed: "docker 명령 실패: {value}",
     error_bootroot_agent_run_failed: "bootroot-agent 실행 실패",
     error_bootroot_agent_not_found: "bootroot-agent 바이너리를 찾을 수 없습니다. 시도한 경로: {candidates}",
+    error_bootroot_agent_container_missing: "bootroot-agent 도커 컨테이너를 찾을 수 없습니다: {container}. 이슈 #552 수정 이전에 등록된 서비스라면 초기 발급 후 종료되는 일회성 컨테이너였을 가능성이 높습니다. `bootroot service add --print-only --deploy-type docker --container-name {container} ...`가 출력하는 새 스니펫(`docker run -d --restart unless-stopped`, `--oneshot` 없음)으로 `{container}`를 장기 실행 데몬으로 재생성한 뒤 `bootroot rotate ca-key`를 다시 실행하세요.",
     error_secrets_dir_resolve_failed: "secrets dir 확인 실패",
     error_parse_ca_json_failed: "ca.json 파싱 실패",
     error_serialize_ca_json_failed: "ca.json 직렬화 실패",

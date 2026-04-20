@@ -416,3 +416,38 @@ bootroot rotate force-reissue --service-name edge-proxy --yes
 For local services (daemon/docker), the command signals bootroot-agent after
 deleting the files. For remote services, it prints a hint to run
 `bootroot-remote bootstrap` on the service host.
+
+## Migrating existing docker-deploy services to a long-running sidecar
+
+Before the fix for issue #552, `bootroot service add --deploy-type docker`
+printed a sidecar snippet that ran bootroot-agent as a one-shot container
+(`docker run --rm ... bootroot-agent --config /app/agent.toml --oneshot`).
+Such containers exited immediately after the initial issuance. For those
+installs, `bootroot rotate ca-key` Phase 5 cannot signal renewal because
+there is no container to `docker restart`, and the rotation fails with
+`No such container: <container_name>`.
+
+Recreate the sidecar as a long-running daemon, keeping the same
+`--container-name` recorded in `state.json`:
+
+```bash
+# Remove the old one-shot sidecar if anything is still lingering.
+docker rm -f <container_name> 2>/dev/null || true
+
+# Print the current recommended snippet for an existing registration
+# without modifying state.
+bootroot service add --print-only \
+  --deploy-type docker \
+  --service-name <service> \
+  --container-name <container_name> \
+  ... other flags as originally registered ...
+```
+
+Run the printed `docker run -d --restart unless-stopped ...` command. The
+container will stay `Up` after startup and across host reboots, so
+`docker restart <container_name>` (issued by Phase 5 of
+`bootroot rotate ca-key`) becomes a meaningful signal-renewal action.
+
+If you try to rotate first, Phase 5 now fails fast with a dedicated error
+that names the missing container and points at this procedure instead of
+the generic `exit status: 1` from the old code path.

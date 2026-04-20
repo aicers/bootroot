@@ -22,6 +22,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate ca-key` Phase 5 failing against services
+  registered with `--deploy-type docker` and a custom
+  `--container-name`. The restart target now reads
+  `entry.container_name` from `state.json` rather than assuming a
+  hardcoded `bootroot-agent-<service>` prefix, and the `service add`
+  docker snippet recommends a long-running daemon container
+  (`docker run -d --restart unless-stopped`, without `--oneshot`) so
+  `docker restart` is a meaningful signal-renewal action. Services
+  that were registered before this fix and created a one-shot sidecar
+  (the old `docker run --rm ... --oneshot` snippet) will see a
+  dedicated error at rotate time naming the missing container and
+  pointing operators at the new long-running snippet; see
+  `docs/en/operations.md` for migration steps. The pre-flight
+  `docker container inspect` captures stderr and only maps the
+  specific "No such container/object" response to the migration
+  hint; other inspect failures (e.g. daemon unreachable, permission
+  denied) surface verbatim as `docker command failed: …` so the
+  real problem is not masked. If the actual `docker restart` itself
+  fails after the inspect succeeds, the error now names the real
+  container (e.g. `docker restart my-nginx failed with status: …`)
+  instead of the removed hardcoded `bootroot-agent` label, so
+  operators can identify the signaled container from the failure
+  output. (Closes #552)
 - Fixed `bootroot init` storing the host-side PostgreSQL port in the
   step-ca DSN written to OpenBao KV / `ca.json` when
   `POSTGRES_HOST_PORT` differed from `5432`, and fixed `bootroot rotate

@@ -575,9 +575,11 @@ async fn test_app_add_prints_docker_snippet() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(stdout.contains("docker run --rm"));
+    assert!(stdout.contains("docker run -d"));
+    assert!(stdout.contains("--restart unless-stopped"));
     assert!(stdout.contains("--name edge-proxy"));
     assert!(stdout.contains("/app/agent.toml"));
+    assert!(!stdout.contains("--oneshot"));
 }
 
 #[cfg(unix)]
