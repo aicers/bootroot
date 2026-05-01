@@ -54,7 +54,49 @@ pub(crate) fn compose_has_responder(compose_file: &Path, messages: &Messages) ->
 pub(crate) fn compose_has_openbao(compose_file: &Path, messages: &Messages) -> Result<bool> {
     let compose_contents = std::fs::read_to_string(compose_file)
         .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
-    Ok(compose_contents.contains("openbao"))
+    Ok(compose_has_top_level_service(&compose_contents, "openbao"))
+}
+
+/// Returns true when the compose document declares a top-level service
+/// whose mapping key is exactly `service_name`.
+///
+/// Avoids substring matching on the raw file so that occurrences of the
+/// name in container names, hostnames, secret names, comments, image
+/// tags, or volume paths do not produce false positives. This matters
+/// for `openbao` specifically because external-OpenBao deployments may
+/// reference the name without declaring an `openbao:` service.
+fn compose_has_top_level_service(yaml: &str, service_name: &str) -> bool {
+    let mut in_services = false;
+    let mut child_indent: Option<usize> = None;
+    for raw_line in yaml.lines() {
+        // Strip end-of-line comments. A `#` inside quoted scalars would
+        // be misclassified, but compose service keys are bare
+        // identifiers, so this is safe for the structural scan.
+        let line = raw_line.split('#').next().unwrap_or("");
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 {
+            in_services = line.trim_start().starts_with("services:");
+            child_indent = None;
+            continue;
+        }
+        if !in_services {
+            continue;
+        }
+        let key_indent = *child_indent.get_or_insert(indent);
+        if indent != key_indent {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(service_name)
+            && rest.starts_with(':')
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolves the responder admin URL, selecting `https://` when TLS is
@@ -174,6 +216,53 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         let dir = tempfile::tempdir().unwrap();
         let secrets_dir = dir.path().join("secrets");
         assert!(!responder_tls_configured(&secrets_dir).unwrap());
+    }
+
+    #[test]
+    fn compose_has_top_level_service_detects_openbao_key() {
+        let yaml = "services:\n  openbao:\n    image: openbao/openbao:latest\n";
+        assert!(compose_has_top_level_service(yaml, "openbao"));
+    }
+
+    #[test]
+    fn compose_has_top_level_service_ignores_substring_in_other_fields() {
+        // `openbao` appears only as a hostname / image name / volume
+        // path / comment / container_name — never as a service key.
+        let yaml = "\
+# uses an external openbao instance
+services:
+  app:
+    image: example/app:latest
+    container_name: my-openbao-client
+    environment:
+      - VAULT_ADDR=https://openbao.example.com:8200
+    volumes:
+      - ./openbao-secrets:/secrets:ro
+volumes:
+  openbao-data:
+";
+        assert!(!compose_has_top_level_service(yaml, "openbao"));
+    }
+
+    #[test]
+    fn compose_has_top_level_service_rejects_prefixed_service_key() {
+        let yaml = "services:\n  my-openbao:\n    image: x:latest\n";
+        assert!(!compose_has_top_level_service(yaml, "openbao"));
+    }
+
+    #[test]
+    fn compose_has_top_level_service_skips_volumes_block_with_same_key() {
+        // A top-level `volumes:` block that defines an `openbao:` volume
+        // must not satisfy the predicate.
+        let yaml = "\
+services:
+  app:
+    image: example/app:latest
+volumes:
+  openbao:
+    driver: local
+";
+        assert!(!compose_has_top_level_service(yaml, "openbao"));
     }
 
     #[test]

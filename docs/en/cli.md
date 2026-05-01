@@ -808,10 +808,16 @@ result, the command now works from any working directory and any
 
 - `bootroot infra install` and `bootroot service add` must have
   completed for the service.
-- Either:
-  - `bootroot-openbao` exists locally (compose-managed) — the default
-    case; the project label drives discovery, OR
-  - `--openbao-network` is supplied (external OpenBao case).
+- Then one of:
+  - The compose file declares an `openbao:` service — the
+    `bootroot-openbao` container must exist locally so the project
+    label can be discovered. `--openbao-network` is optional in this
+    branch and only overrides the network name; it does not bypass the
+    label discovery.
+  - The compose file does **not** declare an `openbao:` service
+    (external-OpenBao case) — `--openbao-network` is required and is
+    the only way to specify the sidecar's network. No container
+    inspection is performed in this branch.
 
 ### Failure conditions
 
@@ -823,10 +829,15 @@ The command is considered failed when:
   flow does not apply; secret_id handoff is operator-driven on the
   service machine)
 - Per-service `agent-docker.hcl` config is missing
-- `bootroot-openbao` container not found and `--openbao-network` not
-  provided
-- `bootroot-openbao` container exists but has no
+- The compose file declares an `openbao:` service but the
+  `bootroot-openbao` container is not found (failure applies whether
+  or not `--openbao-network` was supplied — the project label is still
+  needed for `-p`)
+- The compose file declares an `openbao:` service but the
+  `bootroot-openbao` container exists without a
   `com.docker.compose.project` label
+- The compose file does not declare an `openbao:` service and
+  `--openbao-network` was not supplied
 - `--openbao-network` (or the discovered network) fails the docker
   network name validation
 

@@ -783,10 +783,15 @@ bootroot service agent start ...`) 없이 동작합니다.
 
 - 해당 서비스에 대해 `bootroot infra install`과 `bootroot service add`가
   완료되어 있어야 합니다.
-- 다음 중 하나여야 합니다.
-  - `bootroot-openbao`가 로컬에 존재(compose로 관리됨) — 기본
-    경로이며, project 라벨로 자동 도출, 또는
-  - `--openbao-network` 전달(외부 OpenBao 사례)
+- 그리고 다음 중 하나여야 합니다.
+  - compose 파일이 `openbao:` 서비스를 선언한 경우 — project 라벨
+    조회를 위해 `bootroot-openbao` 컨테이너가 로컬에 존재해야 합니다.
+    이 분기에서 `--openbao-network`는 선택사항이며 네트워크 이름만
+    덮어씁니다. 라벨 조회를 건너뛰지 않습니다.
+  - compose 파일이 `openbao:` 서비스를 선언하지 **않은** 경우(외부
+    OpenBao 사례) — `--openbao-network`가 필수이며 사이드카가 붙는
+    네트워크를 지정하는 유일한 수단입니다. 이 분기에서는 컨테이너
+    조회를 수행하지 않습니다.
 
 ### 실패 조건
 
@@ -798,10 +803,13 @@ bootroot service agent start ...`) 없이 동작합니다.
   플로우가 적용되지 않으며, secret_id 핸드오프는 서비스 머신에서
   운영자가 수행)
 - 서비스별 `agent-docker.hcl` 설정 파일 누락
-- `bootroot-openbao` 컨테이너가 없는데 `--openbao-network`가
-  전달되지 않음
-- `bootroot-openbao` 컨테이너에 `com.docker.compose.project` 라벨이
-  없음
+- compose 파일이 `openbao:` 서비스를 선언했는데 `bootroot-openbao`
+  컨테이너를 찾을 수 없음(`--openbao-network` 전달 여부와 무관 —
+  `-p` 인자에 쓰이는 project 라벨이 여전히 필요)
+- compose 파일이 `openbao:` 서비스를 선언했는데 `bootroot-openbao`
+  컨테이너에 `com.docker.compose.project` 라벨이 없음
+- compose 파일이 `openbao:` 서비스를 선언하지 않았는데
+  `--openbao-network`가 전달되지 않음
 - `--openbao-network`(또는 자동 도출된 네트워크 이름)가 docker
   네트워크 이름 규칙 검증에 실패
 

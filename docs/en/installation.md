@@ -313,9 +313,13 @@ Recommended deployment policy:
   to step-ca and
   `openbao-agent-responder` to responder so each service renders only its own
   required secrets.
-- service OpenBao Agent (recommended):
-    1. Docker services: use a per-service sidecar
-    2. daemon services: run OpenBao Agent as a daemon **per service**
+- service OpenBao Agent (recommended): default to a per-service
+  sidecar regardless of `--deploy-type`. `bootroot service add` already
+  surfaces `bootroot service agent start` as the next step. The two
+  deployment models for the OpenBao Agent (sidecar vs. operator-run
+  host daemon) are independent of the service `--deploy-type` — see
+  [docs/en/cli.md](cli.md#sidecar-vs-host-daemon-for-the-openbao-agent)
+  for when the host-daemon alternative is appropriate.
 
 For service OpenBao Agent flow, `role_id`/`secret_id` live under
 `secrets/services/<service>/`. Keep the directory `0700` and the files `0600`.

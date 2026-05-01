@@ -363,21 +363,36 @@ fn apply_service_agent_compose_override(
 ) -> Result<()> {
     let compose_str = compose_file.to_string_lossy();
     let override_str = override_path.to_string_lossy();
-    let mut args: Vec<&str> = vec!["compose"];
-    if let Some(project) = project {
-        args.extend_from_slice(&["-p", project]);
-    }
-    args.extend_from_slice(&[
-        "-f",
-        compose_str.as_ref(),
-        "-f",
-        override_str.as_ref(),
-        "up",
-        "-d",
-        service_name,
-    ]);
-    run_docker(&args, "docker compose service agent start", messages)?;
+    let args = build_compose_up_args(&compose_str, &override_str, service_name, project);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_docker(&arg_refs, "docker compose service agent start", messages)?;
     Ok(())
+}
+
+/// Builds the argument list for the `docker compose ... up -d <service>`
+/// invocation. Extracted so the `-p` plumbing is unit-testable without
+/// shelling out.
+fn build_compose_up_args(
+    compose_path: &str,
+    override_path: &str,
+    service_name: &str,
+    project: Option<&str>,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec!["compose".to_string()];
+    if let Some(project) = project {
+        args.push("-p".to_string());
+        args.push(project.to_string());
+    }
+    args.extend([
+        "-f".to_string(),
+        compose_path.to_string(),
+        "-f".to_string(),
+        override_path.to_string(),
+        "up".to_string(),
+        "-d".to_string(),
+        service_name.to_string(),
+    ]);
+    args
 }
 
 #[cfg(test)]
@@ -973,6 +988,47 @@ mod tests {
                 "{name} should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn build_compose_up_args_includes_project_when_supplied() {
+        let args = build_compose_up_args(
+            "/path/to/docker-compose.yml",
+            "/path/to/override.yml",
+            "openbao-agent-myapp",
+            Some("myorg-prod"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "compose",
+                "-p",
+                "myorg-prod",
+                "-f",
+                "/path/to/docker-compose.yml",
+                "-f",
+                "/path/to/override.yml",
+                "up",
+                "-d",
+                "openbao-agent-myapp",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_compose_up_args_omits_project_when_not_supplied() {
+        let args = build_compose_up_args(
+            "/path/to/docker-compose.yml",
+            "/path/to/override.yml",
+            "openbao-agent-myapp",
+            None,
+        );
+        assert!(
+            !args.iter().any(|a| a == "-p"),
+            "must not include -p flag when project is None: {args:?}"
+        );
+        assert_eq!(args.first().map(String::as_str), Some("compose"));
+        assert_eq!(args.last().map(String::as_str), Some("openbao-agent-myapp"));
     }
 
     #[test]

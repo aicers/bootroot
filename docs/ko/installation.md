@@ -320,9 +320,14 @@ openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
   사이드카를 각각 분리해서 사용합니다. 즉 step-ca에는
   `openbao-agent-stepca`, responder에는 `openbao-agent-responder`를 붙여
   각 서비스가 필요한 시크릿만 렌더링하도록 운영합니다.
-- 서비스 OpenBao Agent(권장):
-    1. Docker 서비스: 서비스별 사이드카
-    2. daemon 서비스: OpenBao Agent를 daemon으로 **서비스마다 1개** 실행
+- 서비스 OpenBao Agent(권장): `--deploy-type`과 무관하게 서비스별
+  사이드카를 기본으로 사용합니다. `bootroot service add`도
+  `bootroot service agent start`를 다음 단계로 안내합니다. OpenBao
+  Agent의 두 배포 모델(사이드카 vs. 운영자가 직접 운영하는 호스트
+  데몬)은 서비스 `--deploy-type`과 독립적이며, 호스트 데몬 대안이
+  적절한 경우는
+  [docs/ko/cli.md](cli.md#openbao-agent-사이드카-vs-호스트-데몬)를
+  참고하세요.
 
 서비스용 OpenBao Agent의 `role_id`/`secret_id` 파일은
 `secrets/services/<service>/` 아래에 있으며, 해당 디렉터리는 `0700`, 파일은
