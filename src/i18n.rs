@@ -476,6 +476,10 @@ pub(crate) struct Strings {
     pub(crate) error_service_remote_bootstrap: &'static str,
     pub(crate) error_service_agent_config_missing: &'static str,
     pub(crate) service_agent_start_completed: &'static str,
+    pub(crate) error_openbao_container_not_found: &'static str,
+    pub(crate) error_openbao_container_no_project_label: &'static str,
+    pub(crate) error_openbao_network_required_external: &'static str,
+    pub(crate) error_invalid_docker_network_name: &'static str,
 }
 
 pub(crate) struct Messages {

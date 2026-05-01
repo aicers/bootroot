@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
 
@@ -8,21 +9,32 @@ use super::local_config::{
 use super::{OPENBAO_AGENT_DOCKER_CONFIG_FILENAME, OPENBAO_SERVICE_CONFIG_DIR};
 use crate::cli::args::ServiceAgentStartArgs;
 use crate::commands::infra::run_docker;
-use crate::commands::init::{compose_has_openbao, resolve_openbao_agent_addr};
+use crate::commands::init::{
+    OPENBAO_CONTAINER_NAME, compose_has_openbao, resolve_openbao_agent_addr,
+};
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, DeployType, ServiceEntry, StateFile};
-
-/// Compose project name, matching the convention used by `bootroot init`.
-const COMPOSE_PROJECT: &str = "bootroot";
-
-/// Docker network created by `docker compose -p bootroot`.
-const COMPOSE_NETWORK: &str = "bootroot_default";
 
 /// Compose override filename written per service.
 const SERVICE_COMPOSE_OVERRIDE: &str = "docker-compose.override.yml";
 
 /// Mount point inside service sidecar containers.
 const SIDECAR_CONTAINER_MOUNT: &str = "/openbao/secrets";
+
+/// Docker compose project label inspected on the `OpenBao` container.
+const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+
+/// Suffix appended to the discovered compose project to derive the
+/// default docker network name (`<project>_default`).
+const COMPOSE_DEFAULT_NETWORK_SUFFIX: &str = "_default";
+
+/// Outcome of resolving the docker network and (optional) compose
+/// project to use for the per-service sidecar.
+#[derive(Debug)]
+struct SidecarTopology {
+    network: String,
+    project: Option<String>,
+}
 
 /// Runs `bootroot service agent start`.
 pub(crate) fn run_service_agent_start(
@@ -58,23 +70,161 @@ pub(crate) fn run_service_agent_start(
 
     let compose_file = &args.compose_file.compose_file;
     let override_path = service_openbao_dir.join(SERVICE_COMPOSE_OVERRIDE);
+
+    if let Some(network) = args.openbao_network.as_deref() {
+        validate_docker_network_name(network, messages)?;
+    }
+
+    let topology = resolve_sidecar_topology(
+        compose_file,
+        args.openbao_network.as_deref(),
+        messages,
+        &inspect_label_via_docker,
+    )?;
+
     write_service_agent_compose_override(
         compose_file,
         secrets_dir,
         &service_openbao_dir,
         entry,
         &state.openbao_url,
+        &topology.network,
         messages,
     )?;
 
     let service_name = format!("openbao-agent-{}", args.service_name);
-    apply_service_agent_compose_override(compose_file, &override_path, &service_name, messages)?;
+    apply_service_agent_compose_override(
+        compose_file,
+        &override_path,
+        &service_name,
+        topology.project.as_deref(),
+        messages,
+    )?;
 
     println!(
         "{}",
         messages.service_agent_start_completed(&args.service_name)
     );
     Ok(())
+}
+
+/// Resolves the (network, project) pair driving the sidecar override
+/// and the `docker compose -p` invocation. Implements the decision
+/// matrix from issue #577.
+fn resolve_sidecar_topology(
+    compose_file: &Path,
+    network_override: Option<&str>,
+    messages: &Messages,
+    inspect_label: &dyn Fn(&str, &str, &Messages) -> Result<LabelLookup>,
+) -> Result<SidecarTopology> {
+    let has_openbao = compose_has_openbao(compose_file, messages)?;
+    match (has_openbao, network_override) {
+        (true, Some(net)) => {
+            let project = discover_compose_project(messages, inspect_label)?;
+            Ok(SidecarTopology {
+                network: net.to_string(),
+                project: Some(project),
+            })
+        }
+        (true, None) => {
+            let project = discover_compose_project(messages, inspect_label)?;
+            let network = format!("{project}{COMPOSE_DEFAULT_NETWORK_SUFFIX}");
+            validate_docker_network_name(&network, messages)?;
+            Ok(SidecarTopology {
+                network,
+                project: Some(project),
+            })
+        }
+        (false, Some(net)) => Ok(SidecarTopology {
+            network: net.to_string(),
+            project: None,
+        }),
+        (false, None) => anyhow::bail!(messages.error_openbao_network_required_external()),
+    }
+}
+
+/// Outcome of inspecting a docker container label.
+enum LabelLookup {
+    /// The container exists and the requested label is present.
+    Present(String),
+    /// The container exists but the requested label is missing or empty.
+    MissingLabel,
+    /// The container itself does not exist.
+    ContainerNotFound,
+}
+
+/// Discovers the docker compose project name from the `OpenBao`
+/// container's `com.docker.compose.project` label.
+fn discover_compose_project(
+    messages: &Messages,
+    inspect_label: &dyn Fn(&str, &str, &Messages) -> Result<LabelLookup>,
+) -> Result<String> {
+    match inspect_label(OPENBAO_CONTAINER_NAME, COMPOSE_PROJECT_LABEL, messages)? {
+        LabelLookup::Present(value) => {
+            validate_docker_network_name(&value, messages)?;
+            Ok(value)
+        }
+        LabelLookup::MissingLabel => {
+            anyhow::bail!(messages.error_openbao_container_no_project_label())
+        }
+        LabelLookup::ContainerNotFound => {
+            anyhow::bail!(messages.error_openbao_container_not_found())
+        }
+    }
+}
+
+/// Reads a single label from a docker container via `docker inspect`.
+///
+/// Distinguishes "container missing" from "label missing/empty" so the
+/// caller can surface a precise error.
+fn inspect_label_via_docker(
+    container: &str,
+    label: &str,
+    _messages: &Messages,
+) -> Result<LabelLookup> {
+    let format_arg = format!("{{{{index .Config.Labels \"{label}\"}}}}");
+    let output = ProcessCommand::new("docker")
+        .args(["inspect", "--format", &format_arg, container])
+        .output()
+        .with_context(|| "failed to run `docker inspect`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.to_lowercase().contains("no such") {
+            return Ok(LabelLookup::ContainerNotFound);
+        }
+        anyhow::bail!("`docker inspect` failed: {}", stderr.trim());
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `go template` renders missing/empty map values as `<no value>`.
+    if value.is_empty() || value == "<no value>" {
+        Ok(LabelLookup::MissingLabel)
+    } else {
+        Ok(LabelLookup::Present(value))
+    }
+}
+
+/// Validates that `name` is safe to embed in YAML as a docker network
+/// name. The whitelist matches docker's own accepted naming rules and
+/// rejects characters (newline, colon, quote, ...) that could break
+/// the override file.
+fn validate_docker_network_name(name: &str, messages: &Messages) -> Result<()> {
+    if !is_valid_docker_network_name(name) {
+        anyhow::bail!(messages.error_invalid_docker_network_name(name));
+    }
+    Ok(())
+}
+
+fn is_valid_docker_network_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
 /// Writes a per-service compose override that defines the sidecar agent
@@ -85,8 +235,14 @@ fn write_service_agent_compose_override(
     service_openbao_dir: &Path,
     entry: &ServiceEntry,
     openbao_url: &str,
+    network_name: &str,
     messages: &Messages,
 ) -> Result<()> {
+    // Defence in depth: never emit an override that would inject
+    // arbitrary YAML even if a discovered value slipped past earlier
+    // validation.
+    validate_docker_network_name(network_name, messages)?;
+
     let mount_root = std::fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
 
@@ -161,7 +317,7 @@ fn write_service_agent_compose_override(
       - default
 networks:
   default:
-    name: {COMPOSE_NETWORK}
+    name: {network_name}
     external: true
 "#,
         secrets_path = mount_root.display(),
@@ -202,22 +358,24 @@ fn apply_service_agent_compose_override(
     compose_file: &Path,
     override_path: &Path,
     service_name: &str,
+    project: Option<&str>,
     messages: &Messages,
 ) -> Result<()> {
     let compose_str = compose_file.to_string_lossy();
     let override_str = override_path.to_string_lossy();
-    let args = [
-        "compose",
-        "-p",
-        COMPOSE_PROJECT,
+    let mut args: Vec<&str> = vec!["compose"];
+    if let Some(project) = project {
+        args.extend_from_slice(&["-p", project]);
+    }
+    args.extend_from_slice(&[
         "-f",
-        &compose_str,
+        compose_str.as_ref(),
         "-f",
-        &override_str,
+        override_str.as_ref(),
         "up",
         "-d",
         service_name,
-    ];
+    ]);
     run_docker(&args, "docker compose service agent start", messages)?;
     Ok(())
 }
@@ -318,6 +476,7 @@ mod tests {
             &svc_dir,
             &docker_entry("myapp"),
             "http://localhost:8200",
+            "bootroot_default",
             &messages,
         )
         .unwrap();
@@ -343,12 +502,90 @@ mod tests {
             "must depend on openbao when present in compose"
         );
         assert!(
-            contents.contains("bootroot_default"),
-            "must reference bootroot_default network"
+            contents.contains("name: bootroot_default"),
+            "must reference the supplied network"
         );
         assert!(
             !contents.contains("VAULT_CACERT"),
             "http must not set VAULT_CACERT"
+        );
+    }
+
+    #[test]
+    fn compose_override_uses_discovered_network_name() {
+        let dir = tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+
+        let compose_file = dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose_file,
+            "services:\n  openbao:\n    image: openbao/openbao:latest\n",
+        )
+        .unwrap();
+
+        let svc_dir = secrets.join("openbao/services/myapp");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        std::fs::write(svc_dir.join(OPENBAO_AGENT_DOCKER_CONFIG_FILENAME), "").unwrap();
+
+        let messages = crate::i18n::test_messages();
+        write_service_agent_compose_override(
+            &compose_file,
+            &secrets,
+            &svc_dir,
+            &docker_entry("myapp"),
+            "http://localhost:8200",
+            "eloquent-solomon-19b6fe_default",
+            &messages,
+        )
+        .unwrap();
+
+        let contents = std::fs::read_to_string(svc_dir.join(SERVICE_COMPOSE_OVERRIDE)).unwrap();
+        assert!(
+            contents.contains("name: eloquent-solomon-19b6fe_default"),
+            "must use the network name supplied by discovery"
+        );
+        assert!(
+            !contents.contains("name: bootroot_default"),
+            "must not fall back to the hardcoded bootroot_default name"
+        );
+    }
+
+    #[test]
+    fn compose_override_rejects_yaml_injection_via_network_name() {
+        let dir = tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+
+        let compose_file = dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose_file,
+            "services:\n  openbao:\n    image: openbao/openbao:latest\n",
+        )
+        .unwrap();
+
+        let svc_dir = secrets.join("openbao/services/myapp");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        std::fs::write(svc_dir.join(OPENBAO_AGENT_DOCKER_CONFIG_FILENAME), "").unwrap();
+
+        let messages = crate::i18n::test_messages();
+        let err = write_service_agent_compose_override(
+            &compose_file,
+            &secrets,
+            &svc_dir,
+            &docker_entry("myapp"),
+            "http://localhost:8200",
+            "evil\n  rogue: true",
+            &messages,
+        )
+        .expect_err("malicious network name must be rejected");
+        assert!(
+            err.to_string().contains("invalid docker network name"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !svc_dir.join(SERVICE_COMPOSE_OVERRIDE).exists(),
+            "no override file must be written when validation fails"
         );
     }
 
@@ -376,6 +613,7 @@ mod tests {
             &svc_dir,
             &docker_entry("myapp"),
             "https://192.168.1.10:8200",
+            "bootroot_default",
             &messages,
         )
         .unwrap();
@@ -416,6 +654,7 @@ mod tests {
             &svc_dir,
             &docker_entry("myapp"),
             "https://192.168.1.10:8200",
+            "external_net",
             &messages,
         )
         .unwrap();
@@ -452,6 +691,7 @@ mod tests {
             &svc_dir,
             &docker_entry("test"),
             "http://localhost:8200",
+            "external_net",
             &messages,
         )
         .unwrap();
@@ -499,6 +739,7 @@ mod tests {
             &svc_dir,
             &entry,
             "http://localhost:8200",
+            "bootroot_default",
             &messages,
         )
         .unwrap();
@@ -543,6 +784,7 @@ mod tests {
             &svc_dir,
             &docker_entry("myapp"),
             "http://localhost:8200",
+            "external_net",
             &messages,
         )
         .unwrap();
@@ -593,6 +835,7 @@ mod tests {
             &svc_dir,
             &entry,
             "https://localhost:8200",
+            "bootroot_default",
             &messages,
         )
         .unwrap();
@@ -604,5 +847,152 @@ mod tests {
             )),
             "daemon VAULT_CACERT must point at the daemon-certs mount: {contents}"
         );
+    }
+
+    fn write_compose_with_openbao(dir: &Path) -> std::path::PathBuf {
+        let compose_file = dir.join("docker-compose.yml");
+        std::fs::write(
+            &compose_file,
+            "services:\n  openbao:\n    image: openbao/openbao:latest\n",
+        )
+        .unwrap();
+        compose_file
+    }
+
+    fn write_compose_without_openbao(dir: &Path) -> std::path::PathBuf {
+        let compose_file = dir.join("docker-compose.yml");
+        std::fs::write(&compose_file, "services:\n  app:\n    image: app:latest\n").unwrap();
+        compose_file
+    }
+
+    #[test]
+    fn topology_present_unset_uses_discovered_project_and_default_network() {
+        let dir = tempdir().unwrap();
+        let compose_file = write_compose_with_openbao(dir.path());
+        let messages = crate::i18n::test_messages();
+        let lookup = |_: &str, _: &str, _: &Messages| Ok(LabelLookup::Present("custom".into()));
+        let topo = resolve_sidecar_topology(&compose_file, None, &messages, &lookup).unwrap();
+        assert_eq!(topo.network, "custom_default");
+        assert_eq!(topo.project.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn topology_present_set_uses_override_network_and_discovered_project() {
+        let dir = tempdir().unwrap();
+        let compose_file = write_compose_with_openbao(dir.path());
+        let messages = crate::i18n::test_messages();
+        let lookup = |_: &str, _: &str, _: &Messages| Ok(LabelLookup::Present("custom".into()));
+        let topo =
+            resolve_sidecar_topology(&compose_file, Some("ops_net"), &messages, &lookup).unwrap();
+        assert_eq!(topo.network, "ops_net");
+        assert_eq!(topo.project.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn topology_absent_unset_errors_requesting_override() {
+        let dir = tempdir().unwrap();
+        let compose_file = write_compose_without_openbao(dir.path());
+        let messages = crate::i18n::test_messages();
+        let lookup = |_: &str, _: &str, _: &Messages| {
+            panic!("docker inspect must not be invoked when openbao is absent");
+        };
+        let err = resolve_sidecar_topology(&compose_file, None, &messages, &lookup)
+            .expect_err("missing override must error");
+        assert!(
+            err.to_string().contains("--openbao-network"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn topology_absent_set_uses_override_network_and_no_project() {
+        let dir = tempdir().unwrap();
+        let compose_file = write_compose_without_openbao(dir.path());
+        let messages = crate::i18n::test_messages();
+        let lookup = |_: &str, _: &str, _: &Messages| {
+            panic!("docker inspect must not be invoked when openbao is absent");
+        };
+        let topo =
+            resolve_sidecar_topology(&compose_file, Some("ops_net"), &messages, &lookup).unwrap();
+        assert_eq!(topo.network, "ops_net");
+        assert!(topo.project.is_none());
+    }
+
+    #[test]
+    fn topology_present_unset_surfaces_container_not_found() {
+        let dir = tempdir().unwrap();
+        let compose_file = write_compose_with_openbao(dir.path());
+        let messages = crate::i18n::test_messages();
+        let lookup = |_: &str, _: &str, _: &Messages| Ok(LabelLookup::ContainerNotFound);
+        let err = resolve_sidecar_topology(&compose_file, None, &messages, &lookup)
+            .expect_err("missing container must error");
+        assert!(
+            err.to_string().contains("bootroot-openbao"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn topology_present_unset_surfaces_missing_label() {
+        let dir = tempdir().unwrap();
+        let compose_file = write_compose_with_openbao(dir.path());
+        let messages = crate::i18n::test_messages();
+        let lookup = |_: &str, _: &str, _: &Messages| Ok(LabelLookup::MissingLabel);
+        let err = resolve_sidecar_topology(&compose_file, None, &messages, &lookup)
+            .expect_err("missing label must error");
+        assert!(
+            err.to_string().contains("com.docker.compose.project"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn discover_compose_project_rejects_invalid_label_value() {
+        let messages = crate::i18n::test_messages();
+        let lookup = |_: &str, _: &str, _: &Messages| Ok(LabelLookup::Present("evil\nname".into()));
+        let err = discover_compose_project(&messages, &lookup)
+            .expect_err("malicious label must be rejected");
+        assert!(
+            err.to_string().contains("invalid docker network name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_docker_network_name_accepts_safe_inputs() {
+        let messages = crate::i18n::test_messages();
+        for name in [
+            "bootroot_default",
+            "ops-net",
+            "abc.def",
+            "Project_42",
+            "eloquent-solomon-19b6fe_default",
+        ] {
+            assert!(
+                validate_docker_network_name(name, &messages).is_ok(),
+                "{name} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_docker_network_name_rejects_dangerous_inputs() {
+        let messages = crate::i18n::test_messages();
+        for name in [
+            "",
+            "_leading-underscore",
+            "-leading-dash",
+            ".leading-dot",
+            "has space",
+            "has\nnewline",
+            "has:colon",
+            "has\"quote",
+            "has/slash",
+        ] {
+            assert!(
+                validate_docker_network_name(name, &messages).is_err(),
+                "{name} should be rejected"
+            );
+        }
     }
 }

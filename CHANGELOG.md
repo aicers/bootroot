@@ -51,6 +51,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot service agent start` failing with
+  `network bootroot_default declared as external, but could not be
+  found` from any working directory whose name is not `bootroot` (or
+  any deployment with a non-default `COMPOSE_PROJECT_NAME`). The
+  command no longer hardcodes `-p bootroot` and `bootroot_default`;
+  instead it discovers the docker compose project at runtime from the
+  `bootroot-openbao` container's `com.docker.compose.project` label
+  and derives the default network name as `<project>_default`. A new
+  `--openbao-network` flag overrides the network discovery; supplying
+  it is mandatory when OpenBao runs outside bootroot's compose file
+  (separate host, kubernetes, managed service, etc.). Discovered and
+  operator-supplied network names are validated against the docker
+  network naming rules to prevent override-file injection.
+  (Closes #577)
 - Fixed `bootroot rotate` (responder-hmac, approle-secret-id, db,
   stepca-password) timing out for services registered with
   `--deploy-type daemon --delivery-mode local-file`. `service add` now

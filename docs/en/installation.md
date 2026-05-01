@@ -230,12 +230,34 @@ printed by `bootroot service add`.
 
 ### Docker
 
+For per-service agents, `bootroot service agent start --service-name
+<service>` is the recommended path. It writes a per-service compose
+override and starts a sidecar attached to the same docker network as
+the rest of the bootroot infrastructure. The network and compose
+project are discovered at runtime from the `bootroot-openbao`
+container's `com.docker.compose.project` label, so it works from any
+working directory and any `COMPOSE_PROJECT_NAME` value. See
+[CLI > bootroot service agent start](cli.md#bootroot-service-agent-start)
+for full inputs and failure modes.
+
+The raw `docker run` invocations below are kept for reference (e.g.
+debugging or environments where the compose-managed sidecar cannot be
+used). Substitute `<network>` with the actual docker network — by
+default `<project>_default`, where `<project>` is the
+`com.docker.compose.project` label on `bootroot-openbao`. You can
+inspect it with:
+
+```bash
+docker inspect bootroot-openbao \
+  --format '{{index .Config.Labels "com.docker.compose.project"}}'
+```
+
 OpenBao Agent for step-ca (example):
 
 ```bash
 docker run --rm \
   --name openbao-agent-stepca \
-  --network bootroot_default \
+  --network <network> \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://bootroot-openbao:8200 \
   openbao/openbao:latest \
@@ -247,7 +269,7 @@ OpenBao Agent for responder (example):
 ```bash
 docker run --rm \
   --name openbao-agent-responder \
-  --network bootroot_default \
+  --network <network> \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://bootroot-openbao:8200 \
   openbao/openbao:latest \
@@ -259,7 +281,7 @@ OpenBao Agent for a service (example):
 ```bash
 docker run --rm \
   --name openbao-agent-edge-proxy \
-  --network bootroot_default \
+  --network <network> \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://bootroot-openbao:8200 \
   openbao/openbao:latest \

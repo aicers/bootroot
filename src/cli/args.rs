@@ -121,6 +121,16 @@ pub(crate) struct ServiceAgentStartArgs {
 
     #[command(flatten)]
     pub(crate) compose_file: ComposeFileArgs,
+
+    /// Docker network the sidecar should attach to.
+    ///
+    /// When omitted, the network is discovered from the
+    /// `bootroot-openbao` container's compose project label
+    /// (`<project>_default`). Required when `OpenBao` runs outside
+    /// bootroot's compose file (separate host, kubernetes, managed
+    /// service, etc.).
+    #[arg(long)]
+    pub(crate) openbao_network: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1642,6 +1652,31 @@ mod tests {
                     args.compose_file.compose_file,
                     PathBuf::from("docker-compose.yml")
                 );
+                assert!(
+                    args.openbao_network.is_none(),
+                    "openbao_network must default to None"
+                );
+            }
+            _ => panic!("expected service agent start"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_agent_start_with_openbao_network() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "agent",
+            "start",
+            "--service-name",
+            "myapp",
+            "--openbao-network",
+            "external_net",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Agent(ServiceAgentCommand::Start(args))) => {
+                assert_eq!(args.service_name, "myapp");
+                assert_eq!(args.openbao_network.as_deref(), Some("external_net"));
             }
             _ => panic!("expected service agent start"),
         }

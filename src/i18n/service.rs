@@ -906,4 +906,23 @@ impl Messages {
             &[("value", value)],
         )
     }
+
+    pub(crate) fn error_openbao_container_not_found(&self) -> &'static str {
+        self.strings().error_openbao_container_not_found
+    }
+
+    pub(crate) fn error_openbao_container_no_project_label(&self) -> &'static str {
+        self.strings().error_openbao_container_no_project_label
+    }
+
+    pub(crate) fn error_openbao_network_required_external(&self) -> &'static str {
+        self.strings().error_openbao_network_required_external
+    }
+
+    pub(crate) fn error_invalid_docker_network_name(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_invalid_docker_network_name,
+            &[("value", value)],
+        )
+    }
 }
