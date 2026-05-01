@@ -753,7 +753,7 @@ bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
 선언되어 있는지 여부를 의미합니다.
 
 | OpenBao in compose | `--openbao-network` | 동작 |
-|---|---|---|
+| --- | --- | --- |
 | 있음 | 미설정 | `bootroot-openbao`의 project 라벨을 조회하여 `-p`에 `<project>`, override 네트워크에 `<project>_default`를 사용 |
 | 있음 | 설정 | override에는 전달된 네트워크를 사용하되, `-p` 결정을 위해 project 라벨 조회는 그대로 수행 |
 | 없음 | 미설정 | 오류: OpenBao가 bootroot compose 외부에서 동작하면 `--openbao-network`가 필요합니다 |
@@ -830,7 +830,7 @@ bootroot service agent start \
 "agent" 단어를 공유하지만 완전히 다른 소프트웨어입니다.
 
 | 소프트웨어 | 역할 | 실행 주체 |
-|---|---|---|
+| --- | --- | --- |
 | OpenBao Agent (`bao agent`) | OpenBao에서 시크릿을 받아와 템플릿을 렌더링 | bootroot(사이드카) 또는 운영자(호스트 데몬) |
 | `bootroot-agent` | step-ca 대상으로 TLS 인증서 발급/갱신 | 운영자(호스트 데몬, 별도 바이너리) |
 
@@ -846,7 +846,7 @@ Agent 자체는 bootroot가 관리하는 사이드카 컨테이너로 띄울 수
 있습니다.
 
 | 항목 | 사이드카(기본) | 호스트 데몬(대안) |
-|---|---|---|
+| --- | --- | --- |
 | rotate 신호 경로 | 능동(`docker restart` → 즉시 재렌더링) | 수동(`static_secret_render_interval = 30s` 폴링에 의존) |
 | rotate 지연 | 수 초 | 최대 30초 |
 | 라이프사이클 관리 | bootroot 소유(`service agent start`) | 운영자 소유(systemd unit 등) |

@@ -778,7 +778,7 @@ the following decision matrix (rows 1 and 2 read whether the compose
 file declares an `openbao` service):
 
 | OpenBao in compose | `--openbao-network` | Behavior |
-|---|---|---|
+| --- | --- | --- |
 | present | unset | Discover project label on `bootroot-openbao`; use `<project>` for `-p` and `<project>_default` for the override network |
 | present | set | Use the given network in the override; still discover project label for `-p` |
 | absent | unset | Error: `--openbao-network` is required when OpenBao runs outside bootroot's compose |
@@ -855,7 +855,7 @@ the `bootroot-agent` certificate daemon. Two completely different
 software packages share the word "agent":
 
 | Software | Role | Who runs it |
-|---|---|---|
+| --- | --- | --- |
 | OpenBao Agent (`bao agent`) | Fetches secrets from OpenBao, renders templates | bootroot (sidecar) or operator (host daemon) |
 | `bootroot-agent` | Issues/renews TLS certs against step-ca | Operator (host daemon, separate binary) |
 
@@ -871,7 +871,7 @@ daemon (`bao agent
 -config=secrets/openbao/services/<svc>/agent.hcl`).
 
 | Concern | Sidecar (default) | Host daemon (alternative) |
-|---|---|---|
+| --- | --- | --- |
 | rotate signal path | Active (`docker restart` → immediate re-render) | Passive (relies on `static_secret_render_interval = 30s` polling) |
 | rotate latency | ~seconds | up to 30s |
 | Lifecycle management | bootroot owns it (`service agent start`) | Operator owns it (systemd unit, etc.) |
