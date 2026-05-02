@@ -97,8 +97,11 @@ HOST_DAEMON_OBA_CONTAINER="${HOST_DAEMON_OBA_CONTAINER:-bootroot-openbao-agent-h
 #   openbao-missing  - removes the bootroot-openbao container before
 #                      invoking `service openbao-sidecar start` and
 #                      asserts the command exits non-zero with the
-#                      "container not found" i18n message.  Skips the
-#                      rotation phase (state is intentionally degraded).
+#                      full "container not found" i18n message,
+#                      including the `bootroot infra install` /
+#                      `--openbao-network` remediation guidance.
+#                      Skips the rotation phase (state is intentionally
+#                      degraded).
 #   external-openbao - swaps in a stripped compose file (no openbao
 #                      service) and an external docker network for the
 #                      `service openbao-sidecar start` call.  Asserts the
@@ -360,13 +363,33 @@ remove_openbao_container_for_missing_topology() {
   fi
 }
 
-# Asserts `service openbao-sidecar start` fails with the expected i18n
-# message.  Captures stderr+stdout so the test can grep for the
-# substring even when bootroot logs to stderr.
+# Asserts `service openbao-sidecar start` fails and the captured
+# stderr+stdout contains *every* expected substring.  Multiple
+# substrings let us pin both the symptom and the remediation portion
+# of an i18n message, so a regression that drops the remediation hint
+# is caught even when the symptom string is unchanged.
+#
+# Usage:
+#   assert_service_oba_start_fails <service> <substring> [<substring>...] \
+#     -- [bootroot service openbao-sidecar start args...]
+#
+# The literal `--` separates expected-substring args from bootroot
+# CLI args.  At least one substring is required.
 assert_service_oba_start_fails() {
   local service="$1"
-  local expected_substring="$2"
-  shift 2
+  shift
+  local -a expected_substrings=()
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+    expected_substrings+=("$1")
+    shift
+  done
+  if [ "$#" -eq 0 ]; then
+    fail "assert_service_oba_start_fails: missing '--' separator before bootroot args"
+  fi
+  shift # discard the literal --
+  if [ "${#expected_substrings[@]}" -eq 0 ]; then
+    fail "assert_service_oba_start_fails: at least one expected substring is required"
+  fi
   local capture_file
   capture_file="$(mktemp "$ARTIFACT_DIR/oba-start-fail.XXXXXX")"
   rm -f "$AGENT_CONFIG_PATH"
@@ -374,14 +397,17 @@ assert_service_oba_start_fails() {
   if (cd "$WORKSPACE_DIR" && "$BOOTROOT_BIN" service openbao-sidecar start \
         --service-name "$service" "$@") >"$capture_file" 2>&1; then
     cat "$capture_file" >>"$RUN_LOG" || true
-    fail "service openbao-sidecar start unexpectedly succeeded for ${service} (expected failure containing: ${expected_substring})"
+    fail "service openbao-sidecar start unexpectedly succeeded for ${service} (expected failure containing: ${expected_substrings[*]})"
   fi
   cat "$capture_file" >>"$RUN_LOG" || true
-  if ! grep -qF -e "$expected_substring" "$capture_file"; then
-    fail "service openbao-sidecar start error did not contain expected substring '${expected_substring}' (see $capture_file)"
-  fi
-  printf '[lifecycle] service openbao-sidecar start failed as expected: substring=%q\n' \
-    "$expected_substring" >>"$RUN_LOG"
+  local substring
+  for substring in "${expected_substrings[@]}"; do
+    if ! grep -qF -e "$substring" "$capture_file"; then
+      fail "service openbao-sidecar start error did not contain expected substring '${substring}' (see $capture_file)"
+    fi
+    printf '[lifecycle] service openbao-sidecar start failed as expected: substring=%q\n' \
+      "$substring" >>"$RUN_LOG"
+  done
 }
 
 # Writes a stripped compose file that has no `openbao` service,
@@ -471,6 +497,7 @@ run_external_openbao_topology_assertions() {
   # with the i18n message that requests the flag.
   assert_service_oba_start_fails "$service" \
     "--openbao-network" \
+    -- \
     --compose-file "$stripped_compose"
 
   # Positive: with --openbao-network the sidecar attaches to the
@@ -1153,8 +1180,19 @@ main() {
     openbao-missing)
       log_phase "topology-openbao-missing"
       remove_openbao_container_for_missing_topology
+      # Assert the full "container not found" i18n contract: the
+      # symptom (`container not found`) AND both halves of the
+      # remediation hint (`bootroot infra install` and
+      # `--openbao-network`).  A regression that drops either half
+      # of the remediation now fails the arm.  The em-dash that
+      # joins the message in en.rs is intentionally not asserted on,
+      # so a future tweak to that punctuation does not break this
+      # arm.
       assert_service_oba_start_fails "$SIDECAR_OBA_SERVICE" \
         "container not found" \
+        "bootroot infra install" \
+        "--openbao-network" \
+        -- \
         --compose-file "$COMPOSE_FILE"
       write_manifest
       return 0
