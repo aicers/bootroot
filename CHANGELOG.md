@@ -6,22 +6,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Changed
-
-- Renamed `bootroot service agent start` to `bootroot service
-  openbao-sidecar start`. The new name resolves two ambiguities in
-  the previous spelling: which software ("agent" clashed with the
-  unrelated `bootroot-agent` certificate daemon — `openbao` makes the
-  identity explicit) and which deployment pattern (`agent` did not
-  hint that the command manages only the sidecar variant of the
-  OpenBao Agent — `sidecar` makes that explicit and leaves room for
-  a future host-daemon subcommand). All docs, examples, and the
-  next-steps text emitted by `bootroot service add` now use the new
-  name. The previous `bootroot service agent start` form keeps
-  working for one release as a hidden deprecated alias that prints a
-  warning pointing at the new name; it will be removed in the
-  following release. (Closes #578)
-
 ### Security
 
 - Bumped `rustls-webpki` from 0.103.10 to 0.103.12 to address
@@ -463,6 +447,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Renamed `bootroot service agent start` to `bootroot service
+  openbao-sidecar start`. The new name resolves two ambiguities in
+  the previous spelling: which software ("agent" clashed with the
+  unrelated `bootroot-agent` certificate daemon — `openbao` makes the
+  identity explicit) and which deployment pattern (`agent` did not
+  hint that the command manages only the sidecar variant of the
+  OpenBao Agent — `sidecar` makes that explicit and leaves room for
+  a future host-daemon subcommand). All docs, examples, and the
+  next-steps text emitted by `bootroot service add` now use the new
+  name. The previous `bootroot service agent start` form keeps
+  working for one release as a hidden deprecated alias that prints a
+  warning pointing at the new name; it will be removed in the
+  following release. (Closes #578)
 - Changed `bootroot service agent start` to take `--service-name <NAME>`
   instead of a positional `<SERVICE_NAME>` argument, matching the other
   per-service subcommands (`service add`, `service info`, `service update`).
