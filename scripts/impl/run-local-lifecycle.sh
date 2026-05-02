@@ -82,8 +82,26 @@ SIDECAR_OBA_READY_DELAY_SECS="${SIDECAR_OBA_READY_DELAY_SECS:-2}"
 #                 (passive rotate-signal path via static_secret_render_interval)
 OBA_DEPLOYMENT="${OBA_DEPLOYMENT:-sidecar}"
 HOST_DAEMON_OBA_CONTAINER="${HOST_DAEMON_OBA_CONTAINER:-bootroot-openbao-agent-host-${EDGE_SERVICE}}"
-# Worst-case rotate latency for the host-daemon path: agents poll on
-# `static_secret_render_interval = 30s`, so allow ~2x for jitter.
+# Upper bound for the responder-hmac rotate's wall-clock under each
+# OBA deployment.  The two thresholds together prove which propagation
+# route OpenBao Agent took:
+#
+#   sidecar:     bootroot's active container restart hands the new
+#                HMAC over instantly, so the rotate must complete
+#                well below `static_secret_render_interval` (=30s).
+#                If the active route silently regresses (e.g. wrong
+#                container name, signal not delivered), rotate would
+#                still succeed via the polling fallback — but the
+#                wall-clock would jump above this threshold and we'd
+#                catch the regression here instead of letting it ship
+#                undetected (the gap that #577 sat in for a release).
+#
+#   host-daemon: bootroot has no handle on the operator-managed
+#                daemon, so the active restart silently no-ops and
+#                only the polling fallback (`static_secret_render_interval
+#                = 30s`) propagates the new HMAC.  Allow the full
+#                polling window plus jitter.
+SIDECAR_ROTATE_LATENCY_LIMIT_SECS="${SIDECAR_ROTATE_LATENCY_LIMIT_SECS:-25}"
 HOST_DAEMON_RENDER_TIMEOUT_SECS="${HOST_DAEMON_RENDER_TIMEOUT_SECS:-75}"
 CURRENT_PHASE="init"
 export POSTGRES_HOST="127.0.0.1"
@@ -672,6 +690,44 @@ verify_service_with_retry() {
   done
 }
 
+# Asserts the responder-hmac rotate completed within the wall-clock
+# budget for the active OBA deployment.  The two thresholds together
+# distinguish the active sidecar restart route from the host-daemon
+# polling fallback and catch silent regressions in either path:
+#
+#   sidecar:     `bootroot rotate` actively restarts the sidecar
+#                container, so the rendered file must contain the new
+#                HMAC well below the polling fallback window.  A
+#                threshold above `static_secret_render_interval`
+#                (=30s) would let a regression where the active
+#                restart silently no-ops sneak through, because rotate
+#                would still succeed via polling.
+#
+#   host-daemon: `bootroot rotate` cannot signal the operator daemon,
+#                so propagation must wait for the polling fallback.
+assert_responder_hmac_rotate_latency() {
+  local elapsed_secs="$1"
+  local limit_secs route
+  case "$OBA_DEPLOYMENT" in
+    sidecar)
+      limit_secs="$SIDECAR_ROTATE_LATENCY_LIMIT_SECS"
+      route="active sidecar restart"
+      ;;
+    host-daemon)
+      limit_secs="$HOST_DAEMON_RENDER_TIMEOUT_SECS"
+      route="polling fallback (static_secret_render_interval)"
+      ;;
+    *)
+      fail "assert_responder_hmac_rotate_latency: unknown OBA_DEPLOYMENT=$OBA_DEPLOYMENT"
+      ;;
+  esac
+  printf '[lifecycle] responder-hmac rotate elapsed=%ss limit=%ss route=%s deployment=%s\n' \
+    "$elapsed_secs" "$limit_secs" "$route" "$OBA_DEPLOYMENT" >>"$RUN_LOG"
+  if [ "$elapsed_secs" -gt "$limit_secs" ]; then
+    fail "responder-hmac rotate took ${elapsed_secs}s, exceeding the ${limit_secs}s budget for OBA_DEPLOYMENT=${OBA_DEPLOYMENT} (expected route: ${route})"
+  fi
+}
+
 assert_fingerprint_changed() {
   local service="$1"
   local before_label="$2"
@@ -740,6 +796,8 @@ run_rotations_with_verification() {
   run_verify_pair "after-openbao-recovery"
 
   log_phase "rotate-responder-hmac"
+  local rotate_start_epoch rotate_end_epoch rotate_elapsed_secs
+  rotate_start_epoch="$(date +%s)"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
     --openbao-url "http://${STEPCA_HOST_IP}:8200" \
@@ -748,6 +806,9 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     responder-hmac >>"$RUN_LOG" 2>&1
+  rotate_end_epoch="$(date +%s)"
+  rotate_elapsed_secs=$((rotate_end_epoch - rotate_start_epoch))
+  assert_responder_hmac_rotate_latency "$rotate_elapsed_secs"
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-responder-hmac"
