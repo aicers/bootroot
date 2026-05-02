@@ -38,6 +38,7 @@ HTTP01_TARGET_DELAY_SECS="${HTTP01_TARGET_DELAY_SECS:-2}"
 RESPONDER_READY_ATTEMPTS="${RESPONDER_READY_ATTEMPTS:-30}"
 RESPONDER_READY_DELAY_SECS="${RESPONDER_READY_DELAY_SECS:-1}"
 
+OPENBAO_CONTAINER_NAME="bootroot-openbao"
 EDGE_SERVICE="edge-proxy"
 EDGE_HOSTNAME="edge-node-01"
 WEB_SERVICE="web-app"
@@ -82,6 +83,32 @@ SIDECAR_OBA_READY_DELAY_SECS="${SIDECAR_OBA_READY_DELAY_SECS:-2}"
 #                 (passive rotate-signal path via static_secret_render_interval)
 OBA_DEPLOYMENT="${OBA_DEPLOYMENT:-sidecar}"
 HOST_DAEMON_OBA_CONTAINER="${HOST_DAEMON_OBA_CONTAINER:-bootroot-openbao-agent-host-${EDGE_SERVICE}}"
+# Selects which compose-project / OpenBao topology to exercise around
+# `service openbao-sidecar start`.  All values run the same install
+# + init + service-add prefix; later phases differ.
+#
+#   default          - standard bootroot compose, default project name.
+#                      Runs the full lifecycle (sidecar start + rotations).
+#   custom-project   - same as default but exports
+#                      COMPOSE_PROJECT_NAME=$CUSTOM_COMPOSE_PROJECT before
+#                      bringing up the stack.  Asserts the sidecar lands
+#                      in that project (exercises env-var → project-label
+#                      discovery branch in `discover_compose_project`).
+#   openbao-missing  - removes the bootroot-openbao container before
+#                      invoking `service openbao-sidecar start` and
+#                      asserts the command exits non-zero with the
+#                      "container not found" i18n message.  Skips the
+#                      rotation phase (state is intentionally degraded).
+#   external-openbao - swaps in a stripped compose file (no openbao
+#                      service) and an external docker network for the
+#                      `service openbao-sidecar start` call.  Asserts the
+#                      negative path (no flag → required-flag error)
+#                      and the positive path (with --openbao-network the
+#                      sidecar attaches to the external network).  Skips
+#                      the rotation phase.
+OBA_TOPOLOGY="${OBA_TOPOLOGY:-default}"
+CUSTOM_COMPOSE_PROJECT="${CUSTOM_COMPOSE_PROJECT:-myorg-prod}"
+EXTERNAL_OBA_NETWORK="${EXTERNAL_OBA_NETWORK:-oba-ext}"
 # Upper bound for the responder-hmac rotate's wall-clock under each
 # OBA deployment.  The two thresholds together prove which propagation
 # route OpenBao Agent took:
@@ -304,6 +331,134 @@ stop_service_oba() {
   docker rm -f "$HOST_DAEMON_OBA_CONTAINER" >/dev/null 2>&1 || true
 }
 
+# Asserts the sidecar container's compose project label matches the
+# expected value.  Catches regressions where project-label discovery
+# silently falls back to a hardcoded default instead of honouring
+# COMPOSE_PROJECT_NAME (issue #582 scenario 1).
+assert_sidecar_compose_project() {
+  local container="$1"
+  local expected="$2"
+  local actual
+  actual="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$container" 2>/dev/null || true)"
+  if [ "$actual" != "$expected" ]; then
+    docker logs "$container" >>"$RUN_LOG" 2>&1 || true
+    fail "sidecar container $container has compose project label '$actual', expected '$expected' (custom-project topology)"
+  fi
+  printf '[lifecycle] sidecar compose project label verified: container=%s project=%s\n' \
+    "$container" "$actual" >>"$RUN_LOG"
+}
+
+# Removes bootroot-openbao via `docker rm -f` (NOT `docker stop`) so
+# `docker inspect` returns a "no such container" error and exercises
+# the ContainerNotFound branch in `inspect_label_via_docker`.  A plain
+# stop would leave the container's compose project label intact and
+# trigger the Present(value) branch instead.
+remove_openbao_container_for_missing_topology() {
+  docker rm -f "$OPENBAO_CONTAINER_NAME" >/dev/null 2>&1 || true
+  if docker inspect "$OPENBAO_CONTAINER_NAME" >/dev/null 2>&1; then
+    fail "$OPENBAO_CONTAINER_NAME still exists after docker rm -f (openbao-missing topology)"
+  fi
+}
+
+# Asserts `service openbao-sidecar start` fails with the expected i18n
+# message.  Captures stderr+stdout so the test can grep for the
+# substring even when bootroot logs to stderr.
+assert_service_oba_start_fails() {
+  local service="$1"
+  local expected_substring="$2"
+  shift 2
+  local capture_file
+  capture_file="$(mktemp "$ARTIFACT_DIR/oba-start-fail.XXXXXX")"
+  rm -f "$AGENT_CONFIG_PATH"
+  docker rm -f "bootroot-openbao-agent-${service}" >/dev/null 2>&1 || true
+  if (cd "$WORKSPACE_DIR" && "$BOOTROOT_BIN" service openbao-sidecar start \
+        --service-name "$service" "$@") >"$capture_file" 2>&1; then
+    cat "$capture_file" >>"$RUN_LOG" || true
+    fail "service openbao-sidecar start unexpectedly succeeded for ${service} (expected failure containing: ${expected_substring})"
+  fi
+  cat "$capture_file" >>"$RUN_LOG" || true
+  if ! grep -qF "$expected_substring" "$capture_file"; then
+    fail "service openbao-sidecar start error did not contain expected substring '${expected_substring}' (see $capture_file)"
+  fi
+  printf '[lifecycle] service openbao-sidecar start failed as expected: substring=%q\n' \
+    "$expected_substring" >>"$RUN_LOG"
+}
+
+# Writes a stripped compose file that has no `openbao` service,
+# forcing the `compose_has_openbao() == false` branch in
+# `resolve_sidecar_topology`.  Other infra services are kept so the
+# stripped file still parses as a valid compose document.
+write_stripped_compose_file() {
+  local target="$1"
+  cat >"$target" <<'YAML'
+services:
+  placeholder:
+    image: hello-world
+    profiles:
+      - never-up
+YAML
+}
+
+# Drives the external-OpenBao topology assertions: stripped compose
+# with no openbao service + a separately-created docker network the
+# sidecar must attach to via --openbao-network.
+#
+# The positive case sets COMPOSE_PROJECT_NAME to a sentinel value
+# before invoking bootroot, then asserts the sidecar's
+# `com.docker.compose.project` label equals that sentinel.  This
+# proves no `-p <project>` was passed to docker compose: with `-p`,
+# the label would equal the `-p` value (always `bootroot` or the
+# discovered project under #580's logic); without `-p`, it falls
+# through to COMPOSE_PROJECT_NAME == sentinel.
+run_external_openbao_topology_assertions() {
+  local service="$1"
+  local stripped_compose="$ARTIFACT_DIR/docker-compose.stripped.yml"
+  local sidecar_container="bootroot-openbao-agent-${service}"
+  local no_p_sentinel="external-no-p-sentinel"
+  write_stripped_compose_file "$stripped_compose"
+  if ! docker network inspect "$EXTERNAL_OBA_NETWORK" >/dev/null 2>&1; then
+    docker network create "$EXTERNAL_OBA_NETWORK" >/dev/null
+  fi
+
+  # Negative: no --openbao-network and stripped compose → must fail
+  # with the i18n message that requests the flag.
+  assert_service_oba_start_fails "$service" \
+    "--openbao-network" \
+    --compose-file "$stripped_compose"
+
+  # Positive: with --openbao-network the sidecar attaches to the
+  # external network and the docker compose invocation must NOT
+  # include `-p <project>`.  Assert via the COMPOSE_PROJECT_NAME
+  # sentinel; the matching unit test
+  # (`build_compose_up_args_omits_project_when_not_supplied`)
+  # backs this at the function level.
+  rm -f "$AGENT_CONFIG_PATH"
+  docker rm -f "$sidecar_container" >/dev/null 2>&1 || true
+  (cd "$WORKSPACE_DIR" && \
+      COMPOSE_PROJECT_NAME="$no_p_sentinel" \
+      "$BOOTROOT_BIN" service openbao-sidecar start \
+        --service-name "$service" \
+        --compose-file "$stripped_compose" \
+        --openbao-network "$EXTERNAL_OBA_NETWORK") >>"$RUN_LOG" 2>&1
+  if ! docker inspect "$sidecar_container" >/dev/null 2>&1; then
+    fail "sidecar container $sidecar_container not created in external-openbao positive case"
+  fi
+  local network_id
+  network_id="$(docker inspect --format \
+    "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}" \
+    "$sidecar_container" 2>/dev/null || true)"
+  if ! printf '%s' "$network_id" | grep -qw "$EXTERNAL_OBA_NETWORK"; then
+    fail "sidecar container $sidecar_container is not on $EXTERNAL_OBA_NETWORK (networks: $network_id)"
+  fi
+  local actual_project
+  actual_project="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$sidecar_container" 2>/dev/null || true)"
+  if [ "$actual_project" != "$no_p_sentinel" ]; then
+    fail "sidecar container $sidecar_container has compose project '$actual_project', expected '$no_p_sentinel' — proves docker compose was invoked WITH a -p flag instead of relying on COMPOSE_PROJECT_NAME"
+  fi
+  printf '[lifecycle] external-openbao positive case verified: container=%s networks=%q project=%s\n' \
+    "$sidecar_container" "$network_id" "$actual_project" >>"$RUN_LOG"
+}
+
 cleanup_hosts() {
   if [ "$RESOLUTION_MODE" != "hosts" ]; then
     return 0
@@ -324,6 +479,9 @@ cleanup() {
   capture_artifacts
   stop_service_oba
   compose_down
+  if [ "$OBA_TOPOLOGY" = "external-openbao" ]; then
+    docker network rm "$EXTERNAL_OBA_NETWORK" >/dev/null 2>&1 || true
+  fi
 }
 
 on_error() {
@@ -911,6 +1069,19 @@ main() {
   trap cleanup EXIT
   trap 'on_error $LINENO' ERR
 
+  case "$OBA_TOPOLOGY" in
+    default|custom-project|openbao-missing|external-openbao) ;;
+    *) fail "Unsupported OBA_TOPOLOGY: $OBA_TOPOLOGY (expected: default | custom-project | openbao-missing | external-openbao)" ;;
+  esac
+
+  if [ "$OBA_TOPOLOGY" = "custom-project" ]; then
+    # Must be exported BEFORE install_infra so the bootroot-openbao
+    # container picks up the project label this topology asserts on.
+    export COMPOSE_PROJECT_NAME="$CUSTOM_COMPOSE_PROJECT"
+    printf '[lifecycle] custom-project topology: COMPOSE_PROJECT_NAME=%s\n' \
+      "$COMPOSE_PROJECT_NAME" >>"$RUN_LOG"
+  fi
+
   ensure_prerequisites
   configure_resolution_mode
   compose_down
@@ -918,13 +1089,36 @@ main() {
   install_infra
   write_agent_config
   run_bootstrap_chain
-  apply_dns_aliases
-  prepare_stepca_validation_targets
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"
 
+  case "$OBA_TOPOLOGY" in
+    openbao-missing)
+      log_phase "topology-openbao-missing"
+      remove_openbao_container_for_missing_topology
+      assert_service_oba_start_fails "$SIDECAR_OBA_SERVICE" \
+        "container not found" \
+        --compose-file "$COMPOSE_FILE"
+      write_manifest
+      return 0
+      ;;
+    external-openbao)
+      log_phase "topology-external-openbao"
+      run_external_openbao_topology_assertions "$SIDECAR_OBA_SERVICE"
+      write_manifest
+      return 0
+      ;;
+  esac
+
+  apply_dns_aliases
+  prepare_stepca_validation_targets
+
   start_service_oba "$SIDECAR_OBA_SERVICE"
+
+  if [ "$OBA_TOPOLOGY" = "custom-project" ] && [ "$OBA_DEPLOYMENT" = "sidecar" ]; then
+    assert_sidecar_compose_project "$SIDECAR_OBA_CONTAINER" "$CUSTOM_COMPOSE_PROJECT"
+  fi
 
   copy_remote_materials
   log_phase "remote-bootstrap-initial"

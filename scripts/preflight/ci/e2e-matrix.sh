@@ -85,6 +85,56 @@ BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
 BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
 "$ROOT_DIR/scripts/impl/run-local-lifecycle.sh"
 
+# Topology variants of `service openbao-sidecar start` exercise the
+# network-discovery code paths added in #580.  Custom project name
+# runs the full lifecycle; the openbao-missing and external-openbao
+# arms exit early after the targeted negative/positive checks since
+# their post-checks intentionally degrade the stack.  See issue #582.
+echo "[ci-local-e2e] run local lifecycle (no-hosts, OBA topology=custom-project)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-no-hosts-custom-project-${RUN_ID}" \
+PROJECT_NAME="bootroot-e2e-ci-local-no-hosts-custom-project-${RUN_ID}" \
+RESOLUTION_MODE="no-hosts" \
+SECRETS_DIR="$ROOT_DIR/secrets" \
+OBA_DEPLOYMENT="sidecar" \
+OBA_TOPOLOGY="custom-project" \
+TIMEOUT_SECS=120 \
+INFRA_UP_ATTEMPTS=12 \
+INFRA_UP_DELAY_SECS=10 \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
+BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
+"$ROOT_DIR/scripts/impl/run-local-lifecycle.sh"
+
+echo "[ci-local-e2e] run local lifecycle (no-hosts, OBA topology=openbao-missing)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-no-hosts-openbao-missing-${RUN_ID}" \
+PROJECT_NAME="bootroot-e2e-ci-local-no-hosts-openbao-missing-${RUN_ID}" \
+RESOLUTION_MODE="no-hosts" \
+SECRETS_DIR="$ROOT_DIR/secrets" \
+OBA_DEPLOYMENT="sidecar" \
+OBA_TOPOLOGY="openbao-missing" \
+TIMEOUT_SECS=120 \
+INFRA_UP_ATTEMPTS=12 \
+INFRA_UP_DELAY_SECS=10 \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
+BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
+"$ROOT_DIR/scripts/impl/run-local-lifecycle.sh"
+
+echo "[ci-local-e2e] run local lifecycle (no-hosts, OBA topology=external-openbao)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-no-hosts-external-openbao-${RUN_ID}" \
+PROJECT_NAME="bootroot-e2e-ci-local-no-hosts-external-openbao-${RUN_ID}" \
+RESOLUTION_MODE="no-hosts" \
+SECRETS_DIR="$ROOT_DIR/secrets" \
+OBA_DEPLOYMENT="sidecar" \
+OBA_TOPOLOGY="external-openbao" \
+TIMEOUT_SECS=120 \
+INFRA_UP_ATTEMPTS=12 \
+INFRA_UP_DELAY_SECS=10 \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
+BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
+"$ROOT_DIR/scripts/impl/run-local-lifecycle.sh"
+
 # Re-run the same lifecycle but with the host-daemon variant of the
 # OpenBao Agent.  Verifies the polling-fallback rotate path
 # (`static_secret_render_interval = 30s`) the next-steps text in
@@ -172,6 +222,9 @@ BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-custom-project-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-openbao-missing-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-external-openbao-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-remote-no-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-remote-hosts-${RUN_ID}"

@@ -326,31 +326,55 @@ jobs:
             resolution: no-hosts
             artifact: ci-local-no-hosts
             oba_deployment: sidecar
+            oba_topology: default
           - label: local-no-hosts-host-daemon
             script: run-local-lifecycle.sh
             resolution: no-hosts
             artifact: ci-local-no-hosts-host-daemon
             oba_deployment: host-daemon
+            oba_topology: default
+          - label: local-no-hosts-custom-project
+            script: run-local-lifecycle.sh
+            resolution: no-hosts
+            artifact: ci-local-no-hosts-custom-project
+            oba_deployment: sidecar
+            oba_topology: custom-project
+          - label: local-no-hosts-openbao-missing
+            script: run-local-lifecycle.sh
+            resolution: no-hosts
+            artifact: ci-local-no-hosts-openbao-missing
+            oba_deployment: sidecar
+            oba_topology: openbao-missing
+          - label: local-no-hosts-external-openbao
+            script: run-local-lifecycle.sh
+            resolution: no-hosts
+            artifact: ci-local-no-hosts-external-openbao
+            oba_deployment: sidecar
+            oba_topology: external-openbao
           - label: local-hosts
             script: run-local-lifecycle.sh
             resolution: hosts
             artifact: ci-local-hosts
             oba_deployment: sidecar
+            oba_topology: default
           - label: remote-no-hosts
             script: run-remote-lifecycle.sh
             resolution: no-hosts
             artifact: ci-remote-no-hosts
             oba_deployment: ""
+            oba_topology: ""
           - label: remote-hosts
             script: run-remote-lifecycle.sh
             resolution: hosts
             artifact: ci-remote-hosts
             oba_deployment: ""
+            oba_topology: ""
           - label: rotation
             script: run-rotation-recovery.sh
             resolution: ""
             artifact: ci-rotation
             oba_deployment: ""
+            oba_topology: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -385,6 +409,7 @@ jobs:
           PROJECT_NAME="bootroot-e2e-ci-${{ matrix.scenario.label }}-${GITHUB_RUN_ID}" \
           RESOLUTION_MODE="${{ matrix.scenario.resolution }}" \
           OBA_DEPLOYMENT="${{ matrix.scenario.oba_deployment }}" \
+          OBA_TOPOLOGY="${{ matrix.scenario.oba_topology }}" \
           SECRETS_DIR="$(pwd)/secrets" \
           TIMEOUT_SECS=120 \
           INFRA_UP_ATTEMPTS=12 \
