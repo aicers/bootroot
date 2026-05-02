@@ -1081,8 +1081,9 @@ run_rotations_with_verification() {
   if [ -z "${db_admin_dsn:-}" ]; then
     db_admin_dsn="postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/stepca?sslmode=disable"
   else
-    # Replace the Docker-internal host with localhost for host-side access.
-    db_admin_dsn="$(echo "$db_admin_dsn" | sed 's|@postgres:|@127.0.0.1:|')"
+    # Replace the Docker-internal host:port with the host-side mapping.
+    db_admin_dsn="$(echo "$db_admin_dsn" \
+      | sed "s|@postgres:5432|@127.0.0.1:${POSTGRES_HOST_PORT:-5432}|")"
   fi
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
