@@ -403,6 +403,14 @@ YAML
 # with no openbao service + a separately-created docker network the
 # sidecar must attach to via --openbao-network.
 #
+# Provides a reachable OpenBao endpoint on `oba-ext` by connecting the
+# already-initialised `bootroot-openbao` container to that network.
+# The agent.hcl rendered during `service add` always points at
+# `address = "http://bootroot-openbao:8200"` (see
+# `render_docker_agent_config`), so docker DNS on `oba-ext` resolves
+# the address from inside the sidecar and `bao agent` can authenticate
+# and render `agent.toml` end-to-end.
+#
 # The positive case sets COMPOSE_PROJECT_NAME to a sentinel value
 # before invoking bootroot, then asserts the sidecar's
 # `com.docker.compose.project` label equals that sentinel.  This
@@ -410,6 +418,13 @@ YAML
 # the label would equal the `-p` value (always `bootroot` or the
 # discovered project under #580's logic); without `-p`, it falls
 # through to COMPOSE_PROJECT_NAME == sentinel.
+#
+# The `wait_for_oba_render` call after the positive invocation is the
+# core proof that `--openbao-network` plumbed the sidecar to a working
+# OpenBao endpoint — `docker compose up -d` succeeds even when the
+# agent's first connection fails (it would just keep restarting), so
+# the rendered HMAC line in `agent.toml` is the only end-to-end signal
+# that the sidecar actually talked to OpenBao.
 run_external_openbao_topology_assertions() {
   local service="$1"
   local stripped_compose="$ARTIFACT_DIR/docker-compose.stripped.yml"
@@ -418,6 +433,15 @@ run_external_openbao_topology_assertions() {
   write_stripped_compose_file "$stripped_compose"
   if ! docker network inspect "$EXTERNAL_OBA_NETWORK" >/dev/null 2>&1; then
     docker network create "$EXTERNAL_OBA_NETWORK" >/dev/null
+  fi
+  # Attach the existing OpenBao container to oba-ext so the sidecar
+  # (which joins oba-ext only) can resolve `bootroot-openbao` via
+  # docker DNS and reach the API.  Idempotent: `docker network
+  # connect` errors if the container is already attached.
+  if ! docker inspect --format \
+        "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}" \
+        "$OPENBAO_CONTAINER_NAME" 2>/dev/null | grep -qw "$EXTERNAL_OBA_NETWORK"; then
+    docker network connect "$EXTERNAL_OBA_NETWORK" "$OPENBAO_CONTAINER_NAME" >>"$RUN_LOG" 2>&1
   fi
 
   # Negative: no --openbao-network and stripped compose → must fail
@@ -455,7 +479,16 @@ run_external_openbao_topology_assertions() {
   if [ "$actual_project" != "$no_p_sentinel" ]; then
     fail "sidecar container $sidecar_container has compose project '$actual_project', expected '$no_p_sentinel' — proves docker compose was invoked WITH a -p flag instead of relying on COMPOSE_PROJECT_NAME"
   fi
-  printf '[lifecycle] external-openbao positive case verified: container=%s networks=%q project=%s\n' \
+  # End-to-end proof that --openbao-network reached a working OpenBao:
+  # the sidecar must render agent.toml with an http_responder_hmac
+  # value, which only happens after a successful auth + template
+  # fetch round-trip.
+  wait_for_oba_render "$AGENT_CONFIG_PATH" \
+    "$SIDECAR_OBA_READY_ATTEMPTS" \
+    "$SIDECAR_OBA_READY_DELAY_SECS" \
+    "$sidecar_container" \
+    "external-openbao sidecar"
+  printf '[lifecycle] external-openbao positive case verified: container=%s networks=%q project=%s render=ok\n' \
     "$sidecar_container" "$network_id" "$actual_project" >>"$RUN_LOG"
 }
 
