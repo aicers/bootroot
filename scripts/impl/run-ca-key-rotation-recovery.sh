@@ -516,16 +516,12 @@ run_bootstrap_chain() {
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 
   log_phase "service-add"
-  run_bootroot service add \
-    --service-name "$EDGE_SERVICE" --deploy-type daemon --delivery-mode local-file \
-    --hostname "$EDGE_HOSTNAME" --domain "$DOMAIN" \
-    --agent-config "$AGENT_CONFIG_PATH" \
-    --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" --key-path "$CERTS_DIR/${EDGE_SERVICE}.key" \
-    --instance-id "$INSTANCE_ID" \
-    --auth-mode approle \
-    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
-    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
-
+  # Order matters: SIDECAR_OBA_SERVICE (edge-proxy) is added LAST so its
+  # rendered .ctmpl picks up web-app's managed profile from
+  # workspace/agent.toml.  When the daemon-deploy sidecar later renders
+  # that template back to workspace/agent.toml via the bind-mount, both
+  # profiles must survive — otherwise web-app verify fails because its
+  # profile entry got wiped.
   run_bootroot service add \
     --service-name "$WEB_SERVICE" --deploy-type docker --delivery-mode local-file \
     --hostname "$WEB_HOSTNAME" --domain "$DOMAIN" \
@@ -542,6 +538,16 @@ run_bootstrap_chain() {
     --agent-config "$REMOTE_AGENT_CONFIG" \
     --cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" --key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
     --instance-id "$REMOTE_INSTANCE_ID" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
+
+  run_bootroot service add \
+    --service-name "$EDGE_SERVICE" --deploy-type daemon --delivery-mode local-file \
+    --hostname "$EDGE_HOSTNAME" --domain "$DOMAIN" \
+    --agent-config "$AGENT_CONFIG_PATH" \
+    --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" --key-path "$CERTS_DIR/${EDGE_SERVICE}.key" \
+    --instance-id "$INSTANCE_ID" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
