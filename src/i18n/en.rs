@@ -441,4 +441,8 @@ pub(super) static STRINGS: Strings = Strings {
     error_service_remote_bootstrap: "Service uses remote-bootstrap delivery; local sidecar agent start is not supported: {value}",
     error_service_agent_config_missing: "Docker agent config not found: {value}",
     service_agent_start_completed: "bootroot service agent start: started bootroot-openbao-agent-{value}",
+    error_openbao_container_not_found: "`bootroot-openbao` container not found — run `bootroot infra install` first, or pass `--openbao-network` if OpenBao runs outside bootroot's compose",
+    error_openbao_container_no_project_label: "`bootroot-openbao` container has no `com.docker.compose.project` label; cannot infer compose project — pass `--openbao-network` and ensure the container is managed via docker compose",
+    error_openbao_network_required_external: "`--openbao-network` is required when OpenBao runs outside bootroot's compose",
+    error_invalid_docker_network_name: "invalid docker network name: {value}",
 };

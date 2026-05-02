@@ -292,6 +292,16 @@ bootstrap + 명시적 secret_id handoff입니다.
 자격증명을 다시 읽습니다. Docker 배치에서는 에이전트 컨테이너가
 재시작됩니다(`docker restart`).
 
+능동적인 rotate 신호 경로는 **사이드카** 모델 — 즉 `bootroot service
+agent start`로 띄운 `bootroot-openbao-agent-<service>` 컨테이너로
+OpenBao Agent를 운영하는 형태 — 에서만 동작합니다. 운영자가 OpenBao
+Agent를 호스트 데몬으로 운영하는 경우, `rotate`는 수동 경로로
+폴백합니다. 즉 에이전트가 다음 `static_secret_render_interval` 폴링
+시점(기본 30초)에 `secret_id`를 다시 읽어 가므로 전파 지연이 그만큼
+증가합니다. 사이드카 vs 호스트 데몬 트레이드오프는
+[CLI > bootroot service agent start](cli.md#bootroot-service-agent-start)
+를 참고하세요.
+
 `remote-bootstrap` 서비스의 경우, 회전된 `secret_id`는 서비스별 KV 경로
 (`bootroot/services/<service>/secret_id`)에 기록됩니다. 운영자가 서비스
 머신에서 `bootroot-remote apply-secret-id`를 실행해야 합니다. 서비스의

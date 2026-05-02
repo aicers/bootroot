@@ -306,6 +306,16 @@ OpenBao Agent. For daemon-mode deployments the agent receives a `SIGHUP`
 and re-reads the credential without restarting. For Docker deployments
 the agent container is restarted (`docker restart`).
 
+The active rotate signal path requires the **sidecar** model — that
+is, the OpenBao Agent running as a `bootroot-openbao-agent-<service>`
+container started by `bootroot service agent start`. When the
+operator runs the OpenBao Agent as a host daemon instead, `rotate`
+falls back to the passive path: the agent re-reads `secret_id` on
+its next `static_secret_render_interval` poll (default 30 seconds),
+so propagation latency increases accordingly. See
+[CLI > bootroot service agent start](cli.md#bootroot-service-agent-start)
+for the sidecar vs. host-daemon trade-off.
+
 For `remote-bootstrap` services, the rotated `secret_id` is written to
 the per-service KV path (`bootroot/services/<service>/secret_id`). The
 operator must then run `bootroot-remote apply-secret-id` on the service

@@ -441,4 +441,8 @@ pub(super) static STRINGS: Strings = Strings {
     error_service_remote_bootstrap: "서비스가 remote-bootstrap 전달 모드를 사용합니다. 로컬 사이드카 에이전트 시작은 지원되지 않습니다: {value}",
     error_service_agent_config_missing: "Docker 에이전트 설정 파일을 찾을 수 없습니다: {value}",
     service_agent_start_completed: "bootroot service agent start: bootroot-openbao-agent-{value} 시작됨",
+    error_openbao_container_not_found: "`bootroot-openbao` 컨테이너를 찾을 수 없습니다 — 먼저 `bootroot infra install`을 실행하거나, OpenBao를 bootroot compose 외부에서 운영 중이라면 `--openbao-network`를 전달하세요",
+    error_openbao_container_no_project_label: "`bootroot-openbao` 컨테이너에 `com.docker.compose.project` 라벨이 없습니다. compose 프로젝트를 추론할 수 없습니다 — `--openbao-network`를 전달하고 컨테이너가 docker compose로 관리되는지 확인하세요",
+    error_openbao_network_required_external: "OpenBao가 bootroot compose 외부에서 실행 중인 경우 `--openbao-network`가 필요합니다",
+    error_invalid_docker_network_name: "유효하지 않은 docker 네트워크 이름입니다: {value}",
 };

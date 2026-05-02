@@ -24,6 +24,7 @@ Primary commands:
 - `bootroot service add`
 - `bootroot service update`
 - `bootroot service info`
+- `bootroot service agent start`
 - `bootroot verify`
 - `bootroot rotate`
 - `bootroot clean`
@@ -737,6 +738,178 @@ The command is considered failed when:
 
 - Missing `state.json`
 - App not found
+
+## bootroot service agent start
+
+Starts the per-service **OpenBao Agent** (`bao agent`) sidecar
+container for a registered service so secrets can be re-rendered
+immediately on rotate. The command writes a per-service compose
+override under
+`secrets/openbao/services/<service>/docker-compose.override.yml` and
+brings the sidecar up via `docker compose ... up -d`.
+
+> Note: this command manages the **OpenBao Agent**, not the
+> `bootroot-agent` certificate daemon. Two completely different
+> binaries share the word "agent" — see
+> [Naming disambiguation](#openbao-agent-vs-bootroot-agent) below.
+
+### Inputs
+
+- `--service-name`: service name identifier (must already exist in
+  `state.json`)
+- `--compose-file`: compose file path (default `docker-compose.yml`)
+- `--openbao-network`: docker network the sidecar should attach to
+  (optional)
+  - When omitted, the network is discovered from the
+    `bootroot-openbao` container's `com.docker.compose.project` label
+    as `<project>_default`.
+  - Required when OpenBao runs **outside** bootroot's compose file
+    (separate host, kubernetes, managed service, etc.) — there is no
+    `bootroot-openbao` container to inspect, so an explicit network
+    must be supplied.
+  - Validated against the docker network naming rules
+    (`^[A-Za-z0-9][A-Za-z0-9_.-]*$`) to prevent override-file
+    injection.
+
+### Behavior
+
+The command resolves docker network and compose project according to
+the following decision matrix (rows 1 and 2 read whether the compose
+file declares an `openbao` service):
+
+| OpenBao in compose | `--openbao-network` | Behavior |
+| --- | --- | --- |
+| present | unset | Discover project label on `bootroot-openbao`; use `<project>` for `-p` and `<project>_default` for the override network |
+| present | set | Use the given network in the override; still discover project label for `-p` |
+| absent | unset | Error: `--openbao-network` is required when OpenBao runs outside bootroot's compose |
+| absent | set | Use the given network; omit `-p` (defaults to working-directory project) |
+
+This replaces the previous behavior that hardcoded the compose
+project to `bootroot` and the network to `bootroot_default`. As a
+result, the command now works from any working directory and any
+`COMPOSE_PROJECT_NAME` value without requiring a workaround such as
+`COMPOSE_PROJECT_NAME=bootroot bootroot service agent start ...`.
+
+### Outputs
+
+- The created sidecar container is named
+  `bootroot-openbao-agent-<service>`.
+- Bind-mounts depend on the service's `--deploy-type`:
+  - `daemon`: mounts the per-service config and cert directories at
+    `/sidecar-config` and `/sidecar-certs` so the sidecar can render
+    `agent.toml` and `ca-bundle.pem` directly at the paths
+    `bootroot-agent` reads and `rotate` waits on.
+  - `docker`: mounts only the shared secrets directory at
+    `/openbao/secrets`.
+- A success message in the form
+  `bootroot service agent start: started bootroot-openbao-agent-<service>`.
+
+### Prerequisites
+
+- `bootroot infra install` and `bootroot service add` must have
+  completed for the service.
+- Then one of:
+  - The compose file declares an `openbao:` service — the
+    `bootroot-openbao` container must exist locally so the project
+    label can be discovered. `--openbao-network` is optional in this
+    branch and only overrides the network name; it does not bypass the
+    label discovery.
+  - The compose file does **not** declare an `openbao:` service
+    (external-OpenBao case) — `--openbao-network` is required and is
+    the only way to specify the sidecar's network. No container
+    inspection is performed in this branch.
+
+### Failure conditions
+
+The command is considered failed when:
+
+- Missing `state.json`
+- Service not found
+- Service uses `--delivery-mode remote-bootstrap` (the local sidecar
+  flow does not apply; secret_id handoff is operator-driven on the
+  service machine)
+- Per-service `agent-docker.hcl` config is missing
+- The compose file declares an `openbao:` service but the
+  `bootroot-openbao` container is not found (failure applies whether
+  or not `--openbao-network` was supplied — the project label is still
+  needed for `-p`)
+- The compose file declares an `openbao:` service but the
+  `bootroot-openbao` container exists without a
+  `com.docker.compose.project` label
+- The compose file does not declare an `openbao:` service and
+  `--openbao-network` was not supplied
+- `--openbao-network` (or the discovered network) fails the docker
+  network name validation
+
+### Examples
+
+```bash
+# Standard managed compose, any working directory.
+bootroot service agent start --service-name edge-proxy
+
+# External OpenBao (separate host / kubernetes / managed service).
+bootroot service agent start \
+  --service-name edge-proxy \
+  --openbao-network app-shared-net
+
+# Explicit network override even though OpenBao is in compose
+# (e.g. attaching the sidecar to a non-default network).
+bootroot service agent start \
+  --service-name edge-proxy \
+  --openbao-network ops-net
+```
+
+### OpenBao Agent vs `bootroot-agent`
+
+`service agent start` runs the **OpenBao Agent** (`bao agent`), not
+the `bootroot-agent` certificate daemon. Two completely different
+software packages share the word "agent":
+
+| Software | Role | Who runs it |
+| --- | --- | --- |
+| OpenBao Agent (`bao agent`) | Fetches secrets from OpenBao, renders templates | bootroot (sidecar) or operator (host daemon) |
+| `bootroot-agent` | Issues/renews TLS certs against step-ca | Operator (host daemon, separate binary) |
+
+`service agent start` only manages the first one.
+
+### Sidecar vs. host-daemon for the OpenBao Agent
+
+The two deployment models for the OpenBao Agent are independent of
+the service `--deploy-type`. Even when the service runs as a host
+daemon, the OpenBao Agent itself can run either as a
+bootroot-managed sidecar container or as an operator-managed host
+daemon (`bao agent
+-config=secrets/openbao/services/<svc>/agent.hcl`).
+
+| Concern | Sidecar (default) | Host daemon (alternative) |
+| --- | --- | --- |
+| rotate signal path | Active (`docker restart` → immediate re-render) | Passive (relies on `static_secret_render_interval = 30s` polling) |
+| rotate latency | ~seconds | up to 30s |
+| Lifecycle management | bootroot owns it (`service agent start`) | Operator owns it (systemd unit, etc.) |
+| Container name | Standardized: `bootroot-openbao-agent-<svc>` | Operator's PID/unit naming |
+| Privilege isolation | Token/secret_id contained in container | Mixed with host user permissions |
+| Code path uniformity | Same pattern across docker/daemon deploy types | Only viable for daemon deploy type |
+| Debugging | `docker logs bootroot-openbao-agent-<svc>` | `journalctl -u <unit>` (operator-defined) |
+
+When the sidecar is **not** appropriate:
+
+- Hosts without a docker engine.
+- Security policies that mandate systemd-only lifecycles for
+  token-handling processes.
+- Highly resource-constrained environments where the sidecar
+  overhead is unacceptable.
+- Integration with HSMs / security modules accessible only outside
+  containers.
+- Pre-existing operator infrastructure standardized on systemd-based
+  secret management.
+
+**Recommendation:** sidecar is the default and recommended path.
+`bootroot service add` already surfaces `bootroot service agent
+start` as the primary next step. Choose the host-daemon alternative
+only when one of the conditions above applies; in that case,
+lifecycle management of the OpenBao Agent process becomes entirely
+the operator's responsibility, and rotate latency increases to up to
+`static_secret_render_interval` per rotate cycle.
 
 ## bootroot verify
 
