@@ -24,7 +24,7 @@ Primary commands:
 - `bootroot service add`
 - `bootroot service update`
 - `bootroot service info`
-- `bootroot service agent start`
+- `bootroot service openbao-sidecar start`
 - `bootroot verify`
 - `bootroot rotate`
 - `bootroot clean`
@@ -739,7 +739,7 @@ The command is considered failed when:
 - Missing `state.json`
 - App not found
 
-## bootroot service agent start
+## bootroot service openbao-sidecar start
 
 Starts the per-service **OpenBao Agent** (`bao agent`) sidecar
 container for a registered service so secrets can be re-rendered
@@ -788,7 +788,7 @@ This replaces the previous behavior that hardcoded the compose
 project to `bootroot` and the network to `bootroot_default`. As a
 result, the command now works from any working directory and any
 `COMPOSE_PROJECT_NAME` value without requiring a workaround such as
-`COMPOSE_PROJECT_NAME=bootroot bootroot service agent start ...`.
+`COMPOSE_PROJECT_NAME=bootroot bootroot service openbao-sidecar start ...`.
 
 ### Outputs
 
@@ -802,7 +802,7 @@ result, the command now works from any working directory and any
   - `docker`: mounts only the shared secrets directory at
     `/openbao/secrets`.
 - A success message in the form
-  `bootroot service agent start: started bootroot-openbao-agent-<service>`.
+  `bootroot service openbao-sidecar start: started bootroot-openbao-agent-<service>`.
 
 ### Prerequisites
 
@@ -845,23 +845,23 @@ The command is considered failed when:
 
 ```bash
 # Standard managed compose, any working directory.
-bootroot service agent start --service-name edge-proxy
+bootroot service openbao-sidecar start --service-name edge-proxy
 
 # External OpenBao (separate host / kubernetes / managed service).
-bootroot service agent start \
+bootroot service openbao-sidecar start \
   --service-name edge-proxy \
   --openbao-network app-shared-net
 
 # Explicit network override even though OpenBao is in compose
 # (e.g. attaching the sidecar to a non-default network).
-bootroot service agent start \
+bootroot service openbao-sidecar start \
   --service-name edge-proxy \
   --openbao-network ops-net
 ```
 
 ### OpenBao Agent vs `bootroot-agent`
 
-`service agent start` runs the **OpenBao Agent** (`bao agent`), not
+`service openbao-sidecar start` runs the **OpenBao Agent** (`bao agent`), not
 the `bootroot-agent` certificate daemon. Two completely different
 software packages share the word "agent":
 
@@ -870,7 +870,7 @@ software packages share the word "agent":
 | OpenBao Agent (`bao agent`) | Fetches secrets from OpenBao, renders templates | bootroot (sidecar) or operator (host daemon) |
 | `bootroot-agent` | Issues/renews TLS certs against step-ca | Operator (host daemon, separate binary) |
 
-`service agent start` only manages the first one.
+`service openbao-sidecar start` only manages the first one.
 
 ### Sidecar vs. host-daemon for the OpenBao Agent
 
@@ -885,7 +885,7 @@ daemon (`bao agent
 | --- | --- | --- |
 | rotate signal path | Active (`docker restart` → immediate re-render) | Passive (relies on `static_secret_render_interval = 30s` polling) |
 | rotate latency | ~seconds | up to 30s |
-| Lifecycle management | bootroot owns it (`service agent start`) | Operator owns it (systemd unit, etc.) |
+| Lifecycle management | bootroot owns it (`service openbao-sidecar start`) | Operator owns it (systemd unit, etc.) |
 | Container name | Standardized: `bootroot-openbao-agent-<svc>` | Operator's PID/unit naming |
 | Privilege isolation | Token/secret_id contained in container | Mixed with host user permissions |
 | Code path uniformity | Same pattern across docker/daemon deploy types | Only viable for daemon deploy type |
@@ -904,8 +904,8 @@ When the sidecar is **not** appropriate:
   secret management.
 
 **Recommendation:** sidecar is the default and recommended path.
-`bootroot service add` already surfaces `bootroot service agent
-start` as the primary next step. Choose the host-daemon alternative
+`bootroot service add` already surfaces `bootroot service
+openbao-sidecar start` as the primary next step. Choose the host-daemon alternative
 only when one of the conditions above applies; in that case,
 lifecycle management of the OpenBao Agent process becomes entirely
 the operator's responsibility, and rotate latency increases to up to

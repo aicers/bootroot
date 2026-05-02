@@ -167,7 +167,7 @@ next steps:
     - ensure secrets/services/edge-proxy is 0700 and
       role_id/secret_id files are 0600
     - start the managed sidecar with:
-      bootroot service agent start --service-name edge-proxy
+      bootroot service openbao-sidecar start --service-name edge-proxy
       (required so `bootroot rotate` can signal the sidecar; the host
       `bao agent -config=secrets/openbao/services/edge-proxy/agent.hcl`
       remains available as an alternative)

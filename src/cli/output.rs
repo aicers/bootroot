@@ -387,7 +387,7 @@ fn print_service_openbao_agent_steps(
     if matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
         println!(
             "{}",
-            messages.service_next_steps_openbao_agent_bootroot_start(&openbao_steps)
+            messages.service_next_steps_openbao_sidecar_start(&openbao_steps)
         );
     } else {
         match entry.deploy_type {

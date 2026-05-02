@@ -7,7 +7,7 @@ use super::local_config::{
     DOCKER_RENDERED_CA_BUNDLE, SIDECAR_DAEMON_CERTS_MOUNT, SIDECAR_DAEMON_CONFIG_MOUNT,
 };
 use super::{OPENBAO_AGENT_DOCKER_CONFIG_FILENAME, OPENBAO_SERVICE_CONFIG_DIR};
-use crate::cli::args::ServiceAgentStartArgs;
+use crate::cli::args::ServiceOpenbaoSidecarStartArgs;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
     OPENBAO_CONTAINER_NAME, compose_has_openbao, resolve_openbao_agent_addr,
@@ -36,9 +36,9 @@ struct SidecarTopology {
     project: Option<String>,
 }
 
-/// Runs `bootroot service agent start`.
-pub(crate) fn run_service_agent_start(
-    args: &ServiceAgentStartArgs,
+/// Runs `bootroot service openbao-sidecar start`.
+pub(crate) fn run_service_openbao_sidecar_start(
+    args: &ServiceOpenbaoSidecarStartArgs,
     messages: &Messages,
 ) -> Result<()> {
     let state_path = StateFile::default_path();
@@ -103,7 +103,7 @@ pub(crate) fn run_service_agent_start(
 
     println!(
         "{}",
-        messages.service_agent_start_completed(&args.service_name)
+        messages.service_openbao_sidecar_start_completed(&args.service_name)
     );
     Ok(())
 }
@@ -353,7 +353,7 @@ fn daemon_sidecar_bind_mounts(entry: &ServiceEntry, messages: &Messages) -> Resu
     ))
 }
 
-/// Calls `docker compose` to bring up the service agent sidecar.
+/// Calls `docker compose` to bring up the per-service `OpenBao` Agent sidecar.
 fn apply_service_agent_compose_override(
     compose_file: &Path,
     override_path: &Path,
@@ -365,7 +365,11 @@ fn apply_service_agent_compose_override(
     let override_str = override_path.to_string_lossy();
     let args = build_compose_up_args(&compose_str, &override_str, service_name, project);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_docker(&arg_refs, "docker compose service agent start", messages)?;
+    run_docker(
+        &arg_refs,
+        "docker compose service openbao-sidecar start",
+        messages,
+    )?;
     Ok(())
 }
 

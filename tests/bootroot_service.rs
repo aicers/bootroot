@@ -2566,6 +2566,66 @@ fn test_service_info_shows_default_policy_fields() {
     );
 }
 
+/// Guards the deprecated `bootroot service agent start` alias: when
+/// invoked through the legacy spelling, the binary must print a
+/// deprecation warning to stderr that points at the new
+/// `service openbao-sidecar` form, then proceed to execute the same
+/// code path.  Without state.json present the run aborts early, but
+/// the warning is emitted before that — which is exactly what we want
+/// to assert.  Drop in the same release that retires the alias.
+#[cfg(unix)]
+#[test]
+fn test_service_agent_alias_emits_deprecation_warning() {
+    let temp_dir = tempdir().expect("create temp dir");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["service", "agent", "start", "--service-name", "edge-proxy"])
+        .output()
+        .expect("run service agent start (deprecated alias)");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "alias must surface the same state-missing failure as the canonical command; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("`bootroot service agent` is deprecated"),
+        "alias must emit deprecation warning to stderr; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("`bootroot service openbao-sidecar`"),
+        "deprecation warning must point at the canonical command; stderr:\n{stderr}"
+    );
+}
+
+/// Sanity check that the canonical `service openbao-sidecar start`
+/// command does NOT emit the deprecation warning — so we don't ship a
+/// regression where the warning leaks onto the new spelling.
+#[cfg(unix)]
+#[test]
+fn test_service_openbao_sidecar_does_not_emit_deprecation_warning() {
+    let temp_dir = tempdir().expect("create temp dir");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "openbao-sidecar",
+            "start",
+            "--service-name",
+            "edge-proxy",
+        ])
+        .output()
+        .expect("run service openbao-sidecar start");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("is deprecated"),
+        "canonical command must not emit deprecation warning; stderr:\n{stderr}"
+    );
+}
+
 async fn stub_app_add_remote_sync_material(server: &MockServer, service_name: &str) {
     Mock::given(method("GET"))
         .and(path("/v1/secret/metadata/bootroot/agent/eab"))

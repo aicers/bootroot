@@ -64,10 +64,45 @@ RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
 INIT_ROOT_TOKEN=""
 OPENBAO_RECOVERY_OUTPUT_FILE="$ARTIFACT_DIR/openbao-recovery.json"
-SIDECAR_OBA_SERVICE="$WEB_SERVICE"
+# Use a daemon-deploy service for the OBA exercise so the
+# `bootroot service openbao-sidecar start` daemon bind-mounts land
+# the rendered agent.toml at the same host path the test issues
+# certs against (`$AGENT_CONFIG_PATH`).  The docker-deploy variant
+# would render under `$SECRETS_DIR/services/<svc>/` instead, which
+# doesn't match the per-service verify call below.
+SIDECAR_OBA_SERVICE="$EDGE_SERVICE"
 SIDECAR_OBA_CONTAINER="bootroot-openbao-agent-${SIDECAR_OBA_SERVICE}"
 SIDECAR_OBA_READY_ATTEMPTS="${SIDECAR_OBA_READY_ATTEMPTS:-30}"
 SIDECAR_OBA_READY_DELAY_SECS="${SIDECAR_OBA_READY_DELAY_SECS:-2}"
+# Selects which OpenBao Agent deployment to exercise:
+#   sidecar     - bootroot-managed, started via `service openbao-sidecar start`
+#                 (default; active rotate-signal path)
+#   host-daemon - operator-managed, started by this script via
+#                 `docker run --network host` to simulate a host `bao agent`
+#                 (passive rotate-signal path via static_secret_render_interval)
+OBA_DEPLOYMENT="${OBA_DEPLOYMENT:-sidecar}"
+HOST_DAEMON_OBA_CONTAINER="${HOST_DAEMON_OBA_CONTAINER:-bootroot-openbao-agent-host-${EDGE_SERVICE}}"
+# Upper bound for the responder-hmac rotate's wall-clock under each
+# OBA deployment.  The two thresholds together prove which propagation
+# route OpenBao Agent took:
+#
+#   sidecar:     bootroot's active container restart hands the new
+#                HMAC over instantly, so the rotate must complete
+#                well below `static_secret_render_interval` (=30s).
+#                If the active route silently regresses (e.g. wrong
+#                container name, signal not delivered), rotate would
+#                still succeed via the polling fallback — but the
+#                wall-clock would jump above this threshold and we'd
+#                catch the regression here instead of letting it ship
+#                undetected (the gap that #577 sat in for a release).
+#
+#   host-daemon: bootroot has no handle on the operator-managed
+#                daemon, so the active restart silently no-ops and
+#                only the polling fallback (`static_secret_render_interval
+#                = 30s`) propagates the new HMAC.  Allow the full
+#                polling window plus jitter.
+SIDECAR_ROTATE_LATENCY_LIMIT_SECS="${SIDECAR_ROTATE_LATENCY_LIMIT_SECS:-25}"
+HOST_DAEMON_RENDER_TIMEOUT_SECS="${HOST_DAEMON_RENDER_TIMEOUT_SECS:-75}"
 CURRENT_PHASE="init"
 export POSTGRES_HOST="127.0.0.1"
 export POSTGRES_PORT="${POSTGRES_HOST_PORT:-5432}"
@@ -179,44 +214,94 @@ capture_artifacts() {
   docker logs bootroot-openbao-agent-stepca >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs bootroot-openbao-agent-responder >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs "$SIDECAR_OBA_CONTAINER" >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+  docker logs "$HOST_DAEMON_OBA_CONTAINER" >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
 }
 
-start_service_sidecar_oba() {
+# Sidecar variant: invoke the canonical bootroot CLI so CI exercises
+# the same code path operators use.  This catches regressions in the
+# sidecar-management code (e.g. issue #577's hardcoded network bug)
+# that an inline `docker run` shortcut would silently bypass.
+start_service_sidecar_oba_via_bootroot() {
   local service="$1"
-  local container="bootroot-openbao-agent-${service}"
-  local agent_hcl="$SECRETS_DIR/openbao/services/${service}/agent.hcl"
-
-  # Remove the pre-seeded config so readiness waits for sidecar-rendered content.
   rm -f "$AGENT_CONFIG_PATH"
-  docker rm -f "$container" >/dev/null 2>&1 || true
+  docker rm -f "bootroot-openbao-agent-${service}" >/dev/null 2>&1 || true
 
-  # Run sidecar OBA sharing the OpenBao container network so that
-  # localhost:8200 in agent.hcl resolves to the OpenBao server.
-  # --user ensures the container can read secrets/ (0700, owned by runner).
+  run_bootroot service openbao-sidecar start \
+    --service-name "$service" \
+    --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
+  wait_for_oba_render "$AGENT_CONFIG_PATH" \
+    "$SIDECAR_OBA_READY_ATTEMPTS" \
+    "$SIDECAR_OBA_READY_DELAY_SECS" \
+    "bootroot-openbao-agent-${service}" \
+    "sidecar OBA"
+}
+
+# Host-daemon variant: simulate a host-managed `bao agent` by running
+# the OpenBao binary in a container that shares the host network
+# namespace.  agent.hcl points at 127.0.0.1:8200 (the host-published
+# port), and rotate signals propagate via the polling fallback.
+start_service_host_daemon_oba() {
+  local service="$1"
+  local agent_hcl="$SECRETS_DIR/openbao/services/${service}/agent.hcl"
+  rm -f "$AGENT_CONFIG_PATH"
+  docker rm -f "$HOST_DAEMON_OBA_CONTAINER" >/dev/null 2>&1 || true
+
+  # --network host so 127.0.0.1:8200 in agent.hcl reaches the
+  # bootroot-openbao port published to the host.  Bind-mount the same
+  # paths the sidecar uses so agent.toml renders to AGENT_CONFIG_PATH.
   docker run -d \
-    --name "$container" \
+    --name "$HOST_DAEMON_OBA_CONTAINER" \
     --user "$(id -u):$(id -g)" \
-    --network "container:bootroot-openbao" \
+    --network host \
     -v "$ROOT_DIR:$ROOT_DIR" \
     -v "$ARTIFACT_DIR:$ARTIFACT_DIR" \
     openbao/openbao:latest \
     agent -config="$agent_hcl" >>"$RUN_LOG" 2>&1
-
-  local attempt
-  for attempt in $(seq 1 "$SIDECAR_OBA_READY_ATTEMPTS"); do
-    if [ -f "$AGENT_CONFIG_PATH" ] &&
-      grep -Eq '^[[:space:]]*http_responder_hmac[[:space:]]*=[[:space:]]*"[^"]+"' \
-        "$AGENT_CONFIG_PATH" 2>/dev/null; then
-      return 0
-    fi
-    sleep "$SIDECAR_OBA_READY_DELAY_SECS"
-  done
-  docker logs "$container" >>"$RUN_LOG" 2>&1 || true
-  fail "sidecar OBA ($container) did not render agent config within timeout"
+  wait_for_oba_render "$AGENT_CONFIG_PATH" \
+    "$SIDECAR_OBA_READY_ATTEMPTS" \
+    "$SIDECAR_OBA_READY_DELAY_SECS" \
+    "$HOST_DAEMON_OBA_CONTAINER" \
+    "host-daemon OBA"
 }
 
-stop_service_sidecar_oba() {
+# Polls for an OBA-rendered agent.toml signature.  Centralised so
+# both variants share the same readiness contract.
+wait_for_oba_render() {
+  local config_path="$1"
+  local attempts="$2"
+  local delay="$3"
+  local container="$4"
+  local label="$5"
+  local attempt
+  for attempt in $(seq 1 "$attempts"); do
+    if [ -f "$config_path" ] &&
+      grep -Eq '^[[:space:]]*http_responder_hmac[[:space:]]*=[[:space:]]*"[^"]+"' \
+        "$config_path" 2>/dev/null; then
+      return 0
+    fi
+    sleep "$delay"
+  done
+  docker logs "$container" >>"$RUN_LOG" 2>&1 || true
+  fail "${label} (${container}) did not render agent config within timeout"
+}
+
+start_service_oba() {
+  case "$OBA_DEPLOYMENT" in
+    sidecar)
+      start_service_sidecar_oba_via_bootroot "$1"
+      ;;
+    host-daemon)
+      start_service_host_daemon_oba "$1"
+      ;;
+    *)
+      fail "Unsupported OBA_DEPLOYMENT: $OBA_DEPLOYMENT (expected: sidecar | host-daemon)"
+      ;;
+  esac
+}
+
+stop_service_oba() {
   docker rm -f "$SIDECAR_OBA_CONTAINER" >/dev/null 2>&1 || true
+  docker rm -f "$HOST_DAEMON_OBA_CONTAINER" >/dev/null 2>&1 || true
 }
 
 cleanup_hosts() {
@@ -237,7 +322,7 @@ cleanup() {
   log_phase "cleanup"
   cleanup_hosts
   capture_artifacts
-  stop_service_sidecar_oba
+  stop_service_oba
   compose_down
 }
 
@@ -388,20 +473,12 @@ run_bootstrap_chain() {
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 
   log_phase "service-add"
-  run_bootroot service add \
-    --service-name "$EDGE_SERVICE" \
-    --deploy-type daemon \
-    --delivery-mode local-file \
-    --hostname "$EDGE_HOSTNAME" \
-    --domain "$DOMAIN" \
-    --agent-config "$AGENT_CONFIG_PATH" \
-    --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" \
-    --key-path "$CERTS_DIR/${EDGE_SERVICE}.key" \
-    --instance-id "$INSTANCE_ID" \
-    --auth-mode approle \
-    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
-    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
-
+  # Order matters: SIDECAR_OBA_SERVICE (edge-proxy) is added LAST so its
+  # rendered .ctmpl picks up web-app's managed profile from
+  # workspace/agent.toml.  When the daemon-deploy sidecar later renders
+  # that template back to workspace/agent.toml via the bind-mount, both
+  # profiles must survive — otherwise web-app verify fails because its
+  # profile entry got wiped.
   run_bootroot service add \
     --service-name "$WEB_SERVICE" \
     --deploy-type docker \
@@ -427,6 +504,20 @@ run_bootstrap_chain() {
     --cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" \
     --key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
     --instance-id "$REMOTE_INSTANCE_ID" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
+
+  run_bootroot service add \
+    --service-name "$EDGE_SERVICE" \
+    --deploy-type daemon \
+    --delivery-mode local-file \
+    --hostname "$EDGE_HOSTNAME" \
+    --domain "$DOMAIN" \
+    --agent-config "$AGENT_CONFIG_PATH" \
+    --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" \
+    --key-path "$CERTS_DIR/${EDGE_SERVICE}.key" \
+    --instance-id "$INSTANCE_ID" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
@@ -599,6 +690,44 @@ verify_service_with_retry() {
   done
 }
 
+# Asserts the responder-hmac rotate completed within the wall-clock
+# budget for the active OBA deployment.  The two thresholds together
+# distinguish the active sidecar restart route from the host-daemon
+# polling fallback and catch silent regressions in either path:
+#
+#   sidecar:     `bootroot rotate` actively restarts the sidecar
+#                container, so the rendered file must contain the new
+#                HMAC well below the polling fallback window.  A
+#                threshold above `static_secret_render_interval`
+#                (=30s) would let a regression where the active
+#                restart silently no-ops sneak through, because rotate
+#                would still succeed via polling.
+#
+#   host-daemon: `bootroot rotate` cannot signal the operator daemon,
+#                so propagation must wait for the polling fallback.
+assert_responder_hmac_rotate_latency() {
+  local elapsed_secs="$1"
+  local limit_secs route
+  case "$OBA_DEPLOYMENT" in
+    sidecar)
+      limit_secs="$SIDECAR_ROTATE_LATENCY_LIMIT_SECS"
+      route="active sidecar restart"
+      ;;
+    host-daemon)
+      limit_secs="$HOST_DAEMON_RENDER_TIMEOUT_SECS"
+      route="polling fallback (static_secret_render_interval)"
+      ;;
+    *)
+      fail "assert_responder_hmac_rotate_latency: unknown OBA_DEPLOYMENT=$OBA_DEPLOYMENT"
+      ;;
+  esac
+  printf '[lifecycle] responder-hmac rotate elapsed=%ss limit=%ss route=%s deployment=%s\n' \
+    "$elapsed_secs" "$limit_secs" "$route" "$OBA_DEPLOYMENT" >>"$RUN_LOG"
+  if [ "$elapsed_secs" -gt "$limit_secs" ]; then
+    fail "responder-hmac rotate took ${elapsed_secs}s, exceeding the ${limit_secs}s budget for OBA_DEPLOYMENT=${OBA_DEPLOYMENT} (expected route: ${route})"
+  fi
+}
+
 assert_fingerprint_changed() {
   local service="$1"
   local before_label="$2"
@@ -667,6 +796,8 @@ run_rotations_with_verification() {
   run_verify_pair "after-openbao-recovery"
 
   log_phase "rotate-responder-hmac"
+  local rotate_start_epoch rotate_end_epoch rotate_elapsed_secs
+  rotate_start_epoch="$(date +%s)"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
     --openbao-url "http://${STEPCA_HOST_IP}:8200" \
@@ -675,6 +806,9 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     responder-hmac >>"$RUN_LOG" 2>&1
+  rotate_end_epoch="$(date +%s)"
+  rotate_elapsed_secs=$((rotate_end_epoch - rotate_start_epoch))
+  assert_responder_hmac_rotate_latency "$rotate_elapsed_secs"
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-responder-hmac"
@@ -790,7 +924,7 @@ main() {
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"
 
-  start_service_sidecar_oba "$SIDECAR_OBA_SERVICE"
+  start_service_oba "$SIDECAR_OBA_SERVICE"
 
   copy_remote_materials
   log_phase "remote-bootstrap-initial"

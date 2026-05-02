@@ -71,14 +71,38 @@ echo "[ci-local-e2e] run id: $RUN_ID"
 echo "[ci-local-e2e] building bootroot binaries"
 cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
-echo "[ci-local-e2e] run local lifecycle (no-hosts)"
+echo "[ci-local-e2e] run local lifecycle (no-hosts, OBA sidecar)"
 ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}" \
 PROJECT_NAME="bootroot-e2e-ci-local-no-hosts-${RUN_ID}" \
 RESOLUTION_MODE="no-hosts" \
 SECRETS_DIR="$ROOT_DIR/secrets" \
+OBA_DEPLOYMENT="sidecar" \
 TIMEOUT_SECS=120 \
 INFRA_UP_ATTEMPTS=12 \
 INFRA_UP_DELAY_SECS=10 \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
+BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
+"$ROOT_DIR/scripts/impl/run-local-lifecycle.sh"
+
+# Re-run the same lifecycle but with the host-daemon variant of the
+# OpenBao Agent.  Verifies the polling-fallback rotate path
+# (`static_secret_render_interval = 30s`) the next-steps text in
+# `service add` advertises as the alternative to the managed sidecar.
+# See issue #578.
+echo "[ci-local-e2e] run local lifecycle (no-hosts, OBA host-daemon)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-no-hosts-host-daemon-${RUN_ID}" \
+PROJECT_NAME="bootroot-e2e-ci-local-no-hosts-host-daemon-${RUN_ID}" \
+RESOLUTION_MODE="no-hosts" \
+SECRETS_DIR="$ROOT_DIR/secrets" \
+OBA_DEPLOYMENT="host-daemon" \
+TIMEOUT_SECS=180 \
+INFRA_UP_ATTEMPTS=12 \
+INFRA_UP_DELAY_SECS=10 \
+SIDECAR_OBA_READY_ATTEMPTS=40 \
+SIDECAR_OBA_READY_DELAY_SECS=2 \
+VERIFY_ATTEMPTS=20 \
+VERIFY_DELAY_SECS=4 \
 BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
 BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \

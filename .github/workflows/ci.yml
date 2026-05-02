@@ -325,22 +325,32 @@ jobs:
             script: run-local-lifecycle.sh
             resolution: no-hosts
             artifact: ci-local-no-hosts
+            oba_deployment: sidecar
+          - label: local-no-hosts-host-daemon
+            script: run-local-lifecycle.sh
+            resolution: no-hosts
+            artifact: ci-local-no-hosts-host-daemon
+            oba_deployment: host-daemon
           - label: local-hosts
             script: run-local-lifecycle.sh
             resolution: hosts
             artifact: ci-local-hosts
+            oba_deployment: sidecar
           - label: remote-no-hosts
             script: run-remote-lifecycle.sh
             resolution: no-hosts
             artifact: ci-remote-no-hosts
+            oba_deployment: ""
           - label: remote-hosts
             script: run-remote-lifecycle.sh
             resolution: hosts
             artifact: ci-remote-hosts
+            oba_deployment: ""
           - label: rotation
             script: run-rotation-recovery.sh
             resolution: ""
             artifact: ci-rotation
+            oba_deployment: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -360,15 +370,27 @@ jobs:
         if: matrix.scenario.label != 'rotation'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          # Host-daemon arm has to wait for OpenBao Agent's
+          # `static_secret_render_interval` polling fallback (~30s) on
+          # every render-dependent step, so it gets longer per-attempt
+          # delays and a larger budget than the sidecar arms.
+          if [ "${{ matrix.scenario.oba_deployment }}" = "host-daemon" ]; then
+            VERIFY_ATTEMPTS=20
+            VERIFY_DELAY_SECS=4
+          else
+            VERIFY_ATTEMPTS=5
+            VERIFY_DELAY_SECS=5
+          fi
           ARTIFACT_DIR="$ARTIFACT_DIR" \
           PROJECT_NAME="bootroot-e2e-ci-${{ matrix.scenario.label }}-${GITHUB_RUN_ID}" \
           RESOLUTION_MODE="${{ matrix.scenario.resolution }}" \
+          OBA_DEPLOYMENT="${{ matrix.scenario.oba_deployment }}" \
           SECRETS_DIR="$(pwd)/secrets" \
           TIMEOUT_SECS=120 \
           INFRA_UP_ATTEMPTS=12 \
           INFRA_UP_DELAY_SECS=10 \
-          VERIFY_ATTEMPTS=5 \
-          VERIFY_DELAY_SECS=5 \
+          VERIFY_ATTEMPTS="$VERIFY_ATTEMPTS" \
+          VERIFY_DELAY_SECS="$VERIFY_DELAY_SECS" \
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           BOOTROOT_AGENT_BIN="$(pwd)/target/debug/bootroot-agent" \

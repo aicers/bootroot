@@ -447,6 +447,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Renamed `bootroot service agent start` to `bootroot service
+  openbao-sidecar start`. The new name resolves two ambiguities in
+  the previous spelling: which software ("agent" clashed with the
+  unrelated `bootroot-agent` certificate daemon — `openbao` makes the
+  identity explicit) and which deployment pattern (`agent` did not
+  hint that the command manages only the sidecar variant of the
+  OpenBao Agent — `sidecar` makes that explicit and leaves room for
+  a future host-daemon subcommand). All docs, examples, and the
+  next-steps text emitted by `bootroot service add` now use the new
+  name. The previous `bootroot service agent start` form keeps
+  working for one release as a hidden deprecated alias that prints a
+  warning pointing at the new name; it will be removed in the
+  following release. The Docker E2E matrix in
+  `.github/workflows/ci.yml` gained a `local-no-hosts-host-daemon`
+  arm that re-runs the no-hosts lifecycle with
+  `OBA_DEPLOYMENT=host-daemon`, exercising the polling-fallback rotate
+  path (`static_secret_render_interval = 30s`) the next-steps text in
+  `service add` advertises as the alternative to the managed sidecar.
+  `scripts/impl/run-local-lifecycle.sh` also brackets the
+  `responder-hmac` rotate with a wall-clock assertion: in sidecar
+  mode it must complete below `SIDECAR_ROTATE_LATENCY_LIMIT_SECS`
+  (default 25s, well under the 30s polling window) so a regression
+  in the active container-restart route would surface here instead
+  of being masked by the polling fallback; in host-daemon mode it
+  must complete within `HOST_DAEMON_RENDER_TIMEOUT_SECS` (default
+  75s) since bootroot has no handle on the operator-managed daemon
+  and propagation has to wait for the polling cycle. (Closes #578)
 - Changed `bootroot service agent start` to take `--service-name <NAME>`
   instead of a positional `<SERVICE_NAME>` argument, matching the other
   per-service subcommands (`service add`, `service info`, `service update`).
