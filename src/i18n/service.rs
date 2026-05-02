@@ -782,13 +782,12 @@ impl Messages {
         )
     }
 
-    pub(crate) fn service_next_steps_openbao_agent_bootroot_start(
+    pub(crate) fn service_next_steps_openbao_sidecar_start(
         &self,
         data: &ServiceOpenBaoAgentSteps<'_>,
     ) -> String {
         format_template(
-            self.strings()
-                .service_next_steps_openbao_agent_bootroot_start,
+            self.strings().service_next_steps_openbao_sidecar_start,
             &[
                 ("service_name", data.service_name),
                 ("config_path", data.config_path),
@@ -882,8 +881,12 @@ impl Messages {
         self.strings().service_update_no_changes
     }
 
-    pub(crate) fn error_service_agent_start_failed(&self) -> &'static str {
-        self.strings().error_service_agent_start_failed
+    pub(crate) fn error_service_openbao_sidecar_start_failed(&self) -> &'static str {
+        self.strings().error_service_openbao_sidecar_start_failed
+    }
+
+    pub(crate) fn warn_service_agent_alias_deprecated(&self) -> &'static str {
+        self.strings().warn_service_agent_alias_deprecated
     }
 
     pub(crate) fn error_service_remote_bootstrap(&self, value: &str) -> String {
@@ -900,9 +903,9 @@ impl Messages {
         )
     }
 
-    pub(crate) fn service_agent_start_completed(&self, value: &str) -> String {
+    pub(crate) fn service_openbao_sidecar_start_completed(&self, value: &str) -> String {
         format_template(
-            self.strings().service_agent_start_completed,
+            self.strings().service_openbao_sidecar_start_completed,
             &[("value", value)],
         )
     }

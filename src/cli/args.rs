@@ -104,17 +104,22 @@ pub(crate) enum ServiceCommand {
     Add(Box<ServiceAddArgs>),
     Info(ServiceInfoArgs),
     Update(ServiceUpdateArgs),
-    #[command(subcommand)]
-    Agent(ServiceAgentCommand),
+    /// Manages the per-service `OpenBao` Agent sidecar container.
+    #[command(subcommand, name = "openbao-sidecar")]
+    OpenbaoSidecar(ServiceOpenbaoSidecarCommand),
+    /// Deprecated alias for `openbao-sidecar`.  Will be removed in a
+    /// future release; use `service openbao-sidecar` instead.
+    #[command(subcommand, hide = true)]
+    Agent(ServiceOpenbaoSidecarCommand),
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum ServiceAgentCommand {
-    Start(ServiceAgentStartArgs),
+pub(crate) enum ServiceOpenbaoSidecarCommand {
+    Start(ServiceOpenbaoSidecarStartArgs),
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ServiceAgentStartArgs {
+pub(crate) struct ServiceOpenbaoSidecarStartArgs {
     /// Service name identifier
     #[arg(long)]
     pub(crate) service_name: String,
@@ -1636,17 +1641,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_parses_service_agent_start() {
+    fn test_cli_parses_service_openbao_sidecar_start() {
         let cli = Cli::parse_from([
             "bootroot",
             "service",
-            "agent",
+            "openbao-sidecar",
             "start",
             "--service-name",
             "myapp",
         ]);
         match cli.command {
-            CliCommand::Service(ServiceCommand::Agent(ServiceAgentCommand::Start(args))) => {
+            CliCommand::Service(ServiceCommand::OpenbaoSidecar(
+                ServiceOpenbaoSidecarCommand::Start(args),
+            )) => {
                 assert_eq!(args.service_name, "myapp");
                 assert_eq!(
                     args.compose_file.compose_file,
@@ -1657,16 +1664,16 @@ mod tests {
                     "openbao_network must default to None"
                 );
             }
-            _ => panic!("expected service agent start"),
+            _ => panic!("expected service openbao-sidecar start"),
         }
     }
 
     #[test]
-    fn test_cli_parses_service_agent_start_with_openbao_network() {
+    fn test_cli_parses_service_openbao_sidecar_start_with_openbao_network() {
         let cli = Cli::parse_from([
             "bootroot",
             "service",
-            "agent",
+            "openbao-sidecar",
             "start",
             "--service-name",
             "myapp",
@@ -1674,20 +1681,22 @@ mod tests {
             "external_net",
         ]);
         match cli.command {
-            CliCommand::Service(ServiceCommand::Agent(ServiceAgentCommand::Start(args))) => {
+            CliCommand::Service(ServiceCommand::OpenbaoSidecar(
+                ServiceOpenbaoSidecarCommand::Start(args),
+            )) => {
                 assert_eq!(args.service_name, "myapp");
                 assert_eq!(args.openbao_network.as_deref(), Some("external_net"));
             }
-            _ => panic!("expected service agent start"),
+            _ => panic!("expected service openbao-sidecar start"),
         }
     }
 
     #[test]
-    fn test_cli_parses_service_agent_start_custom_compose() {
+    fn test_cli_parses_service_openbao_sidecar_start_custom_compose() {
         let cli = Cli::parse_from([
             "bootroot",
             "service",
-            "agent",
+            "openbao-sidecar",
             "start",
             "--service-name",
             "myapp",
@@ -1695,26 +1704,53 @@ mod tests {
             "custom.yml",
         ]);
         match cli.command {
-            CliCommand::Service(ServiceCommand::Agent(ServiceAgentCommand::Start(args))) => {
+            CliCommand::Service(ServiceCommand::OpenbaoSidecar(
+                ServiceOpenbaoSidecarCommand::Start(args),
+            )) => {
                 assert_eq!(args.service_name, "myapp");
                 assert_eq!(args.compose_file.compose_file, PathBuf::from("custom.yml"));
             }
-            _ => panic!("expected service agent start"),
+            _ => panic!("expected service openbao-sidecar start"),
         }
     }
 
     #[test]
-    fn test_cli_service_agent_start_requires_service_name() {
-        let result = Cli::try_parse_from(["bootroot", "service", "agent", "start"]);
+    fn test_cli_service_openbao_sidecar_start_requires_service_name() {
+        let result = Cli::try_parse_from(["bootroot", "service", "openbao-sidecar", "start"]);
         assert!(result.is_err(), "service-name should be required");
     }
 
     #[test]
-    fn test_cli_service_agent_start_rejects_positional() {
-        let result = Cli::try_parse_from(["bootroot", "service", "agent", "start", "myapp"]);
+    fn test_cli_service_openbao_sidecar_start_rejects_positional() {
+        let result =
+            Cli::try_parse_from(["bootroot", "service", "openbao-sidecar", "start", "myapp"]);
         assert!(
             result.is_err(),
             "positional service name should be rejected"
         );
+    }
+
+    /// Guards the deprecated `service agent start` alias: it must keep
+    /// parsing into the same `ServiceOpenbaoSidecarStartArgs` payload so
+    /// existing operators on the previous CLI surface keep working for
+    /// one release.  Drop in the following release alongside the alias.
+    #[test]
+    fn test_cli_parses_deprecated_service_agent_start_alias() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "agent",
+            "start",
+            "--service-name",
+            "myapp",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Agent(ServiceOpenbaoSidecarCommand::Start(
+                args,
+            ))) => {
+                assert_eq!(args.service_name, "myapp");
+            }
+            _ => panic!("expected deprecated service agent start alias"),
+        }
     }
 }

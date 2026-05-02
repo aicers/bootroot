@@ -1,6 +1,6 @@
-pub(crate) mod agent_start;
 mod approle;
 mod local_config;
+pub(crate) mod openbao_sidecar_start;
 mod remote_bootstrap;
 pub(crate) mod resolve;
 mod secrets;

@@ -164,7 +164,7 @@ bootroot 서비스 추가: 계획
     - ensure secrets/services/edge-proxy is 0700 and
       role_id/secret_id files are 0600
     - 관리형 사이드카를 시작하세요:
-      bootroot service agent start --service-name edge-proxy
+      bootroot service openbao-sidecar start --service-name edge-proxy
       (bootroot rotate가 사이드카에 신호를 보내려면 필요합니다.
       호스트에서 `bao agent -config=secrets/openbao/services/edge-proxy/agent.hcl`을
       실행하는 방법도 대체로 사용할 수 있습니다)

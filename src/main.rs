@@ -8,8 +8,8 @@ mod state;
 use clap::Parser;
 
 use crate::cli::args::{
-    CaCommand, Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand,
-    ServiceAgentCommand, ServiceCommand,
+    CaCommand, Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand, ServiceCommand,
+    ServiceOpenbaoSidecarCommand,
 };
 use crate::i18n::Messages;
 
@@ -97,9 +97,20 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
             commands::service::run_service_update(&args, messages)
                 .with_context(|| messages.error_service_update_failed())?;
         }
-        CliCommand::Service(ServiceCommand::Agent(ServiceAgentCommand::Start(args))) => {
-            commands::service::agent_start::run_service_agent_start(&args, messages)
-                .with_context(|| messages.error_service_agent_start_failed())?;
+        CliCommand::Service(ServiceCommand::OpenbaoSidecar(
+            ServiceOpenbaoSidecarCommand::Start(args),
+        )) => {
+            commands::service::openbao_sidecar_start::run_service_openbao_sidecar_start(
+                &args, messages,
+            )
+            .with_context(|| messages.error_service_openbao_sidecar_start_failed())?;
+        }
+        CliCommand::Service(ServiceCommand::Agent(ServiceOpenbaoSidecarCommand::Start(args))) => {
+            eprintln!("{}", messages.warn_service_agent_alias_deprecated());
+            commands::service::openbao_sidecar_start::run_service_openbao_sidecar_start(
+                &args, messages,
+            )
+            .with_context(|| messages.error_service_openbao_sidecar_start_failed())?;
         }
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,

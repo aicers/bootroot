@@ -230,14 +230,14 @@ printed by `bootroot service add`.
 
 ### Docker
 
-For per-service agents, `bootroot service agent start --service-name
-<service>` is the recommended path. It writes a per-service compose
+For per-service agents, `bootroot service openbao-sidecar start
+--service-name <service>` is the recommended path. It writes a per-service compose
 override and starts a sidecar attached to the same docker network as
 the rest of the bootroot infrastructure. The network and compose
 project are discovered at runtime from the `bootroot-openbao`
 container's `com.docker.compose.project` label, so it works from any
 working directory and any `COMPOSE_PROJECT_NAME` value. See
-[CLI > bootroot service agent start](cli.md#bootroot-service-agent-start)
+[CLI > bootroot service openbao-sidecar start](cli.md#bootroot-service-openbao-sidecar-start)
 for full inputs and failure modes.
 
 The raw `docker run` invocations below are kept for reference (e.g.
@@ -315,7 +315,7 @@ Recommended deployment policy:
   required secrets.
 - service OpenBao Agent (recommended): default to a per-service
   sidecar regardless of `--deploy-type`. `bootroot service add` already
-  surfaces `bootroot service agent start` as the next step. The two
+  surfaces `bootroot service openbao-sidecar start` as the next step. The two
   deployment models for the OpenBao Agent (sidecar vs. operator-run
   host daemon) are independent of the service `--deploy-type` — see
   [docs/en/cli.md](cli.md#sidecar-vs-host-daemon-for-the-openbao-agent)

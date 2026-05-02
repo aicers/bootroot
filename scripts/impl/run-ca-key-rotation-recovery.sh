@@ -58,7 +58,10 @@ RUNTIME_SERVICE_ADD_ROLE_ID=""
 RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
-SIDECAR_OBA_SERVICE="$WEB_SERVICE"
+# Use a daemon-deploy service for the OBA exercise so the bootroot
+# sidecar daemon bind-mounts land the rendered agent.toml at the same
+# host path the test issues certs against (`$AGENT_CONFIG_PATH`).
+SIDECAR_OBA_SERVICE="$EDGE_SERVICE"
 SIDECAR_OBA_CONTAINER="bootroot-openbao-agent-${SIDECAR_OBA_SERVICE}"
 CURRENT_PHASE="init"
 export POSTGRES_HOST="127.0.0.1"
@@ -168,18 +171,14 @@ capture_artifacts() {
 start_service_sidecar_oba() {
   local service="$1"
   local container="bootroot-openbao-agent-${service}"
-  local agent_hcl="$SECRETS_DIR/openbao/services/${service}/agent.hcl"
   # Remove the pre-seeded config so readiness waits for sidecar-rendered content.
   rm -f "$AGENT_CONFIG_PATH"
   docker rm -f "$container" >/dev/null 2>&1 || true
-  docker run -d \
-    --name "$container" \
-    --user "$(id -u):$(id -g)" \
-    --network "container:bootroot-openbao" \
-    -v "$ROOT_DIR:$ROOT_DIR" \
-    -v "$ARTIFACT_DIR:$ARTIFACT_DIR" \
-    openbao/openbao:latest \
-    agent -config="$agent_hcl" >>"$RUN_LOG" 2>&1
+  # Exercise the same code path operators use rather than an inline
+  # `docker run` shortcut.  See issue #578.
+  run_bootroot service openbao-sidecar start \
+    --service-name "$service" \
+    --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
   local attempt
   for attempt in $(seq 1 "$SIDECAR_OBA_READY_ATTEMPTS"); do
     if [ -f "$AGENT_CONFIG_PATH" ] &&
