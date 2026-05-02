@@ -377,7 +377,7 @@ assert_service_oba_start_fails() {
     fail "service openbao-sidecar start unexpectedly succeeded for ${service} (expected failure containing: ${expected_substring})"
   fi
   cat "$capture_file" >>"$RUN_LOG" || true
-  if ! grep -qF "$expected_substring" "$capture_file"; then
+  if ! grep -qF -e "$expected_substring" "$capture_file"; then
     fail "service openbao-sidecar start error did not contain expected substring '${expected_substring}' (see $capture_file)"
   fi
   printf '[lifecycle] service openbao-sidecar start failed as expected: substring=%q\n' \
