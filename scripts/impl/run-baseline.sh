@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+# docker-compose.yml interpolates the entire file regardless of which
+# services are targeted or which profiles are active, so required vars
+# referenced by gated services (e.g. grafana) must still be defined.
+export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-step-pass}"
+export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-admin}"
+
 DEFAULT_SCENARIO_FILE="$ROOT_DIR/tests/e2e/docker_harness/scenarios/scenario-a-single-node-mixed.json"
 SCENARIO_FILE="${SCENARIO_FILE:-$DEFAULT_SCENARIO_FILE}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-baseline-$(date +%s)}"

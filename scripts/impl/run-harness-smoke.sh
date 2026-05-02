@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+# docker-compose.yml interpolates the entire file regardless of which
+# services are targeted or which profiles are active, so required vars
+# referenced by gated services (e.g. grafana) must still be defined.
+export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-step-pass}"
+export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-admin}"
+
 SCENARIO_ID="${SCENARIO_ID:-docker-harness-smoke}"
 PROJECT_NAME="${PROJECT_NAME:-bootroot-e2e-smoke-$$}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-smoke-$PROJECT_NAME}"
