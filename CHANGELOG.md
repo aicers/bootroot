@@ -6,34 +6,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Added
-
-- Added a non-interactive operation surface for CI/scripted rotations
-  (Closes #587):
-  - `bootroot rotate --yes`/`-y` is now a global flag accepted at any
-    position under `rotate` (e.g. `rotate force-reissue --yes` works in
-    addition to the original `rotate --yes force-reissue`).
-  - `--root-token-file <path>` on every `rotate` subcommand reads the
-    OpenBao root token from a file. Resolution order is
-    `--root-token-file` > `--root-token` > `OPENBAO_ROOT_TOKEN` env >
-    interactive prompt. Combining `--root-token-file` with an explicit
-    `--root-token` CLI flag is a parse-time error; the env-vs-flag
-    distinction is enforced via clap so an env-injected token does not
-    falsely trip the conflict check. The file must not be world-readable
-    (`0o644` is rejected with a `chmod 0600` hint); group-readable
-    (`0o640`) is permitted for shared CI/operator groups.
-  - `bootroot rotate force-reissue --wait` now also covers
-    `daemon + local-file` services. It captures the cert serial before
-    `delete + signal`, then polls `paths.cert` (serial as the primary
-    success signal, mtime as a tiebreaker for the rare same-serial
-    reissue case) until the change is observed or `--wait-timeout`
-    expires. The polling cadence is shared with the existing
-    `remote-bootstrap` path so `--wait-timeout` semantics are identical
-    across delivery modes.
-  - `--post-renew-arg` on both `bootroot service add` and
-    `bootroot-remote bootstrap` now sets `allow_hyphen_values = true`,
-    so `--post-renew-arg -HUP` parses without forcing the `=` form.
-
 ### Security
 
 - Bumped `rustls-webpki` from 0.103.10 to 0.103.12 to address
@@ -256,6 +228,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added a non-interactive operation surface for CI/scripted rotations
+  (Closes #587):
+  - `bootroot rotate --yes`/`-y` is now a global flag accepted at any
+    position under `rotate` (e.g. `rotate force-reissue --yes` works in
+    addition to the original `rotate --yes force-reissue`).
+  - `--root-token-file <path>` on every `rotate` subcommand reads the
+    OpenBao root token from a file. Resolution order is
+    `--root-token-file` > `--root-token` > `OPENBAO_ROOT_TOKEN` env >
+    interactive prompt. Combining `--root-token-file` with an explicit
+    `--root-token` CLI flag is a parse-time error; the env-vs-flag
+    distinction is enforced via clap so an env-injected token does not
+    falsely trip the conflict check. The file must not be world-readable
+    (`0o644` is rejected with a `chmod 0600` hint); group-readable
+    (`0o640`) is permitted for shared CI/operator groups.
+  - `bootroot rotate force-reissue --wait` now also covers
+    `daemon + local-file` services. It captures the cert serial before
+    `delete + signal`, then polls `paths.cert` (serial as the primary
+    success signal, mtime as a tiebreaker for the rare same-serial
+    reissue case) until the change is observed or `--wait-timeout`
+    expires. The polling cadence is shared with the existing
+    `remote-bootstrap` path so `--wait-timeout` semantics are identical
+    across delivery modes.
+  - `--post-renew-arg` on both `bootroot service add` and
+    `bootroot-remote bootstrap` now sets `allow_hyphen_values = true`,
+    so `--post-renew-arg -HUP` parses without forcing the `=` form.
 - `bootroot rotate force-reissue` for `--delivery-mode remote-bootstrap`
   services now publishes a versioned reissue request to OpenBao KV at
   `{kv_mount}/data/bootroot/services/<service>/reissue` with
