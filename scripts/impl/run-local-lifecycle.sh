@@ -134,6 +134,13 @@ EXTERNAL_OBA_NETWORK="${EXTERNAL_OBA_NETWORK:-oba-ext}"
 SIDECAR_ROTATE_LATENCY_LIMIT_SECS="${SIDECAR_ROTATE_LATENCY_LIMIT_SECS:-25}"
 HOST_DAEMON_RENDER_TIMEOUT_SECS="${HOST_DAEMON_RENDER_TIMEOUT_SECS:-75}"
 CURRENT_PHASE="init"
+# PID of the long-running bootroot-agent daemon started for the local
+# services (edge-proxy + web-app share AGENT_CONFIG_PATH).  Required so
+# `bootroot rotate force-reissue --wait` can deliver SIGHUP to a real
+# process — without it, pkill -HUP exits 1 ("no processes matched") and
+# the rotate fails before the wait path runs.
+LOCAL_AGENT_DAEMON_PID=""
+LOCAL_AGENT_DAEMON_LOG="$ARTIFACT_DIR/bootroot-agent.log"
 # Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
 # default moved from 5432 to 5433 in #588 §4c; the e2e harness
 # expects 5432 (CI runners free that port before the matrix), so
@@ -565,6 +572,7 @@ cleanup_hosts() {
 cleanup() {
   log_phase "cleanup"
   cleanup_hosts
+  stop_local_bootroot_agent_daemon
   capture_artifacts
   stop_service_oba
   compose_down
@@ -921,6 +929,54 @@ force_reissue_for_service() {
     >>"$RUN_LOG" 2>&1
 }
 
+start_local_bootroot_agent_daemon() {
+  if [ -n "$LOCAL_AGENT_DAEMON_PID" ] && kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
+    return 0
+  fi
+  [ -f "$AGENT_CONFIG_PATH" ] || fail "agent config missing at $AGENT_CONFIG_PATH"
+  printf '[lifecycle] starting bootroot-agent daemon: --config %s\n' \
+    "$AGENT_CONFIG_PATH" >>"$RUN_LOG"
+  "$BOOTROOT_AGENT_BIN" --config "$AGENT_CONFIG_PATH" \
+    >>"$LOCAL_AGENT_DAEMON_LOG" 2>&1 &
+  LOCAL_AGENT_DAEMON_PID=$!
+  # Give the daemon time to load config and install its SIGHUP handler;
+  # otherwise the first force_reissue may signal it before the handler
+  # is ready, masking the wait-path coverage we are trying to add.
+  local attempt
+  for attempt in $(seq 1 20); do
+    if ! kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
+      tail -n 80 "$LOCAL_AGENT_DAEMON_LOG" >>"$RUN_LOG" 2>&1 || true
+      LOCAL_AGENT_DAEMON_PID=""
+      fail "bootroot-agent daemon exited during startup; see $LOCAL_AGENT_DAEMON_LOG"
+    fi
+    if grep -q "Profile .* daemon enabled" "$LOCAL_AGENT_DAEMON_LOG" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  tail -n 80 "$LOCAL_AGENT_DAEMON_LOG" >>"$RUN_LOG" 2>&1 || true
+  fail "bootroot-agent daemon failed to become ready; see $LOCAL_AGENT_DAEMON_LOG"
+}
+
+stop_local_bootroot_agent_daemon() {
+  if [ -z "$LOCAL_AGENT_DAEMON_PID" ]; then
+    return 0
+  fi
+  if kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
+    kill "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
+    local attempt
+    for attempt in $(seq 1 10); do
+      if ! kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 0.2
+    done
+    kill -9 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
+  fi
+  wait "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
+  LOCAL_AGENT_DAEMON_PID=""
+}
+
 force_reissue_remote() {
   rm -f "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key"
 }
@@ -1235,7 +1291,9 @@ main() {
   run_remote_bootstrap
 
   run_verify_pair "initial"
+  start_local_bootroot_agent_daemon
   run_rotations_with_verification
+  stop_local_bootroot_agent_daemon
 
   log_phase "assert-openbao-audit-log"
   assert_openbao_audit_log
