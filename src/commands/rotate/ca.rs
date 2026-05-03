@@ -22,7 +22,12 @@ use crate::commands::trust::{
     load_rotation_state, update_rotation_state,
 };
 use crate::i18n::Messages;
-use crate::state::DeliveryMode;
+use crate::state::{DeliveryMode, ServiceEntry};
+
+/// Cadence shared by `--wait` polling for both `remote-bootstrap` (KV
+/// payload) and `local-file` (cert on disk) delivery so operators see
+/// identical behaviour from `--wait-timeout`.
+const REISSUE_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 // Phases 0–7 form a single logical workflow; splitting would harm readability.
 #[allow(clippy::too_many_lines)]
@@ -537,8 +542,22 @@ pub(super) async fn rotate_force_reissue(
         return rotate_force_reissue_remote(ctx, client, args, messages).await;
     }
 
+    rotate_force_reissue_local(args, &entry, messages).await
+}
+
+async fn rotate_force_reissue_local(
+    args: &RotateForceReissueArgs,
+    entry: &ServiceEntry,
+    messages: &Messages,
+) -> Result<()> {
     let cert_path = &entry.cert_path;
     let key_path = &entry.key_path;
+
+    // Capture the current cert signal *before* delete + signal so the wait
+    // path can detect the agent's rewrite even if the agent races us and
+    // produces a fresh cert with the same mtime resolution as the old one.
+    let before = read_cert_signal(cert_path);
+
     let _ = fs::remove_file(cert_path);
     let _ = fs::remove_file(key_path);
 
@@ -551,12 +570,51 @@ pub(super) async fn rotate_force_reissue(
             &key_path.display().to_string(),
         )
     );
-    signal_bootroot_agent(&entry, messages)?;
+    signal_bootroot_agent(entry, messages)?;
     println!(
         "{}",
         messages.rotate_summary_force_reissue_local_signal(&args.service_name)
     );
-    Ok(())
+
+    if !args.wait {
+        return Ok(());
+    }
+
+    let wait_timeout = humantime::parse_duration(&args.wait_timeout)
+        .with_context(|| format!("invalid --wait-timeout value: {}", args.wait_timeout))?;
+    let started_at = time::OffsetDateTime::now_utc();
+
+    match wait_for_local_completion(cert_path, before.as_ref(), wait_timeout).await {
+        Ok(_after) => {
+            let completed_at = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string());
+            let started_at = started_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string());
+            let elapsed = format_reissue_elapsed(&started_at, &completed_at);
+            println!(
+                "{}",
+                messages.rotate_summary_force_reissue_completed(
+                    &args.service_name,
+                    &completed_at,
+                    &elapsed,
+                )
+            );
+            Ok(())
+        }
+        Err(WaitError::Timeout) => {
+            println!(
+                "{}",
+                messages.rotate_summary_force_reissue_wait_timeout(
+                    &args.service_name,
+                    &args.wait_timeout,
+                )
+            );
+            Ok(())
+        }
+        Err(WaitError::Other(err)) => Err(err),
+    }
 }
 
 async fn rotate_force_reissue_remote(
@@ -664,6 +722,7 @@ async fn rotate_force_reissue_remote(
     }
 }
 
+#[derive(Debug)]
 enum WaitError {
     Timeout,
     Other(anyhow::Error),
@@ -713,8 +772,6 @@ async fn wait_for_remote_completion(
         REISSUE_COMPLETED_AT_KEY, REISSUE_COMPLETED_VERSION_KEY, REISSUE_REQUESTED_AT_KEY,
     };
 
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
     let deadline = tokio::time::Instant::now() + wait_timeout;
     loop {
         match client.try_read_kv_with_version(kv_mount, kv_path).await {
@@ -758,7 +815,94 @@ async fn wait_for_remote_completion(
         if tokio::time::Instant::now() >= deadline {
             return Err(WaitError::Timeout);
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(REISSUE_WAIT_POLL_INTERVAL).await;
+    }
+}
+
+/// Snapshot used to detect a `local-file` cert rewrite under `--wait`.
+///
+/// Serial-only equality is the success signal; mtime is captured as a
+/// tiebreaker only because sub-second resolution varies by filesystem and
+/// can collide across short polling intervals.
+#[derive(Debug, Clone)]
+struct CertSignal {
+    serial: Option<String>,
+    mtime: Option<std::time::SystemTime>,
+}
+
+/// Reads `(serial, mtime)` for an existing cert path. Missing files map to
+/// `None` for both fields so the post-delete poll treats any new readable
+/// cert as success. Errors during parse degrade gracefully to "no
+/// captured serial" so the polling path can still detect a rewrite via
+/// mtime/file-presence.
+fn read_cert_signal(cert_path: &Path) -> Option<CertSignal> {
+    let metadata = fs::metadata(cert_path).ok()?;
+    let mtime = metadata.modified().ok();
+    let serial = read_cert_serial(cert_path).ok();
+    Some(CertSignal { serial, mtime })
+}
+
+fn read_cert_serial(cert_path: &Path) -> Result<String> {
+    use x509_parser::pem::parse_x509_pem;
+
+    let bytes = fs::read(cert_path)
+        .with_context(|| format!("Failed to read cert file: {}", cert_path.display()))?;
+    let (_, pem) = parse_x509_pem(&bytes).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to parse cert PEM ({}): {err:?}",
+            cert_path.display()
+        )
+    })?;
+    let cert = pem.parse_x509().map_err(|err| {
+        anyhow::anyhow!("Failed to parse cert ({}): {err:?}", cert_path.display())
+    })?;
+    Ok(format!("{:X}", cert.tbs_certificate.serial))
+}
+
+async fn wait_for_local_completion(
+    cert_path: &Path,
+    before: Option<&CertSignal>,
+    wait_timeout: std::time::Duration,
+) -> std::result::Result<CertSignal, WaitError> {
+    let deadline = tokio::time::Instant::now() + wait_timeout;
+    loop {
+        if let Some(after) = read_cert_signal(cert_path) {
+            let serial_changed = match (
+                before.and_then(|b| b.serial.as_ref()),
+                after.serial.as_ref(),
+            ) {
+                (None, Some(_)) => true,
+                (Some(prev), Some(curr)) => prev != curr,
+                _ => false,
+            };
+            if serial_changed {
+                return Ok(after);
+            }
+            // Mtime tiebreaker for the rare case where the agent reissues
+            // with an identical serial but a freshly written file (e.g.
+            // some CA-key rotation paths). Sub-second mtime precision is
+            // filesystem-dependent so this is intentionally a fallback,
+            // not the primary signal — we require strictly newer mtime
+            // and a still-parseable post-rewrite cert.
+            let same_serial = matches!(
+                (
+                    before.and_then(|b| b.serial.as_ref()),
+                    after.serial.as_ref(),
+                ),
+                (Some(prev), Some(curr)) if prev == curr,
+            );
+            let mtime_strictly_advanced = matches!(
+                (before.and_then(|b| b.mtime), after.mtime),
+                (Some(prev), Some(curr)) if curr > prev,
+            );
+            if same_serial && mtime_strictly_advanced {
+                return Ok(after);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(WaitError::Timeout);
+        }
+        tokio::time::sleep(REISSUE_WAIT_POLL_INTERVAL).await;
     }
 }
 
@@ -906,5 +1050,123 @@ mod tests {
 
         let result = cert_issued_by_new_intermediate(&missing, &also_missing, &messages);
         assert!(result.is_err(), "missing file should return error");
+    }
+
+    fn write_self_signed_cert(path: &Path, cn: &str) -> String {
+        use rcgen::{CertificateParams, DnType, KeyPair};
+        let key = KeyPair::generate().expect("key");
+        let mut params = CertificateParams::new(vec![cn.to_string()]).expect("params");
+        params.distinguished_name.push(DnType::CommonName, cn);
+        let cert = params.self_signed(&key).expect("self signed");
+        let pem = cert.pem();
+        fs::write(path, &pem).expect("write cert");
+        read_cert_serial(path).expect("read serial")
+    }
+
+    #[test]
+    fn read_cert_serial_returns_uppercase_hex() {
+        let dir = tempdir().expect("tempdir");
+        let cert_path = dir.path().join("leaf.crt");
+        let serial = write_self_signed_cert(&cert_path, "leaf.example");
+        assert!(!serial.is_empty(), "serial must be parsed");
+        assert!(
+            serial.chars().all(|c| c.is_ascii_hexdigit()),
+            "serial must be hex: {serial}"
+        );
+        assert!(
+            serial.chars().all(|c| !c.is_ascii_lowercase()),
+            "serial must be uppercase hex: {serial}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_local_completion_returns_immediately_when_serial_already_changed() {
+        let dir = tempdir().expect("tempdir");
+        let cert_path = dir.path().join("leaf.crt");
+        let serial1 = write_self_signed_cert(&cert_path, "leaf-one.example");
+        let before = read_cert_signal(&cert_path);
+        assert_eq!(
+            before.as_ref().and_then(|s| s.serial.clone()),
+            Some(serial1)
+        );
+
+        let new_serial = write_self_signed_cert(&cert_path, "leaf-two.example");
+        let result = wait_for_local_completion(
+            &cert_path,
+            before.as_ref(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let signal = result.expect("wait should succeed when serial already changed");
+        assert_eq!(signal.serial.as_deref(), Some(new_serial.as_str()));
+    }
+
+    #[tokio::test]
+    async fn wait_for_local_completion_succeeds_when_starting_with_no_cert() {
+        let dir = tempdir().expect("tempdir");
+        let cert_path = dir.path().join("leaf.crt");
+        let before = read_cert_signal(&cert_path);
+        assert!(before.is_none(), "no cert before");
+
+        let _serial = write_self_signed_cert(&cert_path, "fresh.example");
+        let result = wait_for_local_completion(
+            &cert_path,
+            before.as_ref(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let signal = result.expect("wait should succeed once a cert appears");
+        assert!(signal.serial.is_some(), "must observe a serial");
+    }
+
+    #[tokio::test]
+    async fn wait_for_local_completion_times_out_when_unchanged() {
+        let dir = tempdir().expect("tempdir");
+        let cert_path = dir.path().join("leaf.crt");
+        let _serial = write_self_signed_cert(&cert_path, "stable.example");
+        let before = read_cert_signal(&cert_path);
+
+        let result = wait_for_local_completion(
+            &cert_path,
+            before.as_ref(),
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(matches!(result, Err(WaitError::Timeout)));
+    }
+
+    /// Mtime tiebreaker: serial is identical (rare reissue case) but the
+    /// file was rewritten with a strictly newer mtime. The wait must
+    /// detect the rewrite via mtime rather than time out.
+    #[tokio::test]
+    async fn wait_for_local_completion_uses_mtime_tiebreaker_for_same_serial() {
+        let dir = tempdir().expect("tempdir");
+        let cert_path = dir.path().join("leaf.crt");
+
+        // Synthesise a "before" signal whose serial matches what the
+        // post-rewrite file will have, but whose mtime is strictly older.
+        let serial = write_self_signed_cert(&cert_path, "leaf-pre.example");
+        let raw = fs::read(&cert_path).expect("read cert");
+
+        let older_mtime =
+            std::time::SystemTime::now() - std::time::Duration::from_mins(1);
+        let before = Some(CertSignal {
+            serial: Some(serial.clone()),
+            mtime: Some(older_mtime),
+        });
+
+        // Rewrite the file in place to advance mtime while keeping the
+        // exact serial bytes intact.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&cert_path, &raw).expect("rewrite cert");
+
+        let result = wait_for_local_completion(
+            &cert_path,
+            before.as_ref(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let signal = result.expect("mtime tiebreaker should succeed");
+        assert_eq!(signal.serial.as_deref(), Some(serial.as_str()));
     }
 }

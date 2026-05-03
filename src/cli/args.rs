@@ -228,9 +228,21 @@ pub(crate) struct RuntimeAuthArgs {
     #[arg(long, value_enum, default_value = "auto")]
     pub(crate) auth_mode: AuthMode,
 
-    /// `OpenBao` root token
-    #[arg(long, env = "OPENBAO_ROOT_TOKEN")]
+    /// `OpenBao` root token (CLI flag only).
+    ///
+    /// Resolution order: `--root-token-file` (if set, must not be combined
+    /// with `--root-token`) > `--root-token` (CLI) > `OPENBAO_ROOT_TOKEN`
+    /// env > interactive prompt.
+    #[arg(long)]
     pub(crate) root_token: Option<String>,
+
+    /// Path to file containing `OpenBao` root token.
+    ///
+    /// File takes precedence over `OPENBAO_ROOT_TOKEN` env, but errors when
+    /// combined with an explicit `--root-token` CLI flag. The file must not
+    /// be other-readable (mode `0o644` is rejected; use `chmod 0600 <path>`).
+    #[arg(long, conflicts_with = "root_token")]
+    pub(crate) root_token_file: Option<PathBuf>,
 
     /// `OpenBao` `AppRole` `role_id`
     #[arg(long, env = "OPENBAO_APPROLE_ROLE_ID")]
@@ -285,7 +297,7 @@ pub(crate) struct RotateArgs {
     pub(crate) runtime_auth: RuntimeAuthArgs,
 
     /// Skip confirmation prompts
-    #[arg(long)]
+    #[arg(long, short = 'y', global = true)]
     pub(crate) yes: bool,
 
     /// Show secrets in plaintext instead of masking them
@@ -419,11 +431,12 @@ pub(crate) struct RotateForceReissueArgs {
     #[arg(long)]
     pub(crate) requester: Option<String>,
 
-    /// Wait for the remote agent to apply the reissue before returning.
+    /// Wait for the agent to apply the reissue before returning.
     ///
-    /// Only meaningful for `--delivery-mode remote-bootstrap` services:
-    /// polls the `completed_at` field on the same KV path until the
-    /// remote bootroot-agent picks up the request and reports completion.
+    /// For `--delivery-mode remote-bootstrap` services, polls the
+    /// `completed_at` field on the KV reissue path. For local-file
+    /// services, polls the on-disk cert (serial + mtime) until the local
+    /// bootroot-agent rewrites it. Use `--wait-timeout` to bound the wait.
     #[arg(long)]
     pub(crate) wait: bool,
 
@@ -859,8 +872,11 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long)]
     pub(crate) post_renew_command: Option<String>,
 
-    /// Post-renew success hook argument (repeatable, low-level)
-    #[arg(long)]
+    /// Post-renew success hook argument (repeatable, low-level).
+    ///
+    /// Accepts hyphen-prefixed values like `-HUP` or `-f` directly so
+    /// operators can spell `--post-renew-arg -HUP` without the `=` form.
+    #[arg(long, allow_hyphen_values = true)]
     pub(crate) post_renew_arg: Vec<String>,
 
     /// Post-renew success hook timeout in seconds (low-level)
@@ -1751,6 +1767,164 @@ mod tests {
                 assert_eq!(args.service_name, "myapp");
             }
             _ => panic!("expected deprecated service agent start alias"),
+        }
+    }
+
+    /// `--yes` must work both before and after the rotate subcommand
+    /// (issue #587 §1).  Operators and CI scripts expect the flag to
+    /// follow the subcommand naturally.
+    #[test]
+    fn test_cli_rotate_yes_after_subcommand() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "force-reissue",
+            "--service-name",
+            "edge-proxy",
+            "--yes",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => {
+                assert!(args.yes);
+                assert!(matches!(args.command, RotateCommand::ForceReissue(_)));
+            }
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rotate_yes_before_subcommand_still_works() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "--yes",
+            "force-reissue",
+            "--service-name",
+            "edge-proxy",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => {
+                assert!(args.yes);
+                assert!(matches!(args.command, RotateCommand::ForceReissue(_)));
+            }
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rotate_short_y_alias_works() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "force-reissue",
+            "--service-name",
+            "edge-proxy",
+            "-y",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => {
+                assert!(args.yes);
+            }
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rotate_yes_global_on_db_subcommand() {
+        let cli = Cli::parse_from(["bootroot", "rotate", "db", "-y"]);
+        match cli.command {
+            CliCommand::Rotate(args) => {
+                assert!(args.yes);
+                assert!(matches!(args.command, RotateCommand::Db(_)));
+            }
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    /// `--root-token-file` introduced in issue #587 §2.  It must parse
+    /// successfully on rotate subcommands and be mutually exclusive with
+    /// an explicit `--root-token` CLI flag.
+    #[test]
+    fn test_cli_rotate_parses_root_token_file() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "--root-token-file",
+            "/secrets/root.token",
+            "trust-sync",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => {
+                assert_eq!(
+                    args.runtime_auth.root_token_file,
+                    Some(PathBuf::from("/secrets/root.token"))
+                );
+                assert!(args.runtime_auth.root_token.is_none());
+            }
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rotate_rejects_root_token_with_root_token_file() {
+        let result = Cli::try_parse_from([
+            "bootroot",
+            "rotate",
+            "--root-token-file",
+            "/secrets/root.token",
+            "--root-token",
+            "explicit-token",
+            "trust-sync",
+        ]);
+        assert!(
+            result.is_err(),
+            "--root-token-file must conflict with --root-token at parse time"
+        );
+    }
+
+    /// `--post-renew-arg` accepts hyphen-prefixed values (issue #587 §4):
+    /// `-HUP`, `-f`, etc., which previously required `=` to bypass clap's
+    /// short-flag parsing.
+    #[test]
+    fn test_cli_service_add_post_renew_arg_hyphen_value_space_form() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--post-renew-command",
+            "pkill",
+            "--post-renew-arg",
+            "-HUP",
+            "--post-renew-arg",
+            "-f",
+            "--post-renew-arg",
+            "review",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert_eq!(args.post_renew_arg, vec!["-HUP", "-f", "review"]);
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_service_add_post_renew_arg_hyphen_value_eq_form() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--post-renew-command",
+            "pkill",
+            "--post-renew-arg=-HUP",
+            "--post-renew-arg=-f",
+            "--post-renew-arg=review",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert_eq!(args.post_renew_arg, vec!["-HUP", "-f", "review"]);
+            }
+            _ => panic!("expected service add"),
         }
     }
 }
