@@ -1148,8 +1148,7 @@ mod tests {
         let serial = write_self_signed_cert(&cert_path, "leaf-pre.example");
         let raw = fs::read(&cert_path).expect("read cert");
 
-        let older_mtime =
-            std::time::SystemTime::now() - std::time::Duration::from_mins(1);
+        let older_mtime = std::time::SystemTime::now() - std::time::Duration::from_mins(1);
         let before = Some(CertSignal {
             serial: Some(serial.clone()),
             mtime: Some(older_mtime),
