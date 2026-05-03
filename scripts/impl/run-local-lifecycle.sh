@@ -936,7 +936,11 @@ start_local_bootroot_agent_daemon() {
   [ -f "$AGENT_CONFIG_PATH" ] || fail "agent config missing at $AGENT_CONFIG_PATH"
   printf '[lifecycle] starting bootroot-agent daemon: --config %s\n' \
     "$AGENT_CONFIG_PATH" >>"$RUN_LOG"
-  "$BOOTROOT_AGENT_BIN" --config "$AGENT_CONFIG_PATH" \
+  # bootroot-agent uses tracing_subscriber::fmt::init(), whose default
+  # filter is ERROR.  The readiness probe below greps for an info-level
+  # message, so we have to opt into info output explicitly.
+  RUST_LOG="${RUST_LOG:-info}" \
+    "$BOOTROOT_AGENT_BIN" --config "$AGENT_CONFIG_PATH" \
     >>"$LOCAL_AGENT_DAEMON_LOG" 2>&1 &
   LOCAL_AGENT_DAEMON_PID=$!
   # Give the daemon time to load config and install its SIGHUP handler;
