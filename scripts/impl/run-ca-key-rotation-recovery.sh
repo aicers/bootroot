@@ -372,6 +372,8 @@ verify_service_with_retry() {
   done
 }
 
+# Daemon-deploy local-file path: drives `bootroot rotate force-reissue
+# --wait` end-to-end so the in-binary signal+wait code path runs in CI.
 force_reissue_for_service() {
   local service="$1"
   run_bootroot rotate \
@@ -387,13 +389,25 @@ force_reissue_for_service() {
     >>"$RUN_LOG" 2>&1
 }
 
+# Docker-deploy local-file path: web-app is registered with
+# --deploy-type docker --container-name web-app for service-add coverage,
+# but no real `web-app` container runs in this scenario.  The host
+# bootroot-agent owns the cert via the shared agent config, so deleting
+# the files and letting the daemon's missing-cert check pick them up is
+# the right reissue trigger here.  The `bootroot rotate force-reissue`
+# wait-path is exercised by the daemon-deploy edge-proxy call above.
+force_reissue_for_docker_service() {
+  local service="$1"
+  rm -f "$CERTS_DIR/${service}.crt" "$CERTS_DIR/${service}.key"
+}
+
 force_reissue_remote() {
   rm -f "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key"
 }
 
 force_reissue_all_services() {
   force_reissue_for_service "$EDGE_SERVICE"
-  force_reissue_for_service "$WEB_SERVICE"
+  force_reissue_for_docker_service "$WEB_SERVICE"
   force_reissue_remote
 }
 
@@ -772,7 +786,7 @@ scenario_3_partial_reissuance() {
   [ -f "$CERTS_DIR/${WEB_SERVICE}.crt" ] || fail "S3: web-app old cert should still exist"
 
   # Reissue remaining services
-  force_reissue_for_service "$WEB_SERVICE"
+  force_reissue_for_docker_service "$WEB_SERVICE"
   verify_service_with_retry "$WEB_SERVICE"
   run_remote_bootstrap
   force_reissue_remote
