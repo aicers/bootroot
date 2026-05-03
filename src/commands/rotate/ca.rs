@@ -1071,11 +1071,11 @@ mod tests {
         assert!(!serial.is_empty(), "serial must be parsed");
         assert!(
             serial.chars().all(|c| c.is_ascii_hexdigit()),
-            "serial must be hex: {serial}"
+            "serial must be ASCII hex"
         );
         assert!(
             serial.chars().all(|c| !c.is_ascii_lowercase()),
-            "serial must be uppercase hex: {serial}"
+            "serial must be uppercase hex"
         );
     }
 
