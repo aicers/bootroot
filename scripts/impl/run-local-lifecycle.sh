@@ -908,7 +908,17 @@ run_verify_pair() {
 
 force_reissue_for_service() {
   local service="$1"
-  rm -f "$CERTS_DIR/${service}.crt" "$CERTS_DIR/${service}.key"
+  run_bootroot rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
+    --yes \
+    force-reissue \
+    --service-name "$service" \
+    --wait \
+    >>"$RUN_LOG" 2>&1
 }
 
 force_reissue_remote() {
