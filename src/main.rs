@@ -49,6 +49,7 @@ where
     Ok(f(&runtime))
 }
 
+#[allow(clippy::too_many_lines)] // Top-level CLI dispatcher.
 fn run(cli: Cli, messages: &Messages) -> Result<()> {
     match cli.command {
         CliCommand::Infra(InfraCommand::Up(args)) => {
@@ -105,12 +106,27 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
             )
             .with_context(|| messages.error_service_openbao_sidecar_start_failed())?;
         }
+        CliCommand::Service(ServiceCommand::OpenbaoSidecar(
+            ServiceOpenbaoSidecarCommand::Refresh(args),
+        )) => {
+            commands::service::openbao_sidecar_refresh::run_service_openbao_sidecar_refresh(
+                &args, messages,
+            )
+            .with_context(|| messages.error_service_openbao_sidecar_refresh_failed())?;
+        }
         CliCommand::Service(ServiceCommand::Agent(ServiceOpenbaoSidecarCommand::Start(args))) => {
             eprintln!("{}", messages.warn_service_agent_alias_deprecated());
             commands::service::openbao_sidecar_start::run_service_openbao_sidecar_start(
                 &args, messages,
             )
             .with_context(|| messages.error_service_openbao_sidecar_start_failed())?;
+        }
+        CliCommand::Service(ServiceCommand::Agent(ServiceOpenbaoSidecarCommand::Refresh(args))) => {
+            eprintln!("{}", messages.warn_service_agent_alias_deprecated());
+            commands::service::openbao_sidecar_refresh::run_service_openbao_sidecar_refresh(
+                &args, messages,
+            )
+            .with_context(|| messages.error_service_openbao_sidecar_refresh_failed())?;
         }
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,

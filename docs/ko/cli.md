@@ -177,6 +177,22 @@ bootroot infra up
   저장됩니다. CN 측 `openbao_url`은 TLS 검증 후
   `bootroot init`이 바인드 주소 기반 HTTPS URL로 다시
   작성할 때까지 설치 시 루프백 URL로 유지됩니다.
+- `--postgres-host-port <N>`: 호스트 측 `PostgreSQL` 게시 포트입니다.
+  `.env`의 `POSTGRES_HOST_PORT`와 프로세스 환경 변수보다 우선합니다.
+  미지정 시 게시 기본값은 **5433**으로, 통상적인 5432 포트는
+  운영자 측 애플리케이션 DB가 사용할 수 있도록 비워 둡니다.
+
+`docker compose up` 호출 전, `infra install`은 활성 compose
+스택이 게시하는 모든 호스트 측 포트(`PostgreSQL`, `OpenBao`,
+`step-ca`, `bootroot-http01`)에 대해 TCP 바인드 사전 점검을
+수행합니다. 충돌 시 사용 중인 포트와 `lsof` 기반의 PID/명령
+힌트, 권장 조치를 표시한 뒤 즉시 중단되어, 일부 서비스가 바인드에
+실패한 채 다른 서비스만 실행되는 부분 상태를 방지합니다(#588 §4).
+`infra install`은 베이스 compose 파일로만 `docker compose up`을
+호출하므로(즉, `--openbao-bind` / `--http01-admin-bind` 오버라이드
+파일은 `infra up` / `init` 단계에서만 적용되고 설치 시점에는
+적용되지 않음), 사전 점검은 오버라이드 의도가 기록되어 있어도
+항상 로컬호스트 포트를 검사합니다.
 
 ### 출력
 
@@ -291,11 +307,47 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   [운영 > SecretID TTL과 회전 주기](operations.md#secretid-ttl)를
   참고하세요.
 - `--eab-kid`, `--eab-hmac`: 수동 EAB 입력
-  (환경 변수: `EAB_KID`, `EAB_HMAC`). 두 값이 모두 제공되면 bootroot가
-  ACME `newAccount` 요청에 그대로 전달합니다. bootroot는 EAB를
-  프로비저닝하거나 검증하지 않습니다. 번들된 OSS step-ca는 EAB를
-  지원하지 않으므로, 상용 Smallstep Certificate Manager 등 EAB 지원
-  CA를 사용할 때만 필요합니다.
+  (환경 변수: `EAB_KID`, `EAB_HMAC`). 두 값이 모두 제공되면 init이
+  값을 검증한 뒤(`kid`는 비어 있지 않아야 하고, `hmac`은 base64url로
+  최소 16바이트 디코드 가능해야 함) ACME `newAccount` 요청에
+  전달합니다. 번들된 OSS step-ca는 EAB를 지원하지 않으므로, 상용
+  Smallstep Certificate Manager 등 EAB 지원 CA를 사용할 때만
+  필요합니다. 대화형 EAB 프롬프트는 검증 실패 시 재입력을 요청하며,
+  과거처럼 `y` 같은 한 글자 값을 그대로 받지 않습니다(#588 §3a).
+- `--no-eab`: EAB 프롬프트를 생략하고 EAB 자격증명을 KV에 기록하지
+  않습니다. `--eab-kid`/`--eab-hmac`과 함께 사용할 수 없습니다.
+  OSS step-ca 및 EAB를 사용하지 않는 CI 흐름에 권장됩니다(#588 §3b).
+
+이전 `init`이 중간에 실패하고 롤백되었다면 OpenBao는 볼륨에 초기화된
+상태로 남아 있는 반면 bootroot에는 사용 가능한 root token이 없을 수
+있습니다. `init`은 시작 시 이 상태를 감지하고 불투명한
+`403 permission denied`를 노출하는 대신 세 가지 복구 경로
+(`--root-token`/`OPENBAO_ROOT_TOKEN` 재공급, `bootroot clean
+--openbao-only` 실행, 운영자 수동 조치)를 명시한 진단 메시지를
+출력합니다(#588 §5a).
+
+`init`이 런타임 DB 역할/데이터베이스를 프로비저닝(`db-provision` 기능
+활성화)할 때, 대상 DB의 `public` 스키마에 `CREATE, USAGE` 권한을
+런타임 역할에 부여하고 사용된 admin DSN을 고권한 OpenBao KV 경로
+(`bootroot/stepca/db_admin`)에 저장합니다. `bootroot rotate db`는
+이 경로에서 admin DSN을 읽어 들이므로 매 회전 시
+`--db-admin-dsn`을 전달할 필요가 없습니다. 이 KV 경로는 운영자/root
+토큰만 읽을 수 있으며, 런타임 AppRole 정책에서는 의도적으로
+제외됩니다. `init`의 부트스트랩 후 `.env` 비밀번호 회전이 실행되면
+admin 사용자가 회전 대상 런타임 사용자와 같은 경우(번들된 동일 역할
+토폴로지) 저장된 admin DSN이 새 비밀번호로 다시 기록됩니다. 또한
+이 회전은 호스트 측 Postgres 포트를 compose 디렉터리의
+`.env` / 프로세스 환경에서 결정합니다(Docker Compose가
+`${POSTGRES_HOST_PORT:-5433}` 매핑에 사용하는 우선순위와 동일)
+이로써 새 5433 기본값으로 인해 회전이 조용히 건너뛰어지는 일이
+없습니다. `--db-admin-dsn`이 지정되지 않은 경우 compose `.env`의
+`POSTGRES_USER`/`POSTGRES_PASSWORD`로부터 자동 구성되는 admin DSN
+역시 동일한 `${POSTGRES_HOST_PORT:-5433}` 우선순위를 따르며, 호스트
+기본값은 compose 내부 호스트인 `postgres`가 아닌 `127.0.0.1`로
+설정됩니다(`provision_db_sync`는 호스트 측에서 실행되므로 게시된
+포트를 통해 접근해야 합니다). `POSTGRES_HOST` / `POSTGRES_PORT`는
+운영자가 지정한 토폴로지를 위한 명시적 오버라이드로 유지됩니다
+(#588 §1, §2).
 
 DB DSN host 처리 규칙:
 
@@ -880,6 +932,38 @@ Agent 자체는 bootroot가 관리하는 사이드카 컨테이너로 띄울 수
 전적으로 운영자 책임이 되며, rotate 지연은 매 사이클마다 최대
 `static_secret_render_interval`까지 늘어납니다.
 
+## bootroot service openbao-sidecar refresh
+
+서비스별 `OpenBao` Agent 사이드카를 재시작해 consul-template이
+KV 소스를 다시 읽도록 합니다. 운영자가 KV를 수동으로 정리한 뒤
+(예: 오래된 EAB 삭제, 템플릿화된 시크릿 회전 등) 사용합니다 —
+consul-template은 에이전트 프로세스가 재시작될 때까지 이전에
+렌더링한 값을 캐시합니다(#588 §6).
+
+### 입력
+
+- `--service-name`: 서비스 이름(이미 `state.json`에 등록되어 있어야 함)
+
+### 동작
+
+- `--delivery-mode local-file` 서비스: `docker restart
+  bootroot-openbao-agent-<service-name>` 실행.
+- `--delivery-mode remote-bootstrap` 서비스: 운영자 안내 메시지만
+  출력합니다(사이드카는 원격 호스트에 있으며 bootroot에는 신호
+  채널이 없습니다).
+
+### 실패 조건
+
+- `state.json` 부재
+- 서비스 미등록
+- `docker restart` 실패(local-file 모드)
+
+### 예시
+
+```bash
+bootroot service openbao-sidecar refresh --service-name edge-proxy
+```
+
 ## bootroot verify
 
 bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 서비스 온보딩 직후
@@ -933,6 +1017,7 @@ OpenBao와 통신해 값을 갱신합니다.
 - `rotate force-reissue`
 - `rotate ca-key`
 - `rotate openbao-recovery`
+- `rotate eab-clear`
 
 ### 입력
 
@@ -986,11 +1071,18 @@ OpenBao와 통신해 값을 갱신합니다.
 #### `rotate db`
 
 - `--db-admin-dsn`: DB 관리자 DSN (환경 변수 `BOOTROOT_DB_ADMIN_DSN`).
-  `ca.json`이 있으면(즉, `bootroot init --enable db-provision`으로 생성된
-  경우) 선택 사항입니다. bootroot가 `ca.json`의 `db.dataSource` 필드에서
-  현재 관리자 DSN을 자동으로 읽어옵니다. 값을 재정의하려면 플래그를 명시적
-  으로 지정하고, `ca.json`이 없고 대화형 프롬프트를 피하고 싶을 때도 직접
-  지정하세요.
+  해석 우선순위: 이 플래그 → OpenBao KV의 `bootroot/stepca/db_admin`
+  (`init --enable db-provision`이 작성, 운영자/root 토큰만 읽기 가능).
+  둘 다 사용할 수 없으면 두 경로를 명시한 메시지와 함께 실패합니다.
+  KV의 `db_admin`을 정책에서 제외한 AppRole 토큰으로 실행할 때 또는
+  외부 관리 admin 자격을 사용할 때 플래그를 명시적으로 전달하세요.
+  `ca.json.db.dataSource`는 **사용하지 않습니다**: 이 필드는 런타임
+  (`stepca`) DSN을 저장하며, 이를 admin DSN으로 사용한 것이 §2의
+  자기 ALTER 버그의 원인이었습니다. KV 경로를 사용했고 admin DSN의
+  사용자가 회전 대상 런타임 사용자와 같은 경우(번들 동일 역할
+  토폴로지), `provision_db_sync` 완료 후 `rotate db`가
+  `bootroot/stepca/db_admin`도 새 비밀번호로 다시 기록하므로 다음
+  회전이 인증에 실패하지 않습니다(#588 §2).
 - `--db-password`: 새 DB 비밀번호
   (선택, 미지정 시 자동 생성, 환경 변수: `BOOTROOT_DB_PASSWORD`)
 - `--db-timeout-secs`: DB 점검 타임아웃(초, 기본값 `2`)
@@ -1120,6 +1212,35 @@ secret_id를 변경하지 않습니다.
   이 경우 현실적인 복구 경로는 OpenBao 재초기화이며, 결과적으로
   `bootroot init` 재실행과 서비스 재bootstrap이 필요합니다.
 - `--rotate-root-token`은 언실 키 입력 없이 실행할 수 있습니다.
+
+#### `rotate eab-clear`
+
+알려진 모든 EAB KV 경로의 자격증명을 비워서 다음 bootroot-agent
+사이클이 더 이상 오래되었거나 잘못된 EAB 자료를 `agent.toml`에
+템플릿화하지 않도록 합니다. 제거된 `rotate eab`의 후속이며,
+`--no-eab` 및 EAB 입력 검증으로 닫은 증상의 복구 경로입니다
+(#588 §3c).
+
+동작:
+
+- `bootroot/agent/eab` 및 `state.json`에서 열거된 모든
+  `bootroot/services/<svc>/eab` 경로에 빈 `{kid: "", hmac: ""}`을
+  씁니다(KV 목록이 아닌 `state.json`을 기준으로 열거).
+- 각 쓰기 후 `service openbao-sidecar refresh`와 동일한 분기로 영향
+  받는 사이드카를 재시작합니다. `LocalFile` 서비스는 `docker
+  restart bootroot-openbao-agent-<svc>`를 받고, `RemoteBootstrap`
+  서비스는 운영자 안내만 출력합니다.
+- `LocalFile` 사이드카 재시작 실패는 누적되어 치명적으로 처리됩니다.
+  모든 서비스에 대해 KV 쓰기와 재시작을 시도한 뒤, 하나라도 실패하면
+  명령은 0이 아닌 코드로 종료하면서 실패한 서비스 목록을 출력합니다.
+  운영자가 §6의 stale-render 증상을 모르고 남기지 않도록 하기 위함
+  입니다.
+- 완료 후 consul-template은
+  `{{ if .Data.data.kid }}...{{ end }}` 분기를 빈 값으로 렌더링하며,
+  다음 사이클부터 `agent.toml`에 `[eab]` 블록이 포함되지 않습니다.
+
+추가 인자는 없습니다. 글로벌 `--yes`로 확인 프롬프트를 생략할 수
+있습니다.
 
 ### 회전 시크릿 쓰기 대상
 
@@ -1330,17 +1451,31 @@ bootroot ca restart
 
 - `--compose-file`: compose 파일 경로 (기본값 `docker-compose.yml`)
 - `--yes` / `-y`: 확인 프롬프트 생략
+- `--openbao-only`: `bootroot-openbao` 컨테이너와 해당 볼륨만
+  제거합니다. `bootroot-postgres`, `bootroot-http01`, `bootroot-ca`,
+  `secrets/`, `state.json`, `.env`는 그대로 유지됩니다. OpenBao 상태만
+  손상된 경우(예: 부분 init 실패 후) 사용합니다(#588 §5).
 
 ### 동작
 
 - `docker compose down -v --remove-orphans` 실행
 - `secrets/`, `state.json`, `.env` 삭제, 선택적으로 `certs/` 삭제
 - 파괴적 작업 전 확인 프롬프트 표시(`--yes` 미사용 시)
+- `--openbao-only` 사용 시 `openbao` compose 서비스만 중지·제거하고
+  볼륨을 삭제합니다. 다른 서비스는 계속 실행되며 디스크 상태도
+  보존됩니다.
 
 ### 예시
 
 ```bash
 bootroot clean
+```
+
+애플리케이션 DB 또는 step-ca 상태를 잃지 않고 부분 init 상태에서
+복구:
+
+```bash
+bootroot clean --openbao-only --yes
 ```
 
 ## bootroot openbao save-unseal-keys

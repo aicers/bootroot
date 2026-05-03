@@ -885,6 +885,10 @@ impl Messages {
         self.strings().error_service_openbao_sidecar_start_failed
     }
 
+    pub(crate) fn error_service_openbao_sidecar_refresh_failed(&self) -> &'static str {
+        self.strings().error_service_openbao_sidecar_refresh_failed
+    }
+
     pub(crate) fn warn_service_agent_alias_deprecated(&self) -> &'static str {
         self.strings().warn_service_agent_alias_deprecated
     }

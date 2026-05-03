@@ -134,8 +134,14 @@ EXTERNAL_OBA_NETWORK="${EXTERNAL_OBA_NETWORK:-oba-ext}"
 SIDECAR_ROTATE_LATENCY_LIMIT_SECS="${SIDECAR_ROTATE_LATENCY_LIMIT_SECS:-25}"
 HOST_DAEMON_RENDER_TIMEOUT_SECS="${HOST_DAEMON_RENDER_TIMEOUT_SECS:-75}"
 CURRENT_PHASE="init"
+# Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
+# default moved from 5432 to 5433 in #588 §4c; the e2e harness
+# expects 5432 (CI runners free that port before the matrix), so
+# pin it explicitly here to keep compose port mapping aligned with
+# wait_for_postgres_admin and the host-side admin DSN.
+export POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-5432}"
 export POSTGRES_HOST="127.0.0.1"
-export POSTGRES_PORT="${POSTGRES_HOST_PORT:-5432}"
+export POSTGRES_PORT="$POSTGRES_HOST_PORT"
 
 log_phase() {
   local phase="$1"
@@ -675,8 +681,7 @@ run_bootstrap_chain() {
     --stepca-provisioner "acme" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \
-    --eab-kid "dev-kid" \
-    --eab-hmac "dev-hmac" \
+    --no-eab \
     --db-user "step" \
     --db-name "stepca" \
     --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then

@@ -7,7 +7,9 @@ environment may differ.
 ## Prerequisites
 
 - Docker/Docker Compose installed
-- Ports 80/443/8200/9000/5432/8080 available
+- Ports 80/443/8200/9000/5433/8080 available (host-side `PostgreSQL`
+  publishes on 5433 by default; override with `POSTGRES_HOST_PORT` or
+  `bootroot infra install --postgres-host-port <N>`)
 
 The Docker daemon should be configured to **start on reboot**. bootroot's
 containers use restart policies, but Docker itself must be managed by the OS
@@ -494,7 +496,7 @@ Example that rotates all secrets:
 ```bash
 bootroot rotate stepca-password
 bootroot rotate db \
-  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
+  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5433/postgres"
 bootroot rotate responder-hmac
 bootroot rotate openbao-recovery --rotate-root-token
 bootroot rotate approle-secret-id --service-name edge-proxy
@@ -567,7 +569,7 @@ set -euo pipefail
 
 bootroot rotate stepca-password --yes
 bootroot rotate db --yes \
-  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
+  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5433/postgres"
 bootroot rotate responder-hmac --yes
 ```
 

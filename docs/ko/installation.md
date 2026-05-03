@@ -196,8 +196,9 @@ DB DSN이 `secrets/config/ca.json`에 자동으로 기록됩니다.
 - init summary에는 DB host 해석 결과가 함께 출력됩니다
   (예: `localhost -> postgres`).
 - Compose의 PostgreSQL 포트 publish는 localhost 바인딩만 허용됩니다
-  (예: `127.0.0.1:5432:5432`).
-  `0.0.0.0` 바인딩 또는 `5432:5432` 형태는 허용되지 않습니다.
+  (예: `127.0.0.1:5433:5432` — 기본 publish 포트.
+  `POSTGRES_HOST_PORT`로 재정의 가능).
+  `0.0.0.0` 바인딩 또는 `5433:5432` 형태는 허용되지 않습니다.
 
 위 조건을 위반하면 `bootroot init`, `bootroot infra up`,
 `bootroot rotate db`는 즉시 실패합니다.

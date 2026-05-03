@@ -183,6 +183,21 @@ an already-configured environment.
   `openbao_url` remains at the install-time loopback URL
   until `bootroot init` rewrites it to the bind-derived
   HTTPS URL after TLS validation.
+- `--postgres-host-port <N>`: host-side `PostgreSQL` published port.
+  Overrides `POSTGRES_HOST_PORT` from `.env` and the process
+  environment. When unset, the published default is **5433** so
+  bootroot does not claim the conventional 5432 out of the box.
+
+Before invoking `docker compose up`, `infra install` runs a TCP bind
+preflight on every host-side port the active compose stack publishes
+(`PostgreSQL`, `OpenBao`, `step-ca`, `bootroot-http01`). On collision
+it aborts with the busy port, a best-effort PID/command hint via
+`lsof`, and the recommended remediation, instead of leaving earlier
+services running while a later one fails to bind (#588 §4). The
+preflight always checks the localhost ports because `infra install`
+runs `docker compose up` against the base compose file only —
+`--openbao-bind` / `--http01-admin-bind` write override files for
+`infra up` / `init` but are not layered into the install-time `up`.
 
 ### Outputs
 
@@ -301,11 +316,47 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   `bootroot service update --secret-id-ttl`.
   See [Operations > SecretID TTL and rotation cadence](operations.md#secretid-ttl-and-rotation-cadence).
 - `--eab-kid`, `--eab-hmac`: manual EAB input
-  (environment variables: `EAB_KID`, `EAB_HMAC`). Bootroot forwards these
-  values to the ACME `newAccount` request when both are provided; it does
-  not provision or validate them. The bundled OSS step-ca does not support
-  EAB, so these flags apply only when targeting an EAB-capable CA (for
-  example, a commercial Smallstep Certificate Manager deployment).
+  (environment variables: `EAB_KID`, `EAB_HMAC`). When both are
+  provided, init validates them (non-empty `kid`; `hmac` must
+  base64url-decode to at least 16 bytes) and forwards them to the
+  ACME `newAccount` request. The bundled OSS step-ca does not support
+  EAB, so these flags apply only when targeting an EAB-capable CA
+  (for example, a commercial Smallstep Certificate Manager
+  deployment). The interactive EAB prompt re-prompts on validation
+  failure rather than silently accepting garbage (#588 §3a).
+- `--no-eab`: skip the EAB prompt and persist no EAB credentials.
+  Conflicts with `--eab-kid`/`--eab-hmac`. Recommended for OSS
+  step-ca and CI flows that never use EAB (#588 §3b).
+
+If a previous `init` failed mid-flight and rolled back, OpenBao may
+remain initialised in its volume while bootroot has no usable root
+token. `init` detects this state on startup and emits an actionable
+diagnostic naming three recovery paths (re-supply
+`--root-token`/`OPENBAO_ROOT_TOKEN`, run `bootroot clean
+--openbao-only`, or perform manual operator action) instead of
+bubbling up an opaque `403 permission denied` (#588 §5a).
+
+When `init` provisions the runtime database role/database (i.e. the
+`db-provision` feature is enabled), it grants `CREATE, USAGE` on the
+target database's `public` schema to the runtime role and persists
+the admin DSN it used to a high-privilege OpenBao KV path
+(`bootroot/stepca/db_admin`). `bootroot rotate db` reads from that
+path so the operator no longer has to pass `--db-admin-dsn` on every
+rotation. This KV path is intentionally readable only by
+operator/root tokens, not by the runtime AppRole policy. After
+`init`'s post-bootstrap `.env` password rotation runs, the persisted
+admin DSN is rewritten with the new password whenever the admin user
+matches the runtime user being rotated (the bundled same-role
+topology); the rotation also resolves the host-side Postgres port
+from the compose dir's `.env` / process env (same precedence Docker
+Compose uses for `${POSTGRES_HOST_PORT:-5433}`) so the new 5433
+default does not silently skip the rotation. The auto-derived
+admin DSN built when `--db-admin-dsn` is not supplied (from
+`POSTGRES_USER` / `POSTGRES_PASSWORD` in the compose `.env`)
+follows the same `${POSTGRES_HOST_PORT:-5433}` precedence for its
+port and defaults its host to `127.0.0.1` rather than the
+compose-internal `postgres` so the host-side `provision_db_sync`
+can reach it on the published port (#588 §1, §2).
 
 DB DSN host handling:
 
@@ -911,6 +962,41 @@ lifecycle management of the OpenBao Agent process becomes entirely
 the operator's responsibility, and rotate latency increases to up to
 `static_secret_render_interval` per rotate cycle.
 
+## bootroot service openbao-sidecar refresh
+
+Restarts the per-service `OpenBao` Agent sidecar so consul-template
+re-reads its KV sources. Use after manual KV maintenance (clearing
+stale EAB, rotating templated secrets, etc.) — consul-template caches
+the previously-rendered value until the agent process restarts
+(#588 §6).
+
+### Inputs
+
+- `--service-name`: service name identifier (must already exist in
+  `state.json`)
+
+### Behavior
+
+- For services with `--delivery-mode local-file`: runs `docker
+  restart bootroot-openbao-agent-<service-name>`.
+- For services with `--delivery-mode remote-bootstrap`: emits
+  operator guidance only (the sidecar lives on the remote host where
+  bootroot has no signalling channel).
+
+### Failure conditions
+
+The command is considered failed when:
+
+- Missing `state.json`
+- Service not found
+- `docker restart` fails (local-file delivery only)
+
+### Examples
+
+```bash
+bootroot service openbao-sidecar refresh --service-name edge-proxy
+```
+
 ## bootroot verify
 
 Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
@@ -965,6 +1051,7 @@ Supported subcommands:
 - `rotate force-reissue`
 - `rotate ca-key`
 - `rotate openbao-recovery`
+- `rotate eab-clear`
 
 ### Inputs
 
@@ -1018,12 +1105,20 @@ Per subcommand:
 
 #### `rotate db`
 
-- `--db-admin-dsn`: DB admin DSN (env `BOOTROOT_DB_ADMIN_DSN`). Optional
-  when `ca.json` is present (auto-populated by `bootroot init --enable
-  db-provision`); bootroot reads the current admin DSN from
-  `ca.json`'s `db.dataSource` field. Pass the flag explicitly to
-  override, or provide it when `ca.json` is absent and the command would
-  otherwise prompt interactively.
+- `--db-admin-dsn`: DB admin DSN (env `BOOTROOT_DB_ADMIN_DSN`).
+  Resolution order: this flag → `bootroot/stepca/db_admin` in
+  OpenBao KV (written by `init --enable db-provision`, readable
+  only by operator/root tokens). When neither is available the
+  command fails with a message naming both sources. Pass the
+  flag explicitly to override, or when running with an AppRole
+  token whose policy excludes `db_admin`. `ca.json.db.dataSource`
+  is **not** consulted: that field stores the runtime (`stepca`)
+  DSN, and using it as an admin DSN was the original §2 self-ALTER
+  bug. When the KV-backed path is used and the admin DSN's user
+  matches the runtime user being rotated (the bundled same-role
+  topology), `rotate db` also rewrites `bootroot/stepca/db_admin`
+  with the new password after `provision_db_sync` completes, so
+  subsequent rotations continue to authenticate. (#588 §2)
 - `--db-password`: new DB password
   (optional, auto-generated if omitted, env `BOOTROOT_DB_PASSWORD`)
 - `--db-timeout-secs`: DB timeout in seconds (default `2`)
@@ -1163,6 +1258,35 @@ Important behavior:
   In that case, the practical recovery path is re-initializing OpenBao, which
   implies re-running `bootroot init` and re-bootstrapping services.
 - `--rotate-root-token` can be executed without unseal-key input.
+
+#### `rotate eab-clear`
+
+Clears EAB credentials from every known KV path so the next
+bootroot-agent cycle does not template stale or invalid EAB material
+into `agent.toml`. Companion to the now-removed `rotate eab` and the
+recovery path for the symptom closed by `--no-eab` and the EAB
+input validator (#588 §3c).
+
+Behavior:
+
+- Writes empty `{kid: "", hmac: ""}` to `bootroot/agent/eab` and to
+  every per-service path `bootroot/services/<svc>/eab` enumerated
+  from `state.json` (not from KV listings).
+- After each write, refreshes the affected sidecar via the same
+  branch as `service openbao-sidecar refresh`: `LocalFile` services
+  receive `docker restart bootroot-openbao-agent-<svc>`;
+  `RemoteBootstrap` services emit operator guidance only.
+- `LocalFile` refresh failures are collected, not swallowed: every
+  service is still attempted (so no service is left with stale KV),
+  but if any sidecar refresh fails the command exits non-zero and
+  names the affected services so the operator does not silently
+  leave the §6 stale-render symptom in place.
+- After completion, consul-template renders the
+  `{{ if .Data.data.kid }}...{{ end }}` branch as empty and
+  `agent.toml` no longer carries an `[eab]` block on the next cycle.
+
+No additional arguments. Honors the global `--yes` to skip the
+confirmation prompt.
 
 ### Rotated secret write targets
 
@@ -1378,17 +1502,32 @@ re-run `bootroot infra install` and `bootroot init` to start over.
 
 - `--compose-file`: compose file path (default `docker-compose.yml`)
 - `--yes` / `-y`: skip confirmation prompts
+- `--openbao-only`: remove only the `bootroot-openbao` container and
+  its volume; leave `bootroot-postgres`, `bootroot-http01`,
+  `bootroot-ca`, `secrets/`, `state.json`, and `.env` intact. Useful
+  when only the OpenBao state is fouled (e.g. after a partial-init
+  failure — see #588 §5).
 
 ### Behavior
 
 - Runs `docker compose down -v --remove-orphans`
 - Removes `secrets/`, `state.json`, `.env`, and optionally `certs/`
 - Prompts for confirmation before destructive actions (unless `--yes`)
+- With `--openbao-only`: only the `openbao` compose service is
+  stopped, removed, and its volume dropped. Other services keep
+  running and on-disk state is preserved.
 
 ### Examples
 
 ```bash
 bootroot clean
+```
+
+Recover from a partial-init OpenBao state without losing application
+DB or step-ca state:
+
+```bash
+bootroot clean --openbao-only --yes
 ```
 
 ## bootroot openbao save-unseal-keys

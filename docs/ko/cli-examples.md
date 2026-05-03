@@ -7,7 +7,9 @@
 ## 사전 준비
 
 - Docker/Docker Compose 설치
-- 80/443/8200/9000/5432/8080 포트 사용 가능
+- 80/443/8200/9000/5433/8080 포트 사용 가능 (호스트 측 `PostgreSQL`은
+  기본값 5433을 사용합니다. `POSTGRES_HOST_PORT` 또는
+  `bootroot infra install --postgres-host-port <N>`로 재정의 가능)
 
 Docker 데몬은 **재부팅 시 자동 시작**되도록 설정되어 있어야 합니다.
 bootroot가 제공하는 컨테이너들은 `restart` 정책으로 자동 재기동되지만,
@@ -489,7 +491,7 @@ EAB를 지원하는 CA를 사용할 때는 운영자가 OpenBao KV에 직접 새
 ```bash
 bootroot rotate stepca-password
 bootroot rotate db \
-  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
+  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5433/postgres"
 bootroot rotate responder-hmac
 bootroot rotate openbao-recovery --rotate-root-token
 bootroot rotate approle-secret-id --service-name edge-proxy
@@ -562,7 +564,7 @@ set -euo pipefail
 
 bootroot rotate stepca-password --yes
 bootroot rotate db --yes \
-  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5432/postgres"
+  --db-admin-dsn "postgresql://admin:***@127.0.0.1:5433/postgres"
 bootroot rotate responder-hmac --yes
 ```
 

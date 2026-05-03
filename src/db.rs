@@ -15,7 +15,11 @@ pub const DB_COMPOSE_PORT: u16 = 5432;
 /// its published port mapping.
 pub const DB_HOST_RUNTIME_HOST: &str = "127.0.0.1";
 /// Fallback port for host-side resolution when `POSTGRES_HOST_PORT` is unset.
-pub const DEFAULT_POSTGRES_HOST_PORT: u16 = 5432;
+///
+/// Matches the published default in `docker-compose.yml`. bootroot
+/// publishes 5433 so the conventional 5432 stays free for an
+/// application-managed `PostgreSQL` instance.
+pub const DEFAULT_POSTGRES_HOST_PORT: u16 = 5433;
 /// Environment variable that controls the host-side published port.
 pub const POSTGRES_HOST_PORT_ENV: &str = "POSTGRES_HOST_PORT";
 
@@ -214,6 +218,37 @@ fn read_env_file_value(compose_dir: &Path, key: &str) -> Option<String> {
     None
 }
 
+/// Returns the admin DSN that should be persisted to KV after running
+/// [`provision_db_sync`].
+///
+/// When `admin.user == db_user`, `provision_db_sync` has just rewritten
+/// the role's password to `db_password`; the persisted DSN must reflect
+/// the new credential so subsequent admin reads (e.g. `rotate db` reads
+/// `bootroot/stepca/db_admin`) still authenticate. Otherwise the admin
+/// DSN is returned unchanged.
+///
+/// # Errors
+///
+/// Returns an error when `admin_dsn` cannot be parsed.
+pub fn effective_admin_dsn_for_kv(
+    admin_dsn: &str,
+    db_user: &str,
+    db_password: &str,
+) -> Result<String> {
+    let admin = parse_db_dsn(admin_dsn).context("Failed to parse PostgreSQL admin DSN")?;
+    if admin.user != db_user {
+        return Ok(admin_dsn.to_string());
+    }
+    Ok(build_db_dsn(
+        &admin.user,
+        db_password,
+        &admin.host,
+        admin.port,
+        &admin.database,
+        admin.sslmode.as_deref(),
+    ))
+}
+
 /// Validates that a DB identifier is safe to embed in SQL.
 ///
 /// # Panics
@@ -337,7 +372,75 @@ pub fn provision_db_sync(
         &format!("GRANT ALL PRIVILEGES ON DATABASE {db_ident} TO {role_ident}"),
         &[],
     )?;
+    drop(client);
+
+    // PostgreSQL 15+ revokes CREATE on the public schema from PUBLIC by
+    // default. Without an explicit grant, `<db_user>` cannot create the
+    // tables step-ca's first boot needs (SQLSTATE 42501). Run the grant
+    // unconditionally so an operator who hit the original failure
+    // (role/DB exist but the grant is still missing) can recover by
+    // re-running `init --enable db-provision` on the fixed binary.
+    // `GRANT CREATE, USAGE` is idempotent; the second admin connection
+    // is the price of that recovery path. Schema grants must run
+    // against the target DB, not the admin DB.
+    //
+    // When `admin_user == db_user` (a common E2E topology where the
+    // bootstrap PostgreSQL admin is the same role step-ca runs as), the
+    // ALTER ROLE PASSWORD above replaced the admin's own password. The
+    // second connection must therefore use `db_password` rather than
+    // the admin DSN's stored password. `connect_password` handles both
+    // cases: identical-user → new `db_password`, distinct-user → admin
+    // DSN's password unchanged.
+    grant_public_schema(
+        admin_dsn,
+        db_name,
+        db_user,
+        db_password,
+        &role_ident,
+        timeout,
+    )?;
+
     Ok(report)
+}
+
+/// Grants `CREATE, USAGE` on the `public` schema of `db_name` to
+/// `role_ident`. Re-uses the admin DSN for credentials and host but
+/// swaps the database name. PG15+ removed the implicit grant; without
+/// this, step-ca's first `CREATE TABLE` fails with permission denied.
+fn grant_public_schema(
+    admin_dsn: &str,
+    db_name: &str,
+    db_user: &str,
+    db_password: &str,
+    role_ident: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let admin = parse_db_dsn(admin_dsn).context("Failed to parse PostgreSQL admin DSN")?;
+    let connect_password: &str = if admin.user == db_user {
+        db_password
+    } else {
+        admin.password.as_str()
+    };
+    let target_dsn = build_db_dsn(
+        &admin.user,
+        connect_password,
+        &admin.host,
+        admin.port,
+        db_name,
+        admin.sslmode.as_deref(),
+    );
+    let mut config = target_dsn
+        .parse::<postgres::Config>()
+        .context("Failed to parse PostgreSQL target DSN")?;
+    config.connect_timeout(timeout);
+    let mut client = config
+        .connect(NoTls)
+        .context("Failed to connect to PostgreSQL target database")?;
+    client.execute(
+        &format!("GRANT CREATE, USAGE ON SCHEMA public TO {role_ident}"),
+        &[],
+    )?;
+    Ok(())
 }
 
 /// Quotes an SQL identifier by wrapping it in double quotes and escaping
@@ -610,7 +713,10 @@ mod tests {
     fn resolve_postgres_host_port_defaults_when_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _guard = env_port_guard();
-        assert_eq!(resolve_postgres_host_port(dir.path()), 5432);
+        assert_eq!(
+            resolve_postgres_host_port(dir.path()),
+            DEFAULT_POSTGRES_HOST_PORT
+        );
     }
 
     #[test]

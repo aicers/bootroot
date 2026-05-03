@@ -195,7 +195,8 @@ single-host guardrails:
 - init summary prints DB host resolution (for example,
   `localhost -> postgres`).
 - PostgreSQL port publishing in Compose must stay localhost-bound (for example,
-  `127.0.0.1:5432:5432`), not `0.0.0.0` or bare `5432:5432`.
+  `127.0.0.1:5433:5432` — the published default; override with
+  `POSTGRES_HOST_PORT`), not `0.0.0.0` or bare `5433:5432`.
 
 If these conditions are violated, `bootroot init`, `bootroot infra up`, and
 `bootroot rotate db` fail fast.

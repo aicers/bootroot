@@ -1,6 +1,7 @@
 mod approle;
 mod ca;
 mod db;
+mod eab_clear;
 mod helpers;
 mod infra_cert;
 mod openbao_recovery;
@@ -209,6 +210,9 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         }
         RotateCommand::InfraCert(_) => {
             unreachable!("InfraCert is handled before OpenBao client bootstrap")
+        }
+        RotateCommand::EabClear(_) => {
+            eab_clear::rotate_eab_clear(&mut ctx, &client, args.yes, messages).await?;
         }
     }
 

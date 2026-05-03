@@ -116,6 +116,9 @@ pub(crate) enum ServiceCommand {
 #[derive(Subcommand, Debug)]
 pub(crate) enum ServiceOpenbaoSidecarCommand {
     Start(ServiceOpenbaoSidecarStartArgs),
+    /// Restarts the per-service `OpenBao` Agent sidecar so it re-reads
+    /// KV templates after operator-side KV maintenance.
+    Refresh(ServiceOpenbaoSidecarRefreshArgs),
 }
 
 #[derive(Args, Debug)]
@@ -136,6 +139,13 @@ pub(crate) struct ServiceOpenbaoSidecarStartArgs {
     /// service, etc.).
     #[arg(long)]
     pub(crate) openbao_network: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ServiceOpenbaoSidecarRefreshArgs {
+    /// Service name identifier
+    #[arg(long)]
+    pub(crate) service_name: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -334,7 +344,15 @@ pub(crate) enum RotateCommand {
     /// registered in `state.json` `infra_certs`.
     #[command(name = "infra-cert")]
     InfraCert(RotateInfraCertArgs),
+    /// Clears EAB credentials from every known KV path so the next
+    /// bootroot-agent cycle does not template stale or invalid EAB
+    /// material into agent.toml.
+    #[command(name = "eab-clear")]
+    EabClear(RotateEabClearArgs),
 }
+
+#[derive(Args, Debug)]
+pub(crate) struct RotateEabClearArgs {}
 
 #[derive(Args, Debug)]
 pub(crate) struct RotateInfraCertArgs {}
@@ -571,6 +589,13 @@ pub(crate) struct InfraInstallArgs {
     /// Must be a specific reachable IP:port (not wildcard or loopback).
     #[arg(long)]
     pub(crate) http01_admin_advertise_addr: Option<String>,
+
+    /// Host-side `PostgreSQL` published port. Overrides
+    /// `POSTGRES_HOST_PORT` from `.env` and the process environment.
+    /// When unset, the value already in `.env` (or the compose default)
+    /// applies.
+    #[arg(long = "postgres-host-port")]
+    pub(crate) postgres_host_port: Option<u16>,
 }
 
 #[derive(Args, Debug)]
@@ -581,6 +606,14 @@ pub(crate) struct CleanArgs {
     /// Skip confirmation prompts
     #[arg(long, short)]
     pub(crate) yes: bool,
+
+    /// Removes only the `bootroot-openbao` container and its volume,
+    /// leaving `bootroot-postgres`, `bootroot-http01`, `bootroot-ca`,
+    /// `secrets/`, `state.json`, and `.env` intact. Useful when only
+    /// the `OpenBao` state is fouled (e.g. after a partial-init
+    /// failure — see issue #588 §5).
+    #[arg(long = "openbao-only")]
+    pub(crate) openbao_only: bool,
 }
 
 #[derive(Args, Debug)]
@@ -757,6 +790,12 @@ pub(crate) struct InitArgs {
     /// ACME EAB HMAC (optional)
     #[arg(long, env = "EAB_HMAC")]
     pub(crate) eab_hmac: Option<String>,
+
+    /// Skip the ACME EAB prompt and persist no EAB credentials.
+    /// Recommended for OSS step-ca (which does not implement EAB)
+    /// and for CI flows that never use EAB.
+    #[arg(long = "no-eab", conflicts_with_all = ["eab_kid", "eab_hmac"])]
+    pub(crate) no_eab: bool,
 }
 
 impl InitArgs {
