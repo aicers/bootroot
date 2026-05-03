@@ -139,21 +139,29 @@ async fn write_service_kv_secrets(
     messages: &Messages,
 ) -> Result<()> {
     let base = format!("{SERVICE_KV_BASE}/{service_name}");
-    if let (Some(eab_kid), Some(eab_hmac)) =
-        (material.eab_kid.as_deref(), material.eab_hmac.as_deref())
-    {
-        client
-            .write_kv(
-                kv_mount,
-                &format!("{base}/eab"),
-                serde_json::json!({
-                    SERVICE_EAB_KID_KEY: eab_kid,
-                    SERVICE_EAB_HMAC_KEY: eab_hmac,
-                }),
-            )
-            .await
-            .with_context(|| messages.error_openbao_kv_write_failed())?;
-    }
+    // Always write `<base>/eab`, even when no EAB material is configured.
+    // The OpenBao Agent template for the per-service `agent.toml.ctmpl`
+    // references `secret/data/<base>/eab`; consul-template treats a
+    // missing secret as a transient error and retries indefinitely
+    // (~64s with backoff), which prevents the sidecar from rendering
+    // its agent.toml at all when EAB is not configured (e.g. `--no-eab`
+    // at init, bundled OSS step-ca). Writing empty kid/hmac satisfies
+    // the dependency; the template's `{{ if .Data.data.kid }}` guard
+    // skips the [eab] block so no garbage propagates. This mirrors the
+    // recovery path provided by `bootroot rotate eab-clear` (#588 §3c).
+    let eab_kid = material.eab_kid.as_deref().unwrap_or("");
+    let eab_hmac = material.eab_hmac.as_deref().unwrap_or("");
+    client
+        .write_kv(
+            kv_mount,
+            &format!("{base}/eab"),
+            serde_json::json!({
+                SERVICE_EAB_KID_KEY: eab_kid,
+                SERVICE_EAB_HMAC_KEY: eab_hmac,
+            }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
     client
         .write_kv(
             kv_mount,

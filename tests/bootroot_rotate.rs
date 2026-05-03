@@ -2143,9 +2143,14 @@ async fn stub_openbao_for_db_rotation(server: &MockServer, expected_dsn: &str) {
 fn start_mock_postgres() -> (u16, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock pg");
     let port = listener.local_addr().expect("mock pg addr").port();
+    // Accept connections in a loop. `provision_db_sync` may open a
+    // second connection to the target DB to grant `CREATE, USAGE` on
+    // the public schema (see #588 §1), and rotation flows that touch
+    // both `postgres` (admin) and the target DB need the listener to
+    // outlive the first session.
     let handle = std::thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
-            mock_pg_session(stream);
+        while let Ok((stream, _)) = listener.accept() {
+            std::thread::spawn(move || mock_pg_session(stream));
         }
     });
     (port, handle)

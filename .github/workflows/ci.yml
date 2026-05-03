@@ -160,8 +160,7 @@ jobs:
             --http-hmac "dev-hmac" \
             --secrets-dir "$BOOTROOT_SECRETS_DIR" \
             --responder-url "http://localhost:8080" \
-            --eab-kid "dev-kid" \
-            --eab-hmac "dev-hmac" \
+            --no-eab \
             --skip responder-check 2>&1 | tee zero-config-init.log
 
           if ! grep -q "unseal key" zero-config-init.log; then
@@ -182,8 +181,7 @@ jobs:
             --http-hmac "dev-hmac" \
             --secrets-dir "$BOOTROOT_SECRETS_DIR" \
             --responder-url "http://localhost:8080" \
-            --eab-kid "dev-kid" \
-            --eab-hmac "dev-hmac" \
+            --no-eab \
             --skip responder-check | tee cli-init.log
 
           ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' cli-init.log)"

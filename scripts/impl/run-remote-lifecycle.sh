@@ -42,8 +42,6 @@ SERVICE_NAME="edge-proxy"
 HOSTNAME="edge-node-02"
 DOMAIN="trusted.domain"
 INSTANCE_ID="101"
-INIT_EAB_KID="${INIT_EAB_KID:-dev-kid}"
-INIT_EAB_HMAC="${INIT_EAB_HMAC:-dev-hmac}"
 SERVICE_NAME_2="web-app"
 HOSTNAME_2="web-02"
 INSTANCE_ID_2="102"
@@ -63,8 +61,14 @@ RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
 CURRENT_PHASE="init"
+# Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
+# default moved from 5432 to 5433 in #588 §4c; the e2e harness
+# expects 5432 (CI runners free that port before the matrix), so
+# pin it explicitly here to keep compose port mapping aligned with
+# wait_for_postgres_admin and the host-side admin DSN.
+export POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-5432}"
 export POSTGRES_HOST="127.0.0.1"
-export POSTGRES_PORT="${POSTGRES_HOST_PORT:-5432}"
+export POSTGRES_PORT="$POSTGRES_HOST_PORT"
 
 log_phase() {
   local phase="$1"
@@ -255,8 +259,7 @@ run_bootstrap_chain() {
     --enable auto-generate,show-secrets,db-provision \
     --stepca-provisioner "acme" \
     --stepca-password "password" \
-    --eab-kid "$INIT_EAB_KID" \
-    --eab-hmac "$INIT_EAB_HMAC" \
+    --no-eab \
     --http-hmac "dev-hmac" \
     --db-user "step" \
     --db-name "stepca" \

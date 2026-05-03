@@ -51,6 +51,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot service add` leaving the per-service OpenBao Agent
+  sidecar unable to render its `agent.toml` when no EAB is configured
+  (e.g., `bootroot init --no-eab`, bundled OSS step-ca). The sidecar
+  template references `secret/data/bootroot/services/<svc>/eab`, and
+  consul-template treats a missing secret as a transient error and
+  retries indefinitely (~64s with backoff), preventing the first
+  render. `service add` now always writes the per-service EAB path,
+  with empty `kid` / `hmac` when no global EAB is configured; the
+  template's `{{ if .Data.data.kid }}` guard skips the `[eab]` block
+  on empty kid so no garbage propagates to ACME. This mirrors the
+  recovery path provided by `bootroot rotate eab-clear`. (Part of
+  #588)
 - Fixed `bootroot service agent start` failing with
   `network bootroot_default declared as external, but could not be
   found` from any working directory whose name is not `bootroot` (or
@@ -253,6 +265,101 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - `--post-renew-arg` on both `bootroot service add` and
     `bootroot-remote bootstrap` now sets `allow_hyphen_values = true`,
     so `--post-renew-arg -HUP` parses without forcing the `=` form.
+- `bootroot init --enable db-provision` now grants `CREATE, USAGE` on
+  the `public` schema to the role it provisions, closing the PG15+
+  step-ca crashloop described in #588 §1 (`permission denied for
+  schema public` on first `CREATE TABLE`). Ownership stays with
+  `postgres`. The grant runs on every db-provision call (idempotent),
+  so re-running `init --enable db-provision` on a stale install where
+  the role and DB already exist is now a recovery path. When
+  `admin_user == db_user` (the bundled compose topology where
+  `POSTGRES_USER` and `--db-user` are both `step`), the post-ALTER
+  reconnect uses the freshly-set `db_password` rather than the
+  admin DSN's now-stale password — the ALTER changed the admin's own
+  password, so the second connection has to follow. (#588)
+- `bootroot init` persists the admin DSN it used to provision the
+  runtime role/database to a new high-privilege OpenBao KV path
+  (`bootroot/stepca/db_admin`). `bootroot rotate db` now reads from
+  that path so the operator no longer has to pass `--db-admin-dsn`
+  on every rotation; the existing `--db-admin-dsn` flag remains as
+  an override for externally-managed admin credentials. `rotate db`
+  no longer falls back to `ca.json.db.dataSource`, which holds the
+  *runtime* (`stepca`) DSN — using it as an admin DSN was the
+  original §2 self-ALTER bug. When neither the flag nor KV is
+  available, the command fails fast with a message naming both
+  recovery paths. When `admin_user == db_user` (the bundled compose
+  topology where `POSTGRES_USER` and `--db-user` are both `step`),
+  the persisted admin DSN is rebuilt with the freshly-set
+  `db_password` so a later `rotate db` reading from KV does not
+  authenticate with the pre-ALTER password. The same rebuild now
+  also runs at the end of `rotate db` itself (KV-backed path only):
+  after `provision_db_sync` ALTERs the role's password, the
+  persisted admin DSN at `bootroot/stepca/db_admin` is rewritten
+  with the new credential, preventing a stale-after-first-rotation
+  failure on the *next* `rotate db`. The same rebuild also runs at
+  the end of `init`'s post-bootstrap `.env` password rotation so
+  that the persisted admin DSN reflects the post-rotation password
+  before any `rotate db` ever runs; in addition, that rotation now
+  resolves the host-side Postgres port from the compose dir's
+  `.env`/process env (same precedence Docker Compose uses for the
+  `${POSTGRES_HOST_PORT:-5433}` mapping) instead of reusing the
+  compose-internal port from `ca.json`, which would otherwise
+  silently skip the rotation on the new 5433 default. The
+  auto-derived admin DSN built by `init --enable db-provision`
+  from compose `.env` (`POSTGRES_USER`/`POSTGRES_PASSWORD`) now
+  also follows the same `${POSTGRES_HOST_PORT:-5433}` precedence
+  for its port and defaults its host to `127.0.0.1` (the binary
+  runs from the host, not inside the compose network). The prior
+  `postgres:5432` defaults caused `provision_db_sync` to fail
+  before reaching the §1 PG15 schema grant whenever the operator
+  did not pass `--db-admin-dsn` on the new 5433-default install
+  or set a non-default `--postgres-host-port`. `POSTGRES_HOST` /
+  `POSTGRES_PORT` remain explicit overrides for operator-supplied
+  topologies. (#588)
+- `bootroot init --no-eab` skips the EAB prompt and persists no EAB
+  credentials. Recommended for OSS step-ca and CI flows. The
+  interactive EAB prompt now validates inputs (non-empty `kid`,
+  base64url-decodable `hmac` of at least 16 bytes) and re-prompts
+  on failure instead of silently accepting `y` of length 1. (#588)
+- `bootroot rotate eab-clear` writes empty `{kid: "", hmac: ""}` to
+  every known EAB KV path and refreshes each affected sidecar so the
+  templated `agent.toml` drops its `[eab]` block on the next cycle.
+  Companion to the now-removed `rotate eab`. Local-file sidecar
+  refresh failures are now fatal: the command attempts every
+  service's KV write and refresh, then exits non-zero with the list
+  of services whose sidecars are still rendering the old EAB so the
+  operator does not silently leave §6's stale-render symptom in
+  place. (#588)
+- `bootroot infra install` runs a TCP bind preflight on every
+  host-side port the active compose stack publishes (`postgres`,
+  `openbao`, `step-ca`, `bootroot-http01`) before invoking `docker
+  compose up`. On collision it aborts with the busy port, a
+  best-effort PID/command hint via `lsof`, and the recommended
+  remediation, instead of leaving partial containers running after
+  one published port fails to bind. The preflight always checks
+  the localhost ports because `infra install` invokes `docker
+  compose up` against the base compose file only — the
+  `--openbao-bind` / `--http01-admin-bind` override files are
+  recorded for `infra up` / `init` but are not layered into the
+  install-time `up`, so the install-time bind is on `127.0.0.1`
+  regardless of any recorded override intent. (#588)
+- `bootroot infra install --postgres-host-port <N>` overrides
+  `POSTGRES_HOST_PORT` in `.env` *and* in the docker compose
+  subprocess environment so scripted bootstraps no longer need an
+  out-of-band file edit between commands; without the env override
+  Docker Compose's "shell env wins over `.env`" precedence would
+  silently publish the inherited port instead of the flag value.
+  (#588)
+- `bootroot init` detects a partial-init OpenBao state (initialised
+  but no usable root token) and emits an actionable diagnostic
+  naming the three recovery paths instead of bubbling up the opaque
+  `403 permission denied`. (#588)
+- `bootroot clean --openbao-only` removes only the `bootroot-openbao`
+  container and its volume, leaving every other compose service,
+  `secrets/`, `state.json`, and `.env` intact. (#588)
+- `bootroot service openbao-sidecar refresh --service-name <name>`
+  restarts the per-service `OpenBao` Agent sidecar so consul-template
+  re-reads its KV sources after operator-side KV maintenance. (#588)
 - `bootroot rotate force-reissue` for `--delivery-mode remote-bootstrap`
   services now publishes a versioned reissue request to OpenBao KV at
   `{kv_mount}/data/bootroot/services/<service>/reissue` with
@@ -472,6 +579,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- The published `PostgreSQL` host port now defaults to **5433**
+  (`POSTGRES_HOST_PORT=5433`) so bootroot does not claim the
+  conventional 5432 out of the box. The conventional port stays free
+  for an application-managed `PostgreSQL` instance. Operators who
+  explicitly set `POSTGRES_HOST_PORT=5432` are unaffected; ones who
+  relied on the implicit 5432 default will see the published port
+  move on the next `infra install`. The internal `postgres:5432`
+  container address is unchanged, so step-ca's compose-internal DSN
+  is not affected. (#588)
 - Renamed `bootroot service agent start` to `bootroot service
   openbao-sidecar start`. The new name resolves two ambiguities in
   the previous spelling: which software ("agent" clashed with the

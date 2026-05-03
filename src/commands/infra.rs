@@ -310,18 +310,43 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     if !env_path.exists() {
         let postgres_password = bootroot::utils::generate_secret(32)
             .with_context(|| messages.error_generate_secret_failed())?;
-        write_dotenv(
+        let mut entries: Vec<(&str, &str)> = vec![
+            ("POSTGRES_USER", DEFAULT_POSTGRES_USER),
+            ("POSTGRES_PASSWORD", &postgres_password),
+            ("POSTGRES_DB", DEFAULT_POSTGRES_DB),
+            ("GRAFANA_ADMIN_PASSWORD", DEFAULT_GRAFANA_ADMIN_PASSWORD),
+        ];
+        let host_port_str = args.postgres_host_port.map(|p| p.to_string());
+        if let Some(ref s) = host_port_str {
+            entries.push(("POSTGRES_HOST_PORT", s));
+        }
+        write_dotenv(&env_path, &entries, messages)?;
+        println!("{}", messages.infra_install_env_written());
+    } else if let Some(port) = args.postgres_host_port {
+        crate::commands::dotenv::update_dotenv_key(
             &env_path,
-            &[
-                ("POSTGRES_USER", DEFAULT_POSTGRES_USER),
-                ("POSTGRES_PASSWORD", &postgres_password),
-                ("POSTGRES_DB", DEFAULT_POSTGRES_DB),
-                ("GRAFANA_ADMIN_PASSWORD", DEFAULT_GRAFANA_ADMIN_PASSWORD),
-            ],
+            "POSTGRES_HOST_PORT",
+            &port.to_string(),
             messages,
         )?;
-        println!("{}", messages.infra_install_env_written());
     }
+
+    // Pre-bind the host-side ports the active compose stack will publish
+    // so that a collision aborts before `docker compose up` half-creates
+    // containers (the §4a half-up state). The flag wins over .env and
+    // the process env for postgres.
+    //
+    // `infra install` always invokes `docker compose up` with the base
+    // compose file only — the openbao / http01 override files written
+    // above are NOT applied here (`infra up` / `init` are the first
+    // commands to layer them in).  So even when `--openbao-bind` /
+    // `--http01-admin-bind` is set, the install-time bind is still on
+    // 127.0.0.1; the preflight must check those localhost ports
+    // regardless of whether an override intent was recorded.
+    let postgres_host_port = args
+        .postgres_host_port
+        .unwrap_or_else(|| bootroot::db::resolve_postgres_host_port(compose_dir));
+    preflight_compose_published_ports(&args.services, postgres_host_port)?;
 
     // Load local images or pull + build.
     let loaded_archives = if let Some(dir) = args.image_archive_dir.as_deref() {
@@ -333,6 +358,19 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     let compose_str = args.compose_file.compose_file.to_string_lossy();
     let svc_refs: Vec<&str> = args.services.iter().map(String::as_str).collect();
 
+    // Build the compose process environment.  When the operator passed
+    // `--postgres-host-port`, override any inherited `POSTGRES_HOST_PORT`
+    // for the compose subprocess so the flag wins regardless of shell
+    // env (Docker Compose otherwise prefers shell env over `.env`).
+    let host_port_env: Vec<(String, String)> = args
+        .postgres_host_port
+        .map(|p| vec![("POSTGRES_HOST_PORT".to_string(), p.to_string())])
+        .unwrap_or_default();
+    let host_port_env_refs: Vec<(&str, &str)> = host_port_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
     if loaded_archives == 0 {
         let mut pull_args: Vec<&str> = vec![
             "compose",
@@ -342,13 +380,23 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
             "--ignore-pull-failures",
         ];
         pull_args.extend(&svc_refs);
-        run_docker(&pull_args, "docker compose pull", messages)?;
+        run_docker_with_env(
+            &pull_args,
+            &host_port_env_refs,
+            "docker compose pull",
+            messages,
+        )?;
     }
 
     // Use --build to build local images (step-ca, bootroot-http01).
     let mut up_args: Vec<&str> = vec!["compose", "-f", &compose_str, "up", "--build", "-d"];
     up_args.extend(&svc_refs);
-    run_docker(&up_args, "docker compose up --build", messages)?;
+    run_docker_with_env(
+        &up_args,
+        &host_port_env_refs,
+        "docker compose up --build",
+        messages,
+    )?;
 
     // Collect readiness but skip step-ca (it has no config yet).
     let prereq_services: Vec<String> = args
@@ -401,6 +449,114 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
 
     println!("{}", messages.infra_install_completed());
     Ok(())
+}
+
+/// Aborts when `host:port` is already bound on the local machine. The
+/// preflight closes the half-up state where `bootroot-openbao` is
+/// running while postgres failed to bind, recovered today only by
+/// `docker compose down` + `.env` edit + retry.
+///
+/// Implementation note: a successful TCP bind means the port was free
+/// at this instant; a subsequent `docker compose up` could still race a
+/// just-started peer. Acceptable: the diagnostic catches >99% of the
+/// recurring symptom and offers an actionable recovery instead.
+fn preflight_host_port(host: &str, port: u16, remediation: &str) -> Result<()> {
+    let addr = format!("{host}:{port}");
+    match std::net::TcpListener::bind(&addr) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(err) => {
+            let pid_hint = best_effort_listening_pid(port)
+                .map(|hint| format!(" (listener: {hint})"))
+                .unwrap_or_default();
+            anyhow::bail!("host port {addr} is already in use ({err}){pid_hint}; {remediation}");
+        }
+    }
+}
+
+/// Pre-binds every host-side port the active compose stack will publish.
+/// The bound services list is derived from `services` so a partial install
+/// (e.g. `--services openbao`) only checks the ports it will actually
+/// expose.
+///
+/// This is called only from `run_infra_install`, which always runs
+/// `docker compose up` against the base `docker-compose.yml` only — the
+/// openbao / http01 non-loopback override files are deliberately not
+/// layered in until `infra up` / `init`.  So the install-time bind is
+/// always on 127.0.0.1, and the preflight always checks the localhost
+/// ports regardless of any recorded override intent.
+fn preflight_compose_published_ports(services: &[String], postgres_host_port: u16) -> Result<()> {
+    // Static map of compose-declared host ports for the core services.
+    // Kept in sync with docker-compose.yml — adding a published port to
+    // a core service requires a matching entry here.
+    let postgres_remediation = format!(
+        "free port {postgres_host_port}, set POSTGRES_HOST_PORT=<unused-port> in .env, \
+         or pass --postgres-host-port <unused-port>"
+    );
+    let openbao_remediation = "free port 8200 or stop the conflicting listener before retrying \
+         `bootroot infra install`"
+        .to_string();
+    let stepca_remediation = "free port 9000 or stop the conflicting listener before retrying \
+         `bootroot infra install`"
+        .to_string();
+    let http01_remediation = "free port 8080 or stop the conflicting listener before retrying \
+         `bootroot infra install`"
+        .to_string();
+
+    for service in services {
+        match service.as_str() {
+            "postgres" => {
+                preflight_host_port("127.0.0.1", postgres_host_port, &postgres_remediation)?;
+            }
+            "openbao" => {
+                preflight_host_port("127.0.0.1", 8200, &openbao_remediation)?;
+            }
+            "step-ca" => {
+                preflight_host_port("127.0.0.1", 9000, &stepca_remediation)?;
+            }
+            "bootroot-http01" => {
+                preflight_host_port("127.0.0.1", 8080, &http01_remediation)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort lookup of the PID/command listening on `port`. Uses
+/// `lsof` when available and silently returns `None` when not — the
+/// hint is purely additive on top of the failed-bind diagnostic.
+fn best_effort_listening_pid(port: u16) -> Option<String> {
+    let output = ProcessCommand::new("lsof")
+        .args([
+            "-nP",
+            "-iTCP",
+            &format!("-i:{port}"),
+            "-sTCP:LISTEN",
+            "-Fpcn",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut pid: Option<String> = None;
+    let mut command: Option<String> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            pid = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix('c') {
+            command = Some(rest.trim().to_string());
+        }
+    }
+    match (pid, command) {
+        (Some(p), Some(c)) => Some(format!("pid {p} ({c})")),
+        (Some(p), None) => Some(format!("pid {p}")),
+        _ => None,
+    }
 }
 
 /// Checks that `OpenBao` and `PostgreSQL` are running and healthy.
@@ -1078,8 +1234,21 @@ fn is_image_archive(path: &Path) -> bool {
 }
 
 pub(crate) fn run_docker(args: &[&str], context: &str, messages: &Messages) -> Result<()> {
-    let status = ProcessCommand::new("docker")
-        .args(args)
+    run_docker_with_env(args, &[], context, messages)
+}
+
+pub(crate) fn run_docker_with_env(
+    args: &[&str],
+    env: &[(&str, &str)],
+    context: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let mut cmd = ProcessCommand::new("docker");
+    cmd.args(args);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let status = cmd
         .status()
         .with_context(|| messages.error_command_run_failed(context))?;
     if !status.success() {
@@ -1158,6 +1327,82 @@ mod tests {
         let (status, health) = parse_container_state("running");
         assert_eq!(status, "running");
         assert!(health.is_none());
+    }
+
+    /// Closes #588 §4a: a port collision on the host-side `PostgreSQL`
+    /// publish must abort with an actionable message before
+    /// `docker compose up` half-creates containers.
+    #[test]
+    fn preflight_host_port_aborts_when_already_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sentinel");
+        let port = listener.local_addr().expect("addr").port();
+        let remediation = "set POSTGRES_HOST_PORT=<unused-port> in .env, \
+             or pass --postgres-host-port <unused-port>";
+        let err = preflight_host_port("127.0.0.1", port, remediation).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&port.to_string()),
+            "diagnostic must name the busy port, got: {msg}"
+        );
+        assert!(
+            msg.contains("POSTGRES_HOST_PORT"),
+            "diagnostic must name the env var to override, got: {msg}"
+        );
+        assert!(
+            msg.contains("--postgres-host-port"),
+            "diagnostic must name the CLI flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_host_port_succeeds_when_free() {
+        // Pick a free port by binding+dropping the listener. The OS may
+        // reassign that ephemeral port to another process before
+        // `preflight_host_port` re-binds it (CI runners with high port
+        // churn hit this), so retry a handful of times before failing —
+        // the goal is to assert the success path, not the kernel's
+        // ephemeral-port allocator.
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..16 {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                l.local_addr().expect("addr").port()
+            };
+            match preflight_host_port("127.0.0.1", port, "free the listener and retry") {
+                Ok(()) => return,
+                Err(err) => last_err = Some(err),
+            }
+        }
+        panic!(
+            "free port must pass preflight after retries: {}",
+            last_err.expect("at least one attempt failed")
+        );
+    }
+
+    /// Closes #588 §4a: `infra install` only invokes `docker compose
+    /// up` against the base compose file (the override files written
+    /// when `--openbao-bind` / `--http01-admin-bind` is set are not
+    /// layered in until `infra up` / `init`), so the install-time bind
+    /// is always on 127.0.0.1.  The preflight must therefore check the
+    /// localhost openbao / http01 ports unconditionally — skipping them
+    /// based on a recorded override intent reintroduces the half-up
+    /// state where openbao starts but http01 fails to bind 127.0.0.1:8080.
+    #[test]
+    fn preflight_compose_published_ports_checks_openbao_localhost_during_install() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:8200");
+        if listener.is_err() {
+            // Port already in use on this host (e.g. a real openbao
+            // running locally); the preflight must still detect the
+            // collision rather than skip it.
+            let err = preflight_compose_published_ports(&["openbao".to_string()], 5433)
+                .expect_err("preflight must abort when 8200 is busy");
+            assert!(err.to_string().contains("8200"), "{err}");
+            return;
+        }
+        drop(listener);
+        // 8200 free: the preflight succeeds without any "override skip".
+        preflight_compose_published_ports(&["openbao".to_string()], 5433)
+            .expect("free 8200 must pass preflight");
     }
 
     #[test]
@@ -2902,6 +3147,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             http01_admin_tls_required: true,
             http01_admin_bind_wildcard: false,
             http01_admin_advertise_addr: None,
+            postgres_host_port: None,
         };
         let err = run_infra_install(&args, &messages).unwrap_err();
         let msg = err.to_string();

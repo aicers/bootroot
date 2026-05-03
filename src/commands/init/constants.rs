@@ -110,6 +110,12 @@ pub(crate) mod openbao_constants {
 
     pub(crate) const PATH_STEPCA_PASSWORD: &str = "bootroot/stepca/password";
     pub(crate) const PATH_STEPCA_DB: &str = "bootroot/stepca/db";
+    /// Stores the admin DSN bootroot used to provision the runtime
+    /// role/database. Carries strictly higher privilege than
+    /// `PATH_STEPCA_DB` and must NOT be readable by the same `OpenBao`
+    /// policy as the runtime DSN — only operator/root tokens
+    /// (and any future rotate-only `AppRole`) may read this path.
+    pub(crate) const PATH_STEPCA_DB_ADMIN: &str = "bootroot/stepca/db_admin";
     pub(crate) const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
     pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
     pub(crate) const PATH_CA_TRUST: &str = "bootroot/ca";

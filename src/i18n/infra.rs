@@ -155,6 +155,21 @@ impl Messages {
         self.strings().clean_confirm_certs
     }
 
+    pub(crate) fn clean_confirm_openbao_only(&self) -> &'static str {
+        self.strings().clean_confirm_openbao_only
+    }
+
+    pub(crate) fn clean_openbao_only_completed(&self) -> &'static str {
+        self.strings().clean_openbao_only_completed
+    }
+
+    pub(crate) fn error_init_partial_openbao_state(&self, url: &str) -> String {
+        format_template(
+            self.strings().error_init_partial_openbao_state,
+            &[("url", url)],
+        )
+    }
+
     pub(crate) fn error_clean_failed(&self) -> &'static str {
         self.strings().error_clean_failed
     }

@@ -499,6 +499,7 @@ pub(super) mod test_support {
             cert_duration: DEFAULT_CERT_DURATION.to_string(),
             eab_kid: None,
             eab_hmac: None,
+            no_eab: false,
         }
     }
 

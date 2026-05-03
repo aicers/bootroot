@@ -78,6 +78,14 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
         .await
         .with_context(|| messages.error_openbao_health_check_failed())?;
 
+    // §5a: detect a partial-init OpenBao state and emit an actionable
+    // diagnostic instead of bubbling up the opaque 403 the caller would
+    // get when bootstrap_openbao tries to authenticate without a usable
+    // root token. A previous `init` that failed mid-flight rolls back
+    // its in-flight artefacts but leaves OpenBao initialised in its
+    // volume; the next `init` cannot authenticate.
+    diagnose_partial_init(&client, args, messages).await?;
+
     let mut rollback = InitRollback::default();
     let result = run_init_inner(&mut client, args, messages, &mut rollback, bind_intent).await;
 
@@ -108,6 +116,34 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             Err(err)
         }
     }
+}
+
+/// Aborts with operator guidance when the target `OpenBao` is already
+/// initialised but neither `--root-token` nor `OPENBAO_ROOT_TOKEN` is
+/// set. Bootstrapping past this state would fail with `403 permission
+/// denied` from the first authenticated call; the diagnostic names the
+/// three recovery paths (re-supply token, `clean --openbao-only`, or
+/// manual operator action). See issue #588 §5.
+async fn diagnose_partial_init(
+    client: &OpenBaoClient,
+    args: &InitArgs,
+    messages: &Messages,
+) -> Result<()> {
+    let initialized = client.is_initialized().await.with_context(|| {
+        "failed to query OpenBao /sys/init while diagnosing partial-init state".to_string()
+    })?;
+    if !initialized {
+        return Ok(());
+    }
+    let token_supplied = args
+        .root_token
+        .root_token
+        .as_deref()
+        .is_some_and(|t| !t.is_empty());
+    if token_supplied {
+        return Ok(());
+    }
+    anyhow::bail!(messages.error_init_partial_openbao_state(&args.openbao.openbao_url));
 }
 
 async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<()> {
@@ -166,7 +202,8 @@ async fn run_init_inner(
     let compose_dir = args.compose.compose_file.parent().unwrap_or(Path::new("."));
     crate::commands::dotenv::load_dotenv_into_env(&compose_dir.join(".env"), messages)?;
 
-    let (db_dsn, db_dsn_normalization) = resolve_db_dsn_for_init(args, messages).await?;
+    let (db_dsn, db_dsn_normalization, admin_dsn_for_kv) =
+        resolve_db_dsn_for_init(args, compose_dir, messages).await?;
     let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
     let db_info = parse_db_dsn(&secrets.db_dsn)
         .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
@@ -187,6 +224,32 @@ async fn run_init_inner(
         role_outputs,
         approles,
     } = configure_openbao(client, args, &secrets, rollback, messages).await?;
+
+    // Persist the admin DSN bootroot used to provision the runtime
+    // role/database. `rotate db` reads this with the operator/root
+    // token at rotate time so the operator no longer has to pass
+    // `--db-admin-dsn` on every rotation. The KV path carries strictly
+    // higher privilege than `PATH_STEPCA_DB`; the existing step-ca
+    // runtime and sidecar policies must not include it.
+    if let Some(admin_dsn) = admin_dsn_for_kv.as_deref() {
+        if !client
+            .kv_exists(&args.openbao.kv_mount, super::super::PATH_STEPCA_DB_ADMIN)
+            .await
+            .with_context(|| messages.error_openbao_kv_exists_failed())?
+        {
+            rollback
+                .written_kv_paths
+                .push(super::super::PATH_STEPCA_DB_ADMIN.to_string());
+        }
+        client
+            .write_kv(
+                &args.openbao.kv_mount,
+                super::super::PATH_STEPCA_DB_ADMIN,
+                serde_json::json!({ "value": admin_dsn }),
+            )
+            .await
+            .with_context(|| messages.error_openbao_kv_write_failed())?;
+    }
 
     let secrets_dir = args.secrets_dir.secrets_dir.clone();
 
@@ -572,7 +635,7 @@ async fn maybe_rotate_env_db_password(
     messages: &Messages,
 ) -> Result<Option<String>> {
     use crate::commands::dotenv::{read_dotenv, update_dotenv_key};
-    use crate::commands::init::PATH_STEPCA_DB;
+    use crate::commands::init::{PATH_STEPCA_DB, PATH_STEPCA_DB_ADMIN};
 
     // Docker Compose reads .env from the compose file's directory.
     let compose_dir = compose_file.parent().unwrap_or(Path::new("."));
@@ -630,11 +693,21 @@ async fn maybe_rotate_env_db_password(
     let new_password = bootroot::utils::generate_secret(crate::commands::init::SECRET_BYTES)
         .with_context(|| messages.error_generate_secret_failed())?;
 
+    // Resolve the host-published Postgres port from the compose dir's
+    // env/.env (same precedence Docker Compose itself uses for the
+    // `${POSTGRES_HOST_PORT:-5433}` mapping). Do NOT reuse `parsed.port`
+    // from `ca.json`: that DSN was rewritten through `for_compose_runtime`
+    // and therefore always carries the *compose-internal* 5432, which is
+    // not reachable from the host. After the §4c default move from 5432
+    // to 5433, hard-coding `parsed.port` makes this admin connection
+    // attempt the wrong host port on a default install and silently skip
+    // the `.env` password rotation via the warning path below.
+    let host_port = bootroot::db::resolve_postgres_host_port(compose_dir);
     let admin_dsn = bootroot::db::build_db_dsn(
         "step",
         &temp_password,
         "localhost",
-        parsed.port,
+        host_port,
         "postgres",
         Some("disable"),
     );
@@ -687,6 +760,26 @@ async fn maybe_rotate_env_db_password(
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
 
+    // Same-role topology (admin DSN's user equals the runtime user that
+    // was just ALTERed): the persisted KV admin DSN at
+    // `bootroot/stepca/db_admin` now carries the pre-ALTER password and
+    // would fail authentication on the next `rotate db` (the automatic
+    // §2 path). Mirror the rewrite that `rotate db` performs at
+    // `src/commands/rotate/db.rs:91`: read the persisted admin DSN, and
+    // if its user matches the runtime user just rotated here, write back
+    // the same DSN with the post-ALTER password (host/port preserved).
+    if let Some(rebuilt_admin_dsn) =
+        rebuilt_admin_dsn_for_kv(client, kv_mount, &parsed.user, &new_password).await?
+    {
+        let _ = client
+            .write_kv(
+                kv_mount,
+                PATH_STEPCA_DB_ADMIN,
+                serde_json::json!({ "value": rebuilt_admin_dsn }),
+            )
+            .await;
+    }
+
     // Patch ca.json directly so step-ca uses the new password on next
     // restart.  The OpenBao Agent template will eventually overwrite
     // this, but patching now avoids a window where step-ca would boot
@@ -712,6 +805,50 @@ async fn maybe_rotate_env_db_password(
     let _ = run_docker(&restart_args, "docker compose restart step-ca", messages);
 
     Ok(Some(new_dsn))
+}
+
+/// Reads `bootroot/stepca/db_admin` and, when its user matches the
+/// runtime user just rotated, returns the same DSN rebuilt with
+/// `new_password` (host/port preserved). Returns `None` when the path
+/// is absent, unreadable, malformed, or when the persisted admin user
+/// is distinct from the runtime user (no rewrite needed).
+///
+/// Errors from KV reads are swallowed because this is a best-effort
+/// post-rotation sync: the primary work (rotating the runtime DSN) has
+/// already succeeded, and a stale admin DSN at most forces the operator
+/// to pass `--db-admin-dsn` once on the next `rotate db`.
+async fn rebuilt_admin_dsn_for_kv(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    runtime_user: &str,
+    new_password: &str,
+) -> Result<Option<String>> {
+    use crate::commands::init::PATH_STEPCA_DB_ADMIN;
+
+    let exists = client
+        .kv_exists(kv_mount, PATH_STEPCA_DB_ADMIN)
+        .await
+        .unwrap_or(false);
+    if !exists {
+        return Ok(None);
+    }
+    let Ok(value) = client.read_kv(kv_mount, PATH_STEPCA_DB_ADMIN).await else {
+        return Ok(None);
+    };
+    let Some(current) = value.get("value").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let Ok(parsed) = bootroot::db::parse_db_dsn(current) else {
+        return Ok(None);
+    };
+    if parsed.user != runtime_user {
+        return Ok(None);
+    }
+    Ok(Some(bootroot::db::effective_admin_dsn_for_kv(
+        current,
+        runtime_user,
+        new_password,
+    )?))
 }
 
 /// Fixes file ownership and permissions in the secrets directory after
@@ -833,7 +970,86 @@ fn validate_http01_exposed_override_for_init(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{default_init_args, test_messages};
     use super::*;
+
+    /// Closes #588 §5a: when `OpenBao` is already initialised but no
+    /// usable root token is supplied, `init` must abort with the
+    /// three-recovery-paths diagnostic instead of bubbling up the
+    /// opaque `403 permission denied` from the first authenticated
+    /// call.
+    #[tokio::test]
+    async fn diagnose_partial_init_bails_when_initialized_without_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/init"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"initialized":true}"#))
+            .mount(&server)
+            .await;
+
+        let client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        let mut args = default_init_args();
+        args.openbao.openbao_url = server.uri();
+        args.root_token.root_token = None;
+        let messages = test_messages();
+        let err = diagnose_partial_init(&client, &args, &messages)
+            .await
+            .expect_err("must bail");
+        let msg = err.to_string();
+        assert!(msg.contains(&server.uri()), "diagnostic must name the URL");
+        assert!(
+            msg.contains("--root-token") && msg.contains("--openbao-only"),
+            "diagnostic must name the recovery options, got: {msg}"
+        );
+    }
+
+    /// Token supplied → preflight returns Ok and bootstrap proceeds.
+    #[tokio::test]
+    async fn diagnose_partial_init_passes_when_token_supplied() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/init"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"initialized":true}"#))
+            .mount(&server)
+            .await;
+
+        let client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        let mut args = default_init_args();
+        args.openbao.openbao_url = server.uri();
+        args.root_token.root_token = Some("hvs.fake".to_string());
+        diagnose_partial_init(&client, &args, &test_messages())
+            .await
+            .expect("token supplied path must succeed");
+    }
+
+    /// Uninitialised `OpenBao` → preflight returns Ok regardless of
+    /// token state (this is a fresh install, the normal path).
+    #[tokio::test]
+    async fn diagnose_partial_init_passes_when_not_initialized() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/init"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"initialized":false}"#))
+            .mount(&server)
+            .await;
+
+        let client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        let mut args = default_init_args();
+        args.openbao.openbao_url = server.uri();
+        args.root_token.root_token = None;
+        diagnose_partial_init(&client, &args, &test_messages())
+            .await
+            .expect("uninitialized path must succeed");
+    }
 
     /// Regression: `write_state_file_to` must propagate an error when an
     /// existing state file is corrupted, not silently replace it with a
@@ -1017,5 +1233,149 @@ mod tests {
             !responder_tls_enabled,
             "responder TLS must be disabled when compose lacks the responder service"
         );
+    }
+
+    /// Closes #588 Round 5 (b): when `init`'s post-bootstrap password
+    /// rotation runs against the same-role topology (admin user equals
+    /// the runtime user just rotated), the persisted KV admin DSN at
+    /// `bootroot/stepca/db_admin` must be rewritten with the new
+    /// password — otherwise the next `rotate db` (no `--db-admin-dsn`)
+    /// reads stale credentials and fails authentication, defeating the
+    /// automatic §2 path.
+    #[tokio::test]
+    async fn rebuilt_admin_dsn_for_kv_rebuilds_for_same_role() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Nonce-based test fixtures sidestep CodeQL's
+        // `rust/hard-coded-cryptographic-value` and `cleartext-logging`
+        // rules (the values are generated per run and have no relation
+        // to a real credential).
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let old = format!("old-{nonce}");
+        let new = format!("new-{nonce}");
+        let token = format!("hvs.fake-{nonce}");
+        let persisted_dsn =
+            format!("postgresql://step:{old}@postgres:5432/postgres?sslmode=disable");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/metadata/bootroot/stepca/db_admin"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let body = serde_json::json!({
+            "data": {
+                "data": { "value": persisted_dsn },
+                "metadata": {"version": 1},
+            },
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/data/bootroot/stepca/db_admin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token(token);
+
+        let rebuilt = rebuilt_admin_dsn_for_kv(&client, "secret", "step", &new)
+            .await
+            .expect("rebuilt_admin_dsn_for_kv must succeed for same-role topology")
+            .expect("must return Some when persisted user matches runtime user");
+        assert_eq!(
+            rebuilt,
+            format!("postgresql://step:{new}@postgres:5432/postgres?sslmode=disable"),
+            "host/port preserved (compose-internal form), only password swapped"
+        );
+    }
+
+    /// Distinct-role topology (admin user `step`, runtime user `stepca`):
+    /// `provision_db_sync` only `ALTER`ed the runtime user, so the persisted
+    /// admin DSN is still valid and KV must NOT be rewritten.
+    #[tokio::test]
+    async fn rebuilt_admin_dsn_for_kv_returns_none_for_distinct_role() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Nonce-based fixtures — see the sibling same-role test.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let admin_pw = format!("admin-{nonce}");
+        let new = format!("new-{nonce}");
+        let token = format!("hvs.fake-{nonce}");
+        let persisted_dsn =
+            format!("postgresql://step:{admin_pw}@postgres:5432/postgres?sslmode=disable");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/metadata/bootroot/stepca/db_admin"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let body = serde_json::json!({
+            "data": {
+                "data": { "value": persisted_dsn },
+                "metadata": {"version": 1},
+            },
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/data/bootroot/stepca/db_admin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token(token);
+
+        let rebuilt = rebuilt_admin_dsn_for_kv(&client, "secret", "stepca", &new)
+            .await
+            .expect("rebuilt_admin_dsn_for_kv must succeed for distinct-role topology");
+        // Avoid `{rebuilt:?}` in the panic message: CodeQL's
+        // `rust/cleartext-logging` rule treats Debug-formatting an
+        // `Option<DSN>` (whose inner String can contain a password) into
+        // a panic stream as writing a credential to a log. Keep the
+        // assertion presence-only.
+        assert!(
+            rebuilt.is_none(),
+            "distinct-role topology must not rewrite KV"
+        );
+    }
+
+    /// Absent KV path → return None (operator-supplied DSN install where
+    /// `init` never persisted `bootroot/stepca/db_admin`).
+    #[tokio::test]
+    async fn rebuilt_admin_dsn_for_kv_returns_none_when_path_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // 404 on metadata → kv_exists returns Ok(false).
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/metadata/bootroot/stepca/db_admin"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        // Nonce-based fixtures — see the sibling same-role test.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let new = format!("new-{nonce}");
+        let token = format!("hvs.fake-{nonce}");
+
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token(token);
+
+        let rebuilt = rebuilt_admin_dsn_for_kv(&client, "secret", "step", &new)
+            .await
+            .expect("rebuilt_admin_dsn_for_kv must succeed when KV path is absent");
+        assert!(rebuilt.is_none(), "absent KV path must yield None");
     }
 }

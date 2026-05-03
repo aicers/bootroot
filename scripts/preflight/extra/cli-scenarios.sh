@@ -4,8 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 INIT_SUMMARY_JSON="$ROOT_DIR/tmp/cli-init-summary.json"
+# Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
+# default moved from 5432 to 5433 in #588 §4c; this preflight assumes
+# 5432, so pin it explicitly to keep the compose port mapping aligned
+# with wait_for_postgres_admin.
+export POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-5432}"
 export POSTGRES_HOST="127.0.0.1"
-export POSTGRES_PORT="${POSTGRES_HOST_PORT:-5432}"
+export POSTGRES_PORT="$POSTGRES_HOST_PORT"
 
 log() {
   printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"
