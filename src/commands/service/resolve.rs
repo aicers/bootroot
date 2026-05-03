@@ -476,6 +476,7 @@ mod tests {
             runtime_auth: RuntimeAuthArgs {
                 auth_mode: AuthMode::Auto,
                 root_token: None,
+                root_token_file: None,
                 approle_role_id: None,
                 approle_secret_id: None,
                 approle_role_id_file: None,

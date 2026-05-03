@@ -151,8 +151,11 @@ struct BootstrapArgs {
     #[arg(long)]
     post_renew_command: Option<String>,
 
-    /// Post-renew success hook argument (repeatable)
-    #[arg(long)]
+    /// Post-renew success hook argument (repeatable).
+    ///
+    /// Accepts hyphen-prefixed values like `-HUP` or `-f` directly so
+    /// operators can spell `--post-renew-arg -HUP` without the `=` form.
+    #[arg(long, allow_hyphen_values = true)]
     post_renew_arg: Vec<String>,
 
     /// Post-renew success hook timeout in seconds
@@ -563,6 +566,55 @@ mod tests {
             summary_header(Locale::Ko),
             "bootroot-remote 부트스트랩 요약"
         );
+    }
+
+    /// Issue #587 §4: `--post-renew-arg` must accept hyphen-prefixed
+    /// values (e.g. `-HUP`, `-f`) without forcing the `=` form.
+    #[test]
+    fn bootstrap_post_renew_arg_accepts_hyphen_values_in_space_form() {
+        let parsed = Args::try_parse_from([
+            "bootroot-remote",
+            "bootstrap",
+            "--artifact",
+            "/tmp/x.json",
+            "--post-renew-command",
+            "pkill",
+            "--post-renew-arg",
+            "-HUP",
+            "--post-renew-arg",
+            "-f",
+            "--post-renew-arg",
+            "review",
+        ])
+        .expect("parse");
+        match parsed.command {
+            Command::Bootstrap(args) => {
+                assert_eq!(args.post_renew_arg, vec!["-HUP", "-f", "review"]);
+            }
+            Command::ApplySecretId(_) => panic!("expected Bootstrap"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_post_renew_arg_accepts_hyphen_values_in_eq_form() {
+        let parsed = Args::try_parse_from([
+            "bootroot-remote",
+            "bootstrap",
+            "--artifact",
+            "/tmp/x.json",
+            "--post-renew-command",
+            "pkill",
+            "--post-renew-arg=-HUP",
+            "--post-renew-arg=-f",
+            "--post-renew-arg=review",
+        ])
+        .expect("parse");
+        match parsed.command {
+            Command::Bootstrap(args) => {
+                assert_eq!(args.post_renew_arg, vec!["-HUP", "-f", "review"]);
+            }
+            Command::ApplySecretId(_) => panic!("expected Bootstrap"),
+        }
     }
 
     #[test]

@@ -976,8 +976,13 @@ Common:
 - `--kv-mount`: OpenBao KV mount path (optional)
 - `--secrets-dir`: secrets directory (optional)
 - `--auth-mode`: runtime auth mode (`auto`, `root`, `approle`, default `auto`)
-- `--root-token`: OpenBao root token (env `OPENBAO_ROOT_TOKEN`,
-  transition/break-glass path)
+- `--root-token`: OpenBao root token (CLI flag, transition/break-glass
+  path). Mutually exclusive with `--root-token-file`.
+- `--root-token-file`: path to a file containing the OpenBao root token.
+  Resolution order is `--root-token-file` > `--root-token` >
+  `OPENBAO_ROOT_TOKEN` env > interactive prompt. The file must not be
+  world-readable; mode `0o644` is rejected with a `chmod 0600` hint.
+  Group-readable (`0o640`) is permitted for shared CI/operator groups.
 - `--approle-role-id`: OpenBao AppRole role_id
   (env `OPENBAO_APPROLE_ROLE_ID`)
 - `--approle-secret-id`: OpenBao AppRole secret_id
@@ -988,7 +993,9 @@ Common:
   (env `OPENBAO_APPROLE_SECRET_ID_FILE`)
 - `--show-secrets`: print secret-bearing stdout fields in plaintext instead of
   masking them
-- `--yes`: skip confirmation prompts
+- `--yes` / `-y`: skip confirmation prompts. Accepted at any position
+  under `rotate` (e.g. `rotate force-reissue --yes` or
+  `rotate --yes force-reissue`).
 
 Output behavior:
 
@@ -1064,19 +1071,24 @@ Inputs:
 - `--requester`: optional operator label written to the reissue KV
   payload for observability. Defaults to `$USER` / `$LOGNAME`, or
   `unknown` when neither is set.
-- `--wait`: only meaningful for remote-bootstrap services; polls
-  `completed_at` on the same KV path until the remote agent reports
-  completion (or the timeout expires). On success the summary line
-  also reports the end-to-end latency (`completed_at - requested_at`,
-  read from the KV payload) in a human-readable form so the operator
-  does not need to subtract timestamps manually.
+- `--wait`: blocks until bootroot-agent reports completion (or the
+  timeout expires). For `--delivery-mode remote-bootstrap` services it
+  polls `completed_at` on the KV reissue path; for local-file services
+  it polls the on-disk cert at `paths.cert` until the serial changes
+  (mtime is used only as a tiebreaker for the rare same-serial reissue
+  case). On success the summary line also reports the end-to-end
+  latency (for remote, `completed_at - requested_at` from the KV
+  payload; for local, the wall clock between the signal and the cert
+  rewrite) in a human-readable form so the operator does not need to
+  subtract timestamps manually.
 - `--wait-timeout`: maximum time to wait when `--wait` is set. Accepts
   humantime durations (e.g. `90s`, `2m`). Default `2m`.
 
-Without `--wait` the command returns immediately after the KV write; the
-remote agent will apply the reissue within ~one fast-poll interval of its
-next tick. A `--wait` timeout is not an error: the request stays queued
-and the agent still picks it up on its next poll.
+Without `--wait` the command returns immediately after the KV write
+(remote) or the SIGHUP/restart signal (local); bootroot-agent will apply
+the reissue within ~one poll interval of its next tick. A `--wait`
+timeout is not an error: the request stays queued and the agent still
+picks it up on its next poll.
 
 #### `rotate ca-key`
 
