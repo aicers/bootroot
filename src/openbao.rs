@@ -857,7 +857,7 @@ impl OpenBaoClient {
     /// Returns `Ok(None)` when the resource is absent (HTTP 404 or the
     /// equivalent `No secret engine mount` 400 response). Any other
     /// failure — transport errors, 5xx responses, malformed payloads —
-    /// is propagated as `Err`, matching the semantics of [`read_kv`].
+    /// is propagated as `Err`, matching the semantics of [`Self::read_kv`].
     ///
     /// # Errors
     /// Returns an error for anything other than a clean not-found.
