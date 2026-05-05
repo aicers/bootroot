@@ -175,9 +175,18 @@ jobs:
         # cargo binary before sudo and pass the absolute path through
         # setpriv. CARGO_HOME / RUSTUP_HOME / HOME are also preserved
         # so cargo can find the toolchain installed by rustup.
+        #
+        # `sudo` also strips the BOOTROOT_E2E_* fixture variables by
+        # default (env_reset). Without explicitly preserving them,
+        # `tests/e2e_cert_group_chown.rs` would see
+        # BOOTROOT_E2E_REQUIRE_CERT_GROUP unset and fall back to the
+        # dev-mode skip path, defeating the fixture and letting a broken
+        # CI environment produce a green build. Pass them through
+        # --preserve-env so the require-flag actually reaches the test
+        # process.
         run: |
           CARGO_BIN="$(command -v cargo)"
-          sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME \
+          sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME,BOOTROOT_E2E_CERT_GROUP_GID,BOOTROOT_E2E_REQUIRE_CERT_GROUP,BOOTROOT_E2E_CERT_GROUP_NAME \
             setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
             -- "$CARGO_BIN" test
 
