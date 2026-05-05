@@ -638,7 +638,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         }
     }
 
-    let mut cert_group_redeploy_hint: Option<CertGroupRedeployHint> = None;
+    let mut redeploy_hint: Option<CertGroupRedeployHint> = None;
     if let Some(ref raw) = args.cert_group {
         let old_value = entry.cert_group_gid;
         let new_value = parse_cert_group_for_update(raw, entry.delivery_mode)?;
@@ -649,7 +649,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
                 &display_cert_group(old_value),
                 &display_cert_group(new_value),
             ));
-            cert_group_redeploy_hint = Some(CertGroupRedeployHint {
+            redeploy_hint = Some(CertGroupRedeployHint {
                 delivery_mode: entry.delivery_mode,
                 service_name: args.service_name.clone(),
             });
@@ -674,8 +674,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         .save(&state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
 
-    if let (Some(hint), Some(entry)) = (cert_group_redeploy_hint.as_ref(), entry_snapshot.as_ref())
-    {
+    if let (Some(hint), Some(entry)) = (redeploy_hint.as_ref(), entry_snapshot.as_ref()) {
         match hint.delivery_mode {
             DeliveryMode::LocalFile => {
                 rerender_local_managed_profile(entry)?;

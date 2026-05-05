@@ -139,7 +139,7 @@ pub fn render_managed_profile_block(
     key_path: &Path,
     cert_group_gid: Option<u32>,
 ) -> String {
-    let cert_group_line = match cert_group_gid {
+    let group_line = match cert_group_gid {
         Some(gid) => format!("cert_group_gid = {gid}\n"),
         None => String::new(),
     };
@@ -149,7 +149,7 @@ pub fn render_managed_profile_block(
 service_name = \"{service_name}\"\n\
 instance_id = \"{instance_id}\"\n\
 hostname = \"{hostname}\"\n\
-{cert_group_line}\n\
+{group_line}\n\
 [profiles.paths]\n\
 cert = \"{cert}\"\n\
 key = \"{key}\"\n\

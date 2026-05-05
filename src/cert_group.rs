@@ -448,9 +448,8 @@ mod tests {
         // The `wheel` group on macOS / `root` on Linux resolves to gid 0
         // on most systems, exercising the post-resolve gid==0 check.
         // Skip if neither is available.
-        if let Ok(gid) = parse_cert_group_local("nonexistent-bootroot-test-group-xyz") {
-            panic!("parse_local must reject unknown group, got gid {gid}");
-        }
+        let outcome = parse_cert_group_local("nonexistent-bootroot-test-group-xyz");
+        assert!(outcome.is_err(), "parse_local must reject unknown group");
     }
 
     #[test]
