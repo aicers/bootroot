@@ -170,10 +170,16 @@ jobs:
         # re-reads the user's supplementary groups from /etc/group
         # while keeping the original primary gid intact, which is the
         # exact post-login state the test assertions assume.
+        #
+        # `sudo` resets PATH via sudoers `secure_path`, so resolve the
+        # cargo binary before sudo and pass the absolute path through
+        # setpriv. CARGO_HOME / RUSTUP_HOME / HOME are also preserved
+        # so cargo can find the toolchain installed by rustup.
         run: |
-          sudo --preserve-env \
+          CARGO_BIN="$(command -v cargo)"
+          sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME \
             setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
-            -- cargo test
+            -- "$CARGO_BIN" test
 
       # --- E2E Integration Testing (Docker) ---
       - name: Set secrets directory
