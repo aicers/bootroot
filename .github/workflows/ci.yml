@@ -161,11 +161,19 @@ jobs:
 
       - name: Run Unit Tests
         # `usermod -aG` updates /etc/group but the current shell process
-        # doesn't pick up the new supplementary membership. `sg` spawns
-        # a new shell whose group list reflects the updated /etc/group,
-        # so cargo test sees the gid as a real supplementary group and
-        # the kernel `chown(-1, gid)` check actually runs.
-        run: sg "$BOOTROOT_E2E_CERT_GROUP_NAME" -c "cargo test"
+        # inherits the old supplementary group list. `sg <group>` would
+        # work but it makes the named group the *primary* gid of the
+        # spawned shell, which defeats the regression: the test wants
+        # the fixture gid to appear as a non-primary supplementary
+        # group so the kernel `chown(-1, gid)` permission check is
+        # actually exercised. Use `setpriv --init-groups` instead: it
+        # re-reads the user's supplementary groups from /etc/group
+        # while keeping the original primary gid intact, which is the
+        # exact post-login state the test assertions assume.
+        run: |
+          sudo --preserve-env \
+            setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+            -- cargo test
 
       # --- E2E Integration Testing (Docker) ---
       - name: Set secrets directory
