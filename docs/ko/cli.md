@@ -670,6 +670,46 @@ bootroot status
 `--no-wrap`과 `--secret-id-wrap-ttl`은 동일 필드를 제어합니다.
 `--no-wrap`은 저장되는 래핑 TTL을 `0`으로 설정하여 래핑을 완전히 비활성화합니다.
 
+인증서/키 그룹 접근 정책:
+
+- `--cert-group <gid-or-name>`: 발급되는 인증서/키 파일과
+  상위 디렉터리의 그룹 소유자로 사용할 숫자 gid (또는
+  `local-file` 모드에 한해 그룹 이름)
+  - 미설정(기본): 호스트-로컬 기본값을 유지합니다 — 상위
+    디렉터리 `0700`, `<svc>-key.pem` `0600`, `<svc>-cert.pem`
+    `0644`, 운영자의 uid/주 gid 소유.
+  - 설정 시: 매 발급/회전마다 그룹-읽기 정책을 적용합니다 —
+    key 상위 디렉터리 `0750`, cert 상위 디렉터리 `0755`
+    (key와 동일 디렉터리이면 더 엄격한 `0750` 적용), key 파일
+    `0640`, cert 파일 `0644`, 두 디렉터리와 두 파일 모두
+    지정된 gid가 그룹 소유. 컨테이너로 bind-mount된 인증서/키를
+    non-root 사용자로 실행되는 컨테이너 클라이언트가 읽을 수
+    있게 됩니다. 회전 시에도 정책이 다시 적용되므로
+    운영자가 매번 `chmod`를 다시 걸 필요가 없습니다.
+  - 모드별 허용 형식:
+    - `local-file`: 이름 또는 숫자 gid. 이름은 control host의
+      그룹 DB에서 해석됩니다. `service add`/`service update`는
+      현재 프로세스가 해당 gid로 `chown`할 수 있는지 검증하므로
+      (POSIX는 호출자가 해당 그룹의 보조 멤버이거나 root일 것을
+      요구함), 다음 회전이 아닌 설정 시점에 실패가 노출됩니다.
+    - `remote-bootstrap`: 숫자 gid만 허용. 이름 형식은 parse
+      시점에 거부됩니다 — control host의 NSS와 원격 agent
+      host의 NSS가 다를 수 있기 때문입니다. 운영자는 control
+      host, 인증서를 기록하는 원격 호스트, 컨테이너 supplementary
+      group이 모두 동일한 숫자 gid를 사용하도록 정렬해야 합니다.
+  - `--cert-group 0`(root)은 거부됩니다. 운영자 전용 기본값이
+    이미 root에 대해 동작하므로 의미가 없으며 명백한 오설정에
+    해당합니다.
+  - 정책이 활성화된 경우 cert 상위 디렉터리는 bootroot가 소유하는
+    인증서 출력 디렉터리로 취급됩니다: `0755`로 인해 traversal이
+    넓어지므로 무관한 파일을 같은 디렉터리에 두는 것은 지원되지
+    않습니다.
+
+지속성: `cert_group_gid`는 `ServiceEntry`에 저장되고, 관리되는
+`agent.toml` 프로필 블록에 렌더링되며, remote-bootstrap 아티팩트로
+전달되고, `DaemonProfileSettings`에 노출됩니다 — 회전 시마다
+동일한 정책이 다시 적용됩니다.
+
 ### 대화형 동작
 
 - 누락된 필수 입력을 프롬프트로 받습니다(배포 타입 기본값: `daemon`).
@@ -718,6 +758,19 @@ bootroot status
   (`--secret-id-wrap-ttl`과 상호 배타)
 - `--rn-cidrs`: `secret_id` 토큰에 바인딩할 CIDR 범위 (반복 가능).
   기존 바인딩을 제거하려면 `--rn-cidrs clear` 사용
+- `--cert-group <gid-or-name-or-clear>`: 이미 등록된 서비스의
+  인증서/키 그룹 접근 정책을 변경합니다. `service add`와 동일한
+  형식을 받으며 (`local-file`은 이름 또는 숫자, `remote-bootstrap`은
+  숫자만), 추가로 문자열 `clear`를 사용해 기존 정책을 제거하고
+  운영자 전용 기본값으로 되돌릴 수 있습니다. `local-file` 서비스의
+  경우, 다음 agent 재시작과 다음 회전이 새 정책을 반영하도록
+  관리되는 `agent.toml` 프로필 블록을 즉시 다시 렌더링합니다.
+  `remote-bootstrap` 서비스의 경우, 새 `cert_group_gid`가 원격
+  `agent.toml`에 반영되도록 부트스트랩 아티팩트를
+  재발행(`bootroot service add`)하고 원격 agent 호스트에서
+  `bootroot-remote bootstrap --artifact <path>`를 다시 실행하라는
+  경고를 출력합니다. 근거 및 모드별 수용 규칙은 `service add` 섹션을
+  참조하세요.
 
 ### 동작
 

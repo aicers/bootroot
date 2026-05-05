@@ -494,6 +494,7 @@ mod tests {
             output: OutputFormat::Text,
             wrap_token: None,
             wrap_expires_at: None,
+            cert_group_gid: None,
         }
     }
 

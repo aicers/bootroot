@@ -201,6 +201,12 @@ fn validate_profile(profile: &DaemonProfileSettings) -> Result<()> {
     if profile.paths.key.as_os_str().is_empty() {
         anyhow::bail!("profiles.paths.key must not be empty");
     }
+    if profile.cert_group_gid == Some(0) {
+        // gid 0 is `root`. The default agent identity already has
+        // root or operator-only access; granting "the root group"
+        // would be a no-op and is an obvious misconfiguration.
+        anyhow::bail!("profiles.cert_group_gid must not be 0 (root)");
+    }
     if let Some(retry) = &profile.retry {
         validate_retry_settings(&retry.backoff_secs, "profiles.retry.backoff_secs")?;
     }

@@ -121,7 +121,14 @@ pub fn apply_agent_config_baseline_defaults(
 }
 
 /// Renders a managed profile block for `agent.toml`.
+///
+/// When `cert_group_gid` is `Some`, the rendered block contains a
+/// `cert_group_gid = N` line so that the agent applies the
+/// `--cert-group` policy on every issuance and rotation. `None`
+/// preserves the host-local default (operator-only mode/owner) and
+/// emits no line.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // adding cert_group_gid pushes the count to 8; see issue #593
 pub fn render_managed_profile_block(
     begin_prefix: &str,
     end_prefix: &str,
@@ -130,13 +137,19 @@ pub fn render_managed_profile_block(
     hostname: &str,
     cert_path: &Path,
     key_path: &Path,
+    cert_group_gid: Option<u32>,
 ) -> String {
+    let cert_group_line = match cert_group_gid {
+        Some(gid) => format!("cert_group_gid = {gid}\n"),
+        None => String::new(),
+    };
     format!(
         "{begin_prefix} {service_name}\n\
 [[profiles]]\n\
 service_name = \"{service_name}\"\n\
 instance_id = \"{instance_id}\"\n\
-hostname = \"{hostname}\"\n\n\
+hostname = \"{hostname}\"\n\
+{cert_group_line}\n\
 [profiles.paths]\n\
 cert = \"{cert}\"\n\
 key = \"{key}\"\n\
@@ -343,11 +356,51 @@ mod tests {
             "edge-node-01",
             Path::new("certs/edge-proxy.crt"),
             Path::new("certs/edge-proxy.key"),
+            None,
         );
         let once = upsert_managed_profile_block("", BEGIN_PREFIX, END_PREFIX, "edge-proxy", &block);
         let twice =
             upsert_managed_profile_block(&once, BEGIN_PREFIX, END_PREFIX, "edge-proxy", &block);
         assert_eq!(once, twice);
+    }
+
+    /// `--cert-group` opts the rendered profile into a `cert_group_gid`
+    /// line that survives across re-renders. Without it, rotation
+    /// loses the policy and the original issue #593 reproduces.
+    #[test]
+    fn render_managed_profile_block_includes_cert_group_gid() {
+        let block = render_managed_profile_block(
+            BEGIN_PREFIX,
+            END_PREFIX,
+            "edge-proxy",
+            "001",
+            "edge-node-01",
+            Path::new("certs/edge-proxy.crt"),
+            Path::new("certs/edge-proxy.key"),
+            Some(5001),
+        );
+        assert!(
+            block.contains("cert_group_gid = 5001"),
+            "cert_group_gid must appear in the rendered profile: {block}"
+        );
+    }
+
+    #[test]
+    fn render_managed_profile_block_omits_cert_group_gid_when_none() {
+        let block = render_managed_profile_block(
+            BEGIN_PREFIX,
+            END_PREFIX,
+            "edge-proxy",
+            "001",
+            "edge-node-01",
+            Path::new("certs/edge-proxy.crt"),
+            Path::new("certs/edge-proxy.key"),
+            None,
+        );
+        assert!(
+            !block.contains("cert_group_gid"),
+            "cert_group_gid must not appear when no policy is set: {block}"
+        );
     }
 
     #[test]

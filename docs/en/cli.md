@@ -689,6 +689,47 @@ These values are persisted in `state.json` and applied on
 the same field: `--no-wrap` sets the stored wrap TTL to `0`, disabling
 wrapping entirely.
 
+Cert/key group-access policy:
+
+- `--cert-group <gid-or-name>`: numeric gid (or, for `local-file` only,
+  group name) that should own the issued cert/key files and their
+  parent directories.
+  - Unset (default): the agent preserves the host-local default —
+    `0700` parent directories, `0600` `<svc>-key.pem`, `0644`
+    `<svc>-cert.pem`, owned by the operator's uid/primary gid.
+  - Set: on every issuance and rotation the agent applies a
+    group-readable policy — key parent `0750`, cert parent `0755`
+    (or `0750` when the cert and key share a parent), key file
+    `0640`, cert file `0644`, with both parent directories and both
+    files group-owned by the configured gid. This is what makes the
+    bind-mounted cert/key readable to a non-root containerized
+    client without recurring operator `chmod` workarounds — the
+    policy is reapplied on every renew, so it survives rotation.
+  - Mode-by-mode acceptance:
+    - `local-file`: name or numeric gid. Names are resolved against
+      the control host's group DB. `service add` and `service
+      update` validate that the calling process can `chown` to the
+      target gid (POSIX requires the caller to be a supplementary
+      member of the group, or root); if not, the command fails at
+      configure time rather than at the next rotation.
+    - `remote-bootstrap`: numeric gid only. Names are rejected at
+      parse time because the control host's NSS may diverge from
+      the remote agent host's NSS. Operators must line up the same
+      numeric gid on the control host, the cert-writing remote
+      host, and the consuming container's supplementary group.
+  - `--cert-group 0` (root) is rejected. The operator-only default
+    already works for root; granting "the root group" would be a
+    no-op against an obvious misconfiguration.
+  - When the policy is active, the cert parent directory is
+    treated as a bootroot-owned cert output directory: mixing
+    unrelated files into it is unsupported, since `0755` broadens
+    traversal for whatever else lives there.
+
+Persistence: `cert_group_gid` is stored on `ServiceEntry`, rendered
+into the managed `agent.toml` profile block, threaded through the
+remote-bootstrap artifact, and surfaced on `DaemonProfileSettings`,
+so rotation always reapplies the same policy.
+
 ### Interactive behavior
 
 - Prompts for missing required inputs (deploy type defaults to `daemon`).
@@ -739,6 +780,21 @@ full `service add` flow. At least one policy flag is required.
   (conflicts with `--secret-id-wrap-ttl`)
 - `--rn-cidrs`: CIDR ranges to bind the `secret_id` token to
   (repeatable). Use `--rn-cidrs clear` to remove an existing binding
+- `--cert-group <gid-or-name-or-clear>`: change the cert/key
+  group-access policy on a previously added service. Accepts the
+  same forms as `service add` (`local-file` accepts name or
+  numeric; `remote-bootstrap` accepts numeric only), plus the
+  literal string `clear` to remove an existing policy and revert
+  to the operator-only default. For `local-file` services the
+  command re-renders the managed `agent.toml` profile block in
+  place so the next agent restart and the next rotation pick up
+  the new policy. For `remote-bootstrap` services the command
+  prints a warning instructing the operator to re-emit the
+  bootstrap artifact (`bootroot service add`) and re-run
+  `bootroot-remote bootstrap --artifact <path>` on the remote
+  agent host so the new `cert_group_gid` lands in the remote
+  `agent.toml`. See `service add` for the rationale and per-mode
+  acceptance rules.
 
 ### Behavior
 

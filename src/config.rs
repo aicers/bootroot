@@ -119,6 +119,12 @@ pub struct DaemonProfileSettings {
     #[serde(default)]
     pub hooks: HookSettings,
     pub eab: Option<Eab>,
+    /// Numeric gid that owns the issued cert/key files and their
+    /// parent directories under the `--cert-group` policy.
+    /// `None` (the default) preserves the host-local default mode
+    /// and operator-only ownership. See [issue #593].
+    #[serde(default)]
+    pub cert_group_gid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -802,6 +808,83 @@ mod tests {
         let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("openbao.state_path"));
+    }
+
+    /// Round-trip test for the `--cert-group` policy on a profile:
+    /// the daemon must parse `cert_group_gid = N` from the rendered
+    /// `agent.toml` and surface it on the in-memory profile, so the
+    /// issuance/rotation path can apply the group ownership policy.
+    /// Without this, every rotation reverts to operator-only and the
+    /// original issue #593 reproduces.
+    #[test]
+    fn settings_parses_profile_cert_group_gid() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+            domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
+
+            [[profiles]]
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+            cert_group_gid = 5001
+
+            [profiles.paths]
+            cert = "certs/edge-proxy.pem"
+            key = "certs/edge-proxy.key"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        let profile = &settings.profiles[0];
+        assert_eq!(profile.cert_group_gid, Some(5001));
+    }
+
+    #[test]
+    fn settings_defaults_profile_cert_group_gid_to_none() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        let profile = &settings.profiles[0];
+        assert!(profile.cert_group_gid.is_none());
+    }
+
+    /// `cert_group_gid = 0` is rejected at validation: gid 0 is root
+    /// and granting it would be a no-op against the operator-only
+    /// default, while masking an obvious misconfiguration.
+    #[test]
+    fn validate_rejects_cert_group_gid_zero() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+            domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
+
+            [[profiles]]
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+            cert_group_gid = 0
+
+            [profiles.paths]
+            cert = "certs/edge-proxy.pem"
+            key = "certs/edge-proxy.key"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("cert_group_gid"));
     }
 
     /// Accepts the common case where `[openbao]` carries an absolute

@@ -379,6 +379,7 @@ fn build_service_entry_from_role(
         agent_email: resolved.agent_email.clone(),
         agent_server: resolved.agent_server.clone(),
         agent_responder_url: resolved.agent_responder_url.clone(),
+        cert_group_gid: resolved.cert_group_gid,
     }
 }
 
@@ -546,6 +547,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         && args.secret_id_wrap_ttl.is_none()
         && !args.no_wrap
         && args.rn_cidrs.is_empty()
+        && args.cert_group.is_none()
     {
         anyhow::bail!(messages.error_service_update_no_flags());
     }
@@ -636,6 +638,24 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         }
     }
 
+    let mut cert_group_redeploy_hint: Option<CertGroupRedeployHint> = None;
+    if let Some(ref raw) = args.cert_group {
+        let old_value = entry.cert_group_gid;
+        let new_value = parse_cert_group_for_update(raw, entry.delivery_mode)?;
+        entry.cert_group_gid = new_value;
+        if old_value != new_value {
+            changes.push(messages.service_update_field_changed(
+                "cert_group_gid",
+                &display_cert_group(old_value),
+                &display_cert_group(new_value),
+            ));
+            cert_group_redeploy_hint = Some(CertGroupRedeployHint {
+                delivery_mode: entry.delivery_mode,
+                service_name: args.service_name.clone(),
+            });
+        }
+    }
+
     if explicit_ttl_set {
         eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
     }
@@ -645,9 +665,40 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         return Ok(());
     }
 
+    // Snapshot the entry before save so we can re-render the local
+    // managed agent.toml block in the local-file case without holding
+    // the borrow on `state` past the save.
+    let entry_snapshot = state.services.get(&args.service_name).cloned();
+
     state
         .save(&state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
+
+    if let (Some(hint), Some(entry)) = (cert_group_redeploy_hint.as_ref(), entry_snapshot.as_ref())
+    {
+        match hint.delivery_mode {
+            DeliveryMode::LocalFile => {
+                rerender_local_managed_profile(entry)?;
+            }
+            DeliveryMode::RemoteBootstrap => {
+                // Persisting the gid in state.json alone is not enough
+                // for remote-bootstrap services — the remote agent
+                // reads from the bootstrap-rendered `agent.toml` on
+                // disk, and `service add` is the path that re-emits
+                // the artifact.  Fail loudly with the one-line follow-
+                // up the operator must run, so the next rotation
+                // actually picks up the new policy.
+                eprintln!(
+                    "warning: --cert-group changed for remote-bootstrap service {}.\n\
+                     Re-emit the bootstrap artifact with `bootroot service add` \
+                     and re-run `bootroot-remote bootstrap --artifact <path>` on \
+                     the remote agent host so the new cert_group_gid lands in the \
+                     remote agent.toml.",
+                    hint.service_name,
+                );
+            }
+        }
+    }
 
     println!("{}", messages.service_update_summary());
     println!("{}", messages.service_summary_kind(&args.service_name));
@@ -657,6 +708,114 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
     println!("{}", messages.service_update_rotate_hint());
 
     Ok(())
+}
+
+struct CertGroupRedeployHint {
+    delivery_mode: DeliveryMode,
+    service_name: String,
+}
+
+fn parse_cert_group_for_update(raw: &str, delivery_mode: DeliveryMode) -> Result<Option<u32>> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("clear") {
+        return Ok(None);
+    }
+    let gid = match delivery_mode {
+        DeliveryMode::LocalFile => bootroot::cert_group::parse_cert_group_local(trimmed)
+            .map_err(|err| anyhow::anyhow!("{err}"))?,
+        DeliveryMode::RemoteBootstrap => bootroot::cert_group::parse_cert_group_remote(trimmed)
+            .map_err(|err| anyhow::anyhow!("{err}"))?,
+    };
+    if matches!(delivery_mode, DeliveryMode::LocalFile) {
+        bootroot::cert_group::validate_local_gid_membership(gid)
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+    }
+    Ok(Some(gid))
+}
+
+fn display_cert_group(value: Option<u32>) -> String {
+    match value {
+        Some(gid) => gid.to_string(),
+        None => "unset".to_string(),
+    }
+}
+
+/// Re-renders just the managed profile block of the local
+/// `agent.toml` for the given entry. Used by `service update --cert-
+/// group ...` so the next agent restart and the next rotation pick up
+/// the new `cert_group_gid` line without requiring a full `service add`
+/// re-run.
+fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
+    let agent_config_path = &entry.agent_config_path;
+    if !agent_config_path.exists() {
+        anyhow::bail!(
+            "agent config {} not found — re-run `bootroot service add` to generate it",
+            agent_config_path.display()
+        );
+    }
+    let current = std::fs::read_to_string(agent_config_path)
+        .with_context(|| format!("Failed to read {}", agent_config_path.display()))?;
+    let block = bootroot::trust_bootstrap::render_managed_profile_block(
+        MANAGED_PROFILE_BEGIN_PREFIX,
+        MANAGED_PROFILE_END_PREFIX,
+        &entry.service_name,
+        entry.instance_id.as_deref().unwrap_or_default(),
+        &entry.hostname,
+        &entry.cert_path,
+        &entry.key_path,
+        entry.cert_group_gid,
+    );
+    let block = inject_hooks_into_managed_profile_block(&block, &entry.post_renew_hooks);
+    let next = bootroot::trust_bootstrap::upsert_managed_profile_block(
+        &current,
+        MANAGED_PROFILE_BEGIN_PREFIX,
+        MANAGED_PROFILE_END_PREFIX,
+        &entry.service_name,
+        &block,
+    );
+    std::fs::write(agent_config_path, next)
+        .with_context(|| format!("Failed to write {}", agent_config_path.display()))?;
+    Ok(())
+}
+
+fn inject_hooks_into_managed_profile_block(
+    block: &str,
+    hooks: &[crate::state::PostRenewHookEntry],
+) -> String {
+    use std::fmt::Write as _;
+    if hooks.is_empty() {
+        return block.to_string();
+    }
+    let mut hooks_toml = String::new();
+    for hook in hooks {
+        hooks_toml.push_str("\n[[profiles.hooks.post_renew.success]]\n");
+        let _ = writeln!(
+            hooks_toml,
+            "command = {}",
+            bootroot::toml_util::toml_encode_string(&hook.command)
+        );
+        if !hook.args.is_empty() {
+            let formatted = hook
+                .args
+                .iter()
+                .map(|a| bootroot::toml_util::toml_encode_string(a))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(hooks_toml, "args = [{formatted}]");
+        }
+        let _ = writeln!(hooks_toml, "timeout_secs = {}", hook.timeout_secs);
+        let _ = writeln!(hooks_toml, "on_failure = \"{}\"", hook.on_failure);
+    }
+    if let Some(end_pos) = block.rfind(MANAGED_PROFILE_END_PREFIX) {
+        let mut result = block[..end_pos].to_string();
+        result.push_str(&hooks_toml);
+        result.push_str(&block[end_pos..]);
+        result
+    } else {
+        let mut result = block.to_string();
+        result.push_str(&hooks_toml);
+        result
+    }
 }
 
 pub(crate) fn display_policy_value(value: Option<&str>, messages: &Messages) -> String {
@@ -710,6 +869,7 @@ fn non_policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) 
         && entry.agent_email == resolved.agent_email
         && entry.agent_server == resolved.agent_server
         && entry.agent_responder_url == resolved.agent_responder_url
+        && entry.cert_group_gid == resolved.cert_group_gid
 }
 
 fn policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
@@ -761,6 +921,7 @@ mod tests {
             agent_email: None,
             agent_server: None,
             agent_responder_url: None,
+            cert_group_gid: None,
         }
     }
 
@@ -780,6 +941,7 @@ mod tests {
         assert_eq!(entry.agent_email, resolved.agent_email);
         assert_eq!(entry.agent_server, resolved.agent_server);
         assert_eq!(entry.agent_responder_url, resolved.agent_responder_url);
+        assert_eq!(entry.cert_group_gid, resolved.cert_group_gid);
     }
 
     #[test]

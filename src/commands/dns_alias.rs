@@ -202,6 +202,7 @@ mod tests {
             agent_email: None,
             agent_server: None,
             agent_responder_url: None,
+            cert_group_gid: None,
         }
     }
 

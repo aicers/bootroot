@@ -609,6 +609,7 @@ mod tests {
             retry: None,
             hooks: config::HookSettings::default(),
             eab: None,
+            cert_group_gid: None,
         }
     }
 
