@@ -648,7 +648,10 @@ mod tests {
     fn validate_cert_writing_host_gid_rejects_unknown_gid() {
         let outcome = validate_cert_writing_host_gid(4_000_000_000);
         assert!(
-            matches!(outcome, Err(CertGroupError::UnknownGid { gid: 4_000_000_000 })),
+            matches!(
+                outcome,
+                Err(CertGroupError::UnknownGid { gid: 4_000_000_000 })
+            ),
             "expected UnknownGid, got {outcome:?}"
         );
     }

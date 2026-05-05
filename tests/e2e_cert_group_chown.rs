@@ -62,9 +62,10 @@ fn resolve_test_gid() -> Option<u32> {
                  export the numeric gid before running cargo test"
             )
         });
-        let gid: u32 = raw.trim().parse().unwrap_or_else(|_| {
-            panic!("{GID_ENV}={raw:?} is not a valid numeric gid")
-        });
+        let gid: u32 = raw
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{GID_ENV}={raw:?} is not a valid numeric gid"));
         assert!(gid != 0, "{GID_ENV}=0 is rejected: gid 0 is root");
         assert!(
             gid != primary_gid,
