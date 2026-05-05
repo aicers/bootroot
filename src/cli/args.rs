@@ -942,6 +942,21 @@ pub(crate) struct ServiceAddArgs {
     /// CIDR ranges to bind the `secret_id` token to (repeatable, e.g. `--rn-cidrs 10.0.0.0/24`)
     #[arg(long)]
     pub(crate) rn_cidrs: Vec<String>,
+
+    /// Numeric gid or group name that should own the issued cert/key
+    /// files and their parent directories.
+    ///
+    /// When set, the agent applies a group-readable policy
+    /// (`0750`/`0640`/`0644` with group ownership) on every issuance
+    /// and rotation, so non-root containerized clients can read the
+    /// bind-mounted cert and key. When unset, the historical
+    /// operator-only default (`0700`/`0600`/`0644`) is preserved.
+    ///
+    /// `local-file` deployments accept a name or numeric gid;
+    /// `remote-bootstrap` deployments accept numeric form only — see
+    /// issue #593 for the cross-host NSS rationale.
+    #[arg(long, value_name = "GID-OR-NAME")]
+    pub(crate) cert_group: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -975,6 +990,20 @@ pub(crate) struct ServiceUpdateArgs {
     /// Use "clear" to remove an existing binding
     #[arg(long)]
     pub(crate) rn_cidrs: Vec<String>,
+
+    /// Numeric gid or group name that owns the issued cert/key files
+    /// and their parent directories.
+    ///
+    /// Use a numeric gid or group name to enable the group-readable
+    /// policy (`0750`/`0640` with group ownership) on the next
+    /// issuance and rotation. Use the literal string `clear` to
+    /// remove an existing policy and revert to the operator-only
+    /// default (`0700`/`0600`).
+    ///
+    /// `local-file` deployments accept names; `remote-bootstrap`
+    /// deployments accept numeric form only — see issue #593.
+    #[arg(long, value_name = "GID-OR-NAME-OR-CLEAR")]
+    pub(crate) cert_group: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1625,6 +1654,36 @@ mod tests {
             "10m",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_cert_group() {
+        let cli = Cli::parse_from(["bootroot", "service", "add", "--cert-group", "5001"]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert_eq!(args.cert_group.as_deref(), Some("5001"));
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_update_cert_group_clear() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--cert-group",
+            "clear",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Update(args)) => {
+                assert_eq!(args.cert_group.as_deref(), Some("clear"));
+            }
+            _ => panic!("expected service update"),
+        }
     }
 
     #[test]

@@ -240,6 +240,59 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Added `--cert-group <gid-or-name>` to `bootroot service add` and
+  `bootroot service update` so issued service certificates can be
+  delivered to non-root containerized clients without operator-side
+  `chmod` workarounds. When set, the agent applies a group-readable
+  policy on every issuance and rotation: parent directories become
+  `0750` (or `0755` for a distinct cert parent), `<svc>-key.pem`
+  becomes `0640`, `<svc>-cert.pem` stays at `0644`, and group
+  ownership of all four is set to the configured gid. When unset
+  (the default), the historical operator-only modes
+  (`0700`/`0600`/`0644`) are preserved so existing deployments are
+  unchanged. `cert_group_gid` is persisted on `ServiceEntry`,
+  rendered into the managed `agent.toml` profile block, threaded
+  through the remote-bootstrap artifact as a new optional field
+  (no `schema_version` bump — additive change with
+  `skip_serializing_if`), and surfaced on `DaemonProfileSettings`,
+  so rotation re-asserts the policy instead of silently reverting
+  to operator-only.
+  `local-file` deployments accept either a numeric gid or a group
+  name resolved on the control host; `remote-bootstrap` deployments
+  accept numeric form only because the control host's NSS may differ
+  from the remote agent host's. `service add` validates that the
+  caller can `chown` to the target gid for `local-file` mode so the
+  failure surfaces at add-time rather than at the next rotation.
+  `service update --cert-group ...` re-renders the local managed
+  profile block immediately for `local-file` services, and warns the
+  operator to re-emit the bootstrap artifact for `remote-bootstrap`
+  services. The local-file re-render runs before `state.json` is
+  persisted, and re-runs of the same `--cert-group` value re-trigger
+  the re-render — so a previously-failed re-render can be repaired
+  by simply re-running the command, without `state.json` ever
+  drifting ahead of the on-disk managed profile.
+  `--cert-group 0` (root) is rejected at parse time and during
+  config validation. `cert_group_gid` is also rejected when it does
+  not resolve in the cert-writing host's group database
+  (`getgrgid_r`): this orphan-gid case (a numeric gid that exists on
+  a different host — e.g. the container's runtime user — but not on
+  the host that will actually `chown` the cert/key files) is checked
+  at `service add` / `service update` time on the control host for
+  `local-file`, at `bootroot-remote bootstrap` time on the remote
+  agent host for `remote-bootstrap`, and again at `bootroot-agent`
+  config validation, so it surfaces as a loud failure instead of
+  passing the kernel `chown` and reappearing as EACCES inside the
+  consumer. The key file is written via stage-then-rename
+  (sibling temp file created with `O_CREAT|O_EXCL` and `mode=0600`,
+  `chown`d, promoted to `0640`, then renamed over the destination)
+  so the destination path is never observable at a mode wider than
+  the final policy — no umask-derived `0644` window before the
+  clamp, and no group-readable window under the operator's primary
+  gid before the chown lands. The shared cert/key parent detection
+  uses kernel `(dev, ino)` identity rather than textual path
+  equality, so spellings like `certs` vs `certs/.` cannot trick
+  `ensure_cert_parent_dir` into widening a shared key parent from
+  `0750` to `0755`. (Closes #593)
 - Added a non-interactive operation surface for CI/scripted rotations
   (Closes #587):
   - `bootroot rotate --yes`/`-y` is now a global flag accepted at any

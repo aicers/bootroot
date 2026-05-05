@@ -238,6 +238,7 @@ fn render_managed_profile_block(args: &ResolvedServiceAdd) -> String {
         &args.hostname,
         &args.cert_path,
         &args.key_path,
+        args.cert_group_gid,
     );
     inject_hooks_into_profile_block(&base, &args.post_renew_hooks)
 }
@@ -476,6 +477,7 @@ mod tests {
             agent_email: None,
             agent_server: None,
             agent_responder_url: None,
+            cert_group_gid: None,
         }
     }
 

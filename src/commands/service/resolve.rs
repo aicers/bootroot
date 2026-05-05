@@ -49,6 +49,10 @@ pub(crate) struct ResolvedServiceAdd {
     /// `--agent-responder-url` was not provided; renderers fall back
     /// to [`DEFAULT_AGENT_RESPONDER_URL`].
     pub(crate) agent_responder_url: Option<String>,
+    /// Resolved numeric gid for `--cert-group`. `None` means the
+    /// operator did not opt into the group-readable cert policy and
+    /// the agent preserves the host-local default. See issue #593.
+    pub(crate) cert_group_gid: Option<u32>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -162,6 +166,8 @@ pub(super) fn resolve_service_add_args(
     let agent_server = args.agent_server.clone();
     let agent_responder_url = args.agent_responder_url.clone();
 
+    let cert_group_gid = resolve_cert_group_for_add(args, delivery_mode, messages)?;
+
     Ok(ResolvedServiceAdd {
         service_name,
         deploy_type,
@@ -182,7 +188,36 @@ pub(super) fn resolve_service_add_args(
         agent_email,
         agent_server,
         agent_responder_url,
+        cert_group_gid,
     })
+}
+
+/// Resolves `--cert-group` for `service add` based on the deployment
+/// mode. `local-file` accepts a numeric gid or a name and validates
+/// the caller can actually `chown` to it (so the failure surface lands
+/// at `service add` time rather than at the next rotation). `remote-
+/// bootstrap` accepts numeric form only and validates only that the
+/// number is non-zero — name resolution and membership are checked on
+/// the remote agent host because the control host's NSS may differ.
+pub(super) fn resolve_cert_group_for_add(
+    args: &ServiceAddArgs,
+    delivery_mode: DeliveryMode,
+    _messages: &Messages,
+) -> Result<Option<u32>> {
+    let Some(raw) = args.cert_group.as_deref() else {
+        return Ok(None);
+    };
+    let gid = match delivery_mode {
+        DeliveryMode::LocalFile => bootroot::cert_group::parse_cert_group_local(raw)
+            .map_err(|err| anyhow::anyhow!("{err}"))?,
+        DeliveryMode::RemoteBootstrap => bootroot::cert_group::parse_cert_group_remote(raw)
+            .map_err(|err| anyhow::anyhow!("{err}"))?,
+    };
+    if matches!(delivery_mode, DeliveryMode::LocalFile) {
+        bootroot::cert_group::validate_local_gid_membership(gid)
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+    }
+    Ok(Some(gid))
 }
 
 pub(super) fn validate_service_add(args: &ResolvedServiceAdd, messages: &Messages) -> Result<()> {
@@ -493,6 +528,7 @@ mod tests {
             secret_id_wrap_ttl: None,
             no_wrap: false,
             rn_cidrs: Vec::new(),
+            cert_group: None,
         }
     }
 

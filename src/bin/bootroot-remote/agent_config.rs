@@ -144,6 +144,7 @@ pub(super) async fn apply_agent_config_updates(
         &args.profile_hostname,
         &profile_paths.cert_path,
         &profile_paths.key_path,
+        args.cert_group_gid,
     );
     let profile_block = inject_hooks_into_profile_block(&profile_block, args);
     let with_profile =
@@ -331,6 +332,7 @@ fn render_managed_profile_block(
     hostname: &str,
     cert_path: &Path,
     key_path: &Path,
+    cert_group_gid: Option<u32>,
 ) -> String {
     render_profile(
         MANAGED_PROFILE_BEGIN_PREFIX,
@@ -340,6 +342,7 @@ fn render_managed_profile_block(
         hostname,
         cert_path,
         key_path,
+        cert_group_gid,
     )
 }
 
@@ -602,6 +605,7 @@ mod tests {
             output: OutputFormat::Text,
             wrap_token: None,
             wrap_expires_at: None,
+            cert_group_gid: None,
         }
     }
 

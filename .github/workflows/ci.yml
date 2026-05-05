@@ -137,8 +137,58 @@ jobs:
       - name: Pre-pull openbao image for real-daemon TLS E2E
         run: docker pull openbao/openbao:latest
 
+      # Issue #593: provision a dedicated supplementary group for the
+      # runner so `tests/e2e_cert_group_chown.rs` actually exercises a
+      # non-primary gid through the kernel chown permission check. The
+      # test refuses to silently skip when
+      # BOOTROOT_E2E_REQUIRE_CERT_GROUP=1 is exported, so a runner that
+      # ever loses this fixture surfaces as a CI failure rather than
+      # green.
+      - name: Provision cert-group fixture for e2e_cert_group_chown
+        id: cert_group_fixture
+        run: |
+          set -euo pipefail
+          GROUP_NAME="bootroot-e2e-certgrp"
+          if ! getent group "$GROUP_NAME" >/dev/null; then
+            sudo groupadd "$GROUP_NAME"
+          fi
+          GID="$(getent group "$GROUP_NAME" | cut -d: -f3)"
+          sudo usermod -aG "$GROUP_NAME" "$USER"
+          echo "BOOTROOT_E2E_CERT_GROUP_GID=$GID" >> "$GITHUB_ENV"
+          echo "BOOTROOT_E2E_REQUIRE_CERT_GROUP=1" >> "$GITHUB_ENV"
+          echo "BOOTROOT_E2E_CERT_GROUP_NAME=$GROUP_NAME" >> "$GITHUB_ENV"
+          echo "Provisioned $GROUP_NAME (gid=$GID) and added $USER as supplementary member"
+
       - name: Run Unit Tests
-        run: cargo test
+        # `usermod -aG` updates /etc/group but the current shell process
+        # inherits the old supplementary group list. `sg <group>` would
+        # work but it makes the named group the *primary* gid of the
+        # spawned shell, which defeats the regression: the test wants
+        # the fixture gid to appear as a non-primary supplementary
+        # group so the kernel `chown(-1, gid)` permission check is
+        # actually exercised. Use `setpriv --init-groups` instead: it
+        # re-reads the user's supplementary groups from /etc/group
+        # while keeping the original primary gid intact, which is the
+        # exact post-login state the test assertions assume.
+        #
+        # `sudo` resets PATH via sudoers `secure_path`, so resolve the
+        # cargo binary before sudo and pass the absolute path through
+        # setpriv. CARGO_HOME / RUSTUP_HOME / HOME are also preserved
+        # so cargo can find the toolchain installed by rustup.
+        #
+        # `sudo` also strips the BOOTROOT_E2E_* fixture variables by
+        # default (env_reset). Without explicitly preserving them,
+        # `tests/e2e_cert_group_chown.rs` would see
+        # BOOTROOT_E2E_REQUIRE_CERT_GROUP unset and fall back to the
+        # dev-mode skip path, defeating the fixture and letting a broken
+        # CI environment produce a green build. Pass them through
+        # --preserve-env so the require-flag actually reaches the test
+        # process.
+        run: |
+          CARGO_BIN="$(command -v cargo)"
+          sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME,BOOTROOT_E2E_CERT_GROUP_GID,BOOTROOT_E2E_REQUIRE_CERT_GROUP,BOOTROOT_E2E_CERT_GROUP_NAME \
+            setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+            -- "$CARGO_BIN" test
 
       # --- E2E Integration Testing (Docker) ---
       - name: Set secrets directory

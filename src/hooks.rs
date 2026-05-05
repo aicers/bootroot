@@ -316,6 +316,7 @@ mod tests {
             retry: None,
             hooks,
             eab: None,
+            cert_group_gid: None,
         };
 
         let settings = Settings {

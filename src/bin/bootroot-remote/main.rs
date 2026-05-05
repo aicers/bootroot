@@ -207,6 +207,12 @@ struct ResolvedBootstrapArgs {
     output: OutputFormat,
     wrap_token: Option<String>,
     wrap_expires_at: Option<String>,
+    /// Numeric gid that owns the issued cert/key files and their
+    /// parent directories. Carried verbatim from the bootstrap
+    /// artifact so the rendered remote `agent.toml` contains the
+    /// `cert_group_gid` line that survives every rotation. See
+    /// issue #593.
+    cert_group_gid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -338,6 +344,8 @@ struct BootstrapArtifact {
     wrap_token: Option<String>,
     #[serde(default)]
     wrap_expires_at: Option<String>,
+    #[serde(default)]
+    cert_group_gid: Option<u32>,
 }
 
 /// Hook entry as serialized in the bootstrap artifact JSON.
@@ -475,6 +483,7 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
 
     let wrap_token = artifact.as_ref().and_then(|a| a.wrap_token.clone());
     let wrap_expires_at = artifact.as_ref().and_then(|a| a.wrap_expires_at.clone());
+    let cert_group_gid = artifact.as_ref().and_then(|a| a.cert_group_gid);
 
     // When an artifact is provided, its `post_renew_hooks` array is
     // authoritative — even if empty (an explicit "no hooks" choice).
@@ -531,6 +540,7 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         output: args.output,
         wrap_token,
         wrap_expires_at,
+        cert_group_gid,
     })
 }
 

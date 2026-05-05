@@ -150,6 +150,15 @@ pub(crate) struct ServiceEntry {
     /// rationale as [`ServiceEntry::agent_email`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) agent_responder_url: Option<String>,
+    /// Numeric gid that owns the issued cert/key parent directories
+    /// and the key file under the `--cert-group` policy. `None` means
+    /// the operator did not opt into the policy and the agent
+    /// preserves the host-local default (`0700`/`0600`/`0644`,
+    /// operator-only ownership). Persisted so rotation always re-
+    /// applies the same policy without operator-side `chmod`
+    /// workarounds — see issue #593.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cert_group_gid: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -339,6 +348,7 @@ mod tests {
             agent_email: None,
             agent_server: None,
             agent_responder_url: None,
+            cert_group_gid: None,
         };
         let json = serde_json::to_string_pretty(&entry).expect("serialize");
         let parsed: ServiceEntry = serde_json::from_str(&json).expect("deserialize");

@@ -68,6 +68,13 @@ struct RemoteBootstrapArtifact {
     wrap_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wrap_expires_at: Option<String>,
+    /// Numeric gid that owns the issued cert/key files and their
+    /// parent directories under `--cert-group`. `None` is serialized
+    /// as a missing key so a downstream remote agent that pre-dates
+    /// the field continues to work without the policy. See
+    /// issue #593.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cert_group_gid: Option<u32>,
 }
 
 /// Wrap-token metadata to embed in the bootstrap artifact.
@@ -132,6 +139,7 @@ fn build_artifact(
     agent_email: Option<&str>,
     agent_server: Option<&str>,
     agent_responder_url: Option<&str>,
+    cert_group_gid: Option<u32>,
 ) -> RemoteBootstrapArtifact {
     let secret_id_parent = secret_id_path.parent().unwrap_or(Path::new("."));
     let role_id_path = secret_id_parent.join(SERVICE_ROLE_ID_FILENAME);
@@ -168,6 +176,7 @@ fn build_artifact(
         post_renew_hooks: post_renew_hooks.to_vec(),
         wrap_token: wrap_info.map(|w| w.token.clone()),
         wrap_expires_at: wrap_info.map(|w| w.expires_at.clone()),
+        cert_group_gid,
     }
 }
 
@@ -198,6 +207,7 @@ pub(super) async fn write_remote_bootstrap_artifact(
         resolved.agent_email.as_deref(),
         resolved.agent_server.as_deref(),
         resolved.agent_responder_url.as_deref(),
+        resolved.cert_group_gid,
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &resolved.service_name, &artifact, messages)
         .await
@@ -229,6 +239,7 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
         entry.agent_email.as_deref(),
         entry.agent_server.as_deref(),
         entry.agent_responder_url.as_deref(),
+        entry.cert_group_gid,
     );
     write_remote_bootstrap_artifact_file(secrets_dir, &entry.service_name, &artifact, messages)
         .await
@@ -353,6 +364,69 @@ mod tests {
     const TEST_AGENT_SERVER: &str = "https://step-ca.test:9000/acme/acme/directory";
     const TEST_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
 
+    /// `--cert-group` flows through the bootstrap artifact as
+    /// `cert_group_gid`, so the remote agent picks up the policy on
+    /// every rotation. Guards issue #593 on the remote-bootstrap path.
+    #[test]
+    fn build_artifact_carries_cert_group_gid() {
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+            &[],
+            None,
+            TEST_CA_PEM,
+            None,
+            None,
+            None,
+            Some(5001),
+        );
+        assert_eq!(artifact.cert_group_gid, Some(5001));
+
+        let serialized = serde_json::to_string(&artifact).unwrap();
+        assert!(
+            serialized.contains("\"cert_group_gid\":5001"),
+            "cert_group_gid must be serialized: {serialized}"
+        );
+    }
+
+    #[test]
+    fn build_artifact_omits_cert_group_gid_when_unset() {
+        let artifact = build_artifact(
+            "https://ob",
+            "kv",
+            "svc",
+            Path::new("/s/services/svc/secret_id"),
+            Path::new("/etc/svc/agent.toml"),
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            "d.com",
+            "h",
+            None,
+            &[],
+            None,
+            TEST_CA_PEM,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(artifact.cert_group_gid.is_none());
+
+        let serialized = serde_json::to_string(&artifact).unwrap();
+        assert!(
+            !serialized.contains("cert_group_gid"),
+            "cert_group_gid must be omitted from artifact when None: {serialized}"
+        );
+    }
+
     #[test]
     fn build_artifact_typical_case() {
         let artifact = build_artifact(
@@ -372,6 +446,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
 
         assert_eq!(artifact.schema_version, 3);
@@ -445,6 +520,7 @@ mod tests {
             Some(OVERRIDE_EMAIL),
             Some(OVERRIDE_SERVER),
             Some(OVERRIDE_RESPONDER),
+            None,
         );
 
         assert_eq!(artifact.agent_email.as_deref(), Some(OVERRIDE_EMAIL));
@@ -491,6 +567,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(artifact.agent_email.is_none());
@@ -531,6 +608,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
 
         assert_eq!(artifact.profile_instance_id, "");
@@ -555,6 +633,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
         let b = build_artifact(
             "https://ob",
@@ -573,6 +652,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
 
         assert_ne!(a.role_id_path, b.role_id_path);
@@ -599,6 +679,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
 
         // Path::new("secret_id").parent() returns Some(""), not None
@@ -625,6 +706,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
 
         // Path::new("cert.pem").parent() returns Some(""), not None
@@ -658,6 +740,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
 
         assert_eq!(artifact.post_renew_hooks.len(), 1);
@@ -692,6 +775,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
         let cmd = super::render_remote_run_command_legacy(&artifact);
 
@@ -744,6 +828,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
         let cmd = super::render_remote_run_command_legacy(&artifact);
 
@@ -776,6 +861,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
         let cmd = super::render_remote_run_command_legacy(&artifact);
 
@@ -804,6 +890,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
         let with_none = build_artifact(
             "https://ob",
@@ -822,6 +909,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
 
         assert_eq!(
@@ -868,6 +956,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
 
         assert_eq!(artifact.wrap_token.as_deref(), Some("hvs.wrap-token-123"));
@@ -900,6 +989,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
         let cmd = super::render_remote_run_command(&artifact);
 
@@ -932,6 +1022,7 @@ mod tests {
             Some(TEST_AGENT_EMAIL),
             Some(TEST_AGENT_SERVER),
             Some(TEST_AGENT_RESPONDER_URL),
+            None,
         );
         let cmd = super::render_remote_run_command(&artifact);
 

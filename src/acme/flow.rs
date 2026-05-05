@@ -307,8 +307,17 @@ pub async fn issue_certificate(
             (cert_pem.clone(), Vec::new())
         };
         let key_pem = cert_key.serialize_pem();
-        fs_util::write_cert_and_key(&profile.paths.cert, &profile.paths.key, &leaf_pem, &key_pem)
-            .await?;
+        let policy = crate::cert_group::CertGroupPolicy {
+            gid: profile.cert_group_gid,
+        };
+        fs_util::write_cert_and_key(
+            &profile.paths.cert,
+            &profile.paths.key,
+            &leaf_pem,
+            &key_pem,
+            policy,
+        )
+        .await?;
         info!("Certificate saved to: {:?}", profile.paths.cert);
         info!("Private key saved to: {:?}", profile.paths.key);
 
@@ -396,6 +405,7 @@ mod tests {
             retry: None,
             hooks: crate::config::HookSettings::default(),
             eab: None,
+            cert_group_gid: None,
         }
     }
 
@@ -425,8 +435,17 @@ mod tests {
     ) -> Result<()> {
         let (leaf_pem, chain) = split_leaf_and_chain(cert_pem)?;
         let key_pem = rcgen::KeyPair::generate()?.serialize_pem();
-        fs_util::write_cert_and_key(&profile.paths.cert, &profile.paths.key, &leaf_pem, &key_pem)
-            .await?;
+        let policy = crate::cert_group::CertGroupPolicy {
+            gid: profile.cert_group_gid,
+        };
+        fs_util::write_cert_and_key(
+            &profile.paths.cert,
+            &profile.paths.key,
+            &leaf_pem,
+            &key_pem,
+            policy,
+        )
+        .await?;
         if let Some(bundle_path) = &settings.trust.ca_bundle_path
             && !chain.is_empty()
         {
