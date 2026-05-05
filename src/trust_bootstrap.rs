@@ -379,9 +379,10 @@ mod tests {
             Path::new("certs/edge-proxy.key"),
             Some(5001),
         );
+        let has_policy_line = block.contains("cert_group_gid = 5001");
         assert!(
-            block.contains("cert_group_gid = 5001"),
-            "cert_group_gid must appear in the rendered profile: {block}"
+            has_policy_line,
+            "rendered profile must include the policy line"
         );
     }
 
@@ -397,9 +398,10 @@ mod tests {
             Path::new("certs/edge-proxy.key"),
             None,
         );
+        let has_policy_line = block.contains("cert_group_gid");
         assert!(
-            !block.contains("cert_group_gid"),
-            "cert_group_gid must not appear when no policy is set: {block}"
+            !has_policy_line,
+            "rendered profile must omit the policy line when unset"
         );
     }
 
