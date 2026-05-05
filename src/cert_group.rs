@@ -98,6 +98,18 @@ pub enum CertGroupError {
     /// The supplied name was not present in the host's group database.
     #[error("--cert-group: group {0:?} not found in the host group database")]
     UnknownName(String),
+    /// The numeric gid is not present in the host's group database. Most
+    /// often this means the operator passed a gid that exists on a
+    /// different host (e.g. the container image's runtime user) but not
+    /// on the cert-writing host. The kernel would still accept
+    /// `chown(-1, gid)` for an orphan gid, so without this check the
+    /// misconfiguration would persist silently and only surface as an
+    /// access failure inside the consumer.
+    #[error("--cert-group {gid}: gid not found in the host group database")]
+    UnknownGid {
+        /// The gid that does not resolve.
+        gid: u32,
+    },
     /// The current process cannot `chown(-1, gid)` because it is not a
     /// supplementary member of the target group (and is not root).
     #[error(
@@ -164,21 +176,78 @@ pub fn parse_cert_group_remote(raw: &str) -> Result<u32, CertGroupError> {
 }
 
 /// Validates that the current process can `chown(-1, gid)` to the
-/// requested target. Used at `service add` / `service update` time on
-/// the control host for `local-file` deployments only.
+/// requested target on the cert-writing host. Used at `service add` /
+/// `service update` time on the control host for `local-file`
+/// deployments only — the control host is also the cert-writing host
+/// in that mode, so substantive checks (gid existence, chown
+/// permission) run here. The `remote-bootstrap` path runs the
+/// equivalent checks on the remote agent host via
+/// [`validate_cert_writing_host_gid`].
 ///
 /// # Errors
 ///
-/// Returns [`CertGroupError::NotMember`] when the caller is not a
-/// supplementary member of `gid` and is not root.
+/// Returns [`CertGroupError::RootGid`] when `gid == 0`,
+/// [`CertGroupError::UnknownGid`] when the gid is not present in the
+/// host's group database, or [`CertGroupError::NotMember`] when the
+/// caller is not a supplementary member of `gid` and is not root.
 pub fn validate_local_gid_membership(gid: u32) -> Result<(), CertGroupError> {
-    if gid == 0 {
-        return Err(CertGroupError::RootGid);
-    }
+    validate_cert_writing_host_gid(gid)?;
     if !caller_can_chown_to(gid) {
         return Err(CertGroupError::NotMember { gid });
     }
     Ok(())
+}
+
+/// Validates that `gid` is non-zero and is present in the cert-writing
+/// host's group database. The presence check uses `getgrgid_r` so an
+/// orphan numeric gid (one that exists on a different host but not
+/// here) is rejected loudly rather than persisting silently and
+/// surfacing only as a downstream access failure inside the consumer.
+///
+/// This is the substantive check that the issue #593 review calls
+/// out for both deployment modes — `local-file` runs it at `service
+/// add` / `service update` time on the control host (which is also
+/// the cert-writing host), and `remote-bootstrap` runs it on the
+/// remote agent host at `bootroot-remote bootstrap` time.
+///
+/// # Errors
+///
+/// Returns [`CertGroupError::RootGid`] when `gid == 0` or
+/// [`CertGroupError::UnknownGid`] when the gid is not present in the
+/// host's group database.
+pub fn validate_cert_writing_host_gid(gid: u32) -> Result<(), CertGroupError> {
+    if gid == 0 {
+        return Err(CertGroupError::RootGid);
+    }
+    if !gid_exists_on_host(gid) {
+        return Err(CertGroupError::UnknownGid { gid });
+    }
+    Ok(())
+}
+
+/// Returns true when `gid` is present in the host's group database
+/// (`getgrgid_r`). Used to reject orphan numeric gids that exist on a
+/// different host (e.g. the container's runtime user) but not on the
+/// host that will actually `chown` the cert/key files.
+#[must_use]
+pub fn gid_exists_on_host(gid: u32) -> bool {
+    let mut buf: Vec<libc::c_char> = vec![0; 4096];
+    // SAFETY: zeroed `libc::group` is a valid initial value because all
+    // fields are pointers/integers and the call below populates them.
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: All pointers point to live, exclusively-borrowed buffers
+    // for the duration of the call.
+    let rc = unsafe {
+        libc::getgrgid_r(
+            gid,
+            std::ptr::addr_of_mut!(grp),
+            buf.as_mut_ptr(),
+            buf.len(),
+            std::ptr::addr_of_mut!(result),
+        )
+    };
+    rc == 0 && !result.is_null()
 }
 
 /// Returns true when the current process is permitted to `chown(-1, gid)`
@@ -569,6 +638,33 @@ mod tests {
             validate_local_gid_membership(0),
             Err(CertGroupError::RootGid)
         ));
+    }
+
+    /// `getgrgid_r` returns "not found" for a gid that is highly
+    /// unlikely to exist in the host group DB. The exact value chosen
+    /// (`4_000_000_000`) is deliberately well above the typical 16-bit
+    /// gid range and any reasonable system gid allocation.
+    #[test]
+    fn validate_cert_writing_host_gid_rejects_unknown_gid() {
+        let outcome = validate_cert_writing_host_gid(4_000_000_000);
+        assert!(
+            matches!(outcome, Err(CertGroupError::UnknownGid { gid: 4_000_000_000 })),
+            "expected UnknownGid, got {outcome:?}"
+        );
+    }
+
+    /// The current process's effective gid must always exist in the
+    /// host's group DB; this exercises the success path of the
+    /// existence check without depending on any specific named group.
+    #[test]
+    fn validate_cert_writing_host_gid_accepts_caller_egid() {
+        let egid = current_process_egid();
+        if egid == 0 {
+            // root primary gid would be rejected by the gid==0 guard;
+            // skip on root-running test environments.
+            return;
+        }
+        validate_cert_writing_host_gid(egid).expect("egid must resolve in the host group DB");
     }
 
     #[test]

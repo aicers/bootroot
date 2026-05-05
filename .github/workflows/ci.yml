@@ -137,8 +137,35 @@ jobs:
       - name: Pre-pull openbao image for real-daemon TLS E2E
         run: docker pull openbao/openbao:latest
 
+      # Issue #593: provision a dedicated supplementary group for the
+      # runner so `tests/e2e_cert_group_chown.rs` actually exercises a
+      # non-primary gid through the kernel chown permission check. The
+      # test refuses to silently skip when
+      # BOOTROOT_E2E_REQUIRE_CERT_GROUP=1 is exported, so a runner that
+      # ever loses this fixture surfaces as a CI failure rather than
+      # green.
+      - name: Provision cert-group fixture for e2e_cert_group_chown
+        id: cert_group_fixture
+        run: |
+          set -euo pipefail
+          GROUP_NAME="bootroot-e2e-certgrp"
+          if ! getent group "$GROUP_NAME" >/dev/null; then
+            sudo groupadd "$GROUP_NAME"
+          fi
+          GID="$(getent group "$GROUP_NAME" | cut -d: -f3)"
+          sudo usermod -aG "$GROUP_NAME" "$USER"
+          echo "BOOTROOT_E2E_CERT_GROUP_GID=$GID" >> "$GITHUB_ENV"
+          echo "BOOTROOT_E2E_REQUIRE_CERT_GROUP=1" >> "$GITHUB_ENV"
+          echo "BOOTROOT_E2E_CERT_GROUP_NAME=$GROUP_NAME" >> "$GITHUB_ENV"
+          echo "Provisioned $GROUP_NAME (gid=$GID) and added $USER as supplementary member"
+
       - name: Run Unit Tests
-        run: cargo test
+        # `usermod -aG` updates /etc/group but the current shell process
+        # doesn't pick up the new supplementary membership. `sg` spawns
+        # a new shell whose group list reflects the updated /etc/group,
+        # so cargo test sees the gid as a real supplementary group and
+        # the kernel `chown(-1, gid)` check actually runs.
+        run: sg "$BOOTROOT_E2E_CERT_GROUP_NAME" -c "cargo test"
 
       # --- E2E Integration Testing (Docker) ---
       - name: Set secrets directory

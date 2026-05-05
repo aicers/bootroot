@@ -887,6 +887,46 @@ mod tests {
         assert!(err.to_string().contains("cert_group_gid"));
     }
 
+    /// `cert_group_gid` set to a value not present in the host's group
+    /// database is rejected at validation. This is the orphan-gid case
+    /// called out in the issue #593 review: a numeric gid that exists
+    /// on a different host (e.g. the container image's runtime user)
+    /// but not on the cert-writing host. Without this check the kernel
+    /// would silently accept `chown(-1, gid)` and the consumer would
+    /// still hit EACCES because the gid resolves to no real group.
+    #[test]
+    fn validate_rejects_cert_group_gid_unknown_on_host() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+            domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
+
+            [[profiles]]
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+            cert_group_gid = 4000000000
+
+            [profiles.paths]
+            cert = "certs/edge-proxy.pem"
+            key = "certs/edge-proxy.key"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        let err = settings.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cert_group_gid") && msg.contains("4000000000"),
+            "expected unknown-gid error, got: {msg}",
+        );
+    }
+
     /// Accepts the common case where `[openbao]` carries an absolute
     /// `state_path` — this is what `bootroot-remote bootstrap`
     /// auto-provisions when `agent_config_path` is absolute.

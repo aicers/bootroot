@@ -720,6 +720,18 @@ Cert/key group-access policy:
   - `--cert-group 0` (root) is rejected. The operator-only default
     already works for root; granting "the root group" would be a
     no-op against an obvious misconfiguration.
+  - The numeric gid must also resolve in the **cert-writing host's**
+    group database (`getgrgid_r`). An orphan gid — one that exists
+    on a different host (e.g. the container image's runtime user)
+    but not on the host that will actually `chown` the cert/key
+    files — is rejected loudly. For `local-file` this check runs at
+    `service add` / `service update` time on the control host
+    (which is also the cert-writing host); for `remote-bootstrap`
+    the same check runs on the remote agent host at
+    `bootroot-remote bootstrap` time, and again at `bootroot-agent`
+    config validation. Without this check the kernel would silently
+    accept `chown(-1, gid)` and the consumer would still hit
+    `EACCES` because the gid resolves to no real group.
   - When the policy is active, the cert parent directory is
     treated as a bootroot-owned cert output directory: mixing
     unrelated files into it is unsupported, since `0755` broadens

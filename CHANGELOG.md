@@ -272,7 +272,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   by simply re-running the command, without `state.json` ever
   drifting ahead of the on-disk managed profile.
   `--cert-group 0` (root) is rejected at parse time and during
-  config validation. The key file is written via stage-then-rename
+  config validation. `cert_group_gid` is also rejected when it does
+  not resolve in the cert-writing host's group database
+  (`getgrgid_r`): this orphan-gid case (a numeric gid that exists on
+  a different host — e.g. the container's runtime user — but not on
+  the host that will actually `chown` the cert/key files) is checked
+  at `service add` / `service update` time on the control host for
+  `local-file`, at `bootroot-remote bootstrap` time on the remote
+  agent host for `remote-bootstrap`, and again at `bootroot-agent`
+  config validation, so it surfaces as a loud failure instead of
+  passing the kernel `chown` and reappearing as EACCES inside the
+  consumer. The key file is written via stage-then-rename
   (sibling temp file created with `O_CREAT|O_EXCL` and `mode=0600`,
   `chown`d, promoted to `0640`, then renamed over the destination)
   so the destination path is never observable at a mode wider than

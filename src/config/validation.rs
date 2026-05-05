@@ -201,11 +201,18 @@ fn validate_profile(profile: &DaemonProfileSettings) -> Result<()> {
     if profile.paths.key.as_os_str().is_empty() {
         anyhow::bail!("profiles.paths.key must not be empty");
     }
-    if profile.cert_group_gid == Some(0) {
+    if let Some(gid) = profile.cert_group_gid {
         // gid 0 is `root`. The default agent identity already has
         // root or operator-only access; granting "the root group"
         // would be a no-op and is an obvious misconfiguration.
-        anyhow::bail!("profiles.cert_group_gid must not be 0 (root)");
+        // The presence check (getgrgid_r) catches the orphan-gid
+        // case where the gid exists on a different host (e.g. the
+        // container image's runtime user) but not on this
+        // cert-writing host, where `chown(-1, gid)` would silently
+        // succeed and the consumer would still hit EACCES. Issue
+        // #593 review.
+        crate::cert_group::validate_cert_writing_host_gid(gid)
+            .map_err(|err| anyhow::anyhow!("profiles.cert_group_gid: {err}"))?;
     }
     if let Some(retry) = &profile.retry {
         validate_retry_settings(&retry.backoff_secs, "profiles.retry.backoff_secs")?;

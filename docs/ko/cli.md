@@ -700,6 +700,18 @@ bootroot status
   - `--cert-group 0`(root)은 거부됩니다. 운영자 전용 기본값이
     이미 root에 대해 동작하므로 의미가 없으며 명백한 오설정에
     해당합니다.
+  - 숫자 gid는 **인증서를 기록하는 호스트의** 그룹 데이터베이스
+    (`getgrgid_r`)에 반드시 존재해야 합니다. 다른 호스트(예:
+    컨테이너 이미지의 런타임 사용자)에는 존재하지만 실제로
+    `chown`을 수행하는 호스트에는 없는 고아(orphan) gid는
+    명시적으로 거부됩니다. `local-file`의 경우 control host(즉
+    인증서를 기록하는 호스트)에서 `service add` / `service update`
+    시점에 검사하고, `remote-bootstrap`의 경우 원격 agent host에서
+    `bootroot-remote bootstrap` 시점에 검사하며, 추가로
+    `bootroot-agent` 설정 검증에서도 다시 검사합니다. 이 검사가
+    없으면 커널은 `chown(-1, gid)`를 무음으로 받아들이지만 gid가
+    실제 그룹으로 해석되지 않아 컨슈머는 여전히 `EACCES`를 만나게
+    됩니다.
   - 정책이 활성화된 경우 cert 상위 디렉터리는 bootroot가 소유하는
     인증서 출력 디렉터리로 취급됩니다: `0755`로 인해 traversal이
     넓어지므로 무관한 파일을 같은 디렉터리에 두는 것은 지원되지

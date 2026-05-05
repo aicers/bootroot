@@ -452,6 +452,39 @@ fn validate_bootstrap_args(args: &ResolvedBootstrapArgs, lang: Locale) -> Result
             )
         );
     }
+    validate_artifact_cert_group_gid(args.cert_group_gid, lang)?;
+    Ok(())
+}
+
+/// Validates the `cert_group_gid` carried in the bootstrap artifact
+/// against the *remote agent host's* group database. The control host
+/// only enforces the syntactic check (numeric, non-zero); the
+/// substantive existence check belongs here, on the cert-writing host,
+/// because this is where `chown(-1, gid)` will actually run. Failing
+/// loudly here keeps an orphan numeric gid from persisting silently
+/// into rotation only to surface as an EACCES inside the consumer.
+fn validate_artifact_cert_group_gid(gid: Option<u32>, lang: Locale) -> Result<()> {
+    let Some(gid) = gid else {
+        return Ok(());
+    };
+    if let Err(err) = bootroot::cert_group::validate_cert_writing_host_gid(gid) {
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                &format!(
+                    "Bootstrap artifact requested cert_group_gid={gid} but the gid is invalid \
+                     on this remote agent host: {err}. Pre-provision the same numeric gid \
+                     on this host (e.g. `sudo groupadd -g {gid} <name>`) and re-run bootstrap.",
+                ),
+                &format!(
+                    "부트스트랩 아티팩트의 cert_group_gid={gid}이 이 원격 에이전트 호스트에서 \
+                     유효하지 않습니다: {err}. 이 호스트에 동일한 숫자 gid를 미리 생성한 후 \
+                     (예: `sudo groupadd -g {gid} <name>`) bootstrap을 다시 실행하세요.",
+                ),
+            )
+        );
+    }
     Ok(())
 }
 
@@ -689,6 +722,41 @@ mod tests {
         assert!(
             !super::is_openbao_token_rejection(&err),
             "500 should not be classified as token rejection"
+        );
+    }
+
+    /// Bootstrap on the remote agent host must reject a
+    /// `cert_group_gid` that does not resolve in the host's group
+    /// database. This is the orphan-gid path called out in the
+    /// issue #593 round 2 review: the control host accepts numeric
+    /// gids syntactically without an NSS lookup (because the
+    /// control host's NSS may diverge from the remote host's NSS),
+    /// so the substantive existence check has to run here.
+    #[test]
+    fn validate_bootstrap_args_rejects_unknown_cert_group_gid() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let role_id_path = dir.path().join("role_id");
+        std::fs::write(&role_id_path, "rid").expect("write role_id");
+        let secret_id_path = dir.path().join("secret_id");
+        std::fs::write(&secret_id_path, "sid").expect("write secret_id");
+
+        let mut args = dummy_args();
+        args.service_name = "svc".to_string();
+        args.profile_hostname = "host".to_string();
+        args.agent_domain = "example.com".to_string();
+        args.profile_instance_id = Some("1".to_string());
+        args.role_id_path = role_id_path;
+        args.secret_id_path = secret_id_path;
+        args.eab_file_path = dir.path().join("eab.json");
+        args.cert_group_gid = Some(4_000_000_000);
+
+        let err = validate_bootstrap_args(&args, Locale::En)
+            .expect_err("unknown gid must fail bootstrap validation");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cert_group_gid") && msg.contains("4000000000"),
+            "expected unknown-gid error, got: {msg}",
         );
     }
 

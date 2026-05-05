@@ -10,13 +10,18 @@
 //! resulting file matches the requested policy gid.
 //!
 //! Behavior:
-//! - Honors the `BOOTROOT_E2E_CERT_GROUP_GID` env var when the CI
-//!   fixture provisions a dedicated supplementary group for the
-//!   runner user. The number must be non-zero and a supplementary
-//!   gid of the current process.
-//! - Falls back to one of the current process's supplementary gids
-//!   (excluding the primary gid). Skips when none exists, so local
-//!   developer runs without supplementary groups still pass.
+//! - When `BOOTROOT_E2E_REQUIRE_CERT_GROUP=1` is set (CI fixture
+//!   path), the test fails — rather than skips — if
+//!   `BOOTROOT_E2E_CERT_GROUP_GID` is missing, zero, equal to the
+//!   primary gid, unknown to the host group DB, or one the caller
+//!   cannot chown to. This is what locks in the e2e-extended
+//!   regression: a CI environment that didn't provision the fixture
+//!   shows up as a failure, not a silent green.
+//! - Otherwise (local developer runs), the test honors
+//!   `BOOTROOT_E2E_CERT_GROUP_GID` when usable, falls back to a
+//!   supplementary gid of the current process, and skips when no
+//!   suitable gid exists. This keeps `cargo test` runnable on
+//!   developer machines without group setup.
 
 #![cfg(unix)]
 
@@ -29,16 +34,68 @@ use bootroot::cert_group::{
 };
 use bootroot::fs_util;
 
-fn pick_test_gid() -> Option<u32> {
-    if let Ok(raw) = std::env::var("BOOTROOT_E2E_CERT_GROUP_GID")
+const REQUIRE_ENV: &str = "BOOTROOT_E2E_REQUIRE_CERT_GROUP";
+const GID_ENV: &str = "BOOTROOT_E2E_CERT_GROUP_GID";
+
+fn require_ci_fixture() -> bool {
+    matches!(
+        std::env::var(REQUIRE_ENV).ok().as_deref(),
+        Some("1" | "true" | "yes" | "TRUE")
+    )
+}
+
+/// Resolves the gid the test should chown to. In CI-fixture mode
+/// (`BOOTROOT_E2E_REQUIRE_CERT_GROUP=1`) the env-provided gid is
+/// mandatory and any deviation panics with a description of how to
+/// fix the fixture. In dev mode a missing/unusable env var falls
+/// back to a supplementary gid; if none is available the caller
+/// returns `None` and the test is skipped.
+fn resolve_test_gid() -> Option<u32> {
+    let primary_gid = cert_group::current_process_egid();
+    let raw = std::env::var(GID_ENV).ok();
+
+    if require_ci_fixture() {
+        let raw = raw.unwrap_or_else(|| {
+            panic!(
+                "{REQUIRE_ENV}=1 but {GID_ENV} is not set; the CI fixture \
+                 must create a dedicated group, add the runner to it, and \
+                 export the numeric gid before running cargo test"
+            )
+        });
+        let gid: u32 = raw.trim().parse().unwrap_or_else(|_| {
+            panic!("{GID_ENV}={raw:?} is not a valid numeric gid")
+        });
+        assert!(gid != 0, "{GID_ENV}=0 is rejected: gid 0 is root");
+        assert!(
+            gid != primary_gid,
+            "{GID_ENV}={gid} equals the runner's primary gid; the fixture \
+             must allocate a dedicated group whose gid differs from the \
+             runner's primary gid so the chown path is actually exercised"
+        );
+        assert!(
+            cert_group::gid_exists_on_host(gid),
+            "{GID_ENV}={gid} is not present in the host group database; \
+             the fixture must `groupadd` the gid before exporting it"
+        );
+        assert!(
+            cert_group::caller_can_chown_to(gid),
+            "{GID_ENV}={gid} is set but the caller is not a supplementary \
+             member of that group; the fixture must `usermod -aG <name> \
+             $USER` and re-enter the shell (e.g. `sg <name> -c ...`) so \
+             the supplementary membership is visible to the test process"
+        );
+        return Some(gid);
+    }
+
+    if let Some(raw) = raw
         && let Ok(gid) = raw.trim().parse::<u32>()
     {
-        if gid != 0 && cert_group::caller_can_chown_to(gid) {
+        if gid != 0 && gid != primary_gid && cert_group::caller_can_chown_to(gid) {
             return Some(gid);
         }
         eprintln!(
-            "BOOTROOT_E2E_CERT_GROUP_GID={raw} unusable (zero or caller is not a member); \
-             falling back to a supplementary gid"
+            "{GID_ENV}={raw} unusable (zero, equal to primary gid, or caller \
+             is not a member); falling back to a supplementary gid"
         );
     }
     cert_group::one_supplementary_test_gid()
@@ -46,7 +103,7 @@ fn pick_test_gid() -> Option<u32> {
 
 #[tokio::test]
 async fn cert_group_chown_full_round_trip_distinct_parents() {
-    let Some(gid) = pick_test_gid() else {
+    let Some(gid) = resolve_test_gid() else {
         eprintln!("skipped: no supplementary gid available for chown test");
         return;
     };
@@ -92,7 +149,7 @@ async fn cert_group_chown_full_round_trip_distinct_parents() {
 /// container-access fix.
 #[tokio::test]
 async fn cert_group_chown_rotation_re_asserts_gid_ownership() {
-    let Some(gid) = pick_test_gid() else {
+    let Some(gid) = resolve_test_gid() else {
         eprintln!("skipped: no supplementary gid available for chown test");
         return;
     };
