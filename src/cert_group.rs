@@ -16,8 +16,9 @@
 //! See `docs/services/cert-group.md` for the operator-facing overview.
 
 use std::ffi::CString;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::io::Write as _;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use thiserror::Error;
@@ -269,29 +270,111 @@ fn resolve_group_name(name: &str) -> Option<u32> {
 
 /// Writes a private key file under the given policy.
 ///
-/// When `policy` is active, the file is first created at the secure
-/// `0600` default, then `chown`d to the target gid, then promoted to
-/// `0640`. The order matters: opening the file group-readable before
-/// the `chown` lands would briefly expose the key under the operator's
-/// primary gid, which is not the intended audience.
+/// The implementation is staging-then-rename: the bytes are first written
+/// to a temporary file in the same directory created with `O_CREAT |
+/// O_EXCL` and `mode=0600`, the staged file is `chown`d (when policy is
+/// active) and promoted to `0640`, and only then is it `rename`d over
+/// the destination. The destination path is therefore never observable
+/// at a mode wider than the final policy: there is no window where the
+/// destination exists at the umask-derived mode (typically `0644`) before
+/// the clamp lands, and no window where the file is group-readable under
+/// the operator's primary gid before the chown lands. This addresses the
+/// atomic-write requirement called out in issue #593.
 ///
 /// # Errors
 ///
-/// Returns an error if the write, chown, or chmod fails.
+/// Returns an error if the staging write, chown, chmod, or rename fails.
 pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy) -> Result<()> {
-    fs::write(path, key_pem)
-        .await
-        .with_context(|| format!("Failed to write key file {}", path.display()))?;
-    fs::set_permissions(path, std::fs::Permissions::from_mode(KEY_FILE_MODE_DEFAULT))
-        .await
-        .with_context(|| format!("Failed to set initial 0600 on {}", path.display()))?;
-    if let Some(gid) = policy.gid {
-        chown_path(path, gid).await?;
-        fs::set_permissions(path, std::fs::Permissions::from_mode(KEY_FILE_MODE_GROUP))
-            .await
-            .with_context(|| format!("Failed to set 0640 on {}", path.display()))?;
-    }
+    let dest = path.to_path_buf();
+    let key_owned = key_pem.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let parent = dest
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Key path {} has no parent", dest.display()))?;
+        let file_name = dest
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Key path {} has no file name", dest.display()))?;
+
+        let staged = stage_key_file(parent, file_name, &key_owned, policy)?;
+        std::fs::rename(&staged, &dest).map_err(|err| {
+            let _ = std::fs::remove_file(&staged);
+            anyhow::Error::new(err).context(format!(
+                "Failed to rename {} to {}",
+                staged.display(),
+                dest.display()
+            ))
+        })?;
+        Ok(())
+    })
+    .await
+    .context("write_key_file task panicked")??;
     Ok(())
+}
+
+/// Creates the key staging file at `0600` with `O_CREAT|O_EXCL`, writes
+/// the key bytes, applies the policy's chown / chmod while the file is
+/// still at its temporary path, and returns the staged path so the caller
+/// can `rename` it over the destination.
+fn stage_key_file(
+    parent: &Path,
+    final_name: &str,
+    key_pem: &str,
+    policy: CertGroupPolicy,
+) -> Result<PathBuf> {
+    let pid = std::process::id();
+    for attempt in 0u32..32 {
+        let candidate = parent.join(format!(".{final_name}.tmp.{pid}.{attempt}"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create_new(true)
+            .write(true)
+            .mode(KEY_FILE_MODE_DEFAULT);
+        match opts.open(&candidate) {
+            Ok(mut f) => {
+                if let Err(err) = f.write_all(key_pem.as_bytes()) {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(anyhow::Error::new(err)
+                        .context(format!("Failed to write {}", candidate.display())));
+                }
+                if let Err(err) = f.sync_all() {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(anyhow::Error::new(err)
+                        .context(format!("Failed to fsync {}", candidate.display())));
+                }
+                drop(f);
+                if let Some(gid) = policy.gid {
+                    if let Err(err) = std::os::unix::fs::chown(&candidate, None, Some(gid)) {
+                        let _ = std::fs::remove_file(&candidate);
+                        return Err(anyhow::Error::new(err).context(format!(
+                            "Failed to chown {} to gid {gid}",
+                            candidate.display()
+                        )));
+                    }
+                    if let Err(err) = std::fs::set_permissions(
+                        &candidate,
+                        std::fs::Permissions::from_mode(KEY_FILE_MODE_GROUP),
+                    ) {
+                        let _ = std::fs::remove_file(&candidate);
+                        return Err(anyhow::Error::new(err)
+                            .context(format!("Failed to chmod 0640 on {}", candidate.display())));
+                    }
+                }
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "Failed to create staging file in {}",
+                    parent.display()
+                )));
+            }
+        }
+    }
+    anyhow::bail!(
+        "Failed to allocate a staging file for {} in {} after 32 attempts",
+        final_name,
+        parent.display()
+    )
 }
 
 /// Writes a public certificate file under the given policy.
@@ -367,7 +450,7 @@ pub async fn ensure_cert_parent_dir(
         .await
         .with_context(|| format!("Failed to create cert parent dir {}", path.display()))?;
     let mode = if policy.is_active() {
-        if path == key_dir {
+        if same_directory(path, key_dir) {
             KEY_DIR_MODE_GROUP
         } else {
             CERT_DIR_MODE_GROUP
@@ -382,6 +465,34 @@ pub async fn ensure_cert_parent_dir(
         chown_path(path, gid).await?;
     }
     Ok(())
+}
+
+/// Returns true when `a` and `b` refer to the same directory on disk,
+/// using the kernel's `(dev, ino)` identity rather than textual path
+/// equality. Both paths must already exist (the cert/key parents are
+/// `mkdir -p`'d before this is called).
+///
+/// Textual comparison would treat `certs` and `certs/.` (or `./certs`,
+/// or symlinked variants) as distinct directories, which on `--cert-
+/// group` services would cause `ensure_cert_parent_dir` to widen the
+/// shared key/cert directory to `0755` even though
+/// `ensure_key_parent_dir` had already locked it down to `0750`. The
+/// shared-parent case is the security-relevant one (key directory must
+/// not become world-traversable), so it has to be detected reliably.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    // Both parents are `mkdir -p`'d before this is called in production,
+    // but `ensure_key_parent_dir` runs against `key_dir` separately and
+    // some call sites (and tests) only materialise one of the two. If
+    // either path is missing, they cannot be the same directory by any
+    // meaningful definition, so fall through to "distinct" rather than
+    // surfacing a stat error.
+    let Ok(meta_a) = std::fs::metadata(a) else {
+        return false;
+    };
+    let Ok(meta_b) = std::fs::metadata(b) else {
+        return false;
+    };
+    meta_a.dev() == meta_b.dev() && meta_a.ino() == meta_b.ino()
 }
 
 /// Chowns `path` to `(uid=preserved, gid=gid)`.
@@ -545,5 +656,89 @@ mod tests {
             .unwrap();
         let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, KEY_DIR_MODE_GROUP);
+    }
+
+    /// Regression test for the issue #593 review: the shared-parent
+    /// detection must be robust against path spellings that are textually
+    /// distinct but resolve to the same directory (`certs` vs
+    /// `certs/.`). A previous textual comparison would let
+    /// `ensure_cert_parent_dir` widen the directory to `0755` after
+    /// `ensure_key_parent_dir` had locked it down to `0750`, which
+    /// would silently broaden traversal of the key parent.
+    #[tokio::test]
+    async fn ensure_cert_parent_dir_with_policy_shared_via_dot_segment_stays_0750() {
+        let Some(gid) = one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let dotted = shared.join(".");
+
+        ensure_key_parent_dir(&shared, CertGroupPolicy::with_gid(gid))
+            .await
+            .unwrap();
+        ensure_cert_parent_dir(&dotted, &shared, CertGroupPolicy::with_gid(gid))
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, KEY_DIR_MODE_GROUP,
+            "shared cert/key parent must stay at 0750 even when the \
+             cert path is spelled with a `/.` suffix"
+        );
+    }
+
+    /// Regression test for the issue #593 review: the destination key
+    /// path must never be observable at a mode wider than the final
+    /// policy. Specifically, on first issuance the file must not exist
+    /// at `0644` (umask-derived) before being clamped to `0600`. The
+    /// staging-then-rename implementation guarantees this by creating
+    /// the staging file with `O_CREAT|O_EXCL` and `mode=0600` and only
+    /// renaming once the policy is fully applied.
+    #[tokio::test]
+    async fn write_key_file_no_policy_first_issuance_is_never_0644() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("k");
+        // Pre-condition: destination does not exist.
+        assert!(!key.exists());
+        write_key_file(&key, "K", CertGroupPolicy::none())
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, KEY_FILE_MODE_DEFAULT);
+        // The destination must not be world-readable at any point. We
+        // can only assert the post-condition here, but the staging-
+        // then-rename implementation also guarantees no transient
+        // wider-than-0600 mode at the destination path.
+        assert_eq!(mode & 0o077, 0, "key file must not be group/other-readable");
+    }
+
+    /// Rotation must atomically replace the destination, leaving the
+    /// final mode and content correct even though the previous file
+    /// existed under a different mode.
+    #[tokio::test]
+    async fn write_key_file_rotation_replaces_atomically_with_policy() {
+        let Some(gid) = one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("k");
+        write_key_file(&key, "first", CertGroupPolicy::with_gid(gid))
+            .await
+            .unwrap();
+        // Hostile operator-side regression: clamp back to 0600 with
+        // operator's primary gid.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_key_file(&key, "second", CertGroupPolicy::with_gid(gid))
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&key).unwrap();
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(contents, "second");
+        assert_eq!(mode, KEY_FILE_MODE_GROUP);
     }
 }

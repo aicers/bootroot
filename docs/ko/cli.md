@@ -710,6 +710,15 @@ bootroot status
 전달되고, `DaemonProfileSettings`에 노출됩니다 — 회전 시마다
 동일한 정책이 다시 적용됩니다.
 
+원자성: 키 파일은 stage-then-rename 방식으로 기록됩니다 — 같은
+디렉터리의 임시 파일을 `O_CREAT|O_EXCL`와 `mode=0600`으로 먼저
+생성한 뒤, (정책이 활성화된 경우) 그 임시 파일에 대해 `chown`을
+적용하고 `0640`으로 승격한 후, 마지막으로 목적지에 `rename`합니다.
+따라서 목적지 경로는 최종 정책보다 넓은 모드로 노출되는 순간이
+존재하지 않습니다 — 클램프 전 umask 기반의 `0644` 윈도우도,
+chown 전 운영자 기본 gid 하에서 group-readable로 잠시 노출되는
+윈도우도 존재하지 않습니다.
+
 ### 대화형 동작
 
 - 누락된 필수 입력을 프롬프트로 받습니다(배포 타입 기본값: `daemon`).
@@ -770,7 +779,12 @@ bootroot status
   재발행(`bootroot service add`)하고 원격 agent 호스트에서
   `bootroot-remote bootstrap --artifact <path>`를 다시 실행하라는
   경고를 출력합니다. 근거 및 모드별 수용 규칙은 `service add` 섹션을
-  참조하세요.
+  참조하세요. local-file 재렌더링은 `state.json` 저장 이전에 실행되며,
+  같은 `--cert-group` 값으로 재실행하더라도 (state에 이미 같은
+  값이 저장되어 있더라도) 재렌더링이 다시 트리거됩니다 — 따라서
+  이전 재렌더링이 실패한 경우 단순히 동일 명령을 다시 실행하면
+  복구되며, `state.json`이 디스크의 관리 프로필보다 앞서나가는
+  상황은 발생하지 않습니다.
 
 ### 동작
 

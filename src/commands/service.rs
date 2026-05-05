@@ -638,7 +638,17 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         }
     }
 
+    // `cert_group_supplied` triggers a re-render of the managed
+    // agent.toml profile block (local-file) or the operator warning
+    // (remote-bootstrap) on every invocation that passes `--cert-group`,
+    // even when the requested gid matches what is already in state. This
+    // is the repair path for the split-brain class of bug called out in
+    // the issue #593 review: a previous attempt may have saved state but
+    // failed to re-render the managed profile, and a re-run with the
+    // same flag must be able to drive the on-disk profile back into sync
+    // rather than being short-circuited by the no-change early return.
     let mut redeploy_hint: Option<CertGroupRedeployHint> = None;
+    let cert_group_supplied = args.cert_group.is_some();
     if let Some(ref raw) = args.cert_group {
         let old_value = entry.cert_group_gid;
         let new_value = parse_cert_group_for_update(raw, entry.delivery_mode)?;
@@ -649,54 +659,69 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
                 &display_cert_group(old_value),
                 &display_cert_group(new_value),
             ));
-            redeploy_hint = Some(CertGroupRedeployHint {
-                delivery_mode: entry.delivery_mode,
-                service_name: args.service_name.clone(),
-            });
         }
+        redeploy_hint = Some(CertGroupRedeployHint {
+            delivery_mode: entry.delivery_mode,
+            service_name: args.service_name.clone(),
+        });
     }
 
     if explicit_ttl_set {
         eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
     }
 
-    if changes.is_empty() {
+    if changes.is_empty() && !cert_group_supplied {
         println!("{}", messages.service_update_no_changes());
         return Ok(());
     }
 
-    // Snapshot the entry before save so we can re-render the local
-    // managed agent.toml block in the local-file case without holding
-    // the borrow on `state` past the save.
+    // Snapshot the entry without holding the borrow on `state` past the
+    // re-render / save.
     let entry_snapshot = state.services.get(&args.service_name).cloned();
+
+    // Re-render the managed agent.toml block BEFORE persisting state.
+    // If the re-render fails, state.json stays unchanged so a re-run of
+    // the same `service update --cert-group ...` will still see the old
+    // value as the source of truth and re-trigger the re-render rather
+    // than short-circuiting on `changes.is_empty()`. This is the
+    // atomicity half of the issue #593 review's split-brain fix; the
+    // `cert_group_supplied`-driven re-render-on-every-invocation above
+    // is the retry half.
+    if let (Some(hint), Some(entry)) = (redeploy_hint.as_ref(), entry_snapshot.as_ref())
+        && matches!(hint.delivery_mode, DeliveryMode::LocalFile)
+    {
+        rerender_local_managed_profile(entry)?;
+    }
 
     state
         .save(&state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
 
-    if let (Some(hint), Some(entry)) = (redeploy_hint.as_ref(), entry_snapshot.as_ref()) {
-        match hint.delivery_mode {
-            DeliveryMode::LocalFile => {
-                rerender_local_managed_profile(entry)?;
-            }
-            DeliveryMode::RemoteBootstrap => {
-                // Persisting the gid in state.json alone is not enough
-                // for remote-bootstrap services — the remote agent
-                // reads from the bootstrap-rendered `agent.toml` on
-                // disk, and `service add` is the path that re-emits
-                // the artifact.  Fail loudly with the one-line follow-
-                // up the operator must run, so the next rotation
-                // actually picks up the new policy.
-                eprintln!(
-                    "warning: --cert-group changed for remote-bootstrap service {}.\n\
-                     Re-emit the bootstrap artifact with `bootroot service add` \
-                     and re-run `bootroot-remote bootstrap --artifact <path>` on \
-                     the remote agent host so the new cert_group_gid lands in the \
-                     remote agent.toml.",
-                    hint.service_name,
-                );
-            }
-        }
+    if let (Some(hint), Some(_)) = (redeploy_hint.as_ref(), entry_snapshot.as_ref())
+        && matches!(hint.delivery_mode, DeliveryMode::RemoteBootstrap)
+    {
+        // Persisting the gid in state.json alone is not enough for
+        // remote-bootstrap services — the remote agent reads from
+        // the bootstrap-rendered `agent.toml` on disk, and `service
+        // add` is the path that re-emits the artifact. Print a
+        // loud follow-up so the next rotation actually picks up
+        // the new policy.
+        eprintln!(
+            "warning: --cert-group changed for remote-bootstrap service {}.\n\
+             Re-emit the bootstrap artifact with `bootroot service add` \
+             and re-run `bootroot-remote bootstrap --artifact <path>` on \
+             the remote agent host so the new cert_group_gid lands in the \
+             remote agent.toml.",
+            hint.service_name,
+        );
+    }
+
+    if changes.is_empty() {
+        // `--cert-group` was supplied with the value already in state;
+        // we re-rendered the managed profile defensively but had no
+        // policy mutation to report.
+        println!("{}", messages.service_update_no_changes());
+        return Ok(());
     }
 
     println!("{}", messages.service_update_summary());

@@ -266,8 +266,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `service update --cert-group ...` re-renders the local managed
   profile block immediately for `local-file` services, and warns the
   operator to re-emit the bootstrap artifact for `remote-bootstrap`
-  services. `--cert-group 0` (root) is rejected at parse time and
-  during config validation. (Closes #593)
+  services. The local-file re-render runs before `state.json` is
+  persisted, and re-runs of the same `--cert-group` value re-trigger
+  the re-render — so a previously-failed re-render can be repaired
+  by simply re-running the command, without `state.json` ever
+  drifting ahead of the on-disk managed profile.
+  `--cert-group 0` (root) is rejected at parse time and during
+  config validation. The key file is written via stage-then-rename
+  (sibling temp file created with `O_CREAT|O_EXCL` and `mode=0600`,
+  `chown`d, promoted to `0640`, then renamed over the destination)
+  so the destination path is never observable at a mode wider than
+  the final policy — no umask-derived `0644` window before the
+  clamp, and no group-readable window under the operator's primary
+  gid before the chown lands. The shared cert/key parent detection
+  uses kernel `(dev, ino)` identity rather than textual path
+  equality, so spellings like `certs` vs `certs/.` cannot trick
+  `ensure_cert_parent_dir` into widening a shared key parent from
+  `0750` to `0755`. (Closes #593)
 - Added a non-interactive operation surface for CI/scripted rotations
   (Closes #587):
   - `bootroot rotate --yes`/`-y` is now a global flag accepted at any

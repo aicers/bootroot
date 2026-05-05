@@ -730,6 +730,15 @@ into the managed `agent.toml` profile block, threaded through the
 remote-bootstrap artifact, and surfaced on `DaemonProfileSettings`,
 so rotation always reapplies the same policy.
 
+Atomicity: the key file is written via stage-then-rename — the bytes
+are first written to a sibling temp file created with `O_CREAT|O_EXCL`
+and `mode=0600`, the staged file is `chown`d and promoted to `0640`
+(when the policy is active), and only then renamed over the
+destination. The destination path is therefore never observable at a
+mode wider than the final policy: there is no umask-derived `0644`
+window before the clamp, and no group-readable window under the
+operator's primary gid before the chown lands.
+
 ### Interactive behavior
 
 - Prompts for missing required inputs (deploy type defaults to `daemon`).
@@ -794,7 +803,12 @@ full `service add` flow. At least one policy flag is required.
   `bootroot-remote bootstrap --artifact <path>` on the remote
   agent host so the new `cert_group_gid` lands in the remote
   `agent.toml`. See `service add` for the rationale and per-mode
-  acceptance rules.
+  acceptance rules. The local-file re-render runs before
+  `state.json` is saved, and re-runs of the same `--cert-group`
+  value (even when it matches what is already in state) re-trigger
+  the re-render — so a previously-failed re-render can be repaired
+  by simply re-running the command, with no risk of state.json
+  drifting ahead of the on-disk managed profile.
 
 ### Behavior
 
