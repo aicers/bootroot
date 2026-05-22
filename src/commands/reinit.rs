@@ -620,7 +620,9 @@ fn locate_provisioners(value: &serde_json::Value) -> Option<&Vec<serde_json::Val
     {
         return Some(arr);
     }
-    value.get("provisioners").and_then(serde_json::Value::as_array)
+    value
+        .get("provisioners")
+        .and_then(serde_json::Value::as_array)
 }
 
 /// Builds the `InitArgs` payload used to re-run the standard init flow
@@ -1515,13 +1517,15 @@ mod tests {
             &reinit_args.secrets_dir.secrets_dir,
         );
         assert_eq!(
-            init_args.stepca_provisioner, "acme-custom",
+            init_args.stepca_provisioner,
+            "acme-custom",
             "reinit must derive the ACME provisioner name from the \
              preserved ca.json, not default to {default:?}",
             default = crate::commands::init::DEFAULT_STEPCA_PROVISIONER
         );
         assert_eq!(
-            init_args.cert_duration, "72h",
+            init_args.cert_duration,
+            "72h",
             "reinit must derive defaultTLSCertDuration from the preserved \
              ca.json, not default to {default:?}",
             default = crate::commands::init::DEFAULT_CERT_DURATION
