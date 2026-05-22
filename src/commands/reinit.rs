@@ -469,13 +469,15 @@ fn validate_root_token_output_path(path: &Path, messages: &Messages) -> Result<(
 /// `reinit` is supposed to recover from, just through a different
 /// explicit output channel.
 ///
-/// Checks are intentionally narrower than `validate_root_token_output_path`:
-/// `write_init_summary_json` later applies mode `0600` via
-/// `fs_util::set_key_permissions`, so we only verify the kernel will
-/// accept the write (regular file, parent writable) without imposing an
-/// existing-permission constraint.  An existing world-readable summary
-/// file is still acceptable because it will be overwritten and
-/// re-chmodded; the same logic applies to its containing directory.
+/// Mirrors `validate_root_token_output_path`.  The summary JSON carries
+/// the freshly issued root token and unseal keys (see `InitSummary`), so
+/// it must be written with the same atomic restricted-permission write
+/// discipline as `--root-token-output`.  In particular, existing
+/// world-/group-readable destinations are rejected here: even though
+/// `write_init_summary_json` re-applies `0600` after the write, the
+/// content lands in the pre-existing file's permission bits first, and
+/// a `0644` destination would briefly expose root token + unseal keys
+/// to other users on the host between the write and the chmod.
 fn validate_summary_json_output_path(path: &Path, messages: &Messages) -> Result<()> {
     let display = path.display().to_string();
 
@@ -492,6 +494,14 @@ fn validate_summary_json_output_path(path: &Path, messages: &Messages) -> Result
             if !target_meta.is_file() {
                 anyhow::bail!(messages.error_reinit_summary_json_not_file(&display));
             }
+        }
+        // Permission check uses follow-symlink metadata so a symlink to
+        // a regular file is evaluated against the target's mode.
+        let mode_meta =
+            std::fs::metadata(path).with_context(|| messages.error_read_file_failed(&display))?;
+        let mode = mode_meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(messages.error_reinit_summary_json_unsafe(&display));
         }
         // Probe writability the same way `validate_root_token_output_path`
         // does: open for write without `truncate(true)` so the existing
@@ -1289,13 +1299,14 @@ mod tests {
         );
     }
 
-    /// Existing `0644` summary file is acceptable — `write_init_summary_json`
-    /// applies `0600` via `set_key_permissions` after the write.  The
-    /// summary preflight intentionally tolerates wider existing
-    /// permissions because the file is overwritten and re-chmodded; the
-    /// stricter root-token-output mode check is not needed here.
+    /// Regression for Round 7 reviewer item: the summary JSON carries
+    /// the freshly issued root token and unseal keys, so an existing
+    /// world-/group-readable destination must be rejected at preflight.
+    /// Letting `write_init_summary_json` proceed against a `0644` file
+    /// would briefly leave the secret payload world-readable on disk
+    /// between the write and the post-write chmod.
     #[test]
-    fn validate_summary_json_accepts_world_readable_existing_file() {
+    fn validate_summary_json_rejects_world_readable_existing_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("summary.json");
         fs::write(&path, "{}").unwrap();
@@ -1303,8 +1314,31 @@ mod tests {
         perms.set_mode(0o644);
         fs::set_permissions(&path, perms).unwrap();
         let messages = test_messages();
+        let err = validate_summary_json_output_path(&path, &messages).unwrap_err();
+        // Restore so tempdir cleanup succeeds.
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms).unwrap();
+        assert!(
+            err.to_string().contains("--summary-json") || err.to_string().contains("summary-json"),
+            "got: {err}"
+        );
+    }
+
+    /// A `0600` existing summary file is acceptable: the destination
+    /// already meets the no-group/no-other-readable bar that
+    /// `write_init_summary_json`'s atomic write maintains.
+    #[test]
+    fn validate_summary_json_accepts_owner_only_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("summary.json");
+        fs::write(&path, "{}").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms).unwrap();
+        let messages = test_messages();
         validate_summary_json_output_path(&path, &messages)
-            .expect("0644 existing summary file is acceptable (write_init_summary_json re-chmods)");
+            .expect("0600 existing summary file is acceptable");
     }
 
     /// A missing destination is acceptable as long as the parent

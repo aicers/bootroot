@@ -176,13 +176,61 @@ async fn diagnose_partial_init(
     anyhow::bail!(messages.error_init_partial_openbao_state(&args.openbao.openbao_url));
 }
 
+/// Writes the init summary JSON to `path` atomically with mode `0600`.
+///
+/// The summary carries the freshly issued root token and unseal keys
+/// (see `InitSummary`).  A naive `tokio::fs::write` followed by
+/// `set_key_permissions` would briefly expose those secrets:
+/// 1. A newly created file picks up the process umask first (commonly
+///    `0644`) and is only chmodded to `0600` after the secrets land on
+///    disk.
+/// 2. An existing destination's pre-write mode is preserved by the
+///    write — overwriting a `0644` file leaves it world-readable while
+///    the secret-bearing JSON is on disk, until the subsequent chmod.
+///
+/// The same atomic-create discipline used by `write_root_token_file` is
+/// applied here: `OpenOptionsExt::mode(0o600)` ensures new files are
+/// born `0600`, and an explicit `set_permissions(0o600)` immediately
+/// after the write also restricts any pre-existing destination before
+/// `write_all` so the secrets never touch a wider-mode file.  Reinit's
+/// preflight (`validate_summary_json_output_path`) additionally
+/// rejects world-/group-readable existing destinations, but this write
+/// path is deliberately defensive — `--summary-json` may be invoked
+/// from the `init` flow (not just `reinit`) where no preflight runs.
 async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         tokio::fs::create_dir_all(parent).await?;
     }
     let payload = serde_json::to_string_pretty(summary)?;
-    tokio::fs::write(path, payload).await?;
-    fs_util::set_key_permissions(path).await?;
+    let path_buf = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Tighten an existing destination's permissions before any
+        // secret content is written.  No-op for missing files.  The
+        // `OpenOptions::mode` below covers the missing-file case so
+        // the file is born `0600`.
+        if path_buf.exists() {
+            std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path_buf)?;
+        file.write_all(payload.as_bytes())?;
+        file.sync_all()?;
+        // Re-assert permissions in case an existing file's mode
+        // changed between the pre-write set and the open call (e.g.
+        // unusual filesystem semantics).
+        std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking for summary json write failed: {e}"))??;
     Ok(())
 }
 

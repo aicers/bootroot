@@ -208,6 +208,13 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_reinit_summary_json_unsafe(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_reinit_summary_json_unsafe,
+            &[("path", path)],
+        )
+    }
+
     pub(crate) fn error_reinit_explicit_openbao_url(&self, url: &str) -> String {
         format_template(
             self.strings().error_reinit_explicit_openbao_url,

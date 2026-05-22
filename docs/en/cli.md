@@ -1677,10 +1677,18 @@ operator-managed runbook for those.
 - `--summary-json <path>`: passed through to `init`. The path is
   preflight-checked before any destructive operation: reinit refuses
   to start if the path is a directory, an unwritable existing file,
-  or has an unwritable / uncreatable parent. The summary JSON carries
-  the freshly issued root token and unseal keys, so an unwritable
+  an existing file with world-/group-readable permissions (mode
+  `0o644` etc. is rejected with a `chmod 0600` hint), or has an
+  unwritable / uncreatable parent. The summary JSON carries the
+  freshly issued root token and unseal keys, so an unwritable
   destination would recreate the partial-init trap through a
-  different output channel.
+  different output channel, and a wider-than-`0600` destination
+  would briefly leak those secrets on disk between the write and
+  the post-write chmod. The summary file itself is written
+  atomically: new files are born `0600` via the create-mode flag,
+  and any existing destination is tightened to `0600` before the
+  secret payload is written, so the JSON never lands on disk with
+  wider permissions.
 - `--no-eab`: passed through to `init`
 
 ### Behavior

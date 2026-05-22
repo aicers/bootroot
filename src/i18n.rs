@@ -520,6 +520,7 @@ pub(crate) struct Strings {
     pub(crate) error_reinit_root_token_persist_failed: &'static str,
     pub(crate) error_reinit_summary_json_not_file: &'static str,
     pub(crate) error_reinit_summary_json_unwritable: &'static str,
+    pub(crate) error_reinit_summary_json_unsafe: &'static str,
     pub(crate) error_reinit_explicit_openbao_url: &'static str,
 }
 

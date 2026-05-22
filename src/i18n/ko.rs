@@ -484,5 +484,6 @@ pub(super) static STRINGS: Strings = Strings {
     error_reinit_root_token_persist_failed: "경고: 새로 발급된 OpenBao 루트 토큰을 {path}에 저장하지 못했습니다 ({reason}). OpenBao 초기화는 완료되었으므로, 토큰이 소실되지 않도록 아래에 마스킹 없이 출력합니다 — 지금 즉시 캡처하여 안전하게 보관하세요.\nROOT_TOKEN={token}",
     error_reinit_summary_json_not_file: "reinit 시작 거부: `--summary-json` 대상 {path}이(가) 일반 파일이 아닙니다. 재시도하기 전에 일반 파일 경로를 전달하세요.",
     error_reinit_summary_json_unwritable: "reinit 시작 거부: `--summary-json` 대상 {path}에 쓸 수 없습니다 ({reason}). summary JSON에는 새로 발급된 루트 토큰과 unseal key가 포함되므로, 쓰기 불가능한 대상은 partial-init 트랩을 재현합니다. 재시도하기 전에 쓰기 가능한 파일 경로를 전달하세요.",
+    error_reinit_summary_json_unsafe: "reinit 시작 거부: 기존 `--summary-json` 대상 {path}이(가) other-/group-readable 권한을 가지고 있습니다. summary JSON에는 새로 발급된 루트 토큰과 unseal key가 포함되므로, 0600보다 넓은 권한의 파일에 쓰면 해당 비밀이 잠시 노출됩니다. 재시도하기 전에 `chmod 0600 {path}`를 실행하거나 파일을 삭제하세요.",
     error_reinit_explicit_openbao_url: "reinit 시작 거부: `bootroot reinit`은 compose로 관리되는 로컬 OpenBao에서만 동작하므로 명시적인 `--openbao-url {url}`은 허용되지 않습니다. reinit 대상 URL은 compose로 관리되는 서비스(및 스냅샷된 non-loopback bind가 있다면 그것)에서 파생됩니다. `--openbao-url` 없이 다시 실행하세요. 외부/공유 OpenBao를 복구해야 한다면 운영자 런북을 따르세요.",
 };
