@@ -240,9 +240,11 @@ mod tests {
     /// step-ca CA material that's encrypted with the old password.
     #[test]
     fn resolve_init_secrets_preserves_password_in_reinit_mode() {
-        use crate::cli::args::InitFeature;
         use std::fs;
+
         use tempfile::tempdir;
+
+        use crate::cli::args::InitFeature;
 
         let messages = test_messages();
         let dir = tempdir().unwrap();
@@ -271,9 +273,11 @@ mod tests {
     /// fresh secret as before.
     #[test]
     fn resolve_init_secrets_auto_generates_when_not_reinit_mode() {
-        use crate::cli::args::InitFeature;
         use std::fs;
+
         use tempfile::tempdir;
+
+        use crate::cli::args::InitFeature;
 
         let messages = test_messages();
         let dir = tempdir().unwrap();

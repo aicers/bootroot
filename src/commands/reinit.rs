@@ -337,7 +337,11 @@ fn write_reinit_plan<W: Write>(out: &mut W, messages: &Messages) -> io::Result<(
     writeln!(out, "{}", messages.reinit_plan_preserved_ca())?;
     writeln!(out, "{}", messages.reinit_plan_preserved_password())?;
     writeln!(out, "{}", messages.reinit_plan_preserved_postgres())?;
-    writeln!(out, "{}", messages.reinit_plan_preserved_compose_overrides())?;
+    writeln!(
+        out,
+        "{}",
+        messages.reinit_plan_preserved_compose_overrides()
+    )?;
     writeln!(out, "{}", messages.reinit_plan_preserved_intent())?;
     writeln!(out)?;
     writeln!(out, "{}", messages.reinit_plan_service_registry_warning())?;
