@@ -127,7 +127,11 @@ pub(crate) fn remove_openbao_container_and_volumes(
 
 /// Resolves the docker compose project name. Tries the openbao
 /// container's `com.docker.compose.project` label first; if the
-/// container is not present, falls back to the compose-dir basename
+/// container is not present, honours `COMPOSE_PROJECT_NAME` so volume
+/// removal targets the same project that `docker compose up` will
+/// create under (otherwise reinit could wipe `<basename>_openbao-data`
+/// while `infra up` recreated `<env>_openbao-data`, leaving the real
+/// volume intact); only then falls back to the compose-dir basename
 /// normalised the same way docker compose itself derives the default
 /// project name (lowercased; characters outside `[a-z0-9_-]` stripped).
 pub(crate) fn resolve_compose_project(
@@ -136,6 +140,11 @@ pub(crate) fn resolve_compose_project(
 ) -> Result<String> {
     if let Some(value) = inspect(OPENBAO_CONTAINER_NAME, COMPOSE_PROJECT_LABEL)? {
         return Ok(value);
+    }
+    if let Ok(env_value) = std::env::var("COMPOSE_PROJECT_NAME")
+        && !env_value.is_empty()
+    {
+        return Ok(env_value);
     }
     let canonical =
         std::fs::canonicalize(compose_dir).unwrap_or_else(|_| compose_dir.to_path_buf());
@@ -231,8 +240,32 @@ fn remove_file_if_exists(path: &Path, messages: &Messages) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
     use super::*;
     use crate::i18n::Messages;
+
+    /// Serialises tests that mutate `COMPOSE_PROJECT_NAME` so the env
+    /// var is in a known state when `resolve_compose_project` is
+    /// exercised concurrently with the rest of the test suite.  Mirrors
+    /// the `ENV_LOCK` pattern in `commands/reinit.rs::tests`.
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().expect("test env lock must not be poisoned")
+    }
+
+    /// Test helper: clears `COMPOSE_PROJECT_NAME` so basename-fallback
+    /// tests exercise the documented fallback regardless of the
+    /// developer's ambient shell environment.  Callers must hold
+    /// `env_lock()`.
+    fn clear_compose_project_name() {
+        // SAFETY: `env::remove_var` mutates process-global state.  The
+        // caller serialises access via `env_lock()`.
+        unsafe {
+            std::env::remove_var("COMPOSE_PROJECT_NAME");
+        }
+    }
 
     /// Regression test: when the compose file lives in a subdirectory,
     /// `remove_clean_artifacts` must delete `state.json` at the
@@ -287,18 +320,83 @@ mod tests {
 
     #[test]
     fn resolve_compose_project_falls_back_to_compose_dir_basename() {
+        let _guard = env_lock();
+        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
+        clear_compose_project_name();
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("Bootroot.Stack");
         std::fs::create_dir(&dir).unwrap();
         let lookup = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
         let project = resolve_compose_project(&dir, &lookup).unwrap();
+        if let Some(prior) = prior {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
+        }
         // Lowercased, non-`[a-z0-9_-]` stripped — matches docker
         // compose's default project-name normalisation.
         assert_eq!(project, "bootrootstack");
     }
 
+    /// Closes the Round-8 bug: with the container label unavailable
+    /// (e.g. the stuck-after-`clean --openbao-only` recovery path),
+    /// volume removal must honour `COMPOSE_PROJECT_NAME` so the
+    /// `<env>_openbao-data` volume that `docker compose up` will
+    /// recreate is the same one reinit just wiped.  Without this the
+    /// basename-fallback would target `<basename>_openbao-data`,
+    /// leaving the real env-selected volume intact and recreating the
+    /// initialized-without-root-token failure mode.
+    #[test]
+    fn resolve_compose_project_honours_env_var_when_label_absent() {
+        let _guard = env_lock();
+        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
+        // SAFETY: env mutation is serialised by `env_lock` above.
+        unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", "env-project") };
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("BasenameWouldDiffer");
+        std::fs::create_dir(&dir).unwrap();
+        let lookup = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
+        let project = resolve_compose_project(&dir, &lookup).unwrap();
+        // Restore the prior env value before assertions so a failure
+        // does not leave the shared env mutated.
+        if let Some(prior) = prior {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
+        } else {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
+        }
+        assert_eq!(project, "env-project");
+    }
+
+    /// The container label is authoritative for what to delete (the
+    /// resources were physically created under that project), so it
+    /// must win over a divergent `COMPOSE_PROJECT_NAME`.
+    #[test]
+    fn resolve_compose_project_prefers_container_label_over_env_var() {
+        let _guard = env_lock();
+        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
+        // SAFETY: env mutation is serialised by `env_lock` above.
+        unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", "env-project") };
+        let dir = tempfile::tempdir().unwrap();
+        let lookup = |_: &str, _: &str| -> Result<Option<String>> {
+            Ok(Some("label-project".to_string()))
+        };
+        let project = resolve_compose_project(dir.path(), &lookup).unwrap();
+        if let Some(prior) = prior {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
+        } else {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
+        }
+        assert_eq!(project, "label-project");
+    }
+
     #[test]
     fn resolve_compose_project_errors_when_basename_normalises_to_empty() {
+        let _guard = env_lock();
+        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
+        clear_compose_project_name();
         // A directory whose basename strips to empty under the
         // normalisation rule (no ASCII alphanumerics) must not silently
         // produce `_openbao-data` (which would target a nonexistent
@@ -308,6 +406,10 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let lookup = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
         let err = resolve_compose_project(&dir, &lookup).unwrap_err();
+        if let Some(prior) = prior {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
+        }
         assert!(err.to_string().contains("compose project name"));
     }
 

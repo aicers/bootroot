@@ -305,6 +305,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   unseal-key save when the post-init JSON write fails.
   Refuses to run against external/shared OpenBao instances
   (compose-managed local only).
+  When the `bootroot-openbao` container is absent (typically the
+  stuck-after-`clean --openbao-only` recovery path), volume removal
+  now honours `COMPOSE_PROJECT_NAME` so the `<env>_openbao-data`
+  volume that the follow-up `docker compose up` will recreate is the
+  same one reinit wipes. Previously the basename-fallback would have
+  removed `<compose-dir-basename>_openbao-data` while `infra up`
+  recreated `<env>_openbao-data`, leaving the real env-selected
+  volume intact and recreating the initialized-without-root-token
+  failure mode this command is meant to recover from. The container
+  label (when present) still wins over the env var because it is
+  authoritative for what was physically created on disk.
 - Added `--cert-group <gid-or-name>` to `bootroot service add` and
   `bootroot service update` so issued service certificates can be
   delivered to non-root containerized clients without operator-side
