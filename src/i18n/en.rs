@@ -478,6 +478,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_reinit_failed: "bootroot reinit failed",
     error_reinit_external_openbao: "Refusing to reinit: compose file {path} does not declare an `openbao` service. `bootroot reinit` only operates on compose-managed local OpenBao. External or shared OpenBao must use an operator-managed runbook.",
     error_reinit_container_project_mismatch: "Refusing to reinit: container `bootroot-openbao` belongs to compose project `{actual}`, but the current work directory derives project `{expected}`. Refusing to wipe an OpenBao that is not managed by this work directory.",
+    error_reinit_container_missing_compose_label: "Refusing to reinit: container `bootroot-openbao` exists but does not carry the `{label}` compose label. `bootroot reinit` only operates on compose-managed local OpenBao; a container without compose labels cannot be proven to belong to this work directory's compose project. If this container is stale, remove it manually before retrying.",
     error_reinit_root_token_output_unsafe: "Refusing to write root token: existing file {path} has world-/group-readable permissions. Run `chmod 0600 {path}` or remove the file before retrying.",
     error_reinit_root_token_output_not_file: "Refusing to write root token: {path} exists and is not a regular file. Pass a regular-file destination for `--root-token-output`.",
     error_reinit_root_token_output_unwritable: "Refusing to start reinit: cannot write to `--root-token-output` destination {path} ({reason}). Pass a writable file path before retrying.",

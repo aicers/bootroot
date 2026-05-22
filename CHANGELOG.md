@@ -304,7 +304,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `print_init_summary`, `--root-token-output`, and the automatic
   unseal-key save when the post-init JSON write fails.
   Refuses to run against external/shared OpenBao instances
-  (compose-managed local only).
+  (compose-managed local only). A container that exists but is
+  missing either compose label
+  (`com.docker.compose.project`,
+  `com.docker.compose.service`) is rejected explicitly: the scope
+  check now distinguishes "container missing" (the stuck-after-
+  `clean --openbao-only` recovery path) from "container exists but
+  cannot be proven to belong to this work directory's compose
+  project" via a separate `docker container inspect` existence
+  probe.
   When the `bootroot-openbao` container is absent (typically the
   stuck-after-`clean --openbao-only` recovery path), volume removal
   now honours `COMPOSE_PROJECT_NAME` so the `<env>_openbao-data`

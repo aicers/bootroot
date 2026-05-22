@@ -180,6 +180,19 @@ fn normalise_compose_project_name(input: &str) -> String {
         .collect()
 }
 
+/// Reports whether a container exists on the local docker daemon,
+/// independent of any label.  Used by `reinit`'s scope check to
+/// distinguish "container missing" (the stuck-after-`clean --openbao-only`
+/// recovery path) from "container exists but its compose labels are
+/// missing", which `inspect_label_via_docker` cannot tell apart.
+pub(crate) fn container_exists_via_docker(container: &str) -> Result<bool> {
+    let output = ProcessCommand::new("docker")
+        .args(["container", "inspect", "--format", "{{.Id}}", container])
+        .output()
+        .with_context(|| "failed to run `docker container inspect`")?;
+    Ok(output.status.success())
+}
+
 /// Reads a single label from a docker container. Returns `Ok(None)`
 /// when the container is missing OR when the label is unset.
 pub(crate) fn inspect_label_via_docker(container: &str, label: &str) -> Result<Option<String>> {

@@ -157,6 +157,13 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_reinit_container_missing_compose_label(&self, label: &str) -> String {
+        format_template(
+            self.strings().error_reinit_container_missing_compose_label,
+            &[("label", label)],
+        )
+    }
+
     pub(crate) fn error_reinit_root_token_output_unsafe(&self, path: &str) -> String {
         format_template(
             self.strings().error_reinit_root_token_output_unsafe,

@@ -1626,7 +1626,12 @@ bootroot clean --openbao-only --yes
 
 - compose 파일이 `openbao` 서비스를 정의하지 않거나 기존
   `bootroot-openbao` 컨테이너의 compose 라벨이 현재 작업 디렉터리에서
-  파생된 프로젝트와 일치하지 않으면 실행을 거부합니다.
+  파생된 프로젝트와 일치하지 않으면 실행을 거부합니다. 컨테이너가
+  존재하지만 compose 라벨(`com.docker.compose.project`,
+  `com.docker.compose.service`) 중 하나라도 누락된 경우에도 거부합니다 —
+  해당 컨테이너는 이 작업 디렉터리의 compose 프로젝트에 속한다고
+  증명할 수 없으며, `clean --openbao-only` 이후의 stuck 복구 경로로
+  취급해서는 안 됩니다.
 - 파괴적 동작 전에 `state.json`에서 배포 의도 필드를 스냅샷합니다.
 - 스냅샷이 non-default `secrets_dir`을 기록한 경우 (예: 이전 init이
   `--secrets-dir secrets-custom`으로 실행됨), 스냅샷이 CLI 기본값보다

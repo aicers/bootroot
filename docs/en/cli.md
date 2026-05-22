@@ -1696,7 +1696,12 @@ operator-managed runbook for those.
 - Refuses to run when the compose file does not declare an
   `openbao` service, or when an existing `bootroot-openbao`
   container's compose labels do not match the project derived from
-  the current work directory.
+  the current work directory. A container that exists but is missing
+  either compose label (`com.docker.compose.project`,
+  `com.docker.compose.service`) is also rejected — it cannot be
+  proven to belong to this work directory's compose project, and
+  must not be collapsed into the stuck-after-`clean --openbao-only`
+  recovery path.
 - Snapshots deployment-intent fields from `state.json` (OpenBao /
   HTTP-01 admin bind/advertise addresses, `infra_certs`, `secrets_dir`)
   before any destructive operation.

@@ -10,8 +10,8 @@ use crate::cli::args::{
     RootTokenArgs, SecretsDirArgs,
 };
 use crate::commands::clean::{
-    COMPOSE_PROJECT_LABEL, COMPOSE_SERVICE_LABEL, inspect_label_via_docker,
-    remove_openbao_container_and_volumes, resolve_compose_project,
+    COMPOSE_PROJECT_LABEL, COMPOSE_SERVICE_LABEL, container_exists_via_docker,
+    inspect_label_via_docker, remove_openbao_container_and_volumes, resolve_compose_project,
 };
 use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::commands::infra::run_infra_up;
@@ -61,6 +61,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     verify_compose_managed_openbao(
         compose_file,
         &compose_dir,
+        &container_exists_via_docker,
         &inspect_label_via_docker,
         messages,
     )?;
@@ -166,11 +167,22 @@ pub(crate) fn reject_explicit_openbao_url(openbao_url: &str, messages: &Messages
 }
 
 /// Validates that the compose file declares a local `openbao` service
-/// and that, if a `bootroot-openbao` container exists, its compose
-/// labels match the project derived from this work directory.
+/// and that, if a `bootroot-openbao` container exists, BOTH compose
+/// labels are present and match the project derived from this work
+/// directory and the expected `openbao` service.
+///
+/// The existence check is intentionally separate from the label read
+/// because `inspect_label_via_docker` collapses "container missing"
+/// and "container exists but label unset" into the same `Ok(None)`.
+/// A container that exists but is missing one of the compose labels
+/// must NOT be collapsed into the stuck-after-`clean --openbao-only`
+/// recovery path; treating it that way would let reinit wipe an
+/// `OpenBao` whose provenance cannot be proven to belong to this work
+/// directory's compose project.  See the issue's §Scope limitation.
 fn verify_compose_managed_openbao(
     compose_file: &Path,
     compose_dir: &Path,
+    container_exists: &dyn Fn(&str) -> Result<bool>,
     inspect: &dyn Fn(&str, &str) -> Result<Option<String>>,
     messages: &Messages,
 ) -> Result<()> {
@@ -180,24 +192,35 @@ fn verify_compose_managed_openbao(
     if !compose_has_openbao(compose_file, messages)? {
         anyhow::bail!(messages.error_reinit_external_openbao(&compose_file.display().to_string()));
     }
-    let container_project = inspect(OPENBAO_CONTAINER_NAME, COMPOSE_PROJECT_LABEL)?;
-    if let Some(container_project) = container_project.as_deref() {
+    if container_exists(OPENBAO_CONTAINER_NAME)? {
         // When the container exists, the expected project must come
         // from a source independent of the container (env override or
         // compose-dir basename).  Otherwise a mismatched container
         // would never trip the check.
         let expected_project = resolve_expected_compose_project_excluding_container(compose_dir)?;
+        let container_project = inspect(OPENBAO_CONTAINER_NAME, COMPOSE_PROJECT_LABEL)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    messages.error_reinit_container_missing_compose_label(COMPOSE_PROJECT_LABEL)
+                )
+            })?;
         if container_project != expected_project {
             anyhow::bail!(
-                messages
-                    .error_reinit_container_project_mismatch(container_project, &expected_project,)
+                messages.error_reinit_container_project_mismatch(
+                    &container_project,
+                    &expected_project,
+                )
             );
         }
-        if let Some(service) = inspect(OPENBAO_CONTAINER_NAME, COMPOSE_SERVICE_LABEL)?
-            && service != OPENBAO_COMPOSE_SERVICE
-        {
+        let container_service = inspect(OPENBAO_CONTAINER_NAME, COMPOSE_SERVICE_LABEL)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    messages.error_reinit_container_missing_compose_label(COMPOSE_SERVICE_LABEL)
+                )
+            })?;
+        if container_service != OPENBAO_COMPOSE_SERVICE {
             anyhow::bail!(messages.error_reinit_container_project_mismatch(
-                &format!("service={service}"),
+                &format!("service={container_service}"),
                 OPENBAO_COMPOSE_SERVICE,
             ));
         }
@@ -1077,9 +1100,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let compose_file = dir.path().join("docker-compose.yml");
         let messages = test_messages();
+        let container_exists = |_: &str| -> Result<bool> { Ok(false) };
         let inspect = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
-        let err = verify_compose_managed_openbao(&compose_file, dir.path(), &inspect, &messages)
-            .unwrap_err();
+        let err = verify_compose_managed_openbao(
+            &compose_file,
+            dir.path(),
+            &container_exists,
+            &inspect,
+            &messages,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("compose"));
     }
 
@@ -1094,9 +1124,16 @@ mod tests {
         )
         .unwrap();
         let messages = test_messages();
+        let container_exists = |_: &str| -> Result<bool> { Ok(false) };
         let inspect = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
-        let err = verify_compose_managed_openbao(&compose_file, dir.path(), &inspect, &messages)
-            .unwrap_err();
+        let err = verify_compose_managed_openbao(
+            &compose_file,
+            dir.path(),
+            &container_exists,
+            &inspect,
+            &messages,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("openbao"));
     }
 
@@ -1110,9 +1147,12 @@ mod tests {
         let messages = test_messages();
         // Container reports "external" project but the work-dir basename
         // normalises to "bootroot", so the labels do not match.
+        let container_exists = |_: &str| -> Result<bool> { Ok(true) };
         let inspect = |_: &str, label: &str| -> Result<Option<String>> {
             if label == COMPOSE_PROJECT_LABEL {
                 Ok(Some("external".to_string()))
+            } else if label == COMPOSE_SERVICE_LABEL {
+                Ok(Some(OPENBAO_COMPOSE_SERVICE.to_string()))
             } else {
                 Ok(None)
             }
@@ -1124,8 +1164,14 @@ mod tests {
         let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
         // SAFETY: env access is serialised by `env_lock` above.
         unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
-        let err =
-            verify_compose_managed_openbao(&compose_file, &work, &inspect, &messages).unwrap_err();
+        let err = verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            &container_exists,
+            &inspect,
+            &messages,
+        )
+        .unwrap_err();
         if let Some(prior) = prior {
             // SAFETY: still inside the env_lock guard.
             unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
@@ -1143,9 +1189,130 @@ mod tests {
         fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
         let messages = test_messages();
         // Container absent (the stuck-after-clean recovery path).
+        let container_exists = |_: &str| -> Result<bool> { Ok(false) };
         let inspect = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
-        verify_compose_managed_openbao(&compose_file, &work, &inspect, &messages)
-            .expect("should accept missing container when compose declaration is intact");
+        verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            &container_exists,
+            &inspect,
+            &messages,
+        )
+        .expect("should accept missing container when compose declaration is intact");
+    }
+
+    /// Regression for Round 9 reviewer item: an existing
+    /// `bootroot-openbao` container that lacks the compose project label
+    /// must NOT be collapsed into the "container absent" recovery path.
+    /// Previously `inspect_label_via_docker` returned `Ok(None)` for both
+    /// the missing-container and missing-label cases, and the verifier
+    /// fell through to the stuck-after-clean acceptance branch.
+    #[test]
+    fn verify_compose_managed_openbao_rejects_existing_container_with_missing_project_label() {
+        let dir = tempdir().unwrap();
+        let work = dir.path().join("bootroot");
+        fs::create_dir_all(&work).unwrap();
+        let compose_file = work.join("docker-compose.yml");
+        fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
+        let messages = test_messages();
+        let container_exists = |_: &str| -> Result<bool> { Ok(true) };
+        // No compose labels at all (container was started outside compose).
+        let inspect = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
+        let err = verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            &container_exists,
+            &inspect,
+            &messages,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(COMPOSE_PROJECT_LABEL),
+            "got: {err}"
+        );
+    }
+
+    /// Regression for Round 9 reviewer item: an existing container that
+    /// carries a matching project label but is missing the service label
+    /// must also be rejected.  Previously the verifier only rejected a
+    /// *present non-`openbao`* service label and accepted an absent one.
+    #[test]
+    fn verify_compose_managed_openbao_rejects_existing_container_with_missing_service_label() {
+        let dir = tempdir().unwrap();
+        let work = dir.path().join("bootroot");
+        fs::create_dir_all(&work).unwrap();
+        let compose_file = work.join("docker-compose.yml");
+        fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
+        let messages = test_messages();
+        let container_exists = |_: &str| -> Result<bool> { Ok(true) };
+        // Project label matches the work-dir basename, but the service
+        // label is unset.
+        let inspect = |_: &str, label: &str| -> Result<Option<String>> {
+            if label == COMPOSE_PROJECT_LABEL {
+                Ok(Some("bootroot".to_string()))
+            } else {
+                Ok(None)
+            }
+        };
+        let _guard = env_lock();
+        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
+        // SAFETY: env access is serialised by `env_lock` above.
+        unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
+        let result = verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            &container_exists,
+            &inspect,
+            &messages,
+        );
+        if let Some(prior) = prior {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
+        }
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains(COMPOSE_SERVICE_LABEL),
+            "got: {err}"
+        );
+    }
+
+    /// Positive case for Round 9: an existing container with both
+    /// compose labels matching the expected project + service is
+    /// accepted.
+    #[test]
+    fn verify_compose_managed_openbao_accepts_existing_container_with_matching_labels() {
+        let dir = tempdir().unwrap();
+        let work = dir.path().join("bootroot");
+        fs::create_dir_all(&work).unwrap();
+        let compose_file = work.join("docker-compose.yml");
+        fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
+        let messages = test_messages();
+        let container_exists = |_: &str| -> Result<bool> { Ok(true) };
+        let inspect = |_: &str, label: &str| -> Result<Option<String>> {
+            if label == COMPOSE_PROJECT_LABEL {
+                Ok(Some("bootroot".to_string()))
+            } else if label == COMPOSE_SERVICE_LABEL {
+                Ok(Some(OPENBAO_COMPOSE_SERVICE.to_string()))
+            } else {
+                Ok(None)
+            }
+        };
+        let _guard = env_lock();
+        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
+        // SAFETY: env access is serialised by `env_lock` above.
+        unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
+        let result = verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            &container_exists,
+            &inspect,
+            &messages,
+        );
+        if let Some(prior) = prior {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
+        }
+        result.expect("should accept existing container with matching compose labels");
     }
 
     #[test]
