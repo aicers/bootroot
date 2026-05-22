@@ -15,13 +15,20 @@ const OPENBAO_EXPOSED_OVERRIDE: &str = "secrets/openbao/docker-compose.openbao-e
 /// Docker compose project label inspected on the `OpenBao` container so
 /// volume removal can be scoped to `<project>_openbao-*` and not wipe
 /// the project's other named volumes (e.g. `postgres-data`).
-const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+pub(crate) const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+
+/// Compose label naming the docker-compose service for a container. Used
+/// alongside `COMPOSE_PROJECT_LABEL` by `reinit` to verify that the
+/// container scheduled for removal is the project's `openbao` service
+/// and not an unrelated container that happens to be named
+/// `bootroot-openbao`.
+pub(crate) const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 
 /// Named volumes the `openbao` compose service mounts. Removing only
 /// these is the contract `--openbao-only` advertises (#588 §5b);
 /// using `docker compose down -v` instead would also wipe
 /// `postgres-data`, `prometheus-data`, and `grafana-data`.
-const OPENBAO_NAMED_VOLUMES: &[&str] = &["openbao-data", "openbao-audit"];
+pub(crate) const OPENBAO_NAMED_VOLUMES: &[&str] = &["openbao-data", "openbao-audit"];
 
 pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
     if args.openbao_only {
@@ -77,12 +84,23 @@ fn run_clean_openbao_only(args: &CleanArgs, messages: &Messages) -> Result<()> {
     if !args.yes && !prompt_yes_no(messages.clean_confirm_openbao_only(), messages)? {
         anyhow::bail!(messages.error_operation_cancelled());
     }
-    let compose_str = args.compose_file.compose_file.to_string_lossy();
-    let compose_dir = args
-        .compose_file
-        .compose_file
-        .parent()
-        .unwrap_or(Path::new("."));
+    remove_openbao_container_and_volumes(&args.compose_file.compose_file, messages)?;
+    println!("{}", messages.clean_openbao_only_completed());
+    Ok(())
+}
+
+/// Stops and removes the `bootroot-openbao` container and its named
+/// volumes, scoping volume removal to the compose project's prefix so
+/// `postgres-data`, `prometheus-data`, and `grafana-data` are not
+/// touched.  Shared between `bootroot clean --openbao-only` and
+/// `bootroot reinit`; the caller is responsible for any operator
+/// confirmation prompt.
+pub(crate) fn remove_openbao_container_and_volumes(
+    compose_file: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let compose_str = compose_file.to_string_lossy();
+    let compose_dir = compose_file.parent().unwrap_or(Path::new("."));
 
     // Discover the compose project name BEFORE removing the container,
     // while the label is still readable. Falling back to the compose-dir
@@ -104,8 +122,6 @@ fn run_clean_openbao_only(args: &CleanArgs, messages: &Messages) -> Result<()> {
         let vol_args = ["volume", "rm", "-f", full.as_str()];
         run_docker(&vol_args, &format!("docker volume rm {full}"), messages)?;
     }
-
-    println!("{}", messages.clean_openbao_only_completed());
     Ok(())
 }
 
@@ -114,7 +130,7 @@ fn run_clean_openbao_only(args: &CleanArgs, messages: &Messages) -> Result<()> {
 /// container is not present, falls back to the compose-dir basename
 /// normalised the same way docker compose itself derives the default
 /// project name (lowercased; characters outside `[a-z0-9_-]` stripped).
-fn resolve_compose_project(
+pub(crate) fn resolve_compose_project(
     compose_dir: &Path,
     inspect: &dyn Fn(&str, &str) -> Result<Option<String>>,
 ) -> Result<String> {
@@ -157,7 +173,7 @@ fn normalise_compose_project_name(input: &str) -> String {
 
 /// Reads a single label from a docker container. Returns `Ok(None)`
 /// when the container is missing OR when the label is unset.
-fn inspect_label_via_docker(container: &str, label: &str) -> Result<Option<String>> {
+pub(crate) fn inspect_label_via_docker(container: &str, label: &str) -> Result<Option<String>> {
     let format_arg = format!("{{{{index .Config.Labels \"{label}\"}}}}");
     let output = ProcessCommand::new("docker")
         .args(["inspect", "--format", &format_arg, container])

@@ -1557,6 +1557,88 @@ bootroot clean
 bootroot clean --openbao-only --yes
 ```
 
+## bootroot reinit
+
+부분 init된 OpenBao 상태를 원자적으로 복구합니다. OpenBao 소유 상태만
+지우고, 기존 `infra up` 경로로 OpenBao를 다시 기동한 뒤, 표준 init 흐름을
+**reinit 모드**로 다시 실행합니다 (step-ca CA 자료와 `password.txt`는
+보존되며, 기록된 non-loopback 바인드 의도와 이미 보존된 파일에 대한
+덮어쓰기 프롬프트는 발생하지 않습니다).
+
+다음 상황에서는 `init` 대신 `reinit`을 사용하세요.
+
+- 이전 `bootroot init`이 OpenBao 초기화 이후, 루트 토큰을 사용 가능한
+  형태로 저장하기 전에 실패한 경우 (부분 init 함정).
+- 작업 디렉터리를 `rsync`로 다른 호스트에 복사했고 대상 측의 오래된
+  `state.json`이 새 호스트의 비어 있는 OpenBao 볼륨과 충돌하는 경우.
+- 이미 `bootroot clean --openbao-only`를 실행했지만, 이후
+  `bootroot init`이 실행 중인 OpenBao에 도달하지 못해 막힌 경우.
+
+`reinit`은 **compose로 관리되는 로컬 OpenBao**에서만 동작합니다.
+외부/공유 OpenBao 인스턴스는 거부됩니다 — 해당 경우에는 운영자 런북을
+사용하세요.
+
+### 입력
+
+- `--openbao-url`: OpenBao API URL (기본값 `http://localhost:8200`)
+- `--kv-mount`: KV 마운트 경로 (기본값 `secret`)
+- `--secrets-dir`: 시크릿 디렉터리 (기본값 `secrets`)
+- `--compose-file`: docker-compose.yml 경로 (기본값
+  `docker-compose.yml`)
+- `--yes` / `-y`: 확인 프롬프트 건너뛰기. 비대화형으로 실행되며 새로
+  생성된 unseal 키가 `secrets/openbao/unseal-keys.txt`에 자동 저장됩니다
+  (모드 `0600`)
+- `--root-token-output <path>` *(옵트인)*: 새로 발급된 루트 토큰을 제한된
+  권한(`0600`)으로 `<path>`에 기록합니다. 개발/테스트 또는 임시 자동화
+  용도로만 사용하세요 — 영구적인 루트 토큰 파일은 **프로덕션 환경에
+  권장되지 않습니다**.
+- `--enable <features>` / `--skip <phases>` / `--summary-json <path>` /
+  `--no-eab`: `init`으로 그대로 전달됩니다.
+
+### 동작
+
+- compose 파일이 `openbao` 서비스를 정의하지 않거나 기존
+  `bootroot-openbao` 컨테이너의 compose 라벨이 현재 작업 디렉터리에서
+  파생된 프로젝트와 일치하지 않으면 실행을 거부합니다.
+- 파괴적 동작 전에 `state.json`에서 배포 의도 필드를 스냅샷합니다.
+- 파괴적 동작과 보존 항목을 모두 출력합니다. `--yes`가 없으면 확인을
+  요청합니다.
+- `bootroot-openbao` 컨테이너와 `openbao-data` / `openbao-audit`
+  볼륨만 제거합니다 (`postgres-data` 등 다른 named volume은 보존).
+- OpenBao 런타임/부트스트랩 산출물만 제거합니다:
+  `secrets/openbao/unseal-keys.txt`,
+  `secrets/openbao/{stepca,responder,services}`,
+  `secrets/openbao/docker-compose.openbao-agent.override.yml`,
+  서비스별 만료된 AppRole 자격증명 파일
+  (`secrets/services/<svc>/{role_id,secret_id,secret_id.wrapped}`).
+- step-ca 자료 (`secrets/config/ca.json`,
+  `secrets/secrets/root_ca_key`, `secrets/secrets/intermediate_ca_key`),
+  `secrets/password.txt`, PostgreSQL 컨테이너/볼륨, `secrets/openbao/`
+  하위의 운영자 작성 compose 오버라이드는 보존됩니다.
+- 서비스 레지스트리/AppRole/정책 항목이 비어 있는 상태로 `state.json`을
+  다시 작성합니다 (배포 의도 필드만 유지).
+- `infra up --services openbao` 경로로 OpenBao를 다시 기동하여 기록된
+  non-loopback 바인드 오버라이드가 올바르게 적용되도록 합니다.
+- reinit 모드로 `init`을 다시 실행합니다 (기존 step-ca 비밀번호 보존,
+  보존된 파일에 대한 덮어쓰기 프롬프트 억제).
+- reinit 완료 후 서비스 레지스트리는 비어 있으므로 이전에 등록된 각
+  서비스에 대해 `bootroot service add ...`를 다시 실행하세요.
+
+### 예시
+
+부분 init OpenBao 상태에서 비대화형으로 복구하기:
+
+```bash
+bootroot reinit --yes
+```
+
+새로 발급된 루트 토큰을 임시 자동화용으로 캡처하기 (개발/테스트 전용 —
+프로덕션 환경에 권장되지 않음):
+
+```bash
+bootroot reinit --yes --root-token-output ./.root.token
+```
+
 ## bootroot openbao save-unseal-keys
 
 OpenBao 언실 키를 대화형으로 파일에 저장합니다. 저장된 파일은

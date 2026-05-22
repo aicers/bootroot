@@ -6,6 +6,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- New `bootroot reinit` recovery command that atomically wipes
+  OpenBao-owned state and re-runs init while preserving step-ca CA
+  material, `password.txt`, PostgreSQL state, operator-authored compose
+  overrides, and any recorded non-loopback bind intent. Covers the
+  partial-init trap (init failed after OpenBao was initialised), the
+  rsync-clone-to-new-host scenario, and the stuck-after-
+  `clean --openbao-only` recovery path described in issue #598. With
+  `--yes` the entire flow is non-interactive and newly generated
+  unseal keys are written automatically. Refuses to run against
+  external/shared OpenBao instances (compose-managed local only).
+
 ### Security
 
 - Bumped `rustls-webpki` from 0.103.10 to 0.103.12 to address

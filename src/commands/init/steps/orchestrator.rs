@@ -94,6 +94,9 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             if let Some(summary_json) = args.summary_json.as_deref() {
                 write_init_summary_json(summary_json, &summary).await?;
             }
+            if let Some(root_token_path) = args.root_token_output.as_deref() {
+                write_root_token_file(root_token_path, &summary.root_token).await?;
+            }
             print_init_summary(&summary, messages);
 
             // Prompt to save unseal keys if they were just generated.
@@ -156,6 +159,22 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
     Ok(())
 }
 
+/// Persists the freshly generated `OpenBao` root token to `path` with
+/// mode `0600`.  Invoked only when the operator passes
+/// `bootroot reinit --root-token-output <path>`; persistent root token
+/// files are not recommended for production and the surrounding code
+/// validates the destination path before any destructive work begins.
+async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, token).await?;
+    fs_util::set_key_permissions(path).await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 // Keep init flow in one place to preserve ordering across subsystems.
 async fn run_init_inner(
@@ -183,17 +202,23 @@ async fn run_init_inner(
         overwrite_state,
     };
     print_init_plan(&plan, messages);
-    if overwrite_password {
-        confirm_overwrite(messages.prompt_confirm_overwrite_password(), messages)?;
-    }
-    if overwrite_ca_json {
-        confirm_overwrite(messages.prompt_confirm_overwrite_ca_json(), messages)?;
-    }
-    if overwrite_state {
-        confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
-    }
-    if args.has_feature(InitFeature::DbProvision) {
-        confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
+    // Under reinit mode the operator has already authorized destructive
+    // recovery at the `reinit` level, and reinit explicitly preserves
+    // `password.txt`, `ca.json`, and the (just-rewritten) `state.json`.
+    // Skipping these prompts keeps `reinit --yes` non-interactive.
+    if !args.reinit_mode {
+        if overwrite_password {
+            confirm_overwrite(messages.prompt_confirm_overwrite_password(), messages)?;
+        }
+        if overwrite_ca_json {
+            confirm_overwrite(messages.prompt_confirm_overwrite_ca_json(), messages)?;
+        }
+        if overwrite_state {
+            confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
+        }
+        if args.has_feature(InitFeature::DbProvision) {
+            confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
+        }
     }
 
     // Load .env into the process environment so that
@@ -1049,6 +1074,26 @@ mod tests {
         diagnose_partial_init(&client, &args, &test_messages())
             .await
             .expect("uninitialized path must succeed");
+    }
+
+    /// `write_root_token_file` persists the token with mode `0600`.
+    /// Reinit's `--root-token-output` reaches the operator via this
+    /// helper; tightening the permission contract here guards against
+    /// regressions that would leak a freshly minted root token to other
+    /// users on the host.
+    #[tokio::test]
+    async fn write_root_token_file_persists_with_restricted_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("root.token");
+        write_root_token_file(&path, "hvs.fake-token")
+            .await
+            .expect("write");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, "hvs.fake-token");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "root token file must be 0600, got {mode:o}");
     }
 
     /// Regression: `write_state_file_to` must propagate an error when an

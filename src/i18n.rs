@@ -5,6 +5,7 @@ pub(crate) mod en;
 pub(crate) mod infra;
 pub(crate) mod init;
 pub(crate) mod ko;
+pub(crate) mod reinit;
 pub(crate) mod rotate;
 pub(crate) mod service;
 pub(crate) mod status;
@@ -485,6 +486,27 @@ pub(crate) struct Strings {
     pub(crate) error_openbao_container_no_project_label: &'static str,
     pub(crate) error_openbao_network_required_external: &'static str,
     pub(crate) error_invalid_docker_network_name: &'static str,
+    pub(crate) reinit_plan_title: &'static str,
+    pub(crate) reinit_plan_destructive_actions: &'static str,
+    pub(crate) reinit_plan_destructive_container: &'static str,
+    pub(crate) reinit_plan_destructive_volumes: &'static str,
+    pub(crate) reinit_plan_destructive_state_file: &'static str,
+    pub(crate) reinit_plan_destructive_runtime_files: &'static str,
+    pub(crate) reinit_plan_destructive_service_creds: &'static str,
+    pub(crate) reinit_plan_preserved_actions: &'static str,
+    pub(crate) reinit_plan_preserved_ca: &'static str,
+    pub(crate) reinit_plan_preserved_password: &'static str,
+    pub(crate) reinit_plan_preserved_postgres: &'static str,
+    pub(crate) reinit_plan_preserved_compose_overrides: &'static str,
+    pub(crate) reinit_plan_preserved_intent: &'static str,
+    pub(crate) reinit_plan_service_registry_warning: &'static str,
+    pub(crate) reinit_confirm: &'static str,
+    pub(crate) reinit_completed: &'static str,
+    pub(crate) reinit_service_registry_post_summary: &'static str,
+    pub(crate) error_reinit_failed: &'static str,
+    pub(crate) error_reinit_external_openbao: &'static str,
+    pub(crate) error_reinit_container_project_mismatch: &'static str,
+    pub(crate) error_reinit_root_token_output_unsafe: &'static str,
 }
 
 pub(crate) struct Messages {

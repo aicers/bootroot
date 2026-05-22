@@ -1612,6 +1612,103 @@ DB or step-ca state:
 bootroot clean --openbao-only --yes
 ```
 
+## bootroot reinit
+
+Atomically recovers from a partial-init OpenBao state by wiping
+OpenBao-owned state, re-bringing OpenBao up via the existing
+`infra up` path, and re-running the standard init flow in
+**reinit mode** (step-ca CA material and `password.txt` are
+preserved, recorded non-loopback bind intent is preserved, and
+already-preserved files do not trigger overwrite prompts).
+
+Use `reinit` instead of `init` whenever:
+
+- A previous `bootroot init` failed after OpenBao was initialised but
+  before a usable root token was saved (the “partial-init” trap).
+- A work directory was copied to another host via `rsync` and the
+  destination's stale `state.json` is fighting with the new host's
+  fresh OpenBao volume.
+- An operator already ran `bootroot clean --openbao-only` and is now
+  stuck because subsequent `bootroot init` cannot reach a running
+  OpenBao.
+
+`reinit` only operates on **compose-managed local OpenBao**.
+External or shared OpenBao instances are rejected; use an
+operator-managed runbook for those.
+
+### Inputs
+
+- `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
+- `--kv-mount`: KV mount path (default `secret`)
+- `--secrets-dir`: secrets directory (default `secrets`)
+- `--compose-file`: docker-compose.yml path (default
+  `docker-compose.yml`)
+- `--yes` / `-y`: skip confirmation prompts; non-interactive,
+  newly generated unseal keys are written automatically to
+  `secrets/openbao/unseal-keys.txt` (mode `0600`)
+- `--root-token-output <path>` *(opt-in)*: write the freshly issued
+  root token to `<path>` with restricted permissions (`0600`). This
+  is intended for dev/test or ephemeral automation only — persistent
+  root token files are **not recommended for production**. When the
+  destination already exists with world-/group-readable permissions,
+  reinit refuses to overwrite it.
+- `--enable <features>`: passed through to `init` (e.g.
+  `show-secrets`)
+- `--skip <phases>`: passed through to `init` (e.g.
+  `responder-check`)
+- `--summary-json <path>`: passed through to `init`
+- `--no-eab`: passed through to `init`
+
+### Behavior
+
+- Refuses to run when the compose file does not declare an
+  `openbao` service, or when an existing `bootroot-openbao`
+  container's compose labels do not match the project derived from
+  the current work directory.
+- Snapshots deployment-intent fields from `state.json` (OpenBao /
+  HTTP-01 admin bind/advertise addresses, `infra_certs`, `secrets_dir`)
+  before any destructive operation.
+- Prints a plan listing every destructive action and every preserved
+  artifact. Without `--yes`, prompts for confirmation.
+- Stops and removes the `bootroot-openbao` container and the
+  `openbao-data` / `openbao-audit` volumes (the project's other named
+  volumes — `postgres-data`, `prometheus-data`, `grafana-data` — are
+  not touched).
+- Removes only OpenBao runtime/bootstrap artifacts:
+  `secrets/openbao/unseal-keys.txt`, generated OpenBao Agent
+  config trees under `secrets/openbao/{stepca,responder,services}`,
+  `secrets/openbao/docker-compose.openbao-agent.override.yml`, and
+  stale per-service AppRole credential files
+  (`secrets/services/<svc>/{role_id,secret_id,secret_id.wrapped}`).
+- Preserves step-ca material (`secrets/config/ca.json`,
+  `secrets/secrets/root_ca_key`, `secrets/secrets/intermediate_ca_key`),
+  `secrets/password.txt`, the PostgreSQL container/volume, and
+  operator-authored compose overrides under `secrets/openbao/`.
+- Rewrites `state.json` with deployment intent only — service
+  registry, AppRoles, and policies are intentionally empty.
+- Brings OpenBao back up via `infra up --services openbao` so any
+  recorded non-loopback bind override is layered correctly.
+- Re-runs `init` in reinit mode (preserves the existing step-ca
+  password, suppresses overwrite prompts for preserved files).
+- After reinit, the service registry is empty — re-run
+  `bootroot service add ...` for each service that was previously
+  registered.
+
+### Examples
+
+Recover from a partial-init OpenBao state non-interactively:
+
+```bash
+bootroot reinit --yes
+```
+
+Recover and capture the freshly issued root token for ephemeral
+automation (dev/test only — not recommended for production):
+
+```bash
+bootroot reinit --yes --root-token-output ./.root.token
+```
+
 ## bootroot openbao save-unseal-keys
 
 Interactively saves OpenBao unseal keys to a file so that `bootroot infra up`

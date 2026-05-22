@@ -27,6 +27,11 @@ pub(crate) enum CliCommand {
     #[command(subcommand)]
     Monitoring(MonitoringCommand),
     Init(Box<InitArgs>),
+    /// Recovers from a partial-init `OpenBao` state by wiping
+    /// `OpenBao`-owned state and re-running init while preserving step-ca
+    /// material, the operator's compose overrides, and recorded
+    /// deployment intent (non-loopback binds).
+    Reinit(Box<ReinitArgs>),
     Status(Box<StatusArgs>),
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -796,6 +801,21 @@ pub(crate) struct InitArgs {
     /// and for CI flows that never use EAB.
     #[arg(long = "no-eab", conflicts_with_all = ["eab_kid", "eab_hmac"])]
     pub(crate) no_eab: bool,
+
+    /// Internal: invoked from `bootroot reinit`.  Suppresses overwrite
+    /// prompts for files that the reinit caller has already decided to
+    /// preserve (`ca.json`, `password.txt`, `state.json`) so a
+    /// non-interactive `reinit --yes` does not stall on prompts and
+    /// preserved files are not regenerated.
+    #[arg(long, hide = true, default_value_t = false)]
+    pub(crate) reinit_mode: bool,
+
+    /// Internal: invoked from `bootroot reinit --root-token-output`.
+    /// When set, the freshly issued `OpenBao` root token is written to
+    /// this path with mode `0600` after init succeeds.  Hidden from
+    /// `init`'s own surface; only the `reinit` wrapper sets it.
+    #[arg(long, hide = true)]
+    pub(crate) root_token_output: Option<PathBuf>,
 }
 
 impl InitArgs {
@@ -806,6 +826,58 @@ impl InitArgs {
     pub(crate) fn has_skip(&self, phase: InitSkipPhase) -> bool {
         self.skip.contains(&phase)
     }
+}
+
+/// Arguments accepted by `bootroot reinit`.
+///
+/// Most fields mirror `InitArgs` because reinit re-runs init under
+/// reinit-mode semantics after wiping `OpenBao`-owned state.  Operator
+/// secrets (step-ca password, DB DSN, EAB, HMAC) are NOT re-prompted —
+/// reinit preserves the existing step-ca password and re-uses the
+/// existing DSN/HMAC when present.
+#[derive(Args, Debug)]
+pub(crate) struct ReinitArgs {
+    #[command(flatten)]
+    pub(crate) openbao: OpenBaoArgs,
+
+    #[command(flatten)]
+    pub(crate) secrets_dir: SecretsDirArgs,
+
+    #[command(flatten)]
+    pub(crate) compose: ComposeFileArgs,
+
+    /// Skip confirmation prompts.  With `--yes` the entire flow is
+    /// non-interactive: destructive actions proceed without prompting
+    /// and newly-generated `OpenBao` unseal keys are written
+    /// automatically to `secrets/openbao/unseal-keys.txt` (mode `0600`).
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
+
+    /// Optional path to persist the freshly generated `OpenBao` root
+    /// token.  Off by default because persistent root token files are
+    /// not recommended for production.  When set, the file is written
+    /// with restricted permissions (`0600`) and an existing file with
+    /// other-readable permissions is rejected.  Intended for dev/test
+    /// or ephemeral automation only.
+    #[arg(long)]
+    pub(crate) root_token_output: Option<PathBuf>,
+
+    /// Enable optional features passed through to the underlying init
+    /// flow (e.g. `show-secrets`).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub(crate) enable: Vec<InitFeature>,
+
+    /// Skip optional checks (e.g. `responder-check`).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub(crate) skip: Vec<InitSkipPhase>,
+
+    /// Path to init summary JSON file
+    #[arg(long = "summary-json")]
+    pub(crate) summary_json: Option<PathBuf>,
+
+    /// Skip the ACME EAB prompt and persist no EAB credentials.
+    #[arg(long = "no-eab")]
+    pub(crate) no_eab: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2003,6 +2075,58 @@ mod tests {
                 assert_eq!(args.post_renew_arg, vec!["-HUP", "-f", "review"]);
             }
             _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_reinit_defaults() {
+        let cli = Cli::parse_from(["bootroot", "reinit"]);
+        match cli.command {
+            CliCommand::Reinit(args) => {
+                assert!(!args.yes);
+                assert!(args.root_token_output.is_none());
+                assert!(!args.no_eab);
+                assert!(args.enable.is_empty());
+            }
+            _ => panic!("expected reinit"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_reinit_yes_short() {
+        let cli = Cli::parse_from(["bootroot", "reinit", "-y"]);
+        match cli.command {
+            CliCommand::Reinit(args) => assert!(args.yes),
+            _ => panic!("expected reinit"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_reinit_full_flags() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "reinit",
+            "--yes",
+            "--no-eab",
+            "--enable",
+            "show-secrets",
+            "--root-token-output",
+            "/tmp/root.token",
+            "--summary-json",
+            "out.json",
+        ]);
+        match cli.command {
+            CliCommand::Reinit(args) => {
+                assert!(args.yes);
+                assert!(args.no_eab);
+                assert!(args.enable.contains(&InitFeature::ShowSecrets));
+                assert_eq!(
+                    args.root_token_output,
+                    Some(PathBuf::from("/tmp/root.token"))
+                );
+                assert_eq!(args.summary_json, Some(PathBuf::from("out.json")));
+            }
+            _ => panic!("expected reinit"),
         }
     }
 
