@@ -378,9 +378,8 @@ mod tests {
         // SAFETY: env mutation is serialised by `env_lock` above.
         unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", "env-project") };
         let dir = tempfile::tempdir().unwrap();
-        let lookup = |_: &str, _: &str| -> Result<Option<String>> {
-            Ok(Some("label-project".to_string()))
-        };
+        let lookup =
+            |_: &str, _: &str| -> Result<Option<String>> { Ok(Some("label-project".to_string())) };
         let project = resolve_compose_project(dir.path(), &lookup).unwrap();
         if let Some(prior) = prior {
             // SAFETY: still inside the env_lock guard.
