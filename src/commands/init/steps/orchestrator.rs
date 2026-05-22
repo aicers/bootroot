@@ -103,11 +103,19 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             if let Some(root_token_path) = args.root_token_output.as_deref()
                 && let Err(err) = write_root_token_file(root_token_path, &summary.root_token).await
             {
+                // Surface the freshly issued root token on stderr in
+                // cleartext.  Init has just completed against a brand
+                // new OpenBao, so without this channel the operator
+                // would have only the masked summary above (the
+                // `display_secret` helper hides the token unless
+                // `--enable show-secrets` was set) and would have to
+                // run another `reinit` cycle to recover access.
                 eprintln!(
                     "{}",
                     messages.error_reinit_root_token_persist_failed(
                         &root_token_path.display().to_string(),
                         &err.to_string(),
+                        &summary.root_token,
                     )
                 );
                 return Err(err);

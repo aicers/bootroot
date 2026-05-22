@@ -120,10 +120,11 @@ impl Messages {
         &self,
         path: &str,
         reason: &str,
+        token: &str,
     ) -> String {
         format_template(
             self.strings().error_reinit_root_token_persist_failed,
-            &[("path", path), ("reason", reason)],
+            &[("path", path), ("reason", reason), ("token", token)],
         )
     }
 }

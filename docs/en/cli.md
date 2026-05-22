@@ -1653,9 +1653,13 @@ operator-managed runbook for those.
   destination already exists with world-/group-readable permissions,
   reinit refuses to overwrite it. The path is preflight-checked
   before any destructive operation: reinit refuses to start if the
-  path is a directory or if the parent directory is not writable, so
-  a bad path cannot leave the operator with a wiped-and-reinitialised
-  OpenBao plus a failed token write.
+  path is a directory, if the existing file is not writable by the
+  current process (e.g. mode `0400`), or if the parent directory
+  cannot accept a new file, so a bad path cannot leave the operator
+  with a wiped-and-reinitialised OpenBao plus a failed token write.
+  Should the post-init write still fail (e.g. disk full), the
+  freshly issued token is surfaced on stderr in cleartext (prefixed
+  with `ROOT_TOKEN=`) so it is not lost.
 - `--enable <features>`: passed through to `init` (e.g.
   `show-secrets`)
 - `--skip <phases>`: passed through to `init` (e.g.
@@ -1692,6 +1696,13 @@ operator-managed runbook for those.
   registry, AppRoles, and policies are intentionally empty.
 - Brings OpenBao back up via `infra up --services openbao` so any
   recorded non-loopback bind override is layered correctly.
+- When the snapshotted `openbao_bind_addr` is non-loopback and the
+  caller left `--openbao-url` at its default, the second `init` pass
+  targets the restored bind address (`https://<bind>`) instead of
+  `http://localhost:8200` so the post-up health check reaches the
+  TLS-enabled OpenBao without requiring the operator to re-pass
+  `--openbao-url` manually. An explicit `--openbao-url` is honoured
+  verbatim.
 - Re-runs `init` in reinit mode (preserves the existing step-ca
   password, suppresses overwrite prompts for preserved files,
   auto-generates the new HTTP-01 responder HMAC because the previous

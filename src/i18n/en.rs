@@ -473,5 +473,5 @@ pub(super) static STRINGS: Strings = Strings {
     error_reinit_root_token_output_unsafe: "Refusing to write root token: existing file {path} has world-/group-readable permissions. Run `chmod 0600 {path}` or remove the file before retrying.",
     error_reinit_root_token_output_not_file: "Refusing to write root token: {path} exists and is not a regular file. Pass a regular-file destination for `--root-token-output`.",
     error_reinit_root_token_output_unwritable: "Refusing to start reinit: cannot write to `--root-token-output` destination {path} ({reason}). Pass a writable file path before retrying.",
-    error_reinit_root_token_persist_failed: "WARNING: failed to persist the freshly issued OpenBao root token to {path} ({reason}). The token was generated and must be saved manually. The summary above contains it (use `--enable show-secrets` to unmask).",
+    error_reinit_root_token_persist_failed: "WARNING: failed to persist the freshly issued OpenBao root token to {path} ({reason}). OpenBao has been initialised; the token below is shown unmasked so it is not lost — capture it now and store it securely.\nROOT_TOKEN={token}",
 };

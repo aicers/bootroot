@@ -255,11 +255,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `secrets/openbao/unseal-keys.txt` (mode `0600`). The optional
   `--root-token-output <path>` is preflight-validated before any
   destructive operation begins (rejects directories, unwritable
-  parents, and existing world/group-readable files) so a bad path
-  cannot leave the operator with a freshly reinitialised OpenBao plus
-  a failed token write; if the post-init write still fails for any
-  reason, the summary is printed first and a warning that names the
-  freshly issued token surfaces on stderr. Refuses to run against
+  parents, existing world/group-readable files, and existing files
+  that are not writable by the current process such as mode `0400`)
+  so a bad path cannot leave the operator with a freshly reinitialised
+  OpenBao plus a failed token write; if the post-init write still
+  fails for any reason, the summary is printed first and the warning
+  surfaces the freshly issued token on stderr in cleartext
+  (prefixed with `ROOT_TOKEN=`) so it is not lost. When the
+  snapshotted `openbao_bind_addr` is non-loopback and the caller left
+  `--openbao-url` at its default, reinit rewrites the second `init`
+  pass's client URL to the restored bind (`https://<bind>`) so the
+  post-up health check reaches the TLS-enabled OpenBao without
+  requiring `--openbao-url` to be re-passed. Refuses to run against
   external/shared OpenBao instances (compose-managed local only).
 - Added `--cert-group <gid-or-name>` to `bootroot service add` and
   `bootroot service update` so issued service certificates can be

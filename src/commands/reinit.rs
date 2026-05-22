@@ -13,6 +13,7 @@ use crate::commands::clean::{
     COMPOSE_PROJECT_LABEL, COMPOSE_SERVICE_LABEL, inspect_label_via_docker,
     remove_openbao_container_and_volumes, resolve_compose_project,
 };
+use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::commands::infra::run_infra_up;
 use crate::commands::init::{OPENBAO_CONTAINER_NAME, compose_has_openbao, prompt_yes_no, run_init};
 use crate::i18n::Messages;
@@ -104,7 +105,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //    `--root-token-output`, if set, is threaded into the init args
     //    so the freshly issued root token is persisted with mode 0600
     //    after init succeeds.
-    let init_args = init_args_for_reinit(args);
+    let init_args = init_args_for_reinit(args, &snapshot);
     run_init(&init_args, messages).await?;
 
     println!("{}", messages.reinit_completed());
@@ -307,7 +308,7 @@ fn remove_file_if_exists(path: &Path, messages: &Messages) -> Result<()> {
 /// write to *before* any destructive operation begins.  Without this
 /// the destructive sequence runs to completion and the post-init file
 /// write fails — exactly recreating the partial-init trap this command
-/// is meant to recover from.  The check enforces three things:
+/// is meant to recover from.  The check enforces:
 ///
 /// 1. If the path exists it must be a regular file (not a directory or
 ///    symlink to a directory), otherwise the post-init write would fail.
@@ -315,12 +316,14 @@ fn remove_file_if_exists(path: &Path, messages: &Messages) -> Result<()> {
 ///    `0600`-compatible (no group/other bits set) — overwriting a
 ///    world-readable file would briefly widen access to the freshly
 ///    issued root token.
-/// 3. The destination must be writable in practice.  We probe by
-///    creating the parent directory (if missing) and writing a uniquely
-///    named marker file in it, then removing the marker.  This catches
-///    read-only parents, missing intermediate components that cannot be
-///    created, and (when the destination already exists) the operator
-///    not actually having write permission on the file or its parent.
+/// 3. If the file already exists, it must also be writable by this
+///    process.  A file with mode `0400` or `0000` passes the group/other
+///    check above and yet the post-init `tokio::fs::write` would fail,
+///    so we open the destination for writing (without truncating) to
+///    prove the kernel will accept a later write.
+/// 4. The parent directory must accept new files.  We create the parent
+///    if missing and probe with a uniquely named marker so read-only
+///    parents and uncreatable ancestors are caught here.
 fn validate_root_token_output_path(path: &Path, messages: &Messages) -> Result<()> {
     let display = path.display().to_string();
 
@@ -346,6 +349,19 @@ fn validate_root_token_output_path(path: &Path, messages: &Messages) -> Result<(
         if mode & 0o077 != 0 {
             anyhow::bail!(messages.error_reinit_root_token_output_unsafe(&display));
         }
+        // Verify the kernel will actually accept a write to this file.
+        // Opening for write without `truncate(true)` does not modify the
+        // existing contents — it only checks the permission bits and any
+        // filesystem-level constraint (e.g. immutable attribute).  The
+        // handle is dropped immediately.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    messages.error_reinit_root_token_output_unwritable(&display, &err.to_string())
+                )
+            })?;
     }
 
     let parent = path
@@ -413,9 +429,24 @@ fn write_reinit_plan<W: Write>(out: &mut W, messages: &Messages) -> io::Result<(
 /// secrets paths; sets `reinit_mode = true` so the init flow preserves
 /// step-ca material and suppresses overwrite prompts for already-
 /// preserved files.
-fn init_args_for_reinit(args: &ReinitArgs) -> Box<InitArgs> {
+///
+/// When the snapshot carries a non-loopback `openbao_bind_addr`, the
+/// init args `openbao_url` is rewritten to match (`https://<bind>`).
+/// Without this rewrite the second init pass would default to
+/// `http://localhost:8200` and the health check would fail against a
+/// restored non-loopback `OpenBao` bind — the same trap the reproducer
+/// names in §"Scope limitation".  Operators who pass `--openbao-url`
+/// explicitly retain that value; the rewrite only kicks in when the
+/// caller left it at the CLI default.
+fn init_args_for_reinit(args: &ReinitArgs, snapshot: &DeploymentIntent) -> Box<InitArgs> {
+    let mut openbao = args.openbao.clone();
+    if openbao.openbao_url == crate::commands::init::DEFAULT_OPENBAO_URL
+        && let Some(bind) = snapshot.openbao_bind_addr.as_deref()
+    {
+        openbao.openbao_url = client_url_from_bind_addr(bind);
+    }
     Box::new(InitArgs {
-        openbao: args.openbao.clone(),
+        openbao,
         secrets_dir: args.secrets_dir.clone(),
         compose: args.compose.clone(),
         enable: args.enable.clone(),
@@ -451,6 +482,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use anyhow::Result;
     use tempfile::tempdir;
@@ -458,6 +490,18 @@ mod tests {
     use super::*;
     use crate::i18n::test_messages;
     use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
+
+    /// Serialises tests in this module that mutate process-wide
+    /// environment variables (e.g. `COMPOSE_PROJECT_NAME`).  Rust's
+    /// default test runner spawns multiple threads in the same process,
+    /// so concurrent `env::set_var` calls would otherwise race and the
+    /// project-mismatch test could flake under load.  Mirrors the
+    /// `ENV_LOCK` pattern used in `commands/rotate.rs::test_support`.
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().expect("test env lock must not be poisoned")
+    }
 
     fn state_with_intent() -> StateFile {
         let mut infra_certs = BTreeMap::new();
@@ -724,16 +768,16 @@ mod tests {
             }
         };
         // Make sure no stale env override decides the expected project.
-        // SAFETY: tests in this module are not run in parallel with
-        // anything that depends on this env var; the variable is
-        // restored at the end of the test.
+        // The lock guards process-wide env mutation against parallel
+        // tests in this module that also touch `COMPOSE_PROJECT_NAME`.
+        let _guard = env_lock();
         let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
-        // SAFETY: env access is single-threaded inside this test.
+        // SAFETY: env access is serialised by `env_lock` above.
         unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
         let err =
             verify_compose_managed_openbao(&compose_file, &work, &inspect, &messages).unwrap_err();
         if let Some(prior) = prior {
-            // SAFETY: see above.
+            // SAFETY: still inside the env_lock guard.
             unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
         }
         assert!(err.to_string().contains("project"), "got: {err}");
@@ -765,6 +809,32 @@ mod tests {
         let messages = test_messages();
         let err = validate_root_token_output_path(&path, &messages).unwrap_err();
         assert!(err.to_string().contains("0600") || err.to_string().contains("permissions"));
+    }
+
+    /// Regression for Round 2 reviewer item: an existing destination
+    /// with mode `0400` (or `0000`) passes the group/other-readable
+    /// check but is not actually writable by the owning process.  The
+    /// preflight must reject it so the destructive sequence never runs
+    /// against a hopeless target.
+    #[test]
+    fn validate_root_token_output_rejects_non_writable_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("token");
+        fs::write(&path, "tok").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o400);
+        fs::set_permissions(&path, perms).unwrap();
+        let messages = test_messages();
+        let err = validate_root_token_output_path(&path, &messages).unwrap_err();
+        // Restore so tempdir cleanup succeeds.
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms).unwrap();
+        assert!(
+            err.to_string().contains("--root-token-output")
+                || err.to_string().contains("root-token-output"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -918,12 +988,81 @@ mod tests {
             summary_json: None,
             no_eab: true,
         };
-        let init_args = init_args_for_reinit(&reinit_args);
+        let init_args = init_args_for_reinit(&reinit_args, &DeploymentIntent::default());
         assert_eq!(
             init_args.root_token_output,
             Some(PathBuf::from("/tmp/root.token")),
             "reinit must thread root_token_output into init"
         );
         assert!(init_args.reinit_mode, "reinit_mode must be set");
+    }
+
+    /// Regression for the Round 2 reviewer finding: when the snapshot
+    /// carries a non-loopback `openbao_bind_addr`, the init pass must
+    /// target the same address.  Without this rewrite the second init
+    /// would default to `http://localhost:8200` and fail health-check
+    /// against the restored TLS-enabled bind, leaving the operator in a
+    /// partial-recovery state after the destructive sequence already ran.
+    #[test]
+    fn init_args_for_reinit_rewrites_url_from_non_loopback_bind() {
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs {
+                secrets_dir: PathBuf::from("secrets"),
+            },
+            compose: ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let snapshot = DeploymentIntent {
+            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
+            ..DeploymentIntent::default()
+        };
+        let init_args = init_args_for_reinit(&reinit_args, &snapshot);
+        assert_eq!(
+            init_args.openbao.openbao_url, "https://192.168.1.10:8200",
+            "non-loopback bind intent must drive the init client URL"
+        );
+    }
+
+    /// Regression: an operator-supplied `--openbao-url` must not be
+    /// silently overwritten by snapshotted intent.  Only the CLI default
+    /// is rewritten so non-loopback recovery works out of the box.
+    #[test]
+    fn init_args_for_reinit_respects_explicit_openbao_url() {
+        let explicit = "https://10.0.0.5:8200";
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: explicit.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs {
+                secrets_dir: PathBuf::from("secrets"),
+            },
+            compose: ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let snapshot = DeploymentIntent {
+            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
+            ..DeploymentIntent::default()
+        };
+        let init_args = init_args_for_reinit(&reinit_args, &snapshot);
+        assert_eq!(init_args.openbao.openbao_url, explicit);
     }
 }

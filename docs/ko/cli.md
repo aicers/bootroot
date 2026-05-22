@@ -1592,9 +1592,13 @@ bootroot clean --openbao-only --yes
   권한(`0600`)으로 `<path>`에 기록합니다. 개발/테스트 또는 임시 자동화
   용도로만 사용하세요 — 영구적인 루트 토큰 파일은 **프로덕션 환경에
   권장되지 않습니다**. 경로는 파괴적 동작이 시작되기 전에 사전 검증되며,
-  경로가 디렉터리이거나 상위 디렉터리에 쓸 수 없는 경우 reinit이 시작되지
-  않습니다. 따라서 잘못된 경로로 인해 OpenBao가 초기화된 후 토큰 저장이
-  실패하는 상황이 발생하지 않습니다.
+  경로가 디렉터리이거나, 기존 파일이 현재 프로세스에서 쓰기 불가능한
+  경우(예: 모드 `0400`), 또는 상위 디렉터리가 새 파일을 받아들이지
+  못하는 경우 reinit이 시작되지 않습니다. 따라서 잘못된 경로로 인해
+  OpenBao가 초기화된 후 토큰 저장이 실패하는 상황이 발생하지 않습니다.
+  init 이후 쓰기가 그래도 실패하면(예: 디스크 가득) 새로 발급된 토큰을
+  stderr에 마스킹 없이(`ROOT_TOKEN=` 접두사) 출력하여 잃어버리지
+  않도록 합니다.
 - `--enable <features>` / `--skip <phases>` / `--summary-json <path>` /
   `--no-eab`: `init`으로 그대로 전달됩니다.
 
@@ -1622,6 +1626,12 @@ bootroot clean --openbao-only --yes
   다시 작성합니다 (배포 의도 필드만 유지).
 - `infra up --services openbao` 경로로 OpenBao를 다시 기동하여 기록된
   non-loopback 바인드 오버라이드가 올바르게 적용되도록 합니다.
+- 스냅샷한 `openbao_bind_addr`이 non-loopback이고 호출자가
+  `--openbao-url`을 기본값으로 둔 경우, 두 번째 `init` 패스는
+  `http://localhost:8200` 대신 복원된 바인드 주소(`https://<bind>`)를
+  타깃합니다. 이렇게 하면 운영자가 `--openbao-url`을 다시 전달하지
+  않아도 기동 후 health check가 TLS가 활성화된 OpenBao에 도달합니다.
+  명시적으로 전달된 `--openbao-url`은 그대로 사용됩니다.
 - reinit 모드로 `init`을 다시 실행합니다 (기존 step-ca 비밀번호 보존,
   보존된 파일에 대한 덮어쓰기 프롬프트 억제, 이전 HMAC이 wipe된 OpenBao
   KV에 있었으므로 새 HTTP-01 responder HMAC 자동 생성, EAB 등록 프롬프트
