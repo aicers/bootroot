@@ -1636,6 +1636,17 @@ bootroot clean --openbao-only --yes
   보존된 파일에 대한 덮어쓰기 프롬프트 억제, 이전 HMAC이 wipe된 OpenBao
   KV에 있었으므로 새 HTTP-01 responder HMAC 자동 생성, EAB 등록 프롬프트
   생략 — EAB 자격증명이 필요한 운영자는 reinit 후 별도로 등록).
+- `secrets/config/ca.json`에 보존된 step-ca 런타임 DSN을 읽어 두 번째
+  init 패스에 주입하므로, 새로 재초기화된 OpenBao KV에는 보존된
+  PostgreSQL 상태와 여전히 일치하는 자격증명이 기록됩니다. 이전에
+  `init --enable db-provision`이 실행된 경우 `.env`의
+  `POSTGRES_PASSWORD`는 더미 `rotated-use-openbao` 값으로 회전되어 있고
+  실제 런타임 비밀번호는 `ca.json`에만 남아 있습니다. 이 주입이 없으면
+  env에서 파생된 더미 DSN이 OpenBao KV에 기록되어 step-ca 에이전트가
+  더 이상 인증되지 않는 자격증명을 가리키게 됩니다. `ca.json`이 없는
+  경우(rsync 복제 경로 또는 `update_ca_json_with_backup` 실행 전에
+  중단된 부분 init), reinit은 env 기반 리졸버로 폴백합니다 — 이
+  시나리오에서는 `.env`에 실제 비밀번호가 그대로 남아 있습니다.
 - reinit 완료 후 서비스 레지스트리는 비어 있으므로 이전에 등록된 각
   서비스에 대해 `bootroot service add ...`를 다시 실행하세요.
 

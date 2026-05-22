@@ -1709,6 +1709,19 @@ operator-managed runbook for those.
   one lived in the wiped OpenBao KV mount, and skips the EAB
   registration prompt — operators who need EAB credentials register
   them out of band after reinit).
+- Reads the preserved step-ca runtime DSN from
+  `secrets/config/ca.json` and seeds the second init pass with it so
+  the freshly reinitialised OpenBao KV receives credentials that
+  still match the preserved PostgreSQL state. After a previous
+  `init --enable db-provision` run, `.env`'s `POSTGRES_PASSWORD` has
+  been rotated to a dummy `rotated-use-openbao` sentinel and only
+  `ca.json` carries the real runtime password; without this seeding,
+  the env-derived dummy DSN would land in OpenBao KV and step-ca
+  agents would be pointed at credentials that no longer authenticate.
+  When `ca.json` is absent (rsync-clone path or a partial-init that
+  crashed before `update_ca_json_with_backup` ran), reinit falls
+  through to the env-derived resolver — `.env` carries the real
+  password in those scenarios.
 - After reinit, the service registry is empty — re-run
   `bootroot service add ...` for each service that was previously
   registered.

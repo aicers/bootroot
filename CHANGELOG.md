@@ -266,8 +266,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `--openbao-url` at its default, reinit rewrites the second `init`
   pass's client URL to the restored bind (`https://<bind>`) so the
   post-up health check reaches the TLS-enabled OpenBao without
-  requiring `--openbao-url` to be re-passed. Refuses to run against
-  external/shared OpenBao instances (compose-managed local only).
+  requiring `--openbao-url` to be re-passed. Reads the preserved
+  step-ca runtime DSN from `secrets/config/ca.json` and threads it
+  into the second init pass so the freshly reinitialised OpenBao KV
+  receives the credentials that still match the preserved PostgreSQL
+  state, instead of the dummy `rotated-use-openbao` password sitting
+  in `.env` after a previous `init --enable db-provision` run.
+  Refuses to run against external/shared OpenBao instances
+  (compose-managed local only).
 - Added `--cert-group <gid-or-name>` to `bootroot service add` and
   `bootroot service update` so issued service certificates can be
   delivered to non-root containerized clients without operator-side

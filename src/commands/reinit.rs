@@ -424,6 +424,38 @@ fn write_reinit_plan<W: Write>(out: &mut W, messages: &Messages) -> io::Result<(
     Ok(())
 }
 
+/// Reads the preserved step-ca runtime DSN from
+/// `<secrets_dir>/config/ca.json` if present.  After a previous
+/// `init --enable db-provision` run, `.env`'s `POSTGRES_PASSWORD` has
+/// been rotated to a `rotated-use-openbao` dummy and only `ca.json`
+/// carries the real runtime password that still matches the preserved
+/// `PostgreSQL` volume.  Without this read, the second init pass falls
+/// back to `build_dsn_from_env()` and writes the dummy DSN into the
+/// freshly reinitialised `OpenBao` KV; the later
+/// `maybe_rotate_env_db_password` repair path then bails because the
+/// `.env` password already starts with `rotated-`, so the bad DSN
+/// remains and step-ca agents are pointed at credentials that do not
+/// match the preserved database — directly violating the issue's
+/// "Postgres volume/state is preserved" recovery contract.
+///
+/// Returns `None` when `ca.json` is absent (rsync-clone path or a
+/// partial-init that crashed before `update_ca_json_with_backup` ran),
+/// is malformed, or has no `db.dataSource` field.  In those cases the
+/// existing env-derived DSN resolution is left in place.
+fn preserved_db_dsn_from_ca_json(secrets_dir: &Path) -> Option<String> {
+    let ca_json_path = secrets_dir.join("config").join("ca.json");
+    if !ca_json_path.exists() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&ca_json_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    value
+        .get("db")
+        .and_then(|db| db.get("dataSource"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 /// Builds the `InitArgs` payload used to re-run the standard init flow
 /// in reinit mode.  Inherits the operator-supplied `OpenBao` / compose /
 /// secrets paths; sets `reinit_mode = true` so the init flow preserves
@@ -438,6 +470,13 @@ fn write_reinit_plan<W: Write>(out: &mut W, messages: &Messages) -> io::Result<(
 /// names in §"Scope limitation".  Operators who pass `--openbao-url`
 /// explicitly retain that value; the rewrite only kicks in when the
 /// caller left it at the CLI default.
+///
+/// When `secrets/config/ca.json` is present, its `db.dataSource` is
+/// threaded into the init args as `db_dsn` so the second init pass
+/// writes the *preserved* step-ca runtime DSN into the freshly
+/// reinitialised `OpenBao` KV instead of the dummy `rotated-use-openbao`
+/// password sitting in `.env`.  See `preserved_db_dsn_from_ca_json` for
+/// why the env fallback is unsafe under reinit.
 fn init_args_for_reinit(args: &ReinitArgs, snapshot: &DeploymentIntent) -> Box<InitArgs> {
     let mut openbao = args.openbao.clone();
     if openbao.openbao_url == crate::commands::init::DEFAULT_OPENBAO_URL
@@ -445,6 +484,7 @@ fn init_args_for_reinit(args: &ReinitArgs, snapshot: &DeploymentIntent) -> Box<I
     {
         openbao.openbao_url = client_url_from_bind_addr(bind);
     }
+    let db_dsn = preserved_db_dsn_from_ca_json(&args.secrets_dir.secrets_dir);
     Box::new(InitArgs {
         openbao,
         secrets_dir: args.secrets_dir.clone(),
@@ -457,7 +497,7 @@ fn init_args_for_reinit(args: &ReinitArgs, snapshot: &DeploymentIntent) -> Box<I
         openbao_unseal_from_file: None,
         secret_id_ttl: crate::commands::init::SECRET_ID_TTL.to_string(),
         stepca_password: None,
-        db_dsn: None,
+        db_dsn,
         db_admin: DbAdminDsnArgs { admin_dsn: None },
         db_user: None,
         db_password: None,
@@ -1032,6 +1072,109 @@ mod tests {
             init_args.openbao.openbao_url, "https://192.168.1.10:8200",
             "non-loopback bind intent must drive the init client URL"
         );
+    }
+
+    /// Regression for the Round 3 reviewer finding: when a previous
+    /// `init --enable db-provision` ran, `.env`'s `POSTGRES_PASSWORD` is
+    /// the dummy `rotated-use-openbao` sentinel and only `ca.json`
+    /// carries the real runtime DSN.  The second init pass must seed
+    /// `args.db_dsn` from `ca.json` so the env-derived dummy never
+    /// reaches the freshly reinitialised `OpenBao` KV.  Without this,
+    /// the `maybe_rotate_env_db_password` repair path bails (`.env`
+    /// already starts with `rotated-`) and the bad DSN remains in KV,
+    /// pointing step-ca agents at credentials that do not match the
+    /// preserved `PostgreSQL` state.
+    #[test]
+    fn init_args_for_reinit_uses_preserved_db_dsn_when_ca_json_present() {
+        let dir = tempdir().expect("tempdir");
+        let secrets_dir = dir.path().to_path_buf();
+        let config_dir = secrets_dir.join("config");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        // The DSN format mirrors what `update_ca_json_with_backup`
+        // writes: compose-internal `postgres:5432`, sslmode=disable.
+        // Nonce-based password sidesteps CodeQL's hard-coded-credential
+        // rule.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let real_password = format!("real-runtime-{nonce}");
+        let expected_dsn =
+            format!("postgresql://step:{real_password}@postgres:5432/stepca?sslmode=disable");
+        fs::write(
+            config_dir.join("ca.json"),
+            format!(r#"{{"db":{{"type":"postgresql","dataSource":"{expected_dsn}"}}}}"#),
+        )
+        .expect("write ca.json");
+
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs { secrets_dir },
+            compose: ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let init_args = init_args_for_reinit(&reinit_args, &DeploymentIntent::default());
+        assert_eq!(
+            init_args.db_dsn.as_deref(),
+            Some(expected_dsn.as_str()),
+            "reinit must seed init args with the preserved ca.json DSN \
+             so the rotated-use-openbao dummy never lands in OpenBao KV"
+        );
+    }
+
+    /// When `ca.json` is absent (rsync-clone path or a partial-init that
+    /// crashed before `update_ca_json_with_backup` ran), reinit must
+    /// leave `db_dsn` unset so the existing env-derived resolver path
+    /// takes over — that path uses the real `.env` password in this
+    /// scenario because it has not been rotated yet.
+    #[test]
+    fn init_args_for_reinit_falls_back_when_ca_json_absent() {
+        let dir = tempdir().expect("tempdir");
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs {
+                secrets_dir: dir.path().to_path_buf(),
+            },
+            compose: ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let init_args = init_args_for_reinit(&reinit_args, &DeploymentIntent::default());
+        assert!(
+            init_args.db_dsn.is_none(),
+            "missing ca.json must leave db_dsn unset for env fallback"
+        );
+    }
+
+    /// Malformed or db-less `ca.json` (e.g. step-ca configured without
+    /// a `db` block) must not crash reinit; the env-derived fallback is
+    /// the correct behaviour in that case.
+    #[test]
+    fn preserved_db_dsn_from_ca_json_returns_none_for_missing_data_source() {
+        let dir = tempdir().expect("tempdir");
+        let config_dir = dir.path().join("config");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(config_dir.join("ca.json"), r#"{"address":":9000"}"#).expect("write ca.json");
+        assert!(preserved_db_dsn_from_ca_json(dir.path()).is_none());
     }
 
     /// Regression: an operator-supplied `--openbao-url` must not be
