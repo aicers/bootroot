@@ -78,6 +78,12 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
             })?
             .with_context(|| messages.error_init_failed())?;
         }
+        CliCommand::Reinit(args) => {
+            with_runtime("reinit", messages, |rt| {
+                rt.block_on(commands::reinit::run_reinit(&args, messages))
+            })?
+            .with_context(|| messages.error_reinit_failed())?;
+        }
         CliCommand::Status(args) => {
             with_runtime("status", messages, |rt| {
                 rt.block_on(commands::status::run_status(&args, messages))

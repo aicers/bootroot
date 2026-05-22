@@ -94,13 +94,43 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             if let Some(summary_json) = args.summary_json.as_deref() {
                 write_init_summary_json(summary_json, &summary).await?;
             }
+            // Print the summary *before* attempting the optional
+            // root-token file write so a write failure does not hide the
+            // freshly issued root token from the operator's terminal —
+            // OpenBao has already been initialised at this point and a
+            // lost token would force another reinit cycle.
             print_init_summary(&summary, messages);
+            if let Some(root_token_path) = args.root_token_output.as_deref()
+                && let Err(err) = write_root_token_file(root_token_path, &summary.root_token).await
+            {
+                // Surface the freshly issued root token on stderr in
+                // cleartext.  Init has just completed against a brand
+                // new OpenBao, so without this channel the operator
+                // would have only the masked summary above (the
+                // `display_secret` helper hides the token unless
+                // `--enable show-secrets` was set) and would have to
+                // run another `reinit` cycle to recover access.
+                eprintln!(
+                    "{}",
+                    messages.error_reinit_root_token_persist_failed(
+                        &root_token_path.display().to_string(),
+                        &err.to_string(),
+                        &summary.root_token,
+                    )
+                );
+                return Err(err);
+            }
 
             // Prompt to save unseal keys if they were just generated.
+            // Under reinit mode the operator already authorized the
+            // destructive flow at the `reinit` level; the issue
+            // acceptance criteria require `reinit --yes` to write the
+            // fresh keys automatically with no further interaction.
             if summary.init_response && !summary.unseal_keys.is_empty() {
                 maybe_save_unseal_keys(
                     &args.secrets_dir.secrets_dir,
                     &summary.unseal_keys,
+                    args.reinit_mode,
                     messages,
                 )
                 .await?;
@@ -146,13 +176,100 @@ async fn diagnose_partial_init(
     anyhow::bail!(messages.error_init_partial_openbao_state(&args.openbao.openbao_url));
 }
 
+/// Writes the init summary JSON to `path` atomically with mode `0600`.
+///
+/// The summary carries the freshly issued root token and unseal keys
+/// (see `InitSummary`).  A naive `tokio::fs::write` followed by
+/// `set_key_permissions` would briefly expose those secrets:
+/// 1. A newly created file picks up the process umask first (commonly
+///    `0644`) and is only chmodded to `0600` after the secrets land on
+///    disk.
+/// 2. An existing destination's pre-write mode is preserved by the
+///    write — overwriting a `0644` file leaves it world-readable while
+///    the secret-bearing JSON is on disk, until the subsequent chmod.
+///
+/// The same atomic-create discipline used by `write_root_token_file` is
+/// applied here: `OpenOptionsExt::mode(0o600)` ensures new files are
+/// born `0600`, and an explicit `set_permissions(0o600)` immediately
+/// after the write also restricts any pre-existing destination before
+/// `write_all` so the secrets never touch a wider-mode file.  Reinit's
+/// preflight (`validate_summary_json_output_path`) additionally
+/// rejects world-/group-readable existing destinations, but this write
+/// path is deliberately defensive — `--summary-json` may be invoked
+/// from the `init` flow (not just `reinit`) where no preflight runs.
 async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         tokio::fs::create_dir_all(parent).await?;
     }
     let payload = serde_json::to_string_pretty(summary)?;
-    tokio::fs::write(path, payload).await?;
-    fs_util::set_key_permissions(path).await?;
+    let path_buf = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Tighten an existing destination's permissions before any
+        // secret content is written.  No-op for missing files.  The
+        // `OpenOptions::mode` below covers the missing-file case so
+        // the file is born `0600`.
+        if path_buf.exists() {
+            std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path_buf)?;
+        file.write_all(payload.as_bytes())?;
+        file.sync_all()?;
+        // Re-assert permissions in case an existing file's mode
+        // changed between the pre-write set and the open call (e.g.
+        // unusual filesystem semantics).
+        std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking for summary json write failed: {e}"))??;
+    Ok(())
+}
+
+/// Persists the freshly generated `OpenBao` root token to `path` with
+/// mode `0600`.  Invoked only when the operator passes
+/// `bootroot reinit --root-token-output <path>`; persistent root token
+/// files are not recommended for production and the surrounding code
+/// validates the destination path before any destructive work begins.
+///
+/// The file is created via `OpenOptionsExt::mode(0o600)` so a freshly
+/// minted root token never exists on disk with the process umask's
+/// default permissions (commonly `0644`) between creation and a
+/// subsequent `chmod` call.  Per-process umask still applies, so an
+/// explicit `set_permissions` follows for the existing-file case where
+/// `OpenOptionsExt::mode` is a no-op on POSIX.
+async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let path_buf = path.to_path_buf();
+    let token = token.to_string();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path_buf)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking for root token write failed: {e}"))??;
     Ok(())
 }
 
@@ -183,17 +300,23 @@ async fn run_init_inner(
         overwrite_state,
     };
     print_init_plan(&plan, messages);
-    if overwrite_password {
-        confirm_overwrite(messages.prompt_confirm_overwrite_password(), messages)?;
-    }
-    if overwrite_ca_json {
-        confirm_overwrite(messages.prompt_confirm_overwrite_ca_json(), messages)?;
-    }
-    if overwrite_state {
-        confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
-    }
-    if args.has_feature(InitFeature::DbProvision) {
-        confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
+    // Under reinit mode the operator has already authorized destructive
+    // recovery at the `reinit` level, and reinit explicitly preserves
+    // `password.txt`, `ca.json`, and the (just-rewritten) `state.json`.
+    // Skipping these prompts keeps `reinit --yes` non-interactive.
+    if !args.reinit_mode {
+        if overwrite_password {
+            confirm_overwrite(messages.prompt_confirm_overwrite_password(), messages)?;
+        }
+        if overwrite_ca_json {
+            confirm_overwrite(messages.prompt_confirm_overwrite_ca_json(), messages)?;
+        }
+        if overwrite_state {
+            confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
+        }
+        if args.has_feature(InitFeature::DbProvision) {
+            confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
+        }
     }
 
     // Load .env into the process environment so that
@@ -603,10 +726,12 @@ async fn run_init_inner(
 async fn maybe_save_unseal_keys(
     secrets_dir: &Path,
     keys: &[String],
+    auto_save: bool,
     messages: &Messages,
 ) -> Result<()> {
     use super::prompts::prompt_yes_no;
-    if prompt_yes_no(messages.prompt_save_unseal_keys(), messages)? {
+    let save = auto_save || prompt_yes_no(messages.prompt_save_unseal_keys(), messages)?;
+    if save {
         let path =
             crate::commands::openbao_unseal::save_unseal_keys(secrets_dir, keys, messages).await?;
         println!(
@@ -1049,6 +1174,76 @@ mod tests {
         diagnose_partial_init(&client, &args, &test_messages())
             .await
             .expect("uninitialized path must succeed");
+    }
+
+    /// Regression: `bootroot reinit --yes` must persist new unseal keys
+    /// automatically without prompting.  `maybe_save_unseal_keys` is the
+    /// only path that writes `secrets/openbao/unseal-keys.txt` during
+    /// init; if the `auto_save` arg does not bypass the prompt the
+    /// recovery flow will stall on `stdin` and the keys will be lost.
+    #[tokio::test]
+    async fn maybe_save_unseal_keys_auto_save_writes_without_prompting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let keys = vec!["key-1".to_string(), "key-2".to_string()];
+        let messages = test_messages();
+        maybe_save_unseal_keys(&secrets, &keys, true, &messages)
+            .await
+            .expect("auto-save must not prompt");
+        let path = secrets.join("openbao").join("unseal-keys.txt");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("key-1") && body.contains("key-2"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "unseal keys file must be 0600, got {mode:o}");
+    }
+
+    /// `write_root_token_file` persists the token with mode `0600`.
+    /// Reinit's `--root-token-output` reaches the operator via this
+    /// helper; tightening the permission contract here guards against
+    /// regressions that would leak a freshly minted root token to other
+    /// users on the host.
+    #[tokio::test]
+    async fn write_root_token_file_persists_with_restricted_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("root.token");
+        write_root_token_file(&path, "hvs.fake-token")
+            .await
+            .expect("write");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, "hvs.fake-token");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "root token file must be 0600, got {mode:o}");
+    }
+
+    /// Regression for Round 5 reviewer item: `write_root_token_file`
+    /// must open the destination with `OpenOptionsExt::mode(0o600)` so
+    /// a freshly minted root token never exists on disk with permissions
+    /// derived from the process umask (commonly `0644`) between create
+    /// and chmod.  Set a permissive umask, write the file, and assert
+    /// it lands with `0600` — under the previous `tokio::fs::write` +
+    /// post-write chmod path this would (briefly) be `0644`.
+    #[tokio::test]
+    async fn write_root_token_file_creates_with_0600_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `umask` is a libc thread-local syscall.  We restore
+        // it before the test returns so concurrent tests are unaffected.
+        let prev = unsafe { libc::umask(0) };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let res = write_root_token_file(&path, "hvs.fake-token").await;
+        unsafe { libc::umask(prev) };
+        res.expect("write");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "root token file must be created atomically with 0600 under any umask, got {mode:o}"
+        );
     }
 
     /// Regression: `write_state_file_to` must propagate an error when an

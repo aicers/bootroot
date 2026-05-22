@@ -1612,6 +1612,189 @@ DB or step-ca state:
 bootroot clean --openbao-only --yes
 ```
 
+## bootroot reinit
+
+Atomically recovers from a partial-init OpenBao state by wiping
+OpenBao-owned state, re-bringing OpenBao up via the existing
+`infra up` path, and re-running the standard init flow in
+**reinit mode** (step-ca CA material and `password.txt` are
+preserved, recorded non-loopback bind intent is preserved, and
+already-preserved files do not trigger overwrite prompts).
+
+Use `reinit` instead of `init` whenever:
+
+- A previous `bootroot init` failed after OpenBao was initialised but
+  before a usable root token was saved (the “partial-init” trap).
+- A work directory was copied to another host via `rsync` and the
+  destination's stale `state.json` is fighting with the new host's
+  fresh OpenBao volume.
+- An operator already ran `bootroot clean --openbao-only` and is now
+  stuck because subsequent `bootroot init` cannot reach a running
+  OpenBao.
+
+`reinit` only operates on **compose-managed local OpenBao**.
+External or shared OpenBao instances are rejected; use an
+operator-managed runbook for those.
+
+### Inputs
+
+- `--openbao-url`: must be left at the CLI default
+  (`http://localhost:8200`). Any other value is rejected before any
+  destructive operation begins because `reinit` only operates on
+  compose-managed local OpenBao; honouring an arbitrary URL would
+  let `reinit` wipe local state and then operate on an external
+  endpoint. Legitimate non-loopback recovery does not need this
+  flag — the init pass URL is derived automatically from the
+  snapshotted `openbao_bind_addr`.
+- `--kv-mount`: KV mount path (default `secret`)
+- `--secrets-dir`: secrets directory (default `secrets`)
+- `--compose-file`: docker-compose.yml path (default
+  `docker-compose.yml`)
+- `--yes` / `-y`: skip confirmation prompts; non-interactive,
+  newly generated unseal keys are written automatically to
+  `secrets/openbao/unseal-keys.txt` (mode `0600`)
+- `--root-token-output <path>` *(opt-in)*: write the freshly issued
+  root token to `<path>` with restricted permissions (`0600`). This
+  is intended for dev/test or ephemeral automation only — persistent
+  root token files are **not recommended for production**. When the
+  destination already exists with world-/group-readable permissions,
+  reinit refuses to overwrite it. The path is preflight-checked
+  before any destructive operation: reinit refuses to start if the
+  path is a directory, if the existing file is not writable by the
+  current process (e.g. mode `0400`), or if the parent directory
+  cannot accept a new file, so a bad path cannot leave the operator
+  with a wiped-and-reinitialised OpenBao plus a failed token write.
+  New token files are created atomically with mode `0600` via
+  `OpenOptionsExt::mode` so the freshly minted root token is never
+  observable on disk with the process umask's default permissions
+  between create and chmod. Should the post-init write still fail
+  (e.g. disk full), the freshly issued token is surfaced on stderr in
+  cleartext (prefixed with `ROOT_TOKEN=`) so it is not lost.
+- `--enable <features>`: passed through to `init` (e.g.
+  `show-secrets`)
+- `--skip <phases>`: passed through to `init` (e.g.
+  `responder-check`)
+- `--summary-json <path>`: passed through to `init`. The path is
+  preflight-checked before any destructive operation: reinit refuses
+  to start if the path is a directory, an unwritable existing file,
+  an existing file with world-/group-readable permissions (mode
+  `0o644` etc. is rejected with a `chmod 0600` hint), or has an
+  unwritable / uncreatable parent. The summary JSON carries the
+  freshly issued root token and unseal keys, so an unwritable
+  destination would recreate the partial-init trap through a
+  different output channel, and a wider-than-`0600` destination
+  would briefly leak those secrets on disk between the write and
+  the post-write chmod. The summary file itself is written
+  atomically: new files are born `0600` via the create-mode flag,
+  and any existing destination is tightened to `0600` before the
+  secret payload is written, so the JSON never lands on disk with
+  wider permissions.
+- `--no-eab`: passed through to `init`
+
+### Behavior
+
+- Refuses to run when the compose file does not declare an
+  `openbao` service, or when an existing `bootroot-openbao`
+  container's compose labels do not match the project derived from
+  the current work directory. A container that exists but is missing
+  either compose label (`com.docker.compose.project`,
+  `com.docker.compose.service`) is also rejected — it cannot be
+  proven to belong to this work directory's compose project, and
+  must not be collapsed into the stuck-after-`clean --openbao-only`
+  recovery path.
+- Snapshots deployment-intent fields from `state.json` (OpenBao /
+  HTTP-01 admin bind/advertise addresses, `infra_certs`, `secrets_dir`)
+  before any destructive operation.
+- When the snapshot records a non-default `secrets_dir` (e.g. the
+  previous init ran with `--secrets-dir secrets-custom`), the
+  snapshot wins over the CLI default and drives **all** secrets-tree
+  operations: artifact cleanup, the preserved `ca.json` DSN read, the
+  preserved `password.txt` lookup, the second init pass's
+  `--secrets-dir`, and the rewritten `state.json.secrets_dir`.
+  Operators do not need to re-pass `--secrets-dir` on the reinit
+  invocation when recovering a previously initialised deployment.
+- Prints a plan listing every destructive action, every preserved
+  artifact, and the snapshotted intent fields (effective
+  `secrets_dir`, OpenBao bind/advertise, HTTP-01 admin
+  bind/advertise, `infra_certs` count) so the operator can verify the
+  recovery target before confirming. Without `--yes`, prompts for
+  confirmation.
+- Stops and removes the `bootroot-openbao` container and the
+  `openbao-data` / `openbao-audit` volumes (the project's other named
+  volumes — `postgres-data`, `prometheus-data`, `grafana-data` — are
+  not touched).
+- Removes only OpenBao runtime/bootstrap artifacts:
+  `secrets/openbao/unseal-keys.txt`, generated OpenBao Agent
+  config trees under `secrets/openbao/{stepca,responder,services}`,
+  `secrets/openbao/docker-compose.openbao-agent.override.yml`, and
+  stale per-service AppRole credential files
+  (`secrets/services/<svc>/{role_id,secret_id,secret_id.wrapped}`).
+- Preserves step-ca material (`secrets/config/ca.json`,
+  `secrets/secrets/root_ca_key`, `secrets/secrets/intermediate_ca_key`),
+  `secrets/password.txt`, the PostgreSQL container/volume, and
+  operator-authored compose overrides under `secrets/openbao/`.
+- Rewrites `state.json` with deployment intent only — service
+  registry, AppRoles, and policies are intentionally empty.
+- Brings OpenBao back up via `infra up --services openbao` so any
+  recorded non-loopback bind override is layered correctly.
+- When the snapshotted `openbao_bind_addr` is non-loopback, the
+  second `init` pass targets the restored bind address
+  (`https://<bind>`) instead of `http://localhost:8200` so the
+  post-up health check reaches the TLS-enabled OpenBao without
+  requiring the operator to re-pass `--openbao-url` manually. The
+  CLI rejects any explicit `--openbao-url` value to prevent reinit
+  from operating on an external endpoint, so this snapshot-driven
+  rewrite is the only sanctioned channel for non-loopback init-pass
+  URLs.
+- Re-runs `init` in reinit mode (preserves the existing step-ca
+  password, suppresses overwrite prompts for preserved files,
+  auto-generates the new HTTP-01 responder HMAC because the previous
+  one lived in the wiped OpenBao KV mount, and skips the EAB
+  registration prompt — operators who need EAB credentials register
+  them out of band after reinit).
+- Reads the preserved step-ca runtime DSN from
+  `secrets/config/ca.json` and seeds the second init pass with it so
+  the freshly reinitialised OpenBao KV receives credentials that
+  still match the preserved PostgreSQL state. After a previous
+  `init --enable db-provision` run, `.env`'s `POSTGRES_PASSWORD` has
+  been rotated to a dummy `rotated-use-openbao` sentinel and only
+  `ca.json` carries the real runtime password; without this seeding,
+  the env-derived dummy DSN would land in OpenBao KV and step-ca
+  agents would be pointed at credentials that no longer authenticate.
+  When `ca.json` is absent (rsync-clone path or a partial-init that
+  crashed before `update_ca_json_with_backup` ran), reinit falls
+  through to the env-derived resolver — `.env` carries the real
+  password in those scenarios.
+- Also derives the ACME provisioner name and `defaultTLSCertDuration`
+  from the preserved `ca.json`. Deployments initialised with
+  `bootroot init --stepca-provisioner <custom>` keep that name on the
+  second init pass (otherwise `update_ca_json_with_backup`'s
+  lookup-by-name path would bail with
+  `ca.json does not contain an ACME provisioner named "acme"` after
+  OpenBao has already been wiped), and deployments initialised with a
+  non-default `--cert-duration` keep that value (otherwise the value
+  would be silently snapped back to the default on every reinit).
+  When `ca.json` is absent or has no ACME provisioner, the CLI
+  defaults apply as a fallback.
+- After reinit, the service registry is empty — re-run
+  `bootroot service add ...` for each service that was previously
+  registered.
+
+### Examples
+
+Recover from a partial-init OpenBao state non-interactively:
+
+```bash
+bootroot reinit --yes
+```
+
+Recover and capture the freshly issued root token for ephemeral
+automation (dev/test only — not recommended for production):
+
+```bash
+bootroot reinit --yes --root-token-output ./.root.token
+```
+
 ## bootroot openbao save-unseal-keys
 
 Interactively saves OpenBao unseal keys to a file so that `bootroot infra up`

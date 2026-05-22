@@ -80,6 +80,17 @@ After the initial install, use `bootroot infra up` to restart the
 already-configured environment. Use `bootroot clean` to tear down everything
 for a fresh start.
 
+If `bootroot init` failed after OpenBao was initialised (the
+"partial-init" trap), or if a work directory was copied to a new host
+via `rsync` and the destination's stale `state.json` conflicts with a
+fresh OpenBao volume, use `bootroot reinit` to atomically wipe the
+OpenBao-owned state and re-run init while preserving step-ca CA
+material and any recorded non-loopback bind intent.
+
+When copying a work directory between machines, exclude `state.json`,
+`secrets/openbao/`, and `secrets/services/` from the rsync (these are
+machine-local) to avoid the partial-init trap on the destination host.
+
 ## Documentation
 
 - Design philosophy: [`DESIGN.md`](DESIGN.md)
