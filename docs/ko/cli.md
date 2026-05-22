@@ -1608,8 +1608,17 @@ bootroot clean --openbao-only --yes
   `bootroot-openbao` 컨테이너의 compose 라벨이 현재 작업 디렉터리에서
   파생된 프로젝트와 일치하지 않으면 실행을 거부합니다.
 - 파괴적 동작 전에 `state.json`에서 배포 의도 필드를 스냅샷합니다.
-- 파괴적 동작과 보존 항목을 모두 출력합니다. `--yes`가 없으면 확인을
-  요청합니다.
+- 스냅샷이 non-default `secrets_dir`을 기록한 경우 (예: 이전 init이
+  `--secrets-dir secrets-custom`으로 실행됨), 스냅샷이 CLI 기본값보다
+  우선하며 **모든** secrets 트리 작업(산출물 정리, 보존된 `ca.json` DSN
+  읽기, 보존된 `password.txt` 조회, 두 번째 init 패스의 `--secrets-dir`,
+  재작성되는 `state.json.secrets_dir`)을 주도합니다. 이미 초기화된
+  배포를 복구할 때 운영자가 reinit 호출에 `--secrets-dir`을 다시 전달할
+  필요가 없습니다.
+- 파괴적 동작, 보존 항목, 그리고 스냅샷한 의도 필드(유효 `secrets_dir`,
+  OpenBao 바인드/광고, HTTP-01 admin 바인드/광고, `infra_certs` 개수)를
+  모두 출력하여 운영자가 확인 전에 복구 대상을 검증할 수 있도록 합니다.
+  `--yes`가 없으면 확인을 요청합니다.
 - `bootroot-openbao` 컨테이너와 `openbao-data` / `openbao-audit`
   볼륨만 제거합니다 (`postgres-data` 등 다른 named volume은 보존).
 - OpenBao 런타임/부트스트랩 산출물만 제거합니다:

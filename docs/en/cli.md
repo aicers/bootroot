@@ -1676,8 +1676,20 @@ operator-managed runbook for those.
 - Snapshots deployment-intent fields from `state.json` (OpenBao /
   HTTP-01 admin bind/advertise addresses, `infra_certs`, `secrets_dir`)
   before any destructive operation.
-- Prints a plan listing every destructive action and every preserved
-  artifact. Without `--yes`, prompts for confirmation.
+- When the snapshot records a non-default `secrets_dir` (e.g. the
+  previous init ran with `--secrets-dir secrets-custom`), the
+  snapshot wins over the CLI default and drives **all** secrets-tree
+  operations: artifact cleanup, the preserved `ca.json` DSN read, the
+  preserved `password.txt` lookup, the second init pass's
+  `--secrets-dir`, and the rewritten `state.json.secrets_dir`.
+  Operators do not need to re-pass `--secrets-dir` on the reinit
+  invocation when recovering a previously initialised deployment.
+- Prints a plan listing every destructive action, every preserved
+  artifact, and the snapshotted intent fields (effective
+  `secrets_dir`, OpenBao bind/advertise, HTTP-01 admin
+  bind/advertise, `infra_certs` count) so the operator can verify the
+  recovery target before confirming. Without `--yes`, prompts for
+  confirmation.
 - Stops and removes the `bootroot-openbao` container and the
   `openbao-data` / `openbao-audit` volumes (the project's other named
   volumes — `postgres-data`, `prometheus-data`, `grafana-data` — are

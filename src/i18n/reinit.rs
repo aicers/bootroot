@@ -21,36 +21,102 @@ impl Messages {
         self.strings().reinit_plan_destructive_state_file
     }
 
-    pub(crate) fn reinit_plan_destructive_runtime_files(&self) -> &'static str {
-        self.strings().reinit_plan_destructive_runtime_files
+    pub(crate) fn reinit_plan_destructive_runtime_files(&self, secrets_dir: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_destructive_runtime_files,
+            &[("secrets_dir", secrets_dir)],
+        )
     }
 
-    pub(crate) fn reinit_plan_destructive_service_creds(&self) -> &'static str {
-        self.strings().reinit_plan_destructive_service_creds
+    pub(crate) fn reinit_plan_destructive_service_creds(&self, secrets_dir: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_destructive_service_creds,
+            &[("secrets_dir", secrets_dir)],
+        )
     }
 
     pub(crate) fn reinit_plan_preserved_actions(&self) -> &'static str {
         self.strings().reinit_plan_preserved_actions
     }
 
-    pub(crate) fn reinit_plan_preserved_ca(&self) -> &'static str {
-        self.strings().reinit_plan_preserved_ca
+    pub(crate) fn reinit_plan_preserved_ca(&self, secrets_dir: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_ca,
+            &[("secrets_dir", secrets_dir)],
+        )
     }
 
-    pub(crate) fn reinit_plan_preserved_password(&self) -> &'static str {
-        self.strings().reinit_plan_preserved_password
+    pub(crate) fn reinit_plan_preserved_password(&self, secrets_dir: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_password,
+            &[("secrets_dir", secrets_dir)],
+        )
     }
 
     pub(crate) fn reinit_plan_preserved_postgres(&self) -> &'static str {
         self.strings().reinit_plan_preserved_postgres
     }
 
-    pub(crate) fn reinit_plan_preserved_compose_overrides(&self) -> &'static str {
-        self.strings().reinit_plan_preserved_compose_overrides
+    pub(crate) fn reinit_plan_preserved_compose_overrides(&self, secrets_dir: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_compose_overrides,
+            &[("secrets_dir", secrets_dir)],
+        )
     }
 
     pub(crate) fn reinit_plan_preserved_intent(&self) -> &'static str {
         self.strings().reinit_plan_preserved_intent
+    }
+
+    pub(crate) fn reinit_plan_preserved_intent_section(&self) -> &'static str {
+        self.strings().reinit_plan_preserved_intent_section
+    }
+
+    pub(crate) fn reinit_plan_preserved_intent_secrets_dir(&self, value: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_intent_secrets_dir,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn reinit_plan_preserved_intent_openbao_bind(&self, value: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_intent_openbao_bind,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn reinit_plan_preserved_intent_openbao_advertise(&self, value: &str) -> String {
+        format_template(
+            self.strings()
+                .reinit_plan_preserved_intent_openbao_advertise,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn reinit_plan_preserved_intent_http01_bind(&self, value: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_intent_http01_bind,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn reinit_plan_preserved_intent_http01_advertise(&self, value: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_intent_http01_advertise,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn reinit_plan_preserved_intent_infra_certs(&self, count: usize) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_intent_infra_certs,
+            &[("count", &count.to_string())],
+        )
+    }
+
+    pub(crate) fn reinit_plan_preserved_intent_none(&self) -> &'static str {
+        self.strings().reinit_plan_preserved_intent_none
     }
 
     pub(crate) fn reinit_plan_service_registry_warning(&self) -> &'static str {

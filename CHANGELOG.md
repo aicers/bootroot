@@ -271,7 +271,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   into the second init pass so the freshly reinitialised OpenBao KV
   receives the credentials that still match the preserved PostgreSQL
   state, instead of the dummy `rotated-use-openbao` password sitting
-  in `.env` after a previous `init --enable db-provision` run.
+  in `.env` after a previous `init --enable db-provision` run. When
+  the snapshot records a non-default `secrets_dir`, the snapshot
+  drives all secrets-tree operations (cleanup, preserved-DSN /
+  `password.txt` reads, the second init pass's `--secrets-dir`, and
+  the rewritten `state.json.secrets_dir`) so a recovery does not
+  silently target the wrong tree when the operator omits
+  `--secrets-dir` from the reinit invocation. The pre-confirmation
+  plan now echoes the snapshotted intent values themselves (effective
+  `secrets_dir`, OpenBao bind/advertise, HTTP-01 admin
+  bind/advertise, `infra_certs` count) so the operator can verify the
+  recovery target before any destructive op runs.
   Refuses to run against external/shared OpenBao instances
   (compose-managed local only).
 - Added `--cert-group <gid-or-name>` to `bootroot service add` and

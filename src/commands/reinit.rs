@@ -61,31 +61,46 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     // 3. Snapshot deployment intent (if state.json exists).
     let snapshot = snapshot_deployment_intent(&state_path)?;
 
-    // 4. Print plan and ask for confirmation.
-    write_reinit_plan(&mut io::stdout().lock(), messages)
-        .with_context(|| messages.error_prompt_write_failed())?;
+    // 4. Derive the effective `secrets_dir` from the snapshot.  When
+    //    `state.json` records a non-default `secrets_dir` (e.g. the
+    //    previous init ran with `--secrets-dir custom`) the snapshot
+    //    wins over the CLI default so cleanup, the preserved-DSN /
+    //    password reads under the init pass, the second init pass'
+    //    `args.secrets_dir`, and the rewritten `state.json.secrets_dir`
+    //    all target the same tree without requiring the operator to
+    //    rediscover and re-pass `--secrets-dir` on every recovery.
+    let effective_secrets_dir = effective_secrets_dir(args, &snapshot);
+
+    // 5. Print plan and ask for confirmation.
+    write_reinit_plan(
+        &mut io::stdout().lock(),
+        &snapshot,
+        &effective_secrets_dir,
+        messages,
+    )
+    .with_context(|| messages.error_prompt_write_failed())?;
     if !args.yes && !prompt_yes_no(messages.reinit_confirm(), messages)? {
         anyhow::bail!(messages.error_operation_cancelled());
     }
 
-    // 5. Stop and remove the OpenBao container + volumes.
+    // 6. Stop and remove the OpenBao container + volumes.
     remove_openbao_container_and_volumes(compose_file, messages)?;
 
-    // 6. Remove OpenBao runtime/bootstrap artifacts (narrow).
-    remove_openbao_runtime_state(&args.secrets_dir.secrets_dir, messages)?;
+    // 7. Remove OpenBao runtime/bootstrap artifacts (narrow).
+    remove_openbao_runtime_state(&effective_secrets_dir, messages)?;
 
-    // 7. Rewrite state.json with intent-only fields BEFORE infra up so
+    // 8. Rewrite state.json with intent-only fields BEFORE infra up so
     //    the infra-up path layers the correct compose overrides for
     //    any recorded non-loopback bind.
     write_minimal_state(
         &state_path,
         &snapshot,
         &args.openbao,
-        &args.secrets_dir,
+        &effective_secrets_dir,
         messages,
     )?;
 
-    // 8. Bring OpenBao back up via the existing infra up path.
+    // 9. Bring OpenBao back up via the existing infra up path.
     let infra_args = InfraUpArgs {
         compose_file: ComposeFileArgs {
             compose_file: compose_file.clone(),
@@ -98,14 +113,14 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     };
     run_infra_up(&infra_args, messages)?;
 
-    // 9. Re-run init in reinit mode.  Reinit-mode behavior is enforced
-    //    inside the init flow: overwrite prompts for preserved files
-    //    are skipped, and an existing `password.txt` short-circuits
-    //    the auto-gen path so the step-ca password is not rotated.
-    //    `--root-token-output`, if set, is threaded into the init args
-    //    so the freshly issued root token is persisted with mode 0600
-    //    after init succeeds.
-    let init_args = init_args_for_reinit(args, &snapshot);
+    // 10. Re-run init in reinit mode.  Reinit-mode behavior is enforced
+    //     inside the init flow: overwrite prompts for preserved files
+    //     are skipped, and an existing `password.txt` short-circuits
+    //     the auto-gen path so the step-ca password is not rotated.
+    //     `--root-token-output`, if set, is threaded into the init args
+    //     so the freshly issued root token is persisted with mode 0600
+    //     after init succeeds.
+    let init_args = init_args_for_reinit(args, &snapshot, &effective_secrets_dir);
     run_init(&init_args, messages).await?;
 
     println!("{}", messages.reinit_completed());
@@ -215,16 +230,13 @@ pub(crate) fn write_minimal_state(
     state_path: &Path,
     snapshot: &DeploymentIntent,
     openbao: &OpenBaoArgs,
-    secrets_dir: &SecretsDirArgs,
+    effective_secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
     let state = StateFile {
         openbao_url: openbao.openbao_url.clone(),
         kv_mount: openbao.kv_mount.clone(),
-        secrets_dir: snapshot
-            .secrets_dir
-            .clone()
-            .or_else(|| Some(secrets_dir.secrets_dir.clone())),
+        secrets_dir: Some(effective_secrets_dir.to_path_buf()),
         policies: BTreeMap::new(),
         approles: BTreeMap::new(),
         services: BTreeMap::new(),
@@ -238,6 +250,19 @@ pub(crate) fn write_minimal_state(
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
+}
+
+/// Returns the effective `secrets_dir` reinit operates on.  When
+/// `state.json` recorded a `secrets_dir` (e.g. the previous init ran
+/// with a non-default `--secrets-dir`), the snapshot wins over the CLI
+/// default so a recovery does not silently target the wrong tree.  When
+/// no snapshot is present (the rsync-clone path or a fresh tree), the
+/// CLI value is used directly.
+pub(crate) fn effective_secrets_dir(args: &ReinitArgs, snapshot: &DeploymentIntent) -> PathBuf {
+    snapshot
+        .secrets_dir
+        .clone()
+        .unwrap_or_else(|| args.secrets_dir.secrets_dir.clone())
 }
 
 /// Removes only `OpenBao` runtime/bootstrap artifacts.  Explicitly
@@ -398,27 +423,103 @@ fn validate_root_token_output_path(path: &Path, messages: &Messages) -> Result<(
 }
 
 /// Writes the reinit plan (destructive actions + preserved artifacts +
-/// service-registry warning) to `out`.  Split from the production
-/// stdout call site so tests can assert both sections appear in the
-/// rendered text.
-fn write_reinit_plan<W: Write>(out: &mut W, messages: &Messages) -> io::Result<()> {
+/// snapshotted intent values + service-registry warning) to `out`.
+/// Snapshot-aware so the operator can see, before confirming, exactly
+/// which secrets tree, `OpenBao` / HTTP-01 bind, and infra-cert entries
+/// the reinit will operate on.  Split from the production stdout call
+/// site so tests can assert each section appears in the rendered text.
+fn write_reinit_plan<W: Write>(
+    out: &mut W,
+    snapshot: &DeploymentIntent,
+    effective_secrets_dir: &Path,
+    messages: &Messages,
+) -> io::Result<()> {
+    let secrets_display = effective_secrets_dir.display().to_string();
     writeln!(out, "{}", messages.reinit_plan_title())?;
     writeln!(out, "{}", messages.reinit_plan_destructive_actions())?;
     writeln!(out, "{}", messages.reinit_plan_destructive_container())?;
     writeln!(out, "{}", messages.reinit_plan_destructive_volumes())?;
     writeln!(out, "{}", messages.reinit_plan_destructive_state_file())?;
-    writeln!(out, "{}", messages.reinit_plan_destructive_runtime_files())?;
-    writeln!(out, "{}", messages.reinit_plan_destructive_service_creds())?;
+    writeln!(
+        out,
+        "{}",
+        messages.reinit_plan_destructive_runtime_files(&secrets_display)
+    )?;
+    writeln!(
+        out,
+        "{}",
+        messages.reinit_plan_destructive_service_creds(&secrets_display)
+    )?;
     writeln!(out, "{}", messages.reinit_plan_preserved_actions())?;
-    writeln!(out, "{}", messages.reinit_plan_preserved_ca())?;
-    writeln!(out, "{}", messages.reinit_plan_preserved_password())?;
+    writeln!(
+        out,
+        "{}",
+        messages.reinit_plan_preserved_ca(&secrets_display)
+    )?;
+    writeln!(
+        out,
+        "{}",
+        messages.reinit_plan_preserved_password(&secrets_display)
+    )?;
     writeln!(out, "{}", messages.reinit_plan_preserved_postgres())?;
     writeln!(
         out,
         "{}",
-        messages.reinit_plan_preserved_compose_overrides()
+        messages.reinit_plan_preserved_compose_overrides(&secrets_display)
     )?;
     writeln!(out, "{}", messages.reinit_plan_preserved_intent())?;
+
+    writeln!(out)?;
+    writeln!(out, "{}", messages.reinit_plan_preserved_intent_section())?;
+    writeln!(
+        out,
+        "{}",
+        messages.reinit_plan_preserved_intent_secrets_dir(&secrets_display)
+    )?;
+    let has_extra_intent = snapshot.openbao_bind_addr.is_some()
+        || snapshot.openbao_advertise_addr.is_some()
+        || snapshot.http01_admin_bind_addr.is_some()
+        || snapshot.http01_admin_advertise_addr.is_some()
+        || !snapshot.infra_certs.is_empty();
+    if let Some(bind) = snapshot.openbao_bind_addr.as_deref() {
+        writeln!(
+            out,
+            "{}",
+            messages.reinit_plan_preserved_intent_openbao_bind(bind)
+        )?;
+    }
+    if let Some(addr) = snapshot.openbao_advertise_addr.as_deref() {
+        writeln!(
+            out,
+            "{}",
+            messages.reinit_plan_preserved_intent_openbao_advertise(addr)
+        )?;
+    }
+    if let Some(addr) = snapshot.http01_admin_bind_addr.as_deref() {
+        writeln!(
+            out,
+            "{}",
+            messages.reinit_plan_preserved_intent_http01_bind(addr)
+        )?;
+    }
+    if let Some(addr) = snapshot.http01_admin_advertise_addr.as_deref() {
+        writeln!(
+            out,
+            "{}",
+            messages.reinit_plan_preserved_intent_http01_advertise(addr)
+        )?;
+    }
+    if !snapshot.infra_certs.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            messages.reinit_plan_preserved_intent_infra_certs(snapshot.infra_certs.len())
+        )?;
+    }
+    if !has_extra_intent {
+        writeln!(out, "{}", messages.reinit_plan_preserved_intent_none())?;
+    }
+
     writeln!(out)?;
     writeln!(out, "{}", messages.reinit_plan_service_registry_warning())?;
     Ok(())
@@ -477,17 +578,23 @@ fn preserved_db_dsn_from_ca_json(secrets_dir: &Path) -> Option<String> {
 /// reinitialised `OpenBao` KV instead of the dummy `rotated-use-openbao`
 /// password sitting in `.env`.  See `preserved_db_dsn_from_ca_json` for
 /// why the env fallback is unsafe under reinit.
-fn init_args_for_reinit(args: &ReinitArgs, snapshot: &DeploymentIntent) -> Box<InitArgs> {
+fn init_args_for_reinit(
+    args: &ReinitArgs,
+    snapshot: &DeploymentIntent,
+    effective_secrets_dir: &Path,
+) -> Box<InitArgs> {
     let mut openbao = args.openbao.clone();
     if openbao.openbao_url == crate::commands::init::DEFAULT_OPENBAO_URL
         && let Some(bind) = snapshot.openbao_bind_addr.as_deref()
     {
         openbao.openbao_url = client_url_from_bind_addr(bind);
     }
-    let db_dsn = preserved_db_dsn_from_ca_json(&args.secrets_dir.secrets_dir);
+    let db_dsn = preserved_db_dsn_from_ca_json(effective_secrets_dir);
     Box::new(InitArgs {
         openbao,
-        secrets_dir: args.secrets_dir.clone(),
+        secrets_dir: SecretsDirArgs {
+            secrets_dir: effective_secrets_dir.to_path_buf(),
+        },
         compose: args.compose.clone(),
         enable: args.enable.clone(),
         skip: args.skip.clone(),
@@ -647,12 +754,10 @@ mod tests {
             openbao_url: "http://localhost:8200".to_string(),
             kv_mount: "secret".to_string(),
         };
-        let secrets_dir = SecretsDirArgs {
-            secrets_dir: PathBuf::from("secrets"),
-        };
+        let effective = PathBuf::from("secrets");
         let messages = test_messages();
 
-        write_minimal_state(&state_path, &snapshot, &openbao, &secrets_dir, &messages).unwrap();
+        write_minimal_state(&state_path, &snapshot, &openbao, &effective, &messages).unwrap();
 
         let rewritten = StateFile::load(&state_path).unwrap();
         assert!(
@@ -969,7 +1074,9 @@ mod tests {
     fn write_reinit_plan_covers_destructive_and_preserved_sections() {
         let messages = test_messages();
         let mut buf = Vec::new();
-        write_reinit_plan(&mut buf, &messages).expect("write plan");
+        let snapshot = DeploymentIntent::default();
+        write_reinit_plan(&mut buf, &snapshot, Path::new("secrets"), &messages)
+            .expect("write plan");
         let rendered = String::from_utf8(buf).expect("utf-8 plan");
 
         // Destructive section + a sentinel destructive action.
@@ -996,11 +1103,97 @@ mod tests {
             "preserved section must list PostgreSQL; got:\n{rendered}"
         );
 
+        // Snapshot-aware preserved intent section.
+        assert!(
+            rendered.contains("Preserved deployment intent"),
+            "plan must include preserved intent section; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("secrets_dir: secrets"),
+            "preserved intent must echo the effective secrets_dir; got:\n{rendered}"
+        );
+
         // Operator-visible warning that the service registry will be
         // empty after reinit completes.
         assert!(
             rendered.contains("service add"),
             "plan must point operator at service add; got:\n{rendered}"
+        );
+    }
+
+    /// Regression for Round 4 reviewer item: the plan must echo the
+    /// actual snapshotted intent values (non-loopback bind addresses,
+    /// infra-cert entries, custom `secrets_dir`) so the operator can
+    /// verify what will survive *before* the destructive sequence runs.
+    /// Without this, the operator only sees the categorical preserved
+    /// list and has to trust that the snapshot is being read correctly.
+    #[test]
+    fn write_reinit_plan_echoes_snapshotted_intent_values() {
+        let messages = test_messages();
+        let mut buf = Vec::new();
+        let snapshot = DeploymentIntent {
+            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
+            openbao_advertise_addr: Some("192.168.1.10:8200".to_string()),
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+            http01_admin_advertise_addr: None,
+            secrets_dir: Some(PathBuf::from("secrets-custom")),
+            infra_certs: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "openbao".to_string(),
+                    InfraCertEntry {
+                        cert_path: PathBuf::from("c"),
+                        key_path: PathBuf::from("k"),
+                        sans: vec!["192.168.1.10".to_string()],
+                        renew_before: "720h".to_string(),
+                        reload_strategy: ReloadStrategy::ContainerRestart {
+                            container_name: "bootroot-openbao".to_string(),
+                        },
+                        issued_at: None,
+                        expires_at: None,
+                    },
+                );
+                m
+            },
+        };
+        write_reinit_plan(&mut buf, &snapshot, Path::new("secrets-custom"), &messages)
+            .expect("write plan");
+        let rendered = String::from_utf8(buf).expect("utf-8 plan");
+
+        // Effective secrets_dir threaded through the destructive +
+        // preserved bullets and echoed in the intent section.
+        assert!(
+            rendered.contains("secrets-custom/openbao/unseal-keys.txt"),
+            "destructive runtime-files bullet must use the effective secrets_dir; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("secrets-custom/config/ca.json"),
+            "preserved CA bullet must use the effective secrets_dir; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("secrets-custom/password.txt"),
+            "preserved password bullet must use the effective secrets_dir; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("secrets_dir: secrets-custom"),
+            "intent section must echo the effective secrets_dir; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("openbao_bind_addr: 192.168.1.10:8200"),
+            "intent section must echo openbao_bind_addr; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("http01_admin_bind_addr: 192.168.1.10:8080"),
+            "intent section must echo http01_admin_bind_addr; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("infra_certs: 1"),
+            "intent section must echo infra_certs count; got:\n{rendered}"
+        );
+        // The advertise field was None so it must NOT appear.
+        assert!(
+            !rendered.contains("http01_admin_advertise_addr"),
+            "absent intent fields must not appear; got:\n{rendered}"
         );
     }
 
@@ -1028,7 +1221,11 @@ mod tests {
             summary_json: None,
             no_eab: true,
         };
-        let init_args = init_args_for_reinit(&reinit_args, &DeploymentIntent::default());
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &DeploymentIntent::default(),
+            &reinit_args.secrets_dir.secrets_dir,
+        );
         assert_eq!(
             init_args.root_token_output,
             Some(PathBuf::from("/tmp/root.token")),
@@ -1067,7 +1264,11 @@ mod tests {
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             ..DeploymentIntent::default()
         };
-        let init_args = init_args_for_reinit(&reinit_args, &snapshot);
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &snapshot,
+            &reinit_args.secrets_dir.secrets_dir,
+        );
         assert_eq!(
             init_args.openbao.openbao_url, "https://192.168.1.10:8200",
             "non-loopback bind intent must drive the init client URL"
@@ -1123,7 +1324,11 @@ mod tests {
             summary_json: None,
             no_eab: true,
         };
-        let init_args = init_args_for_reinit(&reinit_args, &DeploymentIntent::default());
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &DeploymentIntent::default(),
+            &reinit_args.secrets_dir.secrets_dir,
+        );
         assert_eq!(
             init_args.db_dsn.as_deref(),
             Some(expected_dsn.as_str()),
@@ -1158,7 +1363,11 @@ mod tests {
             summary_json: None,
             no_eab: true,
         };
-        let init_args = init_args_for_reinit(&reinit_args, &DeploymentIntent::default());
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &DeploymentIntent::default(),
+            &reinit_args.secrets_dir.secrets_dir,
+        );
         assert!(
             init_args.db_dsn.is_none(),
             "missing ca.json must leave db_dsn unset for env fallback"
@@ -1205,7 +1414,150 @@ mod tests {
             openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
             ..DeploymentIntent::default()
         };
-        let init_args = init_args_for_reinit(&reinit_args, &snapshot);
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &snapshot,
+            &reinit_args.secrets_dir.secrets_dir,
+        );
         assert_eq!(init_args.openbao.openbao_url, explicit);
+    }
+
+    /// Regression for Round 4 reviewer item: when `state.json` snapshots
+    /// a non-default `secrets_dir` (e.g. the previous init ran with
+    /// `--secrets-dir secrets-custom`), the documented `bootroot reinit`
+    /// invocation without `--secrets-dir` must still operate on that
+    /// tree.  The effective dir drives the cleanup path
+    /// (`remove_openbao_runtime_state`), the `ca.json` read in
+    /// `init_args_for_reinit`, the second init pass'
+    /// `args.secrets_dir.secrets_dir`, and the rewritten
+    /// `state.json.secrets_dir`.  Otherwise stale `OpenBao` runtime files
+    /// or service credentials remain in the real tree, the preserved DSN
+    /// is missed, and `password.txt` preservation does not apply.
+    #[test]
+    fn effective_secrets_dir_prefers_snapshot_over_cli_default() {
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs {
+                // CLI default `secrets` — operator did not re-pass the
+                // custom value on the reinit invocation.
+                secrets_dir: PathBuf::from("secrets"),
+            },
+            compose: ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let snapshot = DeploymentIntent {
+            secrets_dir: Some(PathBuf::from("secrets-custom")),
+            ..DeploymentIntent::default()
+        };
+        let effective = effective_secrets_dir(&reinit_args, &snapshot);
+        assert_eq!(effective, PathBuf::from("secrets-custom"));
+    }
+
+    /// Snapshot-driven `secrets_dir` must thread into `InitArgs`, so the
+    /// second init pass reads `password.txt` / `ca.json` from the right
+    /// tree and writes the rewritten `state.json.secrets_dir` back to
+    /// that tree (not the CLI default).
+    #[test]
+    fn init_args_for_reinit_uses_snapshotted_secrets_dir_and_preserved_dsn() {
+        let dir = tempdir().expect("tempdir");
+        let snapshot_secrets = dir.path().join("secrets-custom");
+        let config_dir = snapshot_secrets.join("config");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let real_password = format!("real-runtime-{nonce}");
+        let expected_dsn =
+            format!("postgresql://step:{real_password}@postgres:5432/stepca?sslmode=disable");
+        fs::write(
+            config_dir.join("ca.json"),
+            format!(r#"{{"db":{{"type":"postgresql","dataSource":"{expected_dsn}"}}}}"#),
+        )
+        .expect("write ca.json");
+
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            // CLI default `secrets` (no `--secrets-dir` flag).  An empty
+            // `secrets/config/ca.json` is intentionally NOT created in
+            // the CLI-default tree — the test asserts that the resolver
+            // reads from the snapshot dir, not the CLI default.
+            secrets_dir: SecretsDirArgs {
+                secrets_dir: dir.path().join("secrets"),
+            },
+            compose: ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let snapshot = DeploymentIntent {
+            secrets_dir: Some(snapshot_secrets.clone()),
+            ..DeploymentIntent::default()
+        };
+        let effective = effective_secrets_dir(&reinit_args, &snapshot);
+        assert_eq!(effective, snapshot_secrets);
+
+        let init_args = init_args_for_reinit(&reinit_args, &snapshot, &effective);
+        assert_eq!(
+            init_args.secrets_dir.secrets_dir, snapshot_secrets,
+            "init args must carry the snapshotted secrets_dir so the \
+             second init pass operates on the right tree"
+        );
+        assert_eq!(
+            init_args.db_dsn.as_deref(),
+            Some(expected_dsn.as_str()),
+            "preserved DSN must be read from the snapshotted secrets_dir"
+        );
+    }
+
+    /// The rewritten `state.json` must record the snapshotted (or
+    /// CLI-default fallback) `secrets_dir` so a subsequent reinit on the
+    /// same tree does not silently regress to the CLI default.
+    #[test]
+    fn write_minimal_state_preserves_snapshotted_secrets_dir() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        state_with_intent().save(&state_path).unwrap();
+        let snapshot = DeploymentIntent {
+            secrets_dir: Some(PathBuf::from("secrets-custom")),
+            ..DeploymentIntent::default()
+        };
+        let openbao = OpenBaoArgs {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+        };
+        let messages = test_messages();
+        write_minimal_state(
+            &state_path,
+            &snapshot,
+            &openbao,
+            Path::new("secrets-custom"),
+            &messages,
+        )
+        .unwrap();
+        let rewritten = StateFile::load(&state_path).unwrap();
+        assert_eq!(
+            rewritten.secrets_dir.as_deref(),
+            Some(Path::new("secrets-custom")),
+            "minimal state.json must record the snapshotted secrets_dir"
+        );
     }
 }
