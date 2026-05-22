@@ -247,8 +247,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   partial-init trap (init failed after OpenBao was initialised), the
   rsync-clone-to-new-host scenario, and the stuck-after-
   `clean --openbao-only` recovery path described in issue #598. With
-  `--yes` the entire flow is non-interactive and newly generated
-  unseal keys are written automatically. Refuses to run against
+  `--yes` the entire flow is non-interactive end-to-end: overwrite
+  prompts for preserved files are suppressed, the new HTTP-01
+  responder HMAC is auto-generated (the previous one lived in the
+  wiped OpenBao KV mount), the EAB registration prompt is skipped,
+  and newly generated unseal keys are written automatically to
+  `secrets/openbao/unseal-keys.txt` (mode `0600`). The optional
+  `--root-token-output <path>` is preflight-validated before any
+  destructive operation begins (rejects directories, unwritable
+  parents, and existing world/group-readable files) so a bad path
+  cannot leave the operator with a freshly reinitialised OpenBao plus
+  a failed token write; if the post-init write still fails for any
+  reason, the summary is printed first and a warning that names the
+  freshly issued token surfaces on stderr. Refuses to run against
   external/shared OpenBao instances (compose-managed local only).
 - Added `--cert-group <gid-or-name>` to `bootroot service add` and
   `bootroot service update` so issued service certificates can be

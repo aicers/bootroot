@@ -1591,7 +1591,10 @@ bootroot clean --openbao-only --yes
 - `--root-token-output <path>` *(옵트인)*: 새로 발급된 루트 토큰을 제한된
   권한(`0600`)으로 `<path>`에 기록합니다. 개발/테스트 또는 임시 자동화
   용도로만 사용하세요 — 영구적인 루트 토큰 파일은 **프로덕션 환경에
-  권장되지 않습니다**.
+  권장되지 않습니다**. 경로는 파괴적 동작이 시작되기 전에 사전 검증되며,
+  경로가 디렉터리이거나 상위 디렉터리에 쓸 수 없는 경우 reinit이 시작되지
+  않습니다. 따라서 잘못된 경로로 인해 OpenBao가 초기화된 후 토큰 저장이
+  실패하는 상황이 발생하지 않습니다.
 - `--enable <features>` / `--skip <phases>` / `--summary-json <path>` /
   `--no-eab`: `init`으로 그대로 전달됩니다.
 
@@ -1620,7 +1623,9 @@ bootroot clean --openbao-only --yes
 - `infra up --services openbao` 경로로 OpenBao를 다시 기동하여 기록된
   non-loopback 바인드 오버라이드가 올바르게 적용되도록 합니다.
 - reinit 모드로 `init`을 다시 실행합니다 (기존 step-ca 비밀번호 보존,
-  보존된 파일에 대한 덮어쓰기 프롬프트 억제).
+  보존된 파일에 대한 덮어쓰기 프롬프트 억제, 이전 HMAC이 wipe된 OpenBao
+  KV에 있었으므로 새 HTTP-01 responder HMAC 자동 생성, EAB 등록 프롬프트
+  생략 — EAB 자격증명이 필요한 운영자는 reinit 후 별도로 등록).
 - reinit 완료 후 서비스 레지스트리는 비어 있으므로 이전에 등록된 각
   서비스에 대해 `bootroot service add ...`를 다시 실행하세요.
 

@@ -304,20 +304,80 @@ fn remove_file_if_exists(path: &Path, messages: &Messages) -> Result<()> {
 }
 
 /// Validates that an optional `--root-token-output` path is safe to
-/// write to.  When the file already exists, it must not be world- or
-/// group-readable (the file is meant to carry a freshly issued root
-/// token, so existing permissive permissions are treated as a refusal
-/// to overwrite).
+/// write to *before* any destructive operation begins.  Without this
+/// the destructive sequence runs to completion and the post-init file
+/// write fails — exactly recreating the partial-init trap this command
+/// is meant to recover from.  The check enforces three things:
+///
+/// 1. If the path exists it must be a regular file (not a directory or
+///    symlink to a directory), otherwise the post-init write would fail.
+/// 2. If the file already exists its permissions must already be
+///    `0600`-compatible (no group/other bits set) — overwriting a
+///    world-readable file would briefly widen access to the freshly
+///    issued root token.
+/// 3. The destination must be writable in practice.  We probe by
+///    creating the parent directory (if missing) and writing a uniquely
+///    named marker file in it, then removing the marker.  This catches
+///    read-only parents, missing intermediate components that cannot be
+///    created, and (when the destination already exists) the operator
+///    not actually having write permission on the file or its parent.
 fn validate_root_token_output_path(path: &Path, messages: &Messages) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
+    let display = path.display().to_string();
+
+    if path.exists() {
+        let meta = std::fs::symlink_metadata(path)
+            .with_context(|| messages.error_read_file_failed(&display))?;
+        let file_type = meta.file_type();
+        if !file_type.is_file() && !file_type.is_symlink() {
+            anyhow::bail!(messages.error_reinit_root_token_output_not_file(&display));
+        }
+        if file_type.is_symlink() {
+            let target_meta = std::fs::metadata(path)
+                .with_context(|| messages.error_read_file_failed(&display))?;
+            if !target_meta.is_file() {
+                anyhow::bail!(messages.error_reinit_root_token_output_not_file(&display));
+            }
+        }
+        // Permission check uses follow-symlink metadata so a symlink to
+        // a regular file is evaluated against the target's mode.
+        let mode_meta =
+            std::fs::metadata(path).with_context(|| messages.error_read_file_failed(&display))?;
+        let mode = mode_meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(messages.error_reinit_root_token_output_unsafe(&display));
+        }
     }
-    let meta = std::fs::metadata(path)
-        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        anyhow::bail!(messages.error_reinit_root_token_output_unsafe(&path.display().to_string()));
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    if !parent.exists() {
+        std::fs::create_dir_all(&parent).map_err(|err| {
+            anyhow::anyhow!(
+                messages.error_reinit_root_token_output_unwritable(&display, &err.to_string())
+            )
+        })?;
     }
+    if !parent.is_dir() {
+        anyhow::bail!(messages.error_reinit_root_token_output_unwritable(
+            &display,
+            &format!("parent {} is not a directory", parent.display()),
+        ));
+    }
+    // Probe writability by creating a uniquely named marker in the parent
+    // directory.  The probe is independent of the destination so it does
+    // not race with an existing file the operator may want to keep.
+    let probe = parent.join(format!(
+        ".bootroot-reinit-token-probe.{}",
+        std::process::id()
+    ));
+    if let Err(err) = std::fs::write(&probe, b"") {
+        anyhow::bail!(
+            messages.error_reinit_root_token_output_unwritable(&display, &err.to_string())
+        );
+    }
+    let _ = std::fs::remove_file(&probe);
     Ok(())
 }
 
@@ -724,6 +784,71 @@ mod tests {
         let dir = tempdir().unwrap();
         let messages = test_messages();
         validate_root_token_output_path(&dir.path().join("missing"), &messages).unwrap();
+    }
+
+    /// Regression: a path that exists but is a directory must be
+    /// rejected during preflight.  Otherwise the post-init write would
+    /// fail after `OpenBao` has already been wiped and reinitialised,
+    /// recreating the partial-init trap.
+    #[test]
+    fn validate_root_token_output_rejects_directory_path() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("not-a-file");
+        fs::create_dir_all(&nested).unwrap();
+        let messages = test_messages();
+        let err = validate_root_token_output_path(&nested, &messages).unwrap_err();
+        assert!(
+            err.to_string().contains("regular file") || err.to_string().contains("일반 파일"),
+            "got: {err}"
+        );
+    }
+
+    /// Regression: a missing destination whose parent directory cannot
+    /// be created (because an ancestor is a regular file, not a
+    /// directory) must be rejected during preflight, before any
+    /// destructive operation begins.
+    #[test]
+    fn validate_root_token_output_rejects_uncreatable_parent() {
+        let dir = tempdir().unwrap();
+        // Ancestor that blocks directory creation: a regular file where
+        // a directory would need to be created.
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, "not a dir").unwrap();
+        let target = blocker.join("nested").join("token");
+        let messages = test_messages();
+        let err = validate_root_token_output_path(&target, &messages).unwrap_err();
+        assert!(
+            err.to_string().contains("--root-token-output")
+                || err.to_string().contains("root-token-output"),
+            "got: {err}"
+        );
+    }
+
+    /// Regression: preflight should not silently pass when the parent
+    /// directory exists but is read-only.  This catches the case where
+    /// the operator points `--root-token-output` at a directory they
+    /// cannot write to (e.g. a shared mount mounted read-only).
+    #[test]
+    fn validate_root_token_output_rejects_read_only_parent() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("ro");
+        fs::create_dir_all(&parent).unwrap();
+        let mut perms = fs::metadata(&parent).unwrap().permissions();
+        let original = perms.mode();
+        perms.set_mode(0o500);
+        fs::set_permissions(&parent, perms).unwrap();
+        let target = parent.join("token");
+        let messages = test_messages();
+        let err = validate_root_token_output_path(&target, &messages).unwrap_err();
+        // Restore so tempdir cleanup succeeds.
+        let mut perms = fs::metadata(&parent).unwrap().permissions();
+        perms.set_mode(original);
+        fs::set_permissions(&parent, perms).unwrap();
+        assert!(
+            err.to_string().contains("--root-token-output")
+                || err.to_string().contains("root-token-output"),
+            "got: {err}"
+        );
     }
 
     /// The dry-run plan must surface both destructive actions and

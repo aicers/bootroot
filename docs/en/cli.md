@@ -1651,7 +1651,11 @@ operator-managed runbook for those.
   is intended for dev/test or ephemeral automation only — persistent
   root token files are **not recommended for production**. When the
   destination already exists with world-/group-readable permissions,
-  reinit refuses to overwrite it.
+  reinit refuses to overwrite it. The path is preflight-checked
+  before any destructive operation: reinit refuses to start if the
+  path is a directory or if the parent directory is not writable, so
+  a bad path cannot leave the operator with a wiped-and-reinitialised
+  OpenBao plus a failed token write.
 - `--enable <features>`: passed through to `init` (e.g.
   `show-secrets`)
 - `--skip <phases>`: passed through to `init` (e.g.
@@ -1689,7 +1693,11 @@ operator-managed runbook for those.
 - Brings OpenBao back up via `infra up --services openbao` so any
   recorded non-loopback bind override is layered correctly.
 - Re-runs `init` in reinit mode (preserves the existing step-ca
-  password, suppresses overwrite prompts for preserved files).
+  password, suppresses overwrite prompts for preserved files,
+  auto-generates the new HTTP-01 responder HMAC because the previous
+  one lived in the wiped OpenBao KV mount, and skips the EAB
+  registration prompt — operators who need EAB credentials register
+  them out of band after reinit).
 - After reinit, the service registry is empty — re-run
   `bootroot service add ...` for each service that was previously
   registered.

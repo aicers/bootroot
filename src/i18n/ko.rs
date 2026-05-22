@@ -471,4 +471,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_reinit_external_openbao: "reinit 거부: compose 파일 {path}에 `openbao` 서비스가 정의되어 있지 않습니다. `bootroot reinit`은 compose로 관리되는 로컬 OpenBao에서만 동작합니다. 외부/공유 OpenBao는 운영자 런북을 사용해야 합니다.",
     error_reinit_container_project_mismatch: "reinit 거부: 컨테이너 `bootroot-openbao`가 compose 프로젝트 `{actual}`에 속해 있지만 현재 작업 디렉터리는 프로젝트 `{expected}`로 해석됩니다. 이 작업 디렉터리가 관리하지 않는 OpenBao를 지울 수 없습니다.",
     error_reinit_root_token_output_unsafe: "루트 토큰 쓰기 거부: 기존 파일 {path}이(가) other-/group-readable 권한을 가지고 있습니다. 재시도하기 전에 `chmod 0600 {path}`를 실행하거나 파일을 삭제하세요.",
+    error_reinit_root_token_output_not_file: "루트 토큰 쓰기 거부: {path}이(가) 일반 파일이 아닙니다. `--root-token-output`에는 일반 파일 경로를 전달하세요.",
+    error_reinit_root_token_output_unwritable: "reinit 시작 거부: `--root-token-output` 대상 {path}에 쓸 수 없습니다 ({reason}). 재시도하기 전에 쓰기 가능한 파일 경로를 전달하세요.",
+    error_reinit_root_token_persist_failed: "경고: 새로 발급된 OpenBao 루트 토큰을 {path}에 저장하지 못했습니다 ({reason}). 토큰은 발급되었으므로 수동으로 저장해야 합니다. 위 요약에 토큰이 포함되어 있습니다 (`--enable show-secrets`로 마스킹을 해제하세요).",
 };

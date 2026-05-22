@@ -94,16 +94,35 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             if let Some(summary_json) = args.summary_json.as_deref() {
                 write_init_summary_json(summary_json, &summary).await?;
             }
-            if let Some(root_token_path) = args.root_token_output.as_deref() {
-                write_root_token_file(root_token_path, &summary.root_token).await?;
-            }
+            // Print the summary *before* attempting the optional
+            // root-token file write so a write failure does not hide the
+            // freshly issued root token from the operator's terminal —
+            // OpenBao has already been initialised at this point and a
+            // lost token would force another reinit cycle.
             print_init_summary(&summary, messages);
+            if let Some(root_token_path) = args.root_token_output.as_deref()
+                && let Err(err) = write_root_token_file(root_token_path, &summary.root_token).await
+            {
+                eprintln!(
+                    "{}",
+                    messages.error_reinit_root_token_persist_failed(
+                        &root_token_path.display().to_string(),
+                        &err.to_string(),
+                    )
+                );
+                return Err(err);
+            }
 
             // Prompt to save unseal keys if they were just generated.
+            // Under reinit mode the operator already authorized the
+            // destructive flow at the `reinit` level; the issue
+            // acceptance criteria require `reinit --yes` to write the
+            // fresh keys automatically with no further interaction.
             if summary.init_response && !summary.unseal_keys.is_empty() {
                 maybe_save_unseal_keys(
                     &args.secrets_dir.secrets_dir,
                     &summary.unseal_keys,
+                    args.reinit_mode,
                     messages,
                 )
                 .await?;
@@ -628,10 +647,12 @@ async fn run_init_inner(
 async fn maybe_save_unseal_keys(
     secrets_dir: &Path,
     keys: &[String],
+    auto_save: bool,
     messages: &Messages,
 ) -> Result<()> {
     use super::prompts::prompt_yes_no;
-    if prompt_yes_no(messages.prompt_save_unseal_keys(), messages)? {
+    let save = auto_save || prompt_yes_no(messages.prompt_save_unseal_keys(), messages)?;
+    if save {
         let path =
             crate::commands::openbao_unseal::save_unseal_keys(secrets_dir, keys, messages).await?;
         println!(
@@ -1074,6 +1095,30 @@ mod tests {
         diagnose_partial_init(&client, &args, &test_messages())
             .await
             .expect("uninitialized path must succeed");
+    }
+
+    /// Regression: `bootroot reinit --yes` must persist new unseal keys
+    /// automatically without prompting.  `maybe_save_unseal_keys` is the
+    /// only path that writes `secrets/openbao/unseal-keys.txt` during
+    /// init; if the `auto_save` arg does not bypass the prompt the
+    /// recovery flow will stall on `stdin` and the keys will be lost.
+    #[tokio::test]
+    async fn maybe_save_unseal_keys_auto_save_writes_without_prompting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let keys = vec!["key-1".to_string(), "key-2".to_string()];
+        let messages = test_messages();
+        maybe_save_unseal_keys(&secrets, &keys, true, &messages)
+            .await
+            .expect("auto-save must not prompt");
+        let path = secrets.join("openbao").join("unseal-keys.txt");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("key-1") && body.contains("key-2"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "unseal keys file must be 0600, got {mode:o}");
     }
 
     /// `write_root_token_file` persists the token with mode `0600`.

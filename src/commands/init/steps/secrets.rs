@@ -51,10 +51,17 @@ pub(super) fn resolve_init_secrets(
             messages,
         )?
     };
+    // Under reinit mode the previous HTTP-01 HMAC lived in OpenBao KV
+    // (PATH_AGENT_HTTP01) and was wiped along with the volume.  Reinit
+    // does not re-prompt operators for fresh secrets, so auto-generate a
+    // new HMAC unless the caller explicitly passed `--http-hmac`.  This
+    // keeps `reinit --yes` non-interactive even without the operator
+    // opting into the global `auto-generate` feature.
+    let auto_generate_secret = args.has_feature(InitFeature::AutoGenerate) || args.reinit_mode;
     let http_hmac = resolve_secret(
         messages.prompt_http_hmac(),
         args.http_hmac.as_deref(),
-        args.has_feature(InitFeature::AutoGenerate),
+        auto_generate_secret,
         messages,
     )?;
     let eab = resolve_eab(args, messages)?;
@@ -108,6 +115,13 @@ pub(super) async fn maybe_register_eab(
         return Ok(None);
     }
     if args.no_eab {
+        return Ok(None);
+    }
+    // Reinit does not re-prompt for EAB credentials: the previous EAB
+    // material was wiped with OpenBao's KV mount, and `bootroot reinit`
+    // intentionally has no EAB CLI surface.  Operators who want to
+    // re-register EAB run a follow-up step out of band.
+    if args.reinit_mode {
         return Ok(None);
     }
     if !prompt_yes_no(messages.prompt_eab_register_now(), messages)? {
@@ -298,6 +312,41 @@ mod tests {
             "outside reinit_mode, auto-generate must run"
         );
         assert!(!resolved.stepca_password.is_empty());
+    }
+
+    /// Regression: in reinit mode the previous HTTP-01 HMAC was wiped
+    /// along with `OpenBao`'s KV mount, and `bootroot reinit` does not
+    /// re-prompt operators for fresh secrets.  Without auto-generating
+    /// the HMAC, `reinit --yes` would stall on `prompt_text` for HTTP
+    /// HMAC even though the caller has opted into the non-interactive
+    /// recovery flow.
+    #[test]
+    fn resolve_init_secrets_auto_generates_http_hmac_in_reinit_mode() {
+        use std::fs;
+
+        use tempfile::tempdir;
+
+        let messages = test_messages();
+        let dir = tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        fs::create_dir_all(&secrets).unwrap();
+        fs::write(secrets.join("password.txt"), "preserved\n").unwrap();
+
+        let mut args = super::super::test_support::default_init_args();
+        args.secrets_dir.secrets_dir = secrets;
+        args.reinit_mode = true;
+        args.no_eab = true;
+        // Crucially: no --http-hmac on the CLI, no AutoGenerate feature
+        // — only reinit_mode should drive the auto-gen branch.
+        args.http_hmac = None;
+        args.enable = Vec::new();
+
+        let resolved =
+            resolve_init_secrets(&args, &messages, "ignored-dsn".to_string()).expect("resolve");
+        assert!(
+            !resolved.http_hmac.is_empty(),
+            "reinit_mode must auto-generate a fresh HTTP HMAC instead of prompting"
+        );
     }
 
     #[test]

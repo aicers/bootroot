@@ -97,4 +97,33 @@ impl Messages {
             &[("path", path)],
         )
     }
+
+    pub(crate) fn error_reinit_root_token_output_not_file(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_reinit_root_token_output_not_file,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_reinit_root_token_output_unwritable(
+        &self,
+        path: &str,
+        reason: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_reinit_root_token_output_unwritable,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn error_reinit_root_token_persist_failed(
+        &self,
+        path: &str,
+        reason: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_reinit_root_token_persist_failed,
+            &[("path", path), ("reason", reason)],
+        )
+    }
 }

@@ -507,6 +507,9 @@ pub(crate) struct Strings {
     pub(crate) error_reinit_external_openbao: &'static str,
     pub(crate) error_reinit_container_project_mismatch: &'static str,
     pub(crate) error_reinit_root_token_output_unsafe: &'static str,
+    pub(crate) error_reinit_root_token_output_not_file: &'static str,
+    pub(crate) error_reinit_root_token_output_unwritable: &'static str,
+    pub(crate) error_reinit_root_token_persist_failed: &'static str,
 }
 
 pub(crate) struct Messages {
