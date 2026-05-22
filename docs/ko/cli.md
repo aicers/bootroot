@@ -1596,9 +1596,11 @@ bootroot clean --openbao-only --yes
   경우(예: 모드 `0400`), 또는 상위 디렉터리가 새 파일을 받아들이지
   못하는 경우 reinit이 시작되지 않습니다. 따라서 잘못된 경로로 인해
   OpenBao가 초기화된 후 토큰 저장이 실패하는 상황이 발생하지 않습니다.
-  init 이후 쓰기가 그래도 실패하면(예: 디스크 가득) 새로 발급된 토큰을
-  stderr에 마스킹 없이(`ROOT_TOKEN=` 접두사) 출력하여 잃어버리지
-  않도록 합니다.
+  새 토큰 파일은 `OpenOptionsExt::mode`를 통해 처음부터 `0600` 모드로
+  생성되므로, 새로 발급된 루트 토큰이 생성과 chmod 사이에 프로세스
+  umask 기본 권한으로 노출되는 일이 없습니다. init 이후 쓰기가 그래도
+  실패하면(예: 디스크 가득) 새로 발급된 토큰을 stderr에 마스킹
+  없이(`ROOT_TOKEN=` 접두사) 출력하여 잃어버리지 않도록 합니다.
 - `--enable <features>` / `--skip <phases>` / `--summary-json <path>` /
   `--no-eab`: `init`으로 그대로 전달됩니다.
 
@@ -1656,6 +1658,16 @@ bootroot clean --openbao-only --yes
   경우(rsync 복제 경로 또는 `update_ca_json_with_backup` 실행 전에
   중단된 부분 init), reinit은 env 기반 리졸버로 폴백합니다 — 이
   시나리오에서는 `.env`에 실제 비밀번호가 그대로 남아 있습니다.
+- 보존된 `ca.json`에서 ACME provisioner 이름과
+  `defaultTLSCertDuration`도 함께 읽어 두 번째 init 패스에 적용합니다.
+  `bootroot init --stepca-provisioner <custom>`으로 초기화된 배포는
+  reinit 후에도 동일한 provisioner 이름을 유지하며(그렇지 않으면
+  OpenBao가 이미 wipe된 뒤에 `update_ca_json_with_backup`의 이름 기반
+  조회가 `ca.json does not contain an ACME provisioner named "acme"`
+  로 실패합니다), 비기본 `--cert-duration`으로 초기화된 배포도 reinit
+  마다 기본값으로 되돌아가지 않고 그대로 보존됩니다. `ca.json`이
+  없거나 ACME provisioner가 포함되어 있지 않은 경우에만 CLI 기본값으로
+  폴백합니다.
 - reinit 완료 후 서비스 레지스트리는 비어 있으므로 이전에 등록된 각
   서비스에 대해 `bootroot service add ...`를 다시 실행하세요.
 

@@ -1657,9 +1657,12 @@ operator-managed runbook for those.
   current process (e.g. mode `0400`), or if the parent directory
   cannot accept a new file, so a bad path cannot leave the operator
   with a wiped-and-reinitialised OpenBao plus a failed token write.
-  Should the post-init write still fail (e.g. disk full), the
-  freshly issued token is surfaced on stderr in cleartext (prefixed
-  with `ROOT_TOKEN=`) so it is not lost.
+  New token files are created atomically with mode `0600` via
+  `OpenOptionsExt::mode` so the freshly minted root token is never
+  observable on disk with the process umask's default permissions
+  between create and chmod. Should the post-init write still fail
+  (e.g. disk full), the freshly issued token is surfaced on stderr in
+  cleartext (prefixed with `ROOT_TOKEN=`) so it is not lost.
 - `--enable <features>`: passed through to `init` (e.g.
   `show-secrets`)
 - `--skip <phases>`: passed through to `init` (e.g.
@@ -1734,6 +1737,17 @@ operator-managed runbook for those.
   crashed before `update_ca_json_with_backup` ran), reinit falls
   through to the env-derived resolver — `.env` carries the real
   password in those scenarios.
+- Also derives the ACME provisioner name and `defaultTLSCertDuration`
+  from the preserved `ca.json`. Deployments initialised with
+  `bootroot init --stepca-provisioner <custom>` keep that name on the
+  second init pass (otherwise `update_ca_json_with_backup`'s
+  lookup-by-name path would bail with
+  `ca.json does not contain an ACME provisioner named "acme"` after
+  OpenBao has already been wiped), and deployments initialised with a
+  non-default `--cert-duration` keep that value (otherwise the value
+  would be silently snapped back to the default on every reinit).
+  When `ca.json` is absent or has no ACME provisioner, the CLI
+  defaults apply as a fallback.
 - After reinit, the service registry is empty — re-run
   `bootroot service add ...` for each service that was previously
   registered.

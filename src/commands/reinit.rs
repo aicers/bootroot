@@ -544,17 +544,83 @@ fn write_reinit_plan<W: Write>(
 /// is malformed, or has no `db.dataSource` field.  In those cases the
 /// existing env-derived DSN resolution is left in place.
 fn preserved_db_dsn_from_ca_json(secrets_dir: &Path) -> Option<String> {
-    let ca_json_path = secrets_dir.join("config").join("ca.json");
-    if !ca_json_path.exists() {
-        return None;
-    }
-    let contents = std::fs::read_to_string(&ca_json_path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let value = read_ca_json(secrets_dir)?;
     value
         .get("db")
         .and_then(|db| db.get("dataSource"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+/// Reads `<secrets_dir>/config/ca.json` once for the `preserved_*`
+/// helpers below.  Returns `None` when the file is absent or malformed
+/// so callers fall back to their CLI/default values.
+fn read_ca_json(secrets_dir: &Path) -> Option<serde_json::Value> {
+    let ca_json_path = secrets_dir.join("config").join("ca.json");
+    if !ca_json_path.exists() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&ca_json_path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Returns the first ACME provisioner name recorded in the preserved
+/// `ca.json`, if any.  Reinit reuses this so a deployment initialized
+/// with `bootroot init --stepca-provisioner <custom>` does not get
+/// silently reset to the default `acme` name on the second init pass
+/// (which would make `update_ca_json_with_backup`'s lookup by name
+/// fail and abort the recovery after `OpenBao` was already wiped).
+///
+/// Accepts both the on-disk shape (`authority.provisioners`) and the
+/// flat `provisioners` shape emitted by older `step ca init` builds,
+/// matching `set_acme_cert_duration`'s discovery logic.
+fn preserved_stepca_provisioner_from_ca_json(secrets_dir: &Path) -> Option<String> {
+    let value = read_ca_json(secrets_dir)?;
+    locate_provisioners(&value)?.iter().find_map(|p| {
+        let is_acme = p
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t.eq_ignore_ascii_case("ACME"));
+        if !is_acme {
+            return None;
+        }
+        p.get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+/// Returns `claims.defaultTLSCertDuration` of the first ACME
+/// provisioner in the preserved `ca.json`, if any.  Reinit uses this
+/// so a deployment initialized with a non-default `--cert-duration`
+/// keeps that value on the second init pass rather than silently
+/// snapping back to `DEFAULT_CERT_DURATION`.
+fn preserved_cert_duration_from_ca_json(secrets_dir: &Path) -> Option<String> {
+    let value = read_ca_json(secrets_dir)?;
+    locate_provisioners(&value)?.iter().find_map(|p| {
+        let is_acme = p
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t.eq_ignore_ascii_case("ACME"));
+        if !is_acme {
+            return None;
+        }
+        p.get("claims")
+            .and_then(|c| c.get("defaultTLSCertDuration"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn locate_provisioners(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    if let Some(authority) = value.get("authority")
+        && let Some(arr) = authority
+            .get("provisioners")
+            .and_then(serde_json::Value::as_array)
+    {
+        return Some(arr);
+    }
+    value.get("provisioners").and_then(serde_json::Value::as_array)
 }
 
 /// Builds the `InitArgs` payload used to re-run the standard init flow
@@ -578,6 +644,16 @@ fn preserved_db_dsn_from_ca_json(secrets_dir: &Path) -> Option<String> {
 /// reinitialised `OpenBao` KV instead of the dummy `rotated-use-openbao`
 /// password sitting in `.env`.  See `preserved_db_dsn_from_ca_json` for
 /// why the env fallback is unsafe under reinit.
+///
+/// Likewise, the ACME provisioner name and `defaultTLSCertDuration`
+/// recorded in the preserved `ca.json` win over the CLI defaults.
+/// `update_ca_json_with_backup` later looks the provisioner up by
+/// name when patching `db.dataSource` / `claims.defaultTLSCertDuration`,
+/// so a deployment initialised with `--stepca-provisioner <custom>` or
+/// `--cert-duration <custom>` would otherwise fail (mismatched name) or
+/// be silently reset on every reinit.  See
+/// `preserved_stepca_provisioner_from_ca_json` and
+/// `preserved_cert_duration_from_ca_json`.
 fn init_args_for_reinit(
     args: &ReinitArgs,
     snapshot: &DeploymentIntent,
@@ -590,6 +666,10 @@ fn init_args_for_reinit(
         openbao.openbao_url = client_url_from_bind_addr(bind);
     }
     let db_dsn = preserved_db_dsn_from_ca_json(effective_secrets_dir);
+    let stepca_provisioner = preserved_stepca_provisioner_from_ca_json(effective_secrets_dir)
+        .unwrap_or_else(|| crate::commands::init::DEFAULT_STEPCA_PROVISIONER.to_string());
+    let cert_duration = preserved_cert_duration_from_ca_json(effective_secrets_dir)
+        .unwrap_or_else(|| crate::commands::init::DEFAULT_CERT_DURATION.to_string());
     Box::new(InitArgs {
         openbao,
         secrets_dir: SecretsDirArgs {
@@ -613,8 +693,8 @@ fn init_args_for_reinit(
         http_hmac: None,
         responder_url: None,
         responder_timeout_secs: 5,
-        stepca_provisioner: crate::commands::init::DEFAULT_STEPCA_PROVISIONER.to_string(),
-        cert_duration: crate::commands::init::DEFAULT_CERT_DURATION.to_string(),
+        stepca_provisioner,
+        cert_duration,
         eab_kid: None,
         eab_hmac: None,
         no_eab: args.no_eab,
@@ -1384,6 +1464,124 @@ mod tests {
         fs::create_dir_all(&config_dir).expect("create config dir");
         fs::write(config_dir.join("ca.json"), r#"{"address":":9000"}"#).expect("write ca.json");
         assert!(preserved_db_dsn_from_ca_json(dir.path()).is_none());
+    }
+
+    /// Regression for Round 5 reviewer item: a deployment initialised
+    /// with `bootroot init --stepca-provisioner <custom>` records that
+    /// provisioner name in `ca.json`.  Reinit's second init pass must
+    /// derive it from the preserved file rather than defaulting to
+    /// `acme`, otherwise `update_ca_json_with_backup`'s lookup-by-name
+    /// path bails (`ca.json does not contain an ACME provisioner named
+    /// "acme"`) after `OpenBao` has already been wiped.  Similarly the
+    /// preserved `defaultTLSCertDuration` must win over the CLI default
+    /// so a non-default `--cert-duration` is not silently snapped back.
+    #[test]
+    fn init_args_for_reinit_uses_preserved_stepca_provisioner_and_cert_duration_from_ca_json() {
+        let dir = tempdir().expect("tempdir");
+        let secrets_dir = dir.path().to_path_buf();
+        let config_dir = secrets_dir.join("config");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(
+            config_dir.join("ca.json"),
+            r#"{
+                "authority":{"provisioners":[
+                    {"type":"JWK","name":"admin"},
+                    {"type":"ACME","name":"acme-custom","claims":{"defaultTLSCertDuration":"72h"}}
+                ]},
+                "db":{"type":"postgresql","dataSource":"postgresql://u:p@h:5432/d?sslmode=disable"}
+            }"#,
+        )
+        .expect("write ca.json");
+
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs { secrets_dir },
+            compose: ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &DeploymentIntent::default(),
+            &reinit_args.secrets_dir.secrets_dir,
+        );
+        assert_eq!(
+            init_args.stepca_provisioner, "acme-custom",
+            "reinit must derive the ACME provisioner name from the \
+             preserved ca.json, not default to {default:?}",
+            default = crate::commands::init::DEFAULT_STEPCA_PROVISIONER
+        );
+        assert_eq!(
+            init_args.cert_duration, "72h",
+            "reinit must derive defaultTLSCertDuration from the preserved \
+             ca.json, not default to {default:?}",
+            default = crate::commands::init::DEFAULT_CERT_DURATION
+        );
+    }
+
+    /// Falls back to CLI defaults when `ca.json` is absent (rsync-clone
+    /// path or pre-`update_ca_json_with_backup` crash) so reinit still
+    /// works against a fresh tree.
+    #[test]
+    fn init_args_for_reinit_falls_back_to_default_stepca_settings_when_ca_json_absent() {
+        let dir = tempdir().expect("tempdir");
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs {
+                secrets_dir: dir.path().to_path_buf(),
+            },
+            compose: ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &DeploymentIntent::default(),
+            &reinit_args.secrets_dir.secrets_dir,
+        );
+        assert_eq!(
+            init_args.stepca_provisioner,
+            crate::commands::init::DEFAULT_STEPCA_PROVISIONER
+        );
+        assert_eq!(
+            init_args.cert_duration,
+            crate::commands::init::DEFAULT_CERT_DURATION
+        );
+    }
+
+    /// Even when `ca.json` exists but has no ACME provisioner (or no
+    /// `defaultTLSCertDuration` claim), the CLI defaults must apply
+    /// instead of an empty/zero value reaching `update_ca_json_with_backup`.
+    #[test]
+    fn preserved_stepca_settings_from_ca_json_return_none_when_no_acme() {
+        let dir = tempdir().expect("tempdir");
+        let config_dir = dir.path().join("config");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(
+            config_dir.join("ca.json"),
+            r#"{"authority":{"provisioners":[{"type":"JWK","name":"admin"}]}}"#,
+        )
+        .expect("write ca.json");
+        assert!(preserved_stepca_provisioner_from_ca_json(dir.path()).is_none());
+        assert!(preserved_cert_duration_from_ca_json(dir.path()).is_none());
     }
 
     /// Regression: an operator-supplied `--openbao-url` must not be

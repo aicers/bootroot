@@ -191,14 +191,37 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
 /// `bootroot reinit --root-token-output <path>`; persistent root token
 /// files are not recommended for production and the surrounding code
 /// validates the destination path before any destructive work begins.
+///
+/// The file is created via `OpenOptionsExt::mode(0o600)` so a freshly
+/// minted root token never exists on disk with the process umask's
+/// default permissions (commonly `0644`) between creation and a
+/// subsequent `chmod` call.  Per-process umask still applies, so an
+/// explicit `set_permissions` follows for the existing-file case where
+/// `OpenOptionsExt::mode` is a no-op on POSIX.
 async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent).await?;
     }
-    tokio::fs::write(path, token).await?;
-    fs_util::set_key_permissions(path).await?;
+    let path_buf = path.to_path_buf();
+    let token = token.to_string();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path_buf)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking for root token write failed: {e}"))??;
     Ok(())
 }
 
@@ -1147,6 +1170,32 @@ mod tests {
         assert_eq!(body, "hvs.fake-token");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "root token file must be 0600, got {mode:o}");
+    }
+
+    /// Regression for Round 5 reviewer item: `write_root_token_file`
+    /// must open the destination with `OpenOptionsExt::mode(0o600)` so
+    /// a freshly minted root token never exists on disk with permissions
+    /// derived from the process umask (commonly `0644`) between create
+    /// and chmod.  Set a permissive umask, write the file, and assert
+    /// it lands with `0600` — under the previous `tokio::fs::write` +
+    /// post-write chmod path this would (briefly) be `0644`.
+    #[tokio::test]
+    async fn write_root_token_file_creates_with_0600_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `umask` is a libc thread-local syscall.  We restore
+        // it before the test returns so concurrent tests are unaffected.
+        let prev = unsafe { libc::umask(0) };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let res = write_root_token_file(&path, "hvs.fake-token").await;
+        unsafe { libc::umask(prev) };
+        res.expect("write");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "root token file must be created atomically with 0600 under any umask, got {mode:o}"
+        );
     }
 
     /// Regression: `write_state_file_to` must propagate an error when an

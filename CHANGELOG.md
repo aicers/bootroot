@@ -282,6 +282,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `secrets_dir`, OpenBao bind/advertise, HTTP-01 admin
   bind/advertise, `infra_certs` count) so the operator can verify the
   recovery target before any destructive op runs.
+  Reinit also derives the ACME provisioner name and
+  `defaultTLSCertDuration` from the preserved `ca.json` so a deployment
+  initialised with `bootroot init --stepca-provisioner <custom>` or a
+  custom `--cert-duration` keeps those settings on the second init pass
+  instead of either failing
+  (`ca.json does not contain an ACME provisioner named "acme"`) or
+  being silently snapped back to the default. The
+  `--root-token-output` write now creates the destination atomically
+  with mode `0600` via `OpenOptionsExt::mode` so a freshly minted root
+  token is never observable on disk with the process umask's default
+  permissions between create and chmod.
   Refuses to run against external/shared OpenBao instances
   (compose-managed local only).
 - Added `--cert-group <gid-or-name>` to `bootroot service add` and
