@@ -293,6 +293,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   with mode `0600` via `OpenOptionsExt::mode` so a freshly minted root
   token is never observable on disk with the process umask's default
   permissions between create and chmod.
+  Rejects any explicit `--openbao-url` value: only the CLI default is
+  accepted, so reinit cannot wipe local state and then operate on an
+  external endpoint. Legitimate non-loopback recovery is driven by the
+  snapshotted `openbao_bind_addr` rewrite above. The `--summary-json`
+  destination is also preflight-checked before any destructive
+  operation (rejects directories, unwritable existing files, and
+  uncreatable/read-only parents), so an unwritable summary path
+  cannot recreate the partial-init trap by short-circuiting
+  `print_init_summary`, `--root-token-output`, and the automatic
+  unseal-key save when the post-init JSON write fails.
   Refuses to run against external/shared OpenBao instances
   (compose-managed local only).
 - Added `--cert-group <gid-or-name>` to `bootroot service add` and

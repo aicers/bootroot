@@ -43,7 +43,21 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         .to_path_buf();
     let state_path = StateFile::default_path();
 
-    // 1. Scope check: refuse external OpenBao / project mismatch.
+    // 1. Refuse any operator-supplied `--openbao-url` that differs from
+    //    the CLI default.  This is purely args-derived so it runs before
+    //    any docker call.  The compose-label scope check that follows
+    //    only proves the local compose declaration / container labels
+    //    match; it does NOT prove the URL later threaded into `run_init`
+    //    points at that compose-managed service.  Honouring an arbitrary
+    //    URL would let `reinit --openbao-url https://shared-openbao.example`
+    //    wipe local OpenBao state and then operate on an external
+    //    endpoint — directly violating the issue's §Scope limitation.
+    //    Legitimate non-loopback recovery does not need this flag: the
+    //    init pass URL is derived from the snapshotted `openbao_bind_addr`
+    //    in `init_args_for_reinit` when present.
+    reject_explicit_openbao_url(&args.openbao.openbao_url, messages)?;
+
+    // 2. Scope check: refuse external OpenBao / project mismatch.
     verify_compose_managed_openbao(
         compose_file,
         &compose_dir,
@@ -51,17 +65,29 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         messages,
     )?;
 
-    // 2. Validate the optional --root-token-output path BEFORE any
+    // 3. Validate the optional --root-token-output path BEFORE any
     //    destructive operation so a bad path does not leave the
     //    operator in a half-wiped state.
     if let Some(out) = args.root_token_output.as_deref() {
         validate_root_token_output_path(out, messages)?;
     }
 
-    // 3. Snapshot deployment intent (if state.json exists).
+    // 4. Same preflight for the optional `--summary-json` destination.
+    //    `InitSummary` carries `root_token` + `unseal_keys`, so the JSON
+    //    write is the only recovery channel for those secrets when
+    //    `--enable show-secrets` is not set.  A bad summary path failing
+    //    *after* OpenBao has been reinitialised but *before*
+    //    `print_init_summary` / `--root-token-output` / `maybe_save_unseal_keys`
+    //    run would recreate the partial-init trap this command is meant
+    //    to recover from, via a different output channel.
+    if let Some(out) = args.summary_json.as_deref() {
+        validate_summary_json_output_path(out, messages)?;
+    }
+
+    // 5. Snapshot deployment intent (if state.json exists).
     let snapshot = snapshot_deployment_intent(&state_path)?;
 
-    // 4. Derive the effective `secrets_dir` from the snapshot.  When
+    // 6. Derive the effective `secrets_dir` from the snapshot.  When
     //    `state.json` records a non-default `secrets_dir` (e.g. the
     //    previous init ran with `--secrets-dir custom`) the snapshot
     //    wins over the CLI default so cleanup, the preserved-DSN /
@@ -71,7 +97,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //    rediscover and re-pass `--secrets-dir` on every recovery.
     let effective_secrets_dir = effective_secrets_dir(args, &snapshot);
 
-    // 5. Print plan and ask for confirmation.
+    // 7. Print plan and ask for confirmation.
     write_reinit_plan(
         &mut io::stdout().lock(),
         &snapshot,
@@ -83,15 +109,15 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         anyhow::bail!(messages.error_operation_cancelled());
     }
 
-    // 6. Stop and remove the OpenBao container + volumes.
+    // 8. Stop and remove the OpenBao container + volumes.
     remove_openbao_container_and_volumes(compose_file, messages)?;
 
-    // 7. Remove OpenBao runtime/bootstrap artifacts (narrow).
+    // 9. Remove OpenBao runtime/bootstrap artifacts (narrow).
     remove_openbao_runtime_state(&effective_secrets_dir, messages)?;
 
-    // 8. Rewrite state.json with intent-only fields BEFORE infra up so
-    //    the infra-up path layers the correct compose overrides for
-    //    any recorded non-loopback bind.
+    // 10. Rewrite state.json with intent-only fields BEFORE infra up so
+    //     the infra-up path layers the correct compose overrides for
+    //     any recorded non-loopback bind.
     write_minimal_state(
         &state_path,
         &snapshot,
@@ -100,7 +126,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         messages,
     )?;
 
-    // 9. Bring OpenBao back up via the existing infra up path.
+    // 11. Bring OpenBao back up via the existing infra up path.
     let infra_args = InfraUpArgs {
         compose_file: ComposeFileArgs {
             compose_file: compose_file.clone(),
@@ -113,7 +139,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     };
     run_infra_up(&infra_args, messages)?;
 
-    // 10. Re-run init in reinit mode.  Reinit-mode behavior is enforced
+    // 12. Re-run init in reinit mode.  Reinit-mode behavior is enforced
     //     inside the init flow: overwrite prompts for preserved files
     //     are skipped, and an existing `password.txt` short-circuits
     //     the auto-gen path so the step-ca password is not rotated.
@@ -125,6 +151,17 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
 
     println!("{}", messages.reinit_completed());
     println!("{}", messages.reinit_service_registry_post_summary());
+    Ok(())
+}
+
+/// Rejects an operator-supplied `--openbao-url` that differs from the
+/// CLI default.  See the caller's preflight comment in `run_reinit` for
+/// the threat model: an arbitrary URL would let reinit wipe local
+/// `OpenBao` state and then operate on an external endpoint.
+pub(crate) fn reject_explicit_openbao_url(openbao_url: &str, messages: &Messages) -> Result<()> {
+    if openbao_url != crate::commands::init::DEFAULT_OPENBAO_URL {
+        anyhow::bail!(messages.error_reinit_explicit_openbao_url(openbao_url));
+    }
     Ok(())
 }
 
@@ -417,6 +454,82 @@ fn validate_root_token_output_path(path: &Path, messages: &Messages) -> Result<(
         anyhow::bail!(
             messages.error_reinit_root_token_output_unwritable(&display, &err.to_string())
         );
+    }
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// Validates that the optional `--summary-json` destination is safe to
+/// write to *before* any destructive operation begins.  Without this
+/// preflight, a bad summary path failing inside `write_init_summary_json`
+/// would short-circuit `run_init`'s post-init flow — meaning
+/// `print_init_summary`, `--root-token-output`, and the automatic
+/// unseal-key save under reinit mode would all be skipped after `OpenBao`
+/// has already been reinitialised.  That is the exact partial-init trap
+/// `reinit` is supposed to recover from, just through a different
+/// explicit output channel.
+///
+/// Checks are intentionally narrower than `validate_root_token_output_path`:
+/// `write_init_summary_json` later applies mode `0600` via
+/// `fs_util::set_key_permissions`, so we only verify the kernel will
+/// accept the write (regular file, parent writable) without imposing an
+/// existing-permission constraint.  An existing world-readable summary
+/// file is still acceptable because it will be overwritten and
+/// re-chmodded; the same logic applies to its containing directory.
+fn validate_summary_json_output_path(path: &Path, messages: &Messages) -> Result<()> {
+    let display = path.display().to_string();
+
+    if path.exists() {
+        let meta = std::fs::symlink_metadata(path)
+            .with_context(|| messages.error_read_file_failed(&display))?;
+        let file_type = meta.file_type();
+        if !file_type.is_file() && !file_type.is_symlink() {
+            anyhow::bail!(messages.error_reinit_summary_json_not_file(&display));
+        }
+        if file_type.is_symlink() {
+            let target_meta = std::fs::metadata(path)
+                .with_context(|| messages.error_read_file_failed(&display))?;
+            if !target_meta.is_file() {
+                anyhow::bail!(messages.error_reinit_summary_json_not_file(&display));
+            }
+        }
+        // Probe writability the same way `validate_root_token_output_path`
+        // does: open for write without `truncate(true)` so the existing
+        // contents are not modified, just to prove the kernel will accept
+        // a later write.  Catches mode `0400`, immutable attributes, etc.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    messages.error_reinit_summary_json_unwritable(&display, &err.to_string())
+                )
+            })?;
+    }
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    if !parent.exists() {
+        std::fs::create_dir_all(&parent).map_err(|err| {
+            anyhow::anyhow!(
+                messages.error_reinit_summary_json_unwritable(&display, &err.to_string())
+            )
+        })?;
+    }
+    if !parent.is_dir() {
+        anyhow::bail!(messages.error_reinit_summary_json_unwritable(
+            &display,
+            &format!("parent {} is not a directory", parent.display()),
+        ));
+    }
+    let probe = parent.join(format!(
+        ".bootroot-reinit-summary-probe.{}",
+        std::process::id()
+    ));
+    if let Err(err) = std::fs::write(&probe, b"") {
+        anyhow::bail!(messages.error_reinit_summary_json_unwritable(&display, &err.to_string()));
     }
     let _ = std::fs::remove_file(&probe);
     Ok(())
@@ -1148,6 +1261,118 @@ mod tests {
         );
     }
 
+    /// Regression for Round 6 reviewer item: when `--summary-json`
+    /// points at an unwritable destination (existing file with mode
+    /// `0400`), the preflight must catch it before the destructive
+    /// sequence runs.  Otherwise the post-init `write_init_summary_json`
+    /// fails after `OpenBao` has already been reinitialised, and the
+    /// early-return short-circuits `print_init_summary`,
+    /// `--root-token-output`, and `maybe_save_unseal_keys` — recreating
+    /// the partial-init trap through a different output channel.
+    #[test]
+    fn validate_summary_json_rejects_non_writable_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("summary.json");
+        fs::write(&path, "{}").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o400);
+        fs::set_permissions(&path, perms).unwrap();
+        let messages = test_messages();
+        let err = validate_summary_json_output_path(&path, &messages).unwrap_err();
+        // Restore so tempdir cleanup succeeds.
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms).unwrap();
+        assert!(
+            err.to_string().contains("--summary-json") || err.to_string().contains("summary-json"),
+            "got: {err}"
+        );
+    }
+
+    /// Existing `0644` summary file is acceptable — `write_init_summary_json`
+    /// applies `0600` via `set_key_permissions` after the write.  The
+    /// summary preflight intentionally tolerates wider existing
+    /// permissions because the file is overwritten and re-chmodded; the
+    /// stricter root-token-output mode check is not needed here.
+    #[test]
+    fn validate_summary_json_accepts_world_readable_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("summary.json");
+        fs::write(&path, "{}").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&path, perms).unwrap();
+        let messages = test_messages();
+        validate_summary_json_output_path(&path, &messages)
+            .expect("0644 existing summary file is acceptable (write_init_summary_json re-chmods)");
+    }
+
+    /// A missing destination is acceptable as long as the parent
+    /// directory can accept a new file.  Mirrors
+    /// `validate_root_token_output_accepts_missing_file`.
+    #[test]
+    fn validate_summary_json_accepts_missing_file() {
+        let dir = tempdir().unwrap();
+        let messages = test_messages();
+        validate_summary_json_output_path(&dir.path().join("summary.json"), &messages).unwrap();
+    }
+
+    /// Regression: a path that exists but is a directory must be
+    /// rejected.  Otherwise `write_init_summary_json` would fail after
+    /// the destructive sequence has already run.
+    #[test]
+    fn validate_summary_json_rejects_directory_path() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("not-a-file");
+        fs::create_dir_all(&nested).unwrap();
+        let messages = test_messages();
+        let err = validate_summary_json_output_path(&nested, &messages).unwrap_err();
+        assert!(
+            err.to_string().contains("regular file") || err.to_string().contains("일반 파일"),
+            "got: {err}"
+        );
+    }
+
+    /// Regression: a missing destination whose parent cannot be created
+    /// (because an ancestor is a regular file, not a directory) must be
+    /// rejected during preflight.
+    #[test]
+    fn validate_summary_json_rejects_uncreatable_parent() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, "not a dir").unwrap();
+        let target = blocker.join("nested").join("summary.json");
+        let messages = test_messages();
+        let err = validate_summary_json_output_path(&target, &messages).unwrap_err();
+        assert!(
+            err.to_string().contains("--summary-json") || err.to_string().contains("summary-json"),
+            "got: {err}"
+        );
+    }
+
+    /// Regression: read-only parent directories must surface as a
+    /// preflight failure, not a post-destructive write failure.
+    #[test]
+    fn validate_summary_json_rejects_read_only_parent() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("ro");
+        fs::create_dir_all(&parent).unwrap();
+        let mut perms = fs::metadata(&parent).unwrap().permissions();
+        let original = perms.mode();
+        perms.set_mode(0o500);
+        fs::set_permissions(&parent, perms).unwrap();
+        let target = parent.join("summary.json");
+        let messages = test_messages();
+        let err = validate_summary_json_output_path(&target, &messages).unwrap_err();
+        let mut perms = fs::metadata(&parent).unwrap().permissions();
+        perms.set_mode(original);
+        fs::set_permissions(&parent, perms).unwrap();
+        assert!(
+            err.to_string().contains("--summary-json") || err.to_string().contains("summary-json"),
+            "got: {err}"
+        );
+    }
+
     /// The dry-run plan must surface both destructive actions and
     /// preserved artifacts so the operator can see, before confirming,
     /// what will be wiped versus what will survive.  Asserts both
@@ -1588,40 +1813,49 @@ mod tests {
         assert!(preserved_cert_duration_from_ca_json(dir.path()).is_none());
     }
 
-    /// Regression: an operator-supplied `--openbao-url` must not be
-    /// silently overwritten by snapshotted intent.  Only the CLI default
-    /// is rewritten so non-loopback recovery works out of the box.
+    /// Regression for Round 6 reviewer item: an operator-supplied
+    /// `--openbao-url` that differs from the CLI default must be
+    /// rejected before any docker call so reinit cannot wipe local
+    /// `OpenBao` state and then operate on an external endpoint.
+    /// Legitimate non-loopback recovery does not need this flag — the
+    /// init pass URL is derived from the snapshotted bind in
+    /// `init_args_for_reinit`.
     #[test]
-    fn init_args_for_reinit_respects_explicit_openbao_url() {
-        let explicit = "https://10.0.0.5:8200";
-        let reinit_args = ReinitArgs {
-            openbao: OpenBaoArgs {
-                openbao_url: explicit.to_string(),
-                kv_mount: "secret".to_string(),
-            },
-            secrets_dir: SecretsDirArgs {
-                secrets_dir: PathBuf::from("secrets"),
-            },
-            compose: ComposeFileArgs {
-                compose_file: PathBuf::from("docker-compose.yml"),
-            },
-            yes: true,
-            root_token_output: None,
-            enable: Vec::new(),
-            skip: Vec::new(),
-            summary_json: None,
-            no_eab: true,
-        };
-        let snapshot = DeploymentIntent {
-            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
-            ..DeploymentIntent::default()
-        };
-        let init_args = init_args_for_reinit(
-            &reinit_args,
-            &snapshot,
-            &reinit_args.secrets_dir.secrets_dir,
+    fn reject_explicit_openbao_url_blocks_non_default_url() {
+        let messages = test_messages();
+        let err =
+            reject_explicit_openbao_url("https://shared-openbao.example", &messages).unwrap_err();
+        assert!(
+            err.to_string().contains("shared-openbao.example"),
+            "got: {err}"
         );
-        assert_eq!(init_args.openbao.openbao_url, explicit);
+        assert!(
+            err.to_string().contains("--openbao-url") || err.to_string().contains("openbao-url"),
+            "got: {err}"
+        );
+    }
+
+    /// Even a non-loopback URL that *could* be the local compose bind
+    /// (e.g. `https://192.168.1.10:8200`) must be rejected from the CLI
+    /// surface — the snapshot-driven rewrite in `init_args_for_reinit`
+    /// is the only sanctioned channel for non-loopback init-pass URLs.
+    /// Otherwise the operator could bypass the compose-label scope check
+    /// by passing a URL that *happens* to match an external service on
+    /// the same subnet.
+    #[test]
+    fn reject_explicit_openbao_url_blocks_non_loopback_explicit_value() {
+        let messages = test_messages();
+        reject_explicit_openbao_url("https://192.168.1.10:8200", &messages)
+            .expect_err("any non-default URL must be rejected, even private-subnet ones");
+    }
+
+    /// The CLI default must pass through so the documented `bootroot reinit`
+    /// invocation (no `--openbao-url`) keeps working.
+    #[test]
+    fn reject_explicit_openbao_url_accepts_cli_default() {
+        let messages = test_messages();
+        reject_explicit_openbao_url(crate::commands::init::DEFAULT_OPENBAO_URL, &messages)
+            .expect("CLI default URL must be accepted");
     }
 
     /// Regression for Round 4 reviewer item: when `state.json` snapshots

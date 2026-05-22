@@ -1580,7 +1580,13 @@ bootroot clean --openbao-only --yes
 
 ### 입력
 
-- `--openbao-url`: OpenBao API URL (기본값 `http://localhost:8200`)
+- `--openbao-url`: CLI 기본값(`http://localhost:8200`)에 고정해야
+  합니다. 다른 값은 어떤 파괴적 동작이 시작되기 전에 거부됩니다.
+  `reinit`은 compose로 관리되는 로컬 OpenBao에서만 동작하므로,
+  임의의 URL을 허용하면 reinit이 로컬 상태를 wipe한 뒤 외부 엔드포인트를
+  대상으로 동작할 수 있기 때문입니다. 합법적인 non-loopback 복구는 이
+  플래그가 필요하지 않습니다 — 두 번째 init 패스의 URL은 스냅샷된
+  `openbao_bind_addr`에서 자동으로 파생됩니다.
 - `--kv-mount`: KV 마운트 경로 (기본값 `secret`)
 - `--secrets-dir`: 시크릿 디렉터리 (기본값 `secrets`)
 - `--compose-file`: docker-compose.yml 경로 (기본값
@@ -1601,8 +1607,14 @@ bootroot clean --openbao-only --yes
   umask 기본 권한으로 노출되는 일이 없습니다. init 이후 쓰기가 그래도
   실패하면(예: 디스크 가득) 새로 발급된 토큰을 stderr에 마스킹
   없이(`ROOT_TOKEN=` 접두사) 출력하여 잃어버리지 않도록 합니다.
-- `--enable <features>` / `--skip <phases>` / `--summary-json <path>` /
-  `--no-eab`: `init`으로 그대로 전달됩니다.
+- `--enable <features>` / `--skip <phases>` / `--no-eab`:
+  `init`으로 그대로 전달됩니다.
+- `--summary-json <path>`: `init`으로 그대로 전달되며, 파괴적 동작
+  시작 전에 사전 검증됩니다. 경로가 디렉터리이거나, 기존 파일이 쓰기
+  불가능하거나, 상위 디렉터리가 쓰기 불가능/생성 불가능한 경우 reinit이
+  시작되지 않습니다. summary JSON에는 새로 발급된 루트 토큰과 unseal key가
+  포함되므로, 쓰기 불가능한 대상은 partial-init 트랩을 다른 출력 채널을
+  통해 재현하게 됩니다.
 
 ### 동작
 
@@ -1637,12 +1649,13 @@ bootroot clean --openbao-only --yes
   다시 작성합니다 (배포 의도 필드만 유지).
 - `infra up --services openbao` 경로로 OpenBao를 다시 기동하여 기록된
   non-loopback 바인드 오버라이드가 올바르게 적용되도록 합니다.
-- 스냅샷한 `openbao_bind_addr`이 non-loopback이고 호출자가
-  `--openbao-url`을 기본값으로 둔 경우, 두 번째 `init` 패스는
-  `http://localhost:8200` 대신 복원된 바인드 주소(`https://<bind>`)를
-  타깃합니다. 이렇게 하면 운영자가 `--openbao-url`을 다시 전달하지
-  않아도 기동 후 health check가 TLS가 활성화된 OpenBao에 도달합니다.
-  명시적으로 전달된 `--openbao-url`은 그대로 사용됩니다.
+- 스냅샷한 `openbao_bind_addr`이 non-loopback인 경우, 두 번째
+  `init` 패스는 `http://localhost:8200` 대신 복원된 바인드
+  주소(`https://<bind>`)를 타깃합니다. 이렇게 하면 운영자가
+  `--openbao-url`을 다시 전달하지 않아도 기동 후 health check가
+  TLS가 활성화된 OpenBao에 도달합니다. CLI는 명시적인
+  `--openbao-url` 값을 거부하므로, 이 스냅샷 기반 재작성이
+  non-loopback init 패스 URL에 대한 유일한 공식 경로입니다.
 - reinit 모드로 `init`을 다시 실행합니다 (기존 step-ca 비밀번호 보존,
   보존된 파일에 대한 덮어쓰기 프롬프트 억제, 이전 HMAC이 wipe된 OpenBao
   KV에 있었으므로 새 HTTP-01 responder HMAC 자동 생성, EAB 등록 프롬프트

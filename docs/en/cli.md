@@ -1638,7 +1638,14 @@ operator-managed runbook for those.
 
 ### Inputs
 
-- `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
+- `--openbao-url`: must be left at the CLI default
+  (`http://localhost:8200`). Any other value is rejected before any
+  destructive operation begins because `reinit` only operates on
+  compose-managed local OpenBao; honouring an arbitrary URL would
+  let `reinit` wipe local state and then operate on an external
+  endpoint. Legitimate non-loopback recovery does not need this
+  flag — the init pass URL is derived automatically from the
+  snapshotted `openbao_bind_addr`.
 - `--kv-mount`: KV mount path (default `secret`)
 - `--secrets-dir`: secrets directory (default `secrets`)
 - `--compose-file`: docker-compose.yml path (default
@@ -1667,7 +1674,13 @@ operator-managed runbook for those.
   `show-secrets`)
 - `--skip <phases>`: passed through to `init` (e.g.
   `responder-check`)
-- `--summary-json <path>`: passed through to `init`
+- `--summary-json <path>`: passed through to `init`. The path is
+  preflight-checked before any destructive operation: reinit refuses
+  to start if the path is a directory, an unwritable existing file,
+  or has an unwritable / uncreatable parent. The summary JSON carries
+  the freshly issued root token and unseal keys, so an unwritable
+  destination would recreate the partial-init trap through a
+  different output channel.
 - `--no-eab`: passed through to `init`
 
 ### Behavior
@@ -1711,13 +1724,15 @@ operator-managed runbook for those.
   registry, AppRoles, and policies are intentionally empty.
 - Brings OpenBao back up via `infra up --services openbao` so any
   recorded non-loopback bind override is layered correctly.
-- When the snapshotted `openbao_bind_addr` is non-loopback and the
-  caller left `--openbao-url` at its default, the second `init` pass
-  targets the restored bind address (`https://<bind>`) instead of
-  `http://localhost:8200` so the post-up health check reaches the
-  TLS-enabled OpenBao without requiring the operator to re-pass
-  `--openbao-url` manually. An explicit `--openbao-url` is honoured
-  verbatim.
+- When the snapshotted `openbao_bind_addr` is non-loopback, the
+  second `init` pass targets the restored bind address
+  (`https://<bind>`) instead of `http://localhost:8200` so the
+  post-up health check reaches the TLS-enabled OpenBao without
+  requiring the operator to re-pass `--openbao-url` manually. The
+  CLI rejects any explicit `--openbao-url` value to prevent reinit
+  from operating on an external endpoint, so this snapshot-driven
+  rewrite is the only sanctioned channel for non-loopback init-pass
+  URLs.
 - Re-runs `init` in reinit mode (preserves the existing step-ca
   password, suppresses overwrite prompts for preserved files,
   auto-generates the new HTTP-01 responder HMAC because the previous
