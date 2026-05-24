@@ -163,7 +163,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
     }
 
     let runtime_auth = resolve_runtime_auth(&args.runtime_auth, true, messages)?;
-    let mut client = OpenBaoClient::new(&ctx.openbao_url)
+    let mut client = OpenBaoClient::with_local_trust(&ctx.openbao_url, ctx.paths.secrets_dir())
         .with_context(|| messages.error_openbao_client_create_failed())?;
     authenticate_openbao_client(&mut client, &runtime_auth, messages).await?;
     client

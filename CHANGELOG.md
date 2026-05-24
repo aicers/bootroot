@@ -98,7 +98,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   preview, and remote-idempotent paths and into the init orchestrator
   so the post-TLS operator surface stops blackholing on the new
   `--openbao-bind` + `--openbao-tls-required` topology the
-  reinit-recovery E2E exercises. (Part of #600)
+  reinit-recovery E2E exercises. `bootroot rotate` (every non-
+  `infra-cert` subcommand) and `bootroot status` now go through the
+  same constructor — they used `OpenBaoClient::new` and would have
+  failed with `UnknownIssuer` against the same post-reinit topology.
+  The reinit-recovery E2E asserts the regression by running
+  `bootroot status --openbao-url https://<bind>` after each scenario.
+  (Part of #600)
 - Fixed `bootroot service add` leaving the per-service OpenBao Agent
   sidecar unable to render its `agent.toml` when no EAB is configured
   (e.g., `bootroot init --no-eab`, bundled OSS step-ca). The sidecar

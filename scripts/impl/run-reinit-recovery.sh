@@ -348,6 +348,25 @@ assert_post_reinit_contracts() {
   if [ "$svc_count" != "0" ]; then
     fail "[$label] post-reinit services registry is not empty (count=$svc_count)"
   fi
+
+  # 5. State-backed operator commands talk TLS to the non-loopback
+  # bind without UnknownIssuer.  `bootroot status` constructs its
+  # `OpenBaoClient` against the supplied `--openbao-url` but anchors
+  # the rustls trust store on the local step-ca bundle via
+  # `with_local_trust`.  Regression guard for #600 review round 1:
+  # before the fix, status (and rotate) used `OpenBaoClient::new`,
+  # which ships only webpki-roots and therefore fails the handshake
+  # against the step-ca-signed OpenBao server cert post-reinit.
+  if ! run_bootroot status \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "https://${OPENBAO_BIND_ADDR}" \
+    >"$ARTIFACT_DIR/status-${label}.log" 2>&1; then
+    {
+      echo "bootroot status failed after reinit (label=${label}, tail):"
+      tail -n 80 "$ARTIFACT_DIR/status-${label}.log" || true
+    } >>"$RUN_LOG"
+    fail "[$label] bootroot status against https://${OPENBAO_BIND_ADDR} failed after reinit"
+  fi
 }
 
 # ---------------------------------------------------------------------------
