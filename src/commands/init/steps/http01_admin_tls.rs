@@ -80,11 +80,7 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
         args.push("--san");
         args.push(san);
     }
-    args.extend([
-        "--not-after",
-        HTTP01_ADMIN_TLS_DEFAULT_NOT_AFTER,
-        "--force",
-    ]);
+    args.extend(["--not-after", HTTP01_ADMIN_TLS_DEFAULT_NOT_AFTER, "--force"]);
 
     run_docker(
         &args,
