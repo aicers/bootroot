@@ -1763,24 +1763,31 @@ operator-managed runbook for those.
   OpenBao KV mount, and skips the EAB registration prompt —
   operators who need EAB credentials register them out of band after
   reinit). When `secrets/password.txt` is absent (rsync-clone path
-  or operator-removed) **and** neither preserved step-ca CA key
-  (`secrets/secrets/root_ca_key`, `secrets/secrets/intermediate_ca_key`)
-  is present, the step-ca password is auto-generated non-interactively
-  so `reinit --yes` never stalls on a password prompt; the new
-  password is written to `secrets/password.txt` and encrypts the
-  freshly initialised CA material that the second init pass creates
-  from scratch. (`secrets/config/ca.json` alone is not blocking — it
-  carries no key material and cannot lock the operator out.) When
-  `secrets/password.txt` is absent **but at least one preserved CA
-  key (`root_ca_key` or `intermediate_ca_key`) is still on disk**,
-  reinit refuses to start before any destructive operation runs —
-  those key files are encrypted with the original password, so
-  generating a fresh one would render a deployment whose
-  `password.txt` cannot unlock the preserved CA keys, and any later
+  or operator-removed) **and** every preserved step-ca artifact
+  (`secrets/config/ca.json`, `secrets/secrets/root_ca_key`,
+  `secrets/secrets/intermediate_ca_key`) is also absent, the step-ca
+  password is auto-generated non-interactively so `reinit --yes`
+  never stalls on a password prompt; the new password is written to
+  `secrets/password.txt` and encrypts the freshly initialised CA
+  material that the second init pass creates from scratch. When
+  `secrets/password.txt` is absent **but any preserved step-ca
+  artifact is still on disk** — either an encrypted CA key
+  (`root_ca_key` / `intermediate_ca_key`) **or** a stale
+  `config/ca.json` alone — reinit refuses to start before any
+  destructive operation runs. Encrypted CA keys are blocking because
+  they were encrypted with the original password, so generating a
+  fresh one would render a deployment whose `password.txt` cannot
+  unlock the preserved CA keys, and any later
   `step certificate create --ca-password-file /home/step/password.txt`
-  path (OpenBao / HTTP-01 TLS issuance) would fail. Restore
-  `password.txt` from a backup, or remove the preserved CA key files
-  to opt into a clean CA rebuild, then retry.
+  path (OpenBao / HTTP-01 TLS issuance) would fail. A stale
+  `config/ca.json` alone is equally blocking even though it carries
+  no key material, because the second init pass's `step ca init`
+  cannot complete cleanly when its config target already exists (it
+  generates fresh cert/key files and then exits non-zero on
+  TTY-bound overwrite confirmation), recreating the partial-init
+  trap after OpenBao has already been wiped. Restore `password.txt`
+  from a backup, or remove every preserved step-ca artifact to opt
+  into a clean CA rebuild, then retry.
 - Reads the preserved step-ca runtime DSN from
   `secrets/config/ca.json` and seeds the second init pass with it so
   the freshly reinitialised OpenBao KV receives credentials that

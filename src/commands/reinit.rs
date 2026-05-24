@@ -188,11 +188,22 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
 /// /home/step/password.txt` path (e.g. the `OpenBao` / HTTP-01 TLS
 /// issuance flows) fails with an undecryptable key.
 ///
+/// Preserved `config/ca.json` alone (without either encrypted CA key)
+/// is also blocking: `ensure_step_ca_initialized` only short-circuits
+/// when all three step-ca artifacts exist, so the second init pass
+/// would otherwise run `step ca init` into a tree that already
+/// contains `ca.json`.  Empirically, `smallstep/step-ca step ca init`
+/// against a populated config directory generates fresh cert/key files
+/// and then exits non-zero with `open /dev/tty failed: no such device
+/// or address` — recreating the partial-init trap after `OpenBao` has
+/// already been wiped.  Requiring the operator to remove the stale
+/// `ca.json` (or restore `password.txt`) keeps reinit atomic.
+///
 /// Running this before the destructive `OpenBao` wipe leaves the
 /// operator's CA material recoverable from backup.  When both
-/// `password.txt` and the CA material are absent, this preflight is a
-/// no-op because the second init pass will run `step ca init` and
-/// generate matching material.
+/// `password.txt` and every step-ca artifact are absent, this
+/// preflight is a no-op because the second init pass will run
+/// `step ca init` and generate matching material from scratch.
 pub(crate) fn verify_stepca_password_recoverable(
     secrets_dir: &Path,
     messages: &Messages,
@@ -201,18 +212,19 @@ pub(crate) fn verify_stepca_password_recoverable(
     if password_path.exists() {
         return Ok(());
     }
-    // Only the encrypted CA *keys* lock the operator out — they are the
-    // files encrypted with the lost password.  `config/ca.json` alone is
-    // not blocking (it carries no key material), but a preserved
-    // `root_ca_key` or `intermediate_ca_key` without `ca.json` is, since
-    // `ensure_step_ca_initialized` would still attempt `step ca init`
-    // into a tree that already contains encrypted key files.
+    // Reinit's fresh-CA rebuild path requires a clean step-ca tree.
+    // The encrypted key files lock the operator out directly; a stale
+    // `config/ca.json` does not lock anyone out, but it derails the
+    // second init pass because `step ca init` cannot complete cleanly
+    // when its config target already exists (it generates cert/key
+    // files and then fails on TTY-bound overwrite confirmation).
+    // Either way, refusing here keeps reinit atomic.
+    let ca_json = secrets_dir.join("config").join("ca.json");
     let root_key = secrets_dir.join("secrets").join("root_ca_key");
     let intermediate_key = secrets_dir.join("secrets").join("intermediate_ca_key");
-    if !root_key.exists() && !intermediate_key.exists() {
+    if !ca_json.exists() && !root_key.exists() && !intermediate_key.exists() {
         return Ok(());
     }
-    let ca_json = secrets_dir.join("config").join("ca.json");
     anyhow::bail!(
         messages.error_reinit_stepca_password_missing_with_ca_material(
             &password_path.display().to_string(),
@@ -2346,19 +2358,32 @@ mod tests {
         );
     }
 
-    /// `ca.json` alone without either CA key is acceptable.  The
-    /// preflight only fires when the CA *keys* are preserved (encrypted
-    /// with the lost password); a config file with no key material
-    /// cannot lock the operator out.
+    /// Regression for Round 3 (#601) reviewer item: a stale
+    /// `config/ca.json` without either CA key is also blocking, even
+    /// though it does not lock the operator out cryptographically.
+    /// `ensure_step_ca_initialized` only short-circuits when all three
+    /// step-ca artifacts exist, so when `ca.json` alone is preserved
+    /// the second init pass would attempt `step ca init` into a tree
+    /// that already contains the config target.  Empirically that
+    /// generates fresh cert/key files and then exits non-zero with
+    /// `open /dev/tty failed`, recreating the partial-init trap after
+    /// `OpenBao` has already been wiped.  The preflight must refuse
+    /// before any destructive operation runs so the operator can
+    /// remove the stale `ca.json` (or restore `password.txt`) and
+    /// retry against an atomic reinit.
     #[test]
-    fn verify_stepca_password_recoverable_accepts_ca_json_without_keys() {
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_ca_json_only() {
         let dir = tempdir().expect("tempdir");
         let secrets = dir.path();
         fs::create_dir_all(secrets.join("config")).expect("config dir");
         fs::write(secrets.join("config/ca.json"), "{}").expect("ca.json");
+        assert!(!secrets.join("password.txt").exists());
+        assert!(!secrets.join("secrets/root_ca_key").exists());
+        assert!(!secrets.join("secrets/intermediate_ca_key").exists());
+
         let messages = test_messages();
-        verify_stepca_password_recoverable(secrets, &messages)
-            .expect("ca.json without keys does not lock the operator out");
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(err.to_string().contains("ca.json"), "got: {err}");
     }
 
     /// When `password.txt` is present, the preflight accepts the

@@ -255,17 +255,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   password generation under `reinit_mode` so `reinit --yes` never
   stalls on the step-ca password prompt (an existing `password.txt`
   is still preserved verbatim so the encrypted CA material remains
-  decryptable; when `password.txt` is absent **but** at least one
-  preserved step-ca CA key — `secrets/secrets/root_ca_key` or
+  decryptable; when `password.txt` is absent **but** any preserved
+  step-ca artifact — `secrets/config/ca.json`,
+  `secrets/secrets/root_ca_key`, or
   `secrets/secrets/intermediate_ca_key` — is still on disk, reinit
-  refuses to start before any destructive operation runs so a freshly
-  generated password cannot be silently written into a deployment
-  whose `password.txt` would then fail to unlock the preserved CA
-  keys; `secrets/config/ca.json` alone is not blocking — it carries
-  no key material — so the safe fresh-CA rebuild path remains open
-  whenever both encrypted CA key files are absent; the operator
-  restores `password.txt` from a backup or removes the preserved CA
-  key files to opt into a clean rebuild),
+  refuses to start before any destructive operation runs. Encrypted
+  CA keys are blocking because a freshly generated password cannot
+  be silently written into a deployment whose `password.txt` would
+  then fail to unlock the preserved CA keys; a stale
+  `secrets/config/ca.json` alone is equally blocking even without
+  encrypted key material because the second init pass's
+  `step ca init` cannot complete cleanly when its config target
+  already exists (it generates fresh cert/key files and then exits
+  non-zero on TTY-bound overwrite confirmation), recreating the
+  partial-init trap after OpenBao has already been wiped. The
+  safe fresh-CA rebuild path remains open whenever every preserved
+  step-ca artifact is absent; otherwise the operator restores
+  `password.txt` from a backup or removes every preserved step-ca
+  artifact to opt into a clean rebuild),
   the EAB registration prompt is skipped, and newly
   generated unseal keys are written automatically to
   `secrets/openbao/unseal-keys.txt` (mode `0600`). The optional
