@@ -357,6 +357,15 @@ run_bootstrap_init() {
   [ -n "$RUNTIME_SERVICE_ADD_ROLE_ID" ] || fail "failed to parse runtime_service_add role_id"
   [ -n "$RUNTIME_SERVICE_ADD_SECRET_ID" ] || fail "failed to parse runtime_service_add secret_id"
 
+  # `bootroot init` returns as soon as `docker compose up -d openbao`
+  # reports the recreated container as Started, but OpenBao itself
+  # needs a couple of seconds to bind the TLS listener on the new
+  # `https://${OPENBAO_BIND_ADDR}` endpoint.  `service add` does not
+  # retry the AppRole login, so fire a readiness probe against the
+  # post-TLS URL first; otherwise the bootstrap races and fails with
+  # `Connection refused`.
+  wait_for_openbao_listening "https://${OPENBAO_BIND_ADDR}"
+
   log_phase "bootstrap-service-add"
   run_bootroot service add \
     --service-name "$EDGE_SERVICE" --deploy-type daemon --delivery-mode local-file \
