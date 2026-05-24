@@ -221,12 +221,16 @@ unseal_openbao_from_summary() {
   done
   local attempt
   for attempt in $(seq 1 "$OPENBAO_READY_ATTEMPTS"); do
-    local sealed
-    sealed="$(docker exec -e BAO_ADDR="https://127.0.0.1:8200" \
+    # `bao status` exits 0 when unsealed, 2 when sealed-but-reachable.
+    # Use the exit code directly: jq's `//` alternative operator treats
+    # boolean `false` as nullish, so `.sealed // "true"` would return
+    # "true" for both sealed and unsealed states and the loop would
+    # never break.
+    local status_rc=0
+    docker exec -e BAO_ADDR="https://127.0.0.1:8200" \
       -e BAO_SKIP_VERIFY=true "$container" \
-      bao status -format=json 2>/dev/null \
-      | jq -r '.sealed // "true"' 2>/dev/null || echo "true")"
-    if [ "$sealed" = "false" ]; then
+      bao status -format=json >/dev/null 2>&1 || status_rc=$?
+    if [ "$status_rc" = "0" ]; then
       return 0
     fi
     sleep "$OPENBAO_READY_DELAY_SECS"
