@@ -178,8 +178,8 @@ pub(crate) fn build_local_plus_webpki_root_store(
     pem_content: &str,
 ) -> Result<rustls::RootCertStore> {
     let mut root_store = rustls::RootCertStore::empty();
-    let (loaded, _) =
-        root_store.add_parsable_certificates(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned());
+    let (loaded, _) = root_store
+        .add_parsable_certificates(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned());
     if loaded == 0 {
         anyhow::bail!("webpki root certificate bundle was empty");
     }
