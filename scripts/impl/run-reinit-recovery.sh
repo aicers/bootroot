@@ -311,19 +311,15 @@ assert_post_reinit_contracts() {
   fi
   wait_for_openbao_listening "https://${OPENBAO_BIND_ADDR}"
 
-  # 4. Service registry intentionally empty.
-  local svc_count approles policies
+  # 4. Service registry intentionally empty.  The system-level
+  # `approles` and `policies` maps are repopulated by every `init`
+  # with the bootroot infrastructure AppRoles/policies (bootroot_agent,
+  # responder, stepca, runtime_service_add, runtime_rotate), so only
+  # the user-facing `services` map is expected to be empty.
+  local svc_count
   svc_count="$(jq -r '.services | length' "$WORKSPACE_DIR/state.json")"
-  approles="$(jq -r '.approles | length' "$WORKSPACE_DIR/state.json")"
-  policies="$(jq -r '.policies | length' "$WORKSPACE_DIR/state.json")"
   if [ "$svc_count" != "0" ]; then
     fail "[$label] post-reinit services registry is not empty (count=$svc_count)"
-  fi
-  if [ "$approles" != "0" ]; then
-    fail "[$label] post-reinit approles registry is not empty (count=$approles)"
-  fi
-  if [ "$policies" != "0" ]; then
-    fail "[$label] post-reinit policies registry is not empty (count=$policies)"
   fi
 }
 
