@@ -1671,7 +1671,17 @@ operator-managed runbook for those.
   (e.g. disk full), the freshly issued token is surfaced on stderr in
   cleartext (prefixed with `ROOT_TOKEN=`) so it is not lost.
 - `--enable <features>`: passed through to `init` (e.g.
-  `show-secrets`)
+  `show-secrets`). `db-provision` is accepted but becomes a no-op
+  when reinit finds a preserved `secrets/config/ca.json` runtime DSN:
+  that DSN is authoritative (the PostgreSQL role's password was
+  rotated to it on the previous init), so re-running provisioning
+  would `ALTER ROLE` the already-good credential to whatever
+  `db-provision` synthesised and break the next rotate cycle. The
+  preserved DSN is threaded into the second init pass and flows back
+  into the freshly reinitialised OpenBao KV verbatim. When `ca.json`
+  is absent (rsync-clone path or a partial-init that crashed before
+  `update_ca_json_with_backup` ran), `db-provision` behaves as in
+  `init`.
 - `--skip <phases>`: passed through to `init` (e.g.
   `responder-check`)
 - `--summary-json <path>`: passed through to `init`. The path is
@@ -1747,11 +1757,16 @@ operator-managed runbook for those.
   rewrite is the only sanctioned channel for non-loopback init-pass
   URLs.
 - Re-runs `init` in reinit mode (preserves the existing step-ca
-  password, suppresses overwrite prompts for preserved files,
-  auto-generates the new HTTP-01 responder HMAC because the previous
-  one lived in the wiped OpenBao KV mount, and skips the EAB
-  registration prompt — operators who need EAB credentials register
-  them out of band after reinit).
+  password when `secrets/password.txt` is present, suppresses
+  overwrite prompts for preserved files, auto-generates the new
+  HTTP-01 responder HMAC because the previous one lived in the wiped
+  OpenBao KV mount, and skips the EAB registration prompt —
+  operators who need EAB credentials register them out of band after
+  reinit). When `secrets/password.txt` is absent (rsync-clone path
+  or operator-removed), the step-ca password is auto-generated
+  non-interactively so `reinit --yes` never stalls on a password
+  prompt; the new password is written to `secrets/password.txt` for
+  the freshly initialised CA material.
 - Reads the preserved step-ca runtime DSN from
   `secrets/config/ca.json` and seeds the second init pass with it so
   the freshly reinitialised OpenBao KV receives credentials that
