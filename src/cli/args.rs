@@ -698,6 +698,15 @@ pub(crate) enum InitSkipPhase {
     ResponderCheck,
 }
 
+// Each boolean flag corresponds to an explicit, per-prompt
+// non-interactive opt-out on the `init` surface (`--no-eab`,
+// `--save-unseal-keys`, `--no-save-unseal-keys`, plus the internal
+// `reinit_mode`).  Per the project pattern (#588 §3b), `init` uses
+// per-prompt explicit flags rather than a global `--yes`, so refactoring
+// them into a single state enum would obscure the clap-level mutual
+// exclusivity (`conflicts_with`) and `requires = "summary_json"`
+// constraints that this surface relies on.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug)]
 pub(crate) struct InitArgs {
     #[command(flatten)]
@@ -801,6 +810,23 @@ pub(crate) struct InitArgs {
     /// and for CI flows that never use EAB.
     #[arg(long = "no-eab", conflicts_with_all = ["eab_kid", "eab_hmac"])]
     pub(crate) no_eab: bool,
+
+    /// Skip the save-unseal-keys prompt and persist the freshly
+    /// generated unseal keys to `<secrets_dir>/openbao/unseal-keys.txt`
+    /// (mode `0600`).  Equivalent to answering `y` at the prompt.
+    #[arg(long = "save-unseal-keys", conflicts_with = "no_save_unseal_keys")]
+    pub(crate) save_unseal_keys: bool,
+
+    /// Skip the save-unseal-keys prompt and do NOT persist the keys to
+    /// the on-disk path.  Requires `--summary-json <path>` so the freshly
+    /// generated keys are captured in the 0600 summary file; without it
+    /// the keys would be lost and would brick the next `OpenBao` restart.
+    #[arg(
+        long = "no-save-unseal-keys",
+        requires = "summary_json",
+        conflicts_with = "save_unseal_keys"
+    )]
+    pub(crate) no_save_unseal_keys: bool,
 
     /// Internal: invoked from `bootroot reinit`.  Suppresses overwrite
     /// prompts for files that the reinit caller has already decided to
@@ -1329,6 +1355,85 @@ mod tests {
         match cli.command {
             CliCommand::Init(args) => {
                 assert_eq!(args.summary_json, Some(PathBuf::from("init-summary.json")));
+            }
+            _ => panic!("expected init"),
+        }
+    }
+
+    /// `--save-unseal-keys` parses to the matching flag and leaves
+    /// `--no-save-unseal-keys` unset.
+    #[test]
+    fn test_cli_parses_init_save_unseal_keys() {
+        let cli = Cli::parse_from(["bootroot", "init", "--save-unseal-keys"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert!(args.save_unseal_keys);
+                assert!(!args.no_save_unseal_keys);
+            }
+            _ => panic!("expected init"),
+        }
+    }
+
+    /// `--no-save-unseal-keys` requires `--summary-json`; with both set
+    /// the parse succeeds.
+    #[test]
+    fn test_cli_parses_init_no_save_unseal_keys_with_summary_json() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "init",
+            "--no-save-unseal-keys",
+            "--summary-json",
+            "init-summary.json",
+        ]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert!(args.no_save_unseal_keys);
+                assert!(!args.save_unseal_keys);
+                assert_eq!(args.summary_json, Some(PathBuf::from("init-summary.json")));
+            }
+            _ => panic!("expected init"),
+        }
+    }
+
+    /// Clap must reject `--no-save-unseal-keys` without `--summary-json`
+    /// at parse time so the operator does not waste a full init cycle
+    /// before discovering the bad combination.
+    #[test]
+    fn test_cli_rejects_no_save_unseal_keys_without_summary_json() {
+        let result = Cli::try_parse_from(["bootroot", "init", "--no-save-unseal-keys"]);
+        assert!(
+            result.is_err(),
+            "--no-save-unseal-keys without --summary-json must be rejected at parse time"
+        );
+    }
+
+    /// Clap must reject the mutually exclusive `--save-unseal-keys` and
+    /// `--no-save-unseal-keys` combination at parse time.
+    #[test]
+    fn test_cli_rejects_save_and_no_save_unseal_keys_together() {
+        let result = Cli::try_parse_from([
+            "bootroot",
+            "init",
+            "--save-unseal-keys",
+            "--no-save-unseal-keys",
+            "--summary-json",
+            "init-summary.json",
+        ]);
+        assert!(
+            result.is_err(),
+            "--save-unseal-keys and --no-save-unseal-keys must be mutually exclusive"
+        );
+    }
+
+    /// Default `init` (no save-unseal-keys flag) leaves both fields
+    /// false — the prompt path stays unchanged for interactive operators.
+    #[test]
+    fn test_cli_init_default_save_unseal_keys_flags_unset() {
+        let cli = Cli::parse_from(["bootroot", "init"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert!(!args.save_unseal_keys);
+                assert!(!args.no_save_unseal_keys);
             }
             _ => panic!("expected init"),
         }

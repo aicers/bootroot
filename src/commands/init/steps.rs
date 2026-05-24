@@ -500,6 +500,8 @@ pub(super) mod test_support {
             eab_kid: None,
             eab_hmac: None,
             no_eab: false,
+            save_unseal_keys: false,
+            no_save_unseal_keys: false,
             reinit_mode: false,
             root_token_output: None,
         }

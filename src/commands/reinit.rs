@@ -409,7 +409,7 @@ fn remove_file_if_exists(path: &Path, messages: &Messages) -> Result<()> {
 /// 4. The parent directory must accept new files.  We create the parent
 ///    if missing and probe with a uniquely named marker so read-only
 ///    parents and uncreatable ancestors are caught here.
-fn validate_root_token_output_path(path: &Path, messages: &Messages) -> Result<()> {
+pub(crate) fn validate_root_token_output_path(path: &Path, messages: &Messages) -> Result<()> {
     let display = path.display().to_string();
 
     if path.exists() {
@@ -501,7 +501,7 @@ fn validate_root_token_output_path(path: &Path, messages: &Messages) -> Result<(
 /// content lands in the pre-existing file's permission bits first, and
 /// a `0644` destination would briefly expose root token + unseal keys
 /// to other users on the host between the write and the chmod.
-fn validate_summary_json_output_path(path: &Path, messages: &Messages) -> Result<()> {
+pub(crate) fn validate_summary_json_output_path(path: &Path, messages: &Messages) -> Result<()> {
     let display = path.display().to_string();
 
     if path.exists() {
@@ -846,6 +846,8 @@ fn init_args_for_reinit(
         eab_kid: None,
         eab_hmac: None,
         no_eab: args.no_eab,
+        save_unseal_keys: false,
+        no_save_unseal_keys: false,
         reinit_mode: true,
         root_token_output: args.root_token_output.clone(),
     })

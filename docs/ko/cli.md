@@ -259,7 +259,13 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--skip <phase,...>`: 선택 단계 건너뛰기(쉼표 구분).
   값: `responder-check`
 - `--summary-json`: init 요약을 머신 파싱용 JSON 파일로 저장
-  (민감 필드 포함 가능: 예 `root_token`)
+  (민감 필드 포함 가능: 예 `root_token`). OpenBao 작업을 시작하기
+  전에 경로를 사전 점검합니다. 경로가 디렉터리이거나, 기존 파일이
+  쓰기 불가/그룹·기타 권한 노출 상태이거나, 부모 디렉터리가
+  생성·쓰기 불가인 경우 init은 어떤 작업도 시작하지 않고
+  중단됩니다. 이는 init이 OpenBao 초기화를 마친 뒤에야 요약 파일
+  쓰기가 실패해 새로 발행된 root token과 unseal key가 어디에도
+  남지 않는 부분 초기화 함정을 방지합니다.
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`).
   기본 실행에서는 필수입니다. preview 모드(`--print-only`/`--dry-run`)에서는
   선택이며, trust 프리뷰를 보려면 지정해야 합니다.
@@ -317,6 +323,19 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--no-eab`: EAB 프롬프트를 생략하고 EAB 자격증명을 KV에 기록하지
   않습니다. `--eab-kid`/`--eab-hmac`과 함께 사용할 수 없습니다.
   OSS step-ca 및 EAB를 사용하지 않는 CI 흐름에 권장됩니다(#588 §3b).
+- `--save-unseal-keys`: "Save unseal keys to file?" 프롬프트를
+  건너뛰고 새로 생성된 unseal 키를
+  `<secrets_dir>/openbao/unseal-keys.txt`에 모드 `0600`으로
+  저장합니다. 프롬프트에 `y`를 입력한 것과 동등합니다.
+  `--no-save-unseal-keys`와 함께 사용할 수 없습니다(#603).
+- `--no-save-unseal-keys`: "Save unseal keys to file?" 프롬프트를
+  건너뛰고 키를 위 경로에 저장하지 않습니다. 새로 생성된 키가
+  0600 요약 파일에 포착되도록 `--summary-json <path>`가 함께
+  필요합니다. 그렇지 않으면 키가 손실되어 다음 OpenBao 재시작이
+  실패합니다. 이 플래그에서는 운영자가 저장을 거부했을 때 키를
+  stdout으로 평문 출력하는 경로도 함께 억제되어(요약 JSON에
+  이미 들어 있고, CI 로그로 유출될 위험을 차단) 출력되지 않습니다.
+  `--save-unseal-keys`와 함께 사용할 수 없습니다(#603).
 
 이전 `init`이 중간에 실패하고 롤백되었다면 OpenBao는 볼륨에 초기화된
 상태로 남아 있는 반면 bootroot에는 사용 가능한 root token이 없을 수

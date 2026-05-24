@@ -60,6 +60,24 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     bootroot::config::validate_cert_duration_vs_default_renew_before(&args.cert_duration)?;
     eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
 
+    // Validate optional secret-bearing output destinations *before* any
+    // OpenBao work begins.  Both files are written only after
+    // `run_init_inner` returns: an unwritable destination would otherwise
+    // fail post-init, after OpenBao has been initialised but before
+    // `print_init_summary` / `maybe_save_unseal_keys` run, recreating
+    // the partial-init trap with the freshly issued root token and
+    // unseal keys captured nowhere.  Reinit already gates the same paths
+    // at its own preflight; this mirrors that for the direct `init`
+    // surface.  Critical for `--no-save-unseal-keys`, whose only capture
+    // channel is the summary JSON, but the same ordering issue applies
+    // to `--save-unseal-keys` and to bare `--summary-json`/`--root-token-output`.
+    if let Some(out) = args.summary_json.as_deref() {
+        crate::commands::reinit::validate_summary_json_output_path(out, messages)?;
+    }
+    if let Some(out) = args.root_token_output.as_deref() {
+        crate::commands::reinit::validate_root_token_output_path(out, messages)?;
+    }
+
     ensure_all_services_localhost_binding(&args.compose.compose_file, messages)?;
 
     // Check whether a non-loopback OpenBao bind intent is stored in
@@ -127,10 +145,17 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             // acceptance criteria require `reinit --yes` to write the
             // fresh keys automatically with no further interaction.
             if summary.init_response && !summary.unseal_keys.is_empty() {
+                let decision = if args.reinit_mode || args.save_unseal_keys {
+                    SaveUnsealKeysDecision::Save
+                } else if args.no_save_unseal_keys {
+                    SaveUnsealKeysDecision::DoNotSave
+                } else {
+                    SaveUnsealKeysDecision::Prompt
+                };
                 maybe_save_unseal_keys(
                     &args.secrets_dir.secrets_dir,
                     &summary.unseal_keys,
-                    args.reinit_mode,
+                    decision,
                     messages,
                 )
                 .await?;
@@ -723,14 +748,33 @@ async fn run_init_inner(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SaveUnsealKeysDecision {
+    /// Neither flag set and not in reinit mode — ask the operator.
+    Prompt,
+    /// `reinit_mode` or `--save-unseal-keys` — write to disk without
+    /// prompting.
+    Save,
+    /// `--no-save-unseal-keys` — skip persistence AND suppress the
+    /// cleartext-echo fallback (operator has captured the keys via
+    /// `--summary-json`, which clap enforces at parse time).
+    DoNotSave,
+}
+
 async fn maybe_save_unseal_keys(
     secrets_dir: &Path,
     keys: &[String],
-    auto_save: bool,
+    decision: SaveUnsealKeysDecision,
     messages: &Messages,
 ) -> Result<()> {
     use super::prompts::prompt_yes_no;
-    let save = auto_save || prompt_yes_no(messages.prompt_save_unseal_keys(), messages)?;
+    let save = match decision {
+        SaveUnsealKeysDecision::Save => true,
+        SaveUnsealKeysDecision::DoNotSave => false,
+        SaveUnsealKeysDecision::Prompt => {
+            prompt_yes_no(messages.prompt_save_unseal_keys(), messages)?
+        }
+    };
     if save {
         let path =
             crate::commands::openbao_unseal::save_unseal_keys(secrets_dir, keys, messages).await?;
@@ -738,9 +782,12 @@ async fn maybe_save_unseal_keys(
             "{}",
             messages.openbao_unseal_keys_saved(&path.display().to_string())
         );
-    } else {
-        // User declined saving — display the keys in cleartext so they
-        // can be copied for manual safekeeping.
+    } else if matches!(decision, SaveUnsealKeysDecision::Prompt) {
+        // User declined saving at the prompt — display the keys in
+        // cleartext so they can be copied for manual safekeeping.  Under
+        // `--no-save-unseal-keys` the keys are already captured in the
+        // 0600 summary JSON (clap enforces `requires = "summary_json"`),
+        // so echoing them here would leak into CI logs — skip it.
         eprintln!("{}", messages.openbao_unseal_keys_not_saved_warning());
         for (idx, key) in keys.iter().enumerate() {
             println!("{}", messages.summary_unseal_key(idx + 1, key));
@@ -1190,7 +1237,7 @@ mod tests {
         std::fs::create_dir_all(&secrets).unwrap();
         let keys = vec!["key-1".to_string(), "key-2".to_string()];
         let messages = test_messages();
-        maybe_save_unseal_keys(&secrets, &keys, true, &messages)
+        maybe_save_unseal_keys(&secrets, &keys, SaveUnsealKeysDecision::Save, &messages)
             .await
             .expect("auto-save must not prompt");
         let path = secrets.join("openbao").join("unseal-keys.txt");
@@ -1198,6 +1245,56 @@ mod tests {
         assert!(body.contains("key-1") && body.contains("key-2"));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "unseal keys file must be 0600, got {mode:o}");
+    }
+
+    /// `SaveUnsealKeysDecision::Save` (driven by `--save-unseal-keys`)
+    /// writes the on-disk unseal-keys file with mode `0600` and skips
+    /// the prompt, matching the reinit-mode write path.
+    #[tokio::test]
+    async fn maybe_save_unseal_keys_save_decision_writes_without_prompting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let keys = vec!["key-a".to_string(), "key-b".to_string()];
+        let messages = test_messages();
+        maybe_save_unseal_keys(&secrets, &keys, SaveUnsealKeysDecision::Save, &messages)
+            .await
+            .expect("--save-unseal-keys decision must not prompt");
+        let path = secrets.join("openbao").join("unseal-keys.txt");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("key-a") && body.contains("key-b"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "unseal keys file must be 0600, got {mode:o}");
+    }
+
+    /// `SaveUnsealKeysDecision::DoNotSave` (driven by
+    /// `--no-save-unseal-keys`) must skip the prompt AND skip the
+    /// on-disk write.  Operators that pass `--no-save-unseal-keys` rely
+    /// on `--summary-json` to capture the keys; the canonical
+    /// `<secrets_dir>/openbao/unseal-keys.txt` must not appear.
+    #[tokio::test]
+    async fn maybe_save_unseal_keys_do_not_save_skips_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let keys = vec!["key-x".to_string(), "key-y".to_string()];
+        let messages = test_messages();
+        maybe_save_unseal_keys(
+            &secrets,
+            &keys,
+            SaveUnsealKeysDecision::DoNotSave,
+            &messages,
+        )
+        .await
+        .expect("--no-save-unseal-keys decision must not prompt");
+        let path = secrets.join("openbao").join("unseal-keys.txt");
+        assert!(
+            !path.exists(),
+            "--no-save-unseal-keys must not write {}",
+            path.display()
+        );
     }
 
     /// `write_root_token_file` persists the token with mode `0600`.
@@ -1243,6 +1340,66 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "root token file must be created atomically with 0600 under any umask, got {mode:o}"
+        );
+    }
+
+    /// Closes #603 Reviewer Round 1: `run_init` must validate
+    /// `--summary-json` *before* any `OpenBao` work begins.  Without this,
+    /// a bad summary destination would fail inside
+    /// `write_init_summary_json` after `run_init_inner` succeeds, leaving
+    /// the freshly issued root token + unseal keys captured nowhere —
+    /// the exact partial-init trap `--no-save-unseal-keys` is designed
+    /// to avoid via the summary-json recovery channel.  The validator is
+    /// the same one reinit uses; this test asserts it fires from the
+    /// init surface too.
+    #[tokio::test]
+    async fn run_init_rejects_bad_summary_json_before_any_work() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory standing in for the summary-json path: any write
+        // attempt would fail, but the preflight catches it first.
+        let bad_path = dir.path().join("not-a-file");
+        std::fs::create_dir_all(&bad_path).unwrap();
+
+        let mut args = default_init_args();
+        args.summary_json = Some(bad_path.clone());
+        // Point compose_file at a non-existent path so that if the
+        // preflight did NOT fire first, the test would fail with a
+        // different (compose-file) error.  The summary-json validator
+        // runs earlier and emits its own diagnostic.
+        args.compose.compose_file = dir.path().join("does-not-exist.yml");
+
+        let err = run_init(&args, &test_messages())
+            .await
+            .expect_err("bad --summary-json must be rejected at preflight");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&bad_path.display().to_string()) || msg.to_lowercase().contains("summary"),
+            "preflight error must reference the summary-json path or label, got: {msg}",
+        );
+    }
+
+    /// Same guarantee for `--root-token-output`: the preflight must fire
+    /// before any `OpenBao` work so a bad token-output destination cannot
+    /// fail post-init with the freshly issued root token already minted.
+    #[tokio::test]
+    async fn run_init_rejects_bad_root_token_output_before_any_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_path = dir.path().join("not-a-file");
+        std::fs::create_dir_all(&bad_path).unwrap();
+
+        let mut args = default_init_args();
+        args.root_token_output = Some(bad_path.clone());
+        args.compose.compose_file = dir.path().join("does-not-exist.yml");
+
+        let err = run_init(&args, &test_messages())
+            .await
+            .expect_err("bad --root-token-output must be rejected at preflight");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&bad_path.display().to_string())
+                || msg.to_lowercase().contains("root token")
+                || msg.to_lowercase().contains("root-token"),
+            "preflight error must reference the root-token-output path or label, got: {msg}",
         );
     }
 

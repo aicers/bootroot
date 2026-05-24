@@ -264,7 +264,14 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--skip <phase,...>`: skip optional phases (comma-separated).
   Values: `responder-check`
 - `--summary-json`: write init summary as machine-readable JSON
-  (it may include sensitive fields such as `root_token`)
+  (it may include sensitive fields such as `root_token`). The path is
+  preflight-checked before any OpenBao work begins: init refuses to
+  start if the path is a directory, an unwritable existing file, a
+  world-/group-readable existing file, or sits under an uncreatable or
+  read-only parent. This avoids the partial-init trap in which init
+  completes against OpenBao and only then fails to write the summary,
+  leaving the freshly issued root token and unseal keys captured
+  nowhere.
 - `--root-token`: OpenBao root token (environment variable:
   `OPENBAO_ROOT_TOKEN`). Required for normal apply mode. Optional in preview
   mode (`--print-only`/`--dry-run`), but required if you want trust preview
@@ -327,6 +334,19 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--no-eab`: skip the EAB prompt and persist no EAB credentials.
   Conflicts with `--eab-kid`/`--eab-hmac`. Recommended for OSS
   step-ca and CI flows that never use EAB (#588 §3b).
+- `--save-unseal-keys`: skip the "Save unseal keys to file?" prompt and
+  persist the freshly generated unseal keys to
+  `<secrets_dir>/openbao/unseal-keys.txt` (mode `0600`). Equivalent to
+  answering `y` at the prompt. Conflicts with `--no-save-unseal-keys`
+  (#603).
+- `--no-save-unseal-keys`: skip the "Save unseal keys to file?" prompt
+  and do NOT persist the keys to that on-disk path. Requires
+  `--summary-json <path>` so the freshly generated keys are captured in
+  the 0600 summary file; without it the keys would be lost and would
+  brick the next OpenBao restart. Under this flag the cleartext-echo
+  fallback is also suppressed (the keys are already in the summary
+  JSON, and echoing would leak them into CI logs). Conflicts with
+  `--save-unseal-keys` (#603).
 
 If a previous `init` failed mid-flight and rolled back, OpenBao may
 remain initialised in its volume while bootroot has no usable root
