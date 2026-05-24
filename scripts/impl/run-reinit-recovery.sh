@@ -173,6 +173,32 @@ wait_for_openbao_listening() {
   fail "OpenBao did not become reachable at $url"
 }
 
+unseal_openbao_from_summary() {
+  local url="$1"
+  # `bootroot init` always uses Shamir threshold=2; the summary JSON
+  # does not record the threshold so feed the first two keys.
+  local threshold=2
+  local i
+  for i in $(seq 0 $((threshold - 1))); do
+    local key
+    key="$(jq -r ".unseal_keys[$i] // empty" "$INIT_SUMMARY_JSON")"
+    [ -n "$key" ] || fail "missing unseal key $i in $INIT_SUMMARY_JSON"
+    curl -kSs -m 5 -X PUT "${url}/v1/sys/unseal" \
+      -d "{\"key\":\"${key}\"}" >/dev/null
+  done
+  local attempt
+  for attempt in $(seq 1 "$OPENBAO_READY_ATTEMPTS"); do
+    local sealed
+    sealed="$(curl -kSs -m 3 "${url}/v1/sys/seal-status" \
+      | jq -r '.sealed // "true"' 2>/dev/null || echo "true")"
+    if [ "$sealed" = "false" ]; then
+      return 0
+    fi
+    sleep "$OPENBAO_READY_DELAY_SECS"
+  done
+  fail "OpenBao did not unseal within timeout at $url"
+}
+
 wait_for_postgres_admin() {
   local host_port="${POSTGRES_HOST_PORT:-5432}"
   local admin_user="${POSTGRES_USER:-step}"
@@ -365,6 +391,12 @@ run_bootstrap_init() {
   # post-TLS URL first; otherwise the bootstrap races and fails with
   # `Connection refused`.
   wait_for_openbao_listening "https://${OPENBAO_BIND_ADDR}"
+
+  # The TLS post-processing step recreates the OpenBao container, which
+  # comes back sealed; `init` does not auto-unseal afterwards.  Without
+  # this `service add` would fail with "Vault is sealed" on AppRole
+  # login.  Replay the unseal keys captured in the bootstrap summary.
+  unseal_openbao_from_summary "https://${OPENBAO_BIND_ADDR}"
 
   log_phase "bootstrap-service-add"
   run_bootroot service add \
