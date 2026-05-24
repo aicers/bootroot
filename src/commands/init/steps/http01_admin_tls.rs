@@ -45,10 +45,8 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let user_arg = format!("{}:{}", meta.uid(), meta.gid());
 
-    let san_arg = sans.join(",");
-
     let intermediate_cert = format!("/home/step/{CA_CERTS_DIR}/{CA_INTERMEDIATE_CERT_FILENAME}");
-    let args: Vec<&str> = vec![
+    let mut args: Vec<&str> = vec![
         "run",
         "--user",
         &user_arg,
@@ -72,12 +70,21 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
         "/home/step/password.txt",
         "--no-password",
         "--insecure",
-        "--san",
-        &san_arg,
+    ];
+    // `step certificate create --san` accepts a single value per flag
+    // and must be repeated per SAN; comma-joining yields one literal
+    // SAN whose DnsName is the joined string (failing hostname
+    // verification for every individual name).  step infers DNS vs IP
+    // from the value shape.
+    for san in sans {
+        args.push("--san");
+        args.push(san);
+    }
+    args.extend([
         "--not-after",
         HTTP01_ADMIN_TLS_DEFAULT_NOT_AFTER,
         "--force",
-    ];
+    ]);
 
     run_docker(
         &args,
