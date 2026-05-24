@@ -259,7 +259,13 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--skip <phase,...>`: 선택 단계 건너뛰기(쉼표 구분).
   값: `responder-check`
 - `--summary-json`: init 요약을 머신 파싱용 JSON 파일로 저장
-  (민감 필드 포함 가능: 예 `root_token`)
+  (민감 필드 포함 가능: 예 `root_token`). OpenBao 작업을 시작하기
+  전에 경로를 사전 점검합니다. 경로가 디렉터리이거나, 기존 파일이
+  쓰기 불가/그룹·기타 권한 노출 상태이거나, 부모 디렉터리가
+  생성·쓰기 불가인 경우 init은 어떤 작업도 시작하지 않고
+  중단됩니다. 이는 init이 OpenBao 초기화를 마친 뒤에야 요약 파일
+  쓰기가 실패해 새로 발행된 root token과 unseal key가 어디에도
+  남지 않는 부분 초기화 함정을 방지합니다.
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`).
   기본 실행에서는 필수입니다. preview 모드(`--print-only`/`--dry-run`)에서는
   선택이며, trust 프리뷰를 보려면 지정해야 합니다.

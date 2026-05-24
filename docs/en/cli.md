@@ -264,7 +264,14 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--skip <phase,...>`: skip optional phases (comma-separated).
   Values: `responder-check`
 - `--summary-json`: write init summary as machine-readable JSON
-  (it may include sensitive fields such as `root_token`)
+  (it may include sensitive fields such as `root_token`). The path is
+  preflight-checked before any OpenBao work begins: init refuses to
+  start if the path is a directory, an unwritable existing file, a
+  world-/group-readable existing file, or sits under an uncreatable or
+  read-only parent. This avoids the partial-init trap in which init
+  completes against OpenBao and only then fails to write the summary,
+  leaving the freshly issued root token and unseal keys captured
+  nowhere.
 - `--root-token`: OpenBao root token (environment variable:
   `OPENBAO_ROOT_TOKEN`). Required for normal apply mode. Optional in preview
   mode (`--print-only`/`--dry-run`), but required if you want trust preview

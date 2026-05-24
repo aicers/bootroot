@@ -60,6 +60,24 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     bootroot::config::validate_cert_duration_vs_default_renew_before(&args.cert_duration)?;
     eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
 
+    // Validate optional secret-bearing output destinations *before* any
+    // OpenBao work begins.  Both files are written only after
+    // `run_init_inner` returns: an unwritable destination would otherwise
+    // fail post-init, after OpenBao has been initialised but before
+    // `print_init_summary` / `maybe_save_unseal_keys` run, recreating
+    // the partial-init trap with the freshly issued root token and
+    // unseal keys captured nowhere.  Reinit already gates the same paths
+    // at its own preflight; this mirrors that for the direct `init`
+    // surface.  Critical for `--no-save-unseal-keys`, whose only capture
+    // channel is the summary JSON, but the same ordering issue applies
+    // to `--save-unseal-keys` and to bare `--summary-json`/`--root-token-output`.
+    if let Some(out) = args.summary_json.as_deref() {
+        crate::commands::reinit::validate_summary_json_output_path(out, messages)?;
+    }
+    if let Some(out) = args.root_token_output.as_deref() {
+        crate::commands::reinit::validate_root_token_output_path(out, messages)?;
+    }
+
     ensure_all_services_localhost_binding(&args.compose.compose_file, messages)?;
 
     // Check whether a non-loopback OpenBao bind intent is stored in
@@ -1322,6 +1340,67 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "root token file must be created atomically with 0600 under any umask, got {mode:o}"
+        );
+    }
+
+    /// Closes #603 Reviewer Round 1: `run_init` must validate
+    /// `--summary-json` *before* any `OpenBao` work begins.  Without this,
+    /// a bad summary destination would fail inside
+    /// `write_init_summary_json` after `run_init_inner` succeeds, leaving
+    /// the freshly issued root token + unseal keys captured nowhere —
+    /// the exact partial-init trap `--no-save-unseal-keys` is designed
+    /// to avoid via the summary-json recovery channel.  The validator is
+    /// the same one reinit uses; this test asserts it fires from the
+    /// init surface too.
+    #[tokio::test]
+    async fn run_init_rejects_bad_summary_json_before_any_work() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory standing in for the summary-json path: any write
+        // attempt would fail, but the preflight catches it first.
+        let bad_path = dir.path().join("not-a-file");
+        std::fs::create_dir_all(&bad_path).unwrap();
+
+        let mut args = default_init_args();
+        args.summary_json = Some(bad_path.clone());
+        // Point compose_file at a non-existent path so that if the
+        // preflight did NOT fire first, the test would fail with a
+        // different (compose-file) error.  The summary-json validator
+        // runs earlier and emits its own diagnostic.
+        args.compose.compose_file = dir.path().join("does-not-exist.yml");
+
+        let err = run_init(&args, &test_messages())
+            .await
+            .expect_err("bad --summary-json must be rejected at preflight");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&bad_path.display().to_string())
+                || msg.to_lowercase().contains("summary"),
+            "preflight error must reference the summary-json path or label, got: {msg}",
+        );
+    }
+
+    /// Same guarantee for `--root-token-output`: the preflight must fire
+    /// before any `OpenBao` work so a bad token-output destination cannot
+    /// fail post-init with the freshly issued root token already minted.
+    #[tokio::test]
+    async fn run_init_rejects_bad_root_token_output_before_any_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_path = dir.path().join("not-a-file");
+        std::fs::create_dir_all(&bad_path).unwrap();
+
+        let mut args = default_init_args();
+        args.root_token_output = Some(bad_path.clone());
+        args.compose.compose_file = dir.path().join("does-not-exist.yml");
+
+        let err = run_init(&args, &test_messages())
+            .await
+            .expect_err("bad --root-token-output must be rejected at preflight");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&bad_path.display().to_string())
+                || msg.to_lowercase().contains("root token")
+                || msg.to_lowercase().contains("root-token"),
+            "preflight error must reference the root-token-output path or label, got: {msg}",
         );
     }
 

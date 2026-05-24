@@ -253,7 +253,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   exclusive. When neither flag is set the interactive prompt (default
   `N`) is preserved, so operators see no behavior change. Reinit's
   internal auto-save path (`args.reinit_mode`) is unaffected.
-  (Closes #603)
+  `bootroot init` also now runs the same `--summary-json` and
+  `--root-token-output` preflight that `bootroot reinit` does, before
+  any OpenBao work starts, so a bad output destination fails fast
+  instead of being discovered post-init with the freshly issued root
+  token and unseal keys already minted (recreating the partial-init
+  trap `--no-save-unseal-keys` is designed to avoid through the
+  summary-json recovery channel). (Closes #603)
 - New `bootroot reinit` recovery command that atomically wipes
   OpenBao-owned state and re-runs init while preserving step-ca CA
   material, `password.txt`, PostgreSQL state, operator-authored compose
