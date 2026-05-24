@@ -201,13 +201,18 @@ pub(crate) fn verify_stepca_password_recoverable(
     if password_path.exists() {
         return Ok(());
     }
-    let ca_json = secrets_dir.join("config").join("ca.json");
+    // Only the encrypted CA *keys* lock the operator out — they are the
+    // files encrypted with the lost password.  `config/ca.json` alone is
+    // not blocking (it carries no key material), but a preserved
+    // `root_ca_key` or `intermediate_ca_key` without `ca.json` is, since
+    // `ensure_step_ca_initialized` would still attempt `step ca init`
+    // into a tree that already contains encrypted key files.
     let root_key = secrets_dir.join("secrets").join("root_ca_key");
     let intermediate_key = secrets_dir.join("secrets").join("intermediate_ca_key");
-    let has_ca_material = ca_json.exists() && (root_key.exists() || intermediate_key.exists());
-    if !has_ca_material {
+    if !root_key.exists() && !intermediate_key.exists() {
         return Ok(());
     }
+    let ca_json = secrets_dir.join("config").join("ca.json");
     anyhow::bail!(
         messages.error_reinit_stepca_password_missing_with_ca_material(
             &password_path.display().to_string(),
@@ -2297,7 +2302,51 @@ mod tests {
             .expect("no CA material → fresh-CA recovery is safe");
     }
 
-    /// `ca.json` alone without either CA key is also acceptable.  The
+    /// Regression for Round 2 (#601) reviewer item: preserved key
+    /// material without `ca.json` must still trip the preflight.  The
+    /// previous predicate required `ca.json` *and* a key file, which
+    /// silently let `reinit --yes` proceed when `ca.json` was missing
+    /// but `root_ca_key` (or `intermediate_ca_key`) was preserved.
+    /// `ensure_step_ca_initialized` only short-circuits when all three
+    /// files exist, so the second init pass would attempt `step ca init`
+    /// into a tree that still contains encrypted key material — either
+    /// overwriting it or failing mid-flow after the destructive
+    /// `OpenBao` wipe.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_root_key_only() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("secrets")).expect("secrets dir");
+        fs::write(secrets.join("secrets/root_ca_key"), "encrypted-key").expect("root_ca_key");
+        assert!(!secrets.join("password.txt").exists());
+        assert!(!secrets.join("config/ca.json").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(err.to_string().contains("root_ca_key"), "got: {err}");
+    }
+
+    /// Companion: an intermediate key without `ca.json` is equally
+    /// blocking.  Same reasoning as the root-key-only case.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_intermediate_key_only() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("secrets")).expect("secrets dir");
+        fs::write(secrets.join("secrets/intermediate_ca_key"), "encrypted-key")
+            .expect("intermediate_ca_key");
+        assert!(!secrets.join("password.txt").exists());
+        assert!(!secrets.join("config/ca.json").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(
+            err.to_string().contains("intermediate_ca_key"),
+            "got: {err}"
+        );
+    }
+
+    /// `ca.json` alone without either CA key is acceptable.  The
     /// preflight only fires when the CA *keys* are preserved (encrypted
     /// with the lost password); a config file with no key material
     /// cannot lock the operator out.
