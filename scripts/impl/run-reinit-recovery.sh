@@ -66,6 +66,10 @@ OPENBAO_BIND_HOST_DEFAULT="172.17.0.1"
 OPENBAO_BIND_HOST="${OPENBAO_BIND_HOST:-$OPENBAO_BIND_HOST_DEFAULT}"
 OPENBAO_BIND_ADDR="${OPENBAO_BIND_ADDR:-${OPENBAO_BIND_HOST}:8200}"
 EXPOSED_OVERRIDE_PATH="$SECRETS_DIR/openbao/docker-compose.openbao-exposed.yml"
+OPENBAO_REPO_DIR="$ROOT_DIR/openbao"
+OPENBAO_REPO_HCL="$OPENBAO_REPO_DIR/openbao.hcl"
+OPENBAO_REPO_CONFIG_DIR="$OPENBAO_REPO_DIR/config"
+OPENBAO_HCL_SNAPSHOT="$ARTIFACT_DIR/openbao.hcl.pristine"
 EDGE_SERVICE="edge-proxy"
 EDGE_HOSTNAME="edge-node-01"
 DOMAIN="trusted.domain"
@@ -158,6 +162,29 @@ cleanup() {
   log_phase "cleanup"
   capture_artifacts
   compose_down
+  restore_repo_openbao_config
+}
+
+# `bootroot init --openbao-bind --openbao-tls-required` rewrites the
+# repo-level `openbao/openbao.hcl` (mounted into the container as
+# `:ro`) to a TLS-enabled listener and drops the issued server cert
+# under `openbao/config/tls/`.  Both paths persist after the script
+# exits, so the next consumer of the same checkout (e.g. the
+# extended suite's `infra-lifecycle` case, which runs after this
+# one) inherits a TLS-bound config while its own `init` talks
+# plaintext.  Restore the snapshot and scrub the TLS cert files so
+# the checkout is left in its pre-run state.
+snapshot_repo_openbao_config() {
+  if [ -f "$OPENBAO_REPO_HCL" ]; then
+    cp "$OPENBAO_REPO_HCL" "$OPENBAO_HCL_SNAPSHOT"
+  fi
+}
+
+restore_repo_openbao_config() {
+  if [ -f "$OPENBAO_HCL_SNAPSHOT" ]; then
+    cp "$OPENBAO_HCL_SNAPSHOT" "$OPENBAO_REPO_HCL"
+  fi
+  rm -rf "$OPENBAO_REPO_CONFIG_DIR"
 }
 
 # Use the public sys/seal-status endpoint (always available, even
@@ -577,6 +604,7 @@ main() {
   ensure_prerequisites
   ensure_bind_host_available
   compose_down
+  snapshot_repo_openbao_config
 
   log_phase "bootstrap-install"
   write_agent_config
