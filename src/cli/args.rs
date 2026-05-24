@@ -890,6 +890,16 @@ pub(crate) struct ReinitArgs {
 
     /// Enable optional features passed through to the underlying init
     /// flow (e.g. `show-secrets`).
+    ///
+    /// `db-provision` is accepted but becomes a no-op when reinit finds
+    /// a preserved `secrets/config/ca.json` runtime DSN: that DSN is
+    /// authoritative (the `PostgreSQL` role's password was rotated to it
+    /// on the previous init), so re-running provisioning would rotate
+    /// the already-good credential and break the next rotate cycle.
+    /// The preserved DSN is threaded into the second init pass and
+    /// flows back into the freshly reinitialised `OpenBao` KV verbatim.
+    /// When `ca.json` is absent (rsync-clone path), `db-provision`
+    /// behaves as in `init`.
     #[arg(long, value_enum, value_delimiter = ',')]
     pub(crate) enable: Vec<InitFeature>,
 

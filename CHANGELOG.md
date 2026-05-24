@@ -270,8 +270,34 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `--yes` the entire flow is non-interactive end-to-end: overwrite
   prompts for preserved files are suppressed, the new HTTP-01
   responder HMAC is auto-generated (the previous one lived in the
-  wiped OpenBao KV mount), the EAB registration prompt is skipped,
-  and newly generated unseal keys are written automatically to
+  wiped OpenBao KV mount), an absent `secrets/password.txt` (rsync-
+  clone path or operator-removed) triggers non-interactive step-ca
+  password generation under `reinit_mode` so `reinit --yes` never
+  stalls on the step-ca password prompt (an existing `password.txt`
+  is still preserved verbatim so the encrypted CA material remains
+  decryptable; when `password.txt` is absent **but** any file
+  `step ca init` writes — `secrets/config/ca.json`,
+  `secrets/config/defaults.json`, `secrets/certs/root_ca.crt`,
+  `secrets/certs/intermediate_ca.crt`,
+  `secrets/secrets/root_ca_key`, or
+  `secrets/secrets/intermediate_ca_key` — is still on disk, reinit
+  refuses to start before any destructive operation runs. Encrypted
+  CA keys are blocking because a freshly generated password cannot
+  be silently written into a deployment whose `password.txt` would
+  then fail to unlock the preserved CA keys; any other preserved
+  `step ca init` write (the `config/` and `certs/` files above) is
+  equally blocking even without encrypted key material because the
+  second init pass's `step ca init` cannot complete cleanly when
+  one of its targets already exists (it generates fresh cert/key
+  files and then exits non-zero on TTY-bound overwrite
+  confirmation), recreating the partial-init trap after OpenBao
+  has already been wiped. The safe fresh-CA rebuild path remains
+  open whenever every file `step ca init` writes is absent;
+  otherwise the operator restores `password.txt` from a backup or
+  removes every preserved step-ca artifact to opt into a clean
+  rebuild),
+  the EAB registration prompt is skipped, and newly
+  generated unseal keys are written automatically to
   `secrets/openbao/unseal-keys.txt` (mode `0600`). The optional
   `--root-token-output <path>` is preflight-validated before any
   destructive operation begins (rejects directories, unwritable
@@ -292,6 +318,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   receives the credentials that still match the preserved PostgreSQL
   state, instead of the dummy `rotated-use-openbao` password sitting
   in `.env` after a previous `init --enable db-provision` run. When
+  the preserved `ca.json` runtime DSN is present, `reinit --enable
+  db-provision` no longer trips `error_db_provision_conflict`: under
+  `reinit_mode` the DSN resolver treats the snapshot-derived DSN as
+  authoritative (the PostgreSQL role's password was rotated to it on
+  the previous init) and skips the provisioning path so the already-
+  good credential is not rotated and broken for the next rotate
+  cycle. When `ca.json` is absent (rsync-clone path or a partial-
+  init that crashed before `update_ca_json_with_backup` ran),
+  `db-provision` behaves as in `init`. When
   the snapshot records a non-default `secrets_dir`, the snapshot
   drives all secrets-tree operations (cleanup, preserved-DSN /
   `password.txt` reads, the second init pass's `--secrets-dir`, and

@@ -28,6 +28,28 @@ const OPENBAO_COMPOSE_SERVICE: &str = "openbao";
 /// `AppRole` / `SecretID` was wiped along with the `OpenBao` volume.
 const STALE_SERVICE_CREDENTIAL_FILES: &[&str] = &["role_id", "secret_id", "secret_id.wrapped"];
 
+/// Every fixed file `step ca init` writes into a step-ca tree (paths
+/// relative to `secrets_dir`).  The reinit preflight refuses the
+/// fresh-CA rebuild path when `password.txt` is missing and *any* of
+/// these is still preserved on disk: an encrypted key locks the
+/// operator out cryptographically if a fresh password is silently
+/// generated, and any other surviving file derails the second init
+/// pass because `ensure_step_ca_initialized` only short-circuits when
+/// all three of `config/ca.json`, `secrets/root_ca_key`, and
+/// `secrets/intermediate_ca_key` exist — otherwise `step ca init` runs
+/// into a tree that already contains one of its targets and exits
+/// non-zero on TTY-bound overwrite confirmation.  Keeping the list
+/// aligned with what `step ca init` actually writes is what makes the
+/// fresh-CA rebuild path atomic.
+const STEP_CA_INIT_ARTIFACTS: &[&str] = &[
+    "config/ca.json",
+    "config/defaults.json",
+    "certs/root_ca.crt",
+    "certs/intermediate_ca.crt",
+    "secrets/root_ca_key",
+    "secrets/intermediate_ca_key",
+];
+
 /// Runs the `bootroot reinit` recovery flow.
 ///
 /// # Errors
@@ -98,6 +120,24 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //    rediscover and re-pass `--secrets-dir` on every recovery.
     let effective_secrets_dir = effective_secrets_dir(args, &snapshot);
 
+    // 6.5. Refuse to start when `password.txt` is missing but the
+    //      preserved step-ca CA material is still present.  The CA keys
+    //      are encrypted with the original password, so generating a
+    //      fresh one under `reinit_mode` (`resolve_init_secrets`'s
+    //      missing-`password.txt` auto-gen branch) would leave the
+    //      deployment with a `password.txt` that cannot unlock the
+    //      preserved root/intermediate keys.  Any later
+    //      `step certificate create --ca-password-file
+    //      /home/step/password.txt` path would then fail with an
+    //      undecryptable key.  Running this before the destructive
+    //      OpenBao wipe keeps the operator's CA material recoverable
+    //      from backup; an operator who has already lost the password
+    //      can remove the CA material to opt into a fresh CA.  When
+    //      both `password.txt` and the CA material are absent, fresh
+    //      password generation is safe because `step ca init` will
+    //      create matching material on the second init pass.
+    verify_stepca_password_recoverable(&effective_secrets_dir, messages)?;
+
     // 7. Print plan and ask for confirmation.
     write_reinit_plan(
         &mut io::stdout().lock(),
@@ -153,6 +193,78 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     println!("{}", messages.reinit_completed());
     println!("{}", messages.reinit_service_registry_post_summary());
     Ok(())
+}
+
+/// Refuses to start reinit when `password.txt` is missing but any file
+/// `step ca init` would write (see `STEP_CA_INIT_ARTIFACTS`) is still
+/// preserved.  See the caller's preflight comment in `run_reinit` for
+/// the rationale: under `reinit_mode`, `resolve_init_secrets` would
+/// otherwise auto-generate a fresh step-ca password without the
+/// operator opting into the global `auto-generate` feature.  Two
+/// distinct failure modes follow when an artifact is preserved:
+///
+/// - An encrypted CA key (`secrets/root_ca_key`,
+///   `secrets/intermediate_ca_key`) is encrypted with the original
+///   password, so the freshly generated password written to
+///   `password.txt` / `OpenBao` KV cannot unlock it; any later
+///   `step certificate create --ca-password-file
+///   /home/step/password.txt` path (e.g. the `OpenBao` / HTTP-01 TLS
+///   issuance flows) fails with an undecryptable key.
+/// - Any other preserved file (`config/ca.json`,
+///   `config/defaults.json`, `certs/root_ca.crt`,
+///   `certs/intermediate_ca.crt`) does not lock anyone out
+///   cryptographically, but `ensure_step_ca_initialized` only
+///   short-circuits when all three of `config/ca.json`,
+///   `secrets/root_ca_key`, and `secrets/intermediate_ca_key` exist
+///   (`stepca_setup.rs:239-244`), so the second init pass otherwise
+///   runs `step ca init` into a tree that already contains one of its
+///   targets.  Empirically `smallstep/step-ca step ca init` against a
+///   tree populated with any of those files generates fresh cert/key
+///   material and then exits non-zero with `open /dev/tty failed: no
+///   such device or address` — recreating the partial-init trap after
+///   `OpenBao` has already been wiped.
+///
+/// Requiring the operator to either restore `password.txt` or remove
+/// every preserved step-ca artifact before retrying keeps reinit
+/// atomic and surfaces the recovery choice up front rather than
+/// mid-flow.
+///
+/// Running this before the destructive `OpenBao` wipe leaves the
+/// operator's CA material recoverable from backup.  When both
+/// `password.txt` and every step-ca artifact are absent, this
+/// preflight is a no-op because the second init pass will run
+/// `step ca init` and generate matching material from scratch.
+pub(crate) fn verify_stepca_password_recoverable(
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let password_path = secrets_dir.join("password.txt");
+    if password_path.exists() {
+        return Ok(());
+    }
+    // Reinit's fresh-CA rebuild path requires a clean step-ca tree —
+    // every fixed target `step ca init` writes must be absent, not just
+    // the three files used by the "already initialized" skip check.
+    let preserved: Vec<PathBuf> = STEP_CA_INIT_ARTIFACTS
+        .iter()
+        .map(|rel| secrets_dir.join(rel))
+        .filter(|path| path.exists())
+        .collect();
+    if preserved.is_empty() {
+        return Ok(());
+    }
+    let preserved_paths = preserved
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        messages.error_reinit_stepca_password_missing_with_ca_material(
+            &password_path.display().to_string(),
+            &secrets_dir.display().to_string(),
+            &preserved_paths,
+        )
+    );
 }
 
 /// Rejects an operator-supplied `--openbao-url` that differs from the
@@ -2165,6 +2277,225 @@ mod tests {
             Some(expected_dsn.as_str()),
             "preserved DSN must be read from the snapshotted secrets_dir"
         );
+    }
+
+    /// Regression for Round 1 (#601) reviewer item: when `password.txt`
+    /// is missing but the preserved step-ca CA material is still on disk,
+    /// the second init pass would auto-generate a fresh password and
+    /// write it to `password.txt` / `OpenBao` KV — but that new password
+    /// cannot unlock the preserved root/intermediate keys.  The
+    /// preflight must bail BEFORE the destructive `OpenBao` wipe so the
+    /// operator's CA material remains recoverable from backup.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_root_key_present() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("config")).expect("config dir");
+        fs::create_dir_all(secrets.join("secrets")).expect("secrets dir");
+        fs::write(secrets.join("config/ca.json"), "{}").expect("ca.json");
+        fs::write(secrets.join("secrets/root_ca_key"), "encrypted-key").expect("root_ca_key");
+        // No password.txt and no intermediate_ca_key — root key alone is
+        // already enough to make password rotation destructive.
+        assert!(!secrets.join("password.txt").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password.txt") || msg.contains("CA material"),
+            "got: {msg}"
+        );
+    }
+
+    /// Companion to the root-key case: an intermediate key alone is
+    /// equally destructive because step-ca's HTTP-01 issuance path uses
+    /// it.  The preflight rejects either preserved key when the password
+    /// is gone, not only the both-keys-present case.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_intermediate_key_present() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("config")).expect("config dir");
+        fs::create_dir_all(secrets.join("secrets")).expect("secrets dir");
+        fs::write(secrets.join("config/ca.json"), "{}").expect("ca.json");
+        fs::write(secrets.join("secrets/intermediate_ca_key"), "encrypted-key")
+            .expect("intermediate_ca_key");
+        assert!(!secrets.join("password.txt").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(
+            err.to_string().contains("intermediate_ca_key") || err.to_string().contains("ca.json"),
+            "got: {err}"
+        );
+    }
+
+    /// Regression: when both `password.txt` and the CA material are
+    /// absent (the rsync-clone-without-CA path or a fresh tree), the
+    /// second init pass will `step ca init` from scratch and the
+    /// auto-generated password will encrypt the new CA — so the
+    /// preflight must not bail.  This is the case the existing
+    /// `secrets.rs` regression test
+    /// (`resolve_init_secrets_auto_generates_stepca_password_when_missing_in_reinit_mode`)
+    /// already covers at the resolver boundary; the preflight just
+    /// needs to leave it alone.
+    #[test]
+    fn verify_stepca_password_recoverable_accepts_missing_password_without_ca_material() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        verify_stepca_password_recoverable(dir.path(), &messages)
+            .expect("no CA material → fresh-CA recovery is safe");
+    }
+
+    /// Regression for Round 2 (#601) reviewer item: preserved key
+    /// material without `ca.json` must still trip the preflight.  The
+    /// previous predicate required `ca.json` *and* a key file, which
+    /// silently let `reinit --yes` proceed when `ca.json` was missing
+    /// but `root_ca_key` (or `intermediate_ca_key`) was preserved.
+    /// `ensure_step_ca_initialized` only short-circuits when all three
+    /// files exist, so the second init pass would attempt `step ca init`
+    /// into a tree that still contains encrypted key material — either
+    /// overwriting it or failing mid-flow after the destructive
+    /// `OpenBao` wipe.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_root_key_only() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("secrets")).expect("secrets dir");
+        fs::write(secrets.join("secrets/root_ca_key"), "encrypted-key").expect("root_ca_key");
+        assert!(!secrets.join("password.txt").exists());
+        assert!(!secrets.join("config/ca.json").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(err.to_string().contains("root_ca_key"), "got: {err}");
+    }
+
+    /// Companion: an intermediate key without `ca.json` is equally
+    /// blocking.  Same reasoning as the root-key-only case.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_intermediate_key_only() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("secrets")).expect("secrets dir");
+        fs::write(secrets.join("secrets/intermediate_ca_key"), "encrypted-key")
+            .expect("intermediate_ca_key");
+        assert!(!secrets.join("password.txt").exists());
+        assert!(!secrets.join("config/ca.json").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(
+            err.to_string().contains("intermediate_ca_key"),
+            "got: {err}"
+        );
+    }
+
+    /// Regression for Round 3 (#601) reviewer item: a stale
+    /// `config/ca.json` without either CA key is also blocking, even
+    /// though it does not lock the operator out cryptographically.
+    /// `ensure_step_ca_initialized` only short-circuits when all three
+    /// step-ca artifacts exist, so when `ca.json` alone is preserved
+    /// the second init pass would attempt `step ca init` into a tree
+    /// that already contains the config target.  Empirically that
+    /// generates fresh cert/key files and then exits non-zero with
+    /// `open /dev/tty failed`, recreating the partial-init trap after
+    /// `OpenBao` has already been wiped.  The preflight must refuse
+    /// before any destructive operation runs so the operator can
+    /// remove the stale `ca.json` (or restore `password.txt`) and
+    /// retry against an atomic reinit.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_ca_json_only() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("config")).expect("config dir");
+        fs::write(secrets.join("config/ca.json"), "{}").expect("ca.json");
+        assert!(!secrets.join("password.txt").exists());
+        assert!(!secrets.join("secrets/root_ca_key").exists());
+        assert!(!secrets.join("secrets/intermediate_ca_key").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(err.to_string().contains("ca.json"), "got: {err}");
+    }
+
+    /// Regression for Round 4 (#601) reviewer item: `step ca init`
+    /// also writes `certs/root_ca.crt`, `certs/intermediate_ca.crt`,
+    /// and `config/defaults.json`.  The Round 3 predicate only keyed
+    /// off the three files used by `ensure_step_ca_initialized`'s
+    /// short-circuit, so a stale `certs/root_ca.crt` (or any of the
+    /// other writes) left the preflight accepting reinit even though
+    /// the second init pass's `step ca init` would still fail mid-flow
+    /// with `open /dev/tty failed` after the destructive `OpenBao`
+    /// wipe.  The preflight must refuse for every file `step ca init`
+    /// would touch.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_root_cert_only() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("certs")).expect("certs dir");
+        fs::write(secrets.join("certs/root_ca.crt"), "stale-cert").expect("root_ca.crt");
+        assert!(!secrets.join("password.txt").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(err.to_string().contains("root_ca.crt"), "got: {err}");
+    }
+
+    /// Companion: a stale `certs/intermediate_ca.crt` alone is also
+    /// blocking — same reasoning as the root-cert-only case.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_intermediate_cert_only() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("certs")).expect("certs dir");
+        fs::write(secrets.join("certs/intermediate_ca.crt"), "stale-cert")
+            .expect("intermediate_ca.crt");
+        assert!(!secrets.join("password.txt").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(
+            err.to_string().contains("intermediate_ca.crt"),
+            "got: {err}"
+        );
+    }
+
+    /// Companion: a stale `config/defaults.json` alone is also
+    /// blocking.  `step ca init` writes it unconditionally, and the
+    /// reviewer's reproduction shows it triggers the same TTY-bound
+    /// overwrite failure when present alone.
+    #[test]
+    fn verify_stepca_password_recoverable_rejects_missing_password_with_defaults_json_only() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("config")).expect("config dir");
+        fs::write(secrets.join("config/defaults.json"), "{}").expect("defaults.json");
+        assert!(!secrets.join("password.txt").exists());
+
+        let messages = test_messages();
+        let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
+        assert!(err.to_string().contains("defaults.json"), "got: {err}");
+    }
+
+    /// When `password.txt` is present, the preflight accepts the
+    /// preserved CA material — the existing
+    /// `resolve_init_secrets`-level preserve-password fast-path handles
+    /// it correctly.
+    #[test]
+    fn verify_stepca_password_recoverable_accepts_password_with_ca_material() {
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path();
+        fs::create_dir_all(secrets.join("config")).expect("config dir");
+        fs::create_dir_all(secrets.join("secrets")).expect("secrets dir");
+        fs::write(secrets.join("config/ca.json"), "{}").expect("ca.json");
+        fs::write(secrets.join("secrets/root_ca_key"), "encrypted-key").expect("root_ca_key");
+        fs::write(secrets.join("secrets/intermediate_ca_key"), "encrypted-key")
+            .expect("intermediate_ca_key");
+        fs::write(secrets.join("password.txt"), "preserved-secret").expect("password.txt");
+        let messages = test_messages();
+        verify_stepca_password_recoverable(secrets, &messages)
+            .expect("present password.txt + preserved CA material is the normal recovery path");
     }
 
     /// The rewritten `state.json` must record the snapshotted (or

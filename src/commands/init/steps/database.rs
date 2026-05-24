@@ -21,10 +21,27 @@ pub(super) async fn resolve_db_dsn_for_init(
     compose_dir: &Path,
     messages: &Messages,
 ) -> Result<(String, DbDsnNormalization, Option<String>)> {
-    if args.has_feature(InitFeature::DbProvision) && args.db_dsn.is_some() {
+    // Under reinit mode the preserved `ca.json` runtime DSN is threaded
+    // into `args.db_dsn` by `init_args_for_reinit`. The PostgreSQL role
+    // it points at already exists with that password (Postgres state is
+    // preserved across reinit), so the snapshot-derived DSN is *not* a
+    // user-supplied conflict with `--enable db-provision` — it is the
+    // authoritative credential the second init pass must thread back
+    // into the freshly reinitialised OpenBao KV. Honor it verbatim and
+    // skip the provisioning path; re-running `ALTER ROLE ... WITH
+    // PASSWORD` would rotate the already-good password to whatever
+    // inputs `db-provision` synthesised and break the next rotate cycle.
+    // Analogous to how `resolve_init_secrets` special-cases `http_hmac`
+    // / `password.txt` under `reinit_mode`.
+    let reinit_preserved_db_dsn =
+        args.reinit_mode && args.has_feature(InitFeature::DbProvision) && args.db_dsn.is_some();
+    if args.has_feature(InitFeature::DbProvision)
+        && args.db_dsn.is_some()
+        && !reinit_preserved_db_dsn
+    {
         anyhow::bail!(messages.error_db_provision_conflict());
     }
-    if args.has_feature(InitFeature::DbProvision) {
+    if args.has_feature(InitFeature::DbProvision) && !reinit_preserved_db_dsn {
         let inputs = resolve_db_provision_inputs(args, compose_dir, messages)?;
         let admin = parse_db_dsn(&inputs.admin_dsn)
             .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
@@ -507,6 +524,57 @@ mod tests {
             ))
             .unwrap_err();
         assert!(err.to_string().contains("db-provision"));
+    }
+
+    /// Regression for #601 §1: under reinit mode the preserved `ca.json`
+    /// runtime DSN is threaded into `args.db_dsn` and must not trip the
+    /// db-provision conflict check. The resolver returns the preserved
+    /// DSN verbatim (compose-normalised) and skips re-provisioning so
+    /// the already-good `PostgreSQL` role's password is not rotated.
+    #[test]
+    fn test_resolve_db_dsn_for_init_accepts_preserved_dsn_in_reinit_mode() {
+        let _guard = env_lock();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let preserved_password = format!("preserved-{nonce}");
+        let mut args = default_init_args();
+        args.reinit_mode = true;
+        args.db_dsn = Some(format!(
+            "postgresql://step:{preserved_password}@127.0.0.1:5433/stepca?sslmode=disable"
+        ));
+        args.enable.push(InitFeature::DbProvision);
+        // Provisioning inputs that would normally drive `ALTER ROLE` —
+        // these must be ignored under reinit_mode because the preserved
+        // DSN is authoritative.
+        args.db_admin.admin_dsn = Some(
+            "postgresql://admin:should-not-be-used@127.0.0.1:5433/postgres?sslmode=disable"
+                .to_string(),
+        );
+        args.db_user = Some("step".to_string());
+        args.db_password = Some("would-rotate-the-good-password".to_string());
+        args.db_name = Some("stepca".to_string());
+
+        let (dsn, normalization, admin_dsn_for_kv) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(resolve_db_dsn_for_init(
+                &args,
+                Path::new("."),
+                &test_messages(),
+            ))
+            .expect("preserved DSN must be accepted under reinit_mode");
+        assert_eq!(
+            dsn,
+            format!("postgresql://step:{preserved_password}@postgres:5432/stepca?sslmode=disable"),
+            "preserved DSN must reach KV verbatim (compose-normalised)"
+        );
+        assert_eq!(normalization.original_host, "127.0.0.1");
+        assert_eq!(normalization.effective_host, "postgres");
+        assert!(
+            admin_dsn_for_kv.is_none(),
+            "reinit must not synthesise an admin DSN; the preserved DSN is authoritative"
+        );
     }
 
     #[test]

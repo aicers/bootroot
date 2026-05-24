@@ -228,4 +228,21 @@ impl Messages {
             &[("url", url)],
         )
     }
+
+    pub(crate) fn error_reinit_stepca_password_missing_with_ca_material(
+        &self,
+        password_path: &str,
+        secrets_dir: &str,
+        preserved_paths: &str,
+    ) -> String {
+        format_template(
+            self.strings()
+                .error_reinit_stepca_password_missing_with_ca_material,
+            &[
+                ("password_path", password_path),
+                ("secrets_dir", secrets_dir),
+                ("preserved_paths", preserved_paths),
+            ],
+        )
+    }
 }

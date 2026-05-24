@@ -523,6 +523,7 @@ pub(crate) struct Strings {
     pub(crate) error_reinit_summary_json_unwritable: &'static str,
     pub(crate) error_reinit_summary_json_unsafe: &'static str,
     pub(crate) error_reinit_explicit_openbao_url: &'static str,
+    pub(crate) error_reinit_stepca_password_missing_with_ca_material: &'static str,
 }
 
 pub(crate) struct Messages {

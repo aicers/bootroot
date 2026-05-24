@@ -41,23 +41,29 @@ pub(super) fn resolve_init_secrets(
     } else {
         None
     };
+    // Under reinit mode the previous step-ca password and HTTP-01 HMAC
+    // are either preserved from the source tree (`password.txt`) or are
+    // gone with the wiped OpenBao KV (`http_hmac`, previously at
+    // PATH_AGENT_HTTP01). Reinit does not re-prompt operators for fresh
+    // secrets, so when a secret cannot be preserved verbatim, generate a
+    // replacement non-interactively even without the operator opting
+    // into the global `auto-generate` feature.  For the step-ca
+    // password this matters specifically when `password.txt` is absent
+    // (rsync-clone path or operator-removed): without the reinit_mode
+    // bypass, `reinit --yes` would stall on the interactive step-ca
+    // password prompt.  An existing `password.txt` still wins above so
+    // the preserved CA material remains decryptable.
+    let auto_generate_secret = args.has_feature(InitFeature::AutoGenerate) || args.reinit_mode;
     let stepca_password = if let Some(existing) = preserved_stepca_password {
         existing
     } else {
         resolve_secret(
             messages.prompt_stepca_password(),
             args.stepca_password.as_deref(),
-            args.has_feature(InitFeature::AutoGenerate),
+            auto_generate_secret,
             messages,
         )?
     };
-    // Under reinit mode the previous HTTP-01 HMAC lived in OpenBao KV
-    // (PATH_AGENT_HTTP01) and was wiped along with the volume.  Reinit
-    // does not re-prompt operators for fresh secrets, so auto-generate a
-    // new HMAC unless the caller explicitly passed `--http-hmac`.  This
-    // keeps `reinit --yes` non-interactive even without the operator
-    // opting into the global `auto-generate` feature.
-    let auto_generate_secret = args.has_feature(InitFeature::AutoGenerate) || args.reinit_mode;
     let http_hmac = resolve_secret(
         messages.prompt_http_hmac(),
         args.http_hmac.as_deref(),
@@ -346,6 +352,42 @@ mod tests {
         assert!(
             !resolved.http_hmac.is_empty(),
             "reinit_mode must auto-generate a fresh HTTP HMAC instead of prompting"
+        );
+    }
+
+    /// Regression for #601 §2: under `reinit_mode`, when
+    /// `secrets/password.txt` is absent (rsync-clone path or operator
+    /// removed it), the step-ca password generation must NOT fall back
+    /// to an interactive prompt. The existing `http_hmac`
+    /// `|| args.reinit_mode` pattern is mirrored here so `reinit --yes`
+    /// without `--enable auto-generate` produces a fresh step-ca
+    /// password non-interactively.
+    #[test]
+    fn resolve_init_secrets_auto_generates_stepca_password_when_missing_in_reinit_mode() {
+        use tempfile::tempdir;
+
+        let messages = test_messages();
+        let dir = tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        // Crucially: NO password.txt exists.
+        assert!(!secrets.join("password.txt").exists());
+
+        let mut args = super::super::test_support::default_init_args();
+        args.secrets_dir.secrets_dir = secrets;
+        args.reinit_mode = true;
+        args.no_eab = true;
+        // No --stepca-password, no --enable auto-generate. Only
+        // reinit_mode should drive the auto-gen branch.
+        args.stepca_password = None;
+        args.enable = Vec::new();
+        args.http_hmac = Some("provided-hmac".to_string());
+
+        let resolved =
+            resolve_init_secrets(&args, &messages, "ignored-dsn".to_string()).expect("resolve");
+        assert!(
+            !resolved.stepca_password.is_empty(),
+            "reinit_mode must auto-generate a fresh step-ca password instead of prompting"
         );
     }
 
