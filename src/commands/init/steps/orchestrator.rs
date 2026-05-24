@@ -1373,8 +1373,7 @@ mod tests {
             .expect_err("bad --summary-json must be rejected at preflight");
         let msg = err.to_string();
         assert!(
-            msg.contains(&bad_path.display().to_string())
-                || msg.to_lowercase().contains("summary"),
+            msg.contains(&bad_path.display().to_string()) || msg.to_lowercase().contains("summary"),
             "preflight error must reference the summary-json path or label, got: {msg}",
         );
     }
