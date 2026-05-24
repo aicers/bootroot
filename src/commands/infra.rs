@@ -2051,7 +2051,7 @@ mod tests {
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"0.0.0.0:8200:8200\"
 ",
         )
@@ -3190,7 +3190,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME),
-            "services:\n  bootroot-http01:\n    ports: !reset\n      - \"192.168.1.10:8080:8080\"\n",
+            "services:\n  bootroot-http01:\n    ports: !override\n      - \"192.168.1.10:8080:8080\"\n",
         )
         .unwrap();
 
