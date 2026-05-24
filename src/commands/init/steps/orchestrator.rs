@@ -89,8 +89,9 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     // Only check openbao + postgres; step-ca may not be bootstrapped yet.
     ensure_init_prereqs_ready(&args.compose.compose_file, messages)?;
 
-    let mut client = OpenBaoClient::new(&args.openbao.openbao_url)
-        .with_context(|| messages.error_openbao_client_create_failed())?;
+    let mut client =
+        OpenBaoClient::with_local_trust(&args.openbao.openbao_url, &args.secrets_dir.secrets_dir)
+            .with_context(|| messages.error_openbao_client_create_failed())?;
     client
         .health_check()
         .await
@@ -543,6 +544,15 @@ async fn run_init_inner(
             let compose_str = args.compose.compose_file.to_string_lossy();
             let config_override_str = override_path.to_string_lossy();
             let exposed_override_str = exposed_override.to_string_lossy();
+            // `--no-deps` is load-bearing here for the same reason as
+            // `apply_responder_compose_override` and
+            // `apply_openbao_agent_compose_override`: this compose
+            // invocation does not include the `openbao-exposed`
+            // override, so without it compose would recreate the
+            // openbao dependency to the merged config and drop its
+            // non-loopback host-port publish.  Reinit-recovery's
+            // second init pass would then lose access to the bind URL
+            // mid-flow.
             let up_args = [
                 "compose",
                 "-f",
@@ -553,6 +563,7 @@ async fn run_init_inner(
                 &*exposed_override_str,
                 "up",
                 "-d",
+                "--no-deps",
                 RESPONDER_SERVICE_NAME,
             ];
             run_docker(

@@ -356,7 +356,7 @@ pub(crate) fn write_http01_exposed_override(
         "\
 services:
   bootroot-http01:
-    ports: !reset
+    ports: !override
       - \"{bind_addr}:8080\"
 "
     );
@@ -927,8 +927,11 @@ fn validate_cert_chain_to_stepca_root(secrets_dir: &Path, cert_bytes: &[u8]) -> 
 /// Generates the compose override file that exposes `OpenBao` on a
 /// non-loopback address.
 ///
-/// The override uses Docker Compose `!reset` to replace the base port
-/// mapping with the operator-specified bind address.
+/// The override uses Docker Compose `!override` to replace the base port
+/// mapping with the operator-specified bind address.  `!reset` looks
+/// equivalent at first glance but discards the new value and removes
+/// the attribute entirely — leaving the container with no host-side
+/// publish at all (verified against Compose v2.x).
 ///
 /// # Errors
 ///
@@ -949,7 +952,7 @@ pub(crate) fn write_openbao_exposed_override(
         "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"{bind_addr}:8200\"
 "
     );
@@ -1109,7 +1112,7 @@ fn has_unsafe_port_binding_for_service(compose: &str, service_key: &str) -> bool
             continue;
         }
 
-        // Match `ports:` with optional YAML tags like `!reset`.
+        // Match `ports:` with optional YAML tags like `!override`.
         if !in_ports && (trimmed == "ports:" || trimmed.starts_with("ports: ")) {
             let rest = trimmed.strip_prefix("ports:").unwrap_or("").trim();
             if let Some(values) = parse_inline_yaml_port_values(rest) {
@@ -1144,11 +1147,11 @@ fn has_unsafe_port_binding_for_service(compose: &str, service_key: &str) -> bool
 /// Extracts port values from an inline YAML array on a `ports:` line.
 ///
 /// Handles forms like `ports: ["5432"]`, `ports: ["0.0.0.0:5432:5432"]`,
-/// and `ports: !reset ["5432"]`.  Returns `None` when the remainder does
+/// and `ports: !override ["5432"]`.  Returns `None` when the remainder does
 /// not contain an inline array.
 fn parse_inline_yaml_port_values(rest: &str) -> Option<Vec<String>> {
     let s = rest.trim();
-    // Skip optional YAML tags (e.g., `!reset`).
+    // Skip optional YAML tags (e.g., `!override`).
     let s = if let Some(after_tag) = s.strip_prefix('!') {
         after_tag
             .split_once(char::is_whitespace)
@@ -1864,7 +1867,7 @@ listener "tcp" {
         assert!(path.exists());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("192.168.1.10:8200:8200"));
-        assert!(content.contains("!reset"));
+        assert!(content.contains("!override"));
     }
 
     #[test]
@@ -1902,11 +1905,11 @@ listener "tcp" {
     }
 
     #[test]
-    fn detects_unsafe_port_binding_with_reset_tag() {
+    fn detects_unsafe_port_binding_with_override_tag() {
         let compose = "\
 services:
   postgres:
-    ports: !reset
+    ports: !override
       - \"0.0.0.0:5432:5432\"
 ";
         assert!(has_unsafe_port_binding_for_service(compose, "postgres:"));
@@ -1924,7 +1927,7 @@ services:
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"192.168.1.10:8200:8200\"
   postgres:
     ports: [\"5432\"]
@@ -1945,10 +1948,10 @@ services:
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"192.168.1.10:8200:8200\"
   postgres:
-    ports: !reset
+    ports: !override
       - \"0.0.0.0:5432:5432\"
 ",
         )
@@ -1967,7 +1970,7 @@ services:
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"192.168.1.10:8200:8200\"
 ",
         )
@@ -1986,7 +1989,7 @@ services:
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"192.168.1.10:8200:8200\"
 ",
         )
@@ -2010,7 +2013,7 @@ services:
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"0.0.0.0:8200:8200\"
 ",
         )
@@ -2032,7 +2035,7 @@ services:
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"192.168.1.10:9200:8200\"
 ",
         )
@@ -2052,7 +2055,7 @@ services:
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
 ",
         )
         .unwrap();
@@ -2071,7 +2074,7 @@ services:
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"[fd12::1]:8200:8200\"
 ",
         )
@@ -2533,7 +2536,7 @@ listener "tcp" {
             "\
 services:
   bootroot-http01:
-    ports: !reset
+    ports: !override
       - \"192.168.1.10:8080:8080\"
   openbao:
     ports:

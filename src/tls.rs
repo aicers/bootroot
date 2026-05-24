@@ -131,11 +131,68 @@ pub fn build_client_config_from_pem(pem_content: &str, pins: &[String]) -> Resul
     }
 }
 
+/// Builds a [`reqwest::Client`] whose trust store is the union of the
+/// Mozilla webpki root certificates (the same set the default `Client`
+/// ships with) and the given PEM-encoded CA bundle.
+///
+/// This is the trust path the CLI uses for state-backed `OpenBao`
+/// connections after `init` has written a step-ca bundle to
+/// `<secrets_dir>/certs/`: the local step-ca-signed `OpenBao` cert
+/// verifies via the appended PEM, while an externally-managed
+/// (publicly-trusted) HTTPS endpoint reachable from the same code path
+/// keeps verifying via the webpki roots.  Replacing the default trust
+/// store with the local PEM alone — as the original `with_pem_trust`
+/// path did — would regress any public-CA HTTPS `OpenBao` URL into an
+/// `UnknownIssuer` failure once `root_ca.crt` exists on disk.
+///
+/// # Errors
+///
+/// Returns an error if the PEM content cannot be parsed or the HTTP
+/// client fails to build.
+pub fn build_http_client_with_local_and_webpki_roots(pem_content: &str) -> Result<Client> {
+    install_crypto_provider();
+    let root_store = build_local_plus_webpki_root_store(pem_content)?;
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Client::builder()
+        .use_preconfigured_tls(config)
+        .build()
+        .context("Failed to build HTTP client with local+webpki roots")
+}
+
 fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn parse_pem_to_root_store(pem_bytes: &[u8]) -> Result<rustls::RootCertStore> {
+/// Builds a [`rustls::RootCertStore`] containing every Mozilla webpki
+/// root plus every certificate parsed from `pem_content`.
+///
+/// Factored out so the union semantics can be asserted in unit tests
+/// without driving a real public-CA TLS handshake.
+///
+/// # Errors
+///
+/// Returns an error if the PEM content cannot be parsed.
+pub(crate) fn build_local_plus_webpki_root_store(
+    pem_content: &str,
+) -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+    let (loaded, _) = root_store
+        .add_parsable_certificates(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned());
+    if loaded == 0 {
+        anyhow::bail!("webpki root certificate bundle was empty");
+    }
+    let local_certs = parse_pem_to_cert_list(pem_content.as_bytes())?;
+    for cert in local_certs {
+        root_store
+            .add(cert)
+            .context("Failed to add local CA certificate")?;
+    }
+    Ok(root_store)
+}
+
+fn parse_pem_to_cert_list(pem_bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     let mut remaining = pem_bytes;
     let mut certs = Vec::new();
     while !remaining.is_empty() {
@@ -145,17 +202,22 @@ fn parse_pem_to_root_store(pem_bytes: &[u8]) -> Result<rustls::RootCertStore> {
         let (rest, pem) =
             parse_x509_pem(remaining).map_err(|_| anyhow::anyhow!("Failed to parse CA bundle"))?;
         if pem.label == "CERTIFICATE" {
-            certs.push(pem.contents);
+            certs.push(CertificateDer::from(pem.contents));
         }
         remaining = rest;
     }
     if certs.is_empty() {
         anyhow::bail!("CA bundle contained no certificates");
     }
+    Ok(certs)
+}
+
+fn parse_pem_to_root_store(pem_bytes: &[u8]) -> Result<rustls::RootCertStore> {
+    let certs = parse_pem_to_cert_list(pem_bytes)?;
     let mut root_store = rustls::RootCertStore::empty();
     for cert in certs {
         root_store
-            .add(CertificateDer::from(cert))
+            .add(cert)
             .context("Failed to add CA certificate")?;
     }
     Ok(root_store)
@@ -594,5 +656,41 @@ mod tests {
         let pin = "aa".repeat(32);
         let client = build_http_client_from_pem(&pem, &[pin]);
         assert!(client.is_ok());
+    }
+
+    /// Proves the local-plus-webpki root store keeps every Mozilla
+    /// webpki trust anchor in place and adds the supplied local PEM on
+    /// top.  The regression we are guarding against: the original
+    /// `with_local_trust` path called into `with_pem_trust`, which
+    /// replaced the trust store with the local PEM alone — so any
+    /// externally-managed (publicly-trusted) HTTPS `OpenBao` URL
+    /// started failing with `UnknownIssuer` once `root_ca.crt` existed
+    /// on disk.
+    #[test]
+    fn build_local_plus_webpki_root_store_unions_webpki_and_local_pem() {
+        let pem = generate_ca_pem();
+        let store = build_local_plus_webpki_root_store(&pem).expect("union store");
+        let webpki_count = webpki_root_certs::TLS_SERVER_ROOT_CERTS.len();
+        assert_eq!(
+            store.len(),
+            webpki_count + 1,
+            "expected webpki ({webpki_count}) + 1 local CA, got {}",
+            store.len()
+        );
+    }
+
+    #[test]
+    fn build_local_plus_webpki_root_store_rejects_empty_pem() {
+        let err = build_local_plus_webpki_root_store("").expect_err("empty PEM");
+        assert!(
+            err.to_string().contains("no certificates"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_http_client_with_local_and_webpki_roots_succeeds_with_valid_pem() {
+        let pem = generate_ca_pem();
+        assert!(build_http_client_with_local_and_webpki_roots(&pem).is_ok());
     }
 }

@@ -228,6 +228,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "webpki-root-certs",
  "wiremock",
  "x509-parser",
 ]

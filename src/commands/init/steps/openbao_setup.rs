@@ -758,6 +758,17 @@ pub(super) fn apply_openbao_agent_compose_override(
 ) -> Result<()> {
     let compose_str = compose_file.to_string_lossy();
     let override_str = override_path.to_string_lossy();
+    // `--no-deps` is load-bearing: the agent override does not include
+    // the `openbao-exposed` compose file, so without it `compose up`
+    // would re-evaluate the openbao dependency against `-f main -f
+    // agent` (no host-port publish) versus the running container's
+    // `-f main -f openbao-exposed` config (non-loopback publish) and
+    // recreate openbao to the merged config, dropping its non-loopback
+    // bind.  Subsequent KV calls against the bind URL then fail with
+    // `Connection refused`.  Reinit's second init pass is the canonical
+    // trip: infra-up starts openbao with the preserved exposed
+    // override, and the agent compose-up here recreates it back to
+    // loopback unless we tell compose to ignore the dependency.
     let args = [
         "compose",
         "-f",
@@ -766,6 +777,7 @@ pub(super) fn apply_openbao_agent_compose_override(
         &*override_str,
         "up",
         "-d",
+        "--no-deps",
         OPENBAO_AGENT_STEPCA_SERVICE,
         OPENBAO_AGENT_RESPONDER_SERVICE,
     ];

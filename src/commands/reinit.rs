@@ -178,7 +178,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         openbao_url: args.openbao.openbao_url.clone(),
         openbao_unseal_from_file: None,
     };
-    run_infra_up(&infra_args, messages)?;
+    run_infra_up(&infra_args, messages).await?;
 
     // 12. Re-run init in reinit mode.  Reinit-mode behavior is enforced
     //     inside the init flow: overwrite prompts for preserved files

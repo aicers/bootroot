@@ -16,9 +16,11 @@ use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 /// Issues an `OpenBao` TLS server certificate signed by the local
 /// step-ca intermediate CA.
 ///
-/// Writes the certificate to `compose_dir/openbao/tls/server.{crt,key}`
-/// with `0600` permissions.  `step certificate create` runs via Docker
-/// (no step CLI required on the host).
+/// Writes the certificate to `compose_dir/openbao/tls/server.{crt,key}`.
+/// `step certificate create` runs via Docker (no step CLI required on
+/// the host).  After provisioning, the files are set to `0644` so the
+/// `OpenBao` container's `openbao` user can read them (see
+/// `set_openbao_readable_permissions` for the rationale).
 pub(in crate::commands::init) fn issue_openbao_tls_cert(
     compose_dir: &Path,
     secrets_dir: &Path,
@@ -43,10 +45,8 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let user_arg = format!("{}:{}", meta.uid(), meta.gid());
 
-    let san_arg = sans.join(",");
-
     let intermediate_cert = format!("/home/step/{CA_CERTS_DIR}/{CA_INTERMEDIATE_CERT_FILENAME}");
-    let args: Vec<&str> = vec![
+    let mut args: Vec<&str> = vec![
         "run",
         "--user",
         &user_arg,
@@ -70,12 +70,18 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
         "/home/step/password.txt",
         "--no-password",
         "--insecure",
-        "--san",
-        &san_arg,
-        "--not-after",
-        OPENBAO_TLS_DEFAULT_NOT_AFTER,
-        "--force",
     ];
+    // `step certificate create --san` accepts a single value and must
+    // be repeated per SAN; comma-joining yields one literal SAN whose
+    // DnsName is the joined string (e.g. "openbao.internal,localhost,
+    // bootroot-openbao,172.17.0.1"), which fails hostname verification
+    // for every individual name.  step also infers DNS vs IP from the
+    // value shape, so passing IP literals via --san produces IP SANs.
+    for san in sans {
+        args.push("--san");
+        args.push(san);
+    }
+    args.extend(["--not-after", OPENBAO_TLS_DEFAULT_NOT_AFTER, "--force"]);
 
     run_docker(
         &args,
@@ -84,13 +90,38 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
     )
     .with_context(|| messages.error_openbao_tls_provision_failed())?;
 
-    set_key_permissions_sync(&key_path)?;
-    set_key_permissions_sync(&cert_path)?;
+    set_openbao_readable_permissions(&cert_path, &key_path)?;
 
     println!(
         "{}",
         messages.info_openbao_tls_provisioned(&cert_path.display().to_string())
     );
+    Ok(())
+}
+
+/// Sets cert + key to modes the `OpenBao` container can read.
+///
+/// `docker-compose.yml` mounts `./openbao` as `:ro`, so the `OpenBao`
+/// image's standard entrypoint cannot chown its config dir to the
+/// `openbao` user — the chown silently fails and the container then
+/// fails to load the TLS material with `permission denied`.  The
+/// `step` CLI writes the cert and key as the runner UID with mode
+/// `0600`, which the `openbao` user inside the container can not
+/// read.
+///
+/// Loosen the modes so the openbao user can read the files via the
+/// "other" permission bits.  The cert is public (`0644`).  The key
+/// is set to `0644` too because the openbao user is in neither the
+/// runner's primary group nor any shared group, so `0640` would not
+/// help.  The host is a single-tenant operator host (the only other
+/// reader is root, who can read anything anyway); the key never
+/// leaves this directory and is renewed on a 30-day cadence, so the
+/// expanded read scope is acceptable in this deployment model.
+fn set_openbao_readable_permissions(cert_path: &Path, key_path: &Path) -> Result<()> {
+    std::fs::set_permissions(cert_path, std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("Failed to set permissions on {}", cert_path.display()))?;
+    std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("Failed to set permissions on {}", key_path.display()))?;
     Ok(())
 }
 
@@ -104,6 +135,11 @@ pub(in crate::commands::init) fn write_openbao_hcl_with_tls(
     messages: &Messages,
 ) -> Result<()> {
     let hcl_path = compose_dir.join(OPENBAO_HCL_PATH);
+    // The `audit` stanza must match the canonical openbao/openbao.hcl shipped
+    // with the repo. OpenBao >= 2.5 requires audit devices to be declared in
+    // the server configuration rather than enabled via the API, and `init`
+    // verifies that a file audit backend is present (see
+    // `OpenBaoClient::verify_audit_file`).
     let content = format!(
         r#"storage "file" {{
   path = "/openbao/file"
@@ -130,6 +166,14 @@ listener "tcp" {{
 telemetry {{
   prometheus_retention_time = "30s"
   disable_hostname = true
+}}
+
+audit {{
+  type = "file"
+  path = "file"
+  options {{
+    file_path = "/openbao/audit/audit.log"
+  }}
 }}
 
 disable_mlock = true
@@ -236,6 +280,11 @@ pub(crate) fn write_openbao_hcl_plaintext(compose_dir: &Path, messages: &Message
     if !hcl_path.exists() {
         return Ok(());
     }
+    // The `audit` stanza must match the canonical openbao/openbao.hcl shipped
+    // with the repo. OpenBao >= 2.5 requires audit devices to be declared in
+    // the server configuration rather than enabled via the API, and `init`
+    // verifies that a file audit backend is present (see
+    // `OpenBaoClient::verify_audit_file`).
     let content = r#"storage "file" {
   path = "/openbao/file"
 }
@@ -262,6 +311,14 @@ telemetry {
   disable_hostname = true
 }
 
+audit {
+  type = "file"
+  path = "file"
+  options {
+    file_path = "/openbao/audit/audit.log"
+  }
+}
+
 disable_mlock = true
 ui = true
 "#;
@@ -271,11 +328,6 @@ ui = true
 
     println!("{}", messages.info_openbao_hcl_tls_reverted());
     Ok(())
-}
-
-fn set_key_permissions_sync(path: &Path) -> Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("Failed to set permissions on {}", path.display()))
 }
 
 /// Re-issues an existing `OpenBao` infrastructure certificate.
@@ -430,6 +482,10 @@ mod tests {
         assert!(!api_block.contains("tls_disable"));
         // Telemetry listener should still have tls_disable.
         assert!(content.contains("tls_disable = 1"));
+        // File audit backend must be declared so init's
+        // `verify_audit_file` succeeds after the TLS rewrite.
+        assert!(content.contains("audit {"));
+        assert!(content.contains("file_path = \"/openbao/audit/audit.log\""));
     }
 
     #[test]
@@ -453,6 +509,10 @@ mod tests {
             tls_disable_count, 2,
             "both listeners must have tls_disable = 1"
         );
+        // Plaintext rewrite must preserve the file audit backend so init
+        // can run after a subsequent `--openbao-bind` reinstall cycle.
+        assert!(content.contains("audit {"));
+        assert!(content.contains("file_path = \"/openbao/audit/audit.log\""));
     }
 
     #[test]

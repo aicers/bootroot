@@ -219,6 +219,13 @@ BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 BOOTROOT_REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote" \
 "$ROOT_DIR/scripts/impl/run-rotation-recovery.sh"
 
+echo "[ci-local-e2e] run reinit recovery (issue #600)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-reinit-recovery-${RUN_ID}" \
+COMPOSE_PROJECT_NAME="bootroot-e2e-ci-reinit-${RUN_ID}" \
+SECRETS_DIR="$ROOT_DIR/secrets" \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+"$ROOT_DIR/scripts/impl/run-reinit-recovery.sh"
+
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}"
@@ -229,3 +236,4 @@ echo "  - $ROOT_DIR/tmp/e2e/ci-local-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-remote-no-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-remote-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-rotation-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-reinit-recovery-${RUN_ID}"

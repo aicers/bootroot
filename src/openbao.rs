@@ -227,6 +227,81 @@ impl OpenBaoClient {
         })
     }
 
+    /// Creates a client that augments the default Mozilla webpki trust
+    /// roots with the step-ca trust bundle at
+    /// `<secrets_dir>/certs/{root_ca.crt,intermediate_ca.crt}` when
+    /// `base_url` is HTTPS and the root bundle exists.
+    ///
+    /// Used by CLI commands that load the URL from `state.json`: after
+    /// `init` switches `OpenBao` to TLS the URL becomes `https://...` but
+    /// the server cert is signed by step-ca's private root, which is not
+    /// in the webpki-roots store the default `Client` ships with.  Without
+    /// this anchor every post-init operator command (service add, status,
+    /// rotate, the second `init` pass during reinit) would fail the TLS
+    /// handshake with `UnknownIssuer`.
+    ///
+    /// The local PEM is *appended* to the webpki root store rather than
+    /// replacing it, so an externally-managed (publicly-trusted) HTTPS
+    /// `OpenBao` URL keeps verifying against the public CA even after
+    /// `init` has populated `<secrets_dir>/certs/`.  An earlier revision
+    /// of this constructor swapped the trust store to PEM-only and
+    /// regressed that path into `UnknownIssuer` once `root_ca.crt`
+    /// existed.
+    ///
+    /// The `OpenBao` TLS server cert is issued by `step certificate create`
+    /// against the step-ca intermediate and written as a single leaf cert
+    /// (no chain).  The server therefore presents only the leaf during
+    /// the handshake, so the client trust store must accept the
+    /// intermediate as a trust anchor directly — anchoring on the root
+    /// alone would leave rustls unable to bridge leaf → intermediate →
+    /// root.  Include the intermediate when it exists so the same client
+    /// works against both leaf-only and full-chain server certs.
+    ///
+    /// Falls back to [`Self::new`] when `base_url` is HTTP or when the
+    /// root bundle does not exist — keeping the legacy plaintext-loopback
+    /// path and any externally-managed (publicly-trusted) HTTPS endpoint
+    /// working unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a bundle file exists but cannot be read or
+    /// parsed, or if the HTTP client fails to build.
+    pub fn with_local_trust(base_url: &str, secrets_dir: &std::path::Path) -> Result<Self> {
+        if base_url.starts_with("https://") {
+            let certs_dir = secrets_dir.join("certs");
+            let root_path = certs_dir.join("root_ca.crt");
+            if root_path.exists() {
+                let mut ca_pem = std::fs::read_to_string(&root_path).with_context(|| {
+                    format!(
+                        "Failed to read OpenBao trust bundle at {}",
+                        root_path.display()
+                    )
+                })?;
+                let intermediate_path = certs_dir.join("intermediate_ca.crt");
+                if intermediate_path.exists() {
+                    let intermediate_pem = std::fs::read_to_string(&intermediate_path)
+                        .with_context(|| {
+                            format!(
+                                "Failed to read OpenBao trust bundle at {}",
+                                intermediate_path.display()
+                            )
+                        })?;
+                    if !ca_pem.ends_with('\n') {
+                        ca_pem.push('\n');
+                    }
+                    ca_pem.push_str(&intermediate_pem);
+                }
+                let client = crate::tls::build_http_client_with_local_and_webpki_roots(&ca_pem)?;
+                return Ok(Self {
+                    base_url: base_url.trim_end_matches('/').to_string(),
+                    client,
+                    token: None,
+                });
+            }
+        }
+        Self::new(base_url)
+    }
+
     /// Creates a new `OpenBao` client with a pre-configured
     /// [`reqwest::Client`].
     #[must_use]
@@ -1514,6 +1589,51 @@ mod tls_integration_tests {
                 key_der: key.serialize_der(),
             }
         }
+
+        fn sign_intermediate(&self, common_name: &str) -> TestIntermediate {
+            let key = KeyPair::generate().expect("generate intermediate key");
+            let mut params = CertificateParams::new(Vec::new()).expect("cert params");
+            params
+                .distinguished_name
+                .push(DnType::CommonName, common_name);
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let cert = params
+                .signed_by(&key, &self.issuer)
+                .expect("signed intermediate cert");
+            let issuer = Issuer::new(params, key);
+            TestIntermediate { cert, issuer }
+        }
+    }
+
+    /// CA-issued intermediate used to simulate the step-ca topology:
+    /// the `OpenBao` server cert is signed by this intermediate, not
+    /// directly by the root.
+    struct TestIntermediate {
+        cert: rcgen::Certificate,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    impl TestIntermediate {
+        fn pem(&self) -> String {
+            self.cert.pem()
+        }
+
+        fn sign_server_cert(&self) -> ServerCert {
+            let key = KeyPair::generate().expect("generate server key");
+            let mut params =
+                CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "localhost");
+            params.is_ca = IsCa::NoCa;
+            let cert = params
+                .signed_by(&key, &self.issuer)
+                .expect("signed server cert");
+            ServerCert {
+                cert_der: cert.der().to_vec(),
+                key_der: key.serialize_der(),
+            }
+        }
     }
 
     struct ServerCert {
@@ -1595,5 +1715,86 @@ mod tls_integration_tests {
             .health_check()
             .await
             .expect_err("health check should fail with wrong CA");
+    }
+
+    /// Proves `with_local_trust` reads the step-ca root bundle from
+    /// `<secrets_dir>/certs/root_ca.crt` so HTTPS verification succeeds
+    /// against a server cert signed by that same CA — the path post-init
+    /// `service add` and reinit's second `init` pass take when `openbao_url`
+    /// is `https://...`.
+    #[tokio::test]
+    async fn with_local_trust_loads_step_ca_bundle_for_https() {
+        let ca = TestCa::generate();
+        let server_cert = ca.sign_server_cert();
+        let port = start_tls_server(server_cert).await;
+
+        let secrets_dir = tempfile::tempdir().expect("tempdir");
+        let certs_dir = secrets_dir.path().join("certs");
+        std::fs::create_dir_all(&certs_dir).expect("create certs dir");
+        std::fs::write(certs_dir.join("root_ca.crt"), ca.pem()).expect("write root_ca.crt");
+
+        let client = OpenBaoClient::with_local_trust(
+            &format!("https://localhost:{port}"),
+            secrets_dir.path(),
+        )
+        .expect("client with local trust");
+
+        client
+            .health_check()
+            .await
+            .expect("health check should pass with step-ca root from secrets_dir");
+    }
+
+    /// Proves `with_local_trust` also picks up `intermediate_ca.crt` so
+    /// a leaf-only server cert (the form `step certificate create` writes
+    /// for `OpenBao`'s TLS) verifies against a trust store that anchors on
+    /// the step-ca intermediate.  Anchoring on the root alone would leave
+    /// rustls unable to bridge leaf → intermediate when the server does
+    /// not present a chain.
+    #[tokio::test]
+    async fn with_local_trust_accepts_leaf_signed_by_intermediate_with_leaf_only_server() {
+        let root = TestCa::generate();
+        let intermediate = root.sign_intermediate("Test Intermediate");
+        let server_cert = intermediate.sign_server_cert();
+        let port = start_tls_server(server_cert).await;
+
+        let secrets_dir = tempfile::tempdir().expect("tempdir");
+        let certs_dir = secrets_dir.path().join("certs");
+        std::fs::create_dir_all(&certs_dir).expect("create certs dir");
+        std::fs::write(certs_dir.join("root_ca.crt"), root.pem()).expect("write root_ca.crt");
+        std::fs::write(certs_dir.join("intermediate_ca.crt"), intermediate.pem())
+            .expect("write intermediate_ca.crt");
+
+        let client = OpenBaoClient::with_local_trust(
+            &format!("https://localhost:{port}"),
+            secrets_dir.path(),
+        )
+        .expect("client with local trust");
+
+        client
+            .health_check()
+            .await
+            .expect("health check should pass when intermediate is in the trust store");
+    }
+
+    /// Proves the helper degrades gracefully when no bundle exists: the
+    /// HTTP path (loopback before TLS is enabled) and the externally-
+    /// trusted HTTPS path keep using the default client.
+    #[tokio::test]
+    async fn with_local_trust_falls_back_to_default_when_bundle_missing() {
+        let secrets_dir = tempfile::tempdir().expect("tempdir");
+
+        // HTTP URL: always uses the default client.
+        let plain = OpenBaoClient::with_local_trust("http://127.0.0.1:1", secrets_dir.path())
+            .expect("http client");
+        assert_eq!(plain.base_url, "http://127.0.0.1:1");
+
+        // HTTPS URL with no bundle: still constructs (system roots), so
+        // an externally-trusted endpoint keeps working.  We don't drive a
+        // request here — just prove construction succeeds.
+        let external =
+            OpenBaoClient::with_local_trust("https://example.invalid", secrets_dir.path())
+                .expect("https client with no bundle still constructs");
+        assert_eq!(external.base_url, "https://example.invalid");
     }
 }

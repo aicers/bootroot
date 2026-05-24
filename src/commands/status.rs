@@ -16,8 +16,20 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
     let readiness = collect_readiness(&args.compose.compose_file, None, &services, messages)?;
     let infra_failures = collect_container_failures(&readiness);
 
-    let mut client = OpenBaoClient::new(&args.openbao.openbao_url)
-        .with_context(|| messages.error_openbao_client_create_failed())?;
+    let state_path = StateFile::default_path();
+    let state = if state_path.exists() {
+        Some(StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?)
+    } else {
+        None
+    };
+    let mut client = match state.as_ref().map(StateFile::secrets_dir) {
+        Some(secrets_dir) => {
+            OpenBaoClient::with_local_trust(&args.openbao.openbao_url, secrets_dir)
+                .with_context(|| messages.error_openbao_client_create_failed())?
+        }
+        None => OpenBaoClient::new(&args.openbao.openbao_url)
+            .with_context(|| messages.error_openbao_client_create_failed())?,
+    };
     let openbao_health = client
         .health_check()
         .await

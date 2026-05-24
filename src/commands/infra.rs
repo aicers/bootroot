@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
@@ -33,8 +34,19 @@ const DEFAULT_POSTGRES_USER: &str = "step";
 const DEFAULT_POSTGRES_DB: &str = "stepca";
 const UNSEAL_KEYS_PATH: &str = "secrets/openbao/unseal-keys.txt";
 
+/// Total budget for the post-`docker compose up -d` wait that gives the
+/// `OpenBao` listener time to bind before the unseal helpers issue their
+/// first API call.  Docker reports the container `Started` as soon as
+/// the entrypoint runs — for a TLS-enabled non-loopback bind (the
+/// reinit-recovery path), several seconds typically elapse before the
+/// kernel accepts a TCP connection on the published port.  Mirrors the
+/// `OPENBAO_READY_ATTEMPTS * OPENBAO_READY_DELAY_SECS` budget used by
+/// `scripts/impl/run-reinit-recovery.sh`'s `wait_for_openbao_listening`.
+const OPENBAO_API_WAIT_ATTEMPTS: u32 = 60;
+const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
+
 #[allow(clippy::too_many_lines)]
-pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
+pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
     ensure_all_services_localhost_binding(&args.compose_file.compose_file, messages)?;
 
     // Check for stored OpenBao non-loopback bind intent.
@@ -132,12 +144,30 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
             None
         }
     });
+    // Resolve the secrets_dir from state when present so the unseal
+    // helpers can anchor TLS trust on the step-ca root/intermediate
+    // bundle.  Without this, the rustls client built by
+    // `OpenBaoClient::new` rejects the step-ca-signed OpenBao server
+    // cert with `UnknownIssuer` on the reinit-recovery path where
+    // OpenBao listens on `https://<non-loopback>:8200`.
+    let effective_secrets_dir = resolve_effective_secrets_dir(&state_path, compose_dir);
     if let Some(path) = unseal_file.as_deref() {
-        auto_unseal_openbao(path, &effective_openbao_url, messages)?;
+        auto_unseal_openbao(
+            path,
+            &effective_openbao_url,
+            effective_secrets_dir.as_deref(),
+            messages,
+        )
+        .await?;
     } else {
         // No key file found — check if OpenBao is sealed and prompt
         // interactively so `infra up` works without --openbao-unseal-from-file.
-        maybe_interactive_unseal(&effective_openbao_url, messages)?;
+        maybe_interactive_unseal(
+            &effective_openbao_url,
+            effective_secrets_dir.as_deref(),
+            messages,
+        )
+        .await?;
     }
 
     let readiness = collect_readiness(
@@ -570,41 +600,114 @@ pub(crate) fn ensure_init_prereqs_ready(compose_file: &Path, messages: &Messages
     Ok(())
 }
 
-fn auto_unseal_openbao(path: &Path, openbao_url: &str, messages: &Messages) -> Result<()> {
+/// Returns the absolute path of the `secrets_dir` recorded in
+/// `state.json` when present.  Used so the unseal helpers can build an
+/// `OpenBao` client anchored on the step-ca root/intermediate bundle
+/// for the non-loopback TLS path.  Returns `None` when the state file
+/// is absent or fails to parse — the caller then falls back to the
+/// default `OpenBaoClient::new`, which is the right choice for the
+/// fresh-install plaintext-loopback flow that has no bundle on disk
+/// yet.
+fn resolve_effective_secrets_dir(state_path: &Path, compose_dir: &Path) -> Option<PathBuf> {
+    if !state_path.exists() {
+        return None;
+    }
+    let state = StateFile::load(state_path).ok()?;
+    let secrets_dir = state.secrets_dir();
+    if secrets_dir.is_absolute() {
+        Some(secrets_dir.to_path_buf())
+    } else {
+        Some(compose_dir.join(secrets_dir))
+    }
+}
+
+/// Builds an [`OpenBaoClient`] for the unseal helpers.  When a
+/// `secrets_dir` is supplied, prefers [`OpenBaoClient::with_local_trust`]
+/// so the rustls trust store includes the step-ca root and intermediate
+/// bundles — required to verify the `OpenBao` server cert issued by
+/// step-ca on the non-loopback TLS path.  Falls back to
+/// [`OpenBaoClient::new`] for the plaintext-loopback / fresh-install
+/// path where no bundle exists yet.
+fn build_openbao_client(
+    openbao_url: &str,
+    secrets_dir: Option<&Path>,
+    messages: &Messages,
+) -> Result<OpenBaoClient> {
+    if let Some(dir) = secrets_dir {
+        OpenBaoClient::with_local_trust(openbao_url, dir)
+            .with_context(|| messages.error_openbao_client_create_failed())
+    } else {
+        OpenBaoClient::new(openbao_url)
+            .with_context(|| messages.error_openbao_client_create_failed())
+    }
+}
+
+/// Polls `sys/seal-status` until the `OpenBao` listener responds or the
+/// budget is exhausted.  Any successful HTTP response (sealed or
+/// unsealed, initialized or not) proves the listener is up, so the
+/// caller can proceed with `is_initialized()` / `seal_status()` /
+/// `unseal()` without racing the post-recreate startup.
+///
+/// On the final attempt, propagates the underlying transport error so
+/// the operator sees the real cause (e.g. TLS handshake failure with
+/// `UnknownIssuer` when the trust bundle is wrong) rather than a
+/// generic "API never became reachable" message.
+async fn wait_for_openbao_api_reachable(client: &OpenBaoClient, messages: &Messages) -> Result<()> {
+    for attempt in 0..OPENBAO_API_WAIT_ATTEMPTS {
+        match client.seal_status().await {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                if attempt + 1 == OPENBAO_API_WAIT_ATTEMPTS {
+                    return Err(err).with_context(|| messages.error_openbao_seal_status_failed());
+                }
+            }
+        }
+        tokio::time::sleep(OPENBAO_API_WAIT_DELAY).await;
+    }
+    unreachable!("loop above returns on every iteration")
+}
+
+async fn auto_unseal_openbao(
+    path: &Path,
+    openbao_url: &str,
+    secrets_dir: Option<&Path>,
+    messages: &Messages,
+) -> Result<()> {
     println!("{}", messages.warning_openbao_unseal_from_file());
     let keys = read_unseal_keys_from_file(path, messages)?;
-    let runtime = tokio::runtime::Runtime::new()
-        .with_context(|| messages.error_runtime_init_failed("infra up"))?;
-    runtime.block_on(async {
-        let client = OpenBaoClient::new(openbao_url)
-            .with_context(|| messages.error_openbao_client_create_failed())?;
+    let client = build_openbao_client(openbao_url, secrets_dir, messages)?;
 
-        // An uninitialized instance always reports sealed=true but has
-        // no unseal keys yet.  A stale key file from a previous run
-        // would cause an unseal error, so skip gracefully.
-        if !client
-            .is_initialized()
-            .await
-            .with_context(|| messages.error_openbao_init_status_failed())?
-        {
-            return Ok(());
-        }
+    // `docker compose up -d` returns once the container is Started, not
+    // when the OpenBao listener is bound.  Poll a public endpoint until
+    // the API answers so the immediately-following `is_initialized()`
+    // does not race the listener and fail with `Connection refused`.
+    wait_for_openbao_api_reachable(&client, messages).await?;
 
-        for key in &keys {
-            client
-                .unseal(key)
-                .await
-                .with_context(|| messages.error_openbao_unseal_failed())?;
-        }
-        let status = client
-            .seal_status()
+    // An uninitialized instance always reports sealed=true but has
+    // no unseal keys yet.  A stale key file from a previous run
+    // would cause an unseal error, so skip gracefully.
+    if !client
+        .is_initialized()
+        .await
+        .with_context(|| messages.error_openbao_init_status_failed())?
+    {
+        return Ok(());
+    }
+
+    for key in &keys {
+        client
+            .unseal(key)
             .await
-            .with_context(|| messages.error_openbao_seal_status_failed())?;
-        if status.sealed {
-            anyhow::bail!(messages.error_openbao_sealed());
-        }
-        Ok(())
-    })
+            .with_context(|| messages.error_openbao_unseal_failed())?;
+    }
+    let status = client
+        .seal_status()
+        .await
+        .with_context(|| messages.error_openbao_seal_status_failed())?;
+    if status.sealed {
+        anyhow::bail!(messages.error_openbao_sealed());
+    }
+    Ok(())
 }
 
 /// Checks whether `OpenBao` is sealed and, if so, prompts the user
@@ -613,52 +716,56 @@ fn auto_unseal_openbao(path: &Path, openbao_url: &str, messages: &Messages) -> R
 /// Skips the prompt when `OpenBao` has not been initialized yet (fresh
 /// `infra install`) or when stdin is not a terminal (CI / scripted
 /// usage).
-fn maybe_interactive_unseal(openbao_url: &str, messages: &Messages) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()
-        .with_context(|| messages.error_runtime_init_failed("infra up"))?;
-    runtime.block_on(async {
-        let client = OpenBaoClient::new(openbao_url)
-            .with_context(|| messages.error_openbao_client_create_failed())?;
+async fn maybe_interactive_unseal(
+    openbao_url: &str,
+    secrets_dir: Option<&Path>,
+    messages: &Messages,
+) -> Result<()> {
+    let client = build_openbao_client(openbao_url, secrets_dir, messages)?;
 
-        // An uninitialized instance always reports sealed=true but has
-        // no unseal keys, so prompting is nonsensical.
-        if !client
-            .is_initialized()
+    // See `auto_unseal_openbao` — the OpenBao listener can be slower
+    // than `docker compose up -d` returning, so wait for the API to
+    // answer before the first `is_initialized()` call.
+    wait_for_openbao_api_reachable(&client, messages).await?;
+
+    // An uninitialized instance always reports sealed=true but has
+    // no unseal keys, so prompting is nonsensical.
+    if !client
+        .is_initialized()
+        .await
+        .with_context(|| messages.error_openbao_init_status_failed())?
+    {
+        return Ok(());
+    }
+
+    let status = client
+        .seal_status()
+        .await
+        .with_context(|| messages.error_openbao_seal_status_failed())?;
+    if !status.sealed {
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{}", messages.warning_openbao_sealed_non_interactive());
+        return Ok(());
+    }
+
+    let keys = prompt_unseal_keys_interactive(status.t, messages)?;
+    for key in &keys {
+        client
+            .unseal(key)
             .await
-            .with_context(|| messages.error_openbao_init_status_failed())?
-        {
-            return Ok(());
-        }
-
-        let status = client
-            .seal_status()
-            .await
-            .with_context(|| messages.error_openbao_seal_status_failed())?;
-        if !status.sealed {
-            return Ok(());
-        }
-
-        if !std::io::stdin().is_terminal() {
-            eprintln!("{}", messages.warning_openbao_sealed_non_interactive());
-            return Ok(());
-        }
-
-        let keys = prompt_unseal_keys_interactive(status.t, messages)?;
-        for key in &keys {
-            client
-                .unseal(key)
-                .await
-                .with_context(|| messages.error_openbao_unseal_failed())?;
-        }
-        let final_status = client
-            .seal_status()
-            .await
-            .with_context(|| messages.error_openbao_seal_status_failed())?;
-        if final_status.sealed {
-            anyhow::bail!(messages.error_openbao_sealed());
-        }
-        Ok(())
-    })
+            .with_context(|| messages.error_openbao_unseal_failed())?;
+    }
+    let final_status = client
+        .seal_status()
+        .await
+        .with_context(|| messages.error_openbao_seal_status_failed())?;
+    if final_status.sealed {
+        anyhow::bail!(messages.error_openbao_sealed());
+    }
+    Ok(())
 }
 
 /// Returns the `OpenBao` exposed compose override path when a
@@ -1295,6 +1402,62 @@ pub(crate) fn docker_output(args: &[&str], messages: &Messages) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_effective_secrets_dir_returns_none_without_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        assert!(resolve_effective_secrets_dir(&state_path, dir.path()).is_none());
+    }
+
+    #[test]
+    fn resolve_effective_secrets_dir_returns_absolute_when_state_uses_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let abs_secrets = dir.path().join("custom-secrets");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: Some(abs_secrets.clone()),
+            policies: std::collections::BTreeMap::new(),
+            approles: std::collections::BTreeMap::new(),
+            services: std::collections::BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
+            infra_certs: std::collections::BTreeMap::new(),
+        };
+        state.save(&state_path).unwrap();
+        assert_eq!(
+            resolve_effective_secrets_dir(&state_path, dir.path()),
+            Some(abs_secrets)
+        );
+    }
+
+    #[test]
+    fn resolve_effective_secrets_dir_joins_relative_path_with_compose_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: Some(PathBuf::from("secrets")),
+            policies: std::collections::BTreeMap::new(),
+            approles: std::collections::BTreeMap::new(),
+            services: std::collections::BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
+            infra_certs: std::collections::BTreeMap::new(),
+        };
+        state.save(&state_path).unwrap();
+        assert_eq!(
+            resolve_effective_secrets_dir(&state_path, dir.path()),
+            Some(dir.path().join("secrets"))
+        );
+    }
 
     #[test]
     fn test_is_image_archive_extensions() {
@@ -2051,7 +2214,7 @@ mod tests {
             "\
 services:
   openbao:
-    ports: !reset
+    ports: !override
       - \"0.0.0.0:8200:8200\"
 ",
         )
@@ -3190,7 +3353,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME),
-            "services:\n  bootroot-http01:\n    ports: !reset\n      - \"192.168.1.10:8080:8080\"\n",
+            "services:\n  bootroot-http01:\n    ports: !override\n      - \"192.168.1.10:8080:8080\"\n",
         )
         .unwrap();
 

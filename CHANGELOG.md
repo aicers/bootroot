@@ -51,6 +51,66 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot init`'s second pass (the one `reinit` runs after wiping
+  OpenBao) recreating the OpenBao container without its
+  `openbao-exposed` compose override and dropping the non-loopback
+  host-port publish mid-flow. `apply_openbao_agent_compose_override`,
+  `apply_responder_compose_override`, and the inline
+  responder TLS compose-up all invoked `docker compose up -d` without
+  `--no-deps`, so compose re-evaluated the openbao dependency against
+  a merged config that lacked the exposed override and recreated the
+  container to the loopback bind. The next KV call (e.g.
+  `write_ca_trust_fingerprints_with_retry`) against
+  `https://<bind>:8200` then failed with `Connection refused`, blowing
+  up reinit-recovery's scenario A. All three call sites now pass
+  `--no-deps`; openbao is left alone, retaining the bind it was
+  brought up with by `reinit`'s `infra up` step. (Part of #600)
+- Fixed `bootroot reinit`'s `infra up` pass racing the OpenBao listener
+  after the volume wipe and bailing with
+  `OpenBao init status check failed: Connection refused`. Docker
+  reports `bootroot-openbao` as Started before the OpenBao process has
+  bound its listener — on the TLS-enabled non-loopback bind exercised
+  by reinit-recovery, the listener typically takes several seconds to
+  accept connections. `run_infra_up`'s unseal helpers
+  (`auto_unseal_openbao` and `maybe_interactive_unseal`) now poll
+  `/v1/sys/seal-status` until the API answers before issuing the first
+  `is_initialized()` call. The same helpers also resolve the
+  `secrets_dir` from `state.json` and build their `OpenBaoClient` via
+  `with_local_trust`, so the post-recreate readiness probe runs over
+  the same step-ca-anchored trust store as the rest of the reinit
+  flow. (Part of #600)
+- Fixed `bootroot service add` and `bootroot init`'s second pass (the
+  one reinit runs after wiping OpenBao) failing the TLS handshake with
+  `UnknownIssuer` against a TLS-enabled OpenBao bind. The CLI's
+  `OpenBaoClient` constructor used webpki-roots only, so the step-ca
+  private root that signs the OpenBao server cert was not trusted.
+  Added `OpenBaoClient::with_local_trust(url, secrets_dir)`, which
+  augments the default Mozilla webpki trust store with
+  `<secrets_dir>/certs/root_ca.crt` (and
+  `<secrets_dir>/certs/intermediate_ca.crt` when present) when the
+  URL is `https://...` and the bundle exists, and falls back to the
+  default client for HTTP (the pre-TLS loopback path) and for HTTPS
+  endpoints with no local bundle (externally-trusted CAs). The local
+  PEM is appended to the webpki root store rather than replacing it,
+  so an externally-managed (publicly-trusted) HTTPS `OpenBao` URL
+  reachable through the same state-backed code path keeps verifying
+  against the public CA even after `init` has populated
+  `<secrets_dir>/certs/`. The intermediate must be added as a trust
+  anchor because the OpenBao TLS server cert is issued by `step
+  certificate create` as a single leaf (no chain), so without the
+  intermediate in the trust store rustls cannot bridge
+  leaf → intermediate → root and the handshake still fails with
+  `UnknownIssuer`. Wired into `service add`'s apply, preview, and
+  remote-idempotent paths and into the init orchestrator so the
+  post-TLS operator surface stops blackholing on the new
+  `--openbao-bind` + `--openbao-tls-required` topology the
+  reinit-recovery E2E exercises. `bootroot rotate` (every non-
+  `infra-cert` subcommand) and `bootroot status` now go through the
+  same constructor — they used `OpenBaoClient::new` and would have
+  failed with `UnknownIssuer` against the same post-reinit topology.
+  The reinit-recovery E2E asserts the regression by running
+  `bootroot status --openbao-url https://<bind>` after each scenario.
+  (Part of #600)
 - Fixed `bootroot service add` leaving the per-service OpenBao Agent
   sidecar unable to render its `agent.toml` when no EAB is configured
   (e.g., `bootroot init --no-eab`, bundled OSS step-ca). The sidecar
@@ -240,6 +300,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Docker-backed E2E recovery harness for `bootroot reinit`
+  (`scripts/impl/run-reinit-recovery.sh`, driven by
+  `tests/docker_e2e_reinit_recovery.rs` and wired into the CI matrix
+  and the extended suite). Drives a real partial-init OpenBao stack
+  through all three #598 failure modes — stuck after
+  `clean --openbao-only`, initialized-OpenBao-without-root-token, and
+  rsync-clone stale local state — and asserts the recovery contracts
+  after each scenario: step-ca root/intermediate fingerprint unchanged,
+  `secrets/password.txt` not overwritten, non-loopback OpenBao bind
+  preserved (compose override survives, intent persists in the
+  rewritten `state.json`, post-reinit OpenBao listens on the same
+  bind), and the rewritten state's service registry is empty. (Closes
+  #600, Closes #598)
 - `bootroot init` now accepts `--save-unseal-keys` and
   `--no-save-unseal-keys` to non-interactively answer the
   "Save unseal keys to file for automatic unseal? [y/N]" prompt,
