@@ -165,6 +165,13 @@ pub(super) fn apply_responder_compose_override(
 ) -> Result<()> {
     let compose_str = compose_file.to_string_lossy();
     let override_str = override_path.to_string_lossy();
+    // `--no-deps` mirrors `apply_openbao_agent_compose_override`: the
+    // responder override does not include the `openbao-exposed`
+    // compose file, so without it `compose up` would recreate openbao
+    // to the (override-less) merged config and drop the non-loopback
+    // host-port publish.  Subsequent KV calls against the bind URL
+    // would then fail with `Connection refused`.  See the comment on
+    // that helper for the reinit-recovery scenario that exercises this.
     let args = [
         "compose",
         "-f",
@@ -173,6 +180,7 @@ pub(super) fn apply_responder_compose_override(
         &*override_str,
         "up",
         "-d",
+        "--no-deps",
         RESPONDER_SERVICE_NAME,
     ];
     run_docker(&args, "docker compose responder override", messages)?;

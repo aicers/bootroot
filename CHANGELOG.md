@@ -51,6 +51,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot init`'s second pass (the one `reinit` runs after wiping
+  OpenBao) recreating the OpenBao container without its
+  `openbao-exposed` compose override and dropping the non-loopback
+  host-port publish mid-flow. `apply_openbao_agent_compose_override`,
+  `apply_responder_compose_override`, and the inline
+  responder TLS compose-up all invoked `docker compose up -d` without
+  `--no-deps`, so compose re-evaluated the openbao dependency against
+  a merged config that lacked the exposed override and recreated the
+  container to the loopback bind. The next KV call (e.g.
+  `write_ca_trust_fingerprints_with_retry`) against
+  `https://<bind>:8200` then failed with `Connection refused`, blowing
+  up reinit-recovery's scenario A. All three call sites now pass
+  `--no-deps`; openbao is left alone, retaining the bind it was
+  brought up with by `reinit`'s `infra up` step. (Part of #600)
 - Fixed `bootroot reinit`'s `infra up` pass racing the OpenBao listener
   after the volume wipe and bailing with
   `OpenBao init status check failed: Connection refused`. Docker

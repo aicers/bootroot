@@ -544,6 +544,15 @@ async fn run_init_inner(
             let compose_str = args.compose.compose_file.to_string_lossy();
             let config_override_str = override_path.to_string_lossy();
             let exposed_override_str = exposed_override.to_string_lossy();
+            // `--no-deps` is load-bearing here for the same reason as
+            // `apply_responder_compose_override` and
+            // `apply_openbao_agent_compose_override`: this compose
+            // invocation does not include the `openbao-exposed`
+            // override, so without it compose would recreate the
+            // openbao dependency to the merged config and drop its
+            // non-loopback host-port publish.  Reinit-recovery's
+            // second init pass would then lose access to the bind URL
+            // mid-flow.
             let up_args = [
                 "compose",
                 "-f",
@@ -554,6 +563,7 @@ async fn run_init_inner(
                 &*exposed_override_str,
                 "up",
                 "-d",
+                "--no-deps",
                 RESPONDER_SERVICE_NAME,
             ];
             run_docker(
