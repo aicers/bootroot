@@ -1763,10 +1763,23 @@ operator-managed runbook for those.
   OpenBao KV mount, and skips the EAB registration prompt —
   operators who need EAB credentials register them out of band after
   reinit). When `secrets/password.txt` is absent (rsync-clone path
-  or operator-removed), the step-ca password is auto-generated
-  non-interactively so `reinit --yes` never stalls on a password
-  prompt; the new password is written to `secrets/password.txt` for
-  the freshly initialised CA material.
+  or operator-removed) **and** the step-ca CA material
+  (`secrets/config/ca.json`, `secrets/secrets/root_ca_key`,
+  `secrets/secrets/intermediate_ca_key`) is also absent, the step-ca
+  password is auto-generated non-interactively so `reinit --yes` never
+  stalls on a password prompt; the new password is written to
+  `secrets/password.txt` and encrypts the freshly initialised CA
+  material that the second init pass creates from scratch. When
+  `secrets/password.txt` is absent **but the CA material is still
+  preserved on disk**, reinit refuses to start before any destructive
+  operation runs — the preserved root/intermediate keys are
+  encrypted with the original password, so generating a fresh one
+  would render a deployment whose `password.txt` cannot unlock the
+  preserved CA keys, and any later
+  `step certificate create --ca-password-file /home/step/password.txt`
+  path (OpenBao / HTTP-01 TLS issuance) would fail. Restore
+  `password.txt` from a backup, or remove the preserved CA material
+  to opt into a clean CA rebuild, then retry.
 - Reads the preserved step-ca runtime DSN from
   `secrets/config/ca.json` and seeds the second init pass with it so
   the freshly reinitialised OpenBao KV receives credentials that

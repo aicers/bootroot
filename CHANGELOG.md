@@ -255,7 +255,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   password generation under `reinit_mode` so `reinit --yes` never
   stalls on the step-ca password prompt (an existing `password.txt`
   is still preserved verbatim so the encrypted CA material remains
-  decryptable), the EAB registration prompt is skipped, and newly
+  decryptable; when `password.txt` is absent **but** the step-ca CA
+  material — `secrets/config/ca.json`, `secrets/secrets/root_ca_key`,
+  `secrets/secrets/intermediate_ca_key` — is still preserved on disk,
+  reinit refuses to start before any destructive operation runs so a
+  freshly generated password cannot be silently written into a
+  deployment whose `password.txt` would then fail to unlock the
+  preserved CA keys; the operator restores `password.txt` from a
+  backup or removes the CA material to opt into a clean rebuild),
+  the EAB registration prompt is skipped, and newly
   generated unseal keys are written automatically to
   `secrets/openbao/unseal-keys.txt` (mode `0600`). The optional
   `--root-token-output <path>` is preflight-validated before any
