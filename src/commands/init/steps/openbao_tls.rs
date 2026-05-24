@@ -16,9 +16,11 @@ use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 /// Issues an `OpenBao` TLS server certificate signed by the local
 /// step-ca intermediate CA.
 ///
-/// Writes the certificate to `compose_dir/openbao/tls/server.{crt,key}`
-/// with `0600` permissions.  `step certificate create` runs via Docker
-/// (no step CLI required on the host).
+/// Writes the certificate to `compose_dir/openbao/tls/server.{crt,key}`.
+/// `step certificate create` runs via Docker (no step CLI required on
+/// the host).  After provisioning, the files are set to `0644` so the
+/// `OpenBao` container's `openbao` user can read them (see
+/// `set_openbao_readable_permissions` for the rationale).
 pub(in crate::commands::init) fn issue_openbao_tls_cert(
     compose_dir: &Path,
     secrets_dir: &Path,
@@ -84,13 +86,38 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
     )
     .with_context(|| messages.error_openbao_tls_provision_failed())?;
 
-    set_key_permissions_sync(&key_path)?;
-    set_key_permissions_sync(&cert_path)?;
+    set_openbao_readable_permissions(&cert_path, &key_path)?;
 
     println!(
         "{}",
         messages.info_openbao_tls_provisioned(&cert_path.display().to_string())
     );
+    Ok(())
+}
+
+/// Sets cert + key to modes the `OpenBao` container can read.
+///
+/// `docker-compose.yml` mounts `./openbao` as `:ro`, so the `OpenBao`
+/// image's standard entrypoint cannot chown its config dir to the
+/// `openbao` user — the chown silently fails and the container then
+/// fails to load the TLS material with `permission denied`.  The
+/// `step` CLI writes the cert and key as the runner UID with mode
+/// `0600`, which the `openbao` user inside the container can not
+/// read.
+///
+/// Loosen the modes so the openbao user can read the files via the
+/// "other" permission bits.  The cert is public (`0644`).  The key
+/// is set to `0644` too because the openbao user is in neither the
+/// runner's primary group nor any shared group, so `0640` would not
+/// help.  The host is a single-tenant operator host (the only other
+/// reader is root, who can read anything anyway); the key never
+/// leaves this directory and is renewed on a 30-day cadence, so the
+/// expanded read scope is acceptable in this deployment model.
+fn set_openbao_readable_permissions(cert_path: &Path, key_path: &Path) -> Result<()> {
+    std::fs::set_permissions(cert_path, std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("Failed to set permissions on {}", cert_path.display()))?;
+    std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("Failed to set permissions on {}", key_path.display()))?;
     Ok(())
 }
 
@@ -297,11 +324,6 @@ ui = true
 
     println!("{}", messages.info_openbao_hcl_tls_reverted());
     Ok(())
-}
-
-fn set_key_permissions_sync(path: &Path) -> Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("Failed to set permissions on {}", path.display()))
 }
 
 /// Re-issues an existing `OpenBao` infrastructure certificate.
