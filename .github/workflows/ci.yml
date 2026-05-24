@@ -423,6 +423,12 @@ jobs:
             artifact: ci-rotation
             oba_deployment: ""
             oba_topology: ""
+          - label: reinit-recovery
+            script: run-reinit-recovery.sh
+            resolution: ""
+            artifact: ci-reinit-recovery
+            oba_deployment: ""
+            oba_topology: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -439,7 +445,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Host-daemon arm has to wait for OpenBao Agent's
@@ -488,6 +494,26 @@ jobs:
           BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
           BOOTROOT_REMOTE_BIN="$(pwd)/target/debug/bootroot-remote" \
           ./scripts/impl/run-rotation-recovery.sh
+
+      - name: Run E2E scenario (reinit recovery)
+        if: matrix.scenario.label == 'reinit-recovery'
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          COMPOSE_PROJECT_NAME="bootroot-e2e-ci-reinit-${GITHUB_RUN_ID}" \
+          SECRETS_DIR="$(pwd)/secrets" \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          ./scripts/impl/run-reinit-recovery.sh || {
+            echo "reinit-recovery failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
+            [ -f "$ARTIFACT_DIR/init.raw.log" ] && tail -n 200 "$ARTIFACT_DIR/init.raw.log" || true
+            for f in "$ARTIFACT_DIR"/reinit-*.raw.log; do
+              [ -f "$f" ] && { echo "--- $(basename "$f") ---"; tail -n 120 "$f"; } || true
+            done
+            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
+            exit 1
+          }
 
       - name: Upload Artifacts
         if: always()

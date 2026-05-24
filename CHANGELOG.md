@@ -240,6 +240,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Docker-backed E2E recovery harness for `bootroot reinit`
+  (`scripts/impl/run-reinit-recovery.sh`, driven by
+  `tests/docker_e2e_reinit_recovery.rs` and wired into the CI matrix
+  and the extended suite). Drives a real partial-init OpenBao stack
+  through all three #598 failure modes — stuck after
+  `clean --openbao-only`, initialized-OpenBao-without-root-token, and
+  rsync-clone stale local state — and asserts the recovery contracts
+  after each scenario: step-ca root/intermediate fingerprint unchanged,
+  `secrets/password.txt` not overwritten, non-loopback OpenBao bind
+  preserved (compose override survives, intent persists in the
+  rewritten `state.json`, post-reinit OpenBao listens on the same
+  bind), and the rewritten state's service registry is empty. (Closes
+  #600, Closes #598)
 - `bootroot init` now accepts `--save-unseal-keys` and
   `--no-save-unseal-keys` to non-interactively answer the
   "Save unseal keys to file for automatic unseal? [y/N]" prompt,

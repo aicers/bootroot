@@ -16,6 +16,7 @@ TIMEOUT_SECS_ROTATION="${TIMEOUT_SECS_ROTATION:-90}"
 TIMEOUT_SECS_RUNNER="${TIMEOUT_SECS_RUNNER:-45}"
 TIMEOUT_SECS_LIFECYCLE="${TIMEOUT_SECS_LIFECYCLE:-600}"
 TIMEOUT_SECS_CA_KEY_RECOVERY="${TIMEOUT_SECS_CA_KEY_RECOVERY:-600}"
+TIMEOUT_SECS_REINIT_RECOVERY="${TIMEOUT_SECS_REINIT_RECOVERY:-900}"
 MAX_CYCLES_RUNNER="${MAX_CYCLES_RUNNER:-4}"
 INTERVAL_SECS_RUNNER="${INTERVAL_SECS_RUNNER:-1}"
 
@@ -108,6 +109,15 @@ case_ca_key_recovery() {
   "$ROOT_DIR/scripts/impl/run-ca-key-rotation-recovery.sh"
 }
 
+case_reinit_recovery() {
+  local case_dir="$ARTIFACT_DIR/reinit-recovery"
+  ARTIFACT_DIR="$case_dir" \
+  COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-reinit-$$" \
+  TIMEOUT_SECS="$TIMEOUT_SECS_REINIT_RECOVERY" \
+  BOOTROOT_BIN="$BOOTROOT_BIN" \
+  "$ROOT_DIR/scripts/impl/run-reinit-recovery.sh"
+}
+
 case_runner_cron() {
   local case_dir="$ARTIFACT_DIR/runner-cron"
   ARTIFACT_DIR="$case_dir" \
@@ -155,6 +165,13 @@ main() {
   fi
 
   if line="$(run_case "ca-key-recovery" case_ca_key_recovery)"; then
+    lines+=("$line")
+  else
+    lines+=("$line")
+    overall_status="fail"
+  fi
+
+  if line="$(run_case "reinit-recovery" case_reinit_recovery)"; then
     lines+=("$line")
   else
     lines+=("$line")
