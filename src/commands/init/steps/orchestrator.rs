@@ -89,11 +89,9 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     // Only check openbao + postgres; step-ca may not be bootstrapped yet.
     ensure_init_prereqs_ready(&args.compose.compose_file, messages)?;
 
-    let mut client = OpenBaoClient::with_local_trust(
-        &args.openbao.openbao_url,
-        &args.secrets_dir.secrets_dir,
-    )
-    .with_context(|| messages.error_openbao_client_create_failed())?;
+    let mut client =
+        OpenBaoClient::with_local_trust(&args.openbao.openbao_url, &args.secrets_dir.secrets_dir)
+            .with_context(|| messages.error_openbao_client_create_failed())?;
     client
         .health_check()
         .await
