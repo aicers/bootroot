@@ -53,8 +53,10 @@ where
 fn run(cli: Cli, messages: &Messages) -> Result<()> {
     match cli.command {
         CliCommand::Infra(InfraCommand::Up(args)) => {
-            commands::infra::run_infra_up(&args, messages)
-                .with_context(|| messages.error_infra_failed())?;
+            with_runtime("infra up", messages, |rt| {
+                rt.block_on(commands::infra::run_infra_up(&args, messages))
+            })?
+            .with_context(|| messages.error_infra_failed())?;
         }
         CliCommand::Infra(InfraCommand::Install(args)) => {
             commands::infra::run_infra_install(&args, messages)

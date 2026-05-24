@@ -34,7 +34,7 @@ const DEFAULT_POSTGRES_DB: &str = "stepca";
 const UNSEAL_KEYS_PATH: &str = "secrets/openbao/unseal-keys.txt";
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
+pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
     ensure_all_services_localhost_binding(&args.compose_file.compose_file, messages)?;
 
     // Check for stored OpenBao non-loopback bind intent.
@@ -133,11 +133,11 @@ pub(crate) fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()
         }
     });
     if let Some(path) = unseal_file.as_deref() {
-        auto_unseal_openbao(path, &effective_openbao_url, messages)?;
+        auto_unseal_openbao(path, &effective_openbao_url, messages).await?;
     } else {
         // No key file found — check if OpenBao is sealed and prompt
         // interactively so `infra up` works without --openbao-unseal-from-file.
-        maybe_interactive_unseal(&effective_openbao_url, messages)?;
+        maybe_interactive_unseal(&effective_openbao_url, messages).await?;
     }
 
     let readiness = collect_readiness(
@@ -570,41 +570,37 @@ pub(crate) fn ensure_init_prereqs_ready(compose_file: &Path, messages: &Messages
     Ok(())
 }
 
-fn auto_unseal_openbao(path: &Path, openbao_url: &str, messages: &Messages) -> Result<()> {
+async fn auto_unseal_openbao(path: &Path, openbao_url: &str, messages: &Messages) -> Result<()> {
     println!("{}", messages.warning_openbao_unseal_from_file());
     let keys = read_unseal_keys_from_file(path, messages)?;
-    let runtime = tokio::runtime::Runtime::new()
-        .with_context(|| messages.error_runtime_init_failed("infra up"))?;
-    runtime.block_on(async {
-        let client = OpenBaoClient::new(openbao_url)
-            .with_context(|| messages.error_openbao_client_create_failed())?;
+    let client = OpenBaoClient::new(openbao_url)
+        .with_context(|| messages.error_openbao_client_create_failed())?;
 
-        // An uninitialized instance always reports sealed=true but has
-        // no unseal keys yet.  A stale key file from a previous run
-        // would cause an unseal error, so skip gracefully.
-        if !client
-            .is_initialized()
-            .await
-            .with_context(|| messages.error_openbao_init_status_failed())?
-        {
-            return Ok(());
-        }
+    // An uninitialized instance always reports sealed=true but has
+    // no unseal keys yet.  A stale key file from a previous run
+    // would cause an unseal error, so skip gracefully.
+    if !client
+        .is_initialized()
+        .await
+        .with_context(|| messages.error_openbao_init_status_failed())?
+    {
+        return Ok(());
+    }
 
-        for key in &keys {
-            client
-                .unseal(key)
-                .await
-                .with_context(|| messages.error_openbao_unseal_failed())?;
-        }
-        let status = client
-            .seal_status()
+    for key in &keys {
+        client
+            .unseal(key)
             .await
-            .with_context(|| messages.error_openbao_seal_status_failed())?;
-        if status.sealed {
-            anyhow::bail!(messages.error_openbao_sealed());
-        }
-        Ok(())
-    })
+            .with_context(|| messages.error_openbao_unseal_failed())?;
+    }
+    let status = client
+        .seal_status()
+        .await
+        .with_context(|| messages.error_openbao_seal_status_failed())?;
+    if status.sealed {
+        anyhow::bail!(messages.error_openbao_sealed());
+    }
+    Ok(())
 }
 
 /// Checks whether `OpenBao` is sealed and, if so, prompts the user
@@ -613,52 +609,48 @@ fn auto_unseal_openbao(path: &Path, openbao_url: &str, messages: &Messages) -> R
 /// Skips the prompt when `OpenBao` has not been initialized yet (fresh
 /// `infra install`) or when stdin is not a terminal (CI / scripted
 /// usage).
-fn maybe_interactive_unseal(openbao_url: &str, messages: &Messages) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()
-        .with_context(|| messages.error_runtime_init_failed("infra up"))?;
-    runtime.block_on(async {
-        let client = OpenBaoClient::new(openbao_url)
-            .with_context(|| messages.error_openbao_client_create_failed())?;
+async fn maybe_interactive_unseal(openbao_url: &str, messages: &Messages) -> Result<()> {
+    let client = OpenBaoClient::new(openbao_url)
+        .with_context(|| messages.error_openbao_client_create_failed())?;
 
-        // An uninitialized instance always reports sealed=true but has
-        // no unseal keys, so prompting is nonsensical.
-        if !client
-            .is_initialized()
+    // An uninitialized instance always reports sealed=true but has
+    // no unseal keys, so prompting is nonsensical.
+    if !client
+        .is_initialized()
+        .await
+        .with_context(|| messages.error_openbao_init_status_failed())?
+    {
+        return Ok(());
+    }
+
+    let status = client
+        .seal_status()
+        .await
+        .with_context(|| messages.error_openbao_seal_status_failed())?;
+    if !status.sealed {
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{}", messages.warning_openbao_sealed_non_interactive());
+        return Ok(());
+    }
+
+    let keys = prompt_unseal_keys_interactive(status.t, messages)?;
+    for key in &keys {
+        client
+            .unseal(key)
             .await
-            .with_context(|| messages.error_openbao_init_status_failed())?
-        {
-            return Ok(());
-        }
-
-        let status = client
-            .seal_status()
-            .await
-            .with_context(|| messages.error_openbao_seal_status_failed())?;
-        if !status.sealed {
-            return Ok(());
-        }
-
-        if !std::io::stdin().is_terminal() {
-            eprintln!("{}", messages.warning_openbao_sealed_non_interactive());
-            return Ok(());
-        }
-
-        let keys = prompt_unseal_keys_interactive(status.t, messages)?;
-        for key in &keys {
-            client
-                .unseal(key)
-                .await
-                .with_context(|| messages.error_openbao_unseal_failed())?;
-        }
-        let final_status = client
-            .seal_status()
-            .await
-            .with_context(|| messages.error_openbao_seal_status_failed())?;
-        if final_status.sealed {
-            anyhow::bail!(messages.error_openbao_sealed());
-        }
-        Ok(())
-    })
+            .with_context(|| messages.error_openbao_unseal_failed())?;
+    }
+    let final_status = client
+        .seal_status()
+        .await
+        .with_context(|| messages.error_openbao_seal_status_failed())?;
+    if final_status.sealed {
+        anyhow::bail!(messages.error_openbao_sealed());
+    }
+    Ok(())
 }
 
 /// Returns the `OpenBao` exposed compose override path when a
