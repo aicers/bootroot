@@ -51,6 +51,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot reinit`'s `infra up` pass racing the OpenBao listener
+  after the volume wipe and bailing with
+  `OpenBao init status check failed: Connection refused`. Docker
+  reports `bootroot-openbao` as Started before the OpenBao process has
+  bound its listener — on the TLS-enabled non-loopback bind exercised
+  by reinit-recovery, the listener typically takes several seconds to
+  accept connections. `run_infra_up`'s unseal helpers
+  (`auto_unseal_openbao` and `maybe_interactive_unseal`) now poll
+  `/v1/sys/seal-status` until the API answers before issuing the first
+  `is_initialized()` call. The same helpers also resolve the
+  `secrets_dir` from `state.json` and build their `OpenBaoClient` via
+  `with_local_trust`, so the post-recreate readiness probe runs over
+  the same step-ca-anchored trust store as the rest of the reinit
+  flow. (Part of #600)
 - Fixed `bootroot service add` and `bootroot init`'s second pass (the
   one reinit runs after wiping OpenBao) failing the TLS handshake with
   `UnknownIssuer` against a TLS-enabled OpenBao bind. The CLI's
