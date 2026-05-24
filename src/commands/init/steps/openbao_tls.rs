@@ -104,6 +104,11 @@ pub(in crate::commands::init) fn write_openbao_hcl_with_tls(
     messages: &Messages,
 ) -> Result<()> {
     let hcl_path = compose_dir.join(OPENBAO_HCL_PATH);
+    // The `audit` stanza must match the canonical openbao/openbao.hcl shipped
+    // with the repo. OpenBao >= 2.5 requires audit devices to be declared in
+    // the server configuration rather than enabled via the API, and `init`
+    // verifies that a file audit backend is present (see
+    // `OpenBaoClient::verify_audit_file`).
     let content = format!(
         r#"storage "file" {{
   path = "/openbao/file"
@@ -130,6 +135,14 @@ listener "tcp" {{
 telemetry {{
   prometheus_retention_time = "30s"
   disable_hostname = true
+}}
+
+audit {{
+  type = "file"
+  path = "file"
+  options {{
+    file_path = "/openbao/audit/audit.log"
+  }}
 }}
 
 disable_mlock = true
@@ -236,6 +249,11 @@ pub(crate) fn write_openbao_hcl_plaintext(compose_dir: &Path, messages: &Message
     if !hcl_path.exists() {
         return Ok(());
     }
+    // The `audit` stanza must match the canonical openbao/openbao.hcl shipped
+    // with the repo. OpenBao >= 2.5 requires audit devices to be declared in
+    // the server configuration rather than enabled via the API, and `init`
+    // verifies that a file audit backend is present (see
+    // `OpenBaoClient::verify_audit_file`).
     let content = r#"storage "file" {
   path = "/openbao/file"
 }
@@ -260,6 +278,14 @@ listener "tcp" {
 telemetry {
   prometheus_retention_time = "30s"
   disable_hostname = true
+}
+
+audit {
+  type = "file"
+  path = "file"
+  options {
+    file_path = "/openbao/audit/audit.log"
+  }
 }
 
 disable_mlock = true
@@ -430,6 +456,10 @@ mod tests {
         assert!(!api_block.contains("tls_disable"));
         // Telemetry listener should still have tls_disable.
         assert!(content.contains("tls_disable = 1"));
+        // File audit backend must be declared so init's
+        // `verify_audit_file` succeeds after the TLS rewrite.
+        assert!(content.contains("audit {"));
+        assert!(content.contains("file_path = \"/openbao/audit/audit.log\""));
     }
 
     #[test]
@@ -453,6 +483,10 @@ mod tests {
             tls_disable_count, 2,
             "both listeners must have tls_disable = 1"
         );
+        // Plaintext rewrite must preserve the file audit backend so init
+        // can run after a subsequent `--openbao-bind` reinstall cycle.
+        assert!(content.contains("audit {"));
+        assert!(content.contains("file_path = \"/openbao/audit/audit.log\""));
     }
 
     #[test]
