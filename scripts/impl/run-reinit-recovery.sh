@@ -463,6 +463,15 @@ run_bootstrap_init() {
 run_reinit() {
   local tag="$1"
   log_phase "reinit-${tag}"
+  # `--skip responder-check` mirrors the bootstrap `init` invocation
+  # above: this harness drives `bootroot` from the host CLI and the
+  # responder admin endpoint defaults to `http://bootroot-http01:8080`
+  # — a Docker-network DNS name that is not resolvable from the host.
+  # The bootstrap path overrides the URL to `http://localhost:8080`
+  # (and also skips the check); `bootroot reinit` does not accept
+  # `--responder-url`, so we propagate the skip instead.  Without it
+  # reinit's second init pass dies with `error sending request for url
+  # (http://bootroot-http01:8080/admin/http01)`.
   if ! BOOTROOT_LANG=en run_bootroot reinit \
     --yes \
     --no-eab \
@@ -470,6 +479,7 @@ run_reinit() {
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$ARTIFACT_DIR/reinit-summary-${tag}.json" \
     --enable auto-generate,show-secrets \
+    --skip responder-check \
     >"$ARTIFACT_DIR/reinit-${tag}.raw.log" 2>&1; then
     {
       echo "bootroot reinit failed (tag=${tag}, raw tail):"
