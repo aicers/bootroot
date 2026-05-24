@@ -204,18 +204,19 @@ pub(crate) fn verify_stepca_password_recoverable(
     let ca_json = secrets_dir.join("config").join("ca.json");
     let root_key = secrets_dir.join("secrets").join("root_ca_key");
     let intermediate_key = secrets_dir.join("secrets").join("intermediate_ca_key");
-    let has_ca_material =
-        ca_json.exists() && (root_key.exists() || intermediate_key.exists());
+    let has_ca_material = ca_json.exists() && (root_key.exists() || intermediate_key.exists());
     if !has_ca_material {
         return Ok(());
     }
-    anyhow::bail!(messages.error_reinit_stepca_password_missing_with_ca_material(
-        &password_path.display().to_string(),
-        &secrets_dir.display().to_string(),
-        &ca_json.display().to_string(),
-        &root_key.display().to_string(),
-        &intermediate_key.display().to_string(),
-    ));
+    anyhow::bail!(
+        messages.error_reinit_stepca_password_missing_with_ca_material(
+            &password_path.display().to_string(),
+            &secrets_dir.display().to_string(),
+            &ca_json.display().to_string(),
+            &root_key.display().to_string(),
+            &intermediate_key.display().to_string(),
+        )
+    );
 }
 
 /// Rejects an operator-supplied `--openbao-url` that differs from the
@@ -2274,8 +2275,7 @@ mod tests {
         let messages = test_messages();
         let err = verify_stepca_password_recoverable(secrets, &messages).unwrap_err();
         assert!(
-            err.to_string().contains("intermediate_ca_key")
-                || err.to_string().contains("ca.json"),
+            err.to_string().contains("intermediate_ca_key") || err.to_string().contains("ca.json"),
             "got: {err}"
         );
     }
