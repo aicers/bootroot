@@ -6,6 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `bootroot init` now accepts `--save-unseal-keys` and
+  `--no-save-unseal-keys` to non-interactively answer the
+  "Save unseal keys to file for automatic unseal? [y/N]" prompt,
+  which was the last remaining interactive prompt on the public `init`
+  surface. `--save-unseal-keys` writes the freshly generated keys to
+  `<secrets_dir>/openbao/unseal-keys.txt` (mode `0600`) without
+  prompting; `--no-save-unseal-keys` skips both the on-disk save and
+  the cleartext-echo fallback, and requires `--summary-json <path>`
+  (enforced at clap parse time) so the keys are captured in the 0600
+  summary JSON instead of being lost. The two flags are mutually
+  exclusive. When neither flag is set the interactive prompt (default
+  `N`) is preserved, so operators see no behavior change. Reinit's
+  internal auto-save path (`args.reinit_mode`) is unaffected.
+  (Closes #603)
+
 ### Security
 
 - Bumped `rustls-webpki` from 0.103.10 to 0.103.12 to address

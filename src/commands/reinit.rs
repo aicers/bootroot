@@ -846,6 +846,8 @@ fn init_args_for_reinit(
         eab_kid: None,
         eab_hmac: None,
         no_eab: args.no_eab,
+        save_unseal_keys: false,
+        no_save_unseal_keys: false,
         reinit_mode: true,
         root_token_output: args.root_token_output.clone(),
     })
