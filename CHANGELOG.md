@@ -255,24 +255,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   password generation under `reinit_mode` so `reinit --yes` never
   stalls on the step-ca password prompt (an existing `password.txt`
   is still preserved verbatim so the encrypted CA material remains
-  decryptable; when `password.txt` is absent **but** any preserved
-  step-ca artifact — `secrets/config/ca.json`,
+  decryptable; when `password.txt` is absent **but** any file
+  `step ca init` writes — `secrets/config/ca.json`,
+  `secrets/config/defaults.json`, `secrets/certs/root_ca.crt`,
+  `secrets/certs/intermediate_ca.crt`,
   `secrets/secrets/root_ca_key`, or
   `secrets/secrets/intermediate_ca_key` — is still on disk, reinit
   refuses to start before any destructive operation runs. Encrypted
   CA keys are blocking because a freshly generated password cannot
   be silently written into a deployment whose `password.txt` would
-  then fail to unlock the preserved CA keys; a stale
-  `secrets/config/ca.json` alone is equally blocking even without
-  encrypted key material because the second init pass's
-  `step ca init` cannot complete cleanly when its config target
-  already exists (it generates fresh cert/key files and then exits
-  non-zero on TTY-bound overwrite confirmation), recreating the
-  partial-init trap after OpenBao has already been wiped. The
-  safe fresh-CA rebuild path remains open whenever every preserved
-  step-ca artifact is absent; otherwise the operator restores
-  `password.txt` from a backup or removes every preserved step-ca
-  artifact to opt into a clean rebuild),
+  then fail to unlock the preserved CA keys; any other preserved
+  `step ca init` write (the `config/` and `certs/` files above) is
+  equally blocking even without encrypted key material because the
+  second init pass's `step ca init` cannot complete cleanly when
+  one of its targets already exists (it generates fresh cert/key
+  files and then exits non-zero on TTY-bound overwrite
+  confirmation), recreating the partial-init trap after OpenBao
+  has already been wiped. The safe fresh-CA rebuild path remains
+  open whenever every file `step ca init` writes is absent;
+  otherwise the operator restores `password.txt` from a backup or
+  removes every preserved step-ca artifact to opt into a clean
+  rebuild),
   the EAB registration prompt is skipped, and newly
   generated unseal keys are written automatically to
   `secrets/openbao/unseal-keys.txt` (mode `0600`). The optional

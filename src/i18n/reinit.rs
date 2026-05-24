@@ -233,9 +233,7 @@ impl Messages {
         &self,
         password_path: &str,
         secrets_dir: &str,
-        ca_json: &str,
-        root_key: &str,
-        intermediate_key: &str,
+        preserved_paths: &str,
     ) -> String {
         format_template(
             self.strings()
@@ -243,9 +241,7 @@ impl Messages {
             &[
                 ("password_path", password_path),
                 ("secrets_dir", secrets_dir),
-                ("ca_json", ca_json),
-                ("root_key", root_key),
-                ("intermediate_key", intermediate_key),
+                ("preserved_paths", preserved_paths),
             ],
         )
     }

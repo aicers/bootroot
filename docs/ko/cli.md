@@ -1681,27 +1681,32 @@ bootroot clean --openbao-only --yes
   프롬프트 억제, 이전 HMAC이 wipe된 OpenBao KV에 있었으므로 새
   HTTP-01 responder HMAC 자동 생성, EAB 등록 프롬프트 생략 — EAB
   자격증명이 필요한 운영자는 reinit 후 별도로 등록). `secrets/password.txt`
-  가 없고 보존된 step-ca 아티팩트(`secrets/config/ca.json`,
-  `secrets/secrets/root_ca_key`, `secrets/secrets/intermediate_ca_key`)
-  도 **전부** 없는 경우(rsync 복제 경로 또는 운영자가 제거함) step-ca
-  비밀번호도 비대화형으로 자동 생성되므로 `reinit --yes`가 비밀번호
+  가 없고 `step ca init`이 기록하는 모든 파일 —
+  `secrets/config/ca.json`, `secrets/config/defaults.json`,
+  `secrets/certs/root_ca.crt`, `secrets/certs/intermediate_ca.crt`,
+  `secrets/secrets/root_ca_key`,
+  `secrets/secrets/intermediate_ca_key` — 도 **전부** 없는
+  경우(rsync 복제 경로 또는 운영자가 제거함) step-ca 비밀번호도
+  비대화형으로 자동 생성되므로 `reinit --yes`가 비밀번호
   프롬프트에서 멈추지 않으며, 새 비밀번호는 두 번째 init 패스가 새로
   만드는 CA 자료를 암호화하기 위해 `secrets/password.txt`에 기록됩니다.
-  `secrets/password.txt`는 없지만 보존된 step-ca 아티팩트가 디스크에
-  **하나라도** 남아 있는 경우 — 암호화된 CA 키(`root_ca_key` /
-  `intermediate_ca_key`) 또는 단독 `config/ca.json` 모두 해당 —
-  reinit은 어떤 파괴적 작업도 수행하기 전에 시작을 거부합니다.
-  암호화된 CA 키는 원래 비밀번호로 암호화되어 있으므로 새 비밀번호를
-  생성하면 `password.txt`가 보존된 CA 키를 해독하지 못하게 되고,
-  이후의 `step certificate create --ca-password-file /home/step/password.txt`
-  경로(OpenBao / HTTP-01 TLS 발급)가 실패합니다. 단독 `config/ca.json`도
-  키 자료를 담고 있지 않음에도 동일하게 차단되어야 합니다. 두 번째
-  init 패스의 `step ca init`은 대상 config 파일이 이미 존재하면
-  정상적으로 완료되지 못하기 때문입니다(새 cert/key 파일을 생성한 뒤
-  TTY 기반 overwrite 확인에서 비정상 종료) — OpenBao가 이미 wipe된
-  뒤에 partial-init 트랩을 재현하게 됩니다. 백업에서 `password.txt`를
-  복구하거나, 보존된 모든 step-ca 아티팩트를 제거하여 CA를 새로
-  빌드하도록 한 뒤 다시 시도하세요.
+  `secrets/password.txt`는 없지만 위에 나열된 여섯 개 경로 중 어느
+  것이라도 디스크에 남아 있는 경우, reinit은 어떤 파괴적 작업도
+  수행하기 전에 시작을 거부합니다. 암호화된 CA 키(`root_ca_key` /
+  `intermediate_ca_key`)는 원래 비밀번호로 암호화되어 있으므로 새
+  비밀번호를 생성하면 `password.txt`가 보존된 CA 키를 해독하지
+  못하게 되고, 이후의 `step certificate create --ca-password-file
+  /home/step/password.txt` 경로(OpenBao / HTTP-01 TLS 발급)가
+  실패합니다. `step ca init`이 기록하는 다른 파일(`config/ca.json`,
+  `config/defaults.json`, `certs/root_ca.crt`,
+  `certs/intermediate_ca.crt`)도 암호화된 키 자료가 없더라도
+  동일하게 차단되어야 합니다. 두 번째 init 패스의 `step ca init`은
+  대상 파일 중 하나라도 이미 존재하면 정상적으로 완료되지 못하기
+  때문입니다(새 cert/key 파일을 생성한 뒤 TTY 기반 overwrite
+  확인에서 비정상 종료) — OpenBao가 이미 wipe된 뒤에 partial-init
+  트랩을 재현하게 됩니다. 백업에서 `password.txt`를 복구하거나,
+  보존된 모든 step-ca 아티팩트를 제거하여 CA를 새로 빌드하도록 한
+  뒤 다시 시도하세요.
 - `secrets/config/ca.json`에 보존된 step-ca 런타임 DSN을 읽어 두 번째
   init 패스에 주입하므로, 새로 재초기화된 OpenBao KV에는 보존된
   PostgreSQL 상태와 여전히 일치하는 자격증명이 기록됩니다. 이전에
