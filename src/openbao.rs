@@ -227,9 +227,10 @@ impl OpenBaoClient {
         })
     }
 
-    /// Creates a client that auto-anchors TLS verification to the step-ca
-    /// trust bundle at `<secrets_dir>/certs/{root_ca.crt,intermediate_ca.crt}`
-    /// when `base_url` is HTTPS and the root bundle exists.
+    /// Creates a client that augments the default Mozilla webpki trust
+    /// roots with the step-ca trust bundle at
+    /// `<secrets_dir>/certs/{root_ca.crt,intermediate_ca.crt}` when
+    /// `base_url` is HTTPS and the root bundle exists.
     ///
     /// Used by CLI commands that load the URL from `state.json`: after
     /// `init` switches `OpenBao` to TLS the URL becomes `https://...` but
@@ -238,6 +239,14 @@ impl OpenBaoClient {
     /// this anchor every post-init operator command (service add, status,
     /// rotate, the second `init` pass during reinit) would fail the TLS
     /// handshake with `UnknownIssuer`.
+    ///
+    /// The local PEM is *appended* to the webpki root store rather than
+    /// replacing it, so an externally-managed (publicly-trusted) HTTPS
+    /// `OpenBao` URL keeps verifying against the public CA even after
+    /// `init` has populated `<secrets_dir>/certs/`.  An earlier revision
+    /// of this constructor swapped the trust store to PEM-only and
+    /// regressed that path into `UnknownIssuer` once `root_ca.crt`
+    /// existed.
     ///
     /// The `OpenBao` TLS server cert is issued by `step certificate create`
     /// against the step-ca intermediate and written as a single leaf cert
@@ -282,7 +291,12 @@ impl OpenBaoClient {
                     }
                     ca_pem.push_str(&intermediate_pem);
                 }
-                return Self::with_pem_trust(base_url, &ca_pem, &[]);
+                let client = crate::tls::build_http_client_with_local_and_webpki_roots(&ca_pem)?;
+                return Ok(Self {
+                    base_url: base_url.trim_end_matches('/').to_string(),
+                    client,
+                    token: None,
+                });
             }
         }
         Self::new(base_url)
