@@ -81,6 +81,7 @@ DEFAULT_STEPCA_PASSWORD="reinit-recovery"
 RUNTIME_SERVICE_ADD_ROLE_ID=""
 RUNTIME_SERVICE_ADD_SECRET_ID=""
 CURRENT_PHASE="bootstrap"
+REPO_OPENBAO_SNAPSHOT_TAKEN=0
 
 # Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
 # default moved from 5432 to 5433 in #588 §4c; the harness expects
@@ -191,9 +192,19 @@ snapshot_repo_openbao_config() {
   if [ -d "$OPENBAO_REPO_TLS_DIR" ]; then
     cp -a "$OPENBAO_REPO_TLS_DIR" "$OPENBAO_TLS_SNAPSHOT"
   fi
+  # Mark the snapshot as taken so the EXIT trap's restore step is a
+  # no-op when the script fails before this point (e.g. prerequisite
+  # checks or bind-host availability) — otherwise the unconditional
+  # `rm -rf` below would delete any pre-existing operator-owned
+  # `openbao/config` or `openbao/tls` tree in the checkout without
+  # having a snapshot to replay.
+  REPO_OPENBAO_SNAPSHOT_TAKEN=1
 }
 
 restore_repo_openbao_config() {
+  if [ "$REPO_OPENBAO_SNAPSHOT_TAKEN" != "1" ]; then
+    return 0
+  fi
   if [ -f "$OPENBAO_HCL_SNAPSHOT" ]; then
     cp "$OPENBAO_HCL_SNAPSHOT" "$OPENBAO_REPO_HCL"
   fi
