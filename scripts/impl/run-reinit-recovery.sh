@@ -145,6 +145,13 @@ ensure_prerequisites() {
 capture_artifacts() {
   compose ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
   compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+  # Container-level OpenBao state, captured straight from inside the
+  # container so the diagnostic is unaffected by host networking flakes
+  # that may have caused the failure in the first place.
+  docker port "$OPENBAO_CONTAINER_NAME" >"$ARTIFACT_DIR/openbao-port.log" 2>&1 || true
+  docker exec -e BAO_ADDR="https://127.0.0.1:8200" -e BAO_SKIP_VERIFY=true \
+    "$OPENBAO_CONTAINER_NAME" bao status -format=json \
+    >"$ARTIFACT_DIR/openbao-bao-status.log" 2>&1 || true
 }
 
 cleanup() {
@@ -173,8 +180,31 @@ wait_for_openbao_listening() {
   fail "OpenBao did not become reachable at $url"
 }
 
+# Unseals via `docker exec` against the in-container CLI so the helper
+# does not depend on the host-published port being routable.  The
+# `--openbao-bind` flow publishes OpenBao on a non-loopback host IP
+# (docker0 gateway by default), and CI runners have occasionally
+# proven unreliable about reaching that host IP between port
+# rebinds during `init`'s TLS recreate.  Talking to OpenBao from
+# inside the container sidesteps that flake entirely.
 unseal_openbao_from_summary() {
-  local url="$1"
+  local container="${OPENBAO_CONTAINER_NAME}"
+  # Wait for the OpenBao API inside the container to become responsive
+  # before submitting unseal keys.  `init`'s TLS recreate leaves the
+  # container Started before the OpenBao process is fully listening.
+  # `bao status` exits 0 when unsealed and 2 when sealed-but-reachable;
+  # both states mean the listener is up and the unseal call is safe.
+  local probe_attempt
+  for probe_attempt in $(seq 1 "$OPENBAO_READY_ATTEMPTS"); do
+    local probe_rc=0
+    docker exec -e BAO_ADDR="https://127.0.0.1:8200" \
+      -e BAO_SKIP_VERIFY=true "$container" \
+      bao status -format=json >/dev/null 2>&1 || probe_rc=$?
+    if [ "$probe_rc" = "0" ] || [ "$probe_rc" = "2" ]; then
+      break
+    fi
+    sleep "$OPENBAO_READY_DELAY_SECS"
+  done
   # `bootroot init` always uses Shamir threshold=2; the summary JSON
   # does not record the threshold so feed the first two keys.
   local threshold=2
@@ -183,20 +213,25 @@ unseal_openbao_from_summary() {
     local key
     key="$(jq -r ".unseal_keys[$i] // empty" "$INIT_SUMMARY_JSON")"
     [ -n "$key" ] || fail "missing unseal key $i in $INIT_SUMMARY_JSON"
-    curl -kSs -m 5 -X PUT "${url}/v1/sys/unseal" \
-      -d "{\"key\":\"${key}\"}" >/dev/null
+    if ! docker exec -e BAO_ADDR="https://127.0.0.1:8200" \
+        -e BAO_SKIP_VERIFY=true "$container" \
+        bao operator unseal "$key" >/dev/null 2>>"$RUN_LOG"; then
+      fail "bao operator unseal failed (key $i)"
+    fi
   done
   local attempt
   for attempt in $(seq 1 "$OPENBAO_READY_ATTEMPTS"); do
     local sealed
-    sealed="$(curl -kSs -m 3 "${url}/v1/sys/seal-status" \
+    sealed="$(docker exec -e BAO_ADDR="https://127.0.0.1:8200" \
+      -e BAO_SKIP_VERIFY=true "$container" \
+      bao status -format=json 2>/dev/null \
       | jq -r '.sealed // "true"' 2>/dev/null || echo "true")"
     if [ "$sealed" = "false" ]; then
       return 0
     fi
     sleep "$OPENBAO_READY_DELAY_SECS"
   done
-  fail "OpenBao did not unseal within timeout at $url"
+  fail "OpenBao did not unseal within timeout via docker exec"
 }
 
 wait_for_postgres_admin() {
@@ -383,20 +418,21 @@ run_bootstrap_init() {
   [ -n "$RUNTIME_SERVICE_ADD_ROLE_ID" ] || fail "failed to parse runtime_service_add role_id"
   [ -n "$RUNTIME_SERVICE_ADD_SECRET_ID" ] || fail "failed to parse runtime_service_add secret_id"
 
-  # `bootroot init` returns as soon as `docker compose up -d openbao`
-  # reports the recreated container as Started, but OpenBao itself
-  # needs a couple of seconds to bind the TLS listener on the new
-  # `https://${OPENBAO_BIND_ADDR}` endpoint.  `service add` does not
-  # retry the AppRole login, so fire a readiness probe against the
-  # post-TLS URL first; otherwise the bootstrap races and fails with
-  # `Connection refused`.
-  wait_for_openbao_listening "https://${OPENBAO_BIND_ADDR}"
-
   # The TLS post-processing step recreates the OpenBao container, which
   # comes back sealed; `init` does not auto-unseal afterwards.  Without
   # this `service add` would fail with "Vault is sealed" on AppRole
   # login.  Replay the unseal keys captured in the bootstrap summary.
-  unseal_openbao_from_summary "https://${OPENBAO_BIND_ADDR}"
+  # Talks to OpenBao via `docker exec` so the unseal does not race
+  # against the host-side port publish coming back up after the
+  # recreate.
+  unseal_openbao_from_summary
+
+  # `service add` connects to OpenBao via state.openbao_url, which
+  # `bootroot init` set to `https://${OPENBAO_BIND_ADDR}`.  Make sure
+  # the host-published port is actually reachable before invoking the
+  # next bootroot command; otherwise the AppRole login fails with
+  # `Connection refused` rather than a clear diagnostic.
+  wait_for_openbao_listening "https://${OPENBAO_BIND_ADDR}"
 
   log_phase "bootstrap-service-add"
   run_bootroot service add \
