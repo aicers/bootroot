@@ -186,8 +186,11 @@ async fn run_service_add_preview(
         return;
     };
     {
-        let mut client = match OpenBaoClient::new(&state.openbao_url)
-            .with_context(|| messages.error_openbao_client_create_failed())
+        let mut client = match OpenBaoClient::with_local_trust(
+            &state.openbao_url,
+            state.secrets_dir(),
+        )
+        .with_context(|| messages.error_openbao_client_create_failed())
         {
             Ok(client) => client,
             Err(err) => {
@@ -261,7 +264,7 @@ async fn run_service_add_apply(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("OpenBao auth is required"))?;
 
-    let mut client = OpenBaoClient::new(&state.openbao_url)
+    let mut client = OpenBaoClient::with_local_trust(&state.openbao_url, state.secrets_dir())
         .with_context(|| messages.error_openbao_client_create_failed())?;
     authenticate_openbao_client(&mut client, auth, messages).await?;
 
@@ -471,7 +474,7 @@ async fn run_service_add_remote_idempotent(
     messages: &Messages,
 ) -> Result<()> {
     let secrets_dir = state.secrets_dir();
-    let mut client = OpenBaoClient::new(&state.openbao_url)
+    let mut client = OpenBaoClient::with_local_trust(&state.openbao_url, secrets_dir)
         .with_context(|| messages.error_openbao_client_create_failed())?;
     let auth = resolved
         .runtime_auth

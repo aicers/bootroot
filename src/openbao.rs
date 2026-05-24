@@ -227,6 +227,43 @@ impl OpenBaoClient {
         })
     }
 
+    /// Creates a client that auto-anchors TLS verification to the step-ca
+    /// root bundle at `<secrets_dir>/certs/root_ca.crt` when `base_url` is
+    /// HTTPS and the bundle exists.
+    ///
+    /// Used by CLI commands that load the URL from `state.json`: after
+    /// `init` switches `OpenBao` to TLS the URL becomes `https://...` but
+    /// the server cert is signed by step-ca's private root, which is not
+    /// in the webpki-roots store the default `Client` ships with.  Without
+    /// this anchor every post-init operator command (service add, status,
+    /// rotate, the second `init` pass during reinit) would fail the TLS
+    /// handshake with `UnknownIssuer`.
+    ///
+    /// Falls back to [`Self::new`] when `base_url` is HTTP or when the
+    /// bundle file does not exist — keeping the legacy plaintext-loopback
+    /// path and any externally-managed (publicly-trusted) HTTPS endpoint
+    /// working unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bundle exists but cannot be read or parsed,
+    /// or if the HTTP client fails to build.
+    pub fn with_local_trust(base_url: &str, secrets_dir: &std::path::Path) -> Result<Self> {
+        if base_url.starts_with("https://") {
+            let ca_path = secrets_dir.join("certs").join("root_ca.crt");
+            if ca_path.exists() {
+                let ca_pem = std::fs::read_to_string(&ca_path).with_context(|| {
+                    format!(
+                        "Failed to read OpenBao trust bundle at {}",
+                        ca_path.display()
+                    )
+                })?;
+                return Self::with_pem_trust(base_url, &ca_pem, &[]);
+            }
+        }
+        Self::new(base_url)
+    }
+
     /// Creates a new `OpenBao` client with a pre-configured
     /// [`reqwest::Client`].
     #[must_use]
@@ -1595,5 +1632,54 @@ mod tls_integration_tests {
             .health_check()
             .await
             .expect_err("health check should fail with wrong CA");
+    }
+
+    /// Proves `with_local_trust` reads the step-ca root bundle from
+    /// `<secrets_dir>/certs/root_ca.crt` so HTTPS verification succeeds
+    /// against a server cert signed by that same CA — the path post-init
+    /// `service add` and reinit's second `init` pass take when `openbao_url`
+    /// is `https://...`.
+    #[tokio::test]
+    async fn with_local_trust_loads_step_ca_bundle_for_https() {
+        let ca = TestCa::generate();
+        let server_cert = ca.sign_server_cert();
+        let port = start_tls_server(server_cert).await;
+
+        let secrets_dir = tempfile::tempdir().expect("tempdir");
+        let certs_dir = secrets_dir.path().join("certs");
+        std::fs::create_dir_all(&certs_dir).expect("create certs dir");
+        std::fs::write(certs_dir.join("root_ca.crt"), ca.pem()).expect("write root_ca.crt");
+
+        let client = OpenBaoClient::with_local_trust(
+            &format!("https://localhost:{port}"),
+            secrets_dir.path(),
+        )
+        .expect("client with local trust");
+
+        client
+            .health_check()
+            .await
+            .expect("health check should pass with step-ca root from secrets_dir");
+    }
+
+    /// Proves the helper degrades gracefully when no bundle exists: the
+    /// HTTP path (loopback before TLS is enabled) and the externally-
+    /// trusted HTTPS path keep using the default client.
+    #[tokio::test]
+    async fn with_local_trust_falls_back_to_default_when_bundle_missing() {
+        let secrets_dir = tempfile::tempdir().expect("tempdir");
+
+        // HTTP URL: always uses the default client.
+        let plain = OpenBaoClient::with_local_trust("http://127.0.0.1:1", secrets_dir.path())
+            .expect("http client");
+        assert_eq!(plain.base_url, "http://127.0.0.1:1");
+
+        // HTTPS URL with no bundle: still constructs (system roots), so
+        // an externally-trusted endpoint keeps working.  We don't drive a
+        // request here — just prove construction succeeds.
+        let external =
+            OpenBaoClient::with_local_trust("https://example.invalid", secrets_dir.path())
+                .expect("https client with no bundle still constructs");
+        assert_eq!(external.base_url, "https://example.invalid");
     }
 }

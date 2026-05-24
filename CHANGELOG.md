@@ -51,6 +51,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot service add` and `bootroot init`'s second pass (the
+  one reinit runs after wiping OpenBao) failing the TLS handshake with
+  `UnknownIssuer` against a TLS-enabled OpenBao bind. The CLI's
+  `OpenBaoClient` constructor used webpki-roots only, so the step-ca
+  private root that signs the OpenBao server cert was not trusted.
+  Added `OpenBaoClient::with_local_trust(url, secrets_dir)`, which
+  auto-anchors verification to `<secrets_dir>/certs/root_ca.crt` when
+  the URL is `https://...` and the bundle exists, and falls back to the
+  default client for HTTP (the pre-TLS loopback path) and for HTTPS
+  endpoints with no local bundle (externally-trusted CAs). Wired into
+  `service add`'s apply, preview, and remote-idempotent paths and into
+  the init orchestrator so the post-TLS operator surface stops
+  blackholing on the new `--openbao-bind` + `--openbao-tls-required`
+  topology the reinit-recovery E2E exercises. (Part of #600)
 - Fixed `bootroot service add` leaving the per-service OpenBao Agent
   sidecar unable to render its `agent.toml` when no EAB is configured
   (e.g., `bootroot init --no-eab`, bundled OSS step-ca). The sidecar
