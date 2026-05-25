@@ -1,4 +1,5 @@
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write as _;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -6,8 +7,91 @@ use tokio::fs;
 
 use crate::cert_group::{self, CA_BUNDLE_FILE_MODE, CertGroupPolicy};
 
-const KEY_FILE_MODE: u32 = 0o600;
+pub const KEY_FILE_MODE: u32 = 0o600;
 const SECRETS_DIR_MODE: u32 = 0o700;
+
+/// Writes `contents` to `path` atomically by staging it in a sibling
+/// temp file and `rename(2)`ing into place.
+///
+/// `bootroot-agent`'s daemon loop re-reads `agent.toml` on every ACME
+/// retry. A non-atomic `fs::write` opens the destination with
+/// `O_TRUNC` and then issues `write_all`, so a concurrent reader can
+/// observe a zero-byte or partially populated file in the gap. That
+/// surfaced in the field (#613) as renewal retries failing with
+/// "profile not found in reloaded config" and exhausting the retry
+/// budget against a transient race. Routing the write through a
+/// same-directory temp file + atomic rename closes the window: a
+/// reader sees either the previous file or the fully written new one.
+///
+/// The supplied `mode` is applied to the staged file before the
+/// rename so the on-disk mode never changes after the file appears at
+/// `path`. When `path` already exists, the existing uid/gid is also
+/// re-applied to the staged file before the rename so the caller does
+/// not silently re-own the destination to the writer's effective
+/// uid/gid (e.g. a `service add` run by root replacing an
+/// agent-readable file with a root-owned `0600` file the long-running
+/// agent process can no longer read).
+///
+/// # Errors
+/// Returns an error if the temp file cannot be created, written,
+/// permissioned, chowned (when ownership preservation is needed), or
+/// renamed.
+pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let dest = path.to_path_buf();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        // Capture the existing destination's uid/gid (if any) so the
+        // rename does not strip operator-meaningful ownership. Missing
+        // file -> None; do not chown the staged file in that case so a
+        // fresh create keeps process default ownership.
+        let existing_owner = std::fs::metadata(&dest).ok().map(|m| (m.uid(), m.gid()));
+
+        let mut tmp = tempfile::NamedTempFile::new_in(&parent)
+            .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
+        tmp.as_file_mut()
+            .write_all(&payload)
+            .with_context(|| format!("Failed to write temp file for {}", dest.display()))?;
+        tmp.as_file_mut()
+            .sync_all()
+            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
+            || {
+                format!(
+                    "Failed to set mode {mode:o} on temp file for {}",
+                    dest.display()
+                )
+            },
+        )?;
+        if let Some((dest_uid, dest_gid)) = existing_owner {
+            let tmp_meta = std::fs::metadata(tmp.path())
+                .with_context(|| format!("Failed to stat temp file for {}", dest.display()))?;
+            if tmp_meta.uid() != dest_uid || tmp_meta.gid() != dest_gid {
+                std::os::unix::fs::chown(tmp.path(), Some(dest_uid), Some(dest_gid)).with_context(
+                    || {
+                        format!(
+                            "Failed to preserve existing uid={dest_uid} gid={dest_gid} on {}",
+                            dest.display()
+                        )
+                    },
+                )?;
+            }
+        }
+        tmp.persist(&dest).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to rename temp file to {}: {}",
+                dest.display(),
+                e.error
+            )
+        })?;
+        Ok(())
+    })
+    .await
+    .context("Atomic write task panicked")?
+}
 
 /// Ensures the secrets directory exists and has secure permissions.
 ///
@@ -348,6 +432,107 @@ mod tests {
         assert_eq!(mode, CA_BUNDLE_FILE_MODE);
         let contents = fs::read_to_string(&bundle_path).await.unwrap();
         assert_eq!(contents, "FRESH");
+    }
+
+    /// `atomic_write` must leave the destination at the supplied mode
+    /// and the requested contents, both for the create case and for
+    /// the overwrite case (rotation).
+    #[tokio::test]
+    async fn atomic_write_creates_and_overwrites_with_mode() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+
+        super::atomic_write(&path, b"first", KEY_FILE_MODE)
+            .await
+            .unwrap();
+        let contents = fs::read_to_string(&path).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(contents, "first");
+        assert_eq!(mode, KEY_FILE_MODE);
+
+        super::atomic_write(&path, b"second", KEY_FILE_MODE)
+            .await
+            .unwrap();
+        let contents = fs::read_to_string(&path).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(contents, "second");
+        assert_eq!(mode, KEY_FILE_MODE);
+    }
+
+    /// Overwriting an existing file via `atomic_write` must preserve
+    /// the destination's gid. The rename otherwise replaces the inode
+    /// with one owned by the writer's effective uid/gid — locking out
+    /// readers in deployments that rely on group ownership (e.g.
+    /// `bootroot-agent` reading an `agent.toml` originally written
+    /// under a cert-group gid, then re-run by root). Requires a
+    /// supplementary gid (see `one_supplementary_test_gid`).
+    #[tokio::test]
+    async fn atomic_write_preserves_existing_gid_on_overwrite() {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(gid) = crate::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+
+        super::atomic_write(&path, b"first", KEY_FILE_MODE)
+            .await
+            .unwrap();
+        std::os::unix::fs::chown(&path, None, Some(gid))
+            .expect("test process must be able to chgrp to a supplementary gid");
+        let pre_meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(pre_meta.gid(), gid, "seed gid must take effect");
+        let pre_uid = pre_meta.uid();
+
+        super::atomic_write(&path, b"second", KEY_FILE_MODE)
+            .await
+            .unwrap();
+
+        let post_meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            post_meta.gid(),
+            gid,
+            "atomic_write overwrite must preserve existing gid"
+        );
+        assert_eq!(
+            post_meta.uid(),
+            pre_uid,
+            "atomic_write overwrite must preserve existing uid"
+        );
+        assert_eq!(
+            post_meta.permissions().mode() & 0o777,
+            KEY_FILE_MODE,
+            "atomic_write overwrite must still apply the requested mode"
+        );
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "second");
+    }
+
+    /// `atomic_write` must not leave the destination at an
+    /// intermediate state if the rename happens to fail — but in the
+    /// common success case, the temp sibling must be cleaned up
+    /// (i.e. the destination's parent directory contains exactly the
+    /// one file after the call).
+    #[tokio::test]
+    async fn atomic_write_cleans_up_temp_sibling_on_success() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+
+        super::atomic_write(&path, b"payload", KEY_FILE_MODE)
+            .await
+            .unwrap();
+
+        let mut entries = Vec::new();
+        let mut rd = fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = rd.next_entry().await.unwrap() {
+            entries.push(entry.file_name());
+        }
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected only the final file, got {entries:?}"
+        );
+        assert_eq!(entries[0], "agent.toml");
     }
 
     /// Under an active `--cert-group` policy, the bundle file must be

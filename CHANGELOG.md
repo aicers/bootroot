@@ -51,6 +51,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot-agent` burning its renewal retry budget against a
+  transient `agent.toml` race. The retry loop introduced by #303
+  re-reads `agent.toml` on every ACME attempt; if a concurrent
+  `bootroot service add` or `OpenBao` Agent sidecar render was mid-write
+  on that file, the reader could observe a truncated file or one that
+  did not yet contain the named profile, and the daemon would fail the
+  attempt with `Profile '<name>' not found in reloaded config` —
+  exhausting the retry budget against a microsecond-scale file race
+  rather than real ACME work. Two changes close the window:
+  `apply_local_service_configs` now writes `agent.toml` via a
+  same-directory temp file + atomic `rename(2)` through the new
+  `fs_util::atomic_write` helper, so a concurrent reader sees either
+  the previous file or the fully written new one; and on the consumer
+  side, `bootroot-agent`'s retry path falls back to the previously
+  loaded in-memory profile (logging at WARN) when the reload itself
+  fails or the named profile is absent from the reloaded file, instead
+  of failing the attempt. When the reload lands on a coherent file
+  the original #303 intent is preserved — freshly-rendered KV values
+  still win. Note that the separate "agent stops logging after retry
+  exhaustion" diagnostic flagged in the issue is unrelated to this
+  retry path and is tracked separately. (Closes #613)
 - Fixed `bootroot reinit` failing immediately with
   `could not derive compose project name from` followed by a trailing
   empty string whenever `--compose-file` was left at its default relative

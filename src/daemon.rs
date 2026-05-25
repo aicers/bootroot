@@ -340,23 +340,17 @@ async fn issue_with_retry(
     let config_path_owned = runtime.config_path.clone();
     let cli_overrides = runtime.cli_overrides.clone();
     let insecure_mode = runtime.insecure_mode;
+    let fallback = (settings.clone(), profile.clone());
     issue_with_retry_inner(
         || {
             let path = config_path_owned.clone();
             let domain = profile_domain.clone();
             let eab = eab.clone();
             let overrides = cli_overrides.clone();
+            let fallback = fallback.clone();
             async move {
-                let mut fresh = config::Settings::new(Some(path))?;
-                fresh.apply_overrides(&overrides);
-                let fresh_profile = fresh
-                    .profiles
-                    .iter()
-                    .find(|p| config::profile_domain(&fresh, p) == domain)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Profile '{domain}' not found in reloaded config")
-                    })?
-                    .clone();
+                let (fresh, fresh_profile) =
+                    reload_profile_or_fallback(&path, &overrides, &domain, fallback);
                 let fresh_eab = profile::resolve_profile_eab(&fresh_profile, eab);
                 acme::issue_certificate(&fresh, &fresh_profile, fresh_eab, insecure_mode).await
             }
@@ -365,6 +359,56 @@ async fn issue_with_retry(
         backoff,
     )
     .await
+}
+
+/// Reloads `agent.toml` for a single retry attempt and locates the
+/// target profile. Falls back to the supplied in-memory pair when the
+/// reload fails or the profile is absent from the reloaded file.
+///
+/// The fallback path exists because the `OpenBao` Agent sidecar still
+/// renders `agent.toml` non-atomically (truncate-then-write), so a
+/// concurrent reader can observe a partial file or one that does not
+/// yet contain the named profile. `apply_local_service_configs` was
+/// updated alongside this fix to write through
+/// [`crate::fs_util::atomic_write`] and no longer contributes to the
+/// race, but until the sidecar path is hardened the consumer-side
+/// fallback is the load-bearing guarantee. Treating those races as
+/// transient and reusing the prior in-memory profile keeps the retry
+/// budget available for genuine ACME failures, while still honouring
+/// `#303`'s intent of picking up freshly-rendered KV values whenever
+/// the reload does land on a coherent file.
+fn reload_profile_or_fallback(
+    config_path: &Path,
+    overrides: &config::CliOverrides,
+    profile_domain: &str,
+    fallback: (config::Settings, config::DaemonProfileSettings),
+) -> (config::Settings, config::DaemonProfileSettings) {
+    match config::Settings::new(Some(config_path.to_path_buf())) {
+        Ok(mut fresh) => {
+            fresh.apply_overrides(overrides);
+            if let Some(matched) = fresh
+                .profiles
+                .iter()
+                .find(|p| config::profile_domain(&fresh, p) == profile_domain)
+                .cloned()
+            {
+                (fresh, matched)
+            } else {
+                tracing::warn!(
+                    "Profile '{profile_domain}' missing from reloaded agent config; \
+                     using previously-loaded profile for this attempt"
+                );
+                fallback
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Failed to reload agent config while renewing '{profile_domain}' ({err}); \
+                 using previously-loaded profile for this attempt"
+            );
+            fallback
+        }
+    }
 }
 
 fn select_retry_backoff<'a>(
@@ -1044,5 +1088,114 @@ mod tests {
             1,
             "only the force path should have issued; periodic must observe the rotated cert under the lock and skip",
         );
+    }
+
+    fn fallback_pair() -> (config::Settings, config::DaemonProfileSettings) {
+        let mut settings = build_settings(vec![5, 10]);
+        settings.domain = "trusted.domain".to_string();
+        settings.email = "fallback@example.com".to_string();
+        let profile = build_profile(PathBuf::from("/tmp/fallback.pem"));
+        (settings, profile)
+    }
+
+    fn write_agent_toml_with_profile(file: &Path, email: &str) {
+        let body = format!(
+            r#"
+domain = "trusted.domain"
+email = "{email}"
+[acme]
+http_responder_url = "http://localhost:8080"
+http_responder_hmac = "dev-hmac"
+
+[[profiles]]
+service_name = "edge-proxy"
+instance_id = "001"
+hostname = "edge-node-01"
+
+[profiles.paths]
+cert = "certs/edge-proxy-a.pem"
+key = "certs/edge-proxy-a.key"
+"#
+        );
+        fs::write(file, body).unwrap();
+    }
+
+    fn write_agent_toml_without_profile(file: &Path) {
+        let body = r#"
+domain = "trusted.domain"
+email = "reloaded@example.com"
+[acme]
+http_responder_url = "http://localhost:8080"
+http_responder_hmac = "dev-hmac"
+"#;
+        fs::write(file, body).unwrap();
+    }
+
+    /// When the reloaded config contains the target profile, the fresh
+    /// values must win — this preserves the original intent of #303
+    /// (pick up freshly-rendered KV values across retries).
+    #[test]
+    fn reload_profile_or_fallback_uses_fresh_when_profile_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        write_agent_toml_with_profile(&path, "reloaded@example.com");
+        let (fallback_settings, fallback_profile) = fallback_pair();
+        let domain = config::profile_domain(&fallback_settings, &fallback_profile);
+
+        let (settings, _profile) = reload_profile_or_fallback(
+            &path,
+            &config::CliOverrides::default(),
+            &domain,
+            (fallback_settings.clone(), fallback_profile.clone()),
+        );
+
+        assert_eq!(settings.email, "reloaded@example.com");
+        assert_ne!(settings.email, fallback_settings.email);
+    }
+
+    /// When the reloaded file is coherent but the named profile is
+    /// missing (the race observed in #613), the fallback pair must be
+    /// returned so the retry consumes ACME work rather than the retry
+    /// budget against a transient file race.
+    #[test]
+    fn reload_profile_or_fallback_uses_fallback_when_profile_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        write_agent_toml_without_profile(&path);
+        let (fallback_settings, fallback_profile) = fallback_pair();
+        let domain = config::profile_domain(&fallback_settings, &fallback_profile);
+
+        let (settings, profile) = reload_profile_or_fallback(
+            &path,
+            &config::CliOverrides::default(),
+            &domain,
+            (fallback_settings.clone(), fallback_profile.clone()),
+        );
+
+        assert_eq!(settings.email, fallback_settings.email);
+        assert_eq!(profile.service_name, fallback_profile.service_name);
+        assert_eq!(profile.instance_id, fallback_profile.instance_id);
+    }
+
+    /// When the reload itself fails — corrupt TOML, mid-truncate
+    /// reader, etc. — the fallback pair must be returned for the same
+    /// retry-budget reason.
+    #[test]
+    fn reload_profile_or_fallback_uses_fallback_when_reload_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(&path, "this = = = is not valid toml").unwrap();
+        let (fallback_settings, fallback_profile) = fallback_pair();
+        let domain = config::profile_domain(&fallback_settings, &fallback_profile);
+
+        let (settings, profile) = reload_profile_or_fallback(
+            &path,
+            &config::CliOverrides::default(),
+            &domain,
+            (fallback_settings.clone(), fallback_profile.clone()),
+        );
+
+        assert_eq!(settings.email, fallback_settings.email);
+        assert_eq!(profile.service_name, fallback_profile.service_name);
     }
 }
