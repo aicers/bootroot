@@ -250,6 +250,284 @@ async fn test_app_add_approle_permission_denied_fails() {
     assert!(stderr.contains("OpenBao policy write failed"));
 }
 
+/// Issue #607: `service add` must `mkdir -p` the parent dirs of the
+/// operator-supplied `--agent-config` / `--cert-path` / `--key-path`
+/// values instead of bailing out with `Parent directory not found`,
+/// which used to force every cold rebuild to keep an out-of-band
+/// `mkdir -p` chain in sync with the flag values.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_creates_missing_parent_dirs_for_output_paths() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+
+    // Deep nested paths whose parents do NOT exist on disk.  The cert
+    // and key parents are intentionally different to exercise both
+    // branches of `write_cert_and_key`.
+    let agent_config = temp_dir.path().join("config/edge-proxy/agent.toml");
+    let cert_path = temp_dir.path().join("mtls/certs/edge-proxy.crt");
+    let key_path = temp_dir.path().join("mtls/private/edge-proxy.key");
+    assert!(!agent_config.parent().unwrap().exists());
+    assert!(!cert_path.parent().unwrap().exists());
+    assert!(!key_path.parent().unwrap().exists());
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Parent directory not found"),
+        "service add must no longer reject missing output parents: {stderr}"
+    );
+
+    // The agent-config write boundary in `local_config.rs` created the
+    // chain and wrote the operator's TOML on top of it.
+    assert!(
+        agent_config.parent().unwrap().exists(),
+        "agent_config parent must be created by service add"
+    );
+    let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
+    assert!(agent_contents.contains("service_name = \"edge-proxy\""));
+
+    // The cert parent is created via the CA-bundle write
+    // (`write_local_ca_bundle` → `ensure_secrets_dir`); the key parent
+    // is created lazily by `write_cert_and_key` at the first rotation,
+    // so we do not assert its existence here.
+    assert!(
+        cert_path.parent().unwrap().exists(),
+        "cert parent must be created by service add (ca-bundle write boundary)"
+    );
+}
+
+/// Issue #607: pre-existing parent dirs with operator-tightened modes
+/// (e.g. `0700`) must NOT be widened by `service add`.  `create_dir_all`
+/// is supposed to leave existing components untouched, but this guards
+/// against future regressions that mistakenly chmod the dir.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_preserves_existing_parent_dir_mode() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+
+    let config_parent = temp_dir.path().join("config");
+    fs::create_dir_all(&config_parent).expect("create config dir");
+    fs::set_permissions(&config_parent, fs::Permissions::from_mode(0o700))
+        .expect("tighten parent mode");
+    let agent_config = config_parent.join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
+
+    let before = fs::metadata(&config_parent).unwrap().permissions().mode() & 0o777;
+    assert_eq!(before, 0o700);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let after = fs::metadata(&config_parent).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        after, 0o700,
+        "pre-existing parent dir mode must not be widened by service add"
+    );
+}
+
+/// Issue #607: when the `--agent-config` parent path collides with an
+/// existing regular file, `create_dir_all` must surface a clear error
+/// (wrapped with the localized `error_write_file_failed` template)
+/// rather than panicking or producing a generic libc message.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_fails_when_agent_config_parent_is_a_file() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+
+    // Stage a regular file where service add will try to mkdir its
+    // parent.  `create_dir_all("blocker/agent.toml-dir")` must fail.
+    let blocker = temp_dir.path().join("blocker");
+    fs::write(&blocker, b"not a directory").expect("stage blocker file");
+    let agent_config = blocker.join("agent.toml");
+    let cert_path = temp_dir.path().join("certs/edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs/edge-proxy.key");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "service add must fail when agent-config parent collides with a file; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Failed to write")
+            && stderr.contains(agent_config.to_string_lossy().as_ref()),
+        "expected localized write-failure for agent-config path, got:\n{stderr}"
+    );
+}
+
+/// Issue #607: `--dry-run` / `--print-only` must remain side-effect-
+/// free even when output-path parents do not exist.  Resolution lives
+/// in `resolve.rs` (no filesystem writes), and the actual mkdir lives
+/// in `local_config.rs`, so preview-mode never reaches it.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_print_only_does_not_create_missing_parent_dirs() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("config/edge-proxy/agent.toml");
+    let cert_path = temp_dir.path().join("mtls/edge-proxy.crt");
+    let key_path = temp_dir.path().join("mtls-key/edge-proxy.key");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+        ])
+        .output()
+        .expect("run service add");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !agent_config.parent().unwrap().exists(),
+        "--print-only must not create agent_config parent"
+    );
+    assert!(
+        !cert_path.parent().unwrap().exists(),
+        "--print-only must not create cert parent"
+    );
+    assert!(
+        !key_path.parent().unwrap().exists(),
+        "--print-only must not create key parent"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_print_only_shows_snippets_without_writes() {
@@ -425,8 +703,13 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
     stub_app_add_openbao(&server, "edge-proxy").await;
     stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
+    // Service add only revalidates a path when the parent is missing
+    // (`must_exist=true`).  Issue #607 dropped that gate for output paths
+    // so `service add` can `create_dir_all` them at the write boundary;
+    // the only remaining reprompt-on-invalid path here is the deploy
+    // type (`invalid` → `daemon`) and the empty instance id.
     let input = format!(
-        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\n{}\nmissing/edge-proxy.crt\n{}\n{}\n\n001\n",
+        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),

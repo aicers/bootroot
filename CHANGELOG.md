@@ -51,6 +51,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot service add` bailing with `Parent directory not found`
+  when the parent of `--agent-config`, `--cert-path`, or `--key-path`
+  did not already exist. `service add` is the authoritative writer for
+  those files, so requiring an out-of-band `mkdir -p` chain in sync
+  with the flag values was gratuitous and was the typical first-time
+  failure mode on a cold rebuild. The resolve-side gate now only
+  applies to read-only inputs (`must_exist=true`); the agent-config
+  parent is created at the write boundary in `local_config.rs` via
+  `create_dir_all`, while cert/key parents continue to be created by
+  `fs_util::write_cert_and_key` under the existing `cert_group`
+  permission policy (so a `--cert-group` 0750 key parent is not
+  flattened to 0755). `create_dir_all` leaves pre-existing components
+  untouched, so an operator-tightened directory mode is preserved.
+  `--dry-run` / `--print-only` remain side-effect-free because
+  resolution does not touch the filesystem. (Closes #607)
 - Fixed `bootroot init`'s second pass (the one `reinit` runs after wiping
   OpenBao) recreating the OpenBao container without its
   `openbao-exposed` compose override and dropping the non-loopback

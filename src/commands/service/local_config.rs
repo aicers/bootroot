@@ -118,6 +118,19 @@ pub(super) async fn apply_local_service_configs(
         messages,
     )
     .await?;
+    // `service add` is the authoritative writer for the operator's
+    // `agent.toml`; create its parent chain if missing so callers do not
+    // have to keep a separate `mkdir -p` in sync with `--agent-config`.
+    // `create_dir_all` leaves pre-existing components untouched (mode
+    // and ownership), so an operator-tightened directory is not widened.
+    // Newly created components use process umask (0755 by default).
+    if let Some(parent) = resolved.agent_config.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).await.with_context(|| {
+            messages.error_write_file_failed(&resolved.agent_config.display().to_string())
+        })?;
+    }
     fs::write(&resolved.agent_config, &next)
         .await
         .with_context(|| {
