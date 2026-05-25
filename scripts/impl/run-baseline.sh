@@ -176,6 +176,7 @@ bootstrap_all() {
 
 assert_state_and_isolation() {
   python3 - "$SERVICES_TSV" "$ARTIFACT_DIR" <<'PY'
+import base64
 import hashlib
 import json
 import sys
@@ -223,13 +224,31 @@ for item in services:
     expected_hmac = f"synced-responder-hmac-{service}-v1"
     if expected_hmac not in agent_config:
         raise SystemExit(f"responder hmac missing in agent config for {service}")
-    expected_fp = hashlib.sha256(f"{service}-v1".encode('utf-8')).hexdigest()
+
+    # The mock now returns a real self-signed CA per (service, version),
+    # so derive the expected fingerprint from the bundle PEM rather than
+    # the previous hardcoded `sha256("{service}-v1")` placeholder. Issue
+    # #622 enforces that every fingerprint in `trust.trusted_ca_sha256`
+    # is actually present in the bundle, so the two must agree.
+    ca_bundle_contents = item["ca_bundle_path"].read_text(encoding='utf-8')
+    pem_blocks = []
+    in_block = False
+    buffer = []
+    for line in ca_bundle_contents.splitlines():
+        if line.strip() == "-----BEGIN CERTIFICATE-----":
+            in_block = True
+            buffer = []
+        elif line.strip() == "-----END CERTIFICATE-----":
+            if in_block:
+                pem_blocks.append("".join(buffer))
+            in_block = False
+        elif in_block:
+            buffer.append(line.strip())
+    if not pem_blocks:
+        raise SystemExit(f"ca_bundle has no CERTIFICATE block for {service}")
+    expected_fp = hashlib.sha256(base64.b64decode(pem_blocks[0])).hexdigest()
     if expected_fp not in agent_config:
         raise SystemExit(f"trusted_ca_sha256 missing in agent config for {service}")
-
-    ca_bundle_contents = item["ca_bundle_path"].read_text(encoding='utf-8')
-    if f"SMOKE-{service}-v1" not in ca_bundle_contents:
-        raise SystemExit(f"ca_bundle mismatch for {service}")
 
     output_file = artifact / f"bootstrap-output-{node}-{service}.json"
     if not output_file.exists():

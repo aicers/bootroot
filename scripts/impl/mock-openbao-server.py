@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+import base64
 import hashlib
 import json
 import os
 import re
+import subprocess
+import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("MOCK_OPENBAO_PORT", "18200"))
@@ -11,6 +14,58 @@ SERVICE_PATH_PATTERN = re.compile(r"^/v1/secret/data/bootroot/services/([^/]+)/(
 CONTROL_ITEMS = {"secret_id", "eab", "http_responder_hmac", "trust"}
 versions: dict[tuple[str, str], int] = {}
 fail_next: dict[tuple[str, str], int] = {}
+# Cache real self-signed CA certs keyed by (service, version) so each
+# rotation cycle returns a *parseable* PEM with a matching DER SHA-256.
+# `bootroot verify` (issue #622) now bails when any fingerprint in
+# `trust.trusted_ca_sha256` is missing from `trust.ca_bundle_path`, so
+# the synthetic "SMOKE-..." placeholder this mock used previously trips
+# the new check on the first rotation cycle.
+_trust_cache: dict[tuple[str, int], tuple[str, str]] = {}
+
+
+def synthetic_trust_anchor(service: str, version: int) -> tuple[str, str]:
+    """Generates a real self-signed CA cert PEM and its DER SHA-256.
+
+    Cached per (service, version) so repeated reads within a cycle
+    return identical bytes (otherwise `write_secret_file` would never
+    settle on `Unchanged` and the agent.toml diff would flap).
+    """
+    key = (service, version)
+    cached = _trust_cache.get(key)
+    if cached is not None:
+        return cached
+    with tempfile.TemporaryDirectory() as tmp:
+        cert_path = os.path.join(tmp, "cert.pem")
+        key_path = os.path.join(tmp, "key.pem")
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-nodes",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                key_path,
+                "-out",
+                cert_path,
+                "-days",
+                "1",
+                "-subj",
+                f"/CN=mock-trust-{service}-v{version}",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with open(cert_path, encoding="utf-8") as fh:
+            pem = fh.read()
+    der = base64.b64decode(
+        "".join(line for line in pem.splitlines() if not line.startswith("-----"))
+    )
+    fingerprint = hashlib.sha256(der).hexdigest()
+    _trust_cache[key] = (pem, fingerprint)
+    return pem, fingerprint
 
 
 def write_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -104,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             if secret_kind == "trust":
-                fingerprint = hashlib.sha256(f"{service}-v{version}".encode()).hexdigest()
+                pem, fingerprint = synthetic_trust_anchor(service, version)
                 write_json(
                     self,
                     200,
@@ -112,11 +167,7 @@ class Handler(BaseHTTPRequestHandler):
                         "data": {
                             "data": {
                                 "trusted_ca_sha256": [fingerprint],
-                                "ca_bundle_pem": (
-                                    "-----BEGIN CERTIFICATE-----\n"
-                                    f"SMOKE-{service}-v{version}\n"
-                                    "-----END CERTIFICATE-----"
-                                ),
+                                "ca_bundle_pem": pem,
                             }
                         }
                     },
