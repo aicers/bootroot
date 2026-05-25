@@ -51,6 +51,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot-agent` overwriting `ca-bundle.pem` with the ACME
+  response chain alone, silently dropping the root that `service add`
+  had seeded. For a stock step-ca deployment the ACME chain contains
+  only the intermediate, so the post-issuance bundle no longer
+  terminated at a self-signed anchor and default-config TLS clients
+  (Node `tls.connect`, `openssl verify` without `-partial_chain`) failed
+  with `unable to get issuer certificate` even though `service add`,
+  `bootroot verify`, and `bootroot status` all reported green. The
+  agent now reads the existing bundle, keeps every block whose DER
+  SHA-256 is listed in `[trust].trusted_ca_sha256` (filtering out junk
+  from prior misconfigurations), unions it with the new ACME chain
+  deduped by fingerprint, and writes the merged result. The test
+  helper goes through the same `write_merged_ca_bundle` path as the
+  production code, so the chain-only write cannot be reintroduced in
+  only one of them. The merge step also fails closed when the existing
+  bundle cannot be read (permissions, ACL drift, or any I/O error other
+  than `NotFound`), so a bundle the agent could not inspect is never
+  silently overwritten with only the ACME chain. `bootroot verify` now
+  also fails when any fingerprint in `trusted_ca_sha256` is absent from
+  `ca_bundle_path`, closing the silent-failure surface so the
+  truncation cannot recur unobserved. (Closes #622)
 - Fixed `bootroot rotate ca-key` phase 5 listing every `local-file`
   service in its "Consumer reload/restart required" hint regardless of
   whether the rotation actually wiped and signaled the service. On a

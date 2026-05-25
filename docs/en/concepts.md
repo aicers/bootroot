@@ -54,15 +54,23 @@ Because Bootroot does not use an external CA, the root CA is step-ca's
 self-signed root certificate, and the intermediate CA certificate is signed by
 that root CA.
 
-- bootroot-agent splits the chain from the ACME response and writes it to
-  `ca_bundle_path`.
+- bootroot-agent **merges** the chain from the ACME response with the
+  trusted certs already present in `ca_bundle_path`, deduped by fingerprint,
+  so the trust anchors seeded by `service add` (root + intermediate)
+  are preserved across every issuance.
 - mTLS services load that bundle to **accept only certificates issued by the
   same step-ca**.
 
 The ACME certificate response is typically a **concatenated PEM** string.
 The first PEM block is the **leaf certificate**, followed by the **chain**
-(intermediate/root). bootroot-agent parses the PEM blocks in order, keeps the
-first block as the leaf, and writes the remaining blocks to `ca_bundle_path`.
+(usually just the intermediate on a stock step-ca deployment). bootroot-agent
+parses the PEM blocks in order and keeps the first block as the leaf. The
+remaining blocks are merged into `ca_bundle_path`: any cert already on disk
+whose SHA-256 is listed in `trusted_ca_sha256` is kept, and the new chain
+blocks are appended, deduped by fingerprint. This preserves the self-signed
+root that consumers need to terminate the chain — overwriting with the
+chain alone would strip the root and break default-config TLS clients
+(`Node tls.connect`, `openssl verify` without `-partial_chain`).
 
 ## CSR (Certificate Signing Request)
 

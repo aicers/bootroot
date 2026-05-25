@@ -191,7 +191,9 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 #### 1) 개념 구분
 
 1. **mTLS 신뢰**: 서비스가 상대 인증서를 검증할 때 사용할 신뢰 번들입니다.
-   bootroot-agent는 발급 응답의 체인(중간/루트)을 `ca_bundle_path`에 저장합니다.
+   매 발급마다 bootroot-agent는 ACME 응답 체인을 `ca_bundle_path`에 이미
+   있던 신뢰 인증서들과 지문 기준으로 중복 제거 후 병합하므로,
+   `service add`가 시드한 루트가 그대로 보존됩니다.
 2. **ACME 서버 TLS 검증**: bootroot-agent가 step-ca(ACME 서버)와 통신할 때
    서버 인증서를 검증하는 동작입니다. mTLS 신뢰와는 별도입니다.
 

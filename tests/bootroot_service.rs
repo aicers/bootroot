@@ -1948,14 +1948,15 @@ async fn stub_app_add_trust_present_with_token(server: &MockServer, token: &str)
         .mount(server)
         .await;
 
+    let (ca_pem, ca_fp) = support::test_trust_material();
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/ca"))
         .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "data": {
-                    "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-                    "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nTRUST\n-----END CERTIFICATE-----"
+                    "trusted_ca_sha256": [ca_fp],
+                    "ca_bundle_pem": ca_pem
                 }
             }
         })))
@@ -2038,13 +2039,14 @@ async fn stub_app_add_service_sync_material_with_token(
         .mount(server)
         .await;
 
+    let (ca_pem, ca_fp) = support::test_trust_material();
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/ca"))
         .and(header("X-Vault-Token", token))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "data": {
-                "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+                "trusted_ca_sha256": [ca_fp],
+                "ca_bundle_pem": ca_pem
             } }
         })))
         .mount(server)
@@ -3112,12 +3114,13 @@ async fn stub_app_add_remote_sync_material(server: &MockServer, service_name: &s
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
+    let (ca_pem, ca_fp) = support::test_trust_material();
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/ca"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "data": {
-                "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+                "trusted_ca_sha256": [ca_fp],
+                "ca_bundle_pem": ca_pem
             } }
         })))
         .mount(server)

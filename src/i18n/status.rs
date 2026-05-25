@@ -64,6 +64,38 @@ impl Messages {
         )
     }
 
+    pub(crate) fn verify_agent_config_load_failed(&self, path: &str, reason: &str) -> String {
+        format_template(
+            self.strings().verify_agent_config_load_failed,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn verify_ca_bundle_read_failed(&self, path: &str) -> String {
+        format_template(
+            self.strings().verify_ca_bundle_read_failed,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn verify_ca_bundle_parse_failed(&self, path: &str) -> String {
+        format_template(
+            self.strings().verify_ca_bundle_parse_failed,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn verify_ca_bundle_missing_fingerprints(
+        &self,
+        path: &str,
+        missing: &str,
+    ) -> String {
+        format_template(
+            self.strings().verify_ca_bundle_missing_fingerprints,
+            &[("path", path), ("missing", missing)],
+        )
+    }
+
     pub(crate) fn status_summary_title(&self) -> &'static str {
         self.strings().status_summary_title
     }

@@ -517,7 +517,7 @@ run_rotation_secret_id() {
 
 run_rotation_trust_sync() {
   log_phase "rotate-trust-sync"
-  local current_trust_json extra_fingerprint ca_bundle_pem payload
+  local current_trust_json extra_cert_pem extra_fingerprint ca_bundle_pem payload tmp_dir
   current_trust_json="$(python3 - "$REMOTE_AGENT_CONFIG_PATH" <<'PY'
 import json
 import sys
@@ -531,8 +531,25 @@ if not trusted:
 print(json.dumps(trusted))
 PY
 )"
-  extra_fingerprint="$(openssl rand -hex 32)"
-  ca_bundle_pem="$(cat "$REMOTE_CERTS_DIR/ca-bundle.pem")"
+  # The extra trust anchor must be a real cert: issue #622 made
+  # `bootroot verify` fail when any fingerprint in
+  # `trust.trusted_ca_sha256` is absent from `trust.ca_bundle_path`,
+  # so a random `openssl rand -hex 32` fingerprint trips the post-
+  # rotation verify in `run_verify_pair "after-trust-sync"`.
+  tmp_dir="$(mktemp -d)"
+  openssl req -x509 -nodes -newkey rsa:2048 \
+    -keyout "$tmp_dir/key.pem" \
+    -out "$tmp_dir/cert.pem" \
+    -days 1 \
+    -subj "/CN=trust-sync-extra-$(date +%s%N)" \
+    >/dev/null 2>&1
+  extra_cert_pem="$(cat "$tmp_dir/cert.pem")"
+  extra_fingerprint="$(openssl x509 -in "$tmp_dir/cert.pem" -outform DER \
+    | openssl dgst -sha256 -hex \
+    | awk '{print $NF}')"
+  rm -rf "$tmp_dir"
+  ca_bundle_pem="$(cat "$REMOTE_CERTS_DIR/ca-bundle.pem")
+$extra_cert_pem"
   payload="$(jq -n --argjson current "$current_trust_json" --arg extra "$extra_fingerprint" --arg pem "$ca_bundle_pem" '{data:{trusted_ca_sha256:($current + [$extra]),ca_bundle_pem:$pem}}')"
   openbao_write_service_kv "$SERVICE_KV_PATH_BASE" "trust" "$payload"
   openbao_write_service_kv "$SERVICE_KV_PATH_BASE_2" "trust" "$payload"

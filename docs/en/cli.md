@@ -1167,6 +1167,8 @@ for those flags.
 ### Outputs
 
 - cert/key presence
+- CA bundle composition check (every fingerprint in
+  `[trust].trusted_ca_sha256` is present in `[trust].ca_bundle_path`)
 - verification summary
 - DB connectivity check status (when enabled)
 
@@ -1176,6 +1178,9 @@ The command is considered failed when:
 
 - bootroot-agent execution failure
 - missing cert/key files
+- `ca_bundle_path` is missing any fingerprint from
+  `trusted_ca_sha256` (e.g. an intermediate-only post-issuance
+  bundle that would break default TLS clients)
 
 ## bootroot rotate
 
