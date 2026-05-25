@@ -131,12 +131,21 @@ pub(super) async fn apply_local_service_configs(
             messages.error_write_file_failed(&resolved.agent_config.display().to_string())
         })?;
     }
-    fs::write(&resolved.agent_config, &next)
-        .await
-        .with_context(|| {
-            messages.error_write_file_failed(&resolved.agent_config.display().to_string())
-        })?;
-    fs_util::set_key_permissions(&resolved.agent_config).await?;
+    // `agent.toml` is hot-read by `bootroot-agent`'s daemon retry loop
+    // on every ACME attempt. Routing the write through a temp file +
+    // atomic rename closes the truncate/write race that surfaced in
+    // #613 as renewals failing with "profile not found in reloaded
+    // config" and exhausting the retry budget against a transient
+    // partial file.
+    fs_util::atomic_write(
+        &resolved.agent_config,
+        next.as_bytes(),
+        fs_util::KEY_FILE_MODE,
+    )
+    .await
+    .with_context(|| {
+        messages.error_write_file_failed(&resolved.agent_config.display().to_string())
+    })?;
 
     let openbao_service_dir = secrets_dir
         .join(OPENBAO_SERVICE_CONFIG_DIR)
