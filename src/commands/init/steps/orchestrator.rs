@@ -348,7 +348,8 @@ async fn run_init_inner(
     // Load .env into the process environment so that
     // `build_admin_dsn_from_env()` and `build_dsn_from_env()` can discover
     // the temporary POSTGRES_PASSWORD written by `infra install`.
-    let compose_dir = args.compose.compose_file.parent().unwrap_or(Path::new("."));
+    let compose_dir = crate::commands::compose_file::compose_file_dir(&args.compose.compose_file);
+    let compose_dir = compose_dir.as_path();
     crate::commands::dotenv::load_dotenv_into_env(&compose_dir.join(".env"), messages)?;
 
     let (db_dsn, db_dsn_normalization, admin_dsn_for_kv) =
@@ -821,7 +822,7 @@ async fn maybe_rotate_env_db_password(
     use crate::commands::init::{PATH_STEPCA_DB, PATH_STEPCA_DB_ADMIN};
 
     // Docker Compose reads .env from the compose file's directory.
-    let compose_dir = compose_file.parent().unwrap_or(Path::new("."));
+    let compose_dir = crate::commands::compose_file::compose_file_dir(compose_file);
     let env_path = compose_dir.join(".env");
     if !env_path.exists() {
         return Ok(None);
@@ -885,7 +886,7 @@ async fn maybe_rotate_env_db_password(
     // to 5433, hard-coding `parsed.port` makes this admin connection
     // attempt the wrong host port on a default install and silently skip
     // the `.env` password rotation via the warning path below.
-    let host_port = bootroot::db::resolve_postgres_host_port(compose_dir);
+    let host_port = bootroot::db::resolve_postgres_host_port(&compose_dir);
     let admin_dsn = bootroot::db::build_db_dsn(
         "step",
         &temp_password,

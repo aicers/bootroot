@@ -13,6 +13,7 @@ use crate::commands::clean::{
     COMPOSE_PROJECT_LABEL, COMPOSE_SERVICE_LABEL, container_exists_via_docker,
     inspect_label_via_docker, remove_openbao_container_and_volumes, resolve_compose_project,
 };
+use crate::commands::compose_file::compose_file_dir;
 use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::commands::infra::run_infra_up;
 use crate::commands::init::{OPENBAO_CONTAINER_NAME, compose_has_openbao, prompt_yes_no, run_init};
@@ -59,10 +60,7 @@ const STEP_CA_INIT_ARTIFACTS: &[&str] = &[
 /// re-run of `init` fails.
 pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result<()> {
     let compose_file = &args.compose.compose_file;
-    let compose_dir = compose_file
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    let compose_dir = compose_file_dir(compose_file);
     let state_path = StateFile::default_path();
 
     // 1. Refuse any operator-supplied `--openbao-url` that differs from
@@ -1427,6 +1425,52 @@ mod tests {
             unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
         }
         result.expect("should accept existing container with matching compose labels");
+    }
+
+    /// Regression for #611: when `--compose-file` is the default
+    /// relative `docker-compose.yml`, `run_reinit` derives `compose_dir`
+    /// via [`compose_file_dir`].  The verifier must accept that
+    /// `compose_dir` and complete its scope check without surfacing
+    /// `could not derive compose project name from `.  Exercises the
+    /// container-absent branch (the stuck-after-`clean --openbao-only`
+    /// recovery path) with CWD pointed at a tempdir holding a valid
+    /// compose declaration.
+    #[test]
+    fn verify_compose_managed_openbao_accepts_default_relative_compose_file() {
+        let _guard = env_lock();
+        let prior_env = std::env::var_os("COMPOSE_PROJECT_NAME");
+        // SAFETY: env access is serialised by `env_lock` above.
+        unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
+
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  openbao:\n    image: openbao\n",
+        )
+        .unwrap();
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let compose_file = PathBuf::from("docker-compose.yml");
+        let compose_dir = compose_file_dir(&compose_file);
+        let messages = test_messages();
+        let container_exists = |_: &str| -> Result<bool> { Ok(false) };
+        let inspect = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
+        let result = verify_compose_managed_openbao(
+            &compose_file,
+            &compose_dir,
+            &container_exists,
+            &inspect,
+            &messages,
+        );
+
+        std::env::set_current_dir(&original_cwd).unwrap();
+        if let Some(prior) = prior_env {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
+        }
+
+        result.expect("default relative --compose-file must not break the scope check");
     }
 
     #[test]

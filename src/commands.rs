@@ -1,5 +1,6 @@
 pub(crate) mod ca;
 pub(crate) mod clean;
+pub(crate) mod compose_file;
 pub(crate) mod constants;
 pub(crate) mod dns_alias;
 pub(crate) mod dotenv;
