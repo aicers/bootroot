@@ -480,7 +480,15 @@ fn validate_path(path: &Path, must_exist: bool, messages: &Messages) -> Result<(
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!(messages.error_parent_not_found(&path.display().to_string()))
     })?;
-    if !parent.as_os_str().is_empty() && !parent.exists() {
+    // For input paths (`must_exist=true`) the parent must already exist —
+    // a read on a missing dir would just produce a less helpful error
+    // downstream.  For output paths (`must_exist=false`) `service add` is
+    // the authoritative writer, so the parent is `create_dir_all`-ed at
+    // the write boundary (`local_config.rs` for `agent_config`,
+    // `fs_util::write_cert_and_key` for `cert_path` / `key_path`).
+    // Resolution stays side-effect-free so `--dry-run` / `--print-only`
+    // do not leak directories onto disk.
+    if must_exist && !parent.as_os_str().is_empty() && !parent.exists() {
         anyhow::bail!(messages.error_parent_not_found(&parent.display().to_string()));
     }
     Ok(())
@@ -488,6 +496,8 @@ fn validate_path(path: &Path, must_exist: bool, messages: &Messages) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
     use crate::cli::args::{AuthMode, RuntimeAuthArgs};
 
@@ -801,6 +811,49 @@ mod tests {
             err.to_string().contains("--post-renew-command"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Issue #607: `service add` output paths must accept a non-existent
+    /// parent so the operator does not have to keep an out-of-band
+    /// `mkdir -p` chain in sync with the flag values. The directory gets
+    /// created at the write boundary (`local_config.rs` and
+    /// `fs_util::write_cert_and_key`) rather than here, so resolution
+    /// stays side-effect-free for `--dry-run` / `--print-only`.
+    #[test]
+    fn validate_path_allows_missing_parent_when_must_exist_is_false() {
+        let messages = Messages::new("en").unwrap();
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("does/not/exist/agent.toml");
+        assert!(!target.parent().unwrap().exists());
+
+        validate_path(&target, false, &messages).expect("missing parent must be accepted");
+        assert!(
+            !target.parent().unwrap().exists(),
+            "validate_path must not create directories on disk"
+        );
+    }
+
+    #[test]
+    fn validate_path_rejects_missing_parent_when_must_exist_is_true() {
+        let messages = Messages::new("en").unwrap();
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("does/not/exist/input.pem");
+
+        let err = validate_path(&target, true, &messages).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "expected a not-found error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_path_accepts_existing_parent_when_must_exist_is_false() {
+        let messages = Messages::new("en").unwrap();
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("agent.toml");
+
+        validate_path(&target, false, &messages).expect("existing parent must be accepted");
     }
 
     #[test]
