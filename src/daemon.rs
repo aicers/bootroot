@@ -365,14 +365,18 @@ async fn issue_with_retry(
 /// target profile. Falls back to the supplied in-memory pair when the
 /// reload fails or the profile is absent from the reloaded file.
 ///
-/// The fallback path exists because `apply_local_service_configs` and
-/// the `OpenBao` Agent sidecar both render `agent.toml` non-atomically:
-/// a concurrent reader can observe a truncated file or one that does
-/// not yet contain the named profile. Treating those races as transient
-/// and reusing the prior in-memory profile keeps the retry budget
-/// available for genuine ACME failures, while still honouring the
-/// `#303` intent of picking up freshly-rendered KV values whenever the
-/// reload does land on a coherent file.
+/// The fallback path exists because the `OpenBao` Agent sidecar still
+/// renders `agent.toml` non-atomically (truncate-then-write), so a
+/// concurrent reader can observe a partial file or one that does not
+/// yet contain the named profile. `apply_local_service_configs` was
+/// updated alongside this fix to write through
+/// [`crate::fs_util::atomic_write`] and no longer contributes to the
+/// race, but until the sidecar path is hardened the consumer-side
+/// fallback is the load-bearing guarantee. Treating those races as
+/// transient and reusing the prior in-memory profile keeps the retry
+/// budget available for genuine ACME failures, while still honouring
+/// `#303`'s intent of picking up freshly-rendered KV values whenever
+/// the reload does land on a coherent file.
 fn reload_profile_or_fallback(
     config_path: &Path,
     overrides: &config::CliOverrides,
