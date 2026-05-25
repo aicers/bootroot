@@ -51,6 +51,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate ca-key` phase 5 listing every `local-file`
+  service in its "Consumer reload/restart required" hint regardless of
+  whether the rotation actually wiped and signaled the service. On a
+  resumed or retried rotation, or after a partial manual migration,
+  services whose cert was already issued by the new intermediate take
+  the skip-migrated branch and are never re-signaled — but they still
+  appeared in the printed hint, so an operator following it would
+  restart consumers that did not need restarting, churning live
+  traffic and eroding trust in the hint. The hint is now built from
+  the services actually processed in the reissue loop, so the
+  skip-migrated branch no longer contributes. (Closes #619)
 - Fixed `bootroot-agent` burning its renewal retry budget against a
   transient `agent.toml` race. The retry loop introduced by #303
   re-reads `agent.toml` on every ACME attempt; if a concurrent
