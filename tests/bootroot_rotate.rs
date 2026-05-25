@@ -2954,12 +2954,20 @@ async fn test_rotate_ca_key_happy_path_phase_0_through_7() {
         stdout.contains("complete") || stdout.contains("Complete"),
         "stdout should mention completion: {stdout}"
     );
-    // Issue #614: phase 5 must surface the consumer-reload hint so
-    // operators see the in-FD pitfall after rotate ca-key wipes the
-    // service cert/key pair.
+    // Issue #619: phase 5 must only build the consumer-reload hint
+    // from services it actually wiped/signaled. Here the only
+    // registered service is already issued by the new intermediate
+    // (skip-migrated branch), so the hint must NOT appear — listing it
+    // would push operators to restart a consumer this rotation did not
+    // touch. The skip-migrated line should still appear to confirm
+    // phase 5 saw the service.
     assert!(
-        stdout.contains("Consumer reload/restart required"),
-        "rotate ca-key should print the consumer-reload hint: {stdout}"
+        stdout.contains("already issued by new intermediate"),
+        "phase 5 should report the service as already migrated: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Consumer reload/restart required"),
+        "rotate ca-key must not print the consumer-reload hint when no service was reissued: {stdout}"
     );
     // rotation-state.json should be cleaned up
     assert!(

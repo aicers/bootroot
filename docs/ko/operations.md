@@ -255,6 +255,12 @@ reload/restart required" 안내를 출력합니다. 훅이 없는 서비스는
 명시적으로 플래그되며 `service update --reload-style ...` 복구
 안내가 함께 표시됩니다.
 
+특히 `rotate ca-key`의 경우 안내에는 이번 호출에서 실제로 인증서를
+삭제하고 재서명한 서비스만 포함됩니다. 이미 새 intermediate로 발급된
+서비스(재개 또는 재시도 회전의 skip-migrated 분기)는 이번 회전이 디스크
+상 leaf를 바꾸지 않았고 컨슈머도 다시 로드할 필요가 없으므로 안내에
+나타나지 않습니다.
+
 `bootroot reinit`은 인증서 파일이 아니라 서비스 레지스트리를 지웁니다.
 완료 안내는 컨슈머의 다음 갱신 주기 전에 갱신 후 훅이 미리 구성되도록
 `bootroot service add ... --reload-style ...`로 각 컨슈머를 재등록할

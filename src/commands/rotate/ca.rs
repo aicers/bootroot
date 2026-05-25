@@ -224,39 +224,32 @@ pub(super) async fn rotate_ca_key(
         println!("{}", messages.rotate_ca_key_phase_reissue());
 
         let new_inter_cert_path = ctx.paths.intermediate_cert();
+        let mut reissued_local: Vec<&ServiceEntry> = Vec::new();
         for entry in ctx.state.services.values() {
-            let cert_path = &entry.cert_path;
-            if cert_path.exists()
-                && cert_issued_by_new_intermediate(cert_path, &new_inter_cert_path, messages)
-                    .unwrap_or(false)
-            {
-                println!(
-                    "{}",
-                    messages.rotate_ca_key_skip_migrated(&entry.service_name)
-                );
-                continue;
-            }
-
-            if matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
-                let _ = fs::remove_file(cert_path);
-                let _ = fs::remove_file(&entry.key_path);
-                signal_bootroot_agent(entry, messages)?;
-            } else {
-                println!(
-                    "{}",
-                    messages.rotate_ca_key_reissue_remote_hint(&entry.service_name)
-                );
+            match classify_phase5_action(entry, &new_inter_cert_path, messages) {
+                Phase5Action::SkipMigrated => {
+                    println!(
+                        "{}",
+                        messages.rotate_ca_key_skip_migrated(&entry.service_name)
+                    );
+                }
+                Phase5Action::LocalReissue => {
+                    let _ = fs::remove_file(&entry.cert_path);
+                    let _ = fs::remove_file(&entry.key_path);
+                    signal_bootroot_agent(entry, messages)?;
+                    reissued_local.push(entry);
+                }
+                Phase5Action::RemoteHint => {
+                    println!(
+                        "{}",
+                        messages.rotate_ca_key_reissue_remote_hint(&entry.service_name)
+                    );
+                }
             }
         }
 
-        let affected_local: Vec<&ServiceEntry> = ctx
-            .state
-            .services
-            .values()
-            .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::LocalFile))
-            .collect();
         crate::commands::service::print_consumer_reload_hint(
-            affected_local.iter().copied(),
+            reissued_local.iter().copied(),
             messages,
         );
 
@@ -441,6 +434,42 @@ fn restart_openbao_agent_sidecars(ctx: &RotateContext, _messages: &Messages) {
     }
     let _ = try_restart_container(OPENBAO_AGENT_STEPCA_CONTAINER);
     let _ = try_restart_container(OPENBAO_AGENT_RESPONDER_CONTAINER);
+}
+
+/// Outcome for one service entry during phase-5 reissue. Decoupled from
+/// the side-effecting loop so the consumer-reload hint can be exercised
+/// from tests without invoking real signal/filesystem operations.
+#[derive(Debug, PartialEq, Eq)]
+enum Phase5Action {
+    /// Service already presents a cert issued by the new intermediate
+    /// (e.g., resumed rotation, partial manual migration). Nothing to
+    /// reissue and the service should NOT appear in the consumer-reload
+    /// hint.
+    SkipMigrated,
+    /// Local-file delivery service whose cert needs to be wiped and
+    /// re-signaled. Goes into the consumer-reload hint.
+    LocalReissue,
+    /// Remote-bootstrap delivery service. Operator gets a remote hint
+    /// but the consumer-reload hint targets local-file consumers only.
+    RemoteHint,
+}
+
+fn classify_phase5_action(
+    entry: &ServiceEntry,
+    new_inter_cert_path: &Path,
+    messages: &Messages,
+) -> Phase5Action {
+    if entry.cert_path.exists()
+        && cert_issued_by_new_intermediate(&entry.cert_path, new_inter_cert_path, messages)
+            .unwrap_or(false)
+    {
+        return Phase5Action::SkipMigrated;
+    }
+    if matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
+        Phase5Action::LocalReissue
+    } else {
+        Phase5Action::RemoteHint
+    }
 }
 
 /// Checks whether a leaf certificate was issued by the new intermediate CA
@@ -1179,5 +1208,123 @@ mod tests {
         .await;
         let signal = result.expect("mtime tiebreaker should succeed");
         assert_eq!(signal.serial.as_deref(), Some(serial.as_str()));
+    }
+
+    fn make_local_file_entry(name: &str, cert_path: std::path::PathBuf) -> ServiceEntry {
+        use std::path::PathBuf;
+
+        use crate::state::{DeployType, ServiceRoleEntry};
+
+        ServiceEntry {
+            service_name: name.to_string(),
+            deploy_type: DeployType::Daemon,
+            delivery_mode: DeliveryMode::LocalFile,
+            hostname: "h".to_string(),
+            domain: "d.example".to_string(),
+            agent_config_path: PathBuf::from("agent.toml"),
+            cert_path,
+            key_path: PathBuf::from("key.pem"),
+            instance_id: None,
+            container_name: None,
+            notes: None,
+            post_renew_hooks: vec![],
+            approle: ServiceRoleEntry {
+                role_name: "r".to_string(),
+                role_id: "id".to_string(),
+                secret_id_path: PathBuf::from("s"),
+                policy_name: "p".to_string(),
+                secret_id_ttl: None,
+                secret_id_wrap_ttl: None,
+                token_bound_cidrs: None,
+            },
+            agent_email: None,
+            agent_server: None,
+            agent_responder_url: None,
+            cert_group_gid: None,
+        }
+    }
+
+    fn build_issuer(cn: &str) -> (rcgen::Issuer<'static, rcgen::KeyPair>, String) {
+        use rcgen::{CertificateParams, DnType, Issuer, KeyPair};
+
+        let key = KeyPair::generate().expect("ca key");
+        let mut params = CertificateParams::new(vec![cn.to_string()]).expect("ca params");
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.clone().self_signed(&key).expect("self-signed CA");
+        (Issuer::new(params, key), cert.pem())
+    }
+
+    fn sign_leaf_with(cn: &str, issuer: &rcgen::Issuer<'static, rcgen::KeyPair>) -> String {
+        use rcgen::{CertificateParams, DnType, KeyPair};
+
+        let key = KeyPair::generate().expect("leaf key");
+        let mut params = CertificateParams::new(vec![cn.to_string()]).expect("leaf params");
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.signed_by(&key, issuer).expect("sign leaf").pem()
+    }
+
+    /// Regression for issue #619: in a mixed registry where one service
+    /// still presents a cert from the old intermediate and another has
+    /// already been migrated, only the unmigrated service should be
+    /// classified for local reissue (and therefore make it into the
+    /// consumer-reload hint).
+    #[test]
+    fn phase5_classifies_only_unmigrated_local_services_for_reissue() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+
+        // Build two intermediates: "old" and "new". A leaf signed by
+        // the new one should be SkipMigrated; a leaf signed by the old
+        // one should be LocalReissue.
+        let (old_issuer, _old_inter_pem) = build_issuer("Old Intermediate");
+        let (new_issuer, new_inter_pem) = build_issuer("New Intermediate");
+
+        let new_inter_path = dir.path().join("new_intermediate.crt");
+        fs::write(&new_inter_path, &new_inter_pem).expect("write new intermediate");
+
+        let unmigrated_cert = dir.path().join("svc_old.crt");
+        fs::write(
+            &unmigrated_cert,
+            sign_leaf_with("svc-old.example", &old_issuer),
+        )
+        .expect("write old leaf");
+        let migrated_cert = dir.path().join("svc_new.crt");
+        fs::write(
+            &migrated_cert,
+            sign_leaf_with("svc-new.example", &new_issuer),
+        )
+        .expect("write new leaf");
+
+        let unmigrated = make_local_file_entry("svc-old", unmigrated_cert);
+        let migrated = make_local_file_entry("svc-new", migrated_cert);
+
+        assert_eq!(
+            classify_phase5_action(&unmigrated, &new_inter_path, &messages),
+            Phase5Action::LocalReissue,
+            "service still on the old intermediate must be reissued"
+        );
+        assert_eq!(
+            classify_phase5_action(&migrated, &new_inter_path, &messages),
+            Phase5Action::SkipMigrated,
+            "service already on the new intermediate must be skipped"
+        );
+
+        // Simulate the phase-5 loop's hint-collection step and verify
+        // only the unmigrated entry would be passed to the
+        // consumer-reload hint.
+        let registry = [&unmigrated, &migrated];
+        let reissued: Vec<&ServiceEntry> = registry
+            .iter()
+            .copied()
+            .filter(|entry| {
+                matches!(
+                    classify_phase5_action(entry, &new_inter_path, &messages),
+                    Phase5Action::LocalReissue
+                )
+            })
+            .collect();
+        assert_eq!(reissued.len(), 1);
+        assert_eq!(reissued[0].service_name, "svc-old");
     }
 }
