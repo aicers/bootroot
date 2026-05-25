@@ -4,6 +4,7 @@ use std::process::Command as ProcessCommand;
 use anyhow::{Context, Result};
 
 use crate::cli::args::CleanArgs;
+use crate::commands::compose_file::compose_file_dir;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{OPENBAO_CONTAINER_NAME, prompt_yes_no};
 use crate::i18n::Messages;
@@ -40,11 +41,8 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
 
     // Resolve paths relative to the compose file directory, matching
     // Docker Compose's bind-mount resolution.
-    let compose_dir = args
-        .compose_file
-        .compose_file
-        .parent()
-        .unwrap_or(Path::new("."));
+    let compose_dir = compose_file_dir(&args.compose_file.compose_file);
+    let compose_dir = compose_dir.as_path();
 
     let compose_str = args.compose_file.compose_file.to_string_lossy();
     let mut down_args: Vec<&str> = vec!["compose", "-f", &compose_str];
@@ -100,7 +98,8 @@ pub(crate) fn remove_openbao_container_and_volumes(
     messages: &Messages,
 ) -> Result<()> {
     let compose_str = compose_file.to_string_lossy();
-    let compose_dir = compose_file.parent().unwrap_or(Path::new("."));
+    let compose_dir = compose_file_dir(compose_file);
+    let compose_dir = compose_dir.as_path();
 
     // Discover the compose project name BEFORE removing the container,
     // while the label is still readable. Falling back to the compose-dir
@@ -430,5 +429,52 @@ mod tests {
         assert_eq!(normalise_compose_project_name("Foo.Bar"), "foobar");
         assert_eq!(normalise_compose_project_name("foo_bar-baz"), "foo_bar-baz");
         assert_eq!(normalise_compose_project_name("a/b\\c d"), "abcd");
+    }
+
+    /// Regression for #611: when `--compose-file` defaults to the
+    /// relative `docker-compose.yml`, the derived `compose_dir` flowing
+    /// into `resolve_compose_project` must canonicalise cleanly.  The
+    /// previous `compose_file.parent().unwrap_or(Path::new("."))` shape
+    /// returned `Some("")` here, then `canonicalize("")` failed and
+    /// `PathBuf::from("").file_name()` returned `None`, surfacing as
+    /// `could not derive compose project name from `.
+    #[test]
+    fn resolve_compose_project_handles_dot_relative_compose_dir() {
+        let _guard = env_lock();
+        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
+        clear_compose_project_name();
+        let compose_dir = compose_file_dir(Path::new("docker-compose.yml"));
+        assert_eq!(compose_dir, std::path::PathBuf::from("."));
+        let lookup = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
+        let result = resolve_compose_project(&compose_dir, &lookup);
+        if let Some(prior) = prior {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
+        }
+        let project = result.expect("resolve_compose_project must succeed for `.`");
+        assert!(!project.is_empty());
+    }
+
+    /// Companion to the test above: when `COMPOSE_PROJECT_NAME` is set,
+    /// `remove_openbao_container_and_volumes` (which calls
+    /// `resolve_compose_project`) must honour it even when the
+    /// `compose_dir` is the helper-normalised `.`.
+    #[test]
+    fn resolve_compose_project_honours_env_var_for_dot_relative_compose_dir() {
+        let _guard = env_lock();
+        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
+        // SAFETY: env mutation is serialised by `env_lock` above.
+        unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", "explicit-env-project") };
+        let compose_dir = compose_file_dir(Path::new("docker-compose.yml"));
+        let lookup = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
+        let result = resolve_compose_project(&compose_dir, &lookup);
+        if let Some(prior) = prior {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
+        } else {
+            // SAFETY: still inside the env_lock guard.
+            unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
+        }
+        assert_eq!(result.unwrap(), "explicit-env-project");
     }
 }

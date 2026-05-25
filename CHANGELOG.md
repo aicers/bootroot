@@ -51,6 +51,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot reinit` failing immediately with
+  `could not derive compose project name from ` (trailing empty string)
+  whenever `--compose-file` was left at its default relative
+  `docker-compose.yml`. `Path::parent` returns `Some("")` — not `None` —
+  for a relative path without a directory component, so the
+  `compose_file.parent().unwrap_or(Path::new("."))` shape used by
+  `reinit`, `clean --openbao-only`, the init orchestrator's `.env`
+  loader and DB-password rotation, and `rotate infra-cert` all fed an
+  empty path into downstream `canonicalize` / `file_name` / `.join`
+  consumers. That broke the curated recovery path documented for
+  partial-init failures and forced operators into the destructive
+  `clean --openbao-only` + `infra install` + `init` escape hatch. The
+  derivation is now funnelled through a single
+  `commands::compose_file::compose_file_dir` helper that normalises the
+  empty-parent case to `"."`. (Closes #611)
 - Fixed `bootroot-agent` writing `ca-bundle.pem` without honoring the
   `--cert-group` policy and without re-asserting a readable mode on
   rotation. The agent now always writes the CA bundle at `0o644` and,

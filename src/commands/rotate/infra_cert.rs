@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use super::RotateContext;
 use super::helpers::{confirm_action, try_restart_container};
+use crate::commands::compose_file::compose_file_dir;
 use crate::commands::init::{
     HTTP01_ADMIN_INFRA_CERT_KEY, OPENBAO_INFRA_CERT_KEY, reissue_http01_admin_tls_cert,
     reissue_openbao_tls_cert,
@@ -31,10 +32,7 @@ pub(super) fn rotate_infra_certs(
     confirm_action(messages.prompt_rotate_infra_tls(), auto_confirm, messages)?;
 
     let state_file = ctx.state_file.clone();
-    let compose_dir = ctx.compose_file.parent().map_or_else(
-        || std::path::PathBuf::from("."),
-        std::path::Path::to_path_buf,
-    );
+    let compose_dir = compose_file_dir(&ctx.compose_file);
 
     let entries: Vec<(String, InfraCertEntry)> = ctx
         .state
