@@ -705,6 +705,14 @@ bootroot status
     non-root 사용자로 실행되는 컨테이너 클라이언트가 읽을 수
     있게 됩니다. 회전 시에도 정책이 다시 적용되므로
     운영자가 매번 `chmod`를 다시 걸 필요가 없습니다.
+  - `[trust].ca_bundle_path`가 설정된 경우, agent는 발급/회전마다
+    `ca-bundle.pem`도 `0644`로 기록하고, 정책이 활성화되어 있으면
+    설정된 gid로 `chgrp`합니다. 번들은 발급자/CA 체인 PEM만
+    담는 공개 신뢰 자료(private key 미포함)이므로 정책 여부와
+    무관하게 `0644`가 사용됩니다. 매 회전마다 모드를 다시
+    적용하므로 이전 writer(예: `bootroot-remote bootstrap`의
+    `0600` secret-file write)가 남긴 더 좁은 모드도 함께
+    덮어씁니다.
   - 모드별 허용 형식:
     - `local-file`: 이름 또는 숫자 gid. 이름은 control host의
       그룹 DB에서 해석됩니다. `service add`/`service update`는

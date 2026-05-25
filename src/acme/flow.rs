@@ -327,7 +327,7 @@ pub async fn issue_certificate(
             } else {
                 verify_chain_fingerprints(&chain, &settings.trust.trusted_ca_sha256)?;
                 let bundle = build_ca_bundle(&chain);
-                fs_util::write_ca_bundle(bundle_path, &bundle).await?;
+                fs_util::write_ca_bundle(bundle_path, &bundle, policy).await?;
                 info!("CA bundle saved to: {:?}", bundle_path);
             }
         }
@@ -451,7 +451,7 @@ mod tests {
         {
             verify_chain_fingerprints(&chain, &settings.trust.trusted_ca_sha256)?;
             let bundle = build_ca_bundle(&chain);
-            fs_util::write_ca_bundle(bundle_path, &bundle).await?;
+            fs_util::write_ca_bundle(bundle_path, &bundle, policy).await?;
         }
         Ok(())
     }

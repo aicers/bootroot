@@ -29,8 +29,8 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 
 use bootroot::cert_group::{
-    self, CERT_DIR_MODE_GROUP, CERT_FILE_MODE, CertGroupPolicy, KEY_DIR_MODE_GROUP,
-    KEY_FILE_MODE_GROUP,
+    self, CA_BUNDLE_FILE_MODE, CERT_DIR_MODE_GROUP, CERT_FILE_MODE, CertGroupPolicy,
+    KEY_DIR_MODE_GROUP, KEY_FILE_MODE_GROUP,
 };
 use bootroot::fs_util;
 
@@ -200,4 +200,51 @@ async fn cert_group_chown_rotation_re_asserts_gid_ownership() {
     assert_eq!(key_meta.gid(), gid, "rotation must restore key gid");
     assert_eq!(dir_meta.permissions().mode() & 0o777, KEY_DIR_MODE_GROUP);
     assert_eq!(dir_meta.gid(), gid, "rotation must restore parent gid");
+}
+
+/// Issue #608: `ca-bundle.pem` must follow the `--cert-group` policy
+/// alongside cert.pem / key.pem, not the bootstrap-time `0o600`
+/// secret-file mode. Seeding the bundle as `0o600` first locks in
+/// the "rotation re-asserts mode" behavior — the bug reported in
+/// the issue is exactly that rotation overwrites the bytes but
+/// never widens the mode, so the container inside the deployment
+/// continues to EACCES on the bundle.
+///
+/// The chosen mode is `0o644` (world-readable) because the bundle
+/// is **public trust material — issuer/CA chain PEM only, never
+/// private keys**. See [`CA_BUNDLE_FILE_MODE`].
+#[tokio::test]
+async fn ca_bundle_is_world_readable_public_trust_material_after_rotation() {
+    let Some(gid) = resolve_test_gid() else {
+        eprintln!("skipped: no supplementary gid available for chown test");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("certs").join("ca-bundle.pem");
+    std::fs::create_dir_all(bundle_path.parent().unwrap()).unwrap();
+
+    // Bootstrap-time state: 0o600, primary gid. Reproduces the
+    // residue left behind by `bootroot-remote bootstrap`'s
+    // `write_secret_file` writer that the issue's evaluation
+    // identifies as the source of the observed `0o600` mode.
+    std::fs::write(&bundle_path, "stale-bundle").unwrap();
+    std::fs::set_permissions(&bundle_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    fs_util::write_ca_bundle(&bundle_path, "fresh-bundle", CertGroupPolicy::with_gid(gid))
+        .await
+        .unwrap();
+
+    let meta = std::fs::metadata(&bundle_path).unwrap();
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        CA_BUNDLE_FILE_MODE,
+        "rotation must widen ca-bundle.pem to 0o644 even when seeded at 0o600"
+    );
+    assert_eq!(
+        meta.gid(),
+        gid,
+        "ca-bundle.pem gid must match the --cert-group policy"
+    );
+    let contents = std::fs::read_to_string(&bundle_path).unwrap();
+    assert_eq!(contents, "fresh-bundle");
 }

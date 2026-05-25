@@ -51,6 +51,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot-agent` writing `ca-bundle.pem` without honoring the
+  `--cert-group` policy and without re-asserting a readable mode on
+  rotation. The agent now always writes the CA bundle at `0o644` and,
+  when `--cert-group <gid>` is configured, `chgrp`s the bundle to the
+  policy's gid on every issuance and rotation — the same treatment
+  already applied to `<svc>-cert.pem` and `<svc>-key.pem`. Re-asserting
+  the mode on every write also undoes any stricter mode left behind by
+  an earlier writer, notably `bootroot-remote bootstrap`'s
+  `write_secret_file` path which creates the bundle at `0o600`; without
+  this fix, rotation overwrote the bytes but never widened the mode, so
+  containerized mTLS clients hit `EACCES` on `ca-bundle.pem` at request
+  time even though bring-up reported success. `0o644` is safe because
+  the bundle is public trust material (issuer/CA chain PEM only, never
+  private keys) — the new `CA_BUNDLE_FILE_MODE` constant documents this
+  invariant. (Closes #608)
 - Fixed `bootroot service add` bailing with `Parent directory not found`
   when the parent of `--agent-config`, `--cert-path`, or `--key-path`
   did not already exist. `service add` is the authoritative writer for

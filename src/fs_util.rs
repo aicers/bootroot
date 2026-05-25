@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tokio::fs;
 
-use crate::cert_group::{self, CertGroupPolicy};
+use crate::cert_group::{self, CA_BUNDLE_FILE_MODE, CertGroupPolicy};
 
 const KEY_FILE_MODE: u32 = 0o600;
 const SECRETS_DIR_MODE: u32 = 0o700;
@@ -90,9 +90,23 @@ pub async fn write_cert_and_key(
 
 /// Writes a CA bundle to disk, creating parent directories as needed.
 ///
+/// Always sets the mode to [`CA_BUNDLE_FILE_MODE`] (`0o644`),
+/// regardless of `policy`. CA bundles are public trust material, and
+/// re-asserting the mode on every write means a rotation overrides
+/// any stricter mode left behind by an earlier writer (notably
+/// `bootroot-remote`'s bootstrap path, which creates the file via
+/// `write_secret_file` at `0o600`). When `policy` is active, also
+/// `chown`s the file to the policy's gid so cert-group members can
+/// read the bundle alongside the cert and key.
+///
 /// # Errors
-/// Returns an error if the directory cannot be created or the bundle cannot be written.
-pub async fn write_ca_bundle(bundle_path: &Path, bundle_pem: &str) -> Result<()> {
+/// Returns an error if the directory cannot be created, the bundle
+/// cannot be written, or the mode/owner cannot be applied.
+pub async fn write_ca_bundle(
+    bundle_path: &Path,
+    bundle_pem: &str,
+    policy: CertGroupPolicy,
+) -> Result<()> {
     let bundle_dir = bundle_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("CA bundle path has no parent directory"))?;
@@ -102,6 +116,27 @@ pub async fn write_ca_bundle(bundle_path: &Path, bundle_pem: &str) -> Result<()>
     fs::write(bundle_path, bundle_pem)
         .await
         .context("Failed to write CA bundle file")?;
+    fs::set_permissions(
+        bundle_path,
+        std::fs::Permissions::from_mode(CA_BUNDLE_FILE_MODE),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to set mode {CA_BUNDLE_FILE_MODE:o} on CA bundle {}",
+            bundle_path.display()
+        )
+    })?;
+    if let Some(gid) = policy.gid {
+        let owned = bundle_path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            std::os::unix::fs::chown(&owned, None, Some(gid)).with_context(|| {
+                format!("Failed to chown CA bundle {} to gid {gid}", owned.display())
+            })
+        })
+        .await
+        .context("CA bundle chown task panicked")??;
+    }
     Ok(())
 }
 
@@ -262,5 +297,80 @@ mod tests {
         let dir_mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
         assert_eq!(key_mode, crate::cert_group::KEY_FILE_MODE_GROUP);
         assert_eq!(dir_mode, crate::cert_group::KEY_DIR_MODE_GROUP);
+    }
+
+    /// CA bundles are public trust material, so the mode must be
+    /// `0o644` whether or not a `--cert-group` policy is in effect.
+    #[tokio::test]
+    async fn write_ca_bundle_no_policy_sets_world_readable_mode() {
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+
+        write_ca_bundle(&bundle_path, "BUNDLE", CertGroupPolicy::none())
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&bundle_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, CA_BUNDLE_FILE_MODE);
+        let contents = fs::read_to_string(&bundle_path).await.unwrap();
+        assert_eq!(contents, "BUNDLE");
+    }
+
+    /// Rotation must re-assert the mode. The issue #608 root cause:
+    /// `bootroot-remote` creates the bundle at `0o600`, then the
+    /// agent's rotation only rewrote the bytes without restoring the
+    /// mode, leaving the container EACCES on the bundle. Seeding the
+    /// file at `0o600` first locks in that the rotation widens it.
+    #[tokio::test]
+    async fn write_ca_bundle_re_asserts_mode_on_rotation_over_0600_seed() {
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        // Seed as a 0o600 file (the bootstrap-time `write_secret_file`
+        // state described in the issue).
+        fs::write(&bundle_path, "stale").await.unwrap();
+        fs::set_permissions(&bundle_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+
+        write_ca_bundle(&bundle_path, "FRESH", CertGroupPolicy::none())
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&bundle_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, CA_BUNDLE_FILE_MODE);
+        let contents = fs::read_to_string(&bundle_path).await.unwrap();
+        assert_eq!(contents, "FRESH");
+    }
+
+    /// Under an active `--cert-group` policy, the bundle file must be
+    /// chgrped to the policy's gid and remain at `0o644` (cert-group
+    /// members get read access via group membership, everyone else
+    /// retains read access because the bundle is public material).
+    #[tokio::test]
+    async fn write_ca_bundle_with_policy_chowns_to_gid_and_keeps_0644() {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(gid) = crate::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+
+        write_ca_bundle(&bundle_path, "BUNDLE", CertGroupPolicy::with_gid(gid))
+            .await
+            .unwrap();
+
+        let meta = std::fs::metadata(&bundle_path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, CA_BUNDLE_FILE_MODE);
+        assert_eq!(meta.gid(), gid, "CA bundle gid must match policy");
     }
 }
