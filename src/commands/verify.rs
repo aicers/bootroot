@@ -1,8 +1,11 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
 use bootroot::db::{check_auth_sync, check_tcp_sync, for_host_runtime, parse_db_dsn};
+use ring::digest;
+use x509_parser::pem::Pem;
 
 use crate::cli::args::VerifyArgs;
 use crate::cli::output::print_verify_plan;
@@ -60,6 +63,7 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
         &messages.verify_empty_key(&entry.key_path.display().to_string()),
     )?;
     verify_cert_san(entry, messages)?;
+    verify_ca_bundle(agent_config, messages)?;
 
     if args.db_check {
         let compose_dir = args
@@ -243,6 +247,82 @@ fn verify_cert_san(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     Ok(())
 }
 
+/// Asserts that every fingerprint pinned in the agent's
+/// `[trust].trusted_ca_sha256` appears in the bundle at
+/// `[trust].ca_bundle_path`.
+///
+/// Closes the silent-failure surface flagged in #622: prior to this
+/// check, an agent run that shrank the bundle to the intermediate-only
+/// chain still passed `bootroot verify` (which only re-ran the agent
+/// and asserted cert/key existence). Downstream TLS clients with
+/// default trust behaviour then failed with `unable to get issuer
+/// certificate` at request time.
+fn verify_ca_bundle(agent_config: &Path, messages: &Messages) -> Result<()> {
+    let settings =
+        bootroot::config::Settings::new(Some(agent_config.to_path_buf())).map_err(|e| {
+            anyhow::anyhow!(messages.verify_agent_config_load_failed(
+                &agent_config.display().to_string(),
+                &e.to_string()
+            ))
+        })?;
+    let Some(bundle_path) = settings.trust.ca_bundle_path.as_ref() else {
+        return Ok(());
+    };
+    if settings.trust.trusted_ca_sha256.is_empty() {
+        return Ok(());
+    }
+    check_ca_bundle_contains_trusted(bundle_path, &settings.trust.trusted_ca_sha256, messages)
+}
+
+fn check_ca_bundle_contains_trusted(
+    bundle_path: &Path,
+    trusted: &[String],
+    messages: &Messages,
+) -> Result<()> {
+    let contents = std::fs::read(bundle_path).map_err(|_| {
+        anyhow::anyhow!(messages.verify_ca_bundle_read_failed(&bundle_path.display().to_string()))
+    })?;
+    let mut present: HashSet<String> = HashSet::new();
+    let mut parsed_any = false;
+    for pem in Pem::iter_from_buffer(&contents) {
+        let pem = pem.map_err(|_| {
+            anyhow::anyhow!(
+                messages.verify_ca_bundle_parse_failed(&bundle_path.display().to_string())
+            )
+        })?;
+        if pem.label == "CERTIFICATE" {
+            present.insert(sha256_hex(&pem.contents));
+            parsed_any = true;
+        }
+    }
+    if !parsed_any {
+        anyhow::bail!(messages.verify_ca_bundle_parse_failed(&bundle_path.display().to_string()));
+    }
+    let mut missing: Vec<String> = trusted
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|fingerprint| !present.contains(fingerprint))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    anyhow::bail!(messages.verify_ca_bundle_missing_fingerprints(
+        &bundle_path.display().to_string(),
+        &missing.join(", ")
+    ));
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = digest::digest(&digest::SHA256, bytes);
+    let mut output = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
 fn expected_dns_name(entry: &ServiceEntry, messages: &Messages) -> Result<String> {
     match entry.deploy_type {
         DeployType::Daemon => {
@@ -285,6 +365,101 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_cert_pem(common_name: &str) -> String {
+        let mut params = rcgen::CertificateParams::new(vec![common_name.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        cert.pem()
+    }
+
+    fn pem_der(pem: &str) -> Vec<u8> {
+        let (_, parsed) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap();
+        parsed.contents
+    }
+
+    #[test]
+    fn check_ca_bundle_passes_when_all_trusted_present() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        let root_pem = test_cert_pem("root.example");
+        let intermediate_pem = test_cert_pem("intermediate.example");
+        std::fs::write(&bundle_path, format!("{root_pem}{intermediate_pem}")).unwrap();
+        let trusted = vec![
+            sha256_hex(&pem_der(&root_pem)),
+            sha256_hex(&pem_der(&intermediate_pem)),
+        ];
+
+        check_ca_bundle_contains_trusted(&bundle_path, &trusted, &messages).unwrap();
+    }
+
+    /// #622: an intermediate-only bundle (the exact post-issuance state
+    /// the agent used to leave behind) must trip `bootroot verify` so
+    /// the silent failure stops being silent.
+    #[test]
+    fn check_ca_bundle_fails_when_trusted_fingerprint_missing() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        let root_pem = test_cert_pem("root.example");
+        let intermediate_pem = test_cert_pem("intermediate.example");
+        std::fs::write(&bundle_path, &intermediate_pem).unwrap();
+        let root_fp = sha256_hex(&pem_der(&root_pem));
+        let trusted = vec![root_fp.clone(), sha256_hex(&pem_der(&intermediate_pem))];
+
+        let err = check_ca_bundle_contains_trusted(&bundle_path, &trusted, &messages).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&root_fp),
+            "missing fingerprint must be named: {rendered}"
+        );
+        assert!(rendered.contains(&bundle_path.display().to_string()));
+    }
+
+    /// Trusted fingerprints are stored lowercase in agent.toml, but
+    /// nothing prevents an operator from typing them uppercase. The
+    /// comparison must be case-insensitive so verify does not flag a
+    /// false positive on a healthy bundle.
+    #[test]
+    fn check_ca_bundle_normalises_trusted_fingerprint_case() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        let root_pem = test_cert_pem("root.example");
+        std::fs::write(&bundle_path, &root_pem).unwrap();
+        let trusted = vec![sha256_hex(&pem_der(&root_pem)).to_uppercase()];
+
+        check_ca_bundle_contains_trusted(&bundle_path, &trusted, &messages).unwrap();
+    }
+
+    #[test]
+    fn check_ca_bundle_fails_when_file_missing() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("nope.pem");
+
+        let err = check_ca_bundle_contains_trusted(&bundle_path, &["00".repeat(32)], &messages)
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains(&bundle_path.display().to_string()));
+    }
+
+    #[test]
+    fn check_ca_bundle_fails_when_no_pem_blocks() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        std::fs::write(&bundle_path, b"not a pem file").unwrap();
+
+        let err = check_ca_bundle_contains_trusted(&bundle_path, &["00".repeat(32)], &messages)
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains(&bundle_path.display().to_string()));
+    }
 
     #[cfg(unix)]
     fn write_executable(path: &Path) {

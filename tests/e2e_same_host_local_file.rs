@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -70,7 +72,11 @@ async fn test_same_host_local_file_happy_path() {
 
     let bundle_contents = fs::read_to_string(&files.ca_bundle_path).expect("read ca-bundle");
     assert!(bundle_contents.contains("BEGIN CERTIFICATE"));
-    assert!(bundle_contents.contains("LOCAL-TRUST"));
+    let (expected_ca_pem, _) = support::test_trust_material();
+    assert!(
+        bundle_contents.contains(expected_ca_pem.trim()),
+        "ca-bundle must carry the synced trust material",
+    );
     assert_mode(&files.ca_bundle_path, 0o600);
 
     assert!(
@@ -667,14 +673,15 @@ async fn stub_service_add_openbao(server: &MockServer) {
         .mount(server)
         .await;
 
+    let (ca_pem, ca_fp) = support::test_trust_material();
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/ca"))
         .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "data": {
-                    "trusted_ca_sha256": ["11".repeat(32)],
-                    "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nLOCAL-TRUST\n-----END CERTIFICATE-----"
+                    "trusted_ca_sha256": [ca_fp],
+                    "ca_bundle_pem": ca_pem
                 }
             }
         })))

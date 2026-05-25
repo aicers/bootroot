@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -9,6 +10,7 @@ use x509_parser::pem::Pem;
 use crate::acme::client::AcmeClient;
 use crate::acme::responder_client;
 use crate::acme::types::{AuthorizationStatus, ChallengeStatus, ChallengeType, OrderStatus};
+use crate::cert_group::CertGroupPolicy;
 use crate::fs_util;
 
 fn contact_from_email(email: &str) -> String {
@@ -91,12 +93,68 @@ fn verify_chain_fingerprints(chain: &[Vec<u8>], trusted: &[String]) -> Result<()
     Ok(())
 }
 
-fn build_ca_bundle(chain: &[Vec<u8>]) -> String {
+/// Merges any trusted certs already on disk at `existing_bundle` with
+/// the newly issued `new_chain`, deduping by DER SHA-256.
+///
+/// The bundle's contract is "everything a consumer needs to validate
+/// certs from this CA hierarchy". For a self-signed root + intermediate
+/// hierarchy the ACME response chain typically contains only the
+/// intermediate, so overwriting the bundle with the chain alone strips
+/// the root and breaks default-config TLS clients (#622). Reading the
+/// existing bundle and keeping every block whose fingerprint is in
+/// `trusted` preserves the root across issuances while still filtering
+/// out any junk left behind by an earlier misconfiguration.
+fn merge_ca_bundle(
+    existing_bundle: Option<&[u8]>,
+    new_chain: &[Vec<u8>],
+    trusted: &[String],
+) -> String {
+    let allowed: HashSet<String> = trusted
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect();
+    let mut order: Vec<Vec<u8>> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Some(existing) = existing_bundle {
+        for pem in Pem::iter_from_buffer(existing) {
+            let Ok(pem) = pem else { continue };
+            if pem.label != "CERTIFICATE" {
+                continue;
+            }
+            let fingerprint = sha256_hex(&pem.contents);
+            if !allowed.contains(&fingerprint) {
+                continue;
+            }
+            if seen.insert(fingerprint) {
+                order.push(pem.contents);
+            }
+        }
+    }
+    for cert in new_chain {
+        let fingerprint = sha256_hex(cert);
+        if seen.insert(fingerprint) {
+            order.push(cert.clone());
+        }
+    }
     let mut bundle = String::new();
-    for cert in chain {
+    for cert in &order {
         bundle.push_str(&encode_cert_pem(cert));
     }
     bundle
+}
+
+/// Writes the merged CA bundle to `bundle_path`. Production code and
+/// the test helper share this path so the chain-only write cannot be
+/// silently reintroduced in only one of them (#622 AC #2).
+async fn write_merged_ca_bundle(
+    bundle_path: &Path,
+    chain: &[Vec<u8>],
+    trusted: &[String],
+    policy: CertGroupPolicy,
+) -> Result<()> {
+    let existing = tokio::fs::read(bundle_path).await.ok();
+    let bundle = merge_ca_bundle(existing.as_deref(), chain, trusted);
+    fs_util::write_ca_bundle(bundle_path, &bundle, policy).await
 }
 
 async fn register_acme_account(
@@ -326,8 +384,13 @@ pub async fn issue_certificate(
                 warn!("Certificate chain not present; CA bundle not updated.");
             } else {
                 verify_chain_fingerprints(&chain, &settings.trust.trusted_ca_sha256)?;
-                let bundle = build_ca_bundle(&chain);
-                fs_util::write_ca_bundle(bundle_path, &bundle, policy).await?;
+                write_merged_ca_bundle(
+                    bundle_path,
+                    &chain,
+                    &settings.trust.trusted_ca_sha256,
+                    policy,
+                )
+                .await?;
                 info!("CA bundle saved to: {:?}", bundle_path);
             }
         }
@@ -450,8 +513,13 @@ mod tests {
             && !chain.is_empty()
         {
             verify_chain_fingerprints(&chain, &settings.trust.trusted_ca_sha256)?;
-            let bundle = build_ca_bundle(&chain);
-            fs_util::write_ca_bundle(bundle_path, &bundle, policy).await?;
+            write_merged_ca_bundle(
+                bundle_path,
+                &chain,
+                &settings.trust.trusted_ca_sha256,
+                policy,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -545,6 +613,97 @@ mod tests {
             .expect("read bundle");
         let count = bundle.matches("BEGIN CERTIFICATE").count();
         assert_eq!(count, 2);
+    }
+
+    /// Regression for #622: when the operator's `service add` writes a
+    /// root+intermediate bundle to disk and the subsequent ACME
+    /// response contains only the intermediate, the agent must keep
+    /// the root in `ca_bundle_path`. Otherwise default-Node/default-
+    /// openssl TLS clients fail with `unable to get issuer certificate`
+    /// because the chain no longer terminates at a trust anchor that
+    /// lives on disk.
+    #[tokio::test]
+    async fn test_multi_pem_preserves_existing_root_in_bundle() {
+        let temp = tempdir().expect("temp dir");
+        let cert_dir = temp.path().join("certs");
+        let bundle_path = temp.path().join("ca-bundle.pem");
+        tokio::fs::create_dir_all(&cert_dir)
+            .await
+            .expect("create cert dir");
+
+        let intermediate_pem = test_cert_pem("intermediate.example");
+        let root_pem = test_cert_pem("root.example");
+        let intermediate_der = parse_pem_der(&intermediate_pem);
+        let root_der = parse_pem_der(&root_pem);
+
+        // Seed the on-disk bundle the way `bootroot service add` does:
+        // root followed by intermediate.
+        tokio::fs::write(&bundle_path, format!("{root_pem}{intermediate_pem}"))
+            .await
+            .expect("seed bundle");
+
+        let mut settings = test_settings();
+        settings.trust.ca_bundle_path = Some(bundle_path.clone());
+        settings.trust.trusted_ca_sha256 =
+            vec![sha256_hex(&root_der), sha256_hex(&intermediate_der)];
+
+        let mut profile = test_profile();
+        profile.paths.cert = cert_dir.join("leaf.pem");
+        profile.paths.key = cert_dir.join("leaf.key");
+
+        // ACME response carries leaf + intermediate only (the typical
+        // step-ca case that triggered the silent failure).
+        let leaf_pem = test_cert_pem("leaf.example");
+        let acme_response = format!("{leaf_pem}{intermediate_pem}");
+
+        write_outputs_for_test(&settings, &profile, &acme_response)
+            .await
+            .expect("write outputs");
+
+        let bundle = tokio::fs::read(&bundle_path).await.expect("read bundle");
+        let fingerprints: HashSet<String> = Pem::iter_from_buffer(&bundle)
+            .filter_map(Result::ok)
+            .filter(|pem| pem.label == "CERTIFICATE")
+            .map(|pem| sha256_hex(&pem.contents))
+            .collect();
+        assert!(
+            fingerprints.contains(&sha256_hex(&root_der)),
+            "root fingerprint must survive issuance: {fingerprints:?}"
+        );
+        assert!(
+            fingerprints.contains(&sha256_hex(&intermediate_der)),
+            "intermediate fingerprint must remain in bundle: {fingerprints:?}"
+        );
+        assert!(
+            !fingerprints.contains(&sha256_hex(&parse_pem_der(&leaf_pem))),
+            "leaf must never appear in ca bundle: {fingerprints:?}"
+        );
+    }
+
+    /// Untrusted blocks already on disk must not survive the merge.
+    /// Anything not in `trusted_ca_sha256` is filtered out before the
+    /// new chain is appended, so a stale or hostile cert that crept
+    /// into `ca-bundle.pem` cannot get re-anointed by the next
+    /// issuance write.
+    #[tokio::test]
+    async fn test_merge_drops_untrusted_existing_blocks() {
+        let intermediate_pem = test_cert_pem("intermediate.example");
+        let intermediate_der = parse_pem_der(&intermediate_pem);
+        let stale_pem = test_cert_pem("stale.example");
+        let combined = format!("{intermediate_pem}{stale_pem}");
+
+        let merged = merge_ca_bundle(
+            Some(combined.as_bytes()),
+            std::slice::from_ref(&intermediate_der),
+            &[sha256_hex(&intermediate_der)],
+        );
+
+        let fingerprints: HashSet<String> = Pem::iter_from_buffer(merged.as_bytes())
+            .filter_map(Result::ok)
+            .map(|pem| sha256_hex(&pem.contents))
+            .collect();
+        assert!(fingerprints.contains(&sha256_hex(&intermediate_der)));
+        assert!(!fingerprints.contains(&sha256_hex(&parse_pem_der(&stale_pem))));
     }
 
     #[tokio::test]

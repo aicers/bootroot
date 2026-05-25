@@ -1125,6 +1125,8 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 서비스 
 ### 출력
 
 - cert/key 존재 여부
+- CA 번들 구성 점검(`[trust].trusted_ca_sha256`의 모든 지문이
+  `[trust].ca_bundle_path`에 포함되어 있는지 확인)
 - 검증 결과 요약
 - DB 연결 점검 결과(옵션 사용 시)
 
@@ -1134,6 +1136,9 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 서비스 
 
 - bootroot-agent 실행 실패
 - cert/key 파일 누락
+- `ca_bundle_path`에 `trusted_ca_sha256`의 지문이 누락된 경우
+  (예: 발급 후 중간 인증서만 남아 기본 TLS 클라이언트 검증이
+  실패하는 상태)
 
 ## bootroot rotate
 

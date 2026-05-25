@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod support;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -79,7 +81,11 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     assert!(agent_contents.contains("service_name = \"edge-proxy\""));
     let bundle_contents = fs::read_to_string(&ca_bundle_path).expect("read ca-bundle");
     assert!(bundle_contents.contains("BEGIN CERTIFICATE"));
-    assert!(bundle_contents.contains("REMOTE"));
+    let (expected_ca_pem, _) = support::test_trust_material();
+    assert!(
+        bundle_contents.contains(expected_ca_pem.trim()),
+        "ca-bundle must carry the remote-bootstrap trust material",
+    );
     assert_mode(&secret_id_path, 0o600);
     assert_mode(&eab_path, 0o600);
     assert_mode(&agent_config_path, 0o600);
@@ -532,14 +538,15 @@ async fn stub_control_plane_global_materials(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
+    let (ca_pem, ca_fp) = support::test_trust_material();
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/ca"))
         .and(header("X-Vault-Token", RUNTIME_CLIENT_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "data": {
-                    "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-                    "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nCONTROL\n-----END CERTIFICATE-----"
+                    "trusted_ca_sha256": [ca_fp],
+                    "ca_bundle_pem": ca_pem
                 }
             }
         })))
@@ -920,6 +927,7 @@ impl TestCa {
 
 /// Routes an HTTP request path to a canned `OpenBao` JSON response.
 fn openbao_route(request_path: &str) -> (u16, String) {
+    let (ca_pem, ca_fp) = support::test_trust_material();
     let body = match request_path {
         "/v1/auth/approle/login" => json!({
             "auth": { "client_token": "tls-token" }
@@ -935,8 +943,8 @@ fn openbao_route(request_path: &str) -> (u16, String) {
         }),
         "/v1/secret/data/bootroot/services/edge-proxy/trust" => json!({
             "data": { "data": {
-                "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nTLS-MOCK\n-----END CERTIFICATE-----"
+                "trusted_ca_sha256": [ca_fp],
+                "ca_bundle_pem": ca_pem
             } }
         }),
         _ => return (404, r#"{"errors":["not found"]}"#.to_string()),
@@ -1207,13 +1215,14 @@ async fn stub_remote_service_secrets(server: &MockServer) {
         })))
         .mount(server)
         .await;
+    let (ca_pem, ca_fp) = support::test_trust_material();
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/services/edge-proxy/trust"))
         .and(header("X-Vault-Token", "remote-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "data": {
-                "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nREMOTE\n-----END CERTIFICATE-----"
+                "trusted_ca_sha256": [ca_fp],
+                "ca_bundle_pem": ca_pem
             } }
         })))
         .mount(server)

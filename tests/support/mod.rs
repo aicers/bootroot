@@ -7,6 +7,7 @@ pub(crate) mod docker_harness;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use rcgen::{CertificateParams, DnType, KeyPair};
@@ -103,6 +104,29 @@ fn test_cert_pem(common_name: &str) -> String {
     let key = KeyPair::generate().expect("key pair");
     let cert = params.self_signed(&key).expect("self signed");
     cert.pem()
+}
+
+/// Returns a process-wide consistent `(ca_bundle_pem, sha256_fingerprint)`
+/// pair so test stubs that hand out trust material on multiple endpoints
+/// (e.g. control-plane CA + remote-bootstrap trust) stay self-consistent.
+/// `bootroot verify`'s post-issuance bundle-fingerprint check (#622)
+/// fails when the agent.toml's `trusted_ca_sha256` does not match every
+/// cert in `ca-bundle.pem`, so reusing the same generated cert across
+/// stubs keeps the e2e verify path green.
+pub(crate) fn test_trust_material() -> &'static (String, String) {
+    static MATERIAL: OnceLock<(String, String)> = OnceLock::new();
+    MATERIAL.get_or_init(|| {
+        let pem = test_cert_pem("bootroot-test-ca");
+        let (_, parsed) =
+            x509_parser::pem::parse_x509_pem(pem.as_bytes()).expect("parse generated ca pem");
+        let digest = ring::digest::digest(&ring::digest::SHA256, &parsed.contents);
+        let mut hex = String::with_capacity(64);
+        for byte in digest.as_ref() {
+            use std::fmt::Write as _;
+            let _ = write!(&mut hex, "{byte:02x}");
+        }
+        (pem, hex)
+    })
 }
 
 pub(crate) fn write_password_file(secrets_dir: &Path, contents: &str) -> Result<()> {
