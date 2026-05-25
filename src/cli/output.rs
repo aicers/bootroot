@@ -664,7 +664,7 @@ fn print_next_steps(summary: &InitSummary, messages: &Messages) {
     }
 }
 
-fn format_hook(hook: &PostRenewHookEntry) -> String {
+pub(crate) fn format_hook(hook: &PostRenewHookEntry) -> String {
     let mut parts = vec![hook.command.clone()];
     parts.extend(hook.args.iter().cloned());
     parts.join(" ")

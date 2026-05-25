@@ -170,6 +170,66 @@ older builds, add `http_responder_hmac` to the `[acme]` section of
 - Validate system trust or `trust.ca_bundle_path`
 - Use `bootroot-agent --insecure` only for temporary diagnosis
 
+## Silent rotation FD desync (issue #614)
+
+After `bootroot rotate ca-key` or `bootroot rotate force-reissue`,
+mTLS handshakes start failing with `UNABLE_TO_GET_ISSUER_CERT` even
+though every status check, log line, and `openssl x509 -subject
+-issuer -noout` comparison looks correct. This means the consumer
+process is still serving the **previous** leaf certificate from an
+open file descriptor while the trust bundle has been updated to the
+**new** PKI generation — and the two intermediate certificates share
+an identical `Subject DN` / `Issuer DN`, so DN inspection alone
+cannot tell them apart.
+
+Background: see [Operations → Rotation and the in-FD pitfall](operations.md#rotation-and-the-in-fd-pitfall).
+
+### Diagnostic: compare AKI on the leaf to SKI on the trusted intermediate
+
+The discriminator is the Authority Key Identifier (AKI) on the leaf
+versus the Subject Key Identifier (SKI) on the intermediate in the
+trust bundle. If they do not match, the chain is broken.
+
+```bash
+# Inspect the leaf the consumer is actually serving (live FD):
+openssl s_client -connect <consumer-host>:<port> -showcerts \
+    </dev/null 2>/dev/null \
+  | openssl x509 -text -noout \
+  | grep -E "Subject:|Issuer:|Authority Key Identifier" -A1
+
+# Inspect the intermediate in the consumer's current trust bundle:
+openssl x509 -in <ca-bundle-or-intermediate>.pem -text -noout \
+  | grep -E "Subject:|Subject Key Identifier" -A1
+```
+
+The leaf's `Authority Key Identifier` must equal the intermediate's
+`Subject Key Identifier`. If only the DNs match but the key IDs
+differ, the consumer is wedged on an old FD.
+
+### Recovery
+
+1. Reload or restart the consumer process so it re-reads the cert /
+   key from disk. The exact action depends on the deployment style:
+   - systemd unit: `systemctl reload <unit>` (or `restart` if the
+     process does not re-read on `SIGHUP`).
+   - native daemon: `pkill -HUP <process-name>`.
+   - container: `docker restart <container-name>`.
+2. Re-verify with the diagnostic above. The leaf's AKI should now
+   equal the new intermediate's SKI.
+3. Wire up a post-renew hook so the next rotation is not silent. If
+   the service was registered without `--reload-style`, use
+   `bootroot service update` to retrofit one in place — there is no
+   need to remove and re-add the service:
+
+   ```bash
+   bootroot service update --service-name <name> \
+     --reload-style sighup --reload-target <process-name>
+   ```
+
+   See
+   [Operations → Configure a post-renew hook at registration time](operations.md#configure-a-post-renew-hook-at-registration-time)
+   for the systemd / sighup / docker-restart recipes.
+
 ## File and hook errors
 
 - Check parent directory existence and write permission for `profiles.paths`

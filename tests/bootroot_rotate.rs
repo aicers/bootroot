@@ -1664,6 +1664,15 @@ async fn test_rotate_force_reissue_deletes_cert_and_key() {
 
     let pkill_args = fs::read_to_string(&pkill_log).expect("read pkill log");
     assert!(pkill_args.contains("-HUP"));
+
+    // Issue #614: rotate force-reissue must surface the
+    // consumer-reload hint so operators with no hook configured see
+    // that the consumer process still serves the previous cert via an
+    // open file descriptor until restarted.
+    assert!(
+        stdout.contains("Consumer reload/restart required"),
+        "rotate force-reissue should print the consumer-reload hint: {stdout}"
+    );
 }
 
 #[cfg(unix)]
@@ -2944,6 +2953,13 @@ async fn test_rotate_ca_key_happy_path_phase_0_through_7() {
     assert!(
         stdout.contains("complete") || stdout.contains("Complete"),
         "stdout should mention completion: {stdout}"
+    );
+    // Issue #614: phase 5 must surface the consumer-reload hint so
+    // operators see the in-FD pitfall after rotate ca-key wipes the
+    // service cert/key pair.
+    assert!(
+        stdout.contains("Consumer reload/restart required"),
+        "rotate ca-key should print the consumer-reload hint: {stdout}"
     );
     // rotation-state.json should be cleaned up
     assert!(

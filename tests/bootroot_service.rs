@@ -15,6 +15,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[cfg(unix)]
 mod support;
 
+// End-to-end fixture exercises a full service add → state.json round
+// trip; the assertion block grew when the consumer-reload hint
+// (issue #614) was added and pushed it past the default 100-line
+// threshold. The project CLAUDE.md treats `clippy::too_many_lines`
+// loosely, so allow it here rather than fragmenting the test.
+#[allow(clippy::too_many_lines)]
 #[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_writes_state_and_secret() {
@@ -77,6 +83,21 @@ async fn test_app_add_writes_state_and_secret() {
     assert!(stdout.contains("daemon profile snippet:"));
     assert!(stdout.contains("- auto-applied bootroot-agent config:"));
     assert!(stdout.contains("- auto-applied OpenBao Agent config:"));
+    // Issue #614: with no --reload-style, the consumer-reload hint
+    // should explicitly call out the missing hook and point at the
+    // service-update remediation path.
+    assert!(
+        stdout.contains("Consumer reload/restart required"),
+        "service add should print the consumer-reload hint: {stdout}"
+    );
+    assert!(
+        stdout.contains("NO post-renew hook configured"),
+        "service add should flag the missing hook: {stdout}"
+    );
+    assert!(
+        stdout.contains("bootroot service update --service-name"),
+        "service add should suggest the service-update remediation: {stdout}"
+    );
 
     assert_state_contains_default_delivery_mode(temp_dir.path());
 
@@ -2350,7 +2371,7 @@ fn test_service_update_no_flags_errors() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("No policy flags specified"));
+    assert!(stderr.contains("No update flags specified"));
 }
 
 #[cfg(unix)]
@@ -2589,6 +2610,156 @@ fn test_service_update_rn_cidrs_clear_removes_bound_cidrs() {
         state["services"]["edge-proxy"]["approle"]["token_bound_cidrs"].is_null(),
         "token_bound_cidrs should be cleared (null) after --rn-cidrs clear"
     );
+}
+
+/// Issue #614 — `service update --reload-style sighup --reload-target X`
+/// installs a post-renew hook on an already-registered service. Tests
+/// the retrofit path that lets operators wire a hook on services that
+/// were registered without `--reload-style`, without having to remove
+/// and re-add the service.
+#[cfg(unix)]
+#[test]
+fn test_service_update_installs_post_renew_hook_via_reload_style() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    // The retrofit re-renders the managed agent.toml block, so seed a
+    // minimal file with the bootroot-managed block markers.
+    let agent_toml = temp_dir.path().join("agent.toml");
+    fs::write(
+        &agent_toml,
+        "# BEGIN bootroot managed profile: edge-proxy\n\
+         [[profiles]]\n\
+         name = \"edge-proxy\"\n\
+         # END bootroot managed profile: edge-proxy\n",
+    )
+    .expect("seed agent.toml");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--reload-style",
+            "sighup",
+            "--reload-target",
+            "review",
+        ])
+        .output()
+        .expect("run service update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("post_renew_hooks"),
+        "should report post_renew_hooks change, got: {stdout}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    let hooks = state["services"]["edge-proxy"]["post_renew_hooks"]
+        .as_array()
+        .expect("post_renew_hooks is an array");
+    assert_eq!(hooks.len(), 1, "expected one hook entry");
+    assert_eq!(hooks[0]["command"], "pkill");
+    assert_eq!(
+        hooks[0]["args"],
+        serde_json::json!(["-HUP", "review"]),
+        "expected sighup args"
+    );
+
+    let agent_contents = fs::read_to_string(&agent_toml).expect("read agent.toml");
+    assert!(
+        agent_contents.contains("[[profiles.hooks.post_renew.success]]"),
+        "agent.toml should be re-rendered with the new hook, got: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("pkill"),
+        "agent.toml should embed the hook command, got: {agent_contents}"
+    );
+}
+
+/// Issue #614 — `service update --reload-style none` clears a
+/// previously configured hook without re-onboarding.
+#[cfg(unix)]
+#[test]
+fn test_service_update_reload_style_none_clears_existing_hook() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    // Seed an existing hook into state and a managed agent.toml block.
+    let state_path = temp_dir.path().join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    state["services"]["edge-proxy"]["post_renew_hooks"] = serde_json::json!([{
+        "command": "pkill",
+        "args": ["-HUP", "review"],
+        "timeout_secs": 30,
+        "on_failure": "continue"
+    }]);
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state).expect("serialize state"),
+    )
+    .expect("write state");
+
+    let agent_toml = temp_dir.path().join("agent.toml");
+    fs::write(
+        &agent_toml,
+        "# BEGIN bootroot managed profile: edge-proxy\n\
+         [[profiles]]\n\
+         name = \"edge-proxy\"\n\
+         [[profiles.hooks.post_renew.success]]\n\
+         command = \"pkill\"\n\
+         args = [\"-HUP\", \"review\"]\n\
+         timeout_secs = 30\n\
+         on_failure = \"continue\"\n\
+         # END bootroot managed profile: edge-proxy\n",
+    )
+    .expect("seed agent.toml");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--reload-style",
+            "none",
+        ])
+        .output()
+        .expect("run service update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("post_renew_hooks"),
+        "should report hooks change, got: {stdout}"
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    let hooks = state["services"]["edge-proxy"]["post_renew_hooks"]
+        .as_array()
+        .expect("post_renew_hooks is an array");
+    assert!(hooks.is_empty(), "hooks should be cleared, got: {hooks:?}");
 }
 
 #[cfg(unix)]

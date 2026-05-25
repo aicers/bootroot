@@ -1112,6 +1112,39 @@ pub(crate) struct ServiceUpdateArgs {
     /// deployments accept numeric form only — see issue #593.
     #[arg(long, value_name = "GID-OR-NAME-OR-CLEAR")]
     pub(crate) cert_group: Option<String>,
+
+    /// Reload style preset for post-renew hook.
+    ///
+    /// Use `none` to clear any previously configured hook. Use
+    /// `systemd`/`sighup`/`docker-restart` together with
+    /// `--reload-target` to install a hook on an already-registered
+    /// service without having to remove and re-add it. See issue
+    /// #614 for the in-FD pitfall this guards against.
+    #[arg(long, value_enum)]
+    pub(crate) reload_style: Option<ReloadStyle>,
+
+    /// Target for reload-style preset (unit name, process name, or container)
+    #[arg(long)]
+    pub(crate) reload_target: Option<String>,
+
+    /// Post-renew success hook command (low-level)
+    #[arg(long)]
+    pub(crate) post_renew_command: Option<String>,
+
+    /// Post-renew success hook argument (repeatable, low-level).
+    ///
+    /// Accepts hyphen-prefixed values like `-HUP` or `-f` directly so
+    /// operators can spell `--post-renew-arg -HUP` without the `=` form.
+    #[arg(long, allow_hyphen_values = true)]
+    pub(crate) post_renew_arg: Vec<String>,
+
+    /// Post-renew success hook timeout in seconds (low-level)
+    #[arg(long)]
+    pub(crate) post_renew_timeout_secs: Option<u64>,
+
+    /// Post-renew success hook failure policy (low-level)
+    #[arg(long, value_enum)]
+    pub(crate) post_renew_on_failure: Option<HookFailurePolicyArg>,
 }
 
 #[derive(Args, Debug)]
@@ -1917,6 +1950,61 @@ mod tests {
         match cli.command {
             CliCommand::Service(ServiceCommand::Update(args)) => {
                 assert_eq!(args.rn_cidrs, vec!["10.0.0.0/8"]);
+            }
+            _ => panic!("expected service update"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_update_reload_style() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--reload-style",
+            "sighup",
+            "--reload-target",
+            "review",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Update(args)) => {
+                assert!(matches!(args.reload_style, Some(ReloadStyle::Sighup)));
+                assert_eq!(args.reload_target.as_deref(), Some("review"));
+            }
+            _ => panic!("expected service update"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_update_post_renew_low_level() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--post-renew-command",
+            "systemctl",
+            "--post-renew-arg",
+            "reload",
+            "--post-renew-arg",
+            "nginx",
+            "--post-renew-timeout-secs",
+            "60",
+            "--post-renew-on-failure",
+            "stop",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Update(args)) => {
+                assert_eq!(args.post_renew_command.as_deref(), Some("systemctl"));
+                assert_eq!(args.post_renew_arg, vec!["reload", "nginx"]);
+                assert_eq!(args.post_renew_timeout_secs, Some(60));
+                assert!(matches!(
+                    args.post_renew_on_failure,
+                    Some(HookFailurePolicyArg::Stop)
+                ));
             }
             _ => panic!("expected service update"),
         }

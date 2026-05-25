@@ -357,6 +357,7 @@ async fn run_service_add_apply(
         trusted_ca_sha256,
         messages,
     );
+    print_consumer_reload_hint(std::iter::once(&entry), messages);
     Ok(())
 }
 
@@ -545,14 +546,31 @@ const INHERIT_SENTINEL: &str = "inherit";
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) -> Result<()> {
+    let hook_inputs = resolve::PostRenewHookInputs {
+        reload_style: args.reload_style,
+        reload_target: args.reload_target.as_deref(),
+        post_renew_command: args.post_renew_command.as_deref(),
+        post_renew_arg: &args.post_renew_arg,
+        post_renew_timeout_secs: args.post_renew_timeout_secs,
+        post_renew_on_failure: args.post_renew_on_failure,
+    };
+    let hooks_supplied = hook_inputs.any_flag_set();
+
     if args.secret_id_ttl.is_none()
         && args.secret_id_wrap_ttl.is_none()
         && !args.no_wrap
         && args.rn_cidrs.is_empty()
         && args.cert_group.is_none()
+        && !hooks_supplied
     {
         anyhow::bail!(messages.error_service_update_no_flags());
     }
+
+    let new_hooks = if hooks_supplied {
+        Some(resolve::resolve_post_renew_hooks_from_parts(&hook_inputs)?)
+    } else {
+        None
+    };
 
     let state_path = StateFile::default_path();
     if !state_path.exists() {
@@ -668,6 +686,20 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         });
     }
 
+    let mut hooks_changed = false;
+    if let Some(new_hooks) = new_hooks {
+        let old_hooks = entry.post_renew_hooks.clone();
+        if old_hooks != new_hooks {
+            entry.post_renew_hooks = new_hooks;
+            changes.push(messages.service_update_field_changed(
+                "post_renew_hooks",
+                &display_post_renew_hooks(&old_hooks, messages),
+                &display_post_renew_hooks(&entry.post_renew_hooks, messages),
+            ));
+            hooks_changed = true;
+        }
+    }
+
     if explicit_ttl_set {
         eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
     }
@@ -689,9 +721,19 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
     // atomicity half of the issue #593 review's split-brain fix; the
     // `cert_group_supplied`-driven re-render-on-every-invocation above
     // is the retry half.
-    if let (Some(hint), Some(entry)) = (redeploy_hint.as_ref(), entry_snapshot.as_ref())
-        && matches!(hint.delivery_mode, DeliveryMode::LocalFile)
-    {
+    //
+    // Hook-only updates (issue #614) follow the same path: a
+    // local-file profile must be rewritten so the new
+    // `[[profiles.hooks.post_renew.success]]` entries take effect on
+    // the next agent reload / renewal.
+    let needs_local_rerender = matches!(
+        entry_snapshot.as_ref().map(|e| e.delivery_mode),
+        Some(DeliveryMode::LocalFile)
+    ) && (matches!(
+        redeploy_hint.as_ref().map(|h| h.delivery_mode),
+        Some(DeliveryMode::LocalFile)
+    ) || hooks_changed);
+    if needs_local_rerender && let Some(entry) = entry_snapshot.as_ref() {
         rerender_local_managed_profile(entry)?;
     }
 
@@ -715,6 +757,20 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
              the remote agent host so the new cert_group_gid lands in the \
              remote agent.toml.",
             hint.service_name,
+        );
+    }
+
+    if hooks_changed
+        && let Some(entry) = entry_snapshot.as_ref()
+        && matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap)
+    {
+        eprintln!(
+            "warning: post-renew hooks changed for remote-bootstrap service {}.\n\
+             Re-emit the bootstrap artifact with `bootroot service add` \
+             and re-run `bootroot-remote bootstrap --artifact <path>` on \
+             the remote agent host so the new hooks land in the remote \
+             agent.toml.",
+            args.service_name,
         );
     }
 
@@ -763,6 +819,55 @@ fn display_cert_group(value: Option<u32>) -> String {
     match value {
         Some(gid) => gid.to_string(),
         None => "unset".to_string(),
+    }
+}
+
+pub(crate) fn display_post_renew_hooks(
+    hooks: &[crate::state::PostRenewHookEntry],
+    messages: &Messages,
+) -> String {
+    if hooks.is_empty() {
+        return messages.service_update_hook_value_none().to_string();
+    }
+    hooks
+        .iter()
+        .map(crate::cli::output::format_hook)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Prints the per-service "post-renew hook status" hint used by
+/// `service add`, `rotate ca-key` (phase 5), and `rotate force-reissue`
+/// to make the in-FD pitfall (issue #614) visible. For each affected
+/// service that lacks a hook, the operator gets a single-line
+/// remediation pointer to `service update --reload-style ...`.
+pub(crate) fn print_consumer_reload_hint<'a, I>(services: I, messages: &Messages)
+where
+    I: IntoIterator<Item = &'a ServiceEntry>,
+{
+    let entries: Vec<&ServiceEntry> = services.into_iter().collect();
+    if entries.is_empty() {
+        return;
+    }
+    println!("{}", messages.hint_consumer_reload_required());
+    let mut any_without_hook = false;
+    for entry in &entries {
+        if entry.post_renew_hooks.is_empty() {
+            println!(
+                "{}",
+                messages.hint_consumer_reload_service_without_hook(&entry.service_name)
+            );
+            any_without_hook = true;
+        } else {
+            let summary = display_post_renew_hooks(&entry.post_renew_hooks, messages);
+            println!(
+                "{}",
+                messages.hint_consumer_reload_service_with_hook(&entry.service_name, &summary)
+            );
+        }
+    }
+    if any_without_hook {
+        println!("{}", messages.hint_consumer_reload_remediation());
     }
 }
 

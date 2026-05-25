@@ -345,6 +345,36 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot service update` now accepts the same post-renew hook flags
+  as `bootroot service add` (`--reload-style`, `--reload-target`, and
+  the low-level `--post-renew-command` / `--post-renew-arg` /
+  `--post-renew-timeout-secs` / `--post-renew-on-failure`) so a hook
+  can be retrofitted on an already-registered service without removing
+  and re-adding it. Use `--reload-style none` to clear a previously
+  configured hook. For `local-file` services, the managed `agent.toml`
+  profile block is re-rendered in place so the new hook takes effect on
+  the next agent reload / renewal. For `remote-bootstrap` services,
+  `service update` updates `state.json` and prints a warning telling
+  the operator to re-emit the bootstrap artifact via
+  `bootroot service add` and re-run
+  `bootroot-remote bootstrap --artifact <path>` on the remote host so
+  the new hook lands in the remote `agent.toml`. `bootroot service add`,
+  `bootroot rotate ca-key` (phase 5), and `bootroot rotate force-reissue`
+  now print a per-service "Consumer reload/restart required" hint that
+  lists each affected service and its post-renew hook status, and points
+  services that lack a hook at the new
+  `bootroot service update --reload-style ...` one-liner. `bootroot
+  reinit` prints a parallel hint reminding the operator to re-register
+  each consumer with `--reload-style ...` before the next renewal
+  cycle. New `docs/en/operations.md` and
+  `docs/en/troubleshooting.md` sections (with Korean parity) document
+  the rotation in-FD pitfall — `rotate ca-key` and
+  `rotate force-reissue` delete each `local-file` service's cert/key
+  pair on disk and signal only the local `bootroot-agent`, so a
+  consumer still serving from an open file descriptor silently keeps
+  the previous leaf certificate — and provide the canonical
+  AKI / SKI diagnostic and the systemd / sighup / docker-restart
+  recipes. (Closes #614)
 - Docker-backed E2E recovery harness for `bootroot reinit`
   (`scripts/impl/run-reinit-recovery.sh`, driven by
   `tests/docker_e2e_reinit_recovery.rs` and wired into the CI matrix

@@ -190,6 +190,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
 
     println!("{}", messages.reinit_completed());
     println!("{}", messages.reinit_service_registry_post_summary());
+    println!("{}", messages.hint_reinit_reload_style());
     Ok(())
 }
 

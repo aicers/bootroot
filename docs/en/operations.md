@@ -182,6 +182,95 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+## Rotation and the in-FD pitfall
+
+`bootroot rotate ca-key` and `bootroot rotate force-reissue` delete each
+`local-file` service's configured cert/key pair on disk
+(`entry.cert_path` and `entry.key_path`, e.g. `/opt/<svc>-mtls/{cert,key}.pem`)
+and signal **only** the local `bootroot-agent`. They do **not** signal
+the consumer process that is currently serving from those files.
+
+Native daemons (`review`, `aimer`, etc.) that were started before the
+rotation keep serving the **previous** leaf certificate via their
+already-open file descriptors, even though the file on disk has been
+replaced. Meanwhile, the `bootroot-agent` for *other* consumers writes
+the new CA bundle (signed by the new PKI generation) to their trust
+stores. The result is a silent post-rotation failure: the trusted
+bundle and the served leaf belong to different PKI generations, mTLS
+handshakes fail with `UNABLE_TO_GET_ISSUER_CERT`, and nothing in the
+logs flags it because the two intermediates share an identical
+`Subject DN` / `Issuer DN`.
+
+Concretely, the discriminator is **not** the DN — it is the Authority
+Key Identifier (AKI) on the leaf versus the Subject Key Identifier
+(SKI) on the trusted intermediate. See
+[Troubleshooting → Silent rotation FD desync](troubleshooting.md#silent-rotation-fd-desync-issue-614)
+for the diagnostic recipe.
+
+### Configure a post-renew hook at registration time
+
+The reliable fix is to declare a post-renew hook when registering the
+service. `bootroot-agent` runs the hook on every successful issuance
+(see `[profiles.hooks.post_renew]` in the rendered `agent.toml`), so
+the consumer process picks up the new cert without operator
+intervention.
+
+```bash
+# native daemon under systemd
+bootroot service add --service-name review \
+  --reload-style systemd --reload-target review.service ...
+
+# native daemon launched directly (uses pkill -HUP <process-name>)
+bootroot service add --service-name review \
+  --reload-style sighup --reload-target review ...
+
+# containerised consumer (issues `docker restart <container>`)
+bootroot service add --service-name aice-web-next \
+  --reload-style docker-restart --reload-target aice-web-next ...
+```
+
+Use `--reload-style none` to explicitly opt out, or the low-level
+`--post-renew-command` / `--post-renew-arg` /
+`--post-renew-timeout-secs` / `--post-renew-on-failure` flags for
+arbitrary commands.
+
+### Retrofitting a hook on an existing service
+
+If the service was registered without `--reload-style`, you no longer
+have to remove and re-add it: `bootroot service update` accepts the
+same hook flags and rewrites the managed `agent.toml` profile block in
+place. This is the canonical one-liner remediation that the CLI hint
+on `service add`, `rotate ca-key`, and `rotate force-reissue` points
+operators at.
+
+```bash
+bootroot service update --service-name review \
+  --reload-style sighup --reload-target review
+```
+
+For `remote-bootstrap` services, the same `service update` call updates
+`state.json`, but the remote agent reads from the bootstrap-rendered
+`agent.toml` on the remote host. `service update` prints a warning
+when this case applies; the operator must re-emit the bootstrap
+artifact via `bootroot service add` and re-run `bootroot-remote
+bootstrap --artifact <path>` on the remote host so the new hook lands
+in the remote agent config.
+
+Use `--reload-style none` to clear a previously registered hook.
+
+### Completion-time hint
+
+`service add`, `rotate ca-key` (phase 5), and `rotate force-reissue`
+print a per-service "Consumer reload/restart required" hint listing
+the affected services and their post-renew hook status. Services
+without a hook are flagged explicitly and accompanied by the
+`service update --reload-style ...` remediation pointer.
+
+`bootroot reinit` wipes the service registry rather than the cert
+files — its completion hint reminds the operator to re-register each
+consumer with `bootroot service add ... --reload-style ...` so the
+post-renew hook is in place before the consumer's next renewal cycle.
+
 ## SecretID TTL and rotation cadence
 
 Service AppRole `secret_id` values are reusable runtime credentials. They

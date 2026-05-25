@@ -881,6 +881,40 @@ impl Messages {
         self.strings().service_update_no_changes
     }
 
+    pub(crate) fn service_update_hook_value_none(&self) -> &'static str {
+        self.strings().service_update_hook_value_none
+    }
+
+    pub(crate) fn hint_consumer_reload_required(&self) -> &'static str {
+        self.strings().hint_consumer_reload_required
+    }
+
+    pub(crate) fn hint_consumer_reload_service_with_hook(
+        &self,
+        service_name: &str,
+        hook: &str,
+    ) -> String {
+        format_template(
+            self.strings().hint_consumer_reload_service_with_hook,
+            &[("service_name", service_name), ("hook", hook)],
+        )
+    }
+
+    pub(crate) fn hint_consumer_reload_service_without_hook(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().hint_consumer_reload_service_without_hook,
+            &[("service_name", service_name)],
+        )
+    }
+
+    pub(crate) fn hint_consumer_reload_remediation(&self) -> &'static str {
+        self.strings().hint_consumer_reload_remediation
+    }
+
+    pub(crate) fn hint_reinit_reload_style(&self) -> &'static str {
+        self.strings().hint_reinit_reload_style
+    }
+
     pub(crate) fn error_service_openbao_sidecar_start_failed(&self) -> &'static str {
         self.strings().error_service_openbao_sidecar_start_failed
     }
