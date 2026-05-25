@@ -249,6 +249,17 @@ pub(super) async fn rotate_ca_key(
             }
         }
 
+        let affected_local: Vec<&ServiceEntry> = ctx
+            .state
+            .services
+            .values()
+            .filter(|entry| matches!(entry.delivery_mode, DeliveryMode::LocalFile))
+            .collect();
+        crate::commands::service::print_consumer_reload_hint(
+            affected_local.iter().copied(),
+            messages,
+        );
+
         rot_state.phase = 5;
         update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
     } else if start_phase < 5 {
@@ -575,6 +586,7 @@ async fn rotate_force_reissue_local(
         "{}",
         messages.rotate_summary_force_reissue_local_signal(&args.service_name)
     );
+    crate::commands::service::print_consumer_reload_hint(std::iter::once(entry), messages);
 
     if !args.wait {
         return Ok(());

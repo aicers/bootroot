@@ -176,6 +176,90 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+## 회전과 in-FD 함정
+
+`bootroot rotate ca-key`와 `bootroot rotate force-reissue`는 각
+`local-file` 서비스의 인증서/키 파일 쌍(`entry.cert_path`와
+`entry.key_path`, 예: `/opt/<svc>-mtls/{cert,key}.pem`)을 디스크에서
+삭제하고 로컬 `bootroot-agent`에**만** 시그널을 보냅니다. 현재 해당
+파일을 서빙 중인 컨슈머 프로세스에는 시그널을 보내지 **않습니다**.
+
+회전 이전에 시작된 네이티브 데몬(`review`, `aimer` 등)은 디스크의 파일이
+교체되었더라도 이미 열린 파일 디스크립터를 통해 **이전** leaf 인증서를
+계속 서빙합니다. 한편 *다른* 컨슈머의 `bootroot-agent`는 새 PKI
+세대로 서명된 새 CA 번들을 해당 컨슈머의 신뢰 저장소에 기록합니다.
+결과적으로 신뢰 번들과 서빙되는 leaf가 서로 다른 PKI 세대에 속하게
+되어 mTLS 핸드셰이크가 `UNABLE_TO_GET_ISSUER_CERT`로 실패하고, 두
+중간 CA가 동일한 `Subject DN` / `Issuer DN`을 공유하기 때문에 로그에는
+아무 단서도 남지 않는 조용한 회전 후 실패가 발생합니다.
+
+구체적으로 식별자는 **DN이 아니라** leaf의 Authority Key
+Identifier(AKI)와 신뢰 번들 내 중간 CA의 Subject Key Identifier(SKI)
+입니다. 진단 절차는
+[트러블슈팅 → 회전 후 FD 비동기 문제](troubleshooting.md#회전-후-fd-비동기-문제-이슈-614)를
+참조하세요.
+
+### 등록 시점에 갱신 후 훅을 구성하기
+
+확실한 해결책은 서비스를 등록할 때 갱신 후 훅을 선언하는 것입니다.
+`bootroot-agent`는 모든 성공적인 발급 시 훅을 실행하므로(렌더링된
+`agent.toml`의 `[profiles.hooks.post_renew]` 참조), 컨슈머 프로세스가
+운영자 개입 없이 새 인증서를 적용합니다.
+
+```bash
+# systemd 하의 네이티브 데몬
+bootroot service add --service-name review \
+  --reload-style systemd --reload-target review.service ...
+
+# 직접 실행되는 네이티브 데몬 (pkill -HUP <process-name> 사용)
+bootroot service add --service-name review \
+  --reload-style sighup --reload-target review ...
+
+# 컨테이너 컨슈머 (`docker restart <container>` 실행)
+bootroot service add --service-name aice-web-next \
+  --reload-style docker-restart --reload-target aice-web-next ...
+```
+
+명시적으로 옵트아웃하려면 `--reload-style none`을 사용하거나, 임의의
+명령에는 저수준 `--post-renew-command` / `--post-renew-arg` /
+`--post-renew-timeout-secs` / `--post-renew-on-failure` 플래그를
+사용하세요.
+
+### 기존 서비스에 훅 재구성
+
+서비스가 `--reload-style` 없이 등록되었더라도 더 이상 제거 후 재등록할
+필요가 없습니다: `bootroot service update`가 동일한 훅 플래그를 받아
+관리되는 `agent.toml` 프로필 블록을 그 자리에서 다시 렌더링합니다. 이것이
+`service add`, `rotate ca-key`, `rotate force-reissue`의 CLI 안내가
+운영자에게 가리키는 표준 한 줄 복구 명령입니다.
+
+```bash
+bootroot service update --service-name review \
+  --reload-style sighup --reload-target review
+```
+
+`remote-bootstrap` 서비스의 경우 동일한 `service update` 호출이
+`state.json`을 갱신하지만, 원격 agent는 원격 호스트의 부트스트랩으로
+렌더링된 `agent.toml`을 읽습니다. `service update`는 이 경우 경고를
+출력하며, 운영자는 `bootroot service add`로 부트스트랩 아티팩트를
+재발행하고 원격 호스트에서 `bootroot-remote bootstrap --artifact <path>`를
+다시 실행해 새 훅이 원격 agent 구성에 반영되도록 해야 합니다.
+
+이전에 등록된 훅을 제거하려면 `--reload-style none`을 사용하세요.
+
+### 완료 시 안내
+
+`service add`, `rotate ca-key`(phase 5), `rotate force-reissue`는
+영향받은 서비스 목록과 각각의 갱신 후 훅 상태를 보여주는 "Consumer
+reload/restart required" 안내를 출력합니다. 훅이 없는 서비스는
+명시적으로 플래그되며 `service update --reload-style ...` 복구
+안내가 함께 표시됩니다.
+
+`bootroot reinit`은 인증서 파일이 아니라 서비스 레지스트리를 지웁니다.
+완료 안내는 컨슈머의 다음 갱신 주기 전에 갱신 후 훅이 미리 구성되도록
+`bootroot service add ... --reload-style ...`로 각 컨슈머를 재등록할
+것을 운영자에게 상기시킵니다.
+
 ## SecretID TTL과 회전 주기
 
 서비스 AppRole `secret_id` 값은 재사용 가능한 런타임 자격증명입니다.

@@ -347,11 +347,51 @@ fn parse_deploy_type(value: &str, messages: &Messages) -> Result<DeployType> {
 }
 
 fn resolve_post_renew_hooks(args: &ServiceAddArgs) -> Result<Vec<PostRenewHookEntry>> {
-    let has_preset = args.reload_style.is_some();
-    let has_low_level = args.post_renew_command.is_some()
-        || !args.post_renew_arg.is_empty()
-        || args.post_renew_timeout_secs.is_some()
-        || args.post_renew_on_failure.is_some();
+    resolve_post_renew_hooks_from_parts(&PostRenewHookInputs {
+        reload_style: args.reload_style,
+        reload_target: args.reload_target.as_deref(),
+        post_renew_command: args.post_renew_command.as_deref(),
+        post_renew_arg: &args.post_renew_arg,
+        post_renew_timeout_secs: args.post_renew_timeout_secs,
+        post_renew_on_failure: args.post_renew_on_failure,
+    })
+}
+
+/// Snapshot of the post-renew hook flags supplied by an operator on
+/// either `service add` or `service update`. The fields are borrowed so
+/// callers do not have to clone vectors and strings just to drive the
+/// shared resolution logic.
+pub(super) struct PostRenewHookInputs<'a> {
+    pub(super) reload_style: Option<ReloadStyle>,
+    pub(super) reload_target: Option<&'a str>,
+    pub(super) post_renew_command: Option<&'a str>,
+    pub(super) post_renew_arg: &'a [String],
+    pub(super) post_renew_timeout_secs: Option<u64>,
+    pub(super) post_renew_on_failure: Option<HookFailurePolicyArg>,
+}
+
+impl PostRenewHookInputs<'_> {
+    /// Reports whether the operator passed any hook-related flag. Used
+    /// by `service update` to distinguish "leave hooks as-is" from
+    /// "rewrite hooks".
+    pub(super) fn any_flag_set(&self) -> bool {
+        self.reload_style.is_some()
+            || self.reload_target.is_some()
+            || self.post_renew_command.is_some()
+            || !self.post_renew_arg.is_empty()
+            || self.post_renew_timeout_secs.is_some()
+            || self.post_renew_on_failure.is_some()
+    }
+}
+
+pub(super) fn resolve_post_renew_hooks_from_parts(
+    inputs: &PostRenewHookInputs<'_>,
+) -> Result<Vec<PostRenewHookEntry>> {
+    let has_preset = inputs.reload_style.is_some();
+    let has_low_level = inputs.post_renew_command.is_some()
+        || !inputs.post_renew_arg.is_empty()
+        || inputs.post_renew_timeout_secs.is_some()
+        || inputs.post_renew_on_failure.is_some();
 
     if has_preset && has_low_level {
         anyhow::bail!(
@@ -359,38 +399,38 @@ fn resolve_post_renew_hooks(args: &ServiceAddArgs) -> Result<Vec<PostRenewHookEn
         );
     }
 
-    if let Some(style) = args.reload_style {
-        return resolve_reload_preset(style, args.reload_target.as_deref());
+    if let Some(style) = inputs.reload_style {
+        return resolve_reload_preset(style, inputs.reload_target);
     }
 
-    if let Some(command) = args.post_renew_command.as_deref() {
+    if let Some(command) = inputs.post_renew_command {
         if command.trim().is_empty() {
             anyhow::bail!("--post-renew-command must not be empty");
         }
-        let timeout = args
+        let timeout = inputs
             .post_renew_timeout_secs
             .unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS);
         if timeout == 0 {
             anyhow::bail!("--post-renew-timeout-secs must be greater than 0");
         }
-        let on_failure = args.post_renew_on_failure.map_or(
+        let on_failure = inputs.post_renew_on_failure.map_or(
             HookFailurePolicyEntry::default(),
             HookFailurePolicyArg::into_entry,
         );
         return Ok(vec![PostRenewHookEntry {
             command: command.to_string(),
-            args: args.post_renew_arg.clone(),
+            args: inputs.post_renew_arg.to_vec(),
             timeout_secs: timeout,
             on_failure,
         }]);
     }
 
-    if args.reload_target.is_some() {
+    if inputs.reload_target.is_some() {
         anyhow::bail!("--reload-target requires --reload-style");
     }
-    if !args.post_renew_arg.is_empty()
-        || args.post_renew_timeout_secs.is_some()
-        || args.post_renew_on_failure.is_some()
+    if !inputs.post_renew_arg.is_empty()
+        || inputs.post_renew_timeout_secs.is_some()
+        || inputs.post_renew_on_failure.is_some()
     {
         anyhow::bail!(
             "--post-renew-arg, --post-renew-timeout-secs, and --post-renew-on-failure require --post-renew-command"

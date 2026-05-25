@@ -791,8 +791,9 @@ chown 전 운영자 기본 gid 하에서 group-readable로 잠시 노출되는
 
 ## bootroot service update
 
-`service add`를 다시 실행하지 않고 서비스별 `secret_id` 정책 필드를
-변경합니다. 정책 플래그 중 하나 이상이 필요합니다.
+`service add`를 다시 실행하지 않고 서비스별 `secret_id` 정책 필드,
+cert-group 정책, 그리고 갱신 후(post-renew) 훅 구성을 변경합니다.
+업데이트 플래그 중 하나 이상이 필요합니다.
 
 ### 입력
 
@@ -824,6 +825,25 @@ chown 전 운영자 기본 gid 하에서 group-readable로 잠시 노출되는
   이전 재렌더링이 실패한 경우 단순히 동일 명령을 다시 실행하면
   복구되며, `state.json`이 디스크의 관리 프로필보다 앞서나가는
   상황은 발생하지 않습니다.
+- `--reload-style`: 갱신 후 훅의 리로드 스타일 프리셋
+  (`sighup`, `systemd`, `docker-restart`, `none`). `service add`와
+  동일한 의미를 가집니다. 이전에 구성된 훅을 제거하려면 `none`을
+  사용하세요. `none`이 아닌 프리셋은 `--reload-target`(프로세스
+  이름, systemd 유닛, 또는 컨테이너 이름)과 함께 사용합니다.
+  저수준 `--post-renew-*` 플래그와 상호 배타입니다.
+- `--reload-target`: 리로드 스타일 프리셋의 대상.
+- `--post-renew-command`, `--post-renew-arg`,
+  `--post-renew-timeout-secs`, `--post-renew-on-failure`:
+  저수준 훅 구성으로, `service add`와 동일한 의미입니다.
+
+`local-file` 서비스의 훅 변경은 관리되는 `agent.toml` 프로필 블록을
+즉시 다시 렌더링합니다. `remote-bootstrap` 서비스의 경우 명령이
+경고를 출력하며, 운영자는 부트스트랩 아티팩트를 재발행하고 원격
+호스트에서 `bootroot-remote bootstrap --artifact <path>`를 다시
+실행해 갱신된 훅이 원격 `agent.toml`에 반영되도록 해야 합니다.
+근거 및 in-FD 함정에 대한 자세한 내용은
+[운영 → 기존 서비스에 훅 재구성](operations.md#기존-서비스에-훅-재구성)을
+참조하세요 (이슈 #614).
 
 ### 동작
 
@@ -844,7 +864,7 @@ chown 전 운영자 기본 gid 하에서 group-readable로 잠시 노출되는
 
 - `state.json` 누락
 - 서비스 미등록
-- 정책 플래그 미지정
+- 업데이트 플래그 미지정
 
 ### 예시
 
@@ -852,6 +872,13 @@ chown 전 운영자 기본 gid 하에서 group-readable로 잠시 노출되는
 bootroot service update --service-name edge-proxy --secret-id-ttl 12h
 bootroot service update --service-name edge-proxy --no-wrap
 bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+
+# 기존 서비스에 갱신 후 훅을 재구성 (이슈 #614).
+bootroot service update --service-name review \
+  --reload-style sighup --reload-target review
+bootroot service update --service-name aice-web-next \
+  --reload-style docker-restart --reload-target aice-web-next
+bootroot service update --service-name edge-proxy --reload-style none
 ```
 
 ## bootroot service info

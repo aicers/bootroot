@@ -168,6 +168,63 @@
 
 ### 발급 직후 호환성 자동 강화 실패
 
+## 회전 후 FD 비동기 문제 (이슈 #614)
+
+`bootroot rotate ca-key` 또는 `bootroot rotate force-reissue` 이후,
+모든 상태 점검, 로그, `openssl x509 -subject -issuer -noout` 비교가
+정상으로 보임에도 mTLS 핸드셰이크가 `UNABLE_TO_GET_ISSUER_CERT`로
+실패합니다. 이는 신뢰 번들이 **새** PKI 세대로 갱신되었음에도 컨슈머
+프로세스가 열린 파일 디스크립터를 통해 **이전** leaf 인증서를 계속
+서빙하고 있다는 의미이며, 두 중간 CA가 동일한 `Subject DN` /
+`Issuer DN`을 공유하기 때문에 DN 검사만으로는 구별할 수 없습니다.
+
+배경: [운영 → 회전과 in-FD 함정](operations.md#회전과-in-fd-함정) 참조.
+
+### 진단: leaf의 AKI와 신뢰된 중간 CA의 SKI 비교
+
+식별자는 leaf의 Authority Key Identifier(AKI)와 신뢰 번들 내 중간
+CA의 Subject Key Identifier(SKI)입니다. 일치하지 않으면 체인이
+끊어진 것입니다.
+
+```bash
+# 컨슈머가 실제로 서빙 중인 leaf 검사 (라이브 FD):
+openssl s_client -connect <consumer-host>:<port> -showcerts \
+    </dev/null 2>/dev/null \
+  | openssl x509 -text -noout \
+  | grep -E "Subject:|Issuer:|Authority Key Identifier" -A1
+
+# 컨슈머의 현재 신뢰 번들 내 중간 CA 검사:
+openssl x509 -in <ca-bundle-or-intermediate>.pem -text -noout \
+  | grep -E "Subject:|Subject Key Identifier" -A1
+```
+
+leaf의 `Authority Key Identifier`는 중간 CA의 `Subject Key
+Identifier`와 같아야 합니다. DN만 일치하고 키 ID가 다르면 컨슈머가
+오래된 FD에 갇혀 있는 것입니다.
+
+### 복구
+
+1. 컨슈머 프로세스를 리로드하거나 재시작하여 디스크에서 인증서/키를
+   다시 읽도록 합니다. 정확한 조치는 배포 스타일에 따라 다릅니다.
+   - systemd 유닛: `systemctl reload <unit>` (프로세스가 `SIGHUP`으로
+     재읽지 않으면 `restart` 사용).
+   - 네이티브 데몬: `pkill -HUP <process-name>`.
+   - 컨테이너: `docker restart <container-name>`.
+2. 위 진단으로 재검증합니다. leaf의 AKI가 새 중간 CA의 SKI와
+   같아져야 합니다.
+3. 다음 회전이 조용히 깨지지 않도록 갱신 후 훅을 구성합니다.
+   서비스가 `--reload-style` 없이 등록된 경우 제거 후 재등록 없이
+   `bootroot service update`로 그 자리에서 훅을 재구성할 수 있습니다.
+
+   ```bash
+   bootroot service update --service-name <name> \
+     --reload-style sighup --reload-target <process-name>
+   ```
+
+   systemd / sighup / docker-restart 레시피는
+   [운영 → 등록 시점에 갱신 후 훅을 구성하기](operations.md#등록-시점에-갱신-후-훅을-구성하기)를
+   참조하세요.
+
 ## 파일/훅 관련 오류
 
 - `profiles.paths`의 상위 디렉터리 존재 여부와 쓰기 권한 확인

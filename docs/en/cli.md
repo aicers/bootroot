@@ -814,8 +814,9 @@ The command is considered failed when:
 
 ## bootroot service update
 
-Modifies per-service `secret_id` policy fields without re-running the
-full `service add` flow. At least one policy flag is required.
+Modifies per-service `secret_id` policy fields, cert-group policy, and
+post-renew hook configuration without re-running the full `service
+add` flow. At least one update flag is required.
 
 ### Inputs
 
@@ -849,6 +850,29 @@ full `service add` flow. At least one policy flag is required.
   the re-render — so a previously-failed re-render can be repaired
   by simply re-running the command, with no risk of state.json
   drifting ahead of the on-disk managed profile.
+- `--reload-style`: reload style preset for the post-renew hook
+  (`sighup`, `systemd`, `docker-restart`, or `none`). Same
+  semantics as `service add`. Use `none` to clear a previously
+  configured hook. Combine with `--reload-target` (process
+  name, systemd unit, or container name) for the non-`none`
+  presets. Mutually exclusive with the low-level
+  `--post-renew-*` flags.
+- `--reload-target`: target for the reload-style preset.
+- `--post-renew-command`, `--post-renew-arg`,
+  `--post-renew-timeout-secs`, `--post-renew-on-failure`:
+  low-level hook configuration; same semantics as on
+  `service add`.
+
+For `local-file` services, a hook change re-renders the managed
+`agent.toml` profile block in place. For `remote-bootstrap`
+services, the command prints a warning instructing the operator
+to re-emit the bootstrap artifact and re-run `bootroot-remote
+bootstrap --artifact <path>` on the remote host so the updated
+hooks land in the remote `agent.toml`. See [Operations →
+Retrofitting a hook on an existing
+service](operations.md#retrofitting-a-hook-on-an-existing-service)
+for the rationale and the in-FD pitfall this guards against
+(issue #614).
 
 ### Behavior
 
@@ -870,7 +894,7 @@ The command is considered failed when:
 
 - Missing `state.json`
 - Service not found
-- No policy flag provided
+- No update flag provided
 
 ### Examples
 
@@ -878,6 +902,13 @@ The command is considered failed when:
 bootroot service update --service-name edge-proxy --secret-id-ttl 12h
 bootroot service update --service-name edge-proxy --no-wrap
 bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+
+# Retrofit a post-renew hook on an existing service (issue #614).
+bootroot service update --service-name review \
+  --reload-style sighup --reload-target review
+bootroot service update --service-name aice-web-next \
+  --reload-style docker-restart --reload-target aice-web-next
+bootroot service update --service-name edge-proxy --reload-style none
 ```
 
 ## bootroot service info
