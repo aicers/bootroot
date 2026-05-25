@@ -920,10 +920,14 @@ mod tests {
         let ok = issue_with_retry_inner(issue_fn, sleep_fn, &TEST_DELAYS).await;
 
         assert!(ok.is_err());
-        assert_eq!(*attempts.lock().unwrap(), 3);
+        assert_eq!(*attempts.lock().unwrap(), TEST_DELAYS.len() + 1);
         assert_eq!(
             *sleeps.lock().unwrap(),
-            vec![Duration::from_secs(1), Duration::from_secs(2)]
+            TEST_DELAYS
+                .iter()
+                .copied()
+                .map(Duration::from_secs)
+                .collect::<Vec<_>>()
         );
     }
 
