@@ -725,6 +725,14 @@ Cert/key group-access policy:
     bind-mounted cert/key readable to a non-root containerized
     client without recurring operator `chmod` workarounds — the
     policy is reapplied on every renew, so it survives rotation.
+  - The agent also writes `ca-bundle.pem` (when
+    `[trust].ca_bundle_path` is configured) at `0644` on every
+    issuance and rotation, and `chgrp`s it to the configured gid
+    when the policy is active. `0644` is used regardless of policy
+    because the bundle is public trust material (issuer/CA chain
+    PEM only, never private keys); re-asserting the mode also
+    overrides any stricter mode left behind by an earlier writer
+    (e.g. `bootroot-remote bootstrap`'s `0600` secret-file write).
   - Mode-by-mode acceptance:
     - `local-file`: name or numeric gid. Names are resolved against
       the control host's group DB. `service add` and `service

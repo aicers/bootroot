@@ -32,6 +32,15 @@ pub const KEY_FILE_MODE_DEFAULT: u32 = 0o600;
 /// Mode for the public cert file. Always world-readable; group policy
 /// only changes ownership.
 pub const CERT_FILE_MODE: u32 = 0o644;
+/// Mode for the CA bundle file. Always world-readable, regardless of
+/// `--cert-group` policy, because the CA bundle is **public trust
+/// material — issuer/CA chain PEM only, never private keys**. This
+/// invariant is what makes `0o644` safe; if the file ever grows to
+/// hold secrets, this mode must change. The mode is re-asserted on
+/// every write so a rotation undoes any prior writer (e.g. the
+/// bootstrap path that creates the file at `0o600`) leaving it at a
+/// stricter mode.
+pub const CA_BUNDLE_FILE_MODE: u32 = 0o644;
 /// Mode for the cert parent directory when `--cert-group` is set and
 /// the cert parent is distinct from the key parent.
 pub const CERT_DIR_MODE_GROUP: u32 = 0o755;
