@@ -195,7 +195,9 @@ This section covers both mTLS trust and **ACME server TLS verification**.
 #### 1) Concept split
 
 1. **mTLS trust**: bundle used by services to verify peer certificates.
-   bootroot-agent writes the chain (intermediate/root) to `ca_bundle_path`.
+   On each issuance bootroot-agent merges the ACME response chain with
+   the trusted certs already present in `ca_bundle_path` (deduped by
+   fingerprint), so the root seeded by `service add` is preserved.
 2. **ACME server TLS verification**: bootroot-agent validates the step-ca
    server certificate during ACME communication. This is separate from mTLS.
 

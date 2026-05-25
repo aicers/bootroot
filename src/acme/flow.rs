@@ -146,13 +146,30 @@ fn merge_ca_bundle(
 /// Writes the merged CA bundle to `bundle_path`. Production code and
 /// the test helper share this path so the chain-only write cannot be
 /// silently reintroduced in only one of them (#622 AC #2).
+///
+/// `NotFound` on the existing bundle is the legitimate first-issuance
+/// case and merges against an empty seed. Every other read error is
+/// propagated: a bundle the agent cannot inspect must not be
+/// overwritten with only the ACME response chain, or the
+/// intermediate-only state this PR hardens against would silently
+/// reappear whenever mode/ACL/ownership drift makes the file
+/// unreadable but still writeable.
 async fn write_merged_ca_bundle(
     bundle_path: &Path,
     chain: &[Vec<u8>],
     trusted: &[String],
     policy: CertGroupPolicy,
 ) -> Result<()> {
-    let existing = tokio::fs::read(bundle_path).await.ok();
+    let existing = match tokio::fs::read(bundle_path).await {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "refusing to overwrite unreadable CA bundle at {}",
+                bundle_path.display()
+            )));
+        }
+    };
     let bundle = merge_ca_bundle(existing.as_deref(), chain, trusted);
     fs_util::write_ca_bundle(bundle_path, &bundle, policy).await
 }
@@ -732,5 +749,41 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("Untrusted CA fingerprint"));
         assert!(!bundle_path.exists());
+    }
+
+    /// `write_merged_ca_bundle` must fail closed when the existing
+    /// bundle cannot be read for reasons other than `NotFound`. The
+    /// previous `.await.ok()` collapsed every read error into an empty
+    /// seed, which would silently overwrite a still-present but
+    /// unreadable bundle with only the ACME chain — the exact
+    /// intermediate-only state #622 hardens against.
+    #[tokio::test]
+    async fn test_write_merged_ca_bundle_fails_when_existing_unreadable() {
+        let temp = tempdir().expect("temp dir");
+        // A directory at `bundle_path` reproduces a non-`NotFound`
+        // read error portably across platforms without depending on
+        // chmod semantics (which root in CI can bypass).
+        let bundle_path = temp.path().join("ca-bundle.pem");
+        tokio::fs::create_dir_all(&bundle_path)
+            .await
+            .expect("create directory at bundle path");
+
+        let intermediate_pem = test_cert_pem("intermediate.example");
+        let intermediate_der = parse_pem_der(&intermediate_pem);
+        let trusted = vec![sha256_hex(&intermediate_der)];
+
+        let err = write_merged_ca_bundle(
+            &bundle_path,
+            std::slice::from_ref(&intermediate_der),
+            &trusted,
+            CertGroupPolicy { gid: None },
+        )
+        .await
+        .expect_err("must refuse to overwrite an unreadable bundle");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("refusing to overwrite unreadable CA bundle"),
+            "expected fail-closed context, got: {message}"
+        );
     }
 }

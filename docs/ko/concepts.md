@@ -48,15 +48,22 @@ CA 번들은 신뢰할 **루트/중간 인증서 체인**을 묶은 파일입니
 Bootroot는 외부 CA를 사용하지 않으므로, 루트 CA는 step-ca가 생성한
 자체 서명(self-signed) 루트이고, 중간 CA는 이 루트 CA로 서명된 인증서입니다.
 
-- bootroot-agent가 ACME 응답에서 체인(중간/루트)을 분리해
-  `ca_bundle_path`에 저장합니다.
+- bootroot-agent는 ACME 응답의 체인을 `ca_bundle_path`에 이미 들어 있는
+  신뢰 인증서들과 **지문 기준으로 중복 제거 후 병합**합니다. 덕분에
+  `service add`가 시드한 루트/중간 인증서가 매 발급마다 보존됩니다.
 - mTLS 서비스는 이 번들을 읽어 **같은 step-ca에서 발급된 인증서만**
   허용하도록 설정합니다.
 
 ACME 인증서 응답은 보통 **PEM 블록이 연속된 문자열**로 내려옵니다.
-첫 번째 PEM 블록이 **리프(leaf) 인증서**, 이후 블록들이 **체인(중간/루트)** 입니다.
-bootroot-agent는 PEM 블록을 순서대로 파싱해 **첫 블록을 리프**, 나머지를
-체인으로 분리하고, 체인 부분만 `ca_bundle_path`에 저장합니다.
+첫 번째 PEM 블록이 **리프(leaf) 인증서**, 이후 블록들이 체인입니다
+(스톡 step-ca 배포에서는 보통 중간 인증서만 포함됩니다).
+bootroot-agent는 PEM 블록을 순서대로 파싱해 **첫 블록은 리프**로 분리하고,
+나머지 체인 블록을 `ca_bundle_path`에 병합합니다. 이때 디스크에 이미 있던
+인증서 중 SHA-256이 `trusted_ca_sha256`에 있는 항목은 유지되고, 새 체인
+블록은 지문 기준 중복 제거 후 추가됩니다. 이렇게 해야 자체 서명 루트가
+계속 번들에 남아 기본 설정의 TLS 클라이언트(`Node tls.connect`,
+`-partial_chain` 없는 `openssl verify`)가 체인을 끝까지 검증할 수 있습니다.
+체인만으로 덮어쓰면 루트가 사라져 검증이 실패합니다.
 
 ## CSR (Certificate Signing Request)
 
