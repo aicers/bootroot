@@ -52,8 +52,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Fixed
 
 - Fixed `bootroot reinit` failing immediately with
-  `could not derive compose project name from ` (trailing empty string)
-  whenever `--compose-file` was left at its default relative
+  `could not derive compose project name from` followed by a trailing
+  empty string whenever `--compose-file` was left at its default relative
   `docker-compose.yml`. `Path::parent` returns `Some("")` — not `None` —
   for a relative path without a directory component, so the
   `compose_file.parent().unwrap_or(Path::new("."))` shape used by
