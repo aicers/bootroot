@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
-use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
 use wiremock::matchers::{body_json, header, header_exists, method, path};
@@ -503,11 +502,14 @@ fn write_state_file(root: &Path, openbao_url: &str) -> anyhow::Result<()> {
 }
 
 fn write_service_cert(cert_path: &Path, key_path: &Path) -> anyhow::Result<()> {
-    let cert = generate_simple_self_signed(vec![format!(
-        "{INSTANCE_ID}.{SERVICE_NAME}.{HOSTNAME}.{DOMAIN}"
-    )])?;
-    fs::write(cert_path, cert.cert.pem()).context("write cert")?;
-    fs::write(key_path, cert.signing_key.serialize_pem()).context("write key")?;
+    // Sign the leaf with the same CA `support::test_trust_material`
+    // bundles, so the chain check added in #627 (`bootroot verify`'s
+    // `leaf_chains_to_bundle`) accepts the pair instead of rejecting
+    // it as a self-signed leaf against an unrelated bundle.
+    let (cert_pem, key_pem) =
+        support::sign_test_leaf(&format!("{INSTANCE_ID}.{SERVICE_NAME}.{HOSTNAME}.{DOMAIN}"));
+    fs::write(cert_path, cert_pem).context("write cert")?;
+    fs::write(key_path, key_pem).context("write key")?;
     Ok(())
 }
 

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use rcgen::{CertificateParams, DnType, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use serde_json::json;
 use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -113,10 +113,16 @@ fn test_cert_pem(common_name: &str) -> String {
 /// fails when the agent.toml's `trusted_ca_sha256` does not match every
 /// cert in `ca-bundle.pem`, so reusing the same generated cert across
 /// stubs keeps the e2e verify path green.
+///
+/// Since #627 the CA is generated with `BasicConstraints cA=TRUE` and
+/// `keyCertSign`, and the keypair is retained inside [`test_ca_state`]
+/// so callers can use [`sign_test_leaf`] to issue a leaf that
+/// chain-verifies against this bundle.
 pub(crate) fn test_trust_material() -> &'static (String, String) {
     static MATERIAL: OnceLock<(String, String)> = OnceLock::new();
     MATERIAL.get_or_init(|| {
-        let pem = test_cert_pem("bootroot-test-ca");
+        let state = test_ca_state();
+        let pem = state.ca_pem.clone();
         let (_, parsed) =
             x509_parser::pem::parse_x509_pem(pem.as_bytes()).expect("parse generated ca pem");
         let digest = ring::digest::digest(&ring::digest::SHA256, &parsed.contents);
@@ -127,6 +133,60 @@ pub(crate) fn test_trust_material() -> &'static (String, String) {
         }
         (pem, hex)
     })
+}
+
+/// Holds the persistent test CA's PEM cert plus the serialized signing
+/// key so [`sign_test_leaf`] can deserialize it on demand. The keypair
+/// is generated once per process; subsequent calls reuse the same
+/// material to keep `test_trust_material`'s fingerprint stable across
+/// stubs.
+pub(crate) struct TestCaState {
+    pub ca_pem: String,
+    ca_key_pem: String,
+}
+
+pub(crate) fn test_ca_state() -> &'static TestCaState {
+    static STATE: OnceLock<TestCaState> = OnceLock::new();
+    STATE.get_or_init(|| {
+        let key = KeyPair::generate().expect("ca key pair");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "bootroot-test-ca");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let cert = params.self_signed(&key).expect("ca self signed");
+        TestCaState {
+            ca_pem: cert.pem(),
+            ca_key_pem: key.serialize_pem(),
+        }
+    })
+}
+
+/// Issues a leaf signed by [`test_ca_state`]'s CA so the on-disk pair
+/// chain-verifies against `test_trust_material()`'s bundle. Used by
+/// service-add unit tests that exercise the full `bootroot verify`
+/// path, which since #627 enforces leaf-to-bundle chaining.
+pub(crate) fn sign_test_leaf(dns_name: &str) -> (String, String) {
+    let state = test_ca_state();
+    let ca_key = KeyPair::from_pem(&state.ca_key_pem).expect("reload ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "bootroot-test-ca");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_issuer = Issuer::new(ca_params, ca_key);
+
+    let mut leaf_params = CertificateParams::new(vec![dns_name.to_string()]).expect("leaf params");
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, dns_name);
+    let leaf_key = KeyPair::generate().expect("leaf key pair");
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &ca_issuer)
+        .expect("sign leaf with test CA");
+    (leaf.pem(), leaf_key.serialize_pem())
 }
 
 pub(crate) fn write_password_file(secrets_dir: &Path, contents: &str) -> Result<()> {
