@@ -51,6 +51,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot-agent` not detecting a post-`init` trust-anchor
+  rotation. Its renewal predicate (`should_renew`) only checked leaf
+  expiry, so after `bootroot clean` + `init` regenerated the step-ca
+  root + intermediate, a still-time-valid leaf signed by the previous
+  intermediate was treated as a no-op. `service add` re-seeded
+  `ca-bundle.pem` with the new generation, the pinned fingerprints in
+  `agent.toml` also reflected the new generation, but `cert.pem`
+  remained signed by the previous intermediate — so every mTLS
+  consumer hit `UNABLE_TO_VERIFY_LEAF_SIGNATURE` for the full
+  remaining 24h of leaf validity. The two PKI generations share
+  Subject/Issuer DN (`O=Bootroot CA, CN=Bootroot CA Root CA` /
+  `Intermediate CA`), so name-based comparison cannot tell them apart;
+  the new `cert_chain::leaf_chains_to_bundle` discriminates by
+  public-key signature instead, walking leaf → issuer → self-signed
+  root inside the bundle. `should_renew` now invokes that walk when
+  `[trust].ca_bundle_path` is configured and forces a reissue when the
+  walk fails (or when the bundle is missing/unreadable), so the next
+  agent tick reissues the leaf and `write_cert_and_key`'s existing
+  `ensure_*_parent_dir` calls re-assert the `--cert-group` parent-dir
+  policy as a side effect. `bootroot verify` also gained the same
+  chain check so the silent-failure surface is closed a second time
+  for operators auditing post-rotation state. (Closes #627)
 - Fixed `bootroot-agent` overwriting `ca-bundle.pem` with the ACME
   response chain alone, silently dropping the root that `service add`
   had seeded. For a stock step-ca deployment the ACME chain contains

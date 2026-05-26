@@ -248,6 +248,7 @@ pub(super) static STRINGS: Strings = Strings {
     verify_ca_bundle_read_failed: "CA 번들({path})을 읽을 수 없습니다",
     verify_ca_bundle_parse_failed: "CA 번들({path})을 파싱할 수 없습니다",
     verify_ca_bundle_missing_fingerprints: "CA 번들({path})에 신뢰 지문이 누락되었습니다: {missing}",
+    verify_cert_chain_failed: "리프 인증서({cert_path})가 CA 번들({bundle_path})에 체인되지 않습니다. 현재 PKI 세대에 맞춰 리프를 재발급하세요.",
     status_summary_title: "bootroot status: 요약",
     status_section_infra: "- infra:",
     status_section_openbao: "- OpenBao:",

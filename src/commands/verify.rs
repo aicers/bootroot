@@ -63,7 +63,7 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
         &messages.verify_empty_key(&entry.key_path.display().to_string()),
     )?;
     verify_cert_san(entry, messages)?;
-    verify_ca_bundle(agent_config, messages)?;
+    verify_ca_bundle(&entry.cert_path, agent_config, messages)?;
 
     if args.db_check {
         let compose_dir = args
@@ -249,15 +249,23 @@ fn verify_cert_san(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
 
 /// Asserts that every fingerprint pinned in the agent's
 /// `[trust].trusted_ca_sha256` appears in the bundle at
-/// `[trust].ca_bundle_path`.
+/// `[trust].ca_bundle_path` and that the on-disk leaf chain-verifies
+/// against the bundle.
 ///
-/// Closes the silent-failure surface flagged in #622: prior to this
-/// check, an agent run that shrank the bundle to the intermediate-only
-/// chain still passed `bootroot verify` (which only re-ran the agent
-/// and asserted cert/key existence). Downstream TLS clients with
-/// default trust behaviour then failed with `unable to get issuer
-/// certificate` at request time.
-fn verify_ca_bundle(agent_config: &Path, messages: &Messages) -> Result<()> {
+/// Closes two distinct silent-failure surfaces:
+///
+/// - #622: an agent run that shrank the bundle to the intermediate-only
+///   chain used to pass `bootroot verify` (which only re-ran the agent
+///   and asserted cert/key existence). Downstream TLS clients with
+///   default trust behaviour then failed with `unable to get issuer
+///   certificate` at request time.
+/// - #627: after a destructive trust-anchor rotation, the pinned
+///   fingerprints in agent.toml and the bundle on disk both reflect the
+///   new generation, but the leaf may still be signed by the previous
+///   intermediate. The fingerprint check passes; the chain check
+///   surfaces the drift so the operator does not learn about it from a
+///   downstream TLS handshake error.
+fn verify_ca_bundle(cert_path: &Path, agent_config: &Path, messages: &Messages) -> Result<()> {
     let settings =
         bootroot::config::Settings::new(Some(agent_config.to_path_buf())).map_err(|e| {
             anyhow::anyhow!(messages.verify_agent_config_load_failed(
@@ -268,10 +276,31 @@ fn verify_ca_bundle(agent_config: &Path, messages: &Messages) -> Result<()> {
     let Some(bundle_path) = settings.trust.ca_bundle_path.as_ref() else {
         return Ok(());
     };
-    if settings.trust.trusted_ca_sha256.is_empty() {
-        return Ok(());
+    if !settings.trust.trusted_ca_sha256.is_empty() {
+        check_ca_bundle_contains_trusted(bundle_path, &settings.trust.trusted_ca_sha256, messages)?;
     }
-    check_ca_bundle_contains_trusted(bundle_path, &settings.trust.trusted_ca_sha256, messages)
+    check_leaf_chains_to_bundle(cert_path, bundle_path, messages)
+}
+
+fn check_leaf_chains_to_bundle(
+    cert_path: &Path,
+    bundle_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let cert_bytes = std::fs::read(cert_path)
+        .with_context(|| messages.error_read_file_failed(&cert_path.display().to_string()))?;
+    let bundle_bytes = std::fs::read(bundle_path).map_err(|_| {
+        anyhow::anyhow!(messages.verify_ca_bundle_read_failed(&bundle_path.display().to_string()))
+    })?;
+    let chains = bootroot::cert_chain::leaf_chains_to_bundle(&cert_bytes, &bundle_bytes)
+        .map_err(|_| anyhow::anyhow!(messages.verify_cert_parse_failed()))?;
+    if !chains {
+        anyhow::bail!(messages.verify_cert_chain_failed(
+            &cert_path.display().to_string(),
+            &bundle_path.display().to_string()
+        ));
+    }
+    Ok(())
 }
 
 fn check_ca_bundle_contains_trusted(
@@ -418,6 +447,66 @@ mod tests {
             "missing fingerprint must be named: {rendered}"
         );
         assert!(rendered.contains(&bundle_path.display().to_string()));
+    }
+
+    fn build_test_ca(label: &str) -> (rcgen::Certificate, rcgen::Issuer<'static, rcgen::KeyPair>) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("{label}-root"));
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let cert = params.self_signed(&key).unwrap();
+        let issuer = rcgen::Issuer::new(params, key);
+        (cert, issuer)
+    }
+
+    fn sign_leaf_pem(common_name: &str, issuer: &rcgen::Issuer<'static, rcgen::KeyPair>) -> String {
+        let mut params = rcgen::CertificateParams::new(vec![common_name.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.signed_by(&key, issuer).unwrap().pem()
+    }
+
+    /// Regression for issue #627: a pinned-fingerprint bundle that
+    /// matches the new PKI generation must not mask the fact that the
+    /// leaf still chains to the previous one.
+    #[test]
+    fn check_leaf_chains_fails_when_leaf_signed_by_previous_generation() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let bundle_path = dir.path().join("ca-bundle.pem");
+
+        let (_, old_issuer) = build_test_ca("gen1");
+        let (new_root, _) = build_test_ca("gen2");
+        std::fs::write(&cert_path, sign_leaf_pem("svc.example", &old_issuer)).unwrap();
+        std::fs::write(&bundle_path, new_root.pem()).unwrap();
+
+        let err = check_leaf_chains_to_bundle(&cert_path, &bundle_path, &messages).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains(&cert_path.display().to_string()));
+        assert!(rendered.contains(&bundle_path.display().to_string()));
+    }
+
+    #[test]
+    fn check_leaf_chains_passes_when_bundle_matches() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let bundle_path = dir.path().join("ca-bundle.pem");
+
+        let (root, issuer) = build_test_ca("gen1");
+        std::fs::write(&cert_path, sign_leaf_pem("svc.example", &issuer)).unwrap();
+        std::fs::write(&bundle_path, root.pem()).unwrap();
+
+        check_leaf_chains_to_bundle(&cert_path, &bundle_path, &messages).unwrap();
     }
 
     /// Trusted fingerprints are stored lowercase in agent.toml, but
