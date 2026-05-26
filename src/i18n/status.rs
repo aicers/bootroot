@@ -96,6 +96,13 @@ impl Messages {
         )
     }
 
+    pub(crate) fn verify_cert_chain_failed(&self, cert_path: &str, bundle_path: &str) -> String {
+        format_template(
+            self.strings().verify_cert_chain_failed,
+            &[("cert_path", cert_path), ("bundle_path", bundle_path)],
+        )
+    }
+
     pub(crate) fn status_summary_title(&self) -> &'static str {
         self.strings().status_summary_title
     }

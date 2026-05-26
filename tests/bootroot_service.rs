@@ -6,7 +6,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 use anyhow::Context;
-use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tempfile::tempdir;
 use wiremock::matchers::{body_json, header, header_exists, method, path};
@@ -1781,9 +1780,14 @@ fn write_cert_with_dns(
     key_path: &std::path::Path,
     dns_name: &str,
 ) -> anyhow::Result<()> {
-    let cert = generate_simple_self_signed(vec![dns_name.to_string()])?;
-    fs::write(cert_path, cert.cert.pem()).context("write cert pem")?;
-    fs::write(key_path, cert.signing_key.serialize_pem()).context("write key pem")?;
+    // Sign the leaf with the same CA `support::test_trust_material` puts in
+    // the bundle so the chain check added in #627 (`bootroot verify`'s
+    // `leaf_chains_to_bundle`) succeeds. A self-signed leaf used to pass
+    // through the predecessor's self-signature shortcut, but that path was
+    // closed when the predicate was hardened to require a real trust anchor.
+    let (cert_pem, key_pem) = support::sign_test_leaf(dns_name);
+    fs::write(cert_path, cert_pem).context("write cert pem")?;
+    fs::write(key_path, key_pem).context("write key pem")?;
     Ok(())
 }
 

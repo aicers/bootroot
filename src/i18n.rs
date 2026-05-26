@@ -284,6 +284,7 @@ pub(crate) struct Strings {
     pub(crate) verify_ca_bundle_read_failed: &'static str,
     pub(crate) verify_ca_bundle_parse_failed: &'static str,
     pub(crate) verify_ca_bundle_missing_fingerprints: &'static str,
+    pub(crate) verify_cert_chain_failed: &'static str,
     pub(crate) status_summary_title: &'static str,
     pub(crate) status_section_infra: &'static str,
     pub(crate) status_section_openbao: &'static str,

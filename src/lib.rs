@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 pub mod acme;
 pub mod agent_args;
+pub mod cert_chain;
 pub mod cert_group;
 pub mod config;
 pub mod db;

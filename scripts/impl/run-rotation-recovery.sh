@@ -156,9 +156,69 @@ control_mock() {
 }
 
 start_mock_openbao() {
+  # The mock persists its synthetic CA cert + key under this dir so
+  # `refresh_leaves` can re-sign each service's leaf with the matching
+  # generation after every `bootstrap_all`. Without that step the
+  # `bootroot verify` chain check added in #627 sees a stale leaf
+  # against the freshly rotated bundle and fails.
+  export MOCK_OPENBAO_TRUST_DIR="$ARTIFACT_DIR/mock-trust"
+  mkdir -p "$MOCK_OPENBAO_TRUST_DIR"
   python3 "$ROOT_DIR/scripts/impl/mock-openbao-server.py" >/dev/null 2>&1 &
   MOCK_OPENBAO_PID="$!"
   wait_for_mock_openbao || fail_with_context "mock OpenBao did not become healthy"
+}
+
+refresh_leaves() {
+  # Re-issue each service's leaf cert with the CA the mock most
+  # recently served under `<service>/current/`. The rotation harness
+  # uses a stub bootroot-agent (`exit 0`), so the production path that
+  # would re-sign the leaf via the renewal predicate never fires;
+  # without this step `bootroot verify` would correctly refuse a leaf
+  # that no longer chains to the bundle. The pre-rotation
+  # `run_verify_all 0 "none"` runs before any bootstrap has populated
+  # agent.toml, so the chain check there is a no-op and we only need
+  # leaves once a bootstrap has written `ca_bundle_path`.
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+    local current_dir="$MOCK_OPENBAO_TRUST_DIR/$service/current"
+    local ca_cert="$current_dir/ca.crt"
+    local ca_key="$current_dir/ca.key"
+    if [ ! -f "$ca_cert" ] || [ ! -f "$ca_key" ]; then
+      continue
+    fi
+    local leaf_cert="$work_dir/certs/${service}.crt"
+    local leaf_key="$work_dir/certs/${service}.key"
+    local dns_name="${instance_id}.${service}.${hostname}.trusted.domain"
+    local sign_dir
+    sign_dir="$(mktemp -d)"
+    openssl genrsa -out "$sign_dir/leaf.key" 2048 >/dev/null 2>&1
+    cat >"$sign_dir/openssl.cnf" <<CNF
+[req]
+distinguished_name=dn
+req_extensions=ext
+prompt=no
+[dn]
+CN=$dns_name
+[ext]
+subjectAltName=DNS:$dns_name
+CNF
+    openssl req -new \
+      -key "$sign_dir/leaf.key" \
+      -out "$sign_dir/leaf.csr" \
+      -config "$sign_dir/openssl.cnf" >/dev/null 2>&1
+    openssl x509 -req \
+      -in "$sign_dir/leaf.csr" \
+      -CA "$ca_cert" \
+      -CAkey "$ca_key" \
+      -CAcreateserial \
+      -out "$sign_dir/leaf.crt" \
+      -days 1 \
+      -extfile "$sign_dir/openssl.cnf" \
+      -extensions ext >/dev/null 2>&1
+    cp "$sign_dir/leaf.crt" "$leaf_cert"
+    cp "$sign_dir/leaf.key" "$leaf_key"
+    chmod 0600 "$leaf_cert" "$leaf_key"
+    rm -rf "$sign_dir"
+  done <"$SERVICES_TSV"
 }
 
 bootstrap_all() {
@@ -364,6 +424,7 @@ main() {
     bootstrap_all 1 "$item"
     set_transition "applied" "cycle1"
     assert_bootstrap_status "$item" "applied"
+    refresh_leaves
     run_verify_all 1 "$item"
     snapshot_state "${item}-cycle1"
 
@@ -373,6 +434,7 @@ main() {
     bootstrap_all 2 "$item"
     set_transition "applied" "cycle2"
     assert_bootstrap_status "$item" "applied"
+    refresh_leaves
     run_verify_all 2 "$item"
     snapshot_state "${item}-cycle2"
 
@@ -388,6 +450,7 @@ main() {
     bootstrap_all 4 "$item"
     set_transition "recovered" "cycle3-recovery"
     assert_bootstrap_status "$item" "applied" "$first_service"
+    refresh_leaves
     run_verify_all 4 "$item"
     snapshot_state "${item}-cycle3-recovery"
   done

@@ -7,9 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::Context;
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, generate_simple_self_signed,
-};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use serde_json::json;
 use tempfile::tempdir;
 use wiremock::matchers::{body_json, header, header_exists, method, path};
@@ -326,13 +324,17 @@ fn write_verify_state(service_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn write_cert_for_service(service_dir: &Path) -> anyhow::Result<()> {
-    let cert = generate_simple_self_signed(vec![format!(
-        "{INSTANCE_ID}.{SERVICE_NAME}.{HOSTNAME}.{DOMAIN}"
-    )])?;
+    // Sign the leaf with the test CA from `support::test_trust_material`
+    // so the chain check added in #627 (`bootroot verify`'s
+    // `leaf_chains_to_bundle`) accepts it. The bundle written by
+    // `bootroot service add` carries that same CA, so a leaf issued by
+    // `support::sign_test_leaf` chains successfully.
+    let (cert_pem, key_pem) =
+        support::sign_test_leaf(&format!("{INSTANCE_ID}.{SERVICE_NAME}.{HOSTNAME}.{DOMAIN}"));
     let cert_path = service_dir.join("certs").join("edge-proxy.crt");
     let key_path = service_dir.join("certs").join("edge-proxy.key");
-    fs::write(&cert_path, cert.cert.pem()).context("write cert")?;
-    fs::write(&key_path, cert.signing_key.serialize_pem()).context("write key")?;
+    fs::write(&cert_path, cert_pem).context("write cert")?;
+    fs::write(&key_path, key_pem).context("write key")?;
     Ok(())
 }
 

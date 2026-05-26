@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::{Mutex as TokioMutex, Semaphore, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::{acme, config, eab, fast_poll, hooks, profile, utils};
+use crate::{acme, cert_chain, config, eab, fast_poll, hooks, profile, utils};
 
 const DEFAULT_AGENT_CONFIG_PATH: &str = "agent.toml";
 
@@ -455,10 +455,29 @@ where
 
 /// Determines whether a certificate should be renewed.
 ///
+/// Returns `true` when the on-disk leaf is missing, near expiry, or no
+/// longer chains to the configured CA bundle. The chain check is the
+/// load-bearing addition for issue #627: a destructive trust-anchor
+/// rotation (`bootroot clean` + re-`init`, operator-side key swap, or
+/// `bootroot rotate ca-key --skip reissue`) leaves a still-time-valid
+/// leaf signed by the *previous* intermediate while `service add`
+/// already replaced the bundle with the new generation's root +
+/// intermediate. Without the chain check the agent treats that leaf as
+/// fine and consumers see `UNABLE_TO_VERIFY_LEAF_SIGNATURE` for the
+/// full remaining 24h of leaf validity.
+///
+/// `[trust].ca_bundle_path` not configured means the operator opted
+/// out of bundle management entirely; in that case only the expiry
+/// gate runs.
+///
 /// # Errors
-/// Returns an error if the certificate cannot be parsed or read.
+/// Returns an error if the certificate cannot be parsed or read for
+/// reasons other than `NotFound`. Chain-verification failures or a
+/// missing/unreadable bundle force a reissue rather than abort the
+/// renewal loop.
 pub(crate) async fn should_renew(
     profile: &config::DaemonProfileSettings,
+    trust: &config::TrustSettings,
     renew_before: Duration,
 ) -> anyhow::Result<bool> {
     let cert_bytes = match tokio::fs::read(&profile.paths.cert).await {
@@ -482,7 +501,50 @@ pub(crate) async fn should_renew(
     let now = time::OffsetDateTime::now_utc();
     let renew_at = now + renew_before;
 
-    Ok(not_after <= renew_at)
+    if not_after <= renew_at {
+        return Ok(true);
+    }
+
+    if let Some(bundle_path) = trust.ca_bundle_path.as_ref() {
+        match tokio::fs::read(bundle_path).await {
+            Ok(bundle_bytes) => match cert_chain::leaf_chains_to_bundle(&cert_bytes, &bundle_bytes)
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        "Certificate at {} no longer chains to CA bundle at {}; reissuing.",
+                        profile.paths.cert.display(),
+                        bundle_path.display()
+                    );
+                    return Ok(true);
+                }
+                Err(err) => {
+                    warn!(
+                        "Chain verification of {} against {} failed ({err}); reissuing.",
+                        profile.paths.cert.display(),
+                        bundle_path.display()
+                    );
+                    return Ok(true);
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    "CA bundle at {} is missing; reissuing to repopulate.",
+                    bundle_path.display()
+                );
+                return Ok(true);
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to read CA bundle at {} ({err}); reissuing.",
+                    bundle_path.display()
+                );
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Parses the certificate expiration timestamp.
@@ -555,7 +617,7 @@ async fn check_and_renew_profile(
     let lock = profile_locks.for_profile(&profile_label);
     let _profile_guard = lock.lock().await;
 
-    let needs_renewal = match should_renew(profile, renew_before).await {
+    let needs_renewal = match should_renew(profile, &settings.trust, renew_before).await {
         Ok(val) => val,
         Err(err) => {
             error!("Profile '{}' renewal check failed: {err}", profile_label);
@@ -696,6 +758,67 @@ mod tests {
         fs::write(cert_path, cert.pem()).unwrap();
     }
 
+    struct TestCa {
+        root_cert: rcgen::Certificate,
+        intermediate_cert: rcgen::Certificate,
+        intermediate_issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+    }
+
+    fn build_test_ca(label: &str) -> TestCa {
+        let root_key = rcgen::KeyPair::generate().unwrap();
+        let mut root_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("{label}-root"));
+        root_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_issuer = rcgen::Issuer::new(root_params, root_key);
+
+        let intermediate_key = rcgen::KeyPair::generate().unwrap();
+        let mut int_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        int_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        int_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("{label}-intermediate"));
+        int_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let intermediate_cert = int_params
+            .signed_by(&intermediate_key, &root_issuer)
+            .unwrap();
+        let intermediate_issuer = rcgen::Issuer::new(int_params, intermediate_key);
+
+        TestCa {
+            root_cert,
+            intermediate_cert,
+            intermediate_issuer,
+        }
+    }
+
+    fn sign_test_leaf(common_name: &str, ca: &TestCa) -> String {
+        let mut params = rcgen::CertificateParams::new(vec![common_name.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(90);
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = params
+            .signed_by(&leaf_key, &ca.intermediate_issuer)
+            .unwrap();
+        leaf.pem()
+    }
+
+    fn test_bundle_pem(ca: &TestCa) -> String {
+        format!("{}{}", ca.root_cert.pem(), ca.intermediate_cert.pem())
+    }
+
     #[test]
     fn test_select_retry_backoff_uses_profile_override() {
         let settings = build_settings(vec![5, 10, 30]);
@@ -775,9 +898,13 @@ mod tests {
         let cert_path = dir.path().join("missing.pem");
         let profile = build_profile(cert_path);
 
-        let renew = should_renew(&profile, Duration::from_mins(1))
-            .await
-            .unwrap();
+        let renew = should_renew(
+            &profile,
+            &config::TrustSettings::default(),
+            Duration::from_mins(1),
+        )
+        .await
+        .unwrap();
 
         assert!(renew);
     }
@@ -791,9 +918,13 @@ mod tests {
         let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(90);
         write_cert(&cert_path, not_after);
 
-        let renew = should_renew(&profile, Duration::from_secs(THIRTY_DAYS_SECS))
-            .await
-            .unwrap();
+        let renew = should_renew(
+            &profile,
+            &config::TrustSettings::default(),
+            Duration::from_secs(THIRTY_DAYS_SECS),
+        )
+        .await
+        .unwrap();
 
         assert!(!renew);
     }
@@ -807,9 +938,13 @@ mod tests {
         let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(1);
         write_cert(&cert_path, not_after);
 
-        let renew = should_renew(&profile, Duration::from_secs(THIRTY_DAYS_SECS))
-            .await
-            .unwrap();
+        let renew = should_renew(
+            &profile,
+            &config::TrustSettings::default(),
+            Duration::from_secs(THIRTY_DAYS_SECS),
+        )
+        .await
+        .unwrap();
 
         assert!(renew);
     }
@@ -821,9 +956,13 @@ mod tests {
         fs::write(&cert_path, "not a cert").unwrap();
         let profile = build_profile(cert_path);
 
-        let err = should_renew(&profile, Duration::from_secs(THIRTY_DAYS_SECS))
-            .await
-            .unwrap_err();
+        let err = should_renew(
+            &profile,
+            &config::TrustSettings::default(),
+            Duration::from_secs(THIRTY_DAYS_SECS),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.to_string().contains("Failed to parse PEM certificate"));
     }
@@ -841,6 +980,88 @@ mod tests {
         assert_eq!(parsed.unix_timestamp(), not_after.unix_timestamp());
     }
 
+    /// Regression for issue #627: when `[trust].ca_bundle_path` is
+    /// configured, a time-valid leaf whose signer is no longer in the
+    /// bundle (the post-`init`-rotation state) must force a reissue.
+    #[tokio::test]
+    async fn test_should_renew_when_leaf_does_not_chain_to_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let bundle_path = dir.path().join("ca-bundle.pem");
+
+        let old_ca = build_test_ca("gen1");
+        let new_ca = build_test_ca("gen2");
+        let leaf_pem = sign_test_leaf("svc.example", &old_ca);
+        fs::write(&cert_path, &leaf_pem).unwrap();
+        fs::write(&bundle_path, test_bundle_pem(&new_ca)).unwrap();
+
+        let profile = build_profile(cert_path);
+        let trust = config::TrustSettings {
+            ca_bundle_path: Some(bundle_path),
+            trusted_ca_sha256: Vec::new(),
+        };
+
+        let renew = should_renew(&profile, &trust, Duration::from_secs(THIRTY_DAYS_SECS))
+            .await
+            .unwrap();
+
+        assert!(
+            renew,
+            "leaf signed by previous intermediate must trigger renewal"
+        );
+    }
+
+    /// Healthy state: leaf chains to the current bundle and is far
+    /// from expiry. The chain check must not force a needless reissue.
+    #[tokio::test]
+    async fn test_should_renew_skips_when_leaf_chains_to_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let bundle_path = dir.path().join("ca-bundle.pem");
+
+        let ca = build_test_ca("gen1");
+        let leaf_pem = sign_test_leaf("svc.example", &ca);
+        fs::write(&cert_path, &leaf_pem).unwrap();
+        fs::write(&bundle_path, test_bundle_pem(&ca)).unwrap();
+
+        let profile = build_profile(cert_path);
+        let trust = config::TrustSettings {
+            ca_bundle_path: Some(bundle_path),
+            trusted_ca_sha256: Vec::new(),
+        };
+
+        let renew = should_renew(&profile, &trust, Duration::from_secs(THIRTY_DAYS_SECS))
+            .await
+            .unwrap();
+
+        assert!(!renew);
+    }
+
+    /// A configured-but-missing bundle is a broken state; the agent
+    /// must reissue so `write_merged_ca_bundle` lays down a fresh
+    /// bundle alongside the new leaf.
+    #[tokio::test]
+    async fn test_should_renew_when_bundle_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let bundle_path = dir.path().join("missing-bundle.pem");
+
+        let ca = build_test_ca("gen1");
+        fs::write(&cert_path, sign_test_leaf("svc.example", &ca)).unwrap();
+
+        let profile = build_profile(cert_path);
+        let trust = config::TrustSettings {
+            ca_bundle_path: Some(bundle_path),
+            trusted_ca_sha256: Vec::new(),
+        };
+
+        let renew = should_renew(&profile, &trust, Duration::from_secs(THIRTY_DAYS_SECS))
+            .await
+            .unwrap();
+
+        assert!(renew);
+    }
+
     #[tokio::test]
     async fn test_should_renew_rejects_large_duration() {
         let dir = tempfile::tempdir().unwrap();
@@ -850,7 +1071,9 @@ mod tests {
         let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(90);
         write_cert(&cert_path, not_after);
 
-        let err = should_renew(&profile, Duration::MAX).await.unwrap_err();
+        let err = should_renew(&profile, &config::TrustSettings::default(), Duration::MAX)
+            .await
+            .unwrap_err();
 
         assert!(
             err.to_string()
@@ -1075,7 +1298,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let lock = locks.for_profile(&profile_label);
                 let _guard = lock.lock().await;
-                let needs = should_renew(&profile, renew_before)
+                let needs = should_renew(&profile, &config::TrustSettings::default(), renew_before)
                     .await
                     .expect("should_renew reads the cert");
                 if needs {

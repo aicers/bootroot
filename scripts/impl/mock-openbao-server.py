@@ -4,14 +4,75 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
-import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("MOCK_OPENBAO_PORT", "18200"))
 TOKEN = "mock-client-token"
-SERVICE_PATH_PATTERN = re.compile(r"^/v1/secret/data/bootroot/services/([^/]+)/([^/]+)$")
+# Service / item names embed into filesystem paths (see TRUST_DIR
+# usage in synthetic_trust_anchor), so restrict the URL capture
+# groups to a path-safe alphabet rather than the looser `[^/]+`.
+# This rejects `..`, `/`, and any character that could escape the
+# `TRUST_DIR/<service>/` jail.
+SAFE_NAME_RE = r"[A-Za-z0-9_-]+"
+SERVICE_PATH_PATTERN = re.compile(
+    rf"^/v1/secret/data/bootroot/services/({SAFE_NAME_RE})/({SAFE_NAME_RE})$"
+)
+SAFE_NAME_FULLMATCH = re.compile(rf"^{SAFE_NAME_RE}$")
 CONTROL_ITEMS = {"secret_id", "eab", "http_responder_hmac", "trust"}
+
+
+# Persist the synthetic CA material (cert + key) under this directory so
+# the rotation harness can re-issue leaves that chain to the bundle the
+# mock just handed out. `bootroot verify`'s chain check (issue #627)
+# rejects a stale leaf, so each `bootstrap_all` cycle has to be followed
+# by a leaf refresh signed by the matching CA generation.
+TRUST_DIR = os.environ.get("MOCK_OPENBAO_TRUST_DIR", "/tmp/mock-openbao-trust")
+
+
+def _safe_name(value: str) -> str:
+    """Rejects path components that contain anything other than the
+    SAFE_NAME alphabet so we cannot construct paths outside TRUST_DIR.
+
+    The HTTP route and control-plane handlers already constrain
+    incoming service/item identifiers via SERVICE_PATH_PATTERN and
+    CONTROL_ITEMS, but inputs reaching this helper from arbitrary
+    JSON payloads (`/control/*`) still need the same scrub.
+    """
+    if not SAFE_NAME_FULLMATCH.fullmatch(value):
+        raise ValueError(f"unsafe path component: {value!r}")
+    return value
+
+
+def _trust_subdir(*parts: str) -> str:
+    """Joins `parts` under TRUST_DIR and verifies the resolved path
+    stays inside the jail.
+
+    Uses `os.path.realpath` plus a `startswith` containment check —
+    the canonical CodeQL-recognised sanitiser for `py/path-injection`.
+    Each `part` is also screened by [`_safe_name`] so the validator
+    can never see a `..` segment in the first place; the containment
+    check is a defensive belt-and-braces against symlink races.
+    """
+    base = os.path.realpath(TRUST_DIR)
+    os.makedirs(base, exist_ok=True)
+    safe_parts = [_safe_name(part) for part in parts]
+    candidate = os.path.realpath(os.path.join(base, *safe_parts))
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise ValueError(f"path escapes TRUST_DIR: {candidate!r}")
+    return candidate
+
+
+def _ca_file(versioned_dir: str, suffix: str) -> str:
+    """Returns a fixed-suffix path beneath `versioned_dir` so CodeQL
+    sees no further user-controlled segments after the
+    `_trust_subdir` containment check."""
+    if suffix not in {"ca.crt", "ca.key", "openssl.cnf"}:
+        raise ValueError(f"unknown CA file suffix: {suffix!r}")
+    return os.path.join(versioned_dir, suffix)
+
+
 versions: dict[tuple[str, str], int] = {}
 fail_next: dict[tuple[str, str], int] = {}
 # Cache real self-signed CA certs keyed by (service, version) so each
@@ -29,41 +90,73 @@ def synthetic_trust_anchor(service: str, version: int) -> tuple[str, str]:
     Cached per (service, version) so repeated reads within a cycle
     return identical bytes (otherwise `write_secret_file` would never
     settle on `Unchanged` and the agent.toml diff would flap).
+
+    The CA is generated with `BasicConstraints CA:TRUE` and
+    `keyUsage keyCertSign,cRLSign` so `bootroot verify`'s chain check
+    (#627) treats it as an acceptable trust anchor — without those
+    extensions the hardened `leaf_chains_to_bundle` predicate rejects
+    the bundle entry even when the public-key signature lines up.
+
+    The CA cert + key are also persisted under `TRUST_DIR/<service>/`
+    so the rotation harness can re-issue a leaf signed by the same CA
+    after each bootstrap cycle.
     """
     key = (service, version)
     cached = _trust_cache.get(key)
     if cached is not None:
         return cached
-    with tempfile.TemporaryDirectory() as tmp:
-        cert_path = os.path.join(tmp, "cert.pem")
-        key_path = os.path.join(tmp, "key.pem")
-        subprocess.run(
-            [
-                "openssl",
-                "req",
-                "-x509",
-                "-nodes",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                key_path,
-                "-out",
-                cert_path,
-                "-days",
-                "1",
-                "-subj",
-                f"/CN=mock-trust-{service}-v{version}",
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    safe_version = int(version)
+    versioned_dir = _trust_subdir(service, f"v{safe_version}")
+    os.makedirs(versioned_dir, exist_ok=True)
+    cert_path = _ca_file(versioned_dir, "ca.crt")
+    key_path = _ca_file(versioned_dir, "ca.key")
+    config_path = _ca_file(versioned_dir, "openssl.cnf")
+    with open(config_path, "w", encoding="utf-8") as fh:
+        fh.write(
+            "[req]\n"
+            "distinguished_name=dn\n"
+            "x509_extensions=ext\n"
+            "prompt=no\n"
+            "[dn]\n"
+            f"CN=mock-trust-{_safe_name(service)}-v{safe_version}\n"
+            "[ext]\n"
+            "basicConstraints=critical,CA:TRUE\n"
+            "keyUsage=critical,keyCertSign,cRLSign\n"
         )
-        with open(cert_path, encoding="utf-8") as fh:
-            pem = fh.read()
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-nodes",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key_path,
+            "-out",
+            cert_path,
+            "-days",
+            "1",
+            "-config",
+            config_path,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with open(cert_path, encoding="utf-8") as fh:
+        pem = fh.read()
     der = base64.b64decode(
         "".join(line for line in pem.splitlines() if not line.startswith("-----"))
     )
     fingerprint = hashlib.sha256(der).hexdigest()
+    # Mirror the just-generated material into `<service>/current/` so
+    # the harness can blindly read the latest CA without tracking
+    # per-item versions on the bash side.
+    current_dir = _trust_subdir(service, "current")
+    os.makedirs(current_dir, exist_ok=True)
+    shutil.copyfile(cert_path, _ca_file(current_dir, "ca.crt"))
+    shutil.copyfile(key_path, _ca_file(current_dir, "ca.key"))
     _trust_cache[key] = (pem, fingerprint)
     return pem, fingerprint
 

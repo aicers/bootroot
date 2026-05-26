@@ -248,6 +248,7 @@ pub(super) static STRINGS: Strings = Strings {
     verify_ca_bundle_read_failed: "Failed to read CA bundle at {path}",
     verify_ca_bundle_parse_failed: "Failed to parse CA bundle at {path}",
     verify_ca_bundle_missing_fingerprints: "CA bundle at {path} is missing trusted fingerprints: {missing}",
+    verify_cert_chain_failed: "Leaf certificate at {cert_path} does not chain to CA bundle at {bundle_path}; reissue the leaf so it matches the current PKI generation.",
     status_summary_title: "bootroot status: summary",
     status_section_infra: "- infra:",
     status_section_openbao: "- OpenBao:",
