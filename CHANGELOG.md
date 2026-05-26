@@ -65,7 +65,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `Intermediate CA`), so name-based comparison cannot tell them apart;
   the new `cert_chain::leaf_chains_to_bundle` discriminates by
   public-key signature instead, walking leaf → issuer → self-signed
-  root inside the bundle. `should_renew` now invokes that walk when
+  trust anchor inside the bundle. The walk only terminates on a
+  self-signed certificate that is actually present in the bundle (a
+  self-signature on the leaf alone is not enough), and intermediate
+  hops must carry the X.509 cA basic constraint with a matching
+  issuer/subject DN — closing the smaller silent-failure surface
+  where a self-signed `cert.pem`, or a non-CA bundle entry, could
+  have masqueraded as a healthy chain. `should_renew` now invokes
+  that walk when
   `[trust].ca_bundle_path` is configured and forces a reissue when the
   walk fails (or when the bundle is missing/unreadable), so the next
   agent tick reissues the leaf and `write_cert_and_key`'s existing

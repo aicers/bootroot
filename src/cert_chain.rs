@@ -17,15 +17,26 @@
 //! that catches the rotation.
 
 use anyhow::{Context, Result};
+use x509_parser::certificate::X509Certificate;
 use x509_parser::pem::Pem;
 
 /// Returns `Ok(true)` when the leaf at `leaf_pem` chain-verifies
-/// against a self-signed root inside `bundle_pem` by public-key
-/// signature.
+/// against a self-signed trust anchor inside `bundle_pem` by
+/// public-key signature.
 ///
-/// `Ok(false)` means the leaf parsed but no path to a self-signed root
-/// could be built from the CAs in the bundle — the on-disk leaf was
-/// issued by a CA generation the bundle no longer trusts.
+/// The walk only terminates on a self-signed certificate that is
+/// *present in the bundle*. A self-signed `leaf_pem` whose key is
+/// not also in the bundle is rejected, since the bundle would not
+/// trust it. Intermediate hops must carry the X.509 CA basic
+/// constraint (and, if a `KeyUsage` extension is present, the
+/// `keyCertSign` bit), and the issuer DN of each hop must match the
+/// subject DN of the next, mirroring what a normal TLS client
+/// enforces.
+///
+/// `Ok(false)` means the leaf parsed but no path to a self-signed
+/// trust anchor could be built from the CAs in the bundle — the
+/// on-disk leaf was issued by a CA generation the bundle no longer
+/// trusts.
 ///
 /// `Err` is reserved for hard parse failures on the leaf or bundle.
 /// Callers in the renewal predicate treat `Err` as "force a reissue"
@@ -49,23 +60,54 @@ pub fn leaf_chains_to_bundle(leaf_pem: &[u8], bundle_pem: &[u8]) -> Result<bool>
         bundle_certs.push(cert);
     }
 
-    // Walk leaf → issuer → ... → self-signed. The depth bound is the
-    // bundle size: any longer walk would have revisited a cert and is
-    // proof of a loop, not a real chain.
+    // Walk leaf → issuer → ... → self-signed trust anchor in the
+    // bundle. Termination is only valid on a bundle certificate; a
+    // self-signature on the leaf itself does not count. The depth
+    // bound is the bundle size: any longer walk would have revisited
+    // a cert and is proof of a loop, not a real chain.
     let mut current = &leaf;
     for _ in 0..=bundle_certs.len() {
-        if current.verify_signature(None).is_ok() {
-            return Ok(true);
-        }
-        let next = bundle_certs
-            .iter()
-            .find(|ca| current.verify_signature(Some(ca.public_key())).is_ok());
-        let Some(next) = next else {
+        let Some(next) = bundle_certs.iter().find(|ca| issued_by(current, ca)) else {
             return Ok(false);
         };
+        if is_self_signed(next) {
+            return Ok(true);
+        }
         current = next;
     }
     Ok(false)
+}
+
+fn issued_by(child: &X509Certificate<'_>, ca: &X509Certificate<'_>) -> bool {
+    if !is_ca_capable(ca) {
+        return false;
+    }
+    if child.issuer() != ca.subject() {
+        return false;
+    }
+    child.verify_signature(Some(ca.public_key())).is_ok()
+}
+
+fn is_self_signed(cert: &X509Certificate<'_>) -> bool {
+    cert.subject() == cert.issuer() && cert.verify_signature(None).is_ok()
+}
+
+fn is_ca_capable(cert: &X509Certificate<'_>) -> bool {
+    // RFC 5280: an issuer of certificates must carry BasicConstraints
+    // with cA=TRUE. If a KeyUsage extension is present it must assert
+    // keyCertSign; absent KeyUsage we accept the BasicConstraints
+    // signal alone, matching common TLS-client leniency.
+    let Ok(Some(bc)) = cert.basic_constraints() else {
+        return false;
+    };
+    if !bc.value.ca {
+        return false;
+    }
+    match cert.key_usage() {
+        Ok(Some(ku)) => ku.value.key_cert_sign(),
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
 fn parse_bundle_pems(bundle_pem: &[u8]) -> Result<Vec<Pem>> {
@@ -211,5 +253,71 @@ mod tests {
         let ok = leaf_chains_to_bundle(leaf.as_bytes(), b"").unwrap();
 
         assert!(!ok);
+    }
+
+    #[test]
+    fn self_signed_leaf_does_not_satisfy_unrelated_bundle() {
+        // A self-signed cert whose key is not part of the bundle must
+        // not be treated as chaining: the bundle would not trust it.
+        // Earlier the walk accepted any self-signature on the
+        // starting cert, so a self-signed leaf passed against an
+        // unrelated bundle. Regression cover for #627 review.
+        let ca = build_ca("gen1");
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["svc.example".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "svc.example");
+        let self_signed = params.self_signed(&key).unwrap();
+
+        let ok =
+            leaf_chains_to_bundle(self_signed.pem().as_bytes(), bundle(&ca).as_bytes()).unwrap();
+
+        assert!(!ok, "self-signed leaf must not chain to unrelated bundle");
+    }
+
+    #[test]
+    fn non_ca_bundle_certificate_cannot_act_as_issuer() {
+        // A leaf-shaped certificate that happens to verify a child's
+        // signature must not satisfy the chain walk: trust anchors
+        // and intermediates need the X.509 cA basic constraint. The
+        // earlier code only looked at signature validity, so a
+        // non-CA bundle entry whose key matched would have been
+        // accepted. Regression cover for #627 review.
+        let ca = build_ca("gen1");
+
+        // Construct a non-CA "issuer" using the gen1 intermediate
+        // keypair: it can produce a valid signature on a child, but
+        // is itself not flagged as a CA. Pair it with a child signed
+        // by that same key and present only the non-CA cert as the
+        // bundle.
+        let masquerade_key = KeyPair::generate().unwrap();
+        let mut masquerade_params =
+            CertificateParams::new(vec!["evil.example".to_string()]).unwrap();
+        masquerade_params
+            .distinguished_name
+            .push(DnType::CommonName, "evil.example");
+        // is_ca defaults to NoCa; do not flip it.
+        let masquerade = masquerade_params
+            .signed_by(&masquerade_key, &ca.root_issuer)
+            .unwrap();
+        let masquerade_issuer = Issuer::new(masquerade_params, masquerade_key);
+
+        let mut child_params = CertificateParams::new(vec!["svc.example".to_string()]).unwrap();
+        child_params
+            .distinguished_name
+            .push(DnType::CommonName, "svc.example");
+        let child_key = KeyPair::generate().unwrap();
+        let child = child_params
+            .signed_by(&child_key, &masquerade_issuer)
+            .unwrap();
+
+        let ok =
+            leaf_chains_to_bundle(child.pem().as_bytes(), masquerade.pem().as_bytes()).unwrap();
+
+        assert!(
+            !ok,
+            "non-CA bundle entry must not be accepted as a trust anchor"
+        );
     }
 }
