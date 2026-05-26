@@ -6,17 +6,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Changed
-
-- `bootroot rotate force-reissue --wait` now exits with status `124`
-  (the GNU `timeout(1)` convention) when the wait window elapses
-  without the agent reporting completion. The previous behaviour was
-  to print the timeout message and exit `0`, which made a deferred
-  reissue indistinguishable from a successful one for scripted
-  callers. The timeout message itself is unchanged. Callers that
-  prefer the old "ignore timeout" semantics can re-establish them
-  with `|| true`. (Closes #629)
-
 ### Security
 
 - Bumped `rustls-webpki` from 0.103.10 to 0.103.12 to address
@@ -1012,6 +1001,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- `bootroot rotate force-reissue --wait` now exits with status `124`
+  (the GNU `timeout(1)` convention) when the wait window elapses
+  without the agent reporting completion. The previous behaviour was
+  to print the timeout message and exit `0`, which made a deferred
+  reissue indistinguishable from a successful one for scripted
+  callers. The timeout message itself is unchanged. Callers that
+  prefer the old "ignore timeout" semantics can re-establish them
+  with `|| true`. (Closes #629)
 - The published `PostgreSQL` host port now defaults to **5433**
   (`POSTGRES_HOST_PORT=5433`) so bootroot does not claim the
   conventional 5432 out of the box. The conventional port stays free
