@@ -71,6 +71,8 @@ def _ca_file(versioned_dir: str, suffix: str) -> str:
     if suffix not in {"ca.crt", "ca.key", "openssl.cnf"}:
         raise ValueError(f"unknown CA file suffix: {suffix!r}")
     return os.path.join(versioned_dir, suffix)
+
+
 versions: dict[tuple[str, str], int] = {}
 fail_next: dict[tuple[str, str], int] = {}
 # Cache real self-signed CA certs keyed by (service, version) so each
