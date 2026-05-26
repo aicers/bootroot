@@ -23,6 +23,14 @@ SAFE_NAME_FULLMATCH = re.compile(rf"^{SAFE_NAME_RE}$")
 CONTROL_ITEMS = {"secret_id", "eab", "http_responder_hmac", "trust"}
 
 
+# Persist the synthetic CA material (cert + key) under this directory so
+# the rotation harness can re-issue leaves that chain to the bundle the
+# mock just handed out. `bootroot verify`'s chain check (issue #627)
+# rejects a stale leaf, so each `bootstrap_all` cycle has to be followed
+# by a leaf refresh signed by the matching CA generation.
+TRUST_DIR = os.environ.get("MOCK_OPENBAO_TRUST_DIR", "/tmp/mock-openbao-trust")
+
+
 def _safe_name(value: str) -> str:
     """Rejects path components that contain anything other than the
     SAFE_NAME alphabet so we cannot construct paths outside TRUST_DIR.
@@ -35,12 +43,34 @@ def _safe_name(value: str) -> str:
     if not SAFE_NAME_FULLMATCH.fullmatch(value):
         raise ValueError(f"unsafe path component: {value!r}")
     return value
-# Persist the synthetic CA material (cert + key) under this directory so
-# the rotation harness can re-issue leaves that chain to the bundle the
-# mock just handed out. `bootroot verify`'s chain check (issue #627)
-# rejects a stale leaf, so each `bootstrap_all` cycle has to be followed
-# by a leaf refresh signed by the matching CA generation.
-TRUST_DIR = os.environ.get("MOCK_OPENBAO_TRUST_DIR", "/tmp/mock-openbao-trust")
+
+
+def _trust_subdir(*parts: str) -> str:
+    """Joins `parts` under TRUST_DIR and verifies the resolved path
+    stays inside the jail.
+
+    Uses `os.path.realpath` plus a `startswith` containment check —
+    the canonical CodeQL-recognised sanitiser for `py/path-injection`.
+    Each `part` is also screened by [`_safe_name`] so the validator
+    can never see a `..` segment in the first place; the containment
+    check is a defensive belt-and-braces against symlink races.
+    """
+    base = os.path.realpath(TRUST_DIR)
+    os.makedirs(base, exist_ok=True)
+    safe_parts = [_safe_name(part) for part in parts]
+    candidate = os.path.realpath(os.path.join(base, *safe_parts))
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise ValueError(f"path escapes TRUST_DIR: {candidate!r}")
+    return candidate
+
+
+def _ca_file(versioned_dir: str, suffix: str) -> str:
+    """Returns a fixed-suffix path beneath `versioned_dir` so CodeQL
+    sees no further user-controlled segments after the
+    `_trust_subdir` containment check."""
+    if suffix not in {"ca.crt", "ca.key", "openssl.cnf"}:
+        raise ValueError(f"unknown CA file suffix: {suffix!r}")
+    return os.path.join(versioned_dir, suffix)
 versions: dict[tuple[str, str], int] = {}
 fail_next: dict[tuple[str, str], int] = {}
 # Cache real self-signed CA certs keyed by (service, version) so each
@@ -73,14 +103,12 @@ def synthetic_trust_anchor(service: str, version: int) -> tuple[str, str]:
     cached = _trust_cache.get(key)
     if cached is not None:
         return cached
-    safe_service = _safe_name(service)
     safe_version = int(version)
-    service_dir = os.path.join(TRUST_DIR, safe_service)
-    versioned_dir = os.path.join(service_dir, f"v{safe_version}")
+    versioned_dir = _trust_subdir(service, f"v{safe_version}")
     os.makedirs(versioned_dir, exist_ok=True)
-    cert_path = os.path.join(versioned_dir, "ca.crt")
-    key_path = os.path.join(versioned_dir, "ca.key")
-    config_path = os.path.join(versioned_dir, "openssl.cnf")
+    cert_path = _ca_file(versioned_dir, "ca.crt")
+    key_path = _ca_file(versioned_dir, "ca.key")
+    config_path = _ca_file(versioned_dir, "openssl.cnf")
     with open(config_path, "w", encoding="utf-8") as fh:
         fh.write(
             "[req]\n"
@@ -88,7 +116,7 @@ def synthetic_trust_anchor(service: str, version: int) -> tuple[str, str]:
             "x509_extensions=ext\n"
             "prompt=no\n"
             "[dn]\n"
-            f"CN=mock-trust-{service}-v{version}\n"
+            f"CN=mock-trust-{_safe_name(service)}-v{safe_version}\n"
             "[ext]\n"
             "basicConstraints=critical,CA:TRUE\n"
             "keyUsage=critical,keyCertSign,cRLSign\n"
@@ -123,10 +151,10 @@ def synthetic_trust_anchor(service: str, version: int) -> tuple[str, str]:
     # Mirror the just-generated material into `<service>/current/` so
     # the harness can blindly read the latest CA without tracking
     # per-item versions on the bash side.
-    current_dir = os.path.join(service_dir, "current")
+    current_dir = _trust_subdir(service, "current")
     os.makedirs(current_dir, exist_ok=True)
-    shutil.copyfile(cert_path, os.path.join(current_dir, "ca.crt"))
-    shutil.copyfile(key_path, os.path.join(current_dir, "ca.key"))
+    shutil.copyfile(cert_path, _ca_file(current_dir, "ca.crt"))
+    shutil.copyfile(key_path, _ca_file(current_dir, "ca.key"))
     _trust_cache[key] = (pem, fingerprint)
     return pem, fingerprint
 
