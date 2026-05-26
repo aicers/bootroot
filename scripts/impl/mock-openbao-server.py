@@ -10,8 +10,31 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("MOCK_OPENBAO_PORT", "18200"))
 TOKEN = "mock-client-token"
-SERVICE_PATH_PATTERN = re.compile(r"^/v1/secret/data/bootroot/services/([^/]+)/([^/]+)$")
+# Service / item names embed into filesystem paths (see TRUST_DIR
+# usage in synthetic_trust_anchor), so restrict the URL capture
+# groups to a path-safe alphabet rather than the looser `[^/]+`.
+# This rejects `..`, `/`, and any character that could escape the
+# `TRUST_DIR/<service>/` jail.
+SAFE_NAME_RE = r"[A-Za-z0-9_-]+"
+SERVICE_PATH_PATTERN = re.compile(
+    rf"^/v1/secret/data/bootroot/services/({SAFE_NAME_RE})/({SAFE_NAME_RE})$"
+)
+SAFE_NAME_FULLMATCH = re.compile(rf"^{SAFE_NAME_RE}$")
 CONTROL_ITEMS = {"secret_id", "eab", "http_responder_hmac", "trust"}
+
+
+def _safe_name(value: str) -> str:
+    """Rejects path components that contain anything other than the
+    SAFE_NAME alphabet so we cannot construct paths outside TRUST_DIR.
+
+    The HTTP route and control-plane handlers already constrain
+    incoming service/item identifiers via SERVICE_PATH_PATTERN and
+    CONTROL_ITEMS, but inputs reaching this helper from arbitrary
+    JSON payloads (`/control/*`) still need the same scrub.
+    """
+    if not SAFE_NAME_FULLMATCH.fullmatch(value):
+        raise ValueError(f"unsafe path component: {value!r}")
+    return value
 # Persist the synthetic CA material (cert + key) under this directory so
 # the rotation harness can re-issue leaves that chain to the bundle the
 # mock just handed out. `bootroot verify`'s chain check (issue #627)
@@ -50,8 +73,10 @@ def synthetic_trust_anchor(service: str, version: int) -> tuple[str, str]:
     cached = _trust_cache.get(key)
     if cached is not None:
         return cached
-    service_dir = os.path.join(TRUST_DIR, service)
-    versioned_dir = os.path.join(service_dir, f"v{version}")
+    safe_service = _safe_name(service)
+    safe_version = int(version)
+    service_dir = os.path.join(TRUST_DIR, safe_service)
+    versioned_dir = os.path.join(service_dir, f"v{safe_version}")
     os.makedirs(versioned_dir, exist_ok=True)
     cert_path = os.path.join(versioned_dir, "ca.crt")
     key_path = os.path.join(versioned_dir, "ca.key")
