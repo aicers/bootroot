@@ -98,10 +98,12 @@ pub(crate) enum CliCommand {
     /// Subcommands cover distinct rotation surfaces (step-ca password,
     /// `PostgreSQL` password, HTTP-01 responder HMAC, `AppRole`
     /// `secret_id`, `OpenBao` recovery credentials, CA key,
-    /// infrastructure TLS certs, EAB credentials). Each subcommand
-    /// updates `OpenBao` KV and `state.json` together so the next
-    /// bootroot-agent cycle picks up the new material without operator
-    /// intervention.
+    /// infrastructure TLS certs, EAB credentials, trust-bundle sync).
+    /// Side effects vary per subcommand: most update both `OpenBao` KV
+    /// and `state.json` so the next bootroot-agent cycle picks the new
+    /// material up automatically, while a few (notably `openbao-recovery`
+    /// and `trust-sync`) operate outside the regular rotate context.
+    /// See each subcommand's `--help` for its exact contract.
     Rotate(RotateArgs),
     /// Tears down the bootroot stack and wipes its filesystem state
     /// (`secrets/`, `state.json`, `.env`, and — with confirmation or
@@ -192,13 +194,14 @@ pub(crate) enum InfraCommand {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum OpenbaoCommand {
-    /// Persists the currently held `OpenBao` unseal keys to
+    /// Persists `OpenBao` unseal keys to
     /// `<secrets_dir>/openbao/unseal-keys.txt` (mode `0600`).
     ///
     /// Useful when an operator initially declined to save the keys at
-    /// init time and later decides to keep them on disk. Requires that
-    /// the keys are still available to bootroot (e.g. via the
-    /// `--summary-json` file from the previous init).
+    /// init time and later decides to keep them on disk. The command
+    /// interactively prompts for the unseal key threshold and the
+    /// matching number of key shares — the operator must paste each
+    /// share at the prompt — then writes the file atomically.
     SaveUnsealKeys(OpenbaoSaveUnsealKeysArgs),
     /// Deletes the on-disk `OpenBao` unseal-keys file under
     /// `<secrets_dir>/openbao/`.
@@ -243,11 +246,14 @@ pub(crate) enum ServiceCommand {
     /// manual snippets without writing files.
     Add(Box<ServiceAddArgs>),
     /// Prints the registered configuration and `OpenBao` `AppRole`
-    /// material for a service.
+    /// metadata for a service.
     ///
-    /// Read-only; safe to run at any time. The `AppRole` `secret_id` is
-    /// masked unless the operator explicitly opts into plaintext output
-    /// via the parent flow's `--show-secrets`.
+    /// Read-only; safe to run at any time. The output covers deploy type,
+    /// hostname, domain, delivery mode, post-renew hooks, the `AppRole`
+    /// role name and `role_id`, `secret_id` TTL / wrap TTL / token-bound
+    /// CIDRs, the rendered agent config / cert / key / `secret_id` paths,
+    /// the service's `OpenBao` KV path, and the next-step sidecar
+    /// snippet. The `AppRole` `secret_id` itself is never printed.
     Info(ServiceInfoArgs),
     /// Edits a registered service's `secret_id` policy, post-renew hook,
     /// or cert ownership in place.
