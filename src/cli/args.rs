@@ -934,7 +934,10 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long)]
     pub(crate) service_name: Option<String>,
 
-    /// Deployment type (daemon or docker)
+    /// Deployment shape of the bootroot-agent process that will renew
+    /// this service's certificate (daemon or docker). NOT the consumer
+    /// service's deployment shape — for consumer reload on renewal, use
+    /// --reload-style and --reload-target.
     #[arg(long, value_enum)]
     pub(crate) deploy_type: Option<DeployType>,
 
@@ -974,7 +977,10 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long)]
     pub(crate) instance_id: Option<String>,
 
-    /// Container name (required for docker)
+    /// Container name of the bootroot-agent itself. Required when
+    /// --deploy-type=docker; ignored otherwise. NOT the consumer
+    /// service's container — for consumer reload on renewal, use
+    /// --reload-style docker-restart --reload-target <NAME>.
     #[arg(long)]
     pub(crate) container_name: Option<String>,
 
