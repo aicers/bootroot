@@ -9,6 +9,29 @@ use crate::commands::init::{
 };
 use crate::state::{DeliveryMode, DeployType, HookFailurePolicyEntry};
 
+const INFRA_AFTER_HELP: &str = "\
+Teardown:
+  This command brings the stack up or installs it; it does not tear it
+  down. Use `bootroot clean` (top-level) to stop the compose stack and
+  wipe `secrets/`, `state.json`, `.env`, and (optionally) `certs/`.
+  Run `bootroot clean --help` for details.";
+
+const CLEAN_LONG_ABOUT: &str = "\
+Tears down the bootroot stack and wipes its filesystem state.
+
+Without flags, `bootroot clean`:
+  - runs `docker compose down -v --remove-orphans` against the main
+    compose file plus any auto-discovered openbao-agent sidecar and
+    `openbao-exposed` overrides under `secrets/openbao/`;
+  - removes `secrets/`, `state.json`, and `.env`;
+  - prompts before removing `certs/` (or removes it without prompting
+    when `--yes` is given).
+
+Pass `--openbao-only` to wipe just the `bootroot-openbao` container and
+its named volumes (recovery from a partial-init OpenBao state); every
+other compose service, `secrets/`, `state.json`, and `.env` stay
+intact.";
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub(crate) struct Cli {
@@ -22,7 +45,9 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum CliCommand {
-    #[command(subcommand)]
+    /// Manages the infrastructure compose stack (`OpenBao`, `PostgreSQL`,
+    /// step-ca, HTTP-01 responder).
+    #[command(subcommand, after_help = INFRA_AFTER_HELP)]
     Infra(InfraCommand),
     #[command(subcommand)]
     Monitoring(MonitoringCommand),
@@ -37,6 +62,10 @@ pub(crate) enum CliCommand {
     Service(ServiceCommand),
     Verify(VerifyArgs),
     Rotate(RotateArgs),
+    /// Tears down the bootroot stack and wipes its filesystem state
+    /// (`secrets/`, `state.json`, `.env`, and — with confirmation or
+    /// `--yes` — `certs/`).
+    #[command(long_about = CLEAN_LONG_ABOUT)]
     Clean(CleanArgs),
     #[command(subcommand)]
     Openbao(OpenbaoCommand),
