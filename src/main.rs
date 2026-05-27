@@ -1,3 +1,5 @@
+use std::process::ExitCode;
+
 use anyhow::{Context, Result};
 
 mod cli;
@@ -11,27 +13,37 @@ use crate::cli::args::{
     CaCommand, Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand, ServiceCommand,
     ServiceOpenbaoSidecarCommand,
 };
+use crate::commands::rotate::RotateOutcome;
 use crate::i18n::Messages;
 
-fn main() {
+/// GNU `timeout(1)` convention: 124 signals the wait window elapsed
+/// before the operation finished. Returned from `bootroot rotate
+/// force-reissue --wait` so scripted callers can distinguish a
+/// successful reissue from one that was merely queued for the agent.
+const EXIT_CODE_WAIT_TIMEOUT: u8 = 124;
+
+fn main() -> ExitCode {
     let cli = Cli::parse();
     let messages = match Messages::new(&cli.lang) {
         Ok(messages) => messages,
         Err(err) => {
             eprintln!("{err}");
-            std::process::exit(1);
+            return ExitCode::from(1);
         }
     };
-    if let Err(err) = run(cli, &messages) {
-        let message = err
-            .chain()
-            .next()
-            .map_or_else(|| "bootroot error".to_string(), ToString::to_string);
-        eprintln!("{message}");
-        for cause in err.chain().skip(1) {
-            eprintln!("{}", messages.error_details(&cause.to_string()));
+    match run(cli, &messages) {
+        Ok(code) => code,
+        Err(err) => {
+            let message = err
+                .chain()
+                .next()
+                .map_or_else(|| "bootroot error".to_string(), ToString::to_string);
+            eprintln!("{message}");
+            for cause in err.chain().skip(1) {
+                eprintln!("{}", messages.error_details(&cause.to_string()));
+            }
+            ExitCode::from(1)
         }
-        std::process::exit(1);
     }
 }
 
@@ -50,7 +62,7 @@ where
 }
 
 #[allow(clippy::too_many_lines)] // Top-level CLI dispatcher.
-fn run(cli: Cli, messages: &Messages) -> Result<()> {
+fn run(cli: Cli, messages: &Messages) -> Result<ExitCode> {
     match cli.command {
         CliCommand::Infra(InfraCommand::Up(args)) => {
             with_runtime("infra up", messages, |rt| {
@@ -139,10 +151,13 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,
         CliCommand::Rotate(args) => {
-            with_runtime("rotate", messages, |rt| {
+            let outcome = with_runtime("rotate", messages, |rt| {
                 rt.block_on(commands::rotate::run_rotate(&args, messages))
             })?
             .with_context(|| messages.error_rotate_failed())?;
+            if matches!(outcome, RotateOutcome::WaitTimedOut) {
+                return Ok(ExitCode::from(EXIT_CODE_WAIT_TIMEOUT));
+            }
         }
         CliCommand::Clean(args) => {
             commands::clean::run_clean(&args, messages)
@@ -165,7 +180,7 @@ fn run(cli: Cli, messages: &Messages) -> Result<()> {
                 .with_context(|| "ca restart failed".to_string())?;
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]

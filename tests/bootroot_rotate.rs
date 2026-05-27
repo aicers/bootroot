@@ -1848,6 +1848,89 @@ async fn test_rotate_force_reissue_remote_wait_reports_completion() {
     );
 }
 
+/// Issue #629: when `--wait` runs out without the agent reporting a
+/// completed reissue, the CLI must exit with code 124 (GNU
+/// `timeout(1)` convention) so scripted callers can distinguish a
+/// finished rotation from one that was merely queued.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_force_reissue_remote_wait_times_out_with_exit_124() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let _secret_path = prepare_app_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        "daemon",
+        "remote-bootstrap",
+    )
+    .expect("prepare state");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/reissue"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "version": 3 }
+        })))
+        .mount(&openbao)
+        .await;
+
+    // GET returns the request payload but NEVER advertises a
+    // `completed_version`, so the wait polls until `--wait-timeout`
+    // elapses without ever observing completion.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/reissue"
+        )))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "data": { "requested_at": "2026-04-19T12:34:56Z", "requester": "ci" },
+                "metadata": { "version": 3 }
+            }
+        })))
+        .mount(&openbao)
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "force-reissue",
+            "--service-name",
+            SERVICE_NAME,
+            "--wait",
+            "--wait-timeout",
+            "1s",
+        ])
+        .output()
+        .expect("run rotate force-reissue --wait");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "expected GNU timeout(1) exit code 124 on --wait timeout;\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("--wait timed out"),
+        "expected timeout message in stdout:\n{stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_rotate_force_reissue_missing_service_fails() {

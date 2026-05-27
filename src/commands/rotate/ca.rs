@@ -10,7 +10,7 @@ use super::helpers::{
 };
 use super::{
     INTERMEDIATE_CA_COMMON_NAME, OPENBAO_AGENT_RESPONDER_CONTAINER, OPENBAO_AGENT_STEPCA_CONTAINER,
-    ROOT_CA_COMMON_NAME, RotateContext,
+    ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome,
 };
 use crate::cli::args::{RotateCaKeyArgs, RotateForceReissueArgs, RotateSkipPhase};
 use crate::commands::infra::run_docker;
@@ -563,7 +563,7 @@ pub(super) async fn rotate_force_reissue(
     args: &RotateForceReissueArgs,
     auto_confirm: bool,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<RotateOutcome> {
     let entry = ctx
         .state
         .services
@@ -589,7 +589,7 @@ async fn rotate_force_reissue_local(
     args: &RotateForceReissueArgs,
     entry: &ServiceEntry,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<RotateOutcome> {
     let cert_path = &entry.cert_path;
     let key_path = &entry.key_path;
 
@@ -618,7 +618,7 @@ async fn rotate_force_reissue_local(
     crate::commands::service::print_consumer_reload_hint(std::iter::once(entry), messages);
 
     if !args.wait {
-        return Ok(());
+        return Ok(RotateOutcome::Completed);
     }
 
     let wait_timeout = humantime::parse_duration(&args.wait_timeout)
@@ -642,7 +642,7 @@ async fn rotate_force_reissue_local(
                     &elapsed,
                 )
             );
-            Ok(())
+            Ok(RotateOutcome::Completed)
         }
         Err(WaitError::Timeout) => {
             println!(
@@ -652,7 +652,7 @@ async fn rotate_force_reissue_local(
                     &args.wait_timeout,
                 )
             );
-            Ok(())
+            Ok(RotateOutcome::WaitTimedOut)
         }
         Err(WaitError::Other(err)) => Err(err),
     }
@@ -663,7 +663,7 @@ async fn rotate_force_reissue_remote(
     client: &OpenBaoClient,
     args: &RotateForceReissueArgs,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<RotateOutcome> {
     use bootroot::trust_bootstrap::{
         REISSUE_REQUESTED_AT_KEY, REISSUE_REQUESTER_KEY, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX,
     };
@@ -718,7 +718,7 @@ async fn rotate_force_reissue_remote(
     );
 
     if !args.wait {
-        return Ok(());
+        return Ok(RotateOutcome::Completed);
     }
 
     match wait_for_remote_completion(
@@ -747,7 +747,7 @@ async fn rotate_force_reissue_remote(
                     &elapsed,
                 )
             );
-            Ok(())
+            Ok(RotateOutcome::Completed)
         }
         Err(WaitError::Timeout) => {
             println!(
@@ -757,7 +757,7 @@ async fn rotate_force_reissue_remote(
                     &args.wait_timeout,
                 )
             );
-            Ok(())
+            Ok(RotateOutcome::WaitTimedOut)
         }
         Err(WaitError::Other(err)) => Err(err),
     }

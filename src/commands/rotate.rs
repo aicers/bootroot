@@ -33,6 +33,16 @@ pub(super) const OPENBAO_RECOVERY_SCOPE_ROOT_TOKEN: &str = "root-token";
 pub(super) const OPENBAO_ROOT_ROTATION_INCOMPLETE_ERROR: &str =
     "OpenBao root-key rotation did not complete; verify unseal keys and retry";
 
+/// Typed outcome of a `bootroot rotate` subcommand so the process
+/// exit code can distinguish a completed rotation from a timed-out
+/// `--wait` window. Routed up through `run_rotate` to `main`, where
+/// `WaitTimedOut` maps to the GNU `timeout(1)` convention of 124.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RotateOutcome {
+    Completed,
+    WaitTimedOut,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct StatePaths {
     secrets_dir: PathBuf,
@@ -116,7 +126,7 @@ pub(super) struct RotateContext {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result<()> {
+pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result<RotateOutcome> {
     let state_path = args
         .state_file
         .clone()
@@ -159,7 +169,8 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
     // InfraCert operates on local files and Docker only — it must not
     // require an OpenBao connection so it can fix a broken/expired cert.
     if let RotateCommand::InfraCert(_) = &args.command {
-        return infra_cert::rotate_infra_certs(&mut ctx, args.yes, messages);
+        infra_cert::rotate_infra_certs(&mut ctx, args.yes, messages)?;
+        return Ok(RotateOutcome::Completed);
     }
 
     let runtime_auth = resolve_runtime_auth(&args.runtime_auth, true, messages)?;
@@ -203,7 +214,9 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
             ca::rotate_trust_sync(&mut ctx, &client, args.yes, messages).await?;
         }
         RotateCommand::ForceReissue(step_args) => {
-            ca::rotate_force_reissue(&mut ctx, &client, step_args, args.yes, messages).await?;
+            let outcome =
+                ca::rotate_force_reissue(&mut ctx, &client, step_args, args.yes, messages).await?;
+            return Ok(outcome);
         }
         RotateCommand::CaKey(step_args) => {
             ca::rotate_ca_key(&mut ctx, &client, step_args, args.yes, messages).await?;
@@ -216,7 +229,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         }
     }
 
-    Ok(())
+    Ok(RotateOutcome::Completed)
 }
 
 #[cfg(test)]
