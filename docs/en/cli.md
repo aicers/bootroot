@@ -1216,6 +1216,7 @@ Supported subcommands:
 - `rotate ca-key`
 - `rotate openbao-recovery`
 - `rotate eab-clear`
+- `rotate infra-cert`
 
 ### Inputs
 
@@ -1451,6 +1452,70 @@ Behavior:
 
 No additional arguments. Honors the global `--yes` to skip the
 confirmation prompt.
+
+#### `rotate infra-cert`
+
+Renews infrastructure TLS certificates registered in `state.json` →
+`infra_certs`. Today this covers the **OpenBao server TLS** cert
+(`openbao` entry) and, when the HTTP-01 responder admin API was
+provisioned with TLS, the **HTTP-01 admin TLS** cert
+(`bootroot-http01` entry). The set is data-driven from
+`infra_certs`; the loop body does not change when a new entry type
+is added — only the per-key dispatch arm.
+
+No subcommand-specific arguments. Honors the global `--yes` to skip
+the confirmation prompt. The command accepts the common `bootroot
+rotate` flag surface, but short-circuits before any OpenBao
+interaction, so only `--state-file`, `--compose-file`,
+`--secrets-dir`, and `--yes` actually influence behavior. The
+OpenBao auth flags (`--auth-mode`, `--root-token` /
+`--root-token-file`, `--approle-*`), the OpenBao connection flags
+(`--openbao-url`, `--kv-mount`), and `--show-secrets` are accepted
+but unused.
+
+Behavior:
+
+- Iterates every entry in `state.json` → `infra_certs`. Each entry
+  carries its own `cert_path`, `key_path`, `sans`, `renew_before`,
+  and `reload_strategy`; the new cert and key are written back to
+  the same paths.
+- Per-entry reissue dispatch:
+  - `openbao` → re-issues the OpenBao server cert and writes it
+    under the compose directory's `openbao/tls/` path.
+  - `bootroot-http01` → re-issues the HTTP-01 responder admin API
+    cert and writes it under the secrets directory's
+    `bootroot-http01/tls/` path.
+- After each successful reissue the entry's `issued_at` is
+  refreshed and the entry's `reload_strategy` runs so the affected
+  container picks up the new material:
+  - `ContainerRestart` (OpenBao) → `docker restart <container>`.
+  - `ContainerSignal` (HTTP-01 admin) → `docker kill -s SIGHUP
+    <container>`.
+- Once every entry has been processed, the updated `infra_certs`
+  map is persisted back to `state.json`.
+
+No-op condition:
+
+- When `infra_certs` is empty, the command prints a "no entries"
+  message and exits 0 without prompting.
+
+Failure conditions:
+
+- Missing `state.json` — the common rotate path bails before
+  subcommand dispatch.
+- ACME failure against step-ca during a per-entry reissue.
+- File-write or permission failure (the renewed key file is
+  `chmod 0600`'d after write).
+- Reload-step failure (target container not running, signal
+  delivery failure, etc.). The error names the affected entry so
+  the operator can re-run after fixing the underlying cause.
+
+Examples:
+
+```bash
+bootroot rotate infra-cert
+bootroot rotate infra-cert --yes
+```
 
 ### Rotated secret write targets
 
