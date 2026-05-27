@@ -396,6 +396,9 @@ force_reissue_for_service() {
 # the files and letting the daemon's missing-cert check pick them up is
 # the right reissue trigger here.  The `bootroot rotate force-reissue`
 # wait-path is exercised by the daemon-deploy edge-proxy call above.
+# Because no real `web-app` container exists, the service-add command
+# above passes `--no-validate-agent` to skip the docker-mode identity
+# check introduced in #631.
 force_reissue_for_docker_service() {
   local service="$1"
   rm -f "$CERTS_DIR/${service}.crt" "$CERTS_DIR/${service}.key"
@@ -615,6 +618,7 @@ run_bootstrap_chain() {
     --agent-config "$AGENT_CONFIG_PATH" \
     --cert-path "$CERTS_DIR/${WEB_SERVICE}.crt" --key-path "$CERTS_DIR/${WEB_SERVICE}.key" \
     --instance-id "$INSTANCE_ID" --container-name "$WEB_SERVICE" \
+    --no-validate-agent \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1

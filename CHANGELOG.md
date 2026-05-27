@@ -49,6 +49,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   OpenBao client still supports bounded-use SecretIDs for non-service
   workflows.
 
+### Added
+
+- `bootroot service add` now validates that
+  `--deploy-type=docker --container-name=X` actually points at a
+  bootroot-agent before persisting state. The shipped docker-compose
+  snippet carries a new identifying label (`bootroot.role=agent`) and
+  the service-add check reads that label first via `docker inspect`,
+  falling back to a `bootroot-agent` substring search in the
+  container's image, entrypoint, and cmd. Missing label /
+  unidentified container / inaccessible `docker inspect` all surface
+  as a non-fatal warning telling the operator that the first
+  `rotate --wait` will exit 124 if no agent picks up the request, and
+  point at the new `--no-validate-agent` flag for legitimate "agent
+  container not up yet" / cross-host / pre-existing-deployment cases.
+  Independent of the docker check, the same command now rejects
+  `--deploy-type=daemon` paired with `--container-name`: that
+  combination has no legitimate meaning and previously slipped through
+  because `resolve_service_add_args` drops `container_name` to `None`
+  for daemon, hiding the operator's typo from the post-resolve
+  validator. `--no-validate-agent` scopes only to the docker identity
+  check and does not bypass the daemon+container-name reject.
+  (Closes #631)
+
 ### Fixed
 
 - Fixed `bootroot-agent` not detecting a post-`init` trust-anchor

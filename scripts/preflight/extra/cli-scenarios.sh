@@ -221,6 +221,7 @@ run_service_scenarios() {
     --key-path "$ROOT_DIR/certs/web-app.key" \
     --instance-id 001 \
     --container-name web-app \
+    --no-validate-agent \
     --auth-mode approle \
     --approle-role-id "$runtime_service_add_role_id" \
     --approle-secret-id "$runtime_service_add_secret_id"

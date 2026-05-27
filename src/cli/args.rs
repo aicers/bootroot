@@ -958,6 +958,11 @@ pub(crate) struct StatusArgs {
 }
 
 #[derive(Args, Debug)]
+// `dry_run`, `print_only`, `no_wrap`, and `no_validate_agent` are
+// independent operator-facing toggles; collapsing them into an enum
+// would obscure the CLI surface and break clap's `#[arg(long)]`
+// derivation, so we accept the extra bool here.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct ServiceAddArgs {
     /// Service name identifier
     #[arg(long)]
@@ -1012,6 +1017,17 @@ pub(crate) struct ServiceAddArgs {
     /// --reload-style docker-restart --reload-target <NAME>.
     #[arg(long)]
     pub(crate) container_name: Option<String>,
+
+    /// Skips the docker-mode identity check that confirms the
+    /// `--container-name` argument actually points at a bootroot-agent
+    /// (label `bootroot.role=agent`, or `bootroot-agent` substring in
+    /// the cmdline/image as a fallback). Useful when the agent
+    /// container does not exist yet at `service add` time or when
+    /// `docker inspect` is unreachable for legitimate reasons.
+    /// Does not bypass the raw `--container-name` / `--deploy-type=daemon`
+    /// conflict reject.
+    #[arg(long)]
+    pub(crate) no_validate_agent: bool,
 
     /// ACME account email persisted into the rendered `agent.toml`
     /// baseline.  Defaults to the compose-topology placeholder when

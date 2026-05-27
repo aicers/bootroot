@@ -618,7 +618,17 @@ bootroot status
 - `--key-path`: 개인키 출력 경로
 - `--instance-id`: 서비스 instance_id
   - 숫자만 허용됩니다 (`001`, `42` 등)
-- `--container-name`: 도커 서비스 컨테이너 이름 (docker 필수)
+- `--container-name`: 도커 서비스 컨테이너 이름 (docker 필수).
+  `--container-name`을 `--deploy-type=daemon`과 함께 지정하면 거부됩니다.
+  이 플래그는 docker 모드에서만 의미가 있습니다.
+- `--no-validate-agent`: `--container-name`이 실제 bootroot-agent를
+  가리키는지 확인하는 docker 모드 신원 검사를 건너뜁니다(라벨
+  `bootroot.role=agent` 우선, 없으면 이미지/entrypoint/cmd에서
+  `bootroot-agent` 부분 문자열 검사로 대체). 에이전트 컨테이너가
+  아직 기동되지 않았거나, `docker inspect`를 사용할 수 없거나,
+  라벨이 없는 기존 배포 환경에서 사용하세요. 이 옵션은 docker 신원
+  검사에만 적용되며 위의 daemon+`--container-name` 거부는 우회하지
+  않습니다.
 - `--auth-mode`: 런타임 인증 모드 (`auto`, `root`, `approle`, 기본값 `auto`)
 - `--root-token`: OpenBao root token (환경 변수: `OPENBAO_ROOT_TOKEN`,
   전환/비상 경로)
@@ -787,7 +797,14 @@ chown 전 운영자 기본 gid 하에서 group-readable로 잠시 노출되는
 - 중복된 `service-name`
 - `instance-id` 누락
 - docker에 `container-name` 누락
+- `--container-name`을 `--deploy-type=daemon`과 함께 지정
 - OpenBao AppRole 생성 실패
+
+`--deploy-type=docker`로 지정한 `--container-name`이 bootroot-agent임을
+확인할 수 없을 때(라벨 `bootroot.role=agent` 없음, 이미지/entrypoint/cmd에
+`bootroot-agent` 부분 문자열 없음, 또는 `docker inspect` 실행 불가)
+등록은 진행되지만 비치명 경고가 출력됩니다. 정상적인 상황이라면
+`--no-validate-agent`로 경고를 숨길 수 있습니다.
 
 ## bootroot service update
 

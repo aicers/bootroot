@@ -885,6 +885,182 @@ async fn test_app_add_prints_docker_snippet() {
     assert!(!stdout.contains("--oneshot"));
 }
 
+/// Issue #631: `service add --deploy-type=daemon --container-name=X`
+/// must fail at the raw-args boundary. `resolve_service_add_args`
+/// already drops `container_name` for daemon, so the check has to run
+/// before resolution; this CLI-level test guards that ordering.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rejects_daemon_with_container_name() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("edge-proxy.crt");
+    let key_path = cert_dir.join("edge-proxy.key");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "edge-proxy",
+            "--deploy-type",
+            "daemon",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--container-name",
+            "web-app",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "expected failure when daemon+container-name combined, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--container-name"),
+        "expected error to mention --container-name, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--deploy-type=docker"),
+        "expected error to point at --deploy-type=docker, got: {stderr}"
+    );
+}
+
+/// Issue #631: docker-mode identity warning fires when the container
+/// does not exist. The warning is non-fatal (registration continues)
+/// and `--no-validate-agent` silences it. Exercised through the
+/// `--print-only` path so no real `OpenBao` stubbing is needed.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_warns_when_docker_container_not_an_agent() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("web-app.crt");
+    let key_path = cert_dir.join("web-app.key");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "web-app",
+            "--deploy-type",
+            "docker",
+            "--hostname",
+            "web-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--container-name",
+            "bootroot-issue-631-no-such-container",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected --print-only run to succeed despite warning, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("bootroot-issue-631-no-such-container"),
+        "expected warning to mention the container, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--no-validate-agent"),
+        "expected warning to point at --no-validate-agent, got: {stderr}"
+    );
+}
+
+/// Issue #631: `--no-validate-agent` silences the docker-mode warning
+/// even when the container is missing or unrelated.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_no_validate_agent_silences_warning() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("web-app.crt");
+    let key_path = cert_dir.join("web-app.key");
+
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--print-only",
+            "--service-name",
+            "web-app",
+            "--deploy-type",
+            "docker",
+            "--hostname",
+            "web-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--container-name",
+            "bootroot-issue-631-no-such-container",
+            "--no-validate-agent",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected --print-only run to succeed, stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("does not look like a bootroot-agent"),
+        "expected --no-validate-agent to silence the no-match warning, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not run `docker inspect"),
+        "expected --no-validate-agent to silence the inspect-failed warning, got: {stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
