@@ -1513,13 +1513,24 @@ Failure conditions:
 
 - Missing `state.json` — the common rotate path bails before
   subcommand dispatch.
-- ACME failure against step-ca during a per-entry reissue.
+- Local CA signing failure during a per-entry reissue. Both
+  dispatch arms run `docker ... step certificate create` against
+  the local step-ca intermediate (`--ca`, `--ca-key`,
+  `--ca-password-file`); this is **not** ACME. Surfaces as a
+  failure of the `step certificate create` docker invocation
+  (e.g. step-ca image missing, intermediate cert/key path
+  unreadable, password file mismatch).
 - File-write or permission failure on the fixed output paths
   listed above (write of the renewed cert/key, or the subsequent
   `chmod` step).
 - Reload-step failure (target container not running, signal
-  delivery failure, etc.). The error names the affected entry so
-  the operator can re-run after fixing the underlying cause.
+  delivery failure, etc.). The reissue dispatch is wrapped with
+  the affected entry name, so a failure during the issue/write
+  phase identifies the entry; the subsequent reload step is not
+  wrapped with the entry name, so a reload failure identifies
+  only the affected container and signal/restart operation. In
+  either case the operator can re-run after fixing the
+  underlying cause.
 
 Examples:
 
