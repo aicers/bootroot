@@ -99,11 +99,10 @@ pub(crate) enum CliCommand {
     /// `PostgreSQL` password, HTTP-01 responder HMAC, `AppRole`
     /// `secret_id`, `OpenBao` recovery credentials, CA key,
     /// infrastructure TLS certs, EAB credentials, trust-bundle sync).
-    /// Side effects vary per subcommand: most update both `OpenBao` KV
-    /// and `state.json` so the next bootroot-agent cycle picks the new
-    /// material up automatically, while a few (notably `openbao-recovery`
-    /// and `trust-sync`) operate outside the regular rotate context.
-    /// See each subcommand's `--help` for its exact contract.
+    /// Side effects vary per subcommand — most write to `OpenBao` KV
+    /// and/or rendered config and restart the relevant container, while
+    /// only `infra-cert` persists changes back to `state.json`. See each
+    /// subcommand's `--help` for its exact contract.
     Rotate(RotateArgs),
     /// Tears down the bootroot stack and wipes its filesystem state
     /// (`secrets/`, `state.json`, `.env`, and — with confirmation or
@@ -218,10 +217,10 @@ pub(crate) enum MonitoringCommand {
     /// Starts the Prometheus/Grafana monitoring stack with the chosen
     /// exposure profile.
     ///
-    /// `lan` binds to loopback; `public` binds to the host's default
-    /// interface. The Grafana admin password defaults to `admin` on
-    /// first start and is rotated when `--grafana-admin-password` is
-    /// supplied.
+    /// `lan` binds to `GRAFANA_LAN_BIND_ADDR` (default `127.0.0.1`);
+    /// `public` binds to all interfaces (`0.0.0.0:3000`). The Grafana
+    /// admin password defaults to `admin` on first start and is rotated
+    /// when `--grafana-admin-password` is supplied.
     Up(MonitoringUpArgs),
     /// Reports the running state of the monitoring stack containers.
     Status(MonitoringStatusArgs),
@@ -485,9 +484,10 @@ pub(crate) enum RotateCommand {
     /// Rotates step-ca's encryption-key password and re-renders
     /// `password.txt`.
     ///
-    /// The new password is written to `secrets/config/password.txt`
-    /// (mode `0600`), recorded in `OpenBao` KV, and the step-ca
-    /// container is restarted so the new password takes effect.
+    /// The new password is staged as `<secrets_dir>/password.txt.new`,
+    /// recorded in `OpenBao` KV, and the `OpenBao` Agent re-renders the
+    /// final `<secrets_dir>/password.txt` (mode `0600`) before step-ca
+    /// is restarted so the new password takes effect.
     StepcaPassword(RotateStepcaPasswordArgs),
     /// Rotates the `PostgreSQL` password used by step-ca and rewrites
     /// the runtime DSN.
@@ -519,30 +519,38 @@ pub(crate) enum RotateCommand {
     /// Rotates the `OpenBao` `AppRole` `secret_id` for one registered
     /// service.
     ///
-    /// Generates a fresh `secret_id` on the configured `AppRole`,
-    /// writes it to the matching remote-bootstrap or local KV path, and
-    /// revokes the previous `secret_id`. The next bootroot-agent cycle
-    /// picks up the new credential automatically.
+    /// Generates a fresh `secret_id` on the configured `AppRole`. For
+    /// local-file services, writes it atomically to the on-disk
+    /// `secret_id` file and reloads the local `OpenBao` Agent so the new
+    /// credential takes effect. For remote-bootstrap services, publishes
+    /// it to the service's KV bootstrap path so the next bootroot-agent
+    /// cycle picks it up. The previous `secret_id` is not explicitly
+    /// revoked; it remains valid until it expires under the `AppRole`'s
+    /// configured TTL.
     #[command(name = "approle-secret-id")]
     AppRoleSecretId(RotateAppRoleSecretIdArgs),
-    /// Synchronizes step-ca's trust bundle with the recorded chain in
-    /// `state.json`.
+    /// Republishes the current step-ca trust material to every
+    /// registered service via `OpenBao` KV.
     ///
-    /// Reconciles the step-ca container's mounted root and intermediate
-    /// certificates against the deployment-intent record and restarts
-    /// step-ca when drift is detected. Read-mostly; only writes when
-    /// drift is found.
+    /// Reads the mounted root/intermediate certificates from disk,
+    /// computes their fingerprints and the combined CA bundle, and
+    /// writes them unconditionally to each registered service's
+    /// `OpenBao` KV trust path. Does not restart step-ca, does not
+    /// compare against `state.json`, and does not detect drift — every
+    /// run rewrites the KV entries.
     #[command(name = "trust-sync")]
     TrustSync(RotateTrustSyncArgs),
     /// Forces a registered service to re-issue its certificate on the
     /// next bootroot-agent cycle.
     ///
-    /// Marks the service for immediate reissuance in `OpenBao` KV (or
-    /// in the local-file path for `local-file` deployments). With
-    /// `--wait`, blocks until the agent has applied the reissue
-    /// (bounded by `--wait-timeout`). Use when a certificate must be
-    /// re-keyed out of band — for example after a private-key
-    /// compromise scare.
+    /// For local-file services, removes the existing cert and key files
+    /// on disk and signals the local bootroot-agent so it issues a fresh
+    /// pair on its next cycle. For remote-bootstrap services, writes a
+    /// versioned reissue request to the service's `OpenBao` KV path so
+    /// the remote agent picks it up. With `--wait`, blocks until the
+    /// agent has applied the reissue (bounded by `--wait-timeout`). Use
+    /// when a certificate must be re-keyed out of band — for example
+    /// after a private-key compromise scare.
     #[command(name = "force-reissue")]
     ForceReissue(RotateForceReissueArgs),
     /// Rotates step-ca's intermediate signing key (and, with `--full`,
