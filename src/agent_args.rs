@@ -3,7 +3,12 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "Daemon that renews service TLS certificates via ACME and reloads their consumers",
+    long_about = None,
+)]
 pub struct Args {
     /// Path to configuration file (default: agent.toml)
     #[arg(long, short)]

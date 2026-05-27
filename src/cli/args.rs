@@ -33,7 +33,12 @@ other compose service, `secrets/`, `state.json`, and `.env` stay
 intact.";
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "Operator CLI for the bootroot certificate and secret control plane",
+    long_about = None,
+)]
 pub(crate) struct Cli {
     /// Language for CLI output (en or ko)
     #[arg(long, env = "BOOTROOT_LANG", default_value = "en", global = true)]
@@ -49,26 +54,75 @@ pub(crate) enum CliCommand {
     /// step-ca, HTTP-01 responder).
     #[command(subcommand, after_help = INFRA_AFTER_HELP)]
     Infra(InfraCommand),
+    /// Manages the optional Prometheus/Grafana monitoring stack.
     #[command(subcommand)]
     Monitoring(MonitoringCommand),
+    /// Initializes a fresh bootroot stack: provisions `OpenBao`, step-ca,
+    /// `PostgreSQL`, and the HTTP-01 responder.
+    ///
+    /// Runs end-to-end on an empty host: starts the compose stack,
+    /// initializes and unseals `OpenBao`, provisions the step-ca PKI,
+    /// renders operator-facing secrets and config under `secrets/`, and
+    /// records the resulting deployment intent in `state.json`. When only
+    /// `OpenBao`-owned state needs to be re-initialized, use `bootroot
+    /// reinit` instead.
     Init(Box<InitArgs>),
     /// Recovers from a partial-init `OpenBao` state by wiping
     /// `OpenBao`-owned state and re-running init while preserving step-ca
     /// material, the operator's compose overrides, and recorded
     /// deployment intent (non-loopback binds).
     Reinit(Box<ReinitArgs>),
+    /// Reports the runtime health of the bootroot infrastructure stack
+    /// and its registered services.
+    ///
+    /// Inspects compose-stack container state, `OpenBao` seal/unseal
+    /// status, step-ca reachability, and the registered service inventory
+    /// in `state.json`. Read-only; safe to run at any time.
     Status(Box<StatusArgs>),
+    /// Registers and manages bootroot-agent-driven service consumers and
+    /// their per-service `OpenBao` Agent sidecars.
     #[command(subcommand)]
     Service(ServiceCommand),
+    /// Verifies that a registered service's bootroot-agent configuration
+    /// is internally consistent and reaches the control plane.
+    ///
+    /// Cross-checks the rendered `agent.toml`, the corresponding
+    /// `state.json` entry, and the bootroot-agent binary itself. With
+    /// `--db-check`, also confirms that the runtime DSN in `ca.json`
+    /// authenticates against `PostgreSQL`. Read-only; safe to run at any
+    /// time.
     Verify(VerifyArgs),
+    /// Rotates infrastructure secrets, keys, and certificates managed by
+    /// bootroot.
+    ///
+    /// Subcommands cover distinct rotation surfaces (step-ca password,
+    /// `PostgreSQL` password, HTTP-01 responder HMAC, `AppRole`
+    /// `secret_id`, `OpenBao` recovery credentials, CA key,
+    /// infrastructure TLS certs, EAB credentials). Each subcommand
+    /// updates `OpenBao` KV and `state.json` together so the next
+    /// bootroot-agent cycle picks up the new material without operator
+    /// intervention.
     Rotate(RotateArgs),
     /// Tears down the bootroot stack and wipes its filesystem state
     /// (`secrets/`, `state.json`, `.env`, and — with confirmation or
     /// `--yes` — `certs/`).
     #[command(long_about = CLEAN_LONG_ABOUT)]
     Clean(CleanArgs),
+    /// Manages `OpenBao` operator material outside the regular init and
+    /// rotate flows.
+    ///
+    /// Currently covers persisting and deleting the on-disk
+    /// `unseal-keys.txt` file under `secrets/openbao/`. Intended for
+    /// post-init operator workflows; routine bootstrap is handled by
+    /// `bootroot init`'s `--save-unseal-keys` / `--no-save-unseal-keys`
+    /// flags.
     #[command(subcommand)]
     Openbao(OpenbaoCommand),
+    /// Manages step-ca configuration that bootroot controls.
+    ///
+    /// Currently scoped to the ACME provisioner's
+    /// `defaultTLSCertDuration` and to restarting the step-ca container
+    /// so a configuration change takes effect.
     #[command(subcommand)]
     Ca(CaCommand),
 }
@@ -116,27 +170,92 @@ pub(crate) struct CaRestartArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum InfraCommand {
+    /// Starts the bootroot compose stack from the existing `secrets/`
+    /// and `state.json`.
+    ///
+    /// Use this on a host that has already been initialized (`bootroot
+    /// init` has been run and `secrets/`, `state.json`, and `.env` are
+    /// present). For first-time setup use `bootroot init`; for recovering
+    /// from a partial init use `bootroot reinit`.
     Up(InfraUpArgs),
+    /// Installs the bootroot compose stack: writes restart-policy
+    /// overrides, optionally re-binds `OpenBao` and the HTTP-01 admin
+    /// API to non-loopback addresses, and brings the stack up.
+    ///
+    /// `--openbao-bind` and `--http01-admin-bind` require explicit TLS
+    /// acknowledgement (`--openbao-tls-required`,
+    /// `--http01-admin-tls-required`) and, for wildcard binds, separate
+    /// `--*-bind-wildcard` and `--*-advertise-addr` flags. These are
+    /// deliberate guardrails — see issue #588 for the rationale.
     Install(InfraInstallArgs),
 }
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum OpenbaoCommand {
+    /// Persists the currently held `OpenBao` unseal keys to
+    /// `<secrets_dir>/openbao/unseal-keys.txt` (mode `0600`).
+    ///
+    /// Useful when an operator initially declined to save the keys at
+    /// init time and later decides to keep them on disk. Requires that
+    /// the keys are still available to bootroot (e.g. via the
+    /// `--summary-json` file from the previous init).
     SaveUnsealKeys(OpenbaoSaveUnsealKeysArgs),
+    /// Deletes the on-disk `OpenBao` unseal-keys file under
+    /// `<secrets_dir>/openbao/`.
+    ///
+    /// Intended for operators who initially saved the keys for
+    /// convenience and now want to remove them from the host. Does not
+    /// rotate the keys themselves; combine with `bootroot rotate
+    /// openbao-recovery --rotate-unseal-keys` for that.
     DeleteUnsealKeys(OpenbaoDeleteUnsealKeysArgs),
 }
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum MonitoringCommand {
+    /// Starts the Prometheus/Grafana monitoring stack with the chosen
+    /// exposure profile.
+    ///
+    /// `lan` binds to loopback; `public` binds to the host's default
+    /// interface. The Grafana admin password defaults to `admin` on
+    /// first start and is rotated when `--grafana-admin-password` is
+    /// supplied.
     Up(MonitoringUpArgs),
+    /// Reports the running state of the monitoring stack containers.
     Status(MonitoringStatusArgs),
+    /// Stops the monitoring stack.
+    ///
+    /// `--reset-grafana-admin-password` clears the persisted Grafana
+    /// admin password so that the next `monitoring up` reseeds it from
+    /// the default or from a freshly supplied
+    /// `--grafana-admin-password`.
     Down(MonitoringDownArgs),
 }
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum ServiceCommand {
+    /// Registers a new bootroot-agent-managed service.
+    ///
+    /// Generates the service's `OpenBao` `AppRole` and `secret_id`,
+    /// renders the agent's `agent.toml` baseline, records the
+    /// deployment intent in `state.json`, and (for daemon and docker
+    /// deployments) validates the supplied bootroot-agent identity. Use
+    /// `--dry-run` to preview the diff or `--print-only` to emit the
+    /// manual snippets without writing files.
     Add(Box<ServiceAddArgs>),
+    /// Prints the registered configuration and `OpenBao` `AppRole`
+    /// material for a service.
+    ///
+    /// Read-only; safe to run at any time. The `AppRole` `secret_id` is
+    /// masked unless the operator explicitly opts into plaintext output
+    /// via the parent flow's `--show-secrets`.
     Info(ServiceInfoArgs),
+    /// Edits a registered service's `secret_id` policy, post-renew hook,
+    /// or cert ownership in place.
+    ///
+    /// Lets the operator adjust `secret_id` TTL, wrap TTL, or CIDR
+    /// binding; swap the reload-style preset; or change `--cert-group`
+    /// without having to remove and re-add the service. See issue #614
+    /// for the in-FD reload pitfall this guards against.
     Update(ServiceUpdateArgs),
     /// Manages the per-service `OpenBao` Agent sidecar container.
     #[command(subcommand, name = "openbao-sidecar")]
@@ -149,6 +268,12 @@ pub(crate) enum ServiceCommand {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum ServiceOpenbaoSidecarCommand {
+    /// Starts the per-service `OpenBao` Agent sidecar container.
+    ///
+    /// The sidecar templates the service's KV material into rendered
+    /// files on a tmpfs volume and signals the service on change. The
+    /// Docker network is auto-discovered from `bootroot-openbao`'s
+    /// compose project label unless `--openbao-network` is supplied.
     Start(ServiceOpenbaoSidecarStartArgs),
     /// Restarts the per-service `OpenBao` Agent sidecar so it re-reads
     /// KV templates after operator-side KV maintenance.
@@ -351,8 +476,27 @@ pub(crate) struct RotateArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RotateCommand {
+    /// Rotates step-ca's encryption-key password and re-renders
+    /// `password.txt`.
+    ///
+    /// The new password is written to `secrets/config/password.txt`
+    /// (mode `0600`), recorded in `OpenBao` KV, and the step-ca
+    /// container is restarted so the new password takes effect.
     StepcaPassword(RotateStepcaPasswordArgs),
+    /// Rotates the `PostgreSQL` password used by step-ca and rewrites
+    /// the runtime DSN.
+    ///
+    /// Alters the role's password in `PostgreSQL`, rewrites the runtime
+    /// DSN in `ca.json` and `OpenBao` KV, and restarts step-ca so the
+    /// new DSN takes effect. Requires a `--db-admin-dsn` capable of
+    /// altering the step-ca role.
     Db(RotateDbArgs),
+    /// Rotates the HTTP-01 responder HMAC secret.
+    ///
+    /// Replaces the shared HMAC used by the HTTP-01 admin API on both
+    /// the responder and on every client (`OpenBao` KV templates and
+    /// rendered config). Triggers a responder restart so the new HMAC
+    /// takes effect.
     ResponderHmac(RotateResponderHmacArgs),
     /// Rotates `OpenBao` recovery credentials manually.
     ///
@@ -366,12 +510,44 @@ pub(crate) enum RotateCommand {
     /// `--rotate-root-token` can run without unseal key input.
     #[command(name = "openbao-recovery")]
     OpenBaoRecovery(RotateOpenBaoRecoveryArgs),
+    /// Rotates the `OpenBao` `AppRole` `secret_id` for one registered
+    /// service.
+    ///
+    /// Generates a fresh `secret_id` on the configured `AppRole`,
+    /// writes it to the matching remote-bootstrap or local KV path, and
+    /// revokes the previous `secret_id`. The next bootroot-agent cycle
+    /// picks up the new credential automatically.
     #[command(name = "approle-secret-id")]
     AppRoleSecretId(RotateAppRoleSecretIdArgs),
+    /// Synchronizes step-ca's trust bundle with the recorded chain in
+    /// `state.json`.
+    ///
+    /// Reconciles the step-ca container's mounted root and intermediate
+    /// certificates against the deployment-intent record and restarts
+    /// step-ca when drift is detected. Read-mostly; only writes when
+    /// drift is found.
     #[command(name = "trust-sync")]
     TrustSync(RotateTrustSyncArgs),
+    /// Forces a registered service to re-issue its certificate on the
+    /// next bootroot-agent cycle.
+    ///
+    /// Marks the service for immediate reissuance in `OpenBao` KV (or
+    /// in the local-file path for `local-file` deployments). With
+    /// `--wait`, blocks until the agent has applied the reissue
+    /// (bounded by `--wait-timeout`). Use when a certificate must be
+    /// re-keyed out of band — for example after a private-key
+    /// compromise scare.
     #[command(name = "force-reissue")]
     ForceReissue(RotateForceReissueArgs),
+    /// Rotates step-ca's intermediate signing key (and, with `--full`,
+    /// the root signing key).
+    ///
+    /// Issues a new intermediate (and optionally root) key, drives
+    /// every registered service through reissuance, and finalizes trust
+    /// once every agent has migrated. Skipped phases (`--skip
+    /// reissue,finalize`) leave the rotation paused for operator
+    /// follow-up. Use `--cleanup` to delete backup files after a
+    /// successful full rotation.
     #[command(name = "ca-key")]
     CaKey(RotateCaKeyArgs),
     /// Renews infrastructure TLS certificates (e.g. `OpenBao` server cert)
