@@ -1,3 +1,4 @@
+mod agent_identity;
 mod approle;
 mod local_config;
 pub(crate) mod openbao_sidecar_refresh;
@@ -21,7 +22,7 @@ use crate::commands::dns_alias::register_dns_alias;
 use crate::commands::init::validate_secret_id_ttl;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
-use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry, StateFile};
+use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, StateFile};
 
 pub(super) const SERVICE_ROLE_PREFIX: &str = "bootroot-service-";
 pub(super) const SERVICE_SECRET_DIR: &str = "services";
@@ -99,6 +100,8 @@ pub(super) struct CaTrustMaterial {
 pub(crate) use resolve::ResolvedServiceAdd;
 
 pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) -> Result<()> {
+    resolve::validate_raw_service_add_args(args, messages)?;
+
     let state_path = StateFile::default_path();
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
@@ -110,6 +113,16 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let resolved = resolve::resolve_service_add_args(args, messages, preview)?;
 
     resolve::validate_service_add(&resolved, messages)?;
+
+    if !args.no_validate_agent
+        && matches!(resolved.deploy_type, DeployType::Docker)
+        && let Some(container) = resolved.container_name.as_deref()
+    {
+        let identity = agent_identity::classify_agent_container(container);
+        if let Some(warning) = agent_identity::render_warning(&identity, container, messages) {
+            eprintln!("{warning}");
+        }
+    }
 
     if let Some(ref ttl) = resolved.secret_id_ttl {
         if let Some(warning) = validate_secret_id_ttl(ttl, messages)? {

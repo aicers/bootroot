@@ -631,7 +631,17 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--key-path`: private key output path
 - `--instance-id`: service instance_id
   - Must be numeric (`001`, `42`, ...)
-- `--container-name`: docker container name (required for docker)
+- `--container-name`: docker container name (required for docker).
+  Combining `--container-name` with `--deploy-type=daemon` is rejected;
+  the flag has meaning only in docker mode.
+- `--no-validate-agent`: skip the docker-mode identity check that
+  confirms `--container-name` actually points at a bootroot-agent
+  (label `bootroot.role=agent`, with a `bootroot-agent` substring
+  fallback against image/entrypoint/cmd). Use when the agent container
+  is not running yet at `service add` time, when `docker inspect` is
+  unreachable, or for pre-existing deployments that lack the label.
+  Scopes only to the docker identity check; does not bypass the
+  daemon+`--container-name` reject above.
 - `--auth-mode`: runtime auth mode (`auto`, `root`, `approle`, default `auto`)
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`,
   transition/break-glass path)
@@ -810,7 +820,15 @@ The command is considered failed when:
 - Duplicate `service-name`
 - Missing `instance-id`
 - Missing `container-name` for docker
+- `--container-name` combined with `--deploy-type=daemon`
 - OpenBao AppRole creation failure
+
+A non-fatal warning (registration still proceeds) is emitted when
+`--deploy-type=docker` is used and the supplied `--container-name`
+cannot be confirmed as a bootroot-agent: missing `bootroot.role=agent`
+label, no `bootroot-agent` substring in image/entrypoint/cmd, or
+`docker inspect` cannot be executed. Pass `--no-validate-agent` to
+silence the warning when this is expected.
 
 ## bootroot service update
 

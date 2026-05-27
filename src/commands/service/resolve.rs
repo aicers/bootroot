@@ -220,6 +220,25 @@ pub(super) fn resolve_cert_group_for_add(
     Ok(Some(gid))
 }
 
+/// Validates the raw `service add` flag combination before
+/// [`resolve_service_add_args`] runs. Catches `--deploy-type=daemon`
+/// paired with `--container-name`, which the resolved-struct validator
+/// cannot see because `resolve_service_add_args` already drops
+/// `container_name` to `None` for `Daemon`. See issue #631.
+pub(super) fn validate_raw_service_add_args(
+    args: &ServiceAddArgs,
+    messages: &Messages,
+) -> Result<()> {
+    let has_container_name = args
+        .container_name
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if matches!(args.deploy_type, Some(DeployType::Daemon)) && has_container_name {
+        anyhow::bail!(messages.error_service_daemon_container_name_conflict());
+    }
+    Ok(())
+}
+
 pub(super) fn validate_service_add(args: &ResolvedServiceAdd, messages: &Messages) -> Result<()> {
     validate_service_name(&args.service_name, messages)?;
     validate_hostname(&args.hostname, messages)?;
@@ -555,6 +574,7 @@ mod tests {
             key_path: None,
             instance_id: None,
             container_name: None,
+            no_validate_agent: false,
             agent_email: None,
             agent_server: None,
             agent_responder_url: None,
@@ -580,6 +600,65 @@ mod tests {
             rn_cidrs: Vec::new(),
             cert_group: None,
         }
+    }
+
+    #[test]
+    fn validate_raw_rejects_daemon_with_container_name() {
+        let messages = Messages::new("en").unwrap();
+        let mut args = empty_args();
+        args.deploy_type = Some(DeployType::Daemon);
+        args.container_name = Some("web-app".to_string());
+
+        let err = validate_raw_service_add_args(&args, &messages).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--container-name"),
+            "expected conflict error to mention --container-name, got: {msg}"
+        );
+        assert!(
+            msg.contains("--deploy-type=docker"),
+            "expected error to point at the docker option, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_raw_accepts_daemon_without_container_name() {
+        let messages = Messages::new("en").unwrap();
+        let mut args = empty_args();
+        args.deploy_type = Some(DeployType::Daemon);
+        args.container_name = None;
+        validate_raw_service_add_args(&args, &messages).expect("daemon without container is ok");
+    }
+
+    #[test]
+    fn validate_raw_accepts_daemon_with_blank_container_name() {
+        let messages = Messages::new("en").unwrap();
+        let mut args = empty_args();
+        args.deploy_type = Some(DeployType::Daemon);
+        args.container_name = Some("   ".to_string());
+        validate_raw_service_add_args(&args, &messages)
+            .expect("daemon with whitespace-only container is treated as unset");
+    }
+
+    #[test]
+    fn validate_raw_accepts_docker_with_container_name() {
+        let messages = Messages::new("en").unwrap();
+        let mut args = empty_args();
+        args.deploy_type = Some(DeployType::Docker);
+        args.container_name = Some("bootroot-agent".to_string());
+        validate_raw_service_add_args(&args, &messages).expect("docker with container is ok");
+    }
+
+    #[test]
+    fn validate_raw_accepts_unspecified_deploy_type() {
+        // The interactive prompt resolves deploy_type later; the raw
+        // validator must not bail when the flag was not passed.
+        let messages = Messages::new("en").unwrap();
+        let mut args = empty_args();
+        args.deploy_type = None;
+        args.container_name = Some("anything".to_string());
+        validate_raw_service_add_args(&args, &messages)
+            .expect("unspecified deploy_type defers to interactive resolution");
     }
 
     #[test]

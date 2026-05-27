@@ -102,6 +102,7 @@ cargo run --bin bootroot -- service add \
   --key-path "$(pwd)/certs/web-app.key" \
   --instance-id 001 \
   --container-name web-app \
+  --no-validate-agent \
   --root-token "$ROOT_TOKEN"
 
 RESPONDER_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"

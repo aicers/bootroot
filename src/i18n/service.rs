@@ -30,6 +30,28 @@ impl Messages {
         self.strings().error_service_container_name_required
     }
 
+    pub(crate) fn error_service_daemon_container_name_conflict(&self) -> &'static str {
+        self.strings().error_service_daemon_container_name_conflict
+    }
+
+    pub(crate) fn warn_service_docker_agent_unidentified(&self, container: &str) -> String {
+        format_template(
+            self.strings().warn_service_docker_agent_unidentified,
+            &[("container", container)],
+        )
+    }
+
+    pub(crate) fn warn_service_docker_agent_inspect_failed(
+        &self,
+        container: &str,
+        details: &str,
+    ) -> String {
+        format_template(
+            self.strings().warn_service_docker_agent_inspect_failed,
+            &[("container", container), ("details", details)],
+        )
+    }
+
     pub(crate) fn error_value_required(&self) -> &'static str {
         self.strings().error_value_required
     }
