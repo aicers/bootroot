@@ -498,15 +498,21 @@ pub(crate) enum RotateCommand {
     ///
     /// Alters the role's password in `PostgreSQL`, rewrites the runtime
     /// DSN in `ca.json` and `OpenBao` KV, and restarts step-ca so the
-    /// new DSN takes effect. Requires a `--db-admin-dsn` capable of
-    /// altering the step-ca role.
+    /// new DSN takes effect. Requires an admin DSN capable of altering
+    /// the step-ca role; resolved from `--db-admin-dsn` first and
+    /// otherwise from `bootroot/stepca/db_admin` in `OpenBao` KV.
+    /// Supply the flag to override the KV value, or when running with
+    /// an `AppRole` token whose policy excludes `db_admin`.
     Db(RotateDbArgs),
     /// Rotates the HTTP-01 responder HMAC secret.
     ///
     /// Replaces the shared HMAC used by the HTTP-01 admin API on both
     /// the responder and on every client (`OpenBao` KV templates and
-    /// rendered config). Triggers a responder restart so the new HMAC
-    /// takes effect.
+    /// rendered config). Restarts the `OpenBao` Agent renderer so the
+    /// new HMAC is written to disk, then signals the responder with
+    /// SIGHUP via `docker compose kill -s HUP` when the compose file
+    /// includes the responder service so it reloads the new value
+    /// without dropping in-flight challenges.
     ResponderHmac(RotateResponderHmacArgs),
     /// Rotates `OpenBao` recovery credentials manually.
     ///
