@@ -89,8 +89,14 @@ pub(crate) enum CliCommand {
     /// Cross-checks the rendered `agent.toml`, the corresponding
     /// `state.json` entry, and the bootroot-agent binary itself. With
     /// `--db-check`, also confirms that the runtime DSN in `ca.json`
-    /// authenticates against `PostgreSQL`. Read-only; safe to run at any
-    /// time.
+    /// authenticates against `PostgreSQL`.
+    ///
+    /// Not read-only: under the hood this invokes `bootroot-agent
+    /// --oneshot`, which performs a full ACME issuance/renewal pass for
+    /// every configured profile (writing the leaf cert and key back to
+    /// disk and running any configured post-renew hooks) before the
+    /// rendered-file and bundle checks run. Treat each invocation as a
+    /// real issuance against step-ca.
     Verify(VerifyArgs),
     /// Rotates infrastructure secrets, keys, and certificates managed by
     /// bootroot.
@@ -281,10 +287,16 @@ pub(crate) enum ServiceCommand {
 pub(crate) enum ServiceOpenbaoSidecarCommand {
     /// Starts the per-service `OpenBao` Agent sidecar container.
     ///
-    /// The sidecar templates the service's KV material into rendered
-    /// files on a tmpfs volume and signals the service on change. The
-    /// Docker network is auto-discovered from `bootroot-openbao`'s
-    /// compose project label unless `--openbao-network` is supplied.
+    /// The sidecar runs `openbao agent` against a generated HCL config
+    /// whose `template` blocks render the managed `agent.toml` and trust
+    /// material from `OpenBao` KV into files under the host secrets
+    /// directory, which is bind-mounted into the container (not a tmpfs
+    /// volume). The template blocks specify only `source`, `destination`,
+    /// and `perms` — the sidecar itself does not signal the consumer on
+    /// re-render; consumer reload is the bootroot-agent's responsibility
+    /// via its post-renew hooks. The Docker network is auto-discovered
+    /// from `bootroot-openbao`'s compose project label unless
+    /// `--openbao-network` is supplied.
     Start(ServiceOpenbaoSidecarStartArgs),
     /// Restarts the per-service `OpenBao` Agent sidecar so it re-reads
     /// KV templates after operator-side KV maintenance.
