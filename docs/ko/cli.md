@@ -1419,15 +1419,23 @@ secret_id를 변경하지 않습니다.
 
 동작:
 
-- `state.json`의 `infra_certs`를 순회합니다. 각 항목은 자체
-  `cert_path`, `key_path`, `sans`, `renew_before`, `reload_strategy`를
-  들고 있으며, 새 cert/key는 동일한 경로에 다시 기록됩니다.
-- 항목별 재발급 디스패치:
-  - `openbao` → OpenBao 서버 인증서를 새로 발급해 compose 디렉터리의
-    `openbao/tls/` 경로에 기록합니다.
+- `state.json`의 `infra_certs`를 순회합니다. 재발급 경로는 각 항목에서
+  `sans`(원래 인증서의 SAN을 재현하기 위함)와 `reload_strategy`(쓰기
+  후 컨테이너 갱신용)만을 사용합니다. 항목에 기록된 `cert_path`,
+  `key_path`, `renew_before`, `expires_at` 필드는 정보용일 뿐이며,
+  새 자료의 기록 위치 결정에는 사용되지 않습니다.
+- 항목별 재발급 디스패치 — 기록 위치는 디스패치되는 함수에 의해
+  고정되며, 항목의 `cert_path` / `key_path` 값과는 무관합니다:
+  - `openbao` → OpenBao 서버 인증서를 새로 발급해
+    `<compose-dir>/openbao/tls/server.crt` 및
+    `<compose-dir>/openbao/tls/server.key`에 기록합니다. 두 파일은
+    `chmod 0644`로 설정되어, 컨테이너 내부의 `openbao` 유저(러너의
+    기본 그룹이나 공유 그룹에 속하지 않음)가 "other" 권한 비트로
+    파일을 읽을 수 있도록 합니다.
   - `bootroot-http01` → HTTP-01 responder admin API 인증서를 새로
-    발급해 secrets 디렉터리의 `bootroot-http01/tls/` 경로에
-    기록합니다.
+    발급해 `<secrets-dir>/bootroot-http01/tls/server.crt` 및
+    `<secrets-dir>/bootroot-http01/tls/server.key`에 기록합니다.
+    두 파일 모두 기록 후 `chmod 0600`이 적용됩니다.
 - 항목별 재발급이 성공하면 해당 항목의 `issued_at`이 갱신되고,
   `reload_strategy`가 실행되어 영향 받는 컨테이너가 새 자료를
   인식하도록 합니다:
@@ -1447,7 +1455,8 @@ secret_id를 변경하지 않습니다.
 - `state.json` 누락 — 공통 rotate 진입 단계에서 서브커맨드 디스패치
   이전에 실패 처리됩니다.
 - 항목 재발급 중 step-ca에 대한 ACME 실패.
-- 파일 쓰기/권한 실패(키 파일은 기록 후 `chmod 0600`이 적용됩니다).
+- 위에 명시된 고정 출력 경로에 대한 파일 쓰기/권한 실패(새 cert/key
+  파일의 기록 또는 그 뒤의 `chmod` 단계).
 - 재시작/시그널 단계 실패(대상 컨테이너 미실행, 시그널 전달 실패
   등). 실패 메시지에 영향 받은 항목 이름이 포함되므로 원인을 해소한
   뒤 다시 실행할 수 있습니다.

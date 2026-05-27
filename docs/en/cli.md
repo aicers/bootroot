@@ -1475,16 +1475,26 @@ but unused.
 
 Behavior:
 
-- Iterates every entry in `state.json` → `infra_certs`. Each entry
-  carries its own `cert_path`, `key_path`, `sans`, `renew_before`,
-  and `reload_strategy`; the new cert and key are written back to
-  the same paths.
-- Per-entry reissue dispatch:
-  - `openbao` → re-issues the OpenBao server cert and writes it
-    under the compose directory's `openbao/tls/` path.
+- Iterates every entry in `state.json` → `infra_certs`. From each
+  entry the reissue path consumes `sans` (to reproduce the SANs of
+  the original cert) and `reload_strategy` (to refresh the affected
+  container after the write). The `cert_path` / `key_path` /
+  `renew_before` / `expires_at` fields recorded in the entry are
+  informational only — they are not consulted to decide where the
+  renewed material is written.
+- Per-entry reissue dispatch — the output paths are fixed by the
+  dispatched function, not by the entry's `cert_path` / `key_path`:
+  - `openbao` → re-issues the OpenBao server cert and writes it to
+    `<compose-dir>/openbao/tls/server.crt` and
+    `<compose-dir>/openbao/tls/server.key`. Both files are then
+    `chmod 0644`'d so the in-container `openbao` user (which is in
+    neither the runner's primary group nor any shared group) can
+    read them via the "other" permission bits.
   - `bootroot-http01` → re-issues the HTTP-01 responder admin API
-    cert and writes it under the secrets directory's
-    `bootroot-http01/tls/` path.
+    cert and writes it to
+    `<secrets-dir>/bootroot-http01/tls/server.crt` and
+    `<secrets-dir>/bootroot-http01/tls/server.key`. Both files are
+    `chmod 0600`'d after write.
 - After each successful reissue the entry's `issued_at` is
   refreshed and the entry's `reload_strategy` runs so the affected
   container picks up the new material:
@@ -1504,8 +1514,9 @@ Failure conditions:
 - Missing `state.json` — the common rotate path bails before
   subcommand dispatch.
 - ACME failure against step-ca during a per-entry reissue.
-- File-write or permission failure (the renewed key file is
-  `chmod 0600`'d after write).
+- File-write or permission failure on the fixed output paths
+  listed above (write of the renewed cert/key, or the subsequent
+  `chmod` step).
 - Reload-step failure (target container not running, signal
   delivery failure, etc.). The error names the affected entry so
   the operator can re-run after fixing the underlying cause.
