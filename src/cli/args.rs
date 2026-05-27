@@ -219,8 +219,12 @@ pub(crate) enum MonitoringCommand {
     ///
     /// `lan` binds to `GRAFANA_LAN_BIND_ADDR` (default `127.0.0.1`);
     /// `public` binds to all interfaces (`0.0.0.0:3000`). The Grafana
-    /// admin password defaults to `admin` on first start and is rotated
-    /// when `--grafana-admin-password` is supplied.
+    /// admin password defaults to `admin` on first boot and is only
+    /// applied then; pass `--grafana-admin-password` before the first
+    /// `monitoring up`, or run `monitoring down
+    /// --reset-grafana-admin-password` to clear the Grafana volume
+    /// before reseeding it. If monitoring is already running, this
+    /// command is a no-op (no password change is applied).
     Up(MonitoringUpArgs),
     /// Reports the running state of the monitoring stack containers.
     Status(MonitoringStatusArgs),
@@ -556,12 +560,18 @@ pub(crate) enum RotateCommand {
     /// Rotates step-ca's intermediate signing key (and, with `--full`,
     /// the root signing key).
     ///
-    /// Issues a new intermediate (and optionally root) key, drives
-    /// every registered service through reissuance, and finalizes trust
-    /// once every agent has migrated. Skipped phases (`--skip
-    /// reissue,finalize`) leave the rotation paused for operator
-    /// follow-up. Use `--cleanup` to delete backup files after a
-    /// successful full rotation.
+    /// Issues a new intermediate (and optionally root) key, then drives
+    /// reissuance for **local-file** services directly: the control
+    /// plane removes their existing cert and key files and signals the
+    /// local bootroot-agent to reissue on its next cycle. For
+    /// **remote-bootstrap** services the control plane only prints an
+    /// instruction to run `bootroot-remote bootstrap` on the service
+    /// host; their reissuance is the operator's responsibility and is
+    /// not verified by the finalize phase (remote-bootstrap services
+    /// are skipped when checking for unmigrated certs). Skipped phases
+    /// (`--skip reissue,finalize`) leave the rotation paused for
+    /// operator follow-up. Use `--cleanup` to delete backup files
+    /// after a successful full rotation.
     #[command(name = "ca-key")]
     CaKey(RotateCaKeyArgs),
     /// Renews infrastructure TLS certificates (e.g. `OpenBao` server cert)
