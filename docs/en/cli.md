@@ -1216,6 +1216,7 @@ Supported subcommands:
 - `rotate ca-key`
 - `rotate openbao-recovery`
 - `rotate eab-clear`
+- `rotate infra-cert`
 
 ### Inputs
 
@@ -1451,6 +1452,92 @@ Behavior:
 
 No additional arguments. Honors the global `--yes` to skip the
 confirmation prompt.
+
+#### `rotate infra-cert`
+
+Renews infrastructure TLS certificates registered in `state.json` →
+`infra_certs`. Today this covers the **OpenBao server TLS** cert
+(`openbao` entry) and, when the HTTP-01 responder admin API was
+provisioned with TLS, the **HTTP-01 admin TLS** cert
+(`bootroot-http01` entry). The set is data-driven from
+`infra_certs`; the loop body does not change when a new entry type
+is added — only the per-key dispatch arm.
+
+No subcommand-specific arguments. Honors the global `--yes` to skip
+the confirmation prompt. The command accepts the common `bootroot
+rotate` flag surface, but short-circuits before any OpenBao
+interaction, so only `--state-file`, `--compose-file`,
+`--secrets-dir`, and `--yes` actually influence behavior. The
+OpenBao auth flags (`--auth-mode`, `--root-token` /
+`--root-token-file`, `--approle-*`), the OpenBao connection flags
+(`--openbao-url`, `--kv-mount`), and `--show-secrets` are accepted
+but unused.
+
+Behavior:
+
+- Iterates every entry in `state.json` → `infra_certs`. From each
+  entry the reissue path consumes `sans` (to reproduce the SANs of
+  the original cert) and `reload_strategy` (to refresh the affected
+  container after the write). The `cert_path` / `key_path` /
+  `renew_before` / `expires_at` fields recorded in the entry are
+  informational only — they are not consulted to decide where the
+  renewed material is written.
+- Per-entry reissue dispatch — the output paths are fixed by the
+  dispatched function, not by the entry's `cert_path` / `key_path`:
+  - `openbao` → re-issues the OpenBao server cert and writes it to
+    `<compose-dir>/openbao/tls/server.crt` and
+    `<compose-dir>/openbao/tls/server.key`. Both files are then
+    `chmod 0644`'d so the in-container `openbao` user (which is in
+    neither the runner's primary group nor any shared group) can
+    read them via the "other" permission bits.
+  - `bootroot-http01` → re-issues the HTTP-01 responder admin API
+    cert and writes it to
+    `<secrets-dir>/bootroot-http01/tls/server.crt` and
+    `<secrets-dir>/bootroot-http01/tls/server.key`. Both files are
+    `chmod 0600`'d after write.
+- After each successful reissue the entry's `issued_at` is
+  refreshed and the entry's `reload_strategy` runs so the affected
+  container picks up the new material:
+  - `ContainerRestart` (OpenBao) → `docker restart <container>`.
+  - `ContainerSignal` (HTTP-01 admin) → `docker kill -s SIGHUP
+    <container>`.
+- Once every entry has been processed, the updated `infra_certs`
+  map is persisted back to `state.json`.
+
+No-op condition:
+
+- When `infra_certs` is empty, the command prints a "no entries"
+  message and exits 0 without prompting.
+
+Failure conditions:
+
+- Missing `state.json` — the common rotate path bails before
+  subcommand dispatch.
+- Local CA signing failure during a per-entry reissue. Both
+  dispatch arms run `docker ... step certificate create` against
+  the local step-ca intermediate (`--ca`, `--ca-key`,
+  `--ca-password-file`); this is **not** ACME. Surfaces as a
+  failure of the `step certificate create` docker invocation
+  (e.g. step-ca image missing, intermediate cert/key path
+  unreadable, password file mismatch).
+- File-write or permission failure on the fixed output paths
+  listed above (write of the renewed cert/key, or the subsequent
+  `chmod` step).
+- Reload-step failure (target container not running, signal
+  delivery failure, etc.). The reissue dispatch is wrapped with
+  the affected entry name, so a failure during the issue/write
+  phase identifies the entry; the subsequent reload step is not
+  wrapped with the entry name, so a reload failure identifies
+  only the affected container and signal/restart operation. In
+  either case the operator can re-run after fixing the
+  underlying cause.
+
+Examples:
+
+```bash
+bootroot rotate infra-cert
+bootroot rotate infra-cert --yes
+```
 
 ### Rotated secret write targets
 

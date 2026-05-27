@@ -1173,6 +1173,7 @@ OpenBao와 통신해 값을 갱신합니다.
 - `rotate ca-key`
 - `rotate openbao-recovery`
 - `rotate eab-clear`
+- `rotate infra-cert`
 
 ### 입력
 
@@ -1396,6 +1397,84 @@ secret_id를 변경하지 않습니다.
 
 추가 인자는 없습니다. 글로벌 `--yes`로 확인 프롬프트를 생략할 수
 있습니다.
+
+#### `rotate infra-cert`
+
+`state.json`의 `infra_certs`에 등록된 인프라 TLS 인증서를
+갱신합니다. 현재 대상은 **OpenBao 서버 TLS** 인증서(`openbao`
+항목)와, HTTP-01 responder의 admin API를 TLS로 프로비저닝한 경우
+**HTTP-01 admin TLS** 인증서(`bootroot-http01` 항목)입니다.
+갱신 대상은 `infra_certs` 데이터에서 결정되므로 새 항목 종류가
+추가되더라도 루프 본문은 바뀌지 않으며, 키별 디스패치 아암만
+추가됩니다.
+
+서브커맨드 전용 인자는 없습니다. 글로벌 `--yes`로 확인 프롬프트를
+생략할 수 있습니다. `bootroot rotate` 공통 플래그를 모두 받아들이지만
+실제 동작에 영향을 주는 것은 `--state-file`, `--compose-file`,
+`--secrets-dir`, `--yes`뿐입니다. OpenBao 인증 플래그(`--auth-mode`,
+`--root-token` / `--root-token-file`, `--approle-*`), OpenBao 연결
+플래그(`--openbao-url`, `--kv-mount`), `--show-secrets`는 받아들이기만
+하고 사용되지 않습니다(이 명령은 OpenBao 호출 이전 단계에서 분기되어
+종료합니다).
+
+동작:
+
+- `state.json`의 `infra_certs`를 순회합니다. 재발급 경로는 각 항목에서
+  `sans`(원래 인증서의 SAN을 재현하기 위함)와 `reload_strategy`(쓰기
+  후 컨테이너 갱신용)만을 사용합니다. 항목에 기록된 `cert_path`,
+  `key_path`, `renew_before`, `expires_at` 필드는 정보용일 뿐이며,
+  새 자료의 기록 위치 결정에는 사용되지 않습니다.
+- 항목별 재발급 디스패치 — 기록 위치는 디스패치되는 함수에 의해
+  고정되며, 항목의 `cert_path` / `key_path` 값과는 무관합니다:
+  - `openbao` → OpenBao 서버 인증서를 새로 발급해
+    `<compose-dir>/openbao/tls/server.crt` 및
+    `<compose-dir>/openbao/tls/server.key`에 기록합니다. 두 파일은
+    `chmod 0644`로 설정되어, 컨테이너 내부의 `openbao` 유저(러너의
+    기본 그룹이나 공유 그룹에 속하지 않음)가 "other" 권한 비트로
+    파일을 읽을 수 있도록 합니다.
+  - `bootroot-http01` → HTTP-01 responder admin API 인증서를 새로
+    발급해 `<secrets-dir>/bootroot-http01/tls/server.crt` 및
+    `<secrets-dir>/bootroot-http01/tls/server.key`에 기록합니다.
+    두 파일 모두 기록 후 `chmod 0600`이 적용됩니다.
+- 항목별 재발급이 성공하면 해당 항목의 `issued_at`이 갱신되고,
+  `reload_strategy`가 실행되어 영향 받는 컨테이너가 새 자료를
+  인식하도록 합니다:
+  - `ContainerRestart` (OpenBao) → `docker restart <container>`
+  - `ContainerSignal` (HTTP-01 admin) → `docker kill -s SIGHUP
+    <container>`
+- 모든 항목 처리가 끝나면 갱신된 `infra_certs` 맵을 `state.json`에
+  다시 저장합니다.
+
+무동작(no-op) 조건:
+
+- `infra_certs`가 비어 있는 경우, "항목 없음" 메시지를 출력하고
+  프롬프트 없이 0으로 종료합니다.
+
+실패 조건:
+
+- `state.json` 누락 — 공통 rotate 진입 단계에서 서브커맨드 디스패치
+  이전에 실패 처리됩니다.
+- 항목 재발급 중 로컬 CA 서명 실패. 두 디스패치 분기 모두 로컬
+  step-ca 중간 인증서(`--ca`, `--ca-key`, `--ca-password-file`)에
+  대해 `docker ... step certificate create`를 실행합니다 — ACME가
+  **아닙니다**. `step certificate create` docker 호출 실패(예:
+  step-ca 이미지 없음, 중간 cert/key 경로 읽기 실패, 패스워드 파일
+  불일치)로 나타납니다.
+- 위에 명시된 고정 출력 경로에 대한 파일 쓰기/권한 실패(새 cert/key
+  파일의 기록 또는 그 뒤의 `chmod` 단계).
+- 재시작/시그널 단계 실패(대상 컨테이너 미실행, 시그널 전달 실패
+  등). 재발급 디스패치는 영향 받은 항목 이름으로 감싸여 있어 발급/
+  쓰기 단계 실패는 항목 이름을 포함하지만, 이어지는 재시작/시그널
+  단계는 항목 이름으로 감싸지지 않아 영향 받은 컨테이너와 시그널/
+  재시작 동작만을 식별합니다. 두 경우 모두 원인을 해소한 뒤 다시
+  실행할 수 있습니다.
+
+예시:
+
+```bash
+bootroot rotate infra-cert
+bootroot rotate infra-cert --yes
+```
 
 ### 회전 시크릿 쓰기 대상
 
