@@ -242,11 +242,13 @@ pub(crate) enum ServiceCommand {
     /// Registers a new bootroot-agent-managed service.
     ///
     /// Generates the service's `OpenBao` `AppRole` and `secret_id`,
-    /// renders the agent's `agent.toml` baseline, records the
-    /// deployment intent in `state.json`, and (for daemon and docker
-    /// deployments) validates the supplied bootroot-agent identity. Use
-    /// `--dry-run` to preview the diff or `--print-only` to emit the
-    /// manual snippets without writing files.
+    /// renders the agent's `agent.toml` baseline, and records the
+    /// deployment intent in `state.json`. For Docker deployments with a
+    /// `--container-name`, also classifies the supplied bootroot-agent
+    /// container against the expected identity (skip with
+    /// `--no-validate-agent`); daemon deployments have no container to
+    /// validate. Use `--dry-run` to preview the diff or `--print-only`
+    /// to emit the manual snippets without writing files.
     Add(Box<ServiceAddArgs>),
     /// Prints the registered configuration and `OpenBao` `AppRole`
     /// metadata for a service.
