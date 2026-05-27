@@ -1009,6 +1009,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   callers. The timeout message itself is unchanged. Callers that
   prefer the old "ignore timeout" semantics can re-establish them
   with `|| true`. (Closes #629)
+- Added a teardown footer to `bootroot infra --help` pointing operators
+  at `bootroot clean` (top-level), plus a `long_about` on `bootroot
+  clean --help` describing the full teardown path (compose down with
+  auto-discovered openbao-agent/openbao-exposed overrides, removal of
+  `secrets/`, `state.json`, `.env`, and prompted `certs/`) so the next
+  help page after the footer is no longer a flag-only dead end.
+  Bring-up lives under `infra` (`up`, `install`) while teardown is the
+  top-level `clean`, so an operator who learned `bootroot infra up`
+  would not naturally discover the teardown command by exploring
+  `bootroot infra --help`. The footer closes the discoverability gap
+  without aliasing `infra down` to `clean` — `docker compose down`
+  semantics only touch containers, networks, and volumes, while
+  `bootroot clean` additionally wipes `secrets/`, `state.json`, `.env`,
+  and (optionally) `certs/`, so an alias would silently turn "stop and
+  bring back up later" into "lose every root token, CA material, and
+  service cert". (Closes #632)
 - The published `PostgreSQL` host port now defaults to **5433**
   (`POSTGRES_HOST_PORT=5433`) so bootroot does not claim the
   conventional 5432 out of the box. The conventional port stays free
