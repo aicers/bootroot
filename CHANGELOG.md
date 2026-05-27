@@ -431,9 +431,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `--deploy-type=docker --container-name=X` actually points at a
   bootroot-agent before persisting state. The shipped docker-compose
   snippet carries a new identifying label (`bootroot.role=agent`) and
-  the service-add check reads that label first via `docker inspect`,
-  falling back to a `bootroot-agent` substring search in the
-  container's image, entrypoint, and cmd. Missing label /
+  the service-add check reads that label first via
+  `docker inspect --type container`, falling back to a
+  `bootroot-agent` substring search in the container's image,
+  entrypoint, and cmd. The `--type container` scope prevents an image
+  (or other docker object) of the same name from satisfying the check
+  — only a real container can, matching what `docker restart` will
+  later require at rotation time. Missing label /
   unidentified container / inaccessible `docker inspect` all surface
   as a non-fatal warning telling the operator that the first
   `rotate --wait` will exit 124 if no agent picks up the request, and

@@ -89,17 +89,33 @@ pub(super) fn render_warning(
     }
 }
 
-fn inspect_via_docker(container: &str) -> Result<DockerInspect> {
-    // `docker inspect --format` with one combined Go template keeps the
-    // call to a single subprocess. Each field is separated by `\x1f`
-    // (unit separator) so embedded whitespace in image names or
-    // entrypoints does not split the output.
+/// Builds the `docker inspect` argument list used to classify a
+/// container. Restricted with `--type container` so an image, network,
+/// or volume that happens to share the requested name cannot satisfy
+/// the check — rotation later issues `docker restart <container>`,
+/// which only operates on containers, so a non-container match would
+/// suppress a warning that actually applies.
+fn build_inspect_args(container: &str) -> Vec<String> {
     let label_key = BOOTROOT_AGENT_LABEL_KEY;
+    // Fields are separated by `\x1f` (unit separator) so embedded
+    // whitespace in image names or entrypoints does not split output.
     let format_arg = format!(
         "{{{{index .Config.Labels \"{label_key}\"}}}}\x1f{{{{.Config.Image}}}}\x1f{{{{join .Config.Entrypoint \" \"}}}}\x1f{{{{join .Config.Cmd \" \"}}}}",
     );
+    vec![
+        "inspect".to_string(),
+        "--type".to_string(),
+        "container".to_string(),
+        "--format".to_string(),
+        format_arg,
+        container.to_string(),
+    ]
+}
+
+fn inspect_via_docker(container: &str) -> Result<DockerInspect> {
+    let args = build_inspect_args(container);
     let output = ProcessCommand::new("docker")
-        .args(["inspect", "--format", &format_arg, container])
+        .args(args.iter().map(String::as_str))
         .output()
         .with_context(|| "failed to run `docker inspect`")?;
     if !output.status.success() {
@@ -212,6 +228,40 @@ mod tests {
         };
         let identity = classify_with_inspect("web-app", &inspect_with(info));
         assert!(matches!(identity, AgentIdentity::NoMatch));
+    }
+
+    #[test]
+    fn inspect_args_are_container_scoped() {
+        let args = build_inspect_args("bootroot-agent");
+        let mut iter = args.iter();
+        assert_eq!(iter.next().map(String::as_str), Some("inspect"));
+        assert_eq!(iter.next().map(String::as_str), Some("--type"));
+        assert_eq!(iter.next().map(String::as_str), Some("container"));
+        assert_eq!(iter.next().map(String::as_str), Some("--format"));
+        let format = iter.next().expect("format arg present");
+        assert!(format.contains(BOOTROOT_AGENT_LABEL_KEY));
+        assert_eq!(iter.next().map(String::as_str), Some("bootroot-agent"));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn image_with_matching_name_but_no_container_surfaces_inspect_failure() {
+        // Real `docker inspect --type container bootroot-agent` exits
+        // non-zero with `No such container` when only an image of that
+        // name exists. The fallback substring path must not fire here:
+        // rotation runs `docker restart <name>`, which requires a
+        // container, so a phantom "Match" against an image would
+        // suppress a warning the operator needs to see.
+        let inspect = |_: &str| -> Result<DockerInspect> {
+            anyhow::bail!("Error: No such container: bootroot-agent")
+        };
+        let identity = classify_with_inspect("bootroot-agent", &inspect);
+        match identity {
+            AgentIdentity::InspectFailed(msg) => {
+                assert!(msg.contains("No such container"));
+            }
+            _ => panic!("expected InspectFailed when only an image of the same name exists"),
+        }
     }
 
     #[test]
