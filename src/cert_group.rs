@@ -95,7 +95,7 @@ pub enum CertGroupError {
     /// In the `remote-bootstrap` deployment mode, only numeric gids are
     /// accepted. The control host's NSS may diverge from the remote
     /// agent host's NSS, so a name lookup on the control host can fail
-    /// or return a colliding number — see [issue #593].
+    /// or return a colliding number — see issue #593.
     #[error(
         "--cert-group must be a numeric gid for remote-bootstrap services (got {0:?}); \
          resolve the name on the remote agent host and pass the number"
