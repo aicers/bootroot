@@ -122,7 +122,7 @@ pub struct DaemonProfileSettings {
     /// Numeric gid that owns the issued cert/key files and their
     /// parent directories under the `--cert-group` policy.
     /// `None` (the default) preserves the host-local default mode
-    /// and operator-only ownership. See [issue #593].
+    /// and operator-only ownership. See issue #593.
     #[serde(default)]
     pub cert_group_gid: Option<u32>,
 }
