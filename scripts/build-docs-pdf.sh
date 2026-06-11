@@ -92,7 +92,7 @@ pdf_plugin = {
         "enabled_if_env": "BOOTROOT_PDF_EXPORT",
         "output_path": os.path.join(root, "site", "pdf", f"bootroot-manual.{locale}.pdf"),
         "custom_template_path": tmp_pdf_dir,
-        "author": f"Version 2.4.0-build.812\n{now.strftime('%B %-d, %Y')}",
+        "author": now.strftime('%B %-d, %Y'),
         "copyright": "© 2026 ClumL Inc.",
         "cover_logo": "docs/.theme/brand.svg",
     }
@@ -102,7 +102,7 @@ if locale == "ko":
     pdf_plugin["with-pdf"]["cover_title"] = "Bootroot"
     pdf_plugin["with-pdf"]["cover_subtitle"] = "사용자 매뉴얼"
     pdf_plugin["with-pdf"]["toc_title"] = "목차"
-    pdf_plugin["with-pdf"]["author"] = f"버전 2.4.0-build.812\n{now.strftime('%Y년 %-m월 %-d일')}"
+    pdf_plugin["with-pdf"]["author"] = now.strftime('%Y년 %-m월 %-d일')
     data.setdefault("extra", {})["cover_tagline"] = "기술 설치 및 운영 매뉴얼"
 else:
     pdf_plugin["with-pdf"]["cover_title"] = "Bootroot"
