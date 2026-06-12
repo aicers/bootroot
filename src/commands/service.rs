@@ -910,6 +910,15 @@ fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
         entry.cert_group_gid,
     );
     let block = inject_hooks_into_managed_profile_block(&block, &entry.post_renew_hooks);
+    // `service add` writes `[trust]` inside the managed-block markers, so
+    // the whole-span replacement below would drop it and leave the agent
+    // unable to verify a private CA. Snapshot it from the pre-replacement
+    // file and re-apply it afterwards. This path is deliberately offline
+    // (no KV handle), so we carry the existing table over verbatim rather
+    // than re-deriving fingerprints. A keyed upsert updates the table in
+    // place wherever it sits, so a `[trust]` already outside the markers
+    // is not duplicated; a file with no `[trust]` keeps none.
+    let trust_pairs = bootroot::toml_util::section_pairs(&current, "trust")?;
     let next = bootroot::trust_bootstrap::upsert_managed_profile_block(
         &current,
         MANAGED_PROFILE_BEGIN_PREFIX,
@@ -917,6 +926,13 @@ fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
         &entry.service_name,
         &block,
     );
+    let next = if let Some(pairs) = trust_pairs {
+        let updates: Vec<(&str, String)> =
+            pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        bootroot::toml_util::upsert_section_keys(&next, "trust", &updates)?
+    } else {
+        next
+    };
     std::fs::write(agent_config_path, next)
         .with_context(|| format!("Failed to write {}", agent_config_path.display()))?;
     Ok(())
