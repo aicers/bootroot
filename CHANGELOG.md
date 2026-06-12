@@ -51,6 +51,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot service update --reload-style`/`--cert-group` dropping
+  the `[trust]` section of a local-file service's `agent.toml`. Because
+  `service add` writes `[trust]` *inside* the `# BEGIN … # END bootroot
+  managed profile` markers, the update path's whole-span re-render
+  silently deleted it, leaving the agent's ACME client with no
+  `trust.ca_bundle_path`. The next renewal then fell back to the system
+  trust store and failed against a private (step-ca) CA with
+  `UnknownIssuer`. `rerender_local_managed_profile` now snapshots the
+  existing `[trust]` table before the block replacement and re-applies it
+  with a keyed upsert afterwards. The carry-over is verbatim — the
+  rerender path is deliberately offline (no KV handle) — and idempotent:
+  a `[trust]` already outside the markers is updated in place rather than
+  duplicated, and a config with no `[trust]` keeps none.
+
 - Fixed `bootroot-agent` not detecting a post-`init` trust-anchor
   rotation. Its renewal predicate (`should_renew`) only checked leaf
   expiry, so after `bootroot clean` + `init` regenerated the step-ca
