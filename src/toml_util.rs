@@ -99,6 +99,33 @@ pub fn insert_missing_section_keys(
     Ok(doc.to_string())
 }
 
+/// Extracts a section's value key-value pairs as raw TOML value strings.
+///
+/// Returns `None` when the section is absent so callers can distinguish
+/// "no section" from "empty section" and avoid synthesizing one. Each
+/// returned value string is the TOML rendering of the value (for example
+/// `"certs/ca.pem"` or `["abc", "def"]`), which round-trips back through
+/// [`upsert_section_keys`]. Only value items are returned; nested
+/// subtables are skipped.
+///
+/// # Errors
+///
+/// Returns an error if `contents` is not valid TOML.
+pub fn section_pairs(contents: &str, section: &str) -> Result<Option<Vec<(String, String)>>> {
+    let doc: DocumentMut = contents.parse().context("failed to parse TOML content")?;
+    let Some(table) = doc.get(section).and_then(Item::as_table) else {
+        return Ok(None);
+    };
+    let pairs = table
+        .iter()
+        .filter_map(|(key, item)| {
+            item.as_value()
+                .map(|value| (key.to_string(), value.to_string().trim().to_string()))
+        })
+        .collect();
+    Ok(Some(pairs))
+}
+
 /// Removes one or more TOML sections by name.
 ///
 /// Handles both top-level (`"eab"`) and dotted (`"profiles.eab"`)
@@ -241,6 +268,39 @@ mod tests {
         let once = upsert_top_level_keys(input, &pairs).unwrap();
         let twice = upsert_top_level_keys(&once, &pairs).unwrap();
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn section_pairs_absent_section_returns_none() {
+        let input = "email = \"admin@example.com\"\n";
+        assert!(section_pairs(input, "trust").unwrap().is_none());
+    }
+
+    #[test]
+    fn section_pairs_round_trips_through_upsert() {
+        let input = "[trust]\n\
+                     ca_bundle_path = \"certs/ca.pem\"\n\
+                     trusted_ca_sha256 = [\"abc\", \"def\"]\n";
+        let pairs = section_pairs(input, "trust").unwrap().expect("present");
+        let updates: Vec<(&str, String)> =
+            pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let output = upsert_section_keys("email = \"x\"\n", "trust", &updates).unwrap();
+        assert!(
+            output.contains("ca_bundle_path = \"certs/ca.pem\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("trusted_ca_sha256 = [\"abc\", \"def\"]"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn section_pairs_skips_subtables() {
+        let input = "[trust]\nca_bundle_path = \"certs/ca.pem\"\n\n[trust.nested]\nx = 1\n";
+        let pairs = section_pairs(input, "trust").unwrap().expect("present");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "ca_bundle_path");
     }
 
     #[test]
