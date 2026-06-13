@@ -3044,6 +3044,130 @@ fn test_service_update_reload_style_no_trust_stays_absent() {
     );
 }
 
+/// Issue #645 — `service update --cert-group …` reaches
+/// `rerender_local_managed_profile` through the `redeploy_hint` branch
+/// (a different trigger than `--reload-style`'s `hooks_changed`), so the
+/// `[trust]` carry-over must hold on this path too. A regression here
+/// would silently reintroduce the issue #643 `UnknownIssuer` bug for
+/// cert-group updates while the `--reload-style` tests stayed green.
+#[cfg(unix)]
+#[test]
+fn test_service_update_cert_group_preserves_inline_trust() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    // Mirror the `service add` layout: `[trust]` lands inside the
+    // BEGIN/END markers as a dangling-comment-preceding table.
+    let agent_toml = temp_dir.path().join("agent.toml");
+    fs::write(
+        &agent_toml,
+        "# BEGIN bootroot managed profile: edge-proxy\n\
+         [[profiles]]\n\
+         name = \"edge-proxy\"\n\
+         \n\
+         [trust]\n\
+         ca_bundle_path = \"/opt/demo-mtls/ca-bundle.pem\"\n\
+         trusted_ca_sha256 = [\"root-sha\", \"intermediate-sha\"]\n\
+         # END bootroot managed profile: edge-proxy\n",
+    )
+    .expect("seed agent.toml");
+
+    // `--cert-group clear` drives the re-render purely through the
+    // `redeploy_hint` branch (no hook change), exercising the trigger the
+    // `--reload-style` tests never reach.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--cert-group",
+            "clear",
+        ])
+        .output()
+        .expect("run service update");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let agent_contents = fs::read_to_string(&agent_toml).expect("read agent.toml");
+    assert!(
+        agent_contents.contains("ca_bundle_path = \"/opt/demo-mtls/ca-bundle.pem\""),
+        "[trust].ca_bundle_path must survive the cert-group re-render, got: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("trusted_ca_sha256 = [\"root-sha\", \"intermediate-sha\"]"),
+        "[trust].trusted_ca_sha256 must survive the cert-group re-render, got: {agent_contents}"
+    );
+    assert_eq!(
+        agent_contents.matches("[trust]").count(),
+        1,
+        "exactly one [trust] section expected, got: {agent_contents}"
+    );
+}
+
+/// Issue #645 — when `[trust]` already lives *outside* the managed-block
+/// markers, the `--cert-group` re-render must update it in place and
+/// never produce a duplicate section, mirroring the `--reload-style`
+/// guarantee.
+#[cfg(unix)]
+#[test]
+fn test_service_update_cert_group_keeps_outside_trust_unique() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let agent_toml = temp_dir.path().join("agent.toml");
+    fs::write(
+        &agent_toml,
+        "[trust]\n\
+         ca_bundle_path = \"/opt/demo-mtls/ca-bundle.pem\"\n\
+         \n\
+         # BEGIN bootroot managed profile: edge-proxy\n\
+         [[profiles]]\n\
+         name = \"edge-proxy\"\n\
+         # END bootroot managed profile: edge-proxy\n",
+    )
+    .expect("seed agent.toml");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--cert-group",
+            "clear",
+        ])
+        .output()
+        .expect("run service update");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let agent_contents = fs::read_to_string(&agent_toml).expect("read agent.toml");
+    assert_eq!(
+        agent_contents.matches("[trust]").count(),
+        1,
+        "an out-of-block [trust] must not be duplicated, got: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("ca_bundle_path = \"/opt/demo-mtls/ca-bundle.pem\""),
+        "[trust].ca_bundle_path must survive, got: {agent_contents}"
+    );
+}
+
 /// Issue #614 — `service update --reload-style none` clears a
 /// previously configured hook without re-onboarding.
 #[cfg(unix)]
