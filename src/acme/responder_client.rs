@@ -64,7 +64,7 @@ pub async fn register_http01_token(
     .await
 }
 
-/// Reads the CA bundle PEM from disk when [`TrustSettings::ca_bundle_path`] is set.
+/// Reads the CA bundle PEM from disk when `TrustSettings::ca_bundle_path` is set.
 fn read_ca_pem_from_trust(trust: &crate::config::TrustSettings) -> Result<Option<String>> {
     let Some(path) = trust.ca_bundle_path.as_ref() else {
         return Ok(None);

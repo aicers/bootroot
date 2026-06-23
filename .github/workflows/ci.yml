@@ -87,6 +87,11 @@ jobs:
       - name: Check Rust Lints (Clippy)
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Check Rustdoc
+        run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: Check Python Formatting
         run: ruff format --check .
 
