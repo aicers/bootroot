@@ -5,6 +5,7 @@ ignores:
   - "secrets/**"
   - ".github/**"
   - ".venv/**"
+  - "target/**"
 config:
   MD013:
     tables: false
