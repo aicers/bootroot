@@ -21,7 +21,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.decide.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Filter Paths
         id: filter
@@ -58,7 +58,7 @@ jobs:
     name: Quality Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -127,7 +127,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Free port 5432 (runner PostgreSQL)
         run: sudo systemctl stop postgresql || true
@@ -435,7 +435,7 @@ jobs:
             oba_deployment: ""
             oba_topology: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Free port 5432 (runner PostgreSQL)
         run: sudo systemctl stop postgresql || true
