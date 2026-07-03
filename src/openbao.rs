@@ -1215,6 +1215,31 @@ impl OpenBaoClient {
 /// Interval at which the `OpenBao` agent re-renders static secrets.
 pub const STATIC_SECRET_RENDER_INTERVAL: &str = "30s";
 
+/// HCL `perms` for secret-bearing rendered files (agent config,
+/// responder HMAC, role/secret IDs, tokens, etc.).
+pub const TEMPLATE_PERMS_SECRET: &str = "0600";
+/// HCL `perms` for public trust material (the CA bundle).
+pub const TEMPLATE_PERMS_PUBLIC: &str = "0644";
+
+/// Source, destination, and rendered `perms` for one `template` block in
+/// the generated `OpenBao` agent HCL.
+///
+/// Carrying `perms` per template lets a single agent config mix
+/// secret-bearing files (kept at [`TEMPLATE_PERMS_SECRET`]) with public
+/// trust material such as the CA bundle (widened to
+/// [`TEMPLATE_PERMS_PUBLIC`]). The named fields make the intent explicit
+/// at every call site and prevent a positional mistake that would
+/// silently widen a secret file's mode.
+pub struct TemplateSpec<'a> {
+    /// Path to the consul-template source (`.ctmpl`).
+    pub source: &'a str,
+    /// Path the agent renders the template to.
+    pub destination: &'a str,
+    /// Octal `perms` string for the rendered file (e.g.
+    /// [`TEMPLATE_PERMS_SECRET`] or [`TEMPLATE_PERMS_PUBLIC`]).
+    pub perms: &'a str,
+}
+
 /// Parameters for [`build_agent_config`].
 pub struct AgentConfigParams<'a> {
     /// Vault/`OpenBao` server address.
@@ -1229,8 +1254,8 @@ pub struct AgentConfigParams<'a> {
     pub mount_path: Option<&'a str>,
     /// Value for `static_secret_render_interval`.
     pub render_interval: &'a str,
-    /// `(source, destination)` pairs for template blocks.
-    pub templates: &'a [(&'a str, &'a str)],
+    /// Template blocks to render, each with its own `perms`.
+    pub templates: &'a [TemplateSpec<'a>],
     /// Optional path to a CA certificate bundle for TLS verification of
     /// the `OpenBao` server.
     pub ca_cert: Option<&'a str>,
@@ -1277,14 +1302,17 @@ template_config {{
 }}
 "#
     );
-    for (source_path, destination_path) in params.templates {
+    for spec in params.templates {
+        let source_path = spec.source;
+        let destination_path = spec.destination;
+        let perms = spec.perms;
         write!(
             &mut config,
             r#"
 template {{
   source = "{source_path}"
   destination = "{destination_path}"
-  perms = "0600"
+  perms = "{perms}"
 }}
 "#
         )
@@ -1463,7 +1491,11 @@ mod agent_config_tests {
             token_path: "/token",
             mount_path: None,
             render_interval: "30s",
-            templates: &[("/tpl.ctmpl", "/out.toml")],
+            templates: &[TemplateSpec {
+                source: "/tpl.ctmpl",
+                destination: "/out.toml",
+                perms: TEMPLATE_PERMS_SECRET,
+            }],
             ca_cert: None,
         });
         assert!(hcl.contains(r#"address = "http://openbao:8200""#));
@@ -1472,6 +1504,7 @@ mod agent_config_tests {
         assert!(!hcl.contains("ca_cert"));
         assert!(hcl.contains(r#"static_secret_render_interval = "30s""#));
         assert!(hcl.contains(r#"source = "/tpl.ctmpl""#));
+        assert!(hcl.contains(r#"perms = "0600""#));
     }
 
     #[test]
@@ -1483,7 +1516,11 @@ mod agent_config_tests {
             token_path: "/token",
             mount_path: Some("auth/approle"),
             render_interval: "30s",
-            templates: &[("/tpl.ctmpl", "/out.toml")],
+            templates: &[TemplateSpec {
+                source: "/tpl.ctmpl",
+                destination: "/out.toml",
+                perms: TEMPLATE_PERMS_SECRET,
+            }],
             ca_cert: None,
         });
         assert!(hcl.contains(r#"mount_path = "auth/approle""#));
@@ -1498,11 +1535,52 @@ mod agent_config_tests {
             token_path: "/token",
             mount_path: None,
             render_interval: "30s",
-            templates: &[("/a.ctmpl", "/a.out"), ("/b.ctmpl", "/b.out")],
+            templates: &[
+                TemplateSpec {
+                    source: "/a.ctmpl",
+                    destination: "/a.out",
+                    perms: TEMPLATE_PERMS_SECRET,
+                },
+                TemplateSpec {
+                    source: "/b.ctmpl",
+                    destination: "/b.out",
+                    perms: TEMPLATE_PERMS_PUBLIC,
+                },
+            ],
             ca_cert: None,
         });
         assert!(hcl.contains(r#"source = "/a.ctmpl""#));
         assert!(hcl.contains(r#"source = "/b.ctmpl""#));
+    }
+
+    #[test]
+    fn per_template_perms_vary_by_spec() {
+        let hcl = build_agent_config(&AgentConfigParams {
+            openbao_addr: "http://openbao:8200",
+            role_id_path: "/role_id",
+            secret_id_path: "/secret_id",
+            token_path: "/token",
+            mount_path: None,
+            render_interval: "30s",
+            templates: &[
+                TemplateSpec {
+                    source: "/agent.ctmpl",
+                    destination: "/agent.toml",
+                    perms: TEMPLATE_PERMS_SECRET,
+                },
+                TemplateSpec {
+                    source: "/ca-bundle.ctmpl",
+                    destination: "/ca-bundle.pem",
+                    perms: TEMPLATE_PERMS_PUBLIC,
+                },
+            ],
+            ca_cert: None,
+        });
+        // The secret-bearing agent config stays 0600.
+        assert!(hcl.contains("  destination = \"/agent.toml\"\n  perms = \"0600\""));
+        // The public CA bundle is widened to 0644 so non-root consumers
+        // in separate containers can read the bind-mounted file.
+        assert!(hcl.contains("  destination = \"/ca-bundle.pem\"\n  perms = \"0644\""));
     }
 
     #[test]
@@ -1514,7 +1592,11 @@ mod agent_config_tests {
             token_path: "/token",
             mount_path: Some("auth/approle"),
             render_interval: "30s",
-            templates: &[("/tpl.ctmpl", "/out.toml")],
+            templates: &[TemplateSpec {
+                source: "/tpl.ctmpl",
+                destination: "/out.toml",
+                perms: TEMPLATE_PERMS_SECRET,
+            }],
             ca_cert: Some("/certs/ca-bundle.pem"),
         });
         assert!(hcl.contains(r#"address = "https://openbao:8200""#));
@@ -1530,7 +1612,11 @@ mod agent_config_tests {
             token_path: "/token",
             mount_path: None,
             render_interval: "30s",
-            templates: &[("/tpl.ctmpl", "/out.toml")],
+            templates: &[TemplateSpec {
+                source: "/tpl.ctmpl",
+                destination: "/out.toml",
+                perms: TEMPLATE_PERMS_SECRET,
+            }],
             ca_cert: None,
         });
         assert!(!hcl.contains("ca_cert"));

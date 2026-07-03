@@ -2,7 +2,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use bootroot::cert_group::CertGroupPolicy;
 use bootroot::fs_util;
+use bootroot::openbao::{TEMPLATE_PERMS_PUBLIC, TEMPLATE_PERMS_SECRET, TemplateSpec};
 use bootroot::toml_util::toml_encode_string;
 use bootroot::trust_bootstrap::{
     AgentConfigBaselineParams, apply_agent_config_baseline_defaults, build_ca_bundle_ctmpl,
@@ -106,7 +108,19 @@ pub(super) async fn apply_local_service_configs(
     next = bootroot::toml_util::upsert_top_level_keys(&next, &domain_updates)?;
     let acme_updates = vec![("http_responder_hmac", sync_material.responder_hmac.clone())];
     next = bootroot::toml_util::upsert_section_keys(&next, "acme", &acme_updates)?;
-    write_local_ca_bundle(&ca_bundle_path, &sync_material.ca_bundle_pem, messages).await?;
+    // The CA bundle is public trust material: write it 0644 and pick up
+    // the `--cert-group` gid when a policy is set, so cert-group members
+    // and non-root consumers in separate containers can read it.
+    let cert_group_policy = CertGroupPolicy {
+        gid: resolved.cert_group_gid,
+    };
+    write_local_ca_bundle(
+        &ca_bundle_path,
+        &sync_material.ca_bundle_pem,
+        cert_group_policy,
+        messages,
+    )
+    .await?;
     let svc_cred_dir = secret_id_path.parent().unwrap_or(secrets_dir);
     // Pre-seed the same ca-bundle.pem path that the agent template
     // renders to, so the sidecar can verify TLS on first boot and
@@ -115,6 +129,7 @@ pub(super) async fn apply_local_service_configs(
     write_local_ca_bundle(
         &docker_ca_bundle_path,
         &sync_material.ca_bundle_pem,
+        cert_group_policy,
         messages,
     )
     .await?;
@@ -166,16 +181,14 @@ pub(super) async fn apply_local_service_configs(
             messages.error_write_file_failed(&bundle_template_path.display().to_string())
         })?;
     fs_util::set_key_permissions(&bundle_template_path).await?;
-    let template_specs = [
-        (
-            template_path.display().to_string(),
-            resolved.agent_config.display().to_string(),
-        ),
-        (
-            bundle_template_path.display().to_string(),
-            ca_bundle_path.display().to_string(),
-        ),
-    ];
+    // The agent config carries secret material (responder HMAC) and
+    // stays 0600; the CA bundle is public trust material and must be
+    // world-readable (0644) so non-root consumers in separate containers
+    // can read the bind-mounted file.
+    let agent_template_source = template_path.display().to_string();
+    let agent_config_dest = resolved.agent_config.display().to_string();
+    let bundle_template_source = bundle_template_path.display().to_string();
+    let ca_bundle_dest = ca_bundle_path.display().to_string();
 
     let role_id_path = secret_id_path
         .parent()
@@ -189,10 +202,18 @@ pub(super) async fn apply_local_service_configs(
     }
     fs_util::set_key_permissions(&token_path).await?;
     let agent_config_path = openbao_service_dir.join(OPENBAO_AGENT_CONFIG_FILENAME);
-    let templates = template_specs
-        .iter()
-        .map(|(source, destination)| (source.as_str(), destination.as_str()))
-        .collect::<Vec<_>>();
+    let templates = [
+        TemplateSpec {
+            source: &agent_template_source,
+            destination: &agent_config_dest,
+            perms: TEMPLATE_PERMS_SECRET,
+        },
+        TemplateSpec {
+            source: &bundle_template_source,
+            destination: &ca_bundle_dest,
+            perms: TEMPLATE_PERMS_PUBLIC,
+        },
+    ];
     let agent_hcl = render_openbao_agent_config(
         openbao_url,
         &role_id_path,
@@ -235,19 +256,33 @@ pub(super) async fn apply_local_service_configs(
     })
 }
 
-async fn write_local_ca_bundle(path: &Path, bundle_pem: &str, messages: &Messages) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs_util::ensure_secrets_dir(parent).await?;
-    }
+/// Pre-seeds a public CA bundle on disk so the sidecar can verify TLS on
+/// first boot, before the agent template renders.
+///
+/// The bundle is public trust material, so it is written at
+/// [`fs_util::write_ca_bundle`]'s `0644` mode (not the operator-only
+/// `0600` used for secrets) and, when a `--cert-group` policy is active,
+/// `chown`ed to the policy gid. This keeps the pre-seeded copy consistent
+/// with what the agent renders on every subsequent run and lets a
+/// non-root consumer in a separate container read the bind-mounted file.
+///
+/// The PEM is normalized to end in a trailing newline before writing to
+/// preserve the historical on-disk shape (`write_ca_bundle` itself writes
+/// bytes verbatim).
+async fn write_local_ca_bundle(
+    path: &Path,
+    bundle_pem: &str,
+    policy: CertGroupPolicy,
+    messages: &Messages,
+) -> Result<()> {
     let contents = if bundle_pem.ends_with('\n') {
         bundle_pem.to_string()
     } else {
         format!("{bundle_pem}\n")
     };
-    fs::write(path, contents)
+    fs_util::write_ca_bundle(path, &contents, policy)
         .await
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    fs_util::set_key_permissions(path).await?;
     Ok(())
 }
 
@@ -317,7 +352,7 @@ fn render_openbao_agent_config(
     role_id_path: &Path,
     secret_id_path: &Path,
     token_path: &Path,
-    templates: &[(&str, &str)],
+    templates: &[TemplateSpec<'_>],
 ) -> String {
     let role_id = role_id_path.display().to_string();
     let secret_id = secret_id_path.display().to_string();
@@ -438,11 +473,22 @@ fn render_docker_agent_config(inputs: &DockerAgentConfigInputs<'_>) -> Result<St
         None
     };
 
-    let templates = [(tpl_source, tpl_dest), (ca_tpl_source, ca_tpl_dest)];
-    let tpl_refs: Vec<(&str, &str)> = templates
-        .iter()
-        .map(|(s, d)| (s.as_str(), d.as_str()))
-        .collect();
+    // The agent config renders secret material (responder HMAC) and
+    // stays 0600; the CA bundle is public trust material rendered at
+    // 0644 so a non-root consumer in a separate container can read the
+    // bind-mounted file without a manual chmod.
+    let tpl_specs = [
+        TemplateSpec {
+            source: &tpl_source,
+            destination: &tpl_dest,
+            perms: TEMPLATE_PERMS_SECRET,
+        },
+        TemplateSpec {
+            source: &ca_tpl_source,
+            destination: &ca_tpl_dest,
+            perms: TEMPLATE_PERMS_PUBLIC,
+        },
+    ];
 
     Ok(bootroot::openbao::build_agent_config(
         &bootroot::openbao::AgentConfigParams {
@@ -452,7 +498,7 @@ fn render_docker_agent_config(inputs: &DockerAgentConfigInputs<'_>) -> Result<St
             token_path: &token,
             mount_path: Some("auth/approle"),
             render_interval: bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
-            templates: &tpl_refs,
+            templates: &tpl_specs,
             ca_cert: ca_cert.as_deref(),
         },
     ))
@@ -1169,6 +1215,18 @@ mod tests {
             "ca bundle dest must be container path"
         );
         assert!(
+            hcl.contains(
+                "  destination = \"/openbao/secrets/services/edge/ca-bundle.pem\"\n  perms = \"0644\""
+            ),
+            "public CA bundle must render at 0644"
+        );
+        assert!(
+            hcl.contains(
+                "  destination = \"/openbao/secrets/services/edge/agent.toml\"\n  perms = \"0600\""
+            ),
+            "secret agent config must stay at 0600"
+        );
+        assert!(
             !hcl.contains("ca_cert"),
             "http address must not include ca_cert"
         );
@@ -1329,7 +1387,11 @@ mod tests {
             Path::new("/secrets/services/edge/role_id"),
             Path::new("/secrets/services/edge/secret_id"),
             Path::new("/secrets/openbao/services/edge/token"),
-            &[("/tpl.ctmpl", "/out.toml")],
+            &[TemplateSpec {
+                source: "/tpl.ctmpl",
+                destination: "/out.toml",
+                perms: TEMPLATE_PERMS_SECRET,
+            }],
         );
 
         assert!(
@@ -1344,5 +1406,66 @@ mod tests {
             !hcl.contains("ca_cert"),
             "host config must not include ca_cert"
         );
+    }
+
+    #[tokio::test]
+    async fn write_local_ca_bundle_is_world_readable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ca-bundle.pem");
+        write_local_ca_bundle(
+            &path,
+            "PEM",
+            CertGroupPolicy::none(),
+            &crate::i18n::test_messages(),
+        )
+        .await
+        .expect("write pre-seeded CA bundle");
+
+        let mode = std::fs::metadata(&path)
+            .expect("bundle metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "pre-seeded CA bundle must be world-readable (0644)"
+        );
+        let contents = std::fs::read_to_string(&path).expect("read bundle");
+        assert_eq!(
+            contents, "PEM\n",
+            "bundle must be normalized to end in a trailing newline"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_local_ca_bundle_honors_cert_group_gid() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Chown against a gid the caller already has membership in, so
+        // the test exercises the policy path without needing root.
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ca-bundle.pem");
+        write_local_ca_bundle(
+            &path,
+            "PEM\n",
+            CertGroupPolicy::with_gid(gid),
+            &crate::i18n::test_messages(),
+        )
+        .await
+        .expect("write pre-seeded CA bundle with policy");
+
+        let meta = std::fs::metadata(&path).expect("bundle metadata");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o644,
+            "cert-group pre-seeded CA bundle must still be 0644"
+        );
+        assert_eq!(meta.gid(), gid, "bundle must be chowned to the policy gid");
     }
 }

@@ -66,6 +66,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   presupposes `bootroot-openbao` exists (it `docker inspect`s it for the
   compose project label), so skipping dependency startup is safe.
   `refresh` is unchanged. (Closes #657)
+- Fixed the `OpenBao` agent rendering `ca-bundle.pem` at `0600`, which
+  broke non-root containerized consumers reading the bind-mounted CA
+  bundle (e.g. Node with `NODE_EXTRA_CA_CERTS`) with `EACCES`. The
+  bundle is public trust material and is now rendered `0644`, while
+  secret-bearing templates (`agent.toml` and its responder HMAC, role/
+  secret IDs, tokens) stay `0600`. `build_agent_config` now carries the
+  mode per template via a `TemplateSpec { source, destination, perms }`
+  struct instead of a hard-coded `perms = "0600"` on every block. The
+  same fix applies to the copies `service add` pre-seeds before the
+  first template render: both the operator-facing `ca-bundle.pem` next
+  to the cert and the Docker sidecar copy now land at `0644` and pick up
+  the `--cert-group` gid when a policy is set, by routing through
+  `fs_util::write_ca_bundle` instead of the `0600` key-permission
+  helper.
 - Fixed `bootroot service update --reload-style`/`--cert-group` dropping
   the `[trust]` section of a local-file service's `agent.toml`. Because
   `service add` writes `[trust]` *inside* the `# BEGIN … # END bootroot
