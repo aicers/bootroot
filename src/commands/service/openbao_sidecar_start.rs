@@ -393,6 +393,12 @@ fn build_compose_up_args(
         "-f".to_string(),
         override_path.to_string(),
         "up".to_string(),
+        // Bring up only the sidecar and never reconcile/recreate the
+        // `openbao` dependency. `start` already presupposes the
+        // `bootroot-openbao` container exists, so recreating it on
+        // config drift would needlessly re-seal a shamir-sealed OpenBao
+        // and drop any override-only port bindings (issue #657).
+        "--no-deps".to_string(),
         "-d".to_string(),
         service_name.to_string(),
     ]);
@@ -1015,6 +1021,7 @@ mod tests {
                 "-f",
                 "/path/to/override.yml",
                 "up",
+                "--no-deps",
                 "-d",
                 "openbao-agent-myapp",
             ]
@@ -1032,6 +1039,10 @@ mod tests {
         assert!(
             !args.iter().any(|a| a == "-p"),
             "must not include -p flag when project is None: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--no-deps"),
+            "must include --no-deps so the openbao dependency is not recreated: {args:?}"
         );
         assert_eq!(args.first().map(String::as_str), Some("compose"));
         assert_eq!(args.last().map(String::as_str), Some("openbao-agent-myapp"));

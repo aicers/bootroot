@@ -51,6 +51,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot service openbao-sidecar start` recreating the
+  `bootroot-openbao` container as a side effect of starting a sidecar.
+  The generated per-service override's `depends_on: openbao` made
+  `docker compose ... up -d openbao-agent-<svc>` reconcile the `openbao`
+  dependency, and because the command resolves only the base
+  `docker-compose.yml`, a stack that published OpenBao through an
+  additional operator override (extra ports, networks, etc.) drifted
+  from the running container and got recreated — re-sealing a
+  shamir-sealed OpenBao and dropping the override-only port bindings.
+  `build_compose_up_args` now passes `--no-deps` on the sidecar `up`, so
+  only the sidecar starts and the `openbao` container is left untouched
+  regardless of which operator overrides published it. `start` already
+  presupposes `bootroot-openbao` exists (it `docker inspect`s it for the
+  compose project label), so skipping dependency startup is safe.
+  `refresh` is unchanged. (Closes #657)
 - Fixed `bootroot service update --reload-style`/`--cert-group` dropping
   the `[trust]` section of a local-file service's `agent.toml`. Because
   `service add` writes `[trust]` *inside* the `# BEGIN … # END bootroot

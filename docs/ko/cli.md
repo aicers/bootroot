@@ -966,6 +966,15 @@ bootroot service update --service-name edge-proxy --reload-style none
 `COMPOSE_PROJECT_NAME` 값에서도 추가 우회(`COMPOSE_PROJECT_NAME=bootroot
 bootroot service openbao-sidecar start ...`) 없이 동작합니다.
 
+사이드카 `up`은 `--no-deps`와 함께 실행되므로 사이드카만 기동하고
+`bootroot-openbao` 컨테이너를 재조정하거나 재생성하지 않습니다. 이
+명령은 기본 `docker-compose.yml`만 해석하기 때문에, OpenBao를 추가
+운영자 override(추가 포트·네트워크 등)로 게시한 스택에서는 그렇지
+않으면 실행 중인 컨테이너와 구성이 어긋나 재생성이 일어나 — shamir로
+봉인된 OpenBao가 다시 봉인되고 override 전용 바인딩이 사라집니다.
+`--no-deps`는 어떤 운영자 override 파일이 OpenBao를 게시했든 이 문제를
+방지합니다.
+
 ### 출력
 
 - 생성되는 사이드카 컨테이너 이름은

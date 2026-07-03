@@ -1000,6 +1000,16 @@ result, the command now works from any working directory and any
 `COMPOSE_PROJECT_NAME` value without requiring a workaround such as
 `COMPOSE_PROJECT_NAME=bootroot bootroot service openbao-sidecar start ...`.
 
+The sidecar `up` is issued with `--no-deps`, so it brings up only the
+sidecar and never reconciles or recreates the `bootroot-openbao`
+container. Because the command resolves only the base
+`docker-compose.yml`, a stack that publishes OpenBao through an
+additional operator override (extra ports, networks, etc.) would
+otherwise drift from the running container and get recreated —
+re-sealing a shamir-sealed OpenBao and dropping the override-only
+bindings. `--no-deps` avoids that regardless of which operator
+override files published OpenBao.
+
 ### Outputs
 
 - The created sidecar container is named
