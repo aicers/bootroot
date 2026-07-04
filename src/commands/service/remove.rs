@@ -776,6 +776,55 @@ mod tests {
         assert!(!strip_managed_profile(&path, "svc").expect("idempotent"));
     }
 
+    /// The exact #662 duplicate — a local-file block and a remote-bootstrap
+    /// block for the same service — is what an already-affected host carries.
+    /// `--strip-config` must clear *both* profile entries and all markers so
+    /// no orphaned, marker-less profile is left behind.
+    #[test]
+    fn strip_managed_profile_clears_both_transition_blocks() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("agent.toml");
+        let render = |markers: bootroot::trust_bootstrap::ManagedProfileMarkers| {
+            bootroot::trust_bootstrap::render_managed_profile_block(
+                markers.begin_prefix,
+                markers.end_prefix,
+                "svc",
+                "001",
+                "host1",
+                Path::new("/certs/cert.pem"),
+                Path::new("/certs/key.pem"),
+                None,
+            )
+        };
+        let local = render(LOCAL_FILE_PROFILE_MARKERS);
+        let remote = render(REMOTE_BOOTSTRAP_PROFILE_MARKERS);
+        let contents = format!(
+            "email = \"a@b.c\"\n\n{local}\n\n{remote}\n\n[trust]\nca_bundle_path = \"c\"\n"
+        );
+        std::fs::write(&path, &contents).expect("write");
+
+        assert!(strip_managed_profile(&path, "svc").expect("strip ok"));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !after.contains("[[profiles]]"),
+            "profile left behind: {after}"
+        );
+        assert!(
+            !after.contains("service_name = \"svc\""),
+            "orphaned profile left behind: {after}"
+        );
+        assert!(
+            !after.contains(LOCAL_FILE_PROFILE_MARKERS.begin_prefix)
+                && !after.contains(REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix),
+            "markers left behind: {after}"
+        );
+        assert!(after.contains("[trust]"), "trust dropped: {after}");
+        after
+            .parse::<toml_edit::DocumentMut>()
+            .expect("valid TOML after strip");
+        assert!(!strip_managed_profile(&path, "svc").expect("idempotent"));
+    }
+
     #[test]
     fn strip_managed_profile_absent_file_is_noop() {
         let dir = tempdir().expect("tempdir");

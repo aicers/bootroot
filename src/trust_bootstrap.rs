@@ -349,16 +349,22 @@ pub fn remove_managed_profile_block(
 /// remove --strip-config` does **not** re-sync: it clears a stale profile
 /// from a still-serving host, so dropping the `[trust]`/`[openbao]` config
 /// the running agent depends on would be a regression. This surgical
-/// variant removes the array element via `toml_edit` (which owns exactly
+/// variant removes the array elements via `toml_edit` (which owns exactly
 /// the profile and its `[profiles.*]` sub-tables) and then sweeps the
 /// begin/end marker comments, which survive as trailing decor. It matches
 /// either code path's markers.
+///
+/// It removes **every** `[[profiles]]` entry for the service, not just the
+/// first: an already-affected host may carry the exact #662 duplicate (a
+/// local-file block and a remote-bootstrap block for the same service), and
+/// the marker sweep clears both marker pairs, so the profile removal must
+/// be equally exhaustive or a marker-less profile would be orphaned.
 ///
 /// # Errors
 ///
 /// Returns an error if `contents` is not valid TOML.
 pub fn remove_managed_service_profile(contents: &str, service_name: &str) -> Result<String> {
-    let (rendered, removed) = toml_util::remove_array_of_tables_entry(
+    let (rendered, removed) = toml_util::remove_array_of_tables_entries(
         contents,
         "profiles",
         "service_name",
@@ -713,6 +719,40 @@ mod tests {
             removed.contains("email = \"a@b.c\""),
             "operator content must survive: {removed}"
         );
+        removed
+            .parse::<toml_edit::DocumentMut>()
+            .expect("valid TOML after strip");
+    }
+
+    /// An already-affected host carries the exact #662 duplicate: one
+    /// local-file block and one remote-bootstrap block for the same
+    /// service. `--strip-config` sweeps both marker pairs, so it must also
+    /// remove *both* `[[profiles]]` entries — otherwise the second profile
+    /// survives without markers and can never be matched/cleaned again.
+    #[test]
+    fn remove_managed_service_profile_clears_both_transition_blocks() {
+        let local = render_profile_for(LOCAL_FILE_PROFILE_MARKERS, "giganto");
+        let remote = render_profile_for(REMOTE_BOOTSTRAP_PROFILE_MARKERS, "giganto");
+        let with_blocks = format!(
+            "email = \"a@b.c\"\n\n{local}\n\n{remote}\n\n[trust]\nca_bundle_path = \"c\"\n"
+        );
+
+        let removed = remove_managed_service_profile(&with_blocks, "giganto").expect("remove ok");
+        assert!(
+            !removed.contains("[[profiles]]"),
+            "no profile entry may remain: {removed}"
+        );
+        assert!(
+            !removed.contains("service_name = \"giganto\""),
+            "no orphaned profile may remain: {removed}"
+        );
+        for markers in ALL_MANAGED_PROFILE_MARKERS {
+            assert!(
+                !removed.contains(markers.begin_prefix) && !removed.contains(markers.end_prefix),
+                "all markers must be gone: {removed}"
+            );
+        }
+        assert!(removed.contains("[trust]"), "trust must survive: {removed}");
         removed
             .parse::<toml_edit::DocumentMut>()
             .expect("valid TOML after strip");
