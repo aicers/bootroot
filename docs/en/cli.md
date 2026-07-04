@@ -958,6 +958,15 @@ regenerates the `secret_id` delivery material regardless, the fresh
   flag is given. Even with the flag, `agent.toml` is edited in place —
   only the managed block is removed — so an operator-owned config file is
   never deleted.
+- `--strip-config`: strip bootroot's managed profile block from
+  `agent.toml` **without** deleting the cert/key files or the per-service
+  secret and `OpenBao` config directories. Intended for a live
+  delivery-mode transition, where the service is still serving so the
+  cert/key must be kept, yet the stale managed block must go. Implied by
+  `--delete-artifacts` (combining the two is redundant but harmless). As
+  with `--delete-artifacts`, the strip removes a block written under
+  *either* delivery mode's markers, so a block left by the opposite mode
+  (or by an older binary) is cleared regardless of which path wrote it.
 - Runtime authentication flags (`--root-token`, `--root-token-file`,
   `--approle-role-id`/`--approle-secret-id`, `--auth-mode`, …): same as
   `service add`, used to authenticate to `OpenBao` for the teardown.
@@ -1008,8 +1017,12 @@ bootroot service remove --service-name edge-proxy --dry-run
 # and agent.toml preserved).
 bootroot service remove --service-name edge-proxy --yes
 
-# Change delivery-mode from local-file to remote-bootstrap.
-bootroot service remove --service-name edge-proxy --yes
+# Change delivery-mode from local-file to remote-bootstrap. The re-add and
+# subsequent bootstrap replace the stale managed block in place, so no
+# manual agent.toml edit is needed; add --strip-config to the remove step
+# to clear the block up front (keeping the cert/key) as a belt-and-braces
+# step for a live transition.
+bootroot service remove --service-name edge-proxy --yes --strip-config
 bootroot service add --service-name edge-proxy \
   --delivery-mode remote-bootstrap ...
 

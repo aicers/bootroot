@@ -7,9 +7,10 @@ use bootroot::fs_util;
 use bootroot::openbao::{TEMPLATE_PERMS_PUBLIC, TEMPLATE_PERMS_SECRET, TemplateSpec};
 use bootroot::toml_util::toml_encode_string;
 use bootroot::trust_bootstrap::{
-    AgentConfigBaselineParams, apply_agent_config_baseline_defaults, build_ca_bundle_ctmpl,
-    build_managed_agent_ctmpl, build_trust_updates,
-    render_managed_profile_block as render_managed_profile, upsert_managed_profile_block,
+    AgentConfigBaselineParams, LOCAL_FILE_PROFILE_MARKERS, apply_agent_config_baseline_defaults,
+    build_ca_bundle_ctmpl, build_managed_agent_ctmpl, build_trust_updates,
+    render_managed_profile_block as render_managed_profile, strip_foreign_managed_profiles,
+    upsert_managed_profile_block,
 };
 use tokio::fs;
 
@@ -66,6 +67,17 @@ pub(super) async fn apply_local_service_configs(
     } else {
         String::new()
     };
+    // Strip any managed profile block the remote-bootstrap path left for
+    // this service on a prior delivery mode, before any table is appended.
+    // Done on the raw file so the strip stays contained to the intended
+    // `[[profiles]]` block (the end marker floats past tables added later).
+    // Without this, a remote→local transition would append a duplicate
+    // block for the service (#662).
+    let current = strip_foreign_managed_profiles(
+        &current,
+        LOCAL_FILE_PROFILE_MARKERS,
+        &resolved.service_name,
+    );
     // Backfill any baseline fields missing from the operator-facing
     // `agent.toml` — both for a fresh file and for an existing file that
     // lacks `email` / `server` / `[acme].http_responder_url` or the
@@ -556,6 +568,49 @@ mod tests {
         let once = upsert_managed_profile("", "edge-proxy", &block);
         let twice = upsert_managed_profile(&once, "edge-proxy", &block);
         assert_eq!(once, twice);
+    }
+
+    /// remote-bootstrap → local-file transition: local-file `service add`
+    /// runs over an `agent.toml` that already carries a `BOOTROOT REMOTE
+    /// PROFILE` block. Stripping foreign blocks before upserting the local
+    /// block must leave exactly one `[[profiles]]`, not a duplicate (#662).
+    #[test]
+    fn test_local_add_strips_pre_existing_remote_block() {
+        let args = test_resolved();
+        let remote_block = render_managed_profile(
+            bootroot::trust_bootstrap::REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix,
+            bootroot::trust_bootstrap::REMOTE_BOOTSTRAP_PROFILE_MARKERS.end_prefix,
+            &args.service_name,
+            args.instance_id.as_deref().unwrap_or_default(),
+            &args.hostname,
+            &args.cert_path,
+            &args.key_path,
+            args.cert_group_gid,
+        );
+        let existing = format!("email = \"admin@example.com\"\n\n{remote_block}\n");
+
+        let stripped = strip_foreign_managed_profiles(
+            &existing,
+            LOCAL_FILE_PROFILE_MARKERS,
+            &args.service_name,
+        );
+        let local_block = render_managed_profile_block(&args);
+        let updated = upsert_managed_profile(&stripped, &args.service_name, &local_block);
+
+        assert_eq!(
+            updated.matches("[[profiles]]").count(),
+            1,
+            "exactly one profile block must remain: {updated}"
+        );
+        assert!(
+            !updated
+                .contains(bootroot::trust_bootstrap::REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix),
+            "the stale remote block must be stripped: {updated}"
+        );
+        assert!(
+            updated.contains(LOCAL_FILE_PROFILE_MARKERS.begin_prefix),
+            "the local-file marker must be present: {updated}"
+        );
     }
 
     #[test]

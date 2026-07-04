@@ -15,8 +15,10 @@ use bootroot::trust_bootstrap::{
 };
 use clap::{Parser, ValueEnum};
 
-const MANAGED_PROFILE_BEGIN_PREFIX: &str = "# BEGIN BOOTROOT REMOTE PROFILE";
-const MANAGED_PROFILE_END_PREFIX: &str = "# END BOOTROOT REMOTE PROFILE";
+const MANAGED_PROFILE_BEGIN_PREFIX: &str =
+    bootroot::trust_bootstrap::REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix;
+const MANAGED_PROFILE_END_PREFIX: &str =
+    bootroot::trust_bootstrap::REMOTE_BOOTSTRAP_PROFILE_MARKERS.end_prefix;
 const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
 const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_AGENT_DOMAIN: &str = "trusted.domain";

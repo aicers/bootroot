@@ -3,12 +3,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
-use bootroot::trust_bootstrap::remove_managed_profile_block;
-
-use super::{
-    MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX, OPENBAO_SERVICE_CONFIG_DIR,
-    REMOTE_BOOTSTRAP_DIR, SERVICE_SECRET_DIR,
+use bootroot::trust_bootstrap::{
+    LOCAL_FILE_PROFILE_MARKERS, REMOTE_BOOTSTRAP_PROFILE_MARKERS, remove_managed_profile_block,
 };
+
+use super::{OPENBAO_SERVICE_CONFIG_DIR, REMOTE_BOOTSTRAP_DIR, SERVICE_SECRET_DIR};
 use crate::cli::args::ServiceRemoveArgs;
 use crate::cli::prompt::Prompt;
 use crate::commands::constants::SERVICE_KV_BASE;
@@ -80,7 +79,13 @@ pub(crate) async fn run_service_remove(
         None
     };
 
-    print_remove_plan(&entry, &kv_paths, artifacts.as_ref(), messages);
+    print_remove_plan(
+        &entry,
+        &kv_paths,
+        artifacts.as_ref(),
+        args.strip_config,
+        messages,
+    );
 
     if args.dry_run {
         println!("{}", messages.service_remove_dry_run());
@@ -135,9 +140,20 @@ pub(crate) async fn run_service_remove(
             let result = delete_file_if_present(file);
             report.record(&format!("file {}", file.display()), result, messages);
         }
-        let strip_result = strip_managed_profile(&plan.agent_config, &entry.service_name);
+    }
+
+    // Strip the managed profile block whenever the operator asked for it,
+    // either via `--delete-artifacts` (which also deleted the cert/key
+    // above) or `--strip-config` (which leaves them intact for a live
+    // delivery-mode transition). The agent config file itself is never
+    // deleted — only bootroot's managed block is removed.
+    if args.delete_artifacts || args.strip_config {
+        let strip_result = strip_managed_profile(&entry.agent_config_path, &entry.service_name);
         report.record(
-            &format!("managed profile block in {}", plan.agent_config.display()),
+            &format!(
+                "managed profile block in {}",
+                entry.agent_config_path.display()
+            ),
             strip_result,
             messages,
         );
@@ -253,6 +269,7 @@ fn print_remove_plan(
     entry: &ServiceEntry,
     kv_paths: &[String],
     artifacts: Option<&ArtifactPlan>,
+    strip_config: bool,
     messages: &Messages,
 ) {
     println!(
@@ -270,26 +287,33 @@ fn print_remove_plan(
     for path in kv_paths {
         println!("{}", messages.service_remove_plan_kv(path));
     }
-    match artifacts {
-        Some(plan) => {
-            for dir in &plan.dirs {
-                println!(
-                    "{}",
-                    messages.service_remove_plan_artifact(&dir.display().to_string())
-                );
-            }
-            for file in &plan.files {
-                println!(
-                    "{}",
-                    messages.service_remove_plan_artifact(&file.display().to_string())
-                );
-            }
+    if let Some(plan) = artifacts {
+        for dir in &plan.dirs {
             println!(
                 "{}",
-                messages.service_remove_plan_agent_config(&plan.agent_config.display().to_string())
+                messages.service_remove_plan_artifact(&dir.display().to_string())
             );
         }
-        None => println!("{}", messages.service_remove_plan_artifacts_preserved()),
+        for file in &plan.files {
+            println!(
+                "{}",
+                messages.service_remove_plan_artifact(&file.display().to_string())
+            );
+        }
+        println!(
+            "{}",
+            messages.service_remove_plan_agent_config(&plan.agent_config.display().to_string())
+        );
+    } else {
+        println!("{}", messages.service_remove_plan_artifacts_preserved());
+        if strip_config {
+            println!(
+                "{}",
+                messages.service_remove_plan_agent_config(
+                    &entry.agent_config_path.display().to_string()
+                )
+            );
+        }
     }
 }
 
@@ -358,9 +382,13 @@ fn delete_file_if_present(path: &Path) -> Result<bool> {
 
 /// Strips bootroot's managed profile block from `agent.toml` in place.
 ///
-/// Returns `Ok(true)` when a block was present and removed, `Ok(false)`
-/// when the file is absent or carries no managed block (idempotent
-/// re-run). The operator-owned file itself is never deleted.
+/// Removes a block written under *either* code path's markers — the
+/// local-file `service add` pair and the `bootroot-remote bootstrap` pair
+/// — so a stale block left by the opposite delivery mode (or by an older
+/// binary) is cleared regardless of which path wrote it. Returns
+/// `Ok(true)` when a block was present and removed, `Ok(false)` when the
+/// file is absent or carries no managed block (idempotent re-run). The
+/// operator-owned file itself is never deleted.
 fn strip_managed_profile(path: &Path, service_name: &str) -> Result<bool> {
     let current = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -369,10 +397,16 @@ fn strip_managed_profile(path: &Path, service_name: &str) -> Result<bool> {
             return Err(err).with_context(|| format!("Failed to read {}", path.display()));
         }
     };
-    let next = remove_managed_profile_block(
+    let mut next = remove_managed_profile_block(
         &current,
-        MANAGED_PROFILE_BEGIN_PREFIX,
-        MANAGED_PROFILE_END_PREFIX,
+        LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
+        LOCAL_FILE_PROFILE_MARKERS.end_prefix,
+        service_name,
+    );
+    next = remove_managed_profile_block(
+        &next,
+        REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix,
+        REMOTE_BOOTSTRAP_PROFILE_MARKERS.end_prefix,
         service_name,
     );
     if next == current {
@@ -594,8 +628,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("agent.toml");
         let block = bootroot::trust_bootstrap::render_managed_profile_block(
-            MANAGED_PROFILE_BEGIN_PREFIX,
-            MANAGED_PROFILE_END_PREFIX,
+            LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
+            LOCAL_FILE_PROFILE_MARKERS.end_prefix,
             "svc",
             "001",
             "host1",
@@ -605,8 +639,8 @@ mod tests {
         );
         let contents = bootroot::trust_bootstrap::upsert_managed_profile_block(
             "email = \"a@b.c\"\n",
-            MANAGED_PROFILE_BEGIN_PREFIX,
-            MANAGED_PROFILE_END_PREFIX,
+            LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
+            LOCAL_FILE_PROFILE_MARKERS.end_prefix,
             "svc",
             &block,
         );
@@ -620,6 +654,33 @@ mod tests {
         // Idempotent: the file still exists, no block, returns false.
         assert!(!strip_managed_profile(&path, "svc").expect("strip idempotent"));
         assert!(path.exists());
+    }
+
+    /// A stale block may sit under the *opposite* path's markers after a
+    /// delivery-mode transition. `--strip-config` must clear it regardless
+    /// of which path wrote it, so strip recognises the remote markers too.
+    #[test]
+    fn strip_managed_profile_removes_remote_marker_block() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("agent.toml");
+        let block = bootroot::trust_bootstrap::render_managed_profile_block(
+            REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix,
+            REMOTE_BOOTSTRAP_PROFILE_MARKERS.end_prefix,
+            "svc",
+            "001",
+            "host1",
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            None,
+        );
+        let contents = format!("email = \"a@b.c\"\n\n{block}\n");
+        std::fs::write(&path, &contents).expect("write");
+
+        assert!(strip_managed_profile(&path, "svc").expect("strip ok"));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(!after.contains("[[profiles]]"));
+        assert!(!after.contains(REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix));
+        assert!(after.contains("email = \"a@b.c\""));
     }
 
     #[test]

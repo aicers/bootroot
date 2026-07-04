@@ -250,6 +250,16 @@ async fn test_same_host_trust_change_propagates_to_agent_config() {
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     assert!(agent_contents.contains("ca_bundle_path = \""));
     assert!(!agent_contents.contains("verify_certificates"));
+    // The local→remote transition must not leave a duplicate profile
+    // block: the pre-existing local-file block is stripped and replaced by
+    // exactly one remote block for the service (#662).
+    assert_eq!(
+        agent_contents.matches("[[profiles]]").count(),
+        1,
+        "exactly one profile block must remain: {agent_contents}"
+    );
+    assert!(!agent_contents.contains("# BEGIN bootroot managed profile:"));
+    assert!(agent_contents.contains("# BEGIN BOOTROOT REMOTE PROFILE"));
     let bundle_contents = fs::read_to_string(&files.ca_bundle_path).expect("read ca-bundle");
     assert!(bundle_contents.contains("BEGIN CERTIFICATE"));
     assert!(bundle_contents.contains("UPDATED-TRUST"));

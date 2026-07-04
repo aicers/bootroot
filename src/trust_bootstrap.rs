@@ -120,6 +120,37 @@ pub fn apply_agent_config_baseline_defaults(
     Ok(next)
 }
 
+/// Begin/end marker prefixes delimiting one code path's managed profile
+/// block in `agent.toml`.
+///
+/// The local-file `service add` path and the `bootroot-remote bootstrap`
+/// path each write their block under a distinct marker pair. Keeping both
+/// pairs here — and pairing every upsert with a strip of the *other*
+/// path's markers via [`strip_foreign_managed_profiles`] — is what stops a
+/// delivery-mode transition from leaving two profile blocks for the same
+/// service (issue #662).
+#[derive(Clone, Copy)]
+pub struct ManagedProfileMarkers {
+    pub begin_prefix: &'static str,
+    pub end_prefix: &'static str,
+}
+
+/// Markers written by the local-file `service add` path.
+pub const LOCAL_FILE_PROFILE_MARKERS: ManagedProfileMarkers = ManagedProfileMarkers {
+    begin_prefix: "# BEGIN bootroot managed profile:",
+    end_prefix: "# END bootroot managed profile:",
+};
+
+/// Markers written by the `bootroot-remote bootstrap` path.
+pub const REMOTE_BOOTSTRAP_PROFILE_MARKERS: ManagedProfileMarkers = ManagedProfileMarkers {
+    begin_prefix: "# BEGIN BOOTROOT REMOTE PROFILE",
+    end_prefix: "# END BOOTROOT REMOTE PROFILE",
+};
+
+/// Every managed-profile marker pair a bootroot code path may have written.
+pub const ALL_MANAGED_PROFILE_MARKERS: [ManagedProfileMarkers; 2] =
+    [LOCAL_FILE_PROFILE_MARKERS, REMOTE_BOOTSTRAP_PROFILE_MARKERS];
+
 /// Renders a managed profile block for `agent.toml`.
 ///
 /// When `cert_group_gid` is `Some`, the rendered block contains a
@@ -229,6 +260,47 @@ pub fn upsert_managed_profile_block(
     }
     updated.push_str(replacement);
     updated
+}
+
+/// Strips every managed profile block written under a marker pair *other*
+/// than `own` for `service_name`, leaving the caller's own block (if any)
+/// untouched.
+///
+/// A delivery-mode transition (`service remove` + `service add
+/// --delivery-mode <other>`, then re-bootstrap on the service host) runs
+/// one code path over an `agent.toml` the other path previously wrote.
+/// Because each path's upsert recognises only its own markers, without
+/// this strip the pre-existing block is never matched and
+/// [`upsert_managed_profile_block`] falls through to its append branch,
+/// leaving a second `[[profiles]]` for the same service.
+///
+/// Callers must run this on the **raw** `agent.toml` contents before
+/// applying their own `[trust]`/`[openbao]`/profile sections. The end
+/// marker of a block is a trailing comment that `toml_edit` floats past
+/// any table inserted afterwards, so stripping only stays contained to the
+/// intended `[[profiles]]` block while the file is still as the other path
+/// last wrote it. The stripped `[trust]` collateral a floated marker may
+/// carry is re-emitted authoritatively by the caller's own trust sync.
+/// See issue #662.
+#[must_use]
+pub fn strip_foreign_managed_profiles(
+    contents: &str,
+    own: ManagedProfileMarkers,
+    service_name: &str,
+) -> String {
+    let mut next = contents.to_string();
+    for markers in ALL_MANAGED_PROFILE_MARKERS {
+        if markers.begin_prefix == own.begin_prefix {
+            continue;
+        }
+        next = remove_managed_profile_block(
+            &next,
+            markers.begin_prefix,
+            markers.end_prefix,
+            service_name,
+        );
+    }
+    next
 }
 
 /// Removes a managed profile block from `agent.toml` contents.
@@ -427,6 +499,70 @@ mod tests {
         let twice =
             upsert_managed_profile_block(&once, BEGIN_PREFIX, END_PREFIX, "edge-proxy", &block);
         assert_eq!(once, twice);
+    }
+
+    fn render_profile_for(markers: ManagedProfileMarkers, service: &str) -> String {
+        render_managed_profile_block(
+            markers.begin_prefix,
+            markers.end_prefix,
+            service,
+            "001",
+            "node-01",
+            Path::new(&format!("certs/{service}.crt")),
+            Path::new(&format!("certs/{service}.key")),
+            None,
+        )
+    }
+
+    /// A delivery-mode transition runs one code path over an `agent.toml`
+    /// the other path wrote. Stripping foreign blocks before upserting the
+    /// own block must leave exactly one `[[profiles]]`, not a duplicate.
+    #[test]
+    fn strip_foreign_managed_profiles_removes_opposite_marker() {
+        let legacy_local = render_profile_for(LOCAL_FILE_PROFILE_MARKERS, "giganto");
+        let existing =
+            format!("email = \"a@b.c\"\n\n{legacy_local}\n\n[trust]\nca_bundle_path = \"c\"\n");
+
+        let stripped =
+            strip_foreign_managed_profiles(&existing, REMOTE_BOOTSTRAP_PROFILE_MARKERS, "giganto");
+        assert!(
+            !stripped.contains(LOCAL_FILE_PROFILE_MARKERS.begin_prefix),
+            "the foreign local-file block must be stripped: {stripped}"
+        );
+
+        let remote = render_profile_for(REMOTE_BOOTSTRAP_PROFILE_MARKERS, "giganto");
+        let updated = upsert_managed_profile_block(
+            &stripped,
+            REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix,
+            REMOTE_BOOTSTRAP_PROFILE_MARKERS.end_prefix,
+            "giganto",
+            &remote,
+        );
+
+        assert_eq!(
+            updated.matches("[[profiles]]").count(),
+            1,
+            "exactly one profile block must remain: {updated}"
+        );
+        assert!(
+            updated.contains(REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix),
+            "the new remote marker must be present: {updated}"
+        );
+        assert!(
+            updated.contains("email = \"a@b.c\""),
+            "operator content must survive: {updated}"
+        );
+    }
+
+    /// Leaves the caller's own block alone — stripping foreign markers is a
+    /// no-op when only the own-path block is present.
+    #[test]
+    fn strip_foreign_managed_profiles_keeps_own_block() {
+        let own = render_profile_for(REMOTE_BOOTSTRAP_PROFILE_MARKERS, "giganto");
+        let existing = format!("email = \"a@b.c\"\n\n{own}\n");
+        let stripped =
+            strip_foreign_managed_profiles(&existing, REMOTE_BOOTSTRAP_PROFILE_MARKERS, "giganto");
+        assert_eq!(stripped, existing);
     }
 
     #[test]

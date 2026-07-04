@@ -924,6 +924,14 @@ bootroot service update --service-name edge-proxy --reload-style none
   생성) 이 플래그가 없으면 디스크 자료는 보존됩니다. 이 플래그가 있어도
   `agent.toml`은 관리 블록만 제거하는 방식으로 편집되므로 운영자 소유 설정
   파일은 삭제되지 않습니다.
+- `--strip-config`: 인증서/키 파일이나 서비스별 시크릿 및 `OpenBao` 설정
+  디렉터리는 삭제하지 않고 `agent.toml`에서 bootroot 관리 프로필 블록만
+  제거합니다. 서비스가 여전히 서비스 중이라 인증서/키는 유지해야 하지만
+  낡은 관리 블록은 제거해야 하는 라이브 delivery-mode 전환을 위한
+  플래그입니다. `--delete-artifacts`에 포함되며(둘을 함께 지정하면 중복이나
+  무해) `--delete-artifacts`와 마찬가지로 *어느* delivery-mode의 마커로
+  기록된 블록이든 제거하므로 반대 모드(또는 이전 바이너리)가 남긴 블록도
+  기록한 경로와 무관하게 정리됩니다.
 - 런타임 인증 플래그(`--root-token`, `--root-token-file`,
   `--approle-role-id`/`--approle-secret-id`, `--auth-mode`, …):
   `service add`와 동일하며, 제거를 위해 `OpenBao`에 인증하는 데 사용됩니다.
@@ -970,8 +978,11 @@ bootroot service remove --service-name edge-proxy --dry-run
 # 서비스 등록 해제(OpenBao AppRole/정책/KV 정리; 인증서/키 및 agent.toml 보존).
 bootroot service remove --service-name edge-proxy --yes
 
-# delivery-mode를 local-file에서 remote-bootstrap으로 변경.
-bootroot service remove --service-name edge-proxy --yes
+# delivery-mode를 local-file에서 remote-bootstrap으로 변경. 재등록과 이어지는
+# 부트스트랩이 낡은 관리 블록을 그 자리에서 교체하므로 agent.toml을 수동으로
+# 편집할 필요가 없습니다. 라이브 전환에서는 remove 단계에 --strip-config를
+# 추가해 (인증서/키는 유지하면서) 블록을 미리 정리할 수 있습니다.
+bootroot service remove --service-name edge-proxy --yes --strip-config
 bootroot service add --service-name edge-proxy \
   --delivery-mode remote-bootstrap ...
 
