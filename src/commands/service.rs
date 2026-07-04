@@ -37,8 +37,10 @@ pub(super) const OPENBAO_AGENT_CA_BUNDLE_TEMPLATE_FILENAME: &str = "ca-bundle.pe
 pub(super) const OPENBAO_AGENT_TOKEN_FILENAME: &str = "token";
 pub(super) const REMOTE_BOOTSTRAP_DIR: &str = "remote-bootstrap/services";
 pub(super) const REMOTE_BOOTSTRAP_FILENAME: &str = "bootstrap.json";
-pub(super) const MANAGED_PROFILE_BEGIN_PREFIX: &str = "# BEGIN bootroot managed profile:";
-pub(super) const MANAGED_PROFILE_END_PREFIX: &str = "# END bootroot managed profile:";
+pub(super) const MANAGED_PROFILE_BEGIN_PREFIX: &str =
+    bootroot::trust_bootstrap::LOCAL_FILE_PROFILE_MARKERS.begin_prefix;
+pub(super) const MANAGED_PROFILE_END_PREFIX: &str =
+    bootroot::trust_bootstrap::LOCAL_FILE_PROFILE_MARKERS.end_prefix;
 pub(super) const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
 pub(super) const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 pub(super) const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";

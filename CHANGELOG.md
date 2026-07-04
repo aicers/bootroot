@@ -51,6 +51,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed a delivery-mode transition (`local-file` → `remote-bootstrap`
+  or the reverse) leaving a duplicate `[[profiles]]` block in
+  `agent.toml`. The two code paths wrote their managed profile under
+  different marker strings, so an upsert on one path never matched the
+  block the other path had written and appended a second one for the
+  same service. Each path now strips any block written under the
+  opposite path's markers before upserting its own, via the shared
+  `strip_foreign_managed_profiles` helper in `trust_bootstrap` (both
+  marker pairs now live there as `LOCAL_FILE_PROFILE_MARKERS` /
+  `REMOTE_BOOTSTRAP_PROFILE_MARKERS`), making both transition
+  directions idempotent on already-deployed hosts. `bootroot service
+  remove` also gains a `--strip-config` flag that removes the managed
+  profile block from `agent.toml` without deleting the cert/key or the
+  per-service secret/config directories, giving operators a
+  non-destructive way to clear a stale block during a live transition;
+  its strip recognises either path's markers, and `--delete-artifacts`
+  implies it. Because that strip has no follow-up re-sync, it removes
+  only the service's `[[profiles]]` entry and its marker comments and
+  preserves the global `[trust]`/`[openbao]`/`[acme]` tables that
+  `toml_edit` floats inside the marker span, so a still-serving host
+  keeps the trust and OpenBao config its agent depends on. (Closes #662)
 - Fixed `bootroot service openbao-sidecar start` recreating the
   `bootroot-openbao` container as a side effect of starting a sidecar.
   The generated per-service override's `depends_on: openbao` made

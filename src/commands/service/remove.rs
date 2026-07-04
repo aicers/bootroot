@@ -3,12 +3,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
-use bootroot::trust_bootstrap::remove_managed_profile_block;
+use bootroot::trust_bootstrap::remove_managed_service_profile;
 
-use super::{
-    MANAGED_PROFILE_BEGIN_PREFIX, MANAGED_PROFILE_END_PREFIX, OPENBAO_SERVICE_CONFIG_DIR,
-    REMOTE_BOOTSTRAP_DIR, SERVICE_SECRET_DIR,
-};
+use super::{OPENBAO_SERVICE_CONFIG_DIR, REMOTE_BOOTSTRAP_DIR, SERVICE_SECRET_DIR};
 use crate::cli::args::ServiceRemoveArgs;
 use crate::cli::prompt::Prompt;
 use crate::commands::constants::SERVICE_KV_BASE;
@@ -80,7 +77,13 @@ pub(crate) async fn run_service_remove(
         None
     };
 
-    print_remove_plan(&entry, &kv_paths, artifacts.as_ref(), messages);
+    print_remove_plan(
+        &entry,
+        &kv_paths,
+        artifacts.as_ref(),
+        args.strip_config,
+        messages,
+    );
 
     if args.dry_run {
         println!("{}", messages.service_remove_dry_run());
@@ -135,9 +138,20 @@ pub(crate) async fn run_service_remove(
             let result = delete_file_if_present(file);
             report.record(&format!("file {}", file.display()), result, messages);
         }
-        let strip_result = strip_managed_profile(&plan.agent_config, &entry.service_name);
+    }
+
+    // Strip the managed profile block whenever the operator asked for it,
+    // either via `--delete-artifacts` (which also deleted the cert/key
+    // above) or `--strip-config` (which leaves them intact for a live
+    // delivery-mode transition). The agent config file itself is never
+    // deleted — only bootroot's managed block is removed.
+    if args.delete_artifacts || args.strip_config {
+        let strip_result = strip_managed_profile(&entry.agent_config_path, &entry.service_name);
         report.record(
-            &format!("managed profile block in {}", plan.agent_config.display()),
+            &format!(
+                "managed profile block in {}",
+                entry.agent_config_path.display()
+            ),
             strip_result,
             messages,
         );
@@ -253,6 +267,7 @@ fn print_remove_plan(
     entry: &ServiceEntry,
     kv_paths: &[String],
     artifacts: Option<&ArtifactPlan>,
+    strip_config: bool,
     messages: &Messages,
 ) {
     println!(
@@ -270,26 +285,33 @@ fn print_remove_plan(
     for path in kv_paths {
         println!("{}", messages.service_remove_plan_kv(path));
     }
-    match artifacts {
-        Some(plan) => {
-            for dir in &plan.dirs {
-                println!(
-                    "{}",
-                    messages.service_remove_plan_artifact(&dir.display().to_string())
-                );
-            }
-            for file in &plan.files {
-                println!(
-                    "{}",
-                    messages.service_remove_plan_artifact(&file.display().to_string())
-                );
-            }
+    if let Some(plan) = artifacts {
+        for dir in &plan.dirs {
             println!(
                 "{}",
-                messages.service_remove_plan_agent_config(&plan.agent_config.display().to_string())
+                messages.service_remove_plan_artifact(&dir.display().to_string())
             );
         }
-        None => println!("{}", messages.service_remove_plan_artifacts_preserved()),
+        for file in &plan.files {
+            println!(
+                "{}",
+                messages.service_remove_plan_artifact(&file.display().to_string())
+            );
+        }
+        println!(
+            "{}",
+            messages.service_remove_plan_agent_config(&plan.agent_config.display().to_string())
+        );
+    } else {
+        println!("{}", messages.service_remove_plan_artifacts_preserved());
+        if strip_config {
+            println!(
+                "{}",
+                messages.service_remove_plan_agent_config(
+                    &entry.agent_config_path.display().to_string()
+                )
+            );
+        }
     }
 }
 
@@ -358,9 +380,18 @@ fn delete_file_if_present(path: &Path) -> Result<bool> {
 
 /// Strips bootroot's managed profile block from `agent.toml` in place.
 ///
-/// Returns `Ok(true)` when a block was present and removed, `Ok(false)`
-/// when the file is absent or carries no managed block (idempotent
-/// re-run). The operator-owned file itself is never deleted.
+/// Removes the managed `[[profiles]]` entry for the service — written
+/// under *either* code path's markers (local-file `service add` or
+/// `bootroot-remote bootstrap`) — plus its marker comment lines, so a
+/// stale block left by the opposite delivery mode (or by an older binary)
+/// is cleared regardless of which path wrote it. Crucially it preserves
+/// the global `[trust]`/`[openbao]`/`[acme]` tables, which `toml_edit`
+/// floats *inside* the marker span: `service remove --strip-config` leaves
+/// the cert/key in place for a still-serving host, so it must not drop the
+/// config that host's agent depends on. Returns `Ok(true)` when a block
+/// was present and removed, `Ok(false)` when the file is absent or carries
+/// no managed block (idempotent re-run). The operator-owned file itself is
+/// never deleted.
 fn strip_managed_profile(path: &Path, service_name: &str) -> Result<bool> {
     let current = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -369,12 +400,8 @@ fn strip_managed_profile(path: &Path, service_name: &str) -> Result<bool> {
             return Err(err).with_context(|| format!("Failed to read {}", path.display()));
         }
     };
-    let next = remove_managed_profile_block(
-        &current,
-        MANAGED_PROFILE_BEGIN_PREFIX,
-        MANAGED_PROFILE_END_PREFIX,
-        service_name,
-    );
+    let next = remove_managed_service_profile(&current, service_name)
+        .with_context(|| format!("Failed to update {}", path.display()))?;
     if next == current {
         return Ok(false);
     }
@@ -387,6 +414,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    use bootroot::trust_bootstrap::{LOCAL_FILE_PROFILE_MARKERS, REMOTE_BOOTSTRAP_PROFILE_MARKERS};
     use tempfile::tempdir;
 
     use super::*;
@@ -594,8 +622,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("agent.toml");
         let block = bootroot::trust_bootstrap::render_managed_profile_block(
-            MANAGED_PROFILE_BEGIN_PREFIX,
-            MANAGED_PROFILE_END_PREFIX,
+            LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
+            LOCAL_FILE_PROFILE_MARKERS.end_prefix,
             "svc",
             "001",
             "host1",
@@ -605,8 +633,8 @@ mod tests {
         );
         let contents = bootroot::trust_bootstrap::upsert_managed_profile_block(
             "email = \"a@b.c\"\n",
-            MANAGED_PROFILE_BEGIN_PREFIX,
-            MANAGED_PROFILE_END_PREFIX,
+            LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
+            LOCAL_FILE_PROFILE_MARKERS.end_prefix,
             "svc",
             &block,
         );
@@ -622,10 +650,209 @@ mod tests {
         assert!(path.exists());
     }
 
+    /// A stale block may sit under the *opposite* path's markers after a
+    /// delivery-mode transition. `--strip-config` must clear it regardless
+    /// of which path wrote it, so strip recognises the remote markers too.
+    #[test]
+    fn strip_managed_profile_removes_remote_marker_block() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("agent.toml");
+        let block = bootroot::trust_bootstrap::render_managed_profile_block(
+            REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix,
+            REMOTE_BOOTSTRAP_PROFILE_MARKERS.end_prefix,
+            "svc",
+            "001",
+            "host1",
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            None,
+        );
+        let contents = format!("email = \"a@b.c\"\n\n{block}\n");
+        std::fs::write(&path, &contents).expect("write");
+
+        assert!(strip_managed_profile(&path, "svc").expect("strip ok"));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(!after.contains("[[profiles]]"));
+        assert!(!after.contains(REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix));
+        assert!(after.contains("email = \"a@b.c\""));
+    }
+
+    /// On a real host `agent.toml` the profile is written first, then the
+    /// `[acme]`/`[trust]`/`[openbao]` tables are upserted; `toml_edit`
+    /// floats the end-marker comment past them, so those global tables end
+    /// up *inside* the marker span. `--strip-config` keeps the cert/key for
+    /// a still-serving host and does not re-sync, so it must clear only the
+    /// profile and leave every global table intact.
+    #[test]
+    fn strip_managed_profile_preserves_floated_global_tables() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("agent.toml");
+        let block = bootroot::trust_bootstrap::render_managed_profile_block(
+            LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
+            LOCAL_FILE_PROFILE_MARKERS.end_prefix,
+            "svc",
+            "001",
+            "host1",
+            Path::new("/certs/cert.pem"),
+            Path::new("/certs/key.pem"),
+            None,
+        );
+        // Build the file the way the real pipeline does: profile first,
+        // then the global sections upserted on top so their tables float
+        // inside the marker span.
+        let contents = bootroot::trust_bootstrap::upsert_managed_profile_block(
+            "email = \"a@b.c\"\n",
+            LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
+            LOCAL_FILE_PROFILE_MARKERS.end_prefix,
+            "svc",
+            &block,
+        );
+        let contents = bootroot::toml_util::upsert_section_keys(
+            &contents,
+            "acme",
+            &[("http_responder_hmac", "hmac".into())],
+        )
+        .expect("acme");
+        let contents = bootroot::toml_util::upsert_section_keys(
+            &contents,
+            "trust",
+            &[
+                ("ca_bundle_path", "certs/ca.pem".into()),
+                ("trusted_ca_sha256", "[\"abc\"]".into()),
+            ],
+        )
+        .expect("trust");
+        let contents = bootroot::toml_util::upsert_section_keys(
+            &contents,
+            "openbao",
+            &[("addr", "http://localhost:8200".into())],
+        )
+        .expect("openbao");
+        // Sanity: the end marker floated past the global tables.
+        let end = format!("{} svc", LOCAL_FILE_PROFILE_MARKERS.end_prefix);
+        let end_pos = contents.find(&end).expect("end marker present");
+        assert!(
+            contents[..end_pos].contains("[openbao]"),
+            "test premise: global tables must float inside the span:\n{contents}"
+        );
+        std::fs::write(&path, &contents).expect("write");
+
+        assert!(strip_managed_profile(&path, "svc").expect("strip ok"));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !after.contains("[[profiles]]"),
+            "profile left behind: {after}"
+        );
+        assert!(
+            !after.contains(LOCAL_FILE_PROFILE_MARKERS.begin_prefix),
+            "begin marker left behind: {after}"
+        );
+        assert!(
+            !after.contains(LOCAL_FILE_PROFILE_MARKERS.end_prefix),
+            "end marker left behind: {after}"
+        );
+        // The global tables the running agent depends on survive.
+        assert!(after.contains("[trust]"), "trust dropped: {after}");
+        assert!(
+            after.contains("ca_bundle_path = \"certs/ca.pem\""),
+            "{after}"
+        );
+        assert!(after.contains("trusted_ca_sha256 = [\"abc\"]"), "{after}");
+        assert!(after.contains("[openbao]"), "openbao dropped: {after}");
+        assert!(
+            after.contains("addr = \"http://localhost:8200\""),
+            "{after}"
+        );
+        assert!(after.contains("[acme]"), "acme dropped: {after}");
+        assert!(after.contains("http_responder_hmac = \"hmac\""), "{after}");
+        assert!(after.contains("email = \"a@b.c\""), "{after}");
+
+        // The stripped file must still parse as valid TOML.
+        after
+            .parse::<toml_edit::DocumentMut>()
+            .expect("valid TOML after strip");
+
+        // Idempotent re-run: no profile remains, returns false.
+        assert!(!strip_managed_profile(&path, "svc").expect("idempotent"));
+    }
+
+    /// The exact #662 duplicate — a local-file block and a remote-bootstrap
+    /// block for the same service — is what an already-affected host carries.
+    /// `--strip-config` must clear *both* profile entries and all markers so
+    /// no orphaned, marker-less profile is left behind.
+    #[test]
+    fn strip_managed_profile_clears_both_transition_blocks() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("agent.toml");
+        let render = |markers: bootroot::trust_bootstrap::ManagedProfileMarkers| {
+            bootroot::trust_bootstrap::render_managed_profile_block(
+                markers.begin_prefix,
+                markers.end_prefix,
+                "svc",
+                "001",
+                "host1",
+                Path::new("/certs/cert.pem"),
+                Path::new("/certs/key.pem"),
+                None,
+            )
+        };
+        let local = render(LOCAL_FILE_PROFILE_MARKERS);
+        let remote = render(REMOTE_BOOTSTRAP_PROFILE_MARKERS);
+        let contents = format!(
+            "email = \"a@b.c\"\n\n{local}\n\n{remote}\n\n[trust]\nca_bundle_path = \"c\"\n"
+        );
+        std::fs::write(&path, &contents).expect("write");
+
+        assert!(strip_managed_profile(&path, "svc").expect("strip ok"));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !after.contains("[[profiles]]"),
+            "profile left behind: {after}"
+        );
+        assert!(
+            !after.contains("service_name = \"svc\""),
+            "orphaned profile left behind: {after}"
+        );
+        assert!(
+            !after.contains(LOCAL_FILE_PROFILE_MARKERS.begin_prefix)
+                && !after.contains(REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix),
+            "markers left behind: {after}"
+        );
+        assert!(after.contains("[trust]"), "trust dropped: {after}");
+        after
+            .parse::<toml_edit::DocumentMut>()
+            .expect("valid TOML after strip");
+        assert!(!strip_managed_profile(&path, "svc").expect("idempotent"));
+    }
+
     #[test]
     fn strip_managed_profile_absent_file_is_noop() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("missing.toml");
         assert!(!strip_managed_profile(&path, "svc").expect("absent ok"));
+    }
+
+    /// An operator-owned `[[profiles]]` entry sharing the `service_name`
+    /// but carrying no bootroot managed marker must survive `--strip-config`
+    /// untouched. Stripping is scoped to bootroot's managed profile, so with
+    /// no managed marker present the file is left byte-for-byte unchanged and
+    /// the strip reports no change.
+    #[test]
+    fn strip_managed_profile_preserves_unmarked_operator_profile() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("agent.toml");
+        let contents = "email = \"a@b.c\"\n\n\
+[[profiles]]\n\
+service_name = \"svc\"\n\
+instance_id = \"001\"\n\n\
+[trust]\nca_bundle_path = \"c\"\n";
+        std::fs::write(&path, contents).expect("write");
+
+        assert!(!strip_managed_profile(&path, "svc").expect("strip noop"));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            after, contents,
+            "unmarked operator profile must be left intact: {after}"
+        );
     }
 }

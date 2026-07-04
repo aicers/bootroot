@@ -1431,6 +1431,10 @@ pub(crate) struct ServiceUpdateArgs {
     pub(crate) post_renew_on_failure: Option<HookFailurePolicyArg>,
 }
 
+// Each boolean flag is a deliberate, independent CLI opt-in (skip
+// confirmation, preview, delete artifacts, strip only the config block);
+// they are not mutually exclusive state and do not model a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug)]
 pub(crate) struct ServiceRemoveArgs {
     /// Service name identifier
@@ -1463,6 +1467,21 @@ pub(crate) struct ServiceRemoveArgs {
     /// deleted.
     #[arg(long)]
     pub(crate) delete_artifacts: bool,
+
+    /// Strips the managed profile block from `agent.toml` without deleting
+    /// the cert/key files or the per-service secret and `OpenBao` config
+    /// directories.
+    ///
+    /// Intended for live delivery-mode transitions: when moving a service
+    /// between `local-file` and `remote-bootstrap` the operator must keep
+    /// the cert/key (the service is still serving) yet wants the stale
+    /// managed block gone so the subsequent bootstrap does not leave a
+    /// duplicate `[[profiles]]`. `--delete-artifacts` already strips the
+    /// block but also deletes the cert/key, so it cannot be used here.
+    /// Implied by `--delete-artifacts`; combining the two is redundant but
+    /// harmless.
+    #[arg(long)]
+    pub(crate) strip_config: bool,
 
     #[command(flatten)]
     pub(crate) runtime_auth: RuntimeAuthArgs,
@@ -2242,6 +2261,7 @@ mod tests {
                 assert!(!args.yes);
                 assert!(!args.dry_run);
                 assert!(!args.delete_artifacts);
+                assert!(!args.strip_config);
             }
             _ => panic!("expected service remove"),
         }
@@ -2264,6 +2284,7 @@ mod tests {
                 assert!(args.yes);
                 assert!(args.dry_run);
                 assert!(args.delete_artifacts);
+                assert!(!args.strip_config);
             }
             _ => panic!("expected service remove"),
         }
@@ -2282,6 +2303,25 @@ mod tests {
         match cli.command {
             CliCommand::Service(ServiceCommand::Remove(args)) => {
                 assert!(args.yes);
+            }
+            _ => panic!("expected service remove"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_remove_strip_config() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "remove",
+            "--service-name",
+            "edge-proxy",
+            "--strip-config",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Remove(args)) => {
+                assert!(args.strip_config);
+                assert!(!args.delete_artifacts);
             }
             _ => panic!("expected service remove"),
         }

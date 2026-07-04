@@ -8,9 +8,10 @@ use bootroot::openbao::{
     TemplateSpec, build_agent_config,
 };
 use bootroot::trust_bootstrap::{
-    AgentConfigBaselineParams, apply_agent_config_baseline_defaults, build_ca_bundle_ctmpl,
-    build_managed_agent_ctmpl, build_trust_updates as build_shared_trust_updates,
-    render_managed_profile_block as render_profile,
+    AgentConfigBaselineParams, REMOTE_BOOTSTRAP_PROFILE_MARKERS,
+    apply_agent_config_baseline_defaults, build_ca_bundle_ctmpl, build_managed_agent_ctmpl,
+    build_trust_updates as build_shared_trust_updates,
+    render_managed_profile_block as render_profile, strip_foreign_managed_profiles,
     upsert_managed_profile_block as upsert_shared_managed_profile_block,
 };
 use tokio::fs;
@@ -57,6 +58,18 @@ pub(super) async fn apply_agent_config_updates(
             );
         }
     };
+    // Strip any managed profile block the local-file path left for this
+    // service on a prior delivery mode, before any table is appended. Done
+    // on the raw file so the strip stays contained to the intended
+    // `[[profiles]]` block (the end marker floats past tables added later,
+    // and the `[trust]` collateral it may carry is re-synced below).
+    // Without this, a local→remote transition would append a duplicate
+    // block for the service (#662).
+    let agent_config = strip_foreign_managed_profiles(
+        &agent_config,
+        REMOTE_BOOTSTRAP_PROFILE_MARKERS,
+        &args.service_name,
+    );
     // Backfill any baseline fields missing from a pre-existing agent.toml
     // (and seed a fresh file from the same baseline).  Without this step,
     // an operator who passed `--agent-server` / `--agent-responder-url`
@@ -580,6 +593,52 @@ mod tests {
         )
         .unwrap();
         assert!(output.contains("http_responder_hmac = \"new\""));
+    }
+
+    /// local-file → remote-bootstrap transition: `bootroot-remote
+    /// bootstrap` runs over an `agent.toml` that already carries a
+    /// `bootroot managed profile` block. Stripping foreign blocks before
+    /// upserting the remote block must leave exactly one `[[profiles]]`,
+    /// not a duplicate (#662).
+    #[test]
+    fn remote_bootstrap_strips_pre_existing_local_block() {
+        let local_block = render_profile(
+            bootroot::trust_bootstrap::LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
+            bootroot::trust_bootstrap::LOCAL_FILE_PROFILE_MARKERS.end_prefix,
+            "giganto",
+            "001",
+            "node-01",
+            Path::new("/etc/bootroot-agent/certs/giganto.crt"),
+            Path::new("/etc/bootroot-agent/certs/giganto.key"),
+            None,
+        );
+        let existing = format!("email = \"admin@example.com\"\n\n{local_block}\n");
+
+        let stripped =
+            strip_foreign_managed_profiles(&existing, REMOTE_BOOTSTRAP_PROFILE_MARKERS, "giganto");
+        let remote_block = render_managed_profile_block(
+            "giganto",
+            "001",
+            "node-01",
+            Path::new("/etc/bootroot-agent/certs/giganto.crt"),
+            Path::new("/etc/bootroot-agent/certs/giganto.key"),
+            None,
+        );
+        let updated = upsert_managed_profile_block(&stripped, "giganto", &remote_block);
+
+        assert_eq!(
+            updated.matches("[[profiles]]").count(),
+            1,
+            "exactly one profile block must remain: {updated}"
+        );
+        assert!(
+            !updated.contains(bootroot::trust_bootstrap::LOCAL_FILE_PROFILE_MARKERS.begin_prefix),
+            "the stale local-file block must be stripped: {updated}"
+        );
+        assert!(
+            updated.contains(REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix),
+            "the remote marker must be present: {updated}"
+        );
     }
 
     #[test]
