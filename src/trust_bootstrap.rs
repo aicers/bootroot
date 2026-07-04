@@ -159,6 +159,42 @@ key = \"{key}\"\n\
     )
 }
 
+/// Locates a marker occupying a complete line at or after `from`.
+///
+/// Returns the byte offset where `marker` begins only when it starts a
+/// line (file start or right after `\n`) and ends a line (`\n`, `\r`, or
+/// EOF). Requiring full-line equality prevents a service name that is a
+/// prefix of another (`api` vs `api-v2`) from matching the wrong block.
+fn find_marker_line(contents: &str, marker: &str, from: usize) -> Option<usize> {
+    let bytes = contents.as_bytes();
+    let mut search = from;
+    while let Some(relative) = contents.get(search..).and_then(|rest| rest.find(marker)) {
+        let start = search + relative;
+        let at_line_start = start == 0 || bytes.get(start - 1) == Some(&b'\n');
+        let at_line_end = matches!(bytes.get(start + marker.len()), None | Some(b'\n' | b'\r'));
+        if at_line_start && at_line_end {
+            return Some(start);
+        }
+        search = start + marker.len();
+    }
+    None
+}
+
+/// Locates the byte span of a managed profile block by its marker lines.
+///
+/// Returns `(begin, end)` where `begin` is the start of the begin-marker
+/// line and `end` is the offset just past the end-marker text. Both
+/// markers must match as complete lines via [`find_marker_line`].
+fn managed_block_span(
+    contents: &str,
+    begin_marker: &str,
+    end_marker: &str,
+) -> Option<(usize, usize)> {
+    let begin = find_marker_line(contents, begin_marker, 0)?;
+    let end_line = find_marker_line(contents, end_marker, begin)?;
+    Some((begin, end_line + end_marker.len()))
+}
+
 /// Upserts a managed profile block in `agent.toml`.
 #[must_use]
 pub fn upsert_managed_profile_block(
@@ -170,10 +206,7 @@ pub fn upsert_managed_profile_block(
 ) -> String {
     let begin_marker = format!("{begin_prefix} {service_name}");
     let end_marker = format!("{end_prefix} {service_name}");
-    if let Some(begin) = contents.find(&begin_marker)
-        && let Some(end_relative) = contents[begin..].find(&end_marker)
-    {
-        let end = begin + end_relative + end_marker.len();
+    if let Some((begin, end)) = managed_block_span(contents, &begin_marker, &end_marker) {
         let suffix = contents[end..]
             .strip_prefix('\n')
             .unwrap_or(&contents[end..]);
@@ -217,13 +250,9 @@ pub fn remove_managed_profile_block(
 ) -> String {
     let begin_marker = format!("{begin_prefix} {service_name}");
     let end_marker = format!("{end_prefix} {service_name}");
-    let Some(begin) = contents.find(&begin_marker) else {
+    let Some((begin, end)) = managed_block_span(contents, &begin_marker, &end_marker) else {
         return contents.to_string();
     };
-    let Some(end_relative) = contents[begin..].find(&end_marker) else {
-        return contents.to_string();
-    };
-    let end = begin + end_relative + end_marker.len();
     let prefix = contents[..begin].trim_end();
     let suffix = contents[end..].trim_start_matches('\n');
     let mut updated = prefix.to_string();
@@ -449,6 +478,45 @@ mod tests {
         assert_eq!(once, contents);
         let twice = remove_managed_profile_block(&once, BEGIN_PREFIX, END_PREFIX, "edge-proxy");
         assert_eq!(twice, contents);
+    }
+
+    /// Service names are DNS labels and can be prefixes of one another
+    /// (`api` vs `api-v2`). Substring marker matching would let a remove
+    /// of `api` strip `api-v2`'s block; full-line matching must target
+    /// only the exact service's block and leave the sibling intact.
+    #[test]
+    fn remove_managed_profile_block_ignores_prefix_named_siblings() {
+        let make_block = |name: &str| {
+            render_managed_profile_block(
+                BEGIN_PREFIX,
+                END_PREFIX,
+                name,
+                "001",
+                "node-01",
+                Path::new(&format!("certs/{name}.crt")),
+                Path::new(&format!("certs/{name}.key")),
+                None,
+            )
+        };
+        let contents = format!("{}\n{}", make_block("api-v2"), make_block("apifoobar"));
+
+        let removed = remove_managed_profile_block(&contents, BEGIN_PREFIX, END_PREFIX, "api");
+        assert_eq!(
+            removed, contents,
+            "removing absent `api` must not touch prefix-sharing siblings: {removed}"
+        );
+
+        let removed_v2 =
+            remove_managed_profile_block(&contents, BEGIN_PREFIX, END_PREFIX, "api-v2");
+        assert!(
+            !removed_v2.contains("api-v2.crt"),
+            "the exact `api-v2` block must be removed: {removed_v2}"
+        );
+        assert!(
+            removed_v2.contains("apifoobar.crt")
+                && removed_v2.contains(&format!("{END_PREFIX} apifoobar")),
+            "the prefix-sharing sibling `apifoobar` must survive intact: {removed_v2}"
+        );
     }
 
     #[test]
