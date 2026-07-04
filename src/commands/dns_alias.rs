@@ -38,6 +38,17 @@ pub(crate) fn register_dns_alias(state: &StateFile, messages: &Messages) -> Resu
     apply_dns_aliases(&aliases, messages)
 }
 
+/// Reconciles the responder aliases after a service is removed.
+///
+/// Unlike [`register_dns_alias`], this still reconnects the responder
+/// when the computed service alias list is empty. The reconnect keeps
+/// only the base `bootroot-http01` alias and drops stale per-service
+/// aliases from Docker's network endpoint.
+pub(crate) fn reconcile_dns_aliases(state: &StateFile, messages: &Messages) -> Result<()> {
+    let aliases = collect_dns_aliases(state);
+    apply_dns_aliases(&aliases, messages)
+}
+
 /// Replays all DNS aliases from `state.json` onto the running
 /// `bootroot-http01` container.
 ///

@@ -51,6 +51,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed the lack of a supported way to change a registered service's
+  delivery mode. `bootroot service remove` now deregisters the service,
+  tears down its OpenBao/DNS/artifact state, and lets operators re-add
+  it with a different `--delivery-mode`. (Closes #656)
 - Fixed `bootroot service openbao-sidecar start` recreating the
   `bootroot-openbao` container as a side effect of starting a sidecar.
   The generated per-service override's `depends_on: openbao` made

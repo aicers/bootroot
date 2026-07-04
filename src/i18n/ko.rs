@@ -393,6 +393,7 @@ pub(super) static STRINGS: Strings = Strings {
     dns_alias_rollback_failed: "심각: 롤백도 실패 — bootroot-http01이 네트워크 {network}에서 분리됨. 수동 복구: docker network connect {network} bootroot-http01 ({error})",
     dns_alias_network_not_found: "컨테이너 {value}에 대한 Docker 네트워크를 찾을 수 없습니다",
     error_service_update_failed: "bootroot service update 실패",
+    error_service_remove_failed: "bootroot service remove 실패",
     error_service_update_no_flags: "업데이트 플래그가 지정되지 않았습니다; --secret-id-ttl, --secret-id-wrap-ttl, --no-wrap, --rn-cidrs, --cert-group, --reload-style, 또는 --post-renew-command를 전달하세요",
     service_update_summary: "bootroot service update: 요약",
     service_update_field_changed: "- {field}: {old} -> {new}",

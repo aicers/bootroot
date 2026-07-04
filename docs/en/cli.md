@@ -23,6 +23,7 @@ Primary commands:
 - `bootroot status`
 - `bootroot service add`
 - `bootroot service update`
+- `bootroot service remove`
 - `bootroot service info`
 - `bootroot service openbao-sidecar start`
 - `bootroot verify`
@@ -927,6 +928,49 @@ bootroot service update --service-name review \
 bootroot service update --service-name aice-web-next \
   --reload-style docker-restart --reload-target aice-web-next
 bootroot service update --service-name edge-proxy --reload-style none
+```
+
+## bootroot service remove
+
+Deregisters a service and tears down its control-plane resources. This is the
+supported flow for changing a service's `--delivery-mode`: remove the service,
+then run `bootroot service add` again with the desired delivery mode.
+
+### Inputs
+
+- `--service-name`: service name identifier
+- `--dry-run`: print the teardown plan without mutating OpenBao, DNS aliases,
+  files, or `state.json`
+- `--yes` / `--force`: skip the confirmation prompt
+- `--delete-artifacts`: also remove bootroot-managed on-disk artifacts for the
+  service. Without this flag, cert/key files and local artifacts are preserved.
+  With this flag, the stored `agent.toml` file is edited in place to remove only
+  the bootroot managed profile block; the file itself is not deleted.
+- OpenBao runtime auth flags (`--root-token`, `--root-token-file`,
+  `--auth-mode approle`, `--approle-role-id`, `--approle-secret-id`, and their
+  file/env variants) are required for non-dry-run teardown.
+
+### Behavior
+
+- Prints the full teardown plan first: stored AppRole name, stored policy name,
+  exact per-service KV paths, and optional artifact cleanup actions.
+- Deletes OpenBao resources first, using the role and policy names stored in
+  `state.json`.
+- Deletes only the exact per-service KV paths written by `service add`.
+- Reconciles the HTTP-01 responder aliases after removing the service, including
+  the empty-alias case when the last alias-bearing service is removed.
+- Removes the service entry from `state.json` last. If remote teardown fails,
+  the state entry remains so the command can be re-run with the stored names.
+
+### Examples
+
+```bash
+bootroot service remove --service-name edge-proxy --dry-run
+bootroot service remove --service-name edge-proxy --yes --root-token "$OPENBAO_ROOT_TOKEN"
+
+# Change delivery mode by deregistering and registering again.
+bootroot service remove --service-name edge-proxy --yes --root-token "$OPENBAO_ROOT_TOKEN"
+bootroot service add --service-name edge-proxy --delivery-mode remote-bootstrap ...
 ```
 
 ## bootroot service info

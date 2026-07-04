@@ -12,15 +12,16 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 
-use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs, ServiceUpdateArgs};
+use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs, ServiceRemoveArgs, ServiceUpdateArgs};
 use crate::cli::output::{
     ServiceAddAppliedPaths, ServiceAddPlan, ServiceAddRemoteBootstrap, ServiceAddSummaryOptions,
     print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
-use crate::commands::constants::DEFAULT_SECRET_ID_WRAP_TTL;
-use crate::commands::dns_alias::register_dns_alias;
-use crate::commands::init::validate_secret_id_ttl;
+use crate::commands::constants::{DEFAULT_SECRET_ID_WRAP_TTL, SERVICE_KV_BASE};
+use crate::commands::dns_alias::{reconcile_dns_aliases, register_dns_alias};
+use crate::commands::init::{prompt_yes_no, validate_secret_id_ttl};
 use crate::commands::openbao_auth::authenticate_openbao_client;
+use crate::commands::trust::SERVICE_TRUST_KV_SUFFIX;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, StateFile};
 
@@ -553,6 +554,377 @@ pub(crate) fn run_service_info(args: &ServiceInfoArgs, messages: &Messages) -> R
         .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
     print_service_info_summary(entry, messages);
     Ok(())
+}
+
+pub(crate) async fn run_service_remove(
+    args: &ServiceRemoveArgs,
+    messages: &Messages,
+) -> Result<()> {
+    let state_path = StateFile::default_path();
+    if !state_path.exists() {
+        anyhow::bail!(messages.error_state_missing());
+    }
+    let mut state =
+        StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
+    let entry = state
+        .services
+        .get(&args.service_name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
+    let plan = ServiceRemovePlan::from_entry(&state, &entry, args.delete_artifacts);
+    print_service_remove_plan(&plan, args.dry_run);
+
+    if args.dry_run {
+        println!("preview mode: no OpenBao, DNS, file, or state changes were made");
+        return Ok(());
+    }
+    if !args.yes && !prompt_yes_no("Remove this service registration? [y/N]: ", messages)? {
+        anyhow::bail!(messages.error_operation_cancelled());
+    }
+
+    let auth = crate::commands::openbao_auth::resolve_runtime_auth(
+        &args.runtime_auth,
+        !args.yes,
+        messages,
+    )?;
+    let mut client = OpenBaoClient::with_local_trust(&state.openbao_url, state.secrets_dir())
+        .with_context(|| messages.error_openbao_client_create_failed())?;
+    authenticate_openbao_client(&mut client, &auth, messages).await?;
+
+    let remote_results = remove_remote_resources(&client, &state.kv_mount, &plan, messages).await;
+    print_teardown_results("OpenBao teardown", &remote_results);
+    if has_failed_results(&remote_results) {
+        anyhow::bail!(
+            "service remove incomplete; state.json was left unchanged so the command can be re-run"
+        );
+    }
+
+    state.services.remove(&args.service_name);
+    reconcile_dns_aliases(&state, messages)?;
+
+    if args.delete_artifacts {
+        let artifact_results = remove_artifacts(&plan.artifacts);
+        print_teardown_results("artifact cleanup", &artifact_results);
+        if has_failed_results(&artifact_results) {
+            anyhow::bail!(
+                "service remove incomplete; state.json was left unchanged so artifact cleanup can be re-run"
+            );
+        }
+    }
+
+    state
+        .save(&state_path)
+        .with_context(|| messages.error_serialize_state_failed())?;
+    println!("bootroot service remove: summary");
+    println!("- removed service: {}", args.service_name);
+    println!("- state entry: removed");
+    Ok(())
+}
+
+struct ServiceRemovePlan {
+    service_name: String,
+    role_name: String,
+    policy_name: String,
+    kv_paths: Vec<String>,
+    artifacts: Vec<ArtifactAction>,
+}
+
+impl ServiceRemovePlan {
+    fn from_entry(state: &StateFile, entry: &ServiceEntry, delete_artifacts: bool) -> Self {
+        let base = format!("{SERVICE_KV_BASE}/{}", entry.service_name);
+        let mut kv_paths = vec![
+            format!("{base}/eab"),
+            format!("{base}/http_responder_hmac"),
+            format!("{base}/{SERVICE_TRUST_KV_SUFFIX}"),
+        ];
+        if matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap) {
+            kv_paths.push(format!("{base}/secret_id"));
+        }
+
+        let mut artifacts = Vec::new();
+        if delete_artifacts {
+            artifacts.push(ArtifactAction::ManagedProfileBlock {
+                path: entry.agent_config_path.clone(),
+                service_name: entry.service_name.clone(),
+            });
+            artifacts.push(ArtifactAction::File(entry.cert_path.clone()));
+            artifacts.push(ArtifactAction::File(entry.key_path.clone()));
+            artifacts.push(ArtifactAction::File(entry.approle.secret_id_path.clone()));
+            if let Some(parent) = entry.approle.secret_id_path.parent() {
+                artifacts.push(ArtifactAction::File(parent.join(SERVICE_ROLE_ID_FILENAME)));
+                artifacts.push(ArtifactAction::Dir(parent.to_path_buf()));
+            }
+            artifacts.push(ArtifactAction::Dir(
+                state
+                    .secrets_dir()
+                    .join(OPENBAO_SERVICE_CONFIG_DIR)
+                    .join(&entry.service_name),
+            ));
+            artifacts.push(ArtifactAction::File(
+                state
+                    .secrets_dir()
+                    .join(REMOTE_BOOTSTRAP_DIR)
+                    .join(&entry.service_name)
+                    .join(REMOTE_BOOTSTRAP_FILENAME),
+            ));
+            artifacts.push(ArtifactAction::Dir(
+                state
+                    .secrets_dir()
+                    .join(REMOTE_BOOTSTRAP_DIR)
+                    .join(&entry.service_name),
+            ));
+        }
+
+        Self {
+            service_name: entry.service_name.clone(),
+            role_name: entry.approle.role_name.clone(),
+            policy_name: entry.approle.policy_name.clone(),
+            kv_paths,
+            artifacts,
+        }
+    }
+}
+
+enum ArtifactAction {
+    File(std::path::PathBuf),
+    Dir(std::path::PathBuf),
+    ManagedProfileBlock {
+        path: std::path::PathBuf,
+        service_name: String,
+    },
+}
+
+impl ArtifactAction {
+    fn description(&self) -> String {
+        match self {
+            Self::File(path) => format!("file {}", path.display()),
+            Self::Dir(path) => format!("directory {}", path.display()),
+            Self::ManagedProfileBlock { path, service_name } => {
+                format!(
+                    "managed profile block for {service_name} in {}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TeardownStatus {
+    Removed,
+    AlreadyAbsent,
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct TeardownResult {
+    resource: String,
+    status: TeardownStatus,
+}
+
+impl TeardownResult {
+    fn removed(resource: impl Into<String>) -> Self {
+        Self {
+            resource: resource.into(),
+            status: TeardownStatus::Removed,
+        }
+    }
+
+    fn absent(resource: impl Into<String>) -> Self {
+        Self {
+            resource: resource.into(),
+            status: TeardownStatus::AlreadyAbsent,
+        }
+    }
+
+    fn failed(resource: impl Into<String>, err: impl std::fmt::Display) -> Self {
+        Self {
+            resource: resource.into(),
+            status: TeardownStatus::Failed(err.to_string()),
+        }
+    }
+}
+
+async fn remove_remote_resources(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    plan: &ServiceRemovePlan,
+    messages: &Messages,
+) -> Vec<TeardownResult> {
+    let mut results = Vec::new();
+    results.push(delete_approle_if_exists(client, &plan.role_name, messages).await);
+    for path in &plan.kv_paths {
+        results.push(delete_kv_if_exists(client, kv_mount, path, messages).await);
+    }
+    results.push(delete_policy_if_exists(client, &plan.policy_name, messages).await);
+    results
+}
+
+async fn delete_approle_if_exists(
+    client: &OpenBaoClient,
+    role_name: &str,
+    messages: &Messages,
+) -> TeardownResult {
+    let resource = format!("AppRole {role_name}");
+    match client
+        .approle_exists(role_name)
+        .await
+        .with_context(|| messages.error_openbao_approle_exists_failed())
+    {
+        Ok(true) => match client.delete_approle(role_name).await {
+            Ok(()) => TeardownResult::removed(resource),
+            Err(err) => TeardownResult::failed(resource, err),
+        },
+        Ok(false) => TeardownResult::absent(resource),
+        Err(err) => TeardownResult::failed(resource, err),
+    }
+}
+
+async fn delete_policy_if_exists(
+    client: &OpenBaoClient,
+    policy_name: &str,
+    messages: &Messages,
+) -> TeardownResult {
+    let resource = format!("policy {policy_name}");
+    match client
+        .policy_exists(policy_name)
+        .await
+        .with_context(|| messages.error_openbao_policy_exists_failed())
+    {
+        Ok(true) => match client.delete_policy(policy_name).await {
+            Ok(()) => TeardownResult::removed(resource),
+            Err(err) => TeardownResult::failed(resource, err),
+        },
+        Ok(false) => TeardownResult::absent(resource),
+        Err(err) => TeardownResult::failed(resource, err),
+    }
+}
+
+async fn delete_kv_if_exists(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    path: &str,
+    messages: &Messages,
+) -> TeardownResult {
+    let resource = format!("KV {kv_mount}/{path}");
+    match client
+        .kv_exists(kv_mount, path)
+        .await
+        .with_context(|| messages.error_openbao_kv_exists_failed())
+    {
+        Ok(true) => match client.delete_kv(kv_mount, path).await {
+            Ok(()) => TeardownResult::removed(resource),
+            Err(err) => TeardownResult::failed(resource, err),
+        },
+        Ok(false) => TeardownResult::absent(resource),
+        Err(err) => TeardownResult::failed(resource, err),
+    }
+}
+
+fn remove_artifacts(actions: &[ArtifactAction]) -> Vec<TeardownResult> {
+    actions.iter().map(remove_artifact).collect()
+}
+
+fn remove_artifact(action: &ArtifactAction) -> TeardownResult {
+    let resource = action.description();
+    match action {
+        ArtifactAction::File(path) => {
+            if !path.exists() {
+                return TeardownResult::absent(resource);
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => TeardownResult::removed(resource),
+                Err(err) => TeardownResult::failed(resource, err),
+            }
+        }
+        ArtifactAction::Dir(path) => {
+            if !path.exists() {
+                return TeardownResult::absent(resource);
+            }
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => TeardownResult::removed(resource),
+                Err(err) => TeardownResult::failed(resource, err),
+            }
+        }
+        ArtifactAction::ManagedProfileBlock { path, service_name } => {
+            if !path.exists() {
+                return TeardownResult::absent(resource);
+            }
+            match remove_managed_profile_block_from_file(path, service_name) {
+                Ok(true) => TeardownResult::removed(resource),
+                Ok(false) => TeardownResult::absent(resource),
+                Err(err) => TeardownResult::failed(resource, err),
+            }
+        }
+    }
+}
+
+fn remove_managed_profile_block_from_file(path: &Path, service_name: &str) -> Result<bool> {
+    let current = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let next = bootroot::trust_bootstrap::remove_managed_profile_block(
+        &current,
+        MANAGED_PROFILE_BEGIN_PREFIX,
+        MANAGED_PROFILE_END_PREFIX,
+        service_name,
+    );
+    if next == current {
+        return Ok(false);
+    }
+    std::fs::write(path, next).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(true)
+}
+
+fn print_service_remove_plan(plan: &ServiceRemovePlan, dry_run: bool) {
+    println!("bootroot service remove: plan");
+    println!("- service name: {}", plan.service_name);
+    println!("- AppRole: {}", plan.role_name);
+    println!("- policy: {}", plan.policy_name);
+    println!("- KV paths:");
+    for path in &plan.kv_paths {
+        println!("  - {path}");
+    }
+    if plan.artifacts.is_empty() {
+        println!("- on-disk artifacts: preserved (pass --delete-artifacts to remove)");
+    } else {
+        println!("- on-disk artifacts:");
+        for action in &plan.artifacts {
+            println!("  - {}", action.description());
+        }
+    }
+    if dry_run {
+        println!("- mode: dry-run");
+    }
+}
+
+fn print_teardown_results(title: &str, results: &[TeardownResult]) {
+    println!("{title}:");
+    for result in results {
+        match &result.status {
+            TeardownStatus::Removed => println!("  - removed: {}", result.resource),
+            TeardownStatus::AlreadyAbsent => println!("  - already absent: {}", result.resource),
+            TeardownStatus::Failed(err) => println!("  - failed: {}: {err}", result.resource),
+        }
+    }
+    let remaining = results
+        .iter()
+        .filter_map(|result| match &result.status {
+            TeardownStatus::Failed(_) => Some(result.resource.as_str()),
+            TeardownStatus::Removed | TeardownStatus::AlreadyAbsent => None,
+        })
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        println!("remaining resources:");
+        for resource in remaining {
+            println!("  - {resource}");
+        }
+    }
+}
+
+fn has_failed_results(results: &[TeardownResult]) -> bool {
+    results
+        .iter()
+        .any(|result| matches!(result.status, TeardownStatus::Failed(_)))
 }
 
 const INHERIT_SENTINEL: &str = "inherit";
@@ -1280,9 +1652,9 @@ mod tests {
     /// one (stored `None` vs. new `Some(Y)`), or simply disagreeing
     /// (stored `Some(X)` vs. new `Some(Y)`) — must not be treated as
     /// idempotent.  `run_service_add` then falls through to the
-    /// `error_service_duplicate` bail, so the operator has to remove
-    /// and re-add the service rather than racing a silent `.ctmpl`
-    /// re-render over an inconsistent definition.
+    /// `error_service_duplicate` bail, so the operator has to run
+    /// `bootroot service remove` and then re-add the service rather than
+    /// racing a silent `.ctmpl` re-render over an inconsistent definition.
     #[test]
     fn is_idempotent_remote_rerun_false_when_agent_overrides_differ() {
         let mut resolved = sample_resolved();

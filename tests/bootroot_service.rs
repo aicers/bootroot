@@ -213,6 +213,116 @@ async fn test_app_add_supports_approle_runtime_auth() {
 }
 
 #[cfg(unix)]
+#[test]
+fn test_service_remove_missing_state_fails() {
+    let temp_dir = tempdir().expect("create temp dir");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["service", "remove", "--service-name", "edge-proxy", "--yes"])
+        .output()
+        .expect("run service remove");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("state.json not found"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_remove_not_found_fails() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["service", "remove", "--service-name", "edge-proxy", "--yes"])
+        .output()
+        .expect("run service remove");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("Service not found: edge-proxy"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_service_remove_dry_run_does_not_mutate_state() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file_with_service(
+        temp_dir.path(),
+        "http://localhost:8200",
+        "edge-proxy",
+        false,
+    )
+    .expect("write state.json");
+    let before = fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "remove",
+            "--service-name",
+            "edge-proxy",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run service remove --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("bootroot service remove: plan"));
+    assert!(stdout.contains("preview mode"));
+    let after = fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
+    assert_eq!(before, after);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_service_remove_deletes_openbao_resources_and_state_entry() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    write_state_file_with_service(temp_dir.path(), &server.uri(), "edge-proxy", true)
+        .expect("write state.json");
+    stub_service_remove_openbao(&server, "stored-edge-role", "stored-edge-policy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "remove",
+            "--service-name",
+            "edge-proxy",
+            "--yes",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service remove");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("removed: AppRole stored-edge-role"));
+    assert!(stdout.contains("removed: policy stored-edge-policy"));
+    assert!(stdout.contains("KV secret/bootroot/services/edge-proxy/secret_id"));
+
+    let state = fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
+    let value: serde_json::Value = serde_json::from_str(&state).expect("parse state");
+    assert!(value["services"]["edge-proxy"].is_null());
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_approle_permission_denied_fails() {
     let temp_dir = tempdir().expect("create temp dir");
@@ -1797,6 +1907,57 @@ fn write_state_file(root: &std::path::Path, openbao_url: &str) -> anyhow::Result
     Ok(())
 }
 
+fn write_state_file_with_service(
+    root: &std::path::Path,
+    openbao_url: &str,
+    service_name: &str,
+    remote_bootstrap: bool,
+) -> anyhow::Result<()> {
+    let delivery_mode = if remote_bootstrap {
+        "remote-bootstrap"
+    } else {
+        "local-file"
+    };
+    let state = json!({
+        "openbao_url": openbao_url,
+        "kv_mount": "secret",
+        "secrets_dir": "secrets",
+        "policies": {},
+        "approles": {},
+        "services": {
+            service_name: {
+                "service_name": service_name,
+                "deploy_type": "daemon",
+                "delivery_mode": delivery_mode,
+                "hostname": "edge-node-01",
+                "domain": "trusted.domain",
+                "agent_config_path": root.join("agent.toml"),
+                "cert_path": root.join("certs").join("edge-proxy.crt"),
+                "key_path": root.join("certs").join("edge-proxy.key"),
+                "instance_id": "001",
+                "container_name": null,
+                "notes": null,
+                "post_renew_hooks": [],
+                "approle": {
+                    "role_name": "stored-edge-role",
+                    "role_id": "stored-role-id",
+                    "secret_id_path": root.join("secrets").join("services").join(service_name).join("secret_id"),
+                    "policy_name": "stored-edge-policy",
+                    "secret_id_ttl": null,
+                    "secret_id_wrap_ttl": null,
+                    "token_bound_cidrs": null
+                }
+            }
+        }
+    });
+    fs::write(
+        root.join("state.json"),
+        serde_json::to_string_pretty(&state)?,
+    )
+    .context("write state.json")?;
+    Ok(())
+}
+
 fn assert_state_contains_default_delivery_mode(root: &std::path::Path) {
     let state_path = root.join("state.json");
     let contents = fs::read_to_string(&state_path).expect("read state.json");
@@ -2044,6 +2205,50 @@ fn write_state_with_app_full(
 
 async fn stub_app_add_openbao(server: &MockServer, service_name: &str) {
     stub_app_add_openbao_with_token(server, service_name, support::ROOT_TOKEN).await;
+}
+
+async fn stub_service_remove_openbao(server: &MockServer, role_name: &str, policy_name: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/auth/approle/role/{role_name}")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/v1/auth/approle/role/{role_name}")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
+
+    for suffix in ["eab", "http_responder_hmac", "trust", "secret_id"] {
+        let path_value = format!("/v1/secret/metadata/bootroot/services/edge-proxy/{suffix}");
+        Mock::given(method("GET"))
+            .and(path(path_value.clone()))
+            .and(header("X-Vault-Token", support::ROOT_TOKEN))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(path_value))
+            .and(header("X-Vault-Token", support::ROOT_TOKEN))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+    }
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/sys/policies/acl/{policy_name}")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/v1/sys/policies/acl/{policy_name}")))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
 }
 
 async fn stub_app_add_openbao_with_token(server: &MockServer, service_name: &str, token: &str) {

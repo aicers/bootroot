@@ -459,6 +459,14 @@ If the rerun arguments differ only in policy fields (`--secret-id-ttl`,
 `--secret-id-wrap-ttl`, `--no-wrap`), the command rejects the request
 and directs the operator to use `bootroot service update` instead.
 
+Changing a registered service from `local-file` to `remote-bootstrap`
+or back is not an in-place update. Use `bootroot service remove
+--service-name <service>` to deregister and tear down the stored
+OpenBao/KV resources, then run `bootroot service add` again with the
+desired `--delivery-mode`. By default, remove preserves cert/key and
+other on-disk material; pass `--delete-artifacts` only when those
+local artifacts should also be cleaned up.
+
 ## `secret_id` hygiene checklist
 
 The `secret_id` is the most sensitive artifact in the remote-bootstrap flow.

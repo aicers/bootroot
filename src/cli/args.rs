@@ -274,6 +274,14 @@ pub(crate) enum ServiceCommand {
     /// without having to remove and re-add the service. See issue #614
     /// for the in-FD reload pitfall this guards against.
     Update(ServiceUpdateArgs),
+    /// Deregisters a registered service and tears down its OpenBao/KV resources.
+    ///
+    /// Deletes the stored `AppRole`, ACL policy, and per-service KV
+    /// entries before removing the service from `state.json`. Cert/key
+    /// files and other on-disk artifacts are preserved unless
+    /// `--delete-artifacts` is supplied. Use `--dry-run` to preview the
+    /// teardown plan without mutating `OpenBao` or local state.
+    Remove(ServiceRemoveArgs),
     /// Manages the per-service `OpenBao` Agent sidecar container.
     #[command(subcommand, name = "openbao-sidecar")]
     OpenbaoSidecar(ServiceOpenbaoSidecarCommand),
@@ -1343,6 +1351,32 @@ pub(crate) struct ServiceInfoArgs {
     /// Service name identifier
     #[arg(long, required = true)]
     pub(crate) service_name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ServiceRemoveArgs {
+    /// Service name identifier
+    #[arg(long, required = true)]
+    pub(crate) service_name: String,
+
+    /// Preview teardown without changing `OpenBao`, files, DNS aliases, or state
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+
+    /// Skip confirmation prompts
+    #[arg(long, alias = "force")]
+    pub(crate) yes: bool,
+
+    /// Also remove bootroot-managed on-disk artifacts for this service.
+    ///
+    /// Cert/key paths are removed only with this flag. The stored
+    /// `agent.toml` path is edited in place to remove the bootroot
+    /// managed profile block; the file itself is not deleted.
+    #[arg(long)]
+    pub(crate) delete_artifacts: bool,
+
+    #[command(flatten)]
+    pub(crate) runtime_auth: RuntimeAuthArgs,
 }
 
 #[derive(Args, Debug)]

@@ -133,6 +133,7 @@ pub(crate) struct Strings {
     pub(crate) error_status_failed: &'static str,
     pub(crate) error_service_add_failed: &'static str,
     pub(crate) error_service_info_failed: &'static str,
+    pub(crate) error_service_remove_failed: &'static str,
     pub(crate) error_verify_failed: &'static str,
     pub(crate) error_rotate_failed: &'static str,
     pub(crate) error_details: &'static str,

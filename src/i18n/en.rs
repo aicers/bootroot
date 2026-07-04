@@ -393,6 +393,7 @@ pub(super) static STRINGS: Strings = Strings {
     dns_alias_rollback_failed: "CRITICAL: rollback also failed — bootroot-http01 is detached from network {network}. Reconnect manually: docker network connect {network} bootroot-http01 ({error})",
     dns_alias_network_not_found: "No Docker network found for container {value}",
     error_service_update_failed: "bootroot service update failed",
+    error_service_remove_failed: "bootroot service remove failed",
     error_service_update_no_flags: "No update flags specified; pass --secret-id-ttl, --secret-id-wrap-ttl, --no-wrap, --rn-cidrs, --cert-group, --reload-style, or --post-renew-command",
     service_update_summary: "bootroot service update: summary",
     service_update_field_changed: "- {field}: {old} -> {new}",

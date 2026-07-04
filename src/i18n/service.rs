@@ -840,6 +840,10 @@ impl Messages {
         self.strings().error_service_update_failed
     }
 
+    pub(crate) fn error_service_remove_failed(&self) -> &'static str {
+        self.strings().error_service_remove_failed
+    }
+
     pub(crate) fn error_service_update_no_flags(&self) -> &'static str {
         self.strings().error_service_update_no_flags
     }

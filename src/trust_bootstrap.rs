@@ -198,6 +198,34 @@ pub fn upsert_managed_profile_block(
     updated
 }
 
+/// Removes a managed profile block from `agent.toml`.
+#[must_use]
+pub fn remove_managed_profile_block(
+    contents: &str,
+    begin_prefix: &str,
+    end_prefix: &str,
+    service_name: &str,
+) -> String {
+    let begin_marker = format!("{begin_prefix} {service_name}");
+    let end_marker = format!("{end_prefix} {service_name}");
+    let Some(begin) = contents.find(&begin_marker) else {
+        return contents.to_string();
+    };
+    let Some(end_relative) = contents[begin..].find(&end_marker) else {
+        return contents.to_string();
+    };
+    let end = begin + end_relative + end_marker.len();
+    let suffix = contents[end..]
+        .strip_prefix('\n')
+        .unwrap_or(&contents[end..]);
+    let mut updated = contents[..begin].to_string();
+    if !updated.is_empty() && !updated.ends_with('\n') && !suffix.is_empty() {
+        updated.push('\n');
+    }
+    updated.push_str(suffix);
+    updated
+}
+
 /// Builds trust section updates for a managed service profile.
 #[must_use]
 pub fn build_trust_updates(
@@ -362,6 +390,30 @@ mod tests {
         let twice =
             upsert_managed_profile_block(&once, BEGIN_PREFIX, END_PREFIX, "edge-proxy", &block);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn remove_managed_profile_block_preserves_operator_content() {
+        let block = render_managed_profile_block(
+            BEGIN_PREFIX,
+            END_PREFIX,
+            "edge-proxy",
+            "001",
+            "edge-node-01",
+            Path::new("certs/edge-proxy.crt"),
+            Path::new("certs/edge-proxy.key"),
+            None,
+        );
+        let contents = format!("email = \"ops@example.com\"\n\n{block}\n[acme]\nretries = 3\n");
+        let removed =
+            remove_managed_profile_block(&contents, BEGIN_PREFIX, END_PREFIX, "edge-proxy");
+        assert!(!removed.contains("service_name = \"edge-proxy\""));
+        assert!(removed.contains("email = \"ops@example.com\""));
+        assert!(removed.contains("[acme]\nretries = 3"));
+        assert_eq!(
+            remove_managed_profile_block(&removed, BEGIN_PREFIX, END_PREFIX, "edge-proxy"),
+            removed
+        );
     }
 
     /// `--cert-group` opts the rendered profile into a `cert_group_gid`
