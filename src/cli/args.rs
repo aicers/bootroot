@@ -274,6 +274,19 @@ pub(crate) enum ServiceCommand {
     /// without having to remove and re-add the service. See issue #614
     /// for the in-FD reload pitfall this guards against.
     Update(ServiceUpdateArgs),
+    /// Deregisters a service and tears down its `OpenBao` material.
+    ///
+    /// Removes the service's `AppRole`, policy, and per-service KV paths
+    /// (by the names stored in `state.json`), refreshes the
+    /// `bootroot-http01` responder's HTTP-01 alias set to drop the
+    /// service, and finally removes the `state.json` entry. Remote
+    /// cleanup runs first and the entry is dropped last, so a partial
+    /// failure leaves the entry (and its stored role/policy names) for a
+    /// safe re-run. On-disk cert/key/agent config are preserved unless
+    /// `--delete-artifacts` is passed. This makes the "remove and re-add"
+    /// flow — the supported way to change a service's `--delivery-mode` —
+    /// an actual command. Use `--dry-run` to preview the teardown plan.
+    Remove(ServiceRemoveArgs),
     /// Manages the per-service `OpenBao` Agent sidecar container.
     #[command(subcommand, name = "openbao-sidecar")]
     OpenbaoSidecar(ServiceOpenbaoSidecarCommand),
@@ -1419,6 +1432,43 @@ pub(crate) struct ServiceUpdateArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct ServiceRemoveArgs {
+    /// Service name identifier
+    #[arg(long, required = true)]
+    pub(crate) service_name: String,
+
+    /// Skips the interactive confirmation prompt.
+    ///
+    /// Required for non-interactive use (CI / scripts): without it, and
+    /// when stdin is not a terminal, `service remove` refuses to proceed
+    /// rather than tearing down a live registration unattended.
+    #[arg(long, visible_alias = "force")]
+    pub(crate) yes: bool,
+
+    /// Previews the teardown plan without mutating `state.json` or
+    /// `OpenBao`.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+
+    /// Also deletes bootroot-owned on-disk artifacts (cert/key files,
+    /// the per-service secret and `OpenBao` config directories, and the
+    /// remote-bootstrap artifact) and strips the managed profile block
+    /// from `agent.toml`.
+    ///
+    /// Off by default: `service add` only records cert/key paths (the
+    /// files are produced later by rotation / the agent), so on-disk
+    /// material is preserved unless this flag is given. Even with the
+    /// flag, `agent.toml` is edited in place — only bootroot's managed
+    /// block is removed — so an operator-owned config file is never
+    /// deleted.
+    #[arg(long)]
+    pub(crate) delete_artifacts: bool,
+
+    #[command(flatten)]
+    pub(crate) runtime_auth: RuntimeAuthArgs,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct VerifyArgs {
     /// Service name identifier
     #[arg(long)]
@@ -2174,6 +2224,66 @@ mod tests {
                 assert_eq!(args.cert_group.as_deref(), Some("clear"));
             }
             _ => panic!("expected service update"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_remove_defaults() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "remove",
+            "--service-name",
+            "edge-proxy",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Remove(args)) => {
+                assert_eq!(args.service_name, "edge-proxy");
+                assert!(!args.yes);
+                assert!(!args.dry_run);
+                assert!(!args.delete_artifacts);
+            }
+            _ => panic!("expected service remove"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_remove_flags() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "remove",
+            "--service-name",
+            "edge-proxy",
+            "--yes",
+            "--dry-run",
+            "--delete-artifacts",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Remove(args)) => {
+                assert!(args.yes);
+                assert!(args.dry_run);
+                assert!(args.delete_artifacts);
+            }
+            _ => panic!("expected service remove"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_remove_force_alias() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "remove",
+            "--service-name",
+            "edge-proxy",
+            "--force",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Remove(args)) => {
+                assert!(args.yes);
+            }
+            _ => panic!("expected service remove"),
         }
     }
 

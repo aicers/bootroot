@@ -13,7 +13,7 @@ use crate::commands::init::PATH_CA_TRUST;
 use crate::i18n::Messages;
 use crate::state::ServiceEntry;
 
-const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
+pub(crate) const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
 const ROTATION_STATE_FILENAME: &str = "rotation-state.json";
 
 /// Describes which CA components are included in the rotation.

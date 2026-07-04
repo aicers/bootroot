@@ -94,6 +94,18 @@ If you see `dial tcp 127.0.0.1:5432: connect: connection refused`, DSN host in
 
 If mode and placement do not match, file/state updates go to the wrong path.
 
+To change the delivery mode of an already-registered service, remove it
+and re-add it with the new mode — `service add` refuses to flip the
+delivery mode of an existing entry:
+
+```bash
+bootroot service remove --service-name <name> --yes
+bootroot service add --service-name <name> --delivery-mode remote-bootstrap ...
+```
+
+See [CLI → bootroot service remove](cli.md#bootroot-service-remove) for
+the full teardown semantics and the `--delete-artifacts` flag.
+
 ## `remote-bootstrap` failures
 
 - Ensure `bootroot-remote bootstrap` completed successfully on the service host

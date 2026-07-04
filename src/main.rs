@@ -118,6 +118,12 @@ fn run(cli: Cli, messages: &Messages) -> Result<ExitCode> {
             commands::service::run_service_update(&args, messages)
                 .with_context(|| messages.error_service_update_failed())?;
         }
+        CliCommand::Service(ServiceCommand::Remove(args)) => {
+            with_runtime("service remove", messages, |rt| {
+                rt.block_on(commands::service::run_service_remove(&args, messages))
+            })?
+            .with_context(|| messages.error_service_remove_failed())?;
+        }
         CliCommand::Service(ServiceCommand::OpenbaoSidecar(
             ServiceOpenbaoSidecarCommand::Start(args),
         )) => {

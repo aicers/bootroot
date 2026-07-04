@@ -4,6 +4,7 @@ mod local_config;
 pub(crate) mod openbao_sidecar_refresh;
 pub(crate) mod openbao_sidecar_start;
 mod remote_bootstrap;
+mod remove;
 pub(crate) mod resolve;
 mod secrets;
 
@@ -97,6 +98,7 @@ pub(super) struct CaTrustMaterial {
     pub(super) trusted_ca_sha256: Vec<String>,
 }
 
+pub(crate) use remove::run_service_remove;
 pub(crate) use resolve::ResolvedServiceAdd;
 
 pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) -> Result<()> {
@@ -1281,8 +1283,9 @@ mod tests {
     /// (stored `Some(X)` vs. new `Some(Y)`) — must not be treated as
     /// idempotent.  `run_service_add` then falls through to the
     /// `error_service_duplicate` bail, so the operator has to remove
-    /// and re-add the service rather than racing a silent `.ctmpl`
-    /// re-render over an inconsistent definition.
+    /// the service with `bootroot service remove` and re-add it rather
+    /// than racing a silent `.ctmpl` re-render over an inconsistent
+    /// definition.
     #[test]
     fn is_idempotent_remote_rerun_false_when_agent_overrides_differ() {
         let mut resolved = sample_resolved();

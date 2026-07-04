@@ -38,6 +38,22 @@ pub(crate) fn register_dns_alias(state: &StateFile, messages: &Messages) -> Resu
     apply_dns_aliases(&aliases, messages)
 }
 
+/// Refreshes the responder's HTTP-01 alias set from `state.json`,
+/// reconnecting the `bootroot-http01` container even when the resulting
+/// alias set is empty.
+///
+/// Unlike [`register_dns_alias`], this does **not** short-circuit on an
+/// empty alias list. `service remove` calls it after dropping a service
+/// so the removed service's stale alias is cleared from the running
+/// responder; removing the last (or only) alias-bearing service must
+/// still reconnect the container with just the base
+/// `bootroot-http01` service alias rather than leaving the orphaned
+/// alias in place.
+pub(crate) fn reconcile_dns_aliases(state: &StateFile, messages: &Messages) -> Result<()> {
+    let aliases = collect_dns_aliases(state);
+    apply_dns_aliases(&aliases, messages)
+}
+
 /// Replays all DNS aliases from `state.json` onto the running
 /// `bootroot-http01` container.
 ///
