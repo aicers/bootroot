@@ -1628,7 +1628,10 @@ async fn test_app_add_includes_trust_snippet_when_present() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(mode, 0o600);
+    assert_eq!(
+        mode, 0o644,
+        "operator-facing CA bundle is public trust material and must be 0644"
+    );
 }
 
 #[cfg(unix)]
@@ -1941,7 +1944,11 @@ fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(docker_ca_mode, 0o600, "Docker CA bundle must be 0600");
+    assert_eq!(
+        docker_ca_mode, 0o644,
+        "Docker CA bundle must be 0644 (public trust material readable by \
+         non-root containerized consumers)"
+    );
 }
 
 fn path_relative_to_root_or_self<'a>(

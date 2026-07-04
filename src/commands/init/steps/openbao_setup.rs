@@ -676,9 +676,15 @@ fn build_openbao_agent_config(
     secret_id_path: &str,
     templates: &[(String, String)],
 ) -> String {
-    let tpl_refs: Vec<(&str, &str)> = templates
+    // Every template here renders secret material (password, CA signing
+    // key JSON, responder config), so all stay at 0600.
+    let tpl_specs: Vec<bootroot::openbao::TemplateSpec<'_>> = templates
         .iter()
-        .map(|(s, d)| (s.as_str(), d.as_str()))
+        .map(|(s, d)| bootroot::openbao::TemplateSpec {
+            source: s.as_str(),
+            destination: d.as_str(),
+            perms: bootroot::openbao::TEMPLATE_PERMS_SECRET,
+        })
         .collect();
     bootroot::openbao::build_agent_config(&bootroot::openbao::AgentConfigParams {
         openbao_addr,
@@ -687,7 +693,7 @@ fn build_openbao_agent_config(
         token_path: INIT_AGENT_TOKEN_PATH,
         mount_path: None,
         render_interval: bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
-        templates: &tpl_refs,
+        templates: &tpl_specs,
         ca_cert: None,
     })
 }

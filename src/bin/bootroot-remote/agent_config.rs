@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use bootroot::fs_util;
-use bootroot::openbao::{AgentConfigParams, STATIC_SECRET_RENDER_INTERVAL, build_agent_config};
+use bootroot::openbao::{
+    AgentConfigParams, STATIC_SECRET_RENDER_INTERVAL, TEMPLATE_PERMS_PUBLIC, TEMPLATE_PERMS_SECRET,
+    TemplateSpec, build_agent_config,
+};
 use bootroot::trust_bootstrap::{
     AgentConfigBaselineParams, apply_agent_config_baseline_defaults, build_ca_bundle_ctmpl,
     build_managed_agent_ctmpl, build_trust_updates as build_shared_trust_updates,
@@ -503,8 +506,16 @@ async fn write_openbao_agent_artifacts(
         &args.secret_id_path,
         &token_path,
         &[
-            (&template_path, &args.agent_config_path),
-            (&bundle_template_path, &args.ca_bundle_path),
+            (
+                &template_path,
+                &args.agent_config_path,
+                TEMPLATE_PERMS_SECRET,
+            ),
+            (
+                &bundle_template_path,
+                &args.ca_bundle_path,
+                TEMPLATE_PERMS_PUBLIC,
+            ),
         ],
     );
     fs::write(&config_path, config).await?;
@@ -517,23 +528,28 @@ fn render_openbao_agent_config(
     role_id_path: &Path,
     secret_id_path: &Path,
     token_path: &Path,
-    template_specs: &[(&Path, &Path)],
+    template_specs: &[(&Path, &Path, &str)],
 ) -> String {
     let role_id = role_id_path.display().to_string();
     let secret_id = secret_id_path.display().to_string();
     let token = token_path.display().to_string();
     let template_strings = template_specs
         .iter()
-        .map(|(source, destination)| {
+        .map(|(source, destination, perms)| {
             (
                 source.display().to_string(),
                 destination.display().to_string(),
+                *perms,
             )
         })
         .collect::<Vec<_>>();
     let templates = template_strings
         .iter()
-        .map(|(source, destination)| (source.as_str(), destination.as_str()))
+        .map(|(source, destination, perms)| TemplateSpec {
+            source: source.as_str(),
+            destination: destination.as_str(),
+            perms,
+        })
         .collect::<Vec<_>>();
     build_agent_config(&AgentConfigParams {
         openbao_addr: openbao_url,
@@ -863,14 +879,24 @@ mod tests {
             &secret_id_path,
             &token_path,
             &[
-                (&agent_template, &agent_dest),
-                (&bundle_template, &bundle_dest),
+                (&agent_template, &agent_dest, TEMPLATE_PERMS_SECRET),
+                (&bundle_template, &bundle_dest, TEMPLATE_PERMS_PUBLIC),
             ],
         );
 
         assert!(
             hcl.contains("remove_secret_id_file_after_reading = false"),
             "remote HCL must keep secret_id file across agent restarts"
+        );
+        assert!(
+            hcl.contains(
+                "  destination = \"/etc/bootroot-agent/ca-bundle.pem\"\n  perms = \"0644\""
+            ),
+            "remote HCL must render the public CA bundle at 0644"
+        );
+        assert!(
+            hcl.contains("  destination = \"/etc/bootroot-agent/agent.toml\"\n  perms = \"0600\""),
+            "remote HCL must keep the secret agent config at 0600"
         );
         assert_eq!(
             hcl.matches("template {").count(),
@@ -914,8 +940,8 @@ mod tests {
             &secret_id_path,
             &token_path,
             &[
-                (&agent_template, &agent_dest),
-                (&bundle_template, &bundle_dest),
+                (&agent_template, &agent_dest, TEMPLATE_PERMS_SECRET),
+                (&bundle_template, &bundle_dest, TEMPLATE_PERMS_PUBLIC),
             ],
         );
 
@@ -927,8 +953,16 @@ mod tests {
         let secret_id_path_str = secret_id_path.display().to_string();
         let token_str = token_path.display().to_string();
         let templates = [
-            (agent_template_str.as_str(), agent_dest_str.as_str()),
-            (bundle_template_str.as_str(), bundle_dest_str.as_str()),
+            TemplateSpec {
+                source: agent_template_str.as_str(),
+                destination: agent_dest_str.as_str(),
+                perms: TEMPLATE_PERMS_SECRET,
+            },
+            TemplateSpec {
+                source: bundle_template_str.as_str(),
+                destination: bundle_dest_str.as_str(),
+                perms: TEMPLATE_PERMS_PUBLIC,
+            },
         ];
         let canonical = build_agent_config(&AgentConfigParams {
             openbao_addr: "http://localhost:8200",

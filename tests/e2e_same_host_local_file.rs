@@ -76,7 +76,10 @@ async fn test_same_host_local_file_happy_path() {
         bundle_contents.contains(expected_ca_pem.trim()),
         "ca-bundle must carry the synced trust material",
     );
-    assert_mode(&files.ca_bundle_path, 0o600);
+    // Public trust material: the CA bundle must be world-readable so a
+    // non-root consumer in a separate container can read the bind-mounted
+    // file. The `.ctmpl` template below stays secret-only (0o600).
+    assert_mode(&files.ca_bundle_path, 0o644);
 
     assert!(
         temp.path()
