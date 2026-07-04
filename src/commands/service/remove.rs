@@ -147,13 +147,22 @@ pub(crate) async fn run_service_remove(
         anyhow::bail!(messages.service_remove_partial_failure(&args.service_name));
     }
 
-    // Everything torn down cleanly — now drop the entry LAST and persist.
-    remove_entry_and_persist(&mut state, &state_path, &args.service_name, messages)?;
-
-    // Refresh the responder's alias set from the post-removal state so
-    // the removed service's HTTP-01 alias is dropped, even when the
-    // resulting alias set is empty.
-    reconcile_dns_aliases(&state, messages)?;
+    // Everything torn down cleanly. Drop the entry from the in-memory
+    // state, refresh the responder's alias set from that post-removal
+    // state, and persist the removal LAST. Reconciling before persisting
+    // means a hard failure while reconnecting the responder (disconnect
+    // succeeded but both reconnect and rollback failed) leaves the
+    // on-disk entry in place, so a re-run of `service remove` still finds
+    // the service and can retry the alias refresh instead of failing with
+    // `error_service_not_found`. The alias refresh is part of
+    // deregistration, not a post-persist afterthought.
+    finalize_removal(
+        &mut state,
+        &state_path,
+        &args.service_name,
+        |post_removal| reconcile_dns_aliases(post_removal, messages),
+        messages,
+    )?;
 
     println!("{}", messages.service_remove_success(&args.service_name));
     Ok(())
@@ -182,17 +191,24 @@ fn require_service_entry(
         .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(service_name)))
 }
 
-/// Drops the service entry from `state.json` and persists it. Called
-/// last, after all remote and on-disk teardown completes, so a partial
-/// failure keeps the entry (and its stored role/policy names) available
-/// for a re-run.
-fn remove_entry_and_persist(
+/// Finalizes the removal: drops the service entry from the in-memory
+/// state, runs `reconcile` against that post-removal state, and only then
+/// persists `state.json`.
+///
+/// The persist is deliberately the last step. If `reconcile` (the DNS
+/// alias refresh) returns a hard error, the on-disk entry — and its
+/// stored role/policy names — is left untouched, so a re-run of
+/// `service remove` still finds the service and can retry rather than
+/// failing with `error_service_not_found`.
+fn finalize_removal(
     state: &mut StateFile,
     state_path: &Path,
     service_name: &str,
+    reconcile: impl FnOnce(&StateFile) -> Result<()>,
     messages: &Messages,
 ) -> Result<()> {
     state.services.remove(service_name);
+    reconcile(state)?;
     state
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())
@@ -453,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_entry_and_persist_drops_entry_from_state_file() {
+    fn finalize_removal_persists_entry_removal_after_reconcile_succeeds() {
         let dir = tempdir().expect("tempdir");
         let messages = test_messages();
         let state_path = dir.path().join("state.json");
@@ -468,7 +484,20 @@ mod tests {
         );
         state.save(&state_path).expect("save");
 
-        remove_entry_and_persist(&mut state, &state_path, "svc", &messages).expect("remove");
+        finalize_removal(
+            &mut state,
+            &state_path,
+            "svc",
+            |post_removal| {
+                assert!(
+                    !post_removal.services.contains_key("svc"),
+                    "reconcile must run against the post-removal state"
+                );
+                Ok(())
+            },
+            &messages,
+        )
+        .expect("remove");
         assert!(!state.services.contains_key("svc"));
 
         let reloaded = StateFile::load(&state_path).expect("reload");
@@ -479,6 +508,39 @@ mod tests {
         assert!(
             reloaded.services.contains_key("keep"),
             "other services must be preserved"
+        );
+    }
+
+    #[test]
+    fn finalize_removal_keeps_on_disk_entry_when_reconcile_fails() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let state_path = dir.path().join("state.json");
+        let mut state = sample_state();
+        state.services.insert(
+            "svc".to_string(),
+            sample_entry("svc", DeliveryMode::LocalFile),
+        );
+        state.save(&state_path).expect("save");
+
+        let err = finalize_removal(
+            &mut state,
+            &state_path,
+            "svc",
+            |_| anyhow::bail!("responder detached"),
+            &messages,
+        )
+        .expect_err("reconcile failure must propagate");
+        assert_eq!(err.to_string(), "responder detached");
+
+        // The persist is the last step, so a reconcile failure must leave
+        // the on-disk entry intact for a safe, idempotent re-run — a
+        // second `service remove` must still find the service rather than
+        // failing with `error_service_not_found`.
+        let reloaded = StateFile::load(&state_path).expect("reload");
+        assert!(
+            reloaded.services.contains_key("svc"),
+            "entry must survive on disk when the alias reconcile fails"
         );
     }
 
