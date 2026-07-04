@@ -831,4 +831,28 @@ mod tests {
         let path = dir.path().join("missing.toml");
         assert!(!strip_managed_profile(&path, "svc").expect("absent ok"));
     }
+
+    /// An operator-owned `[[profiles]]` entry sharing the `service_name`
+    /// but carrying no bootroot managed marker must survive `--strip-config`
+    /// untouched. Stripping is scoped to bootroot's managed profile, so with
+    /// no managed marker present the file is left byte-for-byte unchanged and
+    /// the strip reports no change.
+    #[test]
+    fn strip_managed_profile_preserves_unmarked_operator_profile() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("agent.toml");
+        let contents = "email = \"a@b.c\"\n\n\
+[[profiles]]\n\
+service_name = \"svc\"\n\
+instance_id = \"001\"\n\n\
+[trust]\nca_bundle_path = \"c\"\n";
+        std::fs::write(&path, contents).expect("write");
+
+        assert!(!strip_managed_profile(&path, "svc").expect("strip noop"));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            after, contents,
+            "unmarked operator profile must be left intact: {after}"
+        );
+    }
 }

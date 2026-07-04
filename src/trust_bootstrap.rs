@@ -360,10 +360,23 @@ pub fn remove_managed_profile_block(
 /// the marker sweep clears both marker pairs, so the profile removal must
 /// be equally exhaustive or a marker-less profile would be orphaned.
 ///
+/// Removal is gated on the presence of a managed begin marker for the
+/// service (under either code path). When no managed marker is present the
+/// input is returned unchanged, so an operator-owned, unmarked
+/// `[[profiles]]` entry that merely shares the `service_name` is never
+/// touched — only bootroot's own managed profile is cleared.
+///
 /// # Errors
 ///
 /// Returns an error if `contents` is not valid TOML.
 pub fn remove_managed_service_profile(contents: &str, service_name: &str) -> Result<String> {
+    let has_managed_marker = ALL_MANAGED_PROFILE_MARKERS.iter().any(|markers| {
+        let begin_marker = format!("{} {service_name}", markers.begin_prefix);
+        find_marker_line(contents, &begin_marker, 0).is_some()
+    });
+    if !has_managed_marker {
+        return Ok(contents.to_string());
+    }
     let (rendered, removed) = toml_util::remove_array_of_tables_entries(
         contents,
         "profiles",
@@ -765,6 +778,25 @@ mod tests {
         let contents = "email = \"a@b.c\"\n\n[trust]\nca_bundle_path = \"c\"\n";
         let out = remove_managed_service_profile(contents, "giganto").expect("remove ok");
         assert_eq!(out, contents);
+    }
+
+    /// An operator-owned `[[profiles]]` entry that merely shares the
+    /// `service_name` but carries no bootroot managed marker must survive
+    /// `--strip-config` untouched. Removal is scoped to bootroot's managed
+    /// profile, not "any profile for this service", so with no managed
+    /// marker present the file is returned verbatim (no reflow).
+    #[test]
+    fn remove_managed_service_profile_preserves_unmarked_operator_profile() {
+        let contents = "email = \"a@b.c\"\n\n\
+[[profiles]]\n\
+service_name = \"giganto\"\n\
+instance_id = \"001\"\n\n\
+[trust]\nca_bundle_path = \"c\"\n";
+        let out = remove_managed_service_profile(contents, "giganto").expect("remove ok");
+        assert_eq!(
+            out, contents,
+            "an unmarked operator-owned profile must be left intact: {out}"
+        );
     }
 
     /// Service names are DNS labels and can be prefixes of one another
