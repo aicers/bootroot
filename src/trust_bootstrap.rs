@@ -198,6 +198,42 @@ pub fn upsert_managed_profile_block(
     updated
 }
 
+/// Removes a managed profile block from `agent.toml` contents.
+///
+/// Deletes the `begin_prefix <service_name> … end_prefix <service_name>`
+/// span, collapsing the surrounding blank lines so the file stays
+/// well-formed. Returns the input unchanged when no matching block is
+/// present, so calling it a second time (after the block is already
+/// gone) is a no-op. This is the teardown counterpart to
+/// [`upsert_managed_profile_block`] and lets `service remove
+/// --delete-artifacts` strip bootroot's managed profile from an
+/// operator-owned `agent.toml` without deleting the whole file.
+#[must_use]
+pub fn remove_managed_profile_block(
+    contents: &str,
+    begin_prefix: &str,
+    end_prefix: &str,
+    service_name: &str,
+) -> String {
+    let begin_marker = format!("{begin_prefix} {service_name}");
+    let end_marker = format!("{end_prefix} {service_name}");
+    let Some(begin) = contents.find(&begin_marker) else {
+        return contents.to_string();
+    };
+    let Some(end_relative) = contents[begin..].find(&end_marker) else {
+        return contents.to_string();
+    };
+    let end = begin + end_relative + end_marker.len();
+    let prefix = contents[..begin].trim_end();
+    let suffix = contents[end..].trim_start_matches('\n');
+    let mut updated = prefix.to_string();
+    if !updated.is_empty() && !suffix.is_empty() {
+        updated.push_str("\n\n");
+    }
+    updated.push_str(suffix);
+    updated
+}
+
 /// Builds trust section updates for a managed service profile.
 #[must_use]
 pub fn build_trust_updates(
@@ -362,6 +398,73 @@ mod tests {
         let twice =
             upsert_managed_profile_block(&once, BEGIN_PREFIX, END_PREFIX, "edge-proxy", &block);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn remove_managed_profile_block_strips_span_and_preserves_surroundings() {
+        let block = render_managed_profile_block(
+            BEGIN_PREFIX,
+            END_PREFIX,
+            "edge-proxy",
+            "001",
+            "edge-node-01",
+            Path::new("certs/edge-proxy.crt"),
+            Path::new("certs/edge-proxy.key"),
+            None,
+        );
+        let original = "email = \"admin@example.com\"\n";
+        let with_block = upsert_managed_profile_block(
+            &format!("{original}\n[trust]\nca_bundle_path = \"certs/ca.pem\"\n"),
+            BEGIN_PREFIX,
+            END_PREFIX,
+            "edge-proxy",
+            &block,
+        );
+        assert!(with_block.contains("[[profiles]]"));
+
+        let removed =
+            remove_managed_profile_block(&with_block, BEGIN_PREFIX, END_PREFIX, "edge-proxy");
+        assert!(
+            !removed.contains("[[profiles]]"),
+            "managed block must be gone: {removed}"
+        );
+        assert!(
+            removed.contains("email = \"admin@example.com\""),
+            "operator content before the block must survive: {removed}"
+        );
+        assert!(
+            removed.contains("[trust]"),
+            "operator content after the block must survive: {removed}"
+        );
+        assert!(
+            !removed.contains(BEGIN_PREFIX) && !removed.contains(END_PREFIX),
+            "no managed markers must remain: {removed}"
+        );
+    }
+
+    #[test]
+    fn remove_managed_profile_block_is_idempotent_when_absent() {
+        let contents = "email = \"admin@example.com\"\n\n[trust]\nca_bundle_path = \"c\"\n";
+        let once = remove_managed_profile_block(contents, BEGIN_PREFIX, END_PREFIX, "edge-proxy");
+        assert_eq!(once, contents);
+        let twice = remove_managed_profile_block(&once, BEGIN_PREFIX, END_PREFIX, "edge-proxy");
+        assert_eq!(twice, contents);
+    }
+
+    #[test]
+    fn remove_managed_profile_block_only_content_yields_empty() {
+        let block = render_managed_profile_block(
+            BEGIN_PREFIX,
+            END_PREFIX,
+            "edge-proxy",
+            "001",
+            "edge-node-01",
+            Path::new("certs/edge-proxy.crt"),
+            Path::new("certs/edge-proxy.key"),
+            None,
+        );
+        let removed = remove_managed_profile_block(&block, BEGIN_PREFIX, END_PREFIX, "edge-proxy");
+        assert!(removed.is_empty(), "file with only the block becomes empty");
     }
 
     /// `--cert-group` opts the rendered profile into a `cert_group_gid`

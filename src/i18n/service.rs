@@ -112,6 +112,10 @@ impl Messages {
         self.strings().error_service_info_failed
     }
 
+    pub(crate) fn error_service_remove_failed(&self) -> &'static str {
+        self.strings().error_service_remove_failed
+    }
+
     pub(crate) fn error_verify_failed(&self) -> &'static str {
         self.strings().error_verify_failed
     }
@@ -905,6 +909,109 @@ impl Messages {
 
     pub(crate) fn service_update_hook_value_none(&self) -> &'static str {
         self.strings().service_update_hook_value_none
+    }
+
+    pub(crate) fn service_remove_plan_header(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().service_remove_plan_header,
+            &[("value", service_name)],
+        )
+    }
+
+    pub(crate) fn service_remove_plan_approle(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_remove_plan_approle,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_remove_plan_policy(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_remove_plan_policy,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_remove_plan_kv(&self, value: &str) -> String {
+        format_template(self.strings().service_remove_plan_kv, &[("value", value)])
+    }
+
+    pub(crate) fn service_remove_plan_artifact(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_remove_plan_artifact,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_remove_plan_agent_config(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_remove_plan_agent_config,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_remove_plan_artifacts_preserved(&self) -> &'static str {
+        self.strings().service_remove_plan_artifacts_preserved
+    }
+
+    pub(crate) fn service_remove_dry_run(&self) -> &'static str {
+        self.strings().service_remove_dry_run
+    }
+
+    pub(crate) fn service_remove_confirm_prompt(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().service_remove_confirm_prompt,
+            &[("value", service_name)],
+        )
+    }
+
+    pub(crate) fn service_remove_requires_yes(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().service_remove_requires_yes,
+            &[("value", service_name)],
+        )
+    }
+
+    pub(crate) fn service_remove_aborted(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().service_remove_aborted,
+            &[("value", service_name)],
+        )
+    }
+
+    pub(crate) fn service_remove_resource_removed(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_remove_resource_removed,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_remove_resource_absent(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_remove_resource_absent,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn service_remove_resource_failed(&self, value: &str, error: &str) -> String {
+        format_template(
+            self.strings().service_remove_resource_failed,
+            &[("value", value), ("error", error)],
+        )
+    }
+
+    pub(crate) fn service_remove_success(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().service_remove_success,
+            &[("value", service_name)],
+        )
+    }
+
+    pub(crate) fn service_remove_partial_failure(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().service_remove_partial_failure,
+            &[("value", service_name)],
+        )
     }
 
     pub(crate) fn hint_consumer_reload_required(&self) -> &'static str {

@@ -92,6 +92,17 @@
 
 모드와 실제 배치가 맞지 않으면 설정 반영 경로가 어긋납니다.
 
+이미 등록된 서비스의 전달 모드를 변경하려면 서비스를 제거한 뒤 새 모드로 다시
+추가하세요. `service add`는 기존 항목의 전달 모드 전환을 거부합니다:
+
+```bash
+bootroot service remove --service-name <name> --yes
+bootroot service add --service-name <name> --delivery-mode remote-bootstrap ...
+```
+
+전체 정리 동작과 `--delete-artifacts` 플래그는
+[CLI → bootroot service remove](cli.md#bootroot-service-remove)를 참고하세요.
+
 ## `remote-bootstrap`이 실패할 때
 
 - 서비스 머신에서 `bootroot-remote bootstrap`이 성공적으로 완료되었는지 확인

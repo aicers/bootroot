@@ -23,6 +23,7 @@ Primary commands:
 - `bootroot status`
 - `bootroot service add`
 - `bootroot service update`
+- `bootroot service remove`
 - `bootroot service info`
 - `bootroot service openbao-sidecar start`
 - `bootroot verify`
@@ -927,6 +928,94 @@ bootroot service update --service-name review \
 bootroot service update --service-name aice-web-next \
   --reload-style docker-restart --reload-target aice-web-next
 bootroot service update --service-name edge-proxy --reload-style none
+```
+
+## bootroot service remove
+
+Deregisters a service and tears down its `OpenBao` material. This is the
+supported way to change a registered service's `--delivery-mode` (e.g.
+`local-file` → `remote-bootstrap`): remove the service, then re-add it
+with the new mode. `service add` refuses to flip the delivery mode of an
+existing entry (it bails with a duplicate-service error), so a
+remove-then-re-add is the intended flow. Because changing delivery mode
+regenerates the `secret_id` delivery material regardless, the fresh
+`AppRole` `role_id` produced by re-adding is expected.
+
+### Inputs
+
+- `--service-name`: service name identifier (required)
+- `--yes` (alias `--force`): skip the interactive confirmation prompt.
+  Required for non-interactive use (CI / scripts); without it, and when
+  stdin is not a terminal, the command refuses to proceed.
+- `--dry-run`: print the teardown plan without mutating `state.json` or
+  `OpenBao`.
+- `--delete-artifacts`: also delete bootroot-owned on-disk artifacts —
+  the cert/key files, the per-service secret and `OpenBao` config
+  directories, and the remote-bootstrap artifact — and strip bootroot's
+  managed profile block from `agent.toml`. **Off by default:**
+  `service add` only records cert/key paths (the files are produced later
+  by rotation / the agent), so on-disk material is preserved unless this
+  flag is given. Even with the flag, `agent.toml` is edited in place —
+  only the managed block is removed — so an operator-owned config file is
+  never deleted.
+- Runtime authentication flags (`--root-token`, `--root-token-file`,
+  `--approle-role-id`/`--approle-secret-id`, `--auth-mode`, …): same as
+  `service add`, used to authenticate to `OpenBao` for the teardown.
+
+### Behavior
+
+- Reads the service entry from `state.json` and prints the teardown
+  plan: the `AppRole` and policy (by the names stored in state), the
+  per-service KV paths, and — with `--delete-artifacts` — the on-disk
+  files to delete.
+- Performs remote cleanup first: deletes the per-service KV paths
+  (`eab`, `http_responder_hmac`, the trust entry, and — for
+  `remote-bootstrap` services — `secret_id`), the `AppRole`, and the
+  policy. Each deletion tolerates an already-absent resource, so the
+  command is safely re-runnable after a partial failure.
+- Removes the `state.json` entry **last**, only after all remote (and,
+  with `--delete-artifacts`, on-disk) teardown succeeds. A partial
+  failure keeps the entry — and its stored role/policy names — so a
+  re-run can finish the remaining deletions.
+- Refreshes the `bootroot-http01` responder's HTTP-01 alias set so the
+  removed service's alias is dropped, **including when the resulting
+  alias set becomes empty** (removing the last alias-bearing service
+  still reconnects the responder with only its base alias).
+
+### Outputs
+
+- Teardown plan
+- Per-resource removed / already-absent lines
+- Success confirmation, or — on partial failure — a report of which
+  resources remain plus guidance to re-run
+
+### Failure conditions
+
+The command is considered failed when:
+
+- Missing `state.json`
+- Service not found
+- A remote or on-disk deletion fails (the `state.json` entry is kept for
+  a re-run)
+
+### Examples
+
+```bash
+# Preview the teardown plan.
+bootroot service remove --service-name edge-proxy --dry-run
+
+# Deregister a service (OpenBao AppRole/policy/KV torn down; cert/key
+# and agent.toml preserved).
+bootroot service remove --service-name edge-proxy --yes
+
+# Change delivery-mode from local-file to remote-bootstrap.
+bootroot service remove --service-name edge-proxy --yes
+bootroot service add --service-name edge-proxy \
+  --delivery-mode remote-bootstrap ...
+
+# Full teardown including on-disk artifacts and the managed agent.toml
+# block.
+bootroot service remove --service-name edge-proxy --yes --delete-artifacts
 ```
 
 ## bootroot service info
