@@ -335,6 +335,62 @@ pub fn remove_managed_profile_block(
     updated
 }
 
+/// Removes only the managed `[[profiles]]` entry for `service_name` and
+/// its marker comment lines, leaving every other table untouched.
+///
+/// Unlike [`remove_managed_profile_block`], which deletes the whole byte
+/// span between the begin and end markers, this preserves global tables
+/// (`[trust]`, `[openbao]`, `[acme]`, …) that `toml_edit` floats *inside*
+/// that span when they are appended after the profile block (see the
+/// floating note on [`strip_foreign_managed_profiles`]).
+///
+/// The whole-span strip is correct only where the caller re-emits those
+/// tables afterwards — the delivery-mode transition paths do. `service
+/// remove --strip-config` does **not** re-sync: it clears a stale profile
+/// from a still-serving host, so dropping the `[trust]`/`[openbao]` config
+/// the running agent depends on would be a regression. This surgical
+/// variant removes the array element via `toml_edit` (which owns exactly
+/// the profile and its `[profiles.*]` sub-tables) and then sweeps the
+/// begin/end marker comments, which survive as trailing decor. It matches
+/// either code path's markers.
+///
+/// # Errors
+///
+/// Returns an error if `contents` is not valid TOML.
+pub fn remove_managed_service_profile(contents: &str, service_name: &str) -> Result<String> {
+    let (rendered, removed) = toml_util::remove_array_of_tables_entry(
+        contents,
+        "profiles",
+        "service_name",
+        service_name,
+    )?;
+    let base = if removed { &rendered } else { contents };
+    Ok(strip_profile_marker_lines(base, service_name))
+}
+
+/// Drops any line that exactly matches a begin/end marker for
+/// `service_name`, under either code path's marker pair.
+///
+/// Removing the `[[profiles]]` array element leaves its marker comments
+/// behind as document decor, so they must be swept textually. Full-line
+/// equality (mirroring [`find_marker_line`]) keeps a service name that is
+/// a prefix of another from matching the wrong marker.
+fn strip_profile_marker_lines(contents: &str, service_name: &str) -> String {
+    let mut out = String::with_capacity(contents.len());
+    for line in contents.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        let is_marker = ALL_MANAGED_PROFILE_MARKERS.iter().any(|markers| {
+            body == format!("{} {service_name}", markers.begin_prefix)
+                || body == format!("{} {service_name}", markers.end_prefix)
+        });
+        if !is_marker {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 /// Builds trust section updates for a managed service profile.
 #[must_use]
 pub fn build_trust_updates(
@@ -614,6 +670,61 @@ mod tests {
         assert_eq!(once, contents);
         let twice = remove_managed_profile_block(&once, BEGIN_PREFIX, END_PREFIX, "edge-proxy");
         assert_eq!(twice, contents);
+    }
+
+    /// The surgical variant removes only the `[[profiles]]` entry and its
+    /// marker comments, preserving global tables that floated inside the
+    /// marker span (unlike the whole-span [`remove_managed_profile_block`]).
+    #[test]
+    fn remove_managed_service_profile_preserves_floated_tables() {
+        let block = render_profile_for(LOCAL_FILE_PROFILE_MARKERS, "giganto");
+        let with_block = upsert_managed_profile_block(
+            "email = \"a@b.c\"\n",
+            LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
+            LOCAL_FILE_PROFILE_MARKERS.end_prefix,
+            "giganto",
+            &block,
+        );
+        // Upsert global tables so they float inside the marker span, as the
+        // real pipeline does.
+        let with_block =
+            toml_util::upsert_section_keys(&with_block, "trust", &[("ca_bundle_path", "c".into())])
+                .expect("trust");
+        let with_block =
+            toml_util::upsert_section_keys(&with_block, "openbao", &[("addr", "u".into())])
+                .expect("openbao");
+
+        let removed = remove_managed_service_profile(&with_block, "giganto").expect("remove ok");
+        assert!(
+            !removed.contains("[[profiles]]"),
+            "profile must be gone: {removed}"
+        );
+        assert!(
+            !removed.contains(LOCAL_FILE_PROFILE_MARKERS.begin_prefix)
+                && !removed.contains(LOCAL_FILE_PROFILE_MARKERS.end_prefix),
+            "markers must be gone: {removed}"
+        );
+        assert!(removed.contains("[trust]"), "trust must survive: {removed}");
+        assert!(
+            removed.contains("[openbao]"),
+            "openbao must survive: {removed}"
+        );
+        assert!(
+            removed.contains("email = \"a@b.c\""),
+            "operator content must survive: {removed}"
+        );
+        removed
+            .parse::<toml_edit::DocumentMut>()
+            .expect("valid TOML after strip");
+    }
+
+    /// Returns the input unchanged (no reflow) when the service has no
+    /// managed profile, so an idempotent re-run is a true no-op.
+    #[test]
+    fn remove_managed_service_profile_is_noop_when_absent() {
+        let contents = "email = \"a@b.c\"\n\n[trust]\nca_bundle_path = \"c\"\n";
+        let out = remove_managed_service_profile(contents, "giganto").expect("remove ok");
+        assert_eq!(out, contents);
     }
 
     /// Service names are DNS labels and can be prefixes of one another

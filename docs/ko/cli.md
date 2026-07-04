@@ -928,7 +928,10 @@ bootroot service update --service-name edge-proxy --reload-style none
   디렉터리는 삭제하지 않고 `agent.toml`에서 bootroot 관리 프로필 블록만
   제거합니다. 서비스가 여전히 서비스 중이라 인증서/키는 유지해야 하지만
   낡은 관리 블록은 제거해야 하는 라이브 delivery-mode 전환을 위한
-  플래그입니다. `--delete-artifacts`에 포함되며(둘을 함께 지정하면 중복이나
+  플래그입니다. 해당 서비스의 `[[profiles]]` 항목과 마커 주석만 제거하며,
+  마커 주석 사이에 물리적으로 위치하더라도 실행 중인 에이전트가 의존하는
+  전역 `[trust]`, `[openbao]`, `[acme]` 테이블은 보존합니다.
+  `--delete-artifacts`에 포함되며(둘을 함께 지정하면 중복이나
   무해) `--delete-artifacts`와 마찬가지로 *어느* delivery-mode의 마커로
   기록된 블록이든 제거하므로 반대 모드(또는 이전 바이너리)가 남긴 블록도
   기록한 경로와 무관하게 정리됩니다.

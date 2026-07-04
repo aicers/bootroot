@@ -962,11 +962,15 @@ regenerates the `secret_id` delivery material regardless, the fresh
   `agent.toml` **without** deleting the cert/key files or the per-service
   secret and `OpenBao` config directories. Intended for a live
   delivery-mode transition, where the service is still serving so the
-  cert/key must be kept, yet the stale managed block must go. Implied by
-  `--delete-artifacts` (combining the two is redundant but harmless). As
-  with `--delete-artifacts`, the strip removes a block written under
-  *either* delivery mode's markers, so a block left by the opposite mode
-  (or by an older binary) is cleared regardless of which path wrote it.
+  cert/key must be kept, yet the stale managed block must go. Only the
+  service's `[[profiles]]` entry and its marker comments are removed; the
+  global `[trust]`, `[openbao]`, and `[acme]` tables the running agent
+  depends on are preserved, even though they physically sit inside the
+  marker comments. Implied by `--delete-artifacts` (combining the two is
+  redundant but harmless). As with `--delete-artifacts`, the strip removes
+  a block written under *either* delivery mode's markers, so a block left
+  by the opposite mode (or by an older binary) is cleared regardless of
+  which path wrote it.
 - Runtime authentication flags (`--root-token`, `--root-token-file`,
   `--approle-role-id`/`--approle-secret-id`, `--auth-mode`, …): same as
   `service add`, used to authenticate to `OpenBao` for the teardown.

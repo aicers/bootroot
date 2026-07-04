@@ -150,6 +150,43 @@ pub fn remove_sections(contents: &str, sections: &[&str]) -> Result<String> {
     Ok(doc.to_string())
 }
 
+/// Removes the first array-of-tables entry under `array` whose `key`
+/// equals `value`, dropping the array itself when it becomes empty.
+///
+/// Returns the re-rendered document paired with `true` when an entry was
+/// removed. When no entry matches, returns the input unchanged with
+/// `false` so the caller can skip an unnecessary rewrite (and avoid the
+/// cosmetic reflow `to_string` would otherwise apply). Only the matched
+/// `[[array]]` element is touched — sibling tables (`[trust]`,
+/// `[openbao]`, …) are left in place, even when `toml_edit` had floated
+/// them physically after the removed element.
+///
+/// # Errors
+///
+/// Returns an error if `contents` is not valid TOML.
+pub fn remove_array_of_tables_entry(
+    contents: &str,
+    array: &str,
+    key: &str,
+    value: &str,
+) -> Result<(String, bool)> {
+    let mut doc: DocumentMut = contents.parse().context("failed to parse TOML content")?;
+    let Some(entries) = doc.get_mut(array).and_then(Item::as_array_of_tables_mut) else {
+        return Ok((contents.to_string(), false));
+    };
+    let Some(index) = entries
+        .iter()
+        .position(|table| table.get(key).and_then(Item::as_str) == Some(value))
+    else {
+        return Ok((contents.to_string(), false));
+    };
+    entries.remove(index);
+    if entries.is_empty() {
+        doc.remove(array);
+    }
+    Ok((doc.to_string(), true))
+}
+
 /// Encodes a string as a TOML basic string with proper escaping.
 ///
 /// Returns the value including surrounding double quotes, with all
@@ -172,6 +209,40 @@ fn parse_value(raw: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_array_of_tables_entry_removes_only_the_match() {
+        let input = concat!(
+            "[[profiles]]\nservice_name = \"a\"\n[profiles.paths]\ncert = \"a.pem\"\n\n",
+            "[[profiles]]\nservice_name = \"b\"\n[profiles.paths]\ncert = \"b.pem\"\n\n",
+            "[trust]\nca_bundle_path = \"c\"\n",
+        );
+        let (output, removed) =
+            remove_array_of_tables_entry(input, "profiles", "service_name", "a").unwrap();
+        assert!(removed);
+        assert!(!output.contains("service_name = \"a\""), "{output}");
+        assert!(output.contains("service_name = \"b\""), "{output}");
+        assert!(output.contains("[trust]"), "{output}");
+    }
+
+    #[test]
+    fn remove_array_of_tables_entry_drops_empty_array() {
+        let input = "[[profiles]]\nservice_name = \"a\"\n\n[trust]\nca_bundle_path = \"c\"\n";
+        let (output, removed) =
+            remove_array_of_tables_entry(input, "profiles", "service_name", "a").unwrap();
+        assert!(removed);
+        assert!(!output.contains("[[profiles]]"), "{output}");
+        assert!(output.contains("[trust]"), "{output}");
+    }
+
+    #[test]
+    fn remove_array_of_tables_entry_no_match_is_unchanged() {
+        let input = "[[profiles]]\nservice_name = \"a\"\n";
+        let (output, removed) =
+            remove_array_of_tables_entry(input, "profiles", "service_name", "missing").unwrap();
+        assert!(!removed);
+        assert_eq!(output, input);
+    }
 
     #[test]
     fn upsert_updates_existing_key() {

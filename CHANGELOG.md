@@ -67,7 +67,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   per-service secret/config directories, giving operators a
   non-destructive way to clear a stale block during a live transition;
   its strip recognises either path's markers, and `--delete-artifacts`
-  implies it. (Closes #662)
+  implies it. Because that strip has no follow-up re-sync, it removes
+  only the service's `[[profiles]]` entry and its marker comments and
+  preserves the global `[trust]`/`[openbao]`/`[acme]` tables that
+  `toml_edit` floats inside the marker span, so a still-serving host
+  keeps the trust and OpenBao config its agent depends on. (Closes #662)
 - Fixed `bootroot service openbao-sidecar start` recreating the
   `bootroot-openbao` container as a side effect of starting a sidecar.
   The generated per-service override's `depends_on: openbao` made
