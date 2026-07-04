@@ -414,9 +414,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use tempfile::tempdir;
-
     use bootroot::trust_bootstrap::{LOCAL_FILE_PROFILE_MARKERS, REMOTE_BOOTSTRAP_PROFILE_MARKERS};
+    use tempfile::tempdir;
 
     use super::*;
     use crate::i18n::test_messages;
