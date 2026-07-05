@@ -54,6 +54,7 @@ mod unix_integration {
             phase_contents
                 .contains("\"phase\":\"rotate-infra-secret-id-denied-for-runtime-rotate\"")
         );
+        assert!(phase_contents.contains("\"phase\":\"rotate-secret-id-self-mint\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-openbao-recovery\""));
         assert!(phase_contents.contains("\"phase\":\"bootstrap-after-openbao-recovery\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-responder-hmac\""));

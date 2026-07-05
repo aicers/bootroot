@@ -60,7 +60,7 @@ pub(crate) struct InfraCertEntry {
     pub(crate) expires_at: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct StateFile {
     pub(crate) openbao_url: String,
     pub(crate) kv_mount: String,
@@ -86,6 +86,27 @@ pub(crate) struct StateFile {
     pub(crate) stepca_advertise_addr: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) infra_certs: BTreeMap<String, InfraCertEntry>,
+    /// Operator-supplied CIDR bindings for the rotate `AppRole`
+    /// credentials, keyed by role label (`runtime_rotate` /
+    /// `infra_rotate`). Recorded on the provisioning paths (`bootroot
+    /// init --rotate-bound-cidrs`, root-token infra provisioning run)
+    /// and applied to every subsequently self-minted `secret_id`.
+    /// Never auto-derived from the current connection — the source IP
+    /// `OpenBao` sees varies by deployment mode. See issue #672.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) rotate_bound_cidrs: BTreeMap<String, Vec<String>>,
+    /// Role-level `secret_id` TTL applied to the rotate `AppRole`s at
+    /// init (`--secret-id-ttl`). `bootroot status` derives the dead-man
+    /// warning threshold (half this TTL) from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rotate_secret_id_ttl: Option<String>,
+    /// RFC 3339 timestamp of the last successful `bootroot rotate
+    /// approle-secret-id` invocation (batch, single-service, and infra
+    /// alike). Dead-man record point for the scheduled rotation job: a
+    /// timer that silently stops firing produces no failure log, so
+    /// `bootroot status` warns when this timestamp goes stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_secret_id_rotation: Option<String>,
 }
 
 impl StateFile {
@@ -461,6 +482,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let parsed: StateFile = serde_json::from_str(&json).expect("deserialize");
@@ -486,12 +508,69 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&state).expect("serialize");
         assert!(
             !json.contains("openbao_bind_addr"),
             "None should be skipped"
         );
+    }
+
+    #[test]
+    fn state_file_without_rotation_fields_deserializes_as_defaults() {
+        let json = r#"{
+            "openbao_url": "http://localhost:8200",
+            "kv_mount": "secret"
+        }"#;
+        let parsed: StateFile = serde_json::from_str(json).expect("deserialize");
+        assert!(parsed.rotate_bound_cidrs.is_empty());
+        assert!(parsed.rotate_secret_id_ttl.is_none());
+        assert!(parsed.last_secret_id_rotation.is_none());
+    }
+
+    #[test]
+    fn state_file_rotation_fields_round_trip() {
+        let mut rotate_bound_cidrs = BTreeMap::new();
+        rotate_bound_cidrs.insert(
+            "runtime_rotate".to_string(),
+            vec!["10.0.0.5/32".to_string()],
+        );
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            rotate_bound_cidrs,
+            rotate_secret_id_ttl: Some("48h".to_string()),
+            last_secret_id_rotation: Some("2026-07-05T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let parsed: StateFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            parsed
+                .rotate_bound_cidrs
+                .get("runtime_rotate")
+                .map(Vec::as_slice),
+            Some(["10.0.0.5/32".to_string()].as_slice())
+        );
+        assert_eq!(parsed.rotate_secret_id_ttl.as_deref(), Some("48h"));
+        assert_eq!(
+            parsed.last_secret_id_rotation.as_deref(),
+            Some("2026-07-05T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn state_file_empty_rotation_fields_skipped_in_json() {
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert!(!json.contains("rotate_bound_cidrs"));
+        assert!(!json.contains("rotate_secret_id_ttl"));
+        assert!(!json.contains("last_secret_id_rotation"));
     }
 
     #[test]
@@ -520,6 +599,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&state).expect("serialize");
         assert!(
@@ -584,6 +664,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs,
+            ..Default::default()
         };
         let json = serde_json::to_string_pretty(&state).expect("serialize");
         let parsed: StateFile = serde_json::from_str(&json).expect("deserialize");

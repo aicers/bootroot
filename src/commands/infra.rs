@@ -1110,6 +1110,7 @@ fn save_openbao_bind_intent_to(
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         }
     };
     // Always reset openbao_url to the install-time loopback URL so that a
@@ -1238,6 +1239,7 @@ fn save_http01_admin_bind_intent_to(
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         }
     };
     state.http01_admin_bind_addr = Some(bind_addr.to_string());
@@ -1350,6 +1352,7 @@ fn save_stepca_bind_intent_to(
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         }
     };
     state.stepca_bind_addr = Some(bind_addr.to_string());
@@ -1627,6 +1630,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         assert_eq!(
@@ -1653,6 +1657,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         assert_eq!(
@@ -1799,6 +1804,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let result = resolve_openbao_exposed_override(&state_path, dir.path(), &messages);
@@ -1831,6 +1837,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         assert!(find_openbao_exposed_override(&state_path, dir.path()).is_none());
@@ -1855,6 +1862,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         write_openbao_exposed_override(dir.path(), "192.168.1.10:8200", &messages).unwrap();
@@ -1880,6 +1888,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         // No override file generated — resolve must error, not silently skip.
@@ -1953,6 +1962,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         // Override file must exist for resolve to reach TLS validation.
@@ -1988,6 +1998,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
 
@@ -2125,6 +2136,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         save_openbao_bind_intent_to(
@@ -2167,6 +2179,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         save_openbao_bind_intent_to(
@@ -2236,6 +2249,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs,
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
 
@@ -2293,6 +2307,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("openbao");
@@ -2334,6 +2349,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
 
@@ -2385,6 +2401,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("openbao");
@@ -2432,6 +2449,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         // Write an override with a widened wildcard binding.
@@ -2478,6 +2496,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -2502,6 +2521,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         assert!(effective_openbao_url_from_state(&state_path).is_none());
@@ -2534,6 +2554,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -2561,6 +2582,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -2587,6 +2609,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -2615,6 +2638,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let url = effective_openbao_url_from_state(&state_path);
@@ -2690,6 +2714,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs,
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("openbao");
@@ -2734,6 +2759,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         // Write a TLS-enabled HCL to simulate a previous init.
@@ -2787,6 +2813,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("openbao");
@@ -2850,6 +2877,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         save_http01_admin_bind_intent_to(
@@ -2908,6 +2936,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("responder");
@@ -2968,6 +2997,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs,
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("responder");
@@ -3029,6 +3059,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs,
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
 
@@ -3078,6 +3109,7 @@ services:
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
 
@@ -3181,6 +3213,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"\n";
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let override_dir = dir.path().join("secrets").join("responder");
@@ -3223,6 +3256,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"\n";
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         assert!(has_http01_admin_bind_intent(&state_path).unwrap());
@@ -3268,6 +3302,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"\n";
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let result = resolve_http01_exposed_override(&state_path, dir.path(), &messages);
@@ -3294,6 +3329,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"\n";
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let result = resolve_http01_exposed_override(&state_path, dir.path(), &messages);
@@ -3331,6 +3367,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"\n";
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
 
@@ -3406,6 +3443,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         // Override file must exist for resolve to reach TLS validation.
@@ -3432,6 +3470,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_addr: bind_addr.map(str::to_string),
             stepca_advertise_addr: advertise_addr.map(str::to_string),
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         }
     }
 
@@ -3691,6 +3730,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let result = resolve_responder_compose_override(&state_path, dir.path());
@@ -3715,6 +3755,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         // Bind intent present but init has not run yet — override
@@ -3744,6 +3785,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
 
@@ -3788,6 +3830,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
 
@@ -3877,6 +3920,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
 

@@ -430,6 +430,316 @@ async fn test_rotate_approle_secret_id_remote_sets_pending_status() {
     );
 }
 
+/// End-to-end self-mint contract (#672): a file-based `AppRole` run
+/// rotates its target, then re-mints its own credential with the
+/// documented `num_uses` cap and atomically replaces the
+/// `--approle-secret-id-file` file.
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)] // sequential mock choreography for one CLI run
+#[tokio::test]
+async fn test_rotate_approle_secret_id_self_mints_with_file_based_auth() {
+    const RUNTIME_ROTATE_ROLE: &str = "bootroot-runtime-rotate-role";
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
+        .expect("prepare state");
+    fs::write(&secret_path, "old-secret").expect("seed secret_id");
+
+    let cred_dir = temp_dir.path().join("rotate-cred");
+    fs::create_dir_all(&cred_dir).expect("create cred dir");
+    let cred_path = cred_dir.join("secret_id");
+    fs::write(&cred_path, "old-rotate-secret\n").expect("seed rotate credential");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let pkill_log = temp_dir.path().join("pkill.log");
+    write_fake_pkill(&bin_dir, &pkill_log).expect("write fake pkill");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+    // Initial authentication with the on-disk (old) credential.
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": "rr-role-id",
+            "secret_id": "old-rotate-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "rotate-token" }
+        })))
+        .expect(1)
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
+        .and(header("X-Vault-Token", "rotate-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": "secret-new" }
+        })))
+        .expect(1)
+        .mount(&openbao)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/role-id")))
+        .and(header("X-Vault-Token", "rotate-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "role_id": ROLE_ID }
+        })))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": ROLE_ID,
+            "secret_id": "secret-new"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "client-token" }
+        })))
+        .expect(1)
+        .mount(&openbao)
+        .await;
+    // Mint-own-last: the self-mint must carry the documented
+    // num_uses = 6 cap (3 × the enumerated logins per cycle).
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/auth/approle/role/{RUNTIME_ROTATE_ROLE}/secret-id"
+        )))
+        .and(header("X-Vault-Token", "rotate-token"))
+        .and(body_json(json!({ "num_uses": 6 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": "self-minted-secret" }
+        })))
+        .expect(1)
+        .mount(&openbao)
+        .await;
+    // Post-mint verification login of the new credential.
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": "rr-role-id",
+            "secret_id": "self-minted-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "verified-token" }
+        })))
+        .expect(1)
+        .mount(&openbao)
+        .await;
+
+    let path_env = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path_env);
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            "rr-role-id",
+            "--approle-secret-id-file",
+            cred_path.to_string_lossy().as_ref(),
+            "--yes",
+            "approle-secret-id",
+            "--service-name",
+            SERVICE_NAME,
+        ])
+        .env("PATH", combined_path)
+        .env("PKILL_OUTPUT", &pkill_log)
+        .output()
+        .expect("run rotate approle-secret-id");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("re-minted own bootroot-runtime-rotate-role secret_id"),
+        "summary must report the self-mint; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("self-mint login verification OK"),
+        "summary must report the verification; stdout:\n{stdout}"
+    );
+
+    let replaced = fs::read_to_string(&cred_path).expect("read rotate credential");
+    assert_eq!(
+        replaced, "self-minted-secret",
+        "the credential file must be atomically replaced with the self-minted secret_id"
+    );
+    let mode = fs::metadata(&cred_path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+
+    let state = fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
+    assert!(
+        state.contains("last_secret_id_rotation"),
+        "state.json must record the dead-man timestamp; state:\n{state}"
+    );
+}
+
+/// Infra two-invocation flow (#672): `--infra stepca` self-mints and
+/// replaces the credential file; the follow-up `--infra responder`
+/// invocation must authenticate with the fresh credential it reads
+/// from that file (the old-credential login mock is capped at one use).
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)] // sequential mock choreography for two CLI runs
+#[tokio::test]
+async fn test_rotate_infra_two_invocations_use_fresh_self_minted_credential() {
+    const INFRA_ROTATE_ROLE: &str = "bootroot-infra-rotate-role";
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    write_state_file(temp_dir.path(), &openbao.uri()).expect("write state");
+
+    let cred_dir = temp_dir.path().join("rotate-cred");
+    fs::create_dir_all(&cred_dir).expect("create cred dir");
+    let cred_path = cred_dir.join("secret_id");
+    fs::write(&cred_path, "old-infra-rotate-secret").expect("seed rotate credential");
+
+    // Pre-write the sidecar role_id files so the role-id backfill is
+    // skipped.
+    for (dir, role_id) in [
+        ("stepca", "stepca-role-id"),
+        ("responder", "responder-role-id"),
+    ] {
+        let agent_dir = temp_dir.path().join("secrets").join("openbao").join(dir);
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::write(agent_dir.join("role_id"), role_id).expect("write role_id");
+    }
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+    // The old credential may authenticate exactly once (invocation 1);
+    // invocation 2 must use the self-minted replacement from the file.
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": "ir-role-id",
+            "secret_id": "old-infra-rotate-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "rotate-token" }
+        })))
+        .expect(1)
+        .mount(&openbao)
+        .await;
+    for (role, minted) in [
+        ("bootroot-stepca-role", "stepca-new"),
+        ("bootroot-responder-role", "responder-new"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
+            .and(header("X-Vault-Token", "rotate-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "secret_id": minted }
+            })))
+            .expect(1)
+            .mount(&openbao)
+            .await;
+    }
+    for (role_id, minted) in [
+        ("stepca-role-id", "stepca-new"),
+        ("responder-role-id", "responder-new"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/login"))
+            .and(body_json(json!({
+                "role_id": role_id,
+                "secret_id": minted
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auth": { "client_token": "client-token" }
+            })))
+            .expect(1)
+            .mount(&openbao)
+            .await;
+    }
+    // Both invocations self-mint (per-invocation semantics): mint twice.
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/auth/approle/role/{INFRA_ROTATE_ROLE}/secret-id"
+        )))
+        .and(header("X-Vault-Token", "rotate-token"))
+        .and(body_json(json!({ "num_uses": 6 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": "self-minted-infra" }
+        })))
+        .expect(2)
+        .mount(&openbao)
+        .await;
+    // Verification login of the self-minted credential — also consumed
+    // by invocation 2's initial authentication (same body).
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": "ir-role-id",
+            "secret_id": "self-minted-infra"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "rotate-token" }
+        })))
+        .expect(3)
+        .mount(&openbao)
+        .await;
+
+    let path_env = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path_env);
+    for target in ["stepca", "responder"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "rotate",
+                "--openbao-url",
+                &openbao.uri(),
+                "--auth-mode",
+                "approle",
+                "--approle-role-id",
+                "ir-role-id",
+                "--approle-secret-id-file",
+                cred_path.to_string_lossy().as_ref(),
+                "--yes",
+                "approle-secret-id",
+                "--infra",
+                target,
+            ])
+            .env("PATH", &combined_path)
+            .env("DOCKER_OUTPUT", &docker_log)
+            .output()
+            .expect("run rotate approle-secret-id --infra");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "target {target}: stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("re-minted own bootroot-infra-rotate-role secret_id"),
+            "target {target}: summary must report the self-mint; stdout:\n{stdout}"
+        );
+    }
+
+    let replaced = fs::read_to_string(&cred_path).expect("read rotate credential");
+    assert_eq!(replaced, "self-minted-infra");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_rotate_responder_hmac_remote_sets_pending_status() {

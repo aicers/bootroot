@@ -1164,12 +1164,67 @@ run_rotation_infra_secret_id() {
   fi
 }
 
+# Self-mint of the rotate credentials' own secret_ids (#672): a
+# file-based rotate credential re-mints itself as the final step of a
+# fully successful invocation and atomically replaces the file the
+# scheduler reads. Exercises the runtime-rotate self-mint over two
+# consecutive single-service invocations (the second authenticates with
+# the credential file replaced by the first) and the infra-rotate
+# two-invocation flow (stepca replaces the file, responder reads it
+# fresh). The inline credentials used elsewhere in this script stay
+# valid: self-mint never revokes the previous secret_id.
+run_rotation_secret_id_self_mint() {
+  log_phase "rotate-secret-id-self-mint"
+  local cred_dir="$ARTIFACT_DIR/rotate-creds"
+  mkdir -p "$cred_dir/runtime" "$cred_dir/infra"
+  printf '%s' "$RUNTIME_ROTATE_SECRET_ID" >"$cred_dir/runtime/secret_id"
+  printf '%s' "$INFRA_ROTATE_SECRET_ID" >"$cred_dir/infra/secret_id"
+  chmod 600 "$cred_dir/runtime/secret_id" "$cred_dir/infra/secret_id"
+
+  local pass before after
+  for pass in first second; do
+    before="$(cat "$cred_dir/runtime/secret_id")"
+    run_bootroot rotate \
+      --compose-file "$COMPOSE_FILE" \
+      --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+      --auth-mode approle \
+      --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+      --approle-secret-id-file "$cred_dir/runtime/secret_id" \
+      --yes \
+      approle-secret-id \
+      --service-name "$EDGE_SERVICE" >>"$RUN_LOG" 2>&1 ||
+      fail "runtime-rotate self-mint rotation (${pass} pass) failed"
+    after="$(cat "$cred_dir/runtime/secret_id")"
+    [ -n "$after" ] || fail "runtime-rotate credential file is empty after self-mint (${pass} pass)"
+    [ "$before" != "$after" ] || fail "runtime-rotate credential file was not replaced by the self-mint (${pass} pass)"
+  done
+
+  local target
+  for target in stepca responder; do
+    before="$(cat "$cred_dir/infra/secret_id")"
+    run_bootroot rotate \
+      --compose-file "$COMPOSE_FILE" \
+      --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+      --auth-mode approle \
+      --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+      --approle-secret-id-file "$cred_dir/infra/secret_id" \
+      --yes \
+      approle-secret-id \
+      --infra "$target" >>"$RUN_LOG" 2>&1 ||
+      fail "infra-rotate self-mint rotation (--infra ${target}) failed"
+    after="$(cat "$cred_dir/infra/secret_id")"
+    [ -n "$after" ] || fail "infra-rotate credential file is empty after self-mint (--infra ${target})"
+    [ "$before" != "$after" ] || fail "infra-rotate credential file was not replaced by the self-mint (--infra ${target})"
+  done
+}
+
 run_rotations_with_verification() {
   # Rotate the infra secret_ids first: the stepca-password and
   # responder-hmac phases below drive the restarted sidecars through
   # real template renders, verifying they re-authenticated with the
   # rotated credentials.
   run_rotation_infra_secret_id
+  run_rotation_secret_id_self_mint
 
   log_phase "rotate-openbao-recovery"
   run_bootroot rotate \

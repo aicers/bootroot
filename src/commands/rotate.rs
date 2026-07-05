@@ -16,9 +16,7 @@ use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::{RotateArgs, RotateCommand};
 use crate::commands::init::{CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME};
-use crate::commands::openbao_auth::{
-    RuntimeAuthResolved, authenticate_openbao_client, resolve_runtime_auth,
-};
+use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -209,13 +207,26 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
             .await?;
         }
         RotateCommand::AppRoleSecretId(step_args) => {
-            let is_root_auth = matches!(runtime_auth, RuntimeAuthResolved::RootToken(_));
+            // The self-mint step replaces the on-disk credential file, so
+            // it must know whether the secret_id actually came from a
+            // file: inline/env values take precedence over the *_FILE
+            // flag in resolve_runtime_auth, in which case there is no
+            // file to replace.
+            let secret_id_file = if args.runtime_auth.approle_secret_id.is_none() {
+                args.runtime_auth.approle_secret_id_file.as_deref()
+            } else {
+                None
+            };
+            let auth = approle::RotateAuthContext {
+                runtime_auth: &runtime_auth,
+                secret_id_file,
+            };
             approle::rotate_approle_secret_id(
                 &mut ctx,
                 &client,
                 step_args,
                 args.yes,
-                is_root_auth,
+                &auth,
                 args.show_secrets,
                 messages,
             )

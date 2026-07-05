@@ -18,42 +18,200 @@ use crate::commands::init::{
     APPROLE_BOOTROOT_INFRA_ROTATE, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_STEPCA,
     AppRoleLabel, OPENBAO_AGENT_DIR, OPENBAO_AGENT_RESPONDER_DIR, OPENBAO_AGENT_ROLE_ID_NAME,
     OPENBAO_AGENT_SECRET_ID_NAME, OPENBAO_AGENT_STEPCA_DIR, POLICY_BOOTROOT_INFRA_ROTATE,
-    SECRET_ID_TTL, TOKEN_TTL, infra_rotate_policy,
+    ROTATE_SELF_MINT_NUM_USES, SECRET_ID_TTL, TOKEN_TTL, infra_rotate_policy,
+    validate_rotate_bound_cidrs,
 };
+use crate::commands::openbao_auth::RuntimeAuthResolved;
 use crate::commands::service::resolve::effective_wrap_ttl;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry};
+
+/// How the invocation authenticated, as far as the self-mint step needs
+/// to know: root-token runs perform no self-mint (a root run has no
+/// "own credential" to extend), and `secret_id_file` is `Some` only
+/// when the `AppRole` `secret_id` was resolved from
+/// `--approle-secret-id-file` — the file the self-mint step replaces.
+pub(super) struct RotateAuthContext<'a> {
+    pub(super) runtime_auth: &'a RuntimeAuthResolved,
+    pub(super) secret_id_file: Option<&'a Path>,
+}
+
+/// What the root-token provisioning run does with the recorded CIDR
+/// binding for the infra-rotate credential.
+#[derive(Clone, Copy)]
+enum CidrBindingAction<'a> {
+    /// No flag given: re-apply the state-recorded binding (if any), so
+    /// a recovery run does not silently drop a hardening the operator
+    /// opted into.
+    Keep,
+    /// `--rotate-bound-cidrs`: record the new binding and apply it.
+    Set(&'a [String]),
+    /// `--clear-rotate-bound-cidrs`: remove the recorded binding and
+    /// mint unbound — the recovery path for a bad recorded CIDR.
+    Clear,
+}
 
 pub(super) async fn rotate_approle_secret_id(
     ctx: &mut RotateContext,
     client: &OpenBaoClient,
     args: &RotateAppRoleSecretIdArgs,
     auto_confirm: bool,
-    is_root_auth: bool,
+    auth: &RotateAuthContext<'_>,
     show_secrets: bool,
     messages: &Messages,
 ) -> Result<()> {
-    if let Some(target) = args.infra {
-        return rotate_infra_approle_secret_id(
+    let is_root_auth = matches!(auth.runtime_auth, RuntimeAuthResolved::RootToken(_));
+    if !args.rotate_bound_cidrs.is_empty() {
+        // clap already couples the flag to --infra; the auth mode is
+        // only known at runtime. Rejecting (instead of ignoring) keeps a
+        // mistyped provisioning run from silently minting an unbound
+        // credential.
+        if !is_root_auth {
+            anyhow::bail!(messages.error_rotate_bound_cidrs_requires_provisioning());
+        }
+        validate_rotate_bound_cidrs(&args.rotate_bound_cidrs, messages)?;
+    }
+    if args.clear_rotate_bound_cidrs && !is_root_auth {
+        anyhow::bail!(messages.error_clear_rotate_bound_cidrs_requires_provisioning());
+    }
+
+    let own_label = if let Some(target) = args.infra {
+        let root_provision = is_root_auth.then(|| {
+            if args.clear_rotate_bound_cidrs {
+                CidrBindingAction::Clear
+            } else if args.rotate_bound_cidrs.is_empty() {
+                CidrBindingAction::Keep
+            } else {
+                CidrBindingAction::Set(&args.rotate_bound_cidrs)
+            }
+        });
+        rotate_infra_approle_secret_id(
             ctx,
             client,
             target,
             auto_confirm,
-            is_root_auth,
+            root_provision,
             show_secrets,
             messages,
         )
-        .await;
+        .await?;
+        AppRoleLabel::InfraRotate
+    } else if args.all_services {
+        rotate_all_service_approle_secret_ids(ctx, client, auto_confirm, messages).await?;
+        AppRoleLabel::RuntimeRotate
+    } else {
+        let service_name = args.service_name.as_deref().ok_or_else(|| {
+            // clap's ArgGroup guarantees one selector is present; guard for
+            // callers that construct the args directly.
+            anyhow::anyhow!(messages.error_value_required())
+        })?;
+        rotate_service_approle_secret_id(ctx, client, service_name, auto_confirm, messages).await?;
+        AppRoleLabel::RuntimeRotate
+    };
+
+    // Mint-own-last (#672): only after every target of this invocation
+    // succeeded, and only for runs authenticated as the rotate AppRole
+    // itself. Re-minting the rotate credentials under root auth is the
+    // break-glass recovery procedure, not this step.
+    if let RuntimeAuthResolved::AppRole { role_id, .. } = auth.runtime_auth {
+        self_mint_own_secret_id(
+            ctx,
+            client,
+            own_label,
+            role_id,
+            auth.secret_id_file,
+            messages,
+        )
+        .await?;
     }
-    if args.all_services {
-        return rotate_all_service_approle_secret_ids(ctx, client, auto_confirm, messages).await;
-    }
-    let service_name = args.service_name.as_deref().ok_or_else(|| {
-        // clap's ArgGroup guarantees one selector is present; guard for
-        // callers that construct the args directly.
-        anyhow::anyhow!(messages.error_value_required())
-    })?;
-    rotate_service_approle_secret_id(ctx, client, service_name, auto_confirm, messages).await
+
+    // Dead-man record point (#672): written on every successful
+    // invocation — batch, single-service, and infra alike — and only
+    // after the self-mint above, so a failed self-mint cannot suppress
+    // the stale-rotation warning in `bootroot status`.
+    record_rotation_success(ctx, messages)?;
+    Ok(())
+}
+
+/// Records the RFC 3339 timestamp of a fully successful
+/// `approle-secret-id` invocation in `state.json`. A scheduler that
+/// silently stops firing produces no failure log of its own, so this
+/// timestamp is the only signal `bootroot status` can watch.
+fn record_rotation_success(ctx: &mut RotateContext, messages: &Messages) -> Result<()> {
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("Failed to format the rotation-success timestamp")?;
+    ctx.state.last_secret_id_rotation = Some(now);
+    ctx.state
+        .save(&ctx.state_file)
+        .with_context(|| messages.error_serialize_state_failed())?;
+    Ok(())
+}
+
+/// Re-mints the credential this invocation authenticated with and
+/// atomically replaces the scheduler's credential file (mint-own-last,
+/// issue #672).
+///
+/// The fresh `secret_id` is minted with the recorded CIDR binding and
+/// the [`ROTATE_SELF_MINT_NUM_USES`] cap, then verified with a login
+/// *before* the file is replaced. Multiple `secret_id`s are
+/// concurrently valid and the old one is never eagerly revoked, so any
+/// failure — mint, verification, or a crash before the file write —
+/// self-heals: the next run logs in with the old, still-valid
+/// credential and retries, and the orphaned mint expires by TTL.
+async fn self_mint_own_secret_id(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    label: AppRoleLabel,
+    role_id: &str,
+    secret_id_file: Option<&Path>,
+    messages: &Messages,
+) -> Result<()> {
+    let role_name = label.role_name();
+    let Some(secret_id_path) = secret_id_file else {
+        // Inline/env-supplied credentials leave no file to replace. A
+        // prominent warning — never a silent no-op — keeps the operator
+        // aware that the credential they authenticated with still
+        // expires at its TTL.
+        eprintln!("{}", messages.warning_self_mint_skipped_non_file(role_name));
+        return Ok(());
+    };
+    let token_bound_cidrs = ctx
+        .state
+        .rotate_bound_cidrs
+        .get(&label.to_string())
+        .cloned();
+    let options = SecretIdOptions {
+        ttl: None,
+        num_uses: Some(ROTATE_SELF_MINT_NUM_USES),
+        metadata: None,
+        token_bound_cidrs,
+    };
+    let new_secret_id = client
+        .create_secret_id(role_name, &options)
+        .await
+        .with_context(|| messages.error_self_mint_failed(role_name))?;
+    // Unlike the service flow, verification is unconditional even under
+    // a CIDR binding: the binding names this very host, so a failed
+    // login means the binding (or the credential) is wrong and the
+    // working file must not be replaced.
+    client
+        .login_approle(role_id, &new_secret_id)
+        .await
+        .with_context(|| messages.error_self_mint_verify_failed(role_name))?;
+    write_secret_id_atomic(secret_id_path, &new_secret_id, messages).await?;
+    // The path argument of the summary line is the credential file
+    // path, not the secret value.
+    println!(
+        "{}",
+        messages.rotate_summary_self_mint(
+            role_name,
+            ROTATE_SELF_MINT_NUM_USES,
+            &secret_id_path.display().to_string()
+        )
+    );
+    println!("{}", messages.rotate_summary_self_mint_login_ok(role_name));
+    Ok(())
 }
 
 /// Per-service facts the caller needs to print an accurate summary:
@@ -247,12 +405,15 @@ fn infra_agent_container(target: InfraRoleTarget) -> &'static str {
     }
 }
 
+/// Rotates one infra role's `secret_id`. `root_provision` is `Some`
+/// exactly when the run is root-authenticated: the provisioning step
+/// below runs with the given CIDR-binding action.
 async fn rotate_infra_approle_secret_id(
     ctx: &mut RotateContext,
     client: &OpenBaoClient,
     target: InfraRoleTarget,
     auto_confirm: bool,
-    is_root_auth: bool,
+    root_provision: Option<CidrBindingAction<'_>>,
     show_secrets: bool,
     messages: &Messages,
 ) -> Result<()> {
@@ -270,8 +431,8 @@ async fn rotate_infra_approle_secret_id(
     // operator credential. AppRole-authenticated runs skip this entirely
     // (single-auth model: the resolved credential is the only one the
     // command ever uses).
-    if is_root_auth {
-        provision_infra_rotate_role(ctx, client, show_secrets, messages).await?;
+    if let Some(binding) = root_provision {
+        provision_infra_rotate_role(ctx, client, binding, show_secrets, messages).await?;
     }
 
     let agent_dir = infra_agent_dir(ctx, target);
@@ -356,9 +517,16 @@ async fn ensure_infra_role_id_file(
 /// recovered by simply re-running the root-token path. A fresh
 /// `secret_id` is minted on every run, which also serves as the recovery
 /// path for a lost operator credential.
+///
+/// [`CidrBindingAction::Set`] replaces the state-recorded CIDR binding
+/// for the infra-rotate credential, [`CidrBindingAction::Keep`] keeps
+/// the recorded binding (printed, so a recovery run is never surprised
+/// by it), and [`CidrBindingAction::Clear`] removes it. The minted
+/// operator credential carries the effective binding.
 async fn provision_infra_rotate_role(
     ctx: &mut RotateContext,
     client: &OpenBaoClient,
+    binding: CidrBindingAction<'_>,
     show_secrets: bool,
     messages: &Messages,
 ) -> Result<()> {
@@ -366,12 +534,21 @@ async fn provision_infra_rotate_role(
         .write_policy(POLICY_BOOTROOT_INFRA_ROTATE, &infra_rotate_policy())
         .await
         .with_context(|| messages.error_openbao_policy_write_failed())?;
+    // Preserve the secret_id TTL chosen at `init --secret-id-ttl`:
+    // recreating the role with the default would silently shorten the
+    // live credential's lifetime while `bootroot status` keeps deriving
+    // its stale threshold from the recorded value.
+    let secret_id_ttl = ctx
+        .state
+        .rotate_secret_id_ttl
+        .as_deref()
+        .unwrap_or(SECRET_ID_TTL);
     client
         .create_approle(
             APPROLE_BOOTROOT_INFRA_ROTATE,
             &[POLICY_BOOTROOT_INFRA_ROTATE],
             TOKEN_TTL,
-            SECRET_ID_TTL,
+            secret_id_ttl,
             true,
         )
         .await
@@ -380,12 +557,22 @@ async fn provision_infra_rotate_role(
         .read_role_id(APPROLE_BOOTROOT_INFRA_ROTATE)
         .await
         .with_context(|| messages.error_openbao_role_id_failed())?;
+
+    let label = AppRoleLabel::InfraRotate.to_string();
+    let effective_cidrs = match binding {
+        CidrBindingAction::Set(cidrs) => Some(cidrs.to_vec()),
+        CidrBindingAction::Keep => ctx.state.rotate_bound_cidrs.get(&label).cloned(),
+        CidrBindingAction::Clear => None,
+    };
+    let secret_id_options = SecretIdOptions {
+        token_bound_cidrs: effective_cidrs.clone(),
+        ..SecretIdOptions::default()
+    };
     let secret_id = client
-        .create_secret_id(APPROLE_BOOTROOT_INFRA_ROTATE, &SecretIdOptions::default())
+        .create_secret_id(APPROLE_BOOTROOT_INFRA_ROTATE, &secret_id_options)
         .await
         .with_context(|| messages.error_openbao_secret_id_failed())?;
 
-    let label = AppRoleLabel::InfraRotate.to_string();
     let prev_approle = ctx
         .state
         .approles
@@ -393,10 +580,20 @@ async fn provision_infra_rotate_role(
     let prev_policy = ctx
         .state
         .policies
-        .insert(label, POLICY_BOOTROOT_INFRA_ROTATE.to_string());
-    if prev_approle.as_deref() != Some(APPROLE_BOOTROOT_INFRA_ROTATE)
-        || prev_policy.as_deref() != Some(POLICY_BOOTROOT_INFRA_ROTATE)
-    {
+        .insert(label.clone(), POLICY_BOOTROOT_INFRA_ROTATE.to_string());
+    let mut state_changed = prev_approle.as_deref() != Some(APPROLE_BOOTROOT_INFRA_ROTATE)
+        || prev_policy.as_deref() != Some(POLICY_BOOTROOT_INFRA_ROTATE);
+    match binding {
+        CidrBindingAction::Set(cidrs) => {
+            let prev_cidrs = ctx.state.rotate_bound_cidrs.insert(label, cidrs.to_vec());
+            state_changed |= prev_cidrs.as_deref() != Some(cidrs);
+        }
+        CidrBindingAction::Clear => {
+            state_changed |= ctx.state.rotate_bound_cidrs.remove(&label).is_some();
+        }
+        CidrBindingAction::Keep => {}
+    }
+    if state_changed {
         ctx.state
             .save(&ctx.state_file)
             .with_context(|| messages.error_serialize_state_failed())?;
@@ -409,6 +606,7 @@ async fn provision_infra_rotate_role(
             POLICY_BOOTROOT_INFRA_ROTATE
         )
     );
+    print_cidr_binding_decision(binding, effective_cidrs.as_deref(), messages);
     println!(
         "{}",
         messages.rotate_infra_provisioned_role_id(APPROLE_BOOTROOT_INFRA_ROTATE, &role_id)
@@ -421,6 +619,36 @@ async fn provision_infra_rotate_role(
         )
     );
     Ok(())
+}
+
+/// Surfaces the provisioning run's CIDR-binding decision so a recovery
+/// run without the flag is never surprised by a silently re-applied
+/// (or bad) binding.
+fn print_cidr_binding_decision(
+    binding: CidrBindingAction<'_>,
+    effective_cidrs: Option<&[String]>,
+    messages: &Messages,
+) {
+    match binding {
+        CidrBindingAction::Keep => {
+            if let Some(cidrs) = effective_cidrs {
+                println!(
+                    "{}",
+                    messages.rotate_infra_cidr_binding_kept(
+                        APPROLE_BOOTROOT_INFRA_ROTATE,
+                        &cidrs.join(", ")
+                    )
+                );
+            }
+        }
+        CidrBindingAction::Clear => {
+            println!(
+                "{}",
+                messages.rotate_infra_cidr_binding_cleared(APPROLE_BOOTROOT_INFRA_ROTATE)
+            );
+        }
+        CidrBindingAction::Set(_) => {}
+    }
 }
 
 async fn ensure_role_id_file(
@@ -504,6 +732,7 @@ mod tests {
                 stepca_bind_addr: None,
                 stepca_advertise_addr: None,
                 infra_certs: BTreeMap::new(),
+                ..Default::default()
             },
             paths: super::super::StatePaths::new(dir.join("secrets")),
             state_dir: dir.to_path_buf(),
@@ -629,7 +858,7 @@ mod tests {
             &client,
             InfraRoleTarget::Stepca,
             true,
-            false,
+            None,
             false,
             &messages,
         )
@@ -693,7 +922,7 @@ mod tests {
             &client,
             InfraRoleTarget::Responder,
             true,
-            false,
+            None,
             false,
             &messages,
         )
@@ -759,7 +988,7 @@ mod tests {
             &client,
             InfraRoleTarget::Stepca,
             true,
-            false,
+            None,
             false,
             &messages,
         )
@@ -795,7 +1024,7 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
-        provision_infra_rotate_role(&mut ctx, &client, false, &messages)
+        provision_infra_rotate_role(&mut ctx, &client, CidrBindingAction::Keep, false, &messages)
             .await
             .expect("provisioning should succeed");
 
@@ -867,7 +1096,7 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
-        provision_infra_rotate_role(&mut ctx, &client, false, &messages)
+        provision_infra_rotate_role(&mut ctx, &client, CidrBindingAction::Keep, false, &messages)
             .await
             .expect("re-provisioning must succeed on a current deployment");
 
@@ -1019,6 +1248,875 @@ mod tests {
             args,
             vec!["restart", "bootroot-openbao-agent-beta"],
             "only the successfully rotated target's sidecar must be reloaded"
+        );
+    }
+
+    fn approle_args(
+        service_name: Option<&str>,
+        all_services: bool,
+        infra: Option<InfraRoleTarget>,
+    ) -> RotateAppRoleSecretIdArgs {
+        RotateAppRoleSecretIdArgs {
+            service_name: service_name.map(str::to_string),
+            all_services,
+            infra,
+            rotate_bound_cidrs: Vec::new(),
+            clear_rotate_bound_cidrs: false,
+        }
+    }
+
+    fn approle_auth<'a>(
+        role_id: &str,
+        secret_id: &str,
+        secret_id_file: Option<&'a Path>,
+    ) -> (RuntimeAuthResolved, Option<&'a Path>) {
+        (
+            RuntimeAuthResolved::AppRole {
+                role_id: role_id.to_string(),
+                secret_id: secret_id.to_string(),
+            },
+            secret_id_file,
+        )
+    }
+
+    /// Mounts a self-mint mock for the given rotate role that requires
+    /// the `num_uses` cap in the request body — the sizing-rule
+    /// assertion lives in the request matcher itself.
+    fn mount_self_mint_mock(role: &str, secret_id: &str) -> Mock {
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "num_uses": ROTATE_SELF_MINT_NUM_USES,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "secret_id": secret_id }
+            })))
+    }
+
+    fn mount_login_mock_for(role_id: &str, secret_id: &str, status: u16) -> Mock {
+        let response = if status == 200 {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "auth": { "client_token": "verified-token" }
+            }))
+        } else {
+            ResponseTemplate::new(status).set_body_string(r#"{"errors":["permission denied"]}"#)
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/login"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "role_id": role_id,
+                "secret_id": secret_id,
+            })))
+            .respond_with(response)
+    }
+
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn self_mint_replaces_credential_file_after_successful_run() {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let server = MockServer::start().await;
+        mount_secret_id_mock(&service_role_name("alpha"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("alpha-role-id", "fresh-secret-id", 200)
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_self_mint_mock(RUNTIME_ROTATE_ROLE, "self-minted-secret")
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("rr-role-id", "self-minted-secret", 200)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+        let credential_path = dir.path().join("rotate-cred").join("secret_id");
+        fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
+        fs::write(&credential_path, "old-rotate-secret").expect("seed credential file");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("runtime-rotate-token".to_string());
+        let messages = test_messages();
+        let (runtime_auth, secret_id_file) =
+            approle_auth("rr-role-id", "old-rotate-secret", Some(&credential_path));
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file,
+        };
+        rotate_approle_secret_id(
+            &mut ctx,
+            &client,
+            &approle_args(Some("alpha"), false, None),
+            true,
+            &auth,
+            false,
+            &messages,
+        )
+        .await
+        .expect("rotation with self-mint should succeed");
+
+        let replaced = fs::read_to_string(&credential_path).expect("read credential file");
+        assert_eq!(
+            replaced, "self-minted-secret",
+            "the scheduler's credential file must hold the fresh self-minted secret_id"
+        );
+        assert_eq!(
+            ctx.state
+                .last_secret_id_rotation
+                .as_deref()
+                .map(str::is_empty),
+            Some(false),
+            "the dead-man timestamp must be recorded on success"
+        );
+        let saved = fs::read_to_string(&ctx.state_file).expect("state.json saved");
+        assert!(
+            saved.contains("last_secret_id_rotation"),
+            "state.json must persist the dead-man timestamp"
+        );
+    }
+
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn self_mint_skipped_with_warning_when_auth_not_file_based() {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let server = MockServer::start().await;
+        mount_secret_id_mock(&service_role_name("alpha"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock().expect(1).mount(&server).await;
+        // The self-mint endpoint must never be hit without a file to
+        // replace (defined non-file-auth behavior: warn and skip).
+        mount_self_mint_mock(RUNTIME_ROTATE_ROLE, "self-minted-secret")
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("runtime-rotate-token".to_string());
+        let messages = test_messages();
+        let (runtime_auth, secret_id_file) = approle_auth("rr-role-id", "inline-secret", None);
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file,
+        };
+        rotate_approle_secret_id(
+            &mut ctx,
+            &client,
+            &approle_args(Some("alpha"), false, None),
+            true,
+            &auth,
+            false,
+            &messages,
+        )
+        .await
+        .expect("non-file auth must warn and skip the self-mint, not fail");
+        assert!(
+            ctx.state.last_secret_id_rotation.is_some(),
+            "the dead-man timestamp is still recorded"
+        );
+    }
+
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn no_self_mint_under_root_auth() {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let server = MockServer::start().await;
+        mount_secret_id_mock(&service_role_name("alpha"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock().expect(1).mount(&server).await;
+        mount_self_mint_mock(RUNTIME_ROTATE_ROLE, "self-minted-secret")
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        let messages = test_messages();
+        let runtime_auth = RuntimeAuthResolved::RootToken("root-token".to_string());
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file: None,
+        };
+        rotate_approle_secret_id(
+            &mut ctx,
+            &client,
+            &approle_args(Some("alpha"), false, None),
+            true,
+            &auth,
+            false,
+            &messages,
+        )
+        .await
+        .expect("root-auth rotation succeeds without a self-mint");
+        assert!(
+            ctx.state.last_secret_id_rotation.is_some(),
+            "the dead-man timestamp is recorded for root-auth runs too"
+        );
+    }
+
+    // Mint-own-last ordering: a failed target must abort the invocation
+    // before the self-mint and before the dead-man record point.
+    #[tokio::test]
+    async fn self_mint_and_record_skipped_when_target_fails() {
+        let dir = tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{}/secret-id",
+                service_role_name("alpha")
+            )))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_string(r#"{"errors":["permission denied"]}"#),
+            )
+            .mount(&server)
+            .await;
+        mount_self_mint_mock(RUNTIME_ROTATE_ROLE, "self-minted-secret")
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+        let credential_path = dir.path().join("rotate-cred").join("secret_id");
+        fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
+        fs::write(&credential_path, "old-rotate-secret").expect("seed credential file");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("runtime-rotate-token".to_string());
+        let messages = test_messages();
+        let (runtime_auth, secret_id_file) =
+            approle_auth("rr-role-id", "old-rotate-secret", Some(&credential_path));
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file,
+        };
+        rotate_approle_secret_id(
+            &mut ctx,
+            &client,
+            &approle_args(Some("alpha"), false, None),
+            true,
+            &auth,
+            false,
+            &messages,
+        )
+        .await
+        .expect_err("a failed target must fail the invocation");
+
+        assert_eq!(
+            fs::read_to_string(&credential_path).expect("read credential file"),
+            "old-rotate-secret",
+            "the credential file must be untouched when a target fails"
+        );
+        assert!(
+            ctx.state.last_secret_id_rotation.is_none(),
+            "the dead-man timestamp must not be recorded on failure"
+        );
+        assert!(
+            !ctx.state_file.exists(),
+            "state.json must not be written on failure"
+        );
+    }
+
+    // Crash-safety (no eager revocation): a self-minted credential that
+    // fails its login verification must not replace the working file —
+    // the old secret_id stays valid until TTL, so the next run
+    // self-heals.
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn self_mint_verify_failure_keeps_old_credential_file() {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let server = MockServer::start().await;
+        mount_secret_id_mock(&service_role_name("alpha"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("alpha-role-id", "fresh-secret-id", 200)
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_self_mint_mock(RUNTIME_ROTATE_ROLE, "self-minted-secret")
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("rr-role-id", "self-minted-secret", 403)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+        let credential_path = dir.path().join("rotate-cred").join("secret_id");
+        fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
+        fs::write(&credential_path, "old-rotate-secret").expect("seed credential file");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("runtime-rotate-token".to_string());
+        let messages = test_messages();
+        let (runtime_auth, secret_id_file) =
+            approle_auth("rr-role-id", "old-rotate-secret", Some(&credential_path));
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file,
+        };
+        let err = rotate_approle_secret_id(
+            &mut ctx,
+            &client,
+            &approle_args(Some("alpha"), false, None),
+            true,
+            &auth,
+            false,
+            &messages,
+        )
+        .await
+        .expect_err("a failed self-mint verification must fail the invocation");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(RUNTIME_ROTATE_ROLE),
+            "error must name the rotate credential, got: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(&credential_path).expect("read credential file"),
+            "old-rotate-secret",
+            "the working credential file must not be replaced by an unverified secret_id"
+        );
+        assert!(
+            ctx.state.last_secret_id_rotation.is_none(),
+            "the dead-man timestamp must not be recorded when the self-mint fails"
+        );
+        assert!(
+            !ctx.state_file.exists(),
+            "state.json must not be written when the self-mint fails"
+        );
+    }
+
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn self_mint_applies_recorded_cidr_binding() {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let server = MockServer::start().await;
+        mount_secret_id_mock(&service_role_name("alpha"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("alpha-role-id", "fresh-secret-id", 200)
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The self-mint request must carry the state-recorded binding.
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{RUNTIME_ROTATE_ROLE}/secret-id"
+            )))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "num_uses": ROTATE_SELF_MINT_NUM_USES,
+                "token_bound_cidrs": ["10.0.0.5/32"],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "secret_id": "self-minted-secret" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("rr-role-id", "self-minted-secret", 200)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+        ctx.state.rotate_bound_cidrs.insert(
+            AppRoleLabel::RuntimeRotate.to_string(),
+            vec!["10.0.0.5/32".to_string()],
+        );
+        let credential_path = dir.path().join("rotate-cred").join("secret_id");
+        fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
+        fs::write(&credential_path, "old-rotate-secret").expect("seed credential file");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("runtime-rotate-token".to_string());
+        let messages = test_messages();
+        let (runtime_auth, secret_id_file) =
+            approle_auth("rr-role-id", "old-rotate-secret", Some(&credential_path));
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file,
+        };
+        rotate_approle_secret_id(
+            &mut ctx,
+            &client,
+            &approle_args(Some("alpha"), false, None),
+            true,
+            &auth,
+            false,
+            &messages,
+        )
+        .await
+        .expect("CIDR-bound self-mint should succeed");
+        assert_eq!(
+            fs::read_to_string(&credential_path).expect("read credential file"),
+            "self-minted-secret"
+        );
+    }
+
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn infra_invocation_self_mints_the_infra_rotate_credential() {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let server = MockServer::start().await;
+        mount_secret_id_mock(APPROLE_BOOTROOT_STEPCA)
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("stepca-role-id", "fresh-secret-id", 200)
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_self_mint_mock(APPROLE_BOOTROOT_INFRA_ROTATE, "self-minted-infra")
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("ir-role-id", "self-minted-infra", 200)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        let stepca_dir = ctx
+            .paths
+            .secrets_dir()
+            .join(OPENBAO_AGENT_DIR)
+            .join(OPENBAO_AGENT_STEPCA_DIR);
+        fs::create_dir_all(&stepca_dir).expect("create agent dir");
+        fs::write(
+            stepca_dir.join(OPENBAO_AGENT_ROLE_ID_NAME),
+            "stepca-role-id",
+        )
+        .expect("write role_id");
+        let credential_path = dir.path().join("infra-rotate-cred").join("secret_id");
+        fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
+        fs::write(&credential_path, "old-infra-rotate-secret").expect("seed credential file");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("infra-rotate-token".to_string());
+        let messages = test_messages();
+        let (runtime_auth, secret_id_file) = approle_auth(
+            "ir-role-id",
+            "old-infra-rotate-secret",
+            Some(&credential_path),
+        );
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file,
+        };
+        rotate_approle_secret_id(
+            &mut ctx,
+            &client,
+            &approle_args(None, false, Some(InfraRoleTarget::Stepca)),
+            true,
+            &auth,
+            false,
+            &messages,
+        )
+        .await
+        .expect("infra rotation with self-mint should succeed");
+
+        // The next `--infra responder` invocation reads this file at
+        // startup and authenticates with the fresh credential.
+        assert_eq!(
+            fs::read_to_string(&credential_path).expect("read credential file"),
+            "self-minted-infra"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_bound_cidrs_rejected_without_root_auth() {
+        let dir = tempdir().expect("tempdir");
+        let mut ctx = make_ctx(dir.path());
+        // No OpenBao requests may happen; an unroutable URL makes any
+        // accidental call fail loudly.
+        let mut client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
+        client.set_token("infra-rotate-token".to_string());
+        let messages = test_messages();
+        let (runtime_auth, secret_id_file) = approle_auth("ir-role-id", "secret", None);
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file,
+        };
+        let mut args = approle_args(None, false, Some(InfraRoleTarget::Stepca));
+        args.rotate_bound_cidrs = vec!["10.0.0.5/32".to_string()];
+        let err = rotate_approle_secret_id(&mut ctx, &client, &args, true, &auth, false, &messages)
+            .await
+            .expect_err("--rotate-bound-cidrs without root auth must be rejected");
+        assert!(
+            format!("{err:#}").contains("--rotate-bound-cidrs"),
+            "error must name the flag: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_records_cidr_binding_and_mints_bound_credential() {
+        let dir = tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/sys/policies/acl/{POLICY_BOOTROOT_INFRA_ROTATE}"
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}"
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/role-id"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "role_id": "infra-rotate-role-id" }
+            })))
+            .mount(&server)
+            .await;
+        // The provision mint must carry the operator-supplied binding
+        // (and no num_uses cap: root-mint fallback deployments consume
+        // many logins per credential).
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/secret-id"
+            )))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "token_bound_cidrs": ["10.0.0.5/32"],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "secret_id": "operator-secret" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        let messages = test_messages();
+        let cidrs = vec!["10.0.0.5/32".to_string()];
+        provision_infra_rotate_role(
+            &mut ctx,
+            &client,
+            CidrBindingAction::Set(&cidrs),
+            false,
+            &messages,
+        )
+        .await
+        .expect("provisioning with CIDR binding should succeed");
+
+        assert_eq!(
+            ctx.state
+                .rotate_bound_cidrs
+                .get("infra_rotate")
+                .map(Vec::as_slice),
+            Some(cidrs.as_slice()),
+            "the binding must be recorded for subsequent self-mints"
+        );
+        let saved = fs::read_to_string(&ctx.state_file).expect("state.json saved");
+        assert!(saved.contains("10.0.0.5/32"));
+    }
+
+    #[tokio::test]
+    async fn provision_without_flag_keeps_recorded_cidr_binding() {
+        let dir = tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/sys/policies/acl/{POLICY_BOOTROOT_INFRA_ROTATE}"
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}"
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/role-id"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "role_id": "infra-rotate-role-id" }
+            })))
+            .mount(&server)
+            .await;
+        // Recovery run without the flag: the recorded binding still
+        // applies to the freshly minted operator credential.
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/secret-id"
+            )))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "token_bound_cidrs": ["10.0.0.5/32"],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "secret_id": "operator-secret" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        let label = AppRoleLabel::InfraRotate.to_string();
+        ctx.state
+            .approles
+            .insert(label.clone(), APPROLE_BOOTROOT_INFRA_ROTATE.to_string());
+        ctx.state
+            .policies
+            .insert(label.clone(), POLICY_BOOTROOT_INFRA_ROTATE.to_string());
+        ctx.state
+            .rotate_bound_cidrs
+            .insert(label, vec!["10.0.0.5/32".to_string()]);
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        let messages = test_messages();
+        provision_infra_rotate_role(&mut ctx, &client, CidrBindingAction::Keep, false, &messages)
+            .await
+            .expect("recovery provisioning without the flag should succeed");
+        assert!(
+            !ctx.state_file.exists(),
+            "state.json must not be rewritten when nothing changed"
+        );
+    }
+
+    // Recovery from a bad recorded CIDR: --clear-rotate-bound-cidrs
+    // removes the recorded binding and mints the operator credential
+    // unbound, so subsequent self-mints are unbound too.
+    #[tokio::test]
+    async fn provision_clear_flag_removes_recorded_binding_and_mints_unbound() {
+        let dir = tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/sys/policies/acl/{POLICY_BOOTROOT_INFRA_ROTATE}"
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}"
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/role-id"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "role_id": "infra-rotate-role-id" }
+            })))
+            .mount(&server)
+            .await;
+        // The mint must carry no token_bound_cidrs despite the recorded
+        // binding: the empty JSON body is the unbound assertion.
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/secret-id"
+            )))
+            .and(wiremock::matchers::body_json(serde_json::json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "secret_id": "operator-secret" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        let label = AppRoleLabel::InfraRotate.to_string();
+        ctx.state
+            .approles
+            .insert(label.clone(), APPROLE_BOOTROOT_INFRA_ROTATE.to_string());
+        ctx.state
+            .policies
+            .insert(label.clone(), POLICY_BOOTROOT_INFRA_ROTATE.to_string());
+        ctx.state
+            .rotate_bound_cidrs
+            .insert(label, vec!["192.0.2.9/32".to_string()]);
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        let messages = test_messages();
+        provision_infra_rotate_role(
+            &mut ctx,
+            &client,
+            CidrBindingAction::Clear,
+            false,
+            &messages,
+        )
+        .await
+        .expect("clearing the recorded binding should succeed");
+
+        assert!(
+            !ctx.state.rotate_bound_cidrs.contains_key("infra_rotate"),
+            "the recorded binding must be removed from state"
+        );
+        let saved = fs::read_to_string(&ctx.state_file).expect("state.json saved");
+        assert!(
+            !saved.contains("192.0.2.9/32"),
+            "the cleared binding must not survive in state.json"
+        );
+    }
+
+    // The provisioning path must not reset the infra-rotate role's
+    // secret_id TTL to the default: a deployment initialized with
+    // `--secret-id-ttl 48h` keeps that TTL across a root-token
+    // provisioning or recovery run, matching the threshold `bootroot
+    // status` derives from state.rotate_secret_id_ttl.
+    #[tokio::test]
+    async fn provision_preserves_recorded_secret_id_ttl() {
+        let dir = tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/sys/policies/acl/{POLICY_BOOTROOT_INFRA_ROTATE}"
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}"
+            )))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "token_policies": [POLICY_BOOTROOT_INFRA_ROTATE],
+                "token_ttl": TOKEN_TTL,
+                "token_max_ttl": TOKEN_TTL,
+                "token_renewable": true,
+                "secret_id_ttl": "48h",
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/role-id"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "role_id": "infra-rotate-role-id" }
+            })))
+            .mount(&server)
+            .await;
+        mount_secret_id_mock(APPROLE_BOOTROOT_INFRA_ROTATE)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        ctx.state.rotate_secret_id_ttl = Some("48h".to_string());
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        let messages = test_messages();
+        provision_infra_rotate_role(&mut ctx, &client, CidrBindingAction::Keep, false, &messages)
+            .await
+            .expect("provisioning must keep the recorded secret_id TTL");
+    }
+
+    #[tokio::test]
+    async fn clear_rotate_bound_cidrs_rejected_without_root_auth() {
+        let dir = tempdir().expect("tempdir");
+        let mut ctx = make_ctx(dir.path());
+        // No OpenBao requests may happen; an unroutable URL makes any
+        // accidental call fail loudly.
+        let mut client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
+        client.set_token("infra-rotate-token".to_string());
+        let messages = test_messages();
+        let (runtime_auth, secret_id_file) = approle_auth("ir-role-id", "secret", None);
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file,
+        };
+        let mut args = approle_args(None, false, Some(InfraRoleTarget::Stepca));
+        args.clear_rotate_bound_cidrs = true;
+        let err = rotate_approle_secret_id(&mut ctx, &client, &args, true, &auth, false, &messages)
+            .await
+            .expect_err("--clear-rotate-bound-cidrs without root auth must be rejected");
+        assert!(
+            format!("{err:#}").contains("--clear-rotate-bound-cidrs"),
+            "error must name the flag: {err:#}"
         );
     }
 

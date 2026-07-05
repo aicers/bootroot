@@ -105,6 +105,67 @@ impl Messages {
         )
     }
 
+    pub(crate) fn rotate_summary_self_mint(
+        &self,
+        role_name: &str,
+        num_uses: u32,
+        value: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_summary_self_mint,
+            &[
+                ("role_name", role_name),
+                ("num_uses", &num_uses.to_string()),
+                ("value", value),
+            ],
+        )
+    }
+
+    pub(crate) fn rotate_summary_self_mint_login_ok(&self, role_name: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_self_mint_login_ok,
+            &[("role_name", role_name)],
+        )
+    }
+
+    pub(crate) fn warning_self_mint_skipped_non_file(&self, role_name: &str) -> String {
+        format_template(
+            self.strings().warning_self_mint_skipped_non_file,
+            &[("role_name", role_name)],
+        )
+    }
+
+    pub(crate) fn error_self_mint_failed(&self, role_name: &str) -> String {
+        format_template(
+            self.strings().error_self_mint_failed,
+            &[("role_name", role_name)],
+        )
+    }
+
+    pub(crate) fn error_self_mint_verify_failed(&self, role_name: &str) -> String {
+        format_template(
+            self.strings().error_self_mint_verify_failed,
+            &[("role_name", role_name)],
+        )
+    }
+
+    pub(crate) fn error_rotate_bound_cidrs_requires_provisioning(&self) -> &'static str {
+        self.strings()
+            .error_rotate_bound_cidrs_requires_provisioning
+    }
+
+    pub(crate) fn error_clear_rotate_bound_cidrs_requires_provisioning(&self) -> &'static str {
+        self.strings()
+            .error_clear_rotate_bound_cidrs_requires_provisioning
+    }
+
+    pub(crate) fn error_rotate_bound_cidrs_invalid(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_rotate_bound_cidrs_invalid,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn prompt_rotate_infra_approle_secret_id(&self, role_name: &str) -> String {
         format_template(
             self.strings().prompt_rotate_infra_approle_secret_id,
@@ -163,6 +224,20 @@ impl Messages {
         format_template(
             self.strings().rotate_infra_provisioned_secret_id,
             &[("role_name", role_name), ("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_infra_cidr_binding_kept(&self, role_name: &str, value: &str) -> String {
+        format_template(
+            self.strings().rotate_infra_cidr_binding_kept,
+            &[("role_name", role_name), ("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_infra_cidr_binding_cleared(&self, role_name: &str) -> String {
+        format_template(
+            self.strings().rotate_infra_cidr_binding_cleared,
+            &[("role_name", role_name)],
         )
     }
 

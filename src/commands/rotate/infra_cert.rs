@@ -217,6 +217,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs,
+            ..Default::default()
         };
 
         // Write state under a non-default filename to verify that the
@@ -345,6 +346,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs,
+            ..Default::default()
         };
 
         let state_file = dir.path().join("state.json");

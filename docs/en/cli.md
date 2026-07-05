@@ -324,6 +324,15 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   `bootroot service add --secret-id-ttl` or
   `bootroot service update --secret-id-ttl`.
   See [Operations > SecretID TTL and rotation cadence](operations.md#secretid-ttl-and-rotation-cadence).
+- `--rotate-bound-cidrs`: CIDR ranges to bind the two rotate AppRole
+  credentials (`bootroot-runtime-rotate-role`,
+  `bootroot-infra-rotate-role`) to (repeatable, e.g.
+  `--rotate-bound-cidrs 10.0.0.5/32`). Recorded in `state.json` and
+  re-applied to every self-minted rotate `secret_id`. Supply the source
+  IP OpenBao sees for the control-plane host — it varies by deployment
+  mode, so bootroot never auto-derives it; omitted means no binding
+  (opt-in). Host-boundary control, not process isolation. See
+  [Operations > The rotate credentials' own secret_ids (self-mint)](operations.md#the-rotate-credentials-own-secret_ids-self-mint).
 - `--eab-kid`, `--eab-hmac`: manual EAB input
   (environment variables: `EAB_KID`, `EAB_HMAC`). When both are
   provided, init validates them (non-empty `kid`; `hmac` must
@@ -486,6 +495,12 @@ Checks infra status (including containers) and OpenBao KV/AppRole status.
 
 - Container status summary
 - OpenBao/KV summary
+- Last successful AppRole `secret_id` rotation (when recorded in
+  `state.json`), plus a dead-man **warning** when that timestamp is
+  older than half the rotate roles' `secret_id` TTL (default `24h` →
+  warns past `12h`) — the scheduled rotation job may have silently
+  stopped. See
+  [Operations > Dead-man monitoring and break-glass recovery](operations.md#dead-man-monitoring-and-break-glass-recovery).
 
 ### Failure conditions
 
@@ -493,6 +508,9 @@ The command is considered failed when:
 
 - Missing/unhealthy containers
 - OpenBao API unavailable
+
+The dead-man warning does not fail the command; it is informational
+output to act on.
 
 ### Examples
 
@@ -1430,12 +1448,39 @@ is required:
   (`bootroot-stepca-role` / `bootroot-responder-role`). Authenticate
   with `bootroot-infra-rotate-role` credentials via the usual
   `--auth-mode approle` flags.
+- `--rotate-bound-cidrs`: CIDR ranges to bind the
+  `bootroot-infra-rotate-role` credential to (repeatable). Only valid
+  with `--infra` and only honored on the root-token provisioning run;
+  the binding is recorded in `state.json` and applied to the minted
+  operator credential and every subsequent self-mint. Omitted keeps
+  the recorded binding (the run prints the binding it re-applied).
+- `--clear-rotate-bound-cidrs`: removes the recorded
+  `--rotate-bound-cidrs` binding and mints the operator credential
+  unbound. Only valid with `--infra` and only honored on the
+  root-token provisioning run; conflicts with `--rotate-bound-cidrs`.
+  This is the recovery path for a recorded CIDR that locks the
+  rotation job out — subsequent self-mints are unbound until a
+  provisioning run records a new binding.
 
 The two credentials are deliberately asymmetric: the runtime-rotate
 credential can touch service AppRoles but not the infra roles (the
 infra roles read CA core secrets, so minting their `secret_id`s would
 be a privilege-escalation path), and the infra-rotate credential can
-mint infra `secret_id`s but read nothing from KV.
+mint infra `secret_id`s but read nothing from KV. Each may re-mint
+only its **own** `secret_id` — the self-mint that keeps the scheduled
+rotation job from expiring itself.
+
+Self-mint (mint-own-last): when the run authenticated as a rotate
+AppRole and every target of the invocation succeeded, the command
+re-mints the credential it authenticated with (`num_uses = 6`, the
+recorded `--rotate-bound-cidrs` binding re-applied), verifies the new
+`secret_id` with a login, and atomically replaces the file passed via
+`--approle-secret-id-file`. Inline/env-supplied secret_ids have no
+file to replace — the run warns and skips the self-mint. Root-token
+runs never self-mint. Every successful invocation also records
+`last_secret_id_rotation` in `state.json`, which `bootroot status`
+watches as a dead-man signal. See
+[Operations > The rotate credentials' own secret_ids (self-mint)](operations.md#the-rotate-credentials-own-secret_ids-self-mint).
 
 For infra targets the command writes the new `secret_id` atomically
 (mode `0600`) to `<secrets_dir>/openbao/<stepca|responder>/secret_id`,
@@ -1451,9 +1496,12 @@ rotation once with the root token (`--auth-mode root` or
 `--root-token(-file)`) provisions both, records them in `state.json`,
 and prints the new role's `role_id` and `secret_id` (masked unless
 `--show-secrets`) so day-2 rotations can switch to the scoped
-credential. With AppRole credentials the command never attempts
-provisioning; a missing role surfaces as a permission error with a
-hint.
+credential. The provisioning run preserves the `secret_id` TTL
+recorded at `init --secret-id-ttl` instead of resetting the role to
+the default, so the live credential's lifetime keeps matching the
+threshold `bootroot status` derives from `state.json`. With AppRole
+credentials the command never attempts provisioning; a missing role
+surfaces as a permission error with a hint.
 
 #### `rotate trust-sync`
 

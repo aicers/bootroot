@@ -422,6 +422,7 @@ pub(crate) fn write_minimal_state(
         stepca_bind_addr: snapshot.stepca_bind_addr.clone(),
         stepca_advertise_addr: snapshot.stepca_advertise_addr.clone(),
         infra_certs: snapshot.infra_certs.clone(),
+        ..Default::default()
     };
     state
         .save(state_path)
@@ -966,6 +967,10 @@ fn init_args_for_reinit(
         unseal_key: Vec::new(),
         openbao_unseal_from_file: None,
         secret_id_ttl: crate::commands::init::SECRET_ID_TTL.to_string(),
+        // Reinit wipes OpenBao, so any prior CIDR binding no longer
+        // matches a live credential; the binding is opt-in per init run
+        // and must be re-supplied via `bootroot init --rotate-bound-cidrs`.
+        rotate_bound_cidrs: Vec::new(),
         stepca_password: None,
         db_dsn,
         db_admin: DbAdminDsnArgs { admin_dsn: None },
@@ -1078,6 +1083,7 @@ mod tests {
             stepca_bind_addr: Some("192.168.1.10:9000".to_string()),
             stepca_advertise_addr: None,
             infra_certs,
+            ..Default::default()
         }
     }
 

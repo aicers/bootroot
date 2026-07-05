@@ -17,8 +17,8 @@ use super::http01_admin_tls::{
     build_http01_admin_tls_sans, issue_http01_admin_tls_cert, record_http01_admin_infra_cert,
 };
 use super::openbao_setup::{
-    bootstrap_openbao, configure_openbao, setup_openbao_agents, validate_secret_id_ttl,
-    write_ca_trust_fingerprints_with_retry,
+    bootstrap_openbao, configure_openbao, setup_openbao_agents, validate_rotate_bound_cidrs,
+    validate_secret_id_ttl, write_ca_trust_fingerprints_with_retry,
 };
 use super::openbao_tls::{
     build_openbao_tls_sans, issue_openbao_tls_cert, record_openbao_infra_cert,
@@ -58,6 +58,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     if let Some(warning) = validate_secret_id_ttl(&args.secret_id_ttl, messages)? {
         eprintln!("{warning}");
     }
+    validate_rotate_bound_cidrs(&args.rotate_bound_cidrs, messages)?;
     bootroot::config::validate_cert_duration_vs_default_renew_before(&args.cert_duration)?;
     eprintln!("{}", messages.hint_secret_id_ttl_rotation_cadence());
 
@@ -636,6 +637,8 @@ async fn run_init_inner(
         &args.openbao.kv_mount,
         approles,
         &args.secrets_dir.secrets_dir,
+        &args.rotate_bound_cidrs,
+        &args.secret_id_ttl,
         messages,
     )?;
 
@@ -1093,6 +1096,8 @@ pub(super) fn write_state_file(
     kv_mount: &str,
     approles: BTreeMap<String, String>,
     secrets_dir: &Path,
+    rotate_bound_cidrs: &[String],
+    rotate_secret_id_ttl: &str,
     messages: &Messages,
 ) -> Result<()> {
     write_state_file_to(
@@ -1101,18 +1106,23 @@ pub(super) fn write_state_file(
         kv_mount,
         approles,
         secrets_dir,
+        rotate_bound_cidrs,
+        rotate_secret_id_ttl,
         messages,
     )
 }
 
 /// Inner implementation that accepts an explicit state-file path for
 /// testability.
+#[allow(clippy::too_many_arguments)] // init-time state snapshot: every value is a distinct flag
 fn write_state_file_to(
     state_path: &Path,
     openbao_url: &str,
     kv_mount: &str,
     approles: BTreeMap<String, String>,
     secrets_dir: &Path,
+    rotate_bound_cidrs: &[String],
+    rotate_secret_id_ttl: &str,
     messages: &Messages,
 ) -> Result<()> {
     let (
@@ -1124,6 +1134,7 @@ fn write_state_file_to(
         existing_stepca_bind_addr,
         existing_stepca_advertise_addr,
         existing_infra_certs,
+        existing_last_secret_id_rotation,
     ) = if state_path.exists() {
         let state = StateFile::load(state_path)?;
         (
@@ -1135,6 +1146,7 @@ fn write_state_file_to(
             state.stepca_bind_addr,
             state.stepca_advertise_addr,
             state.infra_certs,
+            state.last_secret_id_rotation,
         )
     } else {
         (
@@ -1146,8 +1158,19 @@ fn write_state_file_to(
             None,
             None,
             BTreeMap::new(),
+            None,
         )
     };
+
+    // The CIDR binding is authoritative per init run (opt-in): the flag
+    // binds both rotate credentials, its absence records no binding —
+    // matching the credentials this run actually minted.
+    let mut rotate_bound_cidrs_map = BTreeMap::new();
+    if !rotate_bound_cidrs.is_empty() {
+        for label in [AppRoleLabel::RuntimeRotate, AppRoleLabel::InfraRotate] {
+            rotate_bound_cidrs_map.insert(label.to_string(), rotate_bound_cidrs.to_vec());
+        }
+    }
 
     let policy_map = AppRoleLabel::policy_map();
     let state = StateFile {
@@ -1164,6 +1187,9 @@ fn write_state_file_to(
         stepca_bind_addr: existing_stepca_bind_addr,
         stepca_advertise_addr: existing_stepca_advertise_addr,
         infra_certs: existing_infra_certs,
+        rotate_bound_cidrs: rotate_bound_cidrs_map,
+        rotate_secret_id_ttl: Some(rotate_secret_id_ttl.to_string()),
+        last_secret_id_rotation: existing_last_secret_id_rotation,
     };
     state
         .save(state_path)
@@ -1478,6 +1504,8 @@ mod tests {
             "secret",
             BTreeMap::new(),
             Path::new("secrets"),
+            &[],
+            "24h",
             &messages,
         );
         assert!(
@@ -1507,6 +1535,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         existing.save(&state_path).unwrap();
         write_state_file_to(
@@ -1515,6 +1544,8 @@ mod tests {
             "secret",
             BTreeMap::new(),
             Path::new("secrets"),
+            &[],
+            "24h",
             &messages,
         )
         .unwrap();
@@ -1523,6 +1554,69 @@ mod tests {
             reloaded.openbao_bind_addr.as_deref(),
             Some("192.168.1.10:8200"),
             "openbao_bind_addr must survive a state rewrite during init"
+        );
+    }
+
+    /// `write_state_file_to` records the rotate-credential fields
+    /// (#672): the operator-supplied CIDR binding for both rotate
+    /// labels, the rotate roles' `secret_id` TTL (the dead-man
+    /// threshold source), and preserves a previously recorded
+    /// rotation-success timestamp across an init re-run.
+    #[test]
+    fn write_state_file_records_rotate_fields_and_preserves_timestamp() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let existing = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            last_secret_id_rotation: Some("2026-07-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        existing.save(&state_path).unwrap();
+        write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &["10.0.0.5/32".to_string()],
+            "48h",
+            &messages,
+        )
+        .unwrap();
+        let reloaded = crate::state::StateFile::load(&state_path).unwrap();
+        for label in ["runtime_rotate", "infra_rotate"] {
+            assert_eq!(
+                reloaded.rotate_bound_cidrs.get(label).map(Vec::as_slice),
+                Some(["10.0.0.5/32".to_string()].as_slice()),
+                "the CIDR binding must be recorded for {label}"
+            );
+        }
+        assert_eq!(reloaded.rotate_secret_id_ttl.as_deref(), Some("48h"));
+        assert_eq!(
+            reloaded.last_secret_id_rotation.as_deref(),
+            Some("2026-07-01T00:00:00Z"),
+            "the dead-man timestamp must survive an init re-run"
+        );
+
+        // Opt-in semantics: an init run without the flag records no
+        // binding (matching the unbound credentials it minted).
+        write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &[],
+            "24h",
+            &messages,
+        )
+        .unwrap();
+        let reloaded = crate::state::StateFile::load(&state_path).unwrap();
+        assert!(
+            reloaded.rotate_bound_cidrs.is_empty(),
+            "omitting --rotate-bound-cidrs must clear the recorded binding"
         );
     }
 
@@ -1548,6 +1642,7 @@ mod tests {
             stepca_bind_addr: Some("0.0.0.0:9000".to_string()),
             stepca_advertise_addr: Some("192.168.1.10:9000".to_string()),
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         existing.save(&state_path).unwrap();
         write_state_file_to(
@@ -1556,6 +1651,8 @@ mod tests {
             "secret",
             BTreeMap::new(),
             Path::new("secrets"),
+            &[],
+            "24h",
             &messages,
         )
         .unwrap();
@@ -1595,6 +1692,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let result = validate_http01_exposed_override_for_init(
@@ -1640,6 +1738,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let result = validate_http01_exposed_override_for_init(
@@ -1682,6 +1781,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         state.save(&state_path).unwrap();
         let has_responder = compose_has_responder(&compose_path, &messages).unwrap();
