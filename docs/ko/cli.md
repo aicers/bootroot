@@ -1453,8 +1453,10 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 - Phase 0 — 사전 점검: 필수 파일 존재 확인, 현재 fingerprint 조회
 - Phase 1 — 백업: 현재 cert/key 파일 백업
 - Phase 2 — 생성: 새 CA 키 쌍 및 인증서 생성
-- Phase 3 — 가산적 trust: 전이 trust(기존 + 신규 fingerprint)를 OpenBao에
-  기록해 서비스가 기존/신규 인증서를 모두 수락하도록 함
+- Phase 3 — 가산적 trust: 전이 trust(기존 + 신규 fingerprint, 두 CA
+  세대를 모두 담은 `ca-bundle.pem`)를 OpenBao에 기록해 서비스가
+  기존/신규 인증서를 모두 수락하고 회전이 진행 중인 동안에도 `bootroot
+  verify`가 통과하도록 함
 - Phase 4 — step-ca 재시작: step-ca 컨테이너를 재시작해 새 키 쌍 적용
 - Phase 5 — 재발급: 서비스 cert/key 삭제 후 bootroot-agent에 시그널
   (daemon은 SIGHUP, Docker는 컨테이너 재시작)을 보내 새 CA로 재발급 유도.

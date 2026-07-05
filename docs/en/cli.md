@@ -1518,7 +1518,9 @@ Phases:
 - Phase 1 — Backup: back up current cert/key files
 - Phase 2 — Generate: create new CA key pair(s) and certificate(s)
 - Phase 3 — Additive trust: write transitional trust (old + new
-  fingerprints) to OpenBao so services accept both old and new certificates
+  fingerprints, with a `ca-bundle.pem` carrying both CA generations) to
+  OpenBao so services accept both old and new certificates and
+  `bootroot verify` passes while the rotation is in flight
 - Phase 4 — Restart step-ca: restart the step-ca container so it uses the
   new key pair
 - Phase 5 — Re-issue: delete service cert/key files and signal

@@ -51,6 +51,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate ca-key` Phase 3 publishing an internally
+  inconsistent transitional trust payload. The fingerprint list
+  correctly carried both CA generations, but the accompanying
+  `ca_bundle_pem` was computed from the live certs — which Phase 2 had
+  already replaced with the new generation — so the OpenBao Agent
+  sidecars rendered a `ca-bundle.pem` missing the old intermediate that
+  the pins still trusted. Any `bootroot verify` run while the rotation
+  was in flight (e.g. after a manual `rotate force-reissue` before
+  finalization) failed with "CA bundle ... is missing trusted
+  fingerprints". Phase 3 now builds the transitional bundle from the
+  live certs plus the Phase-1 backups, deduplicated by fingerprint, so
+  the bundle covers every pinned fingerprint until Phase 6 finalizes.
+  Surfaced by the extended Docker E2E `ca-key-recovery`
+  `scenario-3-partial` case, which verifies mid-rotation.
 - Fixed `bootroot rotate ca-key` leaving local-file services with stale
   trust pins after finalization. Phase 6 (subtractive trust) wrote the
   final fingerprint list to OpenBao KV but — unlike Phase 3 — never

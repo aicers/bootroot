@@ -3485,6 +3485,21 @@ async fn test_rotate_ca_key_full_mode_4_fingerprints() {
     )
     .expect("write rotation-state.json");
 
+    // Any real resumed rotation carries the Phase-1 backups until the
+    // Phase-7 cleanup; Phase 3 reads them to build the transitional
+    // bundle covering both CA generations.
+    let certs_dir = temp_dir.path().join("secrets").join("certs");
+    fs::copy(
+        certs_dir.join("root_ca.crt"),
+        certs_dir.join("root_ca.crt.bak"),
+    )
+    .expect("back up root cert");
+    fs::copy(
+        certs_dir.join("intermediate_ca.crt"),
+        certs_dir.join("intermediate_ca.crt.bak"),
+    )
+    .expect("back up intermediate cert");
+
     // Fake docker for compose restart (Phase 4)
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
