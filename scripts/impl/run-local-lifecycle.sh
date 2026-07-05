@@ -63,6 +63,8 @@ RUNTIME_SERVICE_ADD_ROLE_ID=""
 RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
+INFRA_ROTATE_ROLE_ID=""
+INFRA_ROTATE_SECRET_ID=""
 INIT_ROOT_TOKEN=""
 OPENBAO_RECOVERY_OUTPUT_FILE="$ARTIFACT_DIR/openbao-recovery.json"
 # Use a daemon-deploy service for the OBA exercise so the
@@ -718,11 +720,21 @@ run_bootstrap_chain() {
     jq -r '.approles[] | select(.label == "runtime_rotate") | .secret_id // empty' \
       "$INIT_SUMMARY_JSON"
   )"
+  INFRA_ROTATE_ROLE_ID="$(
+    jq -r '.approles[] | select(.label == "infra_rotate") | .role_id // empty' \
+      "$INIT_SUMMARY_JSON"
+  )"
+  INFRA_ROTATE_SECRET_ID="$(
+    jq -r '.approles[] | select(.label == "infra_rotate") | .secret_id // empty' \
+      "$INIT_SUMMARY_JSON"
+  )"
   INIT_ROOT_TOKEN="$(jq -r '.root_token // empty' "$INIT_SUMMARY_JSON")"
   [ -n "${RUNTIME_SERVICE_ADD_ROLE_ID:-}" ] || fail "Failed to parse runtime_service_add role_id"
   [ -n "${RUNTIME_SERVICE_ADD_SECRET_ID:-}" ] || fail "Failed to parse runtime_service_add secret_id"
   [ -n "${RUNTIME_ROTATE_ROLE_ID:-}" ] || fail "Failed to parse runtime_rotate role_id"
   [ -n "${RUNTIME_ROTATE_SECRET_ID:-}" ] || fail "Failed to parse runtime_rotate secret_id"
+  [ -n "${INFRA_ROTATE_ROLE_ID:-}" ] || fail "Failed to parse infra_rotate role_id"
+  [ -n "${INFRA_ROTATE_SECRET_ID:-}" ] || fail "Failed to parse infra_rotate secret_id"
   [ -n "${INIT_ROOT_TOKEN:-}" ] || fail "Failed to parse init root token"
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 
@@ -1111,7 +1123,54 @@ run_remote_bootstrap() {
   )
 }
 
+rotate_infra_secret_id() {
+  local target="$1"
+  run_bootroot rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --auth-mode approle \
+    --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+    --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+    --yes \
+    approle-secret-id \
+    --infra "$target" >>"$RUN_LOG" 2>&1
+}
+
+run_rotation_infra_secret_id() {
+  log_phase "rotate-infra-secret-id"
+  local target before after
+  for target in stepca responder; do
+    before="$(cat "$SECRETS_DIR/openbao/${target}/secret_id")"
+    rotate_infra_secret_id "$target"
+    after="$(cat "$SECRETS_DIR/openbao/${target}/secret_id")"
+    [ -n "$after" ] || fail "infra secret_id for ${target} is empty after rotation"
+    [ "$before" != "$after" ] || fail "infra secret_id for ${target} did not change"
+  done
+
+  # Privilege-separation boundary (#667): the general runtime-rotate
+  # credential must NOT be able to mint infra secret_ids — that would
+  # let it log in as the stepca role and read CA core secrets.
+  log_phase "rotate-infra-secret-id-denied-for-runtime-rotate"
+  if run_bootroot rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
+    --yes \
+    approle-secret-id \
+    --infra stepca >>"$RUN_LOG" 2>&1; then
+    fail "runtime-rotate credential must not mint infra secret_ids"
+  fi
+}
+
 run_rotations_with_verification() {
+  # Rotate the infra secret_ids first: the stepca-password and
+  # responder-hmac phases below drive the restarted sidecars through
+  # real template renders, verifying they re-authenticated with the
+  # rotated credentials.
+  run_rotation_infra_secret_id
+
   log_phase "rotate-openbao-recovery"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \

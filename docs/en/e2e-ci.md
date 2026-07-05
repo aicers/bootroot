@@ -116,12 +116,15 @@ Execution steps:
    credentials from JSON
 3. `service-add`: add daemon + docker services in `local-file` mode
 4. `verify-initial`: issue/verify initial certs and snapshot fingerprints
-5. `rotate-openbao-recovery`: manually rotate OpenBao root token
-6. `bootstrap-after-openbao-recovery`: re-run remote bootstrap and verify
+5. `rotate-infra-secret-id`: rotate the stepca/responder infra AppRole
+   secret_ids with the dedicated `infra_rotate` credential, then assert
+   the `runtime_rotate` credential is denied on the infra role paths
+6. `rotate-openbao-recovery`: manually rotate OpenBao root token
+7. `bootstrap-after-openbao-recovery`: re-run remote bootstrap and verify
    AppRole-based access continuity
-7. `rotate-responder-hmac`: run rotation and force reissue
-8. `verify-after-responder-hmac`: verify certs again and confirm fingerprint changes
-9. `cleanup`: capture logs/artifacts and tear down Compose
+8. `rotate-responder-hmac`: run rotation and force reissue
+9. `verify-after-responder-hmac`: verify certs again and confirm fingerprint changes
+10. `cleanup`: capture logs/artifacts and tear down Compose
 
 Actual commands (script excerpt):
 
@@ -148,11 +151,23 @@ bootroot service add --service-name edge-proxy --deploy-type daemon \
 bootroot service add --service-name web-app --deploy-type docker \
   --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
 
-# 4) verify-initial / 8) verify-after-responder-hmac
+# 4) verify-initial / 9) verify-after-responder-hmac
 bootroot verify --service-name edge-proxy --agent-config "$AGENT_CONFIG_PATH"
 bootroot verify --service-name web-app --agent-config "$AGENT_CONFIG_PATH"
 
-# 5) rotate-openbao-recovery (manual, explicit operator action)
+# 5) rotate-infra-secret-id
+# from init summary
+#   infra_rotate: role_id/secret_id
+bootroot rotate --compose-file "$COMPOSE_FILE" \
+  --openbao-url "http://127.0.0.1:8200" \
+  --auth-mode approle \
+  --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  --yes approle-secret-id --infra stepca   # then --infra responder
+# negative check: the same command with the runtime_rotate credential
+# must fail with permission denied
+
+# 6) rotate-openbao-recovery (manual, explicit operator action)
 bootroot rotate --compose-file "$COMPOSE_FILE" \
   --openbao-url "http://127.0.0.1:8200" \
   --root-token "$INIT_ROOT_TOKEN" \
@@ -161,7 +176,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
   --rotate-root-token \
   --output "$OPENBAO_RECOVERY_OUTPUT_FILE"
 
-# 7) rotate-responder-hmac
+# 8) rotate-responder-hmac
 # from init summary
 #   runtime_service_add: role_id/secret_id
 #   runtime_rotate: role_id/secret_id

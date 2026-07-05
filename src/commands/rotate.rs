@@ -16,7 +16,9 @@ use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::{RotateArgs, RotateCommand};
 use crate::commands::init::{CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME};
-use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
+use crate::commands::openbao_auth::{
+    RuntimeAuthResolved, authenticate_openbao_client, resolve_runtime_auth,
+};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -207,8 +209,17 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
             .await?;
         }
         RotateCommand::AppRoleSecretId(step_args) => {
-            approle::rotate_approle_secret_id(&mut ctx, &client, step_args, args.yes, messages)
-                .await?;
+            let is_root_auth = matches!(runtime_auth, RuntimeAuthResolved::RootToken(_));
+            approle::rotate_approle_secret_id(
+                &mut ctx,
+                &client,
+                step_args,
+                args.yes,
+                is_root_auth,
+                args.show_secrets,
+                messages,
+            )
+            .await?;
         }
         RotateCommand::TrustSync(_) => {
             ca::rotate_trust_sync(&mut ctx, &client, args.yes, messages).await?;

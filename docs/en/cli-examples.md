@@ -502,6 +502,22 @@ bootroot rotate openbao-recovery --rotate-root-token
 bootroot rotate approle-secret-id --service-name edge-proxy
 bootroot rotate approle-secret-id --service-name web-app
 
+# Rotate the infra AppRole secret_ids consumed by the OpenBao Agent
+# sidecars (requires bootroot-infra-rotate-role credentials, not the
+# runtime-rotate credential used above)
+bootroot rotate \
+  --auth-mode approle \
+  --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  --yes \
+  approle-secret-id --infra stepca
+bootroot rotate \
+  --auth-mode approle \
+  --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  --yes \
+  approle-secret-id --infra responder
+
 # Sync CA trust data to OpenBao and all services
 bootroot rotate trust-sync
 

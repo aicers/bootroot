@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use super::constants::openbao_constants::{
-    APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_RUNTIME_ROTATE,
-    APPROLE_BOOTROOT_RUNTIME_SERVICE_ADD, APPROLE_BOOTROOT_STEPCA, POLICY_BOOTROOT_AGENT,
-    POLICY_BOOTROOT_RESPONDER, POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
-    POLICY_BOOTROOT_STEPCA,
+    APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_INFRA_ROTATE, APPROLE_BOOTROOT_RESPONDER,
+    APPROLE_BOOTROOT_RUNTIME_ROTATE, APPROLE_BOOTROOT_RUNTIME_SERVICE_ADD, APPROLE_BOOTROOT_STEPCA,
+    POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_INFRA_ROTATE, POLICY_BOOTROOT_RESPONDER,
+    POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD, POLICY_BOOTROOT_STEPCA,
 };
 
 /// Identifies a built-in `AppRole` created during `init`.
@@ -20,6 +20,7 @@ pub(crate) enum AppRoleLabel {
     Stepca,
     RuntimeServiceAdd,
     RuntimeRotate,
+    InfraRotate,
 }
 
 impl AppRoleLabel {
@@ -31,6 +32,7 @@ impl AppRoleLabel {
             Self::Stepca,
             Self::RuntimeServiceAdd,
             Self::RuntimeRotate,
+            Self::InfraRotate,
         ]
     }
 
@@ -42,6 +44,7 @@ impl AppRoleLabel {
             Self::Stepca => POLICY_BOOTROOT_STEPCA,
             Self::RuntimeServiceAdd => POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
             Self::RuntimeRotate => POLICY_BOOTROOT_RUNTIME_ROTATE,
+            Self::InfraRotate => POLICY_BOOTROOT_INFRA_ROTATE,
         }
     }
 
@@ -53,6 +56,7 @@ impl AppRoleLabel {
             Self::Stepca => APPROLE_BOOTROOT_STEPCA,
             Self::RuntimeServiceAdd => APPROLE_BOOTROOT_RUNTIME_SERVICE_ADD,
             Self::RuntimeRotate => APPROLE_BOOTROOT_RUNTIME_ROTATE,
+            Self::InfraRotate => APPROLE_BOOTROOT_INFRA_ROTATE,
         }
     }
 
@@ -81,6 +85,7 @@ impl fmt::Display for AppRoleLabel {
             Self::Stepca => "stepca",
             Self::RuntimeServiceAdd => "runtime_service_add",
             Self::RuntimeRotate => "runtime_rotate",
+            Self::InfraRotate => "infra_rotate",
         };
         f.write_str(s)
     }

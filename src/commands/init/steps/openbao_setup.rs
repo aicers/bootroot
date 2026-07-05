@@ -7,8 +7,9 @@ use bootroot::openbao::OpenBaoClient;
 use bootroot::openbao::SecretIdOptions;
 
 use super::super::constants::openbao_constants::{
-    INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, MAX_SECRET_ID_TTL, PATH_AGENT_EAB, PATH_CA_TRUST,
-    PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT,
+    APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_STEPCA, INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD,
+    MAX_SECRET_ID_TTL, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
+    PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_INFRA_ROTATE,
     POLICY_BOOTROOT_RESPONDER, POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
     POLICY_BOOTROOT_STEPCA, RECOMMENDED_SECRET_ID_TTL, TOKEN_TTL,
 };
@@ -483,7 +484,37 @@ path "auth/approle/role/bootroot-service-*/secret-id" {{
 "#
         ),
     );
+    policies.insert(
+        POLICY_BOOTROOT_INFRA_ROTATE.to_string(),
+        infra_rotate_policy(),
+    );
     policies
+}
+
+/// Builds the `bootroot-infra-rotate` policy body.
+///
+/// Grants only what `bootroot rotate approle-secret-id --infra` needs:
+/// minting a fresh `secret_id` for the two infra roles plus reading
+/// their `role_id` (for the on-disk `role_id` backfill and the
+/// post-rotation login verification). Deliberately grants no KV access
+/// and must NOT be widened to `bootroot-service-*` paths — see the
+/// privilege-separation note on [`POLICY_BOOTROOT_INFRA_ROTATE`].
+pub(crate) fn infra_rotate_policy() -> String {
+    format!(
+        r#"path "auth/approle/role/{APPROLE_BOOTROOT_STEPCA}/secret-id" {{
+  capabilities = ["create", "update"]
+}}
+path "auth/approle/role/{APPROLE_BOOTROOT_RESPONDER}/secret-id" {{
+  capabilities = ["create", "update"]
+}}
+path "auth/approle/role/{APPROLE_BOOTROOT_STEPCA}/role-id" {{
+  capabilities = ["read"]
+}}
+path "auth/approle/role/{APPROLE_BOOTROOT_RESPONDER}/role-id" {{
+  capabilities = ["read"]
+}}
+"#
+    )
 }
 
 async fn write_openbao_secrets(
@@ -811,7 +842,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::super::super::constants::openbao_constants::{
-        POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
+        POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_INFRA_ROTATE, POLICY_BOOTROOT_RUNTIME_ROTATE,
+        POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
     };
     use super::super::super::paths::resolve_openbao_agent_addr;
     use super::super::super::types::{AppRoleLabel, AppRoleOutput};
@@ -954,6 +986,30 @@ services:
         assert!(rotate_policy.contains("auth/approle/role/bootroot-service-*/secret-id"));
         assert!(rotate_policy.contains("secret/data/bootroot/ca"));
         assert!(rotate_policy.contains("secret/metadata/bootroot/ca"));
+    }
+
+    #[test]
+    fn test_build_policy_map_infra_rotate_scoped_to_infra_roles_only() {
+        let policies = build_policy_map("secret");
+        let infra_policy = policies.get(POLICY_BOOTROOT_INFRA_ROTATE).unwrap();
+        assert!(infra_policy.contains("auth/approle/role/bootroot-stepca-role/secret-id"));
+        assert!(infra_policy.contains("auth/approle/role/bootroot-responder-role/secret-id"));
+        assert!(infra_policy.contains("auth/approle/role/bootroot-stepca-role/role-id"));
+        assert!(infra_policy.contains("auth/approle/role/bootroot-responder-role/role-id"));
+        // The infra-rotate credential must not touch service roles or KV.
+        assert!(!infra_policy.contains("bootroot-service-"));
+        assert!(!infra_policy.contains("secret/data"));
+    }
+
+    #[test]
+    fn test_build_policy_map_runtime_rotate_excludes_infra_roles() {
+        // Guards the privilege-separation boundary: the general rotate
+        // credential must not be able to mint infra secret_ids, or it
+        // becomes a ladder to the stepca policy's KV surface.
+        let policies = build_policy_map("secret");
+        let rotate_policy = policies.get(POLICY_BOOTROOT_RUNTIME_ROTATE).unwrap();
+        assert!(!rotate_policy.contains("bootroot-stepca-role"));
+        assert!(!rotate_policy.contains("bootroot-responder-role"));
     }
 
     #[test]

@@ -554,16 +554,24 @@ pub(crate) enum RotateCommand {
     #[command(name = "openbao-recovery")]
     OpenBaoRecovery(RotateOpenBaoRecoveryArgs),
     /// Rotates the `OpenBao` `AppRole` `secret_id` for one registered
-    /// service.
+    /// service or one infra role (`--infra stepca|responder`).
     ///
     /// Generates a fresh `secret_id` on the configured `AppRole`. For
     /// local-file services, writes it atomically to the on-disk
     /// `secret_id` file and reloads the local `OpenBao` Agent so the new
     /// credential takes effect. For remote-bootstrap services, publishes
     /// it to the service's KV bootstrap path so the next bootroot-agent
-    /// cycle picks it up. The previous `secret_id` is not explicitly
-    /// revoked; it remains valid until it expires under the `AppRole`'s
-    /// configured TTL.
+    /// cycle picks it up. For infra targets, writes the `secret_id` file
+    /// under `<secrets_dir>/openbao/<name>/` and restarts the matching
+    /// `openbao-agent-stepca` / `openbao-agent-responder` sidecar. The
+    /// previous `secret_id` is not explicitly revoked; it remains valid
+    /// until it expires under the `AppRole`'s configured TTL.
+    ///
+    /// Service targets expect `bootroot-runtime-rotate-role` credentials;
+    /// infra targets expect `bootroot-infra-rotate-role` credentials.
+    /// Running an infra rotation with the root token additionally
+    /// provisions `bootroot-infra-rotate-role` when it does not exist yet
+    /// (upgrade path for deployments initialized before that role).
     #[command(name = "approle-secret-id")]
     AppRoleSecretId(RotateAppRoleSecretIdArgs),
     /// Republishes the current step-ca trust material to every
@@ -693,10 +701,36 @@ pub(crate) struct RotateOpenBaoRecoveryArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(
+    group(
+        ArgGroup::new("approle_target")
+            .required(true)
+            .args(["service_name", "infra"])
+    )
+)]
 pub(crate) struct RotateAppRoleSecretIdArgs {
-    /// App service name to rotate the `AppRole` `secret_id` for
+    /// App service name to rotate the `AppRole` `secret_id` for.
+    ///
+    /// Authenticate with `bootroot-runtime-rotate-role` credentials.
     #[arg(long)]
-    pub(crate) service_name: String,
+    pub(crate) service_name: Option<String>,
+
+    /// Infra role to rotate the `AppRole` `secret_id` for.
+    ///
+    /// Targets the `AppRole`s consumed by the long-running `OpenBao`
+    /// Agent sidecars. Authenticate with `bootroot-infra-rotate-role`
+    /// credentials (or the root token, which also provisions that role
+    /// when missing).
+    #[arg(long, value_enum)]
+    pub(crate) infra: Option<InfraRoleTarget>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InfraRoleTarget {
+    /// `bootroot-stepca-role`, consumed by the `openbao-agent-stepca` sidecar
+    Stepca,
+    /// `bootroot-responder-role`, consumed by the `openbao-agent-responder` sidecar
+    Responder,
 }
 
 #[derive(Args, Debug)]
@@ -1570,7 +1604,69 @@ mod tests {
             "--service-name",
             "api",
         ]);
-        assert!(matches!(cli.command, CliCommand::Rotate(_)));
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::AppRoleSecretId(approle) => {
+                    assert_eq!(approle.service_name.as_deref(), Some("api"));
+                    assert!(approle.infra.is_none());
+                }
+                _ => panic!("expected AppRoleSecretId subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_approle_secret_id_infra() {
+        for (value, expected) in [
+            ("stepca", InfraRoleTarget::Stepca),
+            ("responder", InfraRoleTarget::Responder),
+        ] {
+            let cli =
+                Cli::parse_from(["bootroot", "rotate", "approle-secret-id", "--infra", value]);
+            match cli.command {
+                CliCommand::Rotate(args) => match args.command {
+                    RotateCommand::AppRoleSecretId(approle) => {
+                        assert!(approle.service_name.is_none());
+                        assert_eq!(approle.infra, Some(expected));
+                    }
+                    _ => panic!("expected AppRoleSecretId subcommand"),
+                },
+                _ => panic!("expected Rotate command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_rotate_approle_secret_id_requires_exactly_one_target() {
+        assert!(
+            Cli::try_parse_from(["bootroot", "rotate", "approle-secret-id"]).is_err(),
+            "a target selector must be required"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bootroot",
+                "rotate",
+                "approle-secret-id",
+                "--service-name",
+                "api",
+                "--infra",
+                "stepca",
+            ])
+            .is_err(),
+            "--service-name and --infra must be mutually exclusive"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bootroot",
+                "rotate",
+                "approle-secret-id",
+                "--infra",
+                "not-a-role",
+            ])
+            .is_err(),
+            "--infra must reject values outside the fixed enum"
+        );
     }
 
     #[test]

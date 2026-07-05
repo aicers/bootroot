@@ -442,6 +442,68 @@ If the unwrap call fails because the token was **already unwrapped**
 as a potential security incident. In this case, rotate the `secret_id`
 immediately and investigate the unauthorized access.
 
+## Infra AppRole secret_id rotation (stepca, responder)
+
+The infra AppRoles bootroot creates at init (`bootroot-stepca-role`,
+`bootroot-responder-role`) are consumed by the long-running OpenBao
+Agent sidecars (`openbao-agent-stepca`, `openbao-agent-responder`) and
+share the same `secret_id` TTL as services, so their `secret_id`s must
+be rotated on a cadence too — otherwise the sidecars eventually fail
+OpenBao login with `403 invalid role or secret ID` and the
+cert-issuance machinery behind them stalls.
+
+Rotate them with the `--infra` selector:
+
+```bash
+bootroot rotate \
+  --auth-mode approle \
+  --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  approle-secret-id --infra stepca
+bootroot rotate \
+  --auth-mode approle \
+  --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  approle-secret-id --infra responder
+```
+
+Infra targets require the dedicated `bootroot-infra-rotate-role`
+credential (created at `bootroot init` alongside the other roles). The
+general `bootroot-runtime-rotate-role` credential is intentionally
+denied on the infra role paths: the infra roles read CA core secrets,
+so a credential able to mint their `secret_id`s could escalate to those
+secrets. Conversely, the infra-rotate credential can only mint the two
+infra `secret_id`s (plus read their `role_id`s) and has no KV access.
+
+The command writes the new `secret_id` atomically (mode `0600`) to
+`<secrets_dir>/openbao/<stepca|responder>/secret_id`, restarts the
+matching sidecar container so it re-authenticates, and verifies the
+fresh credential with an AppRole login before reporting success.
+
+**Upgrade note for deployments initialized before this role existed:**
+`bootroot-infra-rotate-role` and its policy are missing on such stacks,
+and the command does not silently assume they exist. Provision them by
+running an `--infra` rotation with the root token:
+
+```bash
+bootroot rotate \
+  --auth-mode root --root-token-file <path> --show-secrets \
+  approle-secret-id --infra stepca
+```
+
+This creates the policy and role, records them in `state.json`, prints
+the new role's `role_id`/`secret_id` (masked without `--show-secrets`),
+and performs the requested rotation. Store the printed credential and
+use it for subsequent `--infra` rotations.
+
+The provisioning is idempotent: every root-token `--infra` run rewrites
+the policy, reapplies the role configuration, backfills missing
+`state.json` entries, and mints a fresh operator `secret_id`. If an
+earlier attempt failed partway, or the printed credential was lost
+before it could be stored, simply re-run the command with the root
+token — the fresh credential replaces the lost one (previously issued
+`secret_id`s stay valid until their TTL).
+
 ## OpenBao restart/recovery checklist
 
 - If OpenBao is `sealed`, unseal it first with unseal keys.

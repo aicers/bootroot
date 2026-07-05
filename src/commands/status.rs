@@ -6,7 +6,9 @@ use crate::commands::infra::{
     ContainerReadiness, collect_container_failures, collect_readiness, default_infra_services,
 };
 use crate::commands::init::{
-    PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
+    APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_INFRA_ROTATE, APPROLE_BOOTROOT_RESPONDER,
+    APPROLE_BOOTROOT_STEPCA, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
+    PATH_STEPCA_PASSWORD,
 };
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -75,9 +77,10 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
     };
 
     let approles = [
-        "bootroot-agent-role",
-        "bootroot-responder-role",
-        "bootroot-stepca-role",
+        APPROLE_BOOTROOT_AGENT,
+        APPROLE_BOOTROOT_RESPONDER,
+        APPROLE_BOOTROOT_STEPCA,
+        APPROLE_BOOTROOT_INFRA_ROTATE,
     ];
     let approle_statuses = if openbao_ok && args.root_token.root_token.is_some() {
         Some(fetch_approle_statuses(&client, &approles, messages).await?)
@@ -270,9 +273,10 @@ fn print_approles_section(messages: &Messages, summary: &StatusSummary<'_>) {
         }
     } else {
         for role in [
-            "bootroot-agent-role",
-            "bootroot-responder-role",
-            "bootroot-stepca-role",
+            APPROLE_BOOTROOT_AGENT,
+            APPROLE_BOOTROOT_RESPONDER,
+            APPROLE_BOOTROOT_STEPCA,
+            APPROLE_BOOTROOT_INFRA_ROTATE,
         ] {
             println!(
                 "{}",
