@@ -482,8 +482,8 @@ fresh credential with an AppRole login before reporting success.
 
 **Upgrade note for deployments initialized before this role existed:**
 `bootroot-infra-rotate-role` and its policy are missing on such stacks,
-and the command does not silently assume they exist. Provision them
-once by running an `--infra` rotation with the root token:
+and the command does not silently assume they exist. Provision them by
+running an `--infra` rotation with the root token:
 
 ```bash
 bootroot rotate \
@@ -495,6 +495,14 @@ This creates the policy and role, records them in `state.json`, prints
 the new role's `role_id`/`secret_id` (masked without `--show-secrets`),
 and performs the requested rotation. Store the printed credential and
 use it for subsequent `--infra` rotations.
+
+The provisioning is idempotent: every root-token `--infra` run rewrites
+the policy, reapplies the role configuration, backfills missing
+`state.json` entries, and mints a fresh operator `secret_id`. If an
+earlier attempt failed partway, or the printed credential was lost
+before it could be stored, simply re-run the command with the root
+token — the fresh credential replaces the lost one (previously issued
+`secret_id`s stay valid until their TTL).
 
 ## OpenBao restart/recovery checklist
 

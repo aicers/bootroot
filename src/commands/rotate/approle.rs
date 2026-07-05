@@ -180,9 +180,11 @@ async fn rotate_infra_approle_secret_id(
 
     // Upgrade path: deployments initialized before the dedicated
     // infra-rotate credential existed can provision it by running this
-    // command once with the root token. AppRole-authenticated runs skip
-    // this entirely (single-auth model: the resolved credential is the
-    // only one the command ever uses).
+    // command with the root token. The provisioning is idempotent, so
+    // re-running recovers a partial earlier attempt and reissues the
+    // operator credential. AppRole-authenticated runs skip this entirely
+    // (single-auth model: the resolved credential is the only one the
+    // command ever uses).
     if is_root_auth {
         provision_infra_rotate_role(ctx, client, show_secrets, messages).await?;
     }
@@ -259,22 +261,22 @@ async fn ensure_infra_role_id_file(
     Ok(role_id)
 }
 
-/// Creates the `bootroot-infra-rotate` policy and `AppRole` when they do
-/// not exist yet, records them in `state.json`, and prints the freshly
-/// minted operator credential (masked unless `--show-secrets`).
+/// Ensures the `bootroot-infra-rotate` policy and `AppRole` are present
+/// and current, backfills missing `state.json` entries, and prints a
+/// freshly minted operator credential (masked unless `--show-secrets`).
+///
+/// Every step is idempotent (`write_policy` and `create_approle` are
+/// create-or-update), so a partial earlier provisioning — role created
+/// but policy/state/credential lost before the run completed — is
+/// recovered by simply re-running the root-token path. A fresh
+/// `secret_id` is minted on every run, which also serves as the recovery
+/// path for a lost operator credential.
 async fn provision_infra_rotate_role(
     ctx: &mut RotateContext,
     client: &OpenBaoClient,
     show_secrets: bool,
     messages: &Messages,
 ) -> Result<()> {
-    if client
-        .approle_exists(APPROLE_BOOTROOT_INFRA_ROTATE)
-        .await
-        .with_context(|| messages.error_openbao_approle_exists_failed())?
-    {
-        return Ok(());
-    }
     client
         .write_policy(POLICY_BOOTROOT_INFRA_ROTATE, &infra_rotate_policy())
         .await
@@ -299,15 +301,21 @@ async fn provision_infra_rotate_role(
         .with_context(|| messages.error_openbao_secret_id_failed())?;
 
     let label = AppRoleLabel::InfraRotate.to_string();
-    ctx.state
+    let prev_approle = ctx
+        .state
         .approles
         .insert(label.clone(), APPROLE_BOOTROOT_INFRA_ROTATE.to_string());
-    ctx.state
+    let prev_policy = ctx
+        .state
         .policies
         .insert(label, POLICY_BOOTROOT_INFRA_ROTATE.to_string());
-    ctx.state
-        .save(&ctx.state_file)
-        .with_context(|| messages.error_serialize_state_failed())?;
+    if prev_approle.as_deref() != Some(APPROLE_BOOTROOT_INFRA_ROTATE)
+        || prev_policy.as_deref() != Some(POLICY_BOOTROOT_INFRA_ROTATE)
+    {
+        ctx.state
+            .save(&ctx.state_file)
+            .with_context(|| messages.error_serialize_state_failed())?;
+    }
 
     println!(
         "{}",
@@ -624,45 +632,15 @@ mod tests {
         );
     }
 
+    // Because every provisioning step is an unconditional
+    // create-or-update (no exists gate), this same path also recovers a
+    // partial earlier attempt: role created in OpenBao but state entries
+    // or the operator credential lost before the run completed.
     #[tokio::test]
     async fn provision_infra_rotate_role_creates_policy_role_and_saves_state() {
         let dir = tempdir().expect("tempdir");
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!(
-                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}"
-            )))
-            .respond_with(ResponseTemplate::new(404).set_body_string(r#"{"errors":[]}"#))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(format!(
-                "/v1/sys/policies/acl/{POLICY_BOOTROOT_INFRA_ROTATE}"
-            )))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(format!(
-                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}"
-            )))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(format!(
-                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/role-id"
-            )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "role_id": "infra-rotate-role-id" }
-            })))
-            .mount(&server)
-            .await;
-        mount_secret_id_mock(APPROLE_BOOTROOT_INFRA_ROTATE)
-            .mount(&server)
-            .await;
+        mount_provisioning_mocks(&server).await;
 
         let mut ctx = make_ctx(dir.path());
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
@@ -684,31 +662,69 @@ mod tests {
         assert!(saved.contains(APPROLE_BOOTROOT_INFRA_ROTATE));
     }
 
-    #[tokio::test]
-    async fn provision_infra_rotate_role_skips_when_role_exists() {
-        let dir = tempdir().expect("tempdir");
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
+    /// Mounts the full set of provisioning mocks: policy write, role
+    /// create-or-update, `role_id` read, and `secret_id` mint — each
+    /// expected exactly once.
+    async fn mount_provisioning_mocks(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/sys/policies/acl/{POLICY_BOOTROOT_INFRA_ROTATE}"
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
             .and(path(format!(
                 "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}"
             )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "token_ttl": 3600 }
-            })))
-            .mount(&server)
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(server)
             .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/role-id"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "role_id": "infra-rotate-role-id" }
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        mount_secret_id_mock(APPROLE_BOOTROOT_INFRA_ROTATE)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    // A fully provisioned deployment still gets the policy/role
+    // refreshed and a fresh operator credential, but state.json is not
+    // rewritten when its entries are already current.
+    #[tokio::test]
+    async fn provision_infra_rotate_role_skips_state_save_when_entries_current() {
+        let dir = tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        mount_provisioning_mocks(&server).await;
 
         let mut ctx = make_ctx(dir.path());
+        let label = AppRoleLabel::InfraRotate.to_string();
+        ctx.state
+            .approles
+            .insert(label.clone(), APPROLE_BOOTROOT_INFRA_ROTATE.to_string());
+        ctx.state
+            .policies
+            .insert(label, POLICY_BOOTROOT_INFRA_ROTATE.to_string());
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
         provision_infra_rotate_role(&mut ctx, &client, false, &messages)
             .await
-            .expect("existing role must be a no-op");
+            .expect("re-provisioning must succeed on a current deployment");
 
         assert!(
             !ctx.state_file.exists(),
-            "state.json must not be rewritten when nothing was provisioned"
+            "state.json must not be rewritten when its entries are already current"
         );
     }
 }

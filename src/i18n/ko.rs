@@ -304,7 +304,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_summary_infra_approle_secret_id: "- 인프라 AppRole {role_name} secret_id 회전: {value}",
     rotate_summary_infra_agent_restarted: "- OpenBao Agent 재시작: {container}",
     rotate_summary_infra_approle_login_ok: "- {role_name} AppRole 로그인 확인",
-    rotate_infra_provisioned_role: "- AppRole {role_name}을(를) 정책 {policy_name}과 함께 생성했습니다",
+    rotate_infra_provisioned_role: "- AppRole {role_name}을(를) 정책 {policy_name}과 함께 프로비저닝했습니다 (없으면 생성, 있으면 갱신)",
     rotate_infra_provisioned_role_id: "- {role_name} role_id: {value}",
     rotate_infra_provisioned_secret_id: "- {role_name} secret_id: {value} (안전하게 보관하세요; 이후 --infra 회전 시 --auth-mode approle과 함께 사용합니다)",
     error_infra_secret_id_mint_failed: "{role_name}의 secret_id 발급에 실패했습니다. 인프라 대상은 bootroot-infra-rotate-role 자격증명(--auth-mode approle)이 필요합니다. 이 역할이 없는 기존 배포에서는 루트 토큰으로 이 명령을 한 번 실행하면 역할이 생성됩니다.",

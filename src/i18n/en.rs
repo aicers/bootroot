@@ -304,7 +304,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_summary_infra_approle_secret_id: "- infra AppRole secret_id rotated for {role_name}: {value}",
     rotate_summary_infra_agent_restarted: "- OpenBao Agent restarted: {container}",
     rotate_summary_infra_approle_login_ok: "- AppRole login OK for {role_name}",
-    rotate_infra_provisioned_role: "- provisioned AppRole {role_name} with policy {policy_name}",
+    rotate_infra_provisioned_role: "- provisioned AppRole {role_name} with policy {policy_name} (created or refreshed)",
     rotate_infra_provisioned_role_id: "- {role_name} role_id: {value}",
     rotate_infra_provisioned_secret_id: "- {role_name} secret_id: {value} (store it securely; use it for future --infra rotations via --auth-mode approle)",
     error_infra_secret_id_mint_failed: "Failed to mint a secret_id for {role_name}. Infra targets require bootroot-infra-rotate-role credentials (--auth-mode approle). On deployments initialized before that role existed, run this command once with the root token to provision it.",

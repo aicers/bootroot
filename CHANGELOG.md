@@ -508,9 +508,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   infra role paths because minting an infra `secret_id` would allow
   logging in as the higher-privilege stepca/responder roles.
   Deployments initialized before the new role existed provision it by
-  running an `--infra` rotation once with the root token, which
-  creates the policy and role, records them in `state.json`, and
-  prints the operator credential (masked unless `--show-secrets`).
+  running an `--infra` rotation with the root token, which creates the
+  policy and role, records them in `state.json`, and prints the
+  operator credential (masked unless `--show-secrets`); the
+  provisioning is idempotent (create-or-update on every step, fresh
+  operator `secret_id` per run), so a partially failed attempt or a
+  lost credential is recovered by re-running with the root token.
   (Closes #667)
 - `bootroot service add` now validates that
   `--deploy-type=docker --container-name=X` actually points at a
