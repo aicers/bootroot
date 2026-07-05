@@ -527,6 +527,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot rotate approle-secret-id` gained an `--all-services`
+  selector (mutually exclusive with `--service-name` and `--infra`)
+  that rotates the `secret_id` of every service registered in
+  `state.json` — both `local-file` and `remote-bootstrap` delivery
+  modes — in one invocation under the existing
+  `bootroot-runtime-rotate-role` credential, so a single scheduled job
+  stays in sync with the registry instead of needing one scheduler
+  unit per service. The batch continues past per-service failures,
+  prints a per-target summary, and exits non-zero if any target
+  failed; an empty registry is a no-op success. Infra roles are
+  deliberately excluded because they use the separate
+  `bootroot-infra-rotate-role` credential (the #667
+  privilege-separation boundary); their two `--infra` invocations are
+  scheduled alongside the batch. The operations guide now carries
+  worked systemd-timer and cron examples that drive the service batch
+  plus the two infra invocations from one scheduled job with
+  least-privilege file-based credentials, recommends an 8–12h
+  interval for the default `24h` TTL (with the smallest-TTL rule when
+  per-service overrides are in play), and documents that neither
+  rotate credential can mint its own `secret_id`, including the
+  interim root-token re-mint procedure until the self-rotation design
+  (#672) lands. (Closes #669)
 - `bootroot rotate approle-secret-id` gained an `--infra
   <stepca|responder>` selector (mutually exclusive with
   `--service-name`) that rotates the `secret_id` of the infra AppRoles

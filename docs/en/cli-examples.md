@@ -499,8 +499,10 @@ bootroot rotate db \
   --db-admin-dsn "postgresql://admin:***@127.0.0.1:5433/postgres"
 bootroot rotate responder-hmac
 bootroot rotate openbao-recovery --rotate-root-token
-bootroot rotate approle-secret-id --service-name edge-proxy
-bootroot rotate approle-secret-id --service-name web-app
+
+# Rotate every registered service secret_id in one invocation
+# (per-service targeting stays available via --service-name)
+bootroot rotate approle-secret-id --all-services
 
 # Rotate the infra AppRole secret_ids consumed by the OpenBao Agent
 # sidecars (requires bootroot-infra-rotate-role credentials, not the
