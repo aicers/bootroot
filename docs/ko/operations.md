@@ -145,11 +145,14 @@ day-2 자동화에서는 root token 대신 AppRole 런타임 인증
 절차용으로만 유지하는 것을 권장합니다.
 `bootroot`는 root token 영구 저장소를 기본 제공하지 않습니다.
 
-예시(크론):
+예시(크론; crontab 항목은 물리적으로 한 줄이어야 합니다 — 크론은 `\`
+줄 연속을 이어 붙이지 않습니다 — 변수 할당은 별도 라인에 둘 수
+있습니다):
 
 ```cron
-0 3 * * 0 OPENBAO_APPROLE_ROLE_ID=... OPENBAO_APPROLE_SECRET_ID=... \
-  bootroot rotate --auth-mode approle stepca-password --yes
+OPENBAO_APPROLE_ROLE_ID=...
+OPENBAO_APPROLE_SECRET_ID=...
+0 3 * * 0 bootroot rotate --auth-mode approle stepca-password --yes
 ```
 
 예시(systemd 타이머):
@@ -263,22 +266,34 @@ WantedBy=timers.target
 유효) 2배 이상 TTL 버퍼가 한 번의 누락을 흡수하지만, 연속 누락이 TTL을
 넘기지 않도록 유닛 실패에 대한 알림을 설정하세요.
 
-동등한 크론 블록(크론은 각 라인을 독립적으로 실행하므로 한 호출의
-실패가 다른 호출을 막지 않습니다):
+크론 동등 구성. crontab 항목은 물리적으로 한 줄이어야 하므로(크론은
+`\` 줄 연속을 이어 붙이지 않습니다), 세 호출을 작은 래퍼 스크립트 —
+예: `/usr/local/sbin/bootroot-rotate-secret-ids`, root 소유, 모드
+`0700` — 에 넣고 크론 항목 하나가 이를 가리키게 하세요. `Type=oneshot`
+유닛과 달리 이 스크립트는 실패한 호출이 있어도 계속 진행하고, 하나라도
+실패하면 0이 아닌 코드로 종료합니다:
 
-```cron
-0 */8 * * * /usr/local/bin/bootroot rotate --auth-mode approle \
+```bash
+#!/bin/sh
+set -u
+status=0
+/usr/local/bin/bootroot rotate --auth-mode approle \
   --approle-role-id-file /etc/bootroot/runtime-rotate/role_id \
   --approle-secret-id-file /etc/bootroot/runtime-rotate/secret_id \
-  approle-secret-id --all-services --yes
-5 */8 * * * /usr/local/bin/bootroot rotate --auth-mode approle \
+  approle-secret-id --all-services --yes || status=1
+/usr/local/bin/bootroot rotate --auth-mode approle \
   --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
   --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
-  approle-secret-id --infra stepca --yes
-10 */8 * * * /usr/local/bin/bootroot rotate --auth-mode approle \
+  approle-secret-id --infra stepca --yes || status=1
+/usr/local/bin/bootroot rotate --auth-mode approle \
   --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
   --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
-  approle-secret-id --infra responder --yes
+  approle-secret-id --infra responder --yes || status=1
+exit "$status"
+```
+
+```cron
+0 */8 * * * /usr/local/sbin/bootroot-rotate-secret-ids
 ```
 
 ### rotate 자격증명 자체의 secret_id

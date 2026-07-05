@@ -151,11 +151,14 @@ For day-2 automation, use runtime AppRole auth (`--auth-mode approle`) instead
 of root token. Root token should be kept for bootstrap/break-glass only.
 `bootroot` does not include a built-in persistent root-token store.
 
-Example (cron):
+Example (cron; a crontab entry must be a single physical line — cron
+does not join `\` continuations — and variable assignments may sit on
+their own lines):
 
 ```cron
-0 3 * * 0 OPENBAO_APPROLE_ROLE_ID=... OPENBAO_APPROLE_SECRET_ID=... \
-  bootroot rotate --auth-mode approle stepca-password --yes
+OPENBAO_APPROLE_ROLE_ID=...
+OPENBAO_APPROLE_SECRET_ID=...
+0 3 * * 0 bootroot rotate --auth-mode approle stepca-password --yes
 ```
 
 Example (systemd timer):
@@ -270,22 +273,34 @@ lines and marks the unit failed. Rotation is idempotent (old
 a single missed run, but alert on unit failures so consecutive misses
 cannot ride past the TTL.
 
-Equivalent cron block (cron runs each line independently, so one
-failing invocation does not block the others):
+Cron equivalent. A crontab entry must be a single physical line (cron
+does not join `\` continuations), so put the three invocations in a
+small wrapper script — e.g. `/usr/local/sbin/bootroot-rotate-secret-ids`,
+root-owned, mode `0700` — and point one cron entry at it. Unlike the
+`Type=oneshot` unit, the script continues past a failing invocation
+and exits non-zero if any invocation failed:
 
-```cron
-0 */8 * * * /usr/local/bin/bootroot rotate --auth-mode approle \
+```bash
+#!/bin/sh
+set -u
+status=0
+/usr/local/bin/bootroot rotate --auth-mode approle \
   --approle-role-id-file /etc/bootroot/runtime-rotate/role_id \
   --approle-secret-id-file /etc/bootroot/runtime-rotate/secret_id \
-  approle-secret-id --all-services --yes
-5 */8 * * * /usr/local/bin/bootroot rotate --auth-mode approle \
+  approle-secret-id --all-services --yes || status=1
+/usr/local/bin/bootroot rotate --auth-mode approle \
   --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
   --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
-  approle-secret-id --infra stepca --yes
-10 */8 * * * /usr/local/bin/bootroot rotate --auth-mode approle \
+  approle-secret-id --infra stepca --yes || status=1
+/usr/local/bin/bootroot rotate --auth-mode approle \
   --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
   --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
-  approle-secret-id --infra responder --yes
+  approle-secret-id --infra responder --yes || status=1
+exit "$status"
+```
+
+```cron
+0 */8 * * * /usr/local/sbin/bootroot-rotate-secret-ids
 ```
 
 ### The rotate credentials' own secret_ids
