@@ -51,6 +51,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate ca-key` leaving local-file services with stale
+  trust pins after finalization. Phase 6 (subtractive trust) wrote the
+  final fingerprint list to OpenBao KV but — unlike Phase 3 — never
+  restarted the per-service OpenBao Agent sidecars, so a local
+  `agent.toml` kept the Phase-3 transitional pins (including the
+  retired intermediate) for up to the sidecar's 30-second static-secret
+  render interval while `ca-bundle.pem` already held only the new
+  generation. `bootroot verify` runs inside that window failed with
+  "CA bundle ... is missing trusted fingerprints". Phase 6 now restarts
+  the sidecars right after the KV write, exactly as Phase 3 does, so
+  pins and bundle converge immediately. Surfaced by the extended Docker
+  E2E `infra-lifecycle` and `ca-key-recovery` cases once the #622
+  fingerprint check landed.
 - Fixed a delivery-mode transition (`local-file` → `remote-bootstrap`
   or the reverse) leaving a duplicate `[[profiles]]` block in
   `agent.toml`. The two code paths wrote their managed profile under

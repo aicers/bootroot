@@ -1527,7 +1527,10 @@ Phases:
   a versioned reissue request to OpenBao KV instead; remote agents pick
   it up on their fast-poll interval (see `rotate force-reissue`)
 - Phase 6 — Finalize trust: write final trust (new fingerprints only) to
-  OpenBao, removing old fingerprints
+  OpenBao, removing old fingerprints, then restart the per-service
+  OpenBao Agent sidecars so local `agent.toml` trust pins and
+  `ca-bundle.pem` re-render immediately instead of waiting out the
+  static-secret render interval
 - Phase 7 — Cleanup: delete `rotation-state.json` and optionally remove
   backup files
 

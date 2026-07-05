@@ -1462,7 +1462,9 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
   기록하며, 원격 agent가 fast-poll 주기에 이를 처리합니다(`rotate
   force-reissue` 참고)
 - Phase 6 — trust 확정: 최종 trust(신규 fingerprint만)를 OpenBao에 기록해
-  기존 fingerprint 제거
+  기존 fingerprint를 제거한 뒤, 서비스별 OpenBao Agent 사이드카를
+  재시작해 로컬 `agent.toml`의 trust 핀과 `ca-bundle.pem`이 static-secret
+  렌더링 주기를 기다리지 않고 즉시 다시 렌더링되도록 합니다
 - Phase 7 — 정리: `rotation-state.json` 삭제, 선택적으로 백업 파일 제거
 
 중간 CA만 교체하는 모드는 3-fingerprint 전이 trust(기존 루트, 기존 중간,

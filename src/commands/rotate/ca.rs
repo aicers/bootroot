@@ -310,6 +310,13 @@ pub(super) async fn rotate_ca_key(
         )
         .await?;
 
+        // Without a restart the sidecars keep serving the Phase-3
+        // transitional pin list (which still includes the retired
+        // intermediate) for up to the 30s static-secret render
+        // interval, so `bootroot verify` sees agent.toml pins that the
+        // finalized bundle no longer contains.
+        restart_openbao_agent_sidecars(ctx, messages);
+
         rot_state.phase = 6;
         update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
     } else if start_phase < 6 {
