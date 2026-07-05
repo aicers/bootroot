@@ -745,7 +745,8 @@ pub(crate) struct RotateAppRoleSecretIdArgs {
     /// self-minted `secret_id`. Supply the source IP `OpenBao` sees for
     /// the control-plane host — it varies by deployment mode, so bootroot
     /// never auto-derives it. Omitted = the recorded binding (if any) is
-    /// kept. Host-boundary control, not process isolation.
+    /// kept; pass `--clear-rotate-bound-cidrs` to remove it.
+    /// Host-boundary control, not process isolation.
     ///
     /// `conflicts_with_all` (rather than `requires = "infra"`) pins the
     /// flag to the infra target: clap treats a `requires` on a member of
@@ -755,6 +756,19 @@ pub(crate) struct RotateAppRoleSecretIdArgs {
         conflicts_with_all = ["service_name", "all_services"]
     )]
     pub(crate) rotate_bound_cidrs: Vec<String>,
+
+    /// Removes the recorded `--rotate-bound-cidrs` binding and mints the
+    /// operator credential unbound.
+    ///
+    /// Only honored on the root-token provisioning run (`--infra` with
+    /// root auth). This is the recovery path for a recorded CIDR that
+    /// locks the rotation job out: subsequent self-mints are unbound
+    /// until a provisioning run records a new binding.
+    #[arg(
+        long = "clear-rotate-bound-cidrs",
+        conflicts_with_all = ["service_name", "all_services", "rotate_bound_cidrs"]
+    )]
+    pub(crate) clear_rotate_bound_cidrs: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1812,6 +1826,63 @@ mod tests {
             ])
             .is_err(),
             "--rotate-bound-cidrs must require --infra"
+        );
+    }
+
+    #[test]
+    fn test_cli_parses_clear_rotate_bound_cidrs() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "approle-secret-id",
+            "--infra",
+            "stepca",
+            "--clear-rotate-bound-cidrs",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::AppRoleSecretId(approle) => {
+                    assert!(approle.clear_rotate_bound_cidrs);
+                    assert!(approle.rotate_bound_cidrs.is_empty());
+                }
+                _ => panic!("expected AppRoleSecretId subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_clear_rotate_bound_cidrs_conflicts_with_set() {
+        // Setting and clearing the binding in one run is contradictory;
+        // reject it at parse time.
+        assert!(
+            Cli::try_parse_from([
+                "bootroot",
+                "rotate",
+                "approle-secret-id",
+                "--infra",
+                "stepca",
+                "--rotate-bound-cidrs",
+                "10.0.0.5/32",
+                "--clear-rotate-bound-cidrs",
+            ])
+            .is_err(),
+            "--clear-rotate-bound-cidrs must conflict with --rotate-bound-cidrs"
+        );
+    }
+
+    #[test]
+    fn test_cli_clear_rotate_bound_cidrs_requires_infra_target() {
+        assert!(
+            Cli::try_parse_from([
+                "bootroot",
+                "rotate",
+                "approle-secret-id",
+                "--all-services",
+                "--clear-rotate-bound-cidrs",
+            ])
+            .is_err(),
+            "--clear-rotate-bound-cidrs must require --infra"
         );
     }
 

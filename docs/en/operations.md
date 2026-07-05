@@ -374,8 +374,12 @@ OpenBao actually sees (e.g. the `remote_address` field of a login
 entry in the audit log) before binding, because a wrong CIDR locks the
 scheduled job out — the self-mint's login verification catches this
 (the run fails and keeps the old, working credential file), but the
-binding must then be fixed before the TTL runs out. When the flag is
-omitted, no binding is applied (opt-in).
+binding must then be fixed before the TTL runs out: re-run the
+root-token infra provisioning with a corrected `--rotate-bound-cidrs`,
+or with `--clear-rotate-bound-cidrs` to drop the binding entirely.
+When the flag is omitted, no binding is applied (opt-in); a later
+provisioning run without the flag keeps whatever binding is recorded
+and prints it, so the hardening is never dropped silently.
 
 This is a **host-boundary control, not process isolation**: OpenBao
 sees only source IPs, so processes co-located on the control-plane
@@ -420,7 +424,10 @@ routine task):
   --show-secrets approle-secret-id --infra stepca --yes`) — every
   root-token run mints and prints a fresh infra-rotate credential
   (re-supply `--rotate-bound-cidrs` here only to change the recorded
-  binding; omitting it keeps the recorded one).
+  binding; omitting it keeps the recorded one, and the run prints the
+  binding it re-applied). If the recorded CIDR itself is what locked
+  the job out, pass `--clear-rotate-bound-cidrs` to remove it and
+  mint unbound.
 - runtime-rotate: mint directly against OpenBao with the root token,
   e.g. `docker compose exec -e BAO_TOKEN=<root-token> openbao bao
   write -f auth/approle/role/bootroot-runtime-rotate-role/secret-id`.

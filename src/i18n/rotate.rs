@@ -154,6 +154,11 @@ impl Messages {
             .error_rotate_bound_cidrs_requires_provisioning
     }
 
+    pub(crate) fn error_clear_rotate_bound_cidrs_requires_provisioning(&self) -> &'static str {
+        self.strings()
+            .error_clear_rotate_bound_cidrs_requires_provisioning
+    }
+
     pub(crate) fn error_rotate_bound_cidrs_invalid(&self, value: &str) -> String {
         format_template(
             self.strings().error_rotate_bound_cidrs_invalid,
@@ -219,6 +224,20 @@ impl Messages {
         format_template(
             self.strings().rotate_infra_provisioned_secret_id,
             &[("role_name", role_name), ("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_infra_cidr_binding_kept(&self, role_name: &str, value: &str) -> String {
+        format_template(
+            self.strings().rotate_infra_cidr_binding_kept,
+            &[("role_name", role_name), ("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_infra_cidr_binding_cleared(&self, role_name: &str) -> String {
+        format_template(
+            self.strings().rotate_infra_cidr_binding_cleared,
+            &[("role_name", role_name)],
         )
     }
 

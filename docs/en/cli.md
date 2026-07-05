@@ -1453,7 +1453,14 @@ is required:
   with `--infra` and only honored on the root-token provisioning run;
   the binding is recorded in `state.json` and applied to the minted
   operator credential and every subsequent self-mint. Omitted keeps
-  the recorded binding.
+  the recorded binding (the run prints the binding it re-applied).
+- `--clear-rotate-bound-cidrs`: removes the recorded
+  `--rotate-bound-cidrs` binding and mints the operator credential
+  unbound. Only valid with `--infra` and only honored on the
+  root-token provisioning run; conflicts with `--rotate-bound-cidrs`.
+  This is the recovery path for a recorded CIDR that locks the
+  rotation job out — subsequent self-mints are unbound until a
+  provisioning run records a new binding.
 
 The two credentials are deliberately asymmetric: the runtime-rotate
 credential can touch service AppRoles but not the infra roles (the
@@ -1489,9 +1496,12 @@ rotation once with the root token (`--auth-mode root` or
 `--root-token(-file)`) provisions both, records them in `state.json`,
 and prints the new role's `role_id` and `secret_id` (masked unless
 `--show-secrets`) so day-2 rotations can switch to the scoped
-credential. With AppRole credentials the command never attempts
-provisioning; a missing role surfaces as a permission error with a
-hint.
+credential. The provisioning run preserves the `secret_id` TTL
+recorded at `init --secret-id-ttl` instead of resetting the role to
+the default, so the live credential's lifetime keeps matching the
+threshold `bootroot status` derives from `state.json`. With AppRole
+credentials the command never attempts provisioning; a missing role
+surfaces as a permission error with a hint.
 
 #### `rotate trust-sync`
 

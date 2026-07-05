@@ -541,16 +541,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   credentials carry `num_uses = 6` (3× the logins enumerated per
   re-mint cycle) and re-apply the operator-supplied CIDR binding
   recorded by the new `--rotate-bound-cidrs` flag on `bootroot init`
-  and on the root-token infra provisioning run. Inline/env-supplied
-  credentials produce a prominent skip warning (no file to replace);
-  root-token runs never self-mint — re-minting under root auth is the
-  break-glass recovery path, which the operations guide now documents
-  as such (downgraded from the interim routine procedure), together
-  with the audit events to alert on (`secret_id` mints against the two
-  rotate role paths). Dead-man monitoring closes the remaining lockout
-  path: every successful invocation records `last_secret_id_rotation`
-  in `state.json`, and `bootroot status` warns when it is older than
-  half the rotate roles' `secret_id` TTL. (Closes #672)
+  and on the root-token infra provisioning run; a provisioning run
+  without the flag keeps the recorded binding and prints it, and the
+  new `--clear-rotate-bound-cidrs` flag removes it — the recovery
+  path for a recorded CIDR that locks the rotation job out. The
+  provisioning run also preserves the `secret_id` TTL recorded at
+  `init --secret-id-ttl` instead of resetting the role to the
+  default. Inline/env-supplied credentials produce a prominent skip
+  warning (no file to replace); root-token runs never self-mint —
+  re-minting under root auth is the break-glass recovery path, which
+  the operations guide now documents as such (downgraded from the
+  interim routine procedure), together with the audit events to alert
+  on (`secret_id` mints against the two rotate role paths). Dead-man
+  monitoring closes the remaining lockout path: every successful
+  invocation records `last_secret_id_rotation` in `state.json` — only
+  after the self-mint step, so a failed self-mint cannot suppress the
+  warning — and `bootroot status` warns when it is older than half
+  the rotate roles' `secret_id` TTL. (Closes #672)
 - `bootroot rotate approle-secret-id` gained an `--all-services`
   selector (mutually exclusive with `--service-name` and `--infra`)
   that rotates the `secret_id` of every service registered in
