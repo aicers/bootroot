@@ -368,6 +368,70 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_stepca_bind_requires_stepca(&self) -> &'static str {
+        self.strings().error_stepca_bind_requires_stepca
+    }
+
+    pub(crate) fn error_stepca_bind_invalid_format(&self) -> &'static str {
+        self.strings().error_stepca_bind_invalid_format
+    }
+
+    pub(crate) fn error_stepca_bind_wildcard_required(&self) -> &'static str {
+        self.strings().error_stepca_bind_wildcard_required
+    }
+
+    pub(crate) fn error_stepca_bind_ipv6_requires_brackets(&self) -> &'static str {
+        self.strings().error_stepca_bind_ipv6_requires_brackets
+    }
+
+    pub(crate) fn error_stepca_advertise_addr_required(&self) -> &'static str {
+        self.strings().error_stepca_advertise_addr_required
+    }
+
+    pub(crate) fn error_stepca_advertise_addr_invalid(&self) -> &'static str {
+        self.strings().error_stepca_advertise_addr_invalid
+    }
+
+    pub(crate) fn error_stepca_advertise_addr_ipv6_requires_brackets(&self) -> &'static str {
+        self.strings()
+            .error_stepca_advertise_addr_ipv6_requires_brackets
+    }
+
+    pub(crate) fn error_stepca_advertise_addr_not_reachable(&self) -> &'static str {
+        self.strings().error_stepca_advertise_addr_not_reachable
+    }
+
+    pub(crate) fn error_stepca_advertise_addr_specific_bind_rejected(&self) -> &'static str {
+        self.strings()
+            .error_stepca_advertise_addr_specific_bind_rejected
+    }
+
+    pub(crate) fn info_stepca_bind_intent_recorded(&self, addr: &str) -> String {
+        format_template(
+            self.strings().info_stepca_bind_intent_recorded,
+            &[("addr", addr)],
+        )
+    }
+
+    pub(crate) fn info_stepca_bind_intent_cleared(&self) -> &'static str {
+        self.strings().info_stepca_bind_intent_cleared
+    }
+
+    pub(crate) fn error_stepca_override_file_missing(&self) -> &'static str {
+        self.strings().error_stepca_override_file_missing
+    }
+
+    pub(crate) fn error_stepca_override_binding_mismatch(
+        &self,
+        expected: &str,
+        actual: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_stepca_override_binding_mismatch,
+            &[("expected", expected), ("actual", actual)],
+        )
+    }
+
     pub(crate) fn info_openbao_tls_provisioned(&self, path: &str) -> String {
         format_template(
             self.strings().info_openbao_tls_provisioned,

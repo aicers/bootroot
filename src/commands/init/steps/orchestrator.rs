@@ -43,7 +43,8 @@ use crate::commands::guardrails::{
     validate_openbao_override_binding, validate_openbao_override_scope, validate_openbao_tls,
 };
 use crate::commands::infra::{
-    ensure_init_prereqs_ready, has_http01_admin_bind_intent, has_openbao_bind_intent, run_docker,
+    ensure_init_prereqs_ready, has_http01_admin_bind_intent, has_openbao_bind_intent,
+    resolve_stepca_exposed_override, run_docker,
 };
 use crate::commands::init::{
     HTTP01_ADMIN_TLS_CERT_REL_PATH, HTTP01_ADMIN_TLS_KEY_REL_PATH,
@@ -450,6 +451,38 @@ async fn run_init_inner(
         let compose_str = args.compose.compose_file.to_string_lossy();
         let restart_args = ["compose", "-f", &*compose_str, "restart", "step-ca"];
         let _ = run_docker(&restart_args, "docker compose restart step-ca", messages);
+    }
+    // Apply the step-ca exposed override when a bind intent is stored.
+    // `infra install --stepca-bind` records the intent and writes the
+    // override but starts step-ca on the base compose file (loopback
+    // publish); init is the next lifecycle command, so without this
+    // step the documented fresh path `infra install --stepca-bind` ->
+    // `init` would leave the ACME directory unreachable from remote
+    // nodes until a separate `infra up`.  Unlike the OpenBao / HTTP-01
+    // admin overrides below there is no TLS gate to sequence around —
+    // step-ca always terminates TLS — so the override applies as soon
+    // as the stored intent validates.  `--no-deps` is load-bearing for
+    // the same reason as the responder invocation below: this compose
+    // file set does not include the openbao / http01 overrides, so
+    // compose must not touch the dependency containers with a merged
+    // config that would drop their non-loopback publishes.
+    if let Some(stepca_override) =
+        resolve_stepca_exposed_override(&StateFile::default_path(), compose_dir, messages)?
+    {
+        let compose_str = args.compose.compose_file.to_string_lossy();
+        let override_str = stepca_override.to_string_lossy();
+        let up_args = [
+            "compose",
+            "-f",
+            &*compose_str,
+            "-f",
+            &*override_str,
+            "up",
+            "-d",
+            "--no-deps",
+            "step-ca",
+        ];
+        run_docker(&up_args, "docker compose up -d step-ca (exposed)", messages)?;
     }
     let stepca_templates = write_stepca_templates(
         &secrets_dir,
@@ -1088,6 +1121,8 @@ fn write_state_file_to(
         existing_openbao_advertise_addr,
         existing_http01_admin_bind_addr,
         existing_http01_admin_advertise_addr,
+        existing_stepca_bind_addr,
+        existing_stepca_advertise_addr,
         existing_infra_certs,
     ) = if state_path.exists() {
         let state = StateFile::load(state_path)?;
@@ -1097,10 +1132,21 @@ fn write_state_file_to(
             state.openbao_advertise_addr,
             state.http01_admin_bind_addr,
             state.http01_admin_advertise_addr,
+            state.stepca_bind_addr,
+            state.stepca_advertise_addr,
             state.infra_certs,
         )
     } else {
-        (BTreeMap::new(), None, None, None, None, BTreeMap::new())
+        (
+            BTreeMap::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+        )
     };
 
     let policy_map = AppRoleLabel::policy_map();
@@ -1115,6 +1161,8 @@ fn write_state_file_to(
         openbao_advertise_addr: existing_openbao_advertise_addr,
         http01_admin_bind_addr: existing_http01_admin_bind_addr,
         http01_admin_advertise_addr: existing_http01_admin_advertise_addr,
+        stepca_bind_addr: existing_stepca_bind_addr,
+        stepca_advertise_addr: existing_stepca_advertise_addr,
         infra_certs: existing_infra_certs,
     };
     state
@@ -1456,6 +1504,8 @@ mod tests {
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         existing.save(&state_path).unwrap();
@@ -1473,6 +1523,52 @@ mod tests {
             reloaded.openbao_bind_addr.as_deref(),
             Some("192.168.1.10:8200"),
             "openbao_bind_addr must survive a state rewrite during init"
+        );
+    }
+
+    /// `write_state_file_to` preserves `stepca_bind_addr` /
+    /// `stepca_advertise_addr` from an existing, valid state file so
+    /// that an `init` re-run does not erase the step-ca exposure intent.
+    #[test]
+    fn write_state_file_preserves_stepca_bind_intent() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let existing = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            policies: BTreeMap::new(),
+            approles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            openbao_bind_addr: None,
+            openbao_advertise_addr: None,
+            http01_admin_bind_addr: None,
+            http01_admin_advertise_addr: None,
+            stepca_bind_addr: Some("0.0.0.0:9000".to_string()),
+            stepca_advertise_addr: Some("192.168.1.10:9000".to_string()),
+            infra_certs: BTreeMap::new(),
+        };
+        existing.save(&state_path).unwrap();
+        write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &messages,
+        )
+        .unwrap();
+        let reloaded = crate::state::StateFile::load(&state_path).unwrap();
+        assert_eq!(
+            reloaded.stepca_bind_addr.as_deref(),
+            Some("0.0.0.0:9000"),
+            "stepca_bind_addr must survive a state rewrite during init"
+        );
+        assert_eq!(
+            reloaded.stepca_advertise_addr.as_deref(),
+            Some("192.168.1.10:9000"),
+            "stepca_advertise_addr must survive a state rewrite during init"
         );
     }
 
@@ -1496,6 +1592,8 @@ mod tests {
             openbao_advertise_addr: None,
             http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         state.save(&state_path).unwrap();
@@ -1539,6 +1637,8 @@ mod tests {
             openbao_advertise_addr: None,
             http01_admin_bind_addr: Some("10.0.0.5:8080".to_string()),
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         state.save(&state_path).unwrap();
@@ -1579,6 +1679,8 @@ mod tests {
             openbao_advertise_addr: None,
             http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         state.save(&state_path).unwrap();

@@ -8,7 +8,7 @@ use x509_parser::pem::parse_x509_pem;
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME,
     HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
-    RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
+    RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
 };
 use crate::i18n::Messages;
 
@@ -410,6 +410,190 @@ pub(crate) fn validate_http01_override_scope(
         if service == "bootroot-http01:" {
             continue;
         }
+        if has_unsafe_port_binding_for_service(&content, service) {
+            let name = service.trim_end_matches(':');
+            anyhow::bail!(messages.error_service_port_binding_unsafe(name));
+        }
+    }
+    Ok(())
+}
+
+/// Validates the `--stepca-bind` CLI flag value.
+///
+/// Reuses the same IP:port format and wildcard rules as `OpenBao` binding.
+/// step-ca's ACME directory already terminates TLS with the step-ca
+/// certificate, so no TLS acknowledgement flag is required.
+///
+/// # Errors
+///
+/// Returns an error when the format is invalid or `0.0.0.0` is used
+/// without `--stepca-bind-wildcard`.
+pub(crate) fn validate_stepca_bind(
+    bind_addr: &str,
+    wildcard_confirmed: bool,
+    messages: &Messages,
+) -> Result<()> {
+    let Some((ip_raw, port_str)) = bind_addr.rsplit_once(':') else {
+        anyhow::bail!(messages.error_stepca_bind_invalid_format());
+    };
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!(messages.error_stepca_bind_invalid_format()))?;
+    if port == 0 {
+        anyhow::bail!(messages.error_stepca_bind_invalid_format());
+    }
+    if ip_raw.is_empty() {
+        anyhow::bail!(messages.error_stepca_bind_invalid_format());
+    }
+    if ip_raw.contains(':') && !(ip_raw.starts_with('[') && ip_raw.ends_with(']')) {
+        anyhow::bail!(messages.error_stepca_bind_ipv6_requires_brackets());
+    }
+    let ip_str = ip_raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(ip_raw);
+    let ip: IpAddr = ip_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!(messages.error_stepca_bind_invalid_format()))?;
+    if ip.is_unspecified() && !wildcard_confirmed {
+        anyhow::bail!(messages.error_stepca_bind_wildcard_required());
+    }
+    Ok(())
+}
+
+/// Validates the step-ca advertise address format.
+///
+/// Rejects wildcard, loopback, malformed, and port-zero values because
+/// remote nodes need to reach this address.
+///
+/// # Errors
+///
+/// Returns an error when the format is invalid or the address is
+/// wildcard / loopback.
+pub(crate) fn validate_stepca_advertise_addr(addr: &str, messages: &Messages) -> Result<()> {
+    let Some((ip_raw, port_str)) = addr.rsplit_once(':') else {
+        anyhow::bail!(messages.error_stepca_advertise_addr_invalid());
+    };
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!(messages.error_stepca_advertise_addr_invalid()))?;
+    if port == 0 {
+        anyhow::bail!(messages.error_stepca_advertise_addr_invalid());
+    }
+    if ip_raw.is_empty() {
+        anyhow::bail!(messages.error_stepca_advertise_addr_invalid());
+    }
+    if ip_raw.contains(':') && !(ip_raw.starts_with('[') && ip_raw.ends_with(']')) {
+        anyhow::bail!(messages.error_stepca_advertise_addr_ipv6_requires_brackets());
+    }
+    let ip_str = ip_raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(ip_raw);
+    let ip: IpAddr = ip_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!(messages.error_stepca_advertise_addr_invalid()))?;
+    if ip.is_unspecified() || ip.is_loopback() {
+        anyhow::bail!(messages.error_stepca_advertise_addr_not_reachable());
+    }
+    Ok(())
+}
+
+/// Rejects `--stepca-advertise-addr` when the bind address is a
+/// specific IP rather than a wildcard.
+///
+/// # Errors
+///
+/// Returns an error when `advertise_addr` is `Some` and `bind_addr` is
+/// not a wildcard.
+pub(crate) fn reject_stepca_advertise_addr_for_specific_bind(
+    bind_addr: &str,
+    advertise_addr: Option<&str>,
+    messages: &Messages,
+) -> Result<()> {
+    if !is_wildcard_bind(bind_addr) && advertise_addr.is_some() {
+        anyhow::bail!(messages.error_stepca_advertise_addr_specific_bind_rejected());
+    }
+    Ok(())
+}
+
+/// Generates the compose override file that exposes step-ca's ACME
+/// directory on a non-loopback address.
+///
+/// # Errors
+///
+/// Returns an error if the override file cannot be written.
+pub(crate) fn write_stepca_exposed_override(
+    compose_dir: &Path,
+    bind_addr: &str,
+    messages: &Messages,
+) -> Result<PathBuf> {
+    let override_dir = compose_dir.join("secrets").join("step-ca");
+    if !override_dir.exists() {
+        fs::create_dir_all(&override_dir).with_context(|| {
+            messages.error_write_file_failed(&override_dir.display().to_string())
+        })?;
+    }
+    let override_path = override_dir.join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
+    let content = format!(
+        "\
+services:
+  step-ca:
+    ports: !override
+      - \"{bind_addr}:9000\"
+"
+    );
+    fs::write(&override_path, content)
+        .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+    Ok(override_path)
+}
+
+/// Validates that the step-ca compose override port mapping matches the
+/// bind address stored in `StateFile`.
+///
+/// # Errors
+///
+/// Returns an error when the override contains no step-ca port mapping,
+/// more than one mapping, or a mapping that does not match the expected
+/// `{bind_addr}:9000` value.
+pub(crate) fn validate_stepca_override_binding(
+    override_path: &Path,
+    expected_bind_addr: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let content = fs::read_to_string(override_path)
+        .with_context(|| messages.error_read_file_failed(&override_path.display().to_string()))?;
+    let mappings = collect_port_mappings_for_service(&content, "step-ca:");
+    let expected = format!("{expected_bind_addr}:9000");
+    if mappings.len() != 1 || mappings.first().map(String::as_str) != Some(expected.as_str()) {
+        let actual = if mappings.is_empty() {
+            "(none)".to_string()
+        } else {
+            mappings.join(", ")
+        };
+        anyhow::bail!(messages.error_stepca_override_binding_mismatch(&expected, &actual));
+    }
+    Ok(())
+}
+
+/// Validates that the step-ca compose override does not introduce
+/// non-loopback port bindings for any guarded service.
+///
+/// step-ca itself is not in `GUARDED_SERVICES`, so every guarded service
+/// is checked — a tampered override must not expose postgres, `OpenBao`,
+/// or the HTTP-01 responder.
+///
+/// # Errors
+///
+/// Returns an error naming the first guarded service that publishes a
+/// non-loopback port.
+pub(crate) fn validate_stepca_override_scope(
+    override_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let content = fs::read_to_string(override_path)
+        .with_context(|| messages.error_read_file_failed(&override_path.display().to_string()))?;
+    for service in GUARDED_SERVICES {
         if has_unsafe_port_binding_for_service(&content, service) {
             let name = service.trim_end_matches(':');
             anyhow::bail!(messages.error_service_port_binding_unsafe(name));
@@ -2545,6 +2729,195 @@ services:
         )
         .unwrap();
         assert!(validate_http01_override_scope(&path, &messages).is_err());
+    }
+
+    // --- step-ca bind validation ---
+
+    #[test]
+    fn validate_stepca_bind_accepts_specific_ip() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_bind("192.168.1.10:9000", false, &messages).is_ok());
+    }
+
+    #[test]
+    fn validate_stepca_bind_rejects_missing_port() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_bind("192.168.1.10", false, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_stepca_bind_rejects_port_zero() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_bind("192.168.1.10:0", false, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_stepca_bind_rejects_wildcard_without_flag() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_bind("0.0.0.0:9000", false, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_stepca_bind_accepts_wildcard_with_flag() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_bind("0.0.0.0:9000", true, &messages).is_ok());
+    }
+
+    #[test]
+    fn validate_stepca_bind_rejects_bare_ipv6() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_bind("::1:9000", false, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_stepca_bind_accepts_bracketed_ipv6() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_bind("[::1]:9000", false, &messages).is_ok());
+    }
+
+    // --- step-ca advertise-addr validation ---
+
+    #[test]
+    fn validate_stepca_advertise_addr_accepts_specific_ip() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_advertise_addr("192.168.1.10:9000", &messages).is_ok());
+        assert!(validate_stepca_advertise_addr("[fd12::1]:9000", &messages).is_ok());
+    }
+
+    #[test]
+    fn validate_stepca_advertise_addr_rejects_wildcard() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_advertise_addr("0.0.0.0:9000", &messages).is_err());
+        assert!(validate_stepca_advertise_addr("[::]:9000", &messages).is_err());
+    }
+
+    #[test]
+    fn validate_stepca_advertise_addr_rejects_loopback() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_advertise_addr("127.0.0.1:9000", &messages).is_err());
+        assert!(validate_stepca_advertise_addr("[::1]:9000", &messages).is_err());
+    }
+
+    #[test]
+    fn validate_stepca_advertise_addr_rejects_malformed() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_advertise_addr("not-an-addr", &messages).is_err());
+        assert!(validate_stepca_advertise_addr(":9000", &messages).is_err());
+        assert!(validate_stepca_advertise_addr("192.168.1.10:", &messages).is_err());
+    }
+
+    #[test]
+    fn validate_stepca_advertise_addr_rejects_port_zero() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_advertise_addr("192.168.1.10:0", &messages).is_err());
+    }
+
+    #[test]
+    fn validate_stepca_advertise_addr_rejects_bare_ipv6() {
+        let messages = crate::i18n::test_messages();
+        assert!(validate_stepca_advertise_addr("fd12::1:9000", &messages).is_err());
+    }
+
+    #[test]
+    fn reject_stepca_advertise_addr_for_specific_ip_bind() {
+        let messages = crate::i18n::test_messages();
+        assert!(
+            reject_stepca_advertise_addr_for_specific_bind(
+                "192.168.1.10:9000",
+                Some("10.0.0.5:9000"),
+                &messages,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn allow_stepca_advertise_addr_for_wildcard_bind() {
+        let messages = crate::i18n::test_messages();
+        assert!(
+            reject_stepca_advertise_addr_for_specific_bind(
+                "0.0.0.0:9000",
+                Some("10.0.0.5:9000"),
+                &messages,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn allow_no_stepca_advertise_addr_for_specific_bind() {
+        let messages = crate::i18n::test_messages();
+        assert!(
+            reject_stepca_advertise_addr_for_specific_bind("10.0.0.5:9000", None, &messages)
+                .is_ok()
+        );
+    }
+
+    // --- step-ca override writing and validation ---
+
+    #[test]
+    fn write_stepca_override_creates_file() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_stepca_exposed_override(dir.path(), "192.168.1.10:9000", &messages).unwrap();
+        assert!(path.exists());
+        assert!(path.ends_with("secrets/step-ca/docker-compose.stepca-exposed.yml"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("192.168.1.10:9000:9000"));
+        assert!(content.contains("step-ca"));
+        assert!(content.contains("!override"));
+    }
+
+    #[test]
+    fn validate_stepca_override_binding_accepts_matching_addr() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_stepca_exposed_override(dir.path(), "192.168.1.10:9000", &messages).unwrap();
+        assert!(validate_stepca_override_binding(&path, "192.168.1.10:9000", &messages).is_ok());
+    }
+
+    #[test]
+    fn validate_stepca_override_binding_rejects_mismatched_addr() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_stepca_exposed_override(dir.path(), "192.168.1.10:9000", &messages).unwrap();
+        let result = validate_stepca_override_binding(&path, "10.0.0.5:9000", &messages);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_stepca_override_scope_rejects_guarded_services() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let override_dir = dir.path().join("secrets").join("step-ca");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        let path = override_dir.join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
+        std::fs::write(
+            &path,
+            "\
+services:
+  step-ca:
+    ports: !override
+      - \"192.168.1.10:9000:9000\"
+  openbao:
+    ports:
+      - \"0.0.0.0:8200:8200\"
+",
+        )
+        .unwrap();
+        assert!(validate_stepca_override_scope(&path, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_stepca_override_scope_accepts_stepca_only_override() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_stepca_exposed_override(dir.path(), "192.168.1.10:9000", &messages).unwrap();
+        assert!(validate_stepca_override_scope(&path, &messages).is_ok());
     }
 
     // --- HTTP-01 admin TLS validation ---

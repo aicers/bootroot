@@ -190,7 +190,8 @@ bootroot infra up
 힌트, 권장 조치를 표시한 뒤 즉시 중단되어, 일부 서비스가 바인드에
 실패한 채 다른 서비스만 실행되는 부분 상태를 방지합니다(#588 §4).
 `infra install`은 베이스 compose 파일로만 `docker compose up`을
-호출하므로(즉, `--openbao-bind` / `--http01-admin-bind` 오버라이드
+호출하므로(즉, `--openbao-bind` / `--http01-admin-bind` /
+`--stepca-bind` 오버라이드
 파일은 `infra up` / `init` 단계에서만 적용되고 설치 시점에는
 적용되지 않음), 사전 점검은 오버라이드 의도가 기록되어 있어도
 항상 로컬호스트 포트를 검사합니다.

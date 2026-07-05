@@ -371,6 +371,8 @@ pub(crate) struct DeploymentIntent {
     pub(crate) openbao_advertise_addr: Option<String>,
     pub(crate) http01_admin_bind_addr: Option<String>,
     pub(crate) http01_admin_advertise_addr: Option<String>,
+    pub(crate) stepca_bind_addr: Option<String>,
+    pub(crate) stepca_advertise_addr: Option<String>,
     pub(crate) secrets_dir: Option<PathBuf>,
     pub(crate) infra_certs: BTreeMap<String, crate::state::InfraCertEntry>,
 }
@@ -387,6 +389,8 @@ pub(crate) fn snapshot_deployment_intent(state_path: &Path) -> Result<Deployment
         openbao_advertise_addr: state.openbao_advertise_addr,
         http01_admin_bind_addr: state.http01_admin_bind_addr,
         http01_admin_advertise_addr: state.http01_admin_advertise_addr,
+        stepca_bind_addr: state.stepca_bind_addr,
+        stepca_advertise_addr: state.stepca_advertise_addr,
         secrets_dir: state.secrets_dir,
         infra_certs: state.infra_certs,
     })
@@ -415,6 +419,8 @@ pub(crate) fn write_minimal_state(
         openbao_advertise_addr: snapshot.openbao_advertise_addr.clone(),
         http01_admin_bind_addr: snapshot.http01_admin_bind_addr.clone(),
         http01_admin_advertise_addr: snapshot.http01_admin_advertise_addr.clone(),
+        stepca_bind_addr: snapshot.stepca_bind_addr.clone(),
+        stepca_advertise_addr: snapshot.stepca_advertise_addr.clone(),
         infra_certs: snapshot.infra_certs.clone(),
     };
     state
@@ -685,6 +691,8 @@ pub(crate) fn validate_summary_json_output_path(path: &Path, messages: &Messages
 /// which secrets tree, `OpenBao` / HTTP-01 bind, and infra-cert entries
 /// the reinit will operate on.  Split from the production stdout call
 /// site so tests can assert each section appears in the rendered text.
+// Sequential plan rendering — one writeln per preserved-intent line.
+#[allow(clippy::too_many_lines)]
 fn write_reinit_plan<W: Write>(
     out: &mut W,
     snapshot: &DeploymentIntent,
@@ -737,6 +745,8 @@ fn write_reinit_plan<W: Write>(
         || snapshot.openbao_advertise_addr.is_some()
         || snapshot.http01_admin_bind_addr.is_some()
         || snapshot.http01_admin_advertise_addr.is_some()
+        || snapshot.stepca_bind_addr.is_some()
+        || snapshot.stepca_advertise_addr.is_some()
         || !snapshot.infra_certs.is_empty();
     if let Some(bind) = snapshot.openbao_bind_addr.as_deref() {
         writeln!(
@@ -764,6 +774,20 @@ fn write_reinit_plan<W: Write>(
             out,
             "{}",
             messages.reinit_plan_preserved_intent_http01_advertise(addr)
+        )?;
+    }
+    if let Some(addr) = snapshot.stepca_bind_addr.as_deref() {
+        writeln!(
+            out,
+            "{}",
+            messages.reinit_plan_preserved_intent_stepca_bind(addr)
+        )?;
+    }
+    if let Some(addr) = snapshot.stepca_advertise_addr.as_deref() {
+        writeln!(
+            out,
+            "{}",
+            messages.reinit_plan_preserved_intent_stepca_advertise(addr)
         )?;
     }
     if !snapshot.infra_certs.is_empty() {
@@ -1051,6 +1075,8 @@ mod tests {
             openbao_advertise_addr: Some("192.168.1.10:8200".to_string()),
             http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: Some("192.168.1.10:9000".to_string()),
+            stepca_advertise_addr: None,
             infra_certs,
         }
     }
@@ -1078,6 +1104,10 @@ mod tests {
         assert_eq!(
             snapshot.http01_admin_bind_addr.as_deref(),
             Some("192.168.1.10:8080")
+        );
+        assert_eq!(
+            snapshot.stepca_bind_addr.as_deref(),
+            Some("192.168.1.10:9000")
         );
         assert_eq!(snapshot.infra_certs.len(), 1);
         // DeploymentIntent does not carry services / policies / approles
@@ -1116,6 +1146,11 @@ mod tests {
             rewritten.http01_admin_bind_addr.as_deref(),
             Some("192.168.1.10:8080"),
             "http01_admin_bind_addr intent must survive"
+        );
+        assert_eq!(
+            rewritten.stepca_bind_addr.as_deref(),
+            Some("192.168.1.10:9000"),
+            "stepca_bind_addr intent must survive"
         );
         assert_eq!(rewritten.infra_certs.len(), 1, "infra_certs must survive");
     }
@@ -1803,6 +1838,8 @@ mod tests {
             openbao_advertise_addr: Some("192.168.1.10:8200".to_string()),
             http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: Some("192.168.1.10:9000".to_string()),
+            stepca_advertise_addr: None,
             secrets_dir: Some(PathBuf::from("secrets-custom")),
             infra_certs: {
                 let mut m = BTreeMap::new();
@@ -1854,12 +1891,20 @@ mod tests {
             "intent section must echo http01_admin_bind_addr; got:\n{rendered}"
         );
         assert!(
+            rendered.contains("stepca_bind_addr: 192.168.1.10:9000"),
+            "intent section must echo stepca_bind_addr; got:\n{rendered}"
+        );
+        assert!(
             rendered.contains("infra_certs: 1"),
             "intent section must echo infra_certs count; got:\n{rendered}"
         );
-        // The advertise field was None so it must NOT appear.
+        // The advertise fields were None so they must NOT appear.
         assert!(
             !rendered.contains("http01_admin_advertise_addr"),
+            "absent intent fields must not appear; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("stepca_advertise_addr"),
             "absent intent fields must not appear; got:\n{rendered}"
         );
     }

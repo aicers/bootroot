@@ -80,6 +80,10 @@ pub(crate) struct StateFile {
     pub(crate) http01_admin_bind_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) http01_admin_advertise_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stepca_bind_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stepca_advertise_addr: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) infra_certs: BTreeMap<String, InfraCertEntry>,
 }
@@ -454,6 +458,8 @@ mod tests {
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -477,6 +483,8 @@ mod tests {
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -509,6 +517,8 @@ mod tests {
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -571,6 +581,8 @@ mod tests {
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs,
         };
         let json = serde_json::to_string_pretty(&state).expect("serialize");
