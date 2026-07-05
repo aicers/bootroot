@@ -202,6 +202,24 @@ impl Messages {
         )
     }
 
+    pub(crate) fn status_last_secret_id_rotation(&self, value: &str) -> String {
+        format_template(
+            self.strings().status_last_secret_id_rotation,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn status_warning_secret_id_rotation_stale(
+        &self,
+        age: &str,
+        threshold: &str,
+    ) -> String {
+        format_template(
+            self.strings().status_warning_secret_id_rotation_stale,
+            &[("age", age), ("threshold", threshold)],
+        )
+    }
+
     pub(crate) fn status_error_openbao_unreachable(&self) -> &'static str {
         self.strings().status_error_openbao_unreachable
     }

@@ -465,6 +465,7 @@ mod tests {
                 stepca_bind_addr: None,
                 stepca_advertise_addr: None,
                 infra_certs: BTreeMap::new(),
+                ..Default::default()
             },
             paths: super::super::StatePaths::new(dir.path().to_path_buf()),
             state_dir: dir.path().to_path_buf(),

@@ -230,7 +230,12 @@ out of unit files, crontabs, and process listings. `bootroot init`
 prints both credentials (masked unless `--show-secrets`); on
 deployments initialized before `bootroot-infra-rotate-role` existed, a
 root-token `--infra` run provisions it and prints the credential (see
-the upgrade note in the infra section).
+the upgrade note in the infra section). File-based auth is also what
+keeps the rotate credentials themselves fresh: each successful
+invocation re-mints its own `secret_id` and atomically replaces the
+`--approle-secret-id-file` file (see
+[the self-mint section](#the-rotate-credentials-own-secret_ids-self-mint)),
+so the files seeded once at setup never need a routine manual re-mint.
 
 Worked example — systemd timer + oneshot unit
 (`bootroot-rotate-secret-ids.service`):
@@ -303,36 +308,129 @@ exit "$status"
 0 */8 * * * /usr/local/sbin/bootroot-rotate-secret-ids
 ```
 
-### The rotate credentials' own secret_ids
+### The rotate credentials' own secret_ids (self-mint)
 
 The scheduled job authenticates with two AppRoles whose `secret_id`s
-are subject to the same TTL as everything else, and **neither can mint
-its own**: the runtime-rotate policy mints only on
-`bootroot-service-*` role paths, the infra-rotate policy only on the
-two infra role paths. Left unaddressed, the job locks itself out
-within one TTL. A first-party self-rotation design is tracked in
-[#672](https://github.com/aicers/bootroot/issues/672); until it lands,
-apply this interim procedure:
+are subject to the same TTL as everything else. Each rotate policy
+grants `update` on its **own** `auth/approle/role/<self>/secret-id`
+path (and only that — no cross-mint: neither rotate credential can
+reach the other's surface, preserving the privilege-separation
+boundary), and every `approle-secret-id` invocation **re-mints the
+credential it authenticated with as its final step**, after all
+targets of that invocation succeeded, then atomically replaces the
+credential file the scheduler reads
+([#672](https://github.com/aicers/bootroot/issues/672)). Normal
+operation therefore never touches the root token; the root token stays
+strictly break-glass.
 
-- Re-mint both rotate credentials on a schedule shorter than their TTL
-  using the break-glass root token (consistent with the
-  bootstrap/break-glass carve-out — this is a scheduled operator task,
-  not part of the automated job):
-  - infra-rotate: run one root-token `--infra` rotation
-    (`bootroot rotate --auth-mode root --root-token-file <path>
-    --show-secrets approle-secret-id --infra stepca --yes`) — every
-    root-token run mints and prints a fresh infra-rotate credential.
-  - runtime-rotate: mint directly against OpenBao with the root token,
-    e.g. `docker compose exec -e BAO_TOKEN=<root-token> openbao bao
-    write -f auth/approle/role/bootroot-runtime-rotate-role/secret-id`.
-- Optionally widen the window by initializing the roles with a longer
-  `--secret-id-ttl` (values above `48h` warn, above `168h` are
-  rejected) so the operator re-mint can be, say, weekly.
+How the self-mint behaves:
 
-After each re-mint, update the credential files referenced by the
-scheduled job (e.g. under `/etc/bootroot/`); previously issued
-`secret_id`s stay valid until their TTL, so the swap is not
-time-critical within one TTL window.
+- **Per invocation, mint-own-last.** Each invocation re-mints its own
+  credential only after every target succeeded. For runtime-rotate
+  (one batch invocation per job) this equals job-level mint-own-last;
+  for infra-rotate — consumed by two invocations (`--infra stepca`,
+  `--infra responder`) — the credential file is replaced at the end of
+  each successful invocation and the next invocation reads the fresh
+  file at startup. The extra mint per job is harmless: orphaned
+  `secret_id`s expire by TTL.
+- **File contract.** The self-mint replaces the file passed via
+  `--approle-secret-id-file` — the form the worked scheduler examples
+  above already use. When the `secret_id` was supplied inline
+  (`--approle-secret-id`) or via `OPENBAO_APPROLE_SECRET_ID`, there is
+  no file to replace: the run prints a prominent warning and skips the
+  self-mint (the credential then still expires at its TTL). Root-token
+  runs perform no self-mint — a root run has no "own credential" to
+  extend; re-minting the rotate credentials under root auth is the
+  break-glass recovery procedure below.
+- **Verified before the swap, never eagerly revoked.** The fresh
+  `secret_id` must pass a login verification before the file is
+  replaced, and the previous `secret_id` is never revoked (it expires
+  by TTL). Multiple `secret_id`s are concurrently valid, so a crash or
+  failure at any point self-heals: the next run logs in with the old,
+  still-valid credential and re-mints.
+- **Bounded uses.** Self-minted rotate `secret_id`s carry
+  `num_uses = 6`: 3× the logins enumerated per re-mint cycle (the next
+  invocation's base login plus the new credential's verification
+  login), leaving headroom for transient-error retries and the
+  crash-recovery login. A stolen snapshot of the credential is a
+  wasting asset; the legitimate cycle is never starved. Pair this with
+  a generous role TTL (`--secret-id-ttl`, up to the `168h` cap) so a
+  stalled scheduler has a wide recovery window.
+
+#### CIDR binding (`--rotate-bound-cidrs`)
+
+Optionally bind the rotate credentials to the control-plane host:
+`bootroot init --rotate-bound-cidrs <cidr>` binds both rotate
+credentials; the root-token infra provisioning run accepts the same
+flag for `bootroot-infra-rotate-role`. The binding is recorded in
+`state.json` and re-applied to every self-minted `secret_id`.
+
+The value is **operator-supplied, never auto-derived**: the source IP
+OpenBao sees for the control-plane host varies by deployment mode —
+with the default loopback-published OpenBao port it is typically
+`127.0.0.1/32` (Linux) or the Docker bridge gateway (Docker Desktop);
+with a non-loopback bind it is the host's LAN address. Verify what
+OpenBao actually sees (e.g. the `remote_address` field of a login
+entry in the audit log) before binding, because a wrong CIDR locks the
+scheduled job out — the self-mint's login verification catches this
+(the run fails and keeps the old, working credential file), but the
+binding must then be fixed before the TTL runs out. When the flag is
+omitted, no binding is applied (opt-in).
+
+This is a **host-boundary control, not process isolation**: OpenBao
+sees only source IPs, so processes co-located on the control-plane
+host are indistinguishable from the rotation job.
+
+#### Audit alerting for rotate-credential mints
+
+The file audit backend is enabled and verified at init, but bootroot
+ships no alert pipeline — wire this rule into your own log pipeline.
+Alert on `secret_id` mint requests against the two rotate role paths,
+i.e. audit entries where `request.path` equals:
+
+- `auth/approle/role/bootroot-runtime-rotate-role/secret-id`
+- `auth/approle/role/bootroot-infra-rotate-role/secret-id`
+
+Expect exactly one mint per rotate credential per scheduled run (plus
+one extra infra-rotate mint per job under the two-invocation flow, and
+operator-driven mints during init/provisioning). Anything outside the
+scheduler's cadence or from an unexpected `remote_address` is a signal
+worth paging on: it is the exact surface a stolen rotate credential
+would use to extend itself.
+
+#### Dead-man monitoring and break-glass recovery
+
+A timer that silently stops firing is the one remaining lockout path,
+and its failure mode is pure absence — no run means no failure log.
+Every successful `approle-secret-id` invocation therefore records a
+timestamp in `state.json` (`last_secret_id_rotation`), and `bootroot
+status` prints the last rotation success and **warns when it is older
+than half the rotate roles' `secret_id` TTL** (a one-missed-run budget
+under the ≥2× cadence invariant; default TTL `24h` → warns past
+`12h`). Check `bootroot status` from a monitoring hook, or alert on
+the scheduler unit itself.
+
+If the job misses runs beyond the TTL, the rotate credentials expire
+and scheduled runs fail with `403 invalid role or secret ID`. Recover
+with the **break-glass root token** (this is the recovery path, not a
+routine task):
+
+- infra-rotate: run one root-token `--infra` rotation
+  (`bootroot rotate --auth-mode root --root-token-file <path>
+  --show-secrets approle-secret-id --infra stepca --yes`) — every
+  root-token run mints and prints a fresh infra-rotate credential
+  (re-supply `--rotate-bound-cidrs` here only to change the recorded
+  binding; omitting it keeps the recorded one).
+- runtime-rotate: mint directly against OpenBao with the root token,
+  e.g. `docker compose exec -e BAO_TOKEN=<root-token> openbao bao
+  write -f auth/approle/role/bootroot-runtime-rotate-role/secret-id`.
+
+After the re-mint, write the fresh values into the credential files
+referenced by the scheduled job (e.g. under `/etc/bootroot/`); the
+next scheduled run takes over and resumes self-minting. Deployments
+whose compliance regime prohibits self-mint grants can keep this
+root-token re-mint as the routine procedure instead, on a schedule
+shorter than the TTL.
 
 ## Rotation and the in-FD pitfall
 

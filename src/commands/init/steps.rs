@@ -16,7 +16,9 @@ use bootroot::openbao::{InitResponse, OpenBaoClient};
 pub(crate) use ca_certs::{
     compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
 };
-pub(crate) use openbao_setup::{infra_rotate_policy, validate_secret_id_ttl};
+pub(crate) use openbao_setup::{
+    infra_rotate_policy, parse_ttl_to_secs, validate_rotate_bound_cidrs, validate_secret_id_ttl,
+};
 pub(crate) use orchestrator::run_init;
 pub(crate) use prompts::prompt_yes_no;
 
@@ -485,6 +487,7 @@ pub(super) mod test_support {
             unseal_key: Vec::new(),
             openbao_unseal_from_file: None,
             secret_id_ttl: SECRET_ID_TTL.to_string(),
+            rotate_bound_cidrs: Vec::new(),
             stepca_password: None,
             db_dsn: None,
             db_admin: crate::cli::args::DbAdminDsnArgs { admin_dsn: None },

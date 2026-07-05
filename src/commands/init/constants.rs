@@ -109,6 +109,22 @@ pub(crate) mod openbao_constants {
     /// a separate role confines that blast radius.
     pub(crate) const POLICY_BOOTROOT_INFRA_ROTATE: &str = "bootroot-infra-rotate";
 
+    /// Deterministic logins that consume one of a self-minted rotate
+    /// credential's uses within a single re-mint cycle. Self-mint is
+    /// per-invocation, so a credential's cycle spans exactly one
+    /// invocation for both rotate roles: the next invocation's base
+    /// login, plus the post-mint verification login of the freshly
+    /// minted replacement credential.
+    pub(crate) const ROTATE_SELF_MINT_LOGINS_PER_CYCLE: u32 = 2;
+
+    /// `secret_id_num_uses` cap applied to self-minted rotate
+    /// credentials: 3× the enumerated logins per cycle, leaving headroom
+    /// for transient-error login retries and the crash-recovery login
+    /// (a tighter cap risks self-lockout). Bounded uses turn a stolen
+    /// snapshot of the credential into a wasting asset without blocking
+    /// the legitimate cycle.
+    pub(crate) const ROTATE_SELF_MINT_NUM_USES: u32 = 3 * ROTATE_SELF_MINT_LOGINS_PER_CYCLE;
+
     pub(crate) const APPROLE_BOOTROOT_AGENT: &str = "bootroot-agent-role";
     pub(crate) const APPROLE_BOOTROOT_RESPONDER: &str = "bootroot-responder-role";
     pub(crate) const APPROLE_BOOTROOT_STEPCA: &str = "bootroot-stepca-role";

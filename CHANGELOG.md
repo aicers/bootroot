@@ -527,6 +527,30 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Self-rotation for the rotate AppRole credentials
+  (`bootroot-runtime-rotate-role`, `bootroot-infra-rotate-role`). Each
+  rotate policy now grants `update` on its own
+  `auth/approle/role/<self>/secret-id` path (self only — cross-mint
+  stays denied, preserving the #667 separation boundary), and every
+  successful `rotate approle-secret-id` invocation re-mints the
+  credential it authenticated with as its final step (mint-own-last,
+  per invocation), verifies the fresh `secret_id` with a login, and
+  atomically replaces the `--approle-secret-id-file` file the
+  scheduler reads. The previous `secret_id` is never eagerly revoked,
+  so any mid-flight failure self-heals on the next run. Self-minted
+  credentials carry `num_uses = 6` (3× the logins enumerated per
+  re-mint cycle) and re-apply the operator-supplied CIDR binding
+  recorded by the new `--rotate-bound-cidrs` flag on `bootroot init`
+  and on the root-token infra provisioning run. Inline/env-supplied
+  credentials produce a prominent skip warning (no file to replace);
+  root-token runs never self-mint — re-minting under root auth is the
+  break-glass recovery path, which the operations guide now documents
+  as such (downgraded from the interim routine procedure), together
+  with the audit events to alert on (`secret_id` mints against the two
+  rotate role paths). Dead-man monitoring closes the remaining lockout
+  path: every successful invocation records `last_secret_id_rotation`
+  in `state.json`, and `bootroot status` warns when it is older than
+  half the rotate roles' `secret_id` TTL. (Closes #672)
 - `bootroot rotate approle-secret-id` gained an `--all-services`
   selector (mutually exclusive with `--service-name` and `--infra`)
   that rotates the `secret_id` of every service registered in

@@ -253,6 +253,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         state
             .services

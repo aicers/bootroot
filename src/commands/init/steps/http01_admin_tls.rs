@@ -355,6 +355,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         let sans = vec!["responder.internal".to_string(), "localhost".to_string()];
         record_http01_admin_infra_cert(&mut state, dir.path(), sans);

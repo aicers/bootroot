@@ -1056,6 +1056,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         assert_eq!(
             super::artifact_openbao_url(&state),
@@ -1084,6 +1085,7 @@ mod tests {
             stepca_bind_addr: None,
             stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
+            ..Default::default()
         };
         assert_eq!(
             super::artifact_openbao_url(&state),

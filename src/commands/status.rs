@@ -1,5 +1,9 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use bootroot::openbao::{KvMountStatus, OpenBaoClient};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::cli::args::StatusArgs;
 use crate::commands::infra::{
@@ -8,7 +12,7 @@ use crate::commands::infra::{
 use crate::commands::init::{
     APPROLE_BOOTROOT_AGENT, APPROLE_BOOTROOT_INFRA_ROTATE, APPROLE_BOOTROOT_RESPONDER,
     APPROLE_BOOTROOT_STEPCA, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
-    PATH_STEPCA_PASSWORD,
+    PATH_STEPCA_PASSWORD, SECRET_ID_TTL, parse_ttl_to_secs,
 };
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -89,6 +93,13 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
     };
     let service_statuses = load_service_statuses(messages)?;
 
+    let last_secret_id_rotation = state
+        .as_ref()
+        .and_then(|state| state.last_secret_id_rotation.clone());
+    let secret_id_rotation_warning = state
+        .as_ref()
+        .and_then(|state| secret_id_rotation_warning(state, OffsetDateTime::now_utc(), messages));
+
     let summary = StatusSummary {
         readiness: &readiness,
         openbao_ok,
@@ -98,6 +109,8 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         kv_statuses: kv_statuses.as_deref(),
         approle_statuses: approle_statuses.as_deref(),
         service_statuses: &service_statuses,
+        last_secret_id_rotation: last_secret_id_rotation.as_deref(),
+        secret_id_rotation_warning,
     };
     print_status_summary(messages, &summary);
 
@@ -170,6 +183,39 @@ struct StatusSummary<'a> {
     kv_statuses: Option<&'a [(String, bool)]>,
     approle_statuses: Option<&'a [(String, bool)]>,
     service_statuses: &'a [ServiceStatusEntry],
+    last_secret_id_rotation: Option<&'a str>,
+    secret_id_rotation_warning: Option<String>,
+}
+
+/// Dead-man check for the scheduled `secret_id` rotation job (#672):
+/// returns a warning when the last recorded rotation success is older
+/// than half the rotate roles' `secret_id` TTL — a one-missed-run
+/// budget under the documented "TTL ≥ 2× rotation interval" cadence
+/// rule. No timestamp recorded means no verdict (fresh deployments
+/// have not scheduled the job yet); the missing-run failure mode is
+/// pure absence, so this timestamp is the only signal available.
+fn secret_id_rotation_warning(
+    state: &StateFile,
+    now: OffsetDateTime,
+    messages: &Messages,
+) -> Option<String> {
+    let last = state.last_secret_id_rotation.as_deref()?;
+    let last_ts = OffsetDateTime::parse(last, &Rfc3339).ok()?;
+    let ttl = state
+        .rotate_secret_id_ttl
+        .as_deref()
+        .unwrap_or(SECRET_ID_TTL);
+    let threshold_secs = parse_ttl_to_secs(ttl)? / 2;
+    let age_secs = u64::try_from((now - last_ts).whole_seconds()).ok()?;
+    if age_secs <= threshold_secs {
+        return None;
+    }
+    // Round the age to whole minutes so the warning stays readable.
+    let rounded_age_secs = age_secs.saturating_sub(age_secs % 60).max(60);
+    Some(messages.status_warning_secret_id_rotation_stale(
+        &humantime::format_duration(Duration::from_secs(rounded_age_secs)).to_string(),
+        &humantime::format_duration(Duration::from_secs(threshold_secs)).to_string(),
+    ))
 }
 
 struct ServiceStatusEntry {
@@ -195,7 +241,13 @@ fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
     print_openbao_section(messages, summary);
     print_kv_paths_section(messages, summary);
     print_approles_section(messages, summary);
+    if let Some(value) = summary.last_secret_id_rotation {
+        println!("{}", messages.status_last_secret_id_rotation(value));
+    }
     print_services_section(messages, summary);
+    if let Some(warning) = &summary.secret_id_rotation_warning {
+        println!("{warning}");
+    }
 }
 
 fn print_openbao_section(messages: &Messages, summary: &StatusSummary<'_>) {
@@ -298,5 +350,101 @@ fn print_services_section(messages: &Messages, summary: &StatusSummary<'_>) {
                     .status_service_delivery_mode(&service.service_name, &service.delivery_mode)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use time::Duration as TimeDuration;
+
+    use super::*;
+    use crate::i18n::test_messages;
+
+    fn state_with_rotation(
+        last_secret_id_rotation: Option<&str>,
+        rotate_secret_id_ttl: Option<&str>,
+    ) -> StateFile {
+        StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            rotate_secret_id_ttl: rotate_secret_id_ttl.map(str::to_string),
+            last_secret_id_rotation: last_secret_id_rotation.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn rfc3339(ts: OffsetDateTime) -> String {
+        ts.format(&Rfc3339).expect("RFC 3339 formatting")
+    }
+
+    #[test]
+    fn no_recorded_rotation_produces_no_warning() {
+        let state = state_with_rotation(None, None);
+        let messages = test_messages();
+        assert!(secret_id_rotation_warning(&state, OffsetDateTime::now_utc(), &messages).is_none());
+    }
+
+    #[test]
+    fn fresh_rotation_produces_no_warning() {
+        let now = OffsetDateTime::now_utc();
+        let last = rfc3339(now - TimeDuration::hours(1));
+        let state = state_with_rotation(Some(&last), None);
+        let messages = test_messages();
+        assert!(secret_id_rotation_warning(&state, now, &messages).is_none());
+    }
+
+    // The default threshold is half the default 24h TTL: a
+    // one-missed-run budget under the documented ≥2× cadence rule.
+    #[test]
+    fn stale_rotation_warns_past_half_default_ttl() {
+        let now = OffsetDateTime::now_utc();
+        let last = rfc3339(now - TimeDuration::hours(13));
+        let state = state_with_rotation(Some(&last), None);
+        let messages = test_messages();
+        let warning = secret_id_rotation_warning(&state, now, &messages)
+            .expect("13h staleness must exceed the 12h default threshold");
+        assert!(
+            warning.contains("13h"),
+            "warning must name the age: {warning}"
+        );
+        assert!(
+            warning.contains("12h"),
+            "warning must name the threshold: {warning}"
+        );
+    }
+
+    #[test]
+    fn threshold_follows_recorded_rotate_secret_id_ttl() {
+        let now = OffsetDateTime::now_utc();
+        let last = rfc3339(now - TimeDuration::hours(13));
+        // 168h TTL → 84h threshold: 13h staleness stays quiet.
+        let state = state_with_rotation(Some(&last), Some("168h"));
+        let messages = test_messages();
+        assert!(secret_id_rotation_warning(&state, now, &messages).is_none());
+
+        let last = rfc3339(now - TimeDuration::hours(85));
+        let state = state_with_rotation(Some(&last), Some("168h"));
+        let warning = secret_id_rotation_warning(&state, now, &messages)
+            .expect("85h staleness must exceed the 84h threshold");
+        assert!(
+            warning.contains("3days 13h"),
+            "warning must name the age in humanized form: {warning}"
+        );
+    }
+
+    #[test]
+    fn unparseable_timestamp_produces_no_warning() {
+        let state = state_with_rotation(Some("not-a-timestamp"), None);
+        let messages = test_messages();
+        assert!(secret_id_rotation_warning(&state, OffsetDateTime::now_utc(), &messages).is_none());
+    }
+
+    #[test]
+    fn future_timestamp_produces_no_warning() {
+        let now = OffsetDateTime::now_utc();
+        let last = rfc3339(now + TimeDuration::hours(2));
+        let state = state_with_rotation(Some(&last), None);
+        let messages = test_messages();
+        assert!(secret_id_rotation_warning(&state, now, &messages).is_none());
     }
 }

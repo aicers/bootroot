@@ -7,11 +7,12 @@ use bootroot::openbao::OpenBaoClient;
 use bootroot::openbao::SecretIdOptions;
 
 use super::super::constants::openbao_constants::{
-    APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_STEPCA, INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD,
-    MAX_SECRET_ID_TTL, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
-    PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_INFRA_ROTATE,
-    POLICY_BOOTROOT_RESPONDER, POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
-    POLICY_BOOTROOT_STEPCA, RECOMMENDED_SECRET_ID_TTL, TOKEN_TTL,
+    APPROLE_BOOTROOT_INFRA_ROTATE, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_RUNTIME_ROTATE,
+    APPROLE_BOOTROOT_STEPCA, INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, MAX_SECRET_ID_TTL,
+    PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
+    POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_INFRA_ROTATE, POLICY_BOOTROOT_RESPONDER,
+    POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD, POLICY_BOOTROOT_STEPCA,
+    RECOMMENDED_SECRET_ID_TTL, TOKEN_TTL,
 };
 use super::super::constants::{
     OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME, OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR,
@@ -193,14 +194,30 @@ pub(super) async fn configure_openbao(
 
     let mut role_outputs = Vec::new();
     let default_opts = SecretIdOptions::default();
+    // Operator-supplied CIDR binding for the two rotate credentials
+    // (#672 hardening). Applied only to their initial mint here; the
+    // rotate flow re-applies the state-recorded binding on every
+    // self-mint. Other roles are unaffected.
+    let rotate_bound_opts = (!args.rotate_bound_cidrs.is_empty()).then(|| SecretIdOptions {
+        token_bound_cidrs: Some(args.rotate_bound_cidrs.clone()),
+        ..SecretIdOptions::default()
+    });
     for &label in AppRoleLabel::all() {
         let role_name = label.role_name();
         let role_id = client
             .read_role_id(role_name)
             .await
             .with_context(|| messages.error_openbao_role_id_failed())?;
+        let is_rotate_label = matches!(
+            label,
+            AppRoleLabel::RuntimeRotate | AppRoleLabel::InfraRotate
+        );
+        let opts = match (&rotate_bound_opts, is_rotate_label) {
+            (Some(bound), true) => bound,
+            _ => &default_opts,
+        };
         let secret_id = client
-            .create_secret_id(role_name, &default_opts)
+            .create_secret_id(role_name, opts)
             .await
             .with_context(|| messages.error_openbao_secret_id_failed())?;
         role_outputs.push(AppRoleOutput {
@@ -337,7 +354,7 @@ pub(super) async fn write_ca_trust_fingerprints_with_retry(
 /// Parses an `OpenBao`-style duration string into seconds.
 ///
 /// Accepts formats: `"30s"`, `"10m"`, `"24h"`, or bare seconds `"3600"`.
-fn parse_ttl_to_secs(ttl: &str) -> Option<u64> {
+pub(crate) fn parse_ttl_to_secs(ttl: &str) -> Option<u64> {
     let ttl = ttl.trim();
     if ttl.is_empty() {
         return None;
@@ -378,6 +395,19 @@ pub(crate) fn validate_secret_id_ttl(ttl: &str, messages: &Messages) -> Result<O
         )));
     }
     Ok(None)
+}
+
+/// Validates `--rotate-bound-cidrs` values (shared by `bootroot init`
+/// and the root-token infra provisioning run of `bootroot rotate
+/// approle-secret-id`). Unlike the service-side `--rn-cidrs`, there is
+/// no `clear` sentinel: omitting the flag simply records no binding.
+pub(crate) fn validate_rotate_bound_cidrs(values: &[String], messages: &Messages) -> Result<()> {
+    for value in values {
+        if bootroot::input_validation::validate_cidr(value).is_err() {
+            anyhow::bail!(messages.error_rotate_bound_cidrs_invalid(value));
+        }
+    }
+    Ok(())
 }
 
 fn build_policy_map(kv_mount: &str) -> BTreeMap<String, String> {
@@ -481,6 +511,9 @@ path "auth/approle/role/bootroot-service-*/role-id" {{
 path "auth/approle/role/bootroot-service-*/secret-id" {{
   capabilities = ["create", "update"]
 }}
+path "auth/approle/role/{APPROLE_BOOTROOT_RUNTIME_ROTATE}/secret-id" {{
+  capabilities = ["create", "update"]
+}}
 "#
         ),
     );
@@ -496,9 +529,14 @@ path "auth/approle/role/bootroot-service-*/secret-id" {{
 /// Grants only what `bootroot rotate approle-secret-id --infra` needs:
 /// minting a fresh `secret_id` for the two infra roles plus reading
 /// their `role_id` (for the on-disk `role_id` backfill and the
-/// post-rotation login verification). Deliberately grants no KV access
-/// and must NOT be widened to `bootroot-service-*` paths — see the
-/// privilege-separation note on [`POLICY_BOOTROOT_INFRA_ROTATE`].
+/// post-rotation login verification), and minting the credential's own
+/// replacement `secret_id` (the per-invocation self-mint that keeps the
+/// scheduled rotation job from expiring itself — see issue #672).
+/// Deliberately grants no KV access and must NOT be widened to
+/// `bootroot-service-*` paths or to the runtime-rotate role's paths —
+/// each rotate credential may reach only into itself, preserving the
+/// #667 separation boundary. See the privilege-separation note on
+/// [`POLICY_BOOTROOT_INFRA_ROTATE`].
 pub(crate) fn infra_rotate_policy() -> String {
     format!(
         r#"path "auth/approle/role/{APPROLE_BOOTROOT_STEPCA}/secret-id" {{
@@ -512,6 +550,9 @@ path "auth/approle/role/{APPROLE_BOOTROOT_STEPCA}/role-id" {{
 }}
 path "auth/approle/role/{APPROLE_BOOTROOT_RESPONDER}/role-id" {{
   capabilities = ["read"]
+}}
+path "auth/approle/role/{APPROLE_BOOTROOT_INFRA_ROTATE}/secret-id" {{
+  capabilities = ["create", "update"]
 }}
 "#
     )
@@ -989,16 +1030,25 @@ services:
     }
 
     #[test]
-    fn test_build_policy_map_infra_rotate_scoped_to_infra_roles_only() {
+    fn test_build_policy_map_infra_rotate_scoped_to_infra_roles_and_self() {
         let policies = build_policy_map("secret");
         let infra_policy = policies.get(POLICY_BOOTROOT_INFRA_ROTATE).unwrap();
         assert!(infra_policy.contains("auth/approle/role/bootroot-stepca-role/secret-id"));
         assert!(infra_policy.contains("auth/approle/role/bootroot-responder-role/secret-id"));
         assert!(infra_policy.contains("auth/approle/role/bootroot-stepca-role/role-id"));
         assert!(infra_policy.contains("auth/approle/role/bootroot-responder-role/role-id"));
+        // Self-mint grant (#672): the credential may re-mint its own
+        // secret_id, and nothing else on its own role (no role-id read,
+        // no role config write).
+        assert!(infra_policy.contains("auth/approle/role/bootroot-infra-rotate-role/secret-id"));
+        assert!(!infra_policy.contains("auth/approle/role/bootroot-infra-rotate-role/role-id"));
         // The infra-rotate credential must not touch service roles or KV.
         assert!(!infra_policy.contains("bootroot-service-"));
         assert!(!infra_policy.contains("secret/data"));
+        // Cross-mint stays denied (#667): reaching the other rotate
+        // credential's surface with a single leaked credential would
+        // collapse the separation boundary.
+        assert!(!infra_policy.contains("bootroot-runtime-rotate-role"));
     }
 
     #[test]
@@ -1010,6 +1060,39 @@ services:
         let rotate_policy = policies.get(POLICY_BOOTROOT_RUNTIME_ROTATE).unwrap();
         assert!(!rotate_policy.contains("bootroot-stepca-role"));
         assert!(!rotate_policy.contains("bootroot-responder-role"));
+        // Cross-mint stays denied (#667): self-mint must not become a
+        // path into the infra-rotate credential's surface.
+        assert!(!rotate_policy.contains("bootroot-infra-rotate-role"));
+    }
+
+    #[test]
+    fn test_build_policy_map_runtime_rotate_self_mint_scoped_to_own_secret_id() {
+        // Self-mint grant (#672): the credential may re-mint its own
+        // secret_id — and only that — on its own role path.
+        let policies = build_policy_map("secret");
+        let rotate_policy = policies.get(POLICY_BOOTROOT_RUNTIME_ROTATE).unwrap();
+        assert!(rotate_policy.contains("auth/approle/role/bootroot-runtime-rotate-role/secret-id"));
+        assert!(
+            !rotate_policy.contains("auth/approle/role/bootroot-runtime-rotate-role/role-id"),
+            "self-mint needs no role-id read: the scheduler already holds the role_id"
+        );
+    }
+
+    #[test]
+    fn test_rotate_self_mint_num_uses_sizing_rule() {
+        use super::super::super::constants::openbao_constants::{
+            ROTATE_SELF_MINT_LOGINS_PER_CYCLE, ROTATE_SELF_MINT_NUM_USES,
+        };
+        // Sizing rule from #672: enumerate every deterministic login in
+        // one per-invocation cycle (next invocation's base login + the
+        // new credential's post-mint verification login), then apply 3×
+        // headroom for retries and crash recovery.
+        assert_eq!(ROTATE_SELF_MINT_LOGINS_PER_CYCLE, 2);
+        assert_eq!(
+            ROTATE_SELF_MINT_NUM_USES,
+            3 * ROTATE_SELF_MINT_LOGINS_PER_CYCLE
+        );
+        assert_eq!(ROTATE_SELF_MINT_NUM_USES, 6);
     }
 
     #[test]
