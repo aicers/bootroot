@@ -140,11 +140,68 @@ PY
 }
 
 start_mock_openbao() {
+  # The mock persists its synthetic CA cert + key under this dir so
+  # `refresh_leaves` can re-sign each service's leaf with the CA the
+  # bundle actually trusts. Without that step the `bootroot verify`
+  # chain check added in #627 rejects the self-signed workspace leaf
+  # against the mock CA bundle.
+  export MOCK_OPENBAO_TRUST_DIR="$ARTIFACT_DIR/mock-trust"
+  mkdir -p "$MOCK_OPENBAO_TRUST_DIR"
   python3 "$ROOT_DIR/scripts/impl/mock-openbao-server.py" >/dev/null 2>&1 &
   MOCK_OPENBAO_PID="$!"
   if ! wait_for_mock_openbao; then
     fail_with_context "mock OpenBao did not become healthy"
   fi
+}
+
+refresh_leaves() {
+  # Re-issue each service's leaf cert with the CA the mock most
+  # recently served under `<service>/current/`. The baseline harness
+  # uses a stub bootroot-agent (`exit 0`), so the production path that
+  # would re-sign the leaf via the renewal predicate never fires;
+  # without this step `bootroot verify` would correctly refuse a leaf
+  # that does not chain to the bundle trust_sync wrote.
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+    local current_dir="$MOCK_OPENBAO_TRUST_DIR/$service/current"
+    local ca_cert="$current_dir/ca.crt"
+    local ca_key="$current_dir/ca.key"
+    if [ ! -f "$ca_cert" ] || [ ! -f "$ca_key" ]; then
+      continue
+    fi
+    local leaf_cert="$work_dir/certs/${service}.crt"
+    local leaf_key="$work_dir/certs/${service}.key"
+    local dns_name="${instance_id}.${service}.${hostname}.${domain}"
+    local sign_dir
+    sign_dir="$(mktemp -d)"
+    openssl genrsa -out "$sign_dir/leaf.key" 2048 >/dev/null 2>&1
+    cat >"$sign_dir/openssl.cnf" <<CNF
+[req]
+distinguished_name=dn
+req_extensions=ext
+prompt=no
+[dn]
+CN=$dns_name
+[ext]
+subjectAltName=DNS:$dns_name
+CNF
+    openssl req -new \
+      -key "$sign_dir/leaf.key" \
+      -out "$sign_dir/leaf.csr" \
+      -config "$sign_dir/openssl.cnf" >/dev/null 2>&1
+    openssl x509 -req \
+      -in "$sign_dir/leaf.csr" \
+      -CA "$ca_cert" \
+      -CAkey "$ca_key" \
+      -CAcreateserial \
+      -out "$sign_dir/leaf.crt" \
+      -days 1 \
+      -extfile "$sign_dir/openssl.cnf" \
+      -extensions ext >/dev/null 2>&1
+    cp "$sign_dir/leaf.crt" "$leaf_cert"
+    cp "$sign_dir/leaf.key" "$leaf_key"
+    chmod 0600 "$leaf_cert" "$leaf_key"
+    rm -rf "$sign_dir"
+  done <"$SERVICES_TSV"
 }
 
 bootstrap_all() {
@@ -320,6 +377,7 @@ main() {
   done
 
   assert_state_and_isolation
+  refresh_leaves
   run_verify_all
 
   cp -f "$ARTIFACT_DIR/layout.json" "$ARTIFACT_DIR/layout-final.json"
