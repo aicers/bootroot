@@ -1320,9 +1320,20 @@ mod tests {
         );
     }
 
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn self_mint_skipped_with_warning_when_auth_not_file_based() {
         let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
             .expect(1)
@@ -1363,9 +1374,20 @@ mod tests {
         );
     }
 
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn no_self_mint_under_root_auth() {
         let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
             .expect(1)
@@ -1471,9 +1493,20 @@ mod tests {
     // fails its login verification must not replace the working file —
     // the old secret_id stays valid until TTL, so the next run
     // self-heals.
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn self_mint_verify_failure_keeps_old_credential_file() {
         let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
             .expect(1)
@@ -1531,9 +1564,20 @@ mod tests {
         );
     }
 
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn self_mint_applies_recorded_cidr_binding() {
         let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
             .expect(1)
