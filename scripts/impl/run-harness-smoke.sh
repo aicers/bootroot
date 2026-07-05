@@ -200,6 +200,75 @@ for key in ["secret_id", "eab", "responder_hmac", "trust_sync"]:
 PY
 }
 
+refresh_leaf() {
+  # Re-issue the service leaf with the CA the mock most recently
+  # served under `<service>/current/`. The smoke harness uses a stub
+  # bootroot-agent (`exit 0`), so the production path that would
+  # re-sign the leaf via the renewal predicate never fires; without
+  # this step the `bootroot verify` chain check added in #627 would
+  # correctly refuse the self-signed leaf `bootstrap-smoke-node.sh`
+  # seeded against the mock CA bundle trust_sync wrote.
+  local current_dir="$MOCK_OPENBAO_TRUST_DIR/$SERVICE_NAME/current"
+  local ca_cert="$current_dir/ca.crt"
+  local ca_key="$current_dir/ca.key"
+  if [ ! -f "$ca_cert" ] || [ ! -f "$ca_key" ]; then
+    return 0
+  fi
+  local hostname domain instance_id cert_path key_path
+  IFS=$'\t' read -r hostname domain instance_id cert_path key_path < <(
+    python3 - "$WORK_DIR/state.json" "$SERVICE_NAME" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+entry = state["services"][sys.argv[2]]
+print(
+    "\t".join(
+        [
+            entry["hostname"],
+            entry["domain"],
+            entry["instance_id"],
+            entry["cert_path"],
+            entry["key_path"],
+        ]
+    )
+)
+PY
+  )
+  local dns_name="${instance_id}.${SERVICE_NAME}.${hostname}.${domain}"
+  local sign_dir
+  sign_dir="$(mktemp -d)"
+  openssl genrsa -out "$sign_dir/leaf.key" 2048 >/dev/null 2>&1
+  cat >"$sign_dir/openssl.cnf" <<CNF
+[req]
+distinguished_name=dn
+req_extensions=ext
+prompt=no
+[dn]
+CN=$dns_name
+[ext]
+subjectAltName=DNS:$dns_name
+CNF
+  openssl req -new \
+    -key "$sign_dir/leaf.key" \
+    -out "$sign_dir/leaf.csr" \
+    -config "$sign_dir/openssl.cnf" >/dev/null 2>&1
+  openssl x509 -req \
+    -in "$sign_dir/leaf.csr" \
+    -CA "$ca_cert" \
+    -CAkey "$ca_key" \
+    -CAcreateserial \
+    -out "$sign_dir/leaf.crt" \
+    -days 1 \
+    -extfile "$sign_dir/openssl.cnf" \
+    -extensions ext >/dev/null 2>&1
+  cp "$sign_dir/leaf.crt" "$WORK_DIR/$cert_path"
+  cp "$sign_dir/leaf.key" "$WORK_DIR/$key_path"
+  chmod 0600 "$WORK_DIR/$cert_path" "$WORK_DIR/$key_path"
+  rm -rf "$sign_dir"
+}
+
 run_verify() {
   (
     cd "$WORK_DIR"
@@ -225,6 +294,10 @@ main() {
 
   "$ROOT_DIR/scripts/impl/bootstrap-smoke-node.sh" "$WORK_DIR"
 
+  # Persist the mock's synthetic CA material under the artifact dir so
+  # `refresh_leaf` can re-sign the leaf with the CA the bundle trusts.
+  export MOCK_OPENBAO_TRUST_DIR="$ARTIFACT_DIR/mock-trust"
+  mkdir -p "$MOCK_OPENBAO_TRUST_DIR"
   SERVICE_NAME="$SERVICE_NAME" MOCK_OPENBAO_PORT="$MOCK_OPENBAO_PORT" \
     python3 "$ROOT_DIR/scripts/impl/mock-openbao-server.py" >/dev/null 2>&1 &
   printf "%s" "$!" >"$MOCK_OPENBAO_PID_FILE"
@@ -239,6 +312,8 @@ main() {
   done
 
   assert_bootstrap_applied "$BOOTSTRAP_OUTPUT"
+
+  refresh_leaf
 
   log_phase "verify" "service-node-01" "$SERVICE_NAME"
   run_verify

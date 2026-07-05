@@ -64,6 +64,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   pins and bundle converge immediately. Surfaced by the extended Docker
   E2E `infra-lifecycle` and `ca-key-recovery` cases once the #622
   fingerprint check landed.
+- Fixed the extended Docker E2E `scale-contention` (baseline harness)
+  and `runner-timer` / `runner-cron` (smoke harness) cases failing the
+  `bootroot verify` leaf-chain check introduced by #627. Both harnesses
+  seed a self-signed workspace leaf and drive a stub `bootroot-agent`,
+  so nothing ever re-signed the leaf against the mock OpenBao CA that
+  `trust_sync` pins in the bundle. They now persist the mock's
+  synthetic CA material under the artifact dir and re-issue each leaf
+  from `<service>/current/` before verification, mirroring the
+  `refresh_leaves` step the rotation-recovery harness already had.
 - Fixed a delivery-mode transition (`local-file` → `remote-bootstrap`
   or the reverse) leaving a duplicate `[[profiles]]` block in
   `agent.toml`. The two code paths wrote their managed profile under
