@@ -53,6 +53,58 @@ impl Messages {
         )
     }
 
+    pub(crate) fn prompt_rotate_all_approle_secret_ids(&self, count: usize) -> String {
+        format_template(
+            self.strings().prompt_rotate_all_approle_secret_ids,
+            &[("count", &count.to_string())],
+        )
+    }
+
+    pub(crate) fn rotate_all_no_services(&self) -> &'static str {
+        self.strings().rotate_all_no_services
+    }
+
+    pub(crate) fn rotate_all_target_failed(&self, service_name: &str, error: &str) -> String {
+        format_template(
+            self.strings().rotate_all_target_failed,
+            &[("service_name", service_name), ("error", error)],
+        )
+    }
+
+    pub(crate) fn rotate_all_result(&self, ok: usize, failed: usize, total: usize) -> String {
+        format_template(
+            self.strings().rotate_all_result,
+            &[
+                ("ok", &ok.to_string()),
+                ("failed", &failed.to_string()),
+                ("total", &total.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn error_rotate_all_partial_failure(
+        &self,
+        failed: usize,
+        total: usize,
+        names: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_all_partial_failure,
+            &[
+                ("failed", &failed.to_string()),
+                ("total", &total.to_string()),
+                ("names", names),
+            ],
+        )
+    }
+
+    pub(crate) fn error_service_secret_id_mint_failed(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().error_service_secret_id_mint_failed,
+            &[("service_name", service_name)],
+        )
+    }
+
     pub(crate) fn prompt_rotate_infra_approle_secret_id(&self, role_name: &str) -> String {
         format_template(
             self.strings().prompt_rotate_infra_approle_secret_id,

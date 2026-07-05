@@ -494,8 +494,10 @@ bootroot rotate db \
   --db-admin-dsn "postgresql://admin:***@127.0.0.1:5433/postgres"
 bootroot rotate responder-hmac
 bootroot rotate openbao-recovery --rotate-root-token
-bootroot rotate approle-secret-id --service-name edge-proxy
-bootroot rotate approle-secret-id --service-name web-app
+
+# 등록된 모든 서비스의 secret_id를 한 번의 호출로 회전
+# (서비스별 대상 지정은 --service-name으로 계속 가능)
+bootroot rotate approle-secret-id --all-services
 
 # OpenBao Agent 사이드카가 사용하는 인프라 AppRole secret_id 회전
 # (위에서 사용한 runtime-rotate 자격증명이 아니라

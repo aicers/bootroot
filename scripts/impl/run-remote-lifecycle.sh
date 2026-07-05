@@ -505,6 +505,9 @@ run_rotation_secret_id() {
     --yes \
     approle-secret-id \
     --service-name "$SERVICE_NAME" >>"$RUN_LOG" 2>&1
+  # Batch selector (#669): --all-services follows state.json, so this
+  # single invocation covers $SERVICE_NAME_2 and re-rotates
+  # $SERVICE_NAME, doubling as re-run idempotence coverage.
   run_bootroot_control rotate \
     --compose-file "$COMPOSE_FILE" \
     --openbao-url "http://${STEPCA_HOST_IP}:8200" \
@@ -513,7 +516,9 @@ run_rotation_secret_id() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     approle-secret-id \
-    --service-name "$SERVICE_NAME_2" >>"$RUN_LOG" 2>&1
+    --all-services >>"$RUN_LOG" 2>&1
+  grep -q "services rotated: 2 succeeded, 0 failed (total 2)" "$RUN_LOG" \
+    || fail "batch secret_id rotation summary missing from run log"
 }
 
 run_rotation_trust_sync() {

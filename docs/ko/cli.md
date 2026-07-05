@@ -1354,12 +1354,20 @@ OpenBao와 통신해 값을 갱신합니다.
 
 #### `rotate approle-secret-id`
 
-AppRole 하나의 `secret_id`를 회전합니다 — 등록된 서비스 또는 장기 실행
-OpenBao Agent 사이드카가 사용하는 인프라 역할 중 하나를 대상으로 하며,
-두 선택자 중 정확히 하나가 필요합니다:
+AppRole `secret_id`를 회전합니다 — 등록된 서비스 하나, 등록된 모든
+서비스 일괄, 또는 장기 실행 OpenBao Agent 사이드카가 사용하는 인프라
+역할 중 하나를 대상으로 하며, 세 선택자 중 정확히 하나가 필요합니다:
 
 - `--service-name`: 대상 서비스 이름. `bootroot-runtime-rotate-role`
   자격증명으로 인증합니다.
+- `--all-services`: `state.json`에 등록된 모든 서비스(`local-file`과
+  `remote-bootstrap` 전달 모드 모두)를 한 번의 호출로 회전합니다.
+  `bootroot-runtime-rotate-role` 자격증명으로 인증합니다. 스케줄
+  작업용으로 설계되었습니다(`--yes`): 서비스별 실패가 있어도 계속
+  진행하고, 대상별 요약을 출력하며, 하나라도 실패하면 0이 아닌 코드로
+  종료합니다. 빈 서비스 레지스트리는 no-op 성공입니다. 인프라 역할은
+  의도적으로 제외됩니다(별도 자격증명 — 아래 참고). 두 `--infra`
+  호출을 함께 스케줄하세요.
 - `--infra <stepca|responder>`: 대상 인프라 역할
   (`bootroot-stepca-role` / `bootroot-responder-role`).
   `bootroot-infra-rotate-role` 자격증명을 기존 `--auth-mode approle`

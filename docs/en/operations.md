@@ -151,11 +151,14 @@ For day-2 automation, use runtime AppRole auth (`--auth-mode approle`) instead
 of root token. Root token should be kept for bootstrap/break-glass only.
 `bootroot` does not include a built-in persistent root-token store.
 
-Example (cron):
+Example (cron; a crontab entry must be a single physical line — cron
+does not join `\` continuations — and variable assignments may sit on
+their own lines):
 
 ```cron
-0 3 * * 0 OPENBAO_APPROLE_ROLE_ID=... OPENBAO_APPROLE_SECRET_ID=... \
-  bootroot rotate --auth-mode approle stepca-password --yes
+OPENBAO_APPROLE_ROLE_ID=...
+OPENBAO_APPROLE_SECRET_ID=...
+0 3 * * 0 bootroot rotate --auth-mode approle stepca-password --yes
 ```
 
 Example (systemd timer):
@@ -181,6 +184,155 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+### Scheduling AppRole secret_id rotation
+
+Every AppRole `secret_id` bootroot mints carries a short TTL (default
+`24h`), so `secret_id` rotation must be a scheduled job, not a manual
+task — otherwise OpenBao Agent logins start failing with `403 invalid
+role or secret ID` within one TTL of the last rotation. The cadence
+invariant (TTL ≥ 2× rotation interval) and the TTL knobs are documented
+in [SecretID TTL and rotation cadence](#secretid-ttl-and-rotation-cadence);
+this section provides the worked scheduled job.
+
+The model is **one scheduled job, few invocations**. Services and infra
+roles use deliberately separate credentials (`bootroot-runtime-rotate-role`
+cannot touch the infra roles, `bootroot-infra-rotate-role` cannot touch
+service roles or KV — a privilege-escalation boundary), and a single
+`rotate` invocation authenticates exactly once, so the job fires one
+invocation per credential surface instead of mixing them:
+
+- **One batch service invocation**: `bootroot rotate approle-secret-id
+  --all-services --yes` rotates every service registered in
+  `state.json` (both `local-file` and `remote-bootstrap` delivery
+  modes) under the runtime-rotate credential. Because it follows the
+  registry, services added after the scheduler was written are picked
+  up automatically — no per-service unit to keep in sync. It continues
+  past per-service failures, prints a per-target summary, and exits
+  non-zero if any target failed; an empty registry is a no-op success.
+- **Two per-target infra invocations** (`--infra stepca`,
+  `--infra responder`) under the infra-rotate credential; see
+  [Infra AppRole secret_id rotation](#infra-approle-secret_id-rotation-stepca-responder).
+  Do **not** schedule the service batch alone: the infra roles share
+  the same TTL, and skipping them stalls the cert-issuance machinery
+  behind the sidecars.
+
+With the default `24h` TTL, run the job **every 8–12 hours**. With
+per-service `--secret-id-ttl` overrides, the schedule must satisfy the
+invariant for the **smallest** TTL among all targets (services and
+infra roles alike).
+
+Store each rotate credential's `role_id`/`secret_id` in root-owned
+files (mode `0600`), e.g. `/etc/bootroot/runtime-rotate/{role_id,secret_id}`
+and `/etc/bootroot/infra-rotate/{role_id,secret_id}`, and pass them via
+`--approle-role-id-file`/`--approle-secret-id-file` so the secrets stay
+out of unit files, crontabs, and process listings. `bootroot init`
+prints both credentials (masked unless `--show-secrets`); on
+deployments initialized before `bootroot-infra-rotate-role` existed, a
+root-token `--infra` run provisions it and prints the credential (see
+the upgrade note in the infra section).
+
+Worked example — systemd timer + oneshot unit
+(`bootroot-rotate-secret-ids.service`):
+
+```ini
+[Unit]
+Description=Rotate bootroot AppRole secret_ids (services + infra)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/runtime-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/runtime-rotate/secret_id \
+  approle-secret-id --all-services --yes
+ExecStart=/usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
+  approle-secret-id --infra stepca --yes
+ExecStart=/usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
+  approle-secret-id --infra responder --yes
+```
+
+```ini
+[Unit]
+Description=bootroot AppRole secret_id rotation every 8 hours
+
+[Timer]
+OnCalendar=00/8:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+With `Type=oneshot`, a failing `ExecStart` line stops the remaining
+lines and marks the unit failed. Rotation is idempotent (old
+`secret_id`s stay valid until their TTL) and the ≥2× TTL buffer absorbs
+a single missed run, but alert on unit failures so consecutive misses
+cannot ride past the TTL.
+
+Cron equivalent. A crontab entry must be a single physical line (cron
+does not join `\` continuations), so put the three invocations in a
+small wrapper script — e.g. `/usr/local/sbin/bootroot-rotate-secret-ids`,
+root-owned, mode `0700` — and point one cron entry at it. Unlike the
+`Type=oneshot` unit, the script continues past a failing invocation
+and exits non-zero if any invocation failed:
+
+```bash
+#!/bin/sh
+set -u
+status=0
+/usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/runtime-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/runtime-rotate/secret_id \
+  approle-secret-id --all-services --yes || status=1
+/usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
+  approle-secret-id --infra stepca --yes || status=1
+/usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
+  approle-secret-id --infra responder --yes || status=1
+exit "$status"
+```
+
+```cron
+0 */8 * * * /usr/local/sbin/bootroot-rotate-secret-ids
+```
+
+### The rotate credentials' own secret_ids
+
+The scheduled job authenticates with two AppRoles whose `secret_id`s
+are subject to the same TTL as everything else, and **neither can mint
+its own**: the runtime-rotate policy mints only on
+`bootroot-service-*` role paths, the infra-rotate policy only on the
+two infra role paths. Left unaddressed, the job locks itself out
+within one TTL. A first-party self-rotation design is tracked in
+[#672](https://github.com/aicers/bootroot/issues/672); until it lands,
+apply this interim procedure:
+
+- Re-mint both rotate credentials on a schedule shorter than their TTL
+  using the break-glass root token (consistent with the
+  bootstrap/break-glass carve-out — this is a scheduled operator task,
+  not part of the automated job):
+  - infra-rotate: run one root-token `--infra` rotation
+    (`bootroot rotate --auth-mode root --root-token-file <path>
+    --show-secrets approle-secret-id --infra stepca --yes`) — every
+    root-token run mints and prints a fresh infra-rotate credential.
+  - runtime-rotate: mint directly against OpenBao with the root token,
+    e.g. `docker compose exec -e BAO_TOKEN=<root-token> openbao bao
+    write -f auth/approle/role/bootroot-runtime-rotate-role/secret-id`.
+- Optionally widen the window by initializing the roles with a longer
+  `--secret-id-ttl` (values above `48h` warn, above `168h` are
+  rejected) so the operator re-mint can be, say, weekly.
+
+After each re-mint, update the credential files referenced by the
+scheduled job (e.g. under `/etc/bootroot/`); previously issued
+`secret_id`s stay valid until their TTL, so the swap is not
+time-critical within one TTL window.
 
 ## Rotation and the in-FD pitfall
 
@@ -313,6 +465,11 @@ provides exactly one missed-run buffer. If your automation cannot
 guarantee timely execution, increase the TTL or shorten the rotation
 interval.
 
+See
+[Scheduling AppRole secret_id rotation](#scheduling-approle-secret_id-rotation)
+for the worked scheduled job (systemd timer / cron) that implements
+this cadence across all services and the infra roles.
+
 **Per-service overrides:**
 
 - `bootroot service add --secret-id-ttl 48h` sets the TTL at issuance time.
@@ -323,6 +480,11 @@ interval.
 
 When `--secret-id-ttl` is omitted during `service add`, the service
 inherits the role-level TTL configured during `bootroot init`.
+
+When per-service overrides are in play, the rotation schedule must
+satisfy the ≥2× invariant for the **smallest** TTL among all targets —
+a single service overridden down to `12h` forces the whole job to run
+at least every 6 hours.
 
 ## Updating service secret_id policy
 
@@ -450,7 +612,9 @@ Agent sidecars (`openbao-agent-stepca`, `openbao-agent-responder`) and
 share the same `secret_id` TTL as services, so their `secret_id`s must
 be rotated on a cadence too — otherwise the sidecars eventually fail
 OpenBao login with `403 invalid role or secret ID` and the
-cert-issuance machinery behind them stalls.
+cert-issuance machinery behind them stalls. Schedule these two
+invocations in the same job as the service batch — see
+[Scheduling AppRole secret_id rotation](#scheduling-approle-secret_id-rotation).
 
 Rotate them with the `--infra` selector:
 
