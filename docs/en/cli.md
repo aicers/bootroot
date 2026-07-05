@@ -1411,12 +1411,21 @@ Per subcommand:
 
 #### `rotate approle-secret-id`
 
-Rotates the `secret_id` of one AppRole — either a registered service or
-one of the infra roles consumed by the long-running OpenBao Agent
-sidecars. Exactly one of the two selectors is required:
+Rotates AppRole `secret_id`s — a single registered service, every
+registered service at once, or one of the infra roles consumed by the
+long-running OpenBao Agent sidecars. Exactly one of the three selectors
+is required:
 
 - `--service-name`: target service name. Authenticate with
   `bootroot-runtime-rotate-role` credentials.
+- `--all-services`: rotates every service registered in `state.json`
+  (both `local-file` and `remote-bootstrap` delivery modes) in one
+  invocation. Authenticate with `bootroot-runtime-rotate-role`
+  credentials. Designed for scheduled jobs (`--yes`): it continues past
+  per-service failures, prints a per-target summary, and exits non-zero
+  if any target failed; an empty service registry is a no-op success.
+  Infra roles are deliberately excluded (separate credential — see
+  below); schedule the two `--infra` invocations alongside it.
 - `--infra <stepca|responder>`: target infra role
   (`bootroot-stepca-role` / `bootroot-responder-role`). Authenticate
   with `bootroot-infra-rotate-role` credentials via the usual

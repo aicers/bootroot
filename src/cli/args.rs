@@ -705,7 +705,7 @@ pub(crate) struct RotateOpenBaoRecoveryArgs {
     group(
         ArgGroup::new("approle_target")
             .required(true)
-            .args(["service_name", "infra"])
+            .args(["service_name", "all_services", "infra"])
     )
 )]
 pub(crate) struct RotateAppRoleSecretIdArgs {
@@ -714,6 +714,18 @@ pub(crate) struct RotateAppRoleSecretIdArgs {
     /// Authenticate with `bootroot-runtime-rotate-role` credentials.
     #[arg(long)]
     pub(crate) service_name: Option<String>,
+
+    /// Rotates the `AppRole` `secret_id` of every registered service in
+    /// one invocation.
+    ///
+    /// Authenticate with `bootroot-runtime-rotate-role` credentials.
+    /// Infra roles are deliberately excluded (they use the separate
+    /// `bootroot-infra-rotate-role` credential); schedule `--infra`
+    /// invocations alongside this one. Continues past per-service
+    /// failures and exits non-zero if any target failed. An empty
+    /// service registry is a no-op success.
+    #[arg(long)]
+    pub(crate) all_services: bool,
 
     /// Infra role to rotate the `AppRole` `secret_id` for.
     ///
@@ -1657,6 +1669,22 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parses_rotate_approle_secret_id_all_services() {
+        let cli = Cli::parse_from(["bootroot", "rotate", "approle-secret-id", "--all-services"]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::AppRoleSecretId(approle) => {
+                    assert!(approle.all_services);
+                    assert!(approle.service_name.is_none());
+                    assert!(approle.infra.is_none());
+                }
+                _ => panic!("expected AppRoleSecretId subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
     fn test_cli_rotate_approle_secret_id_requires_exactly_one_target() {
         assert!(
             Cli::try_parse_from(["bootroot", "rotate", "approle-secret-id"]).is_err(),
@@ -1674,6 +1702,30 @@ mod tests {
             ])
             .is_err(),
             "--service-name and --infra must be mutually exclusive"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bootroot",
+                "rotate",
+                "approle-secret-id",
+                "--all-services",
+                "--service-name",
+                "api",
+            ])
+            .is_err(),
+            "--all-services and --service-name must be mutually exclusive"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bootroot",
+                "rotate",
+                "approle-secret-id",
+                "--all-services",
+                "--infra",
+                "stepca",
+            ])
+            .is_err(),
+            "--all-services and --infra must be mutually exclusive"
         );
         assert!(
             Cli::try_parse_from([

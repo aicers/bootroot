@@ -45,6 +45,9 @@ pub(super) async fn rotate_approle_secret_id(
         )
         .await;
     }
+    if args.all_services {
+        return rotate_all_service_approle_secret_ids(ctx, client, auto_confirm, messages).await;
+    }
     let service_name = args.service_name.as_deref().ok_or_else(|| {
         // clap's ArgGroup guarantees one selector is present; guard for
         // callers that construct the args directly.
@@ -53,8 +56,17 @@ pub(super) async fn rotate_approle_secret_id(
     rotate_service_approle_secret_id(ctx, client, service_name, auto_confirm, messages).await
 }
 
+/// Per-service facts the caller needs to print an accurate summary:
+/// remote-bootstrap targets skip the agent reload, CIDR-bound targets
+/// skip the login verification.
+struct ServiceRotationReport {
+    secret_id_path: String,
+    agent_reloaded: bool,
+    login_verified: bool,
+}
+
 async fn rotate_service_approle_secret_id(
-    ctx: &mut RotateContext,
+    ctx: &RotateContext,
     client: &OpenBaoClient,
     service_name: &str,
     auto_confirm: bool,
@@ -66,6 +78,92 @@ async fn rotate_service_approle_secret_id(
         messages,
     )?;
 
+    let report = rotate_service_secret_id_once(ctx, client, service_name, messages).await?;
+
+    println!("{}", messages.rotate_summary_title());
+    // CodeQL flags this as cleartext-logging, but the second argument is
+    // `secret_id_path` (a file path), not the secret_id value. Dismiss as false positive.
+    println!(
+        "{}",
+        messages.rotate_summary_approle_secret_id(service_name, &report.secret_id_path)
+    );
+    if report.agent_reloaded {
+        println!("{}", messages.rotate_summary_reload_openbao_agent());
+    }
+    if report.login_verified {
+        println!("{}", messages.rotate_summary_approle_login_ok(service_name));
+    }
+    Ok(())
+}
+
+/// Rotates every registered service `secret_id` in one invocation so a
+/// single scheduled job stays in sync with the registry. One failing
+/// target must not leave the remaining targets unrotated: failures are
+/// collected, reported per target, and turned into a single non-zero
+/// exit at the end.
+async fn rotate_all_service_approle_secret_ids(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    auto_confirm: bool,
+    messages: &Messages,
+) -> Result<()> {
+    let service_names: Vec<String> = ctx.state.services.keys().cloned().collect();
+    if service_names.is_empty() {
+        println!("{}", messages.rotate_all_no_services());
+        return Ok(());
+    }
+    confirm_action(
+        &messages.prompt_rotate_all_approle_secret_ids(service_names.len()),
+        auto_confirm,
+        messages,
+    )?;
+
+    let mut outcomes = Vec::with_capacity(service_names.len());
+    for service_name in &service_names {
+        let outcome = rotate_service_secret_id_once(ctx, client, service_name, messages).await;
+        outcomes.push((service_name.as_str(), outcome));
+    }
+
+    println!("{}", messages.rotate_summary_title());
+    let mut failed_names = Vec::new();
+    for (service_name, outcome) in &outcomes {
+        match outcome {
+            // The second argument is the secret_id file path, not the secret value.
+            Ok(report) => println!(
+                "{}",
+                messages.rotate_summary_approle_secret_id(service_name, &report.secret_id_path)
+            ),
+            Err(error) => {
+                println!(
+                    "{}",
+                    messages.rotate_all_target_failed(service_name, &format!("{error:#}"))
+                );
+                failed_names.push(*service_name);
+            }
+        }
+    }
+    let total = outcomes.len();
+    let failed = failed_names.len();
+    println!(
+        "{}",
+        messages.rotate_all_result(total - failed, failed, total)
+    );
+    if !failed_names.is_empty() {
+        anyhow::bail!(messages.error_rotate_all_partial_failure(
+            failed,
+            total,
+            &failed_names.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+async fn rotate_service_secret_id_once(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    service_name: &str,
+    messages: &Messages,
+) -> Result<ServiceRotationReport> {
     let entry = ctx
         .state
         .services
@@ -95,7 +193,7 @@ async fn rotate_service_approle_secret_id(
                 .await
         }
     }
-    .with_context(|| messages.error_openbao_secret_id_failed())?;
+    .with_context(|| messages.error_service_secret_id_mint_failed(service_name))?;
     if !is_remote {
         write_secret_id_atomic(&entry.approle.secret_id_path, &new_secret_id, messages).await?;
         reload_openbao_agent(&entry, messages)?;
@@ -117,24 +215,11 @@ async fn rotate_service_approle_secret_id(
         )
         .await?;
     }
-
-    println!("{}", messages.rotate_summary_title());
-    // CodeQL flags this as cleartext-logging, but the second argument is
-    // `secret_id_path` (a file path), not the secret_id value. Dismiss as false positive.
-    println!(
-        "{}",
-        messages.rotate_summary_approle_secret_id(
-            service_name,
-            &entry.approle.secret_id_path.display().to_string()
-        )
-    );
-    if !is_remote {
-        println!("{}", messages.rotate_summary_reload_openbao_agent());
-    }
-    if !has_cidr_binding {
-        println!("{}", messages.rotate_summary_approle_login_ok(service_name));
-    }
-    Ok(())
+    Ok(ServiceRotationReport {
+        secret_id_path: entry.approle.secret_id_path.display().to_string(),
+        agent_reloaded: !is_remote,
+        login_verified: !has_cidr_binding,
+    })
 }
 
 fn infra_role_name(target: InfraRoleTarget) -> &'static str {
@@ -396,7 +481,9 @@ mod tests {
         write_fake_docker_script,
     };
     use super::*;
-    use crate::state::StateFile;
+    use crate::state::{DeployType, ServiceRoleEntry, StateFile};
+
+    const RUNTIME_ROTATE_ROLE: &str = "bootroot-runtime-rotate-role";
 
     fn make_ctx(dir: &std::path::Path) -> RotateContext {
         RotateContext {
@@ -422,6 +509,66 @@ mod tests {
             state_dir: dir.to_path_buf(),
             state_file: dir.join("state.json"),
         }
+    }
+
+    fn service_role_name(name: &str) -> String {
+        format!("bootroot-service-{name}-role")
+    }
+
+    fn make_service_entry(
+        base: &std::path::Path,
+        name: &str,
+        delivery_mode: DeliveryMode,
+    ) -> ServiceEntry {
+        ServiceEntry {
+            service_name: name.to_string(),
+            deploy_type: DeployType::Docker,
+            delivery_mode,
+            hostname: "h".to_string(),
+            domain: "d.com".to_string(),
+            agent_config_path: base.join(name).join("agent.hcl"),
+            cert_path: base.join(name).join("cert.pem"),
+            key_path: base.join(name).join("key.pem"),
+            instance_id: None,
+            container_name: None,
+            notes: None,
+            post_renew_hooks: vec![],
+            approle: ServiceRoleEntry {
+                role_name: service_role_name(name),
+                role_id: format!("{name}-role-id"),
+                secret_id_path: base.join(name).join("secret_id"),
+                policy_name: "p".to_string(),
+                secret_id_ttl: None,
+                // Disable response wrapping so the plain secret-id
+                // endpoint mocks match.
+                secret_id_wrap_ttl: Some("0".to_string()),
+                token_bound_cidrs: None,
+            },
+            agent_email: None,
+            agent_server: None,
+            agent_responder_url: None,
+            cert_group_gid: None,
+        }
+    }
+
+    /// Registers a local-file service in the context, pre-creating the
+    /// service dir and `role_id` file so rotation skips the `OpenBao`
+    /// role-id backfill.
+    fn insert_local_service(ctx: &mut RotateContext, base: &std::path::Path, name: &str) {
+        let entry = make_service_entry(base, name, DeliveryMode::LocalFile);
+        let service_dir = entry
+            .approle
+            .secret_id_path
+            .parent()
+            .expect("service secret_id path has a parent")
+            .to_path_buf();
+        fs::create_dir_all(&service_dir).expect("create service dir");
+        fs::write(
+            service_dir.join(ROLE_ID_FILENAME),
+            format!("{name}-role-id"),
+        )
+        .expect("write role_id");
+        ctx.state.services.insert(name.to_string(), entry);
     }
 
     fn mount_secret_id_mock(role: &str) -> Mock {
@@ -727,6 +874,183 @@ mod tests {
         assert!(
             !ctx.state_file.exists(),
             "state.json must not be rewritten when its entries are already current"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_all_services_empty_registry_is_noop_success() {
+        let dir = tempdir().expect("tempdir");
+        let ctx = make_ctx(dir.path());
+        // No OpenBao requests may happen; an unroutable URL makes any
+        // accidental call fail loudly.
+        let mut client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
+        client.set_token("scoped-token".to_string());
+        let messages = test_messages();
+        rotate_all_service_approle_secret_ids(&ctx, &client, true, &messages)
+            .await
+            .expect("an empty service registry must be a no-op success");
+    }
+
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn rotate_all_services_rotates_local_and_remote_targets() {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let server = MockServer::start().await;
+        mount_secret_id_mock(&service_role_name("alpha"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_secret_id_mock(&service_role_name("beta"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock().expect(2).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/secret/data/{SERVICE_KV_BASE}/beta/secret_id"
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+        ctx.state.services.insert(
+            "beta".to_string(),
+            make_service_entry(dir.path(), "beta", DeliveryMode::RemoteBootstrap),
+        );
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("scoped-token".to_string());
+        let messages = test_messages();
+        rotate_all_service_approle_secret_ids(&ctx, &client, true, &messages)
+            .await
+            .expect("batch rotation should succeed");
+
+        let local_secret = fs::read_to_string(dir.path().join("alpha").join("secret_id"))
+            .expect("local secret_id written");
+        assert_eq!(local_secret, "fresh-secret-id");
+        assert!(
+            !dir.path().join("beta").join("secret_id").exists(),
+            "remote-bootstrap targets must not get a local secret_id file"
+        );
+        let logged = fs::read_to_string(&args_log).expect("read docker args");
+        let args: Vec<&str> = logged.lines().collect();
+        assert_eq!(
+            args,
+            vec!["restart", "bootroot-openbao-agent-alpha"],
+            "only the local target's sidecar must be reloaded"
+        );
+    }
+
+    // The env-var lock must be held across the `.await` to prevent
+    // parallel tests from seeing a corrupted PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn rotate_all_services_continues_after_per_target_failure() {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{}/secret-id",
+                service_role_name("alpha")
+            )))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_string(r#"{"errors":["permission denied"]}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_secret_id_mock(&service_role_name("beta"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock().expect(1).mount(&server).await;
+
+        let mut ctx = make_ctx(dir.path());
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+        insert_local_service(&mut ctx, dir.path(), "beta");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("scoped-token".to_string());
+        let messages = test_messages();
+        let err = rotate_all_service_approle_secret_ids(&ctx, &client, true, &messages)
+            .await
+            .expect_err("a partial failure must produce a non-zero exit");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("alpha"),
+            "the error must name the failed service, got: {msg}"
+        );
+        assert!(
+            !msg.contains("beta"),
+            "the error must not list services that rotated successfully, got: {msg}"
+        );
+        assert!(
+            !dir.path().join("alpha").join("secret_id").exists(),
+            "the failed target's secret_id file must not be touched"
+        );
+        let beta_secret = fs::read_to_string(dir.path().join("beta").join("secret_id"))
+            .expect("the remaining target must still be rotated");
+        assert_eq!(beta_secret, "fresh-secret-id");
+        let logged = fs::read_to_string(&args_log).expect("read docker args");
+        let args: Vec<&str> = logged.lines().collect();
+        assert_eq!(
+            args,
+            vec!["restart", "bootroot-openbao-agent-beta"],
+            "only the successfully rotated target's sidecar must be reloaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_service_permission_denied_names_runtime_rotate_credential() {
+        let dir = tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v1/auth/approle/role/{}/secret-id",
+                service_role_name("alpha")
+            )))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_string(r#"{"errors":["permission denied"]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path());
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("infra-rotate-token".to_string());
+        let messages = test_messages();
+        let err = rotate_service_approle_secret_id(&ctx, &client, "alpha", true, &messages)
+            .await
+            .expect_err("permission denied must fail the rotation");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(RUNTIME_ROTATE_ROLE),
+            "error must name the expected credential, got: {msg}"
         );
     }
 }

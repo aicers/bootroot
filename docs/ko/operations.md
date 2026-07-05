@@ -176,6 +176,139 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+### AppRole secret_id 회전 스케줄링
+
+bootroot가 발급하는 모든 AppRole `secret_id`는 짧은 TTL(기본 `24h`)을
+가지므로, `secret_id` 회전은 수동 작업이 아니라 스케줄된 작업이어야
+합니다 — 그렇지 않으면 마지막 회전 후 TTL이 지나는 시점부터 OpenBao
+Agent 로그인이 `403 invalid role or secret ID`로 실패하기 시작합니다.
+주기 불변식(TTL ≥ 회전 주기의 2배)과 TTL 조절 방법은
+[SecretID TTL과 회전 주기](#secretid-ttl과-회전-주기)에 문서화되어
+있으며, 이 절은 실제 동작하는 스케줄 작업 예시를 제공합니다.
+
+모델은 **하나의 스케줄 작업, 소수의 호출**입니다. 서비스와 인프라
+역할은 의도적으로 분리된 자격증명을 사용하고
+(`bootroot-runtime-rotate-role`은 인프라 역할을 다룰 수 없고,
+`bootroot-infra-rotate-role`은 서비스 역할과 KV를 다룰 수 없는 권한
+상승 경계), 단일 `rotate` 호출은 정확히 한 번만 인증하므로, 작업은
+자격증명을 섞는 대신 자격증명 표면당 하나의 호출을 실행합니다:
+
+- **배치 서비스 호출 1회**: `bootroot rotate approle-secret-id
+  --all-services --yes`는 runtime-rotate 자격증명으로 `state.json`에
+  등록된 모든 서비스(`local-file`과 `remote-bootstrap` 전달 모드
+  모두)를 회전합니다. 레지스트리를 따르므로 스케줄러 작성 이후에
+  추가된 서비스도 자동으로 포함됩니다 — 서비스별 유닛을 동기화할
+  필요가 없습니다. 서비스별 실패가 있어도 계속 진행하고, 대상별 요약을
+  출력하며, 하나라도 실패하면 0이 아닌 코드로 종료합니다. 빈
+  레지스트리는 no-op 성공입니다.
+- **인프라 대상별 호출 2회** (`--infra stepca`, `--infra responder`)는
+  infra-rotate 자격증명을 사용합니다.
+  [인프라 AppRole secret_id 회전](#인프라-approle-secret_id-회전-stepca-responder)을
+  참고하세요. 서비스 배치만 스케줄하지 **마세요**: 인프라 역할도
+  동일한 TTL을 공유하며, 빠뜨리면 사이드카 뒤의 인증서 발급 체계가
+  멈춥니다.
+
+기본 `24h` TTL이라면 작업을 **8–12시간마다** 실행하세요. 서비스별
+`--secret-id-ttl` 재정의가 있으면 모든 대상(서비스와 인프라 역할 모두)
+중 **가장 작은** TTL에 대해 불변식을 만족하도록 스케줄해야 합니다.
+
+각 rotate 자격증명의 `role_id`/`secret_id`는 root 소유 파일(모드
+`0600`)에 저장하세요. 예:
+`/etc/bootroot/runtime-rotate/{role_id,secret_id}`와
+`/etc/bootroot/infra-rotate/{role_id,secret_id}`. 그리고
+`--approle-role-id-file`/`--approle-secret-id-file`로 전달해 시크릿이
+유닛 파일, crontab, 프로세스 목록에 남지 않게 하세요. `bootroot init`이
+두 자격증명을 모두 출력합니다(`--show-secrets`가 없으면 마스킹됨).
+`bootroot-infra-rotate-role`이 생기기 전에 초기화된 배포에서는 루트
+토큰 `--infra` 실행이 역할을 프로비저닝하고 자격증명을 출력합니다
+(인프라 절의 업그레이드 노트 참고).
+
+동작 예시 — systemd 타이머 + oneshot 유닛
+(`bootroot-rotate-secret-ids.service`):
+
+```ini
+[Unit]
+Description=bootroot AppRole secret_id 회전 (서비스 + 인프라)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/runtime-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/runtime-rotate/secret_id \
+  approle-secret-id --all-services --yes
+ExecStart=/usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
+  approle-secret-id --infra stepca --yes
+ExecStart=/usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
+  approle-secret-id --infra responder --yes
+```
+
+```ini
+[Unit]
+Description=bootroot AppRole secret_id 8시간 주기 회전
+
+[Timer]
+OnCalendar=00/8:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`Type=oneshot`에서는 실패한 `ExecStart` 라인이 나머지 라인을 중단시키고
+유닛을 실패로 표시합니다. 회전은 멱등이고(기존 `secret_id`는 TTL까지
+유효) 2배 이상 TTL 버퍼가 한 번의 누락을 흡수하지만, 연속 누락이 TTL을
+넘기지 않도록 유닛 실패에 대한 알림을 설정하세요.
+
+동등한 크론 블록(크론은 각 라인을 독립적으로 실행하므로 한 호출의
+실패가 다른 호출을 막지 않습니다):
+
+```cron
+0 */8 * * * /usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/runtime-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/runtime-rotate/secret_id \
+  approle-secret-id --all-services --yes
+5 */8 * * * /usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
+  approle-secret-id --infra stepca --yes
+10 */8 * * * /usr/local/bin/bootroot rotate --auth-mode approle \
+  --approle-role-id-file /etc/bootroot/infra-rotate/role_id \
+  --approle-secret-id-file /etc/bootroot/infra-rotate/secret_id \
+  approle-secret-id --infra responder --yes
+```
+
+### rotate 자격증명 자체의 secret_id
+
+스케줄 작업은 두 AppRole로 인증하는데, 이들의 `secret_id`도 다른 모든
+것과 동일한 TTL의 적용을 받으며 **어느 쪽도 자기 자신의 것을 발급할 수
+없습니다**: runtime-rotate 정책은 `bootroot-service-*` 역할 경로에서만,
+infra-rotate 정책은 두 인프라 역할 경로에서만 발급을 허용합니다.
+방치하면 작업은 TTL 하나가 지나기 전에 스스로 잠깁니다. 자체 회전
+설계는 [#672](https://github.com/aicers/bootroot/issues/672)에서
+추적하며, 그전까지는 다음 임시 절차를 적용하세요:
+
+- 비상(break-glass) 루트 토큰으로 두 rotate 자격증명을 TTL보다 짧은
+  주기로 재발급합니다(부트스트랩/비상 예외와 일관 — 이는 자동화 작업의
+  일부가 아니라 스케줄된 운영자 작업입니다):
+  - infra-rotate: 루트 토큰 `--infra` 회전을 한 번 실행합니다
+    (`bootroot rotate --auth-mode root --root-token-file <path>
+    --show-secrets approle-secret-id --infra stepca --yes`) — 루트
+    토큰 실행마다 새 infra-rotate 자격증명이 발급되어 출력됩니다.
+  - runtime-rotate: 루트 토큰으로 OpenBao에 직접 발급합니다. 예:
+    `docker compose exec -e BAO_TOKEN=<root-token> openbao bao
+    write -f auth/approle/role/bootroot-runtime-rotate-role/secret-id`.
+- 선택적으로 역할을 더 긴 `--secret-id-ttl`로 초기화해 창을 넓힐 수
+  있습니다(`48h` 초과 시 경고, `168h` 초과 시 거부). 그러면 운영자
+  재발급을 예컨대 주 1회로 늦출 수 있습니다.
+
+재발급 후에는 스케줄 작업이 참조하는 자격증명 파일(예:
+`/etc/bootroot/` 아래)을 갱신하세요. 기존에 발급된 `secret_id`는
+TTL까지 유효하므로, 교체는 TTL 창 안이라면 시간에 쫓기지 않습니다.
+
 ## 회전과 in-FD 함정
 
 `bootroot rotate ca-key`와 `bootroot rotate force-reissue`는 각
@@ -297,6 +430,11 @@ reload/restart required" 안내를 출력합니다. 훅이 없는 서비스는
 버퍼를 제공합니다. 자동화가 적시 실행을 보장할 수 없다면 TTL을 늘리거나
 회전 주기를 줄이세요.
 
+이 주기를 모든 서비스와 인프라 역할에 걸쳐 구현하는 동작하는 스케줄
+작업(systemd 타이머 / 크론)은
+[AppRole secret_id 회전 스케줄링](#approle-secret_id-회전-스케줄링)을
+참고하세요.
+
 **서비스별 재정의:**
 
 - `bootroot service add --secret-id-ttl 48h`는 발급 시 TTL을 설정합니다.
@@ -307,6 +445,10 @@ reload/restart required" 안내를 출력합니다. 훅이 없는 서비스는
 
 `service add` 시 `--secret-id-ttl`을 생략하면 `bootroot init` 시
 설정된 역할 수준 TTL을 상속합니다.
+
+서비스별 재정의가 있는 경우, 회전 스케줄은 모든 대상 중 **가장 작은**
+TTL에 대해 2배 이상 불변식을 만족해야 합니다 — 서비스 하나가 `12h`로
+재정의되면 전체 작업을 최소 6시간마다 실행해야 합니다.
 
 ## 서비스 secret_id 정책 변경
 
@@ -427,7 +569,10 @@ bootroot가 init 시 생성하는 인프라 AppRole(`bootroot-stepca-role`,
 동일한 `secret_id` TTL을 공유합니다. 따라서 이들의 `secret_id`도
 주기적으로 회전해야 합니다 — 그렇지 않으면 사이드카가 결국
 `403 invalid role or secret ID`로 OpenBao 로그인에 실패하고, 그 뒤에
-있는 인증서 발급 체계가 멈춥니다.
+있는 인증서 발급 체계가 멈춥니다. 이 두 호출은 서비스 배치와 같은
+작업에 스케줄하세요 —
+[AppRole secret_id 회전 스케줄링](#approle-secret_id-회전-스케줄링)을
+참고하세요.
 
 `--infra` 선택자로 회전합니다:
 
