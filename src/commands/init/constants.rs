@@ -49,6 +49,7 @@ pub(crate) const CA_INTERMEDIATE_CERT_FILENAME: &str = "intermediate_ca.crt";
 
 pub(crate) const OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-exposed.yml";
 pub(crate) const HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.http01-exposed.yml";
+pub(crate) const STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.stepca-exposed.yml";
 
 pub(crate) const OPENBAO_TLS_CERT_PATH: &str = "openbao/tls/server.crt";
 pub(crate) const OPENBAO_TLS_KEY_PATH: &str = "openbao/tls/server.key";

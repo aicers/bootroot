@@ -7,7 +7,7 @@ use super::constants::{
     RESPONDER_CONFIG_NAME,
 };
 use crate::cli::args::InitArgs;
-use crate::commands::constants::RESPONDER_SERVICE_NAME;
+use crate::commands::constants::{RESPONDER_SERVICE_NAME, STEPCA_SERVICE_NAME};
 use crate::commands::guardrails::parse_hcl_string_value;
 use crate::i18n::Messages;
 
@@ -55,6 +55,22 @@ pub(crate) fn compose_has_openbao(compose_file: &Path, messages: &Messages) -> R
     let compose_contents = std::fs::read_to_string(compose_file)
         .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
     Ok(compose_has_top_level_service(&compose_contents, "openbao"))
+}
+
+/// Returns true when the compose file declares a top-level `step-ca`
+/// service.
+///
+/// Uses the structural scan rather than substring matching because the
+/// name also appears in image tags (`smallstep/step-ca:latest`) and
+/// volume paths (`./secrets/step-ca`) of compose files that do not
+/// bundle step-ca itself.
+pub(crate) fn compose_has_stepca(compose_file: &Path, messages: &Messages) -> Result<bool> {
+    let compose_contents = std::fs::read_to_string(compose_file)
+        .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
+    Ok(compose_has_top_level_service(
+        &compose_contents,
+        STEPCA_SERVICE_NAME,
+    ))
 }
 
 /// Returns true when the compose document declares a top-level service
@@ -263,6 +279,38 @@ volumes:
     driver: local
 ";
         assert!(!compose_has_top_level_service(yaml, "openbao"));
+    }
+
+    #[test]
+    fn compose_has_stepca_detects_service_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let compose_path = dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose_path,
+            "services:\n  step-ca:\n    image: smallstep/step-ca:latest\n",
+        )
+        .unwrap();
+        assert!(compose_has_stepca(&compose_path, &crate::i18n::test_messages()).unwrap());
+    }
+
+    #[test]
+    fn compose_has_stepca_ignores_image_and_volume_references() {
+        // `step-ca` appears only in an image tag and a volume path —
+        // an external-CA compose file must not satisfy the predicate.
+        let dir = tempfile::tempdir().unwrap();
+        let compose_path = dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose_path,
+            "\
+services:
+  app:
+    image: smallstep/step-ca:latest
+    volumes:
+      - ./secrets/step-ca:/home/step:ro
+",
+        )
+        .unwrap();
+        assert!(!compose_has_stepca(&compose_path, &crate::i18n::test_messages()).unwrap());
     }
 
     #[test]

@@ -1053,6 +1053,8 @@ mod tests {
             openbao_advertise_addr: Some("192.168.1.10:8200".to_string()),
             http01_admin_bind_addr: None,
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         assert_eq!(
@@ -1079,6 +1081,8 @@ mod tests {
             openbao_advertise_addr: None,
             http01_admin_bind_addr: None,
             http01_admin_advertise_addr: None,
+            stepca_bind_addr: None,
+            stepca_advertise_addr: None,
             infra_certs: BTreeMap::new(),
         };
         assert_eq!(

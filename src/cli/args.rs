@@ -891,6 +891,25 @@ pub(crate) struct InfraInstallArgs {
     #[arg(long)]
     pub(crate) http01_admin_advertise_addr: Option<String>,
 
+    /// Bind step-ca's ACME directory to a non-loopback address.
+    /// Format: `<IP>:<port>`, e.g. `192.168.1.10:9000`. step-ca already
+    /// terminates TLS with its own certificate, so no TLS acknowledgement
+    /// flag is required
+    #[arg(long)]
+    pub(crate) stepca_bind: Option<String>,
+
+    /// Confirm intent to bind step-ca's ACME directory to `0.0.0.0`
+    /// (wildcard). Required when `--stepca-bind` uses `0.0.0.0`
+    #[arg(long)]
+    pub(crate) stepca_bind_wildcard: bool,
+
+    /// Advertised step-ca ACME directory address for remote nodes.
+    /// Required when `--stepca-bind` uses a wildcard address (`0.0.0.0`
+    /// or `[::]`), because remote nodes cannot connect to a wildcard.
+    /// Must be a specific reachable IP:port (not wildcard or loopback).
+    #[arg(long)]
+    pub(crate) stepca_advertise_addr: Option<String>,
+
     /// Host-side `PostgreSQL` published port. Overrides
     /// `POSTGRES_HOST_PORT` from `.env` and the process environment.
     /// When unset, the value already in `.env` (or the compose default)
@@ -2004,6 +2023,62 @@ mod tests {
                 assert_eq!(
                     args.openbao_advertise_addr.as_deref(),
                     Some("192.168.1.10:8200")
+                );
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_infra_install_stepca_bind() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "infra",
+            "install",
+            "--stepca-bind",
+            "192.168.1.10:9000",
+        ]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert_eq!(args.stepca_bind.as_deref(), Some("192.168.1.10:9000"));
+                assert!(!args.stepca_bind_wildcard);
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_infra_install_default_no_stepca_bind() {
+        let cli = Cli::parse_from(["bootroot", "infra", "install"]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert!(args.stepca_bind.is_none());
+                assert!(!args.stepca_bind_wildcard);
+                assert!(args.stepca_advertise_addr.is_none());
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_infra_install_stepca_advertise_addr() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "infra",
+            "install",
+            "--stepca-bind",
+            "0.0.0.0:9000",
+            "--stepca-bind-wildcard",
+            "--stepca-advertise-addr",
+            "192.168.1.10:9000",
+        ]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert_eq!(args.stepca_bind.as_deref(), Some("0.0.0.0:9000"));
+                assert!(args.stepca_bind_wildcard);
+                assert_eq!(
+                    args.stepca_advertise_addr.as_deref(),
+                    Some("192.168.1.10:9000")
                 );
             }
             _ => panic!("expected infra install"),

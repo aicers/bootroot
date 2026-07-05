@@ -32,6 +32,11 @@ filesystem with the control node.
     - The HTTP-01 responder (the `--agent-responder-url` value, e.g.
       `http://responder.internal:8080`).
 
+    All three endpoints bind to `127.0.0.1` on the control node by
+    default. See [Network requirements](#network-requirements) for the
+    managed `infra install` bind flags (`--openbao-bind`,
+    `--stepca-bind`, `--http01-admin-bind`) that expose them.
+
 3. **DNS / name resolution.** The SAN (Subject Alternative Name) for the
     service certificate must resolve from whatever DNS, `/etc/hosts`, or
     cloud-internal DNS the environment uses.
@@ -498,6 +503,55 @@ The remote host must have network connectivity to the following endpoints:
 The `--agent-server` and `--agent-responder-url` values in the bootstrap
 artifact default to localhost placeholders. Replace them with
 remote-reachable endpoints before running on a separate service machine.
+
+### Exposing the control-plane endpoints
+
+By default `docker-compose.yml` publishes all three endpoints on
+`127.0.0.1` only, so none of them is reachable from a remote host until
+the operator opts in. Each endpoint has a managed `infra install` bind
+flag that records the exposure intent in `state.json` and generates a
+compose override; `bootroot infra up` re-applies the stored override, so
+the exposure survives container recreates:
+
+| Endpoint | Bind flag | Companion flags |
+| --- | --- | --- |
+| OpenBao API (`:8200`) | `--openbao-bind <IP>:8200` | `--openbao-tls-required`, `--openbao-bind-wildcard`, `--openbao-advertise-addr` |
+| step-ca ACME directory (`:9000`) | `--stepca-bind <IP>:9000` | `--stepca-bind-wildcard`, `--stepca-advertise-addr` |
+| HTTP-01 admin API (`:8080`) | `--http01-admin-bind <IP>:8080` | `--http01-admin-tls-required`, `--http01-admin-bind-wildcard`, `--http01-admin-advertise-addr` |
+
+`--stepca-bind` is the supported way to make step-ca's ACME directory
+(`:9000`) reachable from remote nodes:
+
+```bash
+bootroot infra install --stepca-bind 192.168.1.10:9000
+```
+
+- The flag writes a managed compose override to
+    `secrets/step-ca/docker-compose.stepca-exposed.yml` and records
+    `stepca_bind_addr` in `state.json`. Without the flag, the default
+    `127.0.0.1:9000` publish is unchanged.
+- `bootroot init` applies the stored override while it configures
+    step-ca, so the fresh `infra install --stepca-bind` → `init` path
+    exposes `:9000` without a separate `infra up`. `infra up` validates
+    and re-applies the same override, so the exposure also survives
+    container recreates.
+- Binding to `0.0.0.0:9000` additionally requires
+    `--stepca-bind-wildcard` and `--stepca-advertise-addr <IP>:9000`,
+    because a remote node cannot connect to a wildcard — a concrete,
+    reachable ACME directory address must be recorded.
+- Unlike the OpenBao and HTTP-01 admin flags there is no
+    `--stepca-tls-required` acknowledgement: step-ca's ACME directory
+    always terminates TLS with the step-ca certificate.
+- Re-running `infra install` without `--stepca-bind` clears the stored
+    intent, removes the override, and reverts to the loopback publish.
+- The flag manages the bundled step-ca service only. `infra install`
+    rejects `--stepca-bind` when the compose file declares no `step-ca`
+    service (e.g. an external-CA topology), mirroring the
+    `--http01-admin-bind` guard, and `infra up` skips a stored step-ca
+    override against such a compose file instead of failing.
+- The advertise address is recorded for operator reference only; pass
+    the matching ACME directory URL yourself via `--agent-server` on
+    `service add` (e.g. `https://192.168.1.10:9000/acme/acme/directory`).
 
 !!! warning
     The automatic HTTP-01 DNS alias registration (added in the current

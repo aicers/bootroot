@@ -197,8 +197,9 @@ it aborts with the busy port, a best-effort PID/command hint via
 services running while a later one fails to bind (#588 §4). The
 preflight always checks the localhost ports because `infra install`
 runs `docker compose up` against the base compose file only —
-`--openbao-bind` / `--http01-admin-bind` write override files for
-`infra up` / `init` but are not layered into the install-time `up`.
+`--openbao-bind` / `--http01-admin-bind` / `--stepca-bind` write
+override files for `infra up` / `init` but are not layered into the
+install-time `up`.
 
 ### Outputs
 

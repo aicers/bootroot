@@ -108,6 +108,20 @@ impl Messages {
         )
     }
 
+    pub(crate) fn reinit_plan_preserved_intent_stepca_bind(&self, value: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_intent_stepca_bind,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn reinit_plan_preserved_intent_stepca_advertise(&self, value: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_preserved_intent_stepca_advertise,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn reinit_plan_preserved_intent_infra_certs(&self, count: usize) -> String {
         format_template(
             self.strings().reinit_plan_preserved_intent_infra_certs,

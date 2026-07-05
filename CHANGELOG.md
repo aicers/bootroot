@@ -515,6 +515,32 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   operator `secret_id` per run), so a partially failed attempt or a
   lost credential is recovered by re-running with the root token.
   (Closes #667)
+- Added `--stepca-bind <IP>:<port>`, `--stepca-bind-wildcard`, and
+  `--stepca-advertise-addr <IP>:<port>` to `bootroot infra install`,
+  giving step-ca's ACME directory (`:9000`) the same managed,
+  state-recorded exposure path that OpenBao (`--openbao-bind`) and the
+  HTTP-01 admin API (`--http01-admin-bind`) already have for multi-host
+  remote bootstrap. The flag writes a managed compose override to
+  `secrets/step-ca/docker-compose.stepca-exposed.yml` and records
+  `stepca_bind_addr` (plus `stepca_advertise_addr` for wildcard binds)
+  in `state.json`. `bootroot init` applies the stored override while it
+  configures step-ca, so the fresh `infra install --stepca-bind` →
+  `init` path exposes `:9000` without a separate `infra up`;
+  `bootroot infra up` validates and re-applies the override so the
+  exposure survives container recreates. Re-running `infra install`
+  without the flag clears the intent and removes the override,
+  reverting to the default `127.0.0.1:9000` publish. Both
+  state-rewrite paths (`init` and `reinit`) preserve the new fields.
+  Unlike the other two endpoints there is no TLS acknowledgement flag:
+  step-ca's ACME directory always terminates TLS with the step-ca
+  certificate, and `GUARDED_SERVICES` is unchanged. The advertise
+  address is recorded for operator reference only — `--agent-server` on
+  `service add` remains the source of the per-service ACME directory
+  URL. The flag manages the bundled step-ca service only: when the
+  compose file declares no `step-ca` service, `infra install` rejects
+  `--stepca-bind` (mirroring the `--http01-admin-bind` guard) and
+  `infra up` skips a stored step-ca override instead of failing.
+  (Closes #668)
 - `bootroot service add` now validates that
   `--deploy-type=docker --container-name=X` actually points at a
   bootroot-agent before persisting state. The shipped docker-compose
