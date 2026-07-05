@@ -189,7 +189,19 @@ pub(super) async fn rotate_ca_key(
                 rot_state.new_intermediate_fp.clone(),
             ]
         };
-        let ca_bundle_pem = compute_ca_bundle_pem(ctx.paths.secrets_dir(), messages).await?;
+        // The live certs already hold the new generation (Phase 2), so
+        // `compute_ca_bundle_pem` would publish a new-generation-only
+        // bundle against the transitional pin list above and every
+        // `bootroot verify` run mid-rotation would fail its fingerprint
+        // check. Include the Phase-1 backups so the bundle carries both
+        // generations, matching the pins.
+        let mut bundle_sources = vec![ctx.paths.root_cert()];
+        if rot_state.mode == RotationMode::Full {
+            bundle_sources.push(ctx.paths.root_cert_bak());
+        }
+        bundle_sources.push(ctx.paths.intermediate_cert_bak());
+        bundle_sources.push(ctx.paths.intermediate_cert());
+        let ca_bundle_pem = concat_unique_ca_certs(&bundle_sources, messages).await?;
         trust::write_trust_to_openbao(
             client,
             &ctx.kv_mount,
@@ -356,6 +368,36 @@ pub(super) async fn rotate_ca_key(
     }
 
     Ok(())
+}
+
+/// Concatenates the given CA certificate files into a PEM bundle,
+/// skipping duplicates by DER SHA-256 (first occurrence wins). Phase 3
+/// uses this to publish a transitional bundle that contains both CA
+/// generations, so the rendered `ca-bundle.pem` satisfies every
+/// fingerprint in the transitional pin list. Missing files are an
+/// error: silently omitting a source would republish a bundle that no
+/// longer covers the pins.
+async fn concat_unique_ca_certs(
+    paths: &[std::path::PathBuf],
+    messages: &Messages,
+) -> Result<String> {
+    let mut bundle = String::new();
+    let mut seen: Vec<String> = Vec::new();
+    for path in paths {
+        let fingerprint = read_ca_cert_fingerprint(path, messages).await?;
+        if seen.contains(&fingerprint) {
+            continue;
+        }
+        seen.push(fingerprint);
+        let pem = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+        bundle.push_str(&pem);
+        if !bundle.ends_with('\n') {
+            bundle.push('\n');
+        }
+    }
+    Ok(bundle)
 }
 
 fn generate_new_root(ctx: &RotateContext, messages: &Messages) -> Result<()> {
@@ -962,6 +1004,78 @@ mod tests {
 
     use super::super::test_support::test_messages;
     use super::*;
+
+    /// Phase 3 must publish a bundle covering both CA generations: the
+    /// transitional pin list still trusts the old intermediate, so a
+    /// bundle missing it makes every mid-rotation `bootroot verify`
+    /// fail its fingerprint-subset check.
+    #[tokio::test]
+    async fn concat_unique_ca_certs_includes_every_generation() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let (_, root_pem) = build_issuer("Root CA");
+        let (_, old_inter_pem) = build_issuer("Old Intermediate CA");
+        let (_, new_inter_pem) = build_issuer("New Intermediate CA");
+
+        let root = dir.path().join("root_ca.crt");
+        let old_inter = dir.path().join("intermediate_ca.crt.bak");
+        let new_inter = dir.path().join("intermediate_ca.crt");
+        fs::write(&root, &root_pem).expect("write root");
+        fs::write(&old_inter, &old_inter_pem).expect("write old intermediate");
+        fs::write(&new_inter, &new_inter_pem).expect("write new intermediate");
+
+        let bundle = concat_unique_ca_certs(&[root, old_inter, new_inter], &messages)
+            .await
+            .expect("bundle");
+
+        assert!(bundle.contains(root_pem.trim()));
+        assert!(bundle.contains(old_inter_pem.trim()));
+        assert!(bundle.contains(new_inter_pem.trim()));
+    }
+
+    /// An intermediate-only resume can hand the same certificate in
+    /// twice (e.g. the backup equals the live cert when Phase 2 found
+    /// the new intermediate already in place); the bundle must contain
+    /// each certificate once.
+    #[tokio::test]
+    async fn concat_unique_ca_certs_dedupes_by_fingerprint() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let (_, root_pem) = build_issuer("Root CA");
+        let (_, inter_pem) = build_issuer("Intermediate CA");
+
+        let root = dir.path().join("root_ca.crt");
+        let inter = dir.path().join("intermediate_ca.crt");
+        let inter_bak = dir.path().join("intermediate_ca.crt.bak");
+        fs::write(&root, &root_pem).expect("write root");
+        fs::write(&inter, &inter_pem).expect("write intermediate");
+        fs::write(&inter_bak, &inter_pem).expect("write intermediate backup");
+
+        let bundle = concat_unique_ca_certs(&[root, inter_bak, inter], &messages)
+            .await
+            .expect("bundle");
+
+        assert_eq!(bundle.matches("BEGIN CERTIFICATE").count(), 2);
+        assert!(bundle.contains(root_pem.trim()));
+        assert!(bundle.contains(inter_pem.trim()));
+    }
+
+    /// A missing source file must fail the Phase-3 bundle build instead
+    /// of silently publishing a bundle that no longer covers the
+    /// transitional pins.
+    #[tokio::test]
+    async fn concat_unique_ca_certs_errors_on_missing_source() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let (_, root_pem) = build_issuer("Root CA");
+
+        let root = dir.path().join("root_ca.crt");
+        fs::write(&root, &root_pem).expect("write root");
+        let missing = dir.path().join("intermediate_ca.crt.bak");
+
+        let result = concat_unique_ca_certs(&[root, missing], &messages).await;
+        assert!(result.is_err());
+    }
 
     #[test]
     fn format_reissue_elapsed_reports_seconds_difference() {
