@@ -432,14 +432,16 @@ bootroot가 init 시 생성하는 인프라 AppRole(`bootroot-stepca-role`,
 `--infra` 선택자로 회전합니다:
 
 ```bash
-bootroot rotate approle-secret-id --infra stepca \
+bootroot rotate \
   --auth-mode approle \
   --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
-  --approle-secret-id "$INFRA_ROTATE_SECRET_ID"
-bootroot rotate approle-secret-id --infra responder \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  approle-secret-id --infra stepca
+bootroot rotate \
   --auth-mode approle \
   --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
-  --approle-secret-id "$INFRA_ROTATE_SECRET_ID"
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  approle-secret-id --infra responder
 ```
 
 인프라 대상에는 전용 `bootroot-infra-rotate-role` 자격증명(다른 역할과
@@ -461,8 +463,9 @@ bootroot rotate approle-secret-id --infra responder \
 프로비저닝하세요:
 
 ```bash
-bootroot rotate approle-secret-id --infra stepca \
-  --auth-mode root --root-token-file <path> --show-secrets
+bootroot rotate \
+  --auth-mode root --root-token-file <path> --show-secrets \
+  approle-secret-id --infra stepca
 ```
 
 이 실행은 정책과 역할을 생성해 `state.json`에 기록하고, 새 역할의

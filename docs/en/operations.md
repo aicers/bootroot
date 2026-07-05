@@ -455,14 +455,16 @@ cert-issuance machinery behind them stalls.
 Rotate them with the `--infra` selector:
 
 ```bash
-bootroot rotate approle-secret-id --infra stepca \
+bootroot rotate \
   --auth-mode approle \
   --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
-  --approle-secret-id "$INFRA_ROTATE_SECRET_ID"
-bootroot rotate approle-secret-id --infra responder \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  approle-secret-id --infra stepca
+bootroot rotate \
   --auth-mode approle \
   --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
-  --approle-secret-id "$INFRA_ROTATE_SECRET_ID"
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  approle-secret-id --infra responder
 ```
 
 Infra targets require the dedicated `bootroot-infra-rotate-role`
@@ -484,8 +486,9 @@ and the command does not silently assume they exist. Provision them
 once by running an `--infra` rotation with the root token:
 
 ```bash
-bootroot rotate approle-secret-id --infra stepca \
-  --auth-mode root --root-token-file <path> --show-secrets
+bootroot rotate \
+  --auth-mode root --root-token-file <path> --show-secrets \
+  approle-secret-id --infra stepca
 ```
 
 This creates the policy and role, records them in `state.json`, prints
