@@ -491,6 +491,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot rotate approle-secret-id` gained an `--infra
+  <stepca|responder>` selector (mutually exclusive with
+  `--service-name`) that rotates the `secret_id` of the infra AppRoles
+  consumed by the long-running OpenBao Agent sidecars
+  (`bootroot-stepca-role` / `bootroot-responder-role`). The command
+  writes the new `secret_id` atomically (mode `0600`) under
+  `<secrets_dir>/openbao/<name>/`, backfills a missing `role_id` file,
+  restarts the matching `bootroot-openbao-agent-*` container so it
+  re-authenticates, and unconditionally verifies the fresh credential
+  with an AppRole login. Infra targets authenticate with a new
+  dedicated `bootroot-infra-rotate-role` AppRole (policy
+  `bootroot-infra-rotate`) created at `bootroot init` alongside the
+  existing roles and reported by `bootroot status`; the general
+  `bootroot-runtime-rotate` policy deliberately keeps no access to the
+  infra role paths because minting an infra `secret_id` would allow
+  logging in as the higher-privilege stepca/responder roles.
+  Deployments initialized before the new role existed provision it by
+  running an `--infra` rotation once with the root token, which
+  creates the policy and role, records them in `state.json`, and
+  prints the operator credential (masked unless `--show-secrets`).
+  (Closes #667)
 - `bootroot service add` now validates that
   `--deploy-type=docker --container-name=X` actually points at a
   bootroot-agent before persisting state. The shipped docker-compose

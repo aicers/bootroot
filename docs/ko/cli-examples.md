@@ -497,6 +497,22 @@ bootroot rotate openbao-recovery --rotate-root-token
 bootroot rotate approle-secret-id --service-name edge-proxy
 bootroot rotate approle-secret-id --service-name web-app
 
+# OpenBao Agent 사이드카가 사용하는 인프라 AppRole secret_id 회전
+# (위에서 사용한 runtime-rotate 자격증명이 아니라
+# bootroot-infra-rotate-role 자격증명 필요)
+bootroot rotate \
+  --auth-mode approle \
+  --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  --yes \
+  approle-secret-id --infra stepca
+bootroot rotate \
+  --auth-mode approle \
+  --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
+  --yes \
+  approle-secret-id --infra responder
+
 # CA trust 데이터를 OpenBao와 모든 서비스에 동기화
 bootroot rotate trust-sync
 

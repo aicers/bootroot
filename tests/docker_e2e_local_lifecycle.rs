@@ -49,6 +49,11 @@ mod unix_integration {
         assert!(phase_contents.contains("\"phase\":\"init\""));
         assert!(phase_contents.contains("\"phase\":\"service-add\""));
         assert!(phase_contents.contains("\"phase\":\"verify-initial\""));
+        assert!(phase_contents.contains("\"phase\":\"rotate-infra-secret-id\""));
+        assert!(
+            phase_contents
+                .contains("\"phase\":\"rotate-infra-secret-id-denied-for-runtime-rotate\"")
+        );
         assert!(phase_contents.contains("\"phase\":\"rotate-openbao-recovery\""));
         assert!(phase_contents.contains("\"phase\":\"bootstrap-after-openbao-recovery\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-responder-hmac\""));

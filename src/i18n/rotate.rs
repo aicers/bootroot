@@ -53,6 +53,74 @@ impl Messages {
         )
     }
 
+    pub(crate) fn prompt_rotate_infra_approle_secret_id(&self, role_name: &str) -> String {
+        format_template(
+            self.strings().prompt_rotate_infra_approle_secret_id,
+            &[("role_name", role_name)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_infra_approle_secret_id(
+        &self,
+        role_name: &str,
+        value: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_summary_infra_approle_secret_id,
+            &[("role_name", role_name), ("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_infra_agent_restarted(&self, container: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_infra_agent_restarted,
+            &[("container", container)],
+        )
+    }
+
+    pub(crate) fn rotate_summary_infra_approle_login_ok(&self, role_name: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_infra_approle_login_ok,
+            &[("role_name", role_name)],
+        )
+    }
+
+    pub(crate) fn rotate_infra_provisioned_role(
+        &self,
+        role_name: &str,
+        policy_name: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_infra_provisioned_role,
+            &[("role_name", role_name), ("policy_name", policy_name)],
+        )
+    }
+
+    pub(crate) fn rotate_infra_provisioned_role_id(&self, role_name: &str, value: &str) -> String {
+        format_template(
+            self.strings().rotate_infra_provisioned_role_id,
+            &[("role_name", role_name), ("value", value)],
+        )
+    }
+
+    pub(crate) fn rotate_infra_provisioned_secret_id(
+        &self,
+        role_name: &str,
+        value: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_infra_provisioned_secret_id,
+            &[("role_name", role_name), ("value", value)],
+        )
+    }
+
+    pub(crate) fn error_infra_secret_id_mint_failed(&self, role_name: &str) -> String {
+        format_template(
+            self.strings().error_infra_secret_id_mint_failed,
+            &[("role_name", role_name)],
+        )
+    }
+
     pub(crate) fn rotate_summary_openbao_recovery_targets(&self, value: &str) -> String {
         format_template(
             self.strings().rotate_summary_openbao_recovery_targets,

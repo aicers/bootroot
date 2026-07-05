@@ -100,6 +100,13 @@ pub(crate) mod openbao_constants {
     pub(crate) const POLICY_BOOTROOT_STEPCA: &str = "bootroot-stepca";
     pub(crate) const POLICY_BOOTROOT_RUNTIME_SERVICE_ADD: &str = "bootroot-runtime-service-add";
     pub(crate) const POLICY_BOOTROOT_RUNTIME_ROTATE: &str = "bootroot-runtime-rotate";
+    /// Dedicated policy for rotating the infra `AppRole` `secret_id`s
+    /// (stepca/responder). Deliberately NOT folded into
+    /// `bootroot-runtime-rotate`: the infra roles read CA core secrets
+    /// (CA password, DB DSN), so a credential that can mint their
+    /// `secret_id`s can escalate to those secrets. Keeping the grant on
+    /// a separate role confines that blast radius.
+    pub(crate) const POLICY_BOOTROOT_INFRA_ROTATE: &str = "bootroot-infra-rotate";
 
     pub(crate) const APPROLE_BOOTROOT_AGENT: &str = "bootroot-agent-role";
     pub(crate) const APPROLE_BOOTROOT_RESPONDER: &str = "bootroot-responder-role";
@@ -107,6 +114,7 @@ pub(crate) mod openbao_constants {
     pub(crate) const APPROLE_BOOTROOT_RUNTIME_SERVICE_ADD: &str =
         "bootroot-runtime-service-add-role";
     pub(crate) const APPROLE_BOOTROOT_RUNTIME_ROTATE: &str = "bootroot-runtime-rotate-role";
+    pub(crate) const APPROLE_BOOTROOT_INFRA_ROTATE: &str = "bootroot-infra-rotate-role";
 
     pub(crate) const PATH_STEPCA_PASSWORD: &str = "bootroot/stepca/password";
     pub(crate) const PATH_STEPCA_DB: &str = "bootroot/stepca/db";

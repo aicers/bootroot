@@ -419,6 +419,57 @@ OpenBao Agent는 로컬 `secret_id` 파일을 읽고 다음 토큰 갱신 주기
 `bootroot-remote`가 잠재적 보안 사고로 표시합니다. 이 경우 `secret_id`를
 즉시 회전하고 비인가 접근을 조사하세요.
 
+## 인프라 AppRole secret_id 회전 (stepca, responder)
+
+bootroot가 init 시 생성하는 인프라 AppRole(`bootroot-stepca-role`,
+`bootroot-responder-role`)은 장기 실행 OpenBao Agent 사이드카
+(`openbao-agent-stepca`, `openbao-agent-responder`)가 사용하며, 서비스와
+동일한 `secret_id` TTL을 공유합니다. 따라서 이들의 `secret_id`도
+주기적으로 회전해야 합니다 — 그렇지 않으면 사이드카가 결국
+`403 invalid role or secret ID`로 OpenBao 로그인에 실패하고, 그 뒤에
+있는 인증서 발급 체계가 멈춥니다.
+
+`--infra` 선택자로 회전합니다:
+
+```bash
+bootroot rotate approle-secret-id --infra stepca \
+  --auth-mode approle \
+  --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID"
+bootroot rotate approle-secret-id --infra responder \
+  --auth-mode approle \
+  --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+  --approle-secret-id "$INFRA_ROTATE_SECRET_ID"
+```
+
+인프라 대상에는 전용 `bootroot-infra-rotate-role` 자격증명(다른 역할과
+함께 `bootroot init`에서 생성됨)이 필요합니다. 범용
+`bootroot-runtime-rotate-role` 자격증명은 인프라 역할 경로에서
+의도적으로 거부됩니다: 인프라 역할은 CA 핵심 시크릿을 읽으므로, 해당
+`secret_id`를 발급할 수 있는 자격증명은 그 시크릿으로 권한을 상승시킬 수
+있기 때문입니다. 반대로 infra-rotate 자격증명은 두 인프라 `secret_id`
+발급(및 `role_id` 읽기)만 가능하고 KV 접근 권한은 없습니다.
+
+이 명령은 새 `secret_id`를
+`<secrets_dir>/openbao/<stepca|responder>/secret_id`에 원자적으로(모드
+`0600`) 기록하고, 사이드카 컨테이너를 재시작해 재인증시키며, AppRole
+로그인으로 새 자격증명을 검증한 뒤 성공을 보고합니다.
+
+**이 역할이 생기기 전에 초기화된 배포의 업그레이드 참고:** 해당 스택에는
+`bootroot-infra-rotate-role`과 정책이 없으며, 명령은 이들이 존재한다고
+가정하지 않습니다. 루트 토큰으로 `--infra` 회전을 한 번 실행해
+프로비저닝하세요:
+
+```bash
+bootroot rotate approle-secret-id --infra stepca \
+  --auth-mode root --root-token-file <path> --show-secrets
+```
+
+이 실행은 정책과 역할을 생성해 `state.json`에 기록하고, 새 역할의
+`role_id`/`secret_id`(`--show-secrets`가 없으면 마스킹됨)를 출력한 뒤
+요청한 회전을 수행합니다. 출력된 자격증명을 보관하고 이후 `--infra`
+회전에 사용하세요.
+
 ## OpenBao 재기동/복구 체크리스트
 
 - OpenBao가 `sealed` 상태면 먼저 unseal keys로 언실을 완료합니다.

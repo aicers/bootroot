@@ -1353,7 +1353,39 @@ OpenBao와 통신해 값을 갱신합니다.
 
 #### `rotate approle-secret-id`
 
-- `--service-name`: 대상 서비스 이름
+AppRole 하나의 `secret_id`를 회전합니다 — 등록된 서비스 또는 장기 실행
+OpenBao Agent 사이드카가 사용하는 인프라 역할 중 하나를 대상으로 하며,
+두 선택자 중 정확히 하나가 필요합니다:
+
+- `--service-name`: 대상 서비스 이름. `bootroot-runtime-rotate-role`
+  자격증명으로 인증합니다.
+- `--infra <stepca|responder>`: 대상 인프라 역할
+  (`bootroot-stepca-role` / `bootroot-responder-role`).
+  `bootroot-infra-rotate-role` 자격증명을 기존 `--auth-mode approle`
+  플래그로 전달해 인증합니다.
+
+두 자격증명은 의도적으로 비대칭입니다: runtime-rotate 자격증명은 서비스
+AppRole만 다룰 수 있고 인프라 역할은 다룰 수 없으며(인프라 역할은 CA
+핵심 시크릿을 읽으므로 해당 `secret_id` 발급 권한은 권한 상승 경로가
+됩니다), infra-rotate 자격증명은 인프라 `secret_id`를 발급할 수 있지만
+KV는 전혀 읽을 수 없습니다.
+
+인프라 대상의 경우 새 `secret_id`를
+`<secrets_dir>/openbao/<stepca|responder>/secret_id`에 원자적으로(모드
+`0600`) 기록하고, `role_id` 파일이 없으면 백필하며, 사이드카가
+재인증하도록 `bootroot-openbao-agent-stepca` /
+`bootroot-openbao-agent-responder` 컨테이너를 재시작한 뒤, AppRole
+로그인으로 새 자격증명을 검증합니다(인프라 역할에는 CIDR 바인딩이
+없으므로 이 검증은 항상 수행됩니다).
+
+업그레이드 경로: `bootroot-infra-rotate-role`이 생기기 전에 초기화된
+배포에는 이 역할과 정책이 없습니다. 루트 토큰(`--auth-mode root` 또는
+`--root-token(-file)`)으로 `--infra` 회전을 한 번 실행하면 둘 다
+생성되어 `state.json`에 기록되고, 새 역할의 `role_id`와
+`secret_id`(`--show-secrets`가 없으면 마스킹됨)가 출력되어 이후 day-2
+회전을 범위가 제한된 자격증명으로 전환할 수 있습니다. AppRole
+자격증명으로 실행하면 프로비저닝을 시도하지 않으며, 역할이 없으면 힌트와
+함께 권한 오류가 표시됩니다.
 
 #### `rotate trust-sync`
 

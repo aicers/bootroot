@@ -1410,7 +1410,40 @@ Per subcommand:
 
 #### `rotate approle-secret-id`
 
-- `--service-name`: target service name
+Rotates the `secret_id` of one AppRole — either a registered service or
+one of the infra roles consumed by the long-running OpenBao Agent
+sidecars. Exactly one of the two selectors is required:
+
+- `--service-name`: target service name. Authenticate with
+  `bootroot-runtime-rotate-role` credentials.
+- `--infra <stepca|responder>`: target infra role
+  (`bootroot-stepca-role` / `bootroot-responder-role`). Authenticate
+  with `bootroot-infra-rotate-role` credentials via the usual
+  `--auth-mode approle` flags.
+
+The two credentials are deliberately asymmetric: the runtime-rotate
+credential can touch service AppRoles but not the infra roles (the
+infra roles read CA core secrets, so minting their `secret_id`s would
+be a privilege-escalation path), and the infra-rotate credential can
+mint infra `secret_id`s but read nothing from KV.
+
+For infra targets the command writes the new `secret_id` atomically
+(mode `0600`) to `<secrets_dir>/openbao/<stepca|responder>/secret_id`,
+backfills the sibling `role_id` file when missing, restarts the
+matching `bootroot-openbao-agent-stepca` /
+`bootroot-openbao-agent-responder` container so the sidecar
+re-authenticates, and verifies the new credential with an AppRole
+login (infra roles carry no CIDR binding, so the check always runs).
+
+Upgrade path: deployments initialized before `bootroot-infra-rotate-role`
+existed do not have the role or its policy. Running an `--infra`
+rotation once with the root token (`--auth-mode root` or
+`--root-token(-file)`) provisions both, records them in `state.json`,
+and prints the new role's `role_id` and `secret_id` (masked unless
+`--show-secrets`) so day-2 rotations can switch to the scoped
+credential. With AppRole credentials the command never attempts
+provisioning; a missing role surfaces as a permission error with a
+hint.
 
 #### `rotate trust-sync`
 

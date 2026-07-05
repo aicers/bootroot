@@ -22,6 +22,7 @@ const POLICY_NAMES: &[&str] = &[
     "bootroot-stepca",
     "bootroot-runtime-service-add",
     "bootroot-runtime-rotate",
+    "bootroot-infra-rotate",
 ];
 const APPROLE_NAMES: &[&str] = &[
     "bootroot-agent-role",
@@ -29,6 +30,7 @@ const APPROLE_NAMES: &[&str] = &[
     "bootroot-stepca-role",
     "bootroot-runtime-service-add-role",
     "bootroot-runtime-rotate-role",
+    "bootroot-infra-rotate-role",
 ];
 
 pub(crate) fn write_fake_docker(dir: &Path) -> Result<PathBuf> {
