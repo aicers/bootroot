@@ -585,6 +585,7 @@ mod tests {
 
     #[test]
     fn build_pinned_root_verifier_returns_none_when_no_pin_matches_bundle() {
+        install_crypto_provider();
         let pem = generate_ca_pem();
         let certs = parse_pem_to_cert_list(pem.as_bytes()).expect("cert list");
         let pins = HashSet::from([String::from("00")]);
@@ -594,6 +595,7 @@ mod tests {
 
     #[test]
     fn build_pinned_root_verifier_returns_some_when_pin_matches_bundle() {
+        install_crypto_provider();
         let pem = generate_ca_pem();
         let certs = parse_pem_to_cert_list(pem.as_bytes()).expect("cert list");
         let cert = certs.first().expect("at least one certificate");
