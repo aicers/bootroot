@@ -6,6 +6,7 @@ use reqwest::Client;
 use rustls::ClientConfig;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::pem::parse_x509_pem;
@@ -51,22 +52,16 @@ pub fn build_http_client(trust: &TrustSettings, insecure_mode: bool) -> Result<C
             .context("Failed to build HTTP client");
     };
 
-    let (root_store, pins) = load_ca_bundle(bundle_path, &trust.trusted_ca_sha256)?;
-    let verifier = WebPkiServerVerifier::builder(Arc::new(root_store.clone()))
-        .build()
-        .context("Failed to build TLS verifier")?;
-    let verifier: Arc<dyn ServerCertVerifier> = if pins.is_empty() {
-        verifier
-    } else {
-        Arc::new(PinnedCertVerifier::new(verifier, pins))
-    };
-
+    let (certs, pins) = load_ca_bundle(bundle_path, &trust.trusted_ca_sha256)?;
+    let root_store = certs_to_root_store(&certs)?;
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    if !trust.trusted_ca_sha256.is_empty() {
-        config.dangerous().set_certificate_verifier(verifier);
+    if !pins.is_empty() {
+        config
+            .dangerous()
+            .set_certificate_verifier(build_pinned_verifier(&certs, &pins)?);
     }
 
     Client::builder()
@@ -112,23 +107,17 @@ pub fn build_http_client_from_pem(pem_content: &str, pins: &[String]) -> Result<
 /// Returns an error if the PEM content cannot be parsed.
 pub fn build_client_config_from_pem(pem_content: &str, pins: &[String]) -> Result<ClientConfig> {
     install_crypto_provider();
-    let root_store = parse_pem_to_root_store(pem_content.as_bytes())?;
+    let certs = parse_pem_to_cert_list(pem_content.as_bytes())?;
+    let root_store = certs_to_root_store(&certs)?;
     let pin_set: HashSet<String> = pins.iter().map(|p| p.to_ascii_lowercase()).collect();
-    if pin_set.is_empty() {
-        Ok(ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth())
-    } else {
-        let verifier = WebPkiServerVerifier::builder(Arc::new(root_store.clone()))
-            .build()
-            .context("Failed to build TLS verifier")?;
-        let pinned = Arc::new(PinnedCertVerifier::new(verifier, pin_set));
-        let mut cfg = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        cfg.dangerous().set_certificate_verifier(pinned);
-        Ok(cfg)
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    if !pin_set.is_empty() {
+        cfg.dangerous()
+            .set_certificate_verifier(build_pinned_verifier(&certs, &pin_set)?);
     }
+    Ok(cfg)
 }
 
 /// Builds a [`reqwest::Client`] whose trust store is the union of the
@@ -212,6 +201,7 @@ fn parse_pem_to_cert_list(pem_bytes: &[u8]) -> Result<Vec<CertificateDer<'static
     Ok(certs)
 }
 
+#[cfg(test)]
 fn parse_pem_to_root_store(pem_bytes: &[u8]) -> Result<rustls::RootCertStore> {
     let certs = parse_pem_to_cert_list(pem_bytes)?;
     let mut root_store = rustls::RootCertStore::empty();
@@ -226,43 +216,86 @@ fn parse_pem_to_root_store(pem_bytes: &[u8]) -> Result<rustls::RootCertStore> {
 fn load_ca_bundle(
     path: &std::path::Path,
     pins: &[String],
-) -> Result<(rustls::RootCertStore, HashSet<String>)> {
+) -> Result<(Vec<CertificateDer<'static>>, HashSet<String>)> {
     let contents = std::fs::read(path)
         .with_context(|| format!("Failed to read CA bundle at {}", path.display()))?;
-    let root_store = parse_pem_to_root_store(&contents)?;
+    let certs = parse_pem_to_cert_list(&contents)?;
     let pins = pins
         .iter()
         .map(|value| value.to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    Ok((root_store, pins))
+    Ok((certs, pins))
+}
+
+/// Builds a [`rustls::RootCertStore`] from an already-parsed certificate list.
+fn certs_to_root_store(certs: &[CertificateDer<'static>]) -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in certs {
+        root_store
+            .add(cert.clone())
+            .context("Failed to add CA certificate")?;
+    }
+    Ok(root_store)
+}
+
+/// Builds the pinned server-certificate verifier for a CA bundle and pin set.
+///
+/// The inner webpki verifier trusts only the bundle certificates whose
+/// SHA-256 fingerprint is pinned, so a successful webpki verification already
+/// proves the presented leaf chains to a pinned trust anchor — no
+/// presented-chain scan is required, and a production leaf-only server is
+/// accepted as long as its issuer is pinned. When no bundle certificate
+/// matches a pin the verifier is direct-pin only: it accepts a handshake
+/// solely when the server presents a directly pinned CA certificate.
+fn build_pinned_verifier(
+    certs: &[CertificateDer<'static>],
+    pins: &HashSet<String>,
+) -> Result<Arc<dyn ServerCertVerifier>> {
+    let inner = build_pinned_root_verifier(certs, pins)?;
+    Ok(Arc::new(PinnedCertVerifier::new(inner, pins.clone())))
+}
+
+/// Builds a webpki verifier whose trust anchors are the pinned subset of the
+/// bundle, or `None` when no bundle certificate matches a pin (an empty root
+/// store cannot back a `WebPkiServerVerifier`, so the caller falls back to a
+/// direct-pin-only verifier instead of failing to build the client).
+fn build_pinned_root_verifier(
+    certs: &[CertificateDer<'static>],
+    pins: &HashSet<String>,
+) -> Result<Option<Arc<dyn ServerCertVerifier>>> {
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in certs {
+        if pins.contains(&sha256_hex(cert.as_ref())) {
+            root_store
+                .add(cert.clone())
+                .context("Failed to add pinned CA certificate")?;
+        }
+    }
+    if root_store.is_empty() {
+        return Ok(None);
+    }
+    let verifier: Arc<dyn ServerCertVerifier> = WebPkiServerVerifier::builder(Arc::new(root_store))
+        .build()
+        .context("Failed to build TLS verifier")?;
+    Ok(Some(verifier))
 }
 
 #[derive(Debug)]
 struct PinnedCertVerifier {
-    inner: Arc<dyn ServerCertVerifier>,
+    /// Webpki verifier restricted to the pinned trust anchors, or `None` when
+    /// no bundle certificate matches a pin (direct-pin-only mode).
+    inner: Option<Arc<dyn ServerCertVerifier>>,
     allowed: HashSet<String>,
+    supported_algs: WebPkiSupportedAlgorithms,
 }
 
 impl PinnedCertVerifier {
-    fn new(inner: Arc<dyn ServerCertVerifier>, allowed: HashSet<String>) -> Self {
-        Self { inner, allowed }
-    }
-
-    fn check_pins(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-    ) -> Result<(), rustls::Error> {
-        let matches = self.allowed.contains(&sha256_hex(end_entity.as_ref()))
-            || intermediates
-                .iter()
-                .any(|cert| self.allowed.contains(&sha256_hex(cert.as_ref())));
-        if matches {
-            Ok(())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            ))
+    fn new(inner: Option<Arc<dyn ServerCertVerifier>>, allowed: HashSet<String>) -> Self {
+        Self {
+            inner,
+            allowed,
+            supported_algs: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
         }
     }
 
@@ -290,15 +323,18 @@ impl ServerCertVerifier for PinnedCertVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        match self.inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        ) {
-            Ok(_) => self.check_pins(end_entity, intermediates)?,
-            Err(_) => self.check_direct_pin(end_entity, now)?,
+        // When the inner verifier trusts only the pinned CA subset, a
+        // successful chain build already proves the leaf chains to a pinned
+        // trust anchor, so no presented-chain scan is needed. The direct-pin
+        // fallback still covers pins that are not part of the bundle.
+        let chained = match &self.inner {
+            Some(inner) => inner
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                .is_ok(),
+            None => false,
+        };
+        if !chained {
+            self.check_direct_pin(end_entity, now)?;
         }
         Ok(ServerCertVerified::assertion())
     }
@@ -309,7 +345,7 @@ impl ServerCertVerifier for PinnedCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        verify_tls12_signature(message, cert, dss, &self.supported_algs)
     }
 
     fn verify_tls13_signature(
@@ -318,11 +354,11 @@ impl ServerCertVerifier for PinnedCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        verify_tls13_signature(message, cert, dss, &self.supported_algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        self.supported_algs.supported_schemes()
     }
 }
 
@@ -516,6 +552,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pinned_verifier_without_inner_accepts_directly_pinned_ca_certificate() {
+        let certificate = generate_ca_certificate();
+        let fingerprint = sha256_hex(certificate.as_ref());
+        let verifier = PinnedCertVerifier::new(None, HashSet::from([fingerprint]));
+        let result = verifier.verify_server_cert(
+            &certificate,
+            &[],
+            &ServerName::try_from("localhost").expect("valid server name"),
+            &[],
+            direct_pin_test_time(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn pinned_verifier_without_inner_rejects_unpinned_certificate() {
+        let certificate = generate_ca_certificate();
+        let verifier = PinnedCertVerifier::new(None, HashSet::from([String::from("00")]));
+        let result = verifier.verify_server_cert(
+            &certificate,
+            &[],
+            &ServerName::try_from("localhost").expect("valid server name"),
+            &[],
+            direct_pin_test_time(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_pinned_root_verifier_returns_none_when_no_pin_matches_bundle() {
+        let pem = generate_ca_pem();
+        let certs = parse_pem_to_cert_list(pem.as_bytes()).expect("cert list");
+        let pins = HashSet::from([String::from("00")]);
+        let verifier = build_pinned_root_verifier(&certs, &pins).expect("build verifier");
+        assert!(verifier.is_none());
+    }
+
+    #[test]
+    fn build_pinned_root_verifier_returns_some_when_pin_matches_bundle() {
+        let pem = generate_ca_pem();
+        let certs = parse_pem_to_cert_list(pem.as_bytes()).expect("cert list");
+        let cert = certs.first().expect("at least one certificate");
+        let pins = HashSet::from([sha256_hex(cert.as_ref())]);
+        let verifier = build_pinned_root_verifier(&certs, &pins).expect("build verifier");
+        assert!(verifier.is_some());
+    }
+
     fn direct_pin_test_time() -> UnixTime {
         UnixTime::since_unix_epoch(Duration::from_secs(DIRECT_PIN_TEST_NOW_SECS))
     }
@@ -525,7 +611,7 @@ mod tests {
         allowed: HashSet<String>,
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let verifier = PinnedCertVerifier::new(Arc::new(RejectingVerifier), allowed);
+        let verifier = PinnedCertVerifier::new(Some(Arc::new(RejectingVerifier)), allowed);
         verifier.verify_server_cert(
             certificate,
             &[],

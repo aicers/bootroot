@@ -83,11 +83,12 @@
 //!   client (trusting `system_ca`) successfully completes a handshake
 //!   for readiness, proving the responder cert is valid under
 //!   "system-trusted" roots.  The RN-side http01 client built via
-//!   `build_client_config_from_pem` then rejects the same chain when
+//!   `build_client_config_from_pem` then rejects the same cert when
 //!   configured with only the artifact anchor, and — in the separate
 //!   pin test — rejects even when the PEM bundle *also* contains
-//!   `system_ca`, because the SHA-256 pin on the artifact CA does not
-//!   match the chain.  The pin test is the strongest in-process proxy
+//!   `system_ca`, because the SHA-256 pin restricts the client's trust
+//!   anchors to the artifact CA, which did not sign the responder cert.
+//!   The pin test is the strongest in-process proxy
 //!   for "the OS store would accept this cert": a PEM bundle that
 //!   explicitly contains both roots short-circuits the question of
 //!   where the root came from.
@@ -183,14 +184,6 @@ struct SignedCert {
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
     issuer_der: Vec<u8>,
-    issuer_pem: String,
-}
-
-/// Concatenates the server's end-entity PEM and its issuer PEM into a single
-/// chain file suitable for handing to a TLS server that will present both to
-/// clients during the handshake.
-fn server_chain_pem(cert: &SignedCert) -> String {
-    format!("{}{}", cert.cert_pem, cert.issuer_pem)
 }
 
 impl TestCa {
@@ -235,7 +228,6 @@ impl TestCa {
             cert_der: cert.der().to_vec(),
             key_der: key.serialize_der(),
             issuer_der: self.der.clone(),
-            issuer_pem: self.pem.clone(),
         }
     }
 }
@@ -978,9 +970,12 @@ async fn test_multi_host_tls_control_plane_happy_path() {
     let responder_cert = step_ca.sign_server_cert("localhost");
     let responder_cert_path = responder_temp.path().join("responder.cert.pem");
     let responder_key_path = responder_temp.path().join("responder.key.pem");
-    // Serve the CA as part of the chain so SHA-256 pin enforcement on the
-    // RN client can match the pinned CA fingerprint against the chain.
-    fs::write(&responder_cert_path, server_chain_pem(&responder_cert))
+    // Serve a leaf-only certificate, exactly as the production responder
+    // does (`step certificate create` writes `server.crt` without
+    // `--bundle`).  Pin enforcement now restricts the RN client's trust
+    // anchors to the pinned CA rather than scanning the presented chain, so
+    // the pinned issuer does not need to appear on the wire.
+    fs::write(&responder_cert_path, responder_cert.cert_pem.as_bytes())
         .expect("write responder cert");
     fs::write(&responder_key_path, &responder_cert.key_pem).expect("write responder key");
 
@@ -1134,9 +1129,12 @@ async fn test_multi_host_tls_rejects_system_trusted_non_artifact_ca() {
     let responder_cert = system_ca.sign_server_cert("localhost");
     let responder_cert_path = responder_temp.path().join("responder.cert.pem");
     let responder_key_path = responder_temp.path().join("responder.key.pem");
-    // Serve the CA as part of the chain so SHA-256 pin enforcement on the
-    // RN client can match the pinned CA fingerprint against the chain.
-    fs::write(&responder_cert_path, server_chain_pem(&responder_cert))
+    // Serve a leaf-only certificate, exactly as the production responder
+    // does (`step certificate create` writes `server.crt` without
+    // `--bundle`).  Pin enforcement now restricts the RN client's trust
+    // anchors to the pinned CA rather than scanning the presented chain, so
+    // the pinned issuer does not need to appear on the wire.
+    fs::write(&responder_cert_path, responder_cert.cert_pem.as_bytes())
         .expect("write responder cert");
     fs::write(&responder_key_path, &responder_cert.key_pem).expect("write responder key");
 
@@ -1252,8 +1250,9 @@ async fn test_multi_host_tls_rejects_system_trusted_non_artifact_ca() {
 /// trusted root in the client's explicit PEM bundle (modelling what would
 /// happen if the client accidentally merged the system trust store into its
 /// roots), and verify that the pin on `step_ca` still rejects the handshake
-/// because the presented certificate's chain does not include the pinned
-/// CA.  Since `build_client_config_from_pem` only ever consults the
+/// because the responder cert chains to a non-pinned CA and the pin
+/// restricts the client's trust anchors to `step_ca` alone.  Since
+/// `build_client_config_from_pem` only ever consults the
 /// supplied PEM (never the OS trust store), passing a PEM that contains
 /// both roots is the strongest in-process proxy for "the server cert would
 /// be system-trusted".
@@ -1270,9 +1269,12 @@ async fn test_multi_host_tls_pin_rejects_chain_valid_but_non_pinned_ca() {
     let responder_cert = system_ca.sign_server_cert("localhost");
     let responder_cert_path = responder_temp.path().join("responder.cert.pem");
     let responder_key_path = responder_temp.path().join("responder.key.pem");
-    // Serve the CA as part of the chain so SHA-256 pin enforcement on the
-    // RN client can match the pinned CA fingerprint against the chain.
-    fs::write(&responder_cert_path, server_chain_pem(&responder_cert))
+    // Serve a leaf-only certificate, exactly as the production responder
+    // does (`step certificate create` writes `server.crt` without
+    // `--bundle`).  Pin enforcement now restricts the RN client's trust
+    // anchors to the pinned CA rather than scanning the presented chain, so
+    // the pinned issuer does not need to appear on the wire.
+    fs::write(&responder_cert_path, responder_cert.cert_pem.as_bytes())
         .expect("write responder cert");
     fs::write(&responder_key_path, &responder_cert.key_pem).expect("write responder key");
 

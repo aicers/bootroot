@@ -349,12 +349,21 @@ mod tests {
         )
     }
 
-    /// Starts a minimal HTTPS responder that returns `200 OK` for any request.
+    /// Starts a minimal HTTPS responder that returns `200 OK` for any request,
+    /// presenting the leaf plus the CA certificate (a full-chain fixture).
     async fn start_tls_responder(
         server_cert_der: Vec<u8>,
         server_key_der: Vec<u8>,
         ca_cert_der: Vec<u8>,
     ) -> u16 {
+        start_tls_responder_chain(vec![server_cert_der, ca_cert_der], server_key_der).await
+    }
+
+    /// Starts a minimal HTTPS responder presenting exactly the given
+    /// certificate chain on the wire.  A single-element chain models the
+    /// production leaf-only `server.crt` that `step certificate create` writes
+    /// without `--bundle`.
+    async fn start_tls_responder_chain(cert_chain: Vec<Vec<u8>>, server_key_der: Vec<u8>) -> u16 {
         use std::sync::Arc;
 
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -363,13 +372,12 @@ mod tests {
         use tokio_rustls::TlsAcceptor;
 
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let server_cert = CertificateDer::from(server_cert_der);
-        let ca_cert = CertificateDer::from(ca_cert_der);
+        let chain = cert_chain.into_iter().map(CertificateDer::from).collect();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key_der));
 
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![server_cert, ca_cert], key)
+            .with_single_cert(chain, key)
             .expect("server TLS config");
 
         let acceptor = TlsAcceptor::from(Arc::new(config));
@@ -442,6 +450,117 @@ mod tests {
         )
         .await
         .expect_err("wrong pin should reject TLS handshake");
+        assert!(
+            err.to_string().contains("Failed to register HTTP-01 token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Generates a self-signed CA and a `localhost` leaf certificate signed by
+    /// it.  Returns `(ca_pem, ca_fingerprint, leaf_cert_der, leaf_key_der)`.
+    fn generate_ca_with_leaf(ca_common_name: &str) -> (String, String, Vec<u8>, Vec<u8>) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("cert params");
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, ca_common_name);
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
+        let ca_pem = ca_cert.pem();
+        let ca_der = ca_cert.der().to_vec();
+
+        let fingerprint = {
+            let digest = ring::digest::digest(&ring::digest::SHA256, &ca_der);
+            let mut hex = String::with_capacity(64);
+            for byte in digest.as_ref() {
+                use std::fmt::Write;
+                write!(hex, "{byte:02x}").expect("hex write");
+            }
+            hex
+        };
+
+        let issuer = Issuer::new(ca_params, ca_key);
+        let leaf_key = KeyPair::generate().expect("generate leaf key");
+        let mut leaf_params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
+        leaf_params.is_ca = IsCa::NoCa;
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("signed leaf cert");
+
+        (
+            ca_pem,
+            fingerprint,
+            leaf_cert.der().to_vec(),
+            leaf_key.serialize_der(),
+        )
+    }
+
+    /// Regression for #675: the production responder presents a **leaf-only**
+    /// certificate (no bundled issuer), yet the pinned agent client must accept
+    /// it because its issuer is pinned.  Before the verifier fix the presented
+    /// chain held only the leaf, which matched no CA pin, so the handshake was
+    /// wrongly rejected.
+    #[tokio::test]
+    async fn test_responder_tls_leaf_only_cert_accepted() {
+        let (ca_pem, ca_fingerprint, leaf_cert_der, leaf_key_der) =
+            generate_ca_with_leaf("Test Responder CA");
+        let port = start_tls_responder_chain(vec![leaf_cert_der], leaf_key_der).await;
+
+        let pins = vec![ca_fingerprint];
+        let trust = ResponderTrust {
+            ca_pem: &ca_pem,
+            ca_pins: &pins,
+        };
+        register_http01_token_with(
+            &format!("https://localhost:{port}"),
+            "hmac-secret",
+            5,
+            "tok",
+            "tok.key",
+            60,
+            Some(&trust),
+        )
+        .await
+        .expect("leaf-only responder with a pinned issuer should be accepted");
+    }
+
+    /// Regression for #675: pinning must narrow trust to the pinned subset of a
+    /// larger bundle.  A leaf chaining to a bundle CA that is **not** pinned is
+    /// chain-valid against the full bundle yet must still be rejected.
+    #[tokio::test]
+    async fn test_responder_tls_non_pinned_bundle_ca_rejected() {
+        let (pinned_ca_pem, pinned_ca_fingerprint, _pinned_leaf, _pinned_key) =
+            generate_ca_with_leaf("Pinned CA");
+        let (unpinned_ca_pem, _unpinned_fingerprint, unpinned_leaf_der, unpinned_key_der) =
+            generate_ca_with_leaf("Unpinned CA");
+
+        // The bundle trusts both CAs, but only the first CA is pinned.
+        let bundle = format!("{pinned_ca_pem}{unpinned_ca_pem}");
+        let pins = vec![pinned_ca_fingerprint];
+        // The responder serves a leaf chaining to the non-pinned CA.
+        let port = start_tls_responder_chain(vec![unpinned_leaf_der], unpinned_key_der).await;
+
+        let trust = ResponderTrust {
+            ca_pem: &bundle,
+            ca_pins: &pins,
+        };
+        let err = register_http01_token_with(
+            &format!("https://localhost:{port}"),
+            "hmac-secret",
+            5,
+            "tok",
+            "tok.key",
+            60,
+            Some(&trust),
+        )
+        .await
+        .expect_err("leaf chaining to a non-pinned bundle CA must be rejected");
         assert!(
             err.to_string().contains("Failed to register HTTP-01 token"),
             "unexpected error: {err}"

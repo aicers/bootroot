@@ -51,6 +51,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed the pinned http-01 admin TLS client rejecting a valid
+  leaf-only responder certificate. `PinnedCertVerifier` matched the
+  `trusted_ca_sha256` pins against the certificates the server
+  presented on the wire, but the pins are the root/intermediate CA
+  fingerprints while the production responder (`step certificate
+  create` without `--bundle`) presents a leaf-only certificate — so
+  nothing in the presented chain matched a pin and the handshake was
+  rejected, surfacing as "error sending request" on the first agent
+  issuance (`POST /admin/http01`). The verifier now restricts its
+  webpki trust anchors to the pinned subset of the CA bundle, so a
+  successful chain build already proves the leaf chains to a pinned CA
+  and the post-verification presented-chain scan is dropped; leaf-only
+  servers are accepted while subset-pinning still narrows trust to the
+  pinned CAs (a leaf chaining to a non-pinned bundle CA is rejected).
+  When no bundle certificate matches a pin the verifier falls back to
+  direct-pin-only mode (accepting a directly presented pinned CA
+  certificate) instead of building a client that rejects every
+  handshake. The same fix covers the ACME (step-ca) and responder-admin
+  clients for both local-file and remote-bootstrap agents.
 - Fixed `bootroot rotate ca-key` Phase 3 publishing an internally
   inconsistent transitional trust payload. The fingerprint list
   correctly carried both CA generations, but the accompanying
