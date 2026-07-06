@@ -849,7 +849,11 @@ async fn test_real_daemon_multi_host_tls_happy_path() {
     let responder_cert = step_ca.sign_server_cert(&["localhost"]);
     let responder_cert_path = responder_temp.path().join("responder.cert.pem");
     let responder_key_path = responder_temp.path().join("responder.key.pem");
-    fs::write(&responder_cert_path, server_chain_pem(&responder_cert))
+    // Present a leaf-only certificate as the production responder does
+    // (`step certificate create` writes `server.crt` without `--bundle`); the
+    // pinned client trusts the issuer via its filtered trust anchors, not the
+    // presented chain.
+    fs::write(&responder_cert_path, responder_cert.cert_pem.as_bytes())
         .expect("write responder cert");
     fs::write(&responder_key_path, &responder_cert.key_pem).expect("write responder key");
 
@@ -1018,7 +1022,11 @@ async fn test_real_daemon_multi_host_tls_rejects_system_trusted_non_artifact_ca(
     let responder_cert = system_ca.sign_server_cert(&["localhost"]);
     let responder_cert_path = responder_temp.path().join("responder.cert.pem");
     let responder_key_path = responder_temp.path().join("responder.key.pem");
-    fs::write(&responder_cert_path, server_chain_pem(&responder_cert))
+    // Present a leaf-only certificate as the production responder does
+    // (`step certificate create` writes `server.crt` without `--bundle`); the
+    // pinned client trusts the issuer via its filtered trust anchors, not the
+    // presented chain.
+    fs::write(&responder_cert_path, responder_cert.cert_pem.as_bytes())
         .expect("write responder cert");
     fs::write(&responder_key_path, &responder_cert.key_pem).expect("write responder key");
 
@@ -1164,7 +1172,11 @@ async fn test_real_daemon_multi_host_tls_pin_rejects_non_pinned_chain() {
     let responder_cert = system_ca.sign_server_cert(&["localhost"]);
     let responder_cert_path = responder_temp.path().join("responder.cert.pem");
     let responder_key_path = responder_temp.path().join("responder.key.pem");
-    fs::write(&responder_cert_path, server_chain_pem(&responder_cert))
+    // Present a leaf-only certificate as the production responder does
+    // (`step certificate create` writes `server.crt` without `--bundle`); the
+    // pinned client trusts the issuer via its filtered trust anchors, not the
+    // presented chain.
+    fs::write(&responder_cert_path, responder_cert.cert_pem.as_bytes())
         .expect("write responder cert");
     fs::write(&responder_key_path, &responder_cert.key_pem).expect("write responder key");
 
