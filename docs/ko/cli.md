@@ -1136,8 +1136,9 @@ bootroot service openbao-sidecar start ...`) 없이 동작합니다.
 - `state.json` 누락
 - 등록되지 않은 서비스
 - 서비스가 `--delivery-mode remote-bootstrap`을 사용 중(로컬 사이드카
-  플로우가 적용되지 않으며, secret_id 핸드오프는 서비스 머신에서
-  운영자가 수행)
+  플로우가 적용되지 않음. 원격 호스트는 `bootroot-agent` self-auth
+  fast-poll을 실행하며, 이것이 trust와 secret_id를 자가 치유하므로
+  해당 서비스에는 OpenBao Agent 사이드카를 시작하지 않음)
 - 서비스별 `agent-docker.hcl` 설정 파일 누락
 - compose 파일이 `openbao:` 서비스를 선언했는데 `bootroot-openbao`
   컨테이너를 찾을 수 없음(`--openbao-network` 전달 여부와 무관 —
@@ -1233,8 +1234,11 @@ consul-template은 에이전트 프로세스가 재시작될 때까지 이전에
 - `--delivery-mode local-file` 서비스: `docker restart
   bootroot-openbao-agent-<service-name>` 실행.
 - `--delivery-mode remote-bootstrap` 서비스: 운영자 안내 메시지만
-  출력합니다(사이드카는 원격 호스트에 있으며 bootroot에는 신호
-  채널이 없습니다).
+  출력합니다. 원격 호스트에는 OpenBao Agent 사이드카가 실행되지
+  않습니다(이슈 #680에서 `bootroot-agent` self-auth fast-poll 모델로
+  이동). trust와 secret_id는 fast-poll로 자가 치유되지만 EAB 같은
+  부트스트랩 시점 KV 설정은 fast-poll 대상이 아니므로, 원격 호스트에서
+  `bootroot-remote bootstrap`을 다시 실행해 KV에서 다시 받아와야 합니다.
 
 ### 실패 조건
 

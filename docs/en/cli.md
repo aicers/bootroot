@@ -1181,8 +1181,9 @@ The command is considered failed when:
 - Missing `state.json`
 - Service not found
 - Service uses `--delivery-mode remote-bootstrap` (the local sidecar
-  flow does not apply; secret_id handoff is operator-driven on the
-  service machine)
+  flow does not apply; the remote host runs `bootroot-agent` self-auth
+  fast-poll, which self-heals trust and secret_id — no OpenBao Agent
+  sidecar is started for it)
 - Per-service `agent-docker.hcl` config is missing
 - The compose file declares an `openbao:` service but the
   `bootroot-openbao` container is not found (failure applies whether
@@ -1284,8 +1285,11 @@ the previously-rendered value until the agent process restarts
 - For services with `--delivery-mode local-file`: runs `docker
   restart bootroot-openbao-agent-<service-name>`.
 - For services with `--delivery-mode remote-bootstrap`: emits
-  operator guidance only (the sidecar lives on the remote host where
-  bootroot has no signalling channel).
+  operator guidance only. No OpenBao Agent sidecar runs on the remote
+  host (issue #680 moved it to the `bootroot-agent` self-auth
+  fast-poll model). Trust and secret_id self-heal via fast-poll, but
+  bootstrap-time KV config such as EAB is not fast-polled — re-run
+  `bootroot-remote bootstrap` on the remote host to re-pull it from KV.
 
 ### Failure conditions
 
