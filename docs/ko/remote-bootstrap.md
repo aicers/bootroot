@@ -114,7 +114,8 @@ scp -p \
   "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
 
 # 3. 부트스트랩 전 schema_version 검증
-if ! jq -e '.schema_version >= 1 and .schema_version <= 4' "$ARTIFACT" > /dev/null; then
+SCHEMA_OK='.schema_version >= 1 and .schema_version <= 4'
+if ! jq -e "$SCHEMA_OK" "$ARTIFACT" > /dev/null; then
   echo "ERROR: $ARTIFACT 의 schema_version이 지원되지 않습니다" >&2
   exit 1
 fi

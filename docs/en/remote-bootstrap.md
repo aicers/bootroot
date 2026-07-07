@@ -116,7 +116,8 @@ scp -p \
   "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
 
 # 3. Validate schema_version before running bootstrap
-if ! jq -e '.schema_version >= 1 and .schema_version <= 4' "$ARTIFACT" > /dev/null; then
+SCHEMA_OK='.schema_version >= 1 and .schema_version <= 4'
+if ! jq -e "$SCHEMA_OK" "$ARTIFACT" > /dev/null; then
   echo "ERROR: unsupported schema_version in $ARTIFACT" >&2
   exit 1
 fi
