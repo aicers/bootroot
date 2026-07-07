@@ -31,9 +31,13 @@ impl<'a> Prompt<'a> {
         self.output
             .flush()
             .with_context(|| self.messages.error_prompt_flush_failed())?;
-        self.input
+        let bytes_read = self
+            .input
             .read_line(&mut line)
             .with_context(|| self.messages.error_prompt_read_failed())?;
+        if bytes_read == 0 {
+            anyhow::bail!(self.messages.error_prompt_read_failed());
+        }
         let trimmed = line.trim();
         if trimmed.is_empty()
             && let Some(value) = default
@@ -96,5 +100,33 @@ mod tests {
         let mut prompt = Prompt::new(&mut input, &mut output, &messages);
         let value = prompt.prompt_text("Label", Some("default")).unwrap();
         assert_eq!(value, "value");
+    }
+
+    // A closed/non-TTY stdin (EOF) must error, not read as an empty value.
+    #[test]
+    fn prompt_text_errors_on_eof() {
+        let mut input = Cursor::new("");
+        let mut output = Vec::new();
+        let messages = Messages::new("en").unwrap();
+        let mut prompt = Prompt::new(&mut input, &mut output, &messages);
+        let result = prompt.prompt_text("Label", None);
+        assert!(result.is_err());
+    }
+
+    // EOF must surface as an error instead of re-prompting forever.
+    #[test]
+    fn prompt_with_validation_errors_on_eof_instead_of_looping() {
+        let mut input = Cursor::new("");
+        let mut output = Vec::new();
+        let messages = Messages::new("en").unwrap();
+        let mut prompt = Prompt::new(&mut input, &mut output, &messages);
+        let result = prompt.prompt_with_validation("Label", None, |value| {
+            if value.trim().is_empty() {
+                anyhow::bail!("Value is required")
+            } else {
+                Ok(value.to_string())
+            }
+        });
+        assert!(result.is_err());
     }
 }

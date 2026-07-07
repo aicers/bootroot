@@ -52,17 +52,37 @@ pub(crate) fn prompt_unseal_keys_interactive(
 ) -> Result<Vec<String>> {
     use std::io::{self, Write};
 
+    io::stdout()
+        .flush()
+        .with_context(|| messages.error_prompt_flush_failed())?;
+    let stdin = io::stdin();
+    let mut lock = stdin.lock();
+    prompt_unseal_keys_from_reader(threshold, messages, &mut lock)
+}
+
+/// Reads unseal keys from the given reader, prompting via stdout.
+/// Fails fast on EOF instead of treating an empty line as valid input.
+fn prompt_unseal_keys_from_reader<R: std::io::BufRead>(
+    threshold: Option<u32>,
+    messages: &Messages,
+    reader: &mut R,
+) -> Result<Vec<String>> {
+    use std::io::Write;
+
     let count = match threshold {
         Some(value) if value > 0 => value,
         _ => {
             print!("Unseal key threshold (t): ");
-            io::stdout()
+            std::io::stdout()
                 .flush()
                 .with_context(|| messages.error_prompt_flush_failed())?;
             let mut input = String::new();
-            io::stdin()
+            let bytes_read = reader
                 .read_line(&mut input)
                 .with_context(|| messages.error_prompt_read_failed())?;
+            if bytes_read == 0 {
+                anyhow::bail!(messages.error_prompt_read_failed());
+            }
             input
                 .trim()
                 .parse::<u32>()
@@ -72,13 +92,16 @@ pub(crate) fn prompt_unseal_keys_interactive(
     let mut keys = Vec::with_capacity(count as usize);
     for index in 1..=count {
         print!("Unseal key {index}/{count}: ");
-        io::stdout()
+        std::io::stdout()
             .flush()
             .with_context(|| messages.error_prompt_flush_failed())?;
         let mut input = String::new();
-        io::stdin()
+        let bytes_read = reader
             .read_line(&mut input)
             .with_context(|| messages.error_prompt_read_failed())?;
+        if bytes_read == 0 {
+            anyhow::bail!(messages.error_prompt_read_failed());
+        }
         keys.push(input.trim().to_string());
     }
     Ok(keys)
@@ -140,5 +163,21 @@ mod tests {
 
         let err = read_unseal_keys_from_file(&file_path, &test_messages()).unwrap_err();
         assert!(err.to_string().contains("Unseal key file is empty"));
+    }
+
+    // EOF while reading the threshold must error, not read as empty input.
+    #[test]
+    fn test_prompt_unseal_keys_errors_on_eof_reading_threshold() {
+        let mut reader = std::io::Cursor::new(b"".as_slice());
+        let result = prompt_unseal_keys_from_reader(None, &test_messages(), &mut reader);
+        assert!(result.is_err());
+    }
+
+    // EOF while collecting keys must error, not push an empty-string key.
+    #[test]
+    fn test_prompt_unseal_keys_errors_on_eof_reading_keys() {
+        let mut reader = std::io::Cursor::new(b"key-1\n".as_slice());
+        let result = prompt_unseal_keys_from_reader(Some(2), &test_messages(), &mut reader);
+        assert!(result.is_err());
     }
 }
