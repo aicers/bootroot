@@ -62,6 +62,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot-remote bootstrap` provisioning a non-unique fast-poll
+  `state_path` for distinct services on one host. The auto-provisioned
+  basename was a fixed `bootroot-agent-state.json`, so two per-service
+  agent configs sharing a directory resolved to the same state file and
+  their fast-poll loops raced on one `FastPollState`, each periodically
+  reverting the other's progress (version-gating thrash, lost
+  reissue-completion tracking). The provisioned basename is now keyed by
+  the service name (`bootroot-agent-state-<service_name>.json`), so
+  per-service configs in one directory resolve to distinct state files.
+  Existing deployments already carry an absolute `state_path`, so a
+  bootstrap rerun preserves the old name unchanged — no migration.
+  Bootstrap also now warns when two sibling managed configs in the target
+  directory resolve to the same absolute `state_path`, covering
+  hand-written or legacy configs that the naming change cannot repair on
+  its own. Docs describe the supported one-agent-per-service layout and
+  note that distinct services cannot share one `[openbao]` config,
+  because it holds a single AppRole credential and cross-service KV reads
+  return `403` under per-service AppRole policies.
 - Fixed the interactive OpenBao root-token prompt spinning in a tight
   infinite loop, printing `OpenBao root token: Value is required`
   without bound, when a command resolved auth through the prompt and

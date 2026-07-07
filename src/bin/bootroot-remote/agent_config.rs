@@ -421,6 +421,11 @@ fn needs_absolute_state_path_provisioning(contents: &str) -> bool {
 /// state path, which is exactly what this provisioning is meant to
 /// avoid; leaving `state_path` unset lets the existing validation
 /// surface the issue instead of silently entrenching a fragile path.
+///
+/// The basename is keyed by `service_name` so that per-service agent
+/// configs sharing one directory (the supported multi-service-per-host
+/// layout) resolve to distinct state files instead of contending over a
+/// single shared `bootroot-agent-state.json`.
 fn default_state_path_for(args: &ResolvedBootstrapArgs) -> Option<String> {
     let parent = args.agent_config_path.parent()?;
     if !parent.is_absolute() {
@@ -428,10 +433,98 @@ fn default_state_path_for(args: &ResolvedBootstrapArgs) -> Option<String> {
     }
     Some(
         parent
-            .join("bootroot-agent-state.json")
+            .join(state_path_basename(&args.service_name))
             .display()
             .to_string(),
     )
+}
+
+/// Derives the per-service fast-poll state filename.
+///
+/// `service_name` is a validated DNS label on the bootstrap path
+/// (`validate_service_name` → `validate_dns_label`), so it contains only
+/// letters, digits, and hyphens and can never introduce a path separator
+/// or `..`. The `debug_assert!` pins that invariant: the produced value
+/// is always a plain basename, never a traversal.
+fn state_path_basename(service_name: &str) -> String {
+    debug_assert!(
+        !service_name.is_empty()
+            && !service_name.contains(['/', '\\'])
+            && !service_name.contains(".."),
+        "service_name must be a validated DNS label, got {service_name:?}"
+    );
+    format!("bootroot-agent-state-{service_name}.json")
+}
+
+/// A group of sibling agent configs that resolve to the same absolute
+/// fast-poll `state_path`. Two `bootroot-agent` processes sharing one
+/// state file race on the fast-poll `FastPollState`, each periodically
+/// reverting the other's progress (version-gating thrash, lost
+/// reissue-completion tracking).
+pub(super) struct StatePathCollision {
+    pub(super) state_path: PathBuf,
+    pub(super) configs: Vec<PathBuf>,
+}
+
+/// Scans sibling `*.toml` configs in `dir` and returns each set of two or
+/// more configs whose `[openbao].state_path` resolves to the same absolute
+/// path.
+///
+/// This compares the resolved `state_path` across sibling configs — the
+/// well-defined collision signal — rather than inspecting the on-disk
+/// state file, which carries no service-ownership metadata. Unreadable,
+/// unparseable, and files without an `[openbao].state_path` are skipped:
+/// this is a best-effort defense-in-depth warning, never a hard failure.
+pub(super) fn detect_state_path_collisions(dir: &Path) -> Vec<StatePathCollision> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut configs: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    configs.sort_unstable();
+
+    let mut by_state: std::collections::BTreeMap<PathBuf, Vec<PathBuf>> =
+        std::collections::BTreeMap::new();
+    for config in configs {
+        let Ok(contents) = std::fs::read_to_string(&config) else {
+            continue;
+        };
+        if let Some(state_path) = resolve_config_state_path(&config, &contents) {
+            by_state.entry(state_path).or_default().push(config);
+        }
+    }
+
+    by_state
+        .into_iter()
+        .filter(|(_, configs)| configs.len() >= 2)
+        .map(|(state_path, configs)| StatePathCollision {
+            state_path,
+            configs,
+        })
+        .collect()
+}
+
+/// Resolves the absolute fast-poll `state_path` declared by a single agent
+/// config, or `None` when the config has no `[openbao].state_path`. A
+/// relative `state_path` is resolved against the config file's parent
+/// directory so that sibling configs sharing a directory compare on equal
+/// footing.
+fn resolve_config_state_path(config_path: &Path, contents: &str) -> Option<PathBuf> {
+    let doc = contents.parse::<toml_edit::DocumentMut>().ok()?;
+    let state_path = doc
+        .get("openbao")
+        .and_then(toml_edit::Item::as_table)?
+        .get("state_path")?
+        .as_str()?;
+    let state_path = Path::new(state_path);
+    if state_path.is_absolute() {
+        Some(state_path.to_path_buf())
+    } else {
+        Some(config_path.parent()?.join(state_path))
+    }
 }
 
 #[cfg(test)]
@@ -604,11 +697,11 @@ mod tests {
             std::path::Path::new(rendered).is_absolute(),
             "state_path should be absolute: {rendered}"
         );
-        assert_eq!(rendered, "/tmp/bootroot-agent-state.json");
+        assert_eq!(rendered, "/tmp/bootroot-agent-state-edge-proxy.json");
 
         let output = bootroot::toml_util::upsert_section_keys(input, "openbao", &pairs).unwrap();
         assert!(
-            output.contains("state_path = \"/tmp/bootroot-agent-state.json\""),
+            output.contains("state_path = \"/tmp/bootroot-agent-state-edge-proxy.json\""),
             "{output}"
         );
     }
@@ -730,13 +823,140 @@ mod tests {
         );
         let output = bootroot::toml_util::upsert_section_keys(input, "openbao", &pairs).unwrap();
         assert!(
-            output.contains("state_path = \"/tmp/bootroot-agent-state.json\""),
+            output.contains("state_path = \"/tmp/bootroot-agent-state-edge-proxy.json\""),
             "{output}"
         );
         assert!(
             !output.contains("state_path = \"bootroot-agent-state.json\""),
             "relative value must be replaced, not kept alongside the absolute one: {output}"
         );
+    }
+
+    #[test]
+    fn default_state_path_for_is_service_keyed_and_unique_per_service() {
+        // Two distinct services bootstrapped into the same directory must
+        // resolve to distinct state_paths so their fast-poll agents do not
+        // race on one shared state file (issue #687, constraint 2).
+        let mut args_a = test_bootstrap_args();
+        args_a.service_name = "giganto".to_string();
+        args_a.agent_config_path = PathBuf::from("/opt/bootroot-closed/config/giganto.toml");
+
+        let mut args_b = test_bootstrap_args();
+        args_b.service_name = "edge-proxy".to_string();
+        args_b.agent_config_path = PathBuf::from("/opt/bootroot-closed/config/edge-proxy.toml");
+
+        let state_a = default_state_path_for(&args_a).expect("absolute config yields state_path");
+        let state_b = default_state_path_for(&args_b).expect("absolute config yields state_path");
+
+        assert_eq!(
+            state_a,
+            "/opt/bootroot-closed/config/bootroot-agent-state-giganto.json"
+        );
+        assert_eq!(
+            state_b,
+            "/opt/bootroot-closed/config/bootroot-agent-state-edge-proxy.json"
+        );
+        assert_ne!(
+            state_a, state_b,
+            "distinct services in one directory must not collide"
+        );
+    }
+
+    #[test]
+    fn build_openbao_updates_preserves_existing_absolute_state_path() {
+        // No-migration guarantee: an existing deployment already carries an
+        // absolute state_path, so a bootstrap re-run must leave it exactly
+        // as-is (issue #687 acceptance criteria).
+        let args = test_bootstrap_args();
+        let input = "[openbao]\n\
+            url = \"https://stale:8200\"\n\
+            state_path = \"/var/lib/bootroot/legacy-state.json\"\n";
+        let pairs = build_openbao_updates(&args, input);
+        assert!(
+            !pairs.iter().any(|(k, _)| *k == "state_path"),
+            "an existing absolute state_path must be preserved, not re-provisioned: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn state_path_basename_is_a_plain_filename_for_valid_dns_labels() {
+        // validate_service_name restricts service_name to a DNS label, so
+        // the derived basename can never contain a path separator or `..`.
+        for service in ["a", "giganto", "edge-proxy", "svc-01", &"x".repeat(63)] {
+            let basename = state_path_basename(service);
+            assert!(
+                !basename.contains('/') && !basename.contains('\\') && !basename.contains(".."),
+                "basename must be a plain filename: {basename}"
+            );
+            assert_eq!(Path::new(&basename).components().count(), 1, "{basename}");
+            assert_eq!(basename, format!("bootroot-agent-state-{service}.json"));
+        }
+    }
+
+    #[test]
+    fn detect_state_path_collisions_flags_shared_absolute_state_path() {
+        // Two sibling managed configs pinned to the same absolute
+        // state_path must be reported (issue #687, collision detection).
+        let dir = tempfile::tempdir().unwrap();
+        let shared = "/var/lib/bootroot/shared-state.json";
+        std::fs::write(
+            dir.path().join("giganto.toml"),
+            format!("[openbao]\nstate_path = \"{shared}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("edge-proxy.toml"),
+            format!("[openbao]\nstate_path = \"{shared}\"\n"),
+        )
+        .unwrap();
+
+        let collisions = detect_state_path_collisions(dir.path());
+        assert_eq!(collisions.len(), 1, "one collision group expected");
+        let collision = collisions.first().expect("collision present");
+        assert_eq!(collision.state_path, Path::new(shared));
+        assert_eq!(collision.configs.len(), 2);
+    }
+
+    #[test]
+    fn detect_state_path_collisions_ignores_distinct_state_paths() {
+        // Distinct (service-keyed) state_paths are the healthy layout and
+        // must not trigger a warning.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("giganto.toml"),
+            "[openbao]\nstate_path = \"/var/lib/bootroot/bootroot-agent-state-giganto.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("edge-proxy.toml"),
+            "[openbao]\nstate_path = \"/var/lib/bootroot/bootroot-agent-state-edge-proxy.json\"\n",
+        )
+        .unwrap();
+
+        assert!(
+            detect_state_path_collisions(dir.path()).is_empty(),
+            "distinct state_paths must not be reported as a collision"
+        );
+    }
+
+    #[test]
+    fn detect_state_path_collisions_flags_shared_relative_state_path() {
+        // Sibling configs both carrying the same relative default filename
+        // resolve to the same directory-relative path and must collide.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("giganto.toml"),
+            "[openbao]\nstate_path = \"bootroot-agent-state.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("edge-proxy.toml"),
+            "[openbao]\nstate_path = \"bootroot-agent-state.json\"\n",
+        )
+        .unwrap();
+
+        let collisions = detect_state_path_collisions(dir.path());
+        assert_eq!(collisions.len(), 1, "shared relative filename must collide");
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 
-use super::agent_config::apply_agent_config_updates;
+use std::path::Path;
+
+use super::agent_config::{apply_agent_config_updates, detect_state_path_collisions};
 use super::io::{
     pull_secrets, read_secret_file, remove_eab_file, write_eab_file, write_secret_file,
 };
@@ -153,6 +155,15 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
 
     let (responder_hmac_status, mut trust_sync_status) =
         apply_agent_config_updates(&args, &pulled, lang).await;
+
+    // Defense-in-depth: the service-keyed `state_path` from fix 1 only
+    // covers freshly provisioned configs. Pre-existing hand-written or
+    // legacy-bootstrapped sibling configs can still share one absolute
+    // `state_path` and silently race on the fast-poll state file, so warn
+    // if two managed configs in the target directory collide.
+    if let Some(dir) = args.agent_config_path.parent() {
+        warn_state_path_collisions(dir, lang);
+    }
 
     match write_secret_file(&args.ca_bundle_path, &pulled.ca_bundle_pem).await {
         Ok(bundle_status) => {
@@ -350,6 +361,40 @@ fn validate_hook_flags(args: &ResolvedBootstrapArgs) -> Result<()> {
         anyhow::bail!("--post-renew-timeout-secs must be greater than 0");
     }
     Ok(())
+}
+
+/// Emits a stderr warning for each set of sibling configs in `dir` that
+/// resolve to the same absolute fast-poll `state_path`. Distinct
+/// `bootroot-agent` processes sharing one state file race on it, so this
+/// surfaces a misconfiguration that fix 1's service-keyed naming cannot
+/// repair on its own (pre-existing hand-written or legacy configs).
+fn warn_state_path_collisions(dir: &Path, lang: Locale) {
+    for collision in detect_state_path_collisions(dir) {
+        let configs = collision
+            .configs
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "{}",
+            localized(
+                lang,
+                &format!(
+                    "warning: agent configs [{configs}] share fast-poll state_path {}; \
+                     distinct services must each use a unique state_path or their agents \
+                     will race and revert each other's fast-poll progress",
+                    collision.state_path.display()
+                ),
+                &format!(
+                    "경고: agent 설정 [{configs}]이(가) fast-poll state_path {}를 공유합니다. \
+                     서로 다른 서비스는 각각 고유한 state_path를 사용해야 하며, 그렇지 않으면 \
+                     각 agent가 서로의 fast-poll 진행 상태를 되돌립니다",
+                    collision.state_path.display()
+                ),
+            )
+        );
+    }
 }
 
 fn validate_bootstrap_args(args: &ResolvedBootstrapArgs, lang: Locale) -> Result<()> {
