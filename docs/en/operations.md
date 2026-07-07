@@ -682,12 +682,17 @@ for the sidecar vs. host-daemon trade-off.
 For `remote-bootstrap` services, the rotated `secret_id` is written to
 the per-service KV path (`bootroot/services/<service>/secret_id`). The
 operator must then run `bootroot-remote apply-secret-id` on the service
-machine to deliver it. The service's OpenBao Agent reads the local
-`secret_id` file and re-authenticates on the next token renewal cycle.
+machine to deliver it, which writes the rotated `secret_id` to the
+agent's local file. In the `remote-bootstrap` flow the remote
+`bootroot-agent` re-authenticates to OpenBao itself via AppRole in its
+fast-poll loop, reading `role_id`/`secret_id` from the files referenced
+by `role_id_path`/`secret_id_path` in the `[openbao]` block that
+`bootroot-remote bootstrap` provisions, and picks up the rotated
+`secret_id` on its next AppRole login.
 
-Note: `bootroot-agent` itself does not re-authenticate with AppRole
-directly in the `remote-bootstrap` flow. It consumes the token file that
-the OpenBao Agent maintains.
+Note: `bootroot-agent` does not depend on a token file maintained by a
+separate OpenBao Agent in the `remote-bootstrap` flow. It performs the
+AppRole login directly from its fast-poll loop.
 
 ### Wrap token expiry recovery
 
