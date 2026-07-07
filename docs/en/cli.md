@@ -12,8 +12,9 @@ Roles:
 
 - `bootroot`: automates infra/init/service/rotate/monitoring on the
   machine hosting step-ca
-- `bootroot-remote`: performs one-shot bootstrap and explicit secret_id
-  handoff on machines hosting remote services
+- `bootroot-remote`: performs one-shot bootstrap on machines hosting remote
+  services (its `apply-secret-id` subcommand is a recovery path for an agent
+  that was offline past its `secret_id_ttl`)
 
 Primary commands:
 
@@ -85,8 +86,13 @@ Runtime supervision is also operator-owned:
 
 When an added service runs on a different machine from the step-ca host,
 run `bootroot-remote bootstrap` once on that service machine to apply the
-initial configuration bundle, then use `bootroot-remote apply-secret-id`
-for explicit secret_id handoff after rotation.
+initial configuration bundle and start `bootroot-agent`. The running agent
+then keeps itself current via its fast-poll loop: it pulls trust and
+`secret_id` rotations from OpenBao and re-renders `agent.toml` without
+operator action, so no second daemon (OpenBao Agent sidecar) runs on the
+remote host. `bootroot-remote apply-secret-id` and re-running
+`bootroot-remote bootstrap` are recovery paths only — needed when an agent
+was offline past its `secret_id_ttl` and its credential already expired.
 
 ## Name resolution responsibilities
 
@@ -564,13 +570,17 @@ automation in the following structure.
 
 You still need to perform:
 
-- Start and keep OpenBao Agent/bootroot-agent running on the service machine
-- For `local-file`, `bootroot service add` already prepares trust files on the
-  same host so the first managed `bootroot-agent` run can start in verify mode
+- For `local-file`, start and keep the per-service OpenBao Agent sidecar and
+  `bootroot-agent` running on the service machine; `bootroot service add`
+  already prepares trust files on the same host so the first managed
+  `bootroot-agent` run can start in verify mode
 - For `remote-bootstrap`, edit the generated `remote run command template`,
-  run `bootroot-remote bootstrap` on the service machine before starting
-  `bootroot-agent`, and use `bootroot-remote apply-secret-id` after
-  secret_id rotation
+  run `bootroot-remote bootstrap` once on the service machine, then keep
+  `bootroot-agent` running. No OpenBao Agent sidecar runs on the remote host:
+  the agent self-authenticates and pulls trust and `secret_id` rotations via
+  fast-poll, so rotations propagate without a manual re-bootstrap or
+  `apply-secret-id` (those are recovery paths only, for an agent offline past
+  its `secret_id_ttl`)
 - Validate issuance path via `bootroot verify` or real service startup
 
 ### 4) Trust automation and preview
@@ -2256,9 +2266,10 @@ bootroot openbao delete-unseal-keys
 `bootroot service add --delivery-mode remote-bootstrap`. It performs a one-shot
 bootstrap of service state (`secret_id`/`eab`/`responder_hmac`/`trust`) stored
 in OpenBao on the step-ca machine to files on remote service machines, and
-updates local files such as `agent.toml`. After the initial bootstrap,
-`bootroot-remote apply-secret-id` handles explicit secret_id handoff after
-rotation.
+updates local files such as `agent.toml`. After the initial bootstrap, the
+running `bootroot-agent` keeps trust and `secret_id` current via its
+fast-poll loop; `bootroot-remote apply-secret-id` is a recovery path for an
+agent that was offline past its `secret_id_ttl`.
 `bootroot-remote` also supports the global `--lang` option
 (environment variable: `BOOTROOT_LANG`).
 
@@ -2359,9 +2370,11 @@ topology to bootroot-agent's compiled-in defaults.
 
 ### `bootroot-remote apply-secret-id`
 
-Applies a rotated secret_id to the remote service machine. Use this command
-after `bootroot rotate approle-secret-id` on the control node to deliver the
-new secret_id to the service machine.
+Applies a rotated secret_id to the remote service machine. This is a
+**recovery** path, not the steady state: a running `bootroot-agent` already
+pulls rotated secret_ids from OpenBao via its fast-poll loop. Use this
+command only to recover an agent that was offline past its `secret_id_ttl`
+(its credential already expired, so it can no longer self-refresh).
 
 Key inputs:
 

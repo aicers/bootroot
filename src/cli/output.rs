@@ -177,7 +177,33 @@ fn print_service_add_snippets(
 ) {
     println!("{}", messages.service_summary_next_steps());
     println!("{}", messages.service_scope_operator_required());
-    print_service_openbao_agent_steps(entry, secret_id_path, messages);
+    match entry.delivery_mode {
+        // Remote-bootstrap hosts run `bootroot-agent` self-auth fast-poll (no
+        // OpenBao Agent sidecar). The one-shot `bootroot-remote bootstrap`
+        // handoff is already printed above; here we only remind the operator to
+        // keep the agent running so trust and secret_id self-heal.
+        DeliveryMode::RemoteBootstrap => print_remote_selfheal_next_steps(messages),
+        DeliveryMode::LocalFile => {
+            print_service_openbao_agent_steps(entry, secret_id_path, messages);
+            print_local_deploy_snippet(entry, secret_id_path, messages);
+            if let Some(trusted) = trusted_ca_sha256 {
+                println!("{}", messages.service_scope_operator_optional());
+                print_trust_snippet(entry, trusted, messages);
+            }
+        }
+    }
+}
+
+fn print_remote_selfheal_next_steps(messages: &Messages) {
+    println!("{}", messages.service_next_steps_remote_selfheal_keep());
+    println!("{}", messages.service_next_steps_remote_selfheal_note());
+}
+
+fn print_local_deploy_snippet(
+    entry: &ServiceEntry,
+    secret_id_path: &std::path::Path,
+    messages: &Messages,
+) {
     match entry.deploy_type {
         DeployType::Daemon => {
             let cert_path = entry.cert_path.display().to_string();
@@ -215,10 +241,6 @@ fn print_service_add_snippets(
             println!("{}", messages.service_next_steps_docker_sidecar(&data));
             print_docker_snippet(entry, messages);
         }
-    }
-    if let Some(trusted) = trusted_ca_sha256 {
-        println!("{}", messages.service_scope_operator_optional());
-        print_trust_snippet(entry, trusted, messages);
     }
 }
 
@@ -294,7 +316,12 @@ pub(crate) fn print_service_info_summary(entry: &ServiceEntry, messages: &Messag
         messages.service_summary_secret_path(&entry.approle.secret_id_path.display().to_string())
     );
     println!("{}", messages.service_summary_next_steps());
-    print_service_openbao_agent_steps(entry, &entry.approle.secret_id_path, messages);
+    match entry.delivery_mode {
+        DeliveryMode::RemoteBootstrap => print_remote_selfheal_next_steps(messages),
+        DeliveryMode::LocalFile => {
+            print_service_openbao_agent_steps(entry, &entry.approle.secret_id_path, messages);
+        }
+    }
 }
 
 fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
@@ -384,27 +411,13 @@ fn print_service_openbao_agent_steps(
         "{}",
         messages.service_next_steps_openbao_agent_permissions(&openbao_steps)
     );
-    if matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
-        println!(
-            "{}",
-            messages.service_next_steps_openbao_sidecar_start(&openbao_steps)
-        );
-    } else {
-        match entry.deploy_type {
-            DeployType::Daemon => {
-                println!(
-                    "{}",
-                    messages.service_next_steps_openbao_agent_daemon_run(&openbao_steps)
-                );
-            }
-            DeployType::Docker => {
-                println!(
-                    "{}",
-                    messages.service_next_steps_openbao_agent_docker_run(&openbao_steps)
-                );
-            }
-        }
-    }
+    // Only local-file delivery runs a per-service OpenBao Agent sidecar; the
+    // remote-bootstrap path never reaches here (see the delivery-mode split in
+    // `print_service_add_snippets` / `print_service_info_summary`).
+    println!(
+        "{}",
+        messages.service_next_steps_openbao_sidecar_start(&openbao_steps)
+    );
 }
 
 fn print_daemon_snippet(entry: &ServiceEntry, messages: &Messages) {

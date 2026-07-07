@@ -228,9 +228,13 @@ pub(super) static STRINGS: Strings = Strings {
     service_next_steps_openbao_agent_role_id_path: "    - role_id 파일: {role_id_path}",
     service_next_steps_openbao_agent_secret_id_path: "    - secret_id 파일: {secret_id_path}",
     service_next_steps_openbao_agent_permissions: "    - {service_dir}는 0700, role_id/secret_id 파일은 0600으로 설정하세요",
-    service_next_steps_openbao_agent_daemon_run: "    - 이 서비스 전용 OpenBao Agent를 호스트에서 {config_path}로 실행하세요",
-    service_next_steps_openbao_agent_docker_run: "    - 이 서비스 전용 OpenBao Agent 사이드카를 {config_path}로 실행하세요",
     service_next_steps_openbao_sidecar_start: "    - 관리형 사이드카를 시작하세요: bootroot service openbao-sidecar start --service-name {service_name} (bootroot rotate가 사이드카에 신호를 보내려면 필요합니다. 호스트에서 `bao agent -config={config_path}`를 실행하는 방법도 대체로 사용할 수 있습니다)",
+    service_next_steps_remote_selfheal_keep: "  - `bootroot-remote bootstrap` 이후 원격 호스트에서 bootroot-agent를 계속 실행하세요(위의 원격 핸드오프 순서 참고).",
+    service_next_steps_remote_selfheal_note: concat!(
+        "  - 원격 호스트에는 OpenBao Agent 사이드카가 필요 없습니다: 실행 중인 bootroot-agent가 스스로 인증하고 ",
+        "trust(ca-bundle.pem + trusted_ca_sha256)와 secret_id 회전을 fast-poll로 가져오므로, ",
+        "CA/trust 및 secret_id 회전이 수동 재부트스트랩이나 apply-secret-id 없이 전파됩니다."
+    ),
     service_snippet_daemon_title: "daemon 프로필 스니펫:",
     service_snippet_docker_title: "docker 사이드카 스니펫:",
     service_snippet_trust_title: "trust 설정 스니펫:",

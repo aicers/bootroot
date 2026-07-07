@@ -228,9 +228,13 @@ pub(super) static STRINGS: Strings = Strings {
     service_next_steps_openbao_agent_role_id_path: "    - role_id file: {role_id_path}",
     service_next_steps_openbao_agent_secret_id_path: "    - secret_id file: {secret_id_path}",
     service_next_steps_openbao_agent_permissions: "    - ensure {service_dir} is 0700 and role_id/secret_id files are 0600",
-    service_next_steps_openbao_agent_daemon_run: "    - run the service-specific OpenBao Agent on the host with {config_path}",
-    service_next_steps_openbao_agent_docker_run: "    - run the service-specific OpenBao Agent sidecar with {config_path}",
     service_next_steps_openbao_sidecar_start: "    - start the managed sidecar with: bootroot service openbao-sidecar start --service-name {service_name} (required so `bootroot rotate` can signal the sidecar; the host `bao agent -config={config_path}` remains available as an alternative)",
+    service_next_steps_remote_selfheal_keep: "  - Keep bootroot-agent running on the remote host after `bootroot-remote bootstrap` (see the remote handoff order above).",
+    service_next_steps_remote_selfheal_note: concat!(
+        "  - No OpenBao Agent sidecar runs on the remote host: the bootroot-agent self-authenticates ",
+        "and pulls trust (ca-bundle.pem + trusted_ca_sha256) and secret_id rotations via fast-poll, ",
+        "so CA/trust and secret_id rotations propagate without a manual re-bootstrap or apply-secret-id."
+    ),
     service_snippet_daemon_title: "daemon profile snippet:",
     service_snippet_docker_title: "docker sidecar snippet:",
     service_snippet_trust_title: "trust settings snippet:",

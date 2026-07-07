@@ -1124,6 +1124,25 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         stdout.contains("localhost placeholders for `--agent-server` and `--agent-responder-url`")
     );
     assert!(stdout.contains("2. Check status on the step-ca host:"));
+    // Remote-bootstrap hosts run the self-auth `bootroot-agent` fast-poll, not a
+    // per-service OpenBao Agent sidecar. The next-steps block must advertise the
+    // self-heal model and must not tell the operator to run an OpenBao Agent.
+    assert!(
+        stdout.contains("Keep bootroot-agent running on the remote host"),
+        "remote-bootstrap add should advertise keeping bootroot-agent running: {stdout}"
+    );
+    assert!(
+        stdout.contains("No OpenBao Agent sidecar runs on the remote host"),
+        "remote-bootstrap add should state no OpenBao Agent sidecar runs: {stdout}"
+    );
+    assert!(
+        !stdout.contains("OpenBao Agent (per-service instance):"),
+        "remote-bootstrap add must not print per-service OpenBao Agent steps: {stdout}"
+    );
+    assert!(
+        !stdout.contains("run the service-specific OpenBao Agent"),
+        "remote-bootstrap add must not instruct running an OpenBao Agent: {stdout}"
+    );
 
     let state_contents =
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
