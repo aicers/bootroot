@@ -873,8 +873,13 @@ After `trust-sync`:
 
 - `local-file`: the local service host already has the updated trust config
   and bundle on disk.
-- `remote-bootstrap`: re-run `bootroot-remote bootstrap` on the service host
-  to apply the updated trust payload and CA bundle there.
+- `remote-bootstrap`: no per-host action is needed. A running
+  `bootroot-agent`'s fast-poll loop reads the updated
+  `bootroot/services/<name>/trust` payload, re-renders the `agent.toml`
+  `[trust]` pins, and rewrites `ca-bundle.pem` within roughly one fast-poll
+  interval. Re-running `bootroot-remote bootstrap` is only a recovery path
+  for an agent that was offline past its `secret_id_ttl` and can no longer
+  self-refresh.
 
 ## Force reissue
 

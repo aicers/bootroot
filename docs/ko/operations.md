@@ -830,8 +830,12 @@ bootroot rotate trust-sync --yes
 `trust-sync` 이후:
 
 - `local-file`: 로컬 서비스 호스트에 갱신된 trust 설정과 번들이 이미 기록됩니다.
-- `remote-bootstrap`: 서비스 호스트에서 `bootroot-remote bootstrap`을 다시
-  실행해 갱신된 trust payload와 CA 번들을 반영합니다.
+- `remote-bootstrap`: 호스트별 조치가 필요 없습니다. 실행 중인
+  `bootroot-agent`의 fast-poll 루프가 갱신된 `bootroot/services/<name>/trust`
+  payload를 읽어 `agent.toml` `[trust]` 핀을 다시 렌더링하고 `ca-bundle.pem`을
+  약 1 fast-poll 주기 내에 다시 기록합니다. `bootroot-remote bootstrap` 재실행은
+  에이전트가 `secret_id_ttl`을 넘겨 오프라인 상태였고 더 이상 스스로 갱신할 수
+  없는 경우의 복구 경로일 뿐입니다.
 
 ## 강제 재발급
 
