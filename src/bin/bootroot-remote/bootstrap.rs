@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
-
 use std::path::Path;
+
+use anyhow::{Context, Result};
 
 use super::agent_config::{apply_agent_config_updates, detect_state_path_collisions};
 use super::io::{
