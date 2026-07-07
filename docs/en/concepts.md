@@ -183,7 +183,9 @@ manual seal, or recovery procedures that transition the node back to sealed.
 
 After bootstrap, the OpenBao Agent authenticates using **AppRole**
 (role_id + secret_id) and receives short-lived tokens. Policies should grant
-only the minimum paths required (read-only for runtime services). AppRole
+only the minimum paths required (read-only over a runtime service's KV
+subtree, except a narrow write on its own `reissue` path so the fast-poll
+loop can acknowledge a `force-reissue` completion). AppRole
 `role_id` and `secret_id` are issued by OpenBao. `role_id` identifies the
 role and is stable, while `secret_id` is a credential that can be rotated.
 Operators deliver the initial values to services (or OpenBao Agent), and

@@ -51,6 +51,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate force-reissue --wait` timing out against
+  `remote-bootstrap` services even though the certificate was reissued.
+  The remote agent's fast-poll loop applied the reissue correctly but
+  its write-back of the `completed_at` / `completed_version` completion
+  markers to `{kv_mount}/data/bootroot/services/<service>/reissue` was
+  denied, because the service AppRole policy (`build_service_policy`)
+  was read-only over the entire service subtree. The control plane
+  therefore never observed `completed_version` and blocked until
+  `--wait-timeout`, while the agent accumulated `pending_completion_writes`
+  retries forever. The policy now grants `create`/`update` (in addition
+  to `read`) on exactly the reissue path and keeps the rest of the
+  subtree read-only. Because there was previously no code path that
+  re-applied a service policy, already-provisioned services would keep
+  the old read-only policy indefinitely; the idempotent remote
+  `service add` re-run now re-applies `build_service_policy` via
+  `write_policy` so pre-existing services pick up the reissue-path write
+  grant. The remote lifecycle E2E now exercises the genuine KV
+  force-reissue round-trip (a real `rotate force-reissue --wait` against
+  a running agent) instead of faking reissue by deleting cert files, so
+  the missing permission would now be caught in CI.
 - Fixed the pinned http-01 admin TLS client rejecting a valid
   leaf-only responder certificate. `PinnedCertVerifier` matched the
   `trusted_ca_sha256` pins against the certificates the server

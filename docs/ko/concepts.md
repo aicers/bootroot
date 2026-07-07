@@ -179,8 +179,10 @@ root token은 초기화 시 **OpenBao가 자동 생성**하며, 운영자가 값
 #### AppRole 자격증명
 
 초기 설정 이후에는 OpenBao Agent가 **AppRole**(role_id + secret_id)로
-로그인해 짧은 TTL 토큰을 받고, 필요한 경로만 읽도록 최소 권한 정책을
-적용합니다. AppRole의 `role_id`/`secret_id`는 OpenBao가 발급합니다.
+로그인해 짧은 TTL 토큰을 받습니다. 최소 권한 정책은 서비스의 KV
+하위 트리를 읽기 전용으로 두되, 자신의 `reissue` 경로에만 좁은 쓰기
+권한을 부여해 fast-poll 루프가 `force-reissue` 완료를 기록할 수 있게
+합니다. AppRole의 `role_id`/`secret_id`는 OpenBao가 발급합니다.
 `role_id`는 역할 식별자이며 고정값이고, `secret_id`는 로그인에 쓰는
 자격증명으로 재발급/회전이 가능합니다. 초기 값은 운영자가
 서비스(OpenBao Agent)에 전달하고, 이후에는 `secret_id`를 주기적으로

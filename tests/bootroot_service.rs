@@ -1347,6 +1347,42 @@ async fn test_app_add_remote_bootstrap_rerun_is_idempotent() {
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
     let state: serde_json::Value = serde_json::from_str(&state_contents).expect("parse state");
     assert!(state["services"]["edge-proxy"].is_object());
+
+    assert_idempotent_rerun_reapplied_policy(&server, "edge-proxy").await;
+}
+
+/// Asserts that the idempotent remote re-run re-POSTed the service policy so a
+/// pre-existing service picks up the reissue-path write grant (issue #677).
+async fn assert_idempotent_rerun_reapplied_policy(server: &MockServer, service_name: &str) {
+    let policy_path = format!("/v1/sys/policies/acl/bootroot-service-{service_name}");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server records requests");
+    let policy_writes: Vec<_> = requests
+        .iter()
+        .filter(|req| req.method.as_str() == "POST" && req.url.path() == policy_path)
+        .collect();
+    assert!(
+        policy_writes.len() >= 2,
+        "expected policy writes from both the initial add and the idempotent re-run, got {}",
+        policy_writes.len()
+    );
+    let last_policy = policy_writes
+        .last()
+        .expect("at least one policy write recorded");
+    let policy_body: serde_json::Value =
+        serde_json::from_slice(&last_policy.body).expect("parse policy write body");
+    let policy_text = policy_body["policy"]
+        .as_str()
+        .expect("policy field is a string");
+    let expected = format!(
+        "path \"secret/data/bootroot/services/{service_name}/reissue\" {{\n  capabilities = [\"read\", \"create\", \"update\"]"
+    );
+    assert!(
+        policy_text.contains(&expected),
+        "re-applied policy must grant create/update on the reissue path, got:\n{policy_text}"
+    );
 }
 
 #[cfg(unix)]

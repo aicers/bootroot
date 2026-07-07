@@ -498,6 +498,9 @@ async fn run_service_add_remote_idempotent(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("OpenBao auth is required"))?;
     crate::commands::openbao_auth::authenticate_openbao_client(&mut client, auth, messages).await?;
+    // Re-apply the service policy so pre-existing services pick up the reissue
+    // path write grant needed for `rotate force-reissue --wait` completion.
+    approle::reapply_service_policy(&client, state, &entry.service_name, messages).await?;
     let ca_bundle_pem = secrets::read_ca_bundle_pem(&client, &state.kv_mount, messages).await?;
     let wrap_ttl = resolve::effective_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref());
     let artifact_wrap_info = if let Some(ttl) = wrap_ttl {

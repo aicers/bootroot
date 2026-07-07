@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
+use bootroot::trust_bootstrap::SERVICE_REISSUE_KV_SUFFIX;
 use tokio::fs;
 
 use super::{
@@ -61,10 +62,38 @@ pub(super) async fn ensure_service_approle(
     })
 }
 
+/// Re-applies the service `AppRole` policy for an already-provisioned service.
+///
+/// `write_policy` is idempotent, so this is safe to run repeatedly. It exists
+/// so that services provisioned before the reissue-path write grant was added
+/// pick up the updated policy on the idempotent remote `service add` re-run,
+/// instead of keeping the old read-only policy indefinitely.
+pub(super) async fn reapply_service_policy(
+    client: &OpenBaoClient,
+    state: &StateFile,
+    service_name: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let policy_name = service_policy_name(service_name);
+    let policy = build_service_policy(&state.kv_mount, service_name);
+    client
+        .write_policy(&policy_name, &policy)
+        .await
+        .with_context(|| messages.error_openbao_policy_write_failed())?;
+    Ok(())
+}
+
 fn build_service_policy(kv_mount: &str, service_name: &str) -> String {
     let base = format!("{SERVICE_KV_BASE}/{service_name}");
+    // The service subtree is read-only except for its own reissue object: the
+    // fast-poll loop must write `completed_at`/`completed_version` back so the
+    // control plane's `rotate force-reissue --wait` can observe completion.
+    // Narrowly grant create/update on exactly that one path.
     format!(
-        r#"path "{kv_mount}/data/{base}/*" {{
+        r#"path "{kv_mount}/data/{base}/{SERVICE_REISSUE_KV_SUFFIX}" {{
+  capabilities = ["read", "create", "update"]
+}}
+path "{kv_mount}/data/{base}/*" {{
   capabilities = ["read"]
 }}
 path "{kv_mount}/metadata/{base}/*" {{
@@ -112,4 +141,49 @@ pub(super) async fn write_role_id_file(
         .with_context(|| messages.error_write_file_failed(&role_path.display().to_string()))?;
     fs_util::set_key_permissions(&role_path).await?;
     Ok(role_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_policy_grants_write_only_on_reissue_path() {
+        let policy = build_service_policy("secret", "edge-proxy");
+
+        assert!(
+            policy.contains(
+                "path \"secret/data/bootroot/services/edge-proxy/reissue\" {\n  capabilities = [\"read\", \"create\", \"update\"]"
+            ),
+            "reissue path must carry create/update, got:\n{policy}"
+        );
+        assert!(
+            policy.contains(
+                "path \"secret/data/bootroot/services/edge-proxy/*\" {\n  capabilities = [\"read\"]"
+            ),
+            "rest of data subtree must stay read-only, got:\n{policy}"
+        );
+        assert!(
+            policy.contains(
+                "path \"secret/metadata/bootroot/services/edge-proxy/*\" {\n  capabilities = [\"list\"]"
+            ),
+            "metadata subtree must stay list-only, got:\n{policy}"
+        );
+    }
+
+    #[test]
+    fn service_policy_grants_no_broader_write_scope() {
+        let policy = build_service_policy("secret", "edge-proxy");
+
+        // Only the reissue rule may carry create/update; no other rule may.
+        for block in policy.split("path ").filter(|b| !b.is_empty()) {
+            let has_write = block.contains("create") || block.contains("update");
+            let is_reissue =
+                block.starts_with("\"secret/data/bootroot/services/edge-proxy/reissue\"");
+            assert!(
+                !has_write || is_reissue,
+                "unexpected write capability outside the reissue path:\n{block}"
+            );
+        }
+    }
 }
