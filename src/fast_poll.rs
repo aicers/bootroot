@@ -26,12 +26,15 @@ use tokio::fs;
 use tokio::sync::{Mutex, Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
+use crate::cert_group::CertGroupPolicy;
+use crate::kv_payload::{TrustPayload, parse_secret_id, parse_trust_payload};
 use crate::openbao::{KvReadWithVersion, OpenBaoClient};
 use crate::trust_bootstrap::{
     REISSUE_COMPLETED_AT_KEY, REISSUE_COMPLETED_VERSION_KEY, REISSUE_REQUESTED_AT_KEY,
-    REISSUE_REQUESTER_KEY, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX,
+    REISSUE_REQUESTER_KEY, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX, SERVICE_SECRET_ID_KV_SUFFIX,
+    SERVICE_TRUST_KV_SUFFIX, build_trust_updates,
 };
-use crate::{config, eab};
+use crate::{config, eab, fs_util, toml_util};
 
 /// Minimum retry cadence when the initial `AppRole` login fails, so a
 /// transient startup error does not hot-loop against `OpenBao`.
@@ -48,6 +51,47 @@ fn read_error_requires_relogin(error: &str) -> bool {
         || error.contains("403")
         || error.contains("missing client token")
         || error.contains("token is not set")
+}
+
+/// Logs the outcomes of a trust or `secret_id` poll tick, escalating a
+/// token-related read failure to a re-login on the next tick (mirroring the
+/// reissue poll's handling). `kind` is `"trust"` or `"secret_id"`.
+fn log_poll_outcomes(kind: &str, outcomes: &[PollApplyOutcome], needs_relogin: &mut bool) {
+    for outcome in outcomes {
+        match outcome {
+            PollApplyOutcome::NoData { service } => {
+                debug!("Service '{service}': no {kind} entry in KV.");
+            }
+            PollApplyOutcome::UpToDate { service, version } => {
+                debug!("Service '{service}': {kind} version {version} already applied.");
+            }
+            PollApplyOutcome::ReadError { service, error } => {
+                warn!("Service '{service}': fast-poll {kind} KV read failed: {error}");
+                if read_error_requires_relogin(error) {
+                    *needs_relogin = true;
+                }
+            }
+            PollApplyOutcome::Applied { service, version } => {
+                info!("Service '{service}': fast-poll applied {kind} update v{version}");
+            }
+            PollApplyOutcome::ApplyError {
+                service,
+                version,
+                error,
+            } => {
+                error!("Service '{service}': fast-poll failed to apply {kind} v{version}: {error}");
+            }
+            PollApplyOutcome::Malformed {
+                service,
+                version,
+                error,
+            } => {
+                warn!(
+                    "Service '{service}': fast-poll {kind} v{version} payload malformed: {error} (skipped)"
+                );
+            }
+        }
+    }
 }
 
 /// On-disk record of the highest KV version the agent has already acted
@@ -76,6 +120,18 @@ pub(crate) struct FastPollState {
     /// version or removed from KV.
     #[serde(default)]
     pub(crate) in_flight_renewals: BTreeMap<String, InFlightRenewal>,
+    /// Highest KV version of the per-service `trust` path already applied
+    /// to `agent.toml` + the CA bundle. Missing entries mean "never
+    /// applied a trust update", so the first sighting applies the current
+    /// KV trust to disk (idempotent when it already matches).
+    #[serde(default)]
+    pub(crate) last_trust_seen_version: BTreeMap<String, u64>,
+    /// Highest KV version of the per-service `secret_id` path already
+    /// written to the `AppRole` `secret_id` file on disk. Missing entries
+    /// mean "never refreshed", so the first sighting writes the current KV
+    /// `secret_id` (idempotent when it already matches).
+    #[serde(default)]
+    pub(crate) last_secret_id_seen_version: BTreeMap<String, u64>,
 }
 
 /// Partial fan-out progress for a fast-poll-triggered renewal that
@@ -175,6 +231,25 @@ pub(crate) trait FastPollHooks: Send + Sync {
         &self,
         profile_label: &str,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Writes the new CA bundle for `service` and upserts the `[trust]`
+    /// section (`ca_bundle_path`, `trusted_ca_sha256`) into `agent.toml`.
+    /// The daemon's per-attempt config reload consumes the result on the
+    /// next renewal.
+    fn apply_trust(
+        &self,
+        service: &str,
+        payload: &TrustPayload,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Writes the rotated `AppRole` `secret_id` for `service` to the
+    /// on-disk `secret_id` file atomically so the next re-login picks up
+    /// the fresh credential.
+    fn apply_secret_id(
+        &self,
+        service: &str,
+        secret_id: &str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
 
 /// Decides whether an observed KV read should trigger a renewal, and
@@ -268,6 +343,246 @@ pub(crate) fn build_completed_payload(
 #[must_use]
 pub(crate) fn reissue_kv_path(service_name: &str) -> String {
     format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_REISSUE_KV_SUFFIX}")
+}
+
+/// Builds the KV path `<SERVICE_KV_BASE>/<service>/<SERVICE_TRUST_KV_SUFFIX>`.
+#[must_use]
+pub(crate) fn trust_kv_path(service_name: &str) -> String {
+    format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_TRUST_KV_SUFFIX}")
+}
+
+/// Builds the KV path `<SERVICE_KV_BASE>/<service>/<SERVICE_SECRET_ID_KV_SUFFIX>`.
+#[must_use]
+pub(crate) fn secret_id_kv_path(service_name: &str) -> String {
+    format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_SECRET_ID_KV_SUFFIX}")
+}
+
+/// Reports whether an observed KV version is newer than the last one the
+/// agent acted on. Unlike the reissue path, the `trust` and `secret_id`
+/// paths are only ever written by the control plane (the agent never
+/// writes back), so a plain `observed > last_seen` gate is exact — there
+/// is no self-ack version to skip. A missing `last_seen` fires on first
+/// sighting, applying the current KV value to disk (idempotent).
+#[must_use]
+fn version_advanced(observed_version: u64, last_seen: Option<u64>) -> bool {
+    last_seen.is_none_or(|seen| observed_version > seen)
+}
+
+/// Outcome of a single per-service trust or `secret_id` poll probe. Shared
+/// by both polls since their version-gated apply lifecycle is identical;
+/// the loop tags each with its poll kind when logging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PollApplyOutcome {
+    /// The KV path holds no entry for this service (404).
+    NoData { service: String },
+    /// The observed version was already applied — nothing to do.
+    UpToDate { service: String, version: u64 },
+    /// The KV read failed; may indicate the token needs re-login.
+    ReadError { service: String, error: String },
+    /// A new version was applied to disk successfully.
+    Applied { service: String, version: u64 },
+    /// A new version was observed but applying it to disk failed.
+    ApplyError {
+        service: String,
+        version: u64,
+        error: String,
+    },
+    /// A new version was observed but its payload failed validation. The
+    /// version is not advanced, so a corrected control-plane write (a
+    /// newer version) is retried.
+    Malformed {
+        service: String,
+        version: u64,
+        error: String,
+    },
+}
+
+/// Runs a single trust poll tick: for each unique service, reads the
+/// per-service `trust` KV path, and on a newer version writes the CA
+/// bundle + upserts the `agent.toml` `[trust]` section via the hook.
+/// Version-gated and idempotent in steady state.
+pub(crate) async fn run_trust_poll_tick<H: FastPollHooks + ?Sized>(
+    hooks: &H,
+    kv_mount: &str,
+    services: &[(String, Vec<String>)],
+    state: &mut FastPollState,
+) -> (Vec<PollApplyOutcome>, bool) {
+    let mut outcomes = Vec::with_capacity(services.len());
+    let mut state_changed = false;
+
+    for (service_name, _profiles) in services {
+        let kv_path = trust_kv_path(service_name);
+        let read = match hooks.read_kv_version(kv_mount, &kv_path).await {
+            Ok(Some(read)) => read,
+            Ok(None) => {
+                outcomes.push(PollApplyOutcome::NoData {
+                    service: service_name.clone(),
+                });
+                continue;
+            }
+            Err(err) => {
+                outcomes.push(PollApplyOutcome::ReadError {
+                    service: service_name.clone(),
+                    error: format!("{err:#}"),
+                });
+                continue;
+            }
+        };
+
+        let last_seen = state.last_trust_seen_version.get(service_name).copied();
+        if !version_advanced(read.version, last_seen) {
+            outcomes.push(PollApplyOutcome::UpToDate {
+                service: service_name.clone(),
+                version: read.version,
+            });
+            continue;
+        }
+
+        let payload = match parse_trust_payload(&read.data) {
+            Ok(payload) => payload,
+            Err(err) => {
+                outcomes.push(PollApplyOutcome::Malformed {
+                    service: service_name.clone(),
+                    version: read.version,
+                    error: format!("{err:#}"),
+                });
+                continue;
+            }
+        };
+
+        match hooks.apply_trust(service_name, &payload).await {
+            Ok(()) => {
+                state
+                    .last_trust_seen_version
+                    .insert(service_name.clone(), read.version);
+                state_changed = true;
+                outcomes.push(PollApplyOutcome::Applied {
+                    service: service_name.clone(),
+                    version: read.version,
+                });
+            }
+            Err(err) => {
+                outcomes.push(PollApplyOutcome::ApplyError {
+                    service: service_name.clone(),
+                    version: read.version,
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+
+    (outcomes, state_changed)
+}
+
+/// Runs a single `secret_id` poll tick: for each unique service, reads the
+/// per-service `secret_id` KV path, and on a newer version writes the
+/// rotated credential to the on-disk `secret_id` file via the hook so the
+/// next `AppRole` re-login uses it. Version-gated and idempotent.
+pub(crate) async fn run_secret_id_poll_tick<H: FastPollHooks + ?Sized>(
+    hooks: &H,
+    kv_mount: &str,
+    services: &[(String, Vec<String>)],
+    state: &mut FastPollState,
+) -> (Vec<PollApplyOutcome>, bool) {
+    let mut outcomes = Vec::with_capacity(services.len());
+    let mut state_changed = false;
+
+    for (service_name, _profiles) in services {
+        let kv_path = secret_id_kv_path(service_name);
+        let read = match hooks.read_kv_version(kv_mount, &kv_path).await {
+            Ok(Some(read)) => read,
+            Ok(None) => {
+                outcomes.push(PollApplyOutcome::NoData {
+                    service: service_name.clone(),
+                });
+                continue;
+            }
+            Err(err) => {
+                outcomes.push(PollApplyOutcome::ReadError {
+                    service: service_name.clone(),
+                    error: format!("{err:#}"),
+                });
+                continue;
+            }
+        };
+
+        let last_seen = state.last_secret_id_seen_version.get(service_name).copied();
+        if !version_advanced(read.version, last_seen) {
+            outcomes.push(PollApplyOutcome::UpToDate {
+                service: service_name.clone(),
+                version: read.version,
+            });
+            continue;
+        }
+
+        let secret_id = match parse_secret_id(&read.data) {
+            Ok(secret_id) => secret_id,
+            Err(err) => {
+                outcomes.push(PollApplyOutcome::Malformed {
+                    service: service_name.clone(),
+                    version: read.version,
+                    error: format!("{err:#}"),
+                });
+                continue;
+            }
+        };
+
+        match hooks.apply_secret_id(service_name, &secret_id).await {
+            Ok(()) => {
+                state
+                    .last_secret_id_seen_version
+                    .insert(service_name.clone(), read.version);
+                state_changed = true;
+                outcomes.push(PollApplyOutcome::Applied {
+                    service: service_name.clone(),
+                    version: read.version,
+                });
+            }
+            Err(err) => {
+                outcomes.push(PollApplyOutcome::ApplyError {
+                    service: service_name.clone(),
+                    version: read.version,
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+
+    (outcomes, state_changed)
+}
+
+/// Resolves the [`CertGroupPolicy`] backing a service's CA bundle write.
+///
+/// `cert_group_gid` is a per-profile field but the CA bundle is
+/// per-service, so when a service's profiles disagree on the gid there is
+/// no single correct owner. The conservative rule is to refuse rather than
+/// silently pick one: require every profile of the service to share the
+/// same `cert_group_gid`.
+///
+/// # Errors
+///
+/// Returns an error when the service's profiles declare more than one
+/// distinct `cert_group_gid`.
+fn resolve_service_cert_group_policy(
+    settings: &config::Settings,
+    service: &str,
+) -> Result<CertGroupPolicy> {
+    let mut gids: BTreeSet<Option<u32>> = BTreeSet::new();
+    for profile in &settings.profiles {
+        if profile.service_name == service {
+            gids.insert(profile.cert_group_gid);
+        }
+    }
+    if gids.len() > 1 {
+        anyhow::bail!(
+            "Service '{service}' profiles disagree on cert_group_gid; \
+             refusing to pick one for the CA bundle"
+        );
+    }
+    Ok(match gids.into_iter().next().flatten() {
+        Some(gid) => CertGroupPolicy::with_gid(gid),
+        None => CertGroupPolicy::none(),
+    })
 }
 
 /// Result of a single fast-poll tick: the per-service outcomes plus
@@ -573,6 +888,50 @@ pub(crate) enum FastPollTickOutcome {
 pub(crate) struct LiveFastPollHooks<F> {
     pub(crate) client: Arc<Mutex<OpenBaoClient>>,
     pub(crate) trigger: F,
+    /// Settings snapshot used to resolve the `[trust].ca_bundle_path` and
+    /// the per-service `cert_group_gid` policy when applying trust.
+    pub(crate) settings: Arc<config::Settings>,
+    /// Resolved `agent.toml` path rewritten by the trust apply.
+    pub(crate) config_path: PathBuf,
+    /// Resolved `AppRole` `secret_id` file rewritten by the `secret_id` apply.
+    pub(crate) secret_id_path: PathBuf,
+}
+
+/// Writes the CA bundle and upserts the `agent.toml` `[trust]` section for a
+/// trust update observed on the fast-poll loop.
+///
+/// The CA bundle goes through [`fs_util::write_ca_bundle`] (`0o644` +
+/// cert-group gid policy) so it stays world-readable and cert-group
+/// consistent like the renewal-time bundle; the `agent.toml` rewrite goes
+/// through [`fs_util::atomic_write`] at `0o600` (the #613-safe writer) so a
+/// crash cannot leave the daemon's hot-read config half-written. The
+/// `upsert_section_keys` round-trip preserves operator-tuned sections.
+async fn apply_trust_to_disk(
+    settings: &config::Settings,
+    config_path: &Path,
+    service: &str,
+    payload: &TrustPayload,
+) -> Result<()> {
+    let ca_bundle_path = settings.trust.ca_bundle_path.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot apply trust for service '{service}': [trust].ca_bundle_path is not configured"
+        )
+    })?;
+    let policy = resolve_service_cert_group_policy(settings, service)?;
+    fs_util::write_ca_bundle(ca_bundle_path, &payload.ca_bundle_pem, policy)
+        .await
+        .with_context(|| format!("Failed to write CA bundle to {}", ca_bundle_path.display()))?;
+
+    let current = fs::read_to_string(config_path)
+        .await
+        .with_context(|| format!("Failed to read agent config at {}", config_path.display()))?;
+    let trust_updates = build_trust_updates(&payload.trusted_ca_sha256, ca_bundle_path);
+    let updated = toml_util::upsert_section_keys(&current, "trust", &trust_updates)
+        .context("Failed to upsert [trust] section into agent config")?;
+    fs_util::atomic_write(config_path, updated.as_bytes(), fs_util::KEY_FILE_MODE)
+        .await
+        .with_context(|| format!("Failed to write agent config to {}", config_path.display()))?;
+    Ok(())
 }
 
 impl<F, Fut> FastPollHooks for LiveFastPollHooks<F>
@@ -617,6 +976,39 @@ where
         let fut = (self.trigger)(profile_label.to_string());
         Box::pin(fut)
     }
+
+    fn apply_trust(
+        &self,
+        service: &str,
+        payload: &TrustPayload,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let settings = Arc::clone(&self.settings);
+        let config_path = self.config_path.clone();
+        let service = service.to_string();
+        let payload = payload.clone();
+        Box::pin(
+            async move { apply_trust_to_disk(&settings, &config_path, &service, &payload).await },
+        )
+    }
+
+    fn apply_secret_id(
+        &self,
+        _service: &str,
+        secret_id: &str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let secret_id_path = self.secret_id_path.clone();
+        // Match the trailing-newline convention of the bootstrap writer so
+        // a first-sighting re-write is byte-identical; `login()` trims on
+        // read either way.
+        let body = format!("{secret_id}\n");
+        Box::pin(async move {
+            fs_util::atomic_write(&secret_id_path, body.as_bytes(), fs_util::KEY_FILE_MODE)
+                .await
+                .with_context(|| {
+                    format!("Failed to write secret_id to {}", secret_id_path.display())
+                })
+        })
+    }
 }
 
 /// Spawns the long-running fast-poll loop. Returns immediately when the
@@ -628,6 +1020,7 @@ where
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_fast_poll_loop(
     settings: Arc<config::Settings>,
+    config_path: PathBuf,
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
@@ -691,11 +1084,15 @@ pub(crate) async fn run_fast_poll_loop(
 
     let renew_fn = Arc::new(renew_fn);
     let settings_for_hooks = Arc::clone(&settings);
+    let settings_for_apply = Arc::clone(&settings);
     let default_eab_for_hooks = default_eab.clone();
     let semaphore_for_hooks = Arc::clone(&semaphore);
     let renew_fn_for_hooks = Arc::clone(&renew_fn);
     let hooks = LiveFastPollHooks {
         client: Arc::clone(&client),
+        settings: settings_for_apply,
+        config_path,
+        secret_id_path: openbao.secret_id_path.clone(),
         trigger: move |profile_label: String| {
             let settings = Arc::clone(&settings_for_hooks);
             let default_eab = default_eab_for_hooks.clone();
@@ -788,7 +1185,82 @@ pub(crate) async fn run_fast_poll_loop(
             }
         }
 
-        if report.state_changed
+        // Trust and secret_id polls ride on the same self-authenticated
+        // client: a trust rotation propagates the new anchors + bundle, and
+        // a secret_id rotation refreshes the credential this very loop
+        // re-authenticates with (keeping it alive past secret_id_ttl).
+        // Snapshot the trust versions before the poll advances them: a
+        // failed HTTPS client rebuild below must be able to roll the version
+        // back so the next tick retries (see the rebuild block). Only
+        // `https://` rebuilds the client, so skip the clone otherwise.
+        let rebuild_client_on_trust = openbao.url.starts_with("https://");
+        let trust_versions_before = if rebuild_client_on_trust {
+            state.last_trust_seen_version.clone()
+        } else {
+            BTreeMap::new()
+        };
+
+        let (trust_outcomes, trust_changed) =
+            run_trust_poll_tick(&hooks, &openbao.kv_mount, &services, &mut state).await;
+        log_poll_outcomes("trust", &trust_outcomes, &mut needs_relogin);
+
+        let (secret_id_outcomes, secret_id_changed) =
+            run_secret_id_poll_tick(&hooks, &openbao.kv_mount, &services, &mut state).await;
+        log_poll_outcomes("secret_id", &secret_id_outcomes, &mut needs_relogin);
+
+        // A trust apply rewrites the on-disk CA bundle, and in the
+        // remote-bootstrap model `[openbao].ca_bundle_path` and
+        // `[trust].ca_bundle_path` are the same file, so that write can move
+        // the very anchors this loop trusts for its own OpenBao connection.
+        // The in-memory client's root set is frozen at construction
+        // (`OpenBaoClient::with_pem_trust` holds a fixed `reqwest::Client`),
+        // so without a rebuild the loop would keep the stale roots and, once
+        // the old anchor is retired and the endpoint presents a cert under
+        // the new signer, fail every subsequent HTTPS read/re-login —
+        // defeating zero-touch trust rotation for the loop that must keep
+        // polling. Rebuild from the refreshed bundle and re-login. Only the
+        // `https://` client anchors trust, so a plaintext endpoint needs no
+        // rebuild.
+        //
+        // Rebuild BEFORE persisting the advanced trust version. `parse_trust_payload`
+        // only checks that `ca_bundle_pem` is non-empty; the real PEM/root-store
+        // validation happens here in `build_openbao_client`. If the bundle is
+        // malformed, unreadable after the write, or otherwise rejected, the
+        // version must NOT stay marked applied — otherwise the poll reports
+        // `UpToDate` forever, never retries the rebuild, and the loop is
+        // stranded on stale roots once the old anchor is retired. On a rebuild
+        // failure, roll the version back so the next tick re-applies and
+        // rebuilds. A re-login failure after a *successful* rebuild is
+        // different: the new roots are already in the client, so we keep the
+        // advanced version and just retry the login.
+        let mut trust_applied = trust_changed;
+        if trust_changed && rebuild_client_on_trust {
+            let rebuilt_ok = match build_openbao_client(&openbao) {
+                Ok(rebuilt) => {
+                    *client.lock().await = rebuilt;
+                    if let Err(err) = login(&client, &openbao).await {
+                        warn!(
+                            "OpenBao re-login after CA bundle rebuild failed: {err:#}. Will retry on the next tick."
+                        );
+                        needs_relogin = true;
+                    } else {
+                        info!(
+                            "Rebuilt OpenBao client from the refreshed CA bundle after a trust update."
+                        );
+                    }
+                    true
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to rebuild OpenBao client after a trust update: {err:#}. Rolling back the applied trust version so the next tick retries the apply and rebuild."
+                    );
+                    false
+                }
+            };
+            trust_applied = reconcile_trust_rebuild(&mut state, trust_versions_before, rebuilt_ok);
+        }
+
+        if (report.state_changed || trust_applied || secret_id_changed)
             && let Err(err) = state.save(&openbao.state_path).await
         {
             error!(
@@ -821,6 +1293,24 @@ pub(crate) async fn run_fast_poll_loop(
 }
 
 pub(crate) type BoxRenew = std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+/// Reconciles the fast-poll state after a post-trust-change HTTPS client
+/// rebuild. When the rebuild succeeded the advanced trust version stands;
+/// when it failed the version is rolled back to `versions_before` so the
+/// next tick retries the apply and rebuild rather than reporting the
+/// stale-root client as up to date. Returns whether the advanced trust
+/// version should be persisted.
+fn reconcile_trust_rebuild(
+    state: &mut FastPollState,
+    versions_before: BTreeMap<String, u64>,
+    rebuilt_ok: bool,
+) -> bool {
+    if rebuilt_ok {
+        return true;
+    }
+    state.last_trust_seen_version = versions_before;
+    false
+}
 
 fn build_openbao_client(openbao: &config::OpenBaoSettings) -> Result<OpenBaoClient> {
     if openbao.url.starts_with("https://") {
@@ -1020,6 +1510,11 @@ mod tests {
         // Profile labels that should fail when their renewal is
         // requested. All others succeed.
         failing_profiles: std::sync::Mutex<std::collections::HashSet<String>>,
+        // Recorded trust / secret_id applies for the poll-tick tests.
+        trust_applies: std::sync::Mutex<Vec<(String, TrustPayload)>>,
+        secret_id_applies: std::sync::Mutex<Vec<(String, String)>>,
+        // When true, every apply_trust / apply_secret_id call fails.
+        fail_applies: std::sync::atomic::AtomicBool,
     }
 
     impl FakeHooks {
@@ -1030,7 +1525,16 @@ mod tests {
                 renew_calls: std::sync::Mutex::new(Vec::new()),
                 write_outcomes: std::sync::Mutex::new(Vec::new()),
                 failing_profiles: std::sync::Mutex::new(std::collections::HashSet::new()),
+                trust_applies: std::sync::Mutex::new(Vec::new()),
+                secret_id_applies: std::sync::Mutex::new(Vec::new()),
+                fail_applies: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        fn fail_applies(self) -> Self {
+            self.fail_applies
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
         }
 
         fn fail_renewals_for(self, profiles: &[&str]) -> Self {
@@ -1100,6 +1604,42 @@ mod tests {
             Box::pin(async move {
                 if fail {
                     anyhow::bail!("simulated renewal failure");
+                }
+                Ok(())
+            })
+        }
+
+        fn apply_trust(
+            &self,
+            service: &str,
+            payload: &TrustPayload,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.trust_applies
+                .lock()
+                .unwrap()
+                .push((service.to_string(), payload.clone()));
+            let fail = self.fail_applies.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    anyhow::bail!("simulated trust apply failure");
+                }
+                Ok(())
+            })
+        }
+
+        fn apply_secret_id(
+            &self,
+            service: &str,
+            secret_id: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.secret_id_applies
+                .lock()
+                .unwrap()
+                .push((service.to_string(), secret_id.to_string()));
+            let fail = self.fail_applies.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    anyhow::bail!("simulated secret_id apply failure");
                 }
                 Ok(())
             })
@@ -1635,5 +2175,416 @@ mod tests {
         assert_eq!(pending.version, 7);
         assert_eq!(pending.completed_at, "2026-04-19T12:00:00Z");
         assert_eq!(pending.requester.as_deref(), Some("alice"));
+    }
+
+    fn trust_read(version: u64) -> KvReadWithVersion {
+        KvReadWithVersion {
+            version,
+            data: serde_json::json!({
+                "trusted_ca_sha256": ["a".repeat(64), "b".repeat(64)],
+                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nMII...\n-----END CERTIFICATE-----\n",
+            }),
+        }
+    }
+
+    #[test]
+    fn kv_path_helpers_format_as_documented() {
+        assert_eq!(
+            trust_kv_path("edge-proxy"),
+            "bootroot/services/edge-proxy/trust"
+        );
+        assert_eq!(
+            secret_id_kv_path("edge-proxy"),
+            "bootroot/services/edge-proxy/secret_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_poll_applies_on_new_version() {
+        let hooks = FakeHooks::new(vec![Ok(Some(trust_read(3)))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_trust_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::Applied { version: 3, .. }
+        ));
+        assert_eq!(state.last_trust_seen_version.get("edge-proxy"), Some(&3));
+        let applies = hooks.trust_applies.lock().unwrap();
+        assert_eq!(applies.len(), 1);
+        assert_eq!(applies[0].0, "edge-proxy");
+        assert_eq!(applies[0].1.trusted_ca_sha256.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn trust_poll_is_idempotent_when_version_unchanged() {
+        let hooks = FakeHooks::new(vec![Ok(Some(trust_read(3)))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+        state
+            .last_trust_seen_version
+            .insert("edge-proxy".to_string(), 3);
+
+        let (outcomes, changed) =
+            run_trust_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::UpToDate { version: 3, .. }
+        ));
+        assert!(hooks.trust_applies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn trust_poll_fires_on_first_sighting() {
+        let hooks = FakeHooks::new(vec![Ok(Some(trust_read(1)))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_trust_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::Applied { version: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn trust_poll_skips_malformed_payload_without_advancing() {
+        let hooks = FakeHooks::new(vec![Ok(Some(KvReadWithVersion {
+            version: 4,
+            // Missing ca_bundle_pem.
+            data: serde_json::json!({ "trusted_ca_sha256": ["a".repeat(64)] }),
+        }))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_trust_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::Malformed { version: 4, .. }
+        ));
+        assert!(state.last_trust_seen_version.is_empty());
+        assert!(hooks.trust_applies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn trust_poll_does_not_advance_when_apply_fails() {
+        let hooks = FakeHooks::new(vec![Ok(Some(trust_read(2)))]).fail_applies();
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_trust_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::ApplyError { version: 2, .. }
+        ));
+        assert!(state.last_trust_seen_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trust_poll_reports_no_data_when_kv_missing() {
+        let hooks = FakeHooks::new(vec![Ok(None)]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_trust_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(outcomes[0], PollApplyOutcome::NoData { .. }));
+    }
+
+    fn secret_id_read(version: u64, value: &str) -> KvReadWithVersion {
+        KvReadWithVersion {
+            version,
+            data: serde_json::json!({ "secret_id": value }),
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_id_poll_applies_on_new_version() {
+        let hooks = FakeHooks::new(vec![Ok(Some(secret_id_read(2, "fresh-secret")))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_secret_id_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::Applied { version: 2, .. }
+        ));
+        assert_eq!(
+            state.last_secret_id_seen_version.get("edge-proxy"),
+            Some(&2)
+        );
+        let applies = hooks.secret_id_applies.lock().unwrap();
+        assert_eq!(applies.len(), 1);
+        assert_eq!(
+            applies[0],
+            ("edge-proxy".to_string(), "fresh-secret".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_id_poll_is_idempotent_when_version_unchanged() {
+        let hooks = FakeHooks::new(vec![Ok(Some(secret_id_read(2, "fresh-secret")))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+        state
+            .last_secret_id_seen_version
+            .insert("edge-proxy".to_string(), 2);
+
+        let (outcomes, changed) =
+            run_secret_id_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::UpToDate { version: 2, .. }
+        ));
+        assert!(hooks.secret_id_applies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn secret_id_poll_skips_malformed_payload_without_advancing() {
+        let hooks = FakeHooks::new(vec![Ok(Some(KvReadWithVersion {
+            version: 5,
+            data: serde_json::json!({ "other": "x" }),
+        }))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_secret_id_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::Malformed { version: 5, .. }
+        ));
+        assert!(state.last_secret_id_seen_version.is_empty());
+        assert!(hooks.secret_id_applies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn secret_id_poll_does_not_advance_when_apply_fails() {
+        let hooks = FakeHooks::new(vec![Ok(Some(secret_id_read(3, "fresh")))]).fail_applies();
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_secret_id_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::ApplyError { version: 3, .. }
+        ));
+        assert!(state.last_secret_id_seen_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_read_error_flags_relogin_for_token_failures() {
+        let mut needs_relogin = false;
+        let outcomes = vec![PollApplyOutcome::ReadError {
+            service: "edge-proxy".to_string(),
+            error: "OpenBao token is not set".to_string(),
+        }];
+        log_poll_outcomes("trust", &outcomes, &mut needs_relogin);
+        assert!(needs_relogin);
+    }
+
+    #[test]
+    fn reconcile_trust_rebuild_keeps_version_on_success() {
+        let mut state = FastPollState::default();
+        state
+            .last_trust_seen_version
+            .insert("edge-proxy".to_string(), 5);
+        let before = state.last_trust_seen_version.clone();
+
+        let persist = reconcile_trust_rebuild(&mut state, before, true);
+
+        assert!(persist);
+        assert_eq!(state.last_trust_seen_version.get("edge-proxy"), Some(&5));
+    }
+
+    #[test]
+    fn reconcile_trust_rebuild_rolls_back_version_on_failure() {
+        // Simulate a tick where the trust poll advanced the version from the
+        // prior value (2) to a new one (5) but the client rebuild failed
+        // (e.g. malformed `ca_bundle_pem` that only fails PEM/root-store
+        // validation, which `parse_trust_payload` does not perform). The
+        // version must roll back so the next tick retries rather than
+        // reporting `UpToDate` and stranding on stale roots.
+        let mut before = BTreeMap::new();
+        before.insert("edge-proxy".to_string(), 2u64);
+        let mut state = FastPollState::default();
+        state
+            .last_trust_seen_version
+            .insert("edge-proxy".to_string(), 5);
+
+        let persist = reconcile_trust_rebuild(&mut state, before, false);
+
+        assert!(!persist);
+        assert_eq!(state.last_trust_seen_version.get("edge-proxy"), Some(&2));
+    }
+
+    #[test]
+    fn reconcile_trust_rebuild_rolls_back_first_ever_version_on_failure() {
+        // First trust apply on a fresh agent (no prior version): a failed
+        // rebuild must clear the entry entirely so the next tick retries.
+        let mut state = FastPollState::default();
+        state
+            .last_trust_seen_version
+            .insert("edge-proxy".to_string(), 1);
+
+        let persist = reconcile_trust_rebuild(&mut state, BTreeMap::new(), false);
+
+        assert!(!persist);
+        assert!(state.last_trust_seen_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fast_poll_state_round_trip_persists_trust_and_secret_id_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = FastPollState::default();
+        state
+            .last_trust_seen_version
+            .insert("edge-proxy".to_string(), 4);
+        state
+            .last_secret_id_seen_version
+            .insert("edge-proxy".to_string(), 9);
+        state.save(&path).await.unwrap();
+
+        let loaded = FastPollState::load(&path).await.unwrap();
+        assert_eq!(loaded.last_trust_seen_version.get("edge-proxy"), Some(&4));
+        assert_eq!(
+            loaded.last_secret_id_seen_version.get("edge-proxy"),
+            Some(&9)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_trust_to_disk_writes_bundle_and_upserts_trust_section() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        let config_path = dir.path().join("agent.toml");
+        std::fs::write(
+            &config_path,
+            "email = \"a@b.c\"\n\n[acme]\nhttp_responder_url = \"http://r\"\n",
+        )
+        .unwrap();
+
+        let mut settings = test_settings("edge-proxy");
+        settings.trust.ca_bundle_path = Some(bundle_path.clone());
+
+        let payload = TrustPayload {
+            trusted_ca_sha256: vec!["a".repeat(64)],
+            ca_bundle_pem: "-----BEGIN CERTIFICATE-----\npem\n-----END CERTIFICATE-----\n"
+                .to_string(),
+        };
+
+        apply_trust_to_disk(&settings, &config_path, "edge-proxy", &payload)
+            .await
+            .expect("apply trust");
+
+        // Bundle written world-readable (0o644).
+        let bundle = std::fs::read_to_string(&bundle_path).unwrap();
+        assert!(bundle.contains("BEGIN CERTIFICATE"));
+        let bundle_mode = std::fs::metadata(&bundle_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(bundle_mode, 0o644);
+
+        // Config gets a [trust] section but keeps operator-tuned sections.
+        let updated = std::fs::read_to_string(&config_path).unwrap();
+        assert!(updated.contains("[trust]"));
+        assert!(updated.contains(&"a".repeat(64)));
+        assert!(updated.contains("email = \"a@b.c\""));
+        assert!(updated.contains("http_responder_url = \"http://r\""));
+        let config_mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(config_mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn apply_trust_to_disk_errors_when_no_ca_bundle_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agent.toml");
+        std::fs::write(&config_path, "email = \"a@b.c\"\n").unwrap();
+        let settings = test_settings("edge-proxy");
+        let payload = TrustPayload {
+            trusted_ca_sha256: vec!["a".repeat(64)],
+            ca_bundle_pem: "pem".to_string(),
+        };
+        assert!(
+            apply_trust_to_disk(&settings, &config_path, "edge-proxy", &payload)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_service_cert_group_policy_errors_on_disagreement() {
+        let mut settings = test_settings("edge-proxy");
+        // Two profiles for the same service disagree on cert_group_gid.
+        let mut second = settings.profiles[0].clone();
+        second.instance_id = "002".to_string();
+        second.cert_group_gid = Some(5001);
+        settings.profiles[0].cert_group_gid = Some(6001);
+        settings.profiles.push(second);
+        assert!(resolve_service_cert_group_policy(&settings, "edge-proxy").is_err());
+    }
+
+    #[test]
+    fn resolve_service_cert_group_policy_uses_shared_gid() {
+        let mut settings = test_settings("edge-proxy");
+        settings.profiles[0].cert_group_gid = Some(5001);
+        let policy = resolve_service_cert_group_policy(&settings, "edge-proxy").unwrap();
+        assert_eq!(policy, CertGroupPolicy::with_gid(5001));
+    }
+
+    /// Builds a minimal [`config::Settings`] with one profile for `service`.
+    fn test_settings(service: &str) -> config::Settings {
+        let toml = format!(
+            "email = \"a@b.c\"\n\
+             server = \"https://ca.example/acme/directory\"\n\
+             domain = \"example.internal\"\n\n\
+             [[profiles]]\n\
+             service_name = \"{service}\"\n\
+             instance_id = \"001\"\n\
+             hostname = \"node-01\"\n\n\
+             [profiles.paths]\n\
+             cert = \"/tmp/cert.pem\"\n\
+             key = \"/tmp/key.pem\"\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, toml).unwrap();
+        config::Settings::new(Some(path)).expect("build settings")
     }
 }

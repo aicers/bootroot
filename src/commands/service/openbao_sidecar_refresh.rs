@@ -27,11 +27,15 @@ pub(crate) fn run_service_openbao_sidecar_refresh(
     refresh_service_sidecar(entry, messages)
 }
 
-/// Restarts a single service's openbao-sidecar container. Branches on
+/// Refreshes a single service's KV-sourced config. Branches on
 /// [`DeliveryMode`]: `LocalFile` invokes `docker restart` against the
-/// fixed `bootroot-openbao-agent-<svc>` container name; `RemoteBootstrap`
-/// emits operator guidance (the sidecar lives on the remote host, where
-/// bootroot has no signalling channel).
+/// fixed `bootroot-openbao-agent-<svc>` container name so consul-template
+/// re-reads its KV sources; `RemoteBootstrap` has **no** `OpenBao` Agent
+/// sidecar on the remote host (issue #680 moved it to the `bootroot-agent`
+/// self-auth fast-poll model), so it emits guidance instead. Trust and
+/// `secret_id` self-heal via fast-poll, but EAB and other bootstrap-time
+/// KV config are only re-pulled by re-running `bootroot-remote bootstrap`
+/// on the remote host — the sidecar restart no longer applies.
 pub(crate) fn refresh_service_sidecar(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     match entry.delivery_mode {
         DeliveryMode::LocalFile => {
@@ -50,8 +54,8 @@ pub(crate) fn refresh_service_sidecar(entry: &ServiceEntry, messages: &Messages)
         }
         DeliveryMode::RemoteBootstrap => {
             println!(
-                "service {} uses remote-bootstrap delivery; restart the openbao-sidecar on the remote host (e.g. `docker restart bootroot-openbao-agent-{}`)",
-                entry.service_name, entry.service_name
+                "service {svc} uses remote-bootstrap delivery; no OpenBao Agent sidecar runs on the remote host. Trust and secret_id self-heal via the bootroot-agent fast-poll loop, but bootstrap-time KV config (e.g. EAB) is not fast-polled — re-run `bootroot-remote bootstrap` on the remote host to re-pull it from KV.",
+                svc = entry.service_name
             );
             Ok(())
         }

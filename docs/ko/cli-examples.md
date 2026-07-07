@@ -327,7 +327,10 @@ bootroot service add \
 `--post-renew-arg`, `--post-renew-timeout-secs`,
 `--post-renew-on-failure`를 사용하세요.
 
-control node에서 secret_id 회전 후 새 secret_id를 원격 노드에 전달:
+control node에서 secret_id 회전 후에는 *실행 중인* 원격 `bootroot-agent`가
+fast-poll 루프로 새 secret_id를 직접 받아오므로 수동 전달이 필요하지 않습니다.
+아래 명령은 `secret_id_ttl`이 지나도록 오프라인이어서 자격 증명이 이미 만료된
+에이전트를 위한 **복구** 경로일 뿐입니다:
 
 ```bash
 bootroot-remote apply-secret-id \

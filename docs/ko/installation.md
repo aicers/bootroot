@@ -452,8 +452,9 @@ docker compose up --build -d bootroot-agent
 
 - 설치: `cargo build --release --bin bootroot-remote`
 - 실행: `bootroot-remote bootstrap ...`(첫 agent 실행 전 초기 trust/bootstrap
-  반영),
-  `bootroot-remote apply-secret-id ...`(secret_id 회전 이후)
+  반영). 이후 실행 중인 `bootroot-agent`가 fast-poll 루프로 trust와 secret_id
+  회전을 가져오므로, `bootroot-remote apply-secret-id ...`는 `secret_id_ttl`을
+  넘겨 오프라인 상태였던 에이전트를 위한 복구 경로일 뿐입니다
 
 `remote-bootstrap` 방식의 상세 인자/예시는 [CLI](cli.md)의
 `bootroot-remote bootstrap`/`apply-secret-id` 섹션 및

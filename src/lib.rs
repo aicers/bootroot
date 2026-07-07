@@ -11,6 +11,7 @@ pub mod eab;
 pub mod fs_util;
 pub mod hooks;
 pub mod input_validation;
+pub mod kv_payload;
 pub mod locale;
 pub mod openbao;
 pub mod profile;

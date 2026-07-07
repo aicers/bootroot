@@ -5,7 +5,7 @@ use bootroot::fs_util;
 use tokio::fs;
 
 use super::summary::ApplyStatus;
-use super::{CA_BUNDLE_PEM_KEY, Locale, TRUSTED_CA_KEY, localized};
+use super::{Locale, localized};
 
 pub(super) async fn read_secret_file(path: &Path, lang: Locale) -> Result<String> {
     let value = fs::read_to_string(path).await?;
@@ -77,60 +77,6 @@ pub(super) fn read_optional_string(
         }
     }
     Ok(None)
-}
-
-pub(super) fn read_required_fingerprints(
-    data: &serde_json::Value,
-    lang: Locale,
-) -> Result<Vec<String>> {
-    let values = data
-        .get(TRUSTED_CA_KEY)
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{}",
-                localized(
-                    lang,
-                    &format!("Missing required array key: {TRUSTED_CA_KEY}"),
-                    &format!("필수 배열 키가 없습니다: {TRUSTED_CA_KEY}"),
-                )
-            )
-        })?;
-    if values.is_empty() {
-        anyhow::bail!(
-            "{}",
-            localized(
-                lang,
-                &format!("{TRUSTED_CA_KEY} must not be empty"),
-                &format!("{TRUSTED_CA_KEY} 값은 비어 있으면 안 됩니다"),
-            )
-        );
-    }
-    let mut fingerprints = Vec::with_capacity(values.len());
-    for value in values {
-        let fingerprint = value.as_str().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{}",
-                localized(
-                    lang,
-                    &format!("{TRUSTED_CA_KEY} must contain strings"),
-                    &format!("{TRUSTED_CA_KEY} 배열은 문자열만 포함해야 합니다"),
-                )
-            )
-        })?;
-        if fingerprint.len() != 64 || !fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            anyhow::bail!(
-                "{}",
-                localized(
-                    lang,
-                    &format!("{TRUSTED_CA_KEY} must be 64 hex chars"),
-                    &format!("{TRUSTED_CA_KEY} 값은 64자리 hex여야 합니다"),
-                )
-            );
-        }
-        fingerprints.push(fingerprint.to_string());
-    }
-    Ok(fingerprints)
 }
 
 pub(super) async fn write_secret_file(path: &Path, contents: &str) -> Result<ApplyStatus> {
@@ -247,7 +193,16 @@ pub(super) async fn pull_secrets(
             )
         })?;
 
-    let secret_id = read_required_string(&secret_id_data, &[super::SECRET_ID_KEY, "value"], lang)?;
+    let secret_id = bootroot::kv_payload::parse_secret_id(&secret_id_data).map_err(|err| {
+        anyhow::anyhow!(
+            "{}",
+            localized(
+                lang,
+                &format!("Invalid service secret_id payload: {err}"),
+                &format!("서비스 secret_id 페이로드가 올바르지 않습니다: {err}"),
+            )
+        )
+    })?;
     let (eab_kid, eab_hmac) = match eab_data.as_ref() {
         Some(data) => {
             let kid = read_optional_string(data, &[super::EAB_KID_KEY], lang)?;
@@ -264,8 +219,18 @@ pub(super) async fn pull_secrets(
     };
     let responder_hmac =
         read_required_string(&hmac_data, &[super::HMAC_KEY, "http_responder_hmac"], lang)?;
-    let trusted_ca_sha256 = read_required_fingerprints(&trust_data, lang)?;
-    let ca_bundle_pem = read_required_string(&trust_data, &[CA_BUNDLE_PEM_KEY], lang)?;
+    let trust = bootroot::kv_payload::parse_trust_payload(&trust_data).map_err(|err| {
+        anyhow::anyhow!(
+            "{}",
+            localized(
+                lang,
+                &format!("Invalid service trust payload: {err}"),
+                &format!("서비스 trust 페이로드가 올바르지 않습니다: {err}"),
+            )
+        )
+    })?;
+    let trusted_ca_sha256 = trust.trusted_ca_sha256;
+    let ca_bundle_pem = trust.ca_bundle_pem;
 
     Ok(PulledSecrets {
         secret_id,
@@ -285,16 +250,6 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-
-    #[test]
-    fn read_required_fingerprints_accepts_valid_values() {
-        let data = serde_json::json!({
-            "trusted_ca_sha256": ["a".repeat(64), "b".repeat(64)]
-        });
-        let parsed =
-            read_required_fingerprints(&data, Locale::En).expect("parse trust fingerprints");
-        assert_eq!(parsed.len(), 2);
-    }
 
     #[test]
     fn read_optional_string_returns_trimmed_value_when_present() {

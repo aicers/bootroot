@@ -3,14 +3,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use bootroot::fs_util;
-use bootroot::openbao::{
-    AgentConfigParams, STATIC_SECRET_RENDER_INTERVAL, TEMPLATE_PERMS_PUBLIC, TEMPLATE_PERMS_SECRET,
-    TemplateSpec, build_agent_config,
-};
 use bootroot::trust_bootstrap::{
     AgentConfigBaselineParams, REMOTE_BOOTSTRAP_PROFILE_MARKERS,
-    apply_agent_config_baseline_defaults, build_ca_bundle_ctmpl, build_managed_agent_ctmpl,
-    build_trust_updates as build_shared_trust_updates,
+    apply_agent_config_baseline_defaults, build_trust_updates as build_shared_trust_updates,
     render_managed_profile_block as render_profile, strip_foreign_managed_profiles,
     upsert_managed_profile_block as upsert_shared_managed_profile_block,
 };
@@ -168,7 +163,6 @@ pub(super) async fn apply_agent_config_updates(
 
     let responder_changed = hmac_updated != override_applied;
     let trust_changed = trust_updated != hmac_updated;
-    let profile_changed = with_profile != openbao_updated;
 
     let mut responder_hmac_status = ApplyItemSummary::applied(if responder_changed {
         ApplyStatus::Applied
@@ -240,19 +234,6 @@ pub(super) async fn apply_agent_config_updates(
                 trust_sync_status = ApplyItemSummary::failed(message);
             }
             return (responder_hmac_status, trust_sync_status);
-        }
-    }
-    if let Err(err) = write_openbao_agent_artifacts(args, &with_profile, lang).await {
-        let message = localized(
-            lang,
-            &format!("openbao agent setup failed: {err}"),
-            &format!("OpenBao Agent 설정 준비 실패: {err}"),
-        );
-        if responder_changed || profile_changed {
-            responder_hmac_status = ApplyItemSummary::failed(message.clone());
-        }
-        if trust_changed || profile_changed {
-            trust_sync_status = ApplyItemSummary::failed(message);
         }
     }
 
@@ -372,10 +353,6 @@ fn upsert_managed_profile_block(contents: &str, service_name: &str, replacement:
     )
 }
 
-pub(super) fn build_ctmpl_content(contents: &str, kv_mount: &str, service_name: &str) -> String {
-    build_managed_agent_ctmpl(contents, kv_mount, service_name)
-}
-
 fn build_trust_updates(
     fingerprints: &[String],
     ca_bundle_path: &Path,
@@ -455,125 +432,6 @@ fn default_state_path_for(args: &ResolvedBootstrapArgs) -> Option<String> {
             .display()
             .to_string(),
     )
-}
-
-async fn write_openbao_agent_artifacts(
-    args: &ResolvedBootstrapArgs,
-    agent_template: &str,
-    lang: Locale,
-) -> Result<()> {
-    let secret_service_dir = args.secret_id_path.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}",
-            localized(
-                lang,
-                "secret_id path has no parent",
-                "secret_id 경로에 상위 디렉터리가 없습니다",
-            )
-        )
-    })?;
-    let secrets_services_dir = secret_service_dir.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}",
-            localized(
-                lang,
-                "secret_id path missing services directory",
-                "secret_id 경로에 services 디렉터리가 없습니다",
-            )
-        )
-    })?;
-    let secrets_dir = secrets_services_dir.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}",
-            localized(
-                lang,
-                "secret_id path missing secrets root",
-                "secret_id 경로에 secrets 루트가 없습니다",
-            )
-        )
-    })?;
-    let openbao_service_dir = secrets_dir
-        .join("openbao")
-        .join("services")
-        .join(&args.service_name);
-    fs_util::ensure_secrets_dir(&openbao_service_dir).await?;
-
-    let template_path = openbao_service_dir.join("agent.toml.ctmpl");
-    let bundle_template_path = openbao_service_dir.join("ca-bundle.pem.ctmpl");
-    let token_path = openbao_service_dir.join("token");
-    let config_path = openbao_service_dir.join("agent.hcl");
-
-    let ctmpl = build_ctmpl_content(agent_template, &args.kv_mount, &args.service_name);
-    fs::write(&template_path, ctmpl).await?;
-    fs_util::set_key_permissions(&template_path).await?;
-    let bundle_ctmpl = build_ca_bundle_ctmpl(&args.kv_mount, &args.service_name);
-    fs::write(&bundle_template_path, bundle_ctmpl).await?;
-    fs_util::set_key_permissions(&bundle_template_path).await?;
-    if !token_path.exists() {
-        fs::write(&token_path, "").await?;
-    }
-    fs_util::set_key_permissions(&token_path).await?;
-    let config = render_openbao_agent_config(
-        &args.openbao_url,
-        &args.role_id_path,
-        &args.secret_id_path,
-        &token_path,
-        &[
-            (
-                &template_path,
-                &args.agent_config_path,
-                TEMPLATE_PERMS_SECRET,
-            ),
-            (
-                &bundle_template_path,
-                &args.ca_bundle_path,
-                TEMPLATE_PERMS_PUBLIC,
-            ),
-        ],
-    );
-    fs::write(&config_path, config).await?;
-    fs_util::set_key_permissions(&config_path).await?;
-    Ok(())
-}
-
-fn render_openbao_agent_config(
-    openbao_url: &str,
-    role_id_path: &Path,
-    secret_id_path: &Path,
-    token_path: &Path,
-    template_specs: &[(&Path, &Path, &str)],
-) -> String {
-    let role_id = role_id_path.display().to_string();
-    let secret_id = secret_id_path.display().to_string();
-    let token = token_path.display().to_string();
-    let template_strings = template_specs
-        .iter()
-        .map(|(source, destination, perms)| {
-            (
-                source.display().to_string(),
-                destination.display().to_string(),
-                *perms,
-            )
-        })
-        .collect::<Vec<_>>();
-    let templates = template_strings
-        .iter()
-        .map(|(source, destination, perms)| TemplateSpec {
-            source: source.as_str(),
-            destination: destination.as_str(),
-            perms,
-        })
-        .collect::<Vec<_>>();
-    build_agent_config(&AgentConfigParams {
-        openbao_addr: openbao_url,
-        role_id_path: &role_id,
-        secret_id_path: &secret_id,
-        token_path: &token,
-        mount_path: Some("auth/approle"),
-        render_interval: STATIC_SECRET_RENDER_INTERVAL,
-        templates: &templates,
-        ca_cert: None,
-    })
 }
 
 #[cfg(test)]
@@ -920,124 +778,6 @@ mod tests {
         );
         let args_arr = hook["args"].as_array().expect("args must be an array");
         assert_eq!(args_arr.get(0).unwrap().as_str().unwrap(), "line1\tline2");
-    }
-
-    #[test]
-    fn render_openbao_agent_config_emits_durable_secret_id_and_both_templates() {
-        let role_id_path = PathBuf::from("/secrets/services/edge/role_id");
-        let secret_id_path = PathBuf::from("/secrets/services/edge/secret_id");
-        let token_path = PathBuf::from("/secrets/openbao/services/edge/token");
-        let agent_template = PathBuf::from("/secrets/openbao/services/edge/agent.toml.ctmpl");
-        let agent_dest = PathBuf::from("/etc/bootroot-agent/agent.toml");
-        let bundle_template = PathBuf::from("/secrets/openbao/services/edge/ca-bundle.pem.ctmpl");
-        let bundle_dest = PathBuf::from("/etc/bootroot-agent/ca-bundle.pem");
-
-        let hcl = render_openbao_agent_config(
-            "https://openbao.example.com:8200",
-            &role_id_path,
-            &secret_id_path,
-            &token_path,
-            &[
-                (&agent_template, &agent_dest, TEMPLATE_PERMS_SECRET),
-                (&bundle_template, &bundle_dest, TEMPLATE_PERMS_PUBLIC),
-            ],
-        );
-
-        assert!(
-            hcl.contains("remove_secret_id_file_after_reading = false"),
-            "remote HCL must keep secret_id file across agent restarts"
-        );
-        assert!(
-            hcl.contains(
-                "  destination = \"/etc/bootroot-agent/ca-bundle.pem\"\n  perms = \"0644\""
-            ),
-            "remote HCL must render the public CA bundle at 0644"
-        );
-        assert!(
-            hcl.contains("  destination = \"/etc/bootroot-agent/agent.toml\"\n  perms = \"0600\""),
-            "remote HCL must keep the secret agent config at 0600"
-        );
-        assert_eq!(
-            hcl.matches("template {").count(),
-            2,
-            "remote HCL must emit both template blocks"
-        );
-        assert!(
-            hcl.contains(r#"source = "/secrets/openbao/services/edge/agent.toml.ctmpl""#),
-            "missing agent template source"
-        );
-        assert!(
-            hcl.contains(r#"destination = "/etc/bootroot-agent/agent.toml""#),
-            "missing agent template destination"
-        );
-        assert!(
-            hcl.contains(r#"source = "/secrets/openbao/services/edge/ca-bundle.pem.ctmpl""#),
-            "missing ca-bundle template source"
-        );
-        assert!(
-            hcl.contains(r#"destination = "/etc/bootroot-agent/ca-bundle.pem""#),
-            "missing ca-bundle template destination"
-        );
-    }
-
-    /// Pins the remote-bootstrap renderer to the same shared primitive
-    /// the local-file renderer uses, so future additions to one side
-    /// cannot silently drop from the other.
-    #[test]
-    fn render_openbao_agent_config_matches_shared_primitive_output() {
-        let role_id_path = PathBuf::from("/secrets/services/edge/role_id");
-        let secret_id_path = PathBuf::from("/secrets/services/edge/secret_id");
-        let token_path = PathBuf::from("/secrets/openbao/services/edge/token");
-        let agent_template = PathBuf::from("/secrets/openbao/services/edge/agent.toml.ctmpl");
-        let agent_dest = PathBuf::from("/etc/bootroot-agent/agent.toml");
-        let bundle_template = PathBuf::from("/secrets/openbao/services/edge/ca-bundle.pem.ctmpl");
-        let bundle_dest = PathBuf::from("/etc/bootroot-agent/ca-bundle.pem");
-
-        let remote = render_openbao_agent_config(
-            "http://localhost:8200",
-            &role_id_path,
-            &secret_id_path,
-            &token_path,
-            &[
-                (&agent_template, &agent_dest, TEMPLATE_PERMS_SECRET),
-                (&bundle_template, &bundle_dest, TEMPLATE_PERMS_PUBLIC),
-            ],
-        );
-
-        let agent_template_str = agent_template.display().to_string();
-        let agent_dest_str = agent_dest.display().to_string();
-        let bundle_template_str = bundle_template.display().to_string();
-        let bundle_dest_str = bundle_dest.display().to_string();
-        let role_id_str = role_id_path.display().to_string();
-        let secret_id_path_str = secret_id_path.display().to_string();
-        let token_str = token_path.display().to_string();
-        let templates = [
-            TemplateSpec {
-                source: agent_template_str.as_str(),
-                destination: agent_dest_str.as_str(),
-                perms: TEMPLATE_PERMS_SECRET,
-            },
-            TemplateSpec {
-                source: bundle_template_str.as_str(),
-                destination: bundle_dest_str.as_str(),
-                perms: TEMPLATE_PERMS_PUBLIC,
-            },
-        ];
-        let canonical = build_agent_config(&AgentConfigParams {
-            openbao_addr: "http://localhost:8200",
-            role_id_path: &role_id_str,
-            secret_id_path: &secret_id_path_str,
-            token_path: &token_str,
-            mount_path: Some("auth/approle"),
-            render_interval: STATIC_SECRET_RENDER_INTERVAL,
-            templates: &templates,
-            ca_cert: None,
-        });
-
-        assert_eq!(
-            remote, canonical,
-            "remote-bootstrap HCL must equal the shared primitive output for the same input"
-        );
     }
 
     /// Regression for the Round 5 review: when `bootroot-remote bootstrap`

@@ -1124,6 +1124,25 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         stdout.contains("localhost placeholders for `--agent-server` and `--agent-responder-url`")
     );
     assert!(stdout.contains("2. Check status on the step-ca host:"));
+    // Remote-bootstrap hosts run the self-auth `bootroot-agent` fast-poll, not a
+    // per-service OpenBao Agent sidecar. The next-steps block must advertise the
+    // self-heal model and must not tell the operator to run an OpenBao Agent.
+    assert!(
+        stdout.contains("Keep bootroot-agent running on the remote host"),
+        "remote-bootstrap add should advertise keeping bootroot-agent running: {stdout}"
+    );
+    assert!(
+        stdout.contains("No OpenBao Agent sidecar runs on the remote host"),
+        "remote-bootstrap add should state no OpenBao Agent sidecar runs: {stdout}"
+    );
+    assert!(
+        !stdout.contains("OpenBao Agent (per-service instance):"),
+        "remote-bootstrap add must not print per-service OpenBao Agent steps: {stdout}"
+    );
+    assert!(
+        !stdout.contains("run the service-specific OpenBao Agent"),
+        "remote-bootstrap add must not instruct running an OpenBao Agent: {stdout}"
+    );
 
     let state_contents =
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
@@ -1215,7 +1234,7 @@ async fn test_app_add_remote_bootstrap_no_wrap_handoff_includes_secret_id() {
 }
 
 fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
-    assert_eq!(bootstrap["schema_version"], 3);
+    assert_eq!(bootstrap["schema_version"], 4);
     assert_eq!(bootstrap["service_name"], "edge-proxy");
     assert_eq!(bootstrap["kv_mount"], "secret");
     assert!(bootstrap["role_id_path"].is_string());
@@ -1224,9 +1243,14 @@ fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
     assert!(bootstrap["agent_config_path"].is_string());
     assert!(bootstrap["ca_bundle_path"].is_string());
     assert!(bootstrap["ca_bundle_pem"].is_string());
-    assert!(bootstrap["openbao_agent_config_path"].is_string());
-    assert!(bootstrap["openbao_agent_template_path"].is_string());
-    assert!(bootstrap["openbao_agent_token_path"].is_string());
+    // schema_version 4 dropped the OpenBao Agent sidecar artifact paths:
+    // the remote agent self-authenticates and renders trust via fast-poll.
+    assert!(
+        bootstrap.get("openbao_agent_config_path").is_none(),
+        "openbao_agent_config_path must be gone from the schema-4 artifact"
+    );
+    assert!(bootstrap.get("openbao_agent_template_path").is_none());
+    assert!(bootstrap.get("openbao_agent_token_path").is_none());
     assert!(
         bootstrap.get("agent_email").is_none(),
         "agent_email must be omitted when no --agent-email override was supplied"

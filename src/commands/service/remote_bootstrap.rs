@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
@@ -6,9 +6,8 @@ use tokio::fs;
 
 use super::resolve::ResolvedServiceAdd;
 use super::{
-    OPENBAO_AGENT_CONFIG_FILENAME, OPENBAO_AGENT_TEMPLATE_FILENAME, OPENBAO_AGENT_TOKEN_FILENAME,
-    OPENBAO_SERVICE_CONFIG_DIR, REMOTE_BOOTSTRAP_DIR, REMOTE_BOOTSTRAP_FILENAME,
-    RemoteBootstrapResult, SERVICE_ROLE_ID_FILENAME,
+    REMOTE_BOOTSTRAP_DIR, REMOTE_BOOTSTRAP_FILENAME, RemoteBootstrapResult,
+    SERVICE_ROLE_ID_FILENAME,
 };
 use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::i18n::Messages;
@@ -42,9 +41,6 @@ struct RemoteBootstrapArtifact {
     agent_config_path: String,
     ca_bundle_path: String,
     ca_bundle_pem: String,
-    openbao_agent_config_path: String,
-    openbao_agent_template_path: String,
-    openbao_agent_token_path: String,
     /// Operator-supplied override for `email`, carried from
     /// `bootroot service add --agent-email` so that `bootroot-remote
     /// bootstrap` can distinguish "explicit override, clobber remote
@@ -148,11 +144,14 @@ fn build_artifact(
         .parent()
         .unwrap_or(Path::new("certs"))
         .join("ca-bundle.pem");
-    let (openbao_agent_config_path, openbao_agent_template_path, openbao_agent_token_path) =
-        remote_openbao_agent_paths(secret_id_path, service_name);
 
     RemoteBootstrapArtifact {
-        schema_version: 3,
+        // schema_version 4 removed the `openbao_agent_*` fields: the
+        // remote `bootroot-agent` now self-authenticates and renders trust
+        // via the fast-poll loop, so the OpenBao Agent sidecar artifacts
+        // are no longer produced. Per the contract above, a field removal
+        // is breaking and requires a bump.
+        schema_version: 4,
         openbao_url: openbao_url.to_string(),
         kv_mount: kv_mount.to_string(),
         service_name: service_name.to_string(),
@@ -162,9 +161,6 @@ fn build_artifact(
         agent_config_path: agent_config_path.display().to_string(),
         ca_bundle_path: ca_bundle_path.display().to_string(),
         ca_bundle_pem: ca_bundle_pem.to_string(),
-        openbao_agent_config_path: openbao_agent_config_path.display().to_string(),
-        openbao_agent_template_path: openbao_agent_template_path.display().to_string(),
-        openbao_agent_token_path: openbao_agent_token_path.display().to_string(),
         agent_email: agent_email.map(str::to_string),
         agent_server: agent_server.map(str::to_string),
         agent_domain: domain.to_string(),
@@ -334,25 +330,6 @@ fn render_remote_run_command_legacy(artifact: &RemoteBootstrapArtifact) -> Strin
     cmd
 }
 
-fn remote_openbao_agent_paths(
-    secret_id_path: &Path,
-    service_name: &str,
-) -> (PathBuf, PathBuf, PathBuf) {
-    let secret_service_dir = secret_id_path.parent().unwrap_or_else(|| Path::new("."));
-    let services_dir = secret_service_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let secrets_dir = services_dir.parent().unwrap_or_else(|| Path::new("."));
-    let openbao_service_dir = secrets_dir
-        .join(OPENBAO_SERVICE_CONFIG_DIR)
-        .join(service_name);
-    (
-        openbao_service_dir.join(OPENBAO_AGENT_CONFIG_FILENAME),
-        openbao_service_dir.join(OPENBAO_AGENT_TEMPLATE_FILENAME),
-        openbao_service_dir.join(OPENBAO_AGENT_TOKEN_FILENAME),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -449,7 +426,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(artifact.schema_version, 3);
+        assert_eq!(artifact.schema_version, 4);
         assert_eq!(artifact.openbao_url, "https://openbao.example.com:8200");
         assert_eq!(artifact.kv_mount, "secret");
         assert_eq!(artifact.service_name, "my-service");
@@ -467,18 +444,6 @@ mod tests {
         );
         assert_eq!(artifact.agent_config_path, "/etc/my-service/agent.toml");
         assert_eq!(artifact.ca_bundle_path, "/certs/my-service/ca-bundle.pem");
-        assert_eq!(
-            artifact.openbao_agent_config_path,
-            "/secrets/openbao/services/my-service/agent.hcl"
-        );
-        assert_eq!(
-            artifact.openbao_agent_template_path,
-            "/secrets/openbao/services/my-service/agent.toml.ctmpl"
-        );
-        assert_eq!(
-            artifact.openbao_agent_token_path,
-            "/secrets/openbao/services/my-service/token"
-        );
         assert_eq!(artifact.agent_domain, "example.com");
         assert_eq!(artifact.agent_email.as_deref(), Some(TEST_AGENT_EMAIL));
         assert_eq!(artifact.agent_server.as_deref(), Some(TEST_AGENT_SERVER));
@@ -656,7 +621,7 @@ mod tests {
         );
 
         assert_ne!(a.role_id_path, b.role_id_path);
-        assert_ne!(a.openbao_agent_config_path, b.openbao_agent_config_path);
+        assert_ne!(a.secret_id_path, b.secret_id_path);
         assert_ne!(a.ca_bundle_path, b.ca_bundle_path);
     }
 

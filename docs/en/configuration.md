@@ -47,9 +47,15 @@ Ownership is split as follows:
   OpenBao Agent config/template and managed `agent.toml` profile
   (including top-level `domain` and `[acme].http_responder_hmac`).
 - **services added with `--delivery-mode remote-bootstrap`**:
-  `bootroot service add` generates a bootstrap
-  artifact, and `bootroot-remote bootstrap` applies `agent.hcl`/template/token
-  and managed `agent.toml` profile on the remote host.
+  `bootroot service add` generates a bootstrap artifact, and
+  `bootroot-remote bootstrap` applies the managed `agent.toml` profile
+  (including the `[openbao]` connection fields) on the remote host. It
+  does **not** install an OpenBao Agent sidecar — no
+  `agent.hcl`/template/token artifacts are generated. Instead the remote
+  `bootroot-agent` self-authenticates via AppRole and, through its own
+  fast-poll loop, renders trust and refreshes its `secret_id` in place, so
+  CA/trust and `secret_id` rotations propagate with no per-host operator
+  action. See [remote-bootstrap](remote-bootstrap.md).
 
 Sample `agent.hcl` snippet:
 
@@ -268,7 +274,9 @@ bundle or a directly presented certificate whose fingerprint is pinned in
 - managed onboarding requires both values; if either is missing,
   `bootroot service add` or `bootroot-remote bootstrap` fails until trust is repaired
 - `local-file`: the per-service OpenBao Agent renders `ca-bundle.pem`
-- `remote-bootstrap`: re-run `bootroot-remote bootstrap` after trust updates
+- `remote-bootstrap`: the running `bootroot-agent` re-renders `ca-bundle.pem`
+  and the `[trust]` pins from OpenBao via its fast-poll loop after trust
+  updates; no manual re-bootstrap is needed on the remote host
 
 Permissions note: the service consuming the CA bundle must be able to read
 `ca_bundle_path`. The simplest setup is running bootroot-agent and service as

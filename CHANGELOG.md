@@ -14,6 +14,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Removed
 
+- Dropped the now-dead OpenBao Agent sidecar artifacts that
+  `bootroot-remote bootstrap` generated for `remote-bootstrap` services
+  (`agent.hcl`, `agent.toml.ctmpl`, `ca-bundle.pem.ctmpl`, and the token
+  sink), together with the `openbao_agent_config_path` /
+  `openbao_agent_template_path` / `openbao_agent_token_path` fields on the
+  bootstrap artifact. Because the remote agent now self-authenticates and
+  renders trust via its fast-poll loop, these artifacts are superseded.
+  Per the artifact `schema_version` contract, removing fields is breaking:
+  `schema_version` is bumped from `3` to `4` and `bootroot-remote` now
+  accepts the `1..=4` range. The local-file delivery path is unaffected —
+  it still renders its own `.ctmpl` templates.
 - Removed ACME EAB auto-issuance and bootroot-side enforcement because
   the bundled OSS step-ca does not support EAB (EAB is a commercial
   Smallstep-only feature). The `bootroot rotate eab` subcommand, the
@@ -579,6 +590,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Made the remote `bootroot-agent` fast-poll loop self-sufficient
+  (approach C): it now pulls two more things from OpenBao KV on the same
+  self-authenticated client that already drives force-reissue. A
+  version-gated **trust poll** reads
+  `bootroot/services/<service>/trust` and, on a new version, writes the
+  new `ca-bundle.pem` (via `write_ca_bundle`, world-readable + cert-group
+  policy) and upserts the `agent.toml` `[trust]` pins atomically at
+  `0o600`, so a CA/trust rotation propagates without a manual
+  re-bootstrap. For an `https://` OpenBao endpoint the loop rebuilds its
+  own client from the refreshed bundle and only marks the trust KV version
+  applied once that rebuild succeeds — a malformed or unreadable bundle is
+  retried on the next tick rather than being recorded as applied and
+  stranding the loop on stale roots. A version-gated **`secret_id` poll** reads
+  `bootroot/services/<service>/secret_id` and writes the rotated
+  credential atomically at `0o600`, so the loop re-authenticates past
+  `secret_id_ttl` (default 24h) without a manual `apply-secret-id`. Both
+  polls are idempotent in steady state and reuse the KV payload
+  validators now shared between `bootroot-remote` and `bootroot-agent`.
+  `apply-secret-id` and re-running `bootroot-remote bootstrap` remain the
+  recovery paths for an agent that went offline past its
+  `secret_id_ttl`.
 - Self-rotation for the rotate AppRole credentials
   (`bootroot-runtime-rotate-role`, `bootroot-infra-rotate-role`). Each
   rotate policy now grants `update` on its own

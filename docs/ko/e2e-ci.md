@@ -234,11 +234,14 @@ sudo -n cp "$tmp_file" /etc/hosts
 목적:
 
 - remote-bootstrap 온보딩과 일회성 bootstrap 반영 방식 검증
-- `trust_sync`, `responder_hmac` 항목의 bootstrap 기반 반영 검증
-- `secret_id` 회전 전달 검증 (운영 환경에서는
-  `bootroot-remote apply-secret-id`를 사용하고, E2E 테스트에서는 이전
-  `secret_id`가 테스트 기간 동안 유효하므로 `bootstrap`을 일괄 사용)
-- 원격 회전/복구 시퀀스 검증
+- `secret_id` 자가 치유 검증: control node에서 `rotate approle-secret-id`
+  실행 후, 실행 중인 `bootroot-agent` fast-poll 루프가 디스크의 자체
+  `secret_id`를 갱신하여 원격에서의 수동 `apply-secret-id` / 재-bootstrap
+  없이 계속 인증
+- trust 자가 치유 검증: KV의 trust 업데이트 후 실행 중인 에이전트가
+  fast-poll로 `[trust]` 핀과 `ca-bundle.pem`을 다시 렌더링하고 수동
+  재-bootstrap 없이 계속 갱신
+- `responder_hmac`의 bootstrap 재반영 및 원격 회전/복구 시퀀스 검증
 
 실행 단계:
 
@@ -249,11 +252,15 @@ sudo -n cp "$tmp_file" /etc/hosts
 4. `bootstrap-initial`: remote node에서 서비스별 `bootroot-remote bootstrap`
    실행
 5. `verify-initial`: remote node에서 인증서 발급/검증
-6. 회전 + bootstrap 재반영 + verify 반복:
-   `rotate-secret-id` -> `bootstrap` -> `verify-after-secret-id`,
-   `rotate-trust-sync` -> `bootstrap` -> `verify-after-trust-sync`,
-   `rotate-responder-hmac` -> `bootstrap` -> `verify-after-responder-hmac`
-7. 각 검증 단계 사이 인증서 fingerprint 변경 여부 확인
+6. 자가 치유 주기(수동 재-bootstrap 없음): control node에서
+   `rotate-secret-id`와 `rotate-trust-sync` 실행 후, `selfheal-<service>`가
+   실행 중인 각 에이전트의 fast-poll 루프가 자체 `secret_id`를 갱신하고
+   trust를 다시 렌더링함을 확인하며, 갱신된 자격증명으로 force-reissue
+   왕복(`before-selfheal` -> `after-selfheal`)을 수행
+7. `responder_hmac`는 여전히 bootstrap으로 전달:
+   `rotate-responder-hmac` -> `bootstrap-after-responder-hmac` ->
+   `verify-after-responder-hmac`
+8. 각 단계 사이 인증서 fingerprint 변경 여부 확인
 
 실제 실행 명령(스크립트 발췌):
 
@@ -276,12 +283,16 @@ bootroot-remote bootstrap --openbao-url "http://127.0.0.1:8200" \
   --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
   --output json
 
-# control node: rotate / remote node: bootstrap 재반영
+# control node: secret_id 회전 + trust 업데이트를 KV에 게시
 bootroot rotate --yes approle-secret-id --service-name edge-proxy
 bootroot rotate --yes approle-secret-id --service-name web-app
-bootroot-remote bootstrap ...  # 서비스별 재반영
+# remote node: 수동 재반영 없음. 실행 중인 bootroot-agent fast-poll 루프가
+# 자체 secret_id를 갱신하고 trust를 다시 렌더링하며, 이후 force-reissue
+# --wait 왕복으로 갱신된 자격증명으로 동작함을 증명(selfheal-<service> 단계).
+
+# responder_hmac는 여전히 bootstrap으로 전달
 bootroot rotate --yes responder-hmac
-bootroot-remote bootstrap ...  # 서비스별 재반영
+bootroot-remote bootstrap ...  # 서비스별 responder_hmac 재반영
 ```
 
 ### 4) 원격 전달 E2E 시나리오 (`hosts`)
@@ -348,12 +359,15 @@ sudo -n cp "$tmp_file" /etc/hosts
 - 단일 타깃 실패 주입 후 복구 검증
 - 회전 후 재반영 검증
 
-> **참고:** E2E 테스트는 `secret_id`를 포함한 모든 회전 항목에
+> **참고:** 이 회전/복구 매트릭스는 `secret_id`를 포함한 모든 회전 항목에
 > `bootroot-remote bootstrap`을 일괄 사용합니다. 이전 `secret_id`가
 > 테스트 기간 동안 유효하고, `bootstrap`과 `apply-secret-id` 모두 동일한
-> 방식으로 인증하기 때문에 동작합니다. 운영 환경에서 `secret_id` 단독
-> 회전 시에는 `bootroot-remote apply-secret-id`를 권장합니다
-> (운영 가이드 참조).
+> 방식으로 인증하기 때문에 동작합니다. 운영 환경에서는 실행 중인
+> `bootroot-agent`가 fast-poll 루프를 통해 운영자 개입 없이 `secret_id`와
+> trust를 자가 치유하며, `apply-secret-id`(및 재-bootstrap)는 `secret_id_ttl`을
+> 넘겨 오프라인 상태였던(따라서 스스로 갱신할 수 없는) 에이전트를 위한 복구
+> 경로입니다(운영 가이드 참조). 위의 원격 전달 라이프사이클 시나리오가 이
+> 자가 치유 경로를 직접 검증합니다.
 
 실행 단계(항목별 반복):
 
@@ -585,8 +599,9 @@ E2E에서 OpenBao 언실/런타임 인증 사용 방식:
 
 - 필수 bootstrap 항목은 summary 출력에서 `applied`, `unchanged`, 또는
   `skipped`(EAB만) 중 하나여야 함
-- 회전 후 재반영이 정상 완료되어야 함 (E2E에서는 `bootstrap` 사용,
-  운영 환경에서 `secret_id` 단독 회전 시에는 `apply-secret-id` 사용)
+- 회전 후 재반영이 정상 완료되어야 함 (회전/복구 매트릭스에서는 `bootstrap`
+  사용, 운영 환경에서는 실행 중인 에이전트가 fast-poll로 `secret_id`/trust를
+  자가 치유하고 `apply-secret-id` / 재-bootstrap은 오프라인 복구 경로)
 - 하나라도 `failed`이면 해당 단계를 실패로 처리함
 
 ## E2E `phases.log` 형식

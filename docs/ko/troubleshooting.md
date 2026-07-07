@@ -106,8 +106,12 @@ bootroot service add --service-name <name> --delivery-mode remote-bootstrap ...
 ## `remote-bootstrap`이 실패할 때
 
 - 서비스 머신에서 `bootroot-remote bootstrap`이 성공적으로 완료되었는지 확인
-- trust 회전 후에는 서비스 머신에서 `bootroot-remote bootstrap`을 다시 실행
-- secret_id 회전 후에는 서비스 머신에서 `bootroot-remote apply-secret-id`를 실행
+- 실행 중인 `bootroot-agent`는 fast-poll 루프로 trust와 secret_id 회전을 스스로
+  반영하므로, 회전마다 운영자가 조치할 필요는 없습니다
+- 복구 시에만: 에이전트가 `secret_id_ttl`을 넘겨 오프라인 상태였고(자격 증명이
+  이미 만료) 스스로 갱신할 수 없다면, 서비스 머신에서 `bootroot-remote
+  bootstrap`을 다시 실행하거나 secret_id만 반영하려면 `bootroot-remote
+  apply-secret-id`를 실행
 - bootstrap summary JSON에서 모든 항목이 `applied` 상태인지 확인
 
 ### Wrap token 만료

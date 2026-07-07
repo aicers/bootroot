@@ -332,8 +332,11 @@ flags `--post-renew-command`, `--post-renew-arg`,
 `--post-renew-timeout-secs`, and
 `--post-renew-on-failure` instead.
 
-After secret_id rotation on the control node, deliver the new secret_id to the
-remote node:
+After secret_id rotation on the control node, a *running* remote
+`bootroot-agent` picks up the new secret_id itself through its fast-poll loop —
+no manual delivery is needed. The command below is the **recovery** path only,
+for an agent that was offline past its `secret_id_ttl` and whose credential
+already expired:
 
 ```bash
 bootroot-remote apply-secret-id \

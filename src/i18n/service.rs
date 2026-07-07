@@ -788,24 +788,12 @@ impl Messages {
         )
     }
 
-    pub(crate) fn service_next_steps_openbao_agent_daemon_run(
-        &self,
-        data: &ServiceOpenBaoAgentSteps<'_>,
-    ) -> String {
-        format_template(
-            self.strings().service_next_steps_openbao_agent_daemon_run,
-            &[("config_path", data.config_path)],
-        )
+    pub(crate) fn service_next_steps_remote_selfheal_keep(&self) -> &'static str {
+        self.strings().service_next_steps_remote_selfheal_keep
     }
 
-    pub(crate) fn service_next_steps_openbao_agent_docker_run(
-        &self,
-        data: &ServiceOpenBaoAgentSteps<'_>,
-    ) -> String {
-        format_template(
-            self.strings().service_next_steps_openbao_agent_docker_run,
-            &[("config_path", data.config_path)],
-        )
+    pub(crate) fn service_next_steps_remote_selfheal_note(&self) -> &'static str {
+        self.strings().service_next_steps_remote_selfheal_note
     }
 
     pub(crate) fn service_next_steps_openbao_sidecar_start(

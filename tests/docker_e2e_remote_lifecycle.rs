@@ -43,28 +43,32 @@ mod unix_integration {
 
         let phase_contents =
             std::fs::read_to_string(phase_log).with_context(|| "Failed to read phase log")?;
-        assert!(phase_contents.contains("\"phase\":\"infra-up\""));
         assert!(phase_contents.contains("\"phase\":\"init\""));
         assert!(phase_contents.contains("\"phase\":\"service-add\""));
         assert!(phase_contents.contains("\"phase\":\"bootstrap-initial\""));
         assert!(phase_contents.contains("\"phase\":\"verify-initial\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-secret-id\""));
-        assert!(phase_contents.contains("\"phase\":\"bootstrap-after-secret-id\""));
-        assert!(phase_contents.contains("\"phase\":\"verify-after-secret-id\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-trust-sync\""));
-        assert!(phase_contents.contains("\"phase\":\"bootstrap-after-trust-sync\""));
-        assert!(phase_contents.contains("\"phase\":\"verify-after-trust-sync\""));
+        // Approach C: a running remote agent self-heals across secret_id and
+        // trust rotation with no manual re-bootstrap, so the lifecycle logs
+        // per-service self-heal phases instead of the removed
+        // bootstrap-after-secret-id / bootstrap-after-trust-sync manual
+        // re-bootstrap phases.
+        assert!(phase_contents.contains("\"phase\":\"selfheal-edge-proxy\""));
+        assert!(phase_contents.contains("\"phase\":\"selfheal-web-app\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-responder-hmac\""));
         assert!(phase_contents.contains("\"phase\":\"bootstrap-after-responder-hmac\""));
         assert!(phase_contents.contains("\"phase\":\"cleanup\""));
 
         let initial = cert_meta.join("edge-proxy-initial.txt");
-        let after_secret_id = cert_meta.join("edge-proxy-after-secret-id.txt");
-        let after_trust_sync = cert_meta.join("edge-proxy-after-trust-sync.txt");
+        // The self-heal round-trip drives a real force-reissue through the
+        // restarted agent (cold AppRole login on the rotated secret_id), so
+        // an after-selfheal snapshot proves the agent kept operating without
+        // a manual bootstrap.
+        let after_selfheal = cert_meta.join("edge-proxy-after-selfheal.txt");
         let after_hmac = cert_meta.join("edge-proxy-after-responder-hmac.txt");
         assert!(initial.exists());
-        assert!(after_secret_id.exists());
-        assert!(after_trust_sync.exists());
+        assert!(after_selfheal.exists());
         assert!(after_hmac.exists());
 
         Ok(artifact_dir)

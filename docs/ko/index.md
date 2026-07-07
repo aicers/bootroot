@@ -191,10 +191,13 @@ CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리
 `sslmode`를 구성해야 합니다.
 
 `bootroot service add`로 등록한 서비스는 step-ca가 설치된 머신에서
-동작할 수도 있고, 다른 머신에서 동작할 수도 있습니다. 어떤 배치이든
-서비스 런타임에는 OpenBao Agent와 bootroot-agent를 함께 구성해야 합니다.
+동작할 수도 있고, 다른 머신에서 동작할 수도 있습니다. 런타임 구성은
+`--delivery-mode`에 따라 달라집니다. `local-file` 서비스는 OpenBao Agent와
+bootroot-agent를 함께 구성하고, `remote-bootstrap` 서비스는 bootroot-agent만
+구성하며 이 에이전트가 AppRole로 OpenBao에 직접 인증합니다(서비스별 OpenBao
+Agent 사이드카 없음).
 
-OpenBao Agent 배치 규칙:
+OpenBao Agent 배치 규칙(`local-file` 서비스 전용):
 
 - Docker 서비스: 서비스별 **OpenBao Agent 사이드카**를 **필수**로 사용
 - 데몬 서비스: 서비스별 **OpenBao Agent 데몬**을 **필수**로 사용
@@ -209,8 +212,12 @@ bootroot-agent 배치 규칙:
 
 bootroot-remote 배치 규칙:
 
-- 초기 설정 시 서비스별로 `bootroot-remote bootstrap`을 1회 실행하고,
-  secret_id 회전 이후에는 `bootroot-remote apply-secret-id`를 실행합니다.
+- 초기 설정 시 서비스별로 `bootroot-remote bootstrap`을 1회 실행합니다. 이후
+  실행 중인 `bootroot-agent`는 자립적으로 동작합니다. fast-poll 루프가 자신의
+  `secret_id`를 갱신하고 trust를 다시 렌더링하므로 `secret_id` 회전에 호스트별
+  조치가 필요하지 않습니다. `bootroot-remote apply-secret-id`는
+  `secret_id_ttl`이 지나도록 오프라인이었던 에이전트를 복구하는 경로일
+  뿐입니다.
 
 참고:
 step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-remote가

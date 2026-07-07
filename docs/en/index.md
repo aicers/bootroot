@@ -212,10 +212,13 @@ with `sslmode=disable`. Configure PostgreSQL TLS and choose an appropriate
 `sslmode` for the remote trust boundary.
 
 Services added by `bootroot service add` may run either on the same machine as
-step-ca or on different machines. Regardless of placement, each service runtime
-must include both OpenBao Agent and bootroot-agent.
+step-ca or on different machines. The runtime composition depends on the
+`--delivery-mode`: `local-file` services run both OpenBao Agent and
+bootroot-agent, while `remote-bootstrap` services run only bootroot-agent,
+which authenticates to OpenBao directly via AppRole (no per-service OpenBao
+Agent sidecar).
 
-OpenBao Agent placement rules:
+OpenBao Agent placement rules (`local-file` services only):
 
 - Docker service: per-service **OpenBao Agent sidecar** is **required**
 - daemon service: per-service **OpenBao Agent daemon** is **required**
@@ -231,7 +234,10 @@ for isolation, lifecycle alignment, and failure blast-radius reasons.
 bootroot-remote placement rules:
 
 - Each service should have `bootroot-remote bootstrap` run once during initial
-  setup, with `bootroot-remote apply-secret-id` run after secret_id rotation.
+  setup. The running `bootroot-agent` is then self-sufficient: its fast-poll
+  loop refreshes its own `secret_id` and re-renders trust, so `secret_id`
+  rotation needs no per-host action. `bootroot-remote apply-secret-id` is only
+  a recovery path for an agent that was offline past its `secret_id_ttl`.
 
 Note:
 If a service is added on the machine where step-ca is installed,
