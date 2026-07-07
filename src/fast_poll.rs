@@ -1189,6 +1189,17 @@ pub(crate) async fn run_fast_poll_loop(
         // client: a trust rotation propagates the new anchors + bundle, and
         // a secret_id rotation refreshes the credential this very loop
         // re-authenticates with (keeping it alive past secret_id_ttl).
+        // Snapshot the trust versions before the poll advances them: a
+        // failed HTTPS client rebuild below must be able to roll the version
+        // back so the next tick retries (see the rebuild block). Only
+        // `https://` rebuilds the client, so skip the clone otherwise.
+        let rebuild_client_on_trust = openbao.url.starts_with("https://");
+        let trust_versions_before = if rebuild_client_on_trust {
+            state.last_trust_seen_version.clone()
+        } else {
+            BTreeMap::new()
+        };
+
         let (trust_outcomes, trust_changed) =
             run_trust_poll_tick(&hooks, &openbao.kv_mount, &services, &mut state).await;
         log_poll_outcomes("trust", &trust_outcomes, &mut needs_relogin);
@@ -1196,15 +1207,6 @@ pub(crate) async fn run_fast_poll_loop(
         let (secret_id_outcomes, secret_id_changed) =
             run_secret_id_poll_tick(&hooks, &openbao.kv_mount, &services, &mut state).await;
         log_poll_outcomes("secret_id", &secret_id_outcomes, &mut needs_relogin);
-
-        if (report.state_changed || trust_changed || secret_id_changed)
-            && let Err(err) = state.save(&openbao.state_path).await
-        {
-            error!(
-                "Failed to persist fast-poll state to {}: {err:#}",
-                openbao.state_path.display()
-            );
-        }
 
         // A trust apply rewrites the on-disk CA bundle, and in the
         // remote-bootstrap model `[openbao].ca_bundle_path` and
@@ -1219,8 +1221,21 @@ pub(crate) async fn run_fast_poll_loop(
         // polling. Rebuild from the refreshed bundle and re-login. Only the
         // `https://` client anchors trust, so a plaintext endpoint needs no
         // rebuild.
-        if trust_changed && openbao.url.starts_with("https://") {
-            match build_openbao_client(&openbao) {
+        //
+        // Rebuild BEFORE persisting the advanced trust version. `parse_trust_payload`
+        // only checks that `ca_bundle_pem` is non-empty; the real PEM/root-store
+        // validation happens here in `build_openbao_client`. If the bundle is
+        // malformed, unreadable after the write, or otherwise rejected, the
+        // version must NOT stay marked applied — otherwise the poll reports
+        // `UpToDate` forever, never retries the rebuild, and the loop is
+        // stranded on stale roots once the old anchor is retired. On a rebuild
+        // failure, roll the version back so the next tick re-applies and
+        // rebuilds. A re-login failure after a *successful* rebuild is
+        // different: the new roots are already in the client, so we keep the
+        // advanced version and just retry the login.
+        let mut trust_applied = trust_changed;
+        if trust_changed && rebuild_client_on_trust {
+            let rebuilt_ok = match build_openbao_client(&openbao) {
                 Ok(rebuilt) => {
                     *client.lock().await = rebuilt;
                     if let Err(err) = login(&client, &openbao).await {
@@ -1233,13 +1248,25 @@ pub(crate) async fn run_fast_poll_loop(
                             "Rebuilt OpenBao client from the refreshed CA bundle after a trust update."
                         );
                     }
+                    true
                 }
                 Err(err) => {
                     warn!(
-                        "Failed to rebuild OpenBao client after a trust update: {err:#}. Keeping the existing client."
+                        "Failed to rebuild OpenBao client after a trust update: {err:#}. Rolling back the applied trust version so the next tick retries the apply and rebuild."
                     );
+                    false
                 }
-            }
+            };
+            trust_applied = reconcile_trust_rebuild(&mut state, trust_versions_before, rebuilt_ok);
+        }
+
+        if (report.state_changed || trust_applied || secret_id_changed)
+            && let Err(err) = state.save(&openbao.state_path).await
+        {
+            error!(
+                "Failed to persist fast-poll state to {}: {err:#}",
+                openbao.state_path.display()
+            );
         }
 
         let mut sleep_for = openbao.fast_poll_interval;
@@ -1266,6 +1293,24 @@ pub(crate) async fn run_fast_poll_loop(
 }
 
 pub(crate) type BoxRenew = std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+/// Reconciles the fast-poll state after a post-trust-change HTTPS client
+/// rebuild. When the rebuild succeeded the advanced trust version stands;
+/// when it failed the version is rolled back to `versions_before` so the
+/// next tick retries the apply and rebuild rather than reporting the
+/// stale-root client as up to date. Returns whether the advanced trust
+/// version should be persisted.
+fn reconcile_trust_rebuild(
+    state: &mut FastPollState,
+    versions_before: BTreeMap<String, u64>,
+    rebuilt_ok: bool,
+) -> bool {
+    if rebuilt_ok {
+        return true;
+    }
+    state.last_trust_seen_version = versions_before;
+    false
+}
 
 fn build_openbao_client(openbao: &config::OpenBaoSettings) -> Result<OpenBaoClient> {
     if openbao.url.starts_with("https://") {
@@ -2363,6 +2408,56 @@ mod tests {
         }];
         log_poll_outcomes("trust", &outcomes, &mut needs_relogin);
         assert!(needs_relogin);
+    }
+
+    #[test]
+    fn reconcile_trust_rebuild_keeps_version_on_success() {
+        let mut state = FastPollState::default();
+        state
+            .last_trust_seen_version
+            .insert("edge-proxy".to_string(), 5);
+        let before = state.last_trust_seen_version.clone();
+
+        let persist = reconcile_trust_rebuild(&mut state, before, true);
+
+        assert!(persist);
+        assert_eq!(state.last_trust_seen_version.get("edge-proxy"), Some(&5));
+    }
+
+    #[test]
+    fn reconcile_trust_rebuild_rolls_back_version_on_failure() {
+        // Simulate a tick where the trust poll advanced the version from the
+        // prior value (2) to a new one (5) but the client rebuild failed
+        // (e.g. malformed `ca_bundle_pem` that only fails PEM/root-store
+        // validation, which `parse_trust_payload` does not perform). The
+        // version must roll back so the next tick retries rather than
+        // reporting `UpToDate` and stranding on stale roots.
+        let mut before = BTreeMap::new();
+        before.insert("edge-proxy".to_string(), 2u64);
+        let mut state = FastPollState::default();
+        state
+            .last_trust_seen_version
+            .insert("edge-proxy".to_string(), 5);
+
+        let persist = reconcile_trust_rebuild(&mut state, before, false);
+
+        assert!(!persist);
+        assert_eq!(state.last_trust_seen_version.get("edge-proxy"), Some(&2));
+    }
+
+    #[test]
+    fn reconcile_trust_rebuild_rolls_back_first_ever_version_on_failure() {
+        // First trust apply on a fresh agent (no prior version): a failed
+        // rebuild must clear the entry entirely so the next tick retries.
+        let mut state = FastPollState::default();
+        state
+            .last_trust_seen_version
+            .insert("edge-proxy".to_string(), 1);
+
+        let persist = reconcile_trust_rebuild(&mut state, BTreeMap::new(), false);
+
+        assert!(!persist);
+        assert!(state.last_trust_seen_version.is_empty());
     }
 
     #[tokio::test]

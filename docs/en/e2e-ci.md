@@ -238,14 +238,20 @@ Configuration:
 Purpose:
 
 - Validate remote-bootstrap onboarding and one-shot bootstrap apply mode
-- Validate bootstrap-driven updates for `eab`, `trust_sync`, `responder_hmac`
+- Validate bootstrap-driven delivery for `eab` and `responder_hmac`
   (the `eab` item covers the operator-provided pass-through: the harness
   writes EAB credentials to OpenBao KV directly and verifies that
-  `bootroot-remote bootstrap` applies them)
-- Validate `secret_id` rotation delivery (in production, operators use
-  `bootroot-remote apply-secret-id`; the E2E test uses `bootstrap` for
-  uniformity since the old `secret_id` is still valid during the test window)
-- Validate remote rotation/recovery sequence
+  `bootroot-remote bootstrap` applies them); `trust_sync` and `secret_id`
+  updates now propagate via the running agent's fast-poll self-heal instead
+- Validate `secret_id` self-heal: after `rotate approle-secret-id` on the
+  control node, the running `bootroot-agent` fast-poll loop refreshes its
+  own on-disk `secret_id` and keeps authenticating with no manual
+  `apply-secret-id` / re-bootstrap on the remote
+- Validate trust self-heal: after a trust update in KV, the running agent
+  re-renders the `[trust]` pins + `ca-bundle.pem` via fast-poll and keeps
+  renewing, with no manual re-bootstrap
+- Validate `responder_hmac` bootstrap re-apply and the remote
+  rotation/recovery sequence
 
 Execution steps:
 
@@ -256,11 +262,15 @@ Execution steps:
 4. `bootstrap-initial`: run `bootroot-remote bootstrap` on remote node
    for each service
 5. `verify-initial`: issue/verify certificates on remote node
-6. Rotation + bootstrap re-apply + verify cycles:
-   `rotate-secret-id` -> `bootstrap` -> `verify-after-secret-id`,
-   `rotate-trust-sync` -> `bootstrap` -> `verify-after-trust-sync`,
-   `rotate-responder-hmac` -> `bootstrap` -> `verify-after-responder-hmac`
-7. Confirm certificate fingerprint changes between each verification snapshot
+6. Self-heal cycle (no manual re-bootstrap): `rotate-secret-id` and
+   `rotate-trust-sync` on the control node, then `selfheal-<service>`
+   asserts each running agent's fast-poll loop refreshes its own
+   `secret_id` and re-renders trust, and drives a force-reissue round-trip
+   (`before-selfheal` -> `after-selfheal`) on the refreshed credential
+7. `responder_hmac` still delivers via bootstrap:
+   `rotate-responder-hmac` -> `bootstrap-after-responder-hmac` ->
+   `verify-after-responder-hmac`
+8. Confirm certificate fingerprint changes between each snapshot
 
 Actual commands (script excerpt):
 
@@ -283,12 +293,17 @@ bootroot-remote bootstrap --openbao-url "http://127.0.0.1:8200" \
   --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
   --output json
 
-# control node: rotate / remote node: re-apply via bootstrap
+# control node: rotate secret_id + publish the trust update to KV
 bootroot rotate --yes approle-secret-id --service-name edge-proxy
 bootroot rotate --yes approle-secret-id --service-name web-app
-bootroot-remote bootstrap ...  # re-apply for each service
+# remote node: NO manual re-apply. The running bootroot-agent fast-poll
+# loop refreshes its own secret_id and re-renders trust; a force-reissue
+# --wait round-trip then proves it operates on the fresh credential
+# (selfheal-<service> phase).
+
+# responder_hmac still delivers via bootstrap
 bootroot rotate --yes responder-hmac
-bootroot-remote bootstrap ...  # re-apply for each service
+bootroot-remote bootstrap ...  # re-apply responder_hmac for each service
 ```
 
 ### 4) remote-delivery E2E scenario (`hosts`)
@@ -355,12 +370,16 @@ Purpose:
 - Validate targeted failure handling and subsequent recovery
 - Validate re-apply after each rotation
 
-> **Note:** The E2E test uses `bootroot-remote bootstrap` to re-apply all
-> rotation items uniformly (including `secret_id`). This works because the
-> old `secret_id` remains valid during the test window and both `bootstrap`
-> and `apply-secret-id` authenticate the same way. In production, the
-> recommended path for `secret_id`-only rotation is
-> `bootroot-remote apply-secret-id` (see the operations guide).
+> **Note:** This rotation/recovery matrix uses `bootroot-remote bootstrap`
+> to re-apply all rotation items uniformly (including `secret_id`), which
+> works because the old `secret_id` remains valid during the test window
+> and both `bootstrap` and `apply-secret-id` authenticate the same way. In
+> production a running `bootroot-agent` self-heals `secret_id` and trust
+> through its fast-poll loop with no operator action; `apply-secret-id`
+> (and re-bootstrap) is the recovery path for an agent that was offline
+> past its `secret_id_ttl` and can no longer self-refresh (see the
+> operations guide). The remote-delivery lifecycle scenario above exercises
+> that self-heal path directly.
 
 Execution steps (per rotation item):
 
@@ -593,8 +612,10 @@ Pass/fail rules:
 
 - each required bootstrap item must show `applied`, `unchanged`, or
   `skipped` (EAB only) in the summary output
-- after rotation, re-apply must complete successfully (`bootstrap` in
-  E2E; `apply-secret-id` for `secret_id`-only rotation in production)
+- after rotation, re-apply must complete successfully (`bootstrap` in the
+  rotation/recovery matrix; in production the running agent self-heals
+  `secret_id`/trust via fast-poll, with `apply-secret-id` / re-bootstrap as
+  the offline-recovery path)
 - if any item shows `failed`, the phase fails
 
 ## E2E `phases.log` format

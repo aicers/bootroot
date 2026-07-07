@@ -598,7 +598,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   new `ca-bundle.pem` (via `write_ca_bundle`, world-readable + cert-group
   policy) and upserts the `agent.toml` `[trust]` pins atomically at
   `0o600`, so a CA/trust rotation propagates without a manual
-  re-bootstrap. A version-gated **`secret_id` poll** reads
+  re-bootstrap. For an `https://` OpenBao endpoint the loop rebuilds its
+  own client from the refreshed bundle and only marks the trust KV version
+  applied once that rebuild succeeds — a malformed or unreadable bundle is
+  retried on the next tick rather than being recorded as applied and
+  stranding the loop on stale roots. A version-gated **`secret_id` poll** reads
   `bootroot/services/<service>/secret_id` and writes the rotated
   credential atomically at `0o600`, so the loop re-authenticates past
   `secret_id_ttl` (default 24h) without a manual `apply-secret-id`. Both
