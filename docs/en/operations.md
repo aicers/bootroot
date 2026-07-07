@@ -682,13 +682,25 @@ for the sidecar vs. host-daemon trade-off.
 For `remote-bootstrap` services, the rotated `secret_id` is written to
 the per-service KV path (`bootroot/services/<service>/secret_id`). The
 operator must then run `bootroot-remote apply-secret-id` on the service
-machine to deliver it, which writes the rotated `secret_id` to the
-agent's local file. In the `remote-bootstrap` flow the remote
-`bootroot-agent` re-authenticates to OpenBao itself via AppRole in its
-fast-poll loop, reading `role_id`/`secret_id` from the files referenced
-by `role_id_path`/`secret_id_path` in the `[openbao]` block that
-`bootroot-remote bootstrap` provisions, and picks up the rotated
-`secret_id` on its next AppRole login.
+machine to deliver it:
+
+```bash
+bootroot-remote apply-secret-id --openbao-url https://<ip>:8200 \
+  --service-name <svc> --role-id-path <dir>/role_id \
+  --secret-id-path <dir>/secret_id --ca-bundle-path <dir>/ca-bundle.pem
+```
+
+When OpenBao is served over HTTPS with a private CA — the required
+posture for any non-loopback `--openbao-bind` — pass `--ca-bundle-path`
+pointing at the same CA file `bootroot-remote bootstrap` wrote (the
+agent's `[openbao].ca_bundle_path`); it anchors TLS to that private CA.
+Omit it only when `--openbao-url` is `http://`. This writes the rotated
+`secret_id` to the agent's local file. In the `remote-bootstrap` flow
+the remote `bootroot-agent` re-authenticates to OpenBao itself via
+AppRole in its fast-poll loop, reading `role_id`/`secret_id` from the
+files referenced by `role_id_path`/`secret_id_path` in the `[openbao]`
+block that `bootroot-remote bootstrap` provisions, and picks up the
+rotated `secret_id` on its next AppRole login.
 
 Note: `bootroot-agent` does not depend on a token file maintained by a
 separate OpenBao Agent in the `remote-bootstrap` flow. It performs the

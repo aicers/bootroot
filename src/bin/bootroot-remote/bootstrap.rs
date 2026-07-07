@@ -1,52 +1,16 @@
 use anyhow::{Context, Result};
-use bootroot::openbao::OpenBaoClient;
 
 use super::agent_config::apply_agent_config_updates;
 use super::io::{
     pull_secrets, read_secret_file, remove_eab_file, write_eab_file, write_secret_file,
 };
+use super::openbao_client::build_openbao_client;
 use super::summary::{ApplyItemSummary, ApplySummary, merge_apply_status, print_summary};
 use super::validation::{
     validate_agent_domain, validate_profile_hostname, validate_profile_instance_id,
     validate_service_name,
 };
 use super::{Locale, ResolvedBootstrapArgs, localized};
-
-/// Creates an [`OpenBaoClient`] for the given URL, anchoring TLS to the
-/// artifact-embedded CA bundle when the URL uses HTTPS.
-fn build_openbao_client(
-    openbao_url: &str,
-    ca_bundle_pem: Option<&str>,
-    lang: Locale,
-) -> Result<OpenBaoClient> {
-    if openbao_url.starts_with("https://") {
-        let pem = ca_bundle_pem.ok_or_else(|| {
-            anyhow::anyhow!(
-                "{}",
-                localized(
-                    lang,
-                    "HTTPS openbao_url requires ca_bundle_pem in the bootstrap artifact",
-                    "HTTPS openbao_url은 부트스트랩 아티팩트에 ca_bundle_pem이 필요합니다",
-                )
-            )
-        })?;
-        OpenBaoClient::with_pem_trust(openbao_url, pem, &[]).with_context(|| {
-            localized(
-                lang,
-                "Failed to build TLS client from artifact CA bundle",
-                "아티팩트 CA 번들로 TLS 클라이언트를 생성하지 못했습니다",
-            )
-        })
-    } else {
-        OpenBaoClient::new(openbao_url).with_context(|| {
-            localized(
-                lang,
-                "Failed to create OpenBao client",
-                "OpenBao 클라이언트를 생성하지 못했습니다",
-            )
-        })
-    }
-}
 
 /// Errors specific to wrap-token unwrapping.
 #[derive(Debug)]

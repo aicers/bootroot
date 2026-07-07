@@ -2244,6 +2244,10 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 - `--service-name`
   - `bootroot service add`와 같은 단일 DNS label 규칙을 따릅니다.
 - `--role-id-path`, `--secret-id-path`
+- `--ca-bundle-path`: `--openbao-url`이 `https://`일 때 TLS를 고정하는 PEM CA
+  번들입니다. `bootroot-remote bootstrap`이 기록한 것과 동일한 CA 파일(에이전트의
+  `[openbao].ca_bundle_path`)을 가리켜야 합니다. HTTPS에서는 필수이며, 없으면
+  AppRole 로그인이 명확한 오류로 즉시 실패합니다. `http://`에서는 무시됩니다.
 - `--output text|json` (기본값 `text`)
 
 출력 보안 규칙:
