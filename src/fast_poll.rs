@@ -1206,6 +1206,42 @@ pub(crate) async fn run_fast_poll_loop(
             );
         }
 
+        // A trust apply rewrites the on-disk CA bundle, and in the
+        // remote-bootstrap model `[openbao].ca_bundle_path` and
+        // `[trust].ca_bundle_path` are the same file, so that write can move
+        // the very anchors this loop trusts for its own OpenBao connection.
+        // The in-memory client's root set is frozen at construction
+        // (`OpenBaoClient::with_pem_trust` holds a fixed `reqwest::Client`),
+        // so without a rebuild the loop would keep the stale roots and, once
+        // the old anchor is retired and the endpoint presents a cert under
+        // the new signer, fail every subsequent HTTPS read/re-login —
+        // defeating zero-touch trust rotation for the loop that must keep
+        // polling. Rebuild from the refreshed bundle and re-login. Only the
+        // `https://` client anchors trust, so a plaintext endpoint needs no
+        // rebuild.
+        if trust_changed && openbao.url.starts_with("https://") {
+            match build_openbao_client(&openbao) {
+                Ok(rebuilt) => {
+                    *client.lock().await = rebuilt;
+                    if let Err(err) = login(&client, &openbao).await {
+                        warn!(
+                            "OpenBao re-login after CA bundle rebuild failed: {err:#}. Will retry on the next tick."
+                        );
+                        needs_relogin = true;
+                    } else {
+                        info!(
+                            "Rebuilt OpenBao client from the refreshed CA bundle after a trust update."
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to rebuild OpenBao client after a trust update: {err:#}. Keeping the existing client."
+                    );
+                }
+            }
+        }
+
         let mut sleep_for = openbao.fast_poll_interval;
         if needs_relogin {
             if let Err(err) = login(&client, &openbao).await {

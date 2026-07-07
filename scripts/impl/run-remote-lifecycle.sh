@@ -597,9 +597,17 @@ run_force_reissue_wait_roundtrip() {
 # secret_id_ttl): starts the long-lived agent, then confirms its fast-poll
 # loop (1) refreshed the on-disk secret_id file to the freshly rotated
 # credential and (2) re-rendered the agent.toml [trust] pins + ca-bundle with
-# the new anchor, and finally that the loop is still operating by completing a
-# genuine force-reissue --wait round-trip through it (which requires it to be
-# authenticated with the refreshed credential).
+# the new anchor.
+#
+# The first agent authenticated with the *old* (still-valid) secret_id, so a
+# force-reissue against it could succeed on that original token alone and
+# would NOT prove the rotated credential is usable for a fresh login. To
+# close that gap we restart the agent after the poll applies: a cold start
+# performs an AppRole login reading ONLY the rotated secret_id from disk, so
+# if the new credential were broken or the file held a non-working value the
+# restarted loop could not authenticate and the subsequent force-reissue
+# --wait would time out. The final round-trip therefore proves the loop is
+# operating specifically on the refreshed credential.
 run_selfheal_roundtrip() {
   local service="$1"
   local agent_config="$2"
@@ -631,8 +639,17 @@ run_selfheal_roundtrip() {
     fail "running agent did not self-heal secret_id/trust for ${service} within $((SELFHEAL_ATTEMPTS * SELFHEAL_DELAY_SECS))s"
   fi
 
-  # The loop kept operating on the refreshed credential: drive a genuine
-  # force-reissue --wait round-trip through the same running agent.
+  # Force a cold re-login on the rotated credential: stop the agent that is
+  # still coasting on the old-secret_id token, then start a fresh process.
+  # Its first act is an AppRole login that reads ONLY the on-disk (rotated)
+  # secret_id, so the round-trip below can only succeed if that credential
+  # actually authenticates.
+  stop_remote_agent
+  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 &
+  REMOTE_AGENT_PID=$!
+
+  # The restarted loop is operating on the refreshed credential: drive a
+  # genuine force-reissue --wait round-trip through it.
   drive_force_reissue_wait "$service" "before-selfheal" "after-selfheal"
 }
 
