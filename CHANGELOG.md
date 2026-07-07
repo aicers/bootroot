@@ -71,6 +71,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   force-reissue round-trip (a real `rotate force-reissue --wait` against
   a running agent) instead of faking reissue by deleting cert files, so
   the missing permission would now be caught in CI.
+- Fixed `bootroot-remote apply-secret-id` failing to connect to an
+  OpenBao served over HTTPS with a private CA. The command built its
+  client unconditionally with `OpenBaoClient::new` (Mozilla webpki roots
+  only) and exposed no CA-bundle flag, so the AppRole login failed at the
+  TLS layer on the required non-loopback `--openbao-bind` posture — the
+  documented rotated-`secret_id` delivery step was unusable on a TLS
+  deployment. It now takes a `--ca-bundle-path` flag and constructs the
+  client with the same scheme-aware helper as `bootroot-remote bootstrap`
+  and fast-poll: for `https://` it anchors TLS to the supplied private CA
+  (erroring fast with a clear, localized message when the flag is absent),
+  and `http://` behaviour is unchanged. Point `--ca-bundle-path` at the
+  same CA file `bootroot-remote bootstrap` wrote (the agent's
+  `[openbao].ca_bundle_path`).
 - Fixed the pinned http-01 admin TLS client rejecting a valid
   leaf-only responder certificate. `PinnedCertVerifier` matched the
   `trusted_ca_sha256` pins against the certificates the server

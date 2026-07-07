@@ -2372,6 +2372,10 @@ Key inputs:
 - `--service-name`
   - Must follow the same single-label DNS rule as `bootroot service add`
 - `--role-id-path`, `--secret-id-path`
+- `--ca-bundle-path`: PEM CA bundle that anchors TLS when `--openbao-url` is
+  `https://`. Point it at the same CA file `bootroot-remote bootstrap` wrote
+  (the agent's `[openbao].ca_bundle_path`). Required for HTTPS — without it the
+  AppRole login fails fast with a clear error; ignored for `http://`.
 - `--output text|json` (default `text`)
 
 Output safety semantics:

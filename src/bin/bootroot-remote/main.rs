@@ -2,6 +2,7 @@ mod agent_config;
 mod apply_secret_id;
 mod bootstrap;
 mod io;
+mod openbao_client;
 mod summary;
 mod validation;
 
@@ -244,6 +245,13 @@ struct ApplySecretIdArgs {
     /// Destination path for `secret_id`
     #[arg(long)]
     secret_id_path: PathBuf,
+
+    /// PEM CA bundle used to anchor TLS when `--openbao-url` is `https://`.
+    /// Point this at the same CA file that `bootroot-remote bootstrap` wrote
+    /// (the agent's `[openbao].ca_bundle_path`). Required for HTTPS, ignored
+    /// for `http://`.
+    #[arg(long)]
+    ca_bundle_path: Option<PathBuf>,
 
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
