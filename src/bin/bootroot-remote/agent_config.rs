@@ -511,7 +511,9 @@ pub(super) fn detect_state_path_collisions(dir: &Path) -> Vec<StatePathCollision
 /// config, or `None` when the config has no `[openbao].state_path`. A
 /// relative `state_path` is resolved against the config file's parent
 /// directory so that sibling configs sharing a directory compare on equal
-/// footing.
+/// footing. The result is lexically normalized so that configs whose
+/// `state_path`s differ only by redundant `.`/`..` spellings still group
+/// together.
 fn resolve_config_state_path(config_path: &Path, contents: &str) -> Option<PathBuf> {
     let doc = contents.parse::<toml_edit::DocumentMut>().ok()?;
     let state_path = doc
@@ -520,11 +522,39 @@ fn resolve_config_state_path(config_path: &Path, contents: &str) -> Option<PathB
         .get("state_path")?
         .as_str()?;
     let state_path = Path::new(state_path);
-    if state_path.is_absolute() {
-        Some(state_path.to_path_buf())
+    let resolved = if state_path.is_absolute() {
+        state_path.to_path_buf()
     } else {
-        Some(config_path.parent()?.join(state_path))
+        config_path.parent()?.join(state_path)
+    };
+    Some(normalize_lexically(&resolved))
+}
+
+/// Collapses `.` and `..` components lexically, without touching the
+/// filesystem. Two configs whose `state_path`s resolve to the same file but
+/// spell it differently (e.g. `config/state.json` vs `config/./state.json`
+/// vs `config/sub/../state.json`) must group together for collision
+/// detection. `std::fs::canonicalize` cannot be used because the state file
+/// need not exist yet, so this normalizes purely lexically.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                // The root's parent is the root; drop a leading `..`.
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normalized.push(component.as_os_str()),
+            },
+            other => normalized.push(other.as_os_str()),
+        }
     }
+    normalized
 }
 
 #[cfg(test)]
@@ -957,6 +987,37 @@ mod tests {
 
         let collisions = detect_state_path_collisions(dir.path());
         assert_eq!(collisions.len(), 1, "shared relative filename must collide");
+    }
+
+    #[test]
+    fn detect_state_path_collisions_flags_mixed_spelling_of_same_path() {
+        // Configs that resolve to the same file but spell it differently
+        // (redundant `.`/`..` components) must still collide: both agents
+        // open the same file even though the raw strings differ.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("giganto.toml"),
+            "[openbao]\nstate_path = \"/opt/bootroot/config/bootroot-agent-state.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("edge-proxy.toml"),
+            "[openbao]\nstate_path = \"/opt/bootroot/config/./sub/../bootroot-agent-state.json\"\n",
+        )
+        .unwrap();
+
+        let collisions = detect_state_path_collisions(dir.path());
+        assert_eq!(
+            collisions.len(),
+            1,
+            "mixed-spelling paths resolving to one file must collide"
+        );
+        let collision = collisions.first().expect("collision present");
+        assert_eq!(
+            collision.state_path,
+            Path::new("/opt/bootroot/config/bootroot-agent-state.json")
+        );
+        assert_eq!(collision.configs.len(), 2);
     }
 
     #[test]
