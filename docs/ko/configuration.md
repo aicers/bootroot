@@ -265,7 +265,9 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 - managed onboarding은 두 값이 모두 필요하며, 하나라도 없으면 trust를 복구할 때까지
   `bootroot service add` 또는 `bootroot-remote bootstrap`이 실패
 - `local-file`: 서비스별 OpenBao Agent가 `ca-bundle.pem`을 렌더하는지 확인
-- `remote-bootstrap`: trust 갱신 후 `bootroot-remote bootstrap`을 다시 실행
+- `remote-bootstrap`: trust 갱신 후 실행 중인 `bootroot-agent`가 fast-poll
+  루프로 OpenBao에서 `ca-bundle.pem`과 `[trust]` 핀을 다시 렌더하므로, 원격
+  호스트에서 수동 재부트스트랩이 필요하지 않습니다
 
 권한 참고: `ca_bundle_path`는 이를 읽는 서비스가 접근 가능해야 합니다.
 가장 단순한 방법은 bootroot-agent와 서비스를 같은 계정/그룹으로 실행하는

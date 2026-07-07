@@ -222,10 +222,16 @@ In `bootroot service add`, `--delivery-mode` is the selector option.
   `bootroot-remote bootstrap` (one-shot).
   In this flow, the `bootroot` CLI on the step-ca machine writes desired
   service state, and `bootroot-remote bootstrap` on the service machine reads
-  and applies it in a single run. After initial bootstrap, secret_id rotation
-  is handled explicitly via `bootroot-remote apply-secret-id`.
+  and applies it in a single run. It installs no OpenBao Agent sidecar; the
+  remote `bootroot-agent` authenticates directly via AppRole. After initial
+  bootstrap the running agent is self-sufficient: its fast-poll loop refreshes
+  its own `secret_id` and re-renders trust from OpenBao, so a `secret_id`
+  rotation needs no operator action on the remote host.
+  `bootroot-remote apply-secret-id` is only a recovery path for an agent that
+  was offline past its `secret_id_ttl` and whose credential already expired.
 
 In both delivery modes, the intended model is the same: prepare trust first,
 then start `bootroot-agent` with verification enabled. `local-file` applies
-that trust directly on the step-ca host, while `remote-bootstrap` applies it
-on the service host through `bootroot-remote bootstrap`.
+that trust directly on the step-ca host, while `remote-bootstrap` applies the
+initial trust on the service host through `bootroot-remote bootstrap` and the
+running agent thereafter re-renders trust itself through its fast-poll loop.

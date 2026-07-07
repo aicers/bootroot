@@ -274,7 +274,9 @@ bundle or a directly presented certificate whose fingerprint is pinned in
 - managed onboarding requires both values; if either is missing,
   `bootroot service add` or `bootroot-remote bootstrap` fails until trust is repaired
 - `local-file`: the per-service OpenBao Agent renders `ca-bundle.pem`
-- `remote-bootstrap`: re-run `bootroot-remote bootstrap` after trust updates
+- `remote-bootstrap`: the running `bootroot-agent` re-renders `ca-bundle.pem`
+  and the `[trust]` pins from OpenBao via its fast-poll loop after trust
+  updates; no manual re-bootstrap is needed on the remote host
 
 Permissions note: the service consuming the CA bundle must be able to read
 `ca_bundle_path`. The simplest setup is running bootroot-agent and service as

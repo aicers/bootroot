@@ -488,9 +488,12 @@ Treat it as a short-lived credential:
     `secrets/services/<service>/secret_id` for local operations —
     protect and delete this file after delivery.
 - **Rotation**: after `bootroot rotate approle-secret-id` on the control
-    node, deliver the new `secret_id` via
-    `bootroot-remote apply-secret-id` on the service machine. See
-    [Operations](operations.md) for the rotation workflow.
+    node, a *running* remote `bootroot-agent` needs no operator action —
+    its fast-poll loop reads the rotated `secret_id` from OpenBao and
+    refreshes its own on-disk credential within roughly one poll interval.
+    `bootroot-remote apply-secret-id` is only a recovery path for an agent
+    that was offline past its `secret_id_ttl` and whose credential already
+    expired. See [Operations](operations.md) for the rotation workflow.
 
 ## Network requirements
 
