@@ -61,6 +61,14 @@ RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
 CURRENT_PHASE="init"
+# PID of the background bootroot-agent daemon started for the genuine
+# KV force-reissue round-trip. Empty when no daemon is running; the
+# cleanup trap kills it so a failed run never leaks the process.
+REMOTE_AGENT_PID=""
+# Bounds the genuine force-reissue --wait round-trip. The agent's default
+# fast_poll_interval is 30s, so allow generous margin over one poll plus an
+# ACME renewal for slow CI runners.
+FORCE_REISSUE_WAIT_TIMEOUT="${FORCE_REISSUE_WAIT_TIMEOUT:-120s}"
 # Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
 # default moved from 5432 to 5433 in #588 §4c; the e2e harness
 # expects 5432 (CI runners free that port before the matrix), so
@@ -136,8 +144,16 @@ cleanup_hosts() {
   rm -f "$tmp_file"
 }
 
+stop_remote_agent() {
+  [ -n "$REMOTE_AGENT_PID" ] || return 0
+  kill "$REMOTE_AGENT_PID" >/dev/null 2>&1 || true
+  wait "$REMOTE_AGENT_PID" 2>/dev/null || true
+  REMOTE_AGENT_PID=""
+}
+
 cleanup() {
   log_phase "cleanup"
+  stop_remote_agent
   cleanup_hosts
   capture_artifacts
   compose_down
@@ -494,6 +510,65 @@ force_reissue_remote_service() {
   rm -f "$REMOTE_CERTS_DIR/${service}.crt" "$REMOTE_CERTS_DIR/${service}.key"
 }
 
+# Exercises the genuine KV force-reissue round-trip for a remote-bootstrap
+# service. Unlike force_reissue_remote_service (which fakes reissue by
+# deleting cert files), this runs a real bootroot-agent daemon so its
+# fast-poll loop observes the control-plane's `rotate force-reissue --wait`
+# KV request, renews via ACME, and writes the completion markers back to
+# KV. That write-back requires the service AppRole to hold create/update on
+# its reissue KV path; without it, `--wait` blocks until timeout. This is
+# the coverage that would have caught issue #677.
+run_force_reissue_wait_roundtrip() {
+  local service="$1"
+  local agent_config="$2"
+  local hostname_val="$3"
+  local instance_id="$4"
+  log_phase "force-reissue-wait-${service}"
+
+  # Re-bootstrap so the agent config, credentials and initial cert are
+  # fresh, then snapshot the cert to detect the reissue.
+  run_remote_bootstrap "$service" "$agent_config" "$hostname_val" "$instance_id"
+  snapshot_cert_meta "$service" "before-force-reissue"
+
+  # Start the long-lived agent so its fast-poll loop is the consumer of the
+  # KV force-reissue request. It authenticates via the service AppRole from
+  # the [openbao] section that bootstrap wrote into the agent config.
+  local agent_log="$ARTIFACT_DIR/remote-agent-${service}.log"
+  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 &
+  REMOTE_AGENT_PID=$!
+  # Give the daemon a moment to load config and complete its initial login
+  # before the request lands, so the next fast-poll tick observes it.
+  sleep 3
+
+  local reissue_log="$ARTIFACT_DIR/force-reissue-${service}.log"
+  local status=0
+  run_bootroot_control rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --auth-mode approle \
+    --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
+    --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
+    --yes \
+    force-reissue \
+    --service-name "$service" \
+    --wait \
+    --wait-timeout "$FORCE_REISSUE_WAIT_TIMEOUT" >"$reissue_log" 2>&1 || status=$?
+
+  cat "$reissue_log" >>"$RUN_LOG"
+  stop_remote_agent
+
+  # Exit code 124 is the --wait timeout convention; any non-zero here means
+  # the round-trip did not complete, which is exactly the #677 regression.
+  [ "$status" -eq 0 ] \
+    || fail "rotate force-reissue --wait exited ${status} for ${service} (expected completion, not timeout)"
+  grep -q "reported completion" "$reissue_log" \
+    || fail "rotate force-reissue --wait for ${service} did not observe agent completion"
+
+  # The agent must have actually reissued the certificate on disk.
+  snapshot_cert_meta "$service" "after-force-reissue"
+  assert_fingerprint_changed "$service" "before-force-reissue" "after-force-reissue"
+}
+
 run_rotation_secret_id() {
   log_phase "rotate-secret-id"
   run_bootroot_control rotate \
@@ -627,6 +702,9 @@ main() {
   run_verify_pair "after-responder-hmac"
   assert_fingerprint_changed "$SERVICE_NAME" "after-trust-sync" "after-responder-hmac"
   assert_fingerprint_changed "$SERVICE_NAME_2" "after-trust-sync" "after-responder-hmac"
+
+  run_force_reissue_wait_roundtrip \
+    "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
 
   log_phase "assert-openbao-audit-log"
   assert_openbao_audit_log
