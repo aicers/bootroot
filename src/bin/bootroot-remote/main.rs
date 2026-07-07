@@ -11,8 +11,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use bootroot::locale::Locale;
 use bootroot::trust_bootstrap::{
-    CA_BUNDLE_PEM_KEY, EAB_HMAC_KEY, EAB_KID_KEY, HMAC_KEY, SECRET_ID_KEY, SERVICE_KV_BASE,
-    TRUSTED_CA_KEY,
+    EAB_HMAC_KEY, EAB_KID_KEY, HMAC_KEY, SECRET_ID_KEY, SERVICE_KV_BASE,
 };
 use clap::{Parser, ValueEnum};
 
@@ -307,7 +306,7 @@ async fn run(args: Args, lang: Locale) -> Result<i32> {
 const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// Highest `schema_version` that this binary understands.
-const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 3;
+const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 4;
 
 /// Minimal header used for the first stage of artifact parsing so that
 /// `schema_version` can be validated before attempting full deserialization.
@@ -1018,13 +1017,13 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_bootstrap_args_rejects_future_schema_with_unknown_fields() {
-        // A future v4 artifact that has completely different fields.  Without
+        // A future v5 artifact that has completely different fields.  Without
         // two-stage parsing, serde would fail with a confusing missing-field
         // error instead of the explicit version rejection.
         let artifact_json = serde_json::json!({
-            "schema_version": 4,
+            "schema_version": 5,
             "completely_new_field": true,
         });
-        assert_rejects_schema_version(&artifact_json, 4).await;
+        assert_rejects_schema_version(&artifact_json, 5).await;
     }
 }

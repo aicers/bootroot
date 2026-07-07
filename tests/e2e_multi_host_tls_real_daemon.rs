@@ -500,14 +500,8 @@ fn bootstrap_artifact(
         .join("secrets")
         .join("services")
         .join(SERVICE_NAME);
-    let openbao_agent_dir = service_node
-        .service_dir()
-        .join("secrets")
-        .join("openbao")
-        .join("services")
-        .join(SERVICE_NAME);
     json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "openbao_url": openbao_url,
         "kv_mount": KV_MOUNT,
         "service_name": SERVICE_NAME,
@@ -517,9 +511,6 @@ fn bootstrap_artifact(
         "agent_config_path": service_node.service_dir().join("agent.toml").to_string_lossy(),
         "ca_bundle_path": service_node.ca_bundle_path().to_string_lossy(),
         "ca_bundle_pem": ca_bundle_pem,
-        "openbao_agent_config_path": openbao_agent_dir.join("agent.hcl").to_string_lossy(),
-        "openbao_agent_template_path": openbao_agent_dir.join("agent.toml.ctmpl").to_string_lossy(),
-        "openbao_agent_token_path": openbao_agent_dir.join("token").to_string_lossy(),
         "agent_email": "admin@example.com",
         "agent_server": "https://localhost:9000/acme/acme/directory",
         "agent_domain": DOMAIN,

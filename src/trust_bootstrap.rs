@@ -20,6 +20,16 @@ pub const CA_BUNDLE_PATH_KEY: &str = "ca_bundle_path";
 /// remote-bootstrap services, and the remote `bootroot-agent` polls it on
 /// its fast-poll interval to trigger an immediate renewal.
 pub const SERVICE_REISSUE_KV_SUFFIX: &str = "reissue";
+/// KV v2 path suffix carrying the service trust material
+/// (`trusted_ca_sha256` + `ca_bundle_pem`).
+///
+/// Full path: `{kv_mount}/data/bootroot/services/<service>/trust`.
+pub const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
+/// KV v2 path suffix carrying the service `AppRole` `secret_id` the remote
+/// fast-poll loop re-authenticates with.
+///
+/// Full path: `{kv_mount}/data/bootroot/services/<service>/secret_id`.
+pub const SERVICE_SECRET_ID_KV_SUFFIX: &str = "secret_id";
 /// Payload field holding the RFC3339 UTC timestamp of the request.
 pub const REISSUE_REQUESTED_AT_KEY: &str = "requested_at";
 /// Payload field describing who issued the request (operator label).

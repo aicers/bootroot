@@ -69,6 +69,16 @@ REMOTE_AGENT_PID=""
 # fast_poll_interval is 30s, so allow generous margin over one poll plus an
 # ACME renewal for slow CI runners.
 FORCE_REISSUE_WAIT_TIMEOUT="${FORCE_REISSUE_WAIT_TIMEOUT:-120s}"
+# Bounds how long the self-heal phase waits for a *running* agent's
+# fast-poll loop to refresh the on-disk secret_id and re-render
+# [trust]+ca-bundle after a control-plane rotation. Must exceed one
+# fast_poll_interval (default 30s); 30 * 2s = 60s of margin.
+SELFHEAL_ATTEMPTS="${SELFHEAL_ATTEMPTS:-30}"
+SELFHEAL_DELAY_SECS="${SELFHEAL_DELAY_SECS:-2}"
+# The extra trust anchor's fingerprint appended by run_rotation_trust_sync,
+# exported so the self-heal assertion can confirm the running agent wrote it
+# into the remote agent.toml [trust] pins via fast-poll.
+TRUST_SYNC_EXTRA_FINGERPRINT=""
 # Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
 # default moved from 5432 to 5433 in #588 §4c; the e2e harness
 # expects 5432 (CI runners free that port before the matrix), so
@@ -518,28 +528,15 @@ force_reissue_remote_service() {
 # KV. That write-back requires the service AppRole to hold create/update on
 # its reissue KV path; without it, `--wait` blocks until timeout. This is
 # the coverage that would have caught issue #677.
-run_force_reissue_wait_roundtrip() {
+# Drives a `rotate force-reissue --wait` against an *already-running* agent
+# (tracked in REMOTE_AGENT_PID) and asserts the KV round-trip completed and
+# the certificate was actually reissued on disk. Stops the agent before
+# returning. Shared by the fresh-bootstrap round-trip and the self-heal
+# round-trip so both exercise the identical completion path.
+drive_force_reissue_wait() {
   local service="$1"
-  local agent_config="$2"
-  local hostname_val="$3"
-  local instance_id="$4"
-  log_phase "force-reissue-wait-${service}"
-
-  # Re-bootstrap so the agent config, credentials and initial cert are
-  # fresh, then snapshot the cert to detect the reissue.
-  run_remote_bootstrap "$service" "$agent_config" "$hostname_val" "$instance_id"
-  snapshot_cert_meta "$service" "before-force-reissue"
-
-  # Start the long-lived agent so its fast-poll loop is the consumer of the
-  # KV force-reissue request. It authenticates via the service AppRole from
-  # the [openbao] section that bootstrap wrote into the agent config.
-  local agent_log="$ARTIFACT_DIR/remote-agent-${service}.log"
-  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 &
-  REMOTE_AGENT_PID=$!
-  # Give the daemon a moment to load config and complete its initial login
-  # before the request lands, so the next fast-poll tick observes it.
-  sleep 3
-
+  local before_label="$2"
+  local after_label="$3"
   local reissue_log="$ARTIFACT_DIR/force-reissue-${service}.log"
   local status=0
   run_bootroot_control rotate \
@@ -565,8 +562,78 @@ run_force_reissue_wait_roundtrip() {
     || fail "rotate force-reissue --wait for ${service} did not observe agent completion"
 
   # The agent must have actually reissued the certificate on disk.
-  snapshot_cert_meta "$service" "after-force-reissue"
-  assert_fingerprint_changed "$service" "before-force-reissue" "after-force-reissue"
+  snapshot_cert_meta "$service" "$after_label"
+  assert_fingerprint_changed "$service" "$before_label" "$after_label"
+}
+
+run_force_reissue_wait_roundtrip() {
+  local service="$1"
+  local agent_config="$2"
+  local hostname_val="$3"
+  local instance_id="$4"
+  log_phase "force-reissue-wait-${service}"
+
+  # Re-bootstrap so the agent config, credentials and initial cert are
+  # fresh, then snapshot the cert to detect the reissue.
+  run_remote_bootstrap "$service" "$agent_config" "$hostname_val" "$instance_id"
+  snapshot_cert_meta "$service" "before-force-reissue"
+
+  # Start the long-lived agent so its fast-poll loop is the consumer of the
+  # KV force-reissue request. It authenticates via the service AppRole from
+  # the [openbao] section that bootstrap wrote into the agent config.
+  local agent_log="$ARTIFACT_DIR/remote-agent-${service}.log"
+  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 &
+  REMOTE_AGENT_PID=$!
+  # Give the daemon a moment to load config and complete its initial login
+  # before the request lands, so the next fast-poll tick observes it.
+  sleep 3
+
+  drive_force_reissue_wait "$service" "before-force-reissue" "after-force-reissue"
+}
+
+# Proves a *running* remote agent stays self-sufficient across control-plane
+# secret_id and trust rotations with NO manual re-bootstrap on the remote
+# host — the whole point of approach C. Deterministic (does not wait out
+# secret_id_ttl): starts the long-lived agent, then confirms its fast-poll
+# loop (1) refreshed the on-disk secret_id file to the freshly rotated
+# credential and (2) re-rendered the agent.toml [trust] pins + ca-bundle with
+# the new anchor, and finally that the loop is still operating by completing a
+# genuine force-reissue --wait round-trip through it (which requires it to be
+# authenticated with the refreshed credential).
+run_selfheal_roundtrip() {
+  local service="$1"
+  local agent_config="$2"
+  log_phase "selfheal-${service}"
+
+  local secret_id_path="$REMOTE_DIR/secrets/services/$service/secret_id"
+  local secret_id_before
+  secret_id_before="$(cat "$secret_id_path")"
+  snapshot_cert_meta "$service" "before-selfheal"
+
+  local agent_log="$ARTIFACT_DIR/selfheal-agent-${service}.log"
+  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 &
+  REMOTE_AGENT_PID=$!
+
+  # Wait for the secret_id + trust polls to apply on disk. The secret_id
+  # file must change to the rotated value and the new trust anchor must
+  # appear in the agent.toml [trust] pins the daemon rewrote.
+  local applied="" attempt
+  for attempt in $(seq 1 "$SELFHEAL_ATTEMPTS"); do
+    if [ "$(cat "$secret_id_path")" != "$secret_id_before" ] \
+      && grep -qi "$TRUST_SYNC_EXTRA_FINGERPRINT" "$agent_config"; then
+      applied="yes"
+      break
+    fi
+    sleep "$SELFHEAL_DELAY_SECS"
+  done
+  if [ -z "$applied" ]; then
+    stop_remote_agent
+    fail "running agent did not self-heal secret_id/trust for ${service} within $((SELFHEAL_ATTEMPTS * SELFHEAL_DELAY_SECS))s"
+  fi
+
+  # The loop kept operating on the refreshed credential: drive a genuine
+  # force-reissue --wait round-trip through the same running agent.
+  drive_force_reissue_wait "$service" "before-selfheal" "after-selfheal"
 }
 
 run_rotation_secret_id() {
@@ -615,8 +682,8 @@ PY
   # The extra trust anchor must be a real cert: issue #622 made
   # `bootroot verify` fail when any fingerprint in
   # `trust.trusted_ca_sha256` is absent from `trust.ca_bundle_path`,
-  # so a random `openssl rand -hex 32` fingerprint trips the post-
-  # rotation verify in `run_verify_pair "after-trust-sync"`.
+  # so a random `openssl rand -hex 32` fingerprint would trip the
+  # post-rotation renewal the self-heal phase drives.
   tmp_dir="$(mktemp -d)"
   openssl req -x509 -nodes -newkey rsa:2048 \
     -keyout "$tmp_dir/key.pem" \
@@ -629,6 +696,9 @@ PY
     | openssl dgst -sha256 -hex \
     | awk '{print $NF}')"
   rm -rf "$tmp_dir"
+  # Export so the self-heal phase can confirm the running agent picked up
+  # this new anchor via fast-poll (no manual re-bootstrap).
+  TRUST_SYNC_EXTRA_FINGERPRINT="$extra_fingerprint"
   ca_bundle_pem="$(cat "$REMOTE_CERTS_DIR/ca-bundle.pem")
 $extra_cert_pem"
   payload="$(jq -n --argjson current "$current_trust_json" --arg extra "$extra_fingerprint" --arg pem "$ca_bundle_pem" '{data:{trusted_ca_sha256:($current + [$extra]),ca_bundle_pem:$pem}}')"
@@ -673,25 +743,17 @@ main() {
 
   run_verify_pair "initial"
 
+  # Approach C: a running remote agent must stay self-sufficient across
+  # secret_id AND trust rotation with NO manual re-bootstrap on the remote.
+  # Rotate both in the control plane, then prove each running agent's
+  # fast-poll loop self-heals (refreshes its own secret_id, re-renders
+  # trust) and keeps operating.
   run_rotation_secret_id
-  log_phase "bootstrap-after-secret-id"
-  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
-  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
-  force_reissue_remote_service "$SERVICE_NAME"
-  force_reissue_remote_service "$SERVICE_NAME_2"
-  run_verify_pair "after-secret-id"
-  assert_fingerprint_changed "$SERVICE_NAME" "initial" "after-secret-id"
-  assert_fingerprint_changed "$SERVICE_NAME_2" "initial" "after-secret-id"
-
   run_rotation_trust_sync
-  log_phase "bootstrap-after-trust-sync"
-  run_remote_bootstrap "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
-  run_remote_bootstrap "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2" "$HOSTNAME_2" "$INSTANCE_ID_2"
-  force_reissue_remote_service "$SERVICE_NAME"
-  force_reissue_remote_service "$SERVICE_NAME_2"
-  run_verify_pair "after-trust-sync"
-  assert_fingerprint_changed "$SERVICE_NAME" "after-secret-id" "after-trust-sync"
-  assert_fingerprint_changed "$SERVICE_NAME_2" "after-secret-id" "after-trust-sync"
+  run_selfheal_roundtrip "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH"
+  run_selfheal_roundtrip "$SERVICE_NAME_2" "$REMOTE_AGENT_CONFIG_PATH_2"
+  assert_fingerprint_changed "$SERVICE_NAME" "initial" "after-selfheal"
+  assert_fingerprint_changed "$SERVICE_NAME_2" "initial" "after-selfheal"
 
   run_rotation_responder_hmac
   log_phase "bootstrap-after-responder-hmac"
@@ -700,8 +762,8 @@ main() {
   force_reissue_remote_service "$SERVICE_NAME"
   force_reissue_remote_service "$SERVICE_NAME_2"
   run_verify_pair "after-responder-hmac"
-  assert_fingerprint_changed "$SERVICE_NAME" "after-trust-sync" "after-responder-hmac"
-  assert_fingerprint_changed "$SERVICE_NAME_2" "after-trust-sync" "after-responder-hmac"
+  assert_fingerprint_changed "$SERVICE_NAME" "after-selfheal" "after-responder-hmac"
+  assert_fingerprint_changed "$SERVICE_NAME_2" "after-selfheal" "after-responder-hmac"
 
   run_force_reissue_wait_roundtrip \
     "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"

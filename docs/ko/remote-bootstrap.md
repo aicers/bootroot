@@ -114,7 +114,7 @@ scp -p \
   "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
 
 # 3. 부트스트랩 전 schema_version 검증
-if ! jq -e '.schema_version == 2' "$ARTIFACT" > /dev/null; then
+if ! jq -e '.schema_version >= 1 and .schema_version <= 4' "$ARTIFACT" > /dev/null; then
   echo "ERROR: $ARTIFACT 의 schema_version이 지원되지 않습니다" >&2
   exit 1
 fi
@@ -210,10 +210,11 @@ ExecStart=/usr/local/bin/bootroot-remote bootstrap \
     - name: schema_version 검증
       ansible.builtin.assert:
         that:
-          - artifact.schema_version == 2
+          - artifact.schema_version >= 1
+          - artifact.schema_version <= 4
         fail_msg: >-
           지원되지 않는 schema_version {{ artifact.schema_version }};
-          이 플레이북은 버전 2만 지원합니다.
+          이 플레이북은 버전 1부터 4까지 지원합니다.
 
     - name: 시크릿 디렉터리 생성
       ansible.builtin.file:
@@ -549,7 +550,7 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 아티팩트는 버전이 지정된 스키마를 따릅니다. 자동화에서는 파싱 전에
 `schema_version`을 확인해야 합니다.
 
-현재 버전: **2**
+현재 버전: **4**
 
 | 필드 | 타입 | 설명 | 사용처 |
 | --- | --- | --- | --- |
@@ -563,9 +564,6 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 | `agent_config_path` | `string` | 원격 호스트의 `agent.toml` 경로 | `--agent-config-path` |
 | `ca_bundle_path` | `string` | 원격 호스트의 CA trust bundle PEM 파일 경로 | `--ca-bundle-path` |
 | `ca_bundle_pem` | `string` | 제어 노드 CA trust 앵커의 인라인 PEM 콘텐츠. 부트스트랩 시 `ca_bundle_path`에 기록됨. `openbao_url`이 HTTPS인 경우 시스템 trust store 대신 이 CA를 TLS trust 앵커로 사용. 공유 프리미티브 — http01 admin 클라이언트(#514)에서도 사용. | 내부 사용 (TLS trust) |
-| `openbao_agent_config_path` | `string` | OpenBao Agent 설정(HCL) 경로 | 내부 사용 |
-| `openbao_agent_template_path` | `string` | OpenBao Agent 템플릿 경로 | 내부 사용 |
-| `openbao_agent_token_path` | `string` | OpenBao Agent 토큰 파일 경로 | 내부 사용 |
 | `agent_email` | `string` | ACME 계정 이메일 | `--agent-email` |
 | `agent_server` | `string` | step-ca ACME 디렉터리 URL (기본값: localhost placeholder) | `--agent-server` |
 | `agent_domain` | `string` | 인증서 SAN 도메인 | `--agent-domain` |
@@ -577,11 +575,14 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 | `post_renew_hooks` | `array` | 갱신 후 훅 항목 (비어있으면 생략). 각 항목은 `command`, `args`, `timeout_secs`, `on_failure` 포함. | `--post-renew-command` 및 관련 플래그 |
 | `wrap_token` | `string?` | 응답 래핑된 `secret_id` 토큰 (`--no-wrap` 사용 시 생략). 민감 정보 — 자격 증명으로 취급하세요. | `bootroot-remote` 언래핑 경로 |
 | `wrap_expires_at` | `string?` | `wrap_token` 만료 시각 (RFC 3339 형식, 래핑 비활성화 시 생략). | `bootroot-remote` 언래핑 오류 분류 |
+| `cert_group_gid` | `u32?` | 발급된 인증서/키 파일을 소유하는 숫자 gid (`--cert-group` 미설정 시 생략). | `--profile-cert-group-gid` |
 
 ### 버전 이력
 
 | 버전 | 변경사항 |
 | --- | --- |
+| 4 | `openbao_agent_config_path` / `openbao_agent_template_path` / `openbao_agent_token_path` 필드 제거. 원격 `bootroot-agent`가 이제 fast-poll 루프를 통해 스스로 인증하고 trust를 렌더링하므로 OpenBao Agent 사이드카 아티팩트가 더 이상 생성되지 않습니다. |
+| 3 | 선택 필드 `cert_group_gid` 추가. |
 | 2 | 필수 필드 `ca_bundle_pem` 추가 (제어 노드 CA 앵커의 인라인 PEM). |
 | 1 | 초기 스키마. |
 

@@ -1215,7 +1215,7 @@ async fn test_app_add_remote_bootstrap_no_wrap_handoff_includes_secret_id() {
 }
 
 fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
-    assert_eq!(bootstrap["schema_version"], 3);
+    assert_eq!(bootstrap["schema_version"], 4);
     assert_eq!(bootstrap["service_name"], "edge-proxy");
     assert_eq!(bootstrap["kv_mount"], "secret");
     assert!(bootstrap["role_id_path"].is_string());
@@ -1224,9 +1224,14 @@ fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
     assert!(bootstrap["agent_config_path"].is_string());
     assert!(bootstrap["ca_bundle_path"].is_string());
     assert!(bootstrap["ca_bundle_pem"].is_string());
-    assert!(bootstrap["openbao_agent_config_path"].is_string());
-    assert!(bootstrap["openbao_agent_template_path"].is_string());
-    assert!(bootstrap["openbao_agent_token_path"].is_string());
+    // schema_version 4 dropped the OpenBao Agent sidecar artifact paths:
+    // the remote agent self-authenticates and renders trust via fast-poll.
+    assert!(
+        bootstrap.get("openbao_agent_config_path").is_none(),
+        "openbao_agent_config_path must be gone from the schema-4 artifact"
+    );
+    assert!(bootstrap.get("openbao_agent_template_path").is_none());
+    assert!(bootstrap.get("openbao_agent_token_path").is_none());
     assert!(
         bootstrap.get("agent_email").is_none(),
         "agent_email must be omitted when no --agent-email override was supplied"

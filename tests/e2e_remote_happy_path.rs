@@ -60,17 +60,20 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     assert!(eab_contents.contains("\"kid\": \"remote-kid\""));
     let agent_contents = fs::read_to_string(&agent_config_path).expect("read agent config");
     let ca_bundle_path = service_dir.join("certs").join("ca-bundle.pem");
+    // schema_version 4: remote bootstrap no longer writes the OpenBao Agent
+    // sidecar artifacts (agent.hcl / agent.toml.ctmpl / token) — the remote
+    // agent self-authenticates and renders trust via the fast-poll loop.
     let openbao_agent_dir = service_dir
         .join("secrets")
         .join("openbao")
         .join("services")
         .join(SERVICE_NAME);
-    let openbao_agent_hcl = openbao_agent_dir.join("agent.hcl");
-    let openbao_agent_template = openbao_agent_dir.join("agent.toml.ctmpl");
-    let openbao_agent_token = openbao_agent_dir.join("token");
-    assert!(openbao_agent_hcl.exists());
-    assert!(openbao_agent_template.exists());
-    assert!(openbao_agent_token.exists());
+    assert!(
+        !openbao_agent_dir.join("agent.hcl").exists(),
+        "remote bootstrap must not write the OpenBao Agent HCL"
+    );
+    assert!(!openbao_agent_dir.join("agent.toml.ctmpl").exists());
+    assert!(!openbao_agent_dir.join("token").exists());
     assert!(agent_contents.contains("http_responder_hmac = \"remote-responder-hmac\""));
     assert!(!agent_contents.contains("verify_certificates"));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
@@ -88,9 +91,6 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     assert_mode(&eab_path, 0o600);
     assert_mode(&agent_config_path, 0o600);
     assert_mode(&ca_bundle_path, 0o600);
-    assert_mode(&openbao_agent_hcl, 0o600);
-    assert_mode(&openbao_agent_template, 0o600);
-    assert_mode(&openbao_agent_token, 0o600);
 
     write_verify_state(&service_dir).expect("write verify state");
     write_cert_for_service(&service_dir).expect("write cert/key");

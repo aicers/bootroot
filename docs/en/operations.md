@@ -137,8 +137,12 @@ fails. Restore the audit configuration and re-run init.
   `Restart=on-failure` and `WantedBy=multi-user.target`.
 - If OpenBao Agent is systemd-managed, split it per service and define
   dependency ordering such as `After=network-online.target`.
-- Run `bootroot-remote bootstrap` once per service at initial setup, then use
-  `bootroot-remote apply-secret-id` after secret_id rotation.
+- Run `bootroot-remote bootstrap` once per service at initial setup. A
+  *running* agent then keeps itself current: its fast-poll loop refreshes
+  its own `secret_id` and re-renders trust from OpenBao KV with no manual
+  step. `bootroot-remote apply-secret-id` is only needed to recover an agent
+  that was offline past its `secret_id_ttl` (its credential already expired,
+  so it cannot self-refresh).
 - Triage flow:
   `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
   -> `bootroot verify --service-name <service>`.
@@ -619,15 +623,22 @@ bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
 ## Remote bootstrap and secret_id handoff operations
 
 For targets added with `--delivery-mode remote-bootstrap`, the operational
-model is one-shot bootstrap followed by explicit secret_id handoff:
+model is one-shot bootstrap; a running agent is then self-sufficient:
 
 1. Run `bootroot-remote bootstrap` once on the service machine after
    `bootroot service add` to apply the initial configuration bundle,
    including trust settings and the CA bundle, before the first
    `bootroot-agent` run.
-2. After `bootroot rotate approle-secret-id` on the control node, run
-   `bootroot-remote apply-secret-id` on the service machine to deliver the
-   new secret_id.
+2. Thereafter the running `bootroot-agent`'s fast-poll loop keeps itself
+   current with no per-host operator action: it refreshes its own
+   `secret_id` from `bootroot/services/<service>/secret_id` (surviving past
+   `secret_id_ttl`) and re-renders the `agent.toml` `[trust]` pins +
+   `ca-bundle.pem` from `bootroot/services/<service>/trust` after a
+   `bootroot rotate approle-secret-id` or a CA/trust rotation on the control
+   node. `bootroot-remote apply-secret-id` and a re-run of `bootroot-remote
+   bootstrap` are recovery paths only — needed when an agent was offline
+   past its `secret_id_ttl` and its credential already expired, so it can no
+   longer self-refresh.
 
 Minimum environment/config checklist:
 
@@ -680,9 +691,20 @@ so propagation latency increases accordingly. See
 for the sidecar vs. host-daemon trade-off.
 
 For `remote-bootstrap` services, the rotated `secret_id` is written to
-the per-service KV path (`bootroot/services/<service>/secret_id`). The
-operator must then run `bootroot-remote apply-secret-id` on the service
-machine to deliver it:
+the per-service KV path (`bootroot/services/<service>/secret_id`). A
+*running* remote `bootroot-agent` needs no operator action: its fast-poll
+loop reads that path with its still-valid credential, writes the rotated
+`secret_id` atomically to the agent's local file, and re-authenticates via
+AppRole on its next re-login — so the loop survives past `secret_id_ttl`
+without any manual step. The same loop reads
+`bootroot/services/<service>/trust` and re-renders the `agent.toml`
+`[trust]` pins + `ca-bundle.pem`, so a CA/trust rotation propagates the
+same way.
+
+`bootroot-remote apply-secret-id` is the **recovery** path, not the steady
+state: it delivers a fresh `secret_id` to an agent that was offline past
+its `secret_id_ttl` (whose credential already expired, so it cannot
+self-refresh):
 
 ```bash
 bootroot-remote apply-secret-id --openbao-url https://<ip>:8200 \
@@ -694,17 +716,12 @@ When OpenBao is served over HTTPS with a private CA — the required
 posture for any non-loopback `--openbao-bind` — pass `--ca-bundle-path`
 pointing at the same CA file `bootroot-remote bootstrap` wrote (the
 agent's `[openbao].ca_bundle_path`); it anchors TLS to that private CA.
-Omit it only when `--openbao-url` is `http://`. This writes the rotated
-`secret_id` to the agent's local file. In the `remote-bootstrap` flow
-the remote `bootroot-agent` re-authenticates to OpenBao itself via
-AppRole in its fast-poll loop, reading `role_id`/`secret_id` from the
-files referenced by `role_id_path`/`secret_id_path` in the `[openbao]`
-block that `bootroot-remote bootstrap` provisions, and picks up the
-rotated `secret_id` on its next AppRole login.
+Omit it only when `--openbao-url` is `http://`.
 
 Note: `bootroot-agent` does not depend on a token file maintained by a
 separate OpenBao Agent in the `remote-bootstrap` flow. It performs the
-AppRole login directly from its fast-poll loop.
+AppRole login directly from its fast-poll loop, and the OpenBao Agent
+sidecar artifacts are no longer generated for `remote-bootstrap` services.
 
 ### Wrap token expiry recovery
 

@@ -116,7 +116,7 @@ scp -p \
   "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
 
 # 3. Validate schema_version before running bootstrap
-if ! jq -e '.schema_version == 2' "$ARTIFACT" > /dev/null; then
+if ! jq -e '.schema_version >= 1 and .schema_version <= 4' "$ARTIFACT" > /dev/null; then
   echo "ERROR: unsupported schema_version in $ARTIFACT" >&2
   exit 1
 fi
@@ -213,10 +213,11 @@ For larger fleets with existing configuration management.
     - name: Validate schema_version
       ansible.builtin.assert:
         that:
-          - artifact.schema_version == 2
+          - artifact.schema_version >= 1
+          - artifact.schema_version <= 4
         fail_msg: >-
           Unsupported schema_version {{ artifact.schema_version }};
-          this playbook supports version 2 only.
+          this playbook supports versions 1 through 4.
 
     - name: Ensure secrets directory
       ansible.builtin.file:
@@ -566,7 +567,7 @@ The JSON artifact written to
 `secrets/remote-bootstrap/services/<service>/bootstrap.json` follows a
 versioned schema. Automation should check `schema_version` before parsing.
 
-Current version: **2**
+Current version: **4**
 
 | Field | Type | Description | Consumed by |
 | --- | --- | --- | --- |
@@ -580,9 +581,6 @@ Current version: **2**
 | `agent_config_path` | `string` | Path to `agent.toml` on the remote host | `--agent-config-path` |
 | `ca_bundle_path` | `string` | Path to CA trust bundle PEM file on the remote host | `--ca-bundle-path` |
 | `ca_bundle_pem` | `string` | Inline PEM content of the control-plane CA trust anchor. Written to `ca_bundle_path` during bootstrap. When `openbao_url` uses HTTPS, this CA is used as the TLS trust anchor instead of the system trust store. Shared primitive — also consumed by the http01 admin client (#514). | Internal (TLS trust) |
-| `openbao_agent_config_path` | `string` | Path to OpenBao Agent config (HCL) | Internal |
-| `openbao_agent_template_path` | `string` | Path to OpenBao Agent template | Internal |
-| `openbao_agent_token_path` | `string` | Path to OpenBao Agent token file | Internal |
 | `agent_email` | `string` | ACME account email | `--agent-email` |
 | `agent_server` | `string` | step-ca ACME directory URL (localhost placeholder by default) | `--agent-server` |
 | `agent_domain` | `string` | Domain for certificate SAN | `--agent-domain` |
@@ -594,11 +592,14 @@ Current version: **2**
 | `post_renew_hooks` | `array` | Post-renew hook entries (omitted when empty). Each entry has `command`, `args`, `timeout_secs`, `on_failure`. | `--post-renew-command` and related flags |
 | `wrap_token` | `string?` | Response-wrapped `secret_id` token (omitted when wrapping is disabled via `--no-wrap`). Sensitive — treat as a credential. | `bootroot-remote` unwrap path |
 | `wrap_expires_at` | `string?` | RFC 3339 timestamp when `wrap_token` expires (omitted when wrapping is disabled). | `bootroot-remote` unwrap error classification |
+| `cert_group_gid` | `u32?` | Numeric gid owning the issued cert/key files (omitted when `--cert-group` is unset). | `--profile-cert-group-gid` |
 
 ### Version history
 
 | Version | Change |
 | --- | --- |
+| 4 | Removed the `openbao_agent_config_path` / `openbao_agent_template_path` / `openbao_agent_token_path` fields. The remote `bootroot-agent` now self-authenticates and renders trust via its fast-poll loop, so the OpenBao Agent sidecar artifacts are no longer generated. |
+| 3 | Added optional `cert_group_gid` field. |
 | 2 | Added required `ca_bundle_pem` field (inline PEM of the control-plane CA anchor). |
 | 1 | Initial schema. |
 

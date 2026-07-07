@@ -119,6 +119,7 @@ pub(crate) async fn run_daemon(
         let semaphore_for_fast = Arc::clone(&semaphore);
         let profile_locks_for_fast = Arc::clone(&profile_locks);
         let shutdown_rx_fast = shutdown_rx.clone();
+        let config_path_for_fast = runtime.config_path.clone();
         let runtime_for_renew = runtime.clone();
         handles.push(tokio::spawn(async move {
             let renew = move |profile: config::DaemonProfileSettings,
@@ -142,6 +143,7 @@ pub(crate) async fn run_daemon(
             };
             fast_poll::run_fast_poll_loop(
                 settings_for_loop,
+                config_path_for_fast,
                 default_eab_for_fast,
                 semaphore_for_fast,
                 shutdown_rx_fast,
