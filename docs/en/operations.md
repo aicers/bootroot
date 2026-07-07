@@ -143,6 +143,17 @@ fails. Restore the audit configuration and re-run init.
   step. `bootroot-remote apply-secret-id` is only needed to recover an agent
   that was offline past its `secret_id_ttl` (its credential already expired,
   so it cannot self-refresh).
+- **Multiple distinct services on one host**: use one `bootroot-agent`
+  plus one agent config per service, each with its own `[openbao]`
+  credential and its own unique `state_path`. Distinct services cannot
+  share one config — the `[openbao]` section holds a single AppRole
+  credential and the fast-poll loop logs in once and reads every
+  service's KV with that one token, so cross-service reads return `403`
+  under per-service AppRole policies. Bootstrap keys the provisioned
+  `state_path` basename on the service name so per-service configs may
+  share a directory without their fast-poll state files colliding; it
+  warns if two sibling configs still resolve to the same `state_path`.
+  See `docs/en/remote-bootstrap.md`.
 - Triage flow:
   `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
   -> `bootroot verify --service-name <service>`.

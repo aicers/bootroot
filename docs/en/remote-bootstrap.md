@@ -392,7 +392,7 @@ role_id_path = "/etc/bootroot/role_id"
 secret_id_path = "/etc/bootroot/secret_id"
 ca_bundle_path = "/etc/bootroot/ca-bundle.pem"   # required for https://
 fast_poll_interval = "30s"                        # optional; default 30s
-state_path = "/etc/bootroot/bootroot-agent-state.json" # provisioned by bootstrap
+state_path = "/etc/bootroot/bootroot-agent-state-giganto.json" # by bootstrap
 ```
 
 `state_path` holds the agent's `last_reissue_seen_version`,
@@ -412,6 +412,19 @@ additionally rejects a relative `state_path` (including the case
 where it is omitted entirely and falls through to an in-tree
 default), so a misconfiguration is caught at `bootroot-agent`
 startup instead of silently running with a fragile state file.
+
+The provisioned basename is keyed by `service_name`
+(`bootroot-agent-state-<service_name>.json`), so per-service agent
+configs sharing one directory resolve to distinct state files instead
+of contending over a single shared state. Existing deployments already
+carry an absolute `state_path`, so a bootstrap rerun preserves the old
+name unchanged — only freshly provisioned configs get the service-keyed
+basename. If bootstrap detects two sibling configs in the target
+directory that resolve to the *same* absolute `state_path` (e.g.
+hand-written or legacy configs), it prints a warning: two
+`bootroot-agent` processes sharing one state file race on it and each
+periodically reverts the other's fast-poll progress. See
+[Running multiple distinct services on one host](#running-multiple-distinct-services-on-one-host).
 
 This mechanism uses the same AppRole credentials the remote agent
 already has, adds one KV read per service per `fast_poll_interval`, and
@@ -452,6 +465,39 @@ without an acknowledgement after the certificate has actually been
 rotated. Pending entries are dropped automatically when a newer
 reissue request supersedes them or when the request is removed from
 KV entirely.
+
+## Running multiple distinct services on one host
+
+A single remote host can run several **distinct** services, but they
+cannot share one agent config. The supported layout is **one
+`bootroot-agent` process plus one agent config per service**, each with
+its own `[openbao]` credential and its own unique `state_path`.
+
+Distinct services cannot share one config for two reasons:
+
+- The `[openbao]` section carries a **single** AppRole credential
+  (`role_id_path` / `secret_id_path`). Bootstrapping a second service
+  into the same config overwrites the first service's credential. The
+  fast-poll loop logs in **once** with that one credential and then reads
+  every enumerated service's KV with the resulting token. Because each
+  service's AppRole policy is scoped to `bootroot/services/<service>/*`,
+  one service's token gets `403 permission denied` on another service's
+  trust / secret_id / reissue KV paths.
+- Multiple `[[profiles]]` in one config are supported only for *instances
+  of the same service* (see above), not for distinct services.
+
+Run `bootroot-remote bootstrap` once per service, targeting a separate
+`--agent-config` for each. Give each config a distinct `state_path`:
+bootstrap does this automatically for freshly provisioned configs by
+keying the basename on `service_name`
+(`bootroot-agent-state-<service_name>.json`), so per-service configs may
+safely share one directory. If you place configs in a shared directory
+with hand-written or legacy `state_path` values, make sure no two
+resolve to the same file — bootstrap warns when it detects a collision,
+because two agents sharing one `state_path` race on the fast-poll state
+and each periodically reverts the other's progress (version-gating
+thrash, lost reissue-completion tracking). Placing each service's config
+in its own directory also avoids the collision.
 
 ## Idempotent service add rerun
 
