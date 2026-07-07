@@ -141,6 +141,7 @@ pub(crate) struct Strings {
     pub(crate) error_prompt_write_failed: &'static str,
     pub(crate) error_prompt_flush_failed: &'static str,
     pub(crate) error_prompt_read_failed: &'static str,
+    pub(crate) error_prompt_eof: &'static str,
     pub(crate) error_prompt_error_write_failed: &'static str,
     pub(crate) error_file_missing: &'static str,
     pub(crate) error_read_file_failed: &'static str,
