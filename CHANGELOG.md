@@ -62,6 +62,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed the interactive OpenBao root-token prompt spinning in a tight
+  infinite loop, printing `OpenBao root token: Value is required`
+  without bound, when a command resolved auth through the prompt and
+  stdin was not a TTY (closed, piped, or a backgrounded/scheduled
+  process with no controlling terminal). `Prompt::prompt_text` now
+  treats a `read_line` return of `0` (EOF) as a distinct error instead
+  of an empty string, so `prompt_with_validation` unwinds on the first
+  EOF rather than re-prompting forever; a blank-but-non-EOF line still
+  resolves to the offered default. `resolve_runtime_auth` additionally
+  guards the root-token prompt with `stdin().is_terminal()` in the
+  `auto` and `root` auth modes, returning a single actionable error
+  that names `--root-token` / `--root-token-file` /
+  `OPENBAO_ROOT_TOKEN` (and AppRole credentials for `auto`) instead of
+  hanging. The `root` mode's "OpenBao root token is required" message
+  was upgraded to name those same inputs.
 - Fixed `bootroot rotate force-reissue --wait` timing out against
   `remote-bootstrap` services even though the certificate was reissued.
   The remote agent's fast-poll loop applied the reissue correctly but

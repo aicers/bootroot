@@ -31,9 +31,13 @@ impl<'a> Prompt<'a> {
         self.output
             .flush()
             .with_context(|| self.messages.error_prompt_flush_failed())?;
-        self.input
+        let read = self
+            .input
             .read_line(&mut line)
             .with_context(|| self.messages.error_prompt_read_failed())?;
+        if read == 0 {
+            anyhow::bail!(self.messages.error_prompt_eof());
+        }
         let trimmed = line.trim();
         if trimmed.is_empty()
             && let Some(value) = default
@@ -96,5 +100,33 @@ mod tests {
         let mut prompt = Prompt::new(&mut input, &mut output, &messages);
         let value = prompt.prompt_text("Label", Some("default")).unwrap();
         assert_eq!(value, "value");
+    }
+
+    #[test]
+    fn prompt_text_errors_on_eof() {
+        let mut input = Cursor::new("");
+        let mut output = Vec::new();
+        let messages = Messages::new("en").unwrap();
+        let mut prompt = Prompt::new(&mut input, &mut output, &messages);
+        let err = prompt
+            .prompt_text("Label", Some("default"))
+            .expect_err("EOF must error");
+        assert_eq!(err.to_string(), messages.error_prompt_eof());
+    }
+
+    #[test]
+    fn prompt_with_validation_errors_on_eof_without_looping() {
+        let mut input = Cursor::new("");
+        let mut output = Vec::new();
+        let messages = Messages::new("en").unwrap();
+        let mut prompt = Prompt::new(&mut input, &mut output, &messages);
+        let result: Result<String> = prompt.prompt_with_validation("Label", None, |value| {
+            if value.trim().is_empty() {
+                anyhow::bail!(messages.error_value_required());
+            }
+            Ok(value.trim().to_string())
+        });
+        let err = result.expect_err("EOF must error instead of looping");
+        assert_eq!(err.to_string(), messages.error_prompt_eof());
     }
 }

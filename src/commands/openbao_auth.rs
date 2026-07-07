@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -9,6 +10,9 @@ use crate::cli::prompt::Prompt;
 use crate::i18n::Messages;
 
 const OPENBAO_ROOT_TOKEN_ENV: &str = "OPENBAO_ROOT_TOKEN";
+const OPENBAO_AUTH_NOT_RESOLVED: &str = "OpenBao auth not resolved: provide --root-token, --root-token-file, \
+     OPENBAO_ROOT_TOKEN env, or AppRole credentials \
+     (--approle-role-id/--approle-secret-id or *_FILE)";
 
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeAuthResolved {
@@ -19,6 +23,24 @@ pub(crate) enum RuntimeAuthResolved {
 pub(crate) fn resolve_runtime_auth(
     args: &RuntimeAuthArgs,
     allow_root_prompt: bool,
+    messages: &Messages,
+) -> Result<RuntimeAuthResolved> {
+    resolve_runtime_auth_inner(
+        args,
+        allow_root_prompt,
+        std::io::stdin().is_terminal(),
+        messages,
+    )
+}
+
+/// Resolves runtime auth, deciding whether the interactive root-token prompt is
+/// reachable from `stdin_is_tty`.  Splitting the TTY check out lets tests assert
+/// the non-interactive error paths without a real terminal and without hitting
+/// the blocking prompt.
+fn resolve_runtime_auth_inner(
+    args: &RuntimeAuthArgs,
+    allow_root_prompt: bool,
+    stdin_is_tty: bool,
     messages: &Messages,
 ) -> Result<RuntimeAuthResolved> {
     let root_token = resolve_root_token(args)?;
@@ -41,20 +63,16 @@ pub(crate) fn resolve_runtime_auth(
             if let (Some(role_id), Some(secret_id)) = (approle_role_id, approle_secret_id) {
                 return Ok(RuntimeAuthResolved::AppRole { role_id, secret_id });
             }
-            if allow_root_prompt {
+            if allow_root_prompt && stdin_is_tty {
                 return prompt_root_token(messages).map(RuntimeAuthResolved::RootToken);
             }
-            anyhow::bail!(
-                "OpenBao auth not resolved: provide --root-token, --root-token-file, \
-                 OPENBAO_ROOT_TOKEN env, or AppRole credentials \
-                 (--approle-role-id/--approle-secret-id or *_FILE)"
-            );
+            anyhow::bail!(OPENBAO_AUTH_NOT_RESOLVED);
         }
         AuthMode::Root => {
             if let Some(root_token) = root_token {
                 return Ok(RuntimeAuthResolved::RootToken(root_token));
             }
-            if allow_root_prompt {
+            if allow_root_prompt && stdin_is_tty {
                 return prompt_root_token(messages).map(RuntimeAuthResolved::RootToken);
             }
             anyhow::bail!(messages.error_openbao_root_token_required());
@@ -364,6 +382,38 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("world-readable"), "msg = {msg}");
         assert!(msg.contains("chmod 0600"), "msg = {msg}");
+    }
+
+    #[test]
+    fn auto_mode_non_tty_bails_actionable_without_prompting() {
+        let _lock = env_lock();
+        let _env = ScopedRootTokenEnv::set(None);
+        let messages = Messages::new("en").expect("messages");
+        let args = args_with(None, None);
+        let err = resolve_runtime_auth_inner(&args, true, false, &messages)
+            .expect_err("non-tty must bail instead of prompting");
+        let msg = err.to_string();
+        assert!(msg.contains("--root-token"), "msg = {msg}");
+        assert!(msg.contains("AppRole"), "msg = {msg}");
+    }
+
+    #[test]
+    fn root_mode_non_tty_bails_actionable_without_prompting() {
+        let _lock = env_lock();
+        let _env = ScopedRootTokenEnv::set(None);
+        let messages = Messages::new("en").expect("messages");
+        let mut args = args_with(None, None);
+        args.auth_mode = AuthMode::Root;
+        let err = resolve_runtime_auth_inner(&args, true, false, &messages)
+            .expect_err("non-tty must bail instead of prompting");
+        assert_eq!(
+            err.to_string(),
+            messages.error_openbao_root_token_required()
+        );
+        assert!(
+            err.to_string().contains("--root-token"),
+            "root-mode error should name the concrete inputs: {err}"
+        );
     }
 
     #[test]

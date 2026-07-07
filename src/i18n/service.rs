@@ -147,6 +147,10 @@ impl Messages {
         self.strings().error_prompt_read_failed
     }
 
+    pub(crate) fn error_prompt_eof(&self) -> &'static str {
+        self.strings().error_prompt_eof
+    }
+
     pub(crate) fn error_prompt_error_write_failed(&self) -> &'static str {
         self.strings().error_prompt_error_write_failed
     }
