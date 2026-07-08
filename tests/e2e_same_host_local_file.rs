@@ -305,6 +305,71 @@ async fn test_same_host_secret_id_rotation_needs_no_process_signal() {
     assert_eq!(role_id, ROLE_ID);
 }
 
+/// Issue #691 acceptance: containerized consumer apps stay supported
+/// with the daemon-only agent. A local `service add` with
+/// `--reload-style docker-restart --reload-target <container>` must
+/// keep cert delivery on host paths a consumer container can
+/// bind-mount, and persist the `docker restart <container>` post-renew
+/// hook in the managed profile so the host daemon restarts the
+/// consumer after each renewal.
+#[tokio::test]
+async fn test_same_host_containerized_consumer_docker_restart_hook() {
+    let temp = tempdir().expect("create tempdir");
+    let server = MockServer::start().await;
+    stub_service_add_openbao(&server).await;
+
+    write_state_file(temp.path(), &server.uri()).expect("write state");
+    let files = init_service_files(temp.path()).expect("init service files");
+    let add_stdout = run_service_add_local_with_extra_args(
+        temp.path(),
+        &files,
+        &[
+            "--reload-style",
+            "docker-restart",
+            "--reload-target",
+            "edge-proxy-container",
+        ],
+    )
+    .expect("service add local with docker-restart reload style");
+
+    assert!(
+        add_stdout.contains("- post-renew hook: docker restart edge-proxy-container"),
+        "docker-restart preset must resolve to a docker restart hook: {add_stdout}"
+    );
+
+    // The hook must be persisted in agent.toml so the host-daemon
+    // bootroot-agent actually restarts the consumer container after each
+    // renewal — not just echoed in the summary.
+    let agent_contents = fs::read_to_string(&files.agent_config).expect("read agent.toml");
+    assert!(
+        agent_contents.contains("[[profiles.hooks.post_renew.success]]"),
+        "agent.toml must carry the persisted post-renew hook: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("command = \"docker\""),
+        "agent.toml hook must run docker: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("args = [\"restart\", \"edge-proxy-container\"]"),
+        "agent.toml hook must restart the consumer container: {agent_contents}"
+    );
+
+    // Cert delivery stays on host paths: the profile's cert/key point at
+    // the host directory the consumer container bind-mounts, and the CA
+    // bundle is world-readable for a non-root consumer.
+    let cert_path = files.cert_path.display().to_string();
+    let key_path = files.key_path.display().to_string();
+    assert!(
+        agent_contents.contains(&format!("cert = \"{cert_path}\"")),
+        "profile cert must stay a bind-mountable host path: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains(&format!("key = \"{key_path}\"")),
+        "profile key must stay a bind-mountable host path: {agent_contents}"
+    );
+    assert_mode(&files.ca_bundle_path, 0o644);
+}
+
 struct ServicePaths {
     agent_config: PathBuf,
     cert_path: PathBuf,
@@ -345,6 +410,14 @@ fn run_service_add_local(
     files: &ServicePaths,
 ) -> anyhow::Result<String> {
     let _ = openbao_url;
+    run_service_add_local_with_extra_args(root, files, &[])
+}
+
+fn run_service_add_local_with_extra_args(
+    root: &Path,
+    files: &ServicePaths,
+    extra_args: &[&str],
+) -> anyhow::Result<String> {
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(root)
         .args([
@@ -373,6 +446,7 @@ fn run_service_add_local(
             "--approle-secret-id",
             RUNTIME_SERVICE_ADD_SECRET_ID,
         ])
+        .args(extra_args)
         .output()
         .context("run service add")?;
     if !output.status.success() {
