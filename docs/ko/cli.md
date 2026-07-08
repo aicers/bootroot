@@ -1236,9 +1236,9 @@ consul-template은 에이전트 프로세스가 재시작될 때까지 이전에
 - `--delivery-mode remote-bootstrap` 서비스: 운영자 안내 메시지만
   출력합니다. 원격 호스트에는 OpenBao Agent 사이드카가 실행되지
   않습니다(이슈 #680에서 `bootroot-agent` self-auth fast-poll 모델로
-  이동). trust와 secret_id는 fast-poll로 자가 치유되지만 EAB 같은
-  부트스트랩 시점 KV 설정은 fast-poll 대상이 아니므로, 원격 호스트에서
-  `bootroot-remote bootstrap`을 다시 실행해 KV에서 다시 받아와야 합니다.
+  이동). trust, secret_id, HTTP responder HMAC, EAB 모두 `bootroot-agent`
+  fast-poll 루프를 통해 `fast_poll_interval` 이내에 자가 치유되므로,
+  재부트스트랩이 필요하지 않습니다.
 
 ### 실패 조건
 

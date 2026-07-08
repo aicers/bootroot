@@ -106,27 +106,31 @@ pub(super) async fn write_secret_file(path: &Path, contents: &str) -> Result<App
     Ok(ApplyStatus::Applied)
 }
 
+/// Writes the service `eab.json` via the shared library writer
+/// ([`bootroot::eab::write_eab_file`]) so the bootstrap producer and the
+/// fast-poll consumer cannot drift on the on-disk shape. Maps the writer's
+/// changed/unchanged bool onto the bootstrap [`ApplyStatus`].
 pub(super) async fn write_eab_file(path: &Path, kid: &str, hmac: &str) -> Result<ApplyStatus> {
-    let payload = serde_json::to_string_pretty(&serde_json::json!({
-        "kid": kid,
-        "hmac": hmac
-    }))?;
-    write_secret_file(path, &payload).await
+    let changed = bootroot::eab::write_eab_file(path, kid, hmac).await?;
+    Ok(if changed {
+        ApplyStatus::Applied
+    } else {
+        ApplyStatus::Unchanged
+    })
 }
 
 /// Removes a stale EAB file that was written by a previous bootstrap so
 /// that `bootroot-agent --eab-file` cannot pick up credentials the
-/// operator has since cleared from `OpenBao`. Returns [`ApplyStatus::Applied`]
-/// when the file existed and was removed and [`ApplyStatus::Skipped`] when
-/// the file was already absent.
+/// operator has since cleared from `OpenBao`. Delegates to the shared library
+/// remover and maps its removed/absent bool onto [`ApplyStatus::Applied`] /
+/// [`ApplyStatus::Skipped`].
 pub(super) async fn remove_eab_file(path: &Path) -> Result<ApplyStatus> {
-    match fs::remove_file(path).await {
-        Ok(()) => Ok(ApplyStatus::Applied),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ApplyStatus::Skipped),
-        Err(err) => {
-            Err(err).with_context(|| format!("Failed to remove stale EAB file: {}", path.display()))
-        }
-    }
+    let removed = bootroot::eab::remove_eab_file(path).await?;
+    Ok(if removed {
+        ApplyStatus::Applied
+    } else {
+        ApplyStatus::Skipped
+    })
 }
 
 #[derive(Debug)]

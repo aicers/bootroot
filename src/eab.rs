@@ -1,15 +1,114 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tokio::sync::watch;
 use tracing::warn;
+
+use crate::fs_util;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EabCredentials {
     pub kid: String,
     #[serde(alias = "key")]
     pub hmac: String,
+}
+
+/// Live, shared view of the daemon's `default_eab`.
+///
+/// `default_eab` is read at issuance time by both the periodic check loop and
+/// the fast-poll force-reissue path. Backing it with a `watch` channel lets
+/// the remote fast-poll loop update the value in place when it observes a
+/// newer `eab` KV version, so a running renewal reflects the change without a
+/// restart. Cloning shares the same underlying channel.
+#[derive(Clone)]
+pub struct SharedEab {
+    rx: watch::Receiver<Option<EabCredentials>>,
+}
+
+impl SharedEab {
+    /// Wraps a `watch` receiver as a shared, live-readable EAB view.
+    #[must_use]
+    pub fn from_receiver(rx: watch::Receiver<Option<EabCredentials>>) -> Self {
+        Self { rx }
+    }
+
+    /// Returns the current `default_eab` value, cloned for the caller.
+    #[must_use]
+    pub fn current(&self) -> Option<EabCredentials> {
+        self.rx.borrow().clone()
+    }
+}
+
+/// Writes EAB credentials to `path` as pretty `{ "kid", "hmac" }` JSON at
+/// key-file permissions (`0o600`), creating the parent secrets directory when
+/// needed. Returns `true` when the on-disk bytes changed and `false` when the
+/// file already held identical content.
+///
+/// Shared by `bootroot-remote bootstrap` and the remote fast-poll loop so the
+/// producer and the `--eab-file` consumer cannot drift on the on-disk shape.
+///
+/// # Errors
+///
+/// Returns an error when the parent directory, the existing file, or the write
+/// cannot be created, read, or written.
+pub async fn write_eab_file(path: &Path, kid: &str, hmac: &str) -> anyhow::Result<bool> {
+    let payload = serde_json::to_string_pretty(&serde_json::json!({
+        "kid": kid,
+        "hmac": hmac,
+    }))
+    .context("Failed to serialize EAB credentials")?;
+    write_key_file(path, &payload).await
+}
+
+/// Writes `contents` (newline-terminated) to a `0o600` key file idempotently,
+/// mirroring the bootstrap `write_secret_file` behaviour so a first-sighting
+/// re-write from the fast-poll loop is byte-identical to the bootstrap writer.
+async fn write_key_file(path: &Path, contents: &str) -> anyhow::Result<bool> {
+    if let Some(parent) = path.parent() {
+        fs_util::ensure_secrets_dir(parent).await?;
+    }
+    let next = if contents.ends_with('\n') {
+        contents.to_string()
+    } else {
+        format!("{contents}\n")
+    };
+    let current = match fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Failed to read existing EAB file: {}", path.display()));
+        }
+    };
+    if current == next {
+        fs_util::set_key_permissions(path).await?;
+        return Ok(false);
+    }
+    fs::write(path, next)
+        .await
+        .with_context(|| format!("Failed to write EAB file: {}", path.display()))?;
+    fs_util::set_key_permissions(path).await?;
+    Ok(true)
+}
+
+/// Removes a stale `eab.json` written by a previous bootstrap or fast-poll
+/// apply so that `bootroot-agent --eab-file` cannot pick up credentials the
+/// operator has since cleared from `OpenBao`. Returns `true` when a file
+/// existed and was removed and `false` when it was already absent.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be removed.
+pub async fn remove_eab_file(path: &Path) -> anyhow::Result<bool> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to remove stale EAB file: {}", path.display()))
+        }
+    }
 }
 
 /// Loads EAB credentials from CLI arguments or a JSON file.
@@ -119,5 +218,58 @@ mod tests {
         let result = load_credentials(None, None, None).await;
         let creds = result.unwrap();
         assert!(creds.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_eab_file_roundtrips_through_load_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets").join("eab.json");
+
+        let changed = write_eab_file(&path, "kid-1", "hmac-1").await.unwrap();
+        assert!(changed);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let creds = load_credentials(None, None, Some(path.clone()))
+            .await
+            .unwrap()
+            .expect("credentials present");
+        assert_eq!(creds.kid, "kid-1");
+        assert_eq!(creds.hmac, "hmac-1");
+
+        // A re-write of the identical content reports no change.
+        let changed_again = write_eab_file(&path, "kid-1", "hmac-1").await.unwrap();
+        assert!(!changed_again);
+    }
+
+    #[tokio::test]
+    async fn remove_eab_file_reports_removed_then_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eab.json");
+        write_eab_file(&path, "kid-1", "hmac-1").await.unwrap();
+
+        assert!(remove_eab_file(&path).await.unwrap());
+        assert!(!remove_eab_file(&path).await.unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn shared_eab_reflects_sender_updates() {
+        let (tx, rx) = watch::channel(None);
+        let shared = SharedEab::from_receiver(rx);
+        assert!(shared.current().is_none());
+
+        tx.send_replace(Some(EabCredentials {
+            kid: "kid-1".to_string(),
+            hmac: "hmac-1".to_string(),
+        }));
+        let current = shared.current().expect("value present after update");
+        assert_eq!(current.kid, "kid-1");
+
+        tx.send_replace(None);
+        assert!(shared.current().is_none());
     }
 }

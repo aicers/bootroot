@@ -644,6 +644,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `apply-secret-id` and re-running `bootroot-remote bootstrap` remain the
   recovery paths for an agent that went offline past its
   `secret_id_ttl`.
+- Extended the remote `bootroot-agent` fast-poll loop to refresh the
+  per-service ACME **EAB** (`bootroot/services/<service>/eab`) from
+  OpenBao KV, completing the set of per-service dynamic secrets the loop
+  self-heals alongside trust, `secret_id`, and the HTTP responder HMAC.
+  Unlike the others, remote EAB does not live in `agent.toml`; its
+  canonical representation is the standalone `eab.json` (`--eab-file`)
+  plus the in-memory `default_eab`. A version-gated **EAB poll** applies a
+  new KV version at most once: a populated `{ "kid", "hmac" }` payload
+  rewrites `eab.json` at `0o600` and publishes the value into a shared
+  `watch`-backed `default_eab`, while the explicit clear shape
+  `{ "kid": "", "hmac": "" }` removes `eab.json` and clears `default_eab`.
+  Both the periodic-check and force-reissue renewal paths now read this
+  live value, so a running agent's next renewal binds with the new EAB
+  (or without one) without a restart or re-bootstrap; the on-disk write
+  precedes the in-memory update so a restart reloads a consistent value.
+  Partial or ambiguous payloads (one of `kid`/`hmac` empty) are rejected
+  and retried on the next tick rather than recorded as applied. The
+  refresh is scoped to the `--eab-file` artifact only: when EAB was pinned
+  via explicit `--eab-kid`/`--eab-hmac` CLI values the poll is a no-op and
+  never overrides the operator's out-of-band value. `rotate eab-clear` on
+  a `remote-bootstrap` service no longer requires a manual re-bootstrap to
+  reach the running agent.
 - Self-rotation for the rotate AppRole credentials
   (`bootroot-runtime-rotate-role`, `bootroot-infra-rotate-role`). Each
   rotate policy now grants `update` on its own
