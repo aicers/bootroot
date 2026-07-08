@@ -209,7 +209,11 @@ Notes:
   cert/key) must be readable — and, for the fast-poll-refreshed files,
   writable — by the unit's user. With `DynamicUser=yes`, prefer
   granting group access (e.g. via `--cert-group` and a shared group on
-  the secrets directory) over widening file modes.
+  the secrets directory) over widening file modes. Ownership you apply
+  this way survives rotation: `bootroot rotate approle-secret-id`
+  rewrites `secret_id` atomically while preserving the file's existing
+  owner/group, so a root-run scheduled rotation does not lock the
+  non-root daemon out of the credential.
 - Post-renew hooks run inside this daemon process, so the unit's
   privileges bound what hooks can do. See
   [Containerized consumer applications](#containerized-consumer-applications)

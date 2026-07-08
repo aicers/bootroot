@@ -74,6 +74,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate approle-secret-id` re-owning the service
+  `secret_id` file to the rotating CLI user. The rewrite staged a fresh
+  `0600` temp file and renamed it over the destination without
+  preserving the existing uid/gid, so a root-run scheduled rotation
+  replaced an operator-chowned, daemon-readable credential with a
+  root-owned file — the non-root `bootroot-agent` host daemon then
+  failed its next AppRole re-login and the fast-poll loop stopped
+  carrying trust/HMAC/EAB updates. The rewrite now goes through the
+  ownership-preserving atomic writer, so operator-applied owner/group
+  on `secret_id` survives rotation.
 - Fixed `bootroot-remote bootstrap` provisioning a non-unique fast-poll
   `state_path` for distinct services on one host. The auto-provisioned
   basename was a fixed `bootroot-agent-state.json`, so two per-service

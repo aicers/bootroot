@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -56,6 +56,16 @@ pub(super) async fn write_secret_file(
     Ok(())
 }
 
+/// Rewrites a `secret_id` file atomically via
+/// [`fs_util::atomic_write`]: same-directory temp file, `0600`, the
+/// destination's existing uid/gid re-applied, then a rename into
+/// place. Ownership preservation is load-bearing for the local-file
+/// service path: the local `bootroot-agent` runs as a hardened
+/// non-root host daemon and re-reads this file on every `AppRole`
+/// re-login, so a root-run `rotate approle-secret-id` must not
+/// replace an operator-chowned, daemon-readable file with a
+/// root-owned `0600` one the daemon can no longer read — that would
+/// kill the fast-poll loop on its next re-login.
 pub(super) async fn write_secret_id_atomic(
     path: &Path,
     value: &str,
@@ -68,28 +78,10 @@ pub(super) async fn write_secret_id_atomic(
         anyhow::bail!(messages.error_parent_not_found(&path.display().to_string()));
     }
     fs_util::ensure_secrets_dir(parent).await?;
-    let temp_path = temp_secret_path(path);
-    tokio::fs::write(&temp_path, value)
-        .await
-        .with_context(|| messages.error_write_file_failed(&temp_path.display().to_string()))?;
-    fs_util::set_key_permissions(&temp_path).await?;
-    tokio::fs::rename(&temp_path, path)
+    fs_util::atomic_write(path, value.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
-}
-
-pub(super) fn temp_secret_path(path: &Path) -> PathBuf {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let file_name = path.file_name().map_or_else(
-        || "secret_id".to_string(),
-        |name| name.to_string_lossy().to_string(),
-    );
-    let temp_name = format!("{file_name}.tmp.{pid}.{nanos}");
-    path.with_file_name(temp_name)
 }
 
 pub(super) fn restart_container(container: &str, messages: &Messages) -> Result<()> {
@@ -230,12 +222,47 @@ mod tests {
         assert!(err.contains("Parent directory not found"));
     }
 
-    #[test]
-    fn temp_secret_path_adds_suffix() {
-        let path = Path::new("/tmp/secret_id");
-        let temp = temp_secret_path(path);
-        let name = temp.file_name().expect("filename").to_string_lossy();
-        assert!(name.starts_with("secret_id.tmp."));
+    /// A root-run `rotate approle-secret-id` must not strip the
+    /// ownership an operator applied so the non-root host daemon can
+    /// read the credential — otherwise the agent's next `AppRole`
+    /// re-login fails and the fast-poll loop dies. Requires a
+    /// supplementary gid (single-gid CI runners skip; the
+    /// e2e-extended job provisions one and keeps coverage).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_secret_id_atomic_preserves_existing_owner_on_rewrite() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().expect("tempdir");
+        let secret_path = dir.path().join("app").join("secret_id");
+        let messages = test_messages();
+
+        write_secret_id_atomic(&secret_path, "old", &messages)
+            .await
+            .expect("initial write");
+        std::os::unix::fs::chown(&secret_path, None, Some(gid))
+            .expect("test process must be able to chgrp to a supplementary gid");
+        let pre_uid = std::fs::metadata(&secret_path).expect("metadata").uid();
+
+        write_secret_id_atomic(&secret_path, "new", &messages)
+            .await
+            .expect("rewrite");
+
+        let meta = std::fs::metadata(&secret_path).expect("metadata");
+        assert_eq!(meta.gid(), gid, "rewrite must preserve the existing gid");
+        assert_eq!(
+            meta.uid(),
+            pre_uid,
+            "rewrite must preserve the existing uid"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let contents = tokio::fs::read_to_string(&secret_path)
+            .await
+            .expect("read secret_id");
+        assert_eq!(contents, "new");
     }
 
     #[tokio::test]
