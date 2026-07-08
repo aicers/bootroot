@@ -27,7 +27,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - The fast-poll and `bootroot-remote bootstrap` OpenBao TLS clients now
     pin to `trusted_ca_sha256`; the post-trust-apply client rebuild reads
     the freshly applied pins from `agent.toml` so a CA rotation swaps both
-    the anchor and the pins.
+    the anchor and the pins. If those pins cannot be recovered, the rebuild
+    fails and rolls the trust version back rather than silently dropping to
+    unpinned bundle-anchored trust.
+  - OpenBao URL scheme detection (plaintext gate, `https://` CA-bundle
+    requirement, and TLS client selection) is now case-insensitive, so a
+    mixed-case `HTTP://` / `HTTPS://` URL is classified like its lowercase
+    form instead of bypassing the plaintext gate or the pinned TLS path.
   - `OpenBaoClient` HTTP clients now carry a 10s connect and 30s request
     timeout so a stalled endpoint cannot wedge the shared fast-poll loop.
 - Bumped `rustls-webpki` from 0.103.10 to 0.103.12 to address

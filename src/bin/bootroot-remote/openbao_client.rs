@@ -20,7 +20,7 @@ pub(super) fn build_openbao_client(
     pins: &[String],
     lang: Locale,
 ) -> Result<OpenBaoClient> {
-    if openbao_url.starts_with("https://") {
+    if bootroot::config::openbao_url_is_https(openbao_url) {
         let pem = ca_bundle_pem.ok_or_else(|| {
             anyhow::anyhow!(
                 "{}",

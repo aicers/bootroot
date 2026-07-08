@@ -9,7 +9,7 @@ mod defaults;
 mod validation;
 
 pub use validation::{
-    openbao_url_is_non_loopback_plaintext, parse_cert_duration,
+    openbao_url_is_https, openbao_url_is_non_loopback_plaintext, parse_cert_duration,
     validate_cert_duration_vs_default_renew_before,
 };
 

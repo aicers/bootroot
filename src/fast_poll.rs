@@ -1590,7 +1590,7 @@ pub(crate) async fn run_fast_poll_loop(
         // failed HTTPS client rebuild below must be able to roll the version
         // back so the next tick retries (see the rebuild block). Only
         // `https://` rebuilds the client, so skip the clone otherwise.
-        let rebuild_client_on_trust = openbao.url.starts_with("https://");
+        let rebuild_client_on_trust = config::openbao_url_is_https(&openbao.url);
         let trust_versions_before = if rebuild_client_on_trust {
             state.last_trust_seen_version.clone()
         } else {
@@ -1636,26 +1636,38 @@ pub(crate) async fn run_fast_poll_loop(
             // the startup snapshot: a rotation that lands a new CA + new
             // pins in KV has just been written to agent.toml, so re-read
             // from there. Stale startup pins would strand the client on
-            // the retired CA and defeat zero-touch rotation.
-            let rebuild_pins = read_trust_pins_from_config(&config_path_for_rebuild).await;
-            let rebuilt_ok = match build_openbao_client(&openbao, &rebuild_pins) {
-                Ok(rebuilt) => {
-                    *client.lock().await = rebuilt;
-                    if let Err(err) = login(&client, &openbao).await {
-                        warn!(
-                            "OpenBao re-login after CA bundle rebuild failed: {err:#}. Will retry on the next tick."
-                        );
-                        needs_relogin = true;
-                    } else {
-                        info!(
-                            "Rebuilt OpenBao client from the refreshed CA bundle after a trust update."
-                        );
+            // the retired CA and defeat zero-touch rotation. Recovering the
+            // pins CAN fail (unreadable/unparseable config, or no pins
+            // written) — treat that as a rebuild failure and roll the
+            // version back rather than silently rebuilding unpinned, which
+            // would downgrade the channel from pinned to bundle-anchored
+            // trust while reporting the rotation as applied.
+            let rebuilt_ok = match read_trust_pins_from_config(&config_path_for_rebuild).await {
+                Ok(rebuild_pins) => match build_openbao_client(&openbao, &rebuild_pins) {
+                    Ok(rebuilt) => {
+                        *client.lock().await = rebuilt;
+                        if let Err(err) = login(&client, &openbao).await {
+                            warn!(
+                                "OpenBao re-login after CA bundle rebuild failed: {err:#}. Will retry on the next tick."
+                            );
+                            needs_relogin = true;
+                        } else {
+                            info!(
+                                "Rebuilt OpenBao client from the refreshed CA bundle after a trust update."
+                            );
+                        }
+                        true
                     }
-                    true
-                }
+                    Err(err) => {
+                        warn!(
+                            "Failed to rebuild OpenBao client after a trust update: {err:#}. Rolling back the applied trust version so the next tick retries the apply and rebuild."
+                        );
+                        false
+                    }
+                },
                 Err(err) => {
                     warn!(
-                        "Failed to rebuild OpenBao client after a trust update: {err:#}. Rolling back the applied trust version so the next tick retries the apply and rebuild."
+                        "Failed to recover the freshly applied trust pins after a trust update: {err:#}. Rolling back the applied trust version so the next tick retries rather than rebuilding with unpinned bundle-anchored trust."
                     );
                     false
                 }
@@ -1735,7 +1747,7 @@ fn build_openbao_client(
     openbao: &config::OpenBaoSettings,
     pins: &[String],
 ) -> Result<OpenBaoClient> {
-    if openbao.url.starts_with("https://") {
+    if config::openbao_url_is_https(&openbao.url) {
         let ca_bundle_path = openbao
             .ca_bundle_path
             .as_ref()
@@ -1754,18 +1766,37 @@ fn build_openbao_client(
 }
 
 /// Reads the current `[trust].trusted_ca_sha256` pins from the on-disk
-/// `agent.toml`. Used to pin the post-trust-apply client rebuild to the
-/// freshly written anchors rather than the startup snapshot. Returns an
-/// empty list (bundle-anchored) if the file is unreadable, unparseable, or
-/// carries no pins — the same fallback as an unpinned config.
-async fn read_trust_pins_from_config(config_path: &Path) -> Vec<String> {
-    let Ok(contents) = fs::read_to_string(config_path).await else {
-        return Vec::new();
-    };
-    let Ok(doc) = contents.parse::<toml_edit::DocumentMut>() else {
-        return Vec::new();
-    };
-    doc.get("trust")
+/// `agent.toml` to pin the post-trust-apply client rebuild to the freshly
+/// written anchors rather than the startup snapshot.
+///
+/// This is only called after a trust apply succeeded, and every trust
+/// payload that applies carries a non-empty `trusted_ca_sha256`
+/// (`parse_trust_payload` rejects an empty pin set), so the just-written
+/// config MUST expose a non-empty pin array. Any failure to recover it —
+/// unreadable file, unparseable TOML, or a missing / non-array / empty
+/// `trusted_ca_sha256` — is therefore an error, NOT a silent fall back to
+/// an empty (bundle-anchored) pin set: swallowing it would let a rotation
+/// downgrade "trust only the pinned anchors" to "trust every CA in the
+/// bundle" while still persisting the version as applied. The caller rolls
+/// the trust version back on `Err` so the next tick retries the apply and
+/// rebuild (issue #695).
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read or parsed, or when it
+/// carries no usable `[trust].trusted_ca_sha256` pins.
+async fn read_trust_pins_from_config(config_path: &Path) -> Result<Vec<String>> {
+    let contents = fs::read_to_string(config_path).await.with_context(|| {
+        format!(
+            "Failed to read agent config for trust pins at {}",
+            config_path.display()
+        )
+    })?;
+    let doc = contents
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("Failed to parse agent config at {}", config_path.display()))?;
+    let pins: Vec<String> = doc
+        .get("trust")
         .and_then(|trust| trust.get("trusted_ca_sha256"))
         .and_then(toml_edit::Item::as_array)
         .map(|array| {
@@ -1774,7 +1805,14 @@ async fn read_trust_pins_from_config(config_path: &Path) -> Vec<String> {
                 .filter_map(|value| value.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if pins.is_empty() {
+        anyhow::bail!(
+            "agent config at {} has no [trust].trusted_ca_sha256 pins after a trust apply",
+            config_path.display()
+        );
+    }
+    Ok(pins)
 }
 
 async fn login(
@@ -3859,7 +3897,9 @@ mod pin_rotation_tests {
             ),
         )
         .unwrap();
-        let fresh_pins = read_trust_pins_from_config(&config_path).await;
+        let fresh_pins = read_trust_pins_from_config(&config_path)
+            .await
+            .expect("recover freshly applied pins");
         assert_eq!(fresh_pins, vec![ca_new.fingerprint.clone()]);
 
         let rebuilt =
@@ -3871,10 +3911,24 @@ mod pin_rotation_tests {
     }
 
     #[tokio::test]
-    async fn read_trust_pins_from_config_returns_empty_when_absent() {
+    async fn read_trust_pins_from_config_errs_when_pins_absent() {
+        // A config with no [trust].trusted_ca_sha256 must NOT silently
+        // recover an empty (bundle-anchored) pin set: since every applied
+        // trust payload carries non-empty pins, an empty read here means a
+        // rotation would downgrade pinned trust. The reader errors so the
+        // caller rolls the trust version back instead.
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("agent.toml");
         std::fs::write(&config_path, "email = \"a@b.c\"\n").unwrap();
-        assert!(read_trust_pins_from_config(&config_path).await.is_empty());
+        assert!(read_trust_pins_from_config(&config_path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_trust_pins_from_config_errs_when_unreadable() {
+        // A missing config file is a recovery failure, not an unpinned
+        // deployment.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("does-not-exist.toml");
+        assert!(read_trust_pins_from_config(&config_path).await.is_err());
     }
 }

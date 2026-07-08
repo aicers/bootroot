@@ -102,25 +102,38 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+/// Reports whether an `openbao.url` uses the `https://` scheme.
+///
+/// URL schemes are case-insensitive (RFC 3986 §3.1), so `HTTPS://host`
+/// designates the same TLS endpoint as `https://host` and must route
+/// through the CA-bundle-anchored client path identically. Comparing the
+/// parsed scheme case-insensitively — rather than a raw `starts_with` —
+/// keeps a mixed-case scheme from silently falling back to the plaintext
+/// client (issue #695). A URL that fails to parse returns `false`.
+#[must_use]
+pub fn openbao_url_is_https(url: &str) -> bool {
+    Url::parse(url.trim()).is_ok_and(|parsed| parsed.scheme().eq_ignore_ascii_case("https"))
+}
+
 /// Reports whether an `openbao.url` is a non-loopback plaintext
 /// `http://` endpoint — the case that exposes `AppRole` credentials and
 /// delivered secrets on the wire and therefore requires the explicit
 /// `allow_plaintext_http` opt-in.
 ///
 /// Loopback plaintext (`localhost`, `127.0.0.0/8`, `[::1]`) and any
-/// `https://` URL return `false`. A URL that does not use the `http://`
-/// scheme, or one whose host cannot be parsed, also returns `false`: the
-/// scheme check confines this to plaintext HTTP, and a host that fails to
-/// parse is left for other validation to reject.
+/// `https://` URL return `false`. A URL whose scheme is not `http`
+/// (compared case-insensitively, so `HTTP://` counts), or one whose host
+/// cannot be parsed, also returns `false`: the scheme check confines this
+/// to plaintext HTTP, and a host that fails to parse is left for other
+/// validation to reject.
 #[must_use]
 pub fn openbao_url_is_non_loopback_plaintext(url: &str) -> bool {
-    let trimmed = url.trim();
-    if !trimmed.starts_with("http://") {
-        return false;
-    }
-    let Ok(parsed) = Url::parse(trimmed) else {
+    let Ok(parsed) = Url::parse(url.trim()) else {
         return false;
     };
+    if !parsed.scheme().eq_ignore_ascii_case("http") {
+        return false;
+    }
     let Some(host) = parsed.host_str() else {
         return false;
     };
@@ -166,7 +179,7 @@ fn validate_openbao_settings(settings: &OpenBaoSettings) -> Result<()> {
     if settings.fast_poll_interval < Duration::from_secs(1) {
         anyhow::bail!("openbao.fast_poll_interval must be at least 1 second");
     }
-    if settings.url.starts_with("https://") && settings.ca_bundle_path.is_none() {
+    if openbao_url_is_https(&settings.url) && settings.ca_bundle_path.is_none() {
         anyhow::bail!("openbao.ca_bundle_path must be set when openbao.url uses https://");
     }
     if let Some(path) = &settings.ca_bundle_path
@@ -403,5 +416,54 @@ mod tests {
         assert!(!openbao_url_is_non_loopback_plaintext(
             "https://openbao.example:8200"
         ));
+    }
+
+    #[test]
+    fn non_loopback_plaintext_classifier_is_scheme_case_insensitive() {
+        // URL schemes are case-insensitive, so a mixed-case plaintext
+        // scheme must still be gated (issue #695).
+        assert!(openbao_url_is_non_loopback_plaintext(
+            "HTTP://10.0.0.5:8200"
+        ));
+        assert!(openbao_url_is_non_loopback_plaintext(
+            "HtTp://openbao.example:8200"
+        ));
+        assert!(!openbao_url_is_non_loopback_plaintext(
+            "HTTP://127.0.0.1:8200"
+        ));
+        assert!(!openbao_url_is_non_loopback_plaintext(
+            "HTTPS://openbao.example:8200"
+        ));
+    }
+
+    #[test]
+    fn https_classifier_is_scheme_case_insensitive() {
+        assert!(openbao_url_is_https("https://openbao.example:8200"));
+        assert!(openbao_url_is_https("HTTPS://openbao.example:8200"));
+        assert!(openbao_url_is_https("HtTpS://openbao.example:8200"));
+        assert!(!openbao_url_is_https("http://openbao.example:8200"));
+        assert!(!openbao_url_is_https("HTTP://openbao.example:8200"));
+        assert!(!openbao_url_is_https("not a url"));
+    }
+
+    #[test]
+    fn openbao_rejects_mixed_case_non_loopback_plaintext_without_opt_in() {
+        let err = validate_openbao_settings(&openbao_settings("HTTP://10.0.0.5:8200", false))
+            .expect_err("mixed-case non-loopback plaintext without opt-in must fail");
+        assert!(
+            format!("{err}").contains("allow_plaintext_http"),
+            "error should point at the opt-in: {err}"
+        );
+    }
+
+    #[test]
+    fn openbao_requires_ca_bundle_for_mixed_case_https() {
+        let err =
+            validate_openbao_settings(&openbao_settings("HTTPS://openbao.example:8200", false))
+                .expect_err("mixed-case https without a CA bundle must fail");
+        assert!(
+            format!("{err}").contains("ca_bundle_path"),
+            "error should require the CA bundle: {err}"
+        );
     }
 }

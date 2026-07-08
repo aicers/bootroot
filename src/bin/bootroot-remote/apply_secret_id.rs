@@ -21,7 +21,7 @@ async fn resolve_ca_bundle_pem(
     ca_bundle_path: Option<&Path>,
     lang: Locale,
 ) -> Result<Option<String>> {
-    if !openbao_url.starts_with("https://") {
+    if !bootroot::config::openbao_url_is_https(openbao_url) {
         return Ok(None);
     }
     let path = ca_bundle_path.ok_or_else(|| {
