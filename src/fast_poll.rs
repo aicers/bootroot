@@ -2760,8 +2760,7 @@ mod tests {
         let services = services_single("edge-proxy", "edge-proxy-domain");
         let mut state = FastPollState::default();
 
-        let outcome =
-            run_hmac_refresh_then_reissue(&hooks, "secret", &services, &mut state).await;
+        let outcome = run_hmac_refresh_then_reissue(&hooks, "secret", &services, &mut state).await;
 
         assert!(outcome.responder_hmac_changed);
         assert!(matches!(
