@@ -35,10 +35,14 @@ Open source dependencies:
 - **Service onboarding**: `bootroot service add` registers service metadata,
   creates an AppRole, automatically registers the HTTP-01 DNS alias on the
   responder, optionally configures a post-renew hook (`--reload-style` or
-  `--post-renew-command`), and prints the run instructions for bootroot-agent
-  and OpenBao Agent — no manual config editing required.
-- **Certificate flow**: bootroot-agent issues/renews certs; OpenBao Agent
-  renders secrets and config files for each service.
+  `--post-renew-command`), writes the agent config (including the `[openbao]`
+  fast-poll section) plus `eab.json`, and prints the host-daemon run command
+  for bootroot-agent — no manual config editing required.
+- **Certificate flow**: bootroot-agent runs as a host daemon that
+  issues/renews certs and keeps its own secrets and config current via its
+  fast-poll loop against OpenBao (trust bundle, AppRole `secret_id`,
+  responder HMAC, EAB). OpenBao Agent serves only the infrastructure
+  components (step-ca and the HTTP-01 responder).
 
 For multi-machine deployments using `--delivery-mode remote-bootstrap`, see
 the [Remote Bootstrap Operator Guide](docs/en/remote-bootstrap.md)

@@ -42,10 +42,6 @@ impl Messages {
         )
     }
 
-    pub(crate) fn rotate_summary_reload_openbao_agent(&self) -> &'static str {
-        self.strings().rotate_summary_reload_openbao_agent
-    }
-
     pub(crate) fn rotate_summary_approle_login_ok(&self, service_name: &str) -> String {
         format_template(
             self.strings().rotate_summary_approle_login_ok,
@@ -554,13 +550,6 @@ impl Messages {
         format_template(
             self.strings().rotate_ca_key_phase_skipped,
             &[("phase", phase)],
-        )
-    }
-
-    pub(crate) fn rotate_sidecar_skip_remote(&self, service_name: &str, interval: &str) -> String {
-        format_template(
-            self.strings().rotate_sidecar_skip_remote,
-            &[("service_name", service_name), ("interval", interval)],
         )
     }
 

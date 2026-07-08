@@ -95,7 +95,6 @@ ARTIFACT="$CONTROL_SECRETS/remote-bootstrap/services/$SERVICE/bootstrap.json"
 # 1. 제어 노드에서 서비스 등록
 bootroot service add \
   --service-name "$SERVICE" \
-  --deploy-type daemon \
   --delivery-mode remote-bootstrap \
   --hostname "$REMOTE_HOST" \
   --domain trusted.domain \

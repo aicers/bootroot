@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bootroot::input_validation::{
     ValidationError, validate_cidr_list, validate_dns_label, validate_domain_name,
     validate_numeric_instance_id,
@@ -14,13 +14,12 @@ use crate::commands::openbao_auth::{
 };
 use crate::i18n::Messages;
 use crate::state::{
-    DEFAULT_HOOK_TIMEOUT_SECS, DeliveryMode, DeployType, HookFailurePolicyEntry, PostRenewHookEntry,
+    DEFAULT_HOOK_TIMEOUT_SECS, DeliveryMode, HookFailurePolicyEntry, PostRenewHookEntry,
 };
 
 #[derive(Debug)]
 pub(crate) struct ResolvedServiceAdd {
     pub(crate) service_name: String,
-    pub(crate) deploy_type: DeployType,
     pub(crate) delivery_mode: DeliveryMode,
     pub(crate) hostname: String,
     pub(crate) domain: String,
@@ -28,7 +27,6 @@ pub(crate) struct ResolvedServiceAdd {
     pub(crate) cert_path: PathBuf,
     pub(crate) key_path: PathBuf,
     pub(crate) instance_id: Option<String>,
-    pub(crate) container_name: Option<String>,
     pub(crate) runtime_auth: Option<RuntimeAuthResolved>,
     pub(crate) notes: Option<String>,
     pub(crate) post_renew_hooks: Vec<PostRenewHookEntry>,
@@ -72,14 +70,6 @@ pub(super) fn resolve_service_add_args(
         })?,
     };
 
-    let deploy_type = match args.deploy_type {
-        Some(value) => value,
-        None => prompt.prompt_with_validation(
-            messages.prompt_deploy_type(),
-            Some("daemon"),
-            |value| parse_deploy_type(value, messages),
-        )?,
-    };
     let delivery_mode = args.delivery_mode.unwrap_or_default();
 
     let hostname = match &args.hostname {
@@ -103,6 +93,14 @@ pub(super) fn resolve_service_add_args(
         false,
         messages,
     )?;
+    // Remote-bootstrap agent-config paths name a file on the *remote*
+    // host, so only local-file paths are normalized against this
+    // host's filesystem.
+    let agent_config = if matches!(delivery_mode, DeliveryMode::LocalFile) {
+        normalize_local_agent_config_path(&agent_config)?
+    } else {
+        agent_config
+    };
 
     let cert_path = resolve_path(
         args.cert_path.clone(),
@@ -126,18 +124,6 @@ pub(super) fn resolve_service_add_args(
             validate_instance_id(value, messages)
         })?,
     };
-    let container_name = match deploy_type {
-        DeployType::Daemon => None,
-        DeployType::Docker => Some(match &args.container_name {
-            Some(value) => value.clone(),
-            None => {
-                prompt.prompt_with_validation(messages.prompt_container_name(), None, |value| {
-                    ensure_non_empty(value, messages)
-                })?
-            }
-        }),
-    };
-
     let runtime_auth = if preview {
         resolve_runtime_auth_optional(&args.runtime_auth)?
     } else {
@@ -170,7 +156,6 @@ pub(super) fn resolve_service_add_args(
 
     Ok(ResolvedServiceAdd {
         service_name,
-        deploy_type,
         delivery_mode,
         hostname,
         domain,
@@ -178,7 +163,6 @@ pub(super) fn resolve_service_add_args(
         cert_path,
         key_path,
         instance_id: Some(instance_id),
-        container_name,
         runtime_auth,
         notes: args.notes.clone(),
         post_renew_hooks,
@@ -220,39 +204,11 @@ pub(super) fn resolve_cert_group_for_add(
     Ok(Some(gid))
 }
 
-/// Validates the raw `service add` flag combination before
-/// [`resolve_service_add_args`] runs. Catches `--deploy-type=daemon`
-/// paired with `--container-name`, which the resolved-struct validator
-/// cannot see because `resolve_service_add_args` already drops
-/// `container_name` to `None` for `Daemon`. See issue #631.
-pub(super) fn validate_raw_service_add_args(
-    args: &ServiceAddArgs,
-    messages: &Messages,
-) -> Result<()> {
-    let has_container_name = args
-        .container_name
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty());
-    if matches!(args.deploy_type, Some(DeployType::Daemon)) && has_container_name {
-        anyhow::bail!(messages.error_service_daemon_container_name_conflict());
-    }
-    Ok(())
-}
-
 pub(super) fn validate_service_add(args: &ResolvedServiceAdd, messages: &Messages) -> Result<()> {
     validate_service_name(&args.service_name, messages)?;
     validate_hostname(&args.hostname, messages)?;
     validate_domain(&args.domain, messages)?;
     validate_instance_id(args.instance_id.as_deref().unwrap_or_default(), messages)?;
-    if matches!(args.deploy_type, DeployType::Docker)
-        && args
-            .container_name
-            .as_deref()
-            .unwrap_or_default()
-            .is_empty()
-    {
-        anyhow::bail!(messages.error_service_container_name_required());
-    }
     Ok(())
 }
 
@@ -267,13 +223,6 @@ pub(crate) fn effective_wrap_ttl(stored: Option<&str>) -> Option<&str> {
         Some("0") => None,
         Some(ttl) => Some(ttl),
     }
-}
-
-fn ensure_non_empty(value: &str, messages: &Messages) -> Result<String> {
-    if value.trim().is_empty() {
-        anyhow::bail!(messages.error_value_required());
-    }
-    Ok(value.trim().to_string())
 }
 
 fn validate_service_name(value: &str, messages: &Messages) -> Result<String> {
@@ -355,14 +304,6 @@ pub(super) fn validate_rn_cidrs(values: &[String], messages: &Messages) -> Resul
         _ => anyhow::anyhow!(messages.error_rn_cidrs_invalid("")),
     })?;
     Ok(())
-}
-
-fn parse_deploy_type(value: &str, messages: &Messages) -> Result<DeployType> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "daemon" => Ok(DeployType::Daemon),
-        "docker" => Ok(DeployType::Docker),
-        _ => anyhow::bail!(messages.error_invalid_deploy_type()),
-    }
 }
 
 fn resolve_post_renew_hooks(args: &ServiceAddArgs) -> Result<Vec<PostRenewHookEntry>> {
@@ -513,6 +454,35 @@ fn resolve_reload_preset(
     }
 }
 
+/// Normalizes a local-file `--agent-config` path to an absolute,
+/// lexically clean form (no `.`/`..` components) so equivalent
+/// spellings of the same file (`agent.toml`, `./agent.toml`,
+/// `sub/../agent.toml`) store and compare identically in the
+/// one-config-per-service conflict guard. Symlinks are deliberately
+/// left unresolved so state keeps the operator's chosen location; the
+/// add-time conflict guard additionally canonicalizes existing files
+/// when comparing, which covers symlinked spellings.
+fn normalize_local_agent_config_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("failed to resolve absolute path for {}", path.display()))?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            // Lexical `..` handling: `a/b/..` is treated as `a`. A
+            // symlinked intermediate directory can defeat this, which
+            // the canonicalizing conflict comparison covers for files
+            // that exist. Popping at the root is a no-op, matching
+            // path resolution semantics for `/..`.
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
 fn resolve_path(
     value: Option<PathBuf>,
     label: &str,
@@ -563,7 +533,6 @@ mod tests {
     fn empty_args() -> ServiceAddArgs {
         ServiceAddArgs {
             service_name: None,
-            deploy_type: None,
             delivery_mode: None,
             dry_run: false,
             print_only: false,
@@ -573,8 +542,6 @@ mod tests {
             cert_path: None,
             key_path: None,
             instance_id: None,
-            container_name: None,
-            no_validate_agent: false,
             agent_email: None,
             agent_server: None,
             agent_responder_url: None,
@@ -602,63 +569,31 @@ mod tests {
         }
     }
 
+    /// Equivalent relative spellings of the same file must normalize
+    /// to one absolute path, or the add-time agent-config conflict
+    /// guard can be bypassed by re-spelling the path (`./agent.toml`
+    /// vs `agent.toml`), letting a second service overwrite the first
+    /// service's single `[openbao]` identity.
     #[test]
-    fn validate_raw_rejects_daemon_with_container_name() {
-        let messages = Messages::new("en").unwrap();
-        let mut args = empty_args();
-        args.deploy_type = Some(DeployType::Daemon);
-        args.container_name = Some("web-app".to_string());
+    fn normalize_local_agent_config_path_unifies_equivalent_spellings() {
+        let plain = normalize_local_agent_config_path(Path::new("agent.toml")).unwrap();
+        let dotted = normalize_local_agent_config_path(Path::new("./agent.toml")).unwrap();
+        let doubled = normalize_local_agent_config_path(Path::new("sub/.././agent.toml")).unwrap();
 
-        let err = validate_raw_service_add_args(&args, &messages).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--container-name"),
-            "expected conflict error to mention --container-name, got: {msg}"
-        );
-        assert!(
-            msg.contains("--deploy-type=docker"),
-            "expected error to point at the docker option, got: {msg}"
-        );
+        assert!(plain.is_absolute(), "normalized path must be absolute");
+        assert_eq!(plain, dotted);
+        assert_eq!(plain, doubled);
     }
 
+    /// Absolute inputs stay put apart from lexical cleanup, so the
+    /// stored `agent_config_path` keeps the operator's chosen
+    /// location instead of a symlink-resolved alias.
     #[test]
-    fn validate_raw_accepts_daemon_without_container_name() {
-        let messages = Messages::new("en").unwrap();
-        let mut args = empty_args();
-        args.deploy_type = Some(DeployType::Daemon);
-        args.container_name = None;
-        validate_raw_service_add_args(&args, &messages).expect("daemon without container is ok");
-    }
-
-    #[test]
-    fn validate_raw_accepts_daemon_with_blank_container_name() {
-        let messages = Messages::new("en").unwrap();
-        let mut args = empty_args();
-        args.deploy_type = Some(DeployType::Daemon);
-        args.container_name = Some("   ".to_string());
-        validate_raw_service_add_args(&args, &messages)
-            .expect("daemon with whitespace-only container is treated as unset");
-    }
-
-    #[test]
-    fn validate_raw_accepts_docker_with_container_name() {
-        let messages = Messages::new("en").unwrap();
-        let mut args = empty_args();
-        args.deploy_type = Some(DeployType::Docker);
-        args.container_name = Some("bootroot-agent".to_string());
-        validate_raw_service_add_args(&args, &messages).expect("docker with container is ok");
-    }
-
-    #[test]
-    fn validate_raw_accepts_unspecified_deploy_type() {
-        // The interactive prompt resolves deploy_type later; the raw
-        // validator must not bail when the flag was not passed.
-        let messages = Messages::new("en").unwrap();
-        let mut args = empty_args();
-        args.deploy_type = None;
-        args.container_name = Some("anything".to_string());
-        validate_raw_service_add_args(&args, &messages)
-            .expect("unspecified deploy_type defers to interactive resolution");
+    fn normalize_local_agent_config_path_cleans_absolute_input() {
+        let normalized =
+            normalize_local_agent_config_path(Path::new("/etc/bootroot/./sub/../agent.toml"))
+                .unwrap();
+        assert_eq!(normalized, Path::new("/etc/bootroot/agent.toml"));
     }
 
     #[test]

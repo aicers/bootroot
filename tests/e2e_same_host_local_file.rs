@@ -36,7 +36,8 @@ async fn test_same_host_local_file_happy_path() {
     write_state_file(temp.path(), &server.uri()).expect("write state");
     let files = init_service_files(temp.path()).expect("init service files");
 
-    run_service_add_local(temp.path(), &server.uri(), &files).expect("service add local");
+    let add_stdout =
+        run_service_add_local(temp.path(), &server.uri(), &files).expect("service add local");
 
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(temp.path().join("state.json")).expect("state"))
@@ -78,83 +79,75 @@ async fn test_same_host_local_file_happy_path() {
     );
     // Public trust material: the CA bundle must be world-readable so a
     // non-root consumer in a separate container can read the bind-mounted
-    // file. The `.ctmpl` template below stays secret-only (0o600).
+    // file.
     assert_mode(&files.ca_bundle_path, 0o644);
 
+    // No OpenBao Agent sidecar artifacts are generated anymore: the local
+    // bootroot-agent is a host daemon whose fast-poll loop (activated by
+    // the [openbao] section) is the single secret-delivery mechanism.
     assert!(
-        temp.path()
+        !temp
+            .path()
             .join("secrets")
             .join("openbao")
             .join("services")
-            .join(SERVICE_NAME)
-            .join("agent.hcl")
-            .exists()
-    );
-    let ctmpl_path = temp
-        .path()
-        .join("secrets")
-        .join("openbao")
-        .join("services")
-        .join(SERVICE_NAME)
-        .join("agent.toml.ctmpl");
-    assert!(ctmpl_path.exists());
-    let ctmpl_contents = fs::read_to_string(&ctmpl_path).expect("read ctmpl");
-    assert!(
-        ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
-        "ctmpl should contain template directives"
+            .exists(),
+        "no per-service OpenBao Agent artifacts must be generated"
     );
     assert!(
-        ctmpl_contents.contains("domain = \"trusted.domain\""),
-        "ctmpl missing domain: {ctmpl_contents}"
+        agent_contents.contains("[openbao]"),
+        "agent.toml missing [openbao] fast-poll section: {agent_contents}"
     );
     assert!(
-        ctmpl_contents.contains("http_responder_hmac"),
-        "ctmpl missing http_responder_hmac: {ctmpl_contents}"
+        agent_contents.contains("kv_mount = \"secret\""),
+        "agent.toml [openbao] missing kv_mount: {agent_contents}"
     );
     assert!(
-        !ctmpl_contents.contains("http_responder_hmac = \"test-responder-hmac\""),
-        "ctmpl should use template expression, not literal hmac: {ctmpl_contents}"
+        agent_contents.contains("role_id_path = \"") && agent_contents.contains("role_id\""),
+        "agent.toml [openbao] missing role_id_path: {agent_contents}"
     );
-    let bundle_ctmpl_path = temp
-        .path()
-        .join("secrets")
-        .join("openbao")
-        .join("services")
-        .join(SERVICE_NAME)
-        .join("ca-bundle.pem.ctmpl");
-    assert!(bundle_ctmpl_path.exists());
-    assert_mode(&bundle_ctmpl_path, 0o600);
-    let bundle_ctmpl_contents = fs::read_to_string(&bundle_ctmpl_path).expect("read bundle ctmpl");
     assert!(
-        bundle_ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
-        "bundle ctmpl should contain template directives"
+        agent_contents.contains("secret_id_path = \""),
+        "agent.toml [openbao] missing secret_id_path: {agent_contents}"
     );
-    assert!(bundle_ctmpl_contents.contains(".Data.data.ca_bundle_pem"));
+    assert!(
+        agent_contents.contains("bootroot-agent-state-edge-proxy.json"),
+        "agent.toml [openbao] missing service-keyed state_path: {agent_contents}"
+    );
+    let state_path_line = agent_contents
+        .lines()
+        .find(|line| line.trim_start().starts_with("state_path"))
+        .expect("agent.toml must carry a state_path line");
+    let state_path_value = state_path_line
+        .split('=')
+        .nth(1)
+        .expect("state_path line has a value")
+        .trim()
+        .trim_matches('"');
+    assert!(
+        Path::new(state_path_value).is_absolute(),
+        "state_path must be absolute: {state_path_line}"
+    );
 
-    let hcl_path = temp
-        .path()
-        .join("secrets")
-        .join("openbao")
-        .join("services")
-        .join(SERVICE_NAME)
-        .join("agent.hcl");
-    let hcl_contents = fs::read_to_string(&hcl_path).expect("read agent.hcl");
+    // EAB regression guard: KV holds EAB material, so service add must
+    // provision eab.json next to secret_id, and the printed run command
+    // must pass it via --eab-file — otherwise fast-poll EAB refresh is a
+    // silent no-op on this host.
+    assert!(files.eab_path.exists(), "eab.json must be provisioned");
+    assert_mode(&files.eab_path, 0o600);
+    let eab_contents = fs::read_to_string(&files.eab_path).expect("read eab.json");
     assert!(
-        hcl_contents.contains("vault {"),
-        "agent.hcl should contain vault block"
+        eab_contents.contains("\"kid\": \"test-kid\""),
+        "eab.json must carry the KV kid: {eab_contents}"
     );
-    assert!(hcl_contents.contains(&format!(
-        "source = \"{}\"",
-        path_relative_to_root_or_self(temp.path(), &ctmpl_path).display()
-    )));
-    assert!(hcl_contents.contains(&format!(
-        "source = \"{}\"",
-        path_relative_to_root_or_self(temp.path(), &bundle_ctmpl_path).display()
-    )));
-    assert!(hcl_contents.contains(&format!(
-        "destination = \"{}\"",
-        files.ca_bundle_path.display()
-    )));
+    assert!(
+        add_stdout.contains("bootroot-agent --config"),
+        "service add must print the daemon run command: {add_stdout}"
+    );
+    assert!(
+        add_stdout.contains("--eab-file") && add_stdout.contains("eab.json"),
+        "the documented run command must include --eab-file: {add_stdout}"
+    );
 
     write_service_cert(&files.cert_path, &files.key_path).expect("write cert");
     write_fake_bootroot_agent(temp.path(), 0).expect("write fake bootroot-agent");
@@ -192,10 +185,20 @@ async fn test_same_host_local_rotation_sequence_keeps_service_operational() {
         ROLE_ID
     );
 
-    // Simulate OBA sidecar rendering agent.toml from ctmpl with rotated KV
-    // values. In production the sidecar polls KV via static_secret_render_interval
-    // and re-renders the template; here we write the expected output directly.
-    simulate_oba_sidecar_render(&files.agent_config, "hmac-updated");
+    // rotate must not restart any per-service container: HMAC propagation
+    // to local agents is the running daemon's fast-poll loop, and the
+    // secret_id file write needs no signal at all.
+    let docker_log = fs::read_to_string(temp.path().join("docker.log")).unwrap_or_default();
+    assert!(
+        !docker_log.contains(&format!("bootroot-openbao-agent-{SERVICE_NAME}")),
+        "rotate must not touch a per-service container: {docker_log}"
+    );
+
+    // Simulate the running bootroot-agent's fast-poll loop applying the
+    // rotated responder HMAC from KV to agent.toml. In production the
+    // daemon does this itself within fast_poll_interval; here we write
+    // the expected output directly.
+    simulate_fast_poll_hmac_apply(&files.agent_config, "hmac-updated");
     let agent_contents = fs::read_to_string(&files.agent_config).expect("read agent.toml");
     assert!(agent_contents.contains("http_responder_hmac = \"hmac-updated\""));
 
@@ -265,8 +268,13 @@ async fn test_same_host_trust_change_propagates_to_agent_config() {
     assert!(bundle_contents.contains("UPDATED-TRUST"));
 }
 
+/// Guards the fast-poll model's no-signal contract for local
+/// `rotate approle-secret-id`: the direct `secret_id` file write is all
+/// that happens — the agent re-reads the file on its next `AppRole`
+/// re-login, so the rotation must succeed even when `pkill` would fail
+/// and no docker daemon exists.
 #[tokio::test]
-async fn test_same_host_failure_then_recovery_for_secret_id_rotation() {
+async fn test_same_host_secret_id_rotation_needs_no_process_signal() {
     let temp = tempdir().expect("create tempdir");
     let server = MockServer::start().await;
     stub_service_add_openbao(&server).await;
@@ -276,31 +284,90 @@ async fn test_same_host_failure_then_recovery_for_secret_id_rotation() {
     run_service_add_local(temp.path(), &server.uri(), &files).expect("service add local");
     stub_secret_id_rotation_openbao(&server, "secret-recovered").await;
 
+    // A failing pkill must be irrelevant: the rotation path performs no
+    // process signal and no docker call.
     write_fake_pkill(temp.path(), 1).expect("write failing pkill");
-    let first = run_rotate_secret_id_with_output(temp.path(), &server.uri());
+    let output = run_rotate_secret_id_with_output(temp.path(), &server.uri());
     assert!(
-        !first.status.success(),
-        "rotation should fail on reload path"
-    );
-    assert!(String::from_utf8_lossy(&first.stderr).contains("bootroot rotate failed"));
-
-    write_fake_pkill(temp.path(), 0).expect("write successful pkill");
-    let second = run_rotate_secret_id_with_output(temp.path(), &server.uri());
-    assert!(
-        second.status.success(),
+        output.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&second.stderr)
+        String::from_utf8_lossy(&output.stderr)
     );
-
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("AppRole login OK"), "stdout: {stdout}");
     assert!(
-        String::from_utf8_lossy(&second.stdout).contains("AppRole login OK"),
-        "stdout: {}",
-        String::from_utf8_lossy(&second.stdout)
+        !stdout.contains("OpenBao Agent"),
+        "no sidecar reload line may be printed: {stdout}"
     );
     let secret = fs::read_to_string(&files.secret_id_path).expect("read secret_id");
     assert!(!secret.trim().is_empty());
     let role_id = fs::read_to_string(&files.role_id_path).expect("read role_id");
     assert_eq!(role_id, ROLE_ID);
+}
+
+/// Issue #691 acceptance: containerized consumer apps stay supported
+/// with the daemon-only agent. A local `service add` with
+/// `--reload-style docker-restart --reload-target <container>` must
+/// keep cert delivery on host paths a consumer container can
+/// bind-mount, and persist the `docker restart <container>` post-renew
+/// hook in the managed profile so the host daemon restarts the
+/// consumer after each renewal.
+#[tokio::test]
+async fn test_same_host_containerized_consumer_docker_restart_hook() {
+    let temp = tempdir().expect("create tempdir");
+    let server = MockServer::start().await;
+    stub_service_add_openbao(&server).await;
+
+    write_state_file(temp.path(), &server.uri()).expect("write state");
+    let files = init_service_files(temp.path()).expect("init service files");
+    let add_stdout = run_service_add_local_with_extra_args(
+        temp.path(),
+        &files,
+        &[
+            "--reload-style",
+            "docker-restart",
+            "--reload-target",
+            "edge-proxy-container",
+        ],
+    )
+    .expect("service add local with docker-restart reload style");
+
+    assert!(
+        add_stdout.contains("- post-renew hook: docker restart edge-proxy-container"),
+        "docker-restart preset must resolve to a docker restart hook: {add_stdout}"
+    );
+
+    // The hook must be persisted in agent.toml so the host-daemon
+    // bootroot-agent actually restarts the consumer container after each
+    // renewal — not just echoed in the summary.
+    let agent_contents = fs::read_to_string(&files.agent_config).expect("read agent.toml");
+    assert!(
+        agent_contents.contains("[[profiles.hooks.post_renew.success]]"),
+        "agent.toml must carry the persisted post-renew hook: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("command = \"docker\""),
+        "agent.toml hook must run docker: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("args = [\"restart\", \"edge-proxy-container\"]"),
+        "agent.toml hook must restart the consumer container: {agent_contents}"
+    );
+
+    // Cert delivery stays on host paths: the profile's cert/key point at
+    // the host directory the consumer container bind-mounts, and the CA
+    // bundle is world-readable for a non-root consumer.
+    let cert_path = files.cert_path.display().to_string();
+    let key_path = files.key_path.display().to_string();
+    assert!(
+        agent_contents.contains(&format!("cert = \"{cert_path}\"")),
+        "profile cert must stay a bind-mountable host path: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains(&format!("key = \"{key_path}\"")),
+        "profile key must stay a bind-mountable host path: {agent_contents}"
+    );
+    assert_mode(&files.ca_bundle_path, 0o644);
 }
 
 struct ServicePaths {
@@ -337,16 +404,20 @@ fn init_service_files(root: &Path) -> anyhow::Result<ServicePaths> {
     })
 }
 
-fn path_relative_to_root_or_self<'a>(root: &'a Path, path: &'a Path) -> &'a Path {
-    path.strip_prefix(root).unwrap_or(path)
-}
-
 fn run_service_add_local(
     root: &Path,
     openbao_url: &str,
     files: &ServicePaths,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let _ = openbao_url;
+    run_service_add_local_with_extra_args(root, files, &[])
+}
+
+fn run_service_add_local_with_extra_args(
+    root: &Path,
+    files: &ServicePaths,
+    extra_args: &[&str],
+) -> anyhow::Result<String> {
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(root)
         .args([
@@ -354,8 +425,6 @@ fn run_service_add_local(
             "add",
             "--service-name",
             SERVICE_NAME,
-            "--deploy-type",
-            "daemon",
             "--delivery-mode",
             "local-file",
             "--hostname",
@@ -377,6 +446,7 @@ fn run_service_add_local(
             "--approle-secret-id",
             RUNTIME_SERVICE_ADD_SECRET_ID,
         ])
+        .args(extra_args)
         .output()
         .context("run service add")?;
     if !output.status.success() {
@@ -385,7 +455,7 @@ fn run_service_add_local(
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn run_rotate_responder_hmac(root: &Path, openbao_url: &str, hmac: &str) -> anyhow::Result<()> {
@@ -397,23 +467,6 @@ fn run_rotate_responder_hmac(root: &Path, openbao_url: &str, hmac: &str) -> anyh
     fs::write(&render_source, format!("hmac_secret = \"{hmac}\"\n"))
         .context("write render source")?;
 
-    // Register sidecar OBA render mapping: when docker restart is called for
-    // the service sidecar container, the fake docker writes agent.toml with
-    // the rotated HMAC, simulating what the real OBA would render from ctmpl.
-    let agent_render_source = root.join("agent-render-src.toml");
-    fs::write(
-        &agent_render_source,
-        format!("[acme]\nhttp_responder_hmac = \"{hmac}\"\n"),
-    )
-    .context("write agent render source")?;
-    let agent_config = root.join("agent.toml");
-    let render_map_dir = write_render_map(
-        root,
-        &format!("bootroot-openbao-agent-{SERVICE_NAME}"),
-        &agent_render_source,
-        &agent_config,
-    )?;
-
     let path_env = env::var("PATH").unwrap_or_default();
     let combined_path = format!("{}:{path_env}", root.join("bin").display());
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
@@ -422,7 +475,6 @@ fn run_rotate_responder_hmac(root: &Path, openbao_url: &str, hmac: &str) -> anyh
         .env("DOCKER_OUTPUT", root.join("docker.log"))
         .env("RENDER_SOURCE", &render_source)
         .env("RENDER_TARGET", responder_dir.join("responder.toml"))
-        .env("RENDER_MAP_DIR", &render_map_dir)
         .args([
             "rotate",
             "--openbao-url",
@@ -547,23 +599,12 @@ if [ -n "${DOCKER_OUTPUT:-}" ]; then
   printf "%s\n" "$*" >> "$DOCKER_OUTPUT"
 fi
 
-# Simulate OpenBao Agent rendering on restart of OBA containers.
-# Each container can have its own render mapping registered via a file
-# at $RENDER_MAP_DIR/<container-name> containing two lines: source, target.
-# Falls back to the global RENDER_SOURCE / RENDER_TARGET env vars.
-if [ "${1:-}" = "restart" ]; then
-  case "${2:-}" in
-    bootroot-openbao-agent-*)
-      container="${2}"
-      if [ -n "${RENDER_MAP_DIR:-}" ] && [ -f "${RENDER_MAP_DIR}/${container}" ]; then
-        src="$(sed -n '1p' "${RENDER_MAP_DIR}/${container}")"
-        dst="$(sed -n '2p' "${RENDER_MAP_DIR}/${container}")"
-        cp "$src" "$dst"
-      elif [ -n "${RENDER_SOURCE:-}" ] && [ -n "${RENDER_TARGET:-}" ]; then
-        cp "$RENDER_SOURCE" "$RENDER_TARGET"
-      fi
-      ;;
-  esac
+# Simulate the infra OpenBao Agent (responder) re-rendering its KV
+# template on restart via the RENDER_SOURCE / RENDER_TARGET env vars.
+if [ "${1:-}" = "restart" ] && [ "${2:-}" = "bootroot-openbao-agent-responder" ]; then
+  if [ -n "${RENDER_SOURCE:-}" ] && [ -n "${RENDER_TARGET:-}" ]; then
+    cp "$RENDER_SOURCE" "$RENDER_TARGET"
+  fi
 fi
 
 exit 0
@@ -575,27 +616,14 @@ exit 0
     Ok(())
 }
 
-fn write_render_map(
-    root: &Path,
-    container: &str,
-    source: &Path,
-    target: &Path,
-) -> anyhow::Result<PathBuf> {
-    let map_dir = root.join("render-map");
-    fs::create_dir_all(&map_dir).context("create render-map dir")?;
-    let content = format!("{}\n{}\n", source.display(), target.display());
-    fs::write(map_dir.join(container), content).context("write render map entry")?;
-    Ok(map_dir)
-}
-
-fn simulate_oba_sidecar_render(agent_config: &Path, hmac: &str) {
+fn simulate_fast_poll_hmac_apply(agent_config: &Path, hmac: &str) {
     let rendered = format!(
         "\
 [acme]
 http_responder_hmac = \"{hmac}\"
 "
     );
-    fs::write(agent_config, rendered).expect("simulate OBA sidecar render");
+    fs::write(agent_config, rendered).expect("simulate fast-poll HMAC apply");
 }
 
 fn write_fake_pkill(root: &Path, exit_code: i32) -> anyhow::Result<()> {

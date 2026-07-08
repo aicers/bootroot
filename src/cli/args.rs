@@ -7,7 +7,7 @@ use crate::commands::init::{
     DEFAULT_CERT_DURATION, DEFAULT_COMPOSE_FILE, DEFAULT_KV_MOUNT, DEFAULT_OPENBAO_URL,
     DEFAULT_SECRETS_DIR, DEFAULT_STEPCA_PROVISIONER, SECRET_ID_TTL,
 };
-use crate::state::{DeliveryMode, DeployType, HookFailurePolicyEntry};
+use crate::state::{DeliveryMode, HookFailurePolicyEntry};
 
 const INFRA_AFTER_HELP: &str = "\
 Teardown:
@@ -21,7 +21,7 @@ Tears down the bootroot stack and wipes its filesystem state.
 
 Without flags, `bootroot clean`:
   - runs `docker compose down -v --remove-orphans` against the main
-    compose file plus any auto-discovered openbao-agent sidecar and
+    compose file plus any auto-discovered infra openbao-agent and
     `openbao-exposed` overrides under `secrets/openbao/`;
   - removes `secrets/`, `state.json`, and `.env`;
   - prompts before removing `certs/` (or removes it without prompting
@@ -79,8 +79,7 @@ pub(crate) enum CliCommand {
     /// status, step-ca reachability, and the registered service inventory
     /// in `state.json`. Read-only; safe to run at any time.
     Status(Box<StatusArgs>),
-    /// Registers and manages bootroot-agent-driven service consumers and
-    /// their per-service `OpenBao` Agent sidecars.
+    /// Registers and manages bootroot-agent-driven service consumers.
     #[command(subcommand)]
     Service(ServiceCommand),
     /// Verifies that a registered service's bootroot-agent configuration
@@ -248,23 +247,21 @@ pub(crate) enum ServiceCommand {
     /// Registers a new bootroot-agent-managed service.
     ///
     /// Generates the service's `OpenBao` `AppRole` and `secret_id`,
-    /// renders the agent's `agent.toml` baseline, and records the
-    /// deployment intent in `state.json`. For Docker deployments with a
-    /// `--container-name`, also classifies the supplied bootroot-agent
-    /// container against the expected identity (skip with
-    /// `--no-validate-agent`); daemon deployments have no container to
-    /// validate. Use `--dry-run` to preview the diff or `--print-only`
-    /// to emit the manual snippets without writing files.
+    /// renders the agent's `agent.toml` baseline (including the
+    /// `[openbao]` fast-poll section the host-daemon `bootroot-agent`
+    /// self-authenticates with), and records the deployment intent in
+    /// `state.json`. Use `--dry-run` to preview the diff or
+    /// `--print-only` to emit the manual snippets without writing files.
     Add(Box<ServiceAddArgs>),
     /// Prints the registered configuration and `OpenBao` `AppRole`
     /// metadata for a service.
     ///
-    /// Read-only; safe to run at any time. The output covers deploy type,
-    /// hostname, domain, delivery mode, post-renew hooks, the `AppRole`
-    /// role name and `role_id`, `secret_id` TTL / wrap TTL / token-bound
-    /// CIDRs, the rendered agent config / cert / key / `secret_id` paths,
-    /// the service's `OpenBao` KV path, and the next-step sidecar
-    /// snippet. The `AppRole` `secret_id` itself is never printed.
+    /// Read-only; safe to run at any time. The output covers hostname,
+    /// domain, delivery mode, post-renew hooks, the `AppRole` role name
+    /// and `role_id`, `secret_id` TTL / wrap TTL / token-bound CIDRs,
+    /// the rendered agent config / cert / key / `secret_id` paths, the
+    /// service's `OpenBao` KV path, and the next-step daemon snippet.
+    /// The `AppRole` `secret_id` itself is never printed.
     Info(ServiceInfoArgs),
     /// Edits a registered service's `secret_id` policy, post-renew hook,
     /// or cert ownership in place.
@@ -287,60 +284,6 @@ pub(crate) enum ServiceCommand {
     /// flow — the supported way to change a service's `--delivery-mode` —
     /// an actual command. Use `--dry-run` to preview the teardown plan.
     Remove(ServiceRemoveArgs),
-    /// Manages the per-service `OpenBao` Agent sidecar container.
-    #[command(subcommand, name = "openbao-sidecar")]
-    OpenbaoSidecar(ServiceOpenbaoSidecarCommand),
-    /// Deprecated alias for `openbao-sidecar`.  Will be removed in a
-    /// future release; use `service openbao-sidecar` instead.
-    #[command(subcommand, hide = true)]
-    Agent(ServiceOpenbaoSidecarCommand),
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum ServiceOpenbaoSidecarCommand {
-    /// Starts the per-service `OpenBao` Agent sidecar container.
-    ///
-    /// The sidecar runs `openbao agent` against a generated HCL config
-    /// whose `template` blocks render the managed `agent.toml` and trust
-    /// material from `OpenBao` KV into files under the host secrets
-    /// directory, which is bind-mounted into the container (not a tmpfs
-    /// volume). The template blocks specify only `source`, `destination`,
-    /// and `perms` — the sidecar itself does not signal the consumer on
-    /// re-render; consumer reload is the bootroot-agent's responsibility
-    /// via its post-renew hooks. The Docker network is auto-discovered
-    /// from `bootroot-openbao`'s compose project label unless
-    /// `--openbao-network` is supplied.
-    Start(ServiceOpenbaoSidecarStartArgs),
-    /// Restarts the per-service `OpenBao` Agent sidecar so it re-reads
-    /// KV templates after operator-side KV maintenance.
-    Refresh(ServiceOpenbaoSidecarRefreshArgs),
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct ServiceOpenbaoSidecarStartArgs {
-    /// Service name identifier
-    #[arg(long)]
-    pub(crate) service_name: String,
-
-    #[command(flatten)]
-    pub(crate) compose_file: ComposeFileArgs,
-
-    /// Docker network the sidecar should attach to.
-    ///
-    /// When omitted, the network is discovered from the
-    /// `bootroot-openbao` container's compose project label
-    /// (`<project>_default`). Required when `OpenBao` runs outside
-    /// bootroot's compose file (separate host, kubernetes, managed
-    /// service, etc.).
-    #[arg(long)]
-    pub(crate) openbao_network: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct ServiceOpenbaoSidecarRefreshArgs {
-    /// Service name identifier
-    #[arg(long)]
-    pub(crate) service_name: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -534,12 +477,15 @@ pub(crate) enum RotateCommand {
     /// Rotates the HTTP-01 responder HMAC secret.
     ///
     /// Replaces the shared HMAC used by the HTTP-01 admin API on both
-    /// the responder and on every client (`OpenBao` KV templates and
-    /// rendered config). Restarts the `OpenBao` Agent renderer so the
-    /// new HMAC is written to disk, then signals the responder with
-    /// SIGHUP via `docker compose kill -s HUP` when the compose file
-    /// includes the responder service so it reloads the new value
-    /// without dropping in-flight challenges.
+    /// the responder and on every client. Writes the new value to the
+    /// infra `OpenBao` KV path and to each registered service's
+    /// per-service KV payload; service `bootroot-agent` daemons (local
+    /// and remote alike) pick it up via their fast-poll loop, so no
+    /// per-service restart happens. Restarts the infra responder
+    /// `OpenBao` Agent so the responder config is re-rendered, then
+    /// signals the responder with SIGHUP via `docker compose kill -s
+    /// HUP` when the compose file includes the responder service so it
+    /// reloads the new value without dropping in-flight challenges.
     ResponderHmac(RotateResponderHmacArgs),
     /// Rotates `OpenBao` recovery credentials manually.
     ///
@@ -558,8 +504,9 @@ pub(crate) enum RotateCommand {
     ///
     /// Generates a fresh `secret_id` on the configured `AppRole`. For
     /// local-file services, writes it atomically to the on-disk
-    /// `secret_id` file and reloads the local `OpenBao` Agent so the new
-    /// credential takes effect. For remote-bootstrap services, publishes
+    /// `secret_id` file; the local bootroot-agent host daemon re-reads
+    /// that file on its next `AppRole` re-login, so no process signal
+    /// or reload is needed. For remote-bootstrap services, publishes
     /// it to the service's KV bootstrap path so the next bootroot-agent
     /// cycle picks it up. For infra targets, writes the `secret_id` file
     /// under `<secrets_dir>/openbao/<name>/` and restarts the matching
@@ -619,9 +566,10 @@ pub(crate) enum RotateCommand {
     /// registered in `state.json` `infra_certs`.
     #[command(name = "infra-cert")]
     InfraCert(RotateInfraCertArgs),
-    /// Clears EAB credentials from every known KV path so the next
-    /// bootroot-agent cycle does not template stale or invalid EAB
-    /// material into agent.toml.
+    /// Clears EAB credentials from every known KV path. Each
+    /// bootroot-agent observes the cleared value on its next fast-poll
+    /// cycle and removes its `eab.json`, so stale or invalid EAB
+    /// material stops being used without any restart or reload.
     #[command(name = "eab-clear")]
     EabClear(RotateEabClearArgs),
 }
@@ -1303,22 +1251,10 @@ pub(crate) struct StatusArgs {
 }
 
 #[derive(Args, Debug)]
-// `dry_run`, `print_only`, `no_wrap`, and `no_validate_agent` are
-// independent operator-facing toggles; collapsing them into an enum
-// would obscure the CLI surface and break clap's `#[arg(long)]`
-// derivation, so we accept the extra bool here.
-#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct ServiceAddArgs {
     /// Service name identifier
     #[arg(long)]
     pub(crate) service_name: Option<String>,
-
-    /// Deployment shape of the bootroot-agent process that will renew
-    /// this service's certificate (daemon or docker). NOT the consumer
-    /// service's deployment shape — for consumer reload on renewal, use
-    /// --reload-style and --reload-target.
-    #[arg(long, value_enum)]
-    pub(crate) deploy_type: Option<DeployType>,
 
     /// Secret delivery mode (local-file or remote-bootstrap)
     #[arg(long, value_enum)]
@@ -1352,27 +1288,9 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long)]
     pub(crate) key_path: Option<PathBuf>,
 
-    /// Instance ID (required for daemon and docker)
+    /// Instance ID (required)
     #[arg(long)]
     pub(crate) instance_id: Option<String>,
-
-    /// Container name of the bootroot-agent itself. Required when
-    /// --deploy-type=docker; ignored otherwise. NOT the consumer
-    /// service's container — for consumer reload on renewal, use
-    /// --reload-style docker-restart --reload-target <NAME>.
-    #[arg(long)]
-    pub(crate) container_name: Option<String>,
-
-    /// Skips the docker-mode identity check that confirms the
-    /// `--container-name` argument actually points at a bootroot-agent
-    /// (label `bootroot.role=agent`, or `bootroot-agent` substring in
-    /// the cmdline/image as a fallback). Useful when the agent
-    /// container does not exist yet at `service add` time or when
-    /// `docker inspect` is unreachable for legitimate reasons.
-    /// Does not bypass the raw `--container-name` / `--deploy-type=daemon`
-    /// conflict reject.
-    #[arg(long)]
-    pub(crate) no_validate_agent: bool,
 
     /// ACME account email persisted into the rendered `agent.toml`
     /// baseline.  Defaults to the compose-topology placeholder when
@@ -1567,8 +1485,8 @@ pub(crate) struct ServiceRemoveArgs {
     pub(crate) dry_run: bool,
 
     /// Also deletes bootroot-owned on-disk artifacts (cert/key files,
-    /// the per-service secret and `OpenBao` config directories, and the
-    /// remote-bootstrap artifact) and strips the managed profile block
+    /// the per-service secret directory, and the remote-bootstrap
+    /// artifact directory) and strips the managed profile block
     /// from `agent.toml`.
     ///
     /// Off by default: `service add` only records cert/key paths (the
@@ -1581,8 +1499,7 @@ pub(crate) struct ServiceRemoveArgs {
     pub(crate) delete_artifacts: bool,
 
     /// Strips the managed profile block from `agent.toml` without deleting
-    /// the cert/key files or the per-service secret and `OpenBao` config
-    /// directories.
+    /// the cert/key files or the per-service secret directory.
     ///
     /// Intended for live delivery-mode transitions: when moving a service
     /// between `local-file` and `remote-bootstrap` the operator must keep
@@ -1995,8 +1912,6 @@ mod tests {
             "--dry-run",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -2846,120 +2761,6 @@ mod tests {
                 assert_eq!(args.rn_cidrs, vec!["clear"]);
             }
             _ => panic!("expected service update"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parses_service_openbao_sidecar_start() {
-        let cli = Cli::parse_from([
-            "bootroot",
-            "service",
-            "openbao-sidecar",
-            "start",
-            "--service-name",
-            "myapp",
-        ]);
-        match cli.command {
-            CliCommand::Service(ServiceCommand::OpenbaoSidecar(
-                ServiceOpenbaoSidecarCommand::Start(args),
-            )) => {
-                assert_eq!(args.service_name, "myapp");
-                assert_eq!(
-                    args.compose_file.compose_file,
-                    PathBuf::from("docker-compose.yml")
-                );
-                assert!(
-                    args.openbao_network.is_none(),
-                    "openbao_network must default to None"
-                );
-            }
-            _ => panic!("expected service openbao-sidecar start"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parses_service_openbao_sidecar_start_with_openbao_network() {
-        let cli = Cli::parse_from([
-            "bootroot",
-            "service",
-            "openbao-sidecar",
-            "start",
-            "--service-name",
-            "myapp",
-            "--openbao-network",
-            "external_net",
-        ]);
-        match cli.command {
-            CliCommand::Service(ServiceCommand::OpenbaoSidecar(
-                ServiceOpenbaoSidecarCommand::Start(args),
-            )) => {
-                assert_eq!(args.service_name, "myapp");
-                assert_eq!(args.openbao_network.as_deref(), Some("external_net"));
-            }
-            _ => panic!("expected service openbao-sidecar start"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parses_service_openbao_sidecar_start_custom_compose() {
-        let cli = Cli::parse_from([
-            "bootroot",
-            "service",
-            "openbao-sidecar",
-            "start",
-            "--service-name",
-            "myapp",
-            "--compose-file",
-            "custom.yml",
-        ]);
-        match cli.command {
-            CliCommand::Service(ServiceCommand::OpenbaoSidecar(
-                ServiceOpenbaoSidecarCommand::Start(args),
-            )) => {
-                assert_eq!(args.service_name, "myapp");
-                assert_eq!(args.compose_file.compose_file, PathBuf::from("custom.yml"));
-            }
-            _ => panic!("expected service openbao-sidecar start"),
-        }
-    }
-
-    #[test]
-    fn test_cli_service_openbao_sidecar_start_requires_service_name() {
-        let result = Cli::try_parse_from(["bootroot", "service", "openbao-sidecar", "start"]);
-        assert!(result.is_err(), "service-name should be required");
-    }
-
-    #[test]
-    fn test_cli_service_openbao_sidecar_start_rejects_positional() {
-        let result =
-            Cli::try_parse_from(["bootroot", "service", "openbao-sidecar", "start", "myapp"]);
-        assert!(
-            result.is_err(),
-            "positional service name should be rejected"
-        );
-    }
-
-    /// Guards the deprecated `service agent start` alias: it must keep
-    /// parsing into the same `ServiceOpenbaoSidecarStartArgs` payload so
-    /// existing operators on the previous CLI surface keep working for
-    /// one release.  Drop in the following release alongside the alias.
-    #[test]
-    fn test_cli_parses_deprecated_service_agent_start_alias() {
-        let cli = Cli::parse_from([
-            "bootroot",
-            "service",
-            "agent",
-            "start",
-            "--service-name",
-            "myapp",
-        ]);
-        match cli.command {
-            CliCommand::Service(ServiceCommand::Agent(ServiceOpenbaoSidecarCommand::Start(
-                args,
-            ))) => {
-                assert_eq!(args.service_name, "myapp");
-            }
-            _ => panic!("expected deprecated service agent start alias"),
         }
     }
 

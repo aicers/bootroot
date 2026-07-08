@@ -382,7 +382,7 @@ async fn run_init_inner(
     // token at rotate time so the operator no longer has to pass
     // `--db-admin-dsn` on every rotation. The KV path carries strictly
     // higher privilege than `PATH_STEPCA_DB`; the existing step-ca
-    // runtime and sidecar policies must not include it.
+    // runtime and infra agent policies must not include it.
     if let Some(admin_dsn) = admin_dsn_for_kv.as_deref() {
         if !client
             .kv_exists(&args.openbao.kv_mount, super::super::PATH_STEPCA_DB_ADMIN)

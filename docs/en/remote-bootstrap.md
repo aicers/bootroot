@@ -97,7 +97,6 @@ ARTIFACT="$CONTROL_SECRETS/remote-bootstrap/services/$SERVICE/bootstrap.json"
 # 1. Register the service on the control node
 bootroot service add \
   --service-name "$SERVICE" \
-  --deploy-type daemon \
   --delivery-mode remote-bootstrap \
   --hostname "$REMOTE_HOST" \
   --domain trusted.domain \

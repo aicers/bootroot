@@ -126,12 +126,11 @@ bootroot init: 요약
 > 운영 환경에서 시크릿 루트가 다르면(예: `/etc/bootroot/secrets`) 같은 상대
 > 구조로 치환해서 읽으면 됩니다.
 
-### 3-1) local-file (기본값): daemon 서비스 추가
+### 3-1) local-file (기본값)
 
 ```bash
 bootroot service add \
   --service-name edge-proxy \
-  --deploy-type daemon \
   --hostname edge-node-01 \
   --domain trusted.domain \
   --agent-config /etc/bootroot/agent.toml \
@@ -141,94 +140,75 @@ bootroot service add \
   --root-token <OPENBAO_ROOT_TOKEN>
 ```
 
-예시 대화/출력(전체):
+예시 대화/출력(요약):
 
 ```text
 OpenBao root token: ********
 
-bootroot 서비스 추가: 계획
+bootroot 서비스 추가: 요약
 - 서비스 이름: edge-proxy
-- 배포 타입: daemon
 - 호스트명: edge-node-01
 - 도메인: trusted.domain
-- instance_id: 001
-- 에이전트 설정: /etc/bootroot/agent.toml
-- cert 경로: /etc/bootroot/certs/edge-proxy.crt
-- key 경로: /etc/bootroot/certs/edge-proxy.key
+- 전달 모드: local-file
+- 정책: bootroot-service-edge-proxy
+- AppRole: bootroot-service-edge-proxy
+- role_id: ********
+- secret_id 경로: secrets/services/edge-proxy/secret_id
+- OpenBao 경로: bootroot/services/edge-proxy
+Bootroot 자동 반영 항목:
+- 자동 반영 bootroot-agent 설정: /etc/bootroot/agent.toml
+- 자동 프로비저닝 EAB 파일 (EAB가 설정된 경우에만 존재; --eab-file로
+  경로 전달): secrets/services/edge-proxy/eab.json
 다음 단계:
-  - AppRole: bootroot-service-edge-proxy
-  - secret_id 경로: secrets/services/edge-proxy/secret_id
-  - OpenBao 경로: bootroot/services/edge-proxy
-  - OpenBao Agent (서비스별 인스턴스):
-    - config: secrets/openbao/services/edge-proxy/agent.hcl
-    - role_id file: secrets/services/edge-proxy/role_id
-    - secret_id file: secrets/services/edge-proxy/secret_id
-    - ensure secrets/services/edge-proxy is 0700 and
-      role_id/secret_id files are 0600
-    - 관리형 사이드카를 시작하세요:
-      bootroot service openbao-sidecar start --service-name edge-proxy
-      (bootroot rotate가 사이드카에 신호를 보내려면 필요합니다.
-      호스트에서 `bao agent -config=secrets/openbao/services/edge-proxy/agent.hcl`을
-      실행하는 방법도 대체로 사용할 수 있습니다)
+운영자 실행 항목 (필수):
   - /etc/bootroot/agent.toml에 프로필(instance_id=001,
     hostname=edge-node-01, domain=trusted.domain,
     cert=/etc/bootroot/certs/edge-proxy.crt,
     key=/etc/bootroot/certs/edge-proxy.key)을 추가하고
     bootroot-agent를 리로드하세요.
+daemon 프로필 스니펫:
+[[profiles]]
+service_name = "edge-proxy"
+...
+daemon 실행 명령 (systemd ExecStart 또는 셸; EAB 회전이 적용되려면
+--eab-file이 필요합니다):
+bootroot-agent --config /etc/bootroot/agent.toml \
+  --eab-file secrets/services/edge-proxy/eab.json
 ```
 
 생성된 `agent.toml`은 바로 실행 가능한 완전한 설정입니다: managed 프로필,
 `[trust]` 섹션, 최상위 `domain`(`--domain`에서 가져옴),
-`[acme].http_responder_hmac`(OpenBao에 저장된 리스폰더 HMAC에서 가져옴)을
-포함합니다. HTTP-01 검증 FQDN도 `bootroot-http01` 컨테이너에 DNS 별칭으로
-자동 등록됩니다. `bootroot-agent` 실행 전에 수동 편집이 필요하지 않습니다.
+`[acme].http_responder_hmac`(OpenBao에 저장된 리스폰더 HMAC에서 가져옴),
+그리고 에이전트의 fast-poll 자체 인증 루프를 활성화하는 `[openbao]`
+섹션(서비스별로 키가 부여된 절대 경로 `state_path`가 `agent.toml` 옆에
+프로비저닝됨)을 포함합니다. HTTP-01 검증 FQDN도 `bootroot-http01`
+컨테이너에 DNS 별칭으로 자동 등록됩니다. `bootroot-agent` 실행 전에 수동
+편집이 필요하지 않으며, 출력된 실행 명령으로 호스트 데몬으로 실행하세요
+(`--eab-file`을 유지해야 합니다).
 
-최신 CLI 출력에는 위 정보와 함께
-`Bootroot 자동 반영 항목`/`운영자 실행 항목 (필수/권장/선택)` 라벨이 표시되어
-자동 처리 범위와 운영자 작업 범위를 명확히 구분해 줍니다.
+### 3-2) local-file: 컨테이너화된 소비 애플리케이션
 
-예시(라벨 중심):
-
-```text
-Bootroot 자동 반영 항목:
-- 자동 반영 bootroot-agent 설정: ...
-- 자동 반영 OpenBao Agent 설정: ...
-
-운영자 실행 항목 (필수):
-- OpenBao Agent 실행
-- bootroot-agent 실행/리로드
-
-운영자 실행 항목 (선택):
-- trust 자동 반영값 대신 수동 trust 고정/오버라이드 적용
-```
-
-### 3-2) local-file (기본값): docker 서비스 추가
+bootroot-agent 자체는 여전히 호스트 데몬으로 실행됩니다. 컨테이너로
+동작하는 애플리케이션이라면 `--cert-path`/`--key-path`를 컨테이너가
+bind-mount하는 호스트 디렉터리로 지정하고, 명시적 컨테이너 이름과 함께
+`docker-restart` post-renew 훅을 설정하세요:
 
 ```bash
 bootroot service add \
   --service-name web-app \
-  --deploy-type docker \
   --hostname web-01 \
   --domain trusted.domain \
   --agent-config /srv/bootroot/agent.toml \
-  --cert-path /srv/bootroot/certs/web-app.crt \
-  --key-path /srv/bootroot/certs/web-app.key \
+  --cert-path /opt/web-app-mtls/web-app.crt \
+  --key-path /opt/web-app-mtls/web-app.key \
   --instance-id 001 \
-  --container-name web-app \
+  --reload-style docker-restart \
+  --reload-target web-app \
   --root-token <OPENBAO_ROOT_TOKEN>
 ```
 
-예시 대화/출력(전체):
-
-```text
-OpenBao root token: ********
-
-다음 단계:
-  - web-app 사이드카(container=web-app, instance_id=001,
-    hostname=web-01, domain=trusted.domain)를
-    /srv/bootroot/agent.toml로 실행하고 AppRole bootroot-service-web-app,
-    secret_id 파일 secrets/services/web-app/secret_id를 사용하세요.
-```
+bind-mount 패턴과 하드닝 유닛/Docker 소켓 트레이드오프는
+[운영 > 컨테이너화된 소비 애플리케이션](operations.md)을 참고하세요.
 
 ### 3-3) remote-bootstrap 전달 모드 + 일회성 bootstrap
 
@@ -240,7 +220,6 @@ OpenBao root token: ********
 ```bash
 bootroot service add \
   --service-name edge-remote \
-  --deploy-type daemon \
   --delivery-mode remote-bootstrap \
   --hostname edge-node-02 \
   --domain trusted.domain \
@@ -304,7 +283,6 @@ bootroot-remote bootstrap \
 ```bash
 bootroot service add \
   --service-name edge-proxy \
-  --deploy-type daemon \
   --hostname edge-node-01 \
   --domain trusted.domain \
   --agent-config /etc/bootroot/agent.toml \
@@ -418,22 +396,23 @@ bootroot 검증: 요약
 여기서 “상시 모드”는 one-shot 검증이 아니라 **지속 실행**으로
 인증서를 주기적으로 갱신하는 운용 모드를 뜻합니다.
 
-daemon 서비스:
-
-- bootroot-agent: 데몬 모드
-- OpenBao Agent: 서비스별 daemon
-
-bootroot-agent는 **서비스별이 아니라 머신별로 1개**를 데몬으로 실행합니다.
-프로필을 추가할 때마다 `agent.toml`을 갱신하고, 데몬을 리로드하세요.
+bootroot-agent는 **호스트 데몬**으로 실행합니다 — 서비스별 OpenBao
+Agent도, Docker 사이드카도 없습니다. **서로 다른 서비스마다**
+`bootroot-agent` 프로세스 하나와 agent 구성 하나를 실행하세요.
+`[openbao]` 섹션은 AppRole 자격증명을 하나만 담으므로 서로 다른 서비스가
+하나의 `agent.toml`을 공유할 수 없습니다. 하나의 구성에 여러
+`[[profiles]]`를 두는 것은 같은 서비스의 인스턴스에 대해서만 지원되며,
+이런 인스턴스를 추가할 때 `agent.toml`을 갱신하고 데몬을 리로드하세요.
 프로세스 종료 시 자동 재기동되도록 systemd에서
-`Restart=always`(또는 `on-failure`)를 설정하는 것을 권장합니다.
+`Restart=always`(또는 `on-failure`)를 설정하는 것을 권장합니다
+([운영 > 하드닝된 systemd 유닛 예시](operations.md) 참고).
+
+`service add`가 출력한 실행 명령을 사용하세요 — EAB 회전이 적용되려면
+`--eab-file`이 필수입니다:
 
 ```bash
-openbao agent -config /etc/bootroot/secrets/openbao/services/edge-proxy/agent.hcl
-```
-
-```bash
-bootroot-agent --config /etc/bootroot/agent.toml
+bootroot-agent --config /etc/bootroot/agent.toml \
+  --eab-file /path/to/secrets/services/edge-proxy/eab.json
 ```
 
 예시 출력:
@@ -444,34 +423,9 @@ Issuing certificate for 001.edge-proxy.edge-node-01.trusted.domain
 Certificate issued successfully.
 ```
 
-docker 서비스:
-
-- OpenBao Agent: 사이드카(서비스별 docker 컨테이너)
-- bootroot-agent: 사이드카(서비스별 docker 컨테이너)
-
-Docker 서비스도 호스트 통합 bootroot-agent daemon을 사용할 수는 있지만,
-지원은 하되 권장하지 않습니다. 격리와 라이프사이클 정합성을 위해 사이드카
-패턴을 권장합니다.
-
-```bash
-AGENT_HCL=/srv/bootroot/secrets/openbao/services/web-app/agent.hcl
-docker run --rm \
-  --name openbao-agent-web-app \
-  -v "$AGENT_HCL":/app/agent.hcl:ro \
-  -v /srv/bootroot/secrets:/app/secrets \
-  openbao/bao:latest \
-  agent -config /app/agent.hcl
-```
-
-```bash
-docker run -d \
-  --name web-app \
-  --restart unless-stopped \
-  -v /srv/bootroot/agent.toml:/app/agent.toml:ro \
-  -v /srv/bootroot/certs:/app/certs \
-  <bootroot-agent-image> \
-  bootroot-agent --config /app/agent.toml
-```
+컨테이너로 동작하는 애플리케이션의 경우에도 같은 호스트 데몬이 컨테이너가
+bind-mount하는 호스트 디렉터리에 cert/key를 기록하고, `docker-restart`
+post-renew 훅이 갱신 때마다 컨테이너를 재시작합니다(3-2절 참고).
 
 예시 출력:
 
@@ -502,7 +456,7 @@ bootroot rotate openbao-recovery --rotate-root-token
 # (서비스별 대상 지정은 --service-name으로 계속 가능)
 bootroot rotate approle-secret-id --all-services
 
-# OpenBao Agent 사이드카가 사용하는 인프라 AppRole secret_id 회전
+# 인프라 OpenBao Agent가 사용하는 인프라 AppRole secret_id 회전
 # (위에서 사용한 runtime-rotate 자격증명이 아니라
 # bootroot-infra-rotate-role 자격증명 필요)
 bootroot rotate \

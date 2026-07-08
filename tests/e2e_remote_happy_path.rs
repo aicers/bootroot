@@ -60,8 +60,8 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     assert!(eab_contents.contains("\"kid\": \"remote-kid\""));
     let agent_contents = fs::read_to_string(&agent_config_path).expect("read agent config");
     let ca_bundle_path = service_dir.join("certs").join("ca-bundle.pem");
-    // schema_version 4: remote bootstrap no longer writes the OpenBao Agent
-    // sidecar artifacts (agent.hcl / agent.toml.ctmpl / token) — the remote
+    // schema_version 4: remote bootstrap does not write OpenBao Agent
+    // artifacts (agent.hcl / agent.toml.ctmpl / token) — the remote
     // agent self-authenticates and renders trust via the fast-poll loop.
     let openbao_agent_dir = service_dir
         .join("secrets")
@@ -116,8 +116,6 @@ fn run_service_add_remote_impl(
         "add".to_string(),
         "--service-name".to_string(),
         SERVICE_NAME.to_string(),
-        "--deploy-type".to_string(),
-        "daemon".to_string(),
         "--delivery-mode".to_string(),
         "remote-bootstrap".to_string(),
         "--hostname".to_string(),
@@ -297,7 +295,6 @@ fn write_verify_state(service_dir: &Path) -> anyhow::Result<()> {
         "services": {
             SERVICE_NAME: {
                 "service_name": SERVICE_NAME,
-                "deploy_type": "daemon",
                 "delivery_mode": "remote-bootstrap",
                 "hostname": HOSTNAME,
                 "domain": DOMAIN,

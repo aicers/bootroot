@@ -13,7 +13,6 @@ COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
-AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-$WORKSPACE_DIR/agent.toml}"
 CERTS_DIR="${CERTS_DIR:-$WORKSPACE_DIR/certs}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-120}"
 INFRA_UP_ATTEMPTS="${INFRA_UP_ATTEMPTS:-6}"
@@ -38,11 +37,18 @@ HTTP01_TARGET_DELAY_SECS="${HTTP01_TARGET_DELAY_SECS:-2}"
 RESPONDER_READY_ATTEMPTS="${RESPONDER_READY_ATTEMPTS:-30}"
 RESPONDER_READY_DELAY_SECS="${RESPONDER_READY_DELAY_SECS:-1}"
 
-OPENBAO_CONTAINER_NAME="bootroot-openbao"
 EDGE_SERVICE="edge-proxy"
 EDGE_HOSTNAME="edge-node-01"
 WEB_SERVICE="web-app"
 WEB_HOSTNAME="web-01"
+# Each distinct local service gets its own agent config (and with it
+# its own `[openbao]` AppRole identity, service-keyed state file,
+# eab.json, and daemon process).  The `[openbao]` section holds a
+# single AppRole identity whose policy only reads that service's KV
+# subtree, so sharing one agent config across distinct services is an
+# unsupported topology.
+EDGE_AGENT_CONFIG="$WORKSPACE_DIR/agent-${EDGE_SERVICE}.toml"
+WEB_AGENT_CONFIG="$WORKSPACE_DIR/agent-${WEB_SERVICE}.toml"
 DOMAIN="trusted.domain"
 INSTANCE_ID="001"
 REMOTE_SERVICE="api-gw"
@@ -67,82 +73,21 @@ INFRA_ROTATE_ROLE_ID=""
 INFRA_ROTATE_SECRET_ID=""
 INIT_ROOT_TOKEN=""
 OPENBAO_RECOVERY_OUTPUT_FILE="$ARTIFACT_DIR/openbao-recovery.json"
-# Use a daemon-deploy service for the OBA exercise so the
-# `bootroot service openbao-sidecar start` daemon bind-mounts land
-# the rendered agent.toml at the same host path the test issues
-# certs against (`$AGENT_CONFIG_PATH`).  The docker-deploy variant
-# would render under `$SECRETS_DIR/services/<svc>/` instead, which
-# doesn't match the per-service verify call below.
-SIDECAR_OBA_SERVICE="$EDGE_SERVICE"
-SIDECAR_OBA_CONTAINER="bootroot-openbao-agent-${SIDECAR_OBA_SERVICE}"
-SIDECAR_OBA_READY_ATTEMPTS="${SIDECAR_OBA_READY_ATTEMPTS:-30}"
-SIDECAR_OBA_READY_DELAY_SECS="${SIDECAR_OBA_READY_DELAY_SECS:-2}"
-# Selects which OpenBao Agent deployment to exercise:
-#   sidecar     - bootroot-managed, started via `service openbao-sidecar start`
-#                 (default; active rotate-signal path)
-#   host-daemon - operator-managed, started by this script via
-#                 `docker run --network host` to simulate a host `bao agent`
-#                 (passive rotate-signal path via static_secret_render_interval)
-OBA_DEPLOYMENT="${OBA_DEPLOYMENT:-sidecar}"
-HOST_DAEMON_OBA_CONTAINER="${HOST_DAEMON_OBA_CONTAINER:-bootroot-openbao-agent-host-${EDGE_SERVICE}}"
-# Selects which compose-project / OpenBao topology to exercise around
-# `service openbao-sidecar start`.  All values run the same install
-# + init + service-add prefix; later phases differ.
-#
-#   default          - standard bootroot compose, default project name.
-#                      Runs the full lifecycle (sidecar start + rotations).
-#   custom-project   - same as default but exports
-#                      COMPOSE_PROJECT_NAME=$CUSTOM_COMPOSE_PROJECT before
-#                      bringing up the stack.  Asserts the sidecar lands
-#                      in that project (exercises env-var → project-label
-#                      discovery branch in `discover_compose_project`).
-#   openbao-missing  - removes the bootroot-openbao container before
-#                      invoking `service openbao-sidecar start` and
-#                      asserts the command exits non-zero with the
-#                      full "container not found" i18n message,
-#                      including the `bootroot infra install` /
-#                      `--openbao-network` remediation guidance.
-#                      Skips the rotation phase (state is intentionally
-#                      degraded).
-#   external-openbao - swaps in a stripped compose file (no openbao
-#                      service) and an external docker network for the
-#                      `service openbao-sidecar start` call.  Asserts the
-#                      negative path (no flag → required-flag error)
-#                      and the positive path (with --openbao-network the
-#                      sidecar attaches to the external network).  Skips
-#                      the rotation phase.
-OBA_TOPOLOGY="${OBA_TOPOLOGY:-default}"
-CUSTOM_COMPOSE_PROJECT="${CUSTOM_COMPOSE_PROJECT:-myorg-prod}"
-EXTERNAL_OBA_NETWORK="${EXTERNAL_OBA_NETWORK:-oba-ext}"
-# Upper bound for the responder-hmac rotate's wall-clock under each
-# OBA deployment.  The two thresholds together prove which propagation
-# route OpenBao Agent took:
-#
-#   sidecar:     bootroot's active container restart hands the new
-#                HMAC over instantly, so the rotate must complete
-#                well below `static_secret_render_interval` (=30s).
-#                If the active route silently regresses (e.g. wrong
-#                container name, signal not delivered), rotate would
-#                still succeed via the polling fallback — but the
-#                wall-clock would jump above this threshold and we'd
-#                catch the regression here instead of letting it ship
-#                undetected (the gap that #577 sat in for a release).
-#
-#   host-daemon: bootroot has no handle on the operator-managed
-#                daemon, so the active restart silently no-ops and
-#                only the polling fallback (`static_secret_render_interval
-#                = 30s`) propagates the new HMAC.  Allow the full
-#                polling window plus jitter.
-SIDECAR_ROTATE_LATENCY_LIMIT_SECS="${SIDECAR_ROTATE_LATENCY_LIMIT_SECS:-25}"
-HOST_DAEMON_RENDER_TIMEOUT_SECS="${HOST_DAEMON_RENDER_TIMEOUT_SECS:-75}"
+# Each host-daemon bootroot-agent's fast-poll loop (default
+# fast_poll_interval = 30s) is the only propagation route for rotated
+# per-service secrets.  After `rotate responder-hmac` the harness waits
+# for each running daemon to upsert the new HMAC into its own agent
+# config before driving verification; allow one full poll interval
+# plus generous margin for slow CI runners.
+RESPONDER_HMAC_PROPAGATION_ATTEMPTS="${RESPONDER_HMAC_PROPAGATION_ATTEMPTS:-45}"
+RESPONDER_HMAC_PROPAGATION_DELAY_SECS="${RESPONDER_HMAC_PROPAGATION_DELAY_SECS:-2}"
 CURRENT_PHASE="init"
-# PID of the long-running bootroot-agent daemon started for the local
-# services (edge-proxy + web-app share AGENT_CONFIG_PATH).  Required so
-# `bootroot rotate force-reissue --wait` can deliver SIGHUP to a real
-# process — without it, pkill -HUP exits 1 ("no processes matched") and
-# the rotate fails before the wait path runs.
-LOCAL_AGENT_DAEMON_PID=""
-LOCAL_AGENT_DAEMON_LOG="$ARTIFACT_DIR/bootroot-agent.log"
+# PIDs of the long-running per-service bootroot-agent daemons (one per
+# distinct local service, each bound to its own agent config).
+# Required so `bootroot rotate force-reissue --wait` can deliver SIGHUP
+# to a real process — without it, pkill -HUP exits 1 ("no processes
+# matched") and the rotate fails before the wait path runs.
+LOCAL_AGENT_DAEMON_PIDS=""
 # Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
 # default moved from 5432 to 5433 in #588 §4c; the e2e harness
 # expects 5432 (CI runners free that port before the matrix), so
@@ -258,303 +203,6 @@ capture_artifacts() {
   docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs bootroot-openbao-agent-stepca >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs bootroot-openbao-agent-responder >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
-  docker logs "$SIDECAR_OBA_CONTAINER" >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
-  docker logs "$HOST_DAEMON_OBA_CONTAINER" >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
-}
-
-# Sidecar variant: invoke the canonical bootroot CLI so CI exercises
-# the same code path operators use.  This catches regressions in the
-# sidecar-management code (e.g. issue #577's hardcoded network bug)
-# that an inline `docker run` shortcut would silently bypass.
-start_service_sidecar_oba_via_bootroot() {
-  local service="$1"
-  rm -f "$AGENT_CONFIG_PATH"
-  docker rm -f "bootroot-openbao-agent-${service}" >/dev/null 2>&1 || true
-
-  run_bootroot service openbao-sidecar start \
-    --service-name "$service" \
-    --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
-  wait_for_oba_render "$AGENT_CONFIG_PATH" \
-    "$SIDECAR_OBA_READY_ATTEMPTS" \
-    "$SIDECAR_OBA_READY_DELAY_SECS" \
-    "bootroot-openbao-agent-${service}" \
-    "sidecar OBA"
-}
-
-# Host-daemon variant: simulate a host-managed `bao agent` by running
-# the OpenBao binary in a container that shares the host network
-# namespace.  agent.hcl points at 127.0.0.1:8200 (the host-published
-# port), and rotate signals propagate via the polling fallback.
-start_service_host_daemon_oba() {
-  local service="$1"
-  local agent_hcl="$SECRETS_DIR/openbao/services/${service}/agent.hcl"
-  rm -f "$AGENT_CONFIG_PATH"
-  docker rm -f "$HOST_DAEMON_OBA_CONTAINER" >/dev/null 2>&1 || true
-
-  # --network host so 127.0.0.1:8200 in agent.hcl reaches the
-  # bootroot-openbao port published to the host.  Bind-mount the same
-  # paths the sidecar uses so agent.toml renders to AGENT_CONFIG_PATH.
-  docker run -d \
-    --name "$HOST_DAEMON_OBA_CONTAINER" \
-    --user "$(id -u):$(id -g)" \
-    --network host \
-    -v "$ROOT_DIR:$ROOT_DIR" \
-    -v "$ARTIFACT_DIR:$ARTIFACT_DIR" \
-    openbao/openbao:latest \
-    agent -config="$agent_hcl" >>"$RUN_LOG" 2>&1
-  wait_for_oba_render "$AGENT_CONFIG_PATH" \
-    "$SIDECAR_OBA_READY_ATTEMPTS" \
-    "$SIDECAR_OBA_READY_DELAY_SECS" \
-    "$HOST_DAEMON_OBA_CONTAINER" \
-    "host-daemon OBA"
-}
-
-# Polls for an OBA-rendered agent.toml signature.  Centralised so
-# both variants share the same readiness contract.
-wait_for_oba_render() {
-  local config_path="$1"
-  local attempts="$2"
-  local delay="$3"
-  local container="$4"
-  local label="$5"
-  local attempt
-  for attempt in $(seq 1 "$attempts"); do
-    if [ -f "$config_path" ] &&
-      grep -Eq '^[[:space:]]*http_responder_hmac[[:space:]]*=[[:space:]]*"[^"]+"' \
-        "$config_path" 2>/dev/null; then
-      return 0
-    fi
-    sleep "$delay"
-  done
-  docker logs "$container" >>"$RUN_LOG" 2>&1 || true
-  fail "${label} (${container}) did not render agent config within timeout"
-}
-
-start_service_oba() {
-  case "$OBA_DEPLOYMENT" in
-    sidecar)
-      start_service_sidecar_oba_via_bootroot "$1"
-      ;;
-    host-daemon)
-      start_service_host_daemon_oba "$1"
-      ;;
-    *)
-      fail "Unsupported OBA_DEPLOYMENT: $OBA_DEPLOYMENT (expected: sidecar | host-daemon)"
-      ;;
-  esac
-}
-
-stop_service_oba() {
-  docker rm -f "$SIDECAR_OBA_CONTAINER" >/dev/null 2>&1 || true
-  docker rm -f "$HOST_DAEMON_OBA_CONTAINER" >/dev/null 2>&1 || true
-}
-
-# Asserts the sidecar container's compose project label matches the
-# expected value.  Catches regressions where project-label discovery
-# silently falls back to a hardcoded default instead of honouring
-# COMPOSE_PROJECT_NAME (issue #582 scenario 1).
-assert_sidecar_compose_project() {
-  local container="$1"
-  local expected="$2"
-  local actual
-  actual="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$container" 2>/dev/null || true)"
-  if [ "$actual" != "$expected" ]; then
-    docker logs "$container" >>"$RUN_LOG" 2>&1 || true
-    fail "sidecar container $container has compose project label '$actual', expected '$expected' (custom-project topology)"
-  fi
-  printf '[lifecycle] sidecar compose project label verified: container=%s project=%s\n' \
-    "$container" "$actual" >>"$RUN_LOG"
-}
-
-# Removes bootroot-openbao via `docker rm -f` (NOT `docker stop`) so
-# `docker inspect` returns a "no such container" error and exercises
-# the ContainerNotFound branch in `inspect_label_via_docker`.  A plain
-# stop would leave the container's compose project label intact and
-# trigger the Present(value) branch instead.
-remove_openbao_container_for_missing_topology() {
-  docker rm -f "$OPENBAO_CONTAINER_NAME" >/dev/null 2>&1 || true
-  if docker inspect "$OPENBAO_CONTAINER_NAME" >/dev/null 2>&1; then
-    fail "$OPENBAO_CONTAINER_NAME still exists after docker rm -f (openbao-missing topology)"
-  fi
-}
-
-# Asserts `service openbao-sidecar start` fails and the captured
-# stderr+stdout contains *every* expected substring.  Multiple
-# substrings let us pin both the symptom and the remediation portion
-# of an i18n message, so a regression that drops the remediation hint
-# is caught even when the symptom string is unchanged.
-#
-# Usage:
-#   assert_service_oba_start_fails <service> <substring> [<substring>...] \
-#     -- [bootroot service openbao-sidecar start args...]
-#
-# The literal `--` separates expected-substring args from bootroot
-# CLI args.  At least one substring is required.
-assert_service_oba_start_fails() {
-  local service="$1"
-  shift
-  local -a expected_substrings=()
-  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
-    expected_substrings+=("$1")
-    shift
-  done
-  if [ "$#" -eq 0 ]; then
-    fail "assert_service_oba_start_fails: missing '--' separator before bootroot args"
-  fi
-  shift # discard the literal --
-  if [ "${#expected_substrings[@]}" -eq 0 ]; then
-    fail "assert_service_oba_start_fails: at least one expected substring is required"
-  fi
-  local capture_file
-  capture_file="$(mktemp "$ARTIFACT_DIR/oba-start-fail.XXXXXX")"
-  rm -f "$AGENT_CONFIG_PATH"
-  docker rm -f "bootroot-openbao-agent-${service}" >/dev/null 2>&1 || true
-  if (cd "$WORKSPACE_DIR" && "$BOOTROOT_BIN" service openbao-sidecar start \
-        --service-name "$service" "$@") >"$capture_file" 2>&1; then
-    cat "$capture_file" >>"$RUN_LOG" || true
-    fail "service openbao-sidecar start unexpectedly succeeded for ${service} (expected failure containing: ${expected_substrings[*]})"
-  fi
-  cat "$capture_file" >>"$RUN_LOG" || true
-  local substring
-  for substring in "${expected_substrings[@]}"; do
-    if ! grep -qF -e "$substring" "$capture_file"; then
-      fail "service openbao-sidecar start error did not contain expected substring '${substring}' (see $capture_file)"
-    fi
-    printf '[lifecycle] service openbao-sidecar start failed as expected: substring=%q\n' \
-      "$substring" >>"$RUN_LOG"
-  done
-}
-
-# Writes a stripped compose file that has no `openbao` service,
-# forcing the `compose_has_openbao() == false` branch in
-# `resolve_sidecar_topology`.  Other infra services are kept so the
-# stripped file still parses as a valid compose document.
-write_stripped_compose_file() {
-  local target="$1"
-  cat >"$target" <<'YAML'
-services:
-  placeholder:
-    image: hello-world
-    profiles:
-      - never-up
-YAML
-}
-
-# Drives the external-OpenBao topology assertions: stripped compose
-# with no openbao service + a separately-created docker network the
-# sidecar must attach to via --openbao-network.
-#
-# Provides a reachable OpenBao endpoint on `oba-ext` by connecting the
-# already-initialised `bootroot-openbao` container to that network.
-# The agent.hcl rendered during `service add` always points at
-# `address = "http://bootroot-openbao:8200"` (see
-# `render_docker_agent_config`), so docker DNS on `oba-ext` resolves
-# the address from inside the sidecar and `bao agent` can authenticate
-# and render `agent.toml` end-to-end.
-#
-# The positive case sets COMPOSE_PROJECT_NAME to a sentinel value
-# before invoking bootroot, then asserts the sidecar's
-# `com.docker.compose.project` label equals that sentinel.  This
-# proves no `-p <project>` was passed to docker compose: with `-p`,
-# the label would equal the `-p` value (always `bootroot` or the
-# discovered project under #580's logic); without `-p`, it falls
-# through to COMPOSE_PROJECT_NAME == sentinel.
-#
-# The `wait_for_oba_render` call after the positive invocation is the
-# core proof that `--openbao-network` plumbed the sidecar to a working
-# OpenBao endpoint — `docker compose up -d` succeeds even when the
-# agent's first connection fails (it would just keep restarting), so
-# the rendered HMAC line in `agent.toml` is the only end-to-end signal
-# that the sidecar actually talked to OpenBao.
-run_external_openbao_topology_assertions() {
-  local service="$1"
-  local stripped_compose="$ARTIFACT_DIR/docker-compose.stripped.yml"
-  local sidecar_container="bootroot-openbao-agent-${service}"
-  local no_p_sentinel="external-no-p-sentinel"
-  write_stripped_compose_file "$stripped_compose"
-  if ! docker network inspect "$EXTERNAL_OBA_NETWORK" >/dev/null 2>&1; then
-    docker network create "$EXTERNAL_OBA_NETWORK" >/dev/null
-  fi
-  # Attach the existing OpenBao container to oba-ext so the sidecar
-  # (which joins oba-ext only) can resolve `bootroot-openbao` via
-  # docker DNS and reach the API.  Idempotent: `docker network
-  # connect` errors if the container is already attached.
-  if ! docker inspect --format \
-        "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}" \
-        "$OPENBAO_CONTAINER_NAME" 2>/dev/null | grep -qw "$EXTERNAL_OBA_NETWORK"; then
-    docker network connect "$EXTERNAL_OBA_NETWORK" "$OPENBAO_CONTAINER_NAME" >>"$RUN_LOG" 2>&1
-  fi
-
-  # Align state.openbao_url with the docker-DNS name used inside the
-  # sidecar.  The override generated by `service openbao-sidecar
-  # start` sets `VAULT_ADDR={state.openbao_url}` verbatim when
-  # `compose_has_openbao` is false (stripped compose), and OpenBao
-  # Agent honours that env var over `vault.address` in the rendered
-  # agent-docker.hcl.  Init left openbao_url at `http://localhost:8200`
-  # which is unreachable from inside the sidecar; rewriting it to the
-  # container name lets docker DNS on `oba-ext` route the request to
-  # the existing bootroot-openbao container we just attached.  The
-  # rendered agent-docker.hcl already addresses OpenBao by container
-  # name, so config and env now agree.
-  local state_file="$WORKSPACE_DIR/state.json"
-  if [ -f "$state_file" ]; then
-    local tmp_state
-    tmp_state="$(mktemp "$ARTIFACT_DIR/state.json.XXXXXX")"
-    jq '.openbao_url = "http://bootroot-openbao:8200"' "$state_file" >"$tmp_state"
-    mv "$tmp_state" "$state_file"
-    printf '[lifecycle] external-openbao topology: rewrote state.openbao_url=%s\n' \
-      "http://bootroot-openbao:8200" >>"$RUN_LOG"
-  else
-    fail "state.json not found at $state_file (external-openbao topology)"
-  fi
-
-  # Negative: no --openbao-network and stripped compose → must fail
-  # with the i18n message that requests the flag.
-  assert_service_oba_start_fails "$service" \
-    "--openbao-network" \
-    -- \
-    --compose-file "$stripped_compose"
-
-  # Positive: with --openbao-network the sidecar attaches to the
-  # external network and the docker compose invocation must NOT
-  # include `-p <project>`.  Assert via the COMPOSE_PROJECT_NAME
-  # sentinel; the matching unit test
-  # (`build_compose_up_args_omits_project_when_not_supplied`)
-  # backs this at the function level.
-  rm -f "$AGENT_CONFIG_PATH"
-  docker rm -f "$sidecar_container" >/dev/null 2>&1 || true
-  (cd "$WORKSPACE_DIR" && \
-      COMPOSE_PROJECT_NAME="$no_p_sentinel" \
-      "$BOOTROOT_BIN" service openbao-sidecar start \
-        --service-name "$service" \
-        --compose-file "$stripped_compose" \
-        --openbao-network "$EXTERNAL_OBA_NETWORK") >>"$RUN_LOG" 2>&1
-  if ! docker inspect "$sidecar_container" >/dev/null 2>&1; then
-    fail "sidecar container $sidecar_container not created in external-openbao positive case"
-  fi
-  local network_id
-  network_id="$(docker inspect --format \
-    "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}" \
-    "$sidecar_container" 2>/dev/null || true)"
-  if ! printf '%s' "$network_id" | grep -qw "$EXTERNAL_OBA_NETWORK"; then
-    fail "sidecar container $sidecar_container is not on $EXTERNAL_OBA_NETWORK (networks: $network_id)"
-  fi
-  local actual_project
-  actual_project="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$sidecar_container" 2>/dev/null || true)"
-  if [ "$actual_project" != "$no_p_sentinel" ]; then
-    fail "sidecar container $sidecar_container has compose project '$actual_project', expected '$no_p_sentinel' — proves docker compose was invoked WITH a -p flag instead of relying on COMPOSE_PROJECT_NAME"
-  fi
-  # End-to-end proof that --openbao-network reached a working OpenBao:
-  # the sidecar must render agent.toml with an http_responder_hmac
-  # value, which only happens after a successful auth + template
-  # fetch round-trip.
-  wait_for_oba_render "$AGENT_CONFIG_PATH" \
-    "$SIDECAR_OBA_READY_ATTEMPTS" \
-    "$SIDECAR_OBA_READY_DELAY_SECS" \
-    "$sidecar_container" \
-    "external-openbao sidecar"
-  printf '[lifecycle] external-openbao positive case verified: container=%s networks=%q project=%s render=ok\n' \
-    "$sidecar_container" "$network_id" "$actual_project" >>"$RUN_LOG"
 }
 
 cleanup_hosts() {
@@ -574,13 +222,9 @@ cleanup_hosts() {
 cleanup() {
   log_phase "cleanup"
   cleanup_hosts
-  stop_local_bootroot_agent_daemon
+  stop_local_bootroot_agent_daemons
   capture_artifacts
-  stop_service_oba
   compose_down
-  if [ "$OBA_TOPOLOGY" = "external-openbao" ]; then
-    docker network rm "$EXTERNAL_OBA_NETWORK" >/dev/null 2>&1 || true
-  fi
 }
 
 on_error() {
@@ -633,8 +277,9 @@ configure_resolution_mode() {
 }
 
 write_agent_config() {
-  mkdir -p "$(dirname "$AGENT_CONFIG_PATH")" "$CERTS_DIR"
-  cat >"$AGENT_CONFIG_PATH" <<EOF
+  local config_path="$1"
+  mkdir -p "$(dirname "$config_path")" "$CERTS_DIR"
+  cat >"$config_path" <<EOF
 email = "admin@example.com"
 server = "${STEPCA_SERVER_URL}"
 domain = "${DOMAIN}"
@@ -739,31 +384,25 @@ run_bootstrap_chain() {
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 
   log_phase "service-add"
-  # Order matters: SIDECAR_OBA_SERVICE (edge-proxy) is added LAST so its
-  # rendered .ctmpl picks up web-app's managed profile from
-  # workspace/agent.toml.  When the daemon-deploy sidecar later renders
-  # that template back to workspace/agent.toml via the bind-mount, both
-  # profiles must survive — otherwise web-app verify fails because its
-  # profile entry got wiped.
+  # Each distinct local service registers its own agent config, so the
+  # `[openbao]` fast-poll section `service add` upserts carries that
+  # service's own AppRole paths and a service-keyed state_path — one
+  # daemon and one identity per service, the supported topology.
   run_bootroot service add \
     --service-name "$WEB_SERVICE" \
-    --deploy-type docker \
     --delivery-mode local-file \
     --hostname "$WEB_HOSTNAME" \
     --domain "$DOMAIN" \
-    --agent-config "$AGENT_CONFIG_PATH" \
+    --agent-config "$WEB_AGENT_CONFIG" \
     --cert-path "$CERTS_DIR/${WEB_SERVICE}.crt" \
     --key-path "$CERTS_DIR/${WEB_SERVICE}.key" \
     --instance-id "$INSTANCE_ID" \
-    --container-name "$WEB_SERVICE" \
-    --no-validate-agent \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 
   run_bootroot service add \
     --service-name "$REMOTE_SERVICE" \
-    --deploy-type daemon \
     --delivery-mode remote-bootstrap \
     --hostname "$REMOTE_HOSTNAME" \
     --domain "$DOMAIN" \
@@ -777,11 +416,10 @@ run_bootstrap_chain() {
 
   run_bootroot service add \
     --service-name "$EDGE_SERVICE" \
-    --deploy-type daemon \
     --delivery-mode local-file \
     --hostname "$EDGE_HOSTNAME" \
     --domain "$DOMAIN" \
-    --agent-config "$AGENT_CONFIG_PATH" \
+    --agent-config "$EDGE_AGENT_CONFIG" \
     --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" \
     --key-path "$CERTS_DIR/${EDGE_SERVICE}.key" \
     --instance-id "$INSTANCE_ID" \
@@ -809,7 +447,10 @@ wait_for_postgres_admin() {
   local admin_user="${POSTGRES_USER:-step}"
   local attempt
   for attempt in $(seq 1 30); do
-    if docker exec bootroot-postgres pg_isready -U "$admin_user" -d postgres >/dev/null 2>&1 &&
+    # Probe over TCP: the initdb bootstrap server listens only on the Unix
+    # socket, so a socket-based pg_isready reports ready before the final
+    # server (the one init connects to over TCP) is up.
+    if docker exec bootroot-postgres pg_isready -h 127.0.0.1 -U "$admin_user" -d postgres >/dev/null 2>&1 &&
       bash -lc ": >/dev/tcp/127.0.0.1/${host_port}" >/dev/null 2>&1; then
       return 0
     fi
@@ -919,8 +560,8 @@ run_verify_pair() {
   local label="$1"
   log_phase "verify-${label}"
   prepare_stepca_validation_targets
-  verify_service_with_retry "$EDGE_SERVICE"
-  verify_service_with_retry "$WEB_SERVICE"
+  verify_service_with_retry "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG"
+  verify_service_with_retry "$WEB_SERVICE" "$WEB_AGENT_CONFIG"
   verify_service_with_retry "$REMOTE_SERVICE" "$REMOTE_AGENT_CONFIG"
   snapshot_cert_meta "$EDGE_SERVICE" "$label"
   snapshot_cert_meta "$WEB_SERVICE" "$label"
@@ -944,68 +585,78 @@ force_reissue_for_service() {
     >>"$RUN_LOG" 2>&1
 }
 
-# Docker-deploy local-file path: web-app is registered with
-# --deploy-type docker --container-name web-app for service-add coverage,
-# but no real `web-app` container runs in this scenario.  The host
-# bootroot-agent owns the cert via the shared agent config, so deleting
-# the files and letting the daemon's missing-cert check pick them up is
-# the right reissue trigger here.  The `bootroot rotate force-reissue`
-# wait-path is exercised by the daemon-deploy edge-proxy call above.
-force_reissue_for_docker_service() {
+# Missing-cert path: web-app's own host bootroot-agent daemon owns its
+# cert, so deleting the files and letting that daemon's missing-cert
+# check pick them up is the right reissue trigger here.  The `bootroot
+# rotate force-reissue` wait-path is exercised by the edge-proxy call
+# above.
+force_reissue_via_missing_cert() {
   local service="$1"
   rm -f "$CERTS_DIR/${service}.crt" "$CERTS_DIR/${service}.key"
 }
 
-start_local_bootroot_agent_daemon() {
-  if [ -n "$LOCAL_AGENT_DAEMON_PID" ] && kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-    return 0
-  fi
-  [ -f "$AGENT_CONFIG_PATH" ] || fail "agent config missing at $AGENT_CONFIG_PATH"
-  printf '[lifecycle] starting bootroot-agent daemon: --config %s\n' \
-    "$AGENT_CONFIG_PATH" >>"$RUN_LOG"
+# Starts one bootroot-agent host daemon bound to a single service's own
+# agent config, eab.json, and AppRole identity.
+start_local_agent_daemon() {
+  local service="$1"
+  local config="$2"
+  local log="$ARTIFACT_DIR/bootroot-agent-${service}.log"
+  # EAB artifact provisioned by `service add` next to the service
+  # secret_id when EAB exists in KV.  Init runs with --no-eab, so the
+  # file is normally absent; the agent treats a missing --eab-file as
+  # open enrollment.
+  local eab_file="$SECRETS_DIR/services/${service}/eab.json"
+  [ -f "$config" ] || fail "agent config missing at $config"
+  printf '[lifecycle] starting bootroot-agent daemon for %s: --config %s --eab-file %s\n' \
+    "$service" "$config" "$eab_file" >>"$RUN_LOG"
   # bootroot-agent uses tracing_subscriber::fmt::init(), whose default
   # filter is ERROR.  The readiness probe below greps for an info-level
   # message, so we have to opt into info output explicitly.
   RUST_LOG="${RUST_LOG:-info}" \
-    "$BOOTROOT_AGENT_BIN" --config "$AGENT_CONFIG_PATH" \
-    >>"$LOCAL_AGENT_DAEMON_LOG" 2>&1 &
-  LOCAL_AGENT_DAEMON_PID=$!
+    "$BOOTROOT_AGENT_BIN" --config "$config" \
+    --eab-file "$eab_file" \
+    >>"$log" 2>&1 &
+  local pid=$!
+  LOCAL_AGENT_DAEMON_PIDS="$LOCAL_AGENT_DAEMON_PIDS $pid"
   # Give the daemon time to load config and install its SIGHUP handler;
   # otherwise the first force_reissue may signal it before the handler
   # is ready, masking the wait-path coverage we are trying to add.
   local attempt
   for attempt in $(seq 1 20); do
-    if ! kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-      tail -n 80 "$LOCAL_AGENT_DAEMON_LOG" >>"$RUN_LOG" 2>&1 || true
-      LOCAL_AGENT_DAEMON_PID=""
-      fail "bootroot-agent daemon exited during startup; see $LOCAL_AGENT_DAEMON_LOG"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      tail -n 80 "$log" >>"$RUN_LOG" 2>&1 || true
+      fail "bootroot-agent daemon for ${service} exited during startup; see $log"
     fi
-    if grep -q "Profile .* daemon enabled" "$LOCAL_AGENT_DAEMON_LOG" 2>/dev/null; then
+    if grep -q "Profile .* daemon enabled" "$log" 2>/dev/null; then
       return 0
     fi
     sleep 0.5
   done
-  tail -n 80 "$LOCAL_AGENT_DAEMON_LOG" >>"$RUN_LOG" 2>&1 || true
-  fail "bootroot-agent daemon failed to become ready; see $LOCAL_AGENT_DAEMON_LOG"
+  tail -n 80 "$log" >>"$RUN_LOG" 2>&1 || true
+  fail "bootroot-agent daemon for ${service} failed to become ready; see $log"
 }
 
-stop_local_bootroot_agent_daemon() {
-  if [ -z "$LOCAL_AGENT_DAEMON_PID" ]; then
-    return 0
-  fi
-  if kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-    kill "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
-    local attempt
-    for attempt in $(seq 1 10); do
-      if ! kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-        break
-      fi
-      sleep 0.2
-    done
-    kill -9 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
-  fi
-  wait "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
-  LOCAL_AGENT_DAEMON_PID=""
+start_local_bootroot_agent_daemons() {
+  start_local_agent_daemon "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG"
+  start_local_agent_daemon "$WEB_SERVICE" "$WEB_AGENT_CONFIG"
+}
+
+stop_local_bootroot_agent_daemons() {
+  local pid attempt
+  for pid in $LOCAL_AGENT_DAEMON_PIDS; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      for attempt in $(seq 1 10); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          break
+        fi
+        sleep 0.2
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+  LOCAL_AGENT_DAEMON_PIDS=""
 }
 
 force_reissue_remote() {
@@ -1014,13 +665,13 @@ force_reissue_remote() {
 
 force_reissue_all_services() {
   force_reissue_for_service "$EDGE_SERVICE"
-  force_reissue_for_docker_service "$WEB_SERVICE"
+  force_reissue_via_missing_cert "$WEB_SERVICE"
   force_reissue_remote
 }
 
 verify_service_with_retry() {
   local service="$1"
-  local agent_config="${2:-$AGENT_CONFIG_PATH}"
+  local agent_config="$2"
   local attempt
   for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
     if run_bootroot verify --service-name "$service" --agent-config "$agent_config" >>"$RUN_LOG" 2>&1; then
@@ -1033,42 +684,36 @@ verify_service_with_retry() {
   done
 }
 
-# Asserts the responder-hmac rotate completed within the wall-clock
-# budget for the active OBA deployment.  The two thresholds together
-# distinguish the active sidecar restart route from the host-daemon
-# polling fallback and catch silent regressions in either path:
-#
-#   sidecar:     `bootroot rotate` actively restarts the sidecar
-#                container, so the rendered file must contain the new
-#                HMAC well below the polling fallback window.  A
-#                threshold above `static_secret_render_interval`
-#                (=30s) would let a regression where the active
-#                restart silently no-ops sneak through, because rotate
-#                would still succeed via polling.
-#
-#   host-daemon: `bootroot rotate` cannot signal the operator daemon,
-#                so propagation must wait for the polling fallback.
-assert_responder_hmac_rotate_latency() {
-  local elapsed_secs="$1"
-  local limit_secs route
-  case "$OBA_DEPLOYMENT" in
-    sidecar)
-      limit_secs="$SIDECAR_ROTATE_LATENCY_LIMIT_SECS"
-      route="active sidecar restart"
-      ;;
-    host-daemon)
-      limit_secs="$HOST_DAEMON_RENDER_TIMEOUT_SECS"
-      route="polling fallback (static_secret_render_interval)"
-      ;;
-    *)
-      fail "assert_responder_hmac_rotate_latency: unknown OBA_DEPLOYMENT=$OBA_DEPLOYMENT"
-      ;;
-  esac
-  printf '[lifecycle] responder-hmac rotate elapsed=%ss limit=%ss route=%s deployment=%s\n' \
-    "$elapsed_secs" "$limit_secs" "$route" "$OBA_DEPLOYMENT" >>"$RUN_LOG"
-  if [ "$elapsed_secs" -gt "$limit_secs" ]; then
-    fail "responder-hmac rotate took ${elapsed_secs}s, exceeding the ${limit_secs}s budget for OBA_DEPLOYMENT=${OBA_DEPLOYMENT} (expected route: ${route})"
-  fi
+# Reads the current `[acme].http_responder_hmac` value from the given
+# agent config.
+current_agent_responder_hmac() {
+  awk -F'"' '/^[[:space:]]*http_responder_hmac[[:space:]]*=/ {print $2; exit}' \
+    "$1"
+}
+
+# Waits for one service daemon's fast-poll loop to upsert the rotated
+# responder HMAC into that service's own agent config.  `bootroot
+# rotate responder-hmac` only writes the new HMAC to per-service KV
+# (plus the infra agents); propagation is each daemon's own fast-poll
+# tick (default fast_poll_interval = 30s) under its own AppRole
+# identity, so the on-disk value changing is the end-to-end proof that
+# the loop observed and applied the rotation for that service.
+wait_for_responder_hmac_propagation() {
+  local service="$1"
+  local config="$2"
+  local before="$3"
+  local attempt current
+  for attempt in $(seq 1 "$RESPONDER_HMAC_PROPAGATION_ATTEMPTS"); do
+    current="$(current_agent_responder_hmac "$config")"
+    if [ -n "$current" ] && [ "$current" != "$before" ]; then
+      printf '[lifecycle] fast-poll propagated rotated responder HMAC for %s within ~%ss\n' \
+        "$service" "$((attempt * RESPONDER_HMAC_PROPAGATION_DELAY_SECS))" >>"$RUN_LOG"
+      return 0
+    fi
+    sleep "$RESPONDER_HMAC_PROPAGATION_DELAY_SECS"
+  done
+  tail -n 80 "$ARTIFACT_DIR/bootroot-agent-${service}.log" >>"$RUN_LOG" 2>&1 || true
+  fail "bootroot-agent fast-poll did not propagate the rotated responder HMAC into $config within $((RESPONDER_HMAC_PROPAGATION_ATTEMPTS * RESPONDER_HMAC_PROPAGATION_DELAY_SECS))s"
 }
 
 assert_fingerprint_changed() {
@@ -1220,9 +865,9 @@ run_rotation_secret_id_self_mint() {
 
 run_rotations_with_verification() {
   # Rotate the infra secret_ids first: the stepca-password and
-  # responder-hmac phases below drive the restarted sidecars through
-  # real template renders, verifying they re-authenticated with the
-  # rotated credentials.
+  # responder-hmac phases below drive the restarted infra OpenBao
+  # Agents (stepca / responder) through real template renders,
+  # verifying they re-authenticated with the rotated credentials.
   run_rotation_infra_secret_id
   run_rotation_secret_id_self_mint
 
@@ -1241,8 +886,9 @@ run_rotations_with_verification() {
   run_verify_pair "after-openbao-recovery"
 
   log_phase "rotate-responder-hmac"
-  local rotate_start_epoch rotate_end_epoch rotate_elapsed_secs
-  rotate_start_epoch="$(date +%s)"
+  local edge_hmac_before web_hmac_before
+  edge_hmac_before="$(current_agent_responder_hmac "$EDGE_AGENT_CONFIG")"
+  web_hmac_before="$(current_agent_responder_hmac "$WEB_AGENT_CONFIG")"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
     --openbao-url "http://${STEPCA_HOST_IP}:8200" \
@@ -1251,9 +897,10 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     responder-hmac >>"$RUN_LOG" 2>&1
-  rotate_end_epoch="$(date +%s)"
-  rotate_elapsed_secs=$((rotate_end_epoch - rotate_start_epoch))
-  assert_responder_hmac_rotate_latency "$rotate_elapsed_secs"
+  # Both per-service daemons must observe the rotation independently:
+  # each reads only its own service's KV subtree.
+  wait_for_responder_hmac_propagation "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG" "$edge_hmac_before"
+  wait_for_responder_hmac_propagation "$WEB_SERVICE" "$WEB_AGENT_CONFIG" "$web_hmac_before"
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-responder-hmac"
@@ -1344,7 +991,7 @@ write_manifest() {
   "mode": "${RESOLUTION_MODE}",
   "compose_file": "${COMPOSE_FILE}",
   "state_file": "${ROOT_DIR}/state.json",
-  "agent_config_path": "${AGENT_CONFIG_PATH}",
+  "agent_config_paths": ["${EDGE_AGENT_CONFIG}", "${WEB_AGENT_CONFIG}"],
   "services": ["${EDGE_SERVICE}", "${WEB_SERVICE}", "${REMOTE_SERVICE}"]
 }
 EOF
@@ -1357,76 +1004,29 @@ main() {
   trap cleanup EXIT
   trap 'on_error $LINENO' ERR
 
-  case "$OBA_TOPOLOGY" in
-    default|custom-project|openbao-missing|external-openbao) ;;
-    *) fail "Unsupported OBA_TOPOLOGY: $OBA_TOPOLOGY (expected: default | custom-project | openbao-missing | external-openbao)" ;;
-  esac
-
-  if [ "$OBA_TOPOLOGY" = "custom-project" ]; then
-    # Must be exported BEFORE install_infra so the bootroot-openbao
-    # container picks up the project label this topology asserts on.
-    export COMPOSE_PROJECT_NAME="$CUSTOM_COMPOSE_PROJECT"
-    printf '[lifecycle] custom-project topology: COMPOSE_PROJECT_NAME=%s\n' \
-      "$COMPOSE_PROJECT_NAME" >>"$RUN_LOG"
-  fi
-
   ensure_prerequisites
   configure_resolution_mode
   compose_down
   reset_stepca_materials_for_e2e
   install_infra
-  write_agent_config
+  write_agent_config "$EDGE_AGENT_CONFIG"
+  write_agent_config "$WEB_AGENT_CONFIG"
   run_bootstrap_chain
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"
 
-  case "$OBA_TOPOLOGY" in
-    openbao-missing)
-      log_phase "topology-openbao-missing"
-      remove_openbao_container_for_missing_topology
-      # Assert the full "container not found" i18n contract: the
-      # symptom (`container not found`) AND both halves of the
-      # remediation hint (`bootroot infra install` and
-      # `--openbao-network`).  A regression that drops either half
-      # of the remediation now fails the arm.  The em-dash that
-      # joins the message in en.rs is intentionally not asserted on,
-      # so a future tweak to that punctuation does not break this
-      # arm.
-      assert_service_oba_start_fails "$SIDECAR_OBA_SERVICE" \
-        "container not found" \
-        "bootroot infra install" \
-        "--openbao-network" \
-        -- \
-        --compose-file "$COMPOSE_FILE"
-      write_manifest
-      return 0
-      ;;
-    external-openbao)
-      log_phase "topology-external-openbao"
-      run_external_openbao_topology_assertions "$SIDECAR_OBA_SERVICE"
-      write_manifest
-      return 0
-      ;;
-  esac
-
   apply_dns_aliases
   prepare_stepca_validation_targets
-
-  start_service_oba "$SIDECAR_OBA_SERVICE"
-
-  if [ "$OBA_TOPOLOGY" = "custom-project" ] && [ "$OBA_DEPLOYMENT" = "sidecar" ]; then
-    assert_sidecar_compose_project "$SIDECAR_OBA_CONTAINER" "$CUSTOM_COMPOSE_PROJECT"
-  fi
 
   copy_remote_materials
   log_phase "remote-bootstrap-initial"
   run_remote_bootstrap
 
   run_verify_pair "initial"
-  start_local_bootroot_agent_daemon
+  start_local_bootroot_agent_daemons
   run_rotations_with_verification
-  stop_local_bootroot_agent_daemon
+  stop_local_bootroot_agent_daemons
 
   log_phase "assert-openbao-audit-log"
   assert_openbao_audit_log

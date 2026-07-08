@@ -96,7 +96,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `scripts/impl/run-local-lifecycle.sh` 기반 단일 머신 시나리오
 - Docker Compose에서 `openbao`, `postgres`, `step-ca`, `bootroot-http01` 실행
 - 서비스는 `--delivery-mode local-file`로 추가
-- 이 시나리오의 서비스 구성(총 2개): `edge-proxy` (`daemon`), `web-app` (`docker`)
+- 이 시나리오의 서비스 구성(총 2개): `edge-proxy`, `web-app`
 - 해석 모드는 `no-hosts` (`/etc/hosts` 수정 없음)
 
 목적:
@@ -110,7 +110,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 1. `infra-up`: Compose 서비스 기동 및 readiness 대기
 2. `init`: `bootroot init --summary-json` 실행 후 JSON에서 런타임 AppRole
    자격증명 파싱
-3. `service-add`: daemon + docker 서비스를 `local-file` 모드로 추가
+3. `service-add`: 두 서비스를 `local-file` 모드로 추가
 4. `verify-initial`: 초기 인증서 발급/검증 후 fingerprint 스냅샷 저장
 5. `rotate-infra-secret-id`: 전용 `infra_rotate` 자격증명으로
    stepca/responder 인프라 AppRole secret_id를 회전한 뒤,
@@ -142,14 +142,16 @@ BOOTROOT_LANG=en printf "y\n" | bootroot init \
   --responder-url "$RESPONDER_URL"
 
 # 3) service-add
-bootroot service add --service-name edge-proxy --deploy-type daemon \
-  --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
-bootroot service add --service-name web-app --deploy-type docker \
-  --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
+# 서로 다른 로컬 서비스는 각자 자신의 에이전트 설정을 사용합니다
+# (서비스마다 데몬 하나, [openbao] AppRole 아이덴티티 하나).
+bootroot service add --service-name edge-proxy \
+  --delivery-mode local-file --agent-config "$EDGE_AGENT_CONFIG"
+bootroot service add --service-name web-app \
+  --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
 # 4) verify-initial / 9) verify-after-responder-hmac
-bootroot verify --service-name edge-proxy --agent-config "$AGENT_CONFIG_PATH"
-bootroot verify --service-name web-app --agent-config "$AGENT_CONFIG_PATH"
+bootroot verify --service-name edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
+bootroot verify --service-name web-app --agent-config "$WEB_AGENT_CONFIG"
 
 # 5) rotate-infra-secret-id
 # init summary에서
@@ -189,7 +191,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
 구성:
 
 - 위와 동일한 스크립트/토폴로지 사용
-- `no-hosts`와 동일한 서비스 구성: `edge-proxy` (`daemon`), `web-app` (`docker`)
+- `no-hosts`와 동일한 서비스 구성: `edge-proxy`, `web-app`
 - 해석 모드는 `hosts`
 - 스크립트가 `stepca.internal`, `responder.internal` 임시 host entry를
   추가/삭제 (`sudo -n` 필요)
@@ -226,8 +228,7 @@ sudo -n cp "$tmp_file" /etc/hosts
 - 한 번의 실행에서 두 workspace 사용:
   `control-node` (step-ca 머신 역할), `remote-node` (서비스 머신 역할)
 - 서비스는 `--delivery-mode remote-bootstrap`으로 추가
-- 이 시나리오의 서비스 구성(총 2개): `edge-proxy` (`daemon`),
-  `web-app` (`docker`)
+- 이 시나리오의 서비스 구성(총 2개): `edge-proxy`, `web-app`
 - 원격 bootstrap 반영은 `bootroot-remote bootstrap`으로 수행
 - 해석 모드는 `no-hosts`
 
@@ -271,9 +272,9 @@ BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \
   --eab-hmac "$INIT_EAB_HMAC"
-bootroot service add --service-name edge-proxy --deploy-type daemon \
+bootroot service add --service-name edge-proxy \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
-bootroot service add --service-name web-app --deploy-type docker \
+bootroot service add --service-name web-app \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH_2"
 
 # remote node: bootstrap (서비스별)
@@ -300,8 +301,7 @@ bootroot-remote bootstrap ...  # 서비스별 responder_hmac 재반영
 구성:
 
 - 위 원격 전달 E2E 시나리오와 동일한 control-node/remote-node 모델
-- remote `no-hosts`와 동일한 서비스 구성: `edge-proxy` (`daemon`),
-  `web-app` (`docker`)
+- remote `no-hosts`와 동일한 서비스 구성: `edge-proxy`, `web-app`
 - 해석 모드는 `hosts`
 - 스크립트가 임시 `/etc/hosts` entry를 추가/정리
 
@@ -343,9 +343,9 @@ sudo -n cp "$tmp_file" /etc/hosts
 
 #### 서비스 구성(3개 노드, 총 8개 서비스)
 
-- `node-a`: daemon-c1 (daemon), daemon-c2 (daemon), docker-c1 (docker)
-- `node-b`: daemon-c3 (daemon), docker-c2 (docker), docker-c3 (docker)
-- `node-c`: daemon-c4 (daemon), docker-c4 (docker)
+- `node-a`: daemon-c1, daemon-c2, docker-c1
+- `node-b`: daemon-c3, docker-c2, docker-c3
+- `node-c`: daemon-c4, docker-c4
 
 각 서비스에 대해 모든 회전 항목을 반복 검증합니다.
 
@@ -395,9 +395,8 @@ bootroot verify --service-name "$service" --agent-config "$agent_config_path"
 
 - 스크립트: `scripts/impl/run-ca-key-rotation-recovery.sh`
 - Docker Compose 인프라 기반 단일 머신
-- 서비스 구성(총 3개): `edge-proxy` (`daemon`, `local-file`),
-  `web-app` (`docker`, `local-file`), `edge-proxy` (`daemon`,
-  `remote-bootstrap`)
+- 서비스 구성(총 3개): `edge-proxy` (`local-file`),
+  `web-app` (`local-file`), `edge-proxy` (`remote-bootstrap`)
 - 5개 장애 주입 시나리오를 동일 인프라에서 순차 실행
 
 목적:

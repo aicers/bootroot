@@ -30,7 +30,10 @@ wait_for_postgres_admin() {
   local admin_user="${POSTGRES_USER:-step}"
   local attempt
   for attempt in $(seq 1 30); do
-    if docker exec bootroot-postgres pg_isready -U "$admin_user" -d postgres >/dev/null 2>&1 &&
+    # Probe over TCP: the initdb bootstrap server listens only on the Unix
+    # socket, so a socket-based pg_isready reports ready before the final
+    # server (the one init connects to over TCP) is up.
+    if docker exec bootroot-postgres pg_isready -h 127.0.0.1 -U "$admin_user" -d postgres >/dev/null 2>&1 &&
       bash -lc ": >/dev/tcp/127.0.0.1/${host_port}" >/dev/null 2>&1; then
       return 0
     fi
@@ -180,7 +183,11 @@ run_service_scenarios() {
   export PATH="$ROOT_DIR/target/debug:$PATH"
 
   mkdir -p "$ROOT_DIR/tmp" "$ROOT_DIR/certs"
-  write_agent_config "$ROOT_DIR/tmp/agent.toml"
+  # One agent.toml per distinct service: the [openbao] section holds a
+  # single AppRole identity, so `service add` rejects a config path
+  # shared across services.
+  write_agent_config "$ROOT_DIR/tmp/agent-edge-proxy.toml"
+  write_agent_config "$ROOT_DIR/tmp/agent-web-app.toml"
 
   local runtime_service_add_role_id runtime_service_add_secret_id
   runtime_service_add_role_id="$(
@@ -200,10 +207,9 @@ run_service_scenarios() {
 
   cargo run --bin bootroot -- service add \
     --service-name edge-proxy \
-    --deploy-type daemon \
     --hostname edge-node-01 \
     --domain trusted.domain \
-    --agent-config "$ROOT_DIR/tmp/agent.toml" \
+    --agent-config "$ROOT_DIR/tmp/agent-edge-proxy.toml" \
     --cert-path "$ROOT_DIR/certs/edge-proxy.crt" \
     --key-path "$ROOT_DIR/certs/edge-proxy.key" \
     --instance-id 001 \
@@ -213,15 +219,12 @@ run_service_scenarios() {
 
   cargo run --bin bootroot -- service add \
     --service-name web-app \
-    --deploy-type docker \
     --hostname web-01 \
     --domain trusted.domain \
-    --agent-config "$ROOT_DIR/tmp/agent.toml" \
+    --agent-config "$ROOT_DIR/tmp/agent-web-app.toml" \
     --cert-path "$ROOT_DIR/certs/web-app.crt" \
     --key-path "$ROOT_DIR/certs/web-app.key" \
     --instance-id 001 \
-    --container-name web-app \
-    --no-validate-agent \
     --auth-mode approle \
     --approle-role-id "$runtime_service_add_role_id" \
     --approle-secret-id "$runtime_service_add_secret_id"
@@ -241,7 +244,7 @@ run_verify() {
   for attempt in {1..3}; do
     if cargo run --bin bootroot -- verify \
       --service-name "$service_name" \
-      --agent-config "$ROOT_DIR/tmp/agent.toml"; then
+      --agent-config "$ROOT_DIR/tmp/agent-${service_name}.toml"; then
       return 0
     fi
     log "Retrying bootroot verify for ${service_name} (attempt ${attempt}/3)"

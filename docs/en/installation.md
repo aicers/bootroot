@@ -16,9 +16,9 @@ Operations policy summary:
 - recommended runtime differs by deployment target:
   step-ca/OpenBao/HTTP-01 responder run as independent services
   (Compose or systemd).
-  For services added via `bootroot service add`, Docker services are best
-  operated with per-service agent sidecars, while daemon services are best
-  operated as host daemons (systemd).
+  For services added via `bootroot service add`, `bootroot-agent` runs as
+  a host daemon (systemd) — including when the consuming application
+  itself runs in a container.
 - in all paths, always-on/restart/dependency guarantees are operator
   responsibilities.
 - bootroot automates config/material generation, but binary installation and
@@ -225,24 +225,21 @@ examples and how to update `secrets/config/ca.json`.
 
 ## OpenBao Agent
 
-OpenBao Agent renders secrets from OpenBao to files. step-ca/responder use
-the `agent.hcl` files produced by `bootroot init`, and services use the paths
-printed by `bootroot service add`.
+OpenBao Agent renders secrets from OpenBao to files. It serves only the
+infrastructure components: step-ca and the HTTP-01 responder use the
+`agent.hcl` files produced by `bootroot init`. Services do **not** run a
+per-service OpenBao Agent — each service's `bootroot-agent` authenticates
+to OpenBao itself and keeps its secrets current via its fast-poll loop
+(see [Concepts > Secret delivery flows](concepts.md#secret-delivery-flows)).
 
 ### Docker
 
-For per-service agents, `bootroot service openbao-sidecar start
---service-name <service>` is the recommended path. It writes a per-service compose
-override and starts a sidecar attached to the same docker network as
-the rest of the bootroot infrastructure. The network and compose
-project are discovered at runtime from the `bootroot-openbao`
-container's `com.docker.compose.project` label, so it works from any
-working directory and any `COMPOSE_PROJECT_NAME` value. See
-[CLI > bootroot service openbao-sidecar start](cli.md#bootroot-service-openbao-sidecar-start)
-for full inputs and failure modes.
+In the default topology, `bootroot init` enables the two infra agents
+(`openbao-agent-stepca`, `openbao-agent-responder`) via compose override —
+no manual step is needed.
 
 The raw `docker run` invocations below are kept for reference (e.g.
-debugging or environments where the compose-managed sidecar cannot be
+debugging or environments where the compose-managed agents cannot be
 used). Substitute `<network>` with the actual docker network — by
 default `<project>_default`, where `<project>` is the
 `com.docker.compose.project` label on `bootroot-openbao`. You can
@@ -277,18 +274,6 @@ docker run --rm \
   agent -config /openbao/secrets/openbao/responder/agent.hcl
 ```
 
-OpenBao Agent for a service (example):
-
-```bash
-docker run --rm \
-  --name openbao-agent-edge-proxy \
-  --network <network> \
-  -v $(pwd)/secrets:/openbao/secrets \
-  -e VAULT_ADDR=http://bootroot-openbao:8200 \
-  openbao/openbao:latest \
-  agent -config /openbao/secrets/openbao/services/edge-proxy/agent.hcl
-```
-
 Why not `VAULT_ADDR=http://localhost:8200` here:
 inside a container, `localhost` points to the agent container itself, not the
 OpenBao container. On Docker networks, use the OpenBao container name
@@ -303,27 +288,23 @@ dedicated OpenBao Agent containers (`openbao-agent-stepca`,
 ### Host run
 
 ```bash
-openbao agent -config /etc/bootroot/openbao/services/<service>/agent.hcl
+openbao agent -config /etc/bootroot/openbao/stepca/agent.hcl
 ```
 
 Recommended deployment policy:
 
 - step-ca/responder: in the bootroot default topology where
   OpenBao/PostgreSQL/step-ca/HTTP-01 responder run on one machine, run a
-  dedicated OpenBao Agent sidecar per service. Attach `openbao-agent-stepca`
-  to step-ca and
-  `openbao-agent-responder` to responder so each service renders only its own
-  required secrets.
-- service OpenBao Agent (recommended): default to a per-service
-  sidecar regardless of `--deploy-type`. `bootroot service add` already
-  surfaces `bootroot service openbao-sidecar start` as the next step. The two
-  deployment models for the OpenBao Agent (sidecar vs. operator-run
-  host daemon) are independent of the service `--deploy-type` — see
-  [docs/en/cli.md](cli.md#sidecar-vs-host-daemon-for-the-openbao-agent)
-  for when the host-daemon alternative is appropriate.
+  dedicated OpenBao Agent container per component. Attach
+  `openbao-agent-stepca` to step-ca and
+  `openbao-agent-responder` to responder so each component renders only its
+  own required secrets.
+- services: no OpenBao Agent. The `bootroot-agent` host daemon's
+  fast-poll loop is the secret-delivery mechanism.
 
-For service OpenBao Agent flow, `role_id`/`secret_id` live under
-`secrets/services/<service>/`. Keep the directory `0700` and the files `0600`.
+For the service `bootroot-agent` flow, `role_id`/`secret_id` (and, when
+EAB is configured, `eab.json`) live under `secrets/services/<service>/`.
+Keep the directory `0700` and the files `0600`.
 
 ## Full reset (dev/test)
 
@@ -379,17 +360,22 @@ responder config and restart the responder.
 
 Recommended deployment policy:
 
-- daemon services: one shared bootroot-agent daemon per host (recommended)
-- Docker services: per-service bootroot-agent sidecar (recommended)
-
-Note: Docker services can use the shared daemon, but this is supported and
-not recommended. A per-service sidecar gives better isolation, better lifecycle
-alignment, and limits failure impact to a single service more easily.
+- bootroot-agent runs as a **host daemon** (systemd). This is the only
+  supported run model for onboarded services — bootroot-agent is not run
+  as a Docker sidecar.
+- one `bootroot-agent` process plus one agent config per **distinct
+  service**: the `[openbao]` section holds a single AppRole credential,
+  so distinct services cannot share one `agent.toml`. Multiple
+  `[[profiles]]` in one config are only for instances of the same
+  service (see
+  [Operations > systemd operations procedure](operations.md#systemd-operations-procedure-recommended-for-bootroot-agent)).
+- applications that consume the certificates may still run in containers:
+  the host daemon writes certs to a host directory the app container
+  bind-mounts, and a `--reload-style docker-restart --reload-target
+  <container>` hook reloads it (see
+  [Operations > Containerized consumer applications](operations.md#containerized-consumer-applications)).
 
 ### Binary
-
-Use this when the **service itself runs as a host binary/daemon** and reads
-certs/keys from the host filesystem.
 
 Build from source:
 
@@ -398,8 +384,19 @@ cargo build --release
 ./target/release/bootroot-agent --config agent.toml --oneshot
 ```
 
-`--oneshot` issues once and exits. For daemon mode, omit it. See
-**Configuration** for details.
+`--oneshot` issues once and exits. For daemon mode, omit it and pass the
+provisioned EAB file path, as printed by `bootroot service add`:
+
+```bash
+bootroot-agent --config /etc/bootroot/agent.toml \
+  --eab-file /path/to/secrets/services/<svc>/eab.json
+```
+
+`--eab-file` is required for EAB rotation to apply — without it, EAB KV
+updates and `rotate eab-clear` are silent no-ops for that agent. See
+**Configuration** for details and
+[Operations > systemd operations procedure](operations.md#systemd-operations-procedure-recommended-for-bootroot-agent)
+for a hardened unit example.
 
 TLS verification override:
 
@@ -416,27 +413,19 @@ Services using mTLS must be able to read the CA bundle written to
 `trust.ca_bundle_path`. The simplest setup is running bootroot-agent and the
 service under the same user or group.
 
-### Docker
+### Docker (demo only)
 
-Use this when the **service itself runs in a container** and can share
-volumes with the bootroot-agent sidecar.
-
-Use the provided compose service:
+The project's default `docker-compose.yml` ships a demo `bootroot-agent`
+container that performs a **one-shot** issuance against the compose stack
+(it reads `agent.toml.compose`):
 
 ```bash
 docker compose up --build -d bootroot-agent
 ```
 
-The agent reads `agent.toml.compose` by default in the container.
-
-In this project's default `docker-compose.yml`, bootroot-agent is launched with
-`--oneshot` (issue once, then exit).
-For production-style continuous renewal, run without `--oneshot` (daemon mode)
-and configure an explicit restart policy (`restart: always` or
-`restart: unless-stopped`).
-If you prefer manual stop behavior, switch to `restart: unless-stopped`.
-Also ensure Docker/Compose itself is managed by systemd (or an equivalent
-service manager) so it survives host reboots.
+This container exists for demo/smoke purposes only. It is **not** a run
+model for onboarded services: production services run the bootroot-agent
+host daemon described above.
 
 ## bootroot-remote (for remote service machines)
 

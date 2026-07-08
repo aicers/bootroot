@@ -89,8 +89,9 @@ SecretID rotation and delivery must be performed by the operator using
 Bootroot CLI (`bootroot` & `bootroot-remote`) commands. All other secrets are
 rotated and delivered automatically by Bootroot. SecretID grants access to
 OpenBao itself, but the remaining secrets can be retrieved by connecting to
-OpenBao, which makes their rotation automatable. OpenBao Agent handles
-retrieving secrets from OpenBao.
+OpenBao, which makes their rotation automatable. The infra OpenBao Agents
+and each service's `bootroot-agent` fast-poll loop handle retrieving
+secrets from OpenBao.
 
 ### Not Automated (1) — OpenBao Unseal Keys and SecretID
 
@@ -138,14 +139,14 @@ operator must directly own both pre-checks and post-rotation validation.
 There are aspects of installation and operations that fall outside Bootroot's
 automation scope:
 
-- **Installation**: The operator must install the Bootroot CLI and per-service
-  OpenBao Agent and `bootroot-agent` manually. (Infrastructure components
+- **Installation**: The operator must install the Bootroot CLI and
+  `bootroot-agent` manually. (Infrastructure components
   including the CA and their OpenBao Agents are installed automatically during
   `bootroot infra install` for first-time setup, or `bootroot infra up` for
   restarting an already-configured environment.)
 - **Process management**: The operator must configure and verify systemd or
-  Docker restart settings so that manually installed OpenBao Agents and
-  `bootroot-agent` instances keep running.
+  Docker restart settings so that manually installed
+  `bootroot-agent` daemons keep running.
 - **Rotation scheduling**: Bootroot provides the rotation command
   (`bootroot rotate`), but scheduling its periodic execution (cron, systemd
   timer, etc.) is the operator's responsibility.
@@ -182,10 +183,9 @@ non-CLI manual flow; other pages keep an operations/concepts/validation focus.
 Runtime selection guidance:
 Operate step-ca/OpenBao/HTTP-01 responder as independent services
 (Compose or systemd). For services added via `bootroot service add`,
-recommended operation differs by deployment type: Docker services are best run
-with per-service agent sidecars, while daemon services are best run as host
-daemons (systemd). In all paths, operators must satisfy reliability
-requirements directly.
+`bootroot-agent` runs as a host daemon (systemd) — including when the
+consuming application itself runs in a container. In all paths,
+operators must satisfy reliability requirements directly.
 
 ## Installation Topology (Summary)
 
@@ -212,24 +212,22 @@ with `sslmode=disable`. Configure PostgreSQL TLS and choose an appropriate
 `sslmode` for the remote trust boundary.
 
 Services added by `bootroot service add` may run either on the same machine as
-step-ca or on different machines. The runtime composition depends on the
-`--delivery-mode`: `local-file` services run both OpenBao Agent and
-bootroot-agent, while `remote-bootstrap` services run only bootroot-agent,
-which authenticates to OpenBao directly via AppRole (no per-service OpenBao
-Agent sidecar).
-
-OpenBao Agent placement rules (`local-file` services only):
-
-- Docker service: per-service **OpenBao Agent sidecar** is **required**
-- daemon service: per-service **OpenBao Agent daemon** is **required**
+step-ca or on different machines. In both `--delivery-mode`s the runtime
+composition is the same: the service runs only bootroot-agent, which
+authenticates to OpenBao directly via AppRole and keeps its secrets
+current through its fast-poll loop (no per-service OpenBao Agent).
 
 bootroot-agent placement rules:
 
-- Docker service: per-service **bootroot-agent sidecar** is recommended
-- daemon service: one shared **bootroot-agent daemon** per host is recommended
-
-Note: Docker services can use the shared daemon, but this is not recommended
-for isolation, lifecycle alignment, and failure blast-radius reasons.
+- **bootroot-agent runs as a host daemon** (systemd) — it is not run as
+  a Docker sidecar. Use one `bootroot-agent` process plus one agent
+  config per **distinct service**; the `[openbao]` section holds a
+  single AppRole credential, so distinct services cannot share one
+  `agent.toml` (multiple `[[profiles]]` are only for instances of the
+  same service).
+- applications that consume the certificates may run in containers: the
+  host daemon writes certs to a host directory the container bind-mounts,
+  and a `docker-restart` post-renew hook reloads the container.
 
 bootroot-remote placement rules:
 
@@ -271,8 +269,10 @@ in practice many deployments configure `/etc/hosts` mappings directly.
 ## Architecture (High Level)
 
 1. Bring up and initialize CA infrastructure
-2. Add services and configure per-service OpenBao Agent and bootroot-agent
-3. OpenBao Agent supplies secrets to bootroot components via rendered files
+2. Add services and configure bootroot-agent per service
+3. The infra OpenBao Agents supply secrets to step-ca/responder via
+   rendered files; each service's bootroot-agent pulls its own secrets
+   from OpenBao through its fast-poll loop
 4. bootroot-agent fetches the ACME directory from step-ca
 5. It registers an ACME account (optionally with EAB)
 6. It requests an order for a domain/SAN set

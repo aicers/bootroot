@@ -95,8 +95,8 @@ pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()>
 
 /// Ensures the secrets directory exists and has secure permissions.
 ///
-/// This helper is for bootroot-internal config artifacts (sidecar
-/// configs, `OpenBao` agent template files, etc.) that must remain
+/// This helper is for bootroot-internal config artifacts (infra
+/// `OpenBao` Agent configs, template files, etc.) that must remain
 /// operator-only. Cert/key parent directories on the agent's
 /// issuance/rotation path go through
 /// [`crate::cert_group::ensure_key_parent_dir`] /

@@ -249,7 +249,11 @@ jobs:
       - name: CLI Service Add + Verify (Smoke)
         run: |
           mkdir -p tmp certs
-          cat > tmp/agent.toml <<'EOF'
+          # One agent.toml per distinct service: the [openbao] section
+          # holds a single AppRole identity, so `service add` rejects a
+          # config path shared across services.
+          for svc in edge-proxy web-app bootroot-agent; do
+          cat > "tmp/agent-${svc}.toml" <<'EOF'
           email = "admin@example.com"
           server = "https://localhost:9000/acme/acme/directory"
           domain = "trusted.domain"
@@ -267,13 +271,13 @@ jobs:
 
           [trust]
           EOF
+          done
 
           cargo run --bin bootroot -- service add \
             --service-name edge-proxy \
-            --deploy-type daemon \
             --hostname edge-node-01 \
             --domain trusted.domain \
-            --agent-config "$(pwd)/tmp/agent.toml" \
+            --agent-config "$(pwd)/tmp/agent-edge-proxy.toml" \
             --cert-path "$(pwd)/certs/edge-proxy.crt" \
             --key-path "$(pwd)/certs/edge-proxy.key" \
             --instance-id 001 \
@@ -281,22 +285,19 @@ jobs:
 
           cargo run --bin bootroot -- service add \
             --service-name web-app \
-            --deploy-type docker \
             --hostname web-01 \
             --domain trusted.domain \
-            --agent-config "$(pwd)/tmp/agent.toml" \
+            --agent-config "$(pwd)/tmp/agent-web-app.toml" \
             --cert-path "$(pwd)/certs/web-app.crt" \
             --key-path "$(pwd)/certs/web-app.key" \
             --instance-id 001 \
-            --container-name web-app \
             --root-token "$OPENBAO_ROOT_TOKEN"
 
           cargo run --bin bootroot -- service add \
             --service-name bootroot-agent \
-            --deploy-type daemon \
             --hostname bootroot-agent \
             --domain trusted.domain \
-            --agent-config "$(pwd)/tmp/agent.toml" \
+            --agent-config "$(pwd)/tmp/agent-bootroot-agent.toml" \
             --cert-path "$(pwd)/certs/bootroot-agent.crt" \
             --key-path "$(pwd)/certs/bootroot-agent.key" \
             --instance-id 001 \
@@ -328,15 +329,15 @@ jobs:
 
           cargo run --bin bootroot -- verify \
             --service-name edge-proxy \
-            --agent-config "$(pwd)/tmp/agent.toml"
+            --agent-config "$(pwd)/tmp/agent-edge-proxy.toml"
 
           cargo run --bin bootroot -- verify \
             --service-name web-app \
-            --agent-config "$(pwd)/tmp/agent.toml"
+            --agent-config "$(pwd)/tmp/agent-web-app.toml"
 
           cargo run --bin bootroot -- verify \
             --service-name bootroot-agent \
-            --agent-config "$(pwd)/tmp/agent.toml"
+            --agent-config "$(pwd)/tmp/agent-bootroot-agent.toml"
 
       - name: Verify CA Health
         run: |
@@ -378,62 +379,26 @@ jobs:
             script: run-local-lifecycle.sh
             resolution: no-hosts
             artifact: ci-local-no-hosts
-            oba_deployment: sidecar
-            oba_topology: default
-          - label: local-no-hosts-host-daemon
-            script: run-local-lifecycle.sh
-            resolution: no-hosts
-            artifact: ci-local-no-hosts-host-daemon
-            oba_deployment: host-daemon
-            oba_topology: default
-          - label: local-no-hosts-custom-project
-            script: run-local-lifecycle.sh
-            resolution: no-hosts
-            artifact: ci-local-no-hosts-custom-project
-            oba_deployment: sidecar
-            oba_topology: custom-project
-          - label: local-no-hosts-openbao-missing
-            script: run-local-lifecycle.sh
-            resolution: no-hosts
-            artifact: ci-local-no-hosts-openbao-missing
-            oba_deployment: sidecar
-            oba_topology: openbao-missing
-          - label: local-no-hosts-external-openbao
-            script: run-local-lifecycle.sh
-            resolution: no-hosts
-            artifact: ci-local-no-hosts-external-openbao
-            oba_deployment: sidecar
-            oba_topology: external-openbao
           - label: local-hosts
             script: run-local-lifecycle.sh
             resolution: hosts
             artifact: ci-local-hosts
-            oba_deployment: sidecar
-            oba_topology: default
           - label: remote-no-hosts
             script: run-remote-lifecycle.sh
             resolution: no-hosts
             artifact: ci-remote-no-hosts
-            oba_deployment: ""
-            oba_topology: ""
           - label: remote-hosts
             script: run-remote-lifecycle.sh
             resolution: hosts
             artifact: ci-remote-hosts
-            oba_deployment: ""
-            oba_topology: ""
           - label: rotation
             script: run-rotation-recovery.sh
             resolution: ""
             artifact: ci-rotation
-            oba_deployment: ""
-            oba_topology: ""
           - label: reinit-recovery
             script: run-reinit-recovery.sh
             resolution: ""
             artifact: ci-reinit-recovery
-            oba_deployment: ""
-            oba_topology: ""
     steps:
       - uses: actions/checkout@v7
 
@@ -453,24 +418,24 @@ jobs:
         if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
-          # Host-daemon arm has to wait for OpenBao Agent's
-          # `static_secret_render_interval` polling fallback (~30s) on
-          # every render-dependent step, so it gets longer per-attempt
-          # delays and a larger budget than the sidecar arms.
-          if [ "${{ matrix.scenario.oba_deployment }}" = "host-daemon" ]; then
+          # Local arms run the daemon-only model: every service agent is
+          # a host bootroot-agent whose fast-poll loop (default
+          # fast_poll_interval = 30s) propagates rotated secrets, so
+          # verify retries are sized to cover a full poll interval.
+          if [ "${{ matrix.scenario.script }}" = "run-local-lifecycle.sh" ]; then
             VERIFY_ATTEMPTS=20
             VERIFY_DELAY_SECS=4
+            TIMEOUT_SECS=180
           else
             VERIFY_ATTEMPTS=5
             VERIFY_DELAY_SECS=5
+            TIMEOUT_SECS=120
           fi
           ARTIFACT_DIR="$ARTIFACT_DIR" \
           PROJECT_NAME="bootroot-e2e-ci-${{ matrix.scenario.label }}-${GITHUB_RUN_ID}" \
           RESOLUTION_MODE="${{ matrix.scenario.resolution }}" \
-          OBA_DEPLOYMENT="${{ matrix.scenario.oba_deployment }}" \
-          OBA_TOPOLOGY="${{ matrix.scenario.oba_topology }}" \
           SECRETS_DIR="$(pwd)/secrets" \
-          TIMEOUT_SECS=120 \
+          TIMEOUT_SECS="$TIMEOUT_SECS" \
           INFRA_UP_ATTEMPTS=12 \
           INFRA_UP_DELAY_SECS=10 \
           VERIFY_ATTEMPTS="$VERIFY_ATTEMPTS" \

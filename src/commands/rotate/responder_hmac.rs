@@ -3,7 +3,7 @@ use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{
     compose_has_responder, confirm_action, reload_compose_service, restart_container,
-    restart_service_sidecar_agents, wait_for_rendered_file,
+    wait_for_rendered_file,
 };
 use super::{OPENBAO_AGENT_RESPONDER_CONTAINER, RENDERED_FILE_TIMEOUT, RotateContext};
 use crate::cli::args::RotateResponderHmacArgs;
@@ -46,7 +46,9 @@ pub(super) async fn rotate_responder_hmac(
     restart_container(OPENBAO_AGENT_RESPONDER_CONTAINER, messages)?;
     wait_for_rendered_file(&responder_path, &hmac, RENDERED_FILE_TIMEOUT, messages).await?;
 
-    restart_service_sidecar_agents(ctx, &hmac, messages).await?;
+    // Service agents (local host daemons and remote alike) pick up the
+    // rotated HMAC from their per-service KV payload via the fast-poll
+    // loop; no per-service restart or reload happens here.
 
     let mut reloaded = false;
     if compose_has_responder(&ctx.compose_file, messages)? {

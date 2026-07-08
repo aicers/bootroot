@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{
-    confirm_action, ensure_file_exists, openbao_agent_container_name, restart_compose_service,
-    signal_bootroot_agent, try_restart_container,
+    confirm_action, ensure_file_exists, restart_compose_service, signal_bootroot_agent,
+    try_restart_container,
 };
 use super::{
     INTERMEDIATE_CA_COMMON_NAME, OPENBAO_AGENT_RESPONDER_CONTAINER, OPENBAO_AGENT_STEPCA_CONTAINER,
@@ -212,7 +212,7 @@ pub(super) async fn rotate_ca_key(
         )
         .await?;
 
-        restart_openbao_agent_sidecars(ctx, messages);
+        restart_infra_openbao_agents();
 
         rot_state.phase = 3;
         update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
@@ -322,12 +322,11 @@ pub(super) async fn rotate_ca_key(
         )
         .await?;
 
-        // Without a restart the sidecars keep serving the Phase-3
-        // transitional pin list (which still includes the retired
-        // intermediate) for up to the 30s static-secret render
-        // interval, so `bootroot verify` sees agent.toml pins that the
-        // finalized bundle no longer contains.
-        restart_openbao_agent_sidecars(ctx, messages);
+        // Without a restart the infra OpenBao Agents keep serving the
+        // Phase-3 transitional pin list (which still includes the
+        // retired intermediate) for up to the 30s static-secret render
+        // interval. Service agents converge on their own via fast-poll.
+        restart_infra_openbao_agents();
 
         rot_state.phase = 6;
         update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
@@ -473,14 +472,12 @@ fn backup_file(src: &Path, dst: &Path, messages: &Messages) -> Result<()> {
     Ok(())
 }
 
-fn restart_openbao_agent_sidecars(ctx: &RotateContext, _messages: &Messages) {
-    for entry in ctx.state.services.values() {
-        if !matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
-            continue;
-        }
-        let container = openbao_agent_container_name(&entry.service_name);
-        let _ = try_restart_container(&container);
-    }
+/// Restarts the infrastructure `OpenBao` Agents (step-ca / responder) so
+/// they re-render their KV templates against the updated trust bundle.
+/// Per-service trust propagation is fast-poll's job: each local
+/// host-daemon `bootroot-agent` observes the KV trust update on its next
+/// fast-poll cycle, so no per-service restart happens here.
+fn restart_infra_openbao_agents() {
     let _ = try_restart_container(OPENBAO_AGENT_STEPCA_CONTAINER);
     let _ = try_restart_container(OPENBAO_AGENT_RESPONDER_CONTAINER);
 }
@@ -1334,11 +1331,10 @@ mod tests {
     fn make_local_file_entry(name: &str, cert_path: std::path::PathBuf) -> ServiceEntry {
         use std::path::PathBuf;
 
-        use crate::state::{DeployType, ServiceRoleEntry};
+        use crate::state::ServiceRoleEntry;
 
         ServiceEntry {
             service_name: name.to_string(),
-            deploy_type: DeployType::Daemon,
             delivery_mode: DeliveryMode::LocalFile,
             hostname: "h".to_string(),
             domain: "d.example".to_string(),
@@ -1346,7 +1342,6 @@ mod tests {
             cert_path,
             key_path: PathBuf::from("key.pem"),
             instance_id: None,
-            container_name: None,
             notes: None,
             post_renew_hooks: vec![],
             approle: ServiceRoleEntry {

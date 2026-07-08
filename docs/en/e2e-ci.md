@@ -99,8 +99,7 @@ Configuration:
 - Single machine baseline used by `scripts/impl/run-local-lifecycle.sh`
 - `openbao`, `postgres`, `step-ca`, `bootroot-http01` run in Docker Compose
 - Services are added with `--delivery-mode local-file`
-- Service set in this scenario (2 services): `edge-proxy` (`daemon`),
-  `web-app` (`docker`)
+- Service set in this scenario (2 services): `edge-proxy`, `web-app`
 - Resolution mode is `no-hosts` (no `/etc/hosts` mutation)
 
 Purpose:
@@ -114,7 +113,7 @@ Execution steps:
 1. `infra-up`: bring up Compose services and wait for readiness
 2. `init`: run `bootroot init --summary-json` and read runtime AppRole
    credentials from JSON
-3. `service-add`: add daemon + docker services in `local-file` mode
+3. `service-add`: add both services in `local-file` mode
 4. `verify-initial`: issue/verify initial certs and snapshot fingerprints
 5. `rotate-infra-secret-id`: rotate the stepca/responder infra AppRole
    secret_ids with the dedicated `infra_rotate` credential, then assert
@@ -146,14 +145,16 @@ BOOTROOT_LANG=en printf "y\n" | bootroot init \
   --responder-url "$RESPONDER_URL"
 
 # 3) service-add
-bootroot service add --service-name edge-proxy --deploy-type daemon \
-  --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
-bootroot service add --service-name web-app --deploy-type docker \
-  --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
+# Each distinct local service gets its own agent config (one daemon
+# and one [openbao] AppRole identity per service).
+bootroot service add --service-name edge-proxy \
+  --delivery-mode local-file --agent-config "$EDGE_AGENT_CONFIG"
+bootroot service add --service-name web-app \
+  --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
 # 4) verify-initial / 9) verify-after-responder-hmac
-bootroot verify --service-name edge-proxy --agent-config "$AGENT_CONFIG_PATH"
-bootroot verify --service-name web-app --agent-config "$AGENT_CONFIG_PATH"
+bootroot verify --service-name edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
+bootroot verify --service-name web-app --agent-config "$WEB_AGENT_CONFIG"
 
 # 5) rotate-infra-secret-id
 # from init summary
@@ -193,7 +194,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
 Configuration:
 
 - Same script and same-machine topology as above
-- Same service set as `no-hosts`: `edge-proxy` (`daemon`), `web-app` (`docker`)
+- Same service set as `no-hosts`: `edge-proxy`, `web-app`
 - Resolution mode is `hosts`
 - Script writes temporary `stepca.internal` / `responder.internal` host entries
   (requires `sudo -n`)
@@ -230,8 +231,7 @@ Configuration:
 - Two workspaces in one run: `control node` (step-ca machine role),
   `remote node` (service machine role)
 - Services are added with `--delivery-mode remote-bootstrap`
-- Service set in this scenario (2 services): `edge-proxy` (`daemon`),
-  `web-app` (`docker`)
+- Service set in this scenario (2 services): `edge-proxy`, `web-app`
 - Remote bootstrap apply is executed by `bootroot-remote bootstrap`
 - Resolution mode is `no-hosts`
 
@@ -281,9 +281,9 @@ BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \
   --eab-hmac "$INIT_EAB_HMAC"
-bootroot service add --service-name edge-proxy --deploy-type daemon \
+bootroot service add --service-name edge-proxy \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
-bootroot service add --service-name web-app --deploy-type docker \
+bootroot service add --service-name web-app \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH_2"
 
 # remote node: bootstrap (per service)
@@ -311,8 +311,7 @@ bootroot-remote bootstrap ...  # re-apply responder_hmac for each service
 Configuration:
 
 - Same control node/remote node model as above
-- Same service set as remote `no-hosts`: `edge-proxy` (`daemon`),
-  `web-app` (`docker`)
+- Same service set as remote `no-hosts`: `edge-proxy`, `web-app`
 - Resolution mode is `hosts`
 - Temporary `/etc/hosts` entries are added/removed by the script
 
@@ -354,9 +353,9 @@ Configuration:
 
 #### Service set in this scenario (3 nodes, 8 services total)
 
-- `node-a`: daemon-c1 (daemon), daemon-c2 (daemon), docker-c1 (docker)
-- `node-b`: daemon-c3 (daemon), docker-c2 (docker), docker-c3 (docker)
-- `node-c`: daemon-c4 (daemon), docker-c4 (docker)
+- `node-a`: daemon-c1, daemon-c2, docker-c1
+- `node-b`: daemon-c3, docker-c2, docker-c3
+- `node-c`: daemon-c4, docker-c4
 
 Each service is validated across all rotation items.
 
@@ -407,9 +406,8 @@ Configuration:
 
 - Script: `scripts/impl/run-ca-key-rotation-recovery.sh`
 - Single machine baseline with Docker Compose infra
-- Service set (3 services): `edge-proxy` (`daemon`, `local-file`),
-  `web-app` (`docker`, `local-file`), `edge-proxy` (`daemon`,
-  `remote-bootstrap`)
+- Service set (3 services): `edge-proxy` (`local-file`),
+  `web-app` (`local-file`), `edge-proxy` (`remote-bootstrap`)
 - 5 failure injection scenarios run sequentially on the same infra
 
 Purpose:

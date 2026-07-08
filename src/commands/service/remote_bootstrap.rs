@@ -148,7 +148,7 @@ fn build_artifact(
     RemoteBootstrapArtifact {
         // schema_version 4 removed the `openbao_agent_*` fields: the
         // remote `bootroot-agent` now self-authenticates and renders trust
-        // via the fast-poll loop, so the OpenBao Agent sidecar artifacts
+        // via the fast-poll loop, so the OpenBao Agent artifacts
         // are no longer produced. Per the contract above, a field removal
         // is breaking and requires a bump.
         schema_version: 4,

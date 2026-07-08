@@ -14,6 +14,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Removed
 
+- Retired the per-service local OpenBao Agent sidecar and the local
+  Docker-sidecar run model for `bootroot-agent`. `bootroot service add
+  --delivery-mode local-file` no longer generates per-service OpenBao
+  Agent artifacts (`agent.hcl` / `.ctmpl` templates / token sink) or
+  relies on `bootroot-openbao-agent-<service>` containers, and the
+  `bootroot service openbao-sidecar start|refresh` subcommands (plus
+  the deprecated `service agent` alias) are gone. The `service add
+  --deploy-type` and `--container-name` flags are removed together with
+  the `deploy_type` / `container_name` fields in `state.json` — there
+  is no per-service Docker deployment variant left to select. The infra
+  OpenBao Agents provisioned by `bootroot init` (`openbao-agent-stepca`,
+  `openbao-agent-responder`) are unchanged. (Closes #691)
 - Dropped the now-dead OpenBao Agent sidecar artifacts that
   `bootroot-remote bootstrap` generated for `remote-bootstrap` services
   (`agent.hcl`, `agent.toml.ctmpl`, `ca-bundle.pem.ctmpl`, and the token
@@ -23,8 +35,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   renders trust via its fast-poll loop, these artifacts are superseded.
   Per the artifact `schema_version` contract, removing fields is breaking:
   `schema_version` is bumped from `3` to `4` and `bootroot-remote` now
-  accepts the `1..=4` range. The local-file delivery path is unaffected —
-  it still renders its own `.ctmpl` templates.
+  accepts the `1..=4` range. The local-file `.ctmpl` rendering was
+  subsequently removed as well (see the #691 entry above).
 - Removed ACME EAB auto-issuance and bootroot-side enforcement because
   the bundled OSS step-ca does not support EAB (EAB is a commercial
   Smallstep-only feature). The `bootroot rotate eab` subcommand, the
@@ -62,6 +74,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate approle-secret-id` re-owning the service
+  `secret_id` file to the rotating CLI user. The rewrite staged a fresh
+  `0600` temp file and renamed it over the destination without
+  preserving the existing uid/gid, so a root-run scheduled rotation
+  replaced an operator-chowned, daemon-readable credential with a
+  root-owned file — the non-root `bootroot-agent` host daemon then
+  failed its next AppRole re-login and the fast-poll loop stopped
+  carrying trust/HMAC/EAB updates. The rewrite now goes through the
+  ownership-preserving atomic writer, so operator-applied owner/group
+  on `secret_id` survives rotation.
 - Fixed `bootroot-remote bootstrap` provisioning a non-unique fast-poll
   `state_path` for distinct services on one host. The auto-provisioned
   basename was a fixed `bootroot-agent-state.json`, so two per-service
@@ -623,6 +645,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot service add` now rejects a `local-file` add whose
+  `--agent-config` path is already registered to a different service.
+  One `agent.toml` serves exactly one distinct service: the top-level
+  `[openbao]` section holds a single AppRole identity, so a second
+  service writing the same file would overwrite the first service's
+  `role_id`/`secret_id`/`state_path` and break its KV reads under
+  per-service AppRole policies. Multiple `[[profiles]]` remain reserved
+  for instances of the same service. The guard also inspects the target
+  file itself: an `agent.toml` still carrying another service's
+  bootroot-managed profile block — typically left by `service remove`
+  without `--strip-config` / `--delete-artifacts`, whose entry is no
+  longer in `state.json` — is rejected too, since the agent would
+  fast-poll the stale profile under the new service's AppRole identity.
+  (Part of #691)
 - Made the remote `bootroot-agent` fast-poll loop self-sufficient
   (approach C): it now pulls two more things from OpenBao KV on the same
   self-authenticated client that already drives force-reissue. A
@@ -1373,6 +1409,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Unified local and remote secret delivery on the `bootroot-agent`
+  fast-poll self-auth loop. `bootroot service add --delivery-mode
+  local-file` now writes the same `[openbao]` section into `agent.toml`
+  that `bootroot-remote bootstrap` provisions (`url`, `kv_mount`,
+  `role_id_path`, `secret_id_path`, `ca_bundle_path`, and an absolute
+  service-keyed `state_path` adjacent to `agent.toml`, e.g.
+  `bootroot-agent-state-<service>.json`), provisions `eab.json` next to
+  the service's `secret_id` (and removes it when KV holds no EAB), and
+  prints the daemon run command
+  `bootroot-agent --config <agent.toml> --eab-file <eab.json>`. The
+  local agent runs only as a hardened non-root systemd host daemon;
+  rotation flows (`approle-secret-id`, `responder-hmac`, `eab-clear`,
+  CA/trust) propagate to local services through the running agent's
+  fast-poll loop with no per-service process restarts, and local
+  `rotate force-reissue` keeps its cert-delete + `pkill -HUP` path.
+  Containerized consumer applications remain supported: the host daemon
+  writes certs to a host directory the app container bind-mounts, and a
+  `--reload-style docker-restart --reload-target <container>`
+  post-renew hook reloads the container (a hardened non-root unit needs
+  `SupplementaryGroups=docker` for that hook — Docker-socket access is
+  root-equivalent — or should prefer sighup/systemd/custom-command
+  reloads). (#691)
 - `bootroot rotate force-reissue --wait` now exits with status `124`
   (the GNU `timeout(1)` convention) when the wait window elapses
   without the agent reporting completion. The previous behaviour was

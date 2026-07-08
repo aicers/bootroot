@@ -130,7 +130,6 @@ for svc in layout['services']:
         svc['ca_bundle_path'],
         svc['summary_json_path'],
         svc['state_path'],
-        svc['deploy_type'],
         svc['hostname'],
         svc['domain'],
         svc['instance_id'],
@@ -161,7 +160,7 @@ refresh_leaves() {
   # would re-sign the leaf via the renewal predicate never fires;
   # without this step `bootroot verify` would correctly refuse a leaf
   # that does not chain to the bundle trust_sync wrote.
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     local current_dir="$MOCK_OPENBAO_TRUST_DIR/$service/current"
     local ca_cert="$current_dir/ca.crt"
     local ca_key="$current_dir/ca.key"
@@ -205,7 +204,7 @@ CNF
 }
 
 bootstrap_all() {
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     set_context "bootstrap" "$node" "$service" "$work_dir"
     log_phase "bootstrap" "$node" "$service"
     local output_file="$ARTIFACT_DIR/bootstrap-output-${node}-${service}.json"
@@ -243,7 +242,7 @@ services = []
 for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
     if not line.strip():
         continue
-    node, service, work_dir, role_id_path, secret_id_path, eab_file_path, agent_config_path, ca_bundle_path, summary_json_path, state_path, deploy_type, hostname, domain, instance_id = line.split('\t')
+    node, service, work_dir, role_id_path, secret_id_path, eab_file_path, agent_config_path, ca_bundle_path, summary_json_path, state_path, hostname, domain, instance_id = line.split('\t')
     services.append(
         {
             "node": node,
@@ -330,7 +329,7 @@ PY
 }
 
 run_verify_all() {
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     set_context "verify" "$node" "$service" "$agent_config_path"
     log_phase "verify" "$node" "$service"
     (
@@ -350,7 +349,7 @@ cleanup() {
     wait "$MOCK_OPENBAO_PID" 2>/dev/null || true
   fi
 
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path; do
     log_phase "cleanup" "$node" "$service"
   done <"$SERVICES_TSV" 2>/dev/null || true
 

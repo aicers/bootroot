@@ -379,7 +379,6 @@ fn write_state_with_service(root: &std::path::Path) -> anyhow::Result<()> {
         "services": {
             "edge-proxy": {
                 "service_name": "edge-proxy",
-                "deploy_type": "daemon",
                 "delivery_mode": "local-file",
                 "hostname": "edge-node-01",
                 "domain": "trusted.domain",
@@ -387,7 +386,6 @@ fn write_state_with_service(root: &std::path::Path) -> anyhow::Result<()> {
                 "cert_path": "certs/edge-proxy.crt",
                 "key_path": "certs/edge-proxy.key",
                 "instance_id": "001",
-                "container_name": null,
                 "notes": null,
                 "approle": {
                     "role_name": "bootroot-service-edge-proxy",

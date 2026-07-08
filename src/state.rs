@@ -139,7 +139,6 @@ impl StateFile {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct ServiceEntry {
     pub(crate) service_name: String,
-    pub(crate) deploy_type: DeployType,
     #[serde(default)]
     pub(crate) delivery_mode: DeliveryMode,
     pub(crate) hostname: String,
@@ -149,8 +148,6 @@ pub(crate) struct ServiceEntry {
     pub(crate) key_path: PathBuf,
     #[serde(default)]
     pub(crate) instance_id: Option<String>,
-    #[serde(default)]
-    pub(crate) container_name: Option<String>,
     #[serde(default)]
     pub(crate) notes: Option<String>,
     #[serde(default)]
@@ -214,19 +211,6 @@ pub(crate) struct ServiceRoleEntry {
     pub(crate) token_bound_cidrs: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum DeployType {
-    Daemon,
-    Docker,
-}
-
-impl fmt::Display for DeployType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_serde_string_value(self, formatter)
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HookFailurePolicyEntry {
@@ -275,22 +259,6 @@ mod tests {
         let mode = DeliveryMode::default();
         assert_eq!(mode, DeliveryMode::LocalFile);
         assert_eq!(mode.to_string(), "local-file");
-    }
-
-    #[test]
-    fn deploy_type_display_matches_serde() {
-        for variant in [DeployType::Daemon, DeployType::Docker] {
-            let serialized = serde_json::to_value(variant)
-                .expect("serialize DeployType")
-                .as_str()
-                .expect("serde value is a string")
-                .to_string();
-            assert_eq!(
-                variant.to_string(),
-                serialized,
-                "Display and serde disagree for {variant:?}"
-            );
-        }
     }
 
     #[test]
@@ -345,7 +313,6 @@ mod tests {
     fn service_entry_with_hooks_round_trips_json() {
         let entry = ServiceEntry {
             service_name: "svc".to_string(),
-            deploy_type: DeployType::Daemon,
             delivery_mode: DeliveryMode::LocalFile,
             hostname: "h".to_string(),
             domain: "d.com".to_string(),
@@ -353,7 +320,6 @@ mod tests {
             cert_path: PathBuf::from("cert.pem"),
             key_path: PathBuf::from("key.pem"),
             instance_id: Some("001".to_string()),
-            container_name: None,
             notes: None,
             post_renew_hooks: vec![PostRenewHookEntry {
                 command: "pkill".to_string(),
@@ -439,7 +405,6 @@ mod tests {
     fn service_entry_without_hooks_deserializes_empty_vec() {
         let json = r#"{
             "service_name": "svc",
-            "deploy_type": "daemon",
             "hostname": "h",
             "domain": "d.com",
             "agent_config_path": "agent.toml",

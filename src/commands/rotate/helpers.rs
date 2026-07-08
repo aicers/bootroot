@@ -1,14 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
 
-use super::{OPENBAO_AGENT_CONTAINER_PREFIX, RENDERED_FILE_POLL_INTERVAL, RotateContext};
+use super::RENDERED_FILE_POLL_INTERVAL;
 use crate::cli::prompt::Prompt;
 use crate::commands::infra::run_docker;
 use crate::i18n::Messages;
-use crate::state::{DeliveryMode, ServiceEntry};
+use crate::state::ServiceEntry;
 
 pub(super) fn confirm_action(prompt: &str, auto_confirm: bool, messages: &Messages) -> Result<()> {
     if auto_confirm {
@@ -56,6 +56,16 @@ pub(super) async fn write_secret_file(
     Ok(())
 }
 
+/// Rewrites a `secret_id` file atomically via
+/// [`fs_util::atomic_write`]: same-directory temp file, `0600`, the
+/// destination's existing uid/gid re-applied, then a rename into
+/// place. Ownership preservation is load-bearing for the local-file
+/// service path: the local `bootroot-agent` runs as a hardened
+/// non-root host daemon and re-reads this file on every `AppRole`
+/// re-login, so a root-run `rotate approle-secret-id` must not
+/// replace an operator-chowned, daemon-readable file with a
+/// root-owned `0600` one the daemon can no longer read — that would
+/// kill the fast-poll loop on its next re-login.
 pub(super) async fn write_secret_id_atomic(
     path: &Path,
     value: &str,
@@ -68,28 +78,10 @@ pub(super) async fn write_secret_id_atomic(
         anyhow::bail!(messages.error_parent_not_found(&path.display().to_string()));
     }
     fs_util::ensure_secrets_dir(parent).await?;
-    let temp_path = temp_secret_path(path);
-    tokio::fs::write(&temp_path, value)
-        .await
-        .with_context(|| messages.error_write_file_failed(&temp_path.display().to_string()))?;
-    fs_util::set_key_permissions(&temp_path).await?;
-    tokio::fs::rename(&temp_path, path)
+    fs_util::atomic_write(path, value.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
-}
-
-pub(super) fn temp_secret_path(path: &Path) -> PathBuf {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let file_name = path.file_name().map_or_else(
-        || "secret_id".to_string(),
-        |name| name.to_string_lossy().to_string(),
-    );
-    let temp_name = format!("{file_name}.tmp.{pid}.{nanos}");
-    path.with_file_name(temp_name)
 }
 
 pub(super) fn restart_container(container: &str, messages: &Messages) -> Result<()> {
@@ -147,95 +139,12 @@ pub(super) async fn wait_for_rendered_file(
 
 pub(super) use crate::commands::init::compose_has_responder;
 
-pub(super) fn openbao_agent_container_name(service_name: &str) -> String {
-    format!("{OPENBAO_AGENT_CONTAINER_PREFIX}-{service_name}")
-}
-
-pub(super) fn reload_openbao_agent(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
-    match entry.deploy_type {
-        crate::state::DeployType::Docker => {
-            let container = openbao_agent_container_name(&entry.service_name);
-            run_docker(
-                &["restart", &container],
-                "docker restart OpenBao Agent",
-                messages,
-            )
-        }
-        crate::state::DeployType::Daemon => reload_openbao_agent_daemon(entry, messages),
-    }
-}
-
+/// Signals the local host-daemon `bootroot-agent` (matched by its
+/// `--config` path in the process cmdline) to re-read its config and
+/// re-check certificates. The local agent runs only as a host daemon,
+/// so `pkill -HUP` is the sole signalling channel.
 #[cfg(unix)]
-fn reload_openbao_agent_daemon(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
-    let config_path = entry.agent_config_path.display().to_string();
-    let status = std::process::Command::new("pkill")
-        .args(["-HUP", "-f", &config_path])
-        .status()
-        .with_context(|| messages.error_command_run_failed("pkill -HUP"))?;
-    if !status.success() {
-        anyhow::bail!(messages.error_command_failed_status("pkill -HUP", &status.to_string()));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn reload_openbao_agent_daemon(_entry: &ServiceEntry, messages: &Messages) -> Result<()> {
-    anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
-}
-
 pub(super) fn signal_bootroot_agent(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
-    match entry.deploy_type {
-        crate::state::DeployType::Docker => {
-            let container = entry
-                .container_name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| anyhow::anyhow!(messages.error_service_container_name_required()))?;
-            match inspect_docker_container(container, messages)? {
-                DockerInspectOutcome::Found => restart_container(container, messages),
-                DockerInspectOutcome::Missing => {
-                    anyhow::bail!(messages.error_bootroot_agent_container_missing(container))
-                }
-            }
-        }
-        crate::state::DeployType::Daemon => signal_bootroot_agent_daemon(entry, messages),
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum DockerInspectOutcome {
-    Found,
-    Missing,
-}
-
-fn inspect_docker_container(container: &str, messages: &Messages) -> Result<DockerInspectOutcome> {
-    let output = std::process::Command::new("docker")
-        .args(["container", "inspect", container])
-        .stdout(std::process::Stdio::null())
-        .output()
-        .with_context(|| messages.error_command_run_failed("docker container inspect"))?;
-    if output.status.success() {
-        return Ok(DockerInspectOutcome::Found);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if is_no_such_container_stderr(&stderr) {
-        return Ok(DockerInspectOutcome::Missing);
-    }
-    anyhow::bail!(messages.error_docker_command_failed(stderr.trim()));
-}
-
-// Docker reports an absent container with either
-// "Error response from daemon: No such container: <name>" or
-// "Error: No such object: <name>"; any other stderr (daemon not reachable,
-// permission denied, TLS errors, …) is an unrelated failure that must
-// surface to the operator unchanged instead of being misattributed to the
-// #552 one-shot migration path.
-fn is_no_such_container_stderr(stderr: &str) -> bool {
-    stderr.contains("No such container") || stderr.contains("No such object")
-}
-
-#[cfg(unix)]
-fn signal_bootroot_agent_daemon(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     let config_path = entry.agent_config_path.display().to_string();
     let status = std::process::Command::new("pkill")
         .args(["-HUP", "-f", &config_path])
@@ -248,7 +157,7 @@ fn signal_bootroot_agent_daemon(entry: &ServiceEntry, messages: &Messages) -> Re
 }
 
 #[cfg(not(unix))]
-fn signal_bootroot_agent_daemon(_entry: &ServiceEntry, messages: &Messages) -> Result<()> {
+pub(super) fn signal_bootroot_agent(_entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
 }
 
@@ -264,36 +173,8 @@ pub(super) fn try_restart_container(container: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn restart_service_sidecar_agents(
-    ctx: &RotateContext,
-    expected_hmac: &str,
-    messages: &Messages,
-) -> Result<()> {
-    let mut agent_config_paths = std::collections::BTreeSet::new();
-    for entry in ctx.state.services.values() {
-        if !matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
-            println!(
-                "{}",
-                messages.rotate_sidecar_skip_remote(
-                    &entry.service_name,
-                    bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
-                )
-            );
-            continue;
-        }
-        let container = openbao_agent_container_name(&entry.service_name);
-        let _ = try_restart_container(&container);
-        agent_config_paths.insert(entry.agent_config_path.clone());
-    }
-    for path in &agent_config_paths {
-        wait_for_rendered_file(path, expected_hmac, super::RENDERED_FILE_TIMEOUT, messages).await?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::path::Path;
     use std::time::Duration;
 
@@ -301,13 +182,6 @@ mod tests {
 
     use super::super::test_support::test_messages;
     use super::*;
-    use crate::state::{DeployType, ServiceRoleEntry, StateFile};
-
-    #[test]
-    fn openbao_agent_container_name_uses_prefix() {
-        let name = openbao_agent_container_name("api");
-        assert_eq!(name, "bootroot-openbao-agent-api");
-    }
 
     #[tokio::test]
     async fn write_secret_id_atomic_overwrites_contents() {
@@ -348,12 +222,47 @@ mod tests {
         assert!(err.contains("Parent directory not found"));
     }
 
-    #[test]
-    fn temp_secret_path_adds_suffix() {
-        let path = Path::new("/tmp/secret_id");
-        let temp = temp_secret_path(path);
-        let name = temp.file_name().expect("filename").to_string_lossy();
-        assert!(name.starts_with("secret_id.tmp."));
+    /// A root-run `rotate approle-secret-id` must not strip the
+    /// ownership an operator applied so the non-root host daemon can
+    /// read the credential — otherwise the agent's next `AppRole`
+    /// re-login fails and the fast-poll loop dies. Requires a
+    /// supplementary gid (single-gid CI runners skip; the
+    /// e2e-extended job provisions one and keeps coverage).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_secret_id_atomic_preserves_existing_owner_on_rewrite() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().expect("tempdir");
+        let secret_path = dir.path().join("app").join("secret_id");
+        let messages = test_messages();
+
+        write_secret_id_atomic(&secret_path, "old", &messages)
+            .await
+            .expect("initial write");
+        std::os::unix::fs::chown(&secret_path, None, Some(gid))
+            .expect("test process must be able to chgrp to a supplementary gid");
+        let pre_uid = std::fs::metadata(&secret_path).expect("metadata").uid();
+
+        write_secret_id_atomic(&secret_path, "new", &messages)
+            .await
+            .expect("rewrite");
+
+        let meta = std::fs::metadata(&secret_path).expect("metadata");
+        assert_eq!(meta.gid(), gid, "rewrite must preserve the existing gid");
+        assert_eq!(
+            meta.uid(),
+            pre_uid,
+            "rewrite must preserve the existing uid"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let contents = tokio::fs::read_to_string(&secret_path)
+            .await
+            .expect("read secret_id");
+        assert_eq!(contents, "new");
     }
 
     #[tokio::test]
@@ -389,298 +298,5 @@ mod tests {
         .await
         .expect_err("should timeout when content never matches");
         assert!(err.to_string().contains("Timed out"));
-    }
-
-    fn make_service_entry(name: &str, delivery_mode: DeliveryMode) -> ServiceEntry {
-        ServiceEntry {
-            service_name: name.to_string(),
-            deploy_type: DeployType::Docker,
-            delivery_mode,
-            hostname: "h".to_string(),
-            domain: "d.com".to_string(),
-            agent_config_path: PathBuf::from("agent.hcl"),
-            cert_path: PathBuf::from("cert.pem"),
-            key_path: PathBuf::from("key.pem"),
-            instance_id: None,
-            container_name: None,
-            notes: None,
-            post_renew_hooks: vec![],
-            approle: ServiceRoleEntry {
-                role_name: "r".to_string(),
-                role_id: "id".to_string(),
-                secret_id_path: PathBuf::from("s"),
-                policy_name: "p".to_string(),
-                secret_id_ttl: None,
-                secret_id_wrap_ttl: None,
-                token_bound_cidrs: None,
-            },
-            agent_email: None,
-            agent_server: None,
-            agent_responder_url: None,
-            cert_group_gid: None,
-        }
-    }
-
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn restart_service_sidecar_agents_skips_remote() {
-        use super::super::test_support::{
-            ScopedEnvVar, env_lock, path_with_prepend, write_fake_docker_script,
-        };
-
-        let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).expect("create bin dir");
-        let docker_path = bin_dir.join("docker");
-        write_fake_docker_script(&docker_path);
-
-        let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(super::super::test_support::TEST_DOCKER_ARGS_ENV, &args_log);
-
-        let mut services = BTreeMap::new();
-        services.insert(
-            "remote-svc".to_string(),
-            make_service_entry("remote-svc", DeliveryMode::RemoteBootstrap),
-        );
-
-        let ctx = super::super::RotateContext {
-            openbao_url: String::new(),
-            kv_mount: String::new(),
-            compose_file: PathBuf::new(),
-            state: StateFile {
-                openbao_url: String::new(),
-                kv_mount: String::new(),
-                secrets_dir: None,
-                policies: BTreeMap::new(),
-                approles: BTreeMap::new(),
-                services,
-                openbao_bind_addr: None,
-                openbao_advertise_addr: None,
-                http01_admin_bind_addr: None,
-                http01_admin_advertise_addr: None,
-                stepca_bind_addr: None,
-                stepca_advertise_addr: None,
-                infra_certs: BTreeMap::new(),
-                ..Default::default()
-            },
-            paths: super::super::StatePaths::new(dir.path().to_path_buf()),
-            state_dir: dir.path().to_path_buf(),
-            state_file: dir.path().join("state.json"),
-        };
-
-        let messages = test_messages();
-        restart_service_sidecar_agents(&ctx, "new-hmac", &messages)
-            .await
-            .expect("should succeed without docker restart");
-
-        assert!(
-            !args_log.exists(),
-            "docker should not have been invoked for a remote service"
-        );
-    }
-
-    #[test]
-    fn signal_bootroot_agent_docker_uses_entry_container_name() {
-        use super::super::test_support::{
-            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
-            write_fake_docker_script,
-        };
-
-        let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).expect("create bin dir");
-        let docker_path = bin_dir.join("docker");
-        write_fake_docker_script(&docker_path);
-
-        let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
-
-        let mut entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
-        entry.container_name = Some("my-nginx".to_string());
-
-        signal_bootroot_agent(&entry, &test_messages())
-            .expect("should invoke docker restart against entry.container_name");
-
-        let logged = std::fs::read_to_string(&args_log).expect("read logged args");
-        let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(args, vec!["restart", "my-nginx"]);
-    }
-
-    #[test]
-    fn signal_bootroot_agent_docker_requires_container_name() {
-        let entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
-        assert!(entry.container_name.is_none());
-
-        let err = signal_bootroot_agent(&entry, &test_messages())
-            .expect_err("missing container_name must fail fast");
-        assert!(err.to_string().contains("container_name"));
-    }
-
-    #[test]
-    fn signal_bootroot_agent_docker_reports_missing_container_with_hint() {
-        use super::super::test_support::{
-            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, TEST_DOCKER_EXIT_ENV, TEST_DOCKER_STDERR_ENV,
-            env_lock, path_with_prepend, write_fake_docker_script,
-        };
-
-        let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).expect("create bin dir");
-        let docker_path = bin_dir.join("docker");
-        write_fake_docker_script(&docker_path);
-
-        let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
-        let _exit = ScopedEnvVar::set(TEST_DOCKER_EXIT_ENV, "1");
-        let _stderr = ScopedEnvVar::set(
-            TEST_DOCKER_STDERR_ENV,
-            "Error response from daemon: No such container: my-nginx\n",
-        );
-
-        let mut entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
-        entry.container_name = Some("my-nginx".to_string());
-
-        let err = signal_bootroot_agent(&entry, &test_messages())
-            .expect_err("missing container must fail with tailored hint");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("my-nginx"),
-            "error should reference the missing container: {msg}"
-        );
-        assert!(
-            msg.contains("docker run -d") && msg.contains("--restart unless-stopped"),
-            "error should recommend recreating the sidecar as a long-running daemon: {msg}"
-        );
-
-        let logged = std::fs::read_to_string(&args_log).expect("read logged args");
-        let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(
-            args,
-            vec!["container", "inspect", "my-nginx"],
-            "rotate must stop at the pre-flight inspect and not invoke docker restart"
-        );
-    }
-
-    #[test]
-    fn signal_bootroot_agent_docker_surfaces_non_absence_inspect_failure() {
-        use super::super::test_support::{
-            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, TEST_DOCKER_EXIT_ENV, TEST_DOCKER_STDERR_ENV,
-            env_lock, path_with_prepend, write_fake_docker_script,
-        };
-
-        let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).expect("create bin dir");
-        let docker_path = bin_dir.join("docker");
-        write_fake_docker_script(&docker_path);
-
-        let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
-        let _exit = ScopedEnvVar::set(TEST_DOCKER_EXIT_ENV, "1");
-        let daemon_stderr = "Cannot connect to the Docker daemon at \
-                             unix:///var/run/docker.sock. Is the docker daemon running?";
-        let _stderr = ScopedEnvVar::set(TEST_DOCKER_STDERR_ENV, daemon_stderr);
-
-        let mut entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
-        entry.container_name = Some("my-nginx".to_string());
-
-        let err = signal_bootroot_agent(&entry, &test_messages())
-            .expect_err("non-absence inspect failures must propagate verbatim");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Cannot connect to the Docker daemon"),
-            "error should preserve docker's own stderr: {msg}"
-        );
-        assert!(
-            !msg.contains("docker run -d"),
-            "must not recommend the #552 migration hint for unrelated docker failures: {msg}"
-        );
-        assert!(
-            !msg.contains("one-shot") && !msg.contains("bootroot-agent docker container not found"),
-            "must not use the missing-container i18n template for unrelated docker failures: {msg}"
-        );
-
-        let logged = std::fs::read_to_string(&args_log).expect("read logged args");
-        let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(
-            args,
-            vec!["container", "inspect", "my-nginx"],
-            "rotate must stop at the pre-flight inspect"
-        );
-    }
-
-    #[test]
-    fn is_no_such_container_stderr_recognizes_known_absence_messages() {
-        assert!(is_no_such_container_stderr(
-            "Error response from daemon: No such container: foo\n"
-        ));
-        assert!(is_no_such_container_stderr("Error: No such object: foo\n"));
-        assert!(!is_no_such_container_stderr(
-            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
-        ));
-        assert!(!is_no_such_container_stderr(
-            "permission denied while trying to connect to the Docker daemon socket"
-        ));
-        assert!(!is_no_such_container_stderr(""));
-    }
-
-    #[test]
-    fn signal_bootroot_agent_docker_restart_failure_names_container() {
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
-
-        use super::super::test_support::{
-            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
-        };
-
-        let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).expect("create bin dir");
-        let docker_path = bin_dir.join("docker");
-        // Succeed on `container inspect`, fail on `restart` so the error
-        // context (which must name the actual container) is the one the
-        // operator sees.
-        let script = r#"#!/bin/sh
-set -eu
-printf '%s\n' "$@" >> "${BOOTROOT_TEST_DOCKER_ARGS:?missing log path}"
-if [ "$1" = "restart" ]; then
-  exit 1
-fi
-exit 0
-"#;
-        std::fs::write(&docker_path, script).expect("write fake docker");
-        #[cfg(unix)]
-        std::fs::set_permissions(&docker_path, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod fake docker");
-
-        let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
-
-        let mut entry = make_service_entry("nginx-docker", DeliveryMode::LocalFile);
-        entry.container_name = Some("my-nginx".to_string());
-
-        let err = signal_bootroot_agent(&entry, &test_messages())
-            .expect_err("docker restart failure must propagate");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("my-nginx"),
-            "restart failure must name the actual container, got: {msg}"
-        );
-        assert!(
-            !msg.contains("bootroot-agent"),
-            "restart failure must not reference the removed hardcoded prefix, got: {msg}"
-        );
     }
 }

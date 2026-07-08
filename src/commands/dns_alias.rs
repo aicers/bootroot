@@ -190,12 +190,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, StateFile};
+    use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry, StateFile};
 
     fn sample_entry(name: &str, instance_id: Option<&str>) -> ServiceEntry {
         ServiceEntry {
             service_name: name.to_string(),
-            deploy_type: DeployType::Docker,
             delivery_mode: DeliveryMode::LocalFile,
             hostname: "host1".to_string(),
             domain: "test.local".to_string(),
@@ -203,7 +202,6 @@ mod tests {
             cert_path: PathBuf::from("/certs/cert.pem"),
             key_path: PathBuf::from("/certs/key.pem"),
             instance_id: instance_id.map(str::to_string),
-            container_name: Some("ctr".to_string()),
             notes: None,
             post_renew_hooks: Vec::new(),
             approle: ServiceRoleEntry {

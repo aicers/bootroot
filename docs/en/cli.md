@@ -26,7 +26,6 @@ Primary commands:
 - `bootroot service update`
 - `bootroot service remove`
 - `bootroot service info`
-- `bootroot service openbao-sidecar start`
 - `bootroot verify`
 - `bootroot rotate`
 - `bootroot clean`
@@ -75,22 +74,20 @@ What operators must install and manage directly:
 - `bootroot-agent`
 - `bootroot-remote` (CLI that runs on the service machine when an added
   service runs on a different machine from the step-ca host)
-- OpenBao Agent (for added services; step-ca/responder agents are auto-prepared
-  by `bootroot init`)
 
-Runtime supervision is also operator-owned:
+Runtime supervision is also operator-owned: `bootroot-agent` runs as a host
+daemon (e.g., a systemd unit with `Restart=always` or `on-failure`). For
+consumer applications that run in containers, ensure container restart
+policy and Docker daemon startup on reboot.
 
-- systemd mode: configure restart policy (`Restart=always` or `on-failure`)
-- container mode: ensure container restart policy and Docker daemon startup on
-  reboot
-
-When an added service runs on a different machine from the step-ca host,
-run `bootroot-remote bootstrap` once on that service machine to apply the
-initial configuration bundle and start `bootroot-agent`. The running agent
-then keeps itself current via its fast-poll loop: it pulls trust and
-`secret_id` rotations from OpenBao and re-renders `agent.toml` without
-operator action, so no second daemon (OpenBao Agent sidecar) runs on the
-remote host. `bootroot-remote apply-secret-id` and re-running
+In both delivery modes, the running `bootroot-agent` keeps itself current
+via its fast-poll loop: it pulls trust, `secret_id`, responder-HMAC, and
+EAB rotations from OpenBao and re-renders `agent.toml` without operator
+action, so no second daemon (per-service OpenBao Agent) runs on any
+service host. When an added service runs on a different machine from the
+step-ca host, run `bootroot-remote bootstrap` once on that service machine
+to apply the initial configuration bundle and start `bootroot-agent`.
+`bootroot-remote apply-secret-id` and re-running
 `bootroot-remote bootstrap` are recovery paths only — needed when an agent
 was offline past its `secret_id_ttl` and its credential already expired.
 
@@ -526,7 +523,7 @@ bootroot status
 
 ## bootroot service add
 
-Onboards a new service (daemon/docker) so it can obtain certificates from
+Onboards a new service so it can obtain certificates from
 step-ca by registering its metadata and creating an OpenBao AppRole.
 When you run this command, **the `bootroot` CLI** performs onboarding
 automation in the following structure.
@@ -546,9 +543,14 @@ automation in the following structure.
   OpenBao/PostgreSQL/step-ca/HTTP-01 responder are installed
 - Auto-applied: managed profile block update (or create) in `agent.toml`,
   top-level `domain` from `--domain`, `[acme].http_responder_hmac` from
-  the responder HMAC stored in OpenBao, local OpenBao Agent
-  template/config/token file generation, and HTTP-01 DNS alias registration
-  on the `bootroot-http01` container
+  the responder HMAC stored in OpenBao, an `[openbao]` section that
+  activates the agent's fast-poll self-auth loop (`url`, `kv_mount`,
+  `role_id_path`, `secret_id_path`, `ca_bundle_path`, and an absolute
+  service-keyed `state_path` adjacent to `agent.toml`, e.g.
+  `/etc/bootroot/bootroot-agent-state-<service>.json`), provisioning of
+  `eab.json` next to the service's `secret_id` (removed when KV holds no
+  EAB), and HTTP-01 DNS alias registration on the `bootroot-http01`
+  container
 
 #### 2-2) `remote-bootstrap`
 
@@ -570,18 +572,27 @@ automation in the following structure.
 
 You still need to perform:
 
-- For `local-file`, start and keep the per-service OpenBao Agent sidecar and
-  `bootroot-agent` running on the service machine; `bootroot service add`
-  already prepares trust files on the same host so the first managed
-  `bootroot-agent` run can start in verify mode
+- For `local-file`, start and keep `bootroot-agent` running as a host
+  daemon using the run command printed by `service add`
+  (`bootroot-agent --config <agent.toml> --eab-file <eab.json>` — see
+  the note below); `bootroot service add` already prepares trust files
+  and the `[openbao]` fast-poll section on the same host so the first
+  managed `bootroot-agent` run can start in verify mode
 - For `remote-bootstrap`, edit the generated `remote run command template`,
   run `bootroot-remote bootstrap` once on the service machine, then keep
-  `bootroot-agent` running. No OpenBao Agent sidecar runs on the remote host:
-  the agent self-authenticates and pulls trust and `secret_id` rotations via
-  fast-poll, so rotations propagate without a manual re-bootstrap or
-  `apply-secret-id` (those are recovery paths only, for an agent offline past
-  its `secret_id_ttl`)
+  `bootroot-agent` running
 - Validate issuance path via `bootroot verify` or real service startup
+
+In both modes, no per-service OpenBao Agent runs on the service host:
+the agent self-authenticates and pulls trust, `secret_id`,
+responder-HMAC, and EAB rotations via fast-poll, so rotations propagate
+without a manual re-bootstrap or `apply-secret-id` (those are recovery
+paths only, for an agent offline past its `secret_id_ttl`).
+
+**`--eab-file` is required for EAB rotation to apply.** The documented
+run command passes the provisioned `eab.json` path via `--eab-file`.
+Without it, EAB updates in KV and `rotate eab-clear` are silent no-ops
+for that agent.
 
 ### 4) Trust automation and preview
 
@@ -598,8 +609,8 @@ automatically as part of onboarding.
   service machine before the first `bootroot-agent` run.
 - `local-file` mode: trust settings are auto-merged into `agent.toml`
   (`trusted_ca_sha256` and `ca_bundle_path`), the CA bundle PEM is written to
-  the local `ca_bundle_path`, and the per-service OpenBao Agent keeps them
-  synchronized.
+  the local `ca_bundle_path`, and the running agent's fast-poll loop keeps
+  them synchronized.
 
 #### 4-2) Managed trust bootstrap (summary)
 
@@ -627,18 +638,20 @@ automatically as part of onboarding.
 
 ### Runtime deployment policy
 
-#### OpenBao Agent
+`bootroot-agent` runs as a **host daemon** (e.g., a systemd unit). It is
+not run as a Docker sidecar, and no per-service OpenBao Agent runs: the
+daemon's own fast-poll loop delivers secrets in both delivery modes. A
+host runs one `bootroot-agent` process plus one agent config per
+**distinct service** — the `[openbao]` section holds a single AppRole
+credential, so distinct services cannot share one `agent.toml`; multiple
+`[[profiles]]` in one config are only for instances of the same service
+(see
+[Operations > systemd operations procedure](operations.md#systemd-operations-procedure-recommended-for-bootroot-agent)).
 
-- Docker service: per-service sidecar (**required**)
-- daemon service: per-service daemon (**required**)
-
-#### bootroot-agent
-
-- Docker service: per-service sidecar (recommended)
-- daemon service: one shared daemon per host (recommended)
-
-Note: Docker services can use the shared daemon, but this is supported and
-not recommended (sidecars provide better isolation/lifecycle alignment).
+Consumer applications that run in containers are still supported: the
+host daemon writes certs to a host directory that the app container
+bind-mounts, and the post-renew hook reloads the container (see
+[Operations > Containerized consumer applications](operations.md#containerized-consumer-applications)).
 
 ### Inputs
 
@@ -647,7 +660,6 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--service-name`: service name identifier
   - Must be a single DNS label: letters, digits, and hyphens only, max 63
     characters, no dots or underscores
-- `--deploy-type`: deployment type (`daemon` or `docker`)
 - `--delivery-mode`: delivery mode (`local-file` or `remote-bootstrap`).
   Note: `remote-bootstrap` is a mode value, not an executable binary, and the
   executable used for this mode is `bootroot-remote`.
@@ -661,17 +673,6 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--key-path`: private key output path
 - `--instance-id`: service instance_id
   - Must be numeric (`001`, `42`, ...)
-- `--container-name`: docker container name (required for docker).
-  Combining `--container-name` with `--deploy-type=daemon` is rejected;
-  the flag has meaning only in docker mode.
-- `--no-validate-agent`: skip the docker-mode identity check that
-  confirms `--container-name` actually points at a bootroot-agent
-  (label `bootroot.role=agent`, with a `bootroot-agent` substring
-  fallback against image/entrypoint/cmd). Use when the agent container
-  is not running yet at `service add` time, when `docker inspect` is
-  unreachable, or for pre-existing deployments that lack the label.
-  Scopes only to the docker identity check; does not bypass the
-  daemon+`--container-name` reject above.
 - `--auth-mode`: runtime auth mode (`auto`, `root`, `approle`, default `auto`)
 - `--root-token`: OpenBao root token (environment variable: `OPENBAO_ROOT_TOKEN`,
   transition/break-glass path)
@@ -821,26 +822,39 @@ operator's primary gid before the chown lands.
 
 ### Interactive behavior
 
-- Prompts for missing required inputs (deploy type defaults to `daemon`).
+- Prompts for missing required inputs.
 - Checks that identifiers are non-empty and match the DNS/numeric rules above,
   that enum values are allowed, and that paths/parent directories are valid.
+- Rejects a `local-file` add whose `--agent-config` path is already used by
+  another service: the `[openbao]` section holds a single AppRole identity,
+  so each distinct service needs its own `agent.toml` (multiple
+  `[[profiles]]` are reserved for instances of the same service). The
+  guard also inspects the target file itself: an `agent.toml` that still
+  contains another service's bootroot-managed profile block — typically
+  left by `service remove` without `--strip-config` /
+  `--delete-artifacts` — is rejected too, because the agent would
+  fast-poll the stale profile under the new service's AppRole identity.
+  Delete the stale `# BEGIN/END bootroot managed profile: <service>`
+  block (or use a separate `agent.toml`) before reusing the file.
 - Prints a plan summary before execution and the final summary after.
 
 ### Outputs
 
 - App metadata summary
 - AppRole/policy/secret_id path summary
-- Delivery mode summary (`local-file` provides
-  auto-applied `agent.toml`/OpenBao Agent config/template paths, and
+- Delivery mode summary (`local-file` provides the auto-applied
+  `agent.toml` path and the auto-provisioned `eab.json` path, and
   `remote-bootstrap` provides a generated bootstrap artifact + ordered remote
   handoff command template)
 - Explicit ownership/scope labels in output:
   `Bootroot-managed`, `Operator-managed (required)`,
   `Operator-managed (recommended)`, and
   `Operator-managed (optional)`
-- Per-service OpenBao Agent guidance (daemon vs docker)
-- Type-specific onboarding guidance (daemon profile / docker sidecar)
-- Copy-paste snippets for daemon profile or docker sidecar (default + preview)
+- Copy-paste snippets: daemon profile block, trust settings, and the
+  daemon run command
+  (`bootroot-agent --config <agent.toml> --eab-file <eab.json>`;
+  `--eab-file` is required for EAB rotation to apply) — printed in both
+  default and preview modes
 
 ### Failure conditions
 
@@ -849,16 +863,7 @@ The command is considered failed when:
 - Missing `state.json`
 - Duplicate `service-name`
 - Missing `instance-id`
-- Missing `container-name` for docker
-- `--container-name` combined with `--deploy-type=daemon`
 - OpenBao AppRole creation failure
-
-A non-fatal warning (registration still proceeds) is emitted when
-`--deploy-type=docker` is used and the supplied `--container-name`
-cannot be confirmed as a bootroot-agent: missing `bootroot.role=agent`
-label, no `bootroot-agent` substring in image/entrypoint/cmd, or
-`docker inspect` cannot be executed. Pass `--no-validate-agent` to
-silence the warning when this is expected.
 
 ## bootroot service update
 
@@ -979,17 +984,20 @@ regenerates the `secret_id` delivery material regardless, the fresh
 - `--dry-run`: print the teardown plan without mutating `state.json` or
   `OpenBao`.
 - `--delete-artifacts`: also delete bootroot-owned on-disk artifacts —
-  the cert/key files, the per-service secret and `OpenBao` config
-  directories, and the remote-bootstrap artifact — and strip bootroot's
+  the cert/key files, the per-service secret directory, and the
+  remote-bootstrap artifact directory — and strip bootroot's
   managed profile block from `agent.toml`. **Off by default:**
   `service add` only records cert/key paths (the files are produced later
   by rotation / the agent), so on-disk material is preserved unless this
   flag is given. Even with the flag, `agent.toml` is edited in place —
   only the managed block is removed — so an operator-owned config file is
-  never deleted.
+  never deleted. Note that removing without `--strip-config` /
+  `--delete-artifacts` leaves the managed profile block in `agent.toml`;
+  a later `service add` for a *different* service reusing that config is
+  rejected until the stale block is stripped.
 - `--strip-config`: strip bootroot's managed profile block from
   `agent.toml` **without** deleting the cert/key files or the per-service
-  secret and `OpenBao` config directories. Intended for a live
+  secret directory. Intended for a live
   delivery-mode transition, where the service is still serving so the
   cert/key must be kept, yet the stale managed block must go. Only the
   service's `[[profiles]]` entry and its marker comments are removed; the
@@ -1075,7 +1083,8 @@ Shows onboarding information for a registered service.
 ### Outputs
 
 - App type/paths/AppRole/secret paths summary
-- Per-service OpenBao Agent guidance (daemon vs docker)
+- Daemon profile and run command snippets (the run command includes
+  `--eab-file`, which is required for EAB rotation to apply)
 
 ### Failure conditions
 
@@ -1084,231 +1093,14 @@ The command is considered failed when:
 - Missing `state.json`
 - App not found
 
-## bootroot service openbao-sidecar start
-
-Starts the per-service **OpenBao Agent** (`bao agent`) sidecar
-container for a registered service so secrets can be re-rendered
-immediately on rotate. The command writes a per-service compose
-override under
-`secrets/openbao/services/<service>/docker-compose.override.yml` and
-brings the sidecar up via `docker compose ... up -d`.
-
-> Note: this command manages the **OpenBao Agent**, not the
-> `bootroot-agent` certificate daemon. Two completely different
-> binaries share the word "agent" — see
-> [Naming disambiguation](#openbao-agent-vs-bootroot-agent) below.
-
-### Inputs
-
-- `--service-name`: service name identifier (must already exist in
-  `state.json`)
-- `--compose-file`: compose file path (default `docker-compose.yml`)
-- `--openbao-network`: docker network the sidecar should attach to
-  (optional)
-  - When omitted, the network is discovered from the
-    `bootroot-openbao` container's `com.docker.compose.project` label
-    as `<project>_default`.
-  - Required when OpenBao runs **outside** bootroot's compose file
-    (separate host, kubernetes, managed service, etc.) — there is no
-    `bootroot-openbao` container to inspect, so an explicit network
-    must be supplied.
-  - Validated against the docker network naming rules
-    (`^[A-Za-z0-9][A-Za-z0-9_.-]*$`) to prevent override-file
-    injection.
-
-### Behavior
-
-The command resolves docker network and compose project according to
-the following decision matrix (rows 1 and 2 read whether the compose
-file declares an `openbao` service):
-
-| OpenBao in compose | `--openbao-network` | Behavior |
-| --- | --- | --- |
-| present | unset | Discover project label on `bootroot-openbao`; use `<project>` for `-p` and `<project>_default` for the override network |
-| present | set | Use the given network in the override; still discover project label for `-p` |
-| absent | unset | Error: `--openbao-network` is required when OpenBao runs outside bootroot's compose |
-| absent | set | Use the given network; omit `-p` (defaults to working-directory project) |
-
-This replaces the previous behavior that hardcoded the compose
-project to `bootroot` and the network to `bootroot_default`. As a
-result, the command now works from any working directory and any
-`COMPOSE_PROJECT_NAME` value without requiring a workaround such as
-`COMPOSE_PROJECT_NAME=bootroot bootroot service openbao-sidecar start ...`.
-
-The sidecar `up` is issued with `--no-deps`, so it brings up only the
-sidecar and never reconciles or recreates the `bootroot-openbao`
-container. Because the command resolves only the base
-`docker-compose.yml`, a stack that publishes OpenBao through an
-additional operator override (extra ports, networks, etc.) would
-otherwise drift from the running container and get recreated —
-re-sealing a shamir-sealed OpenBao and dropping the override-only
-bindings. `--no-deps` avoids that regardless of which operator
-override files published OpenBao.
-
-### Outputs
-
-- The created sidecar container is named
-  `bootroot-openbao-agent-<service>`.
-- Bind-mounts depend on the service's `--deploy-type`:
-  - `daemon`: mounts the per-service config and cert directories at
-    `/sidecar-config` and `/sidecar-certs` so the sidecar can render
-    `agent.toml` and `ca-bundle.pem` directly at the paths
-    `bootroot-agent` reads and `rotate` waits on.
-  - `docker`: mounts only the shared secrets directory at
-    `/openbao/secrets`.
-- A success message in the form
-  `bootroot service openbao-sidecar start: started bootroot-openbao-agent-<service>`.
-
-### Prerequisites
-
-- `bootroot infra install` and `bootroot service add` must have
-  completed for the service.
-- Then one of:
-  - The compose file declares an `openbao:` service — the
-    `bootroot-openbao` container must exist locally so the project
-    label can be discovered. `--openbao-network` is optional in this
-    branch and only overrides the network name; it does not bypass the
-    label discovery.
-  - The compose file does **not** declare an `openbao:` service
-    (external-OpenBao case) — `--openbao-network` is required and is
-    the only way to specify the sidecar's network. No container
-    inspection is performed in this branch.
-
-### Failure conditions
-
-The command is considered failed when:
-
-- Missing `state.json`
-- Service not found
-- Service uses `--delivery-mode remote-bootstrap` (the local sidecar
-  flow does not apply; the remote host runs `bootroot-agent` self-auth
-  fast-poll, which self-heals trust and secret_id — no OpenBao Agent
-  sidecar is started for it)
-- Per-service `agent-docker.hcl` config is missing
-- The compose file declares an `openbao:` service but the
-  `bootroot-openbao` container is not found (failure applies whether
-  or not `--openbao-network` was supplied — the project label is still
-  needed for `-p`)
-- The compose file declares an `openbao:` service but the
-  `bootroot-openbao` container exists without a
-  `com.docker.compose.project` label
-- The compose file does not declare an `openbao:` service and
-  `--openbao-network` was not supplied
-- `--openbao-network` (or the discovered network) fails the docker
-  network name validation
-
-### Examples
-
-```bash
-# Standard managed compose, any working directory.
-bootroot service openbao-sidecar start --service-name edge-proxy
-
-# External OpenBao (separate host / kubernetes / managed service).
-bootroot service openbao-sidecar start \
-  --service-name edge-proxy \
-  --openbao-network app-shared-net
-
-# Explicit network override even though OpenBao is in compose
-# (e.g. attaching the sidecar to a non-default network).
-bootroot service openbao-sidecar start \
-  --service-name edge-proxy \
-  --openbao-network ops-net
-```
-
-### OpenBao Agent vs `bootroot-agent`
-
-`service openbao-sidecar start` runs the **OpenBao Agent** (`bao agent`), not
-the `bootroot-agent` certificate daemon. Two completely different
-software packages share the word "agent":
-
-| Software | Role | Who runs it |
-| --- | --- | --- |
-| OpenBao Agent (`bao agent`) | Fetches secrets from OpenBao, renders templates | bootroot (sidecar) or operator (host daemon) |
-| `bootroot-agent` | Issues/renews TLS certs against step-ca | Operator (host daemon, separate binary) |
-
-`service openbao-sidecar start` only manages the first one.
-
-### Sidecar vs. host-daemon for the OpenBao Agent
-
-The two deployment models for the OpenBao Agent are independent of
-the service `--deploy-type`. Even when the service runs as a host
-daemon, the OpenBao Agent itself can run either as a
-bootroot-managed sidecar container or as an operator-managed host
-daemon (`bao agent
--config=secrets/openbao/services/<svc>/agent.hcl`).
-
-| Concern | Sidecar (default) | Host daemon (alternative) |
-| --- | --- | --- |
-| rotate signal path | Active (`docker restart` → immediate re-render) | Passive (relies on `static_secret_render_interval = 30s` polling) |
-| rotate latency | ~seconds | up to 30s |
-| Lifecycle management | bootroot owns it (`service openbao-sidecar start`) | Operator owns it (systemd unit, etc.) |
-| Container name | Standardized: `bootroot-openbao-agent-<svc>` | Operator's PID/unit naming |
-| Privilege isolation | Token/secret_id contained in container | Mixed with host user permissions |
-| Code path uniformity | Same pattern across docker/daemon deploy types | Only viable for daemon deploy type |
-| Debugging | `docker logs bootroot-openbao-agent-<svc>` | `journalctl -u <unit>` (operator-defined) |
-
-When the sidecar is **not** appropriate:
-
-- Hosts without a docker engine.
-- Security policies that mandate systemd-only lifecycles for
-  token-handling processes.
-- Highly resource-constrained environments where the sidecar
-  overhead is unacceptable.
-- Integration with HSMs / security modules accessible only outside
-  containers.
-- Pre-existing operator infrastructure standardized on systemd-based
-  secret management.
-
-**Recommendation:** sidecar is the default and recommended path.
-`bootroot service add` already surfaces `bootroot service
-openbao-sidecar start` as the primary next step. Choose the host-daemon alternative
-only when one of the conditions above applies; in that case,
-lifecycle management of the OpenBao Agent process becomes entirely
-the operator's responsibility, and rotate latency increases to up to
-`static_secret_render_interval` per rotate cycle.
-
-## bootroot service openbao-sidecar refresh
-
-Restarts the per-service `OpenBao` Agent sidecar so consul-template
-re-reads its KV sources. Use after manual KV maintenance (clearing
-stale EAB, rotating templated secrets, etc.) — consul-template caches
-the previously-rendered value until the agent process restarts
-(#588 §6).
-
-### Inputs
-
-- `--service-name`: service name identifier (must already exist in
-  `state.json`)
-
-### Behavior
-
-- For services with `--delivery-mode local-file`: runs `docker
-  restart bootroot-openbao-agent-<service-name>`.
-- For services with `--delivery-mode remote-bootstrap`: emits
-  operator guidance only. No OpenBao Agent sidecar runs on the remote
-  host (issue #680 moved it to the `bootroot-agent` self-auth
-  fast-poll model). Trust, secret_id, the HTTP responder HMAC, and EAB
-  self-heal via the `bootroot-agent` fast-poll loop within
-  `fast_poll_interval` — no re-bootstrap required.
-
-### Failure conditions
-
-The command is considered failed when:
-
-- Missing `state.json`
-- Service not found
-- `docker restart` fails (local-file delivery only)
-
-### Examples
-
-```bash
-bootroot service openbao-sidecar refresh --service-name edge-proxy
-```
-
 ## bootroot verify
 
 Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 Use it after service onboarding or config changes to confirm issuance works.
+For `local-file` services the one-shot run mirrors the documented daemon
+invocation, including `--eab-file` pointing at the service's `eab.json`
+(next to its `secret_id`), so a CA that requires EAB verifies the same
+issuance path the daemon uses.
 If you want **continuous renewal**, run bootroot-agent in daemon mode
 (without `--oneshot`) after verification. Any CLI overrides you pass
 (e.g. `--http-responder-hmac`, `--ca-url`) are preserved across
@@ -1445,7 +1237,8 @@ Per subcommand:
 
 Rotates AppRole `secret_id`s — a single registered service, every
 registered service at once, or one of the infra roles consumed by the
-long-running OpenBao Agent sidecars. Exactly one of the three selectors
+long-running infra OpenBao Agents (`openbao-agent-stepca` /
+`openbao-agent-responder`). Exactly one of the three selectors
 is required:
 
 - `--service-name`: target service name. Authenticate with
@@ -1500,7 +1293,7 @@ For infra targets the command writes the new `secret_id` atomically
 (mode `0600`) to `<secrets_dir>/openbao/<stepca|responder>/secret_id`,
 backfills the sibling `role_id` file when missing, restarts the
 matching `bootroot-openbao-agent-stepca` /
-`bootroot-openbao-agent-responder` container so the sidecar
+`bootroot-openbao-agent-responder` container so the infra agent
 re-authenticates, and verifies the new credential with an AppRole
 login (infra roles carry no CIDR binding, so the check always runs).
 
@@ -1520,9 +1313,12 @@ surfaces as a permission error with a hint.
 #### `rotate trust-sync`
 
 Syncs CA certificate fingerprints and bundle PEM to OpenBao and updates
-each service's trust data. For remote services, the trust payload is
-written to per-service KV paths. For local services, the agent config
-`[trust]` section is updated and the CA bundle PEM is written to disk.
+each service's trust data by writing the trust payload to every
+registered service's per-service KV path. Local and remote services
+converge the same way: each service's `bootroot-agent` fast-poll loop
+reads the updated payload, rewrites the `[trust]` section in its agent
+config, and rewrites the CA bundle PEM on disk. The command itself
+touches no service files.
 
 No additional arguments.
 
@@ -1530,9 +1326,9 @@ No additional arguments.
 
 Triggers an immediate certificate reissue for a service.
 
-For local (daemon) and Docker services, deletes the recorded cert/key
-files and sends SIGHUP / restarts the container so bootroot-agent reissues
-on the next loop tick.
+For `local-file` services, deletes the recorded cert/key files and sends
+SIGHUP to the bootroot-agent host daemon (`pkill -HUP` against the
+daemon's config path) so it reissues on the next loop tick.
 
 For `--delivery-mode remote-bootstrap` services, the control plane has no
 push channel into the remote host, so cert files cannot be deleted
@@ -1566,7 +1362,7 @@ Inputs:
   humantime durations (e.g. `90s`, `2m`). Default `2m`.
 
 Without `--wait` the command returns immediately after the KV write
-(remote) or the SIGHUP/restart signal (local); bootroot-agent will apply
+(remote) or the SIGHUP signal (local); bootroot-agent will apply
 the reissue within ~one poll interval of its next tick. A `--wait`
 timeout is not an error: the request stays queued and the agent still
 picks it up on its next poll.
@@ -1594,16 +1390,18 @@ Phases:
   `bootroot verify` passes while the rotation is in flight
 - Phase 4 — Restart step-ca: restart the step-ca container so it uses the
   new key pair
-- Phase 5 — Re-issue: delete service cert/key files and signal
-  bootroot-agent (SIGHUP for daemon, container restart for Docker) to
-  trigger re-issuance with the new CA. Remote-bootstrap services publish
+- Phase 5 — Re-issue: delete service cert/key files and signal the
+  bootroot-agent host daemon (SIGHUP) to trigger re-issuance with the
+  new CA. Remote-bootstrap services publish
   a versioned reissue request to OpenBao KV instead; remote agents pick
   it up on their fast-poll interval (see `rotate force-reissue`)
 - Phase 6 — Finalize trust: write final trust (new fingerprints only) to
-  OpenBao, removing old fingerprints, then restart the per-service
-  OpenBao Agent sidecars so local `agent.toml` trust pins and
-  `ca-bundle.pem` re-render immediately instead of waiting out the
-  static-secret render interval
+  OpenBao, removing old fingerprints, then restart the infra OpenBao
+  Agents (`openbao-agent-stepca` / `openbao-agent-responder`) so they
+  stop serving the transitional pin list immediately. Service agents
+  converge on their own: each bootroot-agent's fast-poll loop applies
+  the finalized `agent.toml` trust pins and `ca-bundle.pem` within
+  `fast_poll_interval`
 - Phase 7 — Cleanup: delete `rotation-state.json` and optionally remove
   backup files
 
@@ -1652,9 +1450,10 @@ Important behavior:
 
 #### `rotate eab-clear`
 
-Clears EAB credentials from every known KV path so the next
-bootroot-agent cycle does not template stale or invalid EAB material
-into `agent.toml`. Companion to the now-removed `rotate eab` and the
+Clears EAB credentials from every known KV path. Each bootroot-agent
+observes the cleared value on its next fast-poll cycle and removes its
+`eab.json`, so stale or invalid EAB material stops being used without
+any restart or reload. Companion to the now-removed `rotate eab` and the
 recovery path for the symptom closed by `--no-eab` and the EAB
 input validator (#588 §3c).
 
@@ -1663,18 +1462,14 @@ Behavior:
 - Writes empty `{kid: "", hmac: ""}` to `bootroot/agent/eab` and to
   every per-service path `bootroot/services/<svc>/eab` enumerated
   from `state.json` (not from KV listings).
-- After each write, refreshes the affected sidecar via the same
-  branch as `service openbao-sidecar refresh`: `LocalFile` services
-  receive `docker restart bootroot-openbao-agent-<svc>`;
-  `RemoteBootstrap` services emit operator guidance only.
-- `LocalFile` refresh failures are collected, not swallowed: every
-  service is still attempted (so no service is left with stale KV),
-  but if any sidecar refresh fails the command exits non-zero and
-  names the affected services so the operator does not silently
-  leave the §6 stale-render symptom in place.
-- After completion, consul-template renders the
-  `{{ if .Data.data.kid }}...{{ end }}` branch as empty and
-  `agent.toml` no longer carries an `[eab]` block on the next cycle.
+- Propagation is fast-poll's job: each `bootroot-agent` (local host
+  daemon and remote alike) observes the cleared KV value on its next
+  fast-poll cycle and removes its `eab.json` — no per-service process
+  restart or reload is required.
+- The cleared value only reaches an agent that was started with
+  `--eab-file` (the run command printed by `service add` /
+  `bootroot-remote bootstrap` includes it). Without `--eab-file`, EAB
+  KV updates and `rotate eab-clear` are silent no-ops for that agent.
 
 No additional arguments. Honors the global `--yes` to skip the
 confirmation prompt.
@@ -1818,7 +1613,8 @@ Risk is not zero: host compromise can still expose local secret files.
 
 - Rotation summary (updated files/configs)
 - Restart/reload guidance (step-ca restart, responder reload, etc.)
-- AppRole secret_id rotation includes OpenBao Agent reload and login check
+- AppRole secret_id rotation includes an AppRole login check (and, for
+  `--infra` targets, a restart of the matching infra OpenBao Agent)
 
 ### Failure conditions
 
@@ -2129,8 +1925,8 @@ operator-managed runbook for those.
   volumes — `postgres-data`, `prometheus-data`, `grafana-data` — are
   not touched).
 - Removes only OpenBao runtime/bootstrap artifacts:
-  `secrets/openbao/unseal-keys.txt`, generated OpenBao Agent
-  config trees under `secrets/openbao/{stepca,responder,services}`,
+  `secrets/openbao/unseal-keys.txt`, the generated infra OpenBao Agent
+  config trees under `secrets/openbao/{stepca,responder}`,
   `secrets/openbao/docker-compose.openbao-agent.override.yml`, and
   stale per-service AppRole credential files
   (`secrets/services/<svc>/{role_id,secret_id,secret_id.wrapped}`).

@@ -80,9 +80,7 @@ def main() -> None:
 
         for service in node["services"]:
             service_name = service["service_name"]
-            deploy_type = service["deploy_type"]
             instance_id = service["instance_id"]
-            container_name = service.get("container_name")
 
             secret_dir = work_dir / "secrets" / "services" / service_name
             secret_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +109,6 @@ def main() -> None:
 
             state_services[service_name] = {
                 "service_name": service_name,
-                "deploy_type": deploy_type,
                 "delivery_mode": "remote-bootstrap",
                 "hostname": hostname,
                 "domain": DOMAIN,
@@ -119,7 +116,6 @@ def main() -> None:
                 "cert_path": f"certs/{service_name}.crt",
                 "key_path": f"certs/{service_name}.key",
                 "instance_id": instance_id,
-                "container_name": container_name,
                 "notes": None,
                 "approle": {
                     "role_name": f"bootroot-service-{service_name}",
@@ -132,11 +128,9 @@ def main() -> None:
             layout_entry = {
                 "node_id": node_id,
                 "service_name": service_name,
-                "deploy_type": deploy_type,
                 "hostname": hostname,
                 "domain": DOMAIN,
                 "instance_id": instance_id,
-                "container_name": container_name,
                 "work_dir": str(work_dir),
                 "state_path": str(work_dir / "state.json"),
                 "role_id_path": str(role_id_path),

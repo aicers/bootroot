@@ -452,18 +452,7 @@ pub(crate) fn remove_openbao_runtime_state(secrets_dir: &Path, messages: &Messag
     // 1. unseal-keys.txt
     remove_file_if_exists(&openbao_dir.join("unseal-keys.txt"), messages)?;
 
-    // 2. Per-service openbao-agent runtime + rendered secrets under
-    //    secrets/openbao/services/<service>.  These are produced by
-    //    `service add`, not by `init`, so removing them is safe
-    //    (operators re-run `service add` after reinit).
-    let services_dir = openbao_dir.join("services");
-    if services_dir.is_dir() {
-        std::fs::remove_dir_all(&services_dir).with_context(|| {
-            messages.error_remove_dir_failed(&services_dir.display().to_string())
-        })?;
-    }
-
-    // 3. Generated openbao-agent runtime files under secrets/openbao/
+    // 2. Generated openbao-agent runtime files under secrets/openbao/
     //    (stepca / responder agent configs and any rendered secret files)
     //    that the next `init` regenerates.
     for sub in ["stepca", "responder"] {
@@ -476,7 +465,7 @@ pub(crate) fn remove_openbao_runtime_state(secrets_dir: &Path, messages: &Messag
     let agent_override = openbao_dir.join("docker-compose.openbao-agent.override.yml");
     remove_file_if_exists(&agent_override, messages)?;
 
-    // 4. Stale per-service credential files under secrets/services/<svc>/.
+    // 3. Stale per-service credential files under secrets/services/<svc>/.
     //    Cleanup is intentionally narrow: only credential-bearing files,
     //    not the whole directory, so non-credential service config
     //    survives operator inspection.
@@ -1038,10 +1027,9 @@ mod tests {
         );
         let mut services = BTreeMap::new();
         services.insert("svc".to_string(), {
-            use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry};
+            use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry};
             ServiceEntry {
                 service_name: "svc".to_string(),
-                deploy_type: DeployType::Daemon,
                 delivery_mode: DeliveryMode::LocalFile,
                 hostname: "h".to_string(),
                 domain: "d".to_string(),
@@ -1049,7 +1037,6 @@ mod tests {
                 cert_path: PathBuf::from("c"),
                 key_path: PathBuf::from("k"),
                 instance_id: None,
-                container_name: None,
                 notes: None,
                 post_renew_hooks: Vec::new(),
                 approle: ServiceRoleEntry {
@@ -1181,8 +1168,6 @@ mod tests {
         .unwrap();
         // Wipe list.
         fs::write(secrets.join("openbao/unseal-keys.txt"), "keys").unwrap();
-        fs::create_dir_all(secrets.join("openbao/services/svc")).unwrap();
-        fs::write(secrets.join("openbao/services/svc/agent.hcl"), "rendered").unwrap();
         fs::create_dir_all(secrets.join("openbao/stepca")).unwrap();
         fs::write(secrets.join("openbao/stepca/agent.hcl"), "x").unwrap();
         fs::write(
@@ -1220,10 +1205,6 @@ mod tests {
         assert!(
             !secrets.join("openbao/unseal-keys.txt").exists(),
             "unseal-keys.txt must be deleted"
-        );
-        assert!(
-            !secrets.join("openbao/services").exists(),
-            "per-service openbao-agent dir must be deleted"
         );
         assert!(
             !secrets.join("openbao/stepca").exists(),

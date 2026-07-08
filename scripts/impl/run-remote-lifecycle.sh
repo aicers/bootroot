@@ -243,7 +243,10 @@ wait_for_postgres_admin() {
   local admin_user="${POSTGRES_USER:-step}"
   local attempt
   for attempt in $(seq 1 30); do
-    if docker exec bootroot-postgres pg_isready -U "$admin_user" -d postgres >/dev/null 2>&1 &&
+    # Probe over TCP: the initdb bootstrap server listens only on the Unix
+    # socket, so a socket-based pg_isready reports ready before the final
+    # server (the one init connects to over TCP) is up.
+    if docker exec bootroot-postgres pg_isready -h 127.0.0.1 -U "$admin_user" -d postgres >/dev/null 2>&1 &&
       bash -lc ": >/dev/tcp/127.0.0.1/${host_port}" >/dev/null 2>&1; then
       return 0
     fi
@@ -322,7 +325,6 @@ run_bootstrap_chain() {
   log_phase "service-add"
   run_bootroot_control service add \
     --service-name "$SERVICE_NAME" \
-    --deploy-type daemon \
     --delivery-mode remote-bootstrap \
     --hostname "$HOSTNAME" \
     --domain "$DOMAIN" \
@@ -336,7 +338,6 @@ run_bootstrap_chain() {
 
   run_bootroot_control service add \
     --service-name "$SERVICE_NAME_2" \
-    --deploy-type docker \
     --delivery-mode remote-bootstrap \
     --hostname "$HOSTNAME_2" \
     --domain "$DOMAIN" \
@@ -344,8 +345,6 @@ run_bootstrap_chain() {
     --cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME_2}.crt" \
     --key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME_2}.key" \
     --instance-id "$INSTANCE_ID_2" \
-    --container-name "$SERVICE_NAME_2" \
-    --no-validate-agent \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1

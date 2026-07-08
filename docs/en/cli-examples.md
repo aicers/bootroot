@@ -129,12 +129,11 @@ Sections 3-1 and 3-2 below are default (`local-file`) examples, and 3-3 is a
 > (for example `/etc/bootroot/secrets`), read them with the same relative
 > structure.
 
-### 3-1) local-file (default): daemon service
+### 3-1) local-file (default)
 
 ```bash
 bootroot service add \
   --service-name edge-proxy \
-  --deploy-type daemon \
   --hostname edge-node-01 \
   --domain trusted.domain \
   --agent-config /etc/bootroot/agent.toml \
@@ -144,94 +143,75 @@ bootroot service add \
   --root-token <OPENBAO_ROOT_TOKEN>
 ```
 
-Sample dialog/output (full):
+Sample dialog/output (abridged):
 
 ```text
 OpenBao root token: ********
 
-bootroot service add: plan
+bootroot service add: summary
 - service name: edge-proxy
-- deploy type: daemon
 - hostname: edge-node-01
 - domain: trusted.domain
-- instance_id: 001
-- agent config: /etc/bootroot/agent.toml
-- cert path: /etc/bootroot/certs/edge-proxy.crt
-- key path: /etc/bootroot/certs/edge-proxy.key
+- delivery mode: local-file
+- policy: bootroot-service-edge-proxy
+- AppRole: bootroot-service-edge-proxy
+- role_id: ********
+- secret_id path: secrets/services/edge-proxy/secret_id
+- OpenBao path: bootroot/services/edge-proxy
+Bootroot-managed:
+- auto-applied bootroot-agent config: /etc/bootroot/agent.toml
+- auto-provisioned EAB file (present only when EAB is configured; pass
+  its path via --eab-file): secrets/services/edge-proxy/eab.json
 next steps:
-  - AppRole: bootroot-service-edge-proxy
-  - secret_id path: secrets/services/edge-proxy/secret_id
-  - OpenBao path: bootroot/services/edge-proxy
-  - OpenBao Agent (per-service instance):
-    - config: secrets/openbao/services/edge-proxy/agent.hcl
-    - role_id file: secrets/services/edge-proxy/role_id
-    - secret_id file: secrets/services/edge-proxy/secret_id
-    - ensure secrets/services/edge-proxy is 0700 and
-      role_id/secret_id files are 0600
-    - start the managed sidecar with:
-      bootroot service openbao-sidecar start --service-name edge-proxy
-      (required so `bootroot rotate` can signal the sidecar; the host
-      `bao agent -config=secrets/openbao/services/edge-proxy/agent.hcl`
-      remains available as an alternative)
+Operator-managed (required):
   - Add profile for edge-proxy (instance_id=001, hostname=edge-node-01,
     domain=trusted.domain, cert=/etc/bootroot/certs/edge-proxy.crt,
     key=/etc/bootroot/certs/edge-proxy.key) to /etc/bootroot/agent.toml
     and reload bootroot-agent.
+daemon profile snippet:
+[[profiles]]
+service_name = "edge-proxy"
+...
+daemon run command (systemd ExecStart or shell; --eab-file is required
+for EAB rotation to apply):
+bootroot-agent --config /etc/bootroot/agent.toml \
+  --eab-file secrets/services/edge-proxy/eab.json
 ```
 
 The generated `agent.toml` is a complete, ready-to-run config: it includes
 the managed profile, `[trust]` section, top-level `domain` (from `--domain`),
-and `[acme].http_responder_hmac` (from the responder HMAC stored in OpenBao).
+`[acme].http_responder_hmac` (from the responder HMAC stored in OpenBao),
+and the `[openbao]` section that activates the agent's fast-poll self-auth
+loop (with an absolute service-keyed `state_path` next to `agent.toml`).
 The HTTP-01 validation FQDN is also registered as a DNS alias on
 `bootroot-http01` automatically.
-No manual editing is required before running `bootroot-agent`.
+No manual editing is required before running `bootroot-agent`; run it as a
+host daemon with the printed run command (keep `--eab-file`).
 
-In current CLI output, the same information is also grouped under
-`Bootroot-managed` and `Operator-managed (required/recommended/optional)` labels
-to make ownership boundaries explicit.
+### 3-2) local-file: containerized consumer application
 
-Example (label-focused):
-
-```text
-Bootroot-managed:
-- auto-applied bootroot-agent config: ...
-- auto-applied OpenBao Agent config: ...
-
-Operator-managed (required):
-- run OpenBao Agent
-- run/reload bootroot-agent
-
-Operator-managed (optional):
-- apply manual trust pin/override instead of auto-applied trust values
-```
-
-### 3-2) local-file (default): docker service
+The bootroot-agent itself still runs as a host daemon. For an application
+that runs in a container, point `--cert-path`/`--key-path` at a host
+directory the container bind-mounts, and configure a `docker-restart`
+post-renew hook with the explicit container name:
 
 ```bash
 bootroot service add \
   --service-name web-app \
-  --deploy-type docker \
   --hostname web-01 \
   --domain trusted.domain \
   --agent-config /srv/bootroot/agent.toml \
-  --cert-path /srv/bootroot/certs/web-app.crt \
-  --key-path /srv/bootroot/certs/web-app.key \
+  --cert-path /opt/web-app-mtls/web-app.crt \
+  --key-path /opt/web-app-mtls/web-app.key \
   --instance-id 001 \
-  --container-name web-app \
+  --reload-style docker-restart \
+  --reload-target web-app \
   --root-token <OPENBAO_ROOT_TOKEN>
 ```
 
-Sample dialog/output (full):
-
-```text
-OpenBao root token: ********
-
-next steps:
-  - Run sidecar for web-app (container=web-app, instance_id=001,
-    hostname=web-01, domain=trusted.domain) with config
-    /srv/bootroot/agent.toml, AppRole bootroot-service-web-app, and
-    secret_id file secrets/services/web-app/secret_id.
-```
+See
+[Operations > Containerized consumer applications](operations.md#containerized-consumer-applications)
+for the bind-mount pattern and the hardened-unit/Docker-socket trade-off.
 
 ### 3-3) remote-bootstrap delivery mode + one-shot bootstrap
 
@@ -244,7 +224,6 @@ Control node onboarding (artifact generation):
 ```bash
 bootroot service add \
   --service-name edge-remote \
-  --deploy-type daemon \
   --delivery-mode remote-bootstrap \
   --hostname edge-node-02 \
   --domain trusted.domain \
@@ -310,7 +289,6 @@ certificate renewal:
 ```bash
 bootroot service add \
   --service-name edge-proxy \
-  --deploy-type daemon \
   --hostname edge-node-01 \
   --domain trusted.domain \
   --agent-config /etc/bootroot/agent.toml \
@@ -424,21 +402,23 @@ renewal**, run bootroot-agent in daemon mode (without `--oneshot`).
 “Continuous mode” means the daemon keeps running to renew certificates
 periodically, rather than a one-shot verification run.
 
-daemon:
+bootroot-agent runs as a **host daemon** — no per-service OpenBao Agent
+and no Docker sidecar. Run one `bootroot-agent` process plus one agent
+config per **distinct service**; the `[openbao]` section holds a single
+AppRole credential, so distinct services cannot share one `agent.toml`.
+Multiple `[[profiles]]` in one config are only for instances of the same
+service — update `agent.toml` and reload the daemon when adding such
+instances. Configure systemd so the
+process restarts automatically (set `Restart=always` or `on-failure`;
+see
+[Operations > Hardened systemd unit example](operations.md#hardened-systemd-unit-example)).
 
-- bootroot-agent: daemon mode
-- OpenBao Agent: per-service daemon
-
-bootroot-agent runs **one per machine**, not per service. Update `agent.toml`
-when adding profiles and reload the daemon. Configure systemd so the process
-restarts automatically (set `Restart=always` or `on-failure`).
+Use the run command printed by `service add` — `--eab-file` is required
+for EAB rotation to apply:
 
 ```bash
-openbao agent -config /etc/bootroot/secrets/openbao/services/edge-proxy/agent.hcl
-```
-
-```bash
-bootroot-agent --config /etc/bootroot/agent.toml
+bootroot-agent --config /etc/bootroot/agent.toml \
+  --eab-file /path/to/secrets/services/edge-proxy/eab.json
 ```
 
 Sample output:
@@ -449,42 +429,10 @@ Issuing certificate for 001.edge-proxy.edge-node-01.trusted.domain
 Certificate issued successfully.
 ```
 
-docker:
-
-- OpenBao Agent: sidecar (per-service Docker container)
-- bootroot-agent: sidecar (per-service Docker container)
-
-Docker services may also use the shared bootroot-agent daemon, but this is
-supported and not recommended. The sidecar pattern is preferred for isolation
-and lifecycle alignment.
-
-```bash
-AGENT_HCL=/srv/bootroot/secrets/openbao/services/web-app/agent.hcl
-docker run --rm \
-  --name openbao-agent-web-app \
-  -v "$AGENT_HCL":/app/agent.hcl:ro \
-  -v /srv/bootroot/secrets:/app/secrets \
-  openbao/bao:latest \
-  agent -config /app/agent.hcl
-```
-
-```bash
-docker run -d \
-  --name web-app \
-  --restart unless-stopped \
-  -v /srv/bootroot/agent.toml:/app/agent.toml:ro \
-  -v /srv/bootroot/certs:/app/certs \
-  <bootroot-agent-image> \
-  bootroot-agent --config /app/agent.toml
-```
-
-Sample output:
-
-```text
-Loaded 1 profile(s).
-Issuing certificate for 001.web-app.web-01.trusted.domain
-Certificate issued successfully.
-```
+For an application that runs in a container, the same host daemon writes
+the cert/key to a host directory the container bind-mounts; the
+`docker-restart` post-renew hook restarts the container after each
+renewal (see section 3-2).
 
 ## 7) Secret rotation (examples)
 
@@ -507,8 +455,8 @@ bootroot rotate openbao-recovery --rotate-root-token
 # (per-service targeting stays available via --service-name)
 bootroot rotate approle-secret-id --all-services
 
-# Rotate the infra AppRole secret_ids consumed by the OpenBao Agent
-# sidecars (requires bootroot-infra-rotate-role credentials, not the
+# Rotate the infra AppRole secret_ids consumed by the infra OpenBao
+# Agents (requires bootroot-infra-rotate-role credentials, not the
 # runtime-rotate credential used above)
 bootroot rotate \
   --auth-mode approle \

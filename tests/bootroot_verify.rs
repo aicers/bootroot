@@ -56,8 +56,73 @@ fn test_verify_success() {
     assert!(stdout.contains("- result: ok"));
 }
 
+/// Regression for the local EAB wiring on the verify oneshot: local
+/// services keep EAB in `eab.json` next to their `secret_id` (not in
+/// `agent.toml`), and the daemon run command passes it via
+/// `--eab-file`. The oneshot run must mirror that invocation — if it
+/// drops the flag, verify exercises an open-enrollment issuance path
+/// that fails whenever the CA requires EAB.
 #[test]
-fn test_verify_docker_success() {
+fn test_verify_oneshot_passes_service_eab_file() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    write_cert_with_dns(
+        &cert_path,
+        &key_path,
+        "001.edge-proxy.edge-node-01.trusted.domain",
+    )
+    .expect("write cert");
+
+    write_state_with_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+        .expect("write state");
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let argv_record = temp_dir.path().join("agent-argv.txt");
+    write_recording_bootroot_agent(&bin_dir, &argv_record).expect("write fake agent");
+    let agent_binary = bin_dir.join("bootroot-agent");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "verify",
+            "--service-name",
+            "edge-proxy",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--agent-binary",
+            agent_binary.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run verify");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+
+    let recorded = fs::read_to_string(&argv_record).expect("fake agent recorded its argv");
+    let argv: Vec<&str> = recorded.lines().collect();
+    let flag_index = argv
+        .iter()
+        .position(|arg| *arg == "--eab-file")
+        .unwrap_or_else(|| panic!("oneshot must pass --eab-file, got argv: {argv:?}"));
+    assert_eq!(
+        argv.get(flag_index + 1).copied(),
+        Some("secrets/services/edge-proxy/eab.json"),
+        "eab.json must sit next to the service secret_id, got argv: {argv:?}"
+    );
+    assert!(
+        argv.contains(&"--oneshot"),
+        "verify must still run the agent in oneshot mode, got argv: {argv:?}"
+    );
+}
+
+#[test]
+fn test_verify_second_service_success() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");
     fs::write(&agent_config, "# config").expect("write agent config");
@@ -68,7 +133,7 @@ fn test_verify_docker_success() {
     write_cert_with_dns(&cert_path, &key_path, "001.web-app.web-01.trusted.domain")
         .expect("write cert");
 
-    write_state_with_docker_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+    write_state_with_web_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -450,7 +515,7 @@ fn test_verify_empty_cert_fails() {
 }
 
 #[test]
-fn test_verify_empty_key_fails_docker() {
+fn test_verify_empty_key_fails_second_service() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");
     fs::write(&agent_config, "# config").expect("write agent config");
@@ -462,7 +527,7 @@ fn test_verify_empty_key_fails_docker() {
         .expect("write cert");
     fs::write(&key_path, "").expect("truncate key");
 
-    write_state_with_docker_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+    write_state_with_web_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -607,7 +672,6 @@ fn write_state_with_app(
         "services": {
             "edge-proxy": {
                 "service_name": "edge-proxy",
-                "deploy_type": "daemon",
                 "hostname": "edge-node-01",
                 "domain": "trusted.domain",
                 "agent_config_path": agent_config,
@@ -632,7 +696,7 @@ fn write_state_with_app(
     Ok(())
 }
 
-fn write_state_with_docker_app(
+fn write_state_with_web_app(
     root: &std::path::Path,
     agent_config: &std::path::Path,
     cert_path: &std::path::Path,
@@ -647,14 +711,12 @@ fn write_state_with_docker_app(
         "services": {
             "web-app": {
                 "service_name": "web-app",
-                "deploy_type": "docker",
                 "hostname": "web-01",
                 "domain": "trusted.domain",
                 "instance_id": "001",
                 "agent_config_path": agent_config,
                 "cert_path": cert_path,
                 "key_path": key_path,
-                "container_name": "web-app",
                 "approle": {
                     "role_name": "bootroot-service-web-app",
                     "role_id": "role-web-app",
@@ -687,6 +749,24 @@ fn write_ca_json_with_dsn(root: &std::path::Path, dsn: &str) -> anyhow::Result<(
         serde_json::to_string_pretty(&payload)?,
     )
     .context("write ca.json")?;
+    Ok(())
+}
+
+/// Writes a fake `bootroot-agent` that records each argument it was
+/// invoked with (one per line) to `record_path` and exits 0, so tests
+/// can assert on the exact oneshot argv.
+fn write_recording_bootroot_agent(
+    dir: &std::path::Path,
+    record_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {record}\nexit 0\n",
+        record = record_path.display()
+    );
+    let path = dir.join("bootroot-agent");
+    fs::write(&path, script).context("write recording bootroot-agent")?;
+    fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        .context("set recording bootroot-agent permissions")?;
     Ok(())
 }
 

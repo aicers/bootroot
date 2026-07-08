@@ -1,13 +1,10 @@
 use crate::commands::init::{InitPlan, InitSummary};
-use crate::commands::service::{display_policy_value, display_wrap_ttl};
-use crate::i18n::{
-    Messages, ServiceNextStepsDaemon, ServiceNextStepsDocker, ServiceOpenBaoAgentSteps,
-};
-use crate::state::{DeliveryMode, DeployType, PostRenewHookEntry, ServiceEntry};
+use crate::commands::service::{display_policy_value, display_wrap_ttl, service_eab_file_path};
+use crate::i18n::{Messages, ServiceNextStepsDaemon};
+use crate::state::{DeliveryMode, PostRenewHookEntry, ServiceEntry};
 
 pub(crate) struct ServiceAddPlan<'a> {
     pub(crate) service_name: &'a str,
-    pub(crate) deploy_type: DeployType,
     pub(crate) delivery_mode: crate::state::DeliveryMode,
     pub(crate) hostname: &'a str,
     pub(crate) domain: &'a str,
@@ -15,16 +12,13 @@ pub(crate) struct ServiceAddPlan<'a> {
     pub(crate) cert_path: &'a str,
     pub(crate) key_path: &'a str,
     pub(crate) instance_id: Option<&'a str>,
-    pub(crate) container_name: Option<&'a str>,
     pub(crate) notes: Option<&'a str>,
     pub(crate) post_renew_hooks: &'a [PostRenewHookEntry],
 }
 
 pub(crate) struct ServiceAddAppliedPaths<'a> {
     pub(crate) agent_config: &'a str,
-    pub(crate) openbao_agent_config: &'a str,
-    pub(crate) openbao_agent_docker_config: &'a str,
-    pub(crate) openbao_agent_template: &'a str,
+    pub(crate) eab_file: &'a str,
 }
 
 pub(crate) struct ServiceAddRemoteBootstrap<'a> {
@@ -121,15 +115,7 @@ fn print_local_apply_summary(paths: &ServiceAddAppliedPaths<'_>, messages: &Mess
     );
     println!(
         "{}",
-        messages.service_summary_auto_applied_openbao_config(paths.openbao_agent_config)
-    );
-    println!(
-        "{}",
-        messages.service_summary_auto_applied_openbao_config(paths.openbao_agent_docker_config)
-    );
-    println!(
-        "{}",
-        messages.service_summary_auto_applied_openbao_template(paths.openbao_agent_template)
+        messages.service_summary_auto_applied_eab_file(paths.eab_file)
     );
 }
 
@@ -179,12 +165,11 @@ fn print_service_add_snippets(
     println!("{}", messages.service_scope_operator_required());
     match entry.delivery_mode {
         // Remote-bootstrap hosts run `bootroot-agent` self-auth fast-poll (no
-        // OpenBao Agent sidecar). The one-shot `bootroot-remote bootstrap`
+        // OpenBao Agent). The one-shot `bootroot-remote bootstrap`
         // handoff is already printed above; here we only remind the operator to
         // keep the agent running so trust and secret_id self-heal.
         DeliveryMode::RemoteBootstrap => print_remote_selfheal_next_steps(messages),
         DeliveryMode::LocalFile => {
-            print_service_openbao_agent_steps(entry, secret_id_path, messages);
             print_local_deploy_snippet(entry, secret_id_path, messages);
             if let Some(trusted) = trusted_ca_sha256 {
                 println!("{}", messages.service_scope_operator_optional());
@@ -204,44 +189,20 @@ fn print_local_deploy_snippet(
     secret_id_path: &std::path::Path,
     messages: &Messages,
 ) {
-    match entry.deploy_type {
-        DeployType::Daemon => {
-            let cert_path = entry.cert_path.display().to_string();
-            let key_path = entry.key_path.display().to_string();
-            let config_path = entry.agent_config_path.display().to_string();
-            let data = ServiceNextStepsDaemon {
-                service_name: &entry.service_name,
-                instance_id: entry.instance_id.as_deref().unwrap_or_default(),
-                hostname: &entry.hostname,
-                domain: &entry.domain,
-                cert_path: &cert_path,
-                key_path: &key_path,
-                config_path: &config_path,
-            };
-            println!("{}", messages.service_next_steps_daemon_profile(&data));
-            print_daemon_snippet(entry, messages);
-        }
-        DeployType::Docker => {
-            let cert_path = entry.cert_path.display().to_string();
-            let key_path = entry.key_path.display().to_string();
-            let config_path = entry.agent_config_path.display().to_string();
-            let secret_id_path_value = secret_id_path.display().to_string();
-            let data = ServiceNextStepsDocker {
-                service_name: &entry.service_name,
-                container_name: entry.container_name.as_deref().unwrap_or_default(),
-                instance_id: entry.instance_id.as_deref().unwrap_or_default(),
-                hostname: &entry.hostname,
-                domain: &entry.domain,
-                cert_path: &cert_path,
-                key_path: &key_path,
-                config_path: &config_path,
-                role_name: &entry.approle.role_name,
-                secret_id_path: &secret_id_path_value,
-            };
-            println!("{}", messages.service_next_steps_docker_sidecar(&data));
-            print_docker_snippet(entry, messages);
-        }
-    }
+    let cert_path = entry.cert_path.display().to_string();
+    let key_path = entry.key_path.display().to_string();
+    let config_path = entry.agent_config_path.display().to_string();
+    let data = ServiceNextStepsDaemon {
+        service_name: &entry.service_name,
+        instance_id: entry.instance_id.as_deref().unwrap_or_default(),
+        hostname: &entry.hostname,
+        domain: &entry.domain,
+        cert_path: &cert_path,
+        key_path: &key_path,
+        config_path: &config_path,
+    };
+    println!("{}", messages.service_next_steps_daemon_profile(&data));
+    print_daemon_snippet(entry, secret_id_path, messages);
 }
 
 pub(crate) fn print_service_add_plan(plan: &ServiceAddPlan<'_>, messages: &Messages) {
@@ -260,12 +221,6 @@ pub(crate) fn print_service_info_summary(entry: &ServiceEntry, messages: &Messag
     print_service_fields(entry, messages);
     if let Some(instance_id) = entry.instance_id.as_deref() {
         println!("{}", messages.service_summary_instance_id(instance_id));
-    }
-    if let Some(container_name) = entry.container_name.as_deref() {
-        println!(
-            "{}",
-            messages.service_summary_container_name(container_name)
-        );
     }
     println!(
         "{}",
@@ -319,16 +274,14 @@ pub(crate) fn print_service_info_summary(entry: &ServiceEntry, messages: &Messag
     match entry.delivery_mode {
         DeliveryMode::RemoteBootstrap => print_remote_selfheal_next_steps(messages),
         DeliveryMode::LocalFile => {
-            print_service_openbao_agent_steps(entry, &entry.approle.secret_id_path, messages);
+            print_daemon_run_snippet(entry, &entry.approle.secret_id_path, messages);
         }
     }
 }
 
 fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
-    let deploy_type = entry.deploy_type.to_string();
     let delivery_mode = entry.delivery_mode.to_string();
     println!("{}", messages.service_summary_kind(&entry.service_name));
-    println!("{}", messages.service_summary_deploy_type(&deploy_type));
     println!("{}", messages.service_summary_hostname(&entry.hostname));
     println!("{}", messages.service_summary_domain(&entry.domain));
     println!("{}", messages.service_summary_delivery_mode(&delivery_mode));
@@ -344,21 +297,13 @@ fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
 }
 
 fn print_service_plan_fields(plan: &ServiceAddPlan<'_>, messages: &Messages) {
-    let deploy_type = plan.deploy_type.to_string();
     let delivery_mode = plan.delivery_mode.to_string();
     println!("{}", messages.service_summary_kind(plan.service_name));
-    println!("{}", messages.service_summary_deploy_type(&deploy_type));
     println!("{}", messages.service_summary_hostname(plan.hostname));
     println!("{}", messages.service_summary_domain(plan.domain));
     println!("{}", messages.service_summary_delivery_mode(&delivery_mode));
     if let Some(instance_id) = plan.instance_id {
         println!("{}", messages.service_summary_instance_id(instance_id));
-    }
-    if let Some(container_name) = plan.container_name {
-        println!(
-            "{}",
-            messages.service_summary_container_name(container_name)
-        );
     }
     if let Some(notes) = plan.notes {
         println!("{}", messages.service_summary_notes(notes));
@@ -371,56 +316,11 @@ fn print_service_plan_fields(plan: &ServiceAddPlan<'_>, messages: &Messages) {
     }
 }
 
-fn print_service_openbao_agent_steps(
+fn print_daemon_snippet(
     entry: &ServiceEntry,
     secret_id_path: &std::path::Path,
     messages: &Messages,
 ) {
-    let service_dir = secret_id_path.parent().unwrap_or(std::path::Path::new("."));
-    let role_id_path = service_dir.join("role_id");
-    let secrets_dir = service_dir
-        .parent()
-        .and_then(|parent| parent.parent())
-        .unwrap_or(std::path::Path::new("."));
-    let openbao_agent_config = secrets_dir
-        .join("openbao")
-        .join("services")
-        .join(&entry.service_name)
-        .join("agent.hcl");
-    let openbao_steps = ServiceOpenBaoAgentSteps {
-        service_name: &entry.service_name,
-        config_path: &openbao_agent_config.display().to_string(),
-        role_id_path: &role_id_path.display().to_string(),
-        secret_id_path: &secret_id_path.display().to_string(),
-        service_dir: &service_dir.display().to_string(),
-    };
-    println!("{}", messages.service_next_steps_openbao_agent_title());
-    println!(
-        "{}",
-        messages.service_next_steps_openbao_agent_config(&openbao_steps)
-    );
-    println!(
-        "{}",
-        messages.service_next_steps_openbao_agent_role_id_path(&openbao_steps)
-    );
-    println!(
-        "{}",
-        messages.service_next_steps_openbao_agent_secret_id_path(&openbao_steps)
-    );
-    println!(
-        "{}",
-        messages.service_next_steps_openbao_agent_permissions(&openbao_steps)
-    );
-    // Only local-file delivery runs a per-service OpenBao Agent sidecar; the
-    // remote-bootstrap path never reaches here (see the delivery-mode split in
-    // `print_service_add_snippets` / `print_service_info_summary`).
-    println!(
-        "{}",
-        messages.service_next_steps_openbao_sidecar_start(&openbao_steps)
-    );
-}
-
-fn print_daemon_snippet(entry: &ServiceEntry, messages: &Messages) {
     let instance_id = entry.instance_id.as_deref().unwrap_or_default();
     println!("{}", messages.service_snippet_daemon_title());
     println!("[[profiles]]");
@@ -443,27 +343,26 @@ fn print_daemon_snippet(entry: &ServiceEntry, messages: &Messages) {
     println!("renew_before = \"16h\"");
     println!("check_jitter = \"0s\"");
     println!("{}", messages.service_snippet_domain_hint(&entry.domain));
+    print_daemon_run_snippet(entry, secret_id_path, messages);
 }
 
-fn print_docker_snippet(entry: &ServiceEntry, messages: &Messages) {
-    let container = entry.container_name.as_deref().unwrap_or("bootroot-agent");
-    let config_path = entry.agent_config_path.display();
-    let cert_parent = entry
-        .cert_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
-    println!("{}", messages.service_snippet_docker_title());
-    println!("docker run -d \\");
-    println!("  --name {container} \\");
-    println!("  --restart unless-stopped \\");
-    println!("  -v {config_path}:/app/agent.toml:ro \\");
-    // codeql[rust/cleartext-logging]: output is a filesystem path used in a run snippet.
+/// Prints the host-daemon run command for the local `bootroot-agent`.
+/// `--eab-file` must be part of the documented invocation: the fast-poll
+/// EAB refresh only applies when the agent was started with that flag,
+/// so omitting it turns `rotate eab-clear` / EAB KV updates into silent
+/// no-ops for this service.
+fn print_daemon_run_snippet(
+    entry: &ServiceEntry,
+    secret_id_path: &std::path::Path,
+    messages: &Messages,
+) {
+    let eab_path = service_eab_file_path(secret_id_path);
+    println!("{}", messages.service_snippet_daemon_run_title());
     println!(
-        "  -v {cert_dir}:/app/certs \\",
-        cert_dir = cert_parent.display()
+        "bootroot-agent --config {config} --eab-file {eab}",
+        config = entry.agent_config_path.display(),
+        eab = eab_path.display()
     );
-    println!("  <bootroot-agent-image> \\");
-    println!("  bootroot-agent --config /app/agent.toml");
 }
 
 fn print_trust_snippet(entry: &ServiceEntry, trusted: &[String], messages: &Messages) {

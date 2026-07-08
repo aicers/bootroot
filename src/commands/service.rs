@@ -1,8 +1,5 @@
-mod agent_identity;
 mod approle;
 mod local_config;
-pub(crate) mod openbao_sidecar_refresh;
-pub(crate) mod openbao_sidecar_start;
 mod remote_bootstrap;
 mod remove;
 pub(crate) mod resolve;
@@ -23,18 +20,13 @@ use crate::commands::dns_alias::register_dns_alias;
 use crate::commands::init::validate_secret_id_ttl;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
-use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry, StateFile};
+use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry, StateFile};
 
 pub(super) const SERVICE_ROLE_PREFIX: &str = "bootroot-service-";
 pub(super) const SERVICE_SECRET_DIR: &str = "services";
 pub(super) const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
 pub(super) const SERVICE_SECRET_ID_FILENAME: &str = "secret_id";
-pub(super) const OPENBAO_SERVICE_CONFIG_DIR: &str = "openbao/services";
-pub(super) const OPENBAO_AGENT_CONFIG_FILENAME: &str = "agent.hcl";
-pub(super) const OPENBAO_AGENT_DOCKER_CONFIG_FILENAME: &str = "agent-docker.hcl";
-pub(super) const OPENBAO_AGENT_TEMPLATE_FILENAME: &str = "agent.toml.ctmpl";
-pub(super) const OPENBAO_AGENT_CA_BUNDLE_TEMPLATE_FILENAME: &str = "ca-bundle.pem.ctmpl";
-pub(super) const OPENBAO_AGENT_TOKEN_FILENAME: &str = "token";
+pub(crate) const SERVICE_EAB_FILENAME: &str = "eab.json";
 pub(super) const REMOTE_BOOTSTRAP_DIR: &str = "remote-bootstrap/services";
 pub(super) const REMOTE_BOOTSTRAP_FILENAME: &str = "bootstrap.json";
 pub(super) const MANAGED_PROFILE_BEGIN_PREFIX: &str =
@@ -44,6 +36,38 @@ pub(super) const MANAGED_PROFILE_END_PREFIX: &str =
 pub(super) const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
 pub(super) const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 pub(super) const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
+
+/// Derives a service's `eab.json` path (adjacent to its `secret_id`),
+/// matching what `apply_local_service_configs` provisions.  Every
+/// local `bootroot-agent` invocation (the documented daemon run
+/// command and the `verify` oneshot) must pass this path via
+/// `--eab-file`; the file lives outside `agent.toml`, so an
+/// invocation that omits the flag silently attempts open enrollment.
+pub(crate) fn service_eab_file_path(secret_id_path: &Path) -> std::path::PathBuf {
+    secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(SERVICE_EAB_FILENAME)
+}
+
+/// Reports whether two local agent-config paths name the same file.
+/// Paths resolved by this binary are stored absolute and lexically
+/// normalized, so a literal comparison covers equivalent spellings;
+/// the canonicalizing fallback additionally resolves symlinks for
+/// files that exist, so a symlinked spelling of a registered config
+/// cannot bypass the one-config-per-service guard.
+fn same_agent_config_file(registered: &Path, candidate: &Path) -> bool {
+    if registered == candidate {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(registered),
+        std::fs::canonicalize(candidate),
+    ) {
+        (Ok(registered), Ok(candidate)) => registered == candidate,
+        _ => false,
+    }
+}
 
 /// Resolves an operator-supplied ACME account email to the concrete
 /// value embedded in the `agent.toml` baseline / the remote-bootstrap
@@ -77,9 +101,7 @@ pub(super) struct ServiceAppRoleMaterialized {
 
 pub(super) struct LocalApplyResult {
     agent_config: String,
-    openbao_agent_config: String,
-    openbao_agent_docker_config: String,
-    openbao_agent_template: String,
+    eab_file: String,
 }
 
 pub(super) struct RemoteBootstrapResult {
@@ -104,8 +126,6 @@ pub(crate) use remove::run_service_remove;
 pub(crate) use resolve::ResolvedServiceAdd;
 
 pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) -> Result<()> {
-    resolve::validate_raw_service_add_args(args, messages)?;
-
     let state_path = StateFile::default_path();
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
@@ -117,16 +137,6 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let resolved = resolve::resolve_service_add_args(args, messages, preview)?;
 
     resolve::validate_service_add(&resolved, messages)?;
-
-    if !args.no_validate_agent
-        && matches!(resolved.deploy_type, DeployType::Docker)
-        && let Some(container) = resolved.container_name.as_deref()
-    {
-        let identity = agent_identity::classify_agent_container(container);
-        if let Some(warning) = agent_identity::render_warning(&identity, container, messages) {
-            eprintln!("{warning}");
-        }
-    }
 
     if let Some(ref ttl) = resolved.secret_id_ttl {
         if let Some(warning) = validate_secret_id_ttl(ttl, messages)? {
@@ -140,7 +150,6 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let key_path = resolved.key_path.display().to_string();
     let plan = ServiceAddPlan {
         service_name: &resolved.service_name,
-        deploy_type: resolved.deploy_type,
         delivery_mode: resolved.delivery_mode,
         hostname: &resolved.hostname,
         domain: &resolved.domain,
@@ -148,7 +157,6 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
         cert_path: &cert_path,
         key_path: &key_path,
         instance_id: resolved.instance_id.as_deref(),
-        container_name: resolved.container_name.as_deref(),
         notes: resolved.notes.as_deref(),
         post_renew_hooks: &resolved.post_renew_hooks,
     };
@@ -162,6 +170,44 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
             anyhow::bail!(messages.error_service_policy_mismatch());
         }
         anyhow::bail!(messages.error_service_duplicate(&resolved.service_name));
+    }
+
+    // One `agent.toml` serves exactly one distinct local-file service:
+    // the top-level `[openbao]` section holds a single AppRole identity,
+    // so a second service writing the same file would overwrite the
+    // first service's `role_id`/`secret_id`/`state_path` and break its
+    // KV reads under per-service policies. Multiple `[[profiles]]` are
+    // reserved for instances of the *same* service.
+    if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
+        if let Some(conflict) = state.services.values().find(|entry| {
+            matches!(entry.delivery_mode, DeliveryMode::LocalFile)
+                && same_agent_config_file(&entry.agent_config_path, &resolved.agent_config)
+        }) {
+            anyhow::bail!(messages.error_service_agent_config_conflict(
+                &resolved.agent_config.display().to_string(),
+                &conflict.service_name,
+            ));
+        }
+        // The state check alone misses a service removed without
+        // `--strip-config` / `--delete-artifacts`: its entry is gone but
+        // its managed profile block survives in the file, and the agent
+        // groups and fast-polls every profile in the config — the stale
+        // service would run under the new service's AppRole identity.
+        // Inspect the target file itself for another service's block.
+        if resolved.agent_config.exists() {
+            let contents = std::fs::read_to_string(&resolved.agent_config).with_context(|| {
+                messages.error_read_file_failed(&resolved.agent_config.display().to_string())
+            })?;
+            if let Some(stale) = bootroot::trust_bootstrap::find_foreign_managed_profile_service(
+                &contents,
+                &resolved.service_name,
+            ) {
+                anyhow::bail!(messages.error_service_agent_config_stale_profile(
+                    &resolved.agent_config.display().to_string(),
+                    &stale,
+                ));
+            }
+        }
     }
 
     if preview {
@@ -384,7 +430,6 @@ fn build_service_entry_from_role(
 ) -> ServiceEntry {
     ServiceEntry {
         service_name: resolved.service_name.clone(),
-        deploy_type: resolved.deploy_type,
         delivery_mode: resolved.delivery_mode,
         hostname: resolved.hostname.clone(),
         domain: resolved.domain.clone(),
@@ -392,7 +437,6 @@ fn build_service_entry_from_role(
         cert_path: resolved.cert_path.clone(),
         key_path: resolved.key_path.clone(),
         instance_id: resolved.instance_id.clone(),
-        container_name: resolved.container_name.clone(),
         notes: resolved.notes.clone(),
         post_renew_hooks: resolved.post_renew_hooks.clone(),
         approle,
@@ -467,9 +511,7 @@ fn print_service_add_apply_summary(
         ServiceAddSummaryOptions {
             applied: applied.map(|result| ServiceAddAppliedPaths {
                 agent_config: &result.agent_config,
-                openbao_agent_config: &result.openbao_agent_config,
-                openbao_agent_docker_config: &result.openbao_agent_docker_config,
-                openbao_agent_template: &result.openbao_agent_template,
+                eab_file: &result.eab_file,
             }),
             remote: remote_bootstrap.map(|result| ServiceAddRemoteBootstrap {
                 bootstrap_file: &result.bootstrap_file,
@@ -1023,14 +1065,12 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
 fn non_policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
     matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap)
         && matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap)
-        && entry.deploy_type == resolved.deploy_type
         && entry.hostname == resolved.hostname
         && entry.domain == resolved.domain
         && entry.agent_config_path == resolved.agent_config
         && entry.cert_path == resolved.cert_path
         && entry.key_path == resolved.key_path
         && entry.instance_id == resolved.instance_id
-        && entry.container_name == resolved.container_name
         && entry.notes == resolved.notes
         && entry.post_renew_hooks == resolved.post_renew_hooks
         && entry.agent_email == resolved.agent_email
@@ -1065,12 +1105,11 @@ mod tests {
         policy_fields_match,
     };
     use crate::i18n::Messages;
-    use crate::state::{DeliveryMode, DeployType, ServiceEntry, ServiceRoleEntry};
+    use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry};
 
     fn sample_resolved() -> ResolvedServiceAdd {
         ResolvedServiceAdd {
             service_name: "test-svc".to_string(),
-            deploy_type: DeployType::Docker,
             delivery_mode: DeliveryMode::LocalFile,
             hostname: "host1".to_string(),
             domain: "example.com".to_string(),
@@ -1078,7 +1117,6 @@ mod tests {
             cert_path: PathBuf::from("/certs/cert.pem"),
             key_path: PathBuf::from("/certs/key.pem"),
             instance_id: Some("inst-1".to_string()),
-            container_name: Some("ctr-1".to_string()),
             runtime_auth: None,
             notes: Some("test note".to_string()),
             post_renew_hooks: Vec::new(),
@@ -1094,7 +1132,6 @@ mod tests {
 
     fn assert_common_fields(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) {
         assert_eq!(entry.service_name, resolved.service_name);
-        assert_eq!(entry.deploy_type, resolved.deploy_type);
         assert_eq!(entry.delivery_mode, resolved.delivery_mode);
         assert_eq!(entry.hostname, resolved.hostname);
         assert_eq!(entry.domain, resolved.domain);
@@ -1102,7 +1139,6 @@ mod tests {
         assert_eq!(entry.cert_path, resolved.cert_path);
         assert_eq!(entry.key_path, resolved.key_path);
         assert_eq!(entry.instance_id, resolved.instance_id);
-        assert_eq!(entry.container_name, resolved.container_name);
         assert_eq!(entry.notes, resolved.notes);
         assert_eq!(entry.post_renew_hooks, resolved.post_renew_hooks);
         assert_eq!(entry.agent_email, resolved.agent_email);
@@ -1155,7 +1191,6 @@ mod tests {
     fn build_service_entry_from_role_with_none_optional_fields() {
         let mut resolved = sample_resolved();
         resolved.instance_id = None;
-        resolved.container_name = None;
         resolved.notes = None;
 
         let role = ServiceRoleEntry {
@@ -1171,7 +1206,6 @@ mod tests {
 
         assert_common_fields(&entry, &resolved);
         assert!(entry.instance_id.is_none());
-        assert!(entry.container_name.is_none());
         assert!(entry.notes.is_none());
     }
 
@@ -1289,8 +1323,8 @@ mod tests {
     /// idempotent.  `run_service_add` then falls through to the
     /// `error_service_duplicate` bail, so the operator has to remove
     /// the service with `bootroot service remove` and re-add it rather
-    /// than racing a silent `.ctmpl` re-render over an inconsistent
-    /// definition.
+    /// than silently re-rendering the agent config over an
+    /// inconsistent definition.
     #[test]
     fn is_idempotent_remote_rerun_false_when_agent_overrides_differ() {
         let mut resolved = sample_resolved();

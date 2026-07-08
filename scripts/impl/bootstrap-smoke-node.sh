@@ -24,7 +24,6 @@ cat >"$WORK_DIR/state.json" <<JSON
   "services": {
     "$SERVICE_NAME": {
       "service_name": "$SERVICE_NAME",
-      "deploy_type": "daemon",
       "delivery_mode": "remote-bootstrap",
       "hostname": "$HOSTNAME",
       "domain": "$DOMAIN",
@@ -32,7 +31,6 @@ cat >"$WORK_DIR/state.json" <<JSON
       "cert_path": "certs/$SERVICE_NAME.crt",
       "key_path": "certs/$SERVICE_NAME.key",
       "instance_id": "$INSTANCE_ID",
-      "container_name": null,
       "notes": null,
       "approle": {
         "role_name": "bootroot-service-$SERVICE_NAME",
