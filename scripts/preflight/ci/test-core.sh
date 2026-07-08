@@ -63,7 +63,11 @@ fi
 # --- CLI Service Add + Verify ---
 echo "[test-core] CLI service add + verify (smoke)"
 mkdir -p tmp certs
-cat > tmp/agent.toml <<'EOF'
+# One agent.toml per distinct service: the [openbao] section holds a
+# single AppRole identity, so `service add` rejects a config path
+# shared across services.
+for svc in edge-proxy web-app; do
+  cat > "tmp/agent-${svc}.toml" <<'EOF'
 email = "admin@example.com"
 server = "https://localhost:9000/acme/acme/directory"
 domain = "trusted.domain"
@@ -80,12 +84,13 @@ http_responder_timeout_secs = 5
 http_responder_token_ttl_secs = 300
 
 EOF
+done
 
 cargo run --bin bootroot -- service add \
   --service-name edge-proxy \
   --hostname edge-node-01 \
   --domain trusted.domain \
-  --agent-config "$(pwd)/tmp/agent.toml" \
+  --agent-config "$(pwd)/tmp/agent-edge-proxy.toml" \
   --cert-path "$(pwd)/certs/edge-proxy.crt" \
   --key-path "$(pwd)/certs/edge-proxy.key" \
   --instance-id 001 \
@@ -95,7 +100,7 @@ cargo run --bin bootroot -- service add \
   --service-name web-app \
   --hostname web-01 \
   --domain trusted.domain \
-  --agent-config "$(pwd)/tmp/agent.toml" \
+  --agent-config "$(pwd)/tmp/agent-web-app.toml" \
   --cert-path "$(pwd)/certs/web-app.crt" \
   --key-path "$(pwd)/certs/web-app.key" \
   --instance-id 001 \
@@ -129,11 +134,11 @@ export PATH="$(pwd)/target/debug:$PATH"
 
 cargo run --bin bootroot -- verify \
   --service-name edge-proxy \
-  --agent-config "$(pwd)/tmp/agent.toml"
+  --agent-config "$(pwd)/tmp/agent-edge-proxy.toml"
 
 cargo run --bin bootroot -- verify \
   --service-name web-app \
-  --agent-config "$(pwd)/tmp/agent.toml"
+  --agent-config "$(pwd)/tmp/agent-web-app.toml"
 
 # --- Verify CA Health ---
 echo "[test-core] verifying CA health"

@@ -183,7 +183,11 @@ run_service_scenarios() {
   export PATH="$ROOT_DIR/target/debug:$PATH"
 
   mkdir -p "$ROOT_DIR/tmp" "$ROOT_DIR/certs"
-  write_agent_config "$ROOT_DIR/tmp/agent.toml"
+  # One agent.toml per distinct service: the [openbao] section holds a
+  # single AppRole identity, so `service add` rejects a config path
+  # shared across services.
+  write_agent_config "$ROOT_DIR/tmp/agent-edge-proxy.toml"
+  write_agent_config "$ROOT_DIR/tmp/agent-web-app.toml"
 
   local runtime_service_add_role_id runtime_service_add_secret_id
   runtime_service_add_role_id="$(
@@ -205,7 +209,7 @@ run_service_scenarios() {
     --service-name edge-proxy \
     --hostname edge-node-01 \
     --domain trusted.domain \
-    --agent-config "$ROOT_DIR/tmp/agent.toml" \
+    --agent-config "$ROOT_DIR/tmp/agent-edge-proxy.toml" \
     --cert-path "$ROOT_DIR/certs/edge-proxy.crt" \
     --key-path "$ROOT_DIR/certs/edge-proxy.key" \
     --instance-id 001 \
@@ -217,7 +221,7 @@ run_service_scenarios() {
     --service-name web-app \
     --hostname web-01 \
     --domain trusted.domain \
-    --agent-config "$ROOT_DIR/tmp/agent.toml" \
+    --agent-config "$ROOT_DIR/tmp/agent-web-app.toml" \
     --cert-path "$ROOT_DIR/certs/web-app.crt" \
     --key-path "$ROOT_DIR/certs/web-app.key" \
     --instance-id 001 \
@@ -240,7 +244,7 @@ run_verify() {
   for attempt in {1..3}; do
     if cargo run --bin bootroot -- verify \
       --service-name "$service_name" \
-      --agent-config "$ROOT_DIR/tmp/agent.toml"; then
+      --agent-config "$ROOT_DIR/tmp/agent-${service_name}.toml"; then
       return 0
     fi
     log "Retrying bootroot verify for ${service_name} (attempt ${attempt}/3)"
