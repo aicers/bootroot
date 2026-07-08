@@ -178,8 +178,8 @@ Run the daemon as a non-root user with a locked-down filesystem view.
 `ReadWritePaths=` needs only three locations: the agent config
 directory (`agent.toml` and the fast-poll state file
 `bootroot-agent-state-<svc>.json` live there), the cert output
-directory, and the per-service secrets directory
-(`secret_id`, `eab.json`, `ca-bundle.pem`).
+directory (issued certs and the managed `ca-bundle.pem`), and the
+per-service secrets directory (`role_id`, `secret_id`, `eab.json`).
 
 ```ini
 [Unit]
