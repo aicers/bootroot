@@ -381,13 +381,13 @@ async fn issue_with_retry(
 /// target profile. Falls back to the supplied in-memory pair when the
 /// reload fails or the profile is absent from the reloaded file.
 ///
-/// The fallback path exists because the `OpenBao` Agent sidecar still
-/// renders `agent.toml` non-atomically (truncate-then-write), so a
-/// concurrent reader can observe a partial file or one that does not
-/// yet contain the named profile. `apply_local_service_configs` was
-/// updated alongside this fix to write through
-/// [`crate::fs_util::atomic_write`] and no longer contributes to the
-/// race, but until the sidecar path is hardened the consumer-side
+/// The fallback path exists because some `agent.toml` writers (the
+/// remote bootstrap/fast-poll appliers, operator edits) still rewrite
+/// the file non-atomically (truncate-then-write), so a concurrent
+/// reader can observe a partial file or one that does not yet contain
+/// the named profile. `apply_local_service_configs` writes through
+/// [`crate::fs_util::atomic_write`] and does not contribute to the
+/// race, but until every writer is hardened the consumer-side
 /// fallback is the load-bearing guarantee. Treating those races as
 /// transient and reusing the prior in-memory profile keeps the retry
 /// budget available for genuine ACME failures, while still honouring

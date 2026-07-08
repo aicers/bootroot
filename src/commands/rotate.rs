@@ -20,7 +20,6 @@ use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
-pub(super) const OPENBAO_AGENT_CONTAINER_PREFIX: &str = "bootroot-openbao-agent";
 pub(super) const ROLE_ID_FILENAME: &str = "role_id";
 pub(super) const OPENBAO_AGENT_STEPCA_CONTAINER: &str = "bootroot-openbao-agent-stepca";
 pub(super) const OPENBAO_AGENT_RESPONDER_CONTAINER: &str = "bootroot-openbao-agent-responder";
@@ -267,7 +266,6 @@ pub(super) mod test_support {
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     pub(super) const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
     pub(super) const TEST_DOCKER_EXIT_ENV: &str = "BOOTROOT_TEST_DOCKER_EXIT";
-    pub(super) const TEST_DOCKER_STDERR_ENV: &str = "BOOTROOT_TEST_DOCKER_STDERR";
 
     pub(super) struct ScopedEnvVar {
         key: &'static str,

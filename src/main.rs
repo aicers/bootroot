@@ -11,7 +11,6 @@ use clap::Parser;
 
 use crate::cli::args::{
     CaCommand, Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand, ServiceCommand,
-    ServiceOpenbaoSidecarCommand,
 };
 use crate::commands::rotate::RotateOutcome;
 use crate::i18n::Messages;
@@ -123,36 +122,6 @@ fn run(cli: Cli, messages: &Messages) -> Result<ExitCode> {
                 rt.block_on(commands::service::run_service_remove(&args, messages))
             })?
             .with_context(|| messages.error_service_remove_failed())?;
-        }
-        CliCommand::Service(ServiceCommand::OpenbaoSidecar(
-            ServiceOpenbaoSidecarCommand::Start(args),
-        )) => {
-            commands::service::openbao_sidecar_start::run_service_openbao_sidecar_start(
-                &args, messages,
-            )
-            .with_context(|| messages.error_service_openbao_sidecar_start_failed())?;
-        }
-        CliCommand::Service(ServiceCommand::OpenbaoSidecar(
-            ServiceOpenbaoSidecarCommand::Refresh(args),
-        )) => {
-            commands::service::openbao_sidecar_refresh::run_service_openbao_sidecar_refresh(
-                &args, messages,
-            )
-            .with_context(|| messages.error_service_openbao_sidecar_refresh_failed())?;
-        }
-        CliCommand::Service(ServiceCommand::Agent(ServiceOpenbaoSidecarCommand::Start(args))) => {
-            eprintln!("{}", messages.warn_service_agent_alias_deprecated());
-            commands::service::openbao_sidecar_start::run_service_openbao_sidecar_start(
-                &args, messages,
-            )
-            .with_context(|| messages.error_service_openbao_sidecar_start_failed())?;
-        }
-        CliCommand::Service(ServiceCommand::Agent(ServiceOpenbaoSidecarCommand::Refresh(args))) => {
-            eprintln!("{}", messages.warn_service_agent_alias_deprecated());
-            commands::service::openbao_sidecar_refresh::run_service_openbao_sidecar_refresh(
-                &args, messages,
-            )
-            .with_context(|| messages.error_service_openbao_sidecar_refresh_failed())?;
         }
         CliCommand::Verify(args) => commands::verify::run_verify(&args, messages)
             .with_context(|| messages.error_verify_failed())?,

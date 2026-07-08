@@ -53,9 +53,6 @@ pub const REISSUE_COMPLETED_AT_KEY: &str = "completed_at";
 pub const REISSUE_COMPLETED_VERSION_KEY: &str = "completed_version";
 
 const ACME_SECTION_NAME: &str = "acme";
-const TRUST_SECTION_NAME: &str = "trust";
-const EAB_SECTION_NAME: &str = "eab";
-const PROFILE_EAB_SECTION_NAME: &str = "profiles.eab";
 const HTTP_RESPONDER_HMAC_KEY: &str = "http_responder_hmac";
 
 /// Parameters for [`render_agent_config_baseline`].
@@ -71,9 +68,9 @@ pub struct AgentConfigBaselineParams<'a> {
 /// including `http_responder_url` plus retry/timeout tunables.
 ///
 /// Both the local-file and remote-bootstrap service-add paths feed this
-/// into their managed-profile upserts so the generated `.ctmpl` carries
-/// every field operators commonly need to customise.  Without the
-/// baseline, re-renders on KV rotation reset the file to
+/// into their managed-profile upserts so the rendered `agent.toml`
+/// carries every field operators commonly need to customise.  Without
+/// the baseline, re-renders on KV rotation reset the file to
 /// `bootroot-agent`'s compiled-in defaults, silently overwriting
 /// operator edits to `server` or `[acme].http_responder_url`.
 #[must_use]
@@ -105,10 +102,10 @@ http_responder_token_ttl_secs = 300\n",
 /// Used by the local-file `service add` path to fix #549 for both fresh
 /// and pre-existing `agent.toml` files: any field missing from the file
 /// (for example `email`, `server`, `[acme].http_responder_url`, or the
-/// retry/timeout tunables) is inserted so the sidecar's re-render from
-/// the generated `.ctmpl` does not silently revert to bootroot-agent's
-/// compiled-in defaults.  Existing keys are left alone so this is safe
-/// to apply to an operator-edited file.
+/// retry/timeout tunables) is inserted so later KV-driven re-renders do
+/// not silently revert to bootroot-agent's compiled-in defaults.
+/// Existing keys are left alone so this is safe to apply to an
+/// operator-edited file.
 ///
 /// # Errors
 ///
@@ -462,125 +459,6 @@ pub const ACME_SECTION: &str = ACME_SECTION_NAME;
 #[must_use]
 pub fn build_responder_hmac_updates(hmac: &str) -> Vec<(&'static str, String)> {
     vec![(HTTP_RESPONDER_HMAC_KEY, hmac.to_string())]
-}
-
-/// Builds an `OpenBao` Agent ctmpl for managed `agent.toml` updates.
-#[must_use]
-pub fn build_managed_agent_ctmpl(contents: &str, kv_mount: &str, service_name: &str) -> String {
-    let base = format!("{SERVICE_KV_BASE}/{service_name}");
-
-    let hmac_template = format!(
-        "{{{{ with secret \"{kv_mount}/data/{base}/http_responder_hmac\" }}}}\
-         {{{{ .Data.data.hmac }}}}\
-         {{{{ end }}}}"
-    );
-    let with_hmac = replace_key_line_in_section(
-        contents,
-        ACME_SECTION_NAME,
-        HTTP_RESPONDER_HMAC_KEY,
-        &format!("{HTTP_RESPONDER_HMAC_KEY} = \"{hmac_template}\""),
-    );
-
-    let without_eab =
-        remove_line_sections(&with_hmac, &[EAB_SECTION_NAME, PROFILE_EAB_SECTION_NAME]);
-
-    let trust_template_line = format!(
-        "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
-         {TRUSTED_CA_KEY} = {{{{ .Data.data.{TRUSTED_CA_KEY} | toJSON }}}}\
-         {{{{ end }}}}"
-    );
-    let with_trust = replace_key_line_in_section(
-        &without_eab,
-        TRUST_SECTION_NAME,
-        TRUSTED_CA_KEY,
-        &trust_template_line,
-    );
-
-    let eab_block = format!(
-        "\n{{{{ with secret \"{kv_mount}/data/{base}/eab\" }}}}{{{{ if .Data.data.{EAB_KID_KEY} }}}}\n\
-         [eab]\n\
-         kid = \"{{{{ .Data.data.{EAB_KID_KEY} }}}}\"\n\
-         hmac = \"{{{{ .Data.data.{EAB_HMAC_KEY} }}}}\"\n\
-         \n\
-         [profiles.eab]\n\
-         kid = \"{{{{ .Data.data.{EAB_KID_KEY} }}}}\"\n\
-         hmac = \"{{{{ .Data.data.{EAB_HMAC_KEY} }}}}\"\n\
-         {{{{ end }}}}{{{{ end }}}}\n"
-    );
-
-    let mut result = with_trust;
-    if !result.ends_with('\n') {
-        result.push('\n');
-    }
-    result.push_str(&eab_block);
-    result
-}
-
-/// Builds an `OpenBao` Agent ctmpl for a rendered CA bundle file.
-#[must_use]
-pub fn build_ca_bundle_ctmpl(kv_mount: &str, service_name: &str) -> String {
-    let base = format!("{SERVICE_KV_BASE}/{service_name}");
-    format!(
-        "{{{{ with secret \"{kv_mount}/data/{base}/trust\" }}}}\
-         {{{{ .Data.data.{CA_BUNDLE_PEM_KEY} }}}}\
-         {{{{ end }}}}\n"
-    )
-}
-
-fn is_section_header(value: &str) -> bool {
-    value.starts_with('[') && value.ends_with(']')
-}
-
-fn remove_line_sections(contents: &str, sections: &[&str]) -> String {
-    let mut output = String::new();
-    let mut skip = false;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if is_section_header(trimmed) {
-            let section_name = &trimmed[1..trimmed.len() - 1];
-            skip = sections.contains(&section_name);
-            if skip {
-                continue;
-            }
-        }
-        if skip {
-            continue;
-        }
-        output.push_str(line);
-        output.push('\n');
-    }
-    output
-}
-
-fn replace_key_line_in_section(
-    contents: &str,
-    section: &str,
-    key: &str,
-    replacement: &str,
-) -> String {
-    let mut output = String::new();
-    let mut in_section = false;
-    let mut replaced = false;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if is_section_header(trimmed) {
-            in_section = trimmed == format!("[{section}]");
-        }
-        if in_section
-            && !replaced
-            && (trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}=")))
-        {
-            output.push_str(replacement);
-            output.push('\n');
-            replaced = true;
-            continue;
-        }
-        output.push_str(line);
-        output.push('\n');
-    }
-    output
 }
 
 #[cfg(test)]
@@ -939,19 +817,6 @@ instance_id = \"001\"\n\n\
     }
 
     #[test]
-    fn build_managed_agent_ctmpl_replaces_hmac_and_trust() {
-        let input = "[acme]\nhttp_responder_hmac = \"old-hmac\"\n\n[trust]\ntrusted_ca_sha256 = [\"old\"]\n";
-        let output = build_managed_agent_ctmpl(input, "secret", "edge-proxy");
-
-        assert!(output.contains(
-            "{{ with secret \"secret/data/bootroot/services/edge-proxy/http_responder_hmac\" }}"
-        ));
-        assert!(output.contains("trusted_ca_sha256 = {{ .Data.data.trusted_ca_sha256 | toJSON }}"));
-        assert!(output.contains("[profiles.eab]"));
-        assert!(!output.contains("\"old-hmac\""));
-    }
-
-    #[test]
     fn render_agent_config_baseline_includes_all_documented_fields() {
         let output = render_agent_config_baseline(&AgentConfigBaselineParams {
             email: "admin@example.com",
@@ -972,15 +837,5 @@ instance_id = \"001\"\n\n\
         assert!(output.contains("poll_attempts = 15"));
         assert!(output.contains("http_responder_timeout_secs = 5"));
         assert!(output.contains("http_responder_token_ttl_secs = 300"));
-    }
-
-    #[test]
-    fn build_ca_bundle_ctmpl_reads_service_trust_bundle() {
-        let output = build_ca_bundle_ctmpl("secret", "edge-proxy");
-
-        assert!(
-            output.contains("{{ with secret \"secret/data/bootroot/services/edge-proxy/trust\" }}")
-        );
-        assert!(output.contains("{{ .Data.data.ca_bundle_pem }}"));
     }
 }

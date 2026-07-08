@@ -1,7 +1,4 @@
-use super::{
-    Messages, ServiceNextStepsDaemon, ServiceNextStepsDocker, ServiceOpenBaoAgentSteps,
-    format_template,
-};
+use super::{Messages, ServiceNextStepsDaemon, format_template};
 
 impl Messages {
     pub(crate) fn error_service_duplicate(&self, service_name: &str) -> String {
@@ -26,32 +23,6 @@ impl Messages {
         self.strings().error_service_instance_id_required
     }
 
-    pub(crate) fn error_service_container_name_required(&self) -> &'static str {
-        self.strings().error_service_container_name_required
-    }
-
-    pub(crate) fn error_service_daemon_container_name_conflict(&self) -> &'static str {
-        self.strings().error_service_daemon_container_name_conflict
-    }
-
-    pub(crate) fn warn_service_docker_agent_unidentified(&self, container: &str) -> String {
-        format_template(
-            self.strings().warn_service_docker_agent_unidentified,
-            &[("container", container)],
-        )
-    }
-
-    pub(crate) fn warn_service_docker_agent_inspect_failed(
-        &self,
-        container: &str,
-        details: &str,
-    ) -> String {
-        format_template(
-            self.strings().warn_service_docker_agent_inspect_failed,
-            &[("container", container), ("details", details)],
-        )
-    }
-
     pub(crate) fn error_value_required(&self) -> &'static str {
         self.strings().error_value_required
     }
@@ -70,10 +41,6 @@ impl Messages {
 
     pub(crate) fn error_instance_id_invalid(&self) -> &'static str {
         self.strings().error_instance_id_invalid
-    }
-
-    pub(crate) fn error_invalid_deploy_type(&self) -> &'static str {
-        self.strings().error_invalid_deploy_type
     }
 
     pub(crate) fn error_path_not_found(&self, value: &str) -> String {
@@ -346,13 +313,6 @@ impl Messages {
         )
     }
 
-    pub(crate) fn error_bootroot_agent_container_missing(&self, container: &str) -> String {
-        format_template(
-            self.strings().error_bootroot_agent_container_missing,
-            &[("container", container)],
-        )
-    }
-
     pub(crate) fn error_secrets_dir_resolve_failed(&self) -> &'static str {
         self.strings().error_secrets_dir_resolve_failed
     }
@@ -411,10 +371,6 @@ impl Messages {
         self.strings().prompt_service_name
     }
 
-    pub(crate) fn prompt_deploy_type(&self) -> &'static str {
-        self.strings().prompt_deploy_type
-    }
-
     pub(crate) fn prompt_hostname(&self) -> &'static str {
         self.strings().prompt_hostname
     }
@@ -437,10 +393,6 @@ impl Messages {
 
     pub(crate) fn prompt_instance_id(&self) -> &'static str {
         self.strings().prompt_instance_id
-    }
-
-    pub(crate) fn prompt_container_name(&self) -> &'static str {
-        self.strings().prompt_container_name
     }
 
     pub(crate) fn prompt_confirm_overwrite_password(&self) -> &'static str {
@@ -506,13 +458,6 @@ impl Messages {
         format_template(self.strings().service_summary_kind, &[("value", value)])
     }
 
-    pub(crate) fn service_summary_deploy_type(&self, value: &str) -> String {
-        format_template(
-            self.strings().service_summary_deploy_type,
-            &[("value", value)],
-        )
-    }
-
     pub(crate) fn service_summary_hostname(&self, value: &str) -> String {
         format_template(self.strings().service_summary_hostname, &[("value", value)])
     }
@@ -531,13 +476,6 @@ impl Messages {
     pub(crate) fn service_summary_instance_id(&self, value: &str) -> String {
         format_template(
             self.strings().service_summary_instance_id,
-            &[("value", value)],
-        )
-    }
-
-    pub(crate) fn service_summary_container_name(&self, value: &str) -> String {
-        format_template(
-            self.strings().service_summary_container_name,
             &[("value", value)],
         )
     }
@@ -582,16 +520,9 @@ impl Messages {
         )
     }
 
-    pub(crate) fn service_summary_auto_applied_openbao_config(&self, value: &str) -> String {
+    pub(crate) fn service_summary_auto_applied_eab_file(&self, value: &str) -> String {
         format_template(
-            self.strings().service_summary_auto_applied_openbao_config,
-            &[("value", value)],
-        )
-    }
-
-    pub(crate) fn service_summary_auto_applied_openbao_template(&self, value: &str) -> String {
-        format_template(
-            self.strings().service_summary_auto_applied_openbao_template,
+            self.strings().service_summary_auto_applied_eab_file,
             &[("value", value)],
         )
     }
@@ -723,75 +654,6 @@ impl Messages {
         )
     }
 
-    pub(crate) fn service_next_steps_docker_sidecar(
-        &self,
-        data: &ServiceNextStepsDocker<'_>,
-    ) -> String {
-        format_template(
-            self.strings().service_next_steps_docker_sidecar,
-            &[
-                ("service_name", data.service_name),
-                ("container_name", data.container_name),
-                ("instance_id", data.instance_id),
-                ("hostname", data.hostname),
-                ("domain", data.domain),
-                ("cert_path", data.cert_path),
-                ("key_path", data.key_path),
-                ("config_path", data.config_path),
-                ("role_name", data.role_name),
-                ("secret_id_path", data.secret_id_path),
-            ],
-        )
-    }
-
-    pub(crate) fn service_next_steps_openbao_agent_title(&self) -> &'static str {
-        self.strings().service_next_steps_openbao_agent_title
-    }
-
-    pub(crate) fn service_next_steps_openbao_agent_config(
-        &self,
-        data: &ServiceOpenBaoAgentSteps<'_>,
-    ) -> String {
-        format_template(
-            self.strings().service_next_steps_openbao_agent_config,
-            &[
-                ("service_name", data.service_name),
-                ("config_path", data.config_path),
-            ],
-        )
-    }
-
-    pub(crate) fn service_next_steps_openbao_agent_role_id_path(
-        &self,
-        data: &ServiceOpenBaoAgentSteps<'_>,
-    ) -> String {
-        format_template(
-            self.strings().service_next_steps_openbao_agent_role_id_path,
-            &[("role_id_path", data.role_id_path)],
-        )
-    }
-
-    pub(crate) fn service_next_steps_openbao_agent_secret_id_path(
-        &self,
-        data: &ServiceOpenBaoAgentSteps<'_>,
-    ) -> String {
-        format_template(
-            self.strings()
-                .service_next_steps_openbao_agent_secret_id_path,
-            &[("secret_id_path", data.secret_id_path)],
-        )
-    }
-
-    pub(crate) fn service_next_steps_openbao_agent_permissions(
-        &self,
-        data: &ServiceOpenBaoAgentSteps<'_>,
-    ) -> String {
-        format_template(
-            self.strings().service_next_steps_openbao_agent_permissions,
-            &[("service_dir", data.service_dir)],
-        )
-    }
-
     pub(crate) fn service_next_steps_remote_selfheal_keep(&self) -> &'static str {
         self.strings().service_next_steps_remote_selfheal_keep
     }
@@ -800,25 +662,12 @@ impl Messages {
         self.strings().service_next_steps_remote_selfheal_note
     }
 
-    pub(crate) fn service_next_steps_openbao_sidecar_start(
-        &self,
-        data: &ServiceOpenBaoAgentSteps<'_>,
-    ) -> String {
-        format_template(
-            self.strings().service_next_steps_openbao_sidecar_start,
-            &[
-                ("service_name", data.service_name),
-                ("config_path", data.config_path),
-            ],
-        )
+    pub(crate) fn service_snippet_daemon_run_title(&self) -> &'static str {
+        self.strings().service_snippet_daemon_run_title
     }
 
     pub(crate) fn service_snippet_daemon_title(&self) -> &'static str {
         self.strings().service_snippet_daemon_title
-    }
-
-    pub(crate) fn service_snippet_docker_title(&self) -> &'static str {
-        self.strings().service_snippet_docker_title
     }
 
     pub(crate) fn service_snippet_trust_title(&self) -> &'static str {
@@ -1034,57 +883,5 @@ impl Messages {
 
     pub(crate) fn hint_reinit_reload_style(&self) -> &'static str {
         self.strings().hint_reinit_reload_style
-    }
-
-    pub(crate) fn error_service_openbao_sidecar_start_failed(&self) -> &'static str {
-        self.strings().error_service_openbao_sidecar_start_failed
-    }
-
-    pub(crate) fn error_service_openbao_sidecar_refresh_failed(&self) -> &'static str {
-        self.strings().error_service_openbao_sidecar_refresh_failed
-    }
-
-    pub(crate) fn warn_service_agent_alias_deprecated(&self) -> &'static str {
-        self.strings().warn_service_agent_alias_deprecated
-    }
-
-    pub(crate) fn error_service_remote_bootstrap(&self, value: &str) -> String {
-        format_template(
-            self.strings().error_service_remote_bootstrap,
-            &[("value", value)],
-        )
-    }
-
-    pub(crate) fn error_service_agent_config_missing(&self, value: &str) -> String {
-        format_template(
-            self.strings().error_service_agent_config_missing,
-            &[("value", value)],
-        )
-    }
-
-    pub(crate) fn service_openbao_sidecar_start_completed(&self, value: &str) -> String {
-        format_template(
-            self.strings().service_openbao_sidecar_start_completed,
-            &[("value", value)],
-        )
-    }
-
-    pub(crate) fn error_openbao_container_not_found(&self) -> &'static str {
-        self.strings().error_openbao_container_not_found
-    }
-
-    pub(crate) fn error_openbao_container_no_project_label(&self) -> &'static str {
-        self.strings().error_openbao_container_no_project_label
-    }
-
-    pub(crate) fn error_openbao_network_required_external(&self) -> &'static str {
-        self.strings().error_openbao_network_required_external
-    }
-
-    pub(crate) fn error_invalid_docker_network_name(&self, value: &str) -> String {
-        format_template(
-            self.strings().error_invalid_docker_network_name,
-            &[("value", value)],
-        )
     }
 }

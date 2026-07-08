@@ -24,8 +24,7 @@ pub(crate) use constants::{
     STEPCA_CA_JSON_TEMPLATE_NAME, STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
 };
 pub(crate) use paths::{
-    compose_has_openbao, compose_has_responder, compose_has_stepca, resolve_openbao_agent_addr,
-    to_container_path,
+    compose_has_openbao, compose_has_responder, compose_has_stepca, to_container_path,
 };
 pub(crate) use steps::http01_admin_tls::{
     reissue_http01_admin_tls_cert, strip_responder_tls_config,

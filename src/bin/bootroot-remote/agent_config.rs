@@ -1092,7 +1092,7 @@ mod tests {
 
         // Mirror the in-memory mutation pipeline of
         // `apply_agent_config_updates` (the I/O parts are factored out
-        // so this pure test remains stable across sidecar rewrites).
+        // so this pure test remains stable across writer rewrites).
         let backfilled = apply_agent_config_baseline_defaults(
             pre_existing,
             &AgentConfigBaselineParams {

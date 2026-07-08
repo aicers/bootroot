@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 use bootroot::trust_bootstrap::remove_managed_service_profile;
 
-use super::{OPENBAO_SERVICE_CONFIG_DIR, REMOTE_BOOTSTRAP_DIR, SERVICE_SECRET_DIR};
+use super::{REMOTE_BOOTSTRAP_DIR, SERVICE_SECRET_DIR};
 use crate::cli::args::ServiceRemoveArgs;
 use crate::cli::prompt::Prompt;
 use crate::commands::constants::SERVICE_KV_BASE;
@@ -249,9 +249,6 @@ fn build_artifact_plan(state: &StateFile, entry: &ServiceEntry) -> ArtifactPlan 
             .join(SERVICE_SECRET_DIR)
             .join(&entry.service_name),
         secrets_dir
-            .join(OPENBAO_SERVICE_CONFIG_DIR)
-            .join(&entry.service_name),
-        secrets_dir
             .join(REMOTE_BOOTSTRAP_DIR)
             .join(&entry.service_name),
     ];
@@ -419,7 +416,7 @@ mod tests {
 
     use super::*;
     use crate::i18n::test_messages;
-    use crate::state::{DeployType, ServiceEntry, ServiceRoleEntry};
+    use crate::state::{ServiceEntry, ServiceRoleEntry};
 
     fn sample_state() -> StateFile {
         StateFile {
@@ -443,7 +440,6 @@ mod tests {
     fn sample_entry(name: &str, delivery_mode: DeliveryMode) -> ServiceEntry {
         ServiceEntry {
             service_name: name.to_string(),
-            deploy_type: DeployType::Docker,
             delivery_mode,
             hostname: "host1".to_string(),
             domain: "example.com".to_string(),
@@ -451,7 +447,6 @@ mod tests {
             cert_path: PathBuf::from("/certs/cert.pem"),
             key_path: PathBuf::from("/certs/key.pem"),
             instance_id: Some("001".to_string()),
-            container_name: Some("ctr".to_string()),
             notes: None,
             post_renew_hooks: Vec::new(),
             approle: ServiceRoleEntry {

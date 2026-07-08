@@ -11,7 +11,7 @@ use crate::cli::args::VerifyArgs;
 use crate::cli::output::print_verify_plan;
 use crate::cli::prompt::Prompt;
 use crate::i18n::Messages;
-use crate::state::{DeployType, ServiceEntry, StateFile};
+use crate::state::{ServiceEntry, StateFile};
 
 const AGENT_BINARY_NAME: &str = "bootroot-agent";
 
@@ -353,36 +353,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn expected_dns_name(entry: &ServiceEntry, messages: &Messages) -> Result<String> {
-    match entry.deploy_type {
-        DeployType::Daemon => {
-            let instance_id = entry
-                .instance_id
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!(messages.error_service_instance_id_required()))?;
-            Ok(format!(
-                "{}.{}.{}.{}",
-                instance_id, entry.service_name, entry.hostname, entry.domain
-            ))
-        }
-        DeployType::Docker => {
-            let instance_id = entry
-                .instance_id
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!(messages.error_service_instance_id_required()))?;
-            if entry
-                .container_name
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
-                anyhow::bail!(messages.error_service_container_name_required());
-            }
-            Ok(format!(
-                "{}.{}.{}.{}",
-                instance_id, entry.service_name, entry.hostname, entry.domain
-            ))
-        }
-    }
+    let instance_id = entry
+        .instance_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_instance_id_required()))?;
+    Ok(format!(
+        "{}.{}.{}.{}",
+        instance_id, entry.service_name, entry.hostname, entry.domain
+    ))
 }
 
 #[cfg(test)]

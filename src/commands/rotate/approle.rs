@@ -4,9 +4,7 @@ use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 
-use super::helpers::{
-    confirm_action, reload_openbao_agent, restart_container, write_secret_id_atomic,
-};
+use super::helpers::{confirm_action, restart_container, write_secret_id_atomic};
 use super::{
     OPENBAO_AGENT_RESPONDER_CONTAINER, OPENBAO_AGENT_STEPCA_CONTAINER, ROLE_ID_FILENAME,
     RotateContext,
@@ -215,11 +213,9 @@ async fn self_mint_own_secret_id(
 }
 
 /// Per-service facts the caller needs to print an accurate summary:
-/// remote-bootstrap targets skip the agent reload, CIDR-bound targets
-/// skip the login verification.
+/// CIDR-bound targets skip the login verification.
 struct ServiceRotationReport {
     secret_id_path: String,
-    agent_reloaded: bool,
     login_verified: bool,
 }
 
@@ -245,9 +241,6 @@ async fn rotate_service_approle_secret_id(
         "{}",
         messages.rotate_summary_approle_secret_id(service_name, &report.secret_id_path)
     );
-    if report.agent_reloaded {
-        println!("{}", messages.rotate_summary_reload_openbao_agent());
-    }
     if report.login_verified {
         println!("{}", messages.rotate_summary_approle_login_ok(service_name));
     }
@@ -352,9 +345,11 @@ async fn rotate_service_secret_id_once(
         }
     }
     .with_context(|| messages.error_service_secret_id_mint_failed(service_name))?;
+    // The direct local `secret_id` file write is all that is needed: the
+    // agent's fast-poll loop re-reads the `secret_id` file on every
+    // AppRole re-login, so no process signal or sidecar reload follows.
     if !is_remote {
         write_secret_id_atomic(&entry.approle.secret_id_path, &new_secret_id, messages).await?;
-        reload_openbao_agent(&entry, messages)?;
     }
     let has_cidr_binding = entry.approle.token_bound_cidrs.is_some();
     if !has_cidr_binding {
@@ -375,7 +370,6 @@ async fn rotate_service_secret_id_once(
     }
     Ok(ServiceRotationReport {
         secret_id_path: entry.approle.secret_id_path.display().to_string(),
-        agent_reloaded: !is_remote,
         login_verified: !has_cidr_binding,
     })
 }
@@ -709,7 +703,7 @@ mod tests {
         write_fake_docker_script,
     };
     use super::*;
-    use crate::state::{DeployType, ServiceRoleEntry, StateFile};
+    use crate::state::{ServiceRoleEntry, StateFile};
 
     const RUNTIME_ROTATE_ROLE: &str = "bootroot-runtime-rotate-role";
 
@@ -751,7 +745,6 @@ mod tests {
     ) -> ServiceEntry {
         ServiceEntry {
             service_name: name.to_string(),
-            deploy_type: DeployType::Docker,
             delivery_mode,
             hostname: "h".to_string(),
             domain: "d.com".to_string(),
@@ -759,7 +752,6 @@ mod tests {
             cert_path: base.join(name).join("cert.pem"),
             key_path: base.join(name).join("key.pem"),
             instance_id: None,
-            container_name: None,
             notes: None,
             post_renew_hooks: vec![],
             approle: ServiceRoleEntry {
@@ -1006,7 +998,7 @@ mod tests {
         );
         assert!(
             !args_log.exists(),
-            "the sidecar must not be restarted on mint failure"
+            "the infra OpenBao Agent must not be restarted on mint failure"
         );
     }
 
@@ -1174,12 +1166,10 @@ mod tests {
             !dir.path().join("beta").join("secret_id").exists(),
             "remote-bootstrap targets must not get a local secret_id file"
         );
-        let logged = fs::read_to_string(&args_log).expect("read docker args");
-        let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(
-            args,
-            vec!["restart", "bootroot-openbao-agent-alpha"],
-            "only the local target's sidecar must be reloaded"
+        assert!(
+            !args_log.exists(),
+            "service secret_id rotation must not invoke docker: the local \
+             agent's fast-poll loop re-reads the secret_id file on re-login"
         );
     }
 
@@ -1242,12 +1232,10 @@ mod tests {
         let beta_secret = fs::read_to_string(dir.path().join("beta").join("secret_id"))
             .expect("the remaining target must still be rotated");
         assert_eq!(beta_secret, "fresh-secret-id");
-        let logged = fs::read_to_string(&args_log).expect("read docker args");
-        let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(
-            args,
-            vec!["restart", "bootroot-openbao-agent-beta"],
-            "only the successfully rotated target's sidecar must be reloaded"
+        assert!(
+            !args_log.exists(),
+            "service secret_id rotation must not invoke docker: the local \
+             agent's fast-poll loop re-reads the secret_id file on re-login"
         );
     }
 
