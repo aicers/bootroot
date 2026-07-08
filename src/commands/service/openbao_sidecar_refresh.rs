@@ -33,10 +33,8 @@ pub(crate) fn run_service_openbao_sidecar_refresh(
 /// re-reads its KV sources; `RemoteBootstrap` has **no** `OpenBao` Agent
 /// sidecar on the remote host (issue #680 moved it to the `bootroot-agent`
 /// self-auth fast-poll model), so it emits guidance instead. Trust,
-/// `secret_id`, and the HTTP responder HMAC self-heal via fast-poll, but EAB
-/// and other bootstrap-time KV config are only re-pulled by re-running
-/// `bootroot-remote bootstrap` on the remote host — the sidecar restart no
-/// longer applies.
+/// `secret_id`, the HTTP responder HMAC, and EAB all self-heal via the remote
+/// fast-poll loop within `fast_poll_interval`, so no re-bootstrap is required.
 pub(crate) fn refresh_service_sidecar(entry: &ServiceEntry, messages: &Messages) -> Result<()> {
     match entry.delivery_mode {
         DeliveryMode::LocalFile => {
@@ -55,7 +53,7 @@ pub(crate) fn refresh_service_sidecar(entry: &ServiceEntry, messages: &Messages)
         }
         DeliveryMode::RemoteBootstrap => {
             println!(
-                "service {svc} uses remote-bootstrap delivery; no OpenBao Agent sidecar runs on the remote host. Trust, secret_id, and the HTTP responder HMAC self-heal via the bootroot-agent fast-poll loop, but bootstrap-time KV config (e.g. EAB) is not fast-polled — re-run `bootroot-remote bootstrap` on the remote host to re-pull it from KV.",
+                "service {svc} uses remote-bootstrap delivery; no OpenBao Agent sidecar runs on the remote host. Trust, secret_id, the HTTP responder HMAC, and EAB self-heal via the bootroot-agent fast-poll loop within fast_poll_interval — no re-bootstrap required.",
                 svc = entry.service_name
             );
             Ok(())

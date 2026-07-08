@@ -32,6 +32,7 @@ pub use agent_args::Args;
 pub async fn run_daemon(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
+    eab_refresh_path: Option<PathBuf>,
     config_path: Option<PathBuf>,
     insecure_mode: bool,
     cli_overrides: config::CliOverrides,
@@ -39,6 +40,7 @@ pub async fn run_daemon(
     daemon::run_daemon(
         settings,
         default_eab,
+        eab_refresh_path,
         config_path,
         insecure_mode,
         cli_overrides,

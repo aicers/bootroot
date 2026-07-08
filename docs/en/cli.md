@@ -1287,9 +1287,9 @@ the previously-rendered value until the agent process restarts
 - For services with `--delivery-mode remote-bootstrap`: emits
   operator guidance only. No OpenBao Agent sidecar runs on the remote
   host (issue #680 moved it to the `bootroot-agent` self-auth
-  fast-poll model). Trust and secret_id self-heal via fast-poll, but
-  bootstrap-time KV config such as EAB is not fast-polled — re-run
-  `bootroot-remote bootstrap` on the remote host to re-pull it from KV.
+  fast-poll model). Trust, secret_id, the HTTP responder HMAC, and EAB
+  self-heal via the `bootroot-agent` fast-poll loop within
+  `fast_poll_interval` — no re-bootstrap required.
 
 ### Failure conditions
 

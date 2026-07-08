@@ -36,6 +36,13 @@ pub const SERVICE_SECRET_ID_KV_SUFFIX: &str = "secret_id";
 ///
 /// Full path: `{kv_mount}/data/bootroot/services/<service>/http_responder_hmac`.
 pub const SERVICE_RESPONDER_HMAC_KV_SUFFIX: &str = "http_responder_hmac";
+/// KV v2 path suffix carrying the service EAB credentials (payload
+/// `{ "kid": <value>, "hmac": <value> }`, or the explicit clear shape
+/// `{ "kid": "", "hmac": "" }`) the remote fast-poll loop refreshes into the
+/// on-disk `eab.json` + the in-memory `default_eab`.
+///
+/// Full path: `{kv_mount}/data/bootroot/services/<service>/eab`.
+pub const SERVICE_EAB_KV_SUFFIX: &str = "eab";
 /// Payload field holding the RFC3339 UTC timestamp of the request.
 pub const REISSUE_REQUESTED_AT_KEY: &str = "requested_at";
 /// Payload field describing who issued the request (operator label).

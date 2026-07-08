@@ -34,6 +34,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cli_overrides = CliOverrides::from(&args);
+    // EAB source precedence is CLI `--eab-kid`/`--eab-hmac` (explicit) →
+    // `--eab-file` (`eab.json`) → agent.toml `[eab]`. Fast-poll EAB refresh is
+    // meaningful only for the `--eab-file` remote-bootstrap artifact: when both
+    // CLI values are set the operator has pinned EAB out of band, so refresh
+    // must be a no-op and never override them. `args` is fixed for the process
+    // lifetime, so this holds across HUP reloads too.
+    let eab_cli_pinned = args.eab_kid.is_some() && args.eab_hmac.is_some();
+    let eab_refresh_path = if eab_cli_pinned {
+        None
+    } else {
+        args.eab_file.clone()
+    };
     let mut pending = None;
     #[cfg(unix)]
     let mut hup = signal(SignalKind::hangup())?;
@@ -47,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         let mut task = tokio::spawn(run_daemon(
             Arc::clone(&settings),
             final_eab,
+            eab_refresh_path.clone(),
             args.config.clone(),
             args.insecure,
             cli_overrides.clone(),

@@ -9,7 +9,9 @@
 
 use anyhow::{Result, bail};
 
-use crate::trust_bootstrap::{CA_BUNDLE_PEM_KEY, HMAC_KEY, SECRET_ID_KEY, TRUSTED_CA_KEY};
+use crate::trust_bootstrap::{
+    CA_BUNDLE_PEM_KEY, EAB_HMAC_KEY, EAB_KID_KEY, HMAC_KEY, SECRET_ID_KEY, TRUSTED_CA_KEY,
+};
 
 /// Length in hex characters of a SHA-256 fingerprint.
 const FINGERPRINT_HEX_LEN: usize = 64;
@@ -46,6 +48,62 @@ pub fn parse_trust_payload(data: &serde_json::Value) -> Result<TrustPayload> {
 /// Returns an error when neither key holds a non-empty string.
 pub fn parse_secret_id(data: &serde_json::Value) -> Result<String> {
     parse_required_string(data, &[SECRET_ID_KEY, "value"])
+}
+
+/// Parsed `eab` KV payload: either populated credentials or an explicit
+/// clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EabPayload {
+    /// Populated EAB — both `kid` and `hmac` are non-empty.
+    Populated { kid: String, hmac: String },
+    /// Explicit clear — both `kid` and `hmac` are the empty string.
+    Clear,
+}
+
+/// Parses a service `eab` KV payload.
+///
+/// Accepts either a populated `{ "kid": non-empty, "hmac": non-empty }` or
+/// the explicit clear shape `{ "kid": "", "hmac": "" }`. Rejects partial or
+/// ambiguous shapes (an empty `kid` with a non-empty `hmac` or vice versa),
+/// a missing key, or a non-string value.
+///
+/// The clear shape must NOT be routed through `parse_required_string`: that
+/// helper trims and rejects empty strings, which would misclassify a clear as
+/// malformed and prevent it from ever applying. The KV payload keys the secret
+/// as `hmac` (distinct from the on-disk `eab.json` `key` alias).
+///
+/// # Errors
+///
+/// Returns an error when a key is missing, is not a string, or the two fields
+/// disagree on emptiness.
+pub fn parse_eab_payload(data: &serde_json::Value) -> Result<EabPayload> {
+    let kid = parse_eab_field(data, EAB_KID_KEY)?;
+    let hmac = parse_eab_field(data, EAB_HMAC_KEY)?;
+    match (kid.is_empty(), hmac.is_empty()) {
+        (false, false) => Ok(EabPayload::Populated { kid, hmac }),
+        (true, true) => Ok(EabPayload::Clear),
+        _ => bail!(
+            "EAB payload has partial credentials: {EAB_KID_KEY} and {EAB_HMAC_KEY} must both be \
+             set or both be empty"
+        ),
+    }
+}
+
+/// Reads an `eab` string field, trimmed. Unlike [`parse_required_string`], a
+/// present-but-empty value is preserved (returned as an empty string) so the
+/// caller can distinguish the explicit clear shape from a malformed one.
+///
+/// # Errors
+///
+/// Returns an error when the key is absent or its value is not a string.
+fn parse_eab_field(data: &serde_json::Value, key: &str) -> Result<String> {
+    let value = data
+        .get(key)
+        .ok_or_else(|| anyhow::anyhow!("Missing required EAB key: {key}"))?;
+    let string = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("EAB key {key} must be a string"))?;
+    Ok(string.trim().to_string())
 }
 
 /// Parses a service `http_responder_hmac` KV payload, returning the HMAC.
@@ -201,5 +259,59 @@ mod tests {
     fn parse_responder_hmac_rejects_empty() {
         let data = serde_json::json!({ "hmac": "   " });
         assert!(parse_responder_hmac(&data).is_err());
+    }
+
+    #[test]
+    fn parse_eab_payload_accepts_populated() {
+        let data = serde_json::json!({ "kid": "  the-kid  ", "hmac": "  the-hmac  " });
+        assert_eq!(
+            parse_eab_payload(&data).expect("parse populated"),
+            EabPayload::Populated {
+                kid: "the-kid".to_string(),
+                hmac: "the-hmac".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eab_payload_accepts_explicit_clear() {
+        let data = serde_json::json!({ "kid": "", "hmac": "" });
+        assert_eq!(
+            parse_eab_payload(&data).expect("parse clear"),
+            EabPayload::Clear
+        );
+    }
+
+    #[test]
+    fn parse_eab_payload_treats_whitespace_only_as_clear() {
+        let data = serde_json::json!({ "kid": "   ", "hmac": "   " });
+        assert_eq!(
+            parse_eab_payload(&data).expect("parse whitespace clear"),
+            EabPayload::Clear
+        );
+    }
+
+    #[test]
+    fn parse_eab_payload_rejects_partial_kid_only() {
+        let data = serde_json::json!({ "kid": "the-kid", "hmac": "" });
+        assert!(parse_eab_payload(&data).is_err());
+    }
+
+    #[test]
+    fn parse_eab_payload_rejects_partial_hmac_only() {
+        let data = serde_json::json!({ "kid": "", "hmac": "the-hmac" });
+        assert!(parse_eab_payload(&data).is_err());
+    }
+
+    #[test]
+    fn parse_eab_payload_rejects_missing_key() {
+        let data = serde_json::json!({ "kid": "the-kid" });
+        assert!(parse_eab_payload(&data).is_err());
+    }
+
+    #[test]
+    fn parse_eab_payload_rejects_non_string_value() {
+        let data = serde_json::json!({ "kid": "the-kid", "hmac": 42 });
+        assert!(parse_eab_payload(&data).is_err());
     }
 }
