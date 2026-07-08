@@ -142,14 +142,16 @@ BOOTROOT_LANG=en printf "y\n" | bootroot init \
   --responder-url "$RESPONDER_URL"
 
 # 3) service-add
+# 서로 다른 로컬 서비스는 각자 자신의 에이전트 설정을 사용합니다
+# (서비스마다 데몬 하나, [openbao] AppRole 아이덴티티 하나).
 bootroot service add --service-name edge-proxy \
-  --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
+  --delivery-mode local-file --agent-config "$EDGE_AGENT_CONFIG"
 bootroot service add --service-name web-app \
-  --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
+  --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
 # 4) verify-initial / 9) verify-after-responder-hmac
-bootroot verify --service-name edge-proxy --agent-config "$AGENT_CONFIG_PATH"
-bootroot verify --service-name web-app --agent-config "$AGENT_CONFIG_PATH"
+bootroot verify --service-name edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
+bootroot verify --service-name web-app --agent-config "$WEB_AGENT_CONFIG"
 
 # 5) rotate-infra-secret-id
 # init summary에서

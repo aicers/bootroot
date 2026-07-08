@@ -13,7 +13,6 @@ COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
-AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-$WORKSPACE_DIR/agent.toml}"
 CERTS_DIR="${CERTS_DIR:-$WORKSPACE_DIR/certs}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-120}"
 INFRA_UP_ATTEMPTS="${INFRA_UP_ATTEMPTS:-6}"
@@ -42,6 +41,14 @@ EDGE_SERVICE="edge-proxy"
 EDGE_HOSTNAME="edge-node-01"
 WEB_SERVICE="web-app"
 WEB_HOSTNAME="web-01"
+# Each distinct local service gets its own agent config (and with it
+# its own `[openbao]` AppRole identity, service-keyed state file,
+# eab.json, and daemon process).  The `[openbao]` section holds a
+# single AppRole identity whose policy only reads that service's KV
+# subtree, so sharing one agent config across distinct services is an
+# unsupported topology.
+EDGE_AGENT_CONFIG="$WORKSPACE_DIR/agent-${EDGE_SERVICE}.toml"
+WEB_AGENT_CONFIG="$WORKSPACE_DIR/agent-${WEB_SERVICE}.toml"
 DOMAIN="trusted.domain"
 INSTANCE_ID="001"
 REMOTE_SERVICE="api-gw"
@@ -66,28 +73,21 @@ INFRA_ROTATE_ROLE_ID=""
 INFRA_ROTATE_SECRET_ID=""
 INIT_ROOT_TOKEN=""
 OPENBAO_RECOVERY_OUTPUT_FILE="$ARTIFACT_DIR/openbao-recovery.json"
-# The host-daemon bootroot-agent's fast-poll loop (default
+# Each host-daemon bootroot-agent's fast-poll loop (default
 # fast_poll_interval = 30s) is the only propagation route for rotated
 # per-service secrets.  After `rotate responder-hmac` the harness waits
-# for the running daemon to upsert the new HMAC into agent.toml before
-# driving verification; allow one full poll interval plus generous
-# margin for slow CI runners.
+# for each running daemon to upsert the new HMAC into its own agent
+# config before driving verification; allow one full poll interval
+# plus generous margin for slow CI runners.
 RESPONDER_HMAC_PROPAGATION_ATTEMPTS="${RESPONDER_HMAC_PROPAGATION_ATTEMPTS:-45}"
 RESPONDER_HMAC_PROPAGATION_DELAY_SECS="${RESPONDER_HMAC_PROPAGATION_DELAY_SECS:-2}"
 CURRENT_PHASE="init"
-# PID of the long-running bootroot-agent daemon started for the local
-# services (edge-proxy + web-app share AGENT_CONFIG_PATH).  Required so
-# `bootroot rotate force-reissue --wait` can deliver SIGHUP to a real
-# process — without it, pkill -HUP exits 1 ("no processes matched") and
-# the rotate fails before the wait path runs.
-LOCAL_AGENT_DAEMON_PID=""
-LOCAL_AGENT_DAEMON_LOG="$ARTIFACT_DIR/bootroot-agent.log"
-# EAB artifact provisioned by `service add` next to the service
-# secret_id when EAB exists in KV.  Init runs with --no-eab, so the
-# file is normally absent; the agent treats a missing --eab-file as
-# open enrollment.  Point at the edge-proxy dir because that service's
-# AppRole owns the [openbao] section in the shared agent.toml.
-LOCAL_AGENT_EAB_FILE="$SECRETS_DIR/services/${EDGE_SERVICE}/eab.json"
+# PIDs of the long-running per-service bootroot-agent daemons (one per
+# distinct local service, each bound to its own agent config).
+# Required so `bootroot rotate force-reissue --wait` can deliver SIGHUP
+# to a real process — without it, pkill -HUP exits 1 ("no processes
+# matched") and the rotate fails before the wait path runs.
+LOCAL_AGENT_DAEMON_PIDS=""
 # Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
 # default moved from 5432 to 5433 in #588 §4c; the e2e harness
 # expects 5432 (CI runners free that port before the matrix), so
@@ -222,7 +222,7 @@ cleanup_hosts() {
 cleanup() {
   log_phase "cleanup"
   cleanup_hosts
-  stop_local_bootroot_agent_daemon
+  stop_local_bootroot_agent_daemons
   capture_artifacts
   compose_down
 }
@@ -277,8 +277,9 @@ configure_resolution_mode() {
 }
 
 write_agent_config() {
-  mkdir -p "$(dirname "$AGENT_CONFIG_PATH")" "$CERTS_DIR"
-  cat >"$AGENT_CONFIG_PATH" <<EOF
+  local config_path="$1"
+  mkdir -p "$(dirname "$config_path")" "$CERTS_DIR"
+  cat >"$config_path" <<EOF
 email = "admin@example.com"
 server = "${STEPCA_SERVER_URL}"
 domain = "${DOMAIN}"
@@ -383,18 +384,16 @@ run_bootstrap_chain() {
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 
   log_phase "service-add"
-  # Order matters: EDGE_SERVICE (edge-proxy) is added LAST so the
-  # `[openbao]` fast-poll section its `service add` upserts into the
-  # shared workspace/agent.toml carries edge-proxy's AppRole paths.
-  # The host bootroot-agent daemon authenticates with those
-  # credentials, and `rotate force-reissue --wait` below drives the
-  # KV round-trip against edge-proxy.
+  # Each distinct local service registers its own agent config, so the
+  # `[openbao]` fast-poll section `service add` upserts carries that
+  # service's own AppRole paths and a service-keyed state_path — one
+  # daemon and one identity per service, the supported topology.
   run_bootroot service add \
     --service-name "$WEB_SERVICE" \
     --delivery-mode local-file \
     --hostname "$WEB_HOSTNAME" \
     --domain "$DOMAIN" \
-    --agent-config "$AGENT_CONFIG_PATH" \
+    --agent-config "$WEB_AGENT_CONFIG" \
     --cert-path "$CERTS_DIR/${WEB_SERVICE}.crt" \
     --key-path "$CERTS_DIR/${WEB_SERVICE}.key" \
     --instance-id "$INSTANCE_ID" \
@@ -420,7 +419,7 @@ run_bootstrap_chain() {
     --delivery-mode local-file \
     --hostname "$EDGE_HOSTNAME" \
     --domain "$DOMAIN" \
-    --agent-config "$AGENT_CONFIG_PATH" \
+    --agent-config "$EDGE_AGENT_CONFIG" \
     --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" \
     --key-path "$CERTS_DIR/${EDGE_SERVICE}.key" \
     --instance-id "$INSTANCE_ID" \
@@ -561,8 +560,8 @@ run_verify_pair() {
   local label="$1"
   log_phase "verify-${label}"
   prepare_stepca_validation_targets
-  verify_service_with_retry "$EDGE_SERVICE"
-  verify_service_with_retry "$WEB_SERVICE"
+  verify_service_with_retry "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG"
+  verify_service_with_retry "$WEB_SERVICE" "$WEB_AGENT_CONFIG"
   verify_service_with_retry "$REMOTE_SERVICE" "$REMOTE_AGENT_CONFIG"
   snapshot_cert_meta "$EDGE_SERVICE" "$label"
   snapshot_cert_meta "$WEB_SERVICE" "$label"
@@ -586,67 +585,78 @@ force_reissue_for_service() {
     >>"$RUN_LOG" 2>&1
 }
 
-# Missing-cert path: the host bootroot-agent owns web-app's cert via
-# the shared agent config, so deleting the files and letting the
-# daemon's missing-cert check pick them up is the right reissue
-# trigger here.  The `bootroot rotate force-reissue` wait-path is
-# exercised by the edge-proxy call above.
-force_reissue_for_docker_service() {
+# Missing-cert path: web-app's own host bootroot-agent daemon owns its
+# cert, so deleting the files and letting that daemon's missing-cert
+# check pick them up is the right reissue trigger here.  The `bootroot
+# rotate force-reissue` wait-path is exercised by the edge-proxy call
+# above.
+force_reissue_via_missing_cert() {
   local service="$1"
   rm -f "$CERTS_DIR/${service}.crt" "$CERTS_DIR/${service}.key"
 }
 
-start_local_bootroot_agent_daemon() {
-  if [ -n "$LOCAL_AGENT_DAEMON_PID" ] && kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-    return 0
-  fi
-  [ -f "$AGENT_CONFIG_PATH" ] || fail "agent config missing at $AGENT_CONFIG_PATH"
-  printf '[lifecycle] starting bootroot-agent daemon: --config %s --eab-file %s\n' \
-    "$AGENT_CONFIG_PATH" "$LOCAL_AGENT_EAB_FILE" >>"$RUN_LOG"
+# Starts one bootroot-agent host daemon bound to a single service's own
+# agent config, eab.json, and AppRole identity.
+start_local_agent_daemon() {
+  local service="$1"
+  local config="$2"
+  local log="$ARTIFACT_DIR/bootroot-agent-${service}.log"
+  # EAB artifact provisioned by `service add` next to the service
+  # secret_id when EAB exists in KV.  Init runs with --no-eab, so the
+  # file is normally absent; the agent treats a missing --eab-file as
+  # open enrollment.
+  local eab_file="$SECRETS_DIR/services/${service}/eab.json"
+  [ -f "$config" ] || fail "agent config missing at $config"
+  printf '[lifecycle] starting bootroot-agent daemon for %s: --config %s --eab-file %s\n' \
+    "$service" "$config" "$eab_file" >>"$RUN_LOG"
   # bootroot-agent uses tracing_subscriber::fmt::init(), whose default
   # filter is ERROR.  The readiness probe below greps for an info-level
   # message, so we have to opt into info output explicitly.
   RUST_LOG="${RUST_LOG:-info}" \
-    "$BOOTROOT_AGENT_BIN" --config "$AGENT_CONFIG_PATH" \
-    --eab-file "$LOCAL_AGENT_EAB_FILE" \
-    >>"$LOCAL_AGENT_DAEMON_LOG" 2>&1 &
-  LOCAL_AGENT_DAEMON_PID=$!
+    "$BOOTROOT_AGENT_BIN" --config "$config" \
+    --eab-file "$eab_file" \
+    >>"$log" 2>&1 &
+  local pid=$!
+  LOCAL_AGENT_DAEMON_PIDS="$LOCAL_AGENT_DAEMON_PIDS $pid"
   # Give the daemon time to load config and install its SIGHUP handler;
   # otherwise the first force_reissue may signal it before the handler
   # is ready, masking the wait-path coverage we are trying to add.
   local attempt
   for attempt in $(seq 1 20); do
-    if ! kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-      tail -n 80 "$LOCAL_AGENT_DAEMON_LOG" >>"$RUN_LOG" 2>&1 || true
-      LOCAL_AGENT_DAEMON_PID=""
-      fail "bootroot-agent daemon exited during startup; see $LOCAL_AGENT_DAEMON_LOG"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      tail -n 80 "$log" >>"$RUN_LOG" 2>&1 || true
+      fail "bootroot-agent daemon for ${service} exited during startup; see $log"
     fi
-    if grep -q "Profile .* daemon enabled" "$LOCAL_AGENT_DAEMON_LOG" 2>/dev/null; then
+    if grep -q "Profile .* daemon enabled" "$log" 2>/dev/null; then
       return 0
     fi
     sleep 0.5
   done
-  tail -n 80 "$LOCAL_AGENT_DAEMON_LOG" >>"$RUN_LOG" 2>&1 || true
-  fail "bootroot-agent daemon failed to become ready; see $LOCAL_AGENT_DAEMON_LOG"
+  tail -n 80 "$log" >>"$RUN_LOG" 2>&1 || true
+  fail "bootroot-agent daemon for ${service} failed to become ready; see $log"
 }
 
-stop_local_bootroot_agent_daemon() {
-  if [ -z "$LOCAL_AGENT_DAEMON_PID" ]; then
-    return 0
-  fi
-  if kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-    kill "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
-    local attempt
-    for attempt in $(seq 1 10); do
-      if ! kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-        break
-      fi
-      sleep 0.2
-    done
-    kill -9 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
-  fi
-  wait "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
-  LOCAL_AGENT_DAEMON_PID=""
+start_local_bootroot_agent_daemons() {
+  start_local_agent_daemon "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG"
+  start_local_agent_daemon "$WEB_SERVICE" "$WEB_AGENT_CONFIG"
+}
+
+stop_local_bootroot_agent_daemons() {
+  local pid attempt
+  for pid in $LOCAL_AGENT_DAEMON_PIDS; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      for attempt in $(seq 1 10); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          break
+        fi
+        sleep 0.2
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+  LOCAL_AGENT_DAEMON_PIDS=""
 }
 
 force_reissue_remote() {
@@ -655,13 +665,13 @@ force_reissue_remote() {
 
 force_reissue_all_services() {
   force_reissue_for_service "$EDGE_SERVICE"
-  force_reissue_for_docker_service "$WEB_SERVICE"
+  force_reissue_via_missing_cert "$WEB_SERVICE"
   force_reissue_remote
 }
 
 verify_service_with_retry() {
   local service="$1"
-  local agent_config="${2:-$AGENT_CONFIG_PATH}"
+  local agent_config="$2"
   local attempt
   for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
     if run_bootroot verify --service-name "$service" --agent-config "$agent_config" >>"$RUN_LOG" 2>&1; then
@@ -674,33 +684,36 @@ verify_service_with_retry() {
   done
 }
 
-# Reads the current `[acme].http_responder_hmac` value from the shared
+# Reads the current `[acme].http_responder_hmac` value from the given
 # agent config.
 current_agent_responder_hmac() {
   awk -F'"' '/^[[:space:]]*http_responder_hmac[[:space:]]*=/ {print $2; exit}' \
-    "$AGENT_CONFIG_PATH"
+    "$1"
 }
 
-# Waits for the running bootroot-agent daemon's fast-poll loop to
-# upsert the rotated responder HMAC into agent.toml.  `bootroot rotate
-# responder-hmac` only writes the new HMAC to KV (plus the infra
-# agents); per-service propagation is the daemon's own fast-poll tick
-# (default fast_poll_interval = 30s), so the on-disk value changing is
-# the end-to-end proof that the loop observed and applied the rotation.
+# Waits for one service daemon's fast-poll loop to upsert the rotated
+# responder HMAC into that service's own agent config.  `bootroot
+# rotate responder-hmac` only writes the new HMAC to per-service KV
+# (plus the infra agents); propagation is each daemon's own fast-poll
+# tick (default fast_poll_interval = 30s) under its own AppRole
+# identity, so the on-disk value changing is the end-to-end proof that
+# the loop observed and applied the rotation for that service.
 wait_for_responder_hmac_propagation() {
-  local before="$1"
+  local service="$1"
+  local config="$2"
+  local before="$3"
   local attempt current
   for attempt in $(seq 1 "$RESPONDER_HMAC_PROPAGATION_ATTEMPTS"); do
-    current="$(current_agent_responder_hmac)"
+    current="$(current_agent_responder_hmac "$config")"
     if [ -n "$current" ] && [ "$current" != "$before" ]; then
-      printf '[lifecycle] fast-poll propagated rotated responder HMAC within ~%ss\n' \
-        "$((attempt * RESPONDER_HMAC_PROPAGATION_DELAY_SECS))" >>"$RUN_LOG"
+      printf '[lifecycle] fast-poll propagated rotated responder HMAC for %s within ~%ss\n' \
+        "$service" "$((attempt * RESPONDER_HMAC_PROPAGATION_DELAY_SECS))" >>"$RUN_LOG"
       return 0
     fi
     sleep "$RESPONDER_HMAC_PROPAGATION_DELAY_SECS"
   done
-  tail -n 80 "$LOCAL_AGENT_DAEMON_LOG" >>"$RUN_LOG" 2>&1 || true
-  fail "bootroot-agent fast-poll did not propagate the rotated responder HMAC into $AGENT_CONFIG_PATH within $((RESPONDER_HMAC_PROPAGATION_ATTEMPTS * RESPONDER_HMAC_PROPAGATION_DELAY_SECS))s"
+  tail -n 80 "$ARTIFACT_DIR/bootroot-agent-${service}.log" >>"$RUN_LOG" 2>&1 || true
+  fail "bootroot-agent fast-poll did not propagate the rotated responder HMAC into $config within $((RESPONDER_HMAC_PROPAGATION_ATTEMPTS * RESPONDER_HMAC_PROPAGATION_DELAY_SECS))s"
 }
 
 assert_fingerprint_changed() {
@@ -873,8 +886,9 @@ run_rotations_with_verification() {
   run_verify_pair "after-openbao-recovery"
 
   log_phase "rotate-responder-hmac"
-  local hmac_before_rotate
-  hmac_before_rotate="$(current_agent_responder_hmac)"
+  local edge_hmac_before web_hmac_before
+  edge_hmac_before="$(current_agent_responder_hmac "$EDGE_AGENT_CONFIG")"
+  web_hmac_before="$(current_agent_responder_hmac "$WEB_AGENT_CONFIG")"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
     --openbao-url "http://${STEPCA_HOST_IP}:8200" \
@@ -883,7 +897,10 @@ run_rotations_with_verification() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     responder-hmac >>"$RUN_LOG" 2>&1
-  wait_for_responder_hmac_propagation "$hmac_before_rotate"
+  # Both per-service daemons must observe the rotation independently:
+  # each reads only its own service's KV subtree.
+  wait_for_responder_hmac_propagation "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG" "$edge_hmac_before"
+  wait_for_responder_hmac_propagation "$WEB_SERVICE" "$WEB_AGENT_CONFIG" "$web_hmac_before"
   run_remote_bootstrap
   force_reissue_all_services
   run_verify_pair "after-responder-hmac"
@@ -974,7 +991,7 @@ write_manifest() {
   "mode": "${RESOLUTION_MODE}",
   "compose_file": "${COMPOSE_FILE}",
   "state_file": "${ROOT_DIR}/state.json",
-  "agent_config_path": "${AGENT_CONFIG_PATH}",
+  "agent_config_paths": ["${EDGE_AGENT_CONFIG}", "${WEB_AGENT_CONFIG}"],
   "services": ["${EDGE_SERVICE}", "${WEB_SERVICE}", "${REMOTE_SERVICE}"]
 }
 EOF
@@ -992,7 +1009,8 @@ main() {
   compose_down
   reset_stepca_materials_for_e2e
   install_infra
-  write_agent_config
+  write_agent_config "$EDGE_AGENT_CONFIG"
+  write_agent_config "$WEB_AGENT_CONFIG"
   run_bootstrap_chain
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
@@ -1006,9 +1024,9 @@ main() {
   run_remote_bootstrap
 
   run_verify_pair "initial"
-  start_local_bootroot_agent_daemon
+  start_local_bootroot_agent_daemons
   run_rotations_with_verification
-  stop_local_bootroot_agent_daemon
+  stop_local_bootroot_agent_daemons
 
   log_phase "assert-openbao-audit-log"
   assert_openbao_audit_log

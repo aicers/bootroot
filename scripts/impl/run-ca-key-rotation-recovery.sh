@@ -11,7 +11,6 @@ COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
-AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-$WORKSPACE_DIR/agent.toml}"
 CERTS_DIR="${CERTS_DIR:-$WORKSPACE_DIR/certs}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-120}"
 INFRA_UP_ATTEMPTS="${INFRA_UP_ATTEMPTS:-6}"
@@ -38,6 +37,14 @@ EDGE_SERVICE="edge-proxy"
 EDGE_HOSTNAME="edge-node-01"
 WEB_SERVICE="web-app"
 WEB_HOSTNAME="web-01"
+# Each distinct local service gets its own agent config (and with it
+# its own `[openbao]` AppRole identity, service-keyed state file,
+# eab.json, and daemon process).  The `[openbao]` section holds a
+# single AppRole identity whose policy only reads that service's KV
+# subtree, so sharing one agent config across distinct services is an
+# unsupported topology.
+EDGE_AGENT_CONFIG="$WORKSPACE_DIR/agent-${EDGE_SERVICE}.toml"
+WEB_AGENT_CONFIG="$WORKSPACE_DIR/agent-${WEB_SERVICE}.toml"
 DOMAIN="trusted.domain"
 INSTANCE_ID="001"
 REMOTE_SERVICE="api-gw"
@@ -57,19 +64,12 @@ RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
 CURRENT_PHASE="init"
-# PID of the long-running bootroot-agent daemon started for the local
-# services (edge-proxy + web-app share AGENT_CONFIG_PATH).  Required so
-# `bootroot rotate force-reissue --wait` can deliver SIGHUP to a real
-# process — without it, pkill -HUP exits 1 ("no processes matched") and
-# the rotate fails before the wait path runs.
-LOCAL_AGENT_DAEMON_PID=""
-LOCAL_AGENT_DAEMON_LOG="$ARTIFACT_DIR/bootroot-agent.log"
-# EAB artifact provisioned by `service add` next to the service
-# secret_id when EAB exists in KV.  Init runs with --no-eab, so the
-# file is normally absent; the agent treats a missing --eab-file as
-# open enrollment.  Point at the edge-proxy dir because that service's
-# AppRole owns the [openbao] section in the shared agent.toml.
-LOCAL_AGENT_EAB_FILE="$SECRETS_DIR/services/${EDGE_SERVICE}/eab.json"
+# PIDs of the long-running per-service bootroot-agent daemons (one per
+# distinct local service, each bound to its own agent config).
+# Required so `bootroot rotate force-reissue --wait` can deliver SIGHUP
+# to a real process — without it, pkill -HUP exits 1 ("no processes
+# matched") and the rotate fails before the wait path runs.
+LOCAL_AGENT_DAEMON_PIDS=""
 # Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
 # default moved from 5432 to 5433 in #588 §4c; the e2e harness
 # expects 5432 (CI runners free that port before the matrix), so
@@ -181,7 +181,7 @@ capture_artifacts() {
 
 cleanup() {
   log_phase "cleanup"
-  stop_local_bootroot_agent_daemon
+  stop_local_bootroot_agent_daemons
   capture_artifacts
   compose_down
 }
@@ -331,7 +331,7 @@ assert_fingerprint_changed() {
 }
 
 verify_service_with_retry() {
-  local service="$1" agent_config="${2:-$AGENT_CONFIG_PATH}"
+  local service="$1" agent_config="$2"
   local attempt
   for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
     if run_bootroot verify --service-name "$service" --agent-config "$agent_config" >>"$RUN_LOG" 2>&1; then
@@ -361,12 +361,12 @@ force_reissue_for_service() {
     >>"$RUN_LOG" 2>&1
 }
 
-# Missing-cert path: the host bootroot-agent owns web-app's cert via
-# the shared agent config, so deleting the files and letting the
-# daemon's missing-cert check pick them up is the right reissue
-# trigger here.  The `bootroot rotate force-reissue` wait-path is
-# exercised by the edge-proxy call above.
-force_reissue_for_docker_service() {
+# Missing-cert path: web-app's own host bootroot-agent daemon owns its
+# cert, so deleting the files and letting that daemon's missing-cert
+# check pick them up is the right reissue trigger here.  The `bootroot
+# rotate force-reissue` wait-path is exercised by the edge-proxy call
+# above.
+force_reissue_via_missing_cert() {
   local service="$1"
   rm -f "$CERTS_DIR/${service}.crt" "$CERTS_DIR/${service}.key"
 }
@@ -377,65 +377,76 @@ force_reissue_remote() {
 
 force_reissue_all_services() {
   force_reissue_for_service "$EDGE_SERVICE"
-  force_reissue_for_docker_service "$WEB_SERVICE"
+  force_reissue_via_missing_cert "$WEB_SERVICE"
   force_reissue_remote
 }
 
-start_local_bootroot_agent_daemon() {
-  if [ -n "$LOCAL_AGENT_DAEMON_PID" ] && kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-    return 0
-  fi
-  [ -f "$AGENT_CONFIG_PATH" ] || fail "agent config missing at $AGENT_CONFIG_PATH"
-  printf '[recovery] starting bootroot-agent daemon: --config %s --eab-file %s\n' \
-    "$AGENT_CONFIG_PATH" "$LOCAL_AGENT_EAB_FILE" >>"$RUN_LOG"
+# Starts one bootroot-agent host daemon bound to a single service's own
+# agent config, eab.json, and AppRole identity.
+start_local_agent_daemon() {
+  local service="$1"
+  local config="$2"
+  local log="$ARTIFACT_DIR/bootroot-agent-${service}.log"
+  # EAB artifact provisioned by `service add` next to the service
+  # secret_id when EAB exists in KV.  Init runs with --no-eab, so the
+  # file is normally absent; the agent treats a missing --eab-file as
+  # open enrollment.
+  local eab_file="$SECRETS_DIR/services/${service}/eab.json"
+  [ -f "$config" ] || fail "agent config missing at $config"
+  printf '[recovery] starting bootroot-agent daemon for %s: --config %s --eab-file %s\n' \
+    "$service" "$config" "$eab_file" >>"$RUN_LOG"
   # bootroot-agent uses tracing_subscriber::fmt::init(), whose default
   # filter is ERROR.  The readiness probe below greps for an info-level
   # message, so we have to opt into info output explicitly.
   RUST_LOG="${RUST_LOG:-info}" \
-    "$BOOTROOT_AGENT_BIN" --config "$AGENT_CONFIG_PATH" \
-    --eab-file "$LOCAL_AGENT_EAB_FILE" \
-    >>"$LOCAL_AGENT_DAEMON_LOG" 2>&1 &
-  LOCAL_AGENT_DAEMON_PID=$!
+    "$BOOTROOT_AGENT_BIN" --config "$config" \
+    --eab-file "$eab_file" \
+    >>"$log" 2>&1 &
+  local pid=$!
+  LOCAL_AGENT_DAEMON_PIDS="$LOCAL_AGENT_DAEMON_PIDS $pid"
   local attempt
   for attempt in $(seq 1 20); do
-    if ! kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-      tail -n 80 "$LOCAL_AGENT_DAEMON_LOG" >>"$RUN_LOG" 2>&1 || true
-      LOCAL_AGENT_DAEMON_PID=""
-      fail "bootroot-agent daemon exited during startup; see $LOCAL_AGENT_DAEMON_LOG"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      tail -n 80 "$log" >>"$RUN_LOG" 2>&1 || true
+      fail "bootroot-agent daemon for ${service} exited during startup; see $log"
     fi
-    if grep -q "Profile .* daemon enabled" "$LOCAL_AGENT_DAEMON_LOG" 2>/dev/null; then
+    if grep -q "Profile .* daemon enabled" "$log" 2>/dev/null; then
       return 0
     fi
     sleep 0.5
   done
-  tail -n 80 "$LOCAL_AGENT_DAEMON_LOG" >>"$RUN_LOG" 2>&1 || true
-  fail "bootroot-agent daemon failed to become ready; see $LOCAL_AGENT_DAEMON_LOG"
+  tail -n 80 "$log" >>"$RUN_LOG" 2>&1 || true
+  fail "bootroot-agent daemon for ${service} failed to become ready; see $log"
 }
 
-stop_local_bootroot_agent_daemon() {
-  if [ -z "$LOCAL_AGENT_DAEMON_PID" ]; then
-    return 0
-  fi
-  if kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-    kill "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
-    local attempt
-    for attempt in $(seq 1 10); do
-      if ! kill -0 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null; then
-        break
-      fi
-      sleep 0.2
-    done
-    kill -9 "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
-  fi
-  wait "$LOCAL_AGENT_DAEMON_PID" 2>/dev/null || true
-  LOCAL_AGENT_DAEMON_PID=""
+start_local_bootroot_agent_daemons() {
+  start_local_agent_daemon "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG"
+  start_local_agent_daemon "$WEB_SERVICE" "$WEB_AGENT_CONFIG"
+}
+
+stop_local_bootroot_agent_daemons() {
+  local pid attempt
+  for pid in $LOCAL_AGENT_DAEMON_PIDS; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      for attempt in $(seq 1 10); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          break
+        fi
+        sleep 0.2
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+  LOCAL_AGENT_DAEMON_PIDS=""
 }
 
 run_verify_pair() {
   local label="$1"
   log_phase "verify-${label}"
-  verify_service_with_retry "$EDGE_SERVICE"
-  verify_service_with_retry "$WEB_SERVICE"
+  verify_service_with_retry "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG"
+  verify_service_with_retry "$WEB_SERVICE" "$WEB_AGENT_CONFIG"
   verify_service_with_retry "$REMOTE_SERVICE" "$REMOTE_AGENT_CONFIG"
   snapshot_cert_meta "$EDGE_SERVICE" "$label"
   snapshot_cert_meta "$WEB_SERVICE" "$label"
@@ -500,8 +511,9 @@ run_rotate_ca_key() {
 # ---------------------------------------------------------------------------
 
 write_agent_config() {
-  mkdir -p "$(dirname "$AGENT_CONFIG_PATH")" "$CERTS_DIR"
-  cat >"$AGENT_CONFIG_PATH" <<EOF
+  local config_path="$1"
+  mkdir -p "$(dirname "$config_path")" "$CERTS_DIR"
+  cat >"$config_path" <<EOF
 email = "admin@example.com"
 server = "${STEPCA_SERVER_URL}"
 domain = "${DOMAIN}"
@@ -574,16 +586,14 @@ run_bootstrap_chain() {
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 
   log_phase "service-add"
-  # Order matters: EDGE_SERVICE (edge-proxy) is added LAST so the
-  # `[openbao]` fast-poll section its `service add` upserts into the
-  # shared workspace/agent.toml carries edge-proxy's AppRole paths.
-  # The host bootroot-agent daemon authenticates with those
-  # credentials, and `rotate force-reissue --wait` below drives the
-  # KV round-trip against edge-proxy.
+  # Each distinct local service registers its own agent config, so the
+  # `[openbao]` fast-poll section `service add` upserts carries that
+  # service's own AppRole paths and a service-keyed state_path — one
+  # daemon and one identity per service, the supported topology.
   run_bootroot service add \
     --service-name "$WEB_SERVICE" --delivery-mode local-file \
     --hostname "$WEB_HOSTNAME" --domain "$DOMAIN" \
-    --agent-config "$AGENT_CONFIG_PATH" \
+    --agent-config "$WEB_AGENT_CONFIG" \
     --cert-path "$CERTS_DIR/${WEB_SERVICE}.crt" --key-path "$CERTS_DIR/${WEB_SERVICE}.key" \
     --instance-id "$INSTANCE_ID" \
     --auth-mode approle \
@@ -603,7 +613,7 @@ run_bootstrap_chain() {
   run_bootroot service add \
     --service-name "$EDGE_SERVICE" --delivery-mode local-file \
     --hostname "$EDGE_HOSTNAME" --domain "$DOMAIN" \
-    --agent-config "$AGENT_CONFIG_PATH" \
+    --agent-config "$EDGE_AGENT_CONFIG" \
     --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" --key-path "$CERTS_DIR/${EDGE_SERVICE}.key" \
     --instance-id "$INSTANCE_ID" \
     --auth-mode approle \
@@ -660,7 +670,7 @@ scenario_1_phase3_failure() {
     || fail "S1: unexpected saved phase: $saved_phase (expected 1..6)"
 
   # Restart OpenBao, unseal, then resume rotation.  The running host
-  # bootroot-agent daemon needs no restart: its fast-poll loop
+  # bootroot-agent daemons need no restart: each fast-poll loop
   # re-authenticates on the next tick once OpenBao is back.
   compose start openbao >>"$RUN_LOG" 2>&1
   wait_for_openbao_api
@@ -750,14 +760,14 @@ scenario_3_partial_reissuance() {
 
   # Manually reissue only edge-proxy (1 of 2 LocalFile services)
   force_reissue_for_service "$EDGE_SERVICE"
-  verify_service_with_retry "$EDGE_SERVICE"
+  verify_service_with_retry "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG"
 
   snapshot_cert_meta "$EDGE_SERVICE" "s3-partial"
   [ -f "$CERTS_DIR/${WEB_SERVICE}.crt" ] || fail "S3: web-app old cert should still exist"
 
   # Reissue remaining services
-  force_reissue_for_docker_service "$WEB_SERVICE"
-  verify_service_with_retry "$WEB_SERVICE"
+  force_reissue_via_missing_cert "$WEB_SERVICE"
+  verify_service_with_retry "$WEB_SERVICE" "$WEB_AGENT_CONFIG"
   run_remote_bootstrap
   force_reissue_remote
   verify_service_with_retry "$REMOTE_SERVICE" "$REMOTE_AGENT_CONFIG"
@@ -834,8 +844,8 @@ scenario_5_trustsync_conflict() {
   grep -qi "rotation" "$ARTIFACT_DIR/s5-trustsync-stderr.log" \
     || fail "S5: trust-sync error should mention active rotation"
 
-  # Complete the rotation with --force --cleanup (skip-reissue because
-  # there is no running daemon for the Daemon-type service).
+  # Complete the rotation with --force --cleanup; reissue is skipped
+  # here and driven explicitly via force_reissue_all_services below.
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
   run_remote_bootstrap
@@ -858,7 +868,8 @@ main() {
   compose_down
   reset_stepca_materials_for_e2e
   install_infra
-  write_agent_config
+  write_agent_config "$EDGE_AGENT_CONFIG"
+  write_agent_config "$WEB_AGENT_CONFIG"
   run_bootstrap_chain
   apply_dns_aliases
   wait_for_stepca_http01_targets
@@ -873,13 +884,13 @@ main() {
 
   run_verify_pair "initial"
 
-  start_local_bootroot_agent_daemon
+  start_local_bootroot_agent_daemons
   scenario_1_phase3_failure
   scenario_2_phase4_failure
   scenario_3_partial_reissuance
   scenario_4_finalize_blocked
   scenario_5_trustsync_conflict
-  stop_local_bootroot_agent_daemon
+  stop_local_bootroot_agent_daemons
 }
 
 main "$@"

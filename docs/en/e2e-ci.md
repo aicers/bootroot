@@ -145,14 +145,16 @@ BOOTROOT_LANG=en printf "y\n" | bootroot init \
   --responder-url "$RESPONDER_URL"
 
 # 3) service-add
+# Each distinct local service gets its own agent config (one daemon
+# and one [openbao] AppRole identity per service).
 bootroot service add --service-name edge-proxy \
-  --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
+  --delivery-mode local-file --agent-config "$EDGE_AGENT_CONFIG"
 bootroot service add --service-name web-app \
-  --delivery-mode local-file --agent-config "$AGENT_CONFIG_PATH"
+  --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
 # 4) verify-initial / 9) verify-after-responder-hmac
-bootroot verify --service-name edge-proxy --agent-config "$AGENT_CONFIG_PATH"
-bootroot verify --service-name web-app --agent-config "$AGENT_CONFIG_PATH"
+bootroot verify --service-name edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
+bootroot verify --service-name web-app --agent-config "$WEB_AGENT_CONFIG"
 
 # 5) rotate-infra-secret-id
 # from init summary
