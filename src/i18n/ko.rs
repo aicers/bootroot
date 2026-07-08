@@ -459,7 +459,7 @@ pub(super) static STRINGS: Strings = Strings {
     hint_consumer_reload_service_without_hook: "- {service_name}: 갱신 후 훅이 구성되지 않았습니다. 열린 파일 디스크립터로 인해 컨슈머가 이전 인증서를 계속 사용할 수 있습니다 (이슈 #614).",
     hint_consumer_reload_remediation: "재등록 없이 훅을 설치하려면: `bootroot service update --service-name <name> --reload-style {sighup|systemd|docker-restart} --reload-target <process|unit|container>` (또는 저수준 `--post-renew-command` 형식 사용).",
     hint_reinit_reload_style: "`bootroot service add ...`를 다시 실행할 때 `--reload-style sighup|systemd|docker-restart --reload-target <target>`을 함께 전달하여 갱신 후 훅이 미리 등록되도록 하세요. 그렇지 않으면 이후 회전 후에도 컨슈머가 열린 파일 디스크립터로 이전 인증서를 계속 사용할 수 있습니다 (이슈 #614).",
-    rotate_sidecar_skip_remote: "- {service_name}: 원격 사이드카 건너뜀; OpenBao Agent가 {interval} 이내에 KV 폴링을 통해 새 HMAC를 가져옵니다",
+    rotate_sidecar_skip_remote: "- {service_name}: 원격 사이드카 건너뜀; 원격 bootroot-agent 패스트 폴 루프가 {interval} 이내에 KV 폴링을 통해 새 HMAC를 가져옵니다",
     error_openbao_bind_wildcard_required: "OpenBao를 와일드카드 주소(0.0.0.0 또는 [::])에 바인딩하려면 --openbao-bind-wildcard로 와일드카드 의도를 확인해야 합니다",
     error_openbao_bind_tls_flag_required: "비루프백 OpenBao 바인딩에는 --openbao-tls-required로 필수 TLS를 확인해야 합니다",
     error_openbao_bind_tls_missing: "비루프백 OpenBao 바인딩에는 TLS가 필요합니다: {details}",

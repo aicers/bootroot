@@ -30,6 +30,12 @@ pub const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
 ///
 /// Full path: `{kv_mount}/data/bootroot/services/<service>/secret_id`.
 pub const SERVICE_SECRET_ID_KV_SUFFIX: &str = "secret_id";
+/// KV v2 path suffix carrying the service HTTP-01 responder shared HMAC
+/// (payload `{ "hmac": <value> }`) the remote fast-poll loop refreshes into
+/// `[acme].http_responder_hmac`.
+///
+/// Full path: `{kv_mount}/data/bootroot/services/<service>/http_responder_hmac`.
+pub const SERVICE_RESPONDER_HMAC_KV_SUFFIX: &str = "http_responder_hmac";
 /// Payload field holding the RFC3339 UTC timestamp of the request.
 pub const REISSUE_REQUESTED_AT_KEY: &str = "requested_at";
 /// Payload field describing who issued the request (operator label).
@@ -438,6 +444,17 @@ pub fn build_trust_updates(
         (CA_BUNDLE_PATH_KEY, ca_bundle_path.display().to_string()),
         (TRUSTED_CA_KEY, rendered_fingerprints),
     ]
+}
+
+/// Name of the `agent.toml` section carrying the ACME responder HMAC.
+pub const ACME_SECTION: &str = ACME_SECTION_NAME;
+
+/// Builds the `[acme]` section update carrying the HTTP-01 responder shared
+/// HMAC for a managed service profile. Mirrors [`build_trust_updates`] so the
+/// remote fast-poll loop upserts the same key the bootstrap wrote.
+#[must_use]
+pub fn build_responder_hmac_updates(hmac: &str) -> Vec<(&'static str, String)> {
+    vec![(HTTP_RESPONDER_HMAC_KEY, hmac.to_string())]
 }
 
 /// Builds an `OpenBao` Agent ctmpl for managed `agent.toml` updates.

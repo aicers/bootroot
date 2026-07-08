@@ -459,7 +459,7 @@ pub(super) static STRINGS: Strings = Strings {
     hint_consumer_reload_service_without_hook: "- {service_name}: NO post-renew hook configured; consumer may keep serving the previous cert via an open file descriptor (issue #614).",
     hint_consumer_reload_remediation: "Install a hook in place without re-onboarding: `bootroot service update --service-name <name> --reload-style {sighup|systemd|docker-restart} --reload-target <process|unit|container>` (or use the low-level `--post-renew-command` form).",
     hint_reinit_reload_style: "When re-running `bootroot service add ...`, pass `--reload-style sighup|systemd|docker-restart --reload-target <target>` so a post-renew hook is registered up front — otherwise consumers can keep serving the previous cert through an open file descriptor after later rotations (issue #614).",
-    rotate_sidecar_skip_remote: "- {service_name}: remote sidecar skipped; OpenBao Agent will pick up the new HMAC via KV polling within {interval}",
+    rotate_sidecar_skip_remote: "- {service_name}: remote sidecar skipped; the remote bootroot-agent fast-poll loop will pick up the new HMAC via KV polling within {interval}",
     error_openbao_bind_wildcard_required: "Binding OpenBao to a wildcard address (0.0.0.0 or [::]) requires --openbao-bind-wildcard to confirm wildcard intent",
     error_openbao_bind_tls_flag_required: "Non-loopback OpenBao binding requires --openbao-tls-required to acknowledge mandatory TLS",
     error_openbao_bind_tls_missing: "Non-loopback OpenBao binding requires TLS: {details}",
