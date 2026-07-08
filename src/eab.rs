@@ -113,10 +113,15 @@ pub async fn remove_eab_file(path: &Path) -> anyhow::Result<bool> {
 
 /// Loads EAB credentials from CLI arguments or a JSON file.
 ///
+/// A configured `--eab-file` that does not exist resolves to `None` (open
+/// enrollment): an absent file is the durable cleared representation written by
+/// `bootroot-remote bootstrap` and the fast-poll `eab-clear` apply.
+///
 /// # Errors
 ///
 /// Returns an error if:
-/// - The file path is provided but cannot be read.
+/// - The file path is provided and exists but cannot be read (e.g.
+///   permissions).
 /// - The file content is not valid JSON.
 pub async fn load_credentials(
     cli_kid: Option<String>,
@@ -130,11 +135,19 @@ pub async fn load_credentials(
 
     // 2. Try loading from file
     if let Some(path) = file_path {
-        // Read file directly. If it fails (e.g. not found), we return Error.
-        // This fixes "collapsible_if" and improves UX (explicit failure).
-        let content = fs::read_to_string(&path)
-            .await
-            .context("Failed to read EAB file")?;
+        // An absent `--eab-file` is the durable "no EAB" representation on
+        // remote hosts: `bootroot-remote bootstrap` removes `eab.json` when KV
+        // holds no EAB, and the fast-poll loop removes it on an `eab-clear`. So
+        // a configured-but-missing file means open enrollment, not a hard
+        // error -- otherwise a restart or SIGHUP after a clear would fail to
+        // load even though the running process was already using no EAB, which
+        // would break the "durable across restart" contract. Other read
+        // failures (permissions, etc.) still surface as errors.
+        let content = match fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).context("Failed to read EAB file"),
+        };
 
         if content.trim().is_empty() {
             return Ok(None);
@@ -202,16 +215,33 @@ mod tests {
     }
     #[tokio::test]
     async fn test_load_credentials_file_not_found() {
-        // Path that definitely doesn't exist
+        // A configured-but-missing `--eab-file` is the durable cleared
+        // representation, so the loader reports no credentials (open
+        // enrollment) rather than erroring.
         let path = PathBuf::from("/non/existent/path/for/bootroot/test.json");
-        let result = load_credentials(None, None, Some(path)).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to read EAB file")
-        );
+        let result = load_credentials(None, None, Some(path)).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_credentials_after_clear_returns_none() {
+        // Regression for the restart/SIGHUP path after `rotate eab-clear`:
+        // once the fast-poll loop (or bootstrap) removes `eab.json`, the same
+        // startup load path must resolve to `None` so a restart is consistent
+        // with the running process's cleared `default_eab`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets").join("eab.json");
+
+        write_eab_file(&path, "kid-1", "hmac-1").await.unwrap();
+        let loaded = load_credentials(None, None, Some(path.clone()))
+            .await
+            .unwrap()
+            .expect("credentials present before clear");
+        assert_eq!(loaded.kid, "kid-1");
+
+        assert!(remove_eab_file(&path).await.unwrap());
+        let after_clear = load_credentials(None, None, Some(path)).await.unwrap();
+        assert!(after_clear.is_none());
     }
     #[tokio::test]
     async fn test_load_credentials_none() {

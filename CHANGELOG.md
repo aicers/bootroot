@@ -659,6 +659,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   live value, so a running agent's next renewal binds with the new EAB
   (or without one) without a restart or re-bootstrap; the on-disk write
   precedes the in-memory update so a restart reloads a consistent value.
+  So that the cleared state is equally durable, `--eab-file` loading now
+  treats a configured-but-missing file as open enrollment (no EAB) instead
+  of a hard error, matching the absent-file representation both the
+  fast-poll clear and `bootroot-remote bootstrap` write; a restart or
+  SIGHUP after `rotate eab-clear` therefore loads the same `None` the
+  running process already used rather than failing to start.
   Partial or ambiguous payloads (one of `kid`/`hmac` empty) are rejected
   and retried on the next tick rather than recorded as applied. The
   refresh is scoped to the `--eab-file` artifact only: when EAB was pinned
