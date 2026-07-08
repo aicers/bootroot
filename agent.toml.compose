@@ -1,5 +1,5 @@
 # Bootroot Agent Docker Compose Config (Multi-Profile)
-# This file is for daemon profiles only. Docker sidecars use runtime args/env.
+# bootroot-agent runs as a host daemon and reads this file for its profiles.
 
 email = "admin@example.com"
 server = "https://bootroot-ca:9000/acme/acme/directory"

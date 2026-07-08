@@ -138,16 +138,36 @@ key/value secrets engine). For bootroot, store and inject:
 - HTTP-01 responder HMAC
 - EAB `kid`/`hmac`
 
-### Secret injection flow (OpenBao Agent)
+### Secret delivery flows
 
-Runtime services do not talk to OpenBao directly. The **OpenBao Agent**
-logs in with AppRole and renders secrets to files:
+Two distinct flows keep secrets current at runtime.
 
-- OpenBao Agent logs in with AppRole (role_id + secret_id).
-- Renders templates to files (e.g., `password.txt`, `responder.toml`,
-  `agent.toml`).
-- `bootroot-agent`, the HTTP-01 responder, and step-ca read the rendered
-  files.
+**Infrastructure components (step-ca, HTTP-01 responder).** These do not
+talk to OpenBao directly. `bootroot init` provisions a dedicated
+**OpenBao Agent** for each (`openbao-agent-stepca`,
+`openbao-agent-responder`):
+
+- The OpenBao Agent logs in with AppRole (role_id + secret_id).
+- It renders templates to files (e.g., `password.txt`, `responder.toml`).
+- step-ca and the HTTP-01 responder read the rendered files.
+
+**Runtime services (bootroot-agent).** No per-service OpenBao Agent runs.
+`bootroot-agent` authenticates to OpenBao itself with AppRole and its
+**fast-poll loop** keeps its own material current from KV:
+
+- trust anchors (`ca-bundle.pem` and the `trusted_ca_sha256` pins in
+  `agent.toml`),
+- its own `secret_id` (re-read from disk on each re-login, refreshed from
+  KV by the loop),
+- the HTTP-01 responder HMAC,
+- EAB credentials (written to / removed from `eab.json`, consumed via
+  `--eab-file`).
+
+`bootroot service add --delivery-mode local-file` writes an `[openbao]`
+section into the service's `agent.toml` (url, kv_mount, role_id_path,
+secret_id_path, ca_bundle_path, state_path) that activates this loop —
+the same mechanism `bootroot-remote bootstrap` provisions on remote
+hosts, so both delivery modes share one secret-delivery path.
 
 The `bootroot` CLI calls the OpenBao API only for **administrative actions**
 like init/rotate.
@@ -181,8 +201,9 @@ manual seal, or recovery procedures that transition the node back to sealed.
 
 #### AppRole credentials
 
-After bootstrap, the OpenBao Agent authenticates using **AppRole**
-(role_id + secret_id) and receives short-lived tokens. Policies should grant
+After bootstrap, the infra OpenBao Agents and each service's
+`bootroot-agent` authenticate using **AppRole**
+(role_id + secret_id) and receive short-lived tokens. Policies should grant
 only the minimum paths required (read-only over a runtime service's KV
 subtree, except a narrow write on its own `reissue` path so the fast-poll
 loop can acknowledge a `force-reissue` completion). AppRole
@@ -202,13 +223,13 @@ blast radius if the host is compromised.
 
 To support one of Bootroot's key goals, automated certificate
 issuance/renewal for services, Bootroot provides two service-add modes.
-For issuance/renewal to work, OpenBao Agent and bootroot-agent must be
+For issuance/renewal to work, bootroot-agent must be
 configured correctly per service. How `bootroot service add` applies those
 agent settings differs depending on
 whether the service is on the step-ca machine or on a different machine.
 
-- Same machine: the `bootroot` CLI can directly apply local OpenBao Agent/bootroot-agent
-  related configuration files.
+- Same machine: the `bootroot` CLI can directly apply local bootroot-agent
+  configuration files.
 - Different machine: the `bootroot` CLI cannot directly modify remote files, so
   remote synchronization via `bootroot-remote` on the service machine is
   required.
@@ -216,22 +237,24 @@ whether the service is on the step-ca machine or on a different machine.
 In `bootroot service add`, `--delivery-mode` is the selector option.
 `local-file` and `remote-bootstrap` are the two choices for that option.
 
-- `local-file`: used when the service runs on the step-ca machine.
+- `local-file`: used when the service runs on the step-ca machine. The CLI
+  writes the agent config directly, including the `[openbao]` fast-poll
+  section, and provisions `eab.json` next to the service's `secret_id`.
 - `remote-bootstrap`: used when the service runs on a different machine; the
   service machine applies initial configuration via
   `bootroot-remote bootstrap` (one-shot).
   In this flow, the `bootroot` CLI on the step-ca machine writes desired
   service state, and `bootroot-remote bootstrap` on the service machine reads
-  and applies it in a single run. It installs no OpenBao Agent sidecar; the
-  remote `bootroot-agent` authenticates directly via AppRole. After initial
-  bootstrap the running agent is self-sufficient: its fast-poll loop refreshes
-  its own `secret_id` and re-renders trust from OpenBao, so a `secret_id`
-  rotation needs no operator action on the remote host.
+  and applies it in a single run.
   `bootroot-remote apply-secret-id` is only a recovery path for an agent that
   was offline past its `secret_id_ttl` and whose credential already expired.
 
 In both delivery modes, the intended model is the same: prepare trust first,
-then start `bootroot-agent` with verification enabled. `local-file` applies
-that trust directly on the step-ca host, while `remote-bootstrap` applies the
-initial trust on the service host through `bootroot-remote bootstrap` and the
-running agent thereafter re-renders trust itself through its fast-poll loop.
+then start `bootroot-agent` with verification enabled, running as a host
+daemon (e.g., under systemd). No per-service OpenBao Agent is installed in
+either mode; the running agent is self-sufficient. Its fast-poll loop
+refreshes its own `secret_id`, the responder HMAC, and EAB, and re-renders
+trust from OpenBao, so rotations need no operator action on the service
+host. `local-file` applies the initial trust directly on the step-ca host,
+while `remote-bootstrap` applies it on the service host through
+`bootroot-remote bootstrap`.

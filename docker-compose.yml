@@ -85,11 +85,8 @@ services:
     container_name: bootroot-agent
     restart: always
     labels:
-      # Identifying label inspected by `bootroot service add
-      # --deploy-type=docker` to confirm that the supplied
-      # `--container-name` actually points at a bootroot-agent. Keep this
-      # label in sync with `BOOTROOT_AGENT_LABEL_KEY` /
-      # `BOOTROOT_AGENT_LABEL_VALUE` in src/commands/service/agent_identity.rs.
+      # Identifying label so operators and tooling can recognise the
+      # demo bootroot-agent container at a glance.
       bootroot.role: "agent"
     depends_on:
       - step-ca

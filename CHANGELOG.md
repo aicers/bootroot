@@ -14,6 +14,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Removed
 
+- Retired the per-service local OpenBao Agent sidecar and the local
+  Docker-sidecar run model for `bootroot-agent`. `bootroot service add
+  --delivery-mode local-file` no longer generates per-service OpenBao
+  Agent artifacts (`agent.hcl` / `.ctmpl` templates / token sink) or
+  relies on `bootroot-openbao-agent-<service>` containers, and the
+  `bootroot service openbao-sidecar start|refresh` subcommands (plus
+  the deprecated `service agent` alias) are gone. The `service add
+  --deploy-type` and `--container-name` flags are removed together with
+  the `deploy_type` / `container_name` fields in `state.json` — there
+  is no per-service Docker deployment variant left to select. The infra
+  OpenBao Agents provisioned by `bootroot init` (`openbao-agent-stepca`,
+  `openbao-agent-responder`) are unchanged. (Closes #691)
 - Dropped the now-dead OpenBao Agent sidecar artifacts that
   `bootroot-remote bootstrap` generated for `remote-bootstrap` services
   (`agent.hcl`, `agent.toml.ctmpl`, `ca-bundle.pem.ctmpl`, and the token
@@ -1373,6 +1385,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Unified local and remote secret delivery on the `bootroot-agent`
+  fast-poll self-auth loop. `bootroot service add --delivery-mode
+  local-file` now writes the same `[openbao]` section into `agent.toml`
+  that `bootroot-remote bootstrap` provisions (`url`, `kv_mount`,
+  `role_id_path`, `secret_id_path`, `ca_bundle_path`, and an absolute
+  service-keyed `state_path` adjacent to `agent.toml`, e.g.
+  `bootroot-agent-state-<service>.json`), provisions `eab.json` next to
+  the service's `secret_id` (and removes it when KV holds no EAB), and
+  prints the daemon run command
+  `bootroot-agent --config <agent.toml> --eab-file <eab.json>`. The
+  local agent runs only as a hardened non-root systemd host daemon;
+  rotation flows (`approle-secret-id`, `responder-hmac`, `eab-clear`,
+  CA/trust) propagate to local services through the running agent's
+  fast-poll loop with no per-service process restarts, and local
+  `rotate force-reissue` keeps its cert-delete + `pkill -HUP` path.
+  Containerized consumer applications remain supported: the host daemon
+  writes certs to a host directory the app container bind-mounts, and a
+  `--reload-style docker-restart --reload-target <container>`
+  post-renew hook reloads the container (a hardened non-root unit needs
+  `SupplementaryGroups=docker` for that hook — Docker-socket access is
+  root-equivalent — or should prefer sighup/systemd/custom-command
+  reloads). (#691)
 - `bootroot rotate force-reissue --wait` now exits with status `124`
   (the GNU `timeout(1)` convention) when the wait window elapses
   without the agent reporting completion. The previous behaviour was
