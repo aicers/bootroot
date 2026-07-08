@@ -67,7 +67,7 @@ pub enum EabPayload {
 /// ambiguous shapes (an empty `kid` with a non-empty `hmac` or vice versa),
 /// a missing key, or a non-string value.
 ///
-/// The clear shape must NOT be routed through [`parse_required_string`]: that
+/// The clear shape must NOT be routed through `parse_required_string`: that
 /// helper trims and rejects empty strings, which would misclassify a clear as
 /// malformed and prevent it from ever applying. The KV payload keys the secret
 /// as `hmac` (distinct from the on-disk `eab.json` `key` alias).
