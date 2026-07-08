@@ -35,8 +35,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   renders trust via its fast-poll loop, these artifacts are superseded.
   Per the artifact `schema_version` contract, removing fields is breaking:
   `schema_version` is bumped from `3` to `4` and `bootroot-remote` now
-  accepts the `1..=4` range. The local-file delivery path is unaffected —
-  it still renders its own `.ctmpl` templates.
+  accepts the `1..=4` range. The local-file `.ctmpl` rendering was
+  subsequently removed as well (see the #691 entry above).
 - Removed ACME EAB auto-issuance and bootroot-side enforcement because
   the bundled OSS step-ca does not support EAB (EAB is a commercial
   Smallstep-only feature). The `bootroot rotate eab` subcommand, the
