@@ -91,9 +91,14 @@ case_runner_timer() {
 
 case_infra_lifecycle() {
   local case_dir="$ARTIFACT_DIR/infra-lifecycle"
+  # Verify retries sized to cover a full bootroot-agent fast-poll
+  # interval (default 30s) — the only propagation route for rotated
+  # per-service secrets in the daemon-only model.
   ARTIFACT_DIR="$case_dir" \
   PROJECT_NAME="${PROJECT_PREFIX}-lifecycle-$$" \
   TIMEOUT_SECS="$TIMEOUT_SECS_LIFECYCLE" \
+  VERIFY_ATTEMPTS=20 \
+  VERIFY_DELAY_SECS=4 \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
   "$ROOT_DIR/scripts/impl/run-local-lifecycle.sh"

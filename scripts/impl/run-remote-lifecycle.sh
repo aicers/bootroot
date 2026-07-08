@@ -322,7 +322,6 @@ run_bootstrap_chain() {
   log_phase "service-add"
   run_bootroot_control service add \
     --service-name "$SERVICE_NAME" \
-    --deploy-type daemon \
     --delivery-mode remote-bootstrap \
     --hostname "$HOSTNAME" \
     --domain "$DOMAIN" \
@@ -336,7 +335,6 @@ run_bootstrap_chain() {
 
   run_bootroot_control service add \
     --service-name "$SERVICE_NAME_2" \
-    --deploy-type docker \
     --delivery-mode remote-bootstrap \
     --hostname "$HOSTNAME_2" \
     --domain "$DOMAIN" \
@@ -344,8 +342,6 @@ run_bootstrap_chain() {
     --cert-path "$REMOTE_CERTS_DIR/${SERVICE_NAME_2}.crt" \
     --key-path "$REMOTE_CERTS_DIR/${SERVICE_NAME_2}.key" \
     --instance-id "$INSTANCE_ID_2" \
-    --container-name "$SERVICE_NAME_2" \
-    --no-validate-agent \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1

@@ -104,7 +104,7 @@ capture_artifacts() {
 snapshot_state() {
   local label="$1"
   mkdir -p "$ARTIFACT_DIR/snapshots/$label"
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     cp -f "$state_path" "$ARTIFACT_DIR/snapshots/$label/state-${node}-${service}.json" 2>/dev/null || true
     cp -f "$summary_json_path" "$ARTIFACT_DIR/snapshots/$label/summary-${node}-${service}.json" 2>/dev/null || true
   done <"$SERVICES_TSV"
@@ -142,7 +142,7 @@ import json, sys
 with open(sys.argv[1], encoding='utf-8') as fh:
     layout = json.load(fh)
 for svc in layout['services']:
-    fields = [svc['node_id'], svc['service_name'], svc['work_dir'], svc['role_id_path'], svc['secret_id_path'], svc['eab_file_path'], svc['agent_config_path'], svc['ca_bundle_path'], svc['summary_json_path'], svc['state_path'], svc['deploy_type'], svc['hostname'], svc['domain'], svc['instance_id']]
+    fields = [svc['node_id'], svc['service_name'], svc['work_dir'], svc['role_id_path'], svc['secret_id_path'], svc['eab_file_path'], svc['agent_config_path'], svc['ca_bundle_path'], svc['summary_json_path'], svc['state_path'], svc['hostname'], svc['domain'], svc['instance_id']]
     print("\t".join(fields))
 PY
 }
@@ -178,7 +178,7 @@ refresh_leaves() {
   # `run_verify_all 0 "none"` runs before any bootstrap has populated
   # agent.toml, so the chain check there is a no-op and we only need
   # leaves once a bootstrap has written `ca_bundle_path`.
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     local current_dir="$MOCK_OPENBAO_TRUST_DIR/$service/current"
     local ca_cert="$current_dir/ca.crt"
     local ca_key="$current_dir/ca.key"
@@ -224,7 +224,7 @@ CNF
 bootstrap_all() {
   local cycle="$1"
   local item="$2"
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     set_context "bootstrap" "$node" "$service" "$work_dir"
     log_phase "bootstrap" "$node" "$service" "$cycle" "$item"
     local output_file="$ARTIFACT_DIR/bootstrap-output-${node}-${service}.json"
@@ -349,7 +349,7 @@ PY
 set_versions_all() {
   local mock_item="$1"
   local version="$2"
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     control_mock "set-version" "{\"service\":\"$service\",\"item\":\"$mock_item\",\"version\":$version}"
   done <"$SERVICES_TSV"
 }
@@ -357,7 +357,7 @@ set_versions_all() {
 run_verify_all() {
   local cycle="$1"
   local item="$2"
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     set_context "renew" "$node" "$service" "$agent_config_path"
     log_phase "renew" "$node" "$service" "$cycle" "$item"
     set_context "verify" "$node" "$service" "$agent_config_path"
@@ -378,7 +378,7 @@ cleanup() {
     kill "$MOCK_OPENBAO_PID" >/dev/null 2>&1 || true
     wait "$MOCK_OPENBAO_PID" 2>/dev/null || true
   fi
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     log_phase "cleanup" "$node" "$service" 0 "all"
   done <"$SERVICES_TSV" 2>/dev/null || true
   capture_artifacts
@@ -395,7 +395,7 @@ main() {
   ensure_prerequisites
   generate_workspace
 
-  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path deploy_type hostname domain instance_id; do
+  while IFS=$'\t' read -r node service work_dir role_id_path secret_id_path eab_file_path agent_config_path ca_bundle_path summary_json_path state_path hostname domain instance_id; do
     set_context "bootstrap" "$node" "$service" "$state_path"
     log_phase "bootstrap" "$node" "$service" 0 "all"
   done <"$SERVICES_TSV"

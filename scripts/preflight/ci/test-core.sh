@@ -83,7 +83,6 @@ EOF
 
 cargo run --bin bootroot -- service add \
   --service-name edge-proxy \
-  --deploy-type daemon \
   --hostname edge-node-01 \
   --domain trusted.domain \
   --agent-config "$(pwd)/tmp/agent.toml" \
@@ -94,15 +93,12 @@ cargo run --bin bootroot -- service add \
 
 cargo run --bin bootroot -- service add \
   --service-name web-app \
-  --deploy-type docker \
   --hostname web-01 \
   --domain trusted.domain \
   --agent-config "$(pwd)/tmp/agent.toml" \
   --cert-path "$(pwd)/certs/web-app.crt" \
   --key-path "$(pwd)/certs/web-app.key" \
   --instance-id 001 \
-  --container-name web-app \
-  --no-validate-agent \
   --root-token "$ROOT_TOKEN"
 
 RESPONDER_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"

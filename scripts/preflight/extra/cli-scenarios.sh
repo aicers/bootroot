@@ -200,7 +200,6 @@ run_service_scenarios() {
 
   cargo run --bin bootroot -- service add \
     --service-name edge-proxy \
-    --deploy-type daemon \
     --hostname edge-node-01 \
     --domain trusted.domain \
     --agent-config "$ROOT_DIR/tmp/agent.toml" \
@@ -213,15 +212,12 @@ run_service_scenarios() {
 
   cargo run --bin bootroot -- service add \
     --service-name web-app \
-    --deploy-type docker \
     --hostname web-01 \
     --domain trusted.domain \
     --agent-config "$ROOT_DIR/tmp/agent.toml" \
     --cert-path "$ROOT_DIR/certs/web-app.crt" \
     --key-path "$ROOT_DIR/certs/web-app.key" \
     --instance-id 001 \
-    --container-name web-app \
-    --no-validate-agent \
     --auth-mode approle \
     --approle-role-id "$runtime_service_add_role_id" \
     --approle-secret-id "$runtime_service_add_secret_id"

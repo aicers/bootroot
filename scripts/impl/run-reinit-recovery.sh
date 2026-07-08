@@ -513,7 +513,7 @@ run_bootstrap_init() {
 
   log_phase "bootstrap-service-add"
   run_bootroot service add \
-    --service-name "$EDGE_SERVICE" --deploy-type daemon --delivery-mode local-file \
+    --service-name "$EDGE_SERVICE" --delivery-mode local-file \
     --hostname "$EDGE_HOSTNAME" --domain "$DOMAIN" \
     --agent-config "$AGENT_CONFIG_PATH" \
     --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" \

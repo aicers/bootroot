@@ -33,8 +33,6 @@ HTTP01_TARGET_ATTEMPTS="${HTTP01_TARGET_ATTEMPTS:-40}"
 HTTP01_TARGET_DELAY_SECS="${HTTP01_TARGET_DELAY_SECS:-2}"
 RESPONDER_READY_ATTEMPTS="${RESPONDER_READY_ATTEMPTS:-30}"
 RESPONDER_READY_DELAY_SECS="${RESPONDER_READY_DELAY_SECS:-1}"
-SIDECAR_OBA_READY_ATTEMPTS="${SIDECAR_OBA_READY_ATTEMPTS:-30}"
-SIDECAR_OBA_READY_DELAY_SECS="${SIDECAR_OBA_READY_DELAY_SECS:-2}"
 
 EDGE_SERVICE="edge-proxy"
 EDGE_HOSTNAME="edge-node-01"
@@ -58,11 +56,6 @@ RUNTIME_SERVICE_ADD_ROLE_ID=""
 RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
-# Use a daemon-deploy service for the OBA exercise so the bootroot
-# sidecar daemon bind-mounts land the rendered agent.toml at the same
-# host path the test issues certs against (`$AGENT_CONFIG_PATH`).
-SIDECAR_OBA_SERVICE="$EDGE_SERVICE"
-SIDECAR_OBA_CONTAINER="bootroot-openbao-agent-${SIDECAR_OBA_SERVICE}"
 CURRENT_PHASE="init"
 # PID of the long-running bootroot-agent daemon started for the local
 # services (edge-proxy + web-app share AGENT_CONFIG_PATH).  Required so
@@ -71,6 +64,12 @@ CURRENT_PHASE="init"
 # the rotate fails before the wait path runs.
 LOCAL_AGENT_DAEMON_PID=""
 LOCAL_AGENT_DAEMON_LOG="$ARTIFACT_DIR/bootroot-agent.log"
+# EAB artifact provisioned by `service add` next to the service
+# secret_id when EAB exists in KV.  Init runs with --no-eab, so the
+# file is normally absent; the agent treats a missing --eab-file as
+# open enrollment.  Point at the edge-proxy dir because that service's
+# AppRole owns the [openbao] section in the shared agent.toml.
+LOCAL_AGENT_EAB_FILE="$SECRETS_DIR/services/${EDGE_SERVICE}/eab.json"
 # Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
 # default moved from 5432 to 5433 in #588 §4c; the e2e harness
 # expects 5432 (CI runners free that port before the matrix), so
@@ -178,42 +177,12 @@ capture_artifacts() {
   compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs bootroot-openbao-agent-stepca >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs bootroot-openbao-agent-responder >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
-  docker logs "$SIDECAR_OBA_CONTAINER" >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
-}
-
-start_service_sidecar_oba() {
-  local service="$1"
-  local container="bootroot-openbao-agent-${service}"
-  # Remove the pre-seeded config so readiness waits for sidecar-rendered content.
-  rm -f "$AGENT_CONFIG_PATH"
-  docker rm -f "$container" >/dev/null 2>&1 || true
-  # Exercise the same code path operators use rather than an inline
-  # `docker run` shortcut.  See issue #578.
-  run_bootroot service openbao-sidecar start \
-    --service-name "$service" \
-    --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
-  local attempt
-  for attempt in $(seq 1 "$SIDECAR_OBA_READY_ATTEMPTS"); do
-    if [ -f "$AGENT_CONFIG_PATH" ] &&
-      grep -Eq '^[[:space:]]*http_responder_hmac[[:space:]]*=[[:space:]]*"[^"]+"' \
-        "$AGENT_CONFIG_PATH" 2>/dev/null; then
-      return 0
-    fi
-    sleep "$SIDECAR_OBA_READY_DELAY_SECS"
-  done
-  docker logs "$container" >>"$RUN_LOG" 2>&1 || true
-  fail "sidecar OBA ($container) did not render agent config within timeout"
-}
-
-stop_service_sidecar_oba() {
-  docker rm -f "$SIDECAR_OBA_CONTAINER" >/dev/null 2>&1 || true
 }
 
 cleanup() {
   log_phase "cleanup"
   stop_local_bootroot_agent_daemon
   capture_artifacts
-  stop_service_sidecar_oba
   compose_down
 }
 
@@ -389,16 +358,11 @@ force_reissue_for_service() {
     >>"$RUN_LOG" 2>&1
 }
 
-# Docker-deploy local-file path: web-app is registered with
-# --deploy-type docker --container-name web-app for service-add coverage,
-# but no real `web-app` container runs in this scenario.  The host
-# bootroot-agent owns the cert via the shared agent config, so deleting
-# the files and letting the daemon's missing-cert check pick them up is
-# the right reissue trigger here.  The `bootroot rotate force-reissue`
-# wait-path is exercised by the daemon-deploy edge-proxy call above.
-# Because no real `web-app` container exists, the service-add command
-# above passes `--no-validate-agent` to skip the docker-mode identity
-# check introduced in #631.
+# Missing-cert path: the host bootroot-agent owns web-app's cert via
+# the shared agent config, so deleting the files and letting the
+# daemon's missing-cert check pick them up is the right reissue
+# trigger here.  The `bootroot rotate force-reissue` wait-path is
+# exercised by the edge-proxy call above.
 force_reissue_for_docker_service() {
   local service="$1"
   rm -f "$CERTS_DIR/${service}.crt" "$CERTS_DIR/${service}.key"
@@ -419,13 +383,14 @@ start_local_bootroot_agent_daemon() {
     return 0
   fi
   [ -f "$AGENT_CONFIG_PATH" ] || fail "agent config missing at $AGENT_CONFIG_PATH"
-  printf '[recovery] starting bootroot-agent daemon: --config %s\n' \
-    "$AGENT_CONFIG_PATH" >>"$RUN_LOG"
+  printf '[recovery] starting bootroot-agent daemon: --config %s --eab-file %s\n' \
+    "$AGENT_CONFIG_PATH" "$LOCAL_AGENT_EAB_FILE" >>"$RUN_LOG"
   # bootroot-agent uses tracing_subscriber::fmt::init(), whose default
   # filter is ERROR.  The readiness probe below greps for an info-level
   # message, so we have to opt into info output explicitly.
   RUST_LOG="${RUST_LOG:-info}" \
     "$BOOTROOT_AGENT_BIN" --config "$AGENT_CONFIG_PATH" \
+    --eab-file "$LOCAL_AGENT_EAB_FILE" \
     >>"$LOCAL_AGENT_DAEMON_LOG" 2>&1 &
   LOCAL_AGENT_DAEMON_PID=$!
   local attempt
@@ -606,25 +571,24 @@ run_bootstrap_chain() {
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
 
   log_phase "service-add"
-  # Order matters: SIDECAR_OBA_SERVICE (edge-proxy) is added LAST so its
-  # rendered .ctmpl picks up web-app's managed profile from
-  # workspace/agent.toml.  When the daemon-deploy sidecar later renders
-  # that template back to workspace/agent.toml via the bind-mount, both
-  # profiles must survive — otherwise web-app verify fails because its
-  # profile entry got wiped.
+  # Order matters: EDGE_SERVICE (edge-proxy) is added LAST so the
+  # `[openbao]` fast-poll section its `service add` upserts into the
+  # shared workspace/agent.toml carries edge-proxy's AppRole paths.
+  # The host bootroot-agent daemon authenticates with those
+  # credentials, and `rotate force-reissue --wait` below drives the
+  # KV round-trip against edge-proxy.
   run_bootroot service add \
-    --service-name "$WEB_SERVICE" --deploy-type docker --delivery-mode local-file \
+    --service-name "$WEB_SERVICE" --delivery-mode local-file \
     --hostname "$WEB_HOSTNAME" --domain "$DOMAIN" \
     --agent-config "$AGENT_CONFIG_PATH" \
     --cert-path "$CERTS_DIR/${WEB_SERVICE}.crt" --key-path "$CERTS_DIR/${WEB_SERVICE}.key" \
-    --instance-id "$INSTANCE_ID" --container-name "$WEB_SERVICE" \
-    --no-validate-agent \
+    --instance-id "$INSTANCE_ID" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 
   run_bootroot service add \
-    --service-name "$REMOTE_SERVICE" --deploy-type daemon --delivery-mode remote-bootstrap \
+    --service-name "$REMOTE_SERVICE" --delivery-mode remote-bootstrap \
     --hostname "$REMOTE_HOSTNAME" --domain "$DOMAIN" \
     --agent-config "$REMOTE_AGENT_CONFIG" \
     --cert-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.crt" --key-path "$REMOTE_CERTS_DIR/${REMOTE_SERVICE}.key" \
@@ -634,7 +598,7 @@ run_bootstrap_chain() {
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 
   run_bootroot service add \
-    --service-name "$EDGE_SERVICE" --deploy-type daemon --delivery-mode local-file \
+    --service-name "$EDGE_SERVICE" --delivery-mode local-file \
     --hostname "$EDGE_HOSTNAME" --domain "$DOMAIN" \
     --agent-config "$AGENT_CONFIG_PATH" \
     --cert-path "$CERTS_DIR/${EDGE_SERVICE}.crt" --key-path "$CERTS_DIR/${EDGE_SERVICE}.key" \
@@ -692,13 +656,12 @@ scenario_1_phase3_failure() {
   [ "$saved_phase" -ge 1 ] && [ "$saved_phase" -lt 7 ] \
     || fail "S1: unexpected saved phase: $saved_phase (expected 1..6)"
 
-  # Restart OpenBao, unseal, then resume rotation.
-  # Also restart the OBA sidecar which died when OpenBao went down.
+  # Restart OpenBao, unseal, then resume rotation.  The running host
+  # bootroot-agent daemon needs no restart: its fast-poll loop
+  # re-authenticates on the next tick once OpenBao is back.
   compose start openbao >>"$RUN_LOG" 2>&1
   wait_for_openbao_api
   unseal_openbao
-  stop_service_sidecar_oba
-  start_service_sidecar_oba "$SIDECAR_OBA_SERVICE"
 
   run_rotate_ca_key --skip reissue --force --cleanup >>"$RUN_LOG" 2>&1
 
@@ -900,12 +863,6 @@ main() {
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"
-
-  # Remove the manual agent.toml so the sidecar readiness check actually
-  # waits for the OBA template render (not the stale write_agent_config
-  # output which already contains http_responder_hmac).
-  rm -f "$AGENT_CONFIG_PATH"
-  start_service_sidecar_oba "$SIDECAR_OBA_SERVICE"
 
   copy_remote_materials
   log_phase "remote-bootstrap-initial"
