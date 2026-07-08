@@ -27,12 +27,13 @@ use tokio::sync::{Mutex, Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::cert_group::CertGroupPolicy;
-use crate::kv_payload::{TrustPayload, parse_secret_id, parse_trust_payload};
+use crate::kv_payload::{TrustPayload, parse_responder_hmac, parse_secret_id, parse_trust_payload};
 use crate::openbao::{KvReadWithVersion, OpenBaoClient};
 use crate::trust_bootstrap::{
-    REISSUE_COMPLETED_AT_KEY, REISSUE_COMPLETED_VERSION_KEY, REISSUE_REQUESTED_AT_KEY,
-    REISSUE_REQUESTER_KEY, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX, SERVICE_SECRET_ID_KV_SUFFIX,
-    SERVICE_TRUST_KV_SUFFIX, build_trust_updates,
+    ACME_SECTION, REISSUE_COMPLETED_AT_KEY, REISSUE_COMPLETED_VERSION_KEY,
+    REISSUE_REQUESTED_AT_KEY, REISSUE_REQUESTER_KEY, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX,
+    SERVICE_RESPONDER_HMAC_KV_SUFFIX, SERVICE_SECRET_ID_KV_SUFFIX, SERVICE_TRUST_KV_SUFFIX,
+    build_responder_hmac_updates, build_trust_updates,
 };
 use crate::{config, eab, fs_util, toml_util};
 
@@ -132,6 +133,12 @@ pub(crate) struct FastPollState {
     /// `secret_id` (idempotent when it already matches).
     #[serde(default)]
     pub(crate) last_secret_id_seen_version: BTreeMap<String, u64>,
+    /// Highest KV version of the per-service `http_responder_hmac` path
+    /// already upserted into `[acme].http_responder_hmac` in `agent.toml`.
+    /// Missing entries mean "never refreshed", so the first sighting writes
+    /// the current KV HMAC (idempotent when it already matches).
+    #[serde(default)]
+    pub(crate) last_responder_hmac_seen_version: BTreeMap<String, u64>,
 }
 
 /// Partial fan-out progress for a fast-poll-triggered renewal that
@@ -250,6 +257,16 @@ pub(crate) trait FastPollHooks: Send + Sync {
         service: &str,
         secret_id: &str,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Upserts the rotated HTTP-01 responder HMAC for `service` into
+    /// `[acme].http_responder_hmac` in `agent.toml` atomically. The
+    /// daemon's per-attempt config reload consumes the result on the next
+    /// renewal.
+    fn apply_responder_hmac(
+        &self,
+        service: &str,
+        hmac: &str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
 
 /// Decides whether an observed KV read should trigger a renewal, and
@@ -355,6 +372,12 @@ pub(crate) fn trust_kv_path(service_name: &str) -> String {
 #[must_use]
 pub(crate) fn secret_id_kv_path(service_name: &str) -> String {
     format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_SECRET_ID_KV_SUFFIX}")
+}
+
+/// Builds the KV path `<SERVICE_KV_BASE>/<service>/<SERVICE_RESPONDER_HMAC_KV_SUFFIX>`.
+#[must_use]
+pub(crate) fn responder_hmac_kv_path(service_name: &str) -> String {
+    format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_RESPONDER_HMAC_KV_SUFFIX}")
 }
 
 /// Reports whether an observed KV version is newer than the last one the
@@ -531,6 +554,87 @@ pub(crate) async fn run_secret_id_poll_tick<H: FastPollHooks + ?Sized>(
             Ok(()) => {
                 state
                     .last_secret_id_seen_version
+                    .insert(service_name.clone(), read.version);
+                state_changed = true;
+                outcomes.push(PollApplyOutcome::Applied {
+                    service: service_name.clone(),
+                    version: read.version,
+                });
+            }
+            Err(err) => {
+                outcomes.push(PollApplyOutcome::ApplyError {
+                    service: service_name.clone(),
+                    version: read.version,
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+
+    (outcomes, state_changed)
+}
+
+/// Runs a single `http_responder_hmac` poll tick: for each unique service,
+/// reads the per-service `http_responder_hmac` KV path, and on a newer
+/// version upserts `[acme].http_responder_hmac` into the running `agent.toml`
+/// via the hook so the next ACME renewal authenticates to the responder with
+/// the fresh HMAC. Version-gated and idempotent.
+pub(crate) async fn run_responder_hmac_poll_tick<H: FastPollHooks + ?Sized>(
+    hooks: &H,
+    kv_mount: &str,
+    services: &[(String, Vec<String>)],
+    state: &mut FastPollState,
+) -> (Vec<PollApplyOutcome>, bool) {
+    let mut outcomes = Vec::with_capacity(services.len());
+    let mut state_changed = false;
+
+    for (service_name, _profiles) in services {
+        let kv_path = responder_hmac_kv_path(service_name);
+        let read = match hooks.read_kv_version(kv_mount, &kv_path).await {
+            Ok(Some(read)) => read,
+            Ok(None) => {
+                outcomes.push(PollApplyOutcome::NoData {
+                    service: service_name.clone(),
+                });
+                continue;
+            }
+            Err(err) => {
+                outcomes.push(PollApplyOutcome::ReadError {
+                    service: service_name.clone(),
+                    error: format!("{err:#}"),
+                });
+                continue;
+            }
+        };
+
+        let last_seen = state
+            .last_responder_hmac_seen_version
+            .get(service_name)
+            .copied();
+        if !version_advanced(read.version, last_seen) {
+            outcomes.push(PollApplyOutcome::UpToDate {
+                service: service_name.clone(),
+                version: read.version,
+            });
+            continue;
+        }
+
+        let hmac = match parse_responder_hmac(&read.data) {
+            Ok(hmac) => hmac,
+            Err(err) => {
+                outcomes.push(PollApplyOutcome::Malformed {
+                    service: service_name.clone(),
+                    version: read.version,
+                    error: format!("{err:#}"),
+                });
+                continue;
+            }
+        };
+
+        match hooks.apply_responder_hmac(service_name, &hmac).await {
+            Ok(()) => {
+                state
+                    .last_responder_hmac_seen_version
                     .insert(service_name.clone(), read.version);
                 state_changed = true;
                 outcomes.push(PollApplyOutcome::Applied {
@@ -934,6 +1038,27 @@ async fn apply_trust_to_disk(
     Ok(())
 }
 
+/// Upserts `[acme].http_responder_hmac` in `agent.toml` for a responder-HMAC
+/// update observed on the fast-poll loop.
+///
+/// The rewrite goes through [`fs_util::atomic_write`] at `0o600` (the
+/// #613-safe writer) so a crash cannot leave the daemon's hot-read config
+/// half-written; the `upsert_section_keys` round-trip preserves
+/// operator-tuned sections. The daemon's per-attempt config reload consumes
+/// the new HMAC on the next renewal.
+async fn apply_responder_hmac_to_disk(config_path: &Path, hmac: &str) -> Result<()> {
+    let current = fs::read_to_string(config_path)
+        .await
+        .with_context(|| format!("Failed to read agent config at {}", config_path.display()))?;
+    let hmac_updates = build_responder_hmac_updates(hmac);
+    let updated = toml_util::upsert_section_keys(&current, ACME_SECTION, &hmac_updates)
+        .context("Failed to upsert [acme] responder HMAC into agent config")?;
+    fs_util::atomic_write(config_path, updated.as_bytes(), fs_util::KEY_FILE_MODE)
+        .await
+        .with_context(|| format!("Failed to write agent config to {}", config_path.display()))?;
+    Ok(())
+}
+
 impl<F, Fut> FastPollHooks for LiveFastPollHooks<F>
 where
     F: Fn(String) -> Fut + Send + Sync,
@@ -1008,6 +1133,16 @@ where
                     format!("Failed to write secret_id to {}", secret_id_path.display())
                 })
         })
+    }
+
+    fn apply_responder_hmac(
+        &self,
+        _service: &str,
+        hmac: &str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let config_path = self.config_path.clone();
+        let hmac = hmac.to_string();
+        Box::pin(async move { apply_responder_hmac_to_disk(&config_path, &hmac).await })
     }
 }
 
@@ -1208,6 +1343,19 @@ pub(crate) async fn run_fast_poll_loop(
             run_secret_id_poll_tick(&hooks, &openbao.kv_mount, &services, &mut state).await;
         log_poll_outcomes("secret_id", &secret_id_outcomes, &mut needs_relogin);
 
+        // The responder HMAC rewrite lands in `[acme].http_responder_hmac`
+        // of the same `agent.toml`; the daemon's per-attempt config reload
+        // consumes it on the next ACME renewal, so no client rebuild is
+        // needed (unlike the trust bundle, it does not anchor this loop's
+        // own OpenBao connection).
+        let (responder_hmac_outcomes, responder_hmac_changed) =
+            run_responder_hmac_poll_tick(&hooks, &openbao.kv_mount, &services, &mut state).await;
+        log_poll_outcomes(
+            "responder_hmac",
+            &responder_hmac_outcomes,
+            &mut needs_relogin,
+        );
+
         // A trust apply rewrites the on-disk CA bundle, and in the
         // remote-bootstrap model `[openbao].ca_bundle_path` and
         // `[trust].ca_bundle_path` are the same file, so that write can move
@@ -1260,7 +1408,7 @@ pub(crate) async fn run_fast_poll_loop(
             trust_applied = reconcile_trust_rebuild(&mut state, trust_versions_before, rebuilt_ok);
         }
 
-        if (report.state_changed || trust_applied || secret_id_changed)
+        if (report.state_changed || trust_applied || secret_id_changed || responder_hmac_changed)
             && let Err(err) = state.save(&openbao.state_path).await
         {
             error!(
@@ -1510,10 +1658,13 @@ mod tests {
         // Profile labels that should fail when their renewal is
         // requested. All others succeed.
         failing_profiles: std::sync::Mutex<std::collections::HashSet<String>>,
-        // Recorded trust / secret_id applies for the poll-tick tests.
+        // Recorded trust / secret_id / responder_hmac applies for the
+        // poll-tick tests.
         trust_applies: std::sync::Mutex<Vec<(String, TrustPayload)>>,
         secret_id_applies: std::sync::Mutex<Vec<(String, String)>>,
-        // When true, every apply_trust / apply_secret_id call fails.
+        responder_hmac_applies: std::sync::Mutex<Vec<(String, String)>>,
+        // When true, every apply_trust / apply_secret_id / apply_responder_hmac
+        // call fails.
         fail_applies: std::sync::atomic::AtomicBool,
     }
 
@@ -1527,6 +1678,7 @@ mod tests {
                 failing_profiles: std::sync::Mutex::new(std::collections::HashSet::new()),
                 trust_applies: std::sync::Mutex::new(Vec::new()),
                 secret_id_applies: std::sync::Mutex::new(Vec::new()),
+                responder_hmac_applies: std::sync::Mutex::new(Vec::new()),
                 fail_applies: std::sync::atomic::AtomicBool::new(false),
             }
         }
@@ -1640,6 +1792,24 @@ mod tests {
             Box::pin(async move {
                 if fail {
                     anyhow::bail!("simulated secret_id apply failure");
+                }
+                Ok(())
+            })
+        }
+
+        fn apply_responder_hmac(
+            &self,
+            service: &str,
+            hmac: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.responder_hmac_applies
+                .lock()
+                .unwrap()
+                .push((service.to_string(), hmac.to_string()));
+            let fail = self.fail_applies.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    anyhow::bail!("simulated responder_hmac apply failure");
                 }
                 Ok(())
             })
@@ -2197,6 +2367,10 @@ mod tests {
             secret_id_kv_path("edge-proxy"),
             "bootroot/services/edge-proxy/secret_id"
         );
+        assert_eq!(
+            responder_hmac_kv_path("edge-proxy"),
+            "bootroot/services/edge-proxy/http_responder_hmac"
+        );
     }
 
     #[tokio::test]
@@ -2399,6 +2573,143 @@ mod tests {
         assert!(state.last_secret_id_seen_version.is_empty());
     }
 
+    fn responder_hmac_read(version: u64, value: &str) -> KvReadWithVersion {
+        KvReadWithVersion {
+            version,
+            data: serde_json::json!({ "hmac": value }),
+        }
+    }
+
+    #[tokio::test]
+    async fn responder_hmac_poll_applies_on_new_version() {
+        let hooks = FakeHooks::new(vec![Ok(Some(responder_hmac_read(2, "fresh-hmac")))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_responder_hmac_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::Applied { version: 2, .. }
+        ));
+        assert_eq!(
+            state.last_responder_hmac_seen_version.get("edge-proxy"),
+            Some(&2)
+        );
+        let applies = hooks.responder_hmac_applies.lock().unwrap();
+        assert_eq!(applies.len(), 1);
+        assert_eq!(
+            applies[0],
+            ("edge-proxy".to_string(), "fresh-hmac".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn responder_hmac_poll_is_idempotent_when_version_unchanged() {
+        let hooks = FakeHooks::new(vec![Ok(Some(responder_hmac_read(2, "fresh-hmac")))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+        state
+            .last_responder_hmac_seen_version
+            .insert("edge-proxy".to_string(), 2);
+
+        let (outcomes, changed) =
+            run_responder_hmac_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::UpToDate { version: 2, .. }
+        ));
+        assert!(hooks.responder_hmac_applies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn responder_hmac_poll_skips_malformed_payload_without_advancing() {
+        let hooks = FakeHooks::new(vec![Ok(Some(KvReadWithVersion {
+            version: 5,
+            data: serde_json::json!({ "other": "x" }),
+        }))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_responder_hmac_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::Malformed { version: 5, .. }
+        ));
+        assert!(state.last_responder_hmac_seen_version.is_empty());
+        assert!(hooks.responder_hmac_applies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn responder_hmac_poll_does_not_advance_when_apply_fails() {
+        let hooks = FakeHooks::new(vec![Ok(Some(responder_hmac_read(3, "fresh")))]).fail_applies();
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_responder_hmac_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(!changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::ApplyError { version: 3, .. }
+        ));
+        assert!(state.last_responder_hmac_seen_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn responder_hmac_poll_fires_on_first_sighting() {
+        let hooks = FakeHooks::new(vec![Ok(Some(responder_hmac_read(1, "hmac-v1")))]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let (outcomes, changed) =
+            run_responder_hmac_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+        assert!(changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::Applied { version: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn apply_responder_hmac_to_disk_upserts_acme_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agent.toml");
+        std::fs::write(
+            &config_path,
+            "email = \"a@b.c\"\n\n[acme]\nhttp_responder_url = \"http://r\"\nhttp_responder_hmac = \"old\"\n",
+        )
+        .unwrap();
+
+        apply_responder_hmac_to_disk(&config_path, "new-hmac")
+            .await
+            .expect("apply responder hmac");
+
+        let updated = std::fs::read_to_string(&config_path).unwrap();
+        assert!(updated.contains("http_responder_hmac = \"new-hmac\""));
+        assert!(!updated.contains("\"old\""));
+        // Operator-tuned keys/sections preserved.
+        assert!(updated.contains("email = \"a@b.c\""));
+        assert!(updated.contains("http_responder_url = \"http://r\""));
+        let config_mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(config_mode, 0o600);
+    }
+
     #[tokio::test]
     async fn poll_read_error_flags_relogin_for_token_failures() {
         let mut needs_relogin = false;
@@ -2471,6 +2782,9 @@ mod tests {
         state
             .last_secret_id_seen_version
             .insert("edge-proxy".to_string(), 9);
+        state
+            .last_responder_hmac_seen_version
+            .insert("edge-proxy".to_string(), 6);
         state.save(&path).await.unwrap();
 
         let loaded = FastPollState::load(&path).await.unwrap();
@@ -2478,6 +2792,10 @@ mod tests {
         assert_eq!(
             loaded.last_secret_id_seen_version.get("edge-proxy"),
             Some(&9)
+        );
+        assert_eq!(
+            loaded.last_responder_hmac_seen_version.get("edge-proxy"),
+            Some(&6)
         );
     }
 

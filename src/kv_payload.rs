@@ -9,7 +9,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::trust_bootstrap::{CA_BUNDLE_PEM_KEY, SECRET_ID_KEY, TRUSTED_CA_KEY};
+use crate::trust_bootstrap::{CA_BUNDLE_PEM_KEY, HMAC_KEY, SECRET_ID_KEY, TRUSTED_CA_KEY};
 
 /// Length in hex characters of a SHA-256 fingerprint.
 const FINGERPRINT_HEX_LEN: usize = 64;
@@ -46,6 +46,18 @@ pub fn parse_trust_payload(data: &serde_json::Value) -> Result<TrustPayload> {
 /// Returns an error when neither key holds a non-empty string.
 pub fn parse_secret_id(data: &serde_json::Value) -> Result<String> {
     parse_required_string(data, &[SECRET_ID_KEY, "value"])
+}
+
+/// Parses a service `http_responder_hmac` KV payload, returning the HMAC.
+///
+/// The rotate producer writes the `{ "hmac": <value> }` shape; a bare
+/// `value` key is accepted as a fallback, mirroring [`parse_secret_id`].
+///
+/// # Errors
+///
+/// Returns an error when neither key holds a non-empty string.
+pub fn parse_responder_hmac(data: &serde_json::Value) -> Result<String> {
+    parse_required_string(data, &[HMAC_KEY, "value"])
 }
 
 /// Reads the first non-empty string value among `keys`, trimmed.
@@ -165,5 +177,29 @@ mod tests {
     fn parse_secret_id_rejects_empty() {
         let data = serde_json::json!({ "secret_id": "   " });
         assert!(parse_secret_id(&data).is_err());
+    }
+
+    #[test]
+    fn parse_responder_hmac_reads_hmac_key() {
+        let data = serde_json::json!({ "hmac": "  the-hmac  " });
+        assert_eq!(parse_responder_hmac(&data).expect("parse"), "the-hmac");
+    }
+
+    #[test]
+    fn parse_responder_hmac_falls_back_to_value_key() {
+        let data = serde_json::json!({ "value": "fallback-hmac" });
+        assert_eq!(parse_responder_hmac(&data).expect("parse"), "fallback-hmac");
+    }
+
+    #[test]
+    fn parse_responder_hmac_rejects_missing() {
+        let data = serde_json::json!({ "other": "x" });
+        assert!(parse_responder_hmac(&data).is_err());
+    }
+
+    #[test]
+    fn parse_responder_hmac_rejects_empty() {
+        let data = serde_json::json!({ "hmac": "   " });
+        assert!(parse_responder_hmac(&data).is_err());
     }
 }

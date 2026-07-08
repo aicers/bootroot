@@ -9,6 +9,7 @@ use super::{OPENBAO_AGENT_RESPONDER_CONTAINER, RENDERED_FILE_TIMEOUT, RotateCont
 use crate::cli::args::RotateResponderHmacArgs;
 use crate::commands::constants::{
     RESPONDER_SERVICE_NAME, SERVICE_KV_BASE, SERVICE_RESPONDER_HMAC_KEY,
+    SERVICE_RESPONDER_HMAC_KV_SUFFIX,
 };
 use crate::commands::init::{PATH_RESPONDER_HMAC, SECRET_BYTES};
 use crate::i18n::Messages;
@@ -79,7 +80,7 @@ async fn sync_service_responder_hmac_payloads(
         client
             .write_kv(
                 &ctx.kv_mount,
-                &format!("{SERVICE_KV_BASE}/{service_name}/http_responder_hmac"),
+                &format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_RESPONDER_HMAC_KV_SUFFIX}"),
                 serde_json::json!({ SERVICE_RESPONDER_HMAC_KEY: hmac }),
             )
             .await
