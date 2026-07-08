@@ -366,9 +366,14 @@ docker compose run --rm bootroot-agent
 
 권장 배포 정책:
 
-- 호스트당 bootroot-agent **호스트 데몬**(systemd) 1개가 `agent.toml`의
-  모든 프로필을 담당합니다. 온보딩된 서비스에 대해 지원되는 유일한 실행
-  모델이며, bootroot-agent를 Docker 사이드카로 실행하지 않습니다.
+- bootroot-agent는 **호스트 데몬**(systemd)으로 실행합니다. 온보딩된
+  서비스에 대해 지원되는 유일한 실행 모델이며, bootroot-agent를 Docker
+  사이드카로 실행하지 않습니다.
+- **서로 다른 서비스마다** `bootroot-agent` 프로세스 하나와 agent 구성
+  하나를 사용합니다. `[openbao]` 섹션은 AppRole 자격증명을 하나만 담으므로
+  서로 다른 서비스가 하나의 `agent.toml`을 공유할 수 없습니다. 하나의
+  구성에 여러 `[[profiles]]`를 두는 것은 같은 서비스의 인스턴스에 대해서만
+  지원됩니다([운영 > systemd 운영 절차](operations.md) 참고).
 - 인증서를 소비하는 애플리케이션은 컨테이너로 실행해도 됩니다. 호스트
   데몬이 호스트 디렉터리에 인증서를 기록하고 앱 컨테이너가 그 디렉터리를
   bind-mount하며, `--reload-style docker-restart --reload-target

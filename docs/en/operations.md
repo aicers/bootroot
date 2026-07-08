@@ -138,9 +138,10 @@ fails. Restore the audit configuration and re-run init.
 ## systemd operations procedure (recommended for bootroot-agent)
 
 `bootroot-agent` runs only as a **host daemon** — it is not run as a
-Docker sidecar. One daemon per host serves every profile in its
-`agent.toml`, and its fast-poll loop is the sole secret-delivery
+Docker sidecar. Its fast-poll loop is the sole secret-delivery
 mechanism in both delivery modes (no per-service OpenBao Agent runs).
+A host runs one `bootroot-agent` process plus one agent config per
+**distinct service** — see the multiple-services bullet below.
 
 - Register `bootroot-agent` as a long-running service with
   `Restart=on-failure` and `WantedBy=multi-user.target`.
@@ -161,11 +162,12 @@ mechanism in both delivery modes (no per-service OpenBao Agent runs).
   share one config — the `[openbao]` section holds a single AppRole
   credential and the fast-poll loop logs in once and reads every
   service's KV with that one token, so cross-service reads return `403`
-  under per-service AppRole policies. Bootstrap keys the provisioned
+  under per-service AppRole policies. Both provisioning paths — local
+  `service add` and `bootroot-remote bootstrap` — key the provisioned
   `state_path` basename on the service name so per-service configs may
-  share a directory without their fast-poll state files colliding; it
-  warns if two sibling configs still resolve to the same `state_path`.
-  See `docs/en/remote-bootstrap.md`.
+  share a directory without their fast-poll state files colliding;
+  bootstrap additionally warns if two sibling configs still resolve to
+  the same `state_path`. See `docs/en/remote-bootstrap.md`.
 - Triage flow:
   `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
   -> `bootroot verify --service-name <service>`.

@@ -402,9 +402,13 @@ renewal**, run bootroot-agent in daemon mode (without `--oneshot`).
 “Continuous mode” means the daemon keeps running to renew certificates
 periodically, rather than a one-shot verification run.
 
-bootroot-agent runs **one host daemon per machine**, not per service —
-no per-service OpenBao Agent and no Docker sidecar. Update `agent.toml`
-when adding profiles and reload the daemon. Configure systemd so the
+bootroot-agent runs as a **host daemon** — no per-service OpenBao Agent
+and no Docker sidecar. Run one `bootroot-agent` process plus one agent
+config per **distinct service**; the `[openbao]` section holds a single
+AppRole credential, so distinct services cannot share one `agent.toml`.
+Multiple `[[profiles]]` in one config are only for instances of the same
+service — update `agent.toml` and reload the daemon when adding such
+instances. Configure systemd so the
 process restarts automatically (set `Restart=always` or `on-failure`;
 see
 [Operations > Hardened systemd unit example](operations.md#hardened-systemd-unit-example)).

@@ -219,8 +219,12 @@ current through its fast-poll loop (no per-service OpenBao Agent).
 
 bootroot-agent placement rules:
 
-- one shared **bootroot-agent host daemon** per host (systemd), serving
-  every profile in its `agent.toml`. It is not run as a Docker sidecar.
+- **bootroot-agent runs as a host daemon** (systemd) — it is not run as
+  a Docker sidecar. Use one `bootroot-agent` process plus one agent
+  config per **distinct service**; the `[openbao]` section holds a
+  single AppRole credential, so distinct services cannot share one
+  `agent.toml` (multiple `[[profiles]]` are only for instances of the
+  same service).
 - applications that consume the certificates may run in containers: the
   host daemon writes certs to a host directory the container bind-mounts,
   and a `docker-restart` post-renew hook reloads the container.

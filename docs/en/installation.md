@@ -360,9 +360,15 @@ responder config and restart the responder.
 
 Recommended deployment policy:
 
-- one shared bootroot-agent **host daemon** per host (systemd), serving
-  every profile in its `agent.toml`. This is the only supported run model
-  for onboarded services — bootroot-agent is not run as a Docker sidecar.
+- bootroot-agent runs as a **host daemon** (systemd). This is the only
+  supported run model for onboarded services — bootroot-agent is not run
+  as a Docker sidecar.
+- one `bootroot-agent` process plus one agent config per **distinct
+  service**: the `[openbao]` section holds a single AppRole credential,
+  so distinct services cannot share one `agent.toml`. Multiple
+  `[[profiles]]` in one config are only for instances of the same
+  service (see
+  [Operations > systemd operations procedure](operations.md#systemd-operations-procedure-recommended-for-bootroot-agent)).
 - applications that consume the certificates may still run in containers:
   the host daemon writes certs to a host directory the app container
   bind-mounts, and a `--reload-style docker-restart --reload-target

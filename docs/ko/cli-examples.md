@@ -396,9 +396,13 @@ bootroot 검증: 요약
 여기서 “상시 모드”는 one-shot 검증이 아니라 **지속 실행**으로
 인증서를 주기적으로 갱신하는 운용 모드를 뜻합니다.
 
-bootroot-agent는 **서비스별이 아니라 머신별로 1개**의 호스트 데몬으로
-실행합니다 — 서비스별 OpenBao Agent도, Docker 사이드카도 없습니다.
-프로필을 추가할 때마다 `agent.toml`을 갱신하고, 데몬을 리로드하세요.
+bootroot-agent는 **호스트 데몬**으로 실행합니다 — 서비스별 OpenBao
+Agent도, Docker 사이드카도 없습니다. **서로 다른 서비스마다**
+`bootroot-agent` 프로세스 하나와 agent 구성 하나를 실행하세요.
+`[openbao]` 섹션은 AppRole 자격증명을 하나만 담으므로 서로 다른 서비스가
+하나의 `agent.toml`을 공유할 수 없습니다. 하나의 구성에 여러
+`[[profiles]]`를 두는 것은 같은 서비스의 인스턴스에 대해서만 지원되며,
+이런 인스턴스를 추가할 때 `agent.toml`을 갱신하고 데몬을 리로드하세요.
 프로세스 종료 시 자동 재기동되도록 systemd에서
 `Restart=always`(또는 `on-failure`)를 설정하는 것을 권장합니다
 ([운영 > 하드닝된 systemd 유닛 예시](operations.md) 참고).

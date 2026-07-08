@@ -638,10 +638,15 @@ automatically as part of onboarding.
 
 ### Runtime deployment policy
 
-`bootroot-agent` runs as a **host daemon** (e.g., a systemd unit) — one
-shared daemon per host serves every profile in its `agent.toml`. It is not
-run as a Docker sidecar, and no per-service OpenBao Agent runs: the
-daemon's own fast-poll loop delivers secrets in both delivery modes.
+`bootroot-agent` runs as a **host daemon** (e.g., a systemd unit). It is
+not run as a Docker sidecar, and no per-service OpenBao Agent runs: the
+daemon's own fast-poll loop delivers secrets in both delivery modes. A
+host runs one `bootroot-agent` process plus one agent config per
+**distinct service** — the `[openbao]` section holds a single AppRole
+credential, so distinct services cannot share one `agent.toml`; multiple
+`[[profiles]]` in one config are only for instances of the same service
+(see
+[Operations > systemd operations procedure](operations.md#systemd-operations-procedure-recommended-for-bootroot-agent)).
 
 Consumer applications that run in containers are still supported: the
 host daemon writes certs to a host directory that the app container
