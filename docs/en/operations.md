@@ -162,7 +162,9 @@ A host runs one `bootroot-agent` process plus one agent config per
   share one config — the `[openbao]` section holds a single AppRole
   credential and the fast-poll loop logs in once and reads every
   service's KV with that one token, so cross-service reads return `403`
-  under per-service AppRole policies. Both provisioning paths — local
+  under per-service AppRole policies. Local `service add` enforces
+  this: an add whose `--agent-config` path is already registered to a
+  different service is rejected. Both provisioning paths — local
   `service add` and `bootroot-remote bootstrap` — key the provisioned
   `state_path` basename on the service name so per-service configs may
   share a directory without their fast-poll state files colliding;

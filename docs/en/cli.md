@@ -825,6 +825,10 @@ operator's primary gid before the chown lands.
 - Prompts for missing required inputs.
 - Checks that identifiers are non-empty and match the DNS/numeric rules above,
   that enum values are allowed, and that paths/parent directories are valid.
+- Rejects a `local-file` add whose `--agent-config` path is already used by
+  another service: the `[openbao]` section holds a single AppRole identity,
+  so each distinct service needs its own `agent.toml` (multiple
+  `[[profiles]]` are reserved for instances of the same service).
 - Prints a plan summary before execution and the final summary after.
 
 ### Outputs

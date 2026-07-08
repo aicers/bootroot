@@ -90,6 +90,7 @@ pub(crate) struct Strings {
     pub(crate) error_responder_check_failed: &'static str,
     pub(crate) error_state_missing: &'static str,
     pub(crate) error_service_duplicate: &'static str,
+    pub(crate) error_service_agent_config_conflict: &'static str,
     pub(crate) error_service_policy_mismatch: &'static str,
     pub(crate) error_service_not_found: &'static str,
     pub(crate) error_service_instance_id_required: &'static str,

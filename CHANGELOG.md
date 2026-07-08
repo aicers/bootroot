@@ -645,6 +645,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot service add` now rejects a `local-file` add whose
+  `--agent-config` path is already registered to a different service.
+  One `agent.toml` serves exactly one distinct service: the top-level
+  `[openbao]` section holds a single AppRole identity, so a second
+  service writing the same file would overwrite the first service's
+  `role_id`/`secret_id`/`state_path` and break its KV reads under
+  per-service AppRole policies. Multiple `[[profiles]]` remain reserved
+  for instances of the same service. (Part of #691)
 - Made the remote `bootroot-agent` fast-poll loop self-sufficient
   (approach C): it now pulls two more things from OpenBao KV on the same
   self-authenticated client that already drives force-reissue. A

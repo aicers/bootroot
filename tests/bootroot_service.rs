@@ -1491,6 +1491,91 @@ async fn test_app_add_rejects_duplicate() {
     assert!(stderr.contains("bootroot service add failed"));
 }
 
+/// A second *distinct* local-file service must not reuse another
+/// service's `agent.toml`: the top-level `[openbao]` section holds a
+/// single `AppRole` identity, so a shared config would let the second
+/// add overwrite the first service's `role_id`/`secret_id`/`state_path`
+/// and break its KV reads under per-service policies. The rejection
+/// happens before any `OpenBao` call, so no stubs exist for the second
+/// service name.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rejects_agent_config_shared_across_services() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
+
+    let first = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run first service add");
+    assert!(first.status.success());
+
+    let second_cert_path = temp_dir.path().join("certs").join("billing-api.crt");
+    let second_key_path = temp_dir.path().join("certs").join("billing-api.key");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "billing-api",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            second_cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            second_key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run second service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("is already used by service edge-proxy"),
+        "expected the agent-config conflict rejection, got: {stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_includes_trust_snippet_when_present() {

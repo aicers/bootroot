@@ -70,6 +70,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_responder_check_failed: "HTTP-01 responder check failed",
     error_state_missing: "state.json not found (run `bootroot init` first)",
     error_service_duplicate: "Service already exists: {value}",
+    error_service_agent_config_conflict: "Agent config {path} is already used by service {service}. Each distinct local-file service needs its own agent.toml: the [openbao] section holds a single AppRole identity, so two services sharing one config would overwrite each other's credentials",
     error_service_policy_mismatch: "To change the secret_id policy for an existing service, use `bootroot service update`",
     error_service_not_found: "Service not found: {value}",
     error_service_instance_id_required: "instance_id is required for all services",

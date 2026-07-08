@@ -153,6 +153,24 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
         anyhow::bail!(messages.error_service_duplicate(&resolved.service_name));
     }
 
+    // One `agent.toml` serves exactly one distinct local-file service:
+    // the top-level `[openbao]` section holds a single AppRole identity,
+    // so a second service writing the same file would overwrite the
+    // first service's `role_id`/`secret_id`/`state_path` and break its
+    // KV reads under per-service policies. Multiple `[[profiles]]` are
+    // reserved for instances of the *same* service.
+    if matches!(resolved.delivery_mode, DeliveryMode::LocalFile)
+        && let Some(conflict) = state.services.values().find(|entry| {
+            matches!(entry.delivery_mode, DeliveryMode::LocalFile)
+                && entry.agent_config_path == resolved.agent_config
+        })
+    {
+        anyhow::bail!(messages.error_service_agent_config_conflict(
+            &resolved.agent_config.display().to_string(),
+            &conflict.service_name,
+        ));
+    }
+
     if preview {
         run_service_add_preview(&state, &resolved, messages).await;
         return Ok(());
