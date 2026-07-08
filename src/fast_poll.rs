@@ -1619,11 +1619,13 @@ pub(crate) async fn run_fast_poll_loop(
         // `https://` client anchors trust, so a plaintext endpoint needs no
         // rebuild.
         //
-        // Rebuild BEFORE persisting the advanced trust version. `parse_trust_payload`
-        // only checks that `ca_bundle_pem` is non-empty; the real PEM/root-store
-        // validation happens here in `build_openbao_client`. If the bundle is
-        // malformed, unreadable after the write, or otherwise rejected, the
-        // version must NOT stay marked applied — otherwise the poll reports
+        // Rebuild BEFORE persisting the advanced trust version.
+        // `parse_trust_payload` now validates the bundle's PEM structure and
+        // fingerprint consistency pre-apply, but the root-store construction
+        // that actually anchors this channel's TLS still happens here in
+        // `build_openbao_client`. If the bundle is unreadable after the write,
+        // rejected by rustls, or the freshly applied pins cannot be recovered,
+        // the version must NOT stay marked applied — otherwise the poll reports
         // `UpToDate` forever, never retries the rebuild, and the loop is
         // stranded on stale roots once the old anchor is retired. On a rebuild
         // failure, roll the version back so the next tick re-applies and
@@ -1632,46 +1634,13 @@ pub(crate) async fn run_fast_poll_loop(
         // advanced version and just retry the login.
         let mut trust_applied = trust_changed;
         if trust_changed && rebuild_client_on_trust {
-            // Pin the rebuilt client to the freshly applied anchors, not
-            // the startup snapshot: a rotation that lands a new CA + new
-            // pins in KV has just been written to agent.toml, so re-read
-            // from there. Stale startup pins would strand the client on
-            // the retired CA and defeat zero-touch rotation. Recovering the
-            // pins CAN fail (unreadable/unparseable config, or no pins
-            // written) — treat that as a rebuild failure and roll the
-            // version back rather than silently rebuilding unpinned, which
-            // would downgrade the channel from pinned to bundle-anchored
-            // trust while reporting the rotation as applied.
-            let rebuilt_ok = match read_trust_pins_from_config(&config_path_for_rebuild).await {
-                Ok(rebuild_pins) => match build_openbao_client(&openbao, &rebuild_pins) {
-                    Ok(rebuilt) => {
-                        *client.lock().await = rebuilt;
-                        if let Err(err) = login(&client, &openbao).await {
-                            warn!(
-                                "OpenBao re-login after CA bundle rebuild failed: {err:#}. Will retry on the next tick."
-                            );
-                            needs_relogin = true;
-                        } else {
-                            info!(
-                                "Rebuilt OpenBao client from the refreshed CA bundle after a trust update."
-                            );
-                        }
-                        true
-                    }
-                    Err(err) => {
-                        warn!(
-                            "Failed to rebuild OpenBao client after a trust update: {err:#}. Rolling back the applied trust version so the next tick retries the apply and rebuild."
-                        );
-                        false
-                    }
-                },
-                Err(err) => {
-                    warn!(
-                        "Failed to recover the freshly applied trust pins after a trust update: {err:#}. Rolling back the applied trust version so the next tick retries rather than rebuilding with unpinned bundle-anchored trust."
-                    );
-                    false
-                }
-            };
+            let rebuilt_ok = rebuild_client_after_trust_apply(
+                &client,
+                &openbao,
+                &config_path_for_rebuild,
+                &mut needs_relogin,
+            )
+            .await;
             trust_applied = reconcile_trust_rebuild(&mut state, trust_versions_before, rebuilt_ok);
         }
 
@@ -1729,6 +1698,59 @@ fn reconcile_trust_rebuild(
     }
     state.last_trust_seen_version = versions_before;
     false
+}
+
+/// Rebuilds the fast-poll `OpenBaoClient` after a trust apply, swaps it into
+/// `client`, and re-logs in. Returns whether the rebuild succeeded so the
+/// caller can roll the advanced trust version back on failure.
+///
+/// Pins the rebuilt client to the FRESHLY applied anchors re-read from
+/// `config_path`, never a startup snapshot: a rotation that lands a new CA +
+/// new pins in KV has just written both to `agent.toml`, so the pins are read
+/// back from there. Stale startup pins would strand the client on the retired
+/// CA and defeat zero-touch rotation. Recovering the pins CAN fail (unreadable
+/// / unparseable config, or no pins written) — that is treated as a rebuild
+/// failure so the caller rolls the version back rather than silently rebuilding
+/// unpinned, which would downgrade the channel from pinned to bundle-anchored
+/// trust while reporting the rotation as applied.
+///
+/// A re-login failure after a *successful* rebuild still returns `true` (the
+/// new roots are already swapped in) and sets `needs_relogin` so the caller
+/// retries the login on the next tick.
+async fn rebuild_client_after_trust_apply(
+    client: &Arc<Mutex<OpenBaoClient>>,
+    openbao: &config::OpenBaoSettings,
+    config_path: &Path,
+    needs_relogin: &mut bool,
+) -> bool {
+    let rebuild_pins = match read_trust_pins_from_config(config_path).await {
+        Ok(pins) => pins,
+        Err(err) => {
+            warn!(
+                "Failed to recover the freshly applied trust pins after a trust update: {err:#}. Rolling back the applied trust version so the next tick retries rather than rebuilding with unpinned bundle-anchored trust."
+            );
+            return false;
+        }
+    };
+    let rebuilt = match build_openbao_client(openbao, &rebuild_pins) {
+        Ok(rebuilt) => rebuilt,
+        Err(err) => {
+            warn!(
+                "Failed to rebuild OpenBao client after a trust update: {err:#}. Rolling back the applied trust version so the next tick retries the apply and rebuild."
+            );
+            return false;
+        }
+    };
+    *client.lock().await = rebuilt;
+    if let Err(err) = login(client, openbao).await {
+        warn!(
+            "OpenBao re-login after CA bundle rebuild failed: {err:#}. Will retry on the next tick."
+        );
+        *needs_relogin = true;
+    } else {
+        info!("Rebuilt OpenBao client from the refreshed CA bundle after a trust update.");
+    }
+    true
 }
 
 /// Builds the fast-poll `OpenBaoClient`, anchoring an `https://` endpoint
@@ -3855,12 +3877,14 @@ mod pin_rotation_tests {
 
     /// Item #695: with non-empty pins the fast-poll HTTPS client rejects an
     /// endpoint whose chain does not terminate at a pinned CA, and the
-    /// post-trust-apply rebuild pins to the FRESHLY applied anchors read
-    /// from `agent.toml` — not the startup snapshot. The endpoint is
-    /// rotated to a new CA; a client built with the stale startup pin fails
-    /// against it (this assertion fails if the rebuild reuses the startup
-    /// snapshot), while a client built with the freshly re-read pin keeps
-    /// polling.
+    /// post-trust-apply rebuild pins to the FRESHLY applied anchors read from
+    /// `agent.toml` — not the startup snapshot. This drives the production
+    /// rebuild decision (`rebuild_client_after_trust_apply`, the same helper
+    /// the fast-poll loop calls) rather than re-reading the pins by hand: the
+    /// loop starts holding a client pinned to the retired CA, the endpoint is
+    /// rotated to a new CA, and the helper must swap in a client that reaches
+    /// it. The final assertion fails if the rebuild reuses the stale startup
+    /// snapshot instead of the freshly written pin.
     #[tokio::test]
     async fn rebuild_pins_to_freshly_applied_anchors_not_startup_snapshot() {
         let ca_old = generate_ca("Old Root CA");
@@ -3878,16 +3902,22 @@ mod pin_rotation_tests {
         std::fs::write(&bundle_path, format!("{}{}", ca_old.pem, ca_new.pem)).unwrap();
         let openbao = openbao_settings(&url, &bundle_path);
 
-        // Stale startup pin (old CA): cannot reach the rotated endpoint.
-        let stale = build_openbao_client(&openbao, std::slice::from_ref(&ca_old.fingerprint))
-            .expect("build stale-pinned client");
+        // The loop starts holding a client pinned to the STARTUP snapshot
+        // (old CA); it cannot reach the rotated endpoint.
+        let client = Arc::new(Mutex::new(
+            build_openbao_client(&openbao, std::slice::from_ref(&ca_old.fingerprint))
+                .expect("build startup-pinned client"),
+        ));
         assert!(
-            stale.health_check().await.is_err(),
-            "a client pinned to the retired CA must reject the rotated endpoint"
+            client.lock().await.health_check().await.is_err(),
+            "the startup-pinned client (retired CA) must reject the rotated endpoint"
         );
 
-        // Rotation has just rewritten agent.toml with the NEW pin; the
-        // rebuild re-reads it rather than reusing the startup snapshot.
+        // Rotation has just rewritten agent.toml with the NEW pin. Drive the
+        // production rebuild helper: it MUST re-read the fresh pin from
+        // agent.toml, not reuse the startup snapshot. If it reused the stale
+        // snapshot the swapped-in client would still be pinned to the old CA
+        // and the health check below would fail.
         let config_path = dir.path().join("agent.toml");
         std::fs::write(
             &config_path,
@@ -3897,16 +3927,57 @@ mod pin_rotation_tests {
             ),
         )
         .unwrap();
-        let fresh_pins = read_trust_pins_from_config(&config_path)
-            .await
-            .expect("recover freshly applied pins");
-        assert_eq!(fresh_pins, vec![ca_new.fingerprint.clone()]);
 
-        let rebuilt =
-            build_openbao_client(&openbao, &fresh_pins).expect("build fresh-pinned client");
+        let mut needs_relogin = false;
+        let rebuilt_ok =
+            rebuild_client_after_trust_apply(&client, &openbao, &config_path, &mut needs_relogin)
+                .await;
         assert!(
-            rebuilt.health_check().await.is_ok(),
-            "a client pinned to the freshly applied CA must reach the rotated endpoint"
+            rebuilt_ok,
+            "recovering the freshly applied pins and rebuilding must succeed"
+        );
+        // The stalled/empty test endpoint cannot satisfy an AppRole login, so
+        // the post-rebuild re-login is expected to fail and rearm relogin —
+        // the rebuild itself still succeeded because the roots were swapped in
+        // before the login attempt.
+        assert!(
+            needs_relogin,
+            "a failed post-rebuild re-login must rearm relogin"
+        );
+        assert!(
+            client.lock().await.health_check().await.is_ok(),
+            "after the rebuild the swapped-in client must reach the rotated endpoint using the freshly applied pin (fails if the rebuild reused the startup snapshot)"
+        );
+    }
+
+    /// Item #695 fail-closed guard: when `agent.toml` carries no
+    /// `[trust].trusted_ca_sha256` after a trust apply, the production rebuild
+    /// helper must return `false` so the caller rolls the trust version back,
+    /// rather than silently rebuilding with unpinned bundle-anchored trust.
+    #[tokio::test]
+    async fn rebuild_fails_closed_when_fresh_pins_unrecoverable() {
+        let ca = generate_ca("Root CA");
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        std::fs::write(&bundle_path, &ca.pem).unwrap();
+        let openbao = openbao_settings("https://localhost:8200", &bundle_path);
+        let client = Arc::new(Mutex::new(
+            build_openbao_client(&openbao, std::slice::from_ref(&ca.fingerprint))
+                .expect("build client"),
+        ));
+
+        // A config with no [trust].trusted_ca_sha256 is an unrecoverable pin
+        // read after an apply, not an unpinned deployment.
+        let config_path = dir.path().join("agent.toml");
+        std::fs::write(&config_path, "email = \"a@b.c\"\n").unwrap();
+
+        let mut needs_relogin = false;
+        let rebuilt_ok =
+            rebuild_client_after_trust_apply(&client, &openbao, &config_path, &mut needs_relogin)
+                .await;
+        assert!(
+            !rebuilt_ok,
+            "unrecoverable fresh pins must fail the rebuild closed so the version rolls back"
         );
     }
 
