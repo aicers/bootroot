@@ -1429,9 +1429,10 @@ Important behavior:
 
 #### `rotate eab-clear`
 
-Clears EAB credentials from every known KV path so the next
-bootroot-agent cycle does not template stale or invalid EAB material
-into `agent.toml`. Companion to the now-removed `rotate eab` and the
+Clears EAB credentials from every known KV path. Each bootroot-agent
+observes the cleared value on its next fast-poll cycle and removes its
+`eab.json`, so stale or invalid EAB material stops being used without
+any restart or reload. Companion to the now-removed `rotate eab` and the
 recovery path for the symptom closed by `--no-eab` and the EAB
 input validator (#588 §3c).
 

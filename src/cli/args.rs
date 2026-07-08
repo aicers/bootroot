@@ -501,8 +501,9 @@ pub(crate) enum RotateCommand {
     ///
     /// Generates a fresh `secret_id` on the configured `AppRole`. For
     /// local-file services, writes it atomically to the on-disk
-    /// `secret_id` file and reloads the local `OpenBao` Agent so the new
-    /// credential takes effect. For remote-bootstrap services, publishes
+    /// `secret_id` file; the local bootroot-agent host daemon re-reads
+    /// that file on its next `AppRole` re-login, so no process signal
+    /// or reload is needed. For remote-bootstrap services, publishes
     /// it to the service's KV bootstrap path so the next bootroot-agent
     /// cycle picks it up. For infra targets, writes the `secret_id` file
     /// under `<secrets_dir>/openbao/<name>/` and restarts the matching
@@ -562,9 +563,10 @@ pub(crate) enum RotateCommand {
     /// registered in `state.json` `infra_certs`.
     #[command(name = "infra-cert")]
     InfraCert(RotateInfraCertArgs),
-    /// Clears EAB credentials from every known KV path so the next
-    /// bootroot-agent cycle does not template stale or invalid EAB
-    /// material into agent.toml.
+    /// Clears EAB credentials from every known KV path. Each
+    /// bootroot-agent observes the cleared value on its next fast-poll
+    /// cycle and removes its `eab.json`, so stale or invalid EAB
+    /// material stops being used without any restart or reload.
     #[command(name = "eab-clear")]
     EabClear(RotateEabClearArgs),
 }
