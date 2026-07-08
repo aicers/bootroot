@@ -828,7 +828,14 @@ operator's primary gid before the chown lands.
 - Rejects a `local-file` add whose `--agent-config` path is already used by
   another service: the `[openbao]` section holds a single AppRole identity,
   so each distinct service needs its own `agent.toml` (multiple
-  `[[profiles]]` are reserved for instances of the same service).
+  `[[profiles]]` are reserved for instances of the same service). The
+  guard also inspects the target file itself: an `agent.toml` that still
+  contains another service's bootroot-managed profile block — typically
+  left by `service remove` without `--strip-config` /
+  `--delete-artifacts` — is rejected too, because the agent would
+  fast-poll the stale profile under the new service's AppRole identity.
+  Delete the stale `# BEGIN/END bootroot managed profile: <service>`
+  block (or use a separate `agent.toml`) before reusing the file.
 - Prints a plan summary before execution and the final summary after.
 
 ### Outputs
@@ -984,7 +991,10 @@ regenerates the `secret_id` delivery material regardless, the fresh
   by rotation / the agent), so on-disk material is preserved unless this
   flag is given. Even with the flag, `agent.toml` is edited in place —
   only the managed block is removed — so an operator-owned config file is
-  never deleted.
+  never deleted. Note that removing without `--strip-config` /
+  `--delete-artifacts` leaves the managed profile block in `agent.toml`;
+  a later `service add` for a *different* service reusing that config is
+  rejected until the stale block is stripped.
 - `--strip-config`: strip bootroot's managed profile block from
   `agent.toml` **without** deleting the cert/key files or the per-service
   secret directory. Intended for a live

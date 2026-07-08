@@ -15,6 +15,17 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_service_agent_config_stale_profile(
+        &self,
+        path: &str,
+        service: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_service_agent_config_stale_profile,
+            &[("path", path), ("service", service)],
+        )
+    }
+
     pub(crate) fn error_service_policy_mismatch(&self) -> &'static str {
         self.strings().error_service_policy_mismatch
     }

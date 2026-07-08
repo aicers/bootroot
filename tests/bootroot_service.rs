@@ -1744,6 +1744,124 @@ async fn test_app_add_rejects_agent_config_shared_via_symlink() {
     );
 }
 
+/// The state-based conflict guard cannot see a service removed without
+/// `--strip-config` / `--delete-artifacts`: its `state.json` entry is
+/// gone, but its managed profile block survives in `agent.toml` (the
+/// documented default preserves the file). A later add of a *different*
+/// service reusing that config must still be rejected — the agent
+/// fast-polls every profile in the config under the single `[openbao]`
+/// `AppRole` identity, so the stale service would run under the new
+/// service's credentials.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rejects_agent_config_with_stale_removed_service_profile() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
+
+    let first = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run first service add");
+    assert!(first.status.success());
+
+    // Remove without --strip-config / --delete-artifacts: the entry
+    // leaves state.json but the managed profile block stays in the file.
+    let remove = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "remove",
+            "--service-name",
+            "edge-proxy",
+            "--yes",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service remove");
+    let remove_stderr = String::from_utf8_lossy(&remove.stderr);
+    assert!(
+        remove.status.success(),
+        "service remove must succeed, got: {remove_stderr}"
+    );
+    let config_after_remove = fs::read_to_string(&agent_config).expect("read agent config");
+    assert!(
+        config_after_remove.contains("# BEGIN bootroot managed profile: edge-proxy"),
+        "remove without --strip-config must preserve the managed \
+         profile block: {config_after_remove}"
+    );
+
+    let second_cert_path = temp_dir.path().join("certs").join("billing-api.crt");
+    let second_key_path = temp_dir.path().join("certs").join("billing-api.key");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "billing-api",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            second_cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            second_key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run second service add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("still contains a bootroot-managed profile for service edge-proxy"),
+        "expected the stale-profile rejection, got: {stderr}"
+    );
+    let config_after_reject = fs::read_to_string(&agent_config).expect("read agent config");
+    assert!(
+        !config_after_reject.contains("billing-api"),
+        "the rejected add must not have written anything: {config_after_reject}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_includes_trust_snippet_when_present() {

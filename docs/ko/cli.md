@@ -810,6 +810,13 @@ chown 전 운영자 기본 gid 하에서 group-readable로 잠시 노출되는
   서비스를 추가하면 거부합니다. `[openbao]` 섹션은 하나의 AppRole 자격
   증명만 담으므로, 서로 다른 서비스는 각각 별도의 `agent.toml`을
   사용해야 합니다(여러 `[[profiles]]`는 같은 서비스의 인스턴스용입니다).
+  이 가드는 대상 파일 자체도 검사합니다. `--strip-config` /
+  `--delete-artifacts` 없이 `service remove`를 실행해 다른 서비스의
+  bootroot 관리 프로필 블록이 남아 있는 `agent.toml`도 거부됩니다 —
+  에이전트가 남은 프로필을 새 서비스의 AppRole 자격 증명으로 fast-poll
+  하게 되기 때문입니다. 파일을 재사용하려면 먼저 남아 있는
+  `# BEGIN/END bootroot managed profile: <service>` 블록을 삭제하거나
+  별도의 `agent.toml`을 사용하세요.
 - 실행 전 계획 요약, 실행 후 최종 요약을 출력합니다.
 
 ### 출력
@@ -952,7 +959,10 @@ bootroot service update --service-name edge-proxy --reload-style none
   비활성:** `service add`는 인증서/키 경로만 기록하며(파일은 이후 회전/에이전트가
   생성) 이 플래그가 없으면 디스크 자료는 보존됩니다. 이 플래그가 있어도
   `agent.toml`은 관리 블록만 제거하는 방식으로 편집되므로 운영자 소유 설정
-  파일은 삭제되지 않습니다.
+  파일은 삭제되지 않습니다. `--strip-config` / `--delete-artifacts` 없이
+  제거하면 관리 프로필 블록이 `agent.toml`에 남으며, 이후 *다른* 서비스가
+  그 설정을 재사용하는 `service add`는 남은 블록을 정리하기 전까지
+  거부됩니다.
 - `--strip-config`: 인증서/키 파일이나 서비스별 시크릿 디렉터리는
   삭제하지 않고 `agent.toml`에서 bootroot 관리 프로필 블록만
   제거합니다. 서비스가 여전히 서비스 중이라 인증서/키는 유지해야 하지만

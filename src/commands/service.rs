@@ -178,16 +178,36 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     // first service's `role_id`/`secret_id`/`state_path` and break its
     // KV reads under per-service policies. Multiple `[[profiles]]` are
     // reserved for instances of the *same* service.
-    if matches!(resolved.delivery_mode, DeliveryMode::LocalFile)
-        && let Some(conflict) = state.services.values().find(|entry| {
+    if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
+        if let Some(conflict) = state.services.values().find(|entry| {
             matches!(entry.delivery_mode, DeliveryMode::LocalFile)
                 && same_agent_config_file(&entry.agent_config_path, &resolved.agent_config)
-        })
-    {
-        anyhow::bail!(messages.error_service_agent_config_conflict(
-            &resolved.agent_config.display().to_string(),
-            &conflict.service_name,
-        ));
+        }) {
+            anyhow::bail!(messages.error_service_agent_config_conflict(
+                &resolved.agent_config.display().to_string(),
+                &conflict.service_name,
+            ));
+        }
+        // The state check alone misses a service removed without
+        // `--strip-config` / `--delete-artifacts`: its entry is gone but
+        // its managed profile block survives in the file, and the agent
+        // groups and fast-polls every profile in the config — the stale
+        // service would run under the new service's AppRole identity.
+        // Inspect the target file itself for another service's block.
+        if resolved.agent_config.exists() {
+            let contents = std::fs::read_to_string(&resolved.agent_config).with_context(|| {
+                messages.error_read_file_failed(&resolved.agent_config.display().to_string())
+            })?;
+            if let Some(stale) = bootroot::trust_bootstrap::find_foreign_managed_profile_service(
+                &contents,
+                &resolved.service_name,
+            ) {
+                anyhow::bail!(messages.error_service_agent_config_stale_profile(
+                    &resolved.agent_config.display().to_string(),
+                    &stale,
+                ));
+            }
+        }
     }
 
     if preview {

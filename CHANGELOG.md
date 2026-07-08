@@ -652,7 +652,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   service writing the same file would overwrite the first service's
   `role_id`/`secret_id`/`state_path` and break its KV reads under
   per-service AppRole policies. Multiple `[[profiles]]` remain reserved
-  for instances of the same service. (Part of #691)
+  for instances of the same service. The guard also inspects the target
+  file itself: an `agent.toml` still carrying another service's
+  bootroot-managed profile block — typically left by `service remove`
+  without `--strip-config` / `--delete-artifacts`, whose entry is no
+  longer in `state.json` — is rejected too, since the agent would
+  fast-poll the stale profile under the new service's AppRole identity.
+  (Part of #691)
 - Made the remote `bootroot-agent` fast-poll loop self-sufficient
   (approach C): it now pulls two more things from OpenBao KV on the same
   self-authenticated client that already drives force-reissue. A

@@ -323,6 +323,36 @@ pub fn strip_foreign_managed_profiles(
     next
 }
 
+/// Finds the first bootroot-managed profile in `contents` that belongs
+/// to a service other than `service_name`, returning that service's
+/// name.
+///
+/// Scans the begin markers of every marker family
+/// ([`ALL_MANAGED_PROFILE_MARKERS`]), so it sees profiles written by
+/// both the local-file `service add` path and the `bootroot-remote
+/// bootstrap` path. `service add` uses this to reject reusing an
+/// `agent.toml` that still carries another service's managed profile —
+/// the state-based conflict guard cannot see a service whose entry was
+/// dropped by `service remove` without `--strip-config` /
+/// `--delete-artifacts`, but its leftover `[[profiles]]` block would
+/// keep being grouped and fast-polled under the new service's single
+/// `[openbao]` `AppRole` identity.
+#[must_use]
+pub fn find_foreign_managed_profile_service(contents: &str, service_name: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        for markers in ALL_MANAGED_PROFILE_MARKERS {
+            if let Some(rest) = trimmed.strip_prefix(markers.begin_prefix) {
+                let name = rest.trim();
+                if !name.is_empty() && name != service_name {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Removes a managed profile block from `agent.toml` contents.
 ///
 /// Deletes the `begin_prefix <service_name> … end_prefix <service_name>`
@@ -538,6 +568,48 @@ mod tests {
         assert!(
             updated.contains("email = \"a@b.c\""),
             "operator content must survive: {updated}"
+        );
+    }
+
+    /// A leftover managed profile for another service must be reported so
+    /// `service add` can reject reusing the file: the state-based guard
+    /// cannot see a service removed without `--strip-config`, but its
+    /// stale block would be fast-polled under the new `[openbao]` identity.
+    #[test]
+    fn find_foreign_managed_profile_service_reports_other_service() {
+        let stale = render_profile_for(LOCAL_FILE_PROFILE_MARKERS, "edge-proxy");
+        let contents = format!("email = \"a@b.c\"\n\n{stale}\n");
+        assert_eq!(
+            find_foreign_managed_profile_service(&contents, "billing-api").as_deref(),
+            Some("edge-proxy")
+        );
+        let remote_stale = render_profile_for(REMOTE_BOOTSTRAP_PROFILE_MARKERS, "edge-proxy");
+        let contents = format!("email = \"a@b.c\"\n\n{remote_stale}\n");
+        assert_eq!(
+            find_foreign_managed_profile_service(&contents, "billing-api").as_deref(),
+            Some("edge-proxy")
+        );
+    }
+
+    /// The own service's block (either marker family) and unmanaged files
+    /// are not conflicts — re-adds and delivery-mode transitions must pass.
+    #[test]
+    fn find_foreign_managed_profile_service_ignores_own_and_unmanaged() {
+        let own = render_profile_for(LOCAL_FILE_PROFILE_MARKERS, "edge-proxy");
+        let contents = format!("email = \"a@b.c\"\n\n{own}\n");
+        assert_eq!(
+            find_foreign_managed_profile_service(&contents, "edge-proxy"),
+            None
+        );
+        let remote_own = render_profile_for(REMOTE_BOOTSTRAP_PROFILE_MARKERS, "edge-proxy");
+        let contents = format!("email = \"a@b.c\"\n\n{remote_own}\n");
+        assert_eq!(
+            find_foreign_managed_profile_service(&contents, "edge-proxy"),
+            None
+        );
+        assert_eq!(
+            find_foreign_managed_profile_service("email = \"a@b.c\"\n", "edge-proxy"),
+            None
         );
     }
 

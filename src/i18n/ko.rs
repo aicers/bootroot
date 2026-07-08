@@ -71,6 +71,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_state_missing: "state.json을 찾을 수 없습니다 (`bootroot init`을 먼저 실행하세요)",
     error_service_duplicate: "서비스가 이미 존재합니다: {value}",
     error_service_agent_config_conflict: "에이전트 설정 {path}은(는) 이미 {service} 서비스가 사용 중입니다. [openbao] 섹션은 하나의 AppRole 자격 증명만 담으므로, 서로 다른 local-file 서비스는 각각 별도의 agent.toml을 사용해야 합니다. 하나의 설정을 공유하면 서로의 자격 증명을 덮어쓰게 됩니다",
+    error_service_agent_config_stale_profile: "에이전트 설정 {path}에 {service} 서비스의 bootroot 관리 프로필이 남아 있습니다(--strip-config/--delete-artifacts 없이 `service remove`를 실행하면 남습니다). 에이전트는 설정 안의 모든 프로필을 하나의 [openbao] AppRole 자격 증명으로 fast-poll하므로, 남은 서비스가 이 서비스의 자격 증명으로 실행됩니다. `# BEGIN/END bootroot managed profile: {service}` 블록을 삭제하거나 별도의 agent.toml을 사용한 뒤 다시 시도하세요",
     error_service_policy_mismatch: "기존 서비스의 secret_id 정책을 변경하려면 `bootroot service update`를 사용하세요",
     error_service_not_found: "서비스를 찾을 수 없습니다: {value}",
     error_service_instance_id_required: "모든 서비스에는 instance_id가 필요합니다",
