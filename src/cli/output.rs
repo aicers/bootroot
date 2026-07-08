@@ -1,5 +1,5 @@
 use crate::commands::init::{InitPlan, InitSummary};
-use crate::commands::service::{SERVICE_EAB_FILENAME, display_policy_value, display_wrap_ttl};
+use crate::commands::service::{display_policy_value, display_wrap_ttl, service_eab_file_path};
 use crate::i18n::{Messages, ServiceNextStepsDaemon};
 use crate::state::{DeliveryMode, PostRenewHookEntry, ServiceEntry};
 
@@ -363,15 +363,6 @@ fn print_daemon_run_snippet(
         config = entry.agent_config_path.display(),
         eab = eab_path.display()
     );
-}
-
-/// Derives the service's `eab.json` path (adjacent to its `secret_id`),
-/// matching what `apply_local_service_configs` provisions.
-fn service_eab_file_path(secret_id_path: &std::path::Path) -> std::path::PathBuf {
-    secret_id_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join(SERVICE_EAB_FILENAME)
 }
 
 fn print_trust_snippet(entry: &ServiceEntry, trusted: &[String], messages: &Messages) {

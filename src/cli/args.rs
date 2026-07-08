@@ -477,12 +477,15 @@ pub(crate) enum RotateCommand {
     /// Rotates the HTTP-01 responder HMAC secret.
     ///
     /// Replaces the shared HMAC used by the HTTP-01 admin API on both
-    /// the responder and on every client (`OpenBao` KV templates and
-    /// rendered config). Restarts the `OpenBao` Agent renderer so the
-    /// new HMAC is written to disk, then signals the responder with
-    /// SIGHUP via `docker compose kill -s HUP` when the compose file
-    /// includes the responder service so it reloads the new value
-    /// without dropping in-flight challenges.
+    /// the responder and on every client. Writes the new value to the
+    /// infra `OpenBao` KV path and to each registered service's
+    /// per-service KV payload; service `bootroot-agent` daemons (local
+    /// and remote alike) pick it up via their fast-poll loop, so no
+    /// per-service restart happens. Restarts the infra responder
+    /// `OpenBao` Agent so the responder config is re-rendered, then
+    /// signals the responder with SIGHUP via `docker compose kill -s
+    /// HUP` when the compose file includes the responder service so it
+    /// reloads the new value without dropping in-flight challenges.
     ResponderHmac(RotateResponderHmacArgs),
     /// Rotates `OpenBao` recovery credentials manually.
     ///

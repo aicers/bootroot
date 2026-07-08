@@ -1083,6 +1083,10 @@ The command is considered failed when:
 
 Runs a one-shot issuance via bootroot-agent and verifies cert/key output.
 Use it after service onboarding or config changes to confirm issuance works.
+For `local-file` services the one-shot run mirrors the documented daemon
+invocation, including `--eab-file` pointing at the service's `eab.json`
+(next to its `secret_id`), so a CA that requires EAB verifies the same
+issuance path the daemon uses.
 If you want **continuous renewal**, run bootroot-agent in daemon mode
 (without `--oneshot`) after verification. Any CLI overrides you pass
 (e.g. `--http-responder-hmac`, `--ca-url`) are preserved across
@@ -1295,9 +1299,12 @@ surfaces as a permission error with a hint.
 #### `rotate trust-sync`
 
 Syncs CA certificate fingerprints and bundle PEM to OpenBao and updates
-each service's trust data. For remote services, the trust payload is
-written to per-service KV paths. For local services, the agent config
-`[trust]` section is updated and the CA bundle PEM is written to disk.
+each service's trust data by writing the trust payload to every
+registered service's per-service KV path. Local and remote services
+converge the same way: each service's `bootroot-agent` fast-poll loop
+reads the updated payload, rewrites the `[trust]` section in its agent
+config, and rewrites the CA bundle PEM on disk. The command itself
+touches no service files.
 
 No additional arguments.
 

@@ -927,22 +927,16 @@ This command:
    `secrets/certs/`.
 2. Writes the fingerprints and concatenated PEM bundle to OpenBao
    (`bootroot/ca`).
-3. For each remote service, writes the trust payload to
-   `bootroot/services/<name>/trust`.
-4. For each local service, updates the `[trust]` section in the agent config
-   and writes `ca-bundle.pem` to disk.
+3. For each registered service — local and remote alike — writes the trust
+   payload to `bootroot/services/<name>/trust`.
 
-After `trust-sync`:
-
-- `local-file`: the local service host already has the updated trust config
-  and bundle on disk.
-- `remote-bootstrap`: no per-host action is needed. A running
-  `bootroot-agent`'s fast-poll loop reads the updated
-  `bootroot/services/<name>/trust` payload, re-renders the `agent.toml`
-  `[trust]` pins, and rewrites `ca-bundle.pem` within roughly one fast-poll
-  interval. Re-running `bootroot-remote bootstrap` is only a recovery path
-  for an agent that was offline past its `secret_id_ttl` and can no longer
-  self-refresh.
+After `trust-sync`, no per-host action is needed for either delivery mode. A
+running `bootroot-agent`'s fast-poll loop reads the updated
+`bootroot/services/<name>/trust` payload, re-renders the `agent.toml`
+`[trust]` pins, and rewrites `ca-bundle.pem` within roughly one fast-poll
+interval. For `remote-bootstrap` services, re-running `bootroot-remote
+bootstrap` is only a recovery path for an agent that was offline past its
+`secret_id_ttl` and can no longer self-refresh.
 
 ## Force reissue
 

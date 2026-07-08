@@ -1043,6 +1043,9 @@ bootroot service remove --service-name edge-proxy --yes --delete-artifacts
 
 bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 서비스 온보딩 직후
 또는 설정 변경 후에 실제 발급이 가능한지 확인할 때 사용합니다.
+`local-file` 서비스의 경우 one-shot 실행은 문서화된 데몬 실행 명령과
+동일하게 서비스의 `eab.json`(`secret_id` 옆)을 가리키는 `--eab-file`을
+포함하므로, EAB가 필요한 CA에서도 데몬과 같은 발급 경로를 검증합니다.
 검증 이후에도 **주기적 갱신을 원하면 bootroot-agent를 상시 모드로
 실행**해야 합니다(oneshot 없이 실행). CLI로 전달한 오버라이드
 (예: `--http-responder-hmac`, `--ca-url`)는 데몬 재시도 시에도
@@ -1247,10 +1250,12 @@ status`가 `state.json`에서 유도하는 임계값과 계속 일치합니다. 
 
 #### `rotate trust-sync`
 
-CA 인증서 지문과 번들 PEM을 OpenBao에 동기화하고 각 서비스의 trust
-데이터를 갱신합니다. 원격 서비스의 경우 서비스별 KV 경로에 trust 페이로드를
-기록합니다. 로컬 서비스의 경우 에이전트 설정의 `[trust]` 섹션을 갱신하고
-CA 번들 PEM을 디스크에 기록합니다.
+CA 인증서 지문과 번들 PEM을 OpenBao에 동기화하고, 등록된 모든 서비스의
+서비스별 KV 경로에 trust 페이로드를 기록해 각 서비스의 trust 데이터를
+갱신합니다. 로컬과 원격 서비스 모두 같은 방식으로 수렴합니다. 각 서비스의
+`bootroot-agent` fast-poll 루프가 갱신된 페이로드를 읽어 에이전트 설정의
+`[trust]` 섹션과 디스크의 CA 번들 PEM을 다시 기록합니다. 명령 자체는
+서비스 파일을 직접 수정하지 않습니다.
 
 추가 인수 없음.
 

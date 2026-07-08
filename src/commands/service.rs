@@ -37,6 +37,19 @@ pub(super) const DEFAULT_AGENT_EMAIL: &str = "admin@example.com";
 pub(super) const DEFAULT_AGENT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 pub(super) const DEFAULT_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";
 
+/// Derives a service's `eab.json` path (adjacent to its `secret_id`),
+/// matching what `apply_local_service_configs` provisions.  Every
+/// local `bootroot-agent` invocation (the documented daemon run
+/// command and the `verify` oneshot) must pass this path via
+/// `--eab-file`; the file lives outside `agent.toml`, so an
+/// invocation that omits the flag silently attempts open enrollment.
+pub(crate) fn service_eab_file_path(secret_id_path: &Path) -> std::path::PathBuf {
+    secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(SERVICE_EAB_FILENAME)
+}
+
 /// Resolves an operator-supplied ACME account email to the concrete
 /// value embedded in the `agent.toml` baseline / the remote-bootstrap
 /// artifact.  Falls back to [`DEFAULT_AGENT_EMAIL`] when the operator

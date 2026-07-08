@@ -881,20 +881,16 @@ bootroot rotate trust-sync --yes
 
 1. `secrets/certs/` 아래의 루트/중간 CA 인증서에서 SHA-256 지문을 계산합니다.
 2. 지문과 연결된 PEM 번들을 OpenBao(`bootroot/ca`)에 기록합니다.
-3. 원격 서비스마다 `bootroot/services/<name>/trust`에 trust 페이로드를
-   기록합니다.
-4. 로컬 서비스마다 에이전트 설정의 `[trust]` 섹션을 갱신하고
-   `ca-bundle.pem`을 디스크에 기록합니다.
+3. 로컬과 원격을 가리지 않고 등록된 서비스마다
+   `bootroot/services/<name>/trust`에 trust 페이로드를 기록합니다.
 
-`trust-sync` 이후:
-
-- `local-file`: 로컬 서비스 호스트에 갱신된 trust 설정과 번들이 이미 기록됩니다.
-- `remote-bootstrap`: 호스트별 조치가 필요 없습니다. 실행 중인
-  `bootroot-agent`의 fast-poll 루프가 갱신된 `bootroot/services/<name>/trust`
-  payload를 읽어 `agent.toml` `[trust]` 핀을 다시 렌더링하고 `ca-bundle.pem`을
-  약 1 fast-poll 주기 내에 다시 기록합니다. `bootroot-remote bootstrap` 재실행은
-  에이전트가 `secret_id_ttl`을 넘겨 오프라인 상태였고 더 이상 스스로 갱신할 수
-  없는 경우의 복구 경로일 뿐입니다.
+`trust-sync` 이후에는 어느 전달 모드든 호스트별 조치가 필요 없습니다. 실행
+중인 `bootroot-agent`의 fast-poll 루프가 갱신된
+`bootroot/services/<name>/trust` payload를 읽어 `agent.toml` `[trust]` 핀을
+다시 렌더링하고 `ca-bundle.pem`을 약 1 fast-poll 주기 내에 다시 기록합니다.
+`remote-bootstrap` 서비스의 경우 `bootroot-remote bootstrap` 재실행은
+에이전트가 `secret_id_ttl`을 넘겨 오프라인 상태였고 더 이상 스스로 갱신할 수
+없는 경우의 복구 경로일 뿐입니다.
 
 ## 강제 재발급
 

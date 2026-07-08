@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,7 +12,7 @@ use crate::cli::args::VerifyArgs;
 use crate::cli::output::print_verify_plan;
 use crate::cli::prompt::Prompt;
 use crate::i18n::Messages;
-use crate::state::{ServiceEntry, StateFile};
+use crate::state::{DeliveryMode, ServiceEntry, StateFile};
 
 const AGENT_BINARY_NAME: &str = "bootroot-agent";
 
@@ -36,11 +37,7 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
 
     let agent_binary = resolve_agent_binary(args.agent_binary.as_deref(), messages)?;
     let status = Command::new(&agent_binary)
-        .args([
-            "--config",
-            agent_config.to_string_lossy().as_ref(),
-            "--oneshot",
-        ])
+        .args(oneshot_agent_args(entry, agent_config))
         .status()
         .with_context(|| messages.error_bootroot_agent_run_failed())?;
 
@@ -132,6 +129,30 @@ fn verify_db_connectivity(
         .with_context(|| messages.error_db_check_failed())?;
     check_auth_sync(&dsn, timeout).with_context(|| messages.error_db_auth_failed())?;
     Ok(())
+}
+
+/// Builds the argument list for the verification `--oneshot` agent run.
+///
+/// Local-file services keep EAB material outside `agent.toml`: `service
+/// add` provisions `eab.json` next to the service `secret_id` and the
+/// documented daemon run command passes it via `--eab-file`. The oneshot
+/// must mirror that invocation — without the flag, a CA that requires
+/// EAB sees an open-enrollment attempt and `verify` fails on a healthy
+/// service. A missing `eab.json` is the durable "open enrollment"
+/// representation, so passing the path unconditionally is safe.
+fn oneshot_agent_args(entry: &ServiceEntry, agent_config: &Path) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("--config"),
+        agent_config.as_os_str().to_os_string(),
+    ];
+    if entry.delivery_mode == DeliveryMode::LocalFile {
+        let eab_path =
+            crate::commands::service::service_eab_file_path(&entry.approle.secret_id_path);
+        args.push(OsString::from("--eab-file"));
+        args.push(eab_path.into_os_string());
+    }
+    args.push(OsString::from("--oneshot"));
+    args
 }
 
 fn resolve_agent_binary(override_path: Option<&Path>, messages: &Messages) -> Result<PathBuf> {
@@ -372,6 +393,76 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_service_entry(delivery_mode: DeliveryMode) -> ServiceEntry {
+        ServiceEntry {
+            service_name: "edge-proxy".to_string(),
+            delivery_mode,
+            hostname: "host-a".to_string(),
+            domain: "example.com".to_string(),
+            agent_config_path: PathBuf::from("/etc/bootroot/agent.toml"),
+            cert_path: PathBuf::from("/etc/bootroot/certs/cert.pem"),
+            key_path: PathBuf::from("/etc/bootroot/certs/key.pem"),
+            instance_id: Some("001".to_string()),
+            notes: None,
+            post_renew_hooks: Vec::new(),
+            approle: crate::state::ServiceRoleEntry {
+                role_name: "bootroot-service-edge-proxy".to_string(),
+                role_id: "role-id".to_string(),
+                secret_id_path: PathBuf::from("/secrets/services/edge-proxy/secret_id"),
+                policy_name: "policy".to_string(),
+                secret_id_ttl: None,
+                secret_id_wrap_ttl: None,
+                token_bound_cidrs: None,
+            },
+            agent_email: None,
+            agent_server: None,
+            agent_responder_url: None,
+            cert_group_gid: None,
+        }
+    }
+
+    /// Regression for the local EAB wiring: `service add` provisions
+    /// `eab.json` next to the service `secret_id` and documents a daemon
+    /// run command that passes `--eab-file`, so the `verify` oneshot must
+    /// pass the same file. Dropping it makes verify exercise an
+    /// open-enrollment issuance path that fails when the CA requires EAB.
+    #[test]
+    fn oneshot_args_pass_service_eab_file_for_local_service() {
+        let entry = test_service_entry(DeliveryMode::LocalFile);
+        let config = Path::new("/etc/bootroot/agent.toml");
+
+        let args = oneshot_agent_args(&entry, config);
+
+        let expected: Vec<OsString> = [
+            "--config",
+            "/etc/bootroot/agent.toml",
+            "--eab-file",
+            "/secrets/services/edge-proxy/eab.json",
+            "--oneshot",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(args, expected);
+    }
+
+    /// Remote entries have no locally provisioned `eab.json` (the remote
+    /// host's bootstrap manages it), so the oneshot must not point
+    /// `--eab-file` at a control-plane path that never exists.
+    #[test]
+    fn oneshot_args_omit_eab_file_for_remote_service() {
+        let entry = test_service_entry(DeliveryMode::RemoteBootstrap);
+        let config = Path::new("/etc/bootroot/agent.toml");
+
+        let args = oneshot_agent_args(&entry, config);
+
+        let expected: Vec<OsString> = ["--config", "/etc/bootroot/agent.toml", "--oneshot"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(args, expected);
+    }
 
     fn test_cert_pem(common_name: &str) -> String {
         let mut params = rcgen::CertificateParams::new(vec![common_name.to_string()]).unwrap();
