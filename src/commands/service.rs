@@ -50,6 +50,25 @@ pub(crate) fn service_eab_file_path(secret_id_path: &Path) -> std::path::PathBuf
         .join(SERVICE_EAB_FILENAME)
 }
 
+/// Reports whether two local agent-config paths name the same file.
+/// Paths resolved by this binary are stored absolute and lexically
+/// normalized, so a literal comparison covers equivalent spellings;
+/// the canonicalizing fallback additionally resolves symlinks for
+/// files that exist, so a symlinked spelling of a registered config
+/// cannot bypass the one-config-per-service guard.
+fn same_agent_config_file(registered: &Path, candidate: &Path) -> bool {
+    if registered == candidate {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(registered),
+        std::fs::canonicalize(candidate),
+    ) {
+        (Ok(registered), Ok(candidate)) => registered == candidate,
+        _ => false,
+    }
+}
+
 /// Resolves an operator-supplied ACME account email to the concrete
 /// value embedded in the `agent.toml` baseline / the remote-bootstrap
 /// artifact.  Falls back to [`DEFAULT_AGENT_EMAIL`] when the operator
@@ -162,7 +181,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     if matches!(resolved.delivery_mode, DeliveryMode::LocalFile)
         && let Some(conflict) = state.services.values().find(|entry| {
             matches!(entry.delivery_mode, DeliveryMode::LocalFile)
-                && entry.agent_config_path == resolved.agent_config
+                && same_agent_config_file(&entry.agent_config_path, &resolved.agent_config)
         })
     {
         anyhow::bail!(messages.error_service_agent_config_conflict(

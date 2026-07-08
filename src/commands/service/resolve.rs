@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bootroot::input_validation::{
     ValidationError, validate_cidr_list, validate_dns_label, validate_domain_name,
     validate_numeric_instance_id,
@@ -93,6 +93,14 @@ pub(super) fn resolve_service_add_args(
         false,
         messages,
     )?;
+    // Remote-bootstrap agent-config paths name a file on the *remote*
+    // host, so only local-file paths are normalized against this
+    // host's filesystem.
+    let agent_config = if matches!(delivery_mode, DeliveryMode::LocalFile) {
+        normalize_local_agent_config_path(&agent_config)?
+    } else {
+        agent_config
+    };
 
     let cert_path = resolve_path(
         args.cert_path.clone(),
@@ -446,6 +454,35 @@ fn resolve_reload_preset(
     }
 }
 
+/// Normalizes a local-file `--agent-config` path to an absolute,
+/// lexically clean form (no `.`/`..` components) so equivalent
+/// spellings of the same file (`agent.toml`, `./agent.toml`,
+/// `sub/../agent.toml`) store and compare identically in the
+/// one-config-per-service conflict guard. Symlinks are deliberately
+/// left unresolved so state keeps the operator's chosen location; the
+/// add-time conflict guard additionally canonicalizes existing files
+/// when comparing, which covers symlinked spellings.
+fn normalize_local_agent_config_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("failed to resolve absolute path for {}", path.display()))?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            // Lexical `..` handling: `a/b/..` is treated as `a`. A
+            // symlinked intermediate directory can defeat this, which
+            // the canonicalizing conflict comparison covers for files
+            // that exist. Popping at the root is a no-op, matching
+            // path resolution semantics for `/..`.
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
 fn resolve_path(
     value: Option<PathBuf>,
     label: &str,
@@ -530,6 +567,33 @@ mod tests {
             rn_cidrs: Vec::new(),
             cert_group: None,
         }
+    }
+
+    /// Equivalent relative spellings of the same file must normalize
+    /// to one absolute path, or the add-time agent-config conflict
+    /// guard can be bypassed by re-spelling the path (`./agent.toml`
+    /// vs `agent.toml`), letting a second service overwrite the first
+    /// service's single `[openbao]` identity.
+    #[test]
+    fn normalize_local_agent_config_path_unifies_equivalent_spellings() {
+        let plain = normalize_local_agent_config_path(Path::new("agent.toml")).unwrap();
+        let dotted = normalize_local_agent_config_path(Path::new("./agent.toml")).unwrap();
+        let doubled = normalize_local_agent_config_path(Path::new("sub/.././agent.toml")).unwrap();
+
+        assert!(plain.is_absolute(), "normalized path must be absolute");
+        assert_eq!(plain, dotted);
+        assert_eq!(plain, doubled);
+    }
+
+    /// Absolute inputs stay put apart from lexical cleanup, so the
+    /// stored `agent_config_path` keeps the operator's chosen
+    /// location instead of a symlink-resolved alias.
+    #[test]
+    fn normalize_local_agent_config_path_cleans_absolute_input() {
+        let normalized =
+            normalize_local_agent_config_path(Path::new("/etc/bootroot/./sub/../agent.toml"))
+                .unwrap();
+        assert_eq!(normalized, Path::new("/etc/bootroot/agent.toml"));
     }
 
     #[test]
