@@ -47,8 +47,10 @@ SecretID rotation and delivery must be performed by the operator using
 Bootroot CLI (`bootroot` & `bootroot-remote`) commands. All other secrets are
 rotated and delivered automatically by Bootroot. SecretID grants access to
 OpenBao itself, but the remaining secrets can be retrieved by connecting to
-OpenBao, which makes their rotation automatable. OpenBao Agent handles
-retrieving secrets from OpenBao.
+OpenBao, which makes their rotation automatable. `bootroot-agent` retrieves
+service secrets from OpenBao itself via its fast-poll loop; the
+infrastructure components (step-ca and the HTTP-01 responder) receive theirs
+through dedicated OpenBao Agents.
 
 ## Not Automated (1) — OpenBao Unseal Keys and SecretID
 
@@ -110,13 +112,13 @@ rotations.
 There are aspects of installation and operations that fall outside Bootroot's
 automation scope:
 
-- **Installation**: The operator must install the Bootroot CLI and per-service
-  OpenBao Agent and `bootroot-agent` manually. (Infrastructure components
-  including the CA and their OpenBao Agents are installed automatically during
+- **Installation**: The operator must install the Bootroot CLI and
+  `bootroot-agent` manually. (Infrastructure components including the CA and
+  their OpenBao Agents are installed automatically during
   `bootroot infra up`.)
-- **Process management**: The operator must configure and verify systemd or
-  Docker restart settings so that manually installed OpenBao Agents and
-  `bootroot-agent` instances keep running.
+- **Process management**: The operator must configure and verify the systemd
+  units so that manually installed `bootroot-agent` host daemons keep
+  running.
 - **Rotation scheduling**: Bootroot provides the rotation command
   (`bootroot rotate`), but scheduling its periodic execution (cron, systemd
   timer, etc.) is the operator's responsibility.
