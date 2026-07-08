@@ -82,7 +82,9 @@ pub(super) async fn run_apply_secret_id(args: ApplySecretIdArgs, lang: Locale) -
 
     let ca_bundle_pem =
         resolve_ca_bundle_pem(&args.openbao_url, args.ca_bundle_path.as_deref(), lang).await?;
-    let mut client = build_openbao_client(&args.openbao_url, ca_bundle_pem.as_deref(), lang)?;
+    // `apply-secret-id` has only a `--ca-bundle-path` PEM and no fingerprint
+    // source, so it passes empty pins and stays bundle-anchored (issue #695).
+    let mut client = build_openbao_client(&args.openbao_url, ca_bundle_pem.as_deref(), &[], lang)?;
     let token = client
         .login_approle(&role_id, &current_secret_id)
         .await
@@ -235,6 +237,7 @@ mod tests {
         let client = build_openbao_client(
             &format!("https://localhost:{port}"),
             Some(&ca_pem),
+            &[],
             Locale::En,
         )
         .expect("https client built from the supplied CA bundle");
@@ -287,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_openbao_client_https_without_ca_is_rejected() {
-        let err = build_openbao_client("https://openbao.example:8200", None, Locale::En)
+        let err = build_openbao_client("https://openbao.example:8200", None, &[], Locale::En)
             .expect_err("https client without a CA bundle must be rejected");
         assert!(
             err.to_string().contains("CA bundle"),

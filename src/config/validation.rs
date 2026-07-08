@@ -1,6 +1,8 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use reqwest::Url;
 
 use super::defaults::default_renew_before;
 use super::{DaemonProfileSettings, HookCommand, OpenBaoSettings, Settings, TrustSettings};
@@ -100,9 +102,57 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+/// Reports whether an `openbao.url` is a non-loopback plaintext
+/// `http://` endpoint — the case that exposes `AppRole` credentials and
+/// delivered secrets on the wire and therefore requires the explicit
+/// `allow_plaintext_http` opt-in.
+///
+/// Loopback plaintext (`localhost`, `127.0.0.0/8`, `[::1]`) and any
+/// `https://` URL return `false`. A URL that does not use the `http://`
+/// scheme, or one whose host cannot be parsed, also returns `false`: the
+/// scheme check confines this to plaintext HTTP, and a host that fails to
+/// parse is left for other validation to reject.
+#[must_use]
+pub fn openbao_url_is_non_loopback_plaintext(url: &str) -> bool {
+    let trimmed = url.trim();
+    if !trimmed.starts_with("http://") {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(trimmed) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    !host_is_loopback(host)
+}
+
+/// Reports whether a URL host string designates the loopback interface.
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // `Url::host_str` keeps the brackets around an IPv6 literal; strip
+    // them before parsing.
+    let candidate = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    candidate.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 fn validate_openbao_settings(settings: &OpenBaoSettings) -> Result<()> {
     if settings.url.trim().is_empty() {
         anyhow::bail!("openbao.url must not be empty");
+    }
+    if openbao_url_is_non_loopback_plaintext(&settings.url) && !settings.allow_plaintext_http {
+        anyhow::bail!(
+            "openbao.url ({}) is a non-loopback plaintext http:// endpoint; AppRole \
+             credentials and delivered secrets would cross the network unencrypted. Use \
+             https://, point at a loopback address, or set [openbao] allow_plaintext_http = \
+             true to opt in explicitly",
+            settings.url
+        );
     }
     if settings.kv_mount.trim().is_empty() {
         anyhow::bail!("openbao.kv_mount must not be empty");
@@ -282,5 +332,76 @@ mod tests {
     fn cert_duration_rejects_invalid_value() {
         assert!(validate_cert_duration_vs_default_renew_before("bogus").is_err());
         assert!(validate_cert_duration_vs_default_renew_before("").is_err());
+    }
+
+    fn openbao_settings(url: &str, allow_plaintext_http: bool) -> OpenBaoSettings {
+        OpenBaoSettings {
+            url: url.to_string(),
+            allow_plaintext_http,
+            kv_mount: "secret".to_string(),
+            role_id_path: std::path::PathBuf::from("/etc/bootroot/role_id"),
+            secret_id_path: std::path::PathBuf::from("/etc/bootroot/secret_id"),
+            ca_bundle_path: None,
+            fast_poll_interval: Duration::from_secs(5),
+            state_path: std::path::PathBuf::from("/var/lib/bootroot/state.json"),
+        }
+    }
+
+    #[test]
+    fn openbao_allows_loopback_plaintext_without_opt_in() {
+        for url in [
+            "http://localhost:8200",
+            "http://127.0.0.1:8200",
+            "http://127.5.6.7:8200",
+            "http://[::1]:8200",
+        ] {
+            assert!(
+                validate_openbao_settings(&openbao_settings(url, false)).is_ok(),
+                "loopback plaintext {url} should validate without opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn openbao_allows_https_without_opt_in() {
+        let mut settings = openbao_settings("https://openbao.example:8200", false);
+        settings.ca_bundle_path = Some(std::path::PathBuf::from("/etc/bootroot/ca-bundle.pem"));
+        assert!(validate_openbao_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn openbao_rejects_non_loopback_plaintext_without_opt_in() {
+        let err = validate_openbao_settings(&openbao_settings("http://10.0.0.5:8200", false))
+            .expect_err("non-loopback plaintext without opt-in must fail");
+        let message = format!("{err}");
+        assert!(
+            message.contains("allow_plaintext_http"),
+            "error should point at the opt-in: {message}"
+        );
+    }
+
+    #[test]
+    fn openbao_allows_non_loopback_plaintext_with_opt_in() {
+        assert!(validate_openbao_settings(&openbao_settings("http://10.0.0.5:8200", true)).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_plaintext_classifier_matches_expectations() {
+        assert!(openbao_url_is_non_loopback_plaintext(
+            "http://10.0.0.5:8200"
+        ));
+        assert!(openbao_url_is_non_loopback_plaintext(
+            "http://openbao.example:8200"
+        ));
+        assert!(!openbao_url_is_non_loopback_plaintext(
+            "http://localhost:8200"
+        ));
+        assert!(!openbao_url_is_non_loopback_plaintext(
+            "http://127.0.0.1:8200"
+        ));
+        assert!(!openbao_url_is_non_loopback_plaintext("http://[::1]:8200"));
+        assert!(!openbao_url_is_non_loopback_plaintext(
+            "https://openbao.example:8200"
+        ));
     }
 }

@@ -7,7 +7,9 @@
 //! agree on shape, required fields, and fingerprint formatting. Callers that
 //! need localized error text wrap these errors with their own context.
 
-use anyhow::{Result, bail};
+use std::collections::HashSet;
+
+use anyhow::{Context, Result, bail};
 
 use crate::trust_bootstrap::{
     CA_BUNDLE_PEM_KEY, EAB_HMAC_KEY, EAB_KID_KEY, HMAC_KEY, SECRET_ID_KEY, TRUSTED_CA_KEY,
@@ -26,17 +28,55 @@ pub struct TrustPayload {
 
 /// Parses and validates a service `trust` KV payload.
 ///
+/// Beyond the shape checks, this verifies the payload is internally
+/// consistent before any of it can reach disk: the `ca_bundle_pem` must
+/// parse into at least one certificate, and every `trusted_ca_sha256`
+/// fingerprint must match the SHA-256 of some certificate in that bundle.
+/// The fingerprints and the bundle come from the same payload, so this is
+/// consistency validation rather than independent authentication — but it
+/// rejects non-PEM garbage, empty-certificate bundles, truncated writes,
+/// and operator mistakes before the fast-poll trust-apply hook writes the
+/// bundle to disk (issue #695).
+///
 /// # Errors
 ///
 /// Returns an error when `trusted_ca_sha256` is missing, empty, or contains a
-/// non-string / non-64-hex value, or when `ca_bundle_pem` is missing or empty.
+/// non-string / non-64-hex value, when `ca_bundle_pem` is missing or empty,
+/// when `ca_bundle_pem` does not parse into at least one certificate, or when
+/// a fingerprint does not match any certificate in the bundle.
 pub fn parse_trust_payload(data: &serde_json::Value) -> Result<TrustPayload> {
     let trusted_ca_sha256 = parse_fingerprints(data)?;
     let ca_bundle_pem = parse_required_string(data, &[CA_BUNDLE_PEM_KEY])?;
+    validate_bundle_consistency(&ca_bundle_pem, &trusted_ca_sha256)?;
     Ok(TrustPayload {
         trusted_ca_sha256,
         ca_bundle_pem,
     })
+}
+
+/// Verifies the CA bundle parses into certificates and that every pinned
+/// fingerprint matches one of them.
+///
+/// # Errors
+///
+/// Returns an error when the bundle parses to zero certificates or when a
+/// fingerprint is not present among the bundle certificates' SHA-256 hashes.
+fn validate_bundle_consistency(ca_bundle_pem: &str, fingerprints: &[String]) -> Result<()> {
+    let certs = crate::tls::parse_pem_to_cert_list(ca_bundle_pem.as_bytes())
+        .context("trust payload ca_bundle_pem is not a valid certificate bundle")?;
+    let present: HashSet<String> = certs
+        .iter()
+        .map(|cert| crate::tls::sha256_hex(cert.as_ref()))
+        .collect();
+    for fingerprint in fingerprints {
+        if !present.contains(&fingerprint.to_ascii_lowercase()) {
+            bail!(
+                "trust payload {TRUSTED_CA_KEY} entry {fingerprint} does not match any \
+                 certificate in ca_bundle_pem"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Parses a service `secret_id` KV payload, returning the credential.
@@ -169,15 +209,76 @@ fn parse_fingerprints(data: &serde_json::Value) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    /// Generates a self-signed CA certificate, returning its PEM and the
+    /// lowercase hex SHA-256 of its DER (the `trusted_ca_sha256` form).
+    fn generate_ca_cert() -> (String, String) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+        let key = KeyPair::generate().expect("generate CA key");
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Bootroot Test CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).expect("self-signed cert");
+        let fingerprint = crate::tls::sha256_hex(cert.der().as_ref());
+        (cert.pem(), fingerprint)
+    }
+
     #[test]
     fn parse_trust_payload_accepts_valid_values() {
+        let (pem_a, fp_a) = generate_ca_cert();
+        let (pem_b, fp_b) = generate_ca_cert();
         let data = serde_json::json!({
-            "trusted_ca_sha256": ["a".repeat(64), "b".repeat(64)],
-            "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\n...\n",
+            "trusted_ca_sha256": [fp_a, fp_b],
+            "ca_bundle_pem": format!("{pem_a}{pem_b}"),
         });
         let parsed = parse_trust_payload(&data).expect("parse trust payload");
         assert_eq!(parsed.trusted_ca_sha256.len(), 2);
-        assert!(parsed.ca_bundle_pem.starts_with("-----BEGIN"));
+        assert!(parsed.ca_bundle_pem.contains("-----BEGIN CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn parse_trust_payload_accepts_uppercase_fingerprint() {
+        let (pem, fp) = generate_ca_cert();
+        let data = serde_json::json!({
+            "trusted_ca_sha256": [fp.to_ascii_uppercase()],
+            "ca_bundle_pem": pem,
+        });
+        assert!(parse_trust_payload(&data).is_ok());
+    }
+
+    #[test]
+    fn parse_trust_payload_rejects_non_pem_bundle() {
+        let (_, fp) = generate_ca_cert();
+        let data = serde_json::json!({
+            "trusted_ca_sha256": [fp],
+            "ca_bundle_pem": "this is not a certificate bundle",
+        });
+        assert!(parse_trust_payload(&data).is_err());
+    }
+
+    #[test]
+    fn parse_trust_payload_rejects_bundle_with_no_certificates() {
+        // A syntactically valid PEM that carries no CERTIFICATE entries
+        // parses to zero certs and must be rejected.
+        let (_, fp) = generate_ca_cert();
+        let data = serde_json::json!({
+            "trusted_ca_sha256": [fp],
+            "ca_bundle_pem": "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+        });
+        assert!(parse_trust_payload(&data).is_err());
+    }
+
+    #[test]
+    fn parse_trust_payload_rejects_fingerprint_absent_from_bundle() {
+        let (pem, _) = generate_ca_cert();
+        let data = serde_json::json!({
+            // A well-formed but unrelated fingerprint.
+            "trusted_ca_sha256": ["a".repeat(64)],
+            "ca_bundle_pem": pem,
+        });
+        assert!(parse_trust_payload(&data).is_err());
     }
 
     #[test]

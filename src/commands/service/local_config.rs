@@ -209,6 +209,14 @@ fn build_local_openbao_updates(
             inputs.ca_bundle_path.display().to_string(),
         ),
     ];
+    // A non-loopback plaintext URL fails config validation without the
+    // explicit opt-in. The local `url` defaults to loopback
+    // `http://localhost:8200`, but an operator can point `bootroot init`
+    // at a non-loopback address, so apply the same rule as the remote
+    // writer. Loopback plaintext and https:// never need it.
+    if bootroot::config::openbao_url_is_non_loopback_plaintext(inputs.openbao_url) {
+        pairs.push(("allow_plaintext_http", "true".to_string()));
+    }
     if needs_absolute_state_path_provisioning(inputs.current_contents) {
         pairs.push((
             "state_path",
@@ -683,6 +691,49 @@ mod tests {
             get("state_path"),
             Some("/etc/bootroot/bootroot-agent-state-edge-proxy.json"),
             "state_path must be absolute and service-keyed"
+        );
+    }
+
+    fn openbao_updates_for_url(url: &str) -> Vec<(&'static str, String)> {
+        build_local_openbao_updates(&LocalOpenBaoUpdateInputs {
+            openbao_url: url,
+            kv_mount: "secret",
+            role_id_path: Path::new("secrets/services/edge-proxy/role_id"),
+            secret_id_path: Path::new("secrets/services/edge-proxy/secret_id"),
+            ca_bundle_path: Path::new("certs/ca-bundle.pem"),
+            agent_config_path: Path::new("/etc/bootroot/agent.toml"),
+            service_name: "edge-proxy",
+            current_contents: "",
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_local_openbao_updates_emit_opt_in_for_non_loopback_plaintext() {
+        let updates = openbao_updates_for_url("http://10.0.0.5:8200");
+        assert!(
+            updates
+                .iter()
+                .any(|(k, v)| *k == "allow_plaintext_http" && v == "true"),
+            "non-loopback plaintext must upsert the opt-in: {updates:?}"
+        );
+    }
+
+    #[test]
+    fn test_local_openbao_updates_omit_opt_in_for_loopback_plaintext() {
+        let updates = openbao_updates_for_url("http://localhost:8200");
+        assert!(
+            !updates.iter().any(|(k, _)| *k == "allow_plaintext_http"),
+            "loopback plaintext must not emit the opt-in: {updates:?}"
+        );
+    }
+
+    #[test]
+    fn test_local_openbao_updates_omit_opt_in_for_https() {
+        let updates = openbao_updates_for_url("https://openbao.example:8200");
+        assert!(
+            !updates.iter().any(|(k, _)| *k == "allow_plaintext_http"),
+            "https must not emit the opt-in: {updates:?}"
         );
     }
 

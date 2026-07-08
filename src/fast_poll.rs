@@ -1407,6 +1407,19 @@ pub(crate) async fn run_fast_poll_loop(
         settings.profiles.len(),
     );
 
+    // Item #695: a non-loopback plaintext OpenBao URL validates only with
+    // the explicit `allow_plaintext_http` opt-in. Surface one prominent
+    // startup warning so operators cannot forget that AppRole credentials
+    // and every delivered secret cross the network unencrypted.
+    if config::openbao_url_is_non_loopback_plaintext(&openbao.url) {
+        warn!(
+            "OpenBao URL {} is a non-loopback plaintext http:// endpoint (allow_plaintext_http \
+             is set): AppRole role_id/secret_id and all delivered secrets (secret_id, responder \
+             HMAC, EAB) cross the network UNENCRYPTED. Use https:// in production.",
+            openbao.url
+        );
+    }
+
     let mut state = match FastPollState::load(&openbao.state_path).await {
         Ok(state) => state,
         Err(err) => {
@@ -1418,12 +1431,18 @@ pub(crate) async fn run_fast_poll_loop(
         }
     };
 
-    // Share the OpenBaoClient across hooks and re-login helpers.
-    let client = build_openbao_client(&openbao)?;
+    // Share the OpenBaoClient across hooks and re-login helpers. At
+    // startup the pins come from the config snapshot; the post-trust-apply
+    // rebuild below re-reads them from the freshly written agent.toml.
+    let client = build_openbao_client(&openbao, &settings.trust.trusted_ca_sha256)?;
     let client = Arc::new(Mutex::new(client));
     if let Err(err) = login(&client, &openbao).await {
         warn!("Initial OpenBao AppRole login failed: {err:#}. Will retry on the next tick.");
     }
+
+    // Retain a copy of the config path for the client rebuild's pin
+    // re-read; the canonical copy is moved into the hooks below.
+    let config_path_for_rebuild = config_path.clone();
 
     // The EAB poll runs only when EAB is sourced from `--eab-file`; a
     // CLI-pinned EAB gets `None` here so fast-poll never overrides the
@@ -1613,7 +1632,13 @@ pub(crate) async fn run_fast_poll_loop(
         // advanced version and just retry the login.
         let mut trust_applied = trust_changed;
         if trust_changed && rebuild_client_on_trust {
-            let rebuilt_ok = match build_openbao_client(&openbao) {
+            // Pin the rebuilt client to the freshly applied anchors, not
+            // the startup snapshot: a rotation that lands a new CA + new
+            // pins in KV has just been written to agent.toml, so re-read
+            // from there. Stale startup pins would strand the client on
+            // the retired CA and defeat zero-touch rotation.
+            let rebuild_pins = read_trust_pins_from_config(&config_path_for_rebuild).await;
+            let rebuilt_ok = match build_openbao_client(&openbao, &rebuild_pins) {
                 Ok(rebuilt) => {
                     *client.lock().await = rebuilt;
                     if let Err(err) = login(&client, &openbao).await {
@@ -1694,7 +1719,22 @@ fn reconcile_trust_rebuild(
     false
 }
 
-fn build_openbao_client(openbao: &config::OpenBaoSettings) -> Result<OpenBaoClient> {
+/// Builds the fast-poll `OpenBaoClient`, anchoring an `https://` endpoint
+/// to the on-disk CA bundle and restricting its trust anchors to `pins`
+/// (`trusted_ca_sha256`) when non-empty. An empty pin set keeps the prior
+/// bundle-anchored behavior. A plaintext endpoint ignores `pins` (there is
+/// no TLS to anchor).
+///
+/// The pins the caller passes matter: at startup they come from the config
+/// snapshot, but on the post-trust-apply rebuild they MUST come from the
+/// freshly applied trust (see `read_trust_pins_from_config`) so a rotation
+/// that swaps the CA also swaps the pins — a stale startup snapshot would
+/// strand the rebuilt client on the retired CA and defeat zero-touch
+/// rotation (issue #695).
+fn build_openbao_client(
+    openbao: &config::OpenBaoSettings,
+    pins: &[String],
+) -> Result<OpenBaoClient> {
     if openbao.url.starts_with("https://") {
         let ca_bundle_path = openbao
             .ca_bundle_path
@@ -1706,11 +1746,35 @@ fn build_openbao_client(openbao: &config::OpenBaoSettings) -> Result<OpenBaoClie
                 ca_bundle_path.display()
             )
         })?;
-        OpenBaoClient::with_pem_trust(&openbao.url, &pem, &[])
+        OpenBaoClient::with_pem_trust(&openbao.url, &pem, pins)
             .context("Failed to build OpenBao client with CA bundle")
     } else {
         OpenBaoClient::new(&openbao.url).context("Failed to build OpenBao client")
     }
+}
+
+/// Reads the current `[trust].trusted_ca_sha256` pins from the on-disk
+/// `agent.toml`. Used to pin the post-trust-apply client rebuild to the
+/// freshly written anchors rather than the startup snapshot. Returns an
+/// empty list (bundle-anchored) if the file is unreadable, unparseable, or
+/// carries no pins — the same fallback as an unpinned config.
+async fn read_trust_pins_from_config(config_path: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(config_path).await else {
+        return Vec::new();
+    };
+    let Ok(doc) = contents.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    doc.get("trust")
+        .and_then(|trust| trust.get("trusted_ca_sha256"))
+        .and_then(toml_edit::Item::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn login(
@@ -2615,12 +2679,38 @@ mod tests {
         assert_eq!(pending.requester.as_deref(), Some("alice"));
     }
 
+    /// Generates a self-signed CA certificate, returning its PEM and the
+    /// lowercase hex SHA-256 of its DER (the `trusted_ca_sha256` form).
+    fn generate_ca_cert() -> (String, String) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+        let key = KeyPair::generate().expect("generate CA key");
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Bootroot Test CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).expect("self-signed cert");
+        let fingerprint = crate::tls::sha256_hex(cert.der().as_ref());
+        (cert.pem(), fingerprint)
+    }
+
+    /// Builds a structurally valid trust payload: a two-certificate bundle
+    /// whose members' fingerprints are exactly the pinned list, so it
+    /// passes `parse_trust_payload`'s consistency check.
+    fn valid_trust_bundle() -> (Vec<String>, String) {
+        let (pem_a, fp_a) = generate_ca_cert();
+        let (pem_b, fp_b) = generate_ca_cert();
+        (vec![fp_a, fp_b], format!("{pem_a}{pem_b}"))
+    }
+
     fn trust_read(version: u64) -> KvReadWithVersion {
+        let (fingerprints, ca_bundle_pem) = valid_trust_bundle();
         KvReadWithVersion {
             version,
             data: serde_json::json!({
-                "trusted_ca_sha256": ["a".repeat(64), "b".repeat(64)],
-                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nMII...\n-----END CERTIFICATE-----\n",
+                "trusted_ca_sha256": fingerprints,
+                "ca_bundle_pem": ca_bundle_pem,
             }),
         }
     }
@@ -3361,6 +3451,216 @@ mod tests {
         assert_eq!(config_mode, 0o600);
     }
 
+    /// Trust-poll hook whose `apply_trust` performs the real on-disk write
+    /// (`apply_trust_to_disk`). Used by the no-disk-write regression test so
+    /// that if a malformed payload ever reached the apply stage the seeded
+    /// files would visibly change. Only `read_kv_version` and `apply_trust`
+    /// are exercised by `run_trust_poll_tick`; the rest are unreachable.
+    struct DiskWritingTrustHooks {
+        reads: std::sync::Mutex<std::collections::VecDeque<Result<Option<KvReadWithVersion>>>>,
+        settings: config::Settings,
+        config_path: PathBuf,
+        applied: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FastPollHooks for DiskWritingTrustHooks {
+        fn read_kv_version(
+            &self,
+            _kv_mount: &str,
+            _kv_path: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Option<KvReadWithVersion>>> + Send + '_>>
+        {
+            let next = self.reads.lock().unwrap().pop_front().unwrap_or(Ok(None));
+            Box::pin(async move { next })
+        }
+
+        fn apply_trust(
+            &self,
+            service: &str,
+            payload: &TrustPayload,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.applied
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let settings = self.settings.clone();
+            let config_path = self.config_path.clone();
+            let service = service.to_string();
+            let payload = payload.clone();
+            Box::pin(async move {
+                apply_trust_to_disk(&settings, &config_path, &service, &payload).await
+            })
+        }
+
+        fn write_kv(
+            &self,
+            _: &str,
+            _: &str,
+            _: serde_json::Value,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            unreachable!("write_kv not used by trust poll")
+        }
+
+        fn trigger_renewal(
+            &self,
+            _: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            unreachable!("trigger_renewal not used by trust poll")
+        }
+
+        fn apply_secret_id(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            unreachable!("apply_secret_id not used by trust poll")
+        }
+
+        fn apply_responder_hmac(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            unreachable!("apply_responder_hmac not used by trust poll")
+        }
+
+        fn apply_eab(
+            &self,
+            _: &str,
+            _: &EabPayload,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            unreachable!("apply_eab not used by trust poll")
+        }
+    }
+
+    /// Regression for issue #695 item 2: a malformed trust KV payload
+    /// (non-PEM garbage, empty-certificate bundle, or a fingerprint absent
+    /// from the bundle) is classified `Malformed` by the pre-apply parse
+    /// gate, so `apply_trust` is never invoked, neither the CA bundle file
+    /// nor `agent.toml` changes on disk, and `last_trust_seen_version` does
+    /// not advance. This gate is scheme-independent: because `trust_changed`
+    /// stays false, the loop's HTTPS rebuild/version-reconcile block is
+    /// never entered, so both the pre-fix HTTPS failure (bundle poisoned,
+    /// then version rolled back) and the pre-fix plaintext failure (bundle
+    /// poisoned, version advanced with no retry) are prevented. A
+    /// subsequent corrected payload applies normally.
+    // Exercises three malformed shapes plus the corrected-payload recovery
+    // in one place so the no-disk-write invariant is asserted together.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn malformed_trust_payload_never_reaches_disk() {
+        let (good_fingerprints, good_bundle) = valid_trust_bundle();
+        let valid_fingerprint = good_fingerprints.first().expect("fingerprint").clone();
+
+        let malformed_cases = [
+            // Non-PEM garbage bundle.
+            serde_json::json!({
+                "trusted_ca_sha256": [valid_fingerprint.clone()],
+                "ca_bundle_pem": "not a certificate",
+            }),
+            // Syntactically valid PEM carrying no CERTIFICATE entries.
+            serde_json::json!({
+                "trusted_ca_sha256": [valid_fingerprint.clone()],
+                "ca_bundle_pem": "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+            }),
+            // Well-formed but unrelated fingerprint not present in the bundle.
+            serde_json::json!({
+                "trusted_ca_sha256": ["a".repeat(64)],
+                "ca_bundle_pem": good_bundle.clone(),
+            }),
+        ];
+
+        for malformed in malformed_cases {
+            let dir = tempfile::tempdir().unwrap();
+            let bundle_path = dir.path().join("ca-bundle.pem");
+            let config_path = dir.path().join("agent.toml");
+            let original_bundle =
+                "-----BEGIN CERTIFICATE-----\nORIGINAL\n-----END CERTIFICATE-----\n";
+            let original_config = "email = \"a@b.c\"\n\n[acme]\nurl = \"http://r\"\n";
+            std::fs::write(&bundle_path, original_bundle).unwrap();
+            std::fs::write(&config_path, original_config).unwrap();
+
+            let mut settings = test_settings("edge-proxy");
+            settings.trust.ca_bundle_path = Some(bundle_path.clone());
+
+            let hooks = DiskWritingTrustHooks {
+                reads: std::sync::Mutex::new(std::collections::VecDeque::from(vec![Ok(Some(
+                    KvReadWithVersion {
+                        version: 5,
+                        data: malformed.clone(),
+                    },
+                ))])),
+                settings,
+                config_path: config_path.clone(),
+                applied: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let services = services_single("edge-proxy", "edge-proxy-domain");
+            let mut state = FastPollState::default();
+
+            let (outcomes, changed) =
+                run_trust_poll_tick(&hooks, "secret", &services, &mut state).await;
+
+            assert!(!changed, "malformed payload must not change state");
+            assert!(
+                matches!(outcomes[0], PollApplyOutcome::Malformed { version: 5, .. }),
+                "expected Malformed, got {:?}",
+                outcomes[0]
+            );
+            assert_eq!(
+                hooks.applied.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "apply_trust must never run for a malformed payload"
+            );
+            assert!(state.last_trust_seen_version.is_empty());
+            assert_eq!(
+                std::fs::read_to_string(&bundle_path).unwrap(),
+                original_bundle,
+                "CA bundle must be byte-identical"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap(),
+                original_config,
+                "agent.toml must be byte-identical"
+            );
+        }
+
+        // A corrected payload applies normally against fresh state.
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        let config_path = dir.path().join("agent.toml");
+        std::fs::write(&bundle_path, "seed").unwrap();
+        std::fs::write(&config_path, "email = \"a@b.c\"\n").unwrap();
+        let mut settings = test_settings("edge-proxy");
+        settings.trust.ca_bundle_path = Some(bundle_path.clone());
+        let hooks = DiskWritingTrustHooks {
+            reads: std::sync::Mutex::new(std::collections::VecDeque::from(vec![Ok(Some(
+                KvReadWithVersion {
+                    version: 6,
+                    data: serde_json::json!({
+                        "trusted_ca_sha256": good_fingerprints,
+                        "ca_bundle_pem": good_bundle,
+                    }),
+                },
+            ))])),
+            settings,
+            config_path: config_path.clone(),
+            applied: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+        let (outcomes, changed) =
+            run_trust_poll_tick(&hooks, "secret", &services, &mut state).await;
+        assert!(changed);
+        assert!(matches!(
+            outcomes[0],
+            PollApplyOutcome::Applied { version: 6, .. }
+        ));
+        assert_eq!(state.last_trust_seen_version.get("edge-proxy"), Some(&6));
+        assert!(
+            std::fs::read_to_string(&bundle_path)
+                .unwrap()
+                .contains("BEGIN CERTIFICATE")
+        );
+    }
+
     #[tokio::test]
     async fn apply_trust_to_disk_errors_when_no_ca_bundle_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -3416,5 +3716,165 @@ mod tests {
         let path = dir.path().join("agent.toml");
         std::fs::write(&path, toml).unwrap();
         config::Settings::new(Some(path)).expect("build settings")
+    }
+}
+
+#[cfg(test)]
+mod pin_rotation_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    use super::*;
+
+    struct TestCa {
+        pem: String,
+        fingerprint: String,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    fn generate_ca(common_name: &str) -> TestCa {
+        let key = KeyPair::generate().expect("generate CA key");
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).expect("self-signed CA");
+        let pem = cert.pem();
+        let fingerprint = crate::tls::sha256_hex(cert.der().as_ref());
+        let issuer = Issuer::new(params, key);
+        TestCa {
+            pem,
+            fingerprint,
+            issuer,
+        }
+    }
+
+    fn sign_server_leaf(ca: &TestCa) -> (Vec<u8>, Vec<u8>) {
+        let key = KeyPair::generate().expect("generate server key");
+        let mut params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("certificate params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
+        params.is_ca = IsCa::NoCa;
+        let cert = params
+            .signed_by(&key, &ca.issuer)
+            .expect("signed server cert");
+        (cert.der().to_vec(), key.serialize_der())
+    }
+
+    async fn start_tls_server(cert_der: Vec<u8>, key_der: Vec<u8>) -> u16 {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = CertificateDer::from(cert_der);
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 4096];
+                    let _ = tls.read(&mut buf).await;
+                    let _ = tls
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    fn openbao_settings(url: &str, bundle_path: &Path) -> config::OpenBaoSettings {
+        config::OpenBaoSettings {
+            url: url.to_string(),
+            allow_plaintext_http: false,
+            kv_mount: "secret".to_string(),
+            role_id_path: PathBuf::from("/unused/role_id"),
+            secret_id_path: PathBuf::from("/unused/secret_id"),
+            ca_bundle_path: Some(bundle_path.to_path_buf()),
+            fast_poll_interval: Duration::from_secs(5),
+            state_path: PathBuf::from("/unused/state.json"),
+        }
+    }
+
+    /// Item #695: with non-empty pins the fast-poll HTTPS client rejects an
+    /// endpoint whose chain does not terminate at a pinned CA, and the
+    /// post-trust-apply rebuild pins to the FRESHLY applied anchors read
+    /// from `agent.toml` — not the startup snapshot. The endpoint is
+    /// rotated to a new CA; a client built with the stale startup pin fails
+    /// against it (this assertion fails if the rebuild reuses the startup
+    /// snapshot), while a client built with the freshly re-read pin keeps
+    /// polling.
+    #[tokio::test]
+    async fn rebuild_pins_to_freshly_applied_anchors_not_startup_snapshot() {
+        let ca_old = generate_ca("Old Root CA");
+        let ca_new = generate_ca("New Root CA");
+
+        // The rotated endpoint presents a leaf signed by the NEW CA.
+        let (leaf_der, leaf_key) = sign_server_leaf(&ca_new);
+        let port = start_tls_server(leaf_der, leaf_key).await;
+        let url = format!("https://localhost:{port}");
+
+        // The on-disk bundle carries BOTH anchors; the pin set decides
+        // which is a usable trust anchor for this channel.
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        std::fs::write(&bundle_path, format!("{}{}", ca_old.pem, ca_new.pem)).unwrap();
+        let openbao = openbao_settings(&url, &bundle_path);
+
+        // Stale startup pin (old CA): cannot reach the rotated endpoint.
+        let stale = build_openbao_client(&openbao, std::slice::from_ref(&ca_old.fingerprint))
+            .expect("build stale-pinned client");
+        assert!(
+            stale.health_check().await.is_err(),
+            "a client pinned to the retired CA must reject the rotated endpoint"
+        );
+
+        // Rotation has just rewritten agent.toml with the NEW pin; the
+        // rebuild re-reads it rather than reusing the startup snapshot.
+        let config_path = dir.path().join("agent.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[trust]\ntrusted_ca_sha256 = [\"{}\"]\n",
+                ca_new.fingerprint
+            ),
+        )
+        .unwrap();
+        let fresh_pins = read_trust_pins_from_config(&config_path).await;
+        assert_eq!(fresh_pins, vec![ca_new.fingerprint.clone()]);
+
+        let rebuilt =
+            build_openbao_client(&openbao, &fresh_pins).expect("build fresh-pinned client");
+        assert!(
+            rebuilt.health_check().await.is_ok(),
+            "a client pinned to the freshly applied CA must reach the rotated endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_trust_pins_from_config_returns_empty_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agent.toml");
+        std::fs::write(&config_path, "email = \"a@b.c\"\n").unwrap();
+        assert!(read_trust_pins_from_config(&config_path).await.is_empty());
     }
 }
