@@ -943,14 +943,14 @@ bootroot service update --service-name edge-proxy --reload-style none
 - `--dry-run`: `state.json`이나 `OpenBao`를 변경하지 않고 제거 계획만
   출력합니다.
 - `--delete-artifacts`: bootroot 소유의 디스크 아티팩트(인증서/키 파일,
-  서비스별 시크릿 및 `OpenBao` 설정 디렉터리, 원격 부트스트랩 아티팩트)도
+  서비스별 시크릿 디렉터리, 원격 부트스트랩 아티팩트 디렉터리)도
   삭제하고 `agent.toml`에서 bootroot 관리 프로필 블록을 제거합니다. **기본은
   비활성:** `service add`는 인증서/키 경로만 기록하며(파일은 이후 회전/에이전트가
   생성) 이 플래그가 없으면 디스크 자료는 보존됩니다. 이 플래그가 있어도
   `agent.toml`은 관리 블록만 제거하는 방식으로 편집되므로 운영자 소유 설정
   파일은 삭제되지 않습니다.
-- `--strip-config`: 인증서/키 파일이나 서비스별 시크릿 및 `OpenBao` 설정
-  디렉터리는 삭제하지 않고 `agent.toml`에서 bootroot 관리 프로필 블록만
+- `--strip-config`: 인증서/키 파일이나 서비스별 시크릿 디렉터리는
+  삭제하지 않고 `agent.toml`에서 bootroot 관리 프로필 블록만
   제거합니다. 서비스가 여전히 서비스 중이라 인증서/키는 유지해야 하지만
   낡은 관리 블록은 제거해야 하는 라이브 delivery-mode 전환을 위한
   플래그입니다. 해당 서비스의 `[[profiles]]` 항목과 마커 주석만 제거하며,
@@ -1811,8 +1811,8 @@ bootroot clean --openbao-only --yes
 - `bootroot-openbao` 컨테이너와 `openbao-data` / `openbao-audit`
   볼륨만 제거합니다 (`postgres-data` 등 다른 named volume은 보존).
 - OpenBao 런타임/부트스트랩 산출물만 제거합니다:
-  `secrets/openbao/unseal-keys.txt`,
-  `secrets/openbao/{stepca,responder,services}`,
+  `secrets/openbao/unseal-keys.txt`, 생성된 인프라 OpenBao Agent 설정
+  트리 `secrets/openbao/{stepca,responder}`,
   `secrets/openbao/docker-compose.openbao-agent.override.yml`,
   서비스별 만료된 AppRole 자격증명 파일
   (`secrets/services/<svc>/{role_id,secret_id,secret_id.wrapped}`).

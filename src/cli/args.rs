@@ -1485,8 +1485,8 @@ pub(crate) struct ServiceRemoveArgs {
     pub(crate) dry_run: bool,
 
     /// Also deletes bootroot-owned on-disk artifacts (cert/key files,
-    /// the per-service secret and `OpenBao` config directories, and the
-    /// remote-bootstrap artifact) and strips the managed profile block
+    /// the per-service secret directory, and the remote-bootstrap
+    /// artifact directory) and strips the managed profile block
     /// from `agent.toml`.
     ///
     /// Off by default: `service add` only records cert/key paths (the
@@ -1499,8 +1499,7 @@ pub(crate) struct ServiceRemoveArgs {
     pub(crate) delete_artifacts: bool,
 
     /// Strips the managed profile block from `agent.toml` without deleting
-    /// the cert/key files or the per-service secret and `OpenBao` config
-    /// directories.
+    /// the cert/key files or the per-service secret directory.
     ///
     /// Intended for live delivery-mode transitions: when moving a service
     /// between `local-file` and `remote-bootstrap` the operator must keep

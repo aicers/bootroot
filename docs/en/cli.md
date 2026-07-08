@@ -973,8 +973,8 @@ regenerates the `secret_id` delivery material regardless, the fresh
 - `--dry-run`: print the teardown plan without mutating `state.json` or
   `OpenBao`.
 - `--delete-artifacts`: also delete bootroot-owned on-disk artifacts —
-  the cert/key files, the per-service secret and `OpenBao` config
-  directories, and the remote-bootstrap artifact — and strip bootroot's
+  the cert/key files, the per-service secret directory, and the
+  remote-bootstrap artifact directory — and strip bootroot's
   managed profile block from `agent.toml`. **Off by default:**
   `service add` only records cert/key paths (the files are produced later
   by rotation / the agent), so on-disk material is preserved unless this
@@ -983,7 +983,7 @@ regenerates the `secret_id` delivery material regardless, the fresh
   never deleted.
 - `--strip-config`: strip bootroot's managed profile block from
   `agent.toml` **without** deleting the cert/key files or the per-service
-  secret and `OpenBao` config directories. Intended for a live
+  secret directory. Intended for a live
   delivery-mode transition, where the service is still serving so the
   cert/key must be kept, yet the stale managed block must go. Only the
   service's `[[profiles]]` entry and its marker comments are removed; the
@@ -1911,8 +1911,8 @@ operator-managed runbook for those.
   volumes — `postgres-data`, `prometheus-data`, `grafana-data` — are
   not touched).
 - Removes only OpenBao runtime/bootstrap artifacts:
-  `secrets/openbao/unseal-keys.txt`, generated OpenBao Agent
-  config trees under `secrets/openbao/{stepca,responder,services}`,
+  `secrets/openbao/unseal-keys.txt`, the generated infra OpenBao Agent
+  config trees under `secrets/openbao/{stepca,responder}`,
   `secrets/openbao/docker-compose.openbao-agent.override.yml`, and
   stale per-service AppRole credential files
   (`secrets/services/<svc>/{role_id,secret_id,secret_id.wrapped}`).
