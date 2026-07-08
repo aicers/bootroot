@@ -176,12 +176,34 @@ A host runs one `bootroot-agent` process plus one agent config per
 
 ### Hardened systemd unit example
 
-Run the daemon as a non-root user with a locked-down filesystem view.
-`ReadWritePaths=` needs only three locations: the agent config
-directory (`agent.toml` and the fast-poll state file
+Run the daemon as a dedicated non-root account with a locked-down
+filesystem view. `service add` writes the daemon's inputs —
+`agent.toml`, `role_id`, `secret_id`, and `eab.json` — as owner-only
+(`0600`) files belonging to the invoking user (typically root), so the
+unit needs a **fixed** system account that takes ownership of those
+files once before the first start. `DynamicUser=yes` does not work
+here: its UID is allocated per start, so it cannot own pre-provisioned
+persistent files across restarts, and directory group access alone
+cannot read `0600` files.
+
+One-time preparation after `service add` (paths match the example unit
+below):
+
+```sh
+useradd --system --user-group --no-create-home \
+  --shell /usr/sbin/nologin bootroot-agent
+chown -R bootroot-agent:bootroot-agent \
+  /etc/bootroot /opt/edge-proxy-mtls /srv/bootroot/secrets/services/edge-proxy
+```
+
+`ReadWritePaths=` needs only those same three locations: the agent
+config directory (`agent.toml` and the fast-poll state file
 `bootroot-agent-state-<svc>.json` live there), the cert output
 directory (issued certs and the managed `ca-bundle.pem`), and the
 per-service secrets directory (`role_id`, `secret_id`, `eab.json`).
+All three need write access, not just read: the fast-poll loop
+rewrites `agent.toml` (responder HMAC), `secret_id`, `eab.json`, and
+`ca-bundle.pem`, and renewals write the cert/key.
 
 ```ini
 [Unit]
@@ -190,8 +212,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Or a dedicated non-root account: User=bootroot-agent
-DynamicUser=yes
+User=bootroot-agent
+Group=bootroot-agent
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -207,15 +229,16 @@ WantedBy=multi-user.target
 
 Notes:
 
-- The service's issued files (`role_id`/`secret_id`/`eab.json` and the
-  cert/key) must be readable — and, for the fast-poll-refreshed files,
-  writable — by the unit's user. With `DynamicUser=yes`, prefer
-  granting group access (e.g. via `--cert-group` and a shared group on
-  the secrets directory) over widening file modes. Ownership you apply
-  this way survives rotation: `bootroot rotate approle-secret-id`
-  rewrites `secret_id` atomically while preserving the file's existing
-  owner/group, so a root-run scheduled rotation does not lock the
-  non-root daemon out of the credential.
+- The preparation `chown` survives rotation: `bootroot rotate
+  approle-secret-id` rewrites `secret_id` atomically while preserving
+  the file's existing owner/group, so a root-run scheduled rotation
+  does not lock the non-root daemon out of the credential. Every other
+  refresh (`agent.toml`, `eab.json`, `ca-bundle.pem`, cert/key) is
+  written by the daemon itself via fast-poll, under its own account.
+- Keep the daemon's credential files `0600` under the daemon account.
+  To share the *outputs* other processes consume — the issued cert/key
+  and the managed `ca-bundle.pem` — use `--cert-group` rather than
+  widening the credential files.
 - Post-renew hooks run inside this daemon process, so the unit's
   privileges bound what hooks can do. See
   [Containerized consumer applications](#containerized-consumer-applications)
