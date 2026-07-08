@@ -937,6 +937,46 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
     }
 }
 
+/// Combined outcome of [`run_hmac_refresh_then_reissue`]: the
+/// responder-HMAC poll results plus the reissue tick report.
+pub(crate) struct HmacRefreshReissueOutcome {
+    pub(crate) responder_hmac_outcomes: Vec<PollApplyOutcome>,
+    pub(crate) responder_hmac_changed: bool,
+    pub(crate) report: FastPollTickReport,
+}
+
+/// Refreshes the responder HMAC and then runs the reissue tick, in that
+/// order.
+///
+/// The ordering is load-bearing: a force-reissue request visible in the
+/// same KV snapshot fans out to a renewal, and the issuance path reloads
+/// `agent.toml` on every attempt (`src/daemon.rs`). If the reissue ran
+/// first, that renewal would reload a config still carrying the stale
+/// `[acme].http_responder_hmac` and authenticate to the responder with
+/// the old secret — the exact failure this refresh exists to prevent
+/// once the responder has restarted on the new value. Writing the fresh
+/// HMAC to disk before triggering the reissue closes that same-tick race.
+///
+/// Trust and `secret_id` refreshes deliberately stay in the loop body
+/// after this call: they gate this loop's own `OpenBao` connection, not the
+/// issuance config, so their ordering relative to the reissue tick does
+/// not affect renewal authentication.
+pub(crate) async fn run_hmac_refresh_then_reissue<H: FastPollHooks + ?Sized>(
+    hooks: &H,
+    kv_mount: &str,
+    services: &[(String, Vec<String>)],
+    state: &mut FastPollState,
+) -> HmacRefreshReissueOutcome {
+    let (responder_hmac_outcomes, responder_hmac_changed) =
+        run_responder_hmac_poll_tick(hooks, kv_mount, services, state).await;
+    let report = run_fast_poll_tick(hooks, kv_mount, services, state).await;
+    HmacRefreshReissueOutcome {
+        responder_hmac_outcomes,
+        responder_hmac_changed,
+        report,
+    }
+}
+
 /// Outcome of a single per-service fast-poll probe. The daemon logs
 /// these and tests assert on them directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1255,8 +1295,26 @@ pub(crate) async fn run_fast_poll_loop(
             break;
         }
 
-        let report = run_fast_poll_tick(&hooks, &openbao.kv_mount, &services, &mut state).await;
         let mut needs_relogin = false;
+
+        // Refresh the responder HMAC BEFORE running the reissue tick. A
+        // reissue request visible in the same KV snapshot triggers a
+        // renewal that reloads `agent.toml` per attempt, so the fresh
+        // `[acme].http_responder_hmac` must land on disk first — otherwise
+        // that first renewal authenticates to the responder with the stale
+        // secret. `run_hmac_refresh_then_reissue` fixes this ordering in
+        // one place; see its doc comment.
+        let HmacRefreshReissueOutcome {
+            responder_hmac_outcomes,
+            responder_hmac_changed,
+            report,
+        } = run_hmac_refresh_then_reissue(&hooks, &openbao.kv_mount, &services, &mut state).await;
+        log_poll_outcomes(
+            "responder_hmac",
+            &responder_hmac_outcomes,
+            &mut needs_relogin,
+        );
+
         for outcome in &report.outcomes {
             match outcome {
                 FastPollTickOutcome::NoRequest { service } => {
@@ -1342,19 +1400,6 @@ pub(crate) async fn run_fast_poll_loop(
         let (secret_id_outcomes, secret_id_changed) =
             run_secret_id_poll_tick(&hooks, &openbao.kv_mount, &services, &mut state).await;
         log_poll_outcomes("secret_id", &secret_id_outcomes, &mut needs_relogin);
-
-        // The responder HMAC rewrite lands in `[acme].http_responder_hmac`
-        // of the same `agent.toml`; the daemon's per-attempt config reload
-        // consumes it on the next ACME renewal, so no client rebuild is
-        // needed (unlike the trust bundle, it does not anchor this loop's
-        // own OpenBao connection).
-        let (responder_hmac_outcomes, responder_hmac_changed) =
-            run_responder_hmac_poll_tick(&hooks, &openbao.kv_mount, &services, &mut state).await;
-        log_poll_outcomes(
-            "responder_hmac",
-            &responder_hmac_outcomes,
-            &mut needs_relogin,
-        );
 
         // A trust apply rewrites the on-disk CA bundle, and in the
         // remote-bootstrap model `[openbao].ca_bundle_path` and
@@ -1663,6 +1708,11 @@ mod tests {
         trust_applies: std::sync::Mutex<Vec<(String, TrustPayload)>>,
         secret_id_applies: std::sync::Mutex<Vec<(String, String)>>,
         responder_hmac_applies: std::sync::Mutex<Vec<(String, String)>>,
+        // Chronological log of ordering-sensitive hook calls
+        // ("apply_responder_hmac:<svc>", "renew:<profile>") so tests can
+        // assert the responder-HMAC write lands before the reissue-triggered
+        // renewal within a single tick.
+        op_log: std::sync::Mutex<Vec<String>>,
         // When true, every apply_trust / apply_secret_id / apply_responder_hmac
         // call fails.
         fail_applies: std::sync::atomic::AtomicBool,
@@ -1679,6 +1729,7 @@ mod tests {
                 trust_applies: std::sync::Mutex::new(Vec::new()),
                 secret_id_applies: std::sync::Mutex::new(Vec::new()),
                 responder_hmac_applies: std::sync::Mutex::new(Vec::new()),
+                op_log: std::sync::Mutex::new(Vec::new()),
                 fail_applies: std::sync::atomic::AtomicBool::new(false),
             }
         }
@@ -1748,6 +1799,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(profile_label.to_string());
+            self.op_log
+                .lock()
+                .unwrap()
+                .push(format!("renew:{profile_label}"));
             let fail = self
                 .failing_profiles
                 .lock()
@@ -1806,6 +1861,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((service.to_string(), hmac.to_string()));
+            self.op_log
+                .lock()
+                .unwrap()
+                .push(format!("apply_responder_hmac:{service}"));
             let fail = self.fail_applies.load(std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
                 if fail {
@@ -2678,6 +2737,55 @@ mod tests {
             outcomes[0],
             PollApplyOutcome::Applied { version: 1, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn hmac_refresh_lands_before_reissue_renewal_in_same_tick() {
+        // Both a new responder-HMAC version and a pending reissue are
+        // visible in the same KV snapshot. `read_kv_version` pops from the
+        // end, so the HMAC read (consumed first, by the responder-HMAC
+        // poll) is last; the reissue read (consumed by the reissue tick)
+        // is first.
+        let reissue_read = KvReadWithVersion {
+            version: 5,
+            data: serde_json::json!({
+                "requested_at": "2026-04-19T12:34:56Z",
+                "requester": "alice",
+            }),
+        };
+        let hooks = FakeHooks::new(vec![
+            Ok(Some(reissue_read)),
+            Ok(Some(responder_hmac_read(2, "fresh-hmac"))),
+        ]);
+        let services = services_single("edge-proxy", "edge-proxy-domain");
+        let mut state = FastPollState::default();
+
+        let outcome =
+            run_hmac_refresh_then_reissue(&hooks, "secret", &services, &mut state).await;
+
+        assert!(outcome.responder_hmac_changed);
+        assert!(matches!(
+            outcome.responder_hmac_outcomes[0],
+            PollApplyOutcome::Applied { version: 2, .. }
+        ));
+        assert_eq!(hooks.renew_calls.lock().unwrap().len(), 1);
+
+        // The HMAC write must be recorded strictly before the renewal so
+        // the reissue's per-attempt `agent.toml` reload sees the fresh
+        // secret.
+        let op_log = hooks.op_log.lock().unwrap().clone();
+        let apply_idx = op_log
+            .iter()
+            .position(|op| op == "apply_responder_hmac:edge-proxy")
+            .expect("responder HMAC apply recorded");
+        let renew_idx = op_log
+            .iter()
+            .position(|op| op == "renew:edge-proxy-domain")
+            .expect("reissue renewal recorded");
+        assert!(
+            apply_idx < renew_idx,
+            "responder HMAC must be applied before the reissue renewal, got {op_log:?}"
+        );
     }
 
     #[tokio::test]
