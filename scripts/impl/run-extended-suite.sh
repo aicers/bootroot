@@ -106,9 +106,13 @@ case_infra_lifecycle() {
 
 case_ca_key_recovery() {
   local case_dir="$ARTIFACT_DIR/ca-key-recovery"
+  # Same verify sizing as case_infra_lifecycle: post-rotation reissue
+  # depends on the daemon fast-poll loop (default 30s interval).
   ARTIFACT_DIR="$case_dir" \
   PROJECT_NAME="${PROJECT_PREFIX}-cakr-$$" \
   TIMEOUT_SECS="$TIMEOUT_SECS_CA_KEY_RECOVERY" \
+  VERIFY_ATTEMPTS=20 \
+  VERIFY_DELAY_SECS=4 \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   BOOTROOT_REMOTE_BIN="$BOOTROOT_REMOTE_BIN" \
   "$ROOT_DIR/scripts/impl/run-ca-key-rotation-recovery.sh"
