@@ -1253,8 +1253,8 @@ mod tests {
     /// idempotent.  `run_service_add` then falls through to the
     /// `error_service_duplicate` bail, so the operator has to remove
     /// the service with `bootroot service remove` and re-add it rather
-    /// than racing a silent `.ctmpl` re-render over an inconsistent
-    /// definition.
+    /// than silently re-rendering the agent config over an
+    /// inconsistent definition.
     #[test]
     fn is_idempotent_remote_rerun_false_when_agent_overrides_differ() {
         let mut resolved = sample_resolved();
