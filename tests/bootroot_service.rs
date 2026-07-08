@@ -44,8 +44,6 @@ async fn test_app_add_writes_state_and_secret() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -74,14 +72,40 @@ async fn test_app_add_writes_state_and_secret() {
     );
     assert!(stdout.contains("bootroot service add: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
-    assert!(stdout.contains("- deploy type: daemon"));
     assert!(stdout.contains("- delivery mode: local-file"));
     assert!(stdout.contains("Bootroot-managed:"));
     assert!(stdout.contains("Operator-managed (required):"));
     assert!(stdout.contains("next steps:"));
     assert!(stdout.contains("daemon profile snippet:"));
+    // The Bootroot-managed section lists exactly the two host-daemon
+    // artifacts: the rendered agent config and the provisioned EAB file.
+    // The retired per-service OpenBao Agent artifacts must be gone.
     assert!(stdout.contains("- auto-applied bootroot-agent config:"));
-    assert!(stdout.contains("- auto-applied OpenBao Agent config:"));
+    assert!(stdout.contains(
+        "- auto-provisioned EAB file (present only when EAB is configured; \
+         pass its path via --eab-file):"
+    ));
+    assert!(
+        !stdout.contains("OpenBao Agent config"),
+        "no OpenBao Agent config line may be printed: {stdout}"
+    );
+    // The next-steps block documents the host-daemon run command,
+    // including the --eab-file flag required for EAB rotation to apply.
+    assert!(
+        stdout.contains(
+            "daemon run command (systemd ExecStart or shell; \
+             --eab-file is required for EAB rotation to apply):"
+        ),
+        "next steps must include the daemon run command title: {stdout}"
+    );
+    assert!(
+        stdout.contains("bootroot-agent --config"),
+        "next steps must include the bootroot-agent invocation: {stdout}"
+    );
+    assert!(
+        stdout.contains("--eab-file"),
+        "run command must pass --eab-file: {stdout}"
+    );
     // Issue #614: with no --reload-style, the consumer-reload hint
     // should explicitly call out the missing hook and point at the
     // service-update remediation path.
@@ -137,7 +161,7 @@ async fn test_app_add_writes_state_and_secret() {
         & 0o777;
     assert_eq!(mode, 0o600);
 
-    assert_openbao_service_agent_files(temp_dir.path(), "edge-proxy");
+    assert_local_fast_poll_artifacts(temp_dir.path(), &agent_config, "edge-proxy");
 }
 
 #[cfg(unix)]
@@ -175,8 +199,6 @@ async fn test_app_add_supports_approle_runtime_auth() {
             "runtime-secret-id",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -246,8 +268,6 @@ async fn test_app_add_approle_permission_denied_fails() {
             "runtime-secret-id",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -305,8 +325,6 @@ async fn test_app_add_creates_missing_parent_dirs_for_output_paths() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -391,8 +409,6 @@ async fn test_app_add_preserves_existing_parent_dir_mode() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -456,8 +472,6 @@ async fn test_app_add_fails_when_agent_config_parent_is_a_file() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -510,8 +524,6 @@ async fn test_app_add_print_only_does_not_create_missing_parent_dirs() {
             "--print-only",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -567,8 +579,6 @@ async fn test_app_add_print_only_shows_snippets_without_writes() {
             "--print-only",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -632,8 +642,6 @@ async fn test_app_add_print_only_with_root_token_shows_trust_snippet() {
             "--print-only",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -679,7 +687,7 @@ async fn test_app_add_prompts_for_missing_inputs() {
     stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let input = format!(
-        "edge-proxy\n\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n",
+        "edge-proxy\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
@@ -702,7 +710,6 @@ async fn test_app_add_prompts_for_missing_inputs() {
     assert!(output.status.success());
     assert!(stdout.contains("bootroot service add: summary"));
     assert!(stdout.contains("- service name: edge-proxy"));
-    assert!(stdout.contains("- deploy type: daemon"));
 }
 
 #[cfg(unix)]
@@ -726,10 +733,10 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
     // Service add only revalidates a path when the parent is missing
     // (`must_exist=true`).  Issue #607 dropped that gate for output paths
     // so `service add` can `create_dir_all` them at the write boundary;
-    // the only remaining reprompt-on-invalid path here is the deploy
-    // type (`invalid` → `daemon`) and the empty instance id.
+    // the only remaining reprompt-on-invalid path here is the empty
+    // instance id.
     let input = format!(
-        "edge-proxy\ninvalid\ndaemon\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n\n001\n",
+        "edge-proxy\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
@@ -765,7 +772,7 @@ async fn test_app_add_reprompts_on_invalid_identifier_inputs() {
     write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
 
     let input = format!(
-        "edge.proxy\nedge-proxy\n\nedge_node\nedge-node-01\ntrusted_domain\ntrusted.domain\n{}\n{}\n{}\ninstance-01\n001\n",
+        "edge.proxy\nedge-proxy\nedge_node\nedge-node-01\ntrusted_domain\ntrusted.domain\n{}\n{}\n{}\ninstance-01\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
@@ -813,8 +820,6 @@ async fn test_app_add_rejects_invalid_identifier_args() {
             "--print-only",
             "--service-name",
             "edge.proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -836,9 +841,13 @@ async fn test_app_add_rejects_invalid_identifier_args() {
     assert!(stderr.contains("service_name must be a DNS label"));
 }
 
+/// Issue #691: the containerized-consumer story is the consumer-reload
+/// hook, not a per-service agent sidecar. `service add` must keep
+/// accepting `--reload-style docker-restart --reload-target <container>`
+/// so operators can restart a containerized consumer app after renewal.
 #[cfg(unix)]
 #[tokio::test]
-async fn test_app_add_prints_docker_snippet() {
+async fn test_app_add_accepts_docker_restart_reload_style() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");
     let cert_dir = temp_dir.path().join("certs");
@@ -856,8 +865,6 @@ async fn test_app_add_prints_docker_snippet() {
             "--print-only",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "docker",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -870,195 +877,70 @@ async fn test_app_add_prints_docker_snippet() {
             key_path.to_string_lossy().as_ref(),
             "--instance-id",
             "001",
-            "--container-name",
-            "edge-proxy",
+            "--reload-style",
+            "docker-restart",
+            "--reload-target",
+            "edge-proxy-container",
         ])
         .output()
         .expect("run service add");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success());
-    assert!(stdout.contains("docker run -d"));
-    assert!(stdout.contains("--restart unless-stopped"));
-    assert!(stdout.contains("--name edge-proxy"));
-    assert!(stdout.contains("/app/agent.toml"));
-    assert!(!stdout.contains("--oneshot"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "service add must accept --reload-style docker-restart; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- post-renew hook: docker restart edge-proxy-container"),
+        "docker-restart preset must resolve to a docker restart hook: {stdout}"
+    );
 }
 
-/// Issue #631: `service add --deploy-type=daemon --container-name=X`
-/// must fail at the raw-args boundary. `resolve_service_add_args`
-/// already drops `container_name` for daemon, so the check has to run
-/// before resolution; this CLI-level test guards that ordering.
+/// Issue #691: the per-service local sidecar run model is retired, so
+/// the `--deploy-type`, `--container-name`, and `--no-validate-agent`
+/// flags no longer exist on `service add`. Passing any of them must be
+/// rejected at the clap boundary, guarding against the flags silently
+/// coming back.
 #[cfg(unix)]
 #[tokio::test]
-async fn test_app_add_rejects_daemon_with_container_name() {
+async fn test_app_add_rejects_removed_sidecar_flags() {
     let temp_dir = tempdir().expect("create temp dir");
-    let agent_config = temp_dir.path().join("agent.toml");
-    let cert_dir = temp_dir.path().join("certs");
-    fs::create_dir_all(&cert_dir).expect("create cert dir");
-    let cert_path = cert_dir.join("edge-proxy.crt");
-    let key_path = cert_dir.join("edge-proxy.key");
-
     write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
-        .current_dir(temp_dir.path())
-        .args([
+    for (flag, value) in [
+        ("--deploy-type", Some("daemon")),
+        ("--container-name", Some("web-app")),
+        ("--no-validate-agent", None),
+    ] {
+        let mut args = vec![
             "service",
             "add",
             "--print-only",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
-            "--hostname",
-            "edge-node-01",
-            "--domain",
-            "trusted.domain",
-            "--agent-config",
-            agent_config.to_string_lossy().as_ref(),
-            "--cert-path",
-            cert_path.to_string_lossy().as_ref(),
-            "--key-path",
-            key_path.to_string_lossy().as_ref(),
-            "--instance-id",
-            "001",
-            "--container-name",
-            "web-app",
-        ])
-        .output()
-        .expect("run service add");
+            flag,
+        ];
+        if let Some(value) = value {
+            args.push(value);
+        }
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args(&args)
+            .output()
+            .expect("run service add");
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "expected failure when daemon+container-name combined, stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("--container-name"),
-        "expected error to mention --container-name, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("--deploy-type=docker"),
-        "expected error to point at --deploy-type=docker, got: {stderr}"
-    );
-}
-
-/// Issue #631: docker-mode identity warning fires when the container
-/// does not exist. The warning is non-fatal (registration continues)
-/// and `--no-validate-agent` silences it. Exercised through the
-/// `--print-only` path so no real `OpenBao` stubbing is needed.
-#[cfg(unix)]
-#[tokio::test]
-async fn test_app_add_warns_when_docker_container_not_an_agent() {
-    let temp_dir = tempdir().expect("create temp dir");
-    let agent_config = temp_dir.path().join("agent.toml");
-    let cert_dir = temp_dir.path().join("certs");
-    fs::create_dir_all(&cert_dir).expect("create cert dir");
-    let cert_path = cert_dir.join("web-app.crt");
-    let key_path = cert_dir.join("web-app.key");
-
-    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
-
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
-        .current_dir(temp_dir.path())
-        .args([
-            "service",
-            "add",
-            "--print-only",
-            "--service-name",
-            "web-app",
-            "--deploy-type",
-            "docker",
-            "--hostname",
-            "web-01",
-            "--domain",
-            "trusted.domain",
-            "--agent-config",
-            agent_config.to_string_lossy().as_ref(),
-            "--cert-path",
-            cert_path.to_string_lossy().as_ref(),
-            "--key-path",
-            key_path.to_string_lossy().as_ref(),
-            "--instance-id",
-            "001",
-            "--container-name",
-            "bootroot-issue-631-no-such-container",
-        ])
-        .output()
-        .expect("run service add");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "expected --print-only run to succeed despite warning, stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("bootroot-issue-631-no-such-container"),
-        "expected warning to mention the container, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("--no-validate-agent"),
-        "expected warning to point at --no-validate-agent, got: {stderr}"
-    );
-}
-
-/// Issue #631: `--no-validate-agent` silences the docker-mode warning
-/// even when the container is missing or unrelated.
-#[cfg(unix)]
-#[tokio::test]
-async fn test_app_add_no_validate_agent_silences_warning() {
-    let temp_dir = tempdir().expect("create temp dir");
-    let agent_config = temp_dir.path().join("agent.toml");
-    let cert_dir = temp_dir.path().join("certs");
-    fs::create_dir_all(&cert_dir).expect("create cert dir");
-    let cert_path = cert_dir.join("web-app.crt");
-    let key_path = cert_dir.join("web-app.key");
-
-    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
-
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
-        .current_dir(temp_dir.path())
-        .args([
-            "service",
-            "add",
-            "--print-only",
-            "--service-name",
-            "web-app",
-            "--deploy-type",
-            "docker",
-            "--hostname",
-            "web-01",
-            "--domain",
-            "trusted.domain",
-            "--agent-config",
-            agent_config.to_string_lossy().as_ref(),
-            "--cert-path",
-            cert_path.to_string_lossy().as_ref(),
-            "--key-path",
-            key_path.to_string_lossy().as_ref(),
-            "--instance-id",
-            "001",
-            "--container-name",
-            "bootroot-issue-631-no-such-container",
-            "--no-validate-agent",
-        ])
-        .output()
-        .expect("run service add");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "expected --print-only run to succeed, stderr:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("does not look like a bootroot-agent"),
-        "expected --no-validate-agent to silence the no-match warning, got: {stderr}"
-    );
-    assert!(
-        !stderr.contains("could not run `docker inspect"),
-        "expected --no-validate-agent to silence the inspect-failed warning, got: {stderr}"
-    );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "service add must reject the removed {flag} flag, stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("unexpected argument") && stderr.contains(flag),
+            "expected clap unexpected-argument error for {flag}, got: {stderr}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -1085,8 +967,6 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--delivery-mode",
             "remote-bootstrap",
             "--hostname",
@@ -1124,16 +1004,16 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         stdout.contains("localhost placeholders for `--agent-server` and `--agent-responder-url`")
     );
     assert!(stdout.contains("2. Check status on the step-ca host:"));
-    // Remote-bootstrap hosts run the self-auth `bootroot-agent` fast-poll, not a
-    // per-service OpenBao Agent sidecar. The next-steps block must advertise the
+    // Remote-bootstrap hosts run the self-auth `bootroot-agent` fast-poll, not
+    // a per-service OpenBao Agent. The next-steps block must advertise the
     // self-heal model and must not tell the operator to run an OpenBao Agent.
     assert!(
         stdout.contains("Keep bootroot-agent running on the remote host"),
         "remote-bootstrap add should advertise keeping bootroot-agent running: {stdout}"
     );
     assert!(
-        stdout.contains("No OpenBao Agent sidecar runs on the remote host"),
-        "remote-bootstrap add should state no OpenBao Agent sidecar runs: {stdout}"
+        stdout.contains("No OpenBao Agent runs on the remote host"),
+        "remote-bootstrap add should state no OpenBao Agent runs: {stdout}"
     );
     assert!(
         !stdout.contains("OpenBao Agent (per-service instance):"),
@@ -1152,14 +1032,15 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         "remote-bootstrap"
     );
 
-    let openbao_hcl = temp_dir
+    // No OpenBao Agent artifacts exist anywhere: the remote host runs the
+    // self-auth bootroot-agent fast-poll (schema v4 dropped these paths).
+    let openbao_service_dir = temp_dir
         .path()
         .join("secrets")
         .join("openbao")
         .join("services")
-        .join("edge-proxy")
-        .join("agent.hcl");
-    assert!(!openbao_hcl.exists());
+        .join("edge-proxy");
+    assert!(!openbao_service_dir.exists());
 
     let remote_bootstrap = temp_dir
         .path()
@@ -1199,8 +1080,6 @@ async fn test_app_add_remote_bootstrap_no_wrap_handoff_includes_secret_id() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--delivery-mode",
             "remote-bootstrap",
             "--hostname",
@@ -1243,8 +1122,8 @@ fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
     assert!(bootstrap["agent_config_path"].is_string());
     assert!(bootstrap["ca_bundle_path"].is_string());
     assert!(bootstrap["ca_bundle_pem"].is_string());
-    // schema_version 4 dropped the OpenBao Agent sidecar artifact paths:
-    // the remote agent self-authenticates and renders trust via fast-poll.
+    // schema_version 4 dropped the OpenBao Agent artifact paths: the
+    // remote agent self-authenticates and renders trust via fast-poll.
     assert!(
         bootstrap.get("openbao_agent_config_path").is_none(),
         "openbao_agent_config_path must be gone from the schema-4 artifact"
@@ -1295,8 +1174,6 @@ async fn test_app_add_remote_bootstrap_rerun_is_idempotent() {
         "add",
         "--service-name",
         "edge-proxy",
-        "--deploy-type",
-        "daemon",
         "--delivery-mode",
         "remote-bootstrap",
         "--hostname",
@@ -1434,8 +1311,6 @@ async fn test_app_add_local_file_sets_verify_prerequisites() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -1495,7 +1370,7 @@ async fn test_app_add_local_file_sets_verify_prerequisites() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_app_add_prompts_for_docker_instance_id() {
+async fn test_app_add_prompts_for_missing_instance_id() {
     use support::ROOT_TOKEN;
 
     let temp_dir = tempdir().expect("create temp dir");
@@ -1518,8 +1393,6 @@ async fn test_app_add_prompts_for_docker_instance_id() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "docker",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -1530,8 +1403,6 @@ async fn test_app_add_prompts_for_docker_instance_id() {
             cert_path.to_string_lossy().as_ref(),
             "--key-path",
             key_path.to_string_lossy().as_ref(),
-            "--container-name",
-            "edge-proxy",
             "--root-token",
             ROOT_TOKEN,
         ])
@@ -1572,8 +1443,6 @@ async fn test_app_add_rejects_duplicate() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -1599,8 +1468,6 @@ async fn test_app_add_rejects_duplicate() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -1649,8 +1516,6 @@ async fn test_app_add_includes_trust_snippet_when_present() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -1719,8 +1584,6 @@ async fn test_app_add_uses_synced_trust_when_metadata_missing() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -1776,8 +1639,6 @@ async fn test_app_add_fails_when_synced_trust_bundle_missing() {
             "add",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -1822,6 +1683,29 @@ async fn test_app_info_prints_summary() {
     assert!(stdout.contains("- domain: trusted.domain"));
     assert!(stdout.contains("- delivery mode: local-file"));
     assert!(stdout.contains("- secret_id path: secrets/services/edge-proxy/secret_id"));
+    // Local-file next steps document the host-daemon run command; the
+    // retired per-service OpenBao Agent step block must be gone.
+    assert!(
+        stdout.contains(
+            "daemon run command (systemd ExecStart or shell; \
+             --eab-file is required for EAB rotation to apply):"
+        ),
+        "service info must print the daemon run command title: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "bootroot-agent --config agent.toml --eab-file secrets/services/edge-proxy/eab.json"
+        ),
+        "service info must print the run command with --eab-file: {stdout}"
+    );
+    assert!(
+        !stdout.contains("OpenBao Agent (per-service instance)"),
+        "the per-service OpenBao Agent step block is retired: {stdout}"
+    );
+    assert!(
+        !stdout.contains("openbao-sidecar"),
+        "the openbao-sidecar start hint is retired: {stdout}"
+    );
 }
 
 #[cfg(unix)]
@@ -1870,152 +1754,89 @@ fn assert_state_contains_default_delivery_mode(root: &std::path::Path) {
     );
 }
 
-#[allow(clippy::too_many_lines)]
-fn assert_openbao_service_agent_files(root: &std::path::Path, service_name: &str) {
+/// Asserts the local-file host-daemon artifacts (issue #691): no
+/// per-service `OpenBao` Agent directory, an `agent.toml` `[openbao]`
+/// section that activates the self-auth fast-poll loop, and an
+/// `eab.json` provisioned next to the service `secret_id` (the mock KV
+/// serves non-empty `test-kid`/`test-hmac`, so the file must exist).
+fn assert_local_fast_poll_artifacts(
+    root: &std::path::Path,
+    agent_config: &std::path::Path,
+    service_name: &str,
+) {
+    // The per-service OpenBao Agent artifact directory (agent.hcl,
+    // *.ctmpl, token) is retired — nothing may create it anymore.
     let openbao_service_dir = root
         .join("secrets")
         .join("openbao")
         .join("services")
         .join(service_name);
-    let openbao_hcl = openbao_service_dir.join("agent.hcl");
-    let openbao_ctmpl = openbao_service_dir.join("agent.toml.ctmpl");
-    let openbao_bundle_ctmpl = openbao_service_dir.join("ca-bundle.pem.ctmpl");
-    let openbao_token = openbao_service_dir.join("token");
-    assert!(openbao_hcl.exists());
-    assert!(openbao_ctmpl.exists());
-    assert!(openbao_bundle_ctmpl.exists());
-    assert!(openbao_token.exists());
-
-    let hcl_mode = fs::metadata(&openbao_hcl)
-        .expect("openbao hcl metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    let ctmpl_mode = fs::metadata(&openbao_ctmpl)
-        .expect("openbao ctmpl metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    let bundle_ctmpl_mode = fs::metadata(&openbao_bundle_ctmpl)
-        .expect("openbao bundle ctmpl metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    let token_mode = fs::metadata(&openbao_token)
-        .expect("openbao token metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(hcl_mode, 0o600);
-    assert_eq!(ctmpl_mode, 0o600);
-    assert_eq!(bundle_ctmpl_mode, 0o600);
-    assert_eq!(token_mode, 0o600);
-
-    let ctmpl_contents = fs::read_to_string(&openbao_ctmpl).expect("read ctmpl");
     assert!(
-        ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
-        "ctmpl should contain template directives"
-    );
-    assert!(
-        !ctmpl_contents.contains("test-responder-hmac"),
-        "ctmpl should not contain literal secret values"
-    );
-    let bundle_ctmpl_contents =
-        fs::read_to_string(&openbao_bundle_ctmpl).expect("read bundle ctmpl");
-    assert!(
-        bundle_ctmpl_contents.contains("{{ with secret \"secret/data/bootroot/services/"),
-        "bundle ctmpl should contain template directives"
-    );
-    assert!(
-        bundle_ctmpl_contents.contains(".Data.data.ca_bundle_pem"),
-        "bundle ctmpl should render ca_bundle_pem"
-    );
-    assert!(
-        !bundle_ctmpl_contents.contains("TRUST"),
-        "bundle ctmpl should not contain literal trust values"
+        !openbao_service_dir.exists(),
+        "no OpenBao Agent artifacts may be created for local-file services"
     );
 
-    let hcl_contents = fs::read_to_string(&openbao_hcl).expect("read agent.hcl");
+    // agent.toml carries the [openbao] fast-poll section mirroring what
+    // `bootroot-remote bootstrap` provisions on remote hosts.
+    let agent_contents = fs::read_to_string(agent_config).expect("read agent config");
+    let doc: toml_edit::DocumentMut = agent_contents.parse().expect("agent.toml must parse");
+    let openbao = doc
+        .get("openbao")
+        .and_then(toml_edit::Item::as_table)
+        .expect("agent.toml must contain an [openbao] table");
+    let get = |key: &str| {
+        openbao
+            .get(key)
+            .and_then(toml_edit::Item::as_str)
+            .unwrap_or_else(|| panic!("[openbao].{key} must be a string"))
+    };
+    assert_eq!(get("kv_mount"), "secret");
     assert!(
-        hcl_contents.contains("vault {"),
-        "agent.hcl should contain vault block"
+        get("url").starts_with("http"),
+        "[openbao].url must carry the state openbao_url"
     );
-    assert!(
-        hcl_contents.contains(&format!(
-            "source = \"{}\"",
-            path_relative_to_root_or_self(root, &openbao_ctmpl).display()
-        )),
-        "agent.hcl should render agent.toml"
-    );
-    assert!(
-        hcl_contents.contains(&format!(
-            "source = \"{}\"",
-            path_relative_to_root_or_self(root, &openbao_bundle_ctmpl).display()
-        )),
-        "agent.hcl should render the CA bundle template"
-    );
-    assert!(
-        hcl_contents.contains(&format!(
-            "destination = \"{}\"",
-            root.join("certs").join("ca-bundle.pem").display()
-        )),
-        "agent.hcl should target a CA bundle output path"
-    );
-
-    // Verify Docker sidecar agent config
-    let docker_hcl = openbao_service_dir.join("agent-docker.hcl");
-    assert!(docker_hcl.exists(), "agent-docker.hcl must be generated");
-    let docker_hcl_mode = fs::metadata(&docker_hcl)
-        .expect("docker hcl metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(docker_hcl_mode, 0o600, "agent-docker.hcl must be 0600");
-
-    let docker_hcl_contents = fs::read_to_string(&docker_hcl).expect("read agent-docker.hcl");
-    assert!(
-        docker_hcl_contents.contains("vault {"),
-        "agent-docker.hcl should contain vault block"
-    );
-    assert!(
-        docker_hcl_contents.contains(r#"address = "http://bootroot-openbao:"#),
-        "agent-docker.hcl should use Docker-internal address: {docker_hcl_contents}"
-    );
-    assert!(
-        docker_hcl_contents.contains("/openbao/secrets/"),
-        "agent-docker.hcl should use container-side paths: {docker_hcl_contents}"
-    );
-    assert!(
-        !docker_hcl_contents.contains("localhost"),
-        "agent-docker.hcl must not reference localhost: {docker_hcl_contents}"
-    );
-
-    // Verify CA bundle is pre-seeded in the credential directory at the
-    // same path the agent template renders to, so the sidecar can both
-    // bootstrap TLS and track live trust updates after the template runs.
     let cred_dir = root.join("secrets").join("services").join(service_name);
-    let docker_ca = cred_dir.join("ca-bundle.pem");
-    assert!(
-        docker_ca.exists(),
-        "CA bundle must be pre-seeded for Docker sidecar TLS"
+    assert_eq!(
+        std::path::Path::new(get("role_id_path")),
+        std::path::Path::new("secrets/services")
+            .join(service_name)
+            .join("role_id")
     );
-    let docker_ca_mode = fs::metadata(&docker_ca)
-        .expect("docker ca metadata")
+    assert_eq!(
+        std::path::Path::new(get("secret_id_path")),
+        std::path::Path::new("secrets/services")
+            .join(service_name)
+            .join("secret_id")
+    );
+    assert_eq!(
+        std::path::Path::new(get("ca_bundle_path")),
+        root.join("certs").join("ca-bundle.pem"),
+        "[openbao].ca_bundle_path must sit next to the cert path"
+    );
+    let state_path = get("state_path");
+    assert!(
+        std::path::Path::new(state_path).is_absolute(),
+        "[openbao].state_path must be absolute, got: {state_path}"
+    );
+    assert!(
+        state_path.ends_with(&format!("bootroot-agent-state-{service_name}.json")),
+        "[openbao].state_path must be service-keyed, got: {state_path}"
+    );
+
+    // The mock KV serves non-empty EAB material (test-kid/test-hmac), so
+    // eab.json must be provisioned next to secret_id at 0600 with both
+    // values, ready for the documented `--eab-file` run command.
+    let eab_path = cred_dir.join("eab.json");
+    let eab_contents = fs::read_to_string(&eab_path).expect("read eab.json");
+    let eab: serde_json::Value = serde_json::from_str(&eab_contents).expect("parse eab.json");
+    assert_eq!(eab["kid"], "test-kid");
+    assert_eq!(eab["hmac"], "test-hmac");
+    let eab_mode = fs::metadata(&eab_path)
+        .expect("eab metadata")
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(
-        docker_ca_mode, 0o644,
-        "Docker CA bundle must be 0644 (public trust material readable by \
-         non-root containerized consumers)"
-    );
-}
-
-fn path_relative_to_root_or_self<'a>(
-    root: &'a std::path::Path,
-    path: &'a std::path::Path,
-) -> &'a std::path::Path {
-    path.strip_prefix(root).unwrap_or(path)
+    assert_eq!(eab_mode, 0o600, "eab.json holds credentials; must be 0600");
 }
 
 fn write_cert_with_dns(
@@ -2085,7 +1906,6 @@ fn write_state_with_app_full(
     }
     value["services"]["edge-proxy"] = json!({
         "service_name": "edge-proxy",
-        "deploy_type": "daemon",
         "hostname": "edge-node-01",
         "domain": "trusted.domain",
         "agent_config_path": "agent.toml",
@@ -3328,8 +3148,6 @@ fn test_service_add_rejects_rn_cidrs_clear() {
             "--print-only",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -3379,8 +3197,6 @@ fn test_service_add_print_only_shows_ttl_rotation_cadence_hint() {
             "--print-only",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -3430,8 +3246,6 @@ fn test_service_add_print_only_warns_when_ttl_exceeds_recommended() {
             "--print-only",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -3481,8 +3295,6 @@ fn test_service_add_print_only_rejects_ttl_exceeding_max() {
             "--print-only",
             "--service-name",
             "edge-proxy",
-            "--deploy-type",
-            "daemon",
             "--hostname",
             "edge-node-01",
             "--domain",
@@ -3567,64 +3379,40 @@ fn test_service_info_shows_default_policy_fields() {
     );
 }
 
-/// Guards the deprecated `bootroot service agent start` alias: when
-/// invoked through the legacy spelling, the binary must print a
-/// deprecation warning to stderr that points at the new
-/// `service openbao-sidecar` form, then proceed to execute the same
-/// code path.  Without state.json present the run aborts early, but
-/// the warning is emitted before that — which is exactly what we want
-/// to assert.  Drop in the same release that retires the alias.
+/// Issue #691: the per-service local `OpenBao` Agent run model is retired,
+/// so both `service openbao-sidecar` and its deprecated `service agent`
+/// alias no longer exist. Invoking either must fail at the clap boundary
+/// with an unrecognized-subcommand error, guarding against the commands
+/// silently coming back.
 #[cfg(unix)]
 #[test]
-fn test_service_agent_alias_emits_deprecation_warning() {
+fn test_service_sidecar_subcommands_are_gone() {
     let temp_dir = tempdir().expect("create temp dir");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
-        .current_dir(temp_dir.path())
-        .args(["service", "agent", "start", "--service-name", "edge-proxy"])
-        .output()
-        .expect("run service agent start (deprecated alias)");
+    for subcommand in ["openbao-sidecar", "agent"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "service",
+                subcommand,
+                "start",
+                "--service-name",
+                "edge-proxy",
+            ])
+            .output()
+            .expect("run removed service subcommand");
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "alias must surface the same state-missing failure as the canonical command; stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("`bootroot service agent` is deprecated"),
-        "alias must emit deprecation warning to stderr; stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("`bootroot service openbao-sidecar`"),
-        "deprecation warning must point at the canonical command; stderr:\n{stderr}"
-    );
-}
-
-/// Sanity check that the canonical `service openbao-sidecar start`
-/// command does NOT emit the deprecation warning — so we don't ship a
-/// regression where the warning leaks onto the new spelling.
-#[cfg(unix)]
-#[test]
-fn test_service_openbao_sidecar_does_not_emit_deprecation_warning() {
-    let temp_dir = tempdir().expect("create temp dir");
-
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
-        .current_dir(temp_dir.path())
-        .args([
-            "service",
-            "openbao-sidecar",
-            "start",
-            "--service-name",
-            "edge-proxy",
-        ])
-        .output()
-        .expect("run service openbao-sidecar start");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("is deprecated"),
-        "canonical command must not emit deprecation warning; stderr:\n{stderr}"
-    );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "`bootroot service {subcommand}` must no longer parse; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("unrecognized subcommand") && stderr.contains(subcommand),
+            "expected clap unrecognized-subcommand error for `service {subcommand}`, \
+             got: {stderr}"
+        );
+    }
 }
 
 async fn stub_app_add_remote_sync_material(server: &MockServer, service_name: &str) {

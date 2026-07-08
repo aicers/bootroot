@@ -57,7 +57,7 @@ fn test_verify_success() {
 }
 
 #[test]
-fn test_verify_docker_success() {
+fn test_verify_second_service_success() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");
     fs::write(&agent_config, "# config").expect("write agent config");
@@ -68,7 +68,7 @@ fn test_verify_docker_success() {
     write_cert_with_dns(&cert_path, &key_path, "001.web-app.web-01.trusted.domain")
         .expect("write cert");
 
-    write_state_with_docker_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+    write_state_with_web_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -450,7 +450,7 @@ fn test_verify_empty_cert_fails() {
 }
 
 #[test]
-fn test_verify_empty_key_fails_docker() {
+fn test_verify_empty_key_fails_second_service() {
     let temp_dir = tempdir().expect("create temp dir");
     let agent_config = temp_dir.path().join("agent.toml");
     fs::write(&agent_config, "# config").expect("write agent config");
@@ -462,7 +462,7 @@ fn test_verify_empty_key_fails_docker() {
         .expect("write cert");
     fs::write(&key_path, "").expect("truncate key");
 
-    write_state_with_docker_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
+    write_state_with_web_app(temp_dir.path(), &agent_config, &cert_path, &key_path)
         .expect("write state");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -607,7 +607,6 @@ fn write_state_with_app(
         "services": {
             "edge-proxy": {
                 "service_name": "edge-proxy",
-                "deploy_type": "daemon",
                 "hostname": "edge-node-01",
                 "domain": "trusted.domain",
                 "agent_config_path": agent_config,
@@ -632,7 +631,7 @@ fn write_state_with_app(
     Ok(())
 }
 
-fn write_state_with_docker_app(
+fn write_state_with_web_app(
     root: &std::path::Path,
     agent_config: &std::path::Path,
     cert_path: &std::path::Path,
@@ -647,14 +646,12 @@ fn write_state_with_docker_app(
         "services": {
             "web-app": {
                 "service_name": "web-app",
-                "deploy_type": "docker",
                 "hostname": "web-01",
                 "domain": "trusted.domain",
                 "instance_id": "001",
                 "agent_config_path": agent_config,
                 "cert_path": cert_path,
                 "key_path": key_path,
-                "container_name": "web-app",
                 "approle": {
                     "role_name": "bootroot-service-web-app",
                     "role_id": "role-web-app",

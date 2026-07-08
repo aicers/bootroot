@@ -49,7 +49,7 @@ async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
     let path = env::var("PATH").unwrap_or_default();
     let combined_path = format!("{}:{}", bin_dir.display(), path);
     // The fake docker will copy RENDER_SOURCE to RENDER_TARGET when it sees
-    // `docker restart bootroot-openbao-agent-*`, simulating OBA rendering.
+    // `docker restart` of an infra OBA container, simulating OBA rendering.
     let render_source = secrets_dir.join("password.txt.new");
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
@@ -132,11 +132,11 @@ async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_rotate_approle_secret_id_daemon_updates_secret() {
+async fn test_rotate_approle_secret_id_local_updates_secret() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    let secret_path =
+        prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
     fs::write(&secret_path, "old-secret").expect("seed secret_id");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -195,9 +195,13 @@ async fn test_rotate_approle_secret_id_daemon_updates_secret() {
         & 0o777;
     assert_eq!(mode, 0o600);
 
+    // The agent's fast-poll loop re-reads the secret_id file on every
+    // AppRole re-login, so rotation must not signal the agent process.
     let pkill_args = fs::read_to_string(&pkill_log).expect("read pkill log");
-    assert!(pkill_args.contains("-HUP"));
-    assert!(pkill_args.contains("agent.toml"));
+    assert!(
+        pkill_args.is_empty(),
+        "service secret-id rotation should not signal the agent: {pkill_args}"
+    );
 }
 
 #[cfg(unix)]
@@ -205,9 +209,8 @@ async fn test_rotate_approle_secret_id_daemon_updates_secret() {
 async fn test_rotate_approle_secret_id_applies_default_wrapping_when_policy_absent() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let secret_path =
-        prepare_app_state_no_policy(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-            .expect("prepare state");
+    let secret_path = prepare_app_state_no_policy(temp_dir.path(), &openbao.uri(), "local-file")
+        .expect("prepare state");
     fs::write(&secret_path, "old-secret").expect("seed secret_id");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -252,11 +255,11 @@ async fn test_rotate_approle_secret_id_applies_default_wrapping_when_policy_abse
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_rotate_approle_secret_id_docker_restarts_agent() {
+async fn test_rotate_approle_secret_id_does_not_restart_containers() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "docker", "local-file")
-        .expect("prepare state");
+    let secret_path =
+        prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
     fs::write(&secret_path, "old-secret").expect("seed secret_id");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -264,7 +267,7 @@ async fn test_rotate_approle_secret_id_docker_restarts_agent() {
     let docker_log = temp_dir.path().join("docker.log");
     write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
 
-    stub_openbao_for_rotation(&openbao, "secret-docker").await;
+    stub_openbao_for_rotation(&openbao, "secret-rotated").await;
 
     let path = env::var("PATH").unwrap_or_default();
     let combined_path = format!("{}:{}", bin_dir.display(), path);
@@ -292,12 +295,16 @@ async fn test_rotate_approle_secret_id_docker_restarts_agent() {
         output.status.success(),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    // The local bootroot-agent runs only as a host daemon; service
+    // secret-id rotation must not touch docker at all.
     let docker_args = fs::read_to_string(&docker_log).expect("read docker log");
-    assert!(docker_args.contains("restart"));
-    assert!(docker_args.contains("bootroot-openbao-agent-edge-proxy"));
+    assert!(
+        docker_args.is_empty(),
+        "service secret-id rotation should not invoke docker: {docker_args}"
+    );
 
     let updated = fs::read_to_string(&secret_path).expect("read secret_id");
-    assert_eq!(updated, "secret-docker");
+    assert_eq!(updated, "secret-rotated");
 }
 
 #[cfg(unix)]
@@ -305,9 +312,8 @@ async fn test_rotate_approle_secret_id_docker_restarts_agent() {
 async fn test_rotate_approle_secret_id_skips_login_when_cidr_bound() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let secret_path =
-        prepare_app_state_with_cidrs(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-            .expect("prepare state");
+    let secret_path = prepare_app_state_with_cidrs(temp_dir.path(), &openbao.uri(), "local-file")
+        .expect("prepare state");
     fs::write(&secret_path, "old-secret").expect("seed secret_id");
 
     let bin_dir = temp_dir.path().join("bin");
@@ -396,13 +402,8 @@ async fn test_rotate_approle_secret_id_missing_app_fails() {
 async fn test_rotate_approle_secret_id_remote_sets_pending_status() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let _secret_path = prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
+    let _secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
 
     stub_openbao_for_rotation(&openbao, "secret-remote").await;
 
@@ -441,8 +442,8 @@ async fn test_rotate_approle_secret_id_self_mints_with_file_based_auth() {
     const RUNTIME_ROTATE_ROLE: &str = "bootroot-runtime-rotate-role";
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    let secret_path =
+        prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
     fs::write(&secret_path, "old-secret").expect("seed secret_id");
 
     let cred_dir = temp_dir.path().join("rotate-cred");
@@ -606,8 +607,8 @@ async fn test_rotate_infra_two_invocations_use_fresh_self_minted_credential() {
     let cred_path = cred_dir.join("secret_id");
     fs::write(&cred_path, "old-infra-rotate-secret").expect("seed rotate credential");
 
-    // Pre-write the sidecar role_id files so the role-id backfill is
-    // skipped.
+    // Pre-write the infra agent role_id files so the role-id backfill
+    // is skipped.
     for (dir, role_id) in [
         ("stepca", "stepca-role-id"),
         ("responder", "responder-role-id"),
@@ -745,13 +746,8 @@ async fn test_rotate_infra_two_invocations_use_fresh_self_minted_credential() {
 async fn test_rotate_responder_hmac_remote_sets_pending_status() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let _secret_path = prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
+    let _secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
 
     let compose_file = temp_dir.path().join("docker-compose.yml");
     fs::write(
@@ -840,13 +836,8 @@ async fn test_rotate_responder_hmac_remote_sets_pending_status() {
 async fn test_rotate_responder_hmac_supports_approle_runtime_auth() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let _secret_path = prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
+    let _secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
 
     let compose_file = temp_dir.path().join("docker-compose.yml");
     fs::write(&compose_file, "services: {}\n").expect("write compose");
@@ -912,13 +903,8 @@ async fn test_rotate_responder_hmac_supports_approle_runtime_auth() {
 async fn test_rotate_responder_hmac_approle_permission_denied_fails() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let _secret_path = prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
+    let _secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
 
     let compose_file = temp_dir.path().join("docker-compose.yml");
     fs::write(&compose_file, "services: {}\n").expect("write compose");
@@ -1071,8 +1057,8 @@ async fn test_rotate_openbao_recovery_writes_output_file() {
 async fn test_rotate_openbao_recovery_keeps_approle_state_unchanged() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    let secret_path =
+        prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
     fs::write(&secret_path, "existing-secret-id").expect("write existing secret_id");
 
     let state_path = temp_dir.path().join("state.json");
@@ -1265,7 +1251,6 @@ async fn test_rotate_openbao_recovery_show_secrets_reveals_plaintext() {
 fn prepare_app_state_no_policy(
     root: &Path,
     openbao_url: &str,
-    deploy_type: &str,
     delivery_mode: &str,
 ) -> anyhow::Result<PathBuf> {
     write_state_file(root, openbao_url)?;
@@ -1275,7 +1260,6 @@ fn prepare_app_state_no_policy(
     let secret_id_path = PathBuf::from("secrets/services/edge-proxy/secret_id");
     state["services"][SERVICE_NAME] = json!({
         "service_name": SERVICE_NAME,
-        "deploy_type": deploy_type,
         "delivery_mode": delivery_mode,
         "hostname": "edge-node-01",
         "domain": "trusted.domain",
@@ -1283,7 +1267,6 @@ fn prepare_app_state_no_policy(
         "cert_path": "certs/edge-proxy.crt",
         "key_path": "certs/edge-proxy.key",
         "instance_id": "001",
-        "container_name": "edge-proxy",
         "approle": {
             "role_name": ROLE_NAME,
             "role_id": ROLE_ID,
@@ -1302,7 +1285,6 @@ fn prepare_app_state_no_policy(
 fn prepare_app_state(
     root: &Path,
     openbao_url: &str,
-    deploy_type: &str,
     delivery_mode: &str,
 ) -> anyhow::Result<PathBuf> {
     write_state_file(root, openbao_url)?;
@@ -1312,7 +1294,6 @@ fn prepare_app_state(
     let secret_id_path = PathBuf::from("secrets/services/edge-proxy/secret_id");
     state["services"][SERVICE_NAME] = json!({
         "service_name": SERVICE_NAME,
-        "deploy_type": deploy_type,
         "delivery_mode": delivery_mode,
         "hostname": "edge-node-01",
         "domain": "trusted.domain",
@@ -1320,7 +1301,6 @@ fn prepare_app_state(
         "cert_path": "certs/edge-proxy.crt",
         "key_path": "certs/edge-proxy.key",
         "instance_id": "001",
-        "container_name": "edge-proxy",
         "approle": {
             "role_name": ROLE_NAME,
             "role_id": ROLE_ID,
@@ -1340,7 +1320,6 @@ fn prepare_app_state(
 fn prepare_app_state_with_cidrs(
     root: &Path,
     openbao_url: &str,
-    deploy_type: &str,
     delivery_mode: &str,
 ) -> anyhow::Result<PathBuf> {
     write_state_file(root, openbao_url)?;
@@ -1350,7 +1329,6 @@ fn prepare_app_state_with_cidrs(
     let secret_id_path = PathBuf::from("secrets/services/edge-proxy/secret_id");
     state["services"][SERVICE_NAME] = json!({
         "service_name": SERVICE_NAME,
-        "deploy_type": deploy_type,
         "delivery_mode": delivery_mode,
         "hostname": "edge-node-01",
         "domain": "trusted.domain",
@@ -1358,7 +1336,6 @@ fn prepare_app_state_with_cidrs(
         "cert_path": "certs/edge-proxy.crt",
         "key_path": "certs/edge-proxy.key",
         "instance_id": "001",
-        "container_name": "edge-proxy",
         "approle": {
             "role_name": ROLE_NAME,
             "role_id": ROLE_ID,
@@ -1828,10 +1805,12 @@ if [ -n "${DOCKER_OUTPUT:-}" ]; then
   printf "%s\n" "$*" >> "$DOCKER_OUTPUT"
 fi
 
-# Simulate OpenBao Agent rendering on restart of OBA containers
+# Simulate OpenBao Agent rendering on restart of the infra OBA
+# containers (the only OBA containers left after the local sidecar
+# retirement).
 if [ "${1:-}" = "restart" ]; then
   case "${2:-}" in
-    bootroot-openbao-agent-*)
+    bootroot-openbao-agent-stepca|bootroot-openbao-agent-responder)
       if [ -n "${RENDER_SOURCE:-}" ] && [ -n "${RENDER_TARGET:-}" ]; then
         cp "$RENDER_SOURCE" "$RENDER_TARGET"
       fi
@@ -1856,13 +1835,7 @@ async fn test_rotate_trust_sync_writes_global_and_per_service() {
     let openbao = MockServer::start().await;
 
     support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
-    prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
@@ -1922,8 +1895,8 @@ async fn test_rotate_trust_sync_writes_global_and_per_service() {
 async fn test_rotate_force_reissue_deletes_cert_and_key() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let _secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    let _secret_path =
+        prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
 
     let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
     let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
@@ -1990,13 +1963,8 @@ async fn test_rotate_force_reissue_deletes_cert_and_key() {
 async fn test_rotate_force_reissue_remote_writes_reissue_kv() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let _secret_path = prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
+    let _secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
@@ -2068,13 +2036,8 @@ async fn test_rotate_force_reissue_remote_writes_reissue_kv() {
 async fn test_rotate_force_reissue_remote_wait_reports_completion() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let _secret_path = prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
+    let _secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
@@ -2167,13 +2130,8 @@ async fn test_rotate_force_reissue_remote_wait_reports_completion() {
 async fn test_rotate_force_reissue_remote_wait_times_out_with_exit_124() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
-    let _secret_path = prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
+    let _secret_path = prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
@@ -3003,8 +2961,7 @@ async fn test_rotate_ca_key_finalize_blocks_unmigrated() {
     support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
     support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
         .expect("write password");
-    prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
@@ -3060,13 +3017,7 @@ async fn test_rotate_trust_sync_blocked_by_rotation_state() {
     let openbao = MockServer::start().await;
 
     support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
-    prepare_app_state(
-        temp_dir.path(),
-        &openbao.uri(),
-        "daemon",
-        "remote-bootstrap",
-    )
-    .expect("prepare state");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
 
     // Simulate an in-progress CA key rotation.
     fs::write(
@@ -3260,8 +3211,7 @@ async fn test_rotate_ca_key_happy_path_phase_0_through_7() {
     support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
     support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
         .expect("write password");
-    prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
 
     // Write a docker-compose.yml (needed for Phase 4 restart)
     fs::write(
@@ -3471,8 +3421,7 @@ async fn test_rotate_ca_key_skip_reissue_skips_phase_5() {
     support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
     support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
         .expect("write password");
-    prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
@@ -3562,8 +3511,7 @@ async fn test_rotate_ca_key_force_finalize_with_unmigrated() {
     support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
     support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
         .expect("write password");
-    prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
@@ -3923,8 +3871,7 @@ async fn test_rotate_ca_key_full_force_finalize_enhanced_warning() {
     support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
     support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
         .expect("write password");
-    prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
 
     Mock::given(method("GET"))
         .and(path("/v1/sys/health"))
@@ -4005,8 +3952,7 @@ async fn test_rotate_ca_key_full_mode_happy_path_phase_0_through_7() {
     support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
     support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
         .expect("write password");
-    prepare_app_state(temp_dir.path(), &openbao.uri(), "daemon", "local-file")
-        .expect("prepare state");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "local-file").expect("prepare state");
 
     fs::write(
         temp_dir.path().join("docker-compose.yml"),
