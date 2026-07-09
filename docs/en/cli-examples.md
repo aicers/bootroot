@@ -245,9 +245,10 @@ bootroot-remote bootstrap \
 When wrapping is enabled (the default), the artifact carries a
 `wrap_token` that `bootroot-remote` unwraps at runtime to obtain
 `secret_id`. This avoids exposing sensitive tokens in shell command
-lines and `ps` output. The per-field CLI flag style shown below still
-works for backward compatibility or when wrapping is disabled
-(`--no-wrap`):
+lines and `ps` output. The per-field CLI flag style shown below is an
+alternative invocation shape used when wrapping is disabled
+(`--no-wrap`), which passes the unwrapped `secret_id` and connection
+fields directly instead of reading them from the artifact:
 
 ```bash
 bootroot-remote bootstrap \

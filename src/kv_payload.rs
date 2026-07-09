@@ -110,7 +110,8 @@ pub enum EabPayload {
 /// The clear shape must NOT be routed through `parse_required_string`: that
 /// helper trims and rejects empty strings, which would misclassify a clear as
 /// malformed and prevent it from ever applying. The KV payload keys the secret
-/// as `hmac` (distinct from the on-disk `eab.json` `key` alias).
+/// as `hmac` (distinct from the `key` alias that `eab.json` also accepts for
+/// interop with step-ca's native EAB field name).
 ///
 /// # Errors
 ///

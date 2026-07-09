@@ -390,9 +390,9 @@ fn build_openbao_updates(
     }
     // Provision an absolute `state_path` when either (a) the key is
     // missing, or (b) the existing value is relative. Case (b) catches
-    // legacy configs (written before bootstrap provisioned the key) and
-    // operator-edited configs that accidentally left the default
-    // relative filename in place — rerunning `bootroot-remote bootstrap`
+    // operator-edited configs that left a relative `state_path` — whether
+    // the default relative filename that was never made absolute or a
+    // hand-entered relative value — so rerunning `bootroot-remote bootstrap`
     // must be able to repair them, otherwise the validation hint
     // pointing operators at bootstrap would be misleading.
     if needs_absolute_state_path_provisioning(current_contents)
@@ -876,7 +876,7 @@ mod tests {
 
     #[test]
     fn build_openbao_updates_repairs_relative_state_path() {
-        // Round 8 regression: a legacy config may already carry a
+        // Round 8 regression: a config may already carry a
         // relative `state_path` (e.g. the in-tree default filename, or
         // an operator edit). Rerunning `bootroot-remote bootstrap` must
         // repair it in place, otherwise the validation hint pointing
@@ -938,13 +938,13 @@ mod tests {
 
     #[test]
     fn build_openbao_updates_preserves_existing_absolute_state_path() {
-        // No-migration guarantee: an existing deployment already carries an
-        // absolute state_path, so a bootstrap re-run must leave it exactly
-        // as-is (issue #687 acceptance criteria).
+        // Idempotency guarantee: a deployment already carries an absolute
+        // state_path, so re-running bootstrap must leave it exactly as-is
+        // (issue #687 acceptance criteria).
         let args = test_bootstrap_args();
         let input = "[openbao]\n\
             url = \"https://stale:8200\"\n\
-            state_path = \"/var/lib/bootroot/legacy-state.json\"\n";
+            state_path = \"/var/lib/bootroot/existing-state.json\"\n";
         let pairs = build_openbao_updates(&args, input);
         assert!(
             !pairs.iter().any(|(k, _)| *k == "state_path"),
@@ -1124,7 +1124,7 @@ mod tests {
         // topology fields — mirrors what an operator would see after
         // running an older bootroot that did not seed the baseline.
         let pre_existing =
-            "domain = \"legacy.domain\"\n\n[acme]\nhttp_responder_hmac = \"legacy-hmac\"\n";
+            "domain = \"existing.domain\"\n\n[acme]\nhttp_responder_hmac = \"prior-hmac\"\n";
 
         let mut args = test_bootstrap_args();
         args.agent_email = OVERRIDE_EMAIL.to_string();
@@ -1182,7 +1182,7 @@ mod tests {
             "existing agent.toml must backfill [acme] timeout tunables: {with_hmac}"
         );
         assert!(
-            !with_hmac.contains("legacy-hmac"),
+            !with_hmac.contains("prior-hmac"),
             "hmac must be rotated by the upsert: {with_hmac}"
         );
     }
@@ -1205,7 +1205,7 @@ mod tests {
              domain = \"trusted.domain\"\n\n\
              [acme]\n\
              http_responder_url = \"{OPERATOR_RESPONDER}\"\n\
-             http_responder_hmac = \"legacy-hmac\"\n"
+             http_responder_hmac = \"prior-hmac\"\n"
         );
 
         let args = test_bootstrap_args();

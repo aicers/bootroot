@@ -241,8 +241,9 @@ bootroot-remote bootstrap \
 래핑이 활성(기본값)이면 아티팩트에 `wrap_token`이 포함되며,
 `bootroot-remote`가 런타임에 이를 언래핑하여 `secret_id`를 얻습니다.
 민감한 토큰이 셸 명령줄과 `ps` 출력에 노출되지 않습니다.
-아래의 개별 CLI 플래그 방식은 하위 호환 또는 래핑 비활성(`--no-wrap`)
-시에도 사용할 수 있습니다:
+아래의 개별 CLI 플래그 방식은 래핑을 비활성화(`--no-wrap`)했을 때
+사용하는 대체 호출 형태로, 언래핑된 `secret_id`와 연결 필드를
+아티팩트에서 읽는 대신 직접 전달합니다:
 
 ```bash
 bootroot-remote bootstrap \

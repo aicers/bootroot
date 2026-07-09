@@ -77,6 +77,25 @@ wrapping is enabled (the default):
 | `role_id` | `secrets/services/<service>/role_id` | AppRole identity (long-lived) |
 | `secret_id` | `secrets/services/<service>/secret_id` | AppRole credential (**sensitive**) |
 
+Response wrapping (the default) works with **every** delivery mechanism
+below — SSH, systemd-credentials, Ansible, and cloud-init all carry the
+wrapped `bootstrap.json` just as easily as a raw `secret_id`. It is the
+recommended choice for new deployments: the remote receives a single-use
+`wrap_token` instead of a raw, longer-lived `secret_id` that must be
+stored on disk.
+
+`--no-wrap` is an **independent, optional** choice that disables wrapping
+no matter which delivery mechanism you pick — it is not a property of any
+particular option. It emits a raw `secret_id` that must be copied to and
+stored on the remote host, a weaker at-rest posture. Its one genuine
+rationale is the retry window: the single-use `wrap_token` has a short
+TTL (default 30 minutes) that may expire before bootstrap completes on
+slow or unreliable delivery pipelines — otherwise mitigable by raising
+`--secret-id-wrap-ttl`. It is not recommended for new deployments. The
+examples in Options 2–4 below happen to show the `--no-wrap` form (raw
+`secret_id` plus per-field flags); each works equally well with the
+wrapped `bootstrap.json` and `--artifact`.
+
 ### Option 1: SSH + shell script (recommended starting point)
 
 Best for small deployments with a handful of service machines. The
@@ -137,15 +156,17 @@ ssh "$REMOTE_USER@$REMOTE_HOST" \
 > delivery if your threat model requires it.
 >
 > If wrapping is disabled (`--no-wrap`), you must also copy
-> `secret_id` to the remote host and can use per-field CLI flags
-> instead of `--artifact` for backward compatibility.
+> `secret_id` to the remote host; you can then pass the per-field CLI
+> flags instead of `--artifact` (an alternative invocation shape for the
+> unwrapped credential).
 
-### Option 2: systemd-credentials (`--no-wrap`)
+### Option 2: systemd-credentials
 
-> **Legacy / backward-compatible path.** This option uses per-field CLI
-> flags and a raw `secret_id` file. It applies when wrapping is disabled
-> (`--no-wrap` on `bootroot service add`). For new deployments, prefer
-> Option 1 with `--artifact` and wrapping enabled (the default).
+> **Note:** This example shows the `--no-wrap` form — per-field CLI flags
+> and a raw `secret_id` file loaded via systemd-credentials. Wrapping
+> (the default) also works with systemd-credentials: deliver
+> `bootstrap.json` as the credential and invoke with `--artifact`. See
+> [The transport boundary](#the-transport-boundary) for the trade-offs.
 
 For single-host setups where the secret should never hit a plain filesystem.
 Use `systemd-creds encrypt` on the control node and `LoadCredential=` in
@@ -173,14 +194,12 @@ ExecStart=/usr/local/bin/bootroot-remote bootstrap \
     --output json
 ```
 
-### Option 3: Ansible (`--no-wrap`)
+### Option 3: Ansible
 
-> **Legacy / backward-compatible path.** This option uses per-field CLI
-> flags and copies a raw `secret_id` file. It applies when wrapping is
-> disabled (`--no-wrap` on `bootroot service add`). For new deployments,
-> prefer Option 1 with `--artifact` and wrapping enabled (the default).
-> To adapt this playbook for the wrapped flow, copy `bootstrap.json`
-> instead of `secret_id` and invoke with `--artifact`.
+> **Note:** This playbook shows the `--no-wrap` form — per-field CLI flags
+> and a copied raw `secret_id` file. Wrapping (the default) also works
+> with Ansible: copy `bootstrap.json` instead of `secret_id` and invoke
+> with `--artifact`.
 
 For larger fleets with existing configuration management.
 
@@ -268,14 +287,12 @@ For larger fleets with existing configuration management.
       changed_when: true
 ```
 
-### Option 4: cloud-init (`--no-wrap`)
+### Option 4: cloud-init
 
-> **Legacy / backward-compatible path.** This option uses per-field CLI
-> flags and writes a raw `secret_id` into cloud-init user data. It
-> applies when wrapping is disabled (`--no-wrap` on
-> `bootroot service add`). For new deployments, prefer Option 1 with
-> `--artifact` and wrapping enabled (the default). With wrapping, embed
-> `bootstrap.json` in `write_files` and invoke with `--artifact`.
+> **Note:** This example shows the `--no-wrap` form — per-field CLI flags
+> and a raw `secret_id` written into cloud-init user data. Wrapping (the
+> default) also works with cloud-init: embed `bootstrap.json` in
+> `write_files` and invoke with `--artifact`.
 
 For first-boot provisioning of cloud VMs.
 
@@ -377,9 +394,9 @@ agent has no consumer for the control plane's KV request, and a
 expiry. `bootroot-remote bootstrap` auto-populates the connection
 fields (`url`, `kv_mount`, `role_id_path`, `secret_id_path`,
 `ca_bundle_path`) on every run, so operators do not normally edit it
-by hand. If a legacy remote upgrades bootroot without rerunning
-`bootroot-remote bootstrap`, the section will be absent and
-`force-reissue` requests will not be observed until the next bootstrap
+by hand. If a remote host's `agent.toml` lacks this section and is not
+re-bootstrapped, the section stays absent and `force-reissue` requests
+will not be observed until the next `bootroot-remote bootstrap` run
 populates it.
 
 ```toml
@@ -402,7 +419,7 @@ provisions it to an absolute path adjacent to `agent.toml` whenever
 the current value is missing *or relative*, so the fast-poll state
 does not end up at a cwd-relative location under a systemd-style
 supervisor (where cwd is not contractually writable or stable).
-Rerunning `bootroot-remote bootstrap` therefore repairs a legacy
+Rerunning `bootroot-remote bootstrap` therefore repairs a
 config whose `state_path` was the in-tree relative default, matching
 the remediation hint that config validation prints on startup.
 Operators can override with any absolute path; subsequent bootstrap
@@ -420,7 +437,7 @@ carry an absolute `state_path`, so a bootstrap rerun preserves the old
 name unchanged — only freshly provisioned configs get the service-keyed
 basename. If bootstrap detects two sibling configs in the target
 directory that resolve to the *same* absolute `state_path` (e.g.
-hand-written or legacy configs), it prints a warning: two
+hand-written configs), it prints a warning: two
 `bootroot-agent` processes sharing one state file race on it and each
 periodically reverts the other's fast-poll progress. See
 [Running multiple distinct services on one host](#running-multiple-distinct-services-on-one-host).
@@ -491,7 +508,7 @@ bootstrap does this automatically for freshly provisioned configs by
 keying the basename on `service_name`
 (`bootroot-agent-state-<service_name>.json`), so per-service configs may
 safely share one directory. If you place configs in a shared directory
-with hand-written or legacy `state_path` values, make sure no two
+with hand-written `state_path` values, make sure no two
 resolve to the same file — bootstrap warns when it detects a collision,
 because two agents sharing one `state_path` race on the fast-poll state
 and each periodically reverts the other's progress (version-gating

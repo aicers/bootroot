@@ -293,16 +293,16 @@ fn render_remote_run_command(_artifact: &RemoteBootstrapArtifact) -> String {
 
 /// Escapes a string for embedding inside single quotes in a POSIX shell
 /// command. Replaces each `'` with `'\''` (end quote, literal quote,
-/// resume quote). Only used by the legacy renderer kept for tests.
+/// resume quote). Only used by the per-field renderer kept for tests.
 #[cfg(test)]
 fn shell_escape_single_quoted(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
 
-/// Renders the legacy per-flag command. Kept for test coverage of the
-/// per-flag format used in backward-compatible manual invocations.
+/// Renders the per-field flag command. Kept for test coverage of the
+/// per-field invocation shape, a supported alternative to `--artifact`.
 #[cfg(test)]
-fn render_remote_run_command_legacy(artifact: &RemoteBootstrapArtifact) -> String {
+fn render_remote_run_command_per_field(artifact: &RemoteBootstrapArtifact) -> String {
     use std::fmt::Write as _;
 
     let mut cmd = format!(
@@ -784,7 +784,7 @@ mod tests {
             Some(TEST_AGENT_RESPONDER_URL),
             None,
         );
-        let cmd = super::render_remote_run_command_legacy(&artifact);
+        let cmd = super::render_remote_run_command_per_field(&artifact);
 
         assert!(
             cmd.contains("--post-renew-command 'systemctl'"),
@@ -837,7 +837,7 @@ mod tests {
             Some(TEST_AGENT_RESPONDER_URL),
             None,
         );
-        let cmd = super::render_remote_run_command_legacy(&artifact);
+        let cmd = super::render_remote_run_command_per_field(&artifact);
 
         assert!(
             cmd.contains("--post-renew-command '/usr/bin/notify-O'\\''Brien'"),
@@ -870,7 +870,7 @@ mod tests {
             Some(TEST_AGENT_RESPONDER_URL),
             None,
         );
-        let cmd = super::render_remote_run_command_legacy(&artifact);
+        let cmd = super::render_remote_run_command_per_field(&artifact);
 
         assert!(
             !cmd.contains("--post-renew"),
@@ -1006,7 +1006,7 @@ mod tests {
         );
         assert!(
             !cmd.contains("--openbao-url"),
-            "should not contain legacy flags: {cmd}"
+            "should not contain per-field flags: {cmd}"
         );
     }
 
@@ -1039,7 +1039,7 @@ mod tests {
         );
         assert!(
             !cmd.contains("--openbao-url"),
-            "should not contain legacy flags: {cmd}"
+            "should not contain per-field flags: {cmd}"
         );
     }
 
