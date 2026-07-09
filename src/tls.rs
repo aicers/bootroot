@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -14,6 +15,21 @@ use x509_parser::prelude::ASN1Time;
 use x509_parser::prelude::FromDer;
 
 use crate::config::TrustSettings;
+
+/// Connect timeout for `OpenBao` HTTP clients.
+///
+/// All `OpenBao` payloads are small JSON, so a TCP connect that has not
+/// completed within this bound is almost certainly a stalled or
+/// black-holed endpoint. Bounding the connect keeps a single hung dial
+/// from wedging the shared fast-poll client (see issue #695).
+pub(crate) const OPENBAO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total request timeout for `OpenBao` HTTP clients.
+///
+/// Bounds the whole request (connect + send + receive) so a peer that
+/// accepts the connection and then stalls cannot hang the fast-poll loop
+/// indefinitely, which shares one client across every poll.
+pub(crate) const OPENBAO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Builds a [`reqwest::Client`] configured according to the given
 /// [`TrustSettings`] and runtime TLS override.
@@ -91,6 +107,8 @@ pub fn build_http_client_from_pem(pem_content: &str, pins: &[String]) -> Result<
     let config = build_client_config_from_pem(pem_content, pins)?;
     Client::builder()
         .use_preconfigured_tls(config)
+        .connect_timeout(OPENBAO_CONNECT_TIMEOUT)
+        .timeout(OPENBAO_REQUEST_TIMEOUT)
         .build()
         .context("Failed to build HTTP client from PEM bundle")
 }
@@ -146,6 +164,8 @@ pub fn build_http_client_with_local_and_webpki_roots(pem_content: &str) -> Resul
         .with_no_client_auth();
     Client::builder()
         .use_preconfigured_tls(config)
+        .connect_timeout(OPENBAO_CONNECT_TIMEOUT)
+        .timeout(OPENBAO_REQUEST_TIMEOUT)
         .build()
         .context("Failed to build HTTP client with local+webpki roots")
 }
@@ -181,7 +201,11 @@ pub(crate) fn build_local_plus_webpki_root_store(
     Ok(root_store)
 }
 
-fn parse_pem_to_cert_list(pem_bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
+/// Parses a PEM-encoded byte buffer into the list of `CERTIFICATE`
+/// entries it contains, rejecting a buffer that parses to zero
+/// certificates. Widened to `pub(crate)` so `kv_payload` can structurally
+/// validate a KV trust bundle before it reaches disk (issue #695).
+pub(crate) fn parse_pem_to_cert_list(pem_bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     let mut remaining = pem_bytes;
     let mut certs = Vec::new();
     while !remaining.is_empty() {
@@ -362,7 +386,24 @@ impl ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Computes the `trusted_ca_sha256` fingerprints (lowercase hex SHA-256 of
+/// each certificate's DER) for every certificate in a PEM bundle.
+///
+/// Public so the remote bootstrap binary can advertise a bundle's trust
+/// anchors in its artifact for TLS pinning (issue #695).
+///
+/// # Errors
+///
+/// Returns an error if the PEM parses to zero certificates.
+pub fn ca_bundle_fingerprints(pem_content: &str) -> Result<Vec<String>> {
+    let certs = parse_pem_to_cert_list(pem_content.as_bytes())?;
+    Ok(certs.iter().map(|cert| sha256_hex(cert.as_ref())).collect())
+}
+
+/// Computes the lowercase hex SHA-256 of `bytes`. For a certificate DER
+/// this yields the fingerprint used for `trusted_ca_sha256` pins and the
+/// KV trust-payload consistency check (issue #695).
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
     let mut output = String::with_capacity(digest.as_ref().len() * 2);
     for byte in digest.as_ref() {

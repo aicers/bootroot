@@ -68,6 +68,7 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
             &args.secret_id_path,
             &args.service_name,
             args.ca_bundle_pem.as_deref(),
+            &args.trusted_ca_sha256,
             lang,
         )
         .await
@@ -108,7 +109,12 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
             )
         })?;
 
-    let mut client = build_openbao_client(&args.openbao_url, args.ca_bundle_pem.as_deref(), lang)?;
+    let mut client = build_openbao_client(
+        &args.openbao_url,
+        args.ca_bundle_pem.as_deref(),
+        &args.trusted_ca_sha256,
+        lang,
+    )?;
     let token = client
         .login_approle(&role_id, &current_secret_id)
         .await
@@ -200,6 +206,11 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
 /// Unwraps a response-wrapped `secret_id` and writes it to the
 /// expected file path. Classifies failures as expired or
 /// already-unwrapped tokens with appropriate error messages.
+// The parameters mirror the discrete pieces of the bootstrap transport
+// (URL, wrap token + expiry, destination, CA bundle + pins) that each come
+// from a different artifact field; bundling them into a struct would add a
+// one-use type without improving clarity.
+#[allow(clippy::too_many_arguments)]
 async fn unwrap_and_write_secret_id(
     openbao_url: &str,
     wrap_token: &str,
@@ -207,9 +218,10 @@ async fn unwrap_and_write_secret_id(
     secret_id_path: &std::path::Path,
     service_name: &str,
     ca_bundle_pem: Option<&str>,
+    pins: &[String],
     lang: Locale,
 ) -> Result<()> {
-    let client = build_openbao_client(openbao_url, ca_bundle_pem, lang)?;
+    let client = build_openbao_client(openbao_url, ca_bundle_pem, pins, lang)?;
     match client.unwrap_secret_id(wrap_token).await {
         Ok(secret_id) => {
             write_secret_file(secret_id_path, &secret_id)
@@ -529,6 +541,7 @@ mod tests {
             profile_key_path: None,
             ca_bundle_path: PathBuf::new(),
             ca_bundle_pem: None,
+            trusted_ca_sha256: Vec::new(),
             post_renew_command: None,
             post_renew_arg: Vec::new(),
             post_renew_timeout_secs: None,

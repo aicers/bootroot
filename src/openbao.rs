@@ -198,6 +198,8 @@ impl OpenBaoClient {
     /// Returns an error if the HTTP client cannot be initialized.
     pub fn new(base_url: &str) -> Result<Self> {
         let client = Client::builder()
+            .connect_timeout(crate::tls::OPENBAO_CONNECT_TIMEOUT)
+            .timeout(crate::tls::OPENBAO_REQUEST_TIMEOUT)
             .build()
             .context("Failed to build OpenBao HTTP client")?;
         Ok(Self {
@@ -1882,5 +1884,55 @@ mod tls_integration_tests {
             OpenBaoClient::with_local_trust("https://example.invalid", secrets_dir.path())
                 .expect("https client with no bundle still constructs");
         assert_eq!(external.base_url, "https://example.invalid");
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// A stalling server: accepts the connection and holds every socket
+    /// open forever without ever writing a response, so a client with no
+    /// request timeout would hang indefinitely.
+    async fn spawn_stalling_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalling listener");
+        let addr = listener.local_addr().expect("stalling listener addr");
+        tokio::spawn(async move {
+            // Retain each accepted stream so the connection stays open (a
+            // dropped stream would send RST and unblock the client early);
+            // the loop ends when accept() errors.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Confirms the request timeout constant is wired into the client: a
+    /// read against a server that accepts and stalls fails within the
+    /// bound instead of hanging. Runs under paused time so the virtual
+    /// clock auto-advances to the timeout without a real 30s wait.
+    #[tokio::test(start_paused = true)]
+    async fn read_fails_within_request_timeout_when_server_stalls() {
+        let url = spawn_stalling_server().await;
+        let mut client = OpenBaoClient::new(&url).expect("client init");
+        client.set_token("token".to_string());
+
+        let start = tokio::time::Instant::now();
+        let result = client.try_read_kv("secret", "bootroot/stall").await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "a stalled read must fail rather than hang");
+        assert!(
+            elapsed <= crate::tls::OPENBAO_REQUEST_TIMEOUT + Duration::from_secs(1),
+            "read should time out within the request bound, took {elapsed:?}"
+        );
     }
 }

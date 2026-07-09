@@ -8,7 +8,10 @@ use serde::Deserialize;
 mod defaults;
 mod validation;
 
-pub use validation::{parse_cert_duration, validate_cert_duration_vs_default_renew_before};
+pub use validation::{
+    openbao_url_is_https, openbao_url_is_non_loopback_plaintext, parse_cert_duration,
+    validate_cert_duration_vs_default_renew_before,
+};
 
 /// CLI-provided overrides that must survive config reloads in daemon mode.
 ///
@@ -64,6 +67,16 @@ pub struct Settings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct OpenBaoSettings {
     pub url: String,
+    /// Opt-in that allows a non-loopback plaintext `http://` `url`.
+    ///
+    /// Over plaintext the `AppRole` login POSTs `role_id` + `secret_id`
+    /// as cleartext and every KV poll response carries `secret_id`,
+    /// responder HMAC, and EAB in cleartext, so a non-loopback plaintext
+    /// URL exposes live credentials on the wire. Validation rejects such
+    /// a URL unless the operator sets this flag; loopback plaintext and
+    /// `https://` never require it. See issue #695.
+    #[serde(default)]
+    pub allow_plaintext_http: bool,
     #[serde(default = "defaults::default_kv_mount")]
     pub kv_mount: String,
     pub role_id_path: PathBuf,
@@ -755,7 +768,7 @@ mod tests {
             key = "certs/edge-proxy-a.key"
 
             [openbao]
-            url = "http://openbao:8200"
+            url = "http://localhost:8200"
             role_id_path = "/etc/bootroot/role_id"
             secret_id_path = "/etc/bootroot/secret_id"
             state_path = "bootroot-agent-state.json"
@@ -798,7 +811,7 @@ mod tests {
             key = "certs/edge-proxy-a.key"
 
             [openbao]
-            url = "http://openbao:8200"
+            url = "http://localhost:8200"
             role_id_path = "/etc/bootroot/role_id"
             secret_id_path = "/etc/bootroot/secret_id"
         "#
@@ -951,7 +964,7 @@ mod tests {
             key = "certs/edge-proxy-a.key"
 
             [openbao]
-            url = "http://openbao:8200"
+            url = "http://localhost:8200"
             role_id_path = "/etc/bootroot/role_id"
             secret_id_path = "/etc/bootroot/secret_id"
             state_path = "/var/lib/bootroot/bootroot-agent-state.json"

@@ -265,7 +265,8 @@ async fn test_same_host_trust_change_propagates_to_agent_config() {
     assert!(agent_contents.contains("# BEGIN BOOTROOT REMOTE PROFILE"));
     let bundle_contents = fs::read_to_string(&files.ca_bundle_path).expect("read ca-bundle");
     assert!(bundle_contents.contains("BEGIN CERTIFICATE"));
-    assert!(bundle_contents.contains("UPDATED-TRUST"));
+    let (expected_pem, _) = support::test_trust_material();
+    assert_eq!(bundle_contents.trim(), expected_pem.trim());
 }
 
 /// Guards the fast-poll model's no-signal contract for local
@@ -898,13 +899,17 @@ async fn stub_remote_pull_openbao(server: &MockServer) {
         .mount(server)
         .await;
 
+    // Post-#695 the fast-poll/bootstrap trust parse rejects a bundle whose
+    // fingerprints do not match its certificates, so serve a real,
+    // internally consistent bundle.
+    let (ca_pem, ca_fp) = support::test_trust_material();
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/services/edge-proxy/trust"))
         .and(header("X-Vault-Token", "remote-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "data": {
-                "trusted_ca_sha256": ["22".repeat(32)],
-                "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nUPDATED-TRUST\n-----END CERTIFICATE-----"
+                "trusted_ca_sha256": [ca_fp],
+                "ca_bundle_pem": ca_pem
             } }
         })))
         .mount(server)

@@ -8,6 +8,34 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- Hardened the `bootroot-agent` fast-poll OpenBao channel (#695):
+  - Config validation now rejects a non-loopback plaintext `http://`
+    `[openbao].url` unless the operator sets the new
+    `[openbao] allow_plaintext_http = true` opt-in; loopback plaintext
+    (`localhost`, `127.0.0.0/8`, `[::1]`) and `https://` validate
+    unchanged. Both `[openbao]` config writers (`bootroot-remote
+    bootstrap` and local `bootroot service add`) upsert the opt-in when
+    they write such a URL, and the fast-poll loop logs a startup warning
+    that AppRole credentials and delivered secrets cross the network
+    unencrypted.
+  - The KV `trust` payload is validated for internal consistency before
+    anything reaches disk: `ca_bundle_pem` must parse into at least one
+    certificate and every `trusted_ca_sha256` fingerprint must match a
+    certificate in the bundle. A malformed payload is rejected without
+    writing the CA bundle file or `agent.toml` and without advancing the
+    seen version, so a corrected control-plane write retries naturally.
+  - The fast-poll and `bootroot-remote bootstrap` OpenBao TLS clients now
+    pin to `trusted_ca_sha256`; the post-trust-apply client rebuild reads
+    the freshly applied pins from `agent.toml` so a CA rotation swaps both
+    the anchor and the pins. If those pins cannot be recovered, the rebuild
+    fails and rolls the trust version back rather than silently dropping to
+    unpinned bundle-anchored trust.
+  - OpenBao URL scheme detection (plaintext gate, `https://` CA-bundle
+    requirement, and TLS client selection) is now case-insensitive, so a
+    mixed-case `HTTP://` / `HTTPS://` URL is classified like its lowercase
+    form instead of bypassing the plaintext gate or the pinned TLS path.
+  - `OpenBaoClient` HTTP clients now carry a 10s connect and 30s request
+    timeout so a stalled endpoint cannot wedge the shared fast-poll loop.
 - Bumped `rustls-webpki` from 0.103.10 to 0.103.12 to address
   RUSTSEC-2026-0098 and RUSTSEC-2026-0099 (incorrect name-constraint
   validation for URI and wildcard names).

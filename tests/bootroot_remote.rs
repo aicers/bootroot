@@ -74,10 +74,8 @@ async fn test_bootroot_remote_applies_service_secrets() {
     assert!(agent_contents.contains("ca_bundle_path = \""));
     assert!(agent_contents.contains("trusted_ca_sha256 = ["));
     let bundle_contents = fs::read_to_string(&ca_bundle_path).expect("read ca bundle");
-    assert_eq!(
-        bundle_contents,
-        "-----BEGIN CERTIFICATE-----\nREMOTE\n-----END CERTIFICATE-----\n"
-    );
+    let (expected_bundle, _) = valid_remote_trust();
+    assert_eq!(bundle_contents, expected_bundle);
 
     assert_mode(&secret_id_path, 0o600);
     assert_mode(&eab_file_path, 0o600);
@@ -655,6 +653,42 @@ async fn test_bootroot_remote_reports_partial_failure_with_json_output() {
     assert!(summary["responder_hmac"]["error"].is_string());
 }
 
+/// Returns a valid trust bundle (a real self-signed CA PEM and the matching
+/// SHA-256 fingerprint), cached so the stub payload and the on-disk-bundle
+/// assertion agree. Post-#695 `parse_trust_payload` rejects a bundle whose
+/// fingerprints do not match its certificates, so the stubs must serve a
+/// consistent, parseable bundle.
+fn valid_remote_trust() -> (String, String) {
+    use std::sync::OnceLock;
+
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+    static TRUST: OnceLock<(String, String)> = OnceLock::new();
+    TRUST
+        .get_or_init(|| {
+            let key = KeyPair::generate().expect("generate CA key");
+            let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "Remote Test CA");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let cert = params.self_signed(&key).expect("self-signed CA");
+            let pem = cert.pem();
+            let fingerprint = bootroot::tls::ca_bundle_fingerprints(&pem)
+                .expect("fingerprints")
+                .into_iter()
+                .next()
+                .expect("one fingerprint");
+            (pem, fingerprint)
+        })
+        .clone()
+}
+
+fn valid_trust_payload() -> serde_json::Value {
+    let (pem, fingerprint) = valid_remote_trust();
+    json!({ "trusted_ca_sha256": [fingerprint], "ca_bundle_pem": pem })
+}
+
 async fn stub_openbao_remote_sync(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/auth/approle/login"))
@@ -663,11 +697,7 @@ async fn stub_openbao_remote_sync(server: &MockServer) {
         })))
         .mount(server)
         .await;
-    stub_shared_service_payloads(server, json!({
-        "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-        "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nREMOTE\n-----END CERTIFICATE-----"
-    }))
-    .await;
+    stub_shared_service_payloads(server, valid_trust_payload()).await;
 }
 
 async fn stub_openbao_remote_sync_without_trust_list(server: &MockServer) {
@@ -712,14 +742,7 @@ async fn stub_openbao_remote_sync_without_eab_kv(server: &MockServer) {
         })))
         .mount(server)
         .await;
-    stub_shared_service_payloads_without_eab(
-        server,
-        json!({
-            "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-            "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nREMOTE\n-----END CERTIFICATE-----"
-        }),
-    )
-    .await;
+    stub_shared_service_payloads_without_eab(server, valid_trust_payload()).await;
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/services/edge-proxy/eab"))
         .respond_with(ResponseTemplate::new(404))
@@ -735,14 +758,7 @@ async fn stub_openbao_remote_sync_with_empty_eab_kv(server: &MockServer) {
         })))
         .mount(server)
         .await;
-    stub_shared_service_payloads_without_eab(
-        server,
-        json!({
-            "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-            "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nREMOTE\n-----END CERTIFICATE-----"
-        }),
-    )
-    .await;
+    stub_shared_service_payloads_without_eab(server, valid_trust_payload()).await;
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/services/edge-proxy/eab"))
         .and(header("X-Vault-Token", "remote-token"))
@@ -761,14 +777,7 @@ async fn stub_openbao_remote_sync_with_malformed_eab_kv(server: &MockServer) {
         })))
         .mount(server)
         .await;
-    stub_shared_service_payloads_without_eab(
-        server,
-        json!({
-            "trusted_ca_sha256": ["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"],
-            "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nREMOTE\n-----END CERTIFICATE-----"
-        }),
-    )
-    .await;
+    stub_shared_service_payloads_without_eab(server, valid_trust_payload()).await;
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/bootroot/services/edge-proxy/eab"))
         .and(header("X-Vault-Token", "remote-token"))

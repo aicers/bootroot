@@ -382,6 +382,12 @@ fn build_openbao_updates(
         ("secret_id_path", args.secret_id_path.display().to_string()),
         ("ca_bundle_path", args.ca_bundle_path.display().to_string()),
     ];
+    // A non-loopback plaintext URL fails config validation without the
+    // explicit opt-in, so upsert it whenever we write such a URL. Loopback
+    // plaintext and https:// never need it, so it is not emitted there.
+    if bootroot::config::openbao_url_is_non_loopback_plaintext(&args.openbao_url) {
+        pairs.push(("allow_plaintext_http", "true".to_string()));
+    }
     // Provision an absolute `state_path` when either (a) the key is
     // missing, or (b) the existing value is relative. Case (b) catches
     // legacy configs (written before bootstrap provisioned the key) and
@@ -654,6 +660,7 @@ mod tests {
             profile_key_path: None,
             ca_bundle_path: PathBuf::from("/tmp/ca-bundle.pem"),
             ca_bundle_pem: None,
+            trusted_ca_sha256: Vec::new(),
             post_renew_command: None,
             post_renew_arg: Vec::new(),
             post_renew_timeout_secs: None,
@@ -680,6 +687,43 @@ mod tests {
                 "ca_bundle_path",
                 "state_path",
             ]
+        );
+    }
+
+    #[test]
+    fn build_openbao_updates_emits_opt_in_for_non_loopback_plaintext() {
+        let mut args = test_bootstrap_args();
+        args.openbao_url = "http://10.0.0.5:8200".to_string();
+        let pairs = build_openbao_updates(&args, "");
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == "allow_plaintext_http" && v == "true"),
+            "non-loopback plaintext must upsert the opt-in: {pairs:?}"
+        );
+        let output = bootroot::toml_util::upsert_section_keys("", "openbao", &pairs).unwrap();
+        assert!(output.contains("allow_plaintext_http = true"), "{output}");
+    }
+
+    #[test]
+    fn build_openbao_updates_omits_opt_in_for_loopback_plaintext() {
+        let mut args = test_bootstrap_args();
+        args.openbao_url = "http://127.0.0.1:8200".to_string();
+        let pairs = build_openbao_updates(&args, "");
+        assert!(
+            !pairs.iter().any(|(k, _)| *k == "allow_plaintext_http"),
+            "loopback plaintext must not emit the opt-in: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn build_openbao_updates_omits_opt_in_for_https() {
+        let mut args = test_bootstrap_args();
+        args.openbao_url = "https://openbao.example:8200".to_string();
+        let pairs = build_openbao_updates(&args, "");
+        assert!(
+            !pairs.iter().any(|(k, _)| *k == "allow_plaintext_http"),
+            "https must not emit the opt-in: {pairs:?}"
         );
     }
 

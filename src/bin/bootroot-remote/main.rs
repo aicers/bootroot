@@ -202,6 +202,10 @@ struct ResolvedBootstrapArgs {
     profile_key_path: Option<PathBuf>,
     ca_bundle_path: PathBuf,
     ca_bundle_pem: Option<String>,
+    /// SHA-256 fingerprints pinning the bootstrap `OpenBao` TLS connection
+    /// to the CA bundle's trust anchors. Empty for legacy artifacts, in which
+    /// case bootstrap stays bundle-anchored (issue #695).
+    trusted_ca_sha256: Vec<String>,
     post_renew_command: Option<String>,
     post_renew_arg: Vec<String>,
     post_renew_timeout_secs: Option<u64>,
@@ -347,6 +351,12 @@ struct BootstrapArtifact {
     ca_bundle_path: Option<String>,
     #[serde(default)]
     ca_bundle_pem: Option<String>,
+    /// SHA-256 fingerprints of the CA bundle certificates, used to pin the
+    /// bootstrap `OpenBao` TLS connection (issue #695). Absent for artifacts
+    /// produced before the field existed; then bootstrap stays
+    /// bundle-anchored.
+    #[serde(default)]
+    trusted_ca_sha256: Vec<String>,
     #[serde(default)]
     post_renew_hooks: Vec<ArtifactHookEntry>,
     #[serde(default)]
@@ -489,6 +499,10 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         .or(args.profile_key_path);
 
     let ca_bundle_pem = artifact.as_ref().and_then(|a| a.ca_bundle_pem.clone());
+    let trusted_ca_sha256 = artifact
+        .as_ref()
+        .map(|a| a.trusted_ca_sha256.clone())
+        .unwrap_or_default();
 
     let wrap_token = artifact.as_ref().and_then(|a| a.wrap_token.clone());
     let wrap_expires_at = artifact.as_ref().and_then(|a| a.wrap_expires_at.clone());
@@ -542,6 +556,7 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         profile_key_path,
         ca_bundle_path,
         ca_bundle_pem,
+        trusted_ca_sha256,
         post_renew_command,
         post_renew_arg,
         post_renew_timeout_secs,

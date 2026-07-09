@@ -41,6 +41,12 @@ struct RemoteBootstrapArtifact {
     agent_config_path: String,
     ca_bundle_path: String,
     ca_bundle_pem: String,
+    /// SHA-256 fingerprints of the certificates in `ca_bundle_pem`, in the
+    /// `trusted_ca_sha256` form. The remote `bootstrap` pins its `OpenBao`
+    /// TLS connection to these anchors (issue #695). Serialized only when
+    /// non-empty; a remote that pre-dates the field ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    trusted_ca_sha256: Vec<String>,
     /// Operator-supplied override for `email`, carried from
     /// `bootroot service add --agent-email` so that `bootroot-remote
     /// bootstrap` can distinguish "explicit override, clobber remote
@@ -117,6 +123,17 @@ fn artifact_openbao_url(state: &StateFile) -> String {
 
 /// Builds a `RemoteBootstrapArtifact` from common inputs shared by both
 /// the initial service-add and the idempotent re-run paths.
+/// Computes the `trusted_ca_sha256` fingerprints (lowercase hex SHA-256 of
+/// each certificate's DER) for the certificates in a CA bundle PEM. Returns
+/// an empty list when the bundle is empty or unparseable — the remote
+/// bootstrap then falls back to bundle-anchored TLS (no pins).
+fn fingerprints_from_bundle(ca_bundle_pem: &str) -> Vec<String> {
+    if ca_bundle_pem.trim().is_empty() {
+        return Vec::new();
+    }
+    bootroot::tls::ca_bundle_fingerprints(ca_bundle_pem).unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)] // mirrors the many fields of RemoteBootstrapArtifact
 fn build_artifact(
     openbao_url: &str,
@@ -160,6 +177,7 @@ fn build_artifact(
         eab_file_path: eab_path.display().to_string(),
         agent_config_path: agent_config_path.display().to_string(),
         ca_bundle_path: ca_bundle_path.display().to_string(),
+        trusted_ca_sha256: fingerprints_from_bundle(ca_bundle_pem),
         ca_bundle_pem: ca_bundle_pem.to_string(),
         agent_email: agent_email.map(str::to_string),
         agent_server: agent_server.map(str::to_string),
@@ -334,9 +352,33 @@ fn render_remote_run_command_legacy(artifact: &RemoteBootstrapArtifact) -> Strin
 mod tests {
     use std::path::Path;
 
-    use super::build_artifact;
+    use super::{build_artifact, fingerprints_from_bundle};
 
     const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n";
+
+    /// The artifact must advertise the bundle's real trust-anchor
+    /// fingerprints so `bootroot-remote bootstrap` can pin its `OpenBao`
+    /// TLS connection (issue #695); an unparseable bundle yields no pins.
+    #[test]
+    fn fingerprints_from_bundle_computes_ca_fingerprints() {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+        let key = KeyPair::generate().expect("generate CA key");
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Test CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).expect("self-signed CA");
+        let pem = cert.pem();
+
+        let expected = bootroot::tls::ca_bundle_fingerprints(&pem).expect("fingerprints");
+        assert_eq!(fingerprints_from_bundle(&pem), expected);
+        assert_eq!(expected.len(), 1);
+
+        assert!(fingerprints_from_bundle("not a certificate").is_empty());
+        assert!(fingerprints_from_bundle("").is_empty());
+    }
     const TEST_AGENT_EMAIL: &str = "test@example.com";
     const TEST_AGENT_SERVER: &str = "https://step-ca.test:9000/acme/acme/directory";
     const TEST_AGENT_RESPONDER_URL: &str = "http://127.0.0.1:8080";

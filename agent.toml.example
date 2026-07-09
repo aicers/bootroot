@@ -126,6 +126,14 @@ backoff_secs = [5, 10, 30]
 # secret_id_path = "/etc/bootroot/secret_id"
 # # Required when url uses https://
 # ca_bundle_path = "/etc/bootroot/ca-bundle.pem"
+# # Opt-in for a non-loopback plaintext http:// url.  Over plaintext the
+# # AppRole login and every KV poll response carry role_id/secret_id,
+# # responder HMAC, and EAB in cleartext, so validation rejects a
+# # non-loopback http:// url unless this is set.  Loopback plaintext
+# # (localhost, 127.0.0.0/8, [::1]) and https:// never need it.  When set
+# # against a non-loopback plaintext url, the fast-poll loop logs a
+# # startup warning.  Prefer https:// in production.
+# allow_plaintext_http = false
 # # Poll cadence; defaults to 30s
 # fast_poll_interval = "30s"
 # # Persists `last_reissue_seen_version` across restarts.  Must be an
