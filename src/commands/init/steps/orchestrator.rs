@@ -747,6 +747,20 @@ async fn run_init_inner(
         // never depend on the external advertise address being
         // hairpin-reachable.  The advertise address is consumed
         // separately by remote bootstrap artifact generation.
+        //
+        // Snapshot the pre-TLS `state.json` (still the plaintext URL,
+        // no infra cert entries) before persisting the HTTPS URL, so
+        // rollback can restore it if the deferred agent apply below or
+        // any later fallible step fails after OpenBao has been recreated
+        // on plaintext.
+        rollback.state_backup = Some(RollbackFile {
+            path: state_path.clone(),
+            original: if state_path.exists() {
+                Some(std::fs::read_to_string(&state_path)?)
+            } else {
+                None
+            },
+        });
         state.openbao_url = client_url_from_bind_addr(&bind_addr);
         state
             .save(&state_path)
@@ -758,6 +772,11 @@ async fn run_init_inner(
         // generated their files/override in TLS form but skipped this
         // `docker compose up` while OpenBao was still plaintext.
         if let Some(override_path) = openbao_agent_paths.compose_override_path.as_ref() {
+            // Register the override for rollback *before* applying it so
+            // that even a partial `docker compose up` (one agent started,
+            // the other not) is torn down when a failure triggers
+            // rollback.
+            rollback.openbao_agent_compose_override = Some(override_path.clone());
             apply_openbao_agent_compose_override(
                 &args.compose.compose_file,
                 override_path,
