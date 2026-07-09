@@ -163,8 +163,8 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
         apply_agent_config_updates(&args, &pulled, lang).await;
 
     // Defense-in-depth: the service-keyed `state_path` from fix 1 only
-    // covers freshly provisioned configs. Pre-existing hand-written or
-    // legacy-bootstrapped sibling configs can still share one absolute
+    // covers freshly provisioned configs. Pre-existing hand-written
+    // sibling configs can still share one absolute
     // `state_path` and silently race on the fast-poll state file, so warn
     // if two managed configs in the target directory collide.
     if let Some(dir) = args.agent_config_path.parent() {
@@ -379,7 +379,7 @@ fn validate_hook_flags(args: &ResolvedBootstrapArgs) -> Result<()> {
 /// resolve to the same absolute fast-poll `state_path`. Distinct
 /// `bootroot-agent` processes sharing one state file race on it, so this
 /// surfaces a misconfiguration that fix 1's service-keyed naming cannot
-/// repair on its own (pre-existing hand-written or legacy configs).
+/// repair on its own (pre-existing hand-written configs).
 fn warn_state_path_collisions(dir: &Path, lang: Locale) {
     for collision in detect_state_path_collisions(dir) {
         let configs = collision

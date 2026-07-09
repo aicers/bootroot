@@ -11,6 +11,8 @@ use crate::fs_util;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EabCredentials {
     pub kid: String,
+    // `key` is step-ca's native EAB field name; accept it for interop with
+    // step-ca-produced files, not as an older bootroot spelling of `hmac`.
     #[serde(alias = "key")]
     pub hmac: String,
 }

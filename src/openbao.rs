@@ -260,7 +260,7 @@ impl OpenBaoClient {
     /// works against both leaf-only and full-chain server certs.
     ///
     /// Falls back to [`Self::new`] when `base_url` is HTTP or when the
-    /// root bundle does not exist — keeping the legacy plaintext-loopback
+    /// root bundle does not exist — keeping the plaintext-loopback
     /// path and any externally-managed (publicly-trusted) HTTPS endpoint
     /// working unchanged.
     ///
