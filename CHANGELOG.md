@@ -122,7 +122,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   intermediate, `0644` so the separate agent container can read the
   bind-mounted leaf-chain) — and defers their `docker compose up` to a
   second phase after the `OpenBao` TLS transition, so the agents never
-  start against a still-plaintext listener. The loopback / no-TLS path is
+  start against a still-plaintext listener. That deferred apply runs
+  inside the init rollback envelope: if it (or a later step) fails,
+  rollback stops and removes the two agent containers and restores
+  `state.json`, so a failed TLS init never leaves the agents running with
+  a TLS `VAULT_ADDR`/`ca_cert` (or `state.json` pointing at HTTPS) against
+  a rolled-back plaintext `OpenBao`. The loopback / no-TLS path is
   unchanged: `http://`, no `VAULT_CACERT`, HCL `ca_cert` absent, single
   phase.
 - Fixed `bootroot rotate approle-secret-id` re-owning the service
