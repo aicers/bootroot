@@ -1120,9 +1120,9 @@ mod tests {
         const OVERRIDE_SERVER: &str = "https://step-ca.example.org:9443/acme/acme/directory";
         const OVERRIDE_RESPONDER: &str = "http://responder.internal:18080";
 
-        // Pre-existing `agent.toml` on a remote target that lacks the
-        // topology fields — mirrors what an operator would see after
-        // running an older bootroot that did not seed the baseline.
+        // Operator-authored `agent.toml` already on the remote target
+        // that lacks the topology fields — a partially populated config
+        // that bootstrap must backfill from the artifact overrides.
         let pre_existing =
             "domain = \"existing.domain\"\n\n[acme]\nhttp_responder_hmac = \"prior-hmac\"\n";
 
