@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::cert_group::CertGroupPolicy;
 use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::openbao::SecretIdOptions;
@@ -15,9 +16,10 @@ use super::super::constants::openbao_constants::{
     RECOMMENDED_SECRET_ID_TTL, TOKEN_TTL,
 };
 use super::super::constants::{
-    OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME, OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR,
-    OPENBAO_AGENT_RESPONDER_DIR, OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME,
-    OPENBAO_AGENT_SECRET_ID_NAME, OPENBAO_AGENT_STEPCA_DIR, OPENBAO_AGENT_STEPCA_SERVICE,
+    CA_BUNDLE_FILENAME, CA_CERTS_DIR, OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME,
+    OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR, OPENBAO_AGENT_RESPONDER_DIR,
+    OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME, OPENBAO_AGENT_SECRET_ID_NAME,
+    OPENBAO_AGENT_STEPCA_DIR, OPENBAO_AGENT_STEPCA_SERVICE,
 };
 use super::super::paths::{
     OpenBaoAgentPaths, StepCaTemplatePaths, compose_has_openbao, resolve_openbao_agent_addr,
@@ -34,6 +36,7 @@ use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 
 const INIT_AGENT_TOKEN_PATH: &str = "/openbao/secrets/openbao/token";
+const OPENBAO_AGENT_SECRETS_MOUNT: &str = "/openbao/secrets";
 
 pub(super) async fn bootstrap_openbao(
     client: &mut OpenBaoClient,
@@ -604,6 +607,10 @@ async fn write_openbao_secrets(
     Ok(())
 }
 
+// Each argument is a distinct init-time input (paths, role outputs,
+// templates, TLS gate); bundling them into a struct would only move the
+// same fields behind an indirection used at a single call site.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn setup_openbao_agents(
     compose_file: &Path,
     secrets_dir: &Path,
@@ -611,16 +618,31 @@ pub(super) async fn setup_openbao_agents(
     role_outputs: &[AppRoleOutput],
     stepca_templates: &StepCaTemplatePaths,
     responder_template: &Path,
+    tls_required: bool,
     messages: &Messages,
 ) -> Result<OpenBaoAgentPaths> {
     let compose_has_openbao = compose_has_openbao(compose_file, messages)?;
-    let openbao_agent_addr = resolve_openbao_agent_addr(openbao_url, compose_has_openbao);
+    let mut openbao_agent_addr = resolve_openbao_agent_addr(openbao_url, compose_has_openbao);
+    // The infra agents are generated *before* OpenBao flips to TLS
+    // (`orchestrator.rs`), so `openbao_url` — and therefore the resolved
+    // agent address — is still `http://`.  When OpenBao is provisioned
+    // TLS, force `https://` here: the override's `VAULT_ADDR` env
+    // overrides the HCL `vault.address`, so the scheme must be corrected
+    // at the point the override is minted, not in the scheme-preserving
+    // `resolve_openbao_agent_addr` helper.
+    let ca_cert_container_path = if tls_required {
+        openbao_agent_addr = force_https_scheme(&openbao_agent_addr);
+        Some(provision_agent_ca_bundle(secrets_dir, messages).await?)
+    } else {
+        None
+    };
     let mut openbao_agent_paths = write_openbao_agent_files(
         secrets_dir,
         &openbao_agent_addr,
         role_outputs,
         stepca_templates,
         responder_template,
+        ca_cert_container_path.as_deref(),
         messages,
     )
     .await?;
@@ -634,10 +656,43 @@ pub(super) async fn setup_openbao_agents(
     openbao_agent_paths
         .compose_override_path
         .clone_from(&openbao_agent_override);
-    if let Some(override_path) = openbao_agent_override.as_ref() {
+    // Two-phase bring-up in the TLS case: generate the agent files and
+    // override in their final TLS form here, but defer the agent
+    // `docker compose up` to the post-TLS-transition phase in the
+    // orchestrator.  Starting the agents now — while OpenBao is still
+    // plaintext — would make them try to speak HTTPS to a plaintext
+    // server and fail their init-time render, breaking init.  The
+    // plaintext-loopback path keeps the single-phase apply.
+    if !tls_required && let Some(override_path) = openbao_agent_override.as_ref() {
         apply_openbao_agent_compose_override(compose_file, override_path, messages)?;
     }
     Ok(openbao_agent_paths)
+}
+
+/// Writes the leaf-chain CA bundle the infra agents use to verify the
+/// step-ca-signed `OpenBao` TLS leaf and returns its container-internal
+/// path.
+///
+/// The `OpenBao` TLS listener presents a leaf-only certificate, so the
+/// agent needs root **and** intermediate concatenated to build the
+/// chain.  Reuses [`compute_ca_bundle_pem`] (root + intermediate) and
+/// writes `secrets/certs/ca-bundle.pem` at `0644` via
+/// [`fs_util::write_ca_bundle`] so the separate agent container can read
+/// the bind-mounted file.
+async fn provision_agent_ca_bundle(secrets_dir: &Path, messages: &Messages) -> Result<String> {
+    let ca_bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
+    let bundle_path = secrets_dir.join(CA_CERTS_DIR).join(CA_BUNDLE_FILENAME);
+    fs_util::write_ca_bundle(&bundle_path, &ca_bundle_pem, CertGroupPolicy::none()).await?;
+    to_container_path(secrets_dir, &bundle_path, OPENBAO_AGENT_SECRETS_MOUNT)
+}
+
+/// Rewrites an `http://` agent address to `https://`, leaving any other
+/// scheme untouched.
+fn force_https_scheme(addr: &str) -> String {
+    match addr.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None => addr.to_string(),
+    }
 }
 
 async fn write_openbao_agent_files(
@@ -646,6 +701,7 @@ async fn write_openbao_agent_files(
     role_outputs: &[AppRoleOutput],
     stepca_templates: &StepCaTemplatePaths,
     responder_template: &Path,
+    ca_cert: Option<&str>,
     messages: &Messages,
 ) -> Result<OpenBaoAgentPaths> {
     let base_dir = secrets_dir.join(OPENBAO_AGENT_DIR);
@@ -690,7 +746,7 @@ async fn write_openbao_agent_files(
 
     let stepca_agent_config = stepca_dir.join(OPENBAO_AGENT_CONFIG_NAME);
     let responder_agent_config = responder_dir.join(OPENBAO_AGENT_CONFIG_NAME);
-    let mount = "/openbao/secrets";
+    let mount = OPENBAO_AGENT_SECRETS_MOUNT;
     let password_template =
         to_container_path(secrets_dir, &stepca_templates.password_template_path, mount)?;
     let ca_json_template =
@@ -715,12 +771,14 @@ async fn write_openbao_agent_files(
             (password_template, password_output),
             (ca_json_template, ca_json_output),
         ],
+        ca_cert,
     );
     let responder_config = build_openbao_agent_config(
         openbao_addr,
         "/openbao/secrets/openbao/responder/role_id",
         "/openbao/secrets/openbao/responder/secret_id",
         &[(responder_template, responder_output)],
+        ca_cert,
     );
     tokio::fs::write(&stepca_agent_config, stepca_config)
         .await
@@ -747,6 +805,7 @@ fn build_openbao_agent_config(
     role_id_path: &str,
     secret_id_path: &str,
     templates: &[(String, String)],
+    ca_cert: Option<&str>,
 ) -> String {
     // Every template here renders secret material (password, CA signing
     // key JSON, responder config), so all stay at 0600.
@@ -766,7 +825,7 @@ fn build_openbao_agent_config(
         mount_path: None,
         render_interval: bootroot::openbao::STATIC_SECRET_RENDER_INTERVAL,
         templates: &tpl_specs,
-        ca_cert: None,
+        ca_cert,
     })
 }
 
@@ -886,12 +945,30 @@ mod tests {
         POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_INFRA_ROTATE, POLICY_BOOTROOT_RUNTIME_ROTATE,
         POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
     };
+    use super::super::super::constants::{CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME};
     use super::super::super::paths::resolve_openbao_agent_addr;
     use super::super::super::types::{AppRoleLabel, AppRoleOutput};
     use super::super::responder_setup::write_responder_files;
     use super::super::stepca_setup::write_stepca_templates;
-    use super::super::test_support::test_messages;
+    use super::super::test_support::{test_cert_pem, test_messages};
     use super::*;
+
+    fn stepca_and_responder_roles() -> Vec<AppRoleOutput> {
+        vec![
+            AppRoleOutput {
+                label: AppRoleLabel::Stepca,
+                role_name: "bootroot-stepca-role".to_string(),
+                role_id: "stepca-role-id".to_string(),
+                secret_id: "stepca-secret-id".to_string(),
+            },
+            AppRoleOutput {
+                label: AppRoleLabel::Responder,
+                role_name: "bootroot-responder-role".to_string(),
+                role_id: "responder-role-id".to_string(),
+                secret_id: "responder-secret-id".to_string(),
+            },
+        ]
+    }
 
     #[tokio::test]
     async fn test_write_openbao_agent_files_writes_configs() {
@@ -917,20 +994,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let role_outputs = vec![
-            AppRoleOutput {
-                label: AppRoleLabel::Stepca,
-                role_name: "bootroot-stepca-role".to_string(),
-                role_id: "stepca-role-id".to_string(),
-                secret_id: "stepca-secret-id".to_string(),
-            },
-            AppRoleOutput {
-                label: AppRoleLabel::Responder,
-                role_name: "bootroot-responder-role".to_string(),
-                role_id: "responder-role-id".to_string(),
-                secret_id: "responder-secret-id".to_string(),
-            },
-        ];
+        let role_outputs = stepca_and_responder_roles();
 
         let paths = write_openbao_agent_files(
             &secrets_dir,
@@ -938,6 +1002,7 @@ mod tests {
             &role_outputs,
             &stepca_templates,
             &responder_paths.template_path,
+            None,
             &messages,
         )
         .await
@@ -948,6 +1013,118 @@ mod tests {
         assert!(stepca_config.contains("role_id_file_path"));
         assert!(stepca_config.contains("password.txt.ctmpl"));
         assert!(responder_config.contains("responder.toml.ctmpl"));
+        // Loopback / no-TLS path: the HCL must not carry any CA trust.
+        assert!(!stepca_config.contains("ca_cert"));
+        assert!(!responder_config.contains("ca_cert"));
+    }
+
+    /// TLS path: `setup_openbao_agents` must generate both agent files
+    /// and the compose override in their final TLS form (https +
+    /// HCL `ca_cert` + provisioned `certs/ca-bundle.pem`) but must NOT
+    /// run the agent `docker compose up` — that is deferred to the
+    /// post-TLS-transition phase.  The test asserting timing relies on
+    /// this call succeeding without any docker interaction: if a
+    /// refactor moved the apply back before the TLS-skip guard, this
+    /// call would invoke `docker compose up` and fail.
+    #[tokio::test]
+    async fn test_setup_openbao_agents_tls_generates_https_ca_trust_without_apply() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        fs::create_dir_all(secrets_dir.join("config")).unwrap();
+        fs::write(
+            secrets_dir.join("config").join("ca.json"),
+            r#"{
+                "authority":{"provisioners":[{"type":"ACME","name":"acme"}]},
+                "db":{"type":"postgresql","dataSource":"old"}
+            }"#,
+        )
+        .unwrap();
+        // Root + intermediate certs feed the agent CA bundle.
+        let certs_dir = secrets_dir.join(CA_CERTS_DIR);
+        fs::create_dir_all(&certs_dir).unwrap();
+        fs::write(
+            certs_dir.join(CA_ROOT_CERT_FILENAME),
+            test_cert_pem("root.example"),
+        )
+        .unwrap();
+        fs::write(
+            certs_dir.join(CA_INTERMEDIATE_CERT_FILENAME),
+            test_cert_pem("intermediate.example"),
+        )
+        .unwrap();
+
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(
+            &compose_file,
+            "services:\n  openbao:\n    image: openbao/openbao:latest\n",
+        )
+        .unwrap();
+
+        let messages = test_messages();
+        let stepca_templates =
+            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &messages)
+                .await
+                .unwrap();
+        let responder_paths =
+            write_responder_files(&secrets_dir, "secret", "hmac-123", false, &messages)
+                .await
+                .unwrap();
+        let role_outputs = stepca_and_responder_roles();
+
+        let paths = setup_openbao_agents(
+            &compose_file,
+            &secrets_dir,
+            // http:// input — the setup must force https:// for TLS.
+            "http://127.0.0.1:8200",
+            &role_outputs,
+            &stepca_templates,
+            &responder_paths.template_path,
+            true,
+            &messages,
+        )
+        .await
+        .unwrap();
+
+        let stepca_config = fs::read_to_string(&paths.stepca_agent_config).unwrap();
+        let responder_config = fs::read_to_string(&paths.responder_agent_config).unwrap();
+        let expected_ca = format!("/openbao/secrets/{CA_CERTS_DIR}/{CA_BUNDLE_FILENAME}");
+        assert!(
+            stepca_config.contains(&format!("ca_cert = \"{expected_ca}\"")),
+            "stepca HCL must reference the CA bundle: {stepca_config}"
+        );
+        assert!(
+            responder_config.contains(&format!("ca_cert = \"{expected_ca}\"")),
+            "responder HCL must reference the CA bundle: {responder_config}"
+        );
+        assert!(stepca_config.contains("https://bootroot-openbao:8200"));
+        assert!(responder_config.contains("https://bootroot-openbao:8200"));
+
+        let override_path = paths.compose_override_path.expect("override path");
+        let override_contents = fs::read_to_string(&override_path).unwrap();
+        assert!(
+            override_contents.contains("VAULT_ADDR=https://bootroot-openbao:8200"),
+            "override must force https VAULT_ADDR: {override_contents}"
+        );
+
+        // The provisioned bundle must exist and carry root + intermediate.
+        let bundle = fs::read_to_string(certs_dir.join(CA_BUNDLE_FILENAME)).unwrap();
+        assert_eq!(
+            bundle.matches("BEGIN CERTIFICATE").count(),
+            2,
+            "ca-bundle.pem must concatenate root and intermediate"
+        );
+    }
+
+    #[test]
+    fn test_force_https_scheme_upgrades_http_only() {
+        assert_eq!(
+            force_https_scheme("http://bootroot-openbao:8200"),
+            "https://bootroot-openbao:8200"
+        );
+        assert_eq!(
+            force_https_scheme("https://bootroot-openbao:8200"),
+            "https://bootroot-openbao:8200"
+        );
     }
 
     #[tokio::test]
@@ -984,6 +1161,9 @@ services:
             contents.contains("user:"),
             "compose override must set user for infra OBA containers"
         );
+        // Loopback / no-TLS path keeps http and adds no CA env.
+        assert!(contents.contains("VAULT_ADDR=http://openbao:8200"));
+        assert!(!contents.contains("VAULT_CACERT"));
     }
 
     #[test]
@@ -1105,6 +1285,7 @@ services:
                 "/openbao/templates/password.ctmpl".to_string(),
                 "/openbao/secrets/password.txt".to_string(),
             )],
+            None,
         );
         assert!(
             config.contains("template_config"),
