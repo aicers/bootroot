@@ -102,6 +102,34 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed the two infra `OpenBao` Agents
+  (`bootroot-openbao-agent-stepca` / `-responder`) being unable to
+  authenticate to a native-TLS `OpenBao` provisioned via
+  `infra install --openbao-bind <non-loopback>:8200
+  --openbao-tls-required` (#698). The agents were minted before the
+  `OpenBao` TLS transition, so their compose override pinned
+  `VAULT_ADDR=http://bootroot-openbao:8200` (whose env value overrides the
+  agent HCL `vault.address`) and no CA trust was wired — the HCL was built
+  with `ca_cert: None` and the override emitted no `VAULT_CACERT`. The
+  breakage was latent because both agents render once at init and coast on
+  the init-time token; the first forced re-render (`rotate
+  responder-hmac`, `rotate stepca-password`, a host reboot, or an agent
+  restart after the token TTL) failed AppRole login with `400 Client sent
+  an HTTP request to an HTTPS server`, silently stalling certificate
+  reissuance/renewal fleet-wide. `init` now generates the infra agents in
+  their final TLS form — `https://` `VAULT_ADDR`, HCL `vault { ca_cert }`
+  pointing at a provisioned `secrets/certs/ca-bundle.pem` (root +
+  intermediate, `0644` so the separate agent container can read the
+  bind-mounted leaf-chain) — and defers their `docker compose up` to a
+  second phase after the `OpenBao` TLS transition, so the agents never
+  start against a still-plaintext listener. That deferred apply runs
+  inside the init rollback envelope: if it (or a later step) fails,
+  rollback stops and removes the two agent containers and restores
+  `state.json`, so a failed TLS init never leaves the agents running with
+  a TLS `VAULT_ADDR`/`ca_cert` (or `state.json` pointing at HTTPS) against
+  a rolled-back plaintext `OpenBao`. The loopback / no-TLS path is
+  unchanged: `http://`, no `VAULT_CACERT`, HCL `ca_cert` absent, single
+  phase.
 - Fixed `bootroot rotate approle-secret-id` re-owning the service
   `secret_id` file to the rotating CLI user. The rewrite staged a fresh
   `0600` temp file and renamed it over the destination without

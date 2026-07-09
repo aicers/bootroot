@@ -17,8 +17,9 @@ use super::http01_admin_tls::{
     build_http01_admin_tls_sans, issue_http01_admin_tls_cert, record_http01_admin_infra_cert,
 };
 use super::openbao_setup::{
-    bootstrap_openbao, configure_openbao, setup_openbao_agents, validate_rotate_bound_cidrs,
-    validate_secret_id_ttl, write_ca_trust_fingerprints_with_retry,
+    apply_openbao_agent_compose_override, bootstrap_openbao, configure_openbao,
+    setup_openbao_agents, validate_rotate_bound_cidrs, validate_secret_id_ttl,
+    write_ca_trust_fingerprints_with_retry,
 };
 use super::openbao_tls::{
     build_openbao_tls_sans, issue_openbao_tls_cert, record_openbao_infra_cert,
@@ -529,6 +530,11 @@ async fn run_init_inner(
         messages,
     )
     .await?;
+    // `bind_intent` is true exactly for a non-loopback OpenBao bind,
+    // which mandates `--openbao-tls-required` and later triggers the
+    // OpenBao TLS transition below.  Thread it in so the infra agents
+    // are generated to speak TLS (https + CA trust) and their
+    // `docker compose up` is deferred to the post-TLS-transition phase.
     let openbao_agent_paths = setup_openbao_agents(
         &args.compose.compose_file,
         &secrets_dir,
@@ -536,6 +542,7 @@ async fn run_init_inner(
         &role_outputs,
         &stepca_templates,
         &responder_paths.template_path,
+        bind_intent,
         messages,
     )
     .await?;
@@ -740,10 +747,42 @@ async fn run_init_inner(
         // never depend on the external advertise address being
         // hairpin-reachable.  The advertise address is consumed
         // separately by remote bootstrap artifact generation.
+        //
+        // Snapshot the pre-TLS `state.json` (still the plaintext URL,
+        // no infra cert entries) before persisting the HTTPS URL, so
+        // rollback can restore it if the deferred agent apply below or
+        // any later fallible step fails after OpenBao has been recreated
+        // on plaintext.
+        rollback.state_backup = Some(RollbackFile {
+            path: state_path.clone(),
+            original: if state_path.exists() {
+                Some(std::fs::read_to_string(&state_path)?)
+            } else {
+                None
+            },
+        });
         state.openbao_url = client_url_from_bind_addr(&bind_addr);
         state
             .save(&state_path)
             .with_context(|| messages.error_serialize_state_failed())?;
+
+        // Phase 2 of the infra-agent bring-up: OpenBao now serves TLS,
+        // so apply the deferred agent override to start (and let the two
+        // infra agents authenticate over) HTTPS.  `setup_openbao_agents`
+        // generated their files/override in TLS form but skipped this
+        // `docker compose up` while OpenBao was still plaintext.
+        if let Some(override_path) = openbao_agent_paths.compose_override_path.as_ref() {
+            // Register the override for rollback *before* applying it so
+            // that even a partial `docker compose up` (one agent started,
+            // the other not) is torn down when a failure triggers
+            // rollback.
+            rollback.openbao_agent_compose_override = Some(override_path.clone());
+            apply_openbao_agent_compose_override(
+                &args.compose.compose_file,
+                override_path,
+                messages,
+            )?;
+        }
         state.openbao_url
     } else {
         args.openbao.openbao_url.clone()

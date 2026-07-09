@@ -65,6 +65,17 @@ pub(super) struct InitRollback {
     /// Responder config compose override for restarting without the
     /// exposed port binding during rollback.
     pub(super) responder_compose_override: Option<PathBuf>,
+    /// Infra `OpenBao` agent compose override applied in the TLS case
+    /// (Phase 2, post-TLS-transition).  On rollback the two agent
+    /// containers are stopped and removed so they are not left running
+    /// with a TLS `VAULT_ADDR`/`ca_cert` against a rolled-back plaintext
+    /// `OpenBao`.
+    pub(super) openbao_agent_compose_override: Option<PathBuf>,
+    /// State file snapshot taken before the `OpenBao` TLS transition
+    /// persists the HTTPS URL and infra cert entries.  On rollback it
+    /// restores the pre-TLS `state.json` so it does not keep pointing at
+    /// an HTTPS URL / TLS certs after `OpenBao` is recreated on plaintext.
+    pub(super) state_backup: Option<RollbackFile>,
 }
 
 impl InitRollback {
@@ -108,6 +119,36 @@ impl InitRollback {
             ) {
                 eprintln!("Rollback: failed to recreate OpenBao: {err}");
             }
+        }
+
+        // Stop and remove the two infra OpenBao agents.  In the TLS
+        // case they were started (Phase 2) with an HTTPS `VAULT_ADDR`
+        // and `ca_cert`; OpenBao has just been recreated on plaintext,
+        // so leaving them up would keep them failing AppRole login with
+        // `400 Client sent an HTTP request to an HTTPS server`.  Removing
+        // them returns to the pre-Phase-2 state (agents not started).
+        if let Some(override_path) = &self.openbao_agent_compose_override
+            && let Some(compose_file) = &self.compose_file
+        {
+            let args = rollback_openbao_agent_docker_args(compose_file, override_path);
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(err) = crate::commands::infra::run_docker(
+                &arg_refs,
+                "docker compose rm infra agents (rollback)",
+                messages,
+            ) {
+                eprintln!("Rollback: failed to remove infra OpenBao agents: {err}");
+            }
+        }
+
+        // Restore the pre-TLS `state.json` so it does not keep pointing
+        // at the HTTPS URL / TLS infra certs after OpenBao is back on
+        // plaintext.  Done after the container work so a failed restore
+        // does not skip the Docker teardown above.
+        if let Some(file) = &self.state_backup
+            && let Err(err) = rollback_file(file, messages)
+        {
+            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
         }
 
         // Restore the responder config (removing TLS fields) and
@@ -216,6 +257,31 @@ fn rollback_responder_docker_args(
     args.push("-d".to_string());
     args.push(crate::commands::constants::RESPONDER_SERVICE_NAME.to_string());
     args
+}
+
+/// Builds the Docker Compose arguments for tearing down the infra
+/// `OpenBao` agents during rollback.
+///
+/// Returns `["compose", "-f", <compose>, "-f", <override>, "rm", "-s",
+/// "-f", <stepca>, <responder>]` so the two agent containers are
+/// stopped and removed.  They were started with a TLS `VAULT_ADDR`/
+/// `ca_cert` that a rolled-back plaintext `OpenBao` cannot serve.
+fn rollback_openbao_agent_docker_args(
+    compose_file: &std::path::Path,
+    override_path: &std::path::Path,
+) -> Vec<String> {
+    vec![
+        "compose".to_string(),
+        "-f".to_string(),
+        compose_file.to_string_lossy().into_owned(),
+        "-f".to_string(),
+        override_path.to_string_lossy().into_owned(),
+        "rm".to_string(),
+        "-s".to_string(),
+        "-f".to_string(),
+        super::constants::OPENBAO_AGENT_STEPCA_SERVICE.to_string(),
+        super::constants::OPENBAO_AGENT_RESPONDER_SERVICE.to_string(),
+    ]
 }
 
 fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
@@ -445,6 +511,74 @@ mod rollback_tests {
         assert!(
             args.iter().any(|a| a.ends_with("override.yml")),
             "rollback must include config override when original config existed: {args:?}"
+        );
+    }
+
+    /// Regression: the infra-agent rollback teardown must `rm -s -f`
+    /// both agent services (stop then remove) using the compose file
+    /// plus the agent override, so agents started in the TLS Phase 2
+    /// are not left running against a rolled-back plaintext `OpenBao`.
+    #[test]
+    fn rollback_agent_args_remove_both_services() {
+        use std::path::PathBuf;
+
+        let compose = PathBuf::from("docker-compose.yml");
+        let override_path = PathBuf::from("secrets/openbao/agent.override.yml");
+        let args = super::rollback_openbao_agent_docker_args(&compose, &override_path);
+
+        assert_eq!(args.first().map(String::as_str), Some("compose"));
+        assert!(
+            args.contains(&"rm".to_string())
+                && args.contains(&"-s".to_string())
+                && args.contains(&"-f".to_string()),
+            "rollback must stop and force-remove the agents: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == crate::commands::init::constants::OPENBAO_AGENT_STEPCA_SERVICE)
+                && args
+                    .iter()
+                    .any(|a| a == crate::commands::init::constants::OPENBAO_AGENT_RESPONDER_SERVICE),
+            "rollback must target both infra agent services: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.ends_with("agent.override.yml")),
+            "rollback must pass the agent override so its services are defined: {args:?}"
+        );
+    }
+
+    /// Regression: rollback must restore the pre-TLS `state.json` so it
+    /// does not keep pointing at the HTTPS URL / TLS infra certs after
+    /// `OpenBao` is recreated on plaintext.  Guards the failure window
+    /// opened by the deferred TLS Phase-2 agent apply.
+    #[tokio::test]
+    async fn rollback_restores_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+
+        let state_path = dir.path().join("state.json");
+        let plaintext_state = "{\"openbao_url\":\"http://127.0.0.1:8200\"}\n";
+        std::fs::write(&state_path, plaintext_state).unwrap();
+        // Simulate the HTTPS save that happened before the failure.
+        std::fs::write(&state_path, "{\"openbao_url\":\"https://host:8200\"}\n").unwrap();
+
+        let rollback = InitRollback {
+            state_backup: Some(RollbackFile {
+                path: state_path.clone(),
+                original: Some(plaintext_state.to_string()),
+            }),
+            // No compose_file — skips the container teardown in tests.
+            compose_file: None,
+            ..Default::default()
+        };
+
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        let restored = std::fs::read_to_string(&state_path).unwrap();
+        assert_eq!(
+            restored, plaintext_state,
+            "state.json must be restored to its pre-TLS content after rollback"
         );
     }
 }

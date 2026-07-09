@@ -46,6 +46,7 @@ pub(crate) const DEFAULT_DB_NAME: &str = "stepca";
 pub(crate) const CA_CERTS_DIR: &str = "certs";
 pub(crate) const CA_ROOT_CERT_FILENAME: &str = "root_ca.crt";
 pub(crate) const CA_INTERMEDIATE_CERT_FILENAME: &str = "intermediate_ca.crt";
+pub(crate) const CA_BUNDLE_FILENAME: &str = "ca-bundle.pem";
 
 pub(crate) const OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-exposed.yml";
 pub(crate) const HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.http01-exposed.yml";
