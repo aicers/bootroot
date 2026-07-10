@@ -1086,7 +1086,7 @@ mod tests {
         // Extract just the hook section and parse it as TOML.
         let wrapped = format!(
             "[profiles]\n[profiles.hooks]\n[profiles.hooks.post_renew]{}",
-            &result[result
+            result[result
                 .find("\n[[profiles.hooks.post_renew.success]]")
                 .expect("hook header must exist")..]
                 .split(MANAGED_PROFILE_END_PREFIX)
