@@ -344,25 +344,29 @@ impl PostRenewHookInputs<'_> {
     }
 }
 
+/// Resolves the post-renew hook flags into the ordered list persisted to
+/// state and rendered into `agent.toml`.
+///
+/// A `--reload-style` preset and a `--post-renew-command` custom hook may
+/// be supplied together in one invocation (issue #702). Because clap
+/// collapses each flag into its own field, the relative CLI position
+/// between the two forms is unrecoverable, so the emission order is fixed
+/// by rule rather than by input order: the **preset entry is pushed
+/// first, then the custom-command entry**. Single-form invocations and the
+/// existing per-flag validation are unchanged.
 pub(super) fn resolve_post_renew_hooks_from_parts(
     inputs: &PostRenewHookInputs<'_>,
 ) -> Result<Vec<PostRenewHookEntry>> {
-    let has_preset = inputs.reload_style.is_some();
-    let has_low_level = inputs.post_renew_command.is_some()
-        || !inputs.post_renew_arg.is_empty()
-        || inputs.post_renew_timeout_secs.is_some()
-        || inputs.post_renew_on_failure.is_some();
+    let mut hooks = Vec::new();
 
-    if has_preset && has_low_level {
-        anyhow::bail!(
-            "--reload-style and --post-renew-* flags are mutually exclusive; use one or the other"
-        );
-    }
-
+    // Preset entry first (deterministic order: preset before custom).
     if let Some(style) = inputs.reload_style {
-        return resolve_reload_preset(style, inputs.reload_target);
+        hooks.extend(resolve_reload_preset(style, inputs.reload_target)?);
+    } else if inputs.reload_target.is_some() {
+        anyhow::bail!("--reload-target requires --reload-style");
     }
 
+    // Custom-command entry second.
     if let Some(command) = inputs.post_renew_command {
         if command.trim().is_empty() {
             anyhow::bail!("--post-renew-command must not be empty");
@@ -377,18 +381,13 @@ pub(super) fn resolve_post_renew_hooks_from_parts(
             HookFailurePolicyEntry::default(),
             HookFailurePolicyArg::into_entry,
         );
-        return Ok(vec![PostRenewHookEntry {
+        hooks.push(PostRenewHookEntry {
             command: command.to_string(),
             args: inputs.post_renew_arg.to_vec(),
             timeout_secs: timeout,
             on_failure,
-        }]);
-    }
-
-    if inputs.reload_target.is_some() {
-        anyhow::bail!("--reload-target requires --reload-style");
-    }
-    if !inputs.post_renew_arg.is_empty()
+        });
+    } else if !inputs.post_renew_arg.is_empty()
         || inputs.post_renew_timeout_secs.is_some()
         || inputs.post_renew_on_failure.is_some()
     {
@@ -397,7 +396,7 @@ pub(super) fn resolve_post_renew_hooks_from_parts(
         );
     }
 
-    Ok(Vec::new())
+    Ok(hooks)
 }
 
 fn resolve_reload_preset(
@@ -603,57 +602,80 @@ mod tests {
         assert!(hooks.is_empty());
     }
 
+    /// Issue #702: a `--reload-style` preset and a `--post-renew-command`
+    /// custom hook may now be armed in one invocation. They are emitted in
+    /// a deterministic order — the preset entry first, then the custom
+    /// entry — because clap cannot recover the relative CLI position of the
+    /// two flag groups.
     #[test]
-    fn resolve_hooks_preset_and_low_level_command_are_mutually_exclusive() {
+    fn resolve_hooks_preset_and_custom_command_emit_both_in_order() {
+        let mut args = empty_args();
+        args.reload_style = Some(ReloadStyle::DockerRestart);
+        args.reload_target = Some("aimer-web-next-app-1".to_string());
+        args.post_renew_command = Some("docker".to_string());
+        args.post_renew_arg = vec![
+            "exec".to_string(),
+            "aimer-web-nginx-prod-1".to_string(),
+            "nginx".to_string(),
+            "-s".to_string(),
+            "reload".to_string(),
+        ];
+
+        let hooks = resolve_post_renew_hooks(&args).unwrap();
+        assert_eq!(hooks.len(), 2, "both hooks must be emitted");
+
+        // Preset entry first.
+        assert_eq!(hooks[0].command, "docker");
+        assert_eq!(hooks[0].args, vec!["restart", "aimer-web-next-app-1"]);
+
+        // Custom-command entry second.
+        assert_eq!(hooks[1].command, "docker");
+        assert_eq!(
+            hooks[1].args,
+            vec!["exec", "aimer-web-nginx-prod-1", "nginx", "-s", "reload"]
+        );
+    }
+
+    /// The custom hook's per-hook overrides (timeout, on-failure) apply to
+    /// the custom entry only; the preset keeps its defaults even when both
+    /// are armed together.
+    #[test]
+    fn resolve_hooks_preset_and_custom_command_apply_overrides_to_custom_only() {
         let mut args = empty_args();
         args.reload_style = Some(ReloadStyle::Systemd);
         args.reload_target = Some("nginx".to_string());
         args.post_renew_command = Some("systemctl".to_string());
-
-        let err = resolve_post_renew_hooks(&args).unwrap_err();
-        assert!(
-            err.to_string().contains("mutually exclusive"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_hooks_preset_and_low_level_timeout_are_mutually_exclusive() {
-        let mut args = empty_args();
-        args.reload_style = Some(ReloadStyle::Systemd);
-        args.reload_target = Some("nginx".to_string());
+        args.post_renew_arg = vec!["reload".to_string(), "next-app".to_string()];
         args.post_renew_timeout_secs = Some(60);
-
-        let err = resolve_post_renew_hooks(&args).unwrap_err();
-        assert!(
-            err.to_string().contains("mutually exclusive"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_hooks_preset_and_low_level_on_failure_are_mutually_exclusive() {
-        let mut args = empty_args();
-        args.reload_style = Some(ReloadStyle::Systemd);
-        args.reload_target = Some("nginx".to_string());
         args.post_renew_on_failure = Some(HookFailurePolicyArg::Stop);
 
-        let err = resolve_post_renew_hooks(&args).unwrap_err();
-        assert!(
-            err.to_string().contains("mutually exclusive"),
-            "unexpected error: {err}"
-        );
+        let hooks = resolve_post_renew_hooks(&args).unwrap();
+        assert_eq!(hooks.len(), 2);
+
+        assert_eq!(hooks[0].command, "systemctl");
+        assert_eq!(hooks[0].args, vec!["reload", "nginx"]);
+        assert_eq!(hooks[0].timeout_secs, DEFAULT_HOOK_TIMEOUT_SECS);
+        assert_eq!(hooks[0].on_failure, HookFailurePolicyEntry::Continue);
+
+        assert_eq!(hooks[1].command, "systemctl");
+        assert_eq!(hooks[1].args, vec!["reload", "next-app"]);
+        assert_eq!(hooks[1].timeout_secs, 60);
+        assert_eq!(hooks[1].on_failure, HookFailurePolicyEntry::Stop);
     }
 
+    /// A `--reload-style none` preset contributes no entry, so pairing it
+    /// with orphaned low-level flags still surfaces the
+    /// "require --post-renew-command" error rather than silently accepting
+    /// them.
     #[test]
-    fn resolve_hooks_preset_and_low_level_arg_are_mutually_exclusive() {
+    fn resolve_hooks_none_preset_with_orphan_arg_errors() {
         let mut args = empty_args();
         args.reload_style = Some(ReloadStyle::None);
         args.post_renew_arg = vec!["reload".to_string()];
 
         let err = resolve_post_renew_hooks(&args).unwrap_err();
         assert!(
-            err.to_string().contains("mutually exclusive"),
+            err.to_string().contains("--post-renew-command"),
             "unexpected error: {err}"
         );
     }

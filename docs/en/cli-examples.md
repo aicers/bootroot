@@ -309,7 +309,27 @@ Other preset styles are `sighup` (sends `SIGHUP` via
 `none` (no hook). For full control, use the low-level
 flags `--post-renew-command`, `--post-renew-arg`,
 `--post-renew-timeout-secs`, and
-`--post-renew-on-failure` instead.
+`--post-renew-on-failure`. A preset and a low-level custom
+command may also be combined in one invocation to register
+**both** hooks — the preset entry is emitted first, then
+the custom-command entry (issue #702):
+
+```bash
+bootroot service add \
+  --service-name aimer-web \
+  --hostname aimer-node-01 \
+  --domain trusted.domain \
+  --agent-config /etc/bootroot/agent.toml \
+  --cert-path /etc/bootroot/certs/aimer-web.crt \
+  --key-path /etc/bootroot/certs/aimer-web.key \
+  --instance-id 001 \
+  --reload-style docker-restart \
+  --reload-target aimer-web-next-app-1 \
+  --post-renew-command docker \
+    --post-renew-arg exec --post-renew-arg aimer-web-nginx-prod-1 \
+    --post-renew-arg nginx --post-renew-arg -s --post-renew-arg reload \
+  --root-token <OPENBAO_ROOT_TOKEN>
+```
 
 After secret_id rotation on the control node, a *running* remote
 `bootroot-agent` picks up the new secret_id itself through its fast-poll loop —

@@ -12,7 +12,7 @@ use super::validation::{
     validate_agent_domain, validate_profile_hostname, validate_profile_instance_id,
     validate_service_name,
 };
-use super::{Locale, ResolvedBootstrapArgs, localized};
+use super::{HookFailurePolicy, Locale, ResolvedBootstrapArgs, localized};
 
 /// Errors specific to wrap-token unwrapping.
 #[derive(Debug)]
@@ -353,23 +353,32 @@ fn is_openbao_token_rejection(err: &anyhow::Error) -> bool {
     false
 }
 
-fn validate_hook_flags(args: &ResolvedBootstrapArgs) -> Result<()> {
-    if args.post_renew_command.is_none()
-        && (!args.post_renew_arg.is_empty()
-            || args.post_renew_timeout_secs.is_some()
-            || args.post_renew_on_failure.is_some())
+/// Validates the single-hook `--post-renew-*` CLI flags used on the
+/// artifact-less direct-CLI bootstrap path. Runs during argument
+/// resolution, before the flags are folded into
+/// [`ResolvedBootstrapArgs::post_renew_hooks`]. The artifact path skips
+/// this check because its hooks are already validated upstream by
+/// `bootroot service add`.
+pub(super) fn validate_cli_hook_flags(
+    command: Option<&str>,
+    hook_args: &[String],
+    timeout_secs: Option<u64>,
+    on_failure: Option<HookFailurePolicy>,
+) -> Result<()> {
+    if command.is_none()
+        && (!hook_args.is_empty() || timeout_secs.is_some() || on_failure.is_some())
     {
         anyhow::bail!(
             "--post-renew-arg, --post-renew-timeout-secs, and \
              --post-renew-on-failure require --post-renew-command"
         );
     }
-    if let Some(cmd) = args.post_renew_command.as_deref()
+    if let Some(cmd) = command
         && cmd.trim().is_empty()
     {
         anyhow::bail!("--post-renew-command must not be empty");
     }
-    if let Some(0) = args.post_renew_timeout_secs {
+    if let Some(0) = timeout_secs {
         anyhow::bail!("--post-renew-timeout-secs must be greater than 0");
     }
     Ok(())
@@ -410,7 +419,6 @@ fn warn_state_path_collisions(dir: &Path, lang: Locale) {
 }
 
 fn validate_bootstrap_args(args: &ResolvedBootstrapArgs, lang: Locale) -> Result<()> {
-    validate_hook_flags(args)?;
     validate_service_name(&args.service_name, lang)?;
     validate_profile_hostname(&args.profile_hostname, lang)?;
     validate_agent_domain(&args.agent_domain, lang)?;
@@ -516,9 +524,8 @@ mod tests {
     use super::*;
     use crate::{HookFailurePolicy, OutputFormat};
 
-    /// Builds a `ResolvedBootstrapArgs` with dummy values.  Only hook-related
-    /// fields are meaningful — `validate_hook_flags` runs before any other
-    /// check, so the remaining fields are never inspected in these tests.
+    /// Builds a `ResolvedBootstrapArgs` with dummy values for the
+    /// `validate_bootstrap_args` tests.
     fn dummy_args() -> ResolvedBootstrapArgs {
         ResolvedBootstrapArgs {
             openbao_url: String::new(),
@@ -542,10 +549,7 @@ mod tests {
             ca_bundle_path: PathBuf::new(),
             ca_bundle_pem: None,
             trusted_ca_sha256: Vec::new(),
-            post_renew_command: None,
-            post_renew_arg: Vec::new(),
-            post_renew_timeout_secs: None,
-            post_renew_on_failure: None,
+            post_renew_hooks: Vec::new(),
             output: OutputFormat::Text,
             wrap_token: None,
             wrap_expires_at: None,
@@ -555,11 +559,8 @@ mod tests {
 
     #[test]
     fn hook_flags_without_command_are_rejected() {
-        let mut args = dummy_args();
-        args.post_renew_arg = vec!["reload".to_string()];
-        args.post_renew_timeout_secs = Some(60);
-
-        let err = validate_hook_flags(&args).unwrap_err();
+        let err =
+            validate_cli_hook_flags(None, &["reload".to_string()], Some(60), None).unwrap_err();
         assert!(
             err.to_string().contains("--post-renew-command"),
             "unexpected error: {err}"
@@ -568,10 +569,7 @@ mod tests {
 
     #[test]
     fn hook_timeout_alone_without_command_is_rejected() {
-        let mut args = dummy_args();
-        args.post_renew_timeout_secs = Some(60);
-
-        let err = validate_hook_flags(&args).unwrap_err();
+        let err = validate_cli_hook_flags(None, &[], Some(60), None).unwrap_err();
         assert!(
             err.to_string().contains("--post-renew-command"),
             "unexpected error: {err}"
@@ -580,10 +578,8 @@ mod tests {
 
     #[test]
     fn hook_on_failure_alone_without_command_is_rejected() {
-        let mut args = dummy_args();
-        args.post_renew_on_failure = Some(HookFailurePolicy::Stop);
-
-        let err = validate_hook_flags(&args).unwrap_err();
+        let err =
+            validate_cli_hook_flags(None, &[], None, Some(HookFailurePolicy::Stop)).unwrap_err();
         assert!(
             err.to_string().contains("--post-renew-command"),
             "unexpected error: {err}"
@@ -592,26 +588,25 @@ mod tests {
 
     #[test]
     fn hook_flags_with_command_are_accepted() {
-        let mut args = dummy_args();
-        args.post_renew_command = Some("/usr/bin/reload.sh".to_string());
-        args.post_renew_arg = vec!["--fast".to_string()];
-        args.post_renew_timeout_secs = Some(60);
-
-        assert!(validate_hook_flags(&args).is_ok());
+        assert!(
+            validate_cli_hook_flags(
+                Some("/usr/bin/reload.sh"),
+                &["--fast".to_string()],
+                Some(60),
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn no_hook_flags_are_accepted() {
-        let args = dummy_args();
-        assert!(validate_hook_flags(&args).is_ok());
+        assert!(validate_cli_hook_flags(None, &[], None, None).is_ok());
     }
 
     #[test]
     fn empty_command_is_rejected() {
-        let mut args = dummy_args();
-        args.post_renew_command = Some(String::new());
-
-        let err = validate_hook_flags(&args).unwrap_err();
+        let err = validate_cli_hook_flags(Some(""), &[], None, None).unwrap_err();
         assert!(
             err.to_string().contains("must not be empty"),
             "unexpected error: {err}"
@@ -620,10 +615,7 @@ mod tests {
 
     #[test]
     fn whitespace_only_command_is_rejected() {
-        let mut args = dummy_args();
-        args.post_renew_command = Some("   ".to_string());
-
-        let err = validate_hook_flags(&args).unwrap_err();
+        let err = validate_cli_hook_flags(Some("   "), &[], None, None).unwrap_err();
         assert!(
             err.to_string().contains("must not be empty"),
             "unexpected error: {err}"
@@ -632,11 +624,7 @@ mod tests {
 
     #[test]
     fn zero_timeout_is_rejected() {
-        let mut args = dummy_args();
-        args.post_renew_command = Some("reload.sh".to_string());
-        args.post_renew_timeout_secs = Some(0);
-
-        let err = validate_hook_flags(&args).unwrap_err();
+        let err = validate_cli_hook_flags(Some("reload.sh"), &[], Some(0), None).unwrap_err();
         assert!(
             err.to_string().contains("greater than 0"),
             "unexpected error: {err}"

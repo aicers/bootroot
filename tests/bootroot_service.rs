@@ -164,6 +164,112 @@ async fn test_app_add_writes_state_and_secret() {
     assert_local_fast_poll_artifacts(temp_dir.path(), &agent_config, "edge-proxy");
 }
 
+/// Issue #702 — `service add` may arm a `--reload-style` preset and a
+/// `--post-renew-command` custom hook together. Both must be persisted to
+/// state and rendered into `agent.toml` in the deterministic "preset
+/// first, custom second" order.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_installs_preset_and_custom_hooks_in_order() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+            "--reload-style",
+            "docker-restart",
+            "--reload-target",
+            "aimer-web-next-app-1",
+            "--post-renew-command",
+            "docker",
+            "--post-renew-arg",
+            "exec",
+            "--post-renew-arg",
+            "aimer-web-nginx-prod-1",
+            "--post-renew-arg",
+            "nginx",
+            "--post-renew-arg",
+            "-s",
+            "--post-renew-arg",
+            "reload",
+        ])
+        .output()
+        .expect("run service add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "preset + custom hook must be accepted; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    let hooks = state["services"]["edge-proxy"]["post_renew_hooks"]
+        .as_array()
+        .expect("post_renew_hooks is an array");
+    assert_eq!(hooks.len(), 2, "both hooks must be persisted: {hooks:?}");
+    assert_eq!(hooks[0]["command"], "docker");
+    assert_eq!(
+        hooks[0]["args"],
+        serde_json::json!(["restart", "aimer-web-next-app-1"])
+    );
+    assert_eq!(hooks[1]["command"], "docker");
+    assert_eq!(
+        hooks[1]["args"],
+        serde_json::json!(["exec", "aimer-web-nginx-prod-1", "nginx", "-s", "reload"])
+    );
+
+    let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
+    assert_eq!(
+        agent_contents
+            .matches("[[profiles.hooks.post_renew.success]]")
+            .count(),
+        2,
+        "agent.toml must render both hook blocks: {agent_contents}"
+    );
+    let restart_pos = agent_contents
+        .find("\"restart\"")
+        .expect("restart hook rendered");
+    let exec_pos = agent_contents.find("\"exec\"").expect("exec hook rendered");
+    assert!(
+        restart_pos < exec_pos,
+        "preset hook must render before custom hook: {agent_contents}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_supports_approle_runtime_auth() {
@@ -3125,6 +3231,105 @@ fn test_service_update_installs_post_renew_hook_via_reload_style() {
     assert!(
         agent_contents.contains("pkill"),
         "agent.toml should embed the hook command, got: {agent_contents}"
+    );
+}
+
+/// Issue #702 — `service update` may arm a `--reload-style` preset and a
+/// `--post-renew-command` custom hook in one invocation. Both must be
+/// persisted to state and rendered into `agent.toml`, in the deterministic
+/// order "preset first, custom second", so a leaf consumed by two
+/// processes (e.g. a container restart plus an in-container nginx reload)
+/// can refresh both from a single renewal.
+#[cfg(unix)]
+#[test]
+fn test_service_update_installs_preset_and_custom_hooks_in_order() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+
+    let agent_toml = temp_dir.path().join("agent.toml");
+    fs::write(
+        &agent_toml,
+        "# BEGIN bootroot managed profile: edge-proxy\n\
+         [[profiles]]\n\
+         name = \"edge-proxy\"\n\
+         # END bootroot managed profile: edge-proxy\n",
+    )
+    .expect("seed agent.toml");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "update",
+            "--service-name",
+            "edge-proxy",
+            "--reload-style",
+            "docker-restart",
+            "--reload-target",
+            "aimer-web-next-app-1",
+            "--post-renew-command",
+            "docker",
+            "--post-renew-arg",
+            "exec",
+            "--post-renew-arg",
+            "aimer-web-nginx-prod-1",
+            "--post-renew-arg",
+            "nginx",
+            "--post-renew-arg",
+            "-s",
+            "--post-renew-arg",
+            "reload",
+        ])
+        .output()
+        .expect("run service update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "preset + custom hook must be accepted; stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    let hooks = state["services"]["edge-proxy"]["post_renew_hooks"]
+        .as_array()
+        .expect("post_renew_hooks is an array");
+    assert_eq!(hooks.len(), 2, "both hooks must be persisted: {hooks:?}");
+
+    // Preset entry first.
+    assert_eq!(hooks[0]["command"], "docker");
+    assert_eq!(
+        hooks[0]["args"],
+        serde_json::json!(["restart", "aimer-web-next-app-1"])
+    );
+    // Custom-command entry second.
+    assert_eq!(hooks[1]["command"], "docker");
+    assert_eq!(
+        hooks[1]["args"],
+        serde_json::json!(["exec", "aimer-web-nginx-prod-1", "nginx", "-s", "reload"])
+    );
+
+    let agent_contents = fs::read_to_string(&agent_toml).expect("read agent.toml");
+    assert_eq!(
+        agent_contents
+            .matches("[[profiles.hooks.post_renew.success]]")
+            .count(),
+        2,
+        "agent.toml must render both hook blocks: {agent_contents}"
+    );
+    // The preset "restart" block must be emitted before the custom
+    // "exec …" block.
+    let restart_pos = agent_contents
+        .find("\"restart\"")
+        .expect("restart hook rendered");
+    let exec_pos = agent_contents.find("\"exec\"").expect("exec hook rendered");
+    assert!(
+        restart_pos < exec_pos,
+        "preset hook must render before custom hook: {agent_contents}"
     );
 }
 

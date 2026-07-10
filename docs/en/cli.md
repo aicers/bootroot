@@ -724,12 +724,24 @@ Post-renew hook flags (low-level):
 - `--post-renew-timeout-secs`: hook timeout in seconds (default `30`)
 - `--post-renew-on-failure`: failure policy (`continue` or `stop`, default `continue`)
 
-Preset flags (`--reload-style`/`--reload-target`) and
-low-level flags (`--post-renew-*`) are mutually
-exclusive. When preset flags are used, they expand into
-the equivalent low-level hook settings. These flags are
-also forwarded to `bootroot-remote bootstrap` for the
-`remote-bootstrap` delivery mode.
+A preset (`--reload-style`/`--reload-target`) and a
+low-level custom command (`--post-renew-*`) may be
+supplied together in one invocation, registering **two**
+post-renew hooks — for example, restart a container
+consumer *and* reload another consumer in the same
+renewal. When both are given, the emission order is fixed
+by rule (not by CLI position, which clap cannot recover):
+the **preset entry is written first, then the
+custom-command entry**. When only a preset is given, it
+expands into the equivalent single low-level hook. These
+flags are also forwarded to `bootroot-remote bootstrap`
+for the `remote-bootstrap` delivery mode, where every hook
+is preserved in order.
+
+Registering more than one *custom* command (or more than
+one preset) in a single invocation is not supported; the
+flags remain single-valued apart from the one-preset +
+one-custom combination above.
 
 Per-issuance `secret_id` policy flags:
 
@@ -908,13 +920,20 @@ add` flow. At least one update flag is required.
   semantics as `service add`. Use `none` to clear a previously
   configured hook. Combine with `--reload-target` (process
   name, systemd unit, or container name) for the non-`none`
-  presets. Mutually exclusive with the low-level
-  `--post-renew-*` flags.
+  presets. May be combined with the low-level `--post-renew-*`
+  flags to register a preset hook **and** a custom-command hook
+  in one update; the rewritten hook list is emitted preset-first,
+  then the custom entry, matching `service add`.
 - `--reload-target`: target for the reload-style preset.
 - `--post-renew-command`, `--post-renew-arg`,
   `--post-renew-timeout-secs`, `--post-renew-on-failure`:
   low-level hook configuration; same semantics as on
   `service add`.
+
+When any hook flag is present, `service update` rewrites the
+full hook list for the service (the existing "rewrite vs
+leave-as-is" rule); omitting all hook flags leaves the current
+hooks untouched.
 
 For `local-file` services, a hook change re-renders the managed
 `agent.toml` profile block in place. For `remote-bootstrap`
@@ -962,6 +981,15 @@ bootroot service update --service-name review \
 bootroot service update --service-name aice-web-next \
   --reload-style docker-restart --reload-target aice-web-next
 bootroot service update --service-name edge-proxy --reload-style none
+
+# Arm two hooks in one update (issue #702): restart the next-app
+# container AND reload nginx inside another container. Emitted
+# preset-first, then the custom command.
+bootroot service update --service-name aimer-web \
+  --reload-style docker-restart --reload-target aimer-web-next-app-1 \
+  --post-renew-command docker --post-renew-arg exec \
+    --post-renew-arg aimer-web-nginx-prod-1 \
+    --post-renew-arg nginx --post-renew-arg -s --post-renew-arg reload
 ```
 
 ## bootroot service remove
@@ -2147,12 +2175,18 @@ Key inputs:
     change topology.
 - `--ca-bundle-path`: required output path for the managed step-ca trust
   bundle. Required unless `--artifact` is provided.
-- post-renew hook flags: `--reload-style`,
-  `--reload-target`, `--post-renew-command`,
+- post-renew hook flags: `--post-renew-command`,
   `--post-renew-arg`, `--post-renew-timeout-secs`,
-  `--post-renew-on-failure` (same semantics as
-  `bootroot service add`; passed through from the
-  generated remote handoff command template)
+  `--post-renew-on-failure`. These per-field flags are
+  **single-hook** and used only when no `--artifact` is
+  given. When an `--artifact` is provided, its
+  `post_renew_hooks` array is authoritative and **every**
+  hook it carries is rendered into the remote `agent.toml`
+  in order — so a service registered with a preset plus a
+  custom command (see `bootroot service add`) keeps both
+  hooks on the remote host. (This asymmetry mirrors the
+  `service add` CLI: the artifact path is multi-hook, the
+  bare per-field flags are not.)
 - `--summary-json` (optional) and `--output text|json` (default `text`)
 
 If `agent.toml` does not exist yet, bootstrap creates a baseline config and
