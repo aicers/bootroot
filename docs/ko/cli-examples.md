@@ -304,7 +304,27 @@ bootroot service add \
 `none`(훅 없음)이 있습니다. 세부 제어가 필요하면
 저수준 플래그 `--post-renew-command`,
 `--post-renew-arg`, `--post-renew-timeout-secs`,
-`--post-renew-on-failure`를 사용하세요.
+`--post-renew-on-failure`를 사용하세요. 프리셋과 저수준
+커스텀 명령을 한 번의 호출에서 함께 지정하여 **두** 훅을
+모두 등록할 수도 있습니다 — 프리셋 항목이 먼저, 그다음
+커스텀 명령 항목이 방출됩니다 (이슈 #702):
+
+```bash
+bootroot service add \
+  --service-name aimer-web \
+  --hostname aimer-node-01 \
+  --domain trusted.domain \
+  --agent-config /etc/bootroot/agent.toml \
+  --cert-path /etc/bootroot/certs/aimer-web.crt \
+  --key-path /etc/bootroot/certs/aimer-web.key \
+  --instance-id 001 \
+  --reload-style docker-restart \
+  --reload-target aimer-web-next-app-1 \
+  --post-renew-command docker \
+    --post-renew-arg exec --post-renew-arg aimer-web-nginx-prod-1 \
+    --post-renew-arg nginx --post-renew-arg -s --post-renew-arg reload \
+  --root-token <OPENBAO_ROOT_TOKEN>
+```
 
 control node에서 secret_id 회전 후에는 *실행 중인* 원격 `bootroot-agent`가
 fast-poll 루프로 새 secret_id를 직접 받아오므로 수동 전달이 필요하지 않습니다.

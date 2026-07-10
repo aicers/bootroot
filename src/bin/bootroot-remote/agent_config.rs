@@ -261,31 +261,36 @@ fn resolve_profile_paths(args: &ResolvedBootstrapArgs) -> ProfilePaths {
 }
 
 fn inject_hooks_into_profile_block(block: &str, args: &ResolvedBootstrapArgs) -> String {
-    let Some(command) = args.post_renew_command.as_deref() else {
+    if args.post_renew_hooks.is_empty() {
         return block.to_string();
-    };
-    let timeout_secs = args.post_renew_timeout_secs.unwrap_or(30);
-    let on_failure = match args.post_renew_on_failure {
-        Some(HookFailurePolicy::Stop) => "stop",
-        _ => "continue",
-    };
-    let mut hook_toml = String::from("\n[[profiles.hooks.post_renew.success]]\n");
-    let _ = writeln!(
-        hook_toml,
-        "command = {}",
-        bootroot::toml_util::toml_encode_string(command)
-    );
-    if !args.post_renew_arg.is_empty() {
-        let formatted_args = args
-            .post_renew_arg
-            .iter()
-            .map(|a| bootroot::toml_util::toml_encode_string(a))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(hook_toml, "args = [{formatted_args}]");
     }
-    let _ = writeln!(hook_toml, "timeout_secs = {timeout_secs}");
-    let _ = writeln!(hook_toml, "on_failure = \"{on_failure}\"");
+    // Render one `[[profiles.hooks.post_renew.success]]` block per hook, in
+    // order, so a service registered with multiple post-renew hooks keeps
+    // all of them on the remote host (issue #702).
+    let mut hook_toml = String::new();
+    for hook in &args.post_renew_hooks {
+        hook_toml.push_str("\n[[profiles.hooks.post_renew.success]]\n");
+        let _ = writeln!(
+            hook_toml,
+            "command = {}",
+            bootroot::toml_util::toml_encode_string(&hook.command)
+        );
+        if !hook.args.is_empty() {
+            let formatted_args = hook
+                .args
+                .iter()
+                .map(|a| bootroot::toml_util::toml_encode_string(a))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(hook_toml, "args = [{formatted_args}]");
+        }
+        let _ = writeln!(hook_toml, "timeout_secs = {}", hook.timeout_secs);
+        let on_failure = match hook.on_failure {
+            HookFailurePolicy::Stop => "stop",
+            HookFailurePolicy::Continue => "continue",
+        };
+        let _ = writeln!(hook_toml, "on_failure = \"{on_failure}\"");
+    }
 
     if let Some(end_pos) = block.rfind(MANAGED_PROFILE_END_PREFIX) {
         let mut result = block[..end_pos].to_string();
@@ -568,7 +573,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::OutputFormat;
+    use crate::{OutputFormat, ResolvedPostRenewHook};
 
     #[test]
     fn upsert_toml_section_keys_updates_existing_section() {
@@ -661,10 +666,7 @@ mod tests {
             ca_bundle_path: PathBuf::from("/tmp/ca-bundle.pem"),
             ca_bundle_pem: None,
             trusted_ca_sha256: Vec::new(),
-            post_renew_command: None,
-            post_renew_arg: Vec::new(),
-            post_renew_timeout_secs: None,
-            post_renew_on_failure: None,
+            post_renew_hooks: Vec::new(),
             output: OutputFormat::Text,
             wrap_token: None,
             wrap_expires_at: None,
@@ -1067,9 +1069,12 @@ mod tests {
     #[test]
     fn inject_hooks_escapes_control_characters() {
         let mut args = test_bootstrap_args();
-        args.post_renew_command = Some("echo\nnext".to_string());
-        args.post_renew_arg = vec!["line1\tline2".to_string()];
-        args.post_renew_timeout_secs = Some(10);
+        args.post_renew_hooks = vec![ResolvedPostRenewHook {
+            command: "echo\nnext".to_string(),
+            args: vec!["line1\tline2".to_string()],
+            timeout_secs: 10,
+            on_failure: HookFailurePolicy::Continue,
+        }];
 
         let prefix = MANAGED_PROFILE_BEGIN_PREFIX;
         let suffix = MANAGED_PROFILE_END_PREFIX;
@@ -1103,6 +1108,96 @@ mod tests {
         );
         let args_arr = hook["args"].as_array().expect("args must be an array");
         assert_eq!(args_arr.get(0).unwrap().as_str().unwrap(), "line1\tline2");
+    }
+
+    /// Issue #702: an artifact carrying more than one post-renew hook must
+    /// render one `[[profiles.hooks.post_renew.success]]` block per hook,
+    /// in order, on the remote host's `agent.toml`. The single-hook
+    /// `.first()`-only path silently dropped every hook after the first,
+    /// reintroducing the "second consumer never gets refreshed" failure.
+    #[test]
+    fn inject_hooks_renders_every_hook_in_order() {
+        let mut args = test_bootstrap_args();
+        args.post_renew_hooks = vec![
+            ResolvedPostRenewHook {
+                command: "docker".to_string(),
+                args: vec!["restart".to_string(), "aimer-web-next-app-1".to_string()],
+                timeout_secs: 30,
+                on_failure: HookFailurePolicy::Continue,
+            },
+            ResolvedPostRenewHook {
+                command: "docker".to_string(),
+                args: vec![
+                    "exec".to_string(),
+                    "aimer-web-nginx-prod-1".to_string(),
+                    "nginx".to_string(),
+                    "-s".to_string(),
+                    "reload".to_string(),
+                ],
+                timeout_secs: 45,
+                on_failure: HookFailurePolicy::Stop,
+            },
+        ];
+
+        let prefix = MANAGED_PROFILE_BEGIN_PREFIX;
+        let suffix = MANAGED_PROFILE_END_PREFIX;
+        let block = format!(
+            "{prefix} edge-proxy\n[[profiles]]\nservice_name = \"edge-proxy\"\n{suffix} edge-proxy\n",
+        );
+        let result = inject_hooks_into_profile_block(&block, &args);
+
+        assert_eq!(
+            result
+                .matches("[[profiles.hooks.post_renew.success]]")
+                .count(),
+            2,
+            "both hooks must render a block: {result}"
+        );
+
+        // Parse just the hook section as TOML and assert the ordered
+        // contents of both entries.
+        let start = result
+            .find("\n[[profiles.hooks.post_renew.success]]")
+            .expect("hook header must exist");
+        let hook_section = result[start..]
+            .split(MANAGED_PROFILE_END_PREFIX)
+            .next()
+            .unwrap();
+        let wrapped =
+            format!("[profiles]\n[profiles.hooks]\n[profiles.hooks.post_renew]{hook_section}");
+        let doc: toml_edit::DocumentMut = wrapped.parse().expect("hook TOML must parse");
+        let success = doc["profiles"]["hooks"]["post_renew"]["success"]
+            .as_array_of_tables()
+            .expect("success must be an array of tables");
+        assert_eq!(success.len(), 2, "two hook entries expected");
+
+        let first = success.get(0).expect("first hook");
+        assert_eq!(first["command"].as_str().unwrap(), "docker");
+        assert_eq!(
+            first["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["restart", "aimer-web-next-app-1"]
+        );
+        assert_eq!(first["timeout_secs"].as_integer().unwrap(), 30);
+        assert_eq!(first["on_failure"].as_str().unwrap(), "continue");
+
+        let second = success.get(1).expect("second hook");
+        assert_eq!(second["command"].as_str().unwrap(), "docker");
+        assert_eq!(
+            second["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["exec", "aimer-web-nginx-prod-1", "nginx", "-s", "reload"]
+        );
+        assert_eq!(second["timeout_secs"].as_integer().unwrap(), 45);
+        assert_eq!(second["on_failure"].as_str().unwrap(), "stop");
     }
 
     /// Regression for the Round 5 review: when `bootroot-remote bootstrap`

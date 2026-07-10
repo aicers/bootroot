@@ -593,6 +593,24 @@ Use `--reload-style none` to explicitly opt out, or the low-level
 `--post-renew-timeout-secs` / `--post-renew-on-failure` flags for
 arbitrary commands.
 
+When one leaf is consumed by two processes that each need a
+different refresh action (e.g. a container `docker restart` **and**
+an in-container `nginx -s reload`), pass a preset and a low-level
+custom command together — both hooks are registered from the single
+renewal, emitted preset-first then custom (issue #702):
+
+```bash
+bootroot service add --service-name aimer-web \
+  --reload-style docker-restart --reload-target aimer-web-next-app-1 \
+  --post-renew-command docker --post-renew-arg exec \
+    --post-renew-arg aimer-web-nginx-prod-1 \
+    --post-renew-arg nginx --post-renew-arg -s --post-renew-arg reload ...
+```
+
+This couples both consumers' refresh to the renewal event, replacing
+the fragile out-of-band reload timer that could slip and leave one
+consumer serving an expired leaf.
+
 ### Retrofitting a hook on an existing service
 
 If the service was registered without `--reload-style`, you no longer

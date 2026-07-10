@@ -701,6 +701,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot service add` and `bootroot service update` can now register a
+  `--reload-style` preset hook **and** a `--post-renew-command` custom hook
+  in one invocation, instead of rejecting the combination as mutually
+  exclusive. A single mTLS leaf consumed by two processes that each need a
+  different refresh action (e.g. a container `docker restart` for an
+  in-memory client-cert cache **and** an in-container `nginx -s reload` for
+  a TLS server cert) can now refresh both from the same renewal, coupling
+  both reloads to the renewal event instead of an out-of-band timer.
+  Because clap collapses each flag into its own field, the relative CLI
+  position of the two forms is unrecoverable, so the emission order is
+  fixed by rule: the **preset entry is written first, then the
+  custom-command entry**, both persisted to state and rendered as ordered
+  `[[profiles.hooks.post_renew.success]]` blocks in `agent.toml`. Repeating
+  a custom command (or a preset) more than once in a single invocation
+  remains unsupported. The `bootroot-remote` artifact-ingest path now
+  preserves **every** hook from the bootstrap artifact's `post_renew_hooks`
+  array in order — previously only the first survived onto the remote
+  host's `agent.toml`, silently dropping the second consumer's refresh.
+  (Closes #702)
 - `bootroot service add` now rejects a `local-file` add whose
   `--agent-config` path is already registered to a different service.
   One `agent.toml` serves exactly one distinct service: the top-level

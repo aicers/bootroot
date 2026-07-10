@@ -206,10 +206,11 @@ struct ResolvedBootstrapArgs {
     /// to the CA bundle's trust anchors. Empty for legacy artifacts, in which
     /// case bootstrap stays bundle-anchored (issue #695).
     trusted_ca_sha256: Vec<String>,
-    post_renew_command: Option<String>,
-    post_renew_arg: Vec<String>,
-    post_renew_timeout_secs: Option<u64>,
-    post_renew_on_failure: Option<HookFailurePolicy>,
+    /// Full ordered list of post-renew success hooks to render into the
+    /// remote `agent.toml`. Populated from every entry in the artifact's
+    /// `post_renew_hooks` array (issue #702) or, on the artifact-less
+    /// direct-CLI path, from the single-hook `--post-renew-*` flags.
+    post_renew_hooks: Vec<ResolvedPostRenewHook>,
     output: OutputFormat,
     wrap_token: Option<String>,
     wrap_expires_at: Option<String>,
@@ -225,6 +226,16 @@ struct ResolvedBootstrapArgs {
 enum HookFailurePolicy {
     Continue,
     Stop,
+}
+
+/// A single post-renew success hook, fully resolved into the form rendered
+/// into the remote `agent.toml`.
+#[derive(Debug)]
+struct ResolvedPostRenewHook {
+    command: String,
+    args: Vec<String>,
+    timeout_secs: u64,
+    on_failure: HookFailurePolicy,
 }
 
 #[derive(clap::Args, Debug)]
@@ -509,31 +520,45 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
     let cert_group_gid = artifact.as_ref().and_then(|a| a.cert_group_gid);
 
     // When an artifact is provided, its `post_renew_hooks` array is
-    // authoritative — even if empty (an explicit "no hooks" choice).
-    // CLI hook flags are used only when no artifact is given.
-    let (post_renew_command, post_renew_arg, post_renew_timeout_secs, post_renew_on_failure) =
-        if let Some(a) = artifact.as_ref() {
-            if let Some(hook) = a.post_renew_hooks.first() {
-                (
-                    Some(hook.command.clone()),
-                    hook.args.clone(),
-                    Some(hook.timeout_secs),
-                    Some(match hook.on_failure {
-                        ArtifactHookFailurePolicy::Continue => HookFailurePolicy::Continue,
-                        ArtifactHookFailurePolicy::Stop => HookFailurePolicy::Stop,
-                    }),
-                )
-            } else {
-                (None, Vec::new(), None, None)
-            }
-        } else {
-            (
-                args.post_renew_command,
-                args.post_renew_arg,
-                args.post_renew_timeout_secs,
-                args.post_renew_on_failure,
-            )
-        };
+    // authoritative — even if empty (an explicit "no hooks" choice) — and
+    // every entry is preserved in order so a service registered with two
+    // hooks does not silently lose the second one on the remote host
+    // (issue #702). CLI hook flags are used only when no artifact is given,
+    // and stay single-hook (out of Tier 1 scope).
+    let post_renew_hooks: Vec<ResolvedPostRenewHook> = if let Some(a) = artifact.as_ref() {
+        a.post_renew_hooks
+            .iter()
+            .map(|hook| ResolvedPostRenewHook {
+                command: hook.command.clone(),
+                args: hook.args.clone(),
+                timeout_secs: hook.timeout_secs,
+                on_failure: match hook.on_failure {
+                    ArtifactHookFailurePolicy::Continue => HookFailurePolicy::Continue,
+                    ArtifactHookFailurePolicy::Stop => HookFailurePolicy::Stop,
+                },
+            })
+            .collect()
+    } else {
+        bootstrap::validate_cli_hook_flags(
+            args.post_renew_command.as_deref(),
+            &args.post_renew_arg,
+            args.post_renew_timeout_secs,
+            args.post_renew_on_failure,
+        )?;
+        args.post_renew_command
+            .map(|command| ResolvedPostRenewHook {
+                command,
+                args: args.post_renew_arg,
+                timeout_secs: args
+                    .post_renew_timeout_secs
+                    .unwrap_or_else(default_artifact_hook_timeout),
+                on_failure: args
+                    .post_renew_on_failure
+                    .unwrap_or(HookFailurePolicy::Continue),
+            })
+            .into_iter()
+            .collect()
+    };
 
     Ok(ResolvedBootstrapArgs {
         openbao_url,
@@ -557,10 +582,7 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         ca_bundle_path,
         ca_bundle_pem,
         trusted_ca_sha256,
-        post_renew_command,
-        post_renew_arg,
-        post_renew_timeout_secs,
-        post_renew_on_failure,
+        post_renew_hooks,
         output: args.output,
         wrap_token,
         wrap_expires_at,
@@ -789,13 +811,66 @@ mod tests {
         let resolved = resolve_bootstrap_args(args).await.expect("resolve");
 
         // Artifact hooks must win over CLI hook flags.
-        assert_eq!(resolved.post_renew_command.as_deref(), Some("artifact-cmd"));
-        assert_eq!(resolved.post_renew_arg, vec!["artifact-arg".to_string()]);
-        assert_eq!(resolved.post_renew_timeout_secs, Some(120));
+        assert_eq!(resolved.post_renew_hooks.len(), 1);
+        let hook = resolved.post_renew_hooks.first().expect("one hook");
+        assert_eq!(hook.command, "artifact-cmd");
+        assert_eq!(hook.args, vec!["artifact-arg".to_string()]);
+        assert_eq!(hook.timeout_secs, 120);
+        assert_eq!(hook.on_failure, HookFailurePolicy::Stop);
+    }
+
+    #[tokio::test]
+    async fn resolve_bootstrap_args_preserves_all_artifact_hooks_in_order() {
+        // Issue #702: an artifact carrying two hooks must resolve to both,
+        // in order — not just the first. The single-hook `.first()`-only
+        // ingest dropped the second consumer's refresh action.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact_json = serde_json::json!({
+            "schema_version": 4,
+            "openbao_url": "https://ob:8200",
+            "kv_mount": "kv",
+            "service_name": "svc",
+            "role_id_path": "/r",
+            "secret_id_path": "/s",
+            "eab_file_path": "/e",
+            "agent_config_path": "/a",
+            "ca_bundle_path": "/ca",
+            "post_renew_hooks": [
+                {
+                    "command": "docker",
+                    "args": ["restart", "aimer-web-next-app-1"],
+                    "timeout_secs": 30,
+                    "on_failure": "continue"
+                },
+                {
+                    "command": "docker",
+                    "args": ["exec", "aimer-web-nginx-prod-1", "nginx", "-s", "reload"],
+                    "timeout_secs": 45,
+                    "on_failure": "stop"
+                }
+            ],
+        });
+        let artifact_path = write_artifact_file(dir.path(), &artifact_json.to_string());
+        let resolved = resolve_bootstrap_args(default_bootstrap_args(artifact_path))
+            .await
+            .expect("resolve");
+
+        assert_eq!(resolved.post_renew_hooks.len(), 2, "both hooks preserved");
+
+        let first = resolved.post_renew_hooks.first().expect("first hook");
+        assert_eq!(first.command, "docker");
+        assert_eq!(first.args, vec!["restart", "aimer-web-next-app-1"]);
+        assert_eq!(first.timeout_secs, 30);
+        assert_eq!(first.on_failure, HookFailurePolicy::Continue);
+
+        let second = resolved.post_renew_hooks.get(1).expect("second hook");
+        assert_eq!(second.command, "docker");
         assert_eq!(
-            resolved.post_renew_on_failure,
-            Some(HookFailurePolicy::Stop)
+            second.args,
+            vec!["exec", "aimer-web-nginx-prod-1", "nginx", "-s", "reload"]
         );
+        assert_eq!(second.timeout_secs, 45);
+        assert_eq!(second.on_failure, HookFailurePolicy::Stop);
     }
 
     #[tokio::test]
@@ -844,10 +919,7 @@ mod tests {
 
         // Artifact explicitly sets empty hooks — CLI hooks must NOT leak
         // through, even though the artifact array is empty.
-        assert_eq!(resolved.post_renew_command, None);
-        assert!(resolved.post_renew_arg.is_empty());
-        assert_eq!(resolved.post_renew_timeout_secs, None);
-        assert_eq!(resolved.post_renew_on_failure, None);
+        assert!(resolved.post_renew_hooks.is_empty());
     }
 
     /// Returns `BootstrapArgs` pointing at the given artifact file with all

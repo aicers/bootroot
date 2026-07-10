@@ -566,6 +566,24 @@ bootroot service add --service-name aice-web-next \
 `--post-renew-timeout-secs` / `--post-renew-on-failure` 플래그를
 사용하세요.
 
+하나의 리프를 서로 다른 갱신 동작이 필요한 두 프로세스가 소비할
+때(예: 컨테이너 `docker restart` **및** 컨테이너 내부의
+`nginx -s reload`), 프리셋과 저수준 커스텀 명령을 함께 전달하세요 —
+단일 갱신에서 두 훅이 모두 등록되며, 프리셋이 먼저 그다음 커스텀
+순서로 방출됩니다 (이슈 #702):
+
+```bash
+bootroot service add --service-name aimer-web \
+  --reload-style docker-restart --reload-target aimer-web-next-app-1 \
+  --post-renew-command docker --post-renew-arg exec \
+    --post-renew-arg aimer-web-nginx-prod-1 \
+    --post-renew-arg nginx --post-renew-arg -s --post-renew-arg reload ...
+```
+
+이렇게 하면 두 소비자의 갱신 동작이 모두 갱신 이벤트에 결합되어,
+슬립되어 한 소비자가 만료된 리프를 계속 제공할 수 있는 취약한
+대역 외 리로드 타이머를 대체합니다.
+
 ### 기존 서비스에 훅 재구성
 
 서비스가 `--reload-style` 없이 등록되었더라도 더 이상 제거 후 재등록할
