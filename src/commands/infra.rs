@@ -49,6 +49,48 @@ const UNSEAL_KEYS_PATH: &str = "secrets/openbao/unseal-keys.txt";
 const OPENBAO_API_WAIT_ATTEMPTS: u32 = 60;
 const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
 
+/// Assembles the `docker compose up` argv for `infra install`.
+///
+/// When `no_build` is `false` (the default), the command builds local
+/// images (`--build`), preserving the fresh-clone developer experience.
+/// When `no_build` is `true`, it passes `--no-build --pull never` so a
+/// pre-loaded image is used exactly as-is and the command fails loudly
+/// when a tagged image is absent — the semantics an air-gapped install
+/// needs. `--no-build` alone only suppresses building; for an image-only
+/// service (as in the deploy compose) Compose's default `missing` pull
+/// policy would still fetch an absent image from a registry, which both
+/// reaches the network under an air-gapped install and would silently
+/// substitute a registry image for the preloaded/release payload. Plain
+/// `up` (no `--no-build`) would instead silently build a missing image.
+fn build_compose_up_args<'a>(
+    compose_str: &'a str,
+    no_build: bool,
+    svc_refs: &[&'a str],
+) -> Vec<&'a str> {
+    let mut up_args: Vec<&str> = vec!["compose", "-f", compose_str, "up"];
+    if no_build {
+        up_args.extend(["--no-build", "--pull", "never"]);
+    } else {
+        up_args.push("--build");
+    }
+    up_args.push("-d");
+    up_args.extend(svc_refs);
+    up_args
+}
+
+/// Determines whether `infra install` runs the preliminary `docker compose
+/// pull --ignore-pull-failures` before `up`.
+///
+/// The pull refreshes floating image tags from a registry, so it is skipped
+/// when local archives were loaded (`loaded_archives > 0`). It is also
+/// skipped whenever `--no-build` is set: that mode implements the air-gapped
+/// contract and must never contact a registry, so an absent image fails the
+/// install loudly at `up --pull never` rather than being silently fetched or
+/// substituted for the preloaded release payload.
+fn should_pull_before_up(loaded_archives: usize, no_build: bool) -> bool {
+    loaded_archives == 0 && !no_build
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
     ensure_all_services_localhost_binding(&args.compose_file.compose_file, messages)?;
@@ -474,7 +516,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    if loaded_archives == 0 {
+    if should_pull_before_up(loaded_archives, args.no_build) {
         let mut pull_args: Vec<&str> = vec![
             "compose",
             "-f",
@@ -491,15 +533,16 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         )?;
     }
 
-    // Use --build to build local images (step-ca, bootroot-http01).
-    let mut up_args: Vec<&str> = vec!["compose", "-f", &compose_str, "up", "--build", "-d"];
-    up_args.extend(&svc_refs);
-    run_docker_with_env(
-        &up_args,
-        &host_port_env_refs,
-        "docker compose up --build",
-        messages,
-    )?;
+    // Default builds local images (step-ca, bootroot-http01); `--no-build`
+    // with `--pull never` uses the pre-loaded images exactly as-is for an
+    // air-gapped install, never reaching a registry.
+    let up_args = build_compose_up_args(&compose_str, args.no_build, &svc_refs);
+    let up_label = if args.no_build {
+        "docker compose up --no-build --pull never"
+    } else {
+        "docker compose up --build"
+    };
+    run_docker_with_env(&up_args, &host_port_env_refs, up_label, messages)?;
 
     // Collect readiness but skip step-ca (it has no config yet).
     let prereq_services: Vec<String> = args
@@ -1603,6 +1646,60 @@ pub(crate) fn docker_output(args: &[&str], messages: &Messages) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_compose_up_args_defaults_to_build() {
+        let svc_refs = ["openbao", "postgres"];
+        let args = build_compose_up_args("docker-compose.yml", false, &svc_refs);
+        assert_eq!(
+            args,
+            vec![
+                "compose",
+                "-f",
+                "docker-compose.yml",
+                "up",
+                "--build",
+                "-d",
+                "openbao",
+                "postgres",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_compose_up_args_no_build_selects_no_build_flag() {
+        let svc_refs = ["openbao", "postgres"];
+        let args = build_compose_up_args("docker-compose.deploy.yml", true, &svc_refs);
+        assert_eq!(
+            args,
+            vec![
+                "compose",
+                "-f",
+                "docker-compose.deploy.yml",
+                "up",
+                "--no-build",
+                "--pull",
+                "never",
+                "-d",
+                "openbao",
+                "postgres",
+            ]
+        );
+        assert!(!args.contains(&"--build"));
+    }
+
+    #[test]
+    fn should_pull_before_up_pulls_only_without_archives_or_no_build() {
+        // Default build path with no local archives: refresh floating tags.
+        assert!(should_pull_before_up(0, false));
+        // Local archives loaded: images are already present, skip the pull.
+        assert!(!should_pull_before_up(3, false));
+        // `--no-build` is the air-gapped contract: never reach a registry,
+        // even when no archives were loaded (e.g. images preloaded
+        // externally, or an empty/wrong --image-archive-dir).
+        assert!(!should_pull_before_up(0, true));
+        assert!(!should_pull_before_up(2, true));
+    }
 
     #[test]
     fn resolve_effective_secrets_dir_returns_none_without_state() {
@@ -3884,6 +3981,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_wildcard: false,
             stepca_advertise_addr: None,
             postgres_host_port: None,
+            no_build: false,
         };
         let err = run_infra_install(&args, &messages).unwrap_err();
         let msg = err.to_string();

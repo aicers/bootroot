@@ -41,6 +41,7 @@ jobs:
               - "Cargo.lock"
               - "pyproject.toml"
               - "docker-compose.yml"
+              - "docker-compose.deploy.yml"
               - "Dockerfile*"
               - "responder.toml.example"
               - ".github/workflows/**"
@@ -113,6 +114,9 @@ jobs:
 
       - name: Build Docs
         run: mkdocs build --strict
+
+      - name: Validate Deploy Compose
+        run: ./scripts/validate-deploy-compose.sh
 
       - name: Install cargo-audit
         run: cargo install cargo-audit || true

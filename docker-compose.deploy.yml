@@ -1,0 +1,145 @@
+# Deploy-oriented compose for prebuilt / air-gapped installs.
+#
+# Unlike docker-compose.yml, this file carries NO `build:` contexts: every
+# service references a prebuilt `image:` tag only, so `bootroot infra install`
+# can bring the stack up from a binaries-plus-images payload without a source
+# checkout. Pair it with `infra install --compose-file docker-compose.deploy.yml
+# --image-archive-dir <dir> --no-build`: the tarballs are `docker load`ed and
+# the tagged images are used as-is (no rebuild, no network).
+#
+# Every image reference is interpolated from an environment variable so an
+# installer can pin an exact release tag or a `@sha256:` digest. The defaults
+# match the release-built tags; override them via `.env` or the process
+# environment (e.g. `BOOTROOT_HTTP01_IMAGE=bootroot-http01-responder@sha256:…`).
+#
+# The only source-tree config the default install services still need is
+# `openbao/openbao.hcl` and `responder.toml.compose`; `infra install` itself
+# generates `.env` and creates the `secrets/` and `certs/` directories.
+services:
+  openbao:
+    image: ${OPENBAO_IMAGE:-openbao/openbao:latest}
+    container_name: bootroot-openbao
+    restart: always
+    ports:
+      - "127.0.0.1:8200:8200"
+    expose:
+      - "9101"
+    volumes:
+      - openbao-data:/openbao/file
+      - openbao-audit:/openbao/audit
+      - ./openbao:/openbao/config:ro
+    # The standard entrypoint chowns /openbao/config and /openbao/file but
+    # does not know about /openbao/audit.  Fix ownership before delegating
+    # to the original entrypoint so the openbao user can write audit logs.
+    entrypoint: ["sh", "-c", "chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit && exec docker-entrypoint.sh server -config=/openbao/config/openbao.hcl"]
+
+  # PostgreSQL for step-ca. The port is exposed to the host so that
+  # `bootroot rotate db` (which runs on the host) can connect directly.
+  # PostgreSQL 18 expects the parent directory mount so its default PGDATA
+  # layout works correctly.
+  # The published default is 5433 so bootroot does not claim the
+  # conventional 5432 port; set POSTGRES_HOST_PORT to override.
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:18}
+    container_name: bootroot-postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=step
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      - POSTGRES_DB=stepca
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+
+  step-ca:
+    image: ${BOOTROOT_STEP_CA_IMAGE:-bootroot-step-ca:0.29.0}
+    container_name: bootroot-ca
+    restart: always
+    depends_on:
+      - postgres
+    ports:
+      - "127.0.0.1:9000:9000"
+    expose:
+      - "9102"
+    environment:
+      - STEPUSER=step
+    volumes:
+      - ./secrets:/home/step
+    command:
+      [
+        "/usr/local/bin/step-ca",
+        "/home/step/config/ca.json",
+        "--password-file",
+        "/home/step/password.txt",
+      ]
+
+  bootroot-http01:
+    image: ${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:0.2.0}
+    container_name: bootroot-http01
+    restart: always
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./responder.toml.compose:/app/responder.toml:ro
+    command:
+      - --config=/app/responder.toml
+    networks:
+      default:
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:latest}
+    container_name: bootroot-prometheus
+    restart: always
+    profiles:
+      - lan
+      - public
+    depends_on:
+      - step-ca
+      - openbao
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:latest}
+    container_name: bootroot-grafana
+    restart: always
+    profiles:
+      - lan
+    depends_on:
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+    volumes:
+      - ./monitoring/grafana:/etc/grafana/provisioning:ro
+      - ./monitoring/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_LAN_BIND_ADDR:-127.0.0.1}:3000:3000"
+
+  grafana-public:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:latest}
+    container_name: bootroot-grafana-public
+    restart: always
+    profiles:
+      - public
+    depends_on:
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+    volumes:
+      - ./monitoring/grafana:/etc/grafana/provisioning:ro
+      - ./monitoring/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "0.0.0.0:3000:3000"
+
+volumes:
+  openbao-data:
+  openbao-audit:
+  postgres-data:
+  prometheus-data:
+  grafana-data:

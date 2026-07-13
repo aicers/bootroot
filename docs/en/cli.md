@@ -153,15 +153,34 @@ bootroot infra up
 
 Performs zero-config first-time setup. Generates `.env` with a random
 PostgreSQL password, creates `secrets/` and `certs/` directories, and brings
-up Docker Compose services (including building local images). This is the
+up Docker Compose services (building local images by default). This is the
 recommended entry point on a fresh clone. Use `bootroot infra up` to restart
 an already-configured environment.
+
+For a prebuilt or air-gapped install — no source tree and no network at
+install time — combine `--compose-file docker-compose.deploy.yml`,
+`--image-archive-dir <dir>`, and `--no-build`. The deploy compose carries
+no `build:` contexts (every service references a prebuilt, interpolatable
+`image:` tag), the archive directory supplies the images via `docker load`,
+and `--no-build` uses them as-is instead of rebuilding from source. See
+[Air-gapped install](#air-gapped-install) below.
 
 ### Inputs
 
 - `--compose-file`: compose file path (default `docker-compose.yml`)
 - `--services`: services to start (default `openbao,postgres,step-ca,bootroot-http01`)
-- `--image-archive-dir`: local image archive directory (optional)
+- `--image-archive-dir`: local image archive directory (optional).
+  When set, every `.tar`/`.tgz`/`.tar.gz` archive in the directory is
+  `docker load`ed and `docker compose pull` is skipped, so the images can
+  be made present locally without network access.
+- `--no-build`: run `docker compose up --no-build --pull never` instead of
+  the default `--build`. Uses an already-loaded image exactly as-is and
+  fails loudly when a tagged image is absent, never reaching a registry
+  (unlike a plain `up`, which would silently build a missing image, or a
+  bare `--no-build`, which would still pull an absent image-only service
+  under Compose's default `missing` pull policy). The default stays
+  `--build` so the fresh-clone developer experience is unchanged. Pair with
+  `--image-archive-dir` for an air-gapped install.
 - `--restart-policy`: container restart policy (default `always`)
 - `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
 - `--openbao-bind <IP>:<port>`: bind OpenBao to a
@@ -250,6 +269,38 @@ bootroot infra install \
   --openbao-bind-wildcard \
   --openbao-advertise-addr 192.168.1.10:8200
 ```
+
+### Air-gapped install
+
+A prebuilt / air-gapped installer stages a small set of files next to the
+deploy compose — no source checkout — pre-loads the release-built images
+from local tarballs, and brings the stack up without rebuilding or pulling:
+
+```bash
+bootroot infra install \
+  --compose-file docker-compose.deploy.yml \
+  --image-archive-dir ./images \
+  --no-build
+```
+
+The default install services (`openbao`, `postgres`, `step-ca`,
+`bootroot-http01`) need only two source-tree config files staged alongside
+`docker-compose.deploy.yml`: `openbao/openbao.hcl` and
+`responder.toml.compose`. `infra install` itself generates `.env` (with the
+random PostgreSQL password) and creates the `secrets/` and `certs/`
+directories.
+
+Every image reference in the deploy compose is interpolated from an
+environment variable so an installer can pin an exact release tag or a
+`@sha256:` digest — for example `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
+`BOOTROOT_STEP_CA_IMAGE`, and `BOOTROOT_HTTP01_IMAGE`. Set them in `.env`
+or the process environment; unset variables fall back to the release-built
+defaults.
+
+`--no-build` implies `--pull never`, so `infra install` never contacts a
+registry in this mode: an absent image fails the install loudly rather than
+being silently fetched from the network (defeating the air gap) or
+substituted for the preloaded release payload.
 
 ## bootroot init
 

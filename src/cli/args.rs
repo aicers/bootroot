@@ -910,6 +910,15 @@ pub(crate) struct InfraInstallArgs {
     /// applies.
     #[arg(long = "postgres-host-port")]
     pub(crate) postgres_host_port: Option<u16>,
+
+    /// Skip building images: run `docker compose up --no-build` so the
+    /// already-loaded image is used as-is and the command fails loudly
+    /// when a tagged image is absent. The default builds local images
+    /// (`docker compose up --build`), preserving the fresh-clone
+    /// developer experience. Pair with `--image-archive-dir` to bring an
+    /// air-gapped stack up without a source tree or network.
+    #[arg(long = "no-build")]
+    pub(crate) no_build: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2092,6 +2101,28 @@ mod tests {
         match cli.command {
             CliCommand::Infra(InfraCommand::Install(args)) => {
                 assert_eq!(args.services, vec!["openbao", "postgres"]);
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_infra_install_no_build_flag() {
+        let cli = Cli::parse_from(["bootroot", "infra", "install", "--no-build"]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert!(args.no_build);
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_infra_install_default_builds() {
+        let cli = Cli::parse_from(["bootroot", "infra", "install"]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert!(!args.no_build);
             }
             _ => panic!("expected infra install"),
         }

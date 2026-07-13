@@ -30,6 +30,13 @@ Open source dependencies:
   brings up Docker Compose with `--build`). `bootroot init` then bootstraps
   OpenBao, step-ca, and rotates the DB password. `bootroot infra up` restarts
   an already-configured environment.
+- **Prebuilt / air-gapped**: for an install without a source tree or network,
+  point `infra install` at `docker-compose.deploy.yml` (no `build:` contexts,
+  interpolatable `image:` tags), load the release images from local tarballs
+  with `--image-archive-dir`, and pass `--no-build` to use them as-is
+  (`--no-build` implies `--pull never`, so the install never reaches a
+  registry). See
+  the [CLI reference](docs/en/cli.md) ([한국어](docs/ko/cli.md)).
 - **Monitoring**: Prometheus scrapes step-ca/OpenBao metrics and Grafana
   visualizes them for local ops.
 - **Service onboarding**: `bootroot service add` registers service metadata,
