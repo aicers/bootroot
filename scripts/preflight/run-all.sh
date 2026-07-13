@@ -11,6 +11,9 @@ echo "--- ci/check.sh ---"
 echo "--- validate-deploy-compose.sh ---"
 "$SCRIPT_DIR/../validate-deploy-compose.sh"
 
+echo "--- extra/deploy-no-build-smoke.sh ---"
+"$SCRIPT_DIR/extra/deploy-no-build-smoke.sh"
+
 echo "--- ci/test-core.sh ---"
 "$SCRIPT_DIR/ci/test-core.sh"
 

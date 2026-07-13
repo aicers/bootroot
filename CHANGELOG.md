@@ -725,6 +725,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     the preflight run) asserts the deploy compose renders with no `build:`
     keys and resolves from a directory staging only those files with no
     source tree present.
+  - `scripts/preflight/extra/deploy-no-build-smoke.sh` exercises the real
+    `bootroot infra install --compose-file docker-compose.deploy.yml` path
+    with `--image-archive-dir <dir> --no-build` from a source-tree-free staging
+    directory, loads image archives, and asserts the install never runs
+    `docker compose pull` or `up --build`. (Closes #706)
 - `bootroot service add` and `bootroot service update` can now register a
   `--reload-style` preset hook **and** a `--post-renew-command` custom hook
   in one invocation, instead of rejecting the combination as mutually
