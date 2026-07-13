@@ -148,15 +148,32 @@ bootroot infra up
 
 제로 설정(zero-config) 최초 설치를 수행합니다. 임의의 PostgreSQL
 비밀번호가 포함된 `.env`를 생성하고, `secrets/` 및 `certs/` 디렉터리를
-만들고, Docker Compose 서비스를 기동합니다(로컬 이미지 빌드 포함).
+만들고, Docker Compose 서비스를 기동합니다(기본값은 로컬 이미지 빌드).
 새로 클론한 환경의 권장 진입점입니다. 이미 구성된 환경을 재시작하려면
 `bootroot infra up`을 사용하세요.
+
+사전 빌드/에어갭 설치(소스 트리 없음, 설치 시점 네트워크 없음)에서는
+`--compose-file docker-compose.deploy.yml`, `--image-archive-dir <dir>`,
+`--no-build`를 함께 사용하세요. 배포용 compose에는 `build:` 컨텍스트가
+없고(모든 서비스가 사전 빌드된, 주입 가능한 `image:` 태그를 참조),
+아카이브 디렉터리가 `docker load`로 이미지를 공급하며, `--no-build`가
+소스에서 재빌드하지 않고 그대로 사용합니다. 아래
+[에어갭 설치](#에어갭-설치)를 참고하세요.
 
 ### 입력
 
 - `--compose-file`: compose 파일 경로 (기본값 `docker-compose.yml`)
 - `--services`: 기동 대상 서비스 목록 (기본값 `openbao,postgres,step-ca,bootroot-http01`)
-- `--image-archive-dir`: 로컬 이미지 아카이브 디렉터리(선택)
+- `--image-archive-dir`: 로컬 이미지 아카이브 디렉터리(선택).
+  설정하면 디렉터리 내 모든 `.tar`/`.tgz`/`.tar.gz` 아카이브를
+  `docker load`하고 `docker compose pull`을 건너뛰므로, 네트워크
+  없이도 이미지를 로컬에 준비할 수 있습니다.
+- `--no-build`: 기본 `--build` 대신 `docker compose up --no-build`를
+  실행합니다. 이미 로드된 이미지를 그대로 사용하며 태그된 이미지가
+  없으면 명확히 실패합니다(누락 이미지를 조용히 빌드하는 일반 `up`과
+  다름). 기본값은 `--build`로 유지되어 새로 클론한 개발 경험은
+  변하지 않습니다. 에어갭 설치에서는 `--image-archive-dir`과 함께
+  사용하세요.
 - `--restart-policy`: 컨테이너 재시작 정책 (기본값 `always`)
 - `--openbao-url`: OpenBao API URL (기본값 `http://localhost:8200`)
 - `--openbao-bind <IP>:<port>`: 멀티호스트 배포를 위해
@@ -248,6 +265,32 @@ bootroot infra install \
   --openbao-bind-wildcard \
   --openbao-advertise-addr 192.168.1.10:8200
 ```
+
+### 에어갭 설치
+
+사전 빌드/에어갭 설치는 배포용 compose 옆에 소수의 파일만 스테이징하고
+(소스 체크아웃 불필요) 릴리스 빌드 이미지를 로컬 tarball에서 미리 로드한
+뒤, 재빌드 없이 스택을 기동합니다.
+
+```bash
+bootroot infra install \
+  --compose-file docker-compose.deploy.yml \
+  --image-archive-dir ./images \
+  --no-build
+```
+
+기본 설치 서비스(`openbao`, `postgres`, `step-ca`, `bootroot-http01`)는
+`docker-compose.deploy.yml` 옆에 소스 트리 설정 파일 두 개만 스테이징하면
+됩니다: `openbao/openbao.hcl`과 `responder.toml.compose`. `.env`(임의
+PostgreSQL 비밀번호 포함) 생성과 `secrets/`, `certs/` 디렉터리 생성은
+`infra install`이 직접 수행합니다.
+
+배포용 compose의 모든 이미지 참조는 환경 변수에서 주입되므로, 설치
+도구가 정확한 릴리스 태그나 `@sha256:` 다이제스트를 고정할 수
+있습니다 — 예를 들어 `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
+`BOOTROOT_STEP_CA_IMAGE`, `BOOTROOT_HTTP01_IMAGE`. `.env`나 프로세스
+환경에 설정하며, 설정하지 않은 변수는 릴리스 빌드 기본값으로
+대체됩니다.
 
 ## bootroot init
 

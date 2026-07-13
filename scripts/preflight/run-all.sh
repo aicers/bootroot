@@ -8,6 +8,9 @@ echo "=== Preflight: CI-equivalent checks ==="
 echo "--- ci/check.sh ---"
 "$SCRIPT_DIR/ci/check.sh"
 
+echo "--- validate-deploy-compose.sh ---"
+"$SCRIPT_DIR/../validate-deploy-compose.sh"
+
 echo "--- ci/test-core.sh ---"
 "$SCRIPT_DIR/ci/test-core.sh"
 

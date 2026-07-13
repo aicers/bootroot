@@ -49,6 +49,25 @@ const UNSEAL_KEYS_PATH: &str = "secrets/openbao/unseal-keys.txt";
 const OPENBAO_API_WAIT_ATTEMPTS: u32 = 60;
 const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
 
+/// Assembles the `docker compose up` argv for `infra install`.
+///
+/// When `no_build` is `false` (the default), the command builds local
+/// images (`--build`), preserving the fresh-clone developer experience.
+/// When `no_build` is `true`, it passes `--no-build` so a pre-loaded
+/// image is used as-is and the command fails loudly when a tagged image
+/// is absent — the semantics an air-gapped install needs (plain `up`
+/// would silently build a missing image instead).
+fn build_compose_up_args<'a>(
+    compose_str: &'a str,
+    no_build: bool,
+    svc_refs: &[&'a str],
+) -> Vec<&'a str> {
+    let build_flag = if no_build { "--no-build" } else { "--build" };
+    let mut up_args: Vec<&str> = vec!["compose", "-f", compose_str, "up", build_flag, "-d"];
+    up_args.extend(svc_refs);
+    up_args
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
     ensure_all_services_localhost_binding(&args.compose_file.compose_file, messages)?;
@@ -491,15 +510,15 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         )?;
     }
 
-    // Use --build to build local images (step-ca, bootroot-http01).
-    let mut up_args: Vec<&str> = vec!["compose", "-f", &compose_str, "up", "--build", "-d"];
-    up_args.extend(&svc_refs);
-    run_docker_with_env(
-        &up_args,
-        &host_port_env_refs,
-        "docker compose up --build",
-        messages,
-    )?;
+    // Default builds local images (step-ca, bootroot-http01); `--no-build`
+    // uses the pre-loaded images as-is for an air-gapped install.
+    let up_args = build_compose_up_args(&compose_str, args.no_build, &svc_refs);
+    let up_label = if args.no_build {
+        "docker compose up --no-build"
+    } else {
+        "docker compose up --build"
+    };
+    run_docker_with_env(&up_args, &host_port_env_refs, up_label, messages)?;
 
     // Collect readiness but skip step-ca (it has no config yet).
     let prereq_services: Vec<String> = args
@@ -1603,6 +1622,45 @@ pub(crate) fn docker_output(args: &[&str], messages: &Messages) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_compose_up_args_defaults_to_build() {
+        let svc_refs = ["openbao", "postgres"];
+        let args = build_compose_up_args("docker-compose.yml", false, &svc_refs);
+        assert_eq!(
+            args,
+            vec![
+                "compose",
+                "-f",
+                "docker-compose.yml",
+                "up",
+                "--build",
+                "-d",
+                "openbao",
+                "postgres",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_compose_up_args_no_build_selects_no_build_flag() {
+        let svc_refs = ["openbao", "postgres"];
+        let args = build_compose_up_args("docker-compose.deploy.yml", true, &svc_refs);
+        assert_eq!(
+            args,
+            vec![
+                "compose",
+                "-f",
+                "docker-compose.deploy.yml",
+                "up",
+                "--no-build",
+                "-d",
+                "openbao",
+                "postgres",
+            ]
+        );
+        assert!(!args.contains(&"--build"));
+    }
 
     #[test]
     fn resolve_effective_secrets_dir_returns_none_without_state() {
@@ -3884,6 +3942,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_wildcard: false,
             stepca_advertise_addr: None,
             postgres_host_port: None,
+            no_build: false,
         };
         let err = run_infra_install(&args, &messages).unwrap_err();
         let msg = err.to_string();
