@@ -53,17 +53,27 @@ const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
 ///
 /// When `no_build` is `false` (the default), the command builds local
 /// images (`--build`), preserving the fresh-clone developer experience.
-/// When `no_build` is `true`, it passes `--no-build` so a pre-loaded
-/// image is used as-is and the command fails loudly when a tagged image
-/// is absent — the semantics an air-gapped install needs (plain `up`
-/// would silently build a missing image instead).
+/// When `no_build` is `true`, it passes `--no-build --pull never` so a
+/// pre-loaded image is used exactly as-is and the command fails loudly
+/// when a tagged image is absent — the semantics an air-gapped install
+/// needs. `--no-build` alone only suppresses building; for an image-only
+/// service (as in the deploy compose) Compose's default `missing` pull
+/// policy would still fetch an absent image from a registry, which both
+/// reaches the network under an air-gapped install and would silently
+/// substitute a registry image for the preloaded/release payload. Plain
+/// `up` (no `--no-build`) would instead silently build a missing image.
 fn build_compose_up_args<'a>(
     compose_str: &'a str,
     no_build: bool,
     svc_refs: &[&'a str],
 ) -> Vec<&'a str> {
-    let build_flag = if no_build { "--no-build" } else { "--build" };
-    let mut up_args: Vec<&str> = vec!["compose", "-f", compose_str, "up", build_flag, "-d"];
+    let mut up_args: Vec<&str> = vec!["compose", "-f", compose_str, "up"];
+    if no_build {
+        up_args.extend(["--no-build", "--pull", "never"]);
+    } else {
+        up_args.push("--build");
+    }
+    up_args.push("-d");
     up_args.extend(svc_refs);
     up_args
 }
@@ -511,10 +521,11 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     }
 
     // Default builds local images (step-ca, bootroot-http01); `--no-build`
-    // uses the pre-loaded images as-is for an air-gapped install.
+    // with `--pull never` uses the pre-loaded images exactly as-is for an
+    // air-gapped install, never reaching a registry.
     let up_args = build_compose_up_args(&compose_str, args.no_build, &svc_refs);
     let up_label = if args.no_build {
-        "docker compose up --no-build"
+        "docker compose up --no-build --pull never"
     } else {
         "docker compose up --build"
     };
@@ -1654,6 +1665,8 @@ mod tests {
                 "docker-compose.deploy.yml",
                 "up",
                 "--no-build",
+                "--pull",
+                "never",
                 "-d",
                 "openbao",
                 "postgres",

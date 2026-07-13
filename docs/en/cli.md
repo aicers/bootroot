@@ -173,12 +173,14 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
   When set, every `.tar`/`.tgz`/`.tar.gz` archive in the directory is
   `docker load`ed and `docker compose pull` is skipped, so the images can
   be made present locally without network access.
-- `--no-build`: run `docker compose up --no-build` instead of the default
-  `--build`. Uses an already-loaded image as-is and fails loudly when a
-  tagged image is absent (unlike a plain `up`, which would silently build
-  a missing image). The default stays `--build` so the fresh-clone
-  developer experience is unchanged. Pair with `--image-archive-dir` for
-  an air-gapped install.
+- `--no-build`: run `docker compose up --no-build --pull never` instead of
+  the default `--build`. Uses an already-loaded image exactly as-is and
+  fails loudly when a tagged image is absent, never reaching a registry
+  (unlike a plain `up`, which would silently build a missing image, or a
+  bare `--no-build`, which would still pull an absent image-only service
+  under Compose's default `missing` pull policy). The default stays
+  `--build` so the fresh-clone developer experience is unchanged. Pair with
+  `--image-archive-dir` for an air-gapped install.
 - `--restart-policy`: container restart policy (default `always`)
 - `--openbao-url`: OpenBao API URL (default `http://localhost:8200`)
 - `--openbao-bind <IP>:<port>`: bind OpenBao to a
@@ -272,7 +274,7 @@ bootroot infra install \
 
 A prebuilt / air-gapped installer stages a small set of files next to the
 deploy compose — no source checkout — pre-loads the release-built images
-from local tarballs, and brings the stack up without rebuilding:
+from local tarballs, and brings the stack up without rebuilding or pulling:
 
 ```bash
 bootroot infra install \
@@ -294,6 +296,11 @@ environment variable so an installer can pin an exact release tag or a
 `BOOTROOT_STEP_CA_IMAGE`, and `BOOTROOT_HTTP01_IMAGE`. Set them in `.env`
 or the process environment; unset variables fall back to the release-built
 defaults.
+
+`--no-build` implies `--pull never`, so `infra install` never contacts a
+registry in this mode: an absent image fails the install loudly rather than
+being silently fetched from the network (defeating the air gap) or
+substituted for the preloaded release payload.
 
 ## bootroot init
 

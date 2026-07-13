@@ -33,7 +33,9 @@ Open source dependencies:
 - **Prebuilt / air-gapped**: for an install without a source tree or network,
   point `infra install` at `docker-compose.deploy.yml` (no `build:` contexts,
   interpolatable `image:` tags), load the release images from local tarballs
-  with `--image-archive-dir`, and pass `--no-build` to use them as-is. See
+  with `--image-archive-dir`, and pass `--no-build` to use them as-is
+  (`--no-build` implies `--pull never`, so the install never reaches a
+  registry). See
   the [CLI reference](docs/en/cli.md) ([한국어](docs/ko/cli.md)).
 - **Monitoring**: Prometheus scrapes step-ca/OpenBao metrics and Grafana
   visualizes them for local ops.

@@ -703,13 +703,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - `bootroot infra install` now supports a prebuilt / air-gapped install
   with no source tree and no network at install time (#704):
-  - A new `--no-build` flag runs `docker compose up --no-build` instead of
-    the default `--build`, so an already-loaded image is used as-is and the
-    command fails loudly when a tagged image is absent (unlike a plain `up`,
-    which would silently build a missing image). The default stays `--build`
-    so the fresh-clone developer experience is unchanged. Pair it with the
-    existing `--image-archive-dir` to bring the stack up without a source
-    tree or network.
+  - A new `--no-build` flag runs `docker compose up --no-build --pull never`
+    instead of the default `--build`, so an already-loaded image is used
+    exactly as-is and the command fails loudly when a tagged image is absent,
+    never reaching a registry (unlike a plain `up`, which would silently
+    build a missing image, or a bare `--no-build`, which would still pull an
+    absent image-only service under Compose's default `missing` pull policy).
+    The default stays `--build` so the fresh-clone developer experience is
+    unchanged. Pair it with the existing `--image-archive-dir` to bring the
+    stack up without a source tree or network.
   - A new `docker-compose.deploy.yml` carries no `build:` contexts: every
     service references a prebuilt `image:` tag interpolated from an
     environment variable (`OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
