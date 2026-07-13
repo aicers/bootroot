@@ -78,6 +78,19 @@ fn build_compose_up_args<'a>(
     up_args
 }
 
+/// Determines whether `infra install` runs the preliminary `docker compose
+/// pull --ignore-pull-failures` before `up`.
+///
+/// The pull refreshes floating image tags from a registry, so it is skipped
+/// when local archives were loaded (`loaded_archives > 0`). It is also
+/// skipped whenever `--no-build` is set: that mode implements the air-gapped
+/// contract and must never contact a registry, so an absent image fails the
+/// install loudly at `up --pull never` rather than being silently fetched or
+/// substituted for the preloaded release payload.
+fn should_pull_before_up(loaded_archives: usize, no_build: bool) -> bool {
+    loaded_archives == 0 && !no_build
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Result<()> {
     ensure_all_services_localhost_binding(&args.compose_file.compose_file, messages)?;
@@ -503,7 +516,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    if loaded_archives == 0 {
+    if should_pull_before_up(loaded_archives, args.no_build) {
         let mut pull_args: Vec<&str> = vec![
             "compose",
             "-f",
@@ -1673,6 +1686,19 @@ mod tests {
             ]
         );
         assert!(!args.contains(&"--build"));
+    }
+
+    #[test]
+    fn should_pull_before_up_pulls_only_without_archives_or_no_build() {
+        // Default build path with no local archives: refresh floating tags.
+        assert!(should_pull_before_up(0, false));
+        // Local archives loaded: images are already present, skip the pull.
+        assert!(!should_pull_before_up(3, false));
+        // `--no-build` is the air-gapped contract: never reach a registry,
+        // even when no archives were loaded (e.g. images preloaded
+        // externally, or an empty/wrong --image-archive-dir).
+        assert!(!should_pull_before_up(0, true));
+        assert!(!should_pull_before_up(2, true));
     }
 
     #[test]
