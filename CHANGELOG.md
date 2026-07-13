@@ -701,6 +701,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot infra install` now supports a prebuilt / air-gapped install
+  with no source tree and no network at install time (#704):
+  - A new `--no-build` flag runs `docker compose up --no-build` instead of
+    the default `--build`, so an already-loaded image is used as-is and the
+    command fails loudly when a tagged image is absent (unlike a plain `up`,
+    which would silently build a missing image). The default stays `--build`
+    so the fresh-clone developer experience is unchanged. Pair it with the
+    existing `--image-archive-dir` to bring the stack up without a source
+    tree or network.
+  - A new `docker-compose.deploy.yml` carries no `build:` contexts: every
+    service references a prebuilt `image:` tag interpolated from an
+    environment variable (`OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
+    `BOOTROOT_STEP_CA_IMAGE`, `BOOTROOT_HTTP01_IMAGE`, ...) so an installer
+    can pin an exact release tag or a `@sha256:` digest; the bootroot-built
+    http01 default is release-pinned instead of `:latest`. The default
+    install services need only `openbao/openbao.hcl` and
+    `responder.toml.compose` staged alongside it, since `infra install`
+    generates `.env` and creates `secrets/` and `certs/` itself.
+  - `scripts/validate-deploy-compose.sh` (wired into the CI check job and
+    the preflight run) asserts the deploy compose renders with no `build:`
+    keys and resolves from a directory staging only those files with no
+    source tree present.
 - `bootroot service add` and `bootroot service update` can now register a
   `--reload-style` preset hook **and** a `--post-renew-command` custom hook
   in one invocation, instead of rejecting the combination as mutually
