@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
@@ -188,6 +189,22 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     up_args.extend(["up", "-d"]);
     up_args.extend(&svc_refs);
     run_docker(&up_args, "docker compose up", messages)?;
+
+    // Converge secrets ownership so an operator who upgrades and then only
+    // ever runs `infra up` also repairs any root-owned CA material. Runs
+    // after `up` so the step-ca server image it reuses already exists;
+    // step-ca still runs as root here, so a briefly root-owned key does
+    // not stop it, and the readiness check below is unaffected. On a
+    // legacy tree with `ca.json` the server stays up throughout.
+    if should_sweep_secrets_ownership(&args.services, &args.compose_file.compose_file, messages)? {
+        let sweep_secrets_dir = resolve_effective_secrets_dir(&state_path, compose_dir)
+            .unwrap_or_else(|| compose_dir.join("secrets"));
+        sweep_secrets_ownership(
+            &args.compose_file.compose_file,
+            &sweep_secrets_dir,
+            messages,
+        )?;
+    }
 
     // Auto-detect unseal key file if not explicitly specified.
     // Resolve relative to the compose file directory so custom
@@ -544,6 +561,14 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     };
     run_docker_with_env(&up_args, &host_port_env_refs, up_label, messages)?;
 
+    // Converge secrets ownership before returning so the stack this
+    // command brings up has no root-owned CA material left by an earlier
+    // rotation or manual init. Runs after `up` so the step-ca server
+    // image it reuses exists (loaded from archive or built by `up`).
+    if should_sweep_secrets_ownership(&args.services, &args.compose_file.compose_file, messages)? {
+        sweep_secrets_ownership(&args.compose_file.compose_file, &secrets_dir, messages)?;
+    }
+
     // Collect readiness but skip step-ca (it has no config yet).
     let prereq_services: Vec<String> = args
         .services
@@ -594,6 +619,116 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     println!("{}", messages.infra_install_stepca_not_checked());
 
     println!("{}", messages.infra_install_completed());
+    Ok(())
+}
+
+/// Mount point for the secrets directory inside the ownership-sweep
+/// container. Only the host secrets directory is mounted here — nothing
+/// else in the tree is reachable from inside the sweep.
+const OWNERSHIP_SWEEP_MOUNT: &str = "/secrets";
+
+/// Returns whether the secrets-ownership sweep should run for an `infra`
+/// flow.
+///
+/// Gated on step-ca being genuinely in play: both requested via
+/// `--services` and declared by the compose file. On a topology without
+/// step-ca there is no CA material under `secrets/` to repair, and the
+/// step-ca server image the sweep reuses does not exist there either, so
+/// an ungated sweep would fail rather than merely no-op.
+fn should_sweep_secrets_ownership(
+    services: &[String],
+    compose_file: &Path,
+    messages: &Messages,
+) -> Result<bool> {
+    if !services.iter().any(|s| s == "step-ca") {
+        return Ok(false);
+    }
+    compose_has_stepca(compose_file, messages)
+}
+
+/// Builds the `docker run` argv for the ownership sweep.
+///
+/// Kept pure so tests can assert it mounts ONLY the secrets directory and
+/// uses `--no-dereference`, so `chown -R` never follows a symlink out of
+/// that mount.
+fn build_ownership_sweep_args<'a>(
+    mount: &'a str,
+    user_arg: &'a str,
+    image: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "run",
+        "--rm",
+        // Intentional root: this container runs `chown`, NOT a `step`
+        // subcommand. The `step` helpers must run as the secrets-directory
+        // owner; this one needs root to repair files that a prior
+        // `--user root` run (an old rotation or the pre-fix manual-init
+        // example) left root-owned. A running bootroot process cannot
+        // chown files it does not own, which is why the repair needs a
+        // container at all. Do not "fix" this to a non-root user.
+        "--user",
+        "root",
+        "-v",
+        mount,
+        image,
+        "chown",
+        "-R",
+        // Change the symlink itself rather than its referent, so the
+        // sweep never follows a link out of the mounted secrets tree.
+        "--no-dereference",
+        user_arg,
+        OWNERSHIP_SWEEP_MOUNT,
+    ]
+}
+
+/// Resolves the image the compose stack uses for its `step-ca` service by
+/// inspecting the container Compose created for it.
+///
+/// Reusing exactly that image is what keeps the sweep from introducing
+/// any image a flow did not already bring up: it is loaded from the
+/// archive on the air-gapped path and built by `up --build` on the
+/// fresh-source path, and in both the sweep runs only after `up`, so the
+/// image already exists.
+fn resolve_stepca_image(compose_file: &Path, messages: &Messages) -> Result<String> {
+    let container_id =
+        docker_compose_output(compose_file, None, &["ps", "-a", "-q", "step-ca"], messages)?;
+    let container_id = container_id.trim();
+    if container_id.is_empty() {
+        anyhow::bail!(messages.error_service_no_container("step-ca"));
+    }
+    let image = docker_output(
+        &["inspect", "--format", "{{.Config.Image}}", container_id],
+        messages,
+    )?;
+    Ok(image.trim().to_string())
+}
+
+/// Re-owns every entry under `secrets/` to the directory's own uid/gid
+/// via a one-shot root container, repairing files a prior `--user root`
+/// step helper (rotation or the documented manual init) left root-owned.
+///
+/// This is the single intentional root container in the CA tooling: it
+/// runs `chown`, so it needs root, whereas every `step` helper runs as
+/// the secrets-directory owner. See [`build_ownership_sweep_args`] for
+/// the scoping guarantees — it mounts only the secrets directory and does
+/// not follow symlinks out of it. The sweep is a no-op on a tree whose
+/// ownership is already correct.
+pub(crate) fn sweep_secrets_ownership(
+    compose_file: &Path,
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let mount_root = std::fs::canonicalize(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let mount = format!("{}:{OWNERSHIP_SWEEP_MOUNT}", mount_root.display());
+    // Ownership follows the directory's own owner, never a fixed uid: the
+    // host user and the OpenBao Agents share this directory.
+    let meta = std::fs::metadata(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let user_arg = format!("{}:{}", meta.uid(), meta.gid());
+    let image = resolve_stepca_image(compose_file, messages)?;
+    let args = build_ownership_sweep_args(&mount, &user_arg, &image);
+    run_docker(&args, "docker secrets ownership sweep", messages)?;
     Ok(())
 }
 
@@ -1645,7 +1780,81 @@ pub(crate) fn docker_output(args: &[&str], messages: &Messages) -> Result<String
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
+    use crate::i18n::test_messages;
+
+    const COMPOSE_WITH_STEPCA: &str = "services:\n  openbao:\n    image: openbao/openbao\n  \
+        step-ca:\n    image: bootroot-step-ca:0.29.0\n";
+    const COMPOSE_WITHOUT_STEPCA: &str =
+        "services:\n  openbao:\n    image: openbao/openbao\n  postgres:\n    image: postgres\n";
+
+    fn write_compose(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("docker-compose.yml");
+        std::fs::write(&path, contents).expect("write compose");
+        (dir, path)
+    }
+
+    /// The sweep must run only when step-ca is both requested via
+    /// `--services` and declared by the compose file — otherwise there is
+    /// no CA material to repair and the reused image does not exist.
+    #[test]
+    fn should_sweep_secrets_ownership_requires_service_and_compose() {
+        let messages = test_messages();
+        let (_dir, with_stepca) = write_compose(COMPOSE_WITH_STEPCA);
+        let (_dir2, without_stepca) = write_compose(COMPOSE_WITHOUT_STEPCA);
+        let with_service = vec!["openbao".to_string(), "step-ca".to_string()];
+        let without_service = vec!["openbao".to_string(), "postgres".to_string()];
+
+        assert!(
+            should_sweep_secrets_ownership(&with_service, &with_stepca, &messages).unwrap(),
+            "runs when step-ca is requested and declared"
+        );
+        assert!(
+            !should_sweep_secrets_ownership(&without_service, &with_stepca, &messages).unwrap(),
+            "skipped when step-ca absent from --services"
+        );
+        assert!(
+            !should_sweep_secrets_ownership(&with_service, &without_stepca, &messages).unwrap(),
+            "skipped when compose declares no step-ca service"
+        );
+    }
+
+    /// The sweep container must mount ONLY the secrets directory and chown
+    /// with `--no-dereference` so it never follows a symlink out of the
+    /// mount. It is also the one deliberately-root container.
+    #[test]
+    fn build_ownership_sweep_args_scoped_and_no_symlink_following() {
+        let mount = "/host/secrets:/secrets";
+        let args = build_ownership_sweep_args(mount, "1000:1000", "bootroot-step-ca:0.29.0");
+
+        // Exactly one bind mount, and it is the secrets directory.
+        let mounts: Vec<&&str> = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .filter_map(|(a, b)| (*a == "-v").then_some(b))
+            .collect();
+        assert_eq!(mounts, vec![&mount]);
+        assert!(
+            !args.iter().any(|a| a.contains(":/host") || *a == "/"),
+            "no host-root or extra mounts"
+        );
+
+        // chown recurses but does not dereference symlinks.
+        assert!(args.contains(&"chown"));
+        assert!(args.contains(&"-R"));
+        assert!(args.contains(&"--no-dereference"));
+        assert!(args.contains(&"1000:1000"));
+
+        // The sweep is the intentional root container.
+        let user_pos = args.iter().position(|a| *a == "--user").expect("--user");
+        assert_eq!(args.get(user_pos + 1), Some(&"root"));
+
+        // The chown target is the mount point, nothing outside it.
+        assert_eq!(args.last(), Some(&OWNERSHIP_SWEEP_MOUNT));
+    }
 
     #[test]
     fn build_compose_up_args_defaults_to_build() {

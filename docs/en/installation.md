@@ -66,8 +66,10 @@ If you are not using `bootroot infra install`, you can initialize manually:
 mkdir -p secrets
 printf "%s" "<your-password>" > secrets/password.txt
 
-# Run init inside a container (example)
-docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
+# Run init inside a container as the owner of ./secrets (example)
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v $(pwd)/secrets:/home/step smallstep/step-ca \
   step ca init \
   --name "Bootroot CA" \
   --provisioner "admin" \
@@ -77,6 +79,15 @@ docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
   --provisioner-password-file /home/step/password.txt \
   --acme
 ```
+
+Run the container as the owner of `secrets/`, not as `root`.
+`--user $(id -u):$(id -g)` uses your own uid/gid, which is correct when you
+own `secrets/` (as you do after the `mkdir` above). Everything Bootroot runs
+against `secrets/` runs as that directory's owner — the OpenBao Agent
+sidecars that render `password.txt` and `config/ca.json` into it, and every
+`step` helper container — so material created as `root` would diverge from
+the rest of the tree. Bootroot now repairs such divergence on its next run,
+but the manual path should not create the problem in the first place.
 
 `<your-password>` protects (encrypts) the CA keys. In production use a strong
 password and keep this file out of logs and repositories. In production we
