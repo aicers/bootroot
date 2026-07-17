@@ -81,7 +81,7 @@ mod unix_integration {
                 &format!("POSTGRES_DB={DB_NAME}"),
                 "-p",
                 &port_mapping,
-                "postgres:18",
+                "postgres:18.4",
             ]))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -171,7 +171,7 @@ mod unix_integration {
     }
 
     #[test]
-    #[ignore = "Requires local Docker and postgres:18 image"]
+    #[ignore = "Requires local Docker and postgres:18.4 image"]
     fn provision_db_sync_creates_and_updates_role_password() -> Result<()> {
         let container = PostgresContainer::start()?;
         let admin_dsn = container.admin_dsn();

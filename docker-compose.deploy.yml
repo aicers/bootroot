@@ -17,7 +17,7 @@
 # generates `.env` and creates the `secrets/` and `certs/` directories.
 services:
   openbao:
-    image: ${OPENBAO_IMAGE:-openbao/openbao:latest}
+    image: ${OPENBAO_IMAGE:-openbao/openbao:2.5.5}
     container_name: bootroot-openbao
     restart: always
     ports:
@@ -40,7 +40,7 @@ services:
   # The published default is 5433 so bootroot does not claim the
   # conventional 5432 port; set POSTGRES_HOST_PORT to override.
   postgres:
-    image: ${POSTGRES_IMAGE:-postgres:18}
+    image: ${POSTGRES_IMAGE:-postgres:18.4}
     container_name: bootroot-postgres
     restart: always
     environment:
@@ -88,7 +88,7 @@ services:
       default:
 
   prometheus:
-    image: ${PROMETHEUS_IMAGE:-prom/prometheus:latest}
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.13.1}
     container_name: bootroot-prometheus
     restart: always
     profiles:
@@ -102,7 +102,7 @@ services:
       - prometheus-data:/prometheus
 
   grafana:
-    image: ${GRAFANA_IMAGE:-grafana/grafana:latest}
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.0.3}
     container_name: bootroot-grafana
     restart: always
     profiles:
@@ -120,7 +120,7 @@ services:
       - "${GRAFANA_LAN_BIND_ADDR:-127.0.0.1}:3000:3000"
 
   grafana-public:
-    image: ${GRAFANA_IMAGE:-grafana/grafana:latest}
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.0.3}
     container_name: bootroot-grafana-public
     restart: always
     profiles:
