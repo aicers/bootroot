@@ -78,36 +78,6 @@ services:
     networks:
       default:
 
-  bootroot-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: bootroot-agent
-    restart: always
-    labels:
-      # Identifying label so operators and tooling can recognise the
-      # demo bootroot-agent container at a glance.
-      bootroot.role: "agent"
-    depends_on:
-      - step-ca
-    volumes:
-      - ./certs:/app/certs
-      - ./secrets/certs/root_ca.crt:/app/root_ca.crt
-      - ./secrets:/app/secrets:ro
-      - ./agent.toml.compose:/app/agent.toml:ro
-    entrypoint:
-      - /bin/sh
-      - -lc
-    command:
-      - |
-        cp /app/agent.toml /app/certs/agent.runtime.toml
-        exec /app/bootroot-agent \
-          --oneshot \
-          --ca-url=https://bootroot-ca:9000/acme/acme/directory \
-          --config=/app/certs/agent.runtime.toml
-    environment:
-      - RUST_LOG=info
-
   prometheus:
     image: prom/prometheus:v3.13.1
     container_name: bootroot-prometheus
