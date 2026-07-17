@@ -996,6 +996,14 @@ run_rotations_with_verification() {
   assert_fingerprint_changed "$WEB_SERVICE" "after-stepca-password" "after-db"
   assert_fingerprint_changed "$REMOTE_SERVICE" "after-stepca-password" "after-db"
 
+  # Reseed root-owned CA keys before CA rotation. The earlier
+  # `rotate stepca-password` already converged the tree, so without
+  # reseeding here the CA rotation would run on an already-repaired tree
+  # and would not exercise the sweep's placement in `rotate ca-key`
+  # (before its host-side Phase 1 backup reads the keys).
+  log_phase "reseed-root-owned-ca-keys"
+  seed_root_owned_ca_keys
+
   log_phase "rotate-ca-key"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
@@ -1011,6 +1019,10 @@ run_rotations_with_verification() {
   assert_fingerprint_changed "$EDGE_SERVICE" "after-db" "after-ca-key"
   assert_fingerprint_changed "$WEB_SERVICE" "after-db" "after-ca-key"
   assert_fingerprint_changed "$REMOTE_SERVICE" "after-db" "after-ca-key"
+  # CA rotation reads (Phase 1 host-side backup) and rewrites the CA keys
+  # as the secrets-directory owner after the ownership sweep, so the
+  # reseeded root-owned keys must be converged back to owner-owned.
+  assert_no_root_owned_secrets "rotate ca-key"
 
   log_phase "rotate-ca-key-full"
   run_bootroot rotate \

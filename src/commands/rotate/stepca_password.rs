@@ -36,6 +36,21 @@ pub(super) async fn rotate_stepca_password(
         messages,
     )?;
 
+    let secrets_dir = ctx.paths.secrets_dir();
+    let password_path = ctx.paths.stepca_password();
+    let new_password_path = ctx.paths.stepca_password_new();
+    let root_key = ctx.paths.stepca_root_key();
+    let intermediate_key = ctx.paths.stepca_intermediate_key();
+
+    // Keep the local "missing file" preflight first, before any container
+    // runs: an uninitialized or broken tree must fail with a clear local
+    // error rather than pulling/running the helper image. This mirrors the
+    // CA rotation flow, which also sweeps only after its Phase 0
+    // `ensure_file_exists` checks.
+    ensure_file_exists(&password_path, messages)?;
+    ensure_file_exists(&root_key, messages)?;
+    ensure_file_exists(&intermediate_key, messages)?;
+
     // Converge secrets ownership before re-encrypting any key in place.
     // `step crypto change-pass` now runs as the secrets-directory owner
     // (below), so a key left root-owned by an earlier `--user root`
@@ -49,16 +64,6 @@ pub(super) async fn rotate_stepca_password(
         STEP_CA_HELPER_IMAGE,
         messages,
     )?;
-
-    let secrets_dir = ctx.paths.secrets_dir();
-    let password_path = ctx.paths.stepca_password();
-    let new_password_path = ctx.paths.stepca_password_new();
-    let root_key = ctx.paths.stepca_root_key();
-    let intermediate_key = ctx.paths.stepca_intermediate_key();
-
-    ensure_file_exists(&password_path, messages)?;
-    ensure_file_exists(&root_key, messages)?;
-    ensure_file_exists(&intermediate_key, messages)?;
 
     fs_util::ensure_secrets_dir(secrets_dir).await?;
     write_secret_file(&new_password_path, &new_password, messages).await?;

@@ -666,10 +666,18 @@ fn build_ownership_sweep_args<'a>(
         // container at all. Do not "fix" this to a non-root user.
         "--user",
         "root",
+        // Run `chown` directly instead of through the image's default
+        // entrypoint. The `rotate` flows reuse the `smallstep/step-ca`
+        // helper image here, whose entrypoint would otherwise print a
+        // spurious "there is no ca.json config file" warning — the sweep
+        // deliberately mounts only the secrets subtree, not `/home/step`.
+        // Overriding the entrypoint keeps the sweep visibly just a scoped
+        // `chown` container and off the step-ca init path.
+        "--entrypoint",
+        "chown",
         "-v",
         mount,
         image,
-        "chown",
         "-R",
         // Change the symlink itself rather than its referent, so the
         // sweep never follows a link out of the mounted secrets tree.
@@ -1832,7 +1840,9 @@ mod tests {
     #[test]
     fn build_ownership_sweep_args_scoped_and_no_symlink_following() {
         let mount = "/host/secrets:/secrets";
-        let args = build_ownership_sweep_args(mount, "1000:1000", "bootroot-step-ca:0.29.0");
+        let image = "bootroot-step-ca:0.29.0";
+        let args = build_ownership_sweep_args(mount, "1000:1000", image);
+        let image_pos = args.iter().position(|a| *a == image).expect("image");
 
         // Exactly one bind mount, and it is the secrets directory.
         let mounts: Vec<&&str> = args
@@ -1846,8 +1856,17 @@ mod tests {
             "no host-root or extra mounts"
         );
 
+        // The sweep overrides the image entrypoint so it runs `chown`
+        // directly, never the step-ca init path that would warn about a
+        // missing ca.json under the (deliberately unmounted) /home/step.
+        let ep_pos = args
+            .iter()
+            .position(|a| *a == "--entrypoint")
+            .expect("--entrypoint");
+        assert_eq!(args.get(ep_pos + 1), Some(&"chown"));
+        assert!(ep_pos < image_pos, "--entrypoint precedes the image");
+
         // chown recurses but does not dereference symlinks.
-        assert!(args.contains(&"chown"));
         assert!(args.contains(&"-R"));
         assert!(args.contains(&"--no-dereference"));
         assert!(args.contains(&"1000:1000"));
