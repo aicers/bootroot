@@ -1,8 +1,7 @@
 # Build Stage
-FROM rust:slim-bookworm AS builder
-
-# Install nightly
-RUN rustup toolchain install nightly && rustup default nightly
+# Pinned to an explicit patch release so the shipped binary is reproducible and
+# Dependabot can propose toolchain bumps.
+FROM rust:1.97.1-slim-bookworm AS builder
 
 WORKDIR /usr/src/bootroot
 
