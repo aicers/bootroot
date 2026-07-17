@@ -144,7 +144,7 @@ jobs:
 
       # --- Unit Testing ---
       - name: Pre-pull openbao image for real-daemon TLS E2E
-        run: docker pull openbao/openbao:latest
+        run: docker pull openbao/openbao:2.5.5
 
       # Issue #593: provision a dedicated supplementary group for the
       # runner so `tests/e2e_cert_group_chown.rs` actually exercises a

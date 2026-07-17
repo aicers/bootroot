@@ -265,7 +265,7 @@ docker run --rm \
   --network <network> \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://bootroot-openbao:8200 \
-  openbao/openbao:latest \
+  openbao/openbao:2.5.5 \
   agent -config /openbao/secrets/openbao/stepca/agent.hcl
 ```
 
@@ -277,7 +277,7 @@ docker run --rm \
   --network <network> \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://bootroot-openbao:8200 \
-  openbao/openbao:latest \
+  openbao/openbao:2.5.5 \
   agent -config /openbao/secrets/openbao/responder/agent.hcl
 ```
 

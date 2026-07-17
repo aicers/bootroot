@@ -1,6 +1,6 @@
 services:
   openbao:
-    image: openbao/openbao:latest
+    image: openbao/openbao:2.5.5
     container_name: bootroot-openbao
     restart: always
     ports:
@@ -23,7 +23,7 @@ services:
   # The published default is 5433 so bootroot does not claim the
   # conventional 5432 port; set POSTGRES_HOST_PORT to override.
   postgres:
-    image: postgres:18
+    image: postgres:18.4
     container_name: bootroot-postgres
     restart: always
     environment:
@@ -109,7 +109,7 @@ services:
       - RUST_LOG=info
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.13.1
     container_name: bootroot-prometheus
     restart: always
     profiles:
@@ -123,7 +123,7 @@ services:
       - prometheus-data:/prometheus
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.0.3
     container_name: bootroot-grafana
     restart: always
     profiles:
@@ -141,7 +141,7 @@ services:
       - "${GRAFANA_LAN_BIND_ADDR:-127.0.0.1}:3000:3000"
 
   grafana-public:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.0.3
     container_name: bootroot-grafana-public
     restart: always
     profiles:

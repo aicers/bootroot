@@ -9,8 +9,8 @@ BOOTROOT_VERSION="$(
   awk -F' = ' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml
 )"
 
-OPENBAO_IMAGE="${OPENBAO_IMAGE:-openbao/openbao:latest}"
-POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:18}"
+OPENBAO_IMAGE="${OPENBAO_IMAGE:-openbao/openbao:2.5.5}"
+POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:18.4}"
 BOOTROOT_STEP_CA_IMAGE="${BOOTROOT_STEP_CA_IMAGE:-bootroot-step-ca:0.29.0}"
 BOOTROOT_HTTP01_IMAGE="${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:$BOOTROOT_VERSION}"
 

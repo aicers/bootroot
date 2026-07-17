@@ -37,6 +37,10 @@ use crate::i18n::Messages;
 
 const INIT_AGENT_TOKEN_PATH: &str = "/openbao/secrets/openbao/token";
 const OPENBAO_AGENT_SECRETS_MOUNT: &str = "/openbao/secrets";
+// Keep in sync with the `openbao` service image in docker-compose.yml and
+// docker-compose.deploy.yml so the Agents run the same OpenBao build as the
+// server they authenticate against.
+const OPENBAO_AGENT_IMAGE: &str = "openbao/openbao:2.5.5";
 
 pub(super) async fn bootstrap_openbao(
     client: &mut OpenBaoClient,
@@ -855,7 +859,7 @@ async fn write_openbao_agent_compose_override(
         r#"version: "3.8"
 services:
   {stepca_service}:
-    image: openbao/openbao:latest
+    image: {agent_image}
     container_name: bootroot-openbao-agent-stepca
     user: "{user}"
     restart: always
@@ -865,7 +869,7 @@ services:
     volumes:
       - {secrets_path}:/openbao/secrets
   {responder_service}:
-    image: openbao/openbao:latest
+    image: {agent_image}
     container_name: bootroot-openbao-agent-responder
     user: "{user}"
     restart: always
@@ -877,6 +881,7 @@ services:
 "#,
         stepca_service = OPENBAO_AGENT_STEPCA_SERVICE,
         responder_service = OPENBAO_AGENT_RESPONDER_SERVICE,
+        agent_image = OPENBAO_AGENT_IMAGE,
         depends_on = depends_on,
         openbao_addr = openbao_addr,
         secrets_path = mount_root.display(),
