@@ -15,10 +15,11 @@ Operations policy summary:
 
 - recommended runtime differs by deployment target:
   step-ca/OpenBao/HTTP-01 responder run as independent services
-  (Compose or systemd).
-  For services added via `bootroot service add`, `bootroot-agent` runs as
-  a host daemon (systemd) — including when the consuming application
-  itself runs in a container.
+  (Compose or systemd). They are the only components the compose stack
+  brings up.
+  `bootroot-agent` ships no container image at all: for services added via
+  `bootroot service add` it runs as a host daemon (systemd) — including
+  when the consuming application itself runs in a container.
 - in all paths, always-on/restart/dependency guarantees are operator
   responsibilities.
 - bootroot automates config/material generation, but binary installation and
@@ -324,14 +325,22 @@ bootroot infra install
 bootroot init
 ```
 
-Then start services and verify issuance:
+Then start services, re-add a service, and verify issuance:
 
 ```bash
 docker compose up -d
-docker compose run --rm bootroot-agent
+bootroot service add --service-name edge-proxy --hostname edge-node-01 \
+  --domain trusted.domain --instance-id 001 \
+  --agent-config "$(pwd)/tmp/agent-edge-proxy.toml" \
+  --cert-path "$(pwd)/certs/edge-proxy.crt" \
+  --key-path "$(pwd)/certs/edge-proxy.key"
+bootroot verify --service-name edge-proxy \
+  --agent-config "$(pwd)/tmp/agent-edge-proxy.toml"
 ```
 
-If `certs/bootroot-agent.crt` is created, issuance is working.
+`bootroot verify` runs a one-shot issuance with the bootroot-agent binary. If
+it reports `result: ok` and `certs/edge-proxy.crt` is created, issuance is
+working.
 
 If the responder HMAC mismatches, ensure the OpenBao HMAC secret matches the
 responder config and restart the responder.
@@ -413,19 +422,28 @@ Services using mTLS must be able to read the CA bundle written to
 `trust.ca_bundle_path`. The simplest setup is running bootroot-agent and the
 service under the same user or group.
 
-### Docker (demo only)
+### Smoke-testing against the compose stack
 
-The project's default `docker-compose.yml` ships a demo `bootroot-agent`
-container that performs a **one-shot** issuance against the compose stack
-(it reads `agent.toml.compose`):
+bootroot-agent has no container image: it always runs as a host process, so
+there is nothing to `docker compose up`. To exercise a **one-shot** issuance
+against the compose stack, build the binary and point it at the ports the
+stack publishes to the host:
 
 ```bash
-docker compose up --build -d bootroot-agent
+cargo build --bin bootroot-agent
+./target/debug/bootroot-agent --oneshot --insecure --config agent.toml.compose
 ```
 
-This container exists for demo/smoke purposes only. It is **not** a run
-model for onboarded services: production services run the bootroot-agent
-host daemon described above.
+`agent.toml.compose` is the config for exactly this run model — a native
+binary talking to the compose stack over `localhost`. `--insecure` is needed
+because the compose stack's CA is self-signed and this config carries no
+trust bundle; the managed onboarding flow prepares trust first and does not
+need it. This is a demo/smoke path, not an onboarding path: production
+services run the bootroot-agent host daemon described above with the config
+`bootroot service add` writes.
+
+`scripts/preflight/extra/agent-scenarios.sh` drives the same binary the same
+way across its scenarios.
 
 ## bootroot-remote (for remote service machines)
 

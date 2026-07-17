@@ -66,7 +66,7 @@ mkdir -p tmp certs
 # One agent.toml per distinct service: the [openbao] section holds a
 # single AppRole identity, so `service add` rejects a config path
 # shared across services.
-for svc in edge-proxy web-app; do
+for svc in edge-proxy web-app bootroot-agent; do
   cat > "tmp/agent-${svc}.toml" <<'EOF'
 email = "admin@example.com"
 server = "https://localhost:9000/acme/acme/directory"
@@ -106,6 +106,16 @@ cargo run --bin bootroot -- service add \
   --instance-id 001 \
   --root-token "$ROOT_TOKEN"
 
+cargo run --bin bootroot -- service add \
+  --service-name bootroot-agent \
+  --hostname bootroot-agent \
+  --domain trusted.domain \
+  --agent-config "$(pwd)/tmp/agent-bootroot-agent.toml" \
+  --cert-path "$(pwd)/certs/bootroot-agent.crt" \
+  --key-path "$(pwd)/certs/bootroot-agent.key" \
+  --instance-id 001 \
+  --root-token "$ROOT_TOKEN"
+
 RESPONDER_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
 if [ -z "${RESPONDER_IP:-}" ]; then
   echo "Failed to read responder container IP"
@@ -113,6 +123,7 @@ if [ -z "${RESPONDER_IP:-}" ]; then
 fi
 docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
 docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.web-app.web-01.trusted.domain' >> /etc/hosts"
+docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.bootroot-agent.bootroot-agent.trusted.domain' >> /etc/hosts"
 
 host="001.edge-proxy.edge-node-01.trusted.domain"
 for attempt in {1..15}; do
@@ -140,6 +151,10 @@ cargo run --bin bootroot -- verify \
   --service-name web-app \
   --agent-config "$(pwd)/tmp/agent-web-app.toml"
 
+cargo run --bin bootroot -- verify \
+  --service-name bootroot-agent \
+  --agent-config "$(pwd)/tmp/agent-bootroot-agent.toml"
+
 # --- Verify CA Health ---
 echo "[test-core] verifying CA health"
 for i in {1..10}; do
@@ -157,14 +172,6 @@ done
 # --- Verify Agent Success ---
 echo "[test-core] verifying agent success"
 for i in {1..6}; do
-  if docker logs bootroot-agent 2>&1 | grep -q "Successfully issued certificate"; then
-    echo "PASS: Certificate issued successfully"
-    break
-  fi
-  if docker logs bootroot-agent 2>&1 | grep -q "Certificate issuance succeeded"; then
-    echo "PASS: Certificate issued successfully"
-    break
-  fi
   if [ -s certs/bootroot-agent.crt ] && [ -s certs/bootroot-agent.key ]; then
     echo "PASS: Certificate files created"
     break
@@ -172,9 +179,7 @@ for i in {1..6}; do
   echo "Waiting for certificate issuance..."
   sleep 5
   if [ "$i" -eq 6 ]; then
-    echo "FAIL: Certificate issue message not found"
-    echo "=== Agent Logs ==="
-    docker logs bootroot-agent
+    echo "FAIL: Certificate files not created"
     exit 1
   fi
 done

@@ -42,6 +42,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Removed
 
+- Removed the demo `bootroot-agent` container: the root `Dockerfile`, the
+  `bootroot-agent` service in `docker-compose.yml`, and its break-glass
+  overlay in `docker-compose.test.yml` are gone. The image was the only
+  consumer of that Dockerfile and shipped nowhere — `bootroot-agent` runs
+  as a host daemon in every supported path, so the preflight suite now
+  exercises the shape that ships:
+  `scripts/preflight/extra/agent-scenarios.sh` drives the natively built
+  binary against the compose stack's published host ports in all 14
+  scenarios, and `agent.toml.compose` is retained as that run's config.
+  (Closes #708)
 - Retired the per-service local OpenBao Agent sidecar and the local
   Docker-sidecar run model for `bootroot-agent`. `bootroot service add
   --delivery-mode local-file` no longer generates per-service OpenBao
