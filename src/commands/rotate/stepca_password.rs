@@ -10,7 +10,9 @@ use super::helpers::{
     confirm_action, ensure_file_exists, restart_compose_service, restart_container,
     wait_for_rendered_file, write_secret_file,
 };
-use super::{OPENBAO_AGENT_STEPCA_CONTAINER, RENDERED_FILE_TIMEOUT, RotateContext};
+use super::{
+    OPENBAO_AGENT_STEPCA_CONTAINER, RENDERED_FILE_TIMEOUT, RotateContext, STEP_CA_HELPER_IMAGE,
+};
 use crate::cli::args::RotateStepcaPasswordArgs;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{PATH_STEPCA_PASSWORD, SECRET_BYTES, to_container_path};
@@ -39,10 +41,12 @@ pub(super) async fn rotate_stepca_password(
     // (below), so a key left root-owned by an earlier `--user root`
     // rotation would otherwise become unreadable to it. The sweep repairs
     // that first, keeping this flow working exactly as it does today, and
-    // is a no-op when ownership is already correct.
+    // is a no-op when ownership is already correct. It reuses the
+    // `smallstep/step-ca` image the `step` helpers already run, so it adds
+    // no new dependency.
     crate::commands::infra::sweep_secrets_ownership(
-        &ctx.compose_file,
         ctx.paths.secrets_dir(),
+        STEP_CA_HELPER_IMAGE,
         messages,
     )?;
 

@@ -21,6 +21,11 @@ use crate::i18n::Messages;
 use crate::state::StateFile;
 
 pub(super) const ROLE_ID_FILENAME: &str = "role_id";
+/// Image the `step` helper containers run in the `rotate` flows. The
+/// ownership sweep reuses it so it adds no dependency the flow did not
+/// already have (unlike the compose step-ca *server* image, which is not
+/// present on the air-gapped rotate host).
+pub(super) const STEP_CA_HELPER_IMAGE: &str = "smallstep/step-ca";
 pub(super) const OPENBAO_AGENT_STEPCA_CONTAINER: &str = "bootroot-openbao-agent-stepca";
 pub(super) const OPENBAO_AGENT_RESPONDER_CONTAINER: &str = "bootroot-openbao-agent-responder";
 pub(super) const ROOT_CA_COMMON_NAME: &str = "Bootroot Root CA";

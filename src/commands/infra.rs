@@ -199,11 +199,8 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     if should_sweep_secrets_ownership(&args.services, &args.compose_file.compose_file, messages)? {
         let sweep_secrets_dir = resolve_effective_secrets_dir(&state_path, compose_dir)
             .unwrap_or_else(|| compose_dir.join("secrets"));
-        sweep_secrets_ownership(
-            &args.compose_file.compose_file,
-            &sweep_secrets_dir,
-            messages,
-        )?;
+        let image = resolve_stepca_image(&args.compose_file.compose_file, messages)?;
+        sweep_secrets_ownership(&sweep_secrets_dir, &image, messages)?;
     }
 
     // Auto-detect unseal key file if not explicitly specified.
@@ -566,7 +563,8 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     // rotation or manual init. Runs after `up` so the step-ca server
     // image it reuses exists (loaded from archive or built by `up`).
     if should_sweep_secrets_ownership(&args.services, &args.compose_file.compose_file, messages)? {
-        sweep_secrets_ownership(&args.compose_file.compose_file, &secrets_dir, messages)?;
+        let image = resolve_stepca_image(&args.compose_file.compose_file, messages)?;
+        sweep_secrets_ownership(&secrets_dir, &image, messages)?;
     }
 
     // Collect readiness but skip step-ca (it has no config yet).
@@ -713,9 +711,16 @@ fn resolve_stepca_image(compose_file: &Path, messages: &Messages) -> Result<Stri
 /// the scoping guarantees — it mounts only the secrets directory and does
 /// not follow symlinks out of it. The sweep is a no-op on a tree whose
 /// ownership is already correct.
+///
+/// `image` names the container image to run `chown` in. Callers pass an
+/// image the flow already has on hand so the sweep introduces no new
+/// dependency: the `infra` flows resolve the compose step-ca server image
+/// (see [`resolve_stepca_image`]) after `up` has made it available, while
+/// the `rotate` flows pass the same `smallstep/step-ca` image their `step`
+/// helpers already run.
 pub(crate) fn sweep_secrets_ownership(
-    compose_file: &Path,
     secrets_dir: &Path,
+    image: &str,
     messages: &Messages,
 ) -> Result<()> {
     let mount_root = std::fs::canonicalize(secrets_dir)
@@ -726,8 +731,7 @@ pub(crate) fn sweep_secrets_ownership(
     let meta = std::fs::metadata(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let user_arg = format!("{}:{}", meta.uid(), meta.gid());
-    let image = resolve_stepca_image(compose_file, messages)?;
-    let args = build_ownership_sweep_args(&mount, &user_arg, &image);
+    let args = build_ownership_sweep_args(&mount, &user_arg, image);
     run_docker(&args, "docker secrets ownership sweep", messages)?;
     Ok(())
 }

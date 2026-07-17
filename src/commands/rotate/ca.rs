@@ -11,7 +11,7 @@ use super::helpers::{
 };
 use super::{
     INTERMEDIATE_CA_COMMON_NAME, OPENBAO_AGENT_RESPONDER_CONTAINER, OPENBAO_AGENT_STEPCA_CONTAINER,
-    ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome,
+    ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome, STEP_CA_HELPER_IMAGE,
 };
 use crate::cli::args::{RotateCaKeyArgs, RotateForceReissueArgs, RotateSkipPhase};
 use crate::commands::infra::run_docker;
@@ -39,17 +39,6 @@ pub(super) async fn rotate_ca_key(
     auto_confirm: bool,
     messages: &Messages,
 ) -> Result<()> {
-    // Converge secrets ownership before touching any key material. A host
-    // that rotated (or ran the documented manual init) before this change
-    // can carry root-owned keys the invoking user cannot even read, which
-    // would fail the host-side Phase 1 backup below. The sweep repairs
-    // that in place and is a no-op when ownership is already correct.
-    crate::commands::infra::sweep_secrets_ownership(
-        &ctx.compose_file,
-        ctx.paths.secrets_dir(),
-        messages,
-    )?;
-
     // Phase 0 — Pre-flight
     ensure_file_exists(&ctx.paths.root_cert(), messages)?;
     ensure_file_exists(&ctx.paths.intermediate_cert(), messages)?;
@@ -119,6 +108,21 @@ pub(super) async fn rotate_ca_key(
             phase: 0,
         }
     };
+
+    // Converge secrets ownership before reading or rewriting any key
+    // material. A host that rotated (or ran the documented manual init)
+    // before this change can carry root-owned keys the invoking user
+    // cannot even read, which would fail the host-side Phase 1 backup
+    // below and, on resume, the later key reads. The sweep repairs that in
+    // place and is a no-op when ownership is already correct. It reuses the
+    // `smallstep/step-ca` image the `step` helpers already run, so it adds
+    // no new dependency. Runs unconditionally (not gated on `start_phase`)
+    // so a resumed rotation converges too.
+    crate::commands::infra::sweep_secrets_ownership(
+        ctx.paths.secrets_dir(),
+        STEP_CA_HELPER_IMAGE,
+        messages,
+    )?;
 
     // Phase 1 — Backup
     if start_phase < 1 {

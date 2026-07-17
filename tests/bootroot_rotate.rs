@@ -3647,11 +3647,18 @@ async fn test_rotate_ca_key_full_mode_state_records_full() {
         .mount(&openbao)
         .await;
 
-    // Use a fake docker that fails on root cert generation so Phase 2 fails
-    // but Phase 1 (backup) completes, creating rotation-state.json
+    // Use a fake docker that succeeds on the pre-Phase-1 ownership sweep
+    // (`chown`) but fails on root cert generation so Phase 2 fails while
+    // Phase 1 (backup) completes, creating rotation-state.json.
     let bin_dir = temp_dir.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create bin dir");
-    let fake_docker = "#!/bin/sh\nexit 1\n";
+    let fake_docker = r#"#!/bin/sh
+set -eu
+case "$*" in
+  *"step certificate create"*) exit 1 ;;
+esac
+exit 0
+"#;
     fs::write(bin_dir.join("docker"), fake_docker).expect("write fake docker");
     fs::set_permissions(bin_dir.join("docker"), fs::Permissions::from_mode(0o700)).expect("chmod");
 
