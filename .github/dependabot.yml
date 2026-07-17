@@ -52,3 +52,11 @@ updates:
       - "github-actions"
       - "security"
     open-pull-requests-limit: 5
+  - package-ecosystem: "docker"
+    directories:
+      - "/docker/*"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5

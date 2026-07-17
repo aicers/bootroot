@@ -42,7 +42,8 @@ jobs:
               - "pyproject.toml"
               - "docker-compose.yml"
               - "docker-compose.deploy.yml"
-              - "Dockerfile*"
+              - "docker-compose.test.yml"
+              - "docker/**/Dockerfile"
               - "responder.toml.example"
               - ".github/workflows/**"
 

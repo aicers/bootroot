@@ -1,11 +1,12 @@
-# Bootroot Agent Docker Compose Demo Config (Multi-Profile)
-# Read only by the one-shot demo `bootroot-agent` container in
-# docker-compose.yml (demo/smoke purposes). Onboarded services do not use
+# Bootroot Agent Compose-Stack Demo Config (Multi-Profile)
+# Read only by scripts/preflight/extra/agent-scenarios.sh, which runs the
+# natively built `bootroot-agent` binary from the repo root against the
+# compose stack over its published host ports. Onboarded services do not use
 # this run model: they run bootroot-agent as a host daemon with the agent
 # config written by `bootroot service add`.
 
 email = "admin@example.com"
-server = "https://bootroot-ca:9000/acme/acme/directory"
+server = "https://localhost:9000/acme/acme/directory"
 # Format: <instance_id>.<service_name>.<hostname>.<domain>
 domain = "trusted.domain"
 
@@ -18,7 +19,7 @@ directory_fetch_base_delay_secs = 1
 directory_fetch_max_delay_secs = 10
 poll_attempts = 15
 poll_interval_secs = 2
-http_responder_url = "http://bootroot-http01:8080"
+http_responder_url = "http://localhost:8080"
 # http_responder_hmac must be set to a unique, random value before deployment.
 # Example: openssl rand -hex 32
 http_responder_hmac = "CHANGE-ME"
@@ -34,8 +35,8 @@ instance_id = "001"
 hostname = "bootroot-agent"
 
 [profiles.paths]
-cert = "/app/certs/bootroot-agent.crt"
-key = "/app/certs/bootroot-agent.key"
+cert = "certs/bootroot-agent.crt"
+key = "certs/bootroot-agent.key"
 
 [profiles.daemon]
 check_interval = "1h"
