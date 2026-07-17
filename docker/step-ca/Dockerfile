@@ -1,4 +1,4 @@
-FROM golang:1.24.13-bookworm AS builder
+FROM golang:1.26.5-bookworm AS builder
 ARG STEP_CA_VERSION=v0.29.0
 ENV GOBIN=/usr/local/bin
 RUN apt-get update \
