@@ -262,7 +262,7 @@ pub(super) fn ensure_step_ca_initialized(
         "--rm",
         "-v",
         &*mount,
-        "smallstep/step-ca",
+        "smallstep/step-ca:0.30.2",
         "step",
         "ca",
         "init",

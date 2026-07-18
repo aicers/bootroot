@@ -913,10 +913,12 @@ pub(crate) struct InfraInstallArgs {
 
     /// Skip building images: run `docker compose up --no-build` so the
     /// already-loaded image is used as-is and the command fails loudly
-    /// when a tagged image is absent. The default builds local images
-    /// (`docker compose up --build`), preserving the fresh-clone
-    /// developer experience. Pair with `--image-archive-dir` to bring an
-    /// air-gapped stack up without a source tree or network.
+    /// when a tagged image is absent. The default builds the local
+    /// images that define a build context (`docker compose up --build`);
+    /// prebuilt images such as step-ca are pulled, not built. This
+    /// preserves the fresh-clone developer experience. Pair with
+    /// `--image-archive-dir` to bring an air-gapped stack up without a
+    /// source tree or network.
     #[arg(long = "no-build")]
     pub(crate) no_build: bool,
 }

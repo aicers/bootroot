@@ -36,22 +36,27 @@ services:
       - postgres-data:/var/lib/postgresql
 
   step-ca:
-    build:
-      context: .
-      dockerfile: docker/step-ca/Dockerfile
-      args:
-        - STEP_CA_VERSION=v0.29.0
-    image: bootroot-step-ca:0.29.0
+    image: smallstep/step-ca:0.30.2
     container_name: bootroot-ca
     restart: always
+    # Run as the owner of ./secrets so the container can read the key
+    # material and OpenBao-Agent-rendered files kept there. `infra install`
+    # / `infra up` upsert BOOTROOT_STEPCA_USER into `.env`; when it is unset
+    # (CI, the test overlay, deploy-compose validation) the container falls
+    # back to the image's built-in non-root `step` user (uid/gid 1000).
+    user: "${BOOTROOT_STEPCA_USER:-1000:1000}"
     depends_on:
       - postgres
     ports:
       - "127.0.0.1:9000:9000"
     expose:
       - "9102"
-    environment:
-      - STEPUSER=step
+    # The official image ships a HEALTHCHECK that runs `step ca health`
+    # with no `--ca-url`, which exits non-zero and would make
+    # `bootroot infra up` report step-ca unhealthy. Disable it to preserve
+    # today's status-only readiness behavior.
+    healthcheck:
+      disable: true
     volumes:
       - ./secrets:/home/step
     command:

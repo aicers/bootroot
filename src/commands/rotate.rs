@@ -25,7 +25,7 @@ pub(super) const ROLE_ID_FILENAME: &str = "role_id";
 /// ownership sweep reuses it so it adds no dependency the flow did not
 /// already have (unlike the compose step-ca *server* image, which is not
 /// present on the air-gapped rotate host).
-pub(super) const STEP_CA_HELPER_IMAGE: &str = "smallstep/step-ca";
+pub(super) const STEP_CA_HELPER_IMAGE: &str = "smallstep/step-ca:0.30.2";
 pub(super) const OPENBAO_AGENT_STEPCA_CONTAINER: &str = "bootroot-openbao-agent-stepca";
 pub(super) const OPENBAO_AGENT_RESPONDER_CONTAINER: &str = "bootroot-openbao-agent-responder";
 pub(super) const ROOT_CA_COMMON_NAME: &str = "Bootroot Root CA";

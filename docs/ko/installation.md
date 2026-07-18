@@ -21,10 +21,16 @@
 
 ### Docker(기본)
 
-이 repo는 PostgreSQL 지원 step-ca를 빌드하는 compose 구성을 제공합니다.
+이 repo는 공식 사전 빌드 step-ca 이미지(`smallstep/step-ca:0.30.2`)를
+실행하는 compose 구성을 제공합니다. 이 이미지는 PostgreSQL 지원을 기본
+포함합니다. compose 구성은 step-ca를 빌드하지 않으며, 고정된 공식
+이미지를 내려받습니다. 로컬/실험 용도에 가장 간단한 경로입니다.
+
+step-ca를 기동하는 권장 방법은 아래의 `bootroot infra install`이며 전체
+스택을 처리합니다. 이 서비스 하나만 직접 기동하려면:
 
 ```bash
-docker compose up --build -d step-ca
+docker compose up -d step-ca
 ```
 
 #### step-ca 초기화(최초 1회)
@@ -37,8 +43,8 @@ bootroot infra install
 
 이 명령은 임의의 PostgreSQL 비밀번호가 포함된 `.env`를 생성하고,
 `secrets/` 및 `certs/` 디렉터리를 만들고, Docker Compose 서비스를
-기동합니다(로컬 이미지 빌드 포함). 수동 파일 생성이나 편집이
-필요하지 않습니다.
+기동합니다(로컬 responder 이미지는 빌드하고 나머지는 내려받음). 수동 파일
+생성이나 편집이 필요하지 않습니다.
 
 이미 구성된 환경을 나중에 다시 시작하려면:
 
@@ -61,7 +67,7 @@ printf "%s" "<your-password>" > secrets/password.txt
 # ./secrets 디렉터리 소유자로 컨테이너에서 init 실행(예시)
 docker run --rm \
   --user "$(id -u):$(id -g)" \
-  -v $(pwd)/secrets:/home/step smallstep/step-ca \
+  -v $(pwd)/secrets:/home/step smallstep/step-ca:0.30.2 \
   step ca init \
   --name "Bootroot CA" \
   --provisioner "admin" \
