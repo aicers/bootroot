@@ -29,11 +29,17 @@ Operations policy summary:
 
 ### Docker
 
-The repo includes a compose setup that builds step-ca with PostgreSQL support.
-This is the easiest path for local or lab usage.
+The repo includes a compose setup that runs the official prebuilt step-ca
+image (`smallstep/step-ca:0.30.2`), which ships with PostgreSQL support. The
+compose setup builds nothing for step-ca — it pulls the pinned official
+image. This is the easiest path for local or lab usage.
+
+The recommended way to bring step-ca up is `bootroot infra install` (see
+below), which handles the full stack. To start just this one service
+directly:
 
 ```bash
-docker compose up --build -d step-ca
+docker compose up -d step-ca
 ```
 
 #### Initialize step-ca (first run)
@@ -46,8 +52,8 @@ bootroot infra install
 
 This command generates `.env` with a random PostgreSQL password, creates
 `secrets/` and `certs/` directories, and brings up Docker Compose services
-(including building local images). No manual file creation or editing is
-required.
+(building the local responder image and pulling the rest). No manual file
+creation or editing is required.
 
 To restart an already-configured environment later, use:
 
@@ -69,7 +75,7 @@ printf "%s" "<your-password>" > secrets/password.txt
 # Run init inside a container as the owner of ./secrets (example)
 docker run --rm \
   --user "$(id -u):$(id -g)" \
-  -v $(pwd)/secrets:/home/step smallstep/step-ca \
+  -v $(pwd)/secrets:/home/step smallstep/step-ca:0.30.2 \
   step ca init \
   --name "Bootroot CA" \
   --provisioner "admin" \

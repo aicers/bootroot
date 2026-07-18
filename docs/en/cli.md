@@ -295,7 +295,11 @@ environment variable so an installer can pin an exact release tag or a
 `@sha256:` digest — for example `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
 `BOOTROOT_STEP_CA_IMAGE`, and `BOOTROOT_HTTP01_IMAGE`. Set them in `.env`
 or the process environment; unset variables fall back to the release-built
-defaults.
+defaults. For production and air-gapped installs, pin
+`BOOTROOT_STEP_CA_IMAGE` to a `@sha256:` digest rather than the `0.30.2`
+tag: step-ca is the CA, its default is now a third-party image under a
+mutable tag, and smallstep publishes cosign signatures for its images, so a
+digest gives you an immutable, verifiable reference.
 
 `--no-build` implies `--pull never`, so `infra install` never contacts a
 registry in this mode: an absent image fails the install loudly rather than

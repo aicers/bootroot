@@ -11,7 +11,7 @@ BOOTROOT_VERSION="$(
 
 OPENBAO_IMAGE="${OPENBAO_IMAGE:-openbao/openbao:2.5.5}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:18.4}"
-BOOTROOT_STEP_CA_IMAGE="${BOOTROOT_STEP_CA_IMAGE:-bootroot-step-ca:0.29.0}"
+BOOTROOT_STEP_CA_IMAGE="${BOOTROOT_STEP_CA_IMAGE:-smallstep/step-ca:0.30.2}"
 BOOTROOT_HTTP01_IMAGE="${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:$BOOTROOT_VERSION}"
 
 STAGE_DIR="$(mktemp -d)"
@@ -81,11 +81,12 @@ prepare_images() {
   log "pulling third-party images for archive preparation"
   docker pull "$OPENBAO_IMAGE"
   docker pull "$POSTGRES_IMAGE"
+  docker pull "$BOOTROOT_STEP_CA_IMAGE"
 
-  log "building bootroot infra images"
+  log "building responder image"
   POSTGRES_PASSWORD=build-only \
     GRAFANA_ADMIN_PASSWORD=build-only \
-    docker compose -f docker-compose.yml build step-ca bootroot-http01
+    docker compose -f docker-compose.yml build bootroot-http01
   docker tag bootroot-http01-responder:latest "$BOOTROOT_HTTP01_IMAGE"
 
   mkdir -p "$ARCHIVE_DIR"

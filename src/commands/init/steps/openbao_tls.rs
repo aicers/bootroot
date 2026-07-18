@@ -55,7 +55,7 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
         &secrets_mount,
         "-v",
         &tls_mount,
-        "smallstep/step-ca",
+        "smallstep/step-ca:0.30.2",
         "step",
         "certificate",
         "create",

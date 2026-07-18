@@ -38,6 +38,12 @@ const DEFAULT_GRAFANA_ADMIN_PASSWORD: &str = "admin";
 const DEFAULT_POSTGRES_USER: &str = "step";
 const DEFAULT_POSTGRES_DB: &str = "stepca";
 const UNSEAL_KEYS_PATH: &str = "secrets/openbao/unseal-keys.txt";
+/// `.env` key that pins the uid/gid the step-ca container runs as. Both
+/// compose files interpolate it as `${BOOTROOT_STEPCA_USER:-1000:1000}`,
+/// so an unset value falls back to the image's built-in non-root `step`
+/// user. `infra install` / `infra up` keep it equal to the `secrets/`
+/// owner so the container can read its own key material.
+const STEPCA_USER_ENV_KEY: &str = "BOOTROOT_STEPCA_USER";
 
 /// Total budget for the post-`docker compose up -d` wait that gives the
 /// `OpenBao` listener time to bind before the unseal helpers issue their
@@ -144,6 +150,17 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
         0
     };
 
+    // Keep the step-ca uid/gid variable in `.env` current before `up` reads
+    // it, so an upgraded deployment whose `.env` predates this variable runs
+    // step-ca as the `secrets/` owner rather than the 1000:1000
+    // interpolation default. An operator who only ever runs `infra up` after
+    // an upgrade converges without being told to edit `.env` by hand.
+    if should_sweep_secrets_ownership(&args.services, &args.compose_file.compose_file, messages)? {
+        let up_secrets_dir = resolve_effective_secrets_dir(&state_path, compose_dir)
+            .unwrap_or_else(|| compose_dir.join("secrets"));
+        upsert_stepca_user_env(&compose_dir.join(".env"), &up_secrets_dir, messages)?;
+    }
+
     let compose_str = args.compose_file.compose_file.to_string_lossy();
     let svc_refs: Vec<&str> = args.services.iter().map(String::as_str).collect();
 
@@ -191,11 +208,13 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     run_docker(&up_args, "docker compose up", messages)?;
 
     // Converge secrets ownership so an operator who upgrades and then only
-    // ever runs `infra up` also repairs any root-owned CA material. Runs
-    // after `up` so the step-ca server image it reuses already exists;
-    // step-ca still runs as root here, so a briefly root-owned key does
-    // not stop it, and the readiness check below is unaffected. On a
-    // legacy tree with `ca.json` the server stays up throughout.
+    // ever runs `infra up` also repairs any root-owned CA material left by
+    // an earlier rotation or manual init. Runs after `up` so the step-ca
+    // server image it reuses already exists. step-ca now runs as the
+    // secrets-directory owner, so a root-owned key it cannot read makes it
+    // restart until this sweep re-owns the tree; `restart: always` then
+    // brings it back before the readiness check below. On a tree whose
+    // ownership is already correct the server stays up throughout.
     if should_sweep_secrets_ownership(&args.services, &args.compose_file.compose_file, messages)? {
         let sweep_secrets_dir = resolve_effective_secrets_dir(&state_path, compose_dir)
             .unwrap_or_else(|| compose_dir.join("secrets"));
@@ -465,7 +484,29 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
 
     // Docker Compose reads .env from the compose file's directory.
     let env_path = compose_dir.join(".env");
-    if !env_path.exists() {
+    // step-ca runs as the `secrets/` owner; pin that uid/gid so a mount
+    // owned by a non-default uid is readable. `secrets_dir` was just
+    // created (or already existed) above, so its owner is the intended one.
+    let stepca_user = stepca_user_from_secrets_dir(&secrets_dir, messages)?;
+    if env_path.exists() {
+        // Existing deployment: upsert the step-ca uid/gid so a host whose
+        // `.env` predates this variable still runs step-ca as the `secrets/`
+        // owner rather than the 1000:1000 interpolation default.
+        crate::commands::dotenv::update_dotenv_key(
+            &env_path,
+            STEPCA_USER_ENV_KEY,
+            &stepca_user,
+            messages,
+        )?;
+        if let Some(port) = args.postgres_host_port {
+            crate::commands::dotenv::update_dotenv_key(
+                &env_path,
+                "POSTGRES_HOST_PORT",
+                &port.to_string(),
+                messages,
+            )?;
+        }
+    } else {
         let postgres_password = bootroot::utils::generate_secret(32)
             .with_context(|| messages.error_generate_secret_failed())?;
         let mut entries: Vec<(&str, &str)> = vec![
@@ -473,6 +514,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
             ("POSTGRES_PASSWORD", &postgres_password),
             ("POSTGRES_DB", DEFAULT_POSTGRES_DB),
             ("GRAFANA_ADMIN_PASSWORD", DEFAULT_GRAFANA_ADMIN_PASSWORD),
+            (STEPCA_USER_ENV_KEY, &stepca_user),
         ];
         let host_port_str = args.postgres_host_port.map(|p| p.to_string());
         if let Some(ref s) = host_port_str {
@@ -480,13 +522,6 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         }
         write_dotenv(&env_path, &entries, messages)?;
         println!("{}", messages.infra_install_env_written());
-    } else if let Some(port) = args.postgres_host_port {
-        crate::commands::dotenv::update_dotenv_key(
-            &env_path,
-            "POSTGRES_HOST_PORT",
-            &port.to_string(),
-            messages,
-        )?;
     }
 
     // Pre-bind the host-side ports the active compose stack will publish
@@ -547,8 +582,9 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         )?;
     }
 
-    // Default builds local images (step-ca, bootroot-http01); `--no-build`
-    // with `--pull never` uses the pre-loaded images exactly as-is for an
+    // Default builds the only local image (bootroot-http01); step-ca is the
+    // official prebuilt image and is pulled, not built. `--no-build` with
+    // `--pull never` uses the pre-loaded images exactly as-is for an
     // air-gapped install, never reaching a registry.
     let up_args = build_compose_up_args(&compose_str, args.no_build, &svc_refs);
     let up_label = if args.no_build {
@@ -667,7 +703,7 @@ fn build_ownership_sweep_args<'a>(
         "--user",
         "root",
         // Run `chown` directly instead of through the image's default
-        // entrypoint. The `rotate` flows reuse the `smallstep/step-ca`
+        // entrypoint. The `rotate` flows reuse the `smallstep/step-ca:0.30.2`
         // helper image here, whose entrypoint would otherwise print a
         // spurious "there is no ca.json config file" warning — the sweep
         // deliberately mounts only the secrets subtree, not `/home/step`.
@@ -724,8 +760,8 @@ fn resolve_stepca_image(compose_file: &Path, messages: &Messages) -> Result<Stri
 /// image the flow already has on hand so the sweep introduces no new
 /// dependency: the `infra` flows resolve the compose step-ca server image
 /// (see [`resolve_stepca_image`]) after `up` has made it available, while
-/// the `rotate` flows pass the same `smallstep/step-ca` image their `step`
-/// helpers already run.
+/// the `rotate` flows pass the same `smallstep/step-ca:0.30.2` image their
+/// `step` helpers already run.
 pub(crate) fn sweep_secrets_ownership(
     secrets_dir: &Path,
     image: &str,
@@ -742,6 +778,34 @@ pub(crate) fn sweep_secrets_ownership(
     let args = build_ownership_sweep_args(&mount, &user_arg, image);
     run_docker(&args, "docker secrets ownership sweep", messages)?;
     Ok(())
+}
+
+/// Resolves the `uid:gid` string step-ca must run as: the owner of the
+/// `secrets/` directory. This matches the value the `OpenBao` Agent sidecars
+/// and every `step` helper container already use, so all writers under
+/// `secrets/` share one owner and the server can read what they render.
+fn stepca_user_from_secrets_dir(secrets_dir: &Path, messages: &Messages) -> Result<String> {
+    let meta = std::fs::metadata(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    Ok(format!("{}:{}", meta.uid(), meta.gid()))
+}
+
+/// Upserts `BOOTROOT_STEPCA_USER` into an existing compose `.env` so
+/// step-ca runs as the `secrets/` owner on upgraded deployments.
+///
+/// A host that installed before this variable existed keeps an `.env` with
+/// no uid entry; without the upsert compose falls back to the `1000:1000`
+/// interpolation default and step-ca cannot read a `secrets/` owned by a
+/// different uid. [`update_dotenv_key`](crate::commands::dotenv::update_dotenv_key)
+/// rewrites the key in place and appends it when absent. A missing `.env`
+/// is a no-op: `infra install` writes the value on first creation, and
+/// `infra up` requires an `.env` for its other required variables anyway.
+fn upsert_stepca_user_env(env_path: &Path, secrets_dir: &Path, messages: &Messages) -> Result<()> {
+    if !env_path.exists() {
+        return Ok(());
+    }
+    let user = stepca_user_from_secrets_dir(secrets_dir, messages)?;
+    crate::commands::dotenv::update_dotenv_key(env_path, STEPCA_USER_ENV_KEY, &user, messages)
 }
 
 /// Aborts when `host:port` is already bound on the local machine. The
@@ -1798,7 +1862,7 @@ mod tests {
     use crate::i18n::test_messages;
 
     const COMPOSE_WITH_STEPCA: &str = "services:\n  openbao:\n    image: openbao/openbao\n  \
-        step-ca:\n    image: bootroot-step-ca:0.29.0\n";
+        step-ca:\n    image: smallstep/step-ca:0.30.2\n";
     const COMPOSE_WITHOUT_STEPCA: &str =
         "services:\n  openbao:\n    image: openbao/openbao\n  postgres:\n    image: postgres\n";
 
@@ -1834,13 +1898,44 @@ mod tests {
         );
     }
 
+    /// `upsert_stepca_user_env` records the `secrets/` owner uid/gid in an
+    /// existing `.env` that predates the variable, and is a no-op when no
+    /// `.env` exists yet.
+    #[test]
+    fn upsert_stepca_user_env_appends_to_existing_and_skips_missing() {
+        let messages = test_messages();
+        let dir = tempdir().expect("tempdir");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let meta = std::fs::metadata(&secrets_dir).expect("stat secrets");
+        let expected = format!("{}:{}", meta.uid(), meta.gid());
+
+        let env_path = dir.path().join(".env");
+        // Missing file: no-op, nothing created.
+        upsert_stepca_user_env(&env_path, &secrets_dir, &messages).expect("no-op on missing");
+        assert!(!env_path.exists(), "missing .env stays absent");
+
+        // Existing file without the key: the key is appended, others kept.
+        std::fs::write(&env_path, "POSTGRES_PASSWORD=secret\n").expect("write env");
+        upsert_stepca_user_env(&env_path, &secrets_dir, &messages).expect("upsert");
+        let contents = std::fs::read_to_string(&env_path).expect("read env");
+        assert!(
+            contents.contains(&format!("{STEPCA_USER_ENV_KEY}={expected}")),
+            "uid/gid upserted: {contents}"
+        );
+        assert!(
+            contents.contains("POSTGRES_PASSWORD=secret"),
+            "existing entries preserved: {contents}"
+        );
+    }
+
     /// The sweep container must mount ONLY the secrets directory and chown
     /// with `--no-dereference` so it never follows a symlink out of the
     /// mount. It is also the one deliberately-root container.
     #[test]
     fn build_ownership_sweep_args_scoped_and_no_symlink_following() {
         let mount = "/host/secrets:/secrets";
-        let image = "bootroot-step-ca:0.29.0";
+        let image = "smallstep/step-ca:0.30.2";
         let args = build_ownership_sweep_args(mount, "1000:1000", image);
         let image_pos = args.iter().position(|a| *a == image).expect("image");
 
