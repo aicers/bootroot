@@ -58,8 +58,10 @@ const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
 
 /// Assembles the `docker compose up` argv for `infra install`.
 ///
-/// When `no_build` is `false` (the default), the command builds local
-/// images (`--build`), preserving the fresh-clone developer experience.
+/// When `no_build` is `false` (the default), the command builds the
+/// local images that define a build context (`--build`), preserving the
+/// fresh-clone developer experience; prebuilt images such as step-ca are
+/// pulled rather than built.
 /// When `no_build` is `true`, it passes `--no-build --pull never` so a
 /// pre-loaded image is used exactly as-is and the command fails loudly
 /// when a tagged image is absent — the semantics an air-gapped install
@@ -597,7 +599,8 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     // Converge secrets ownership before returning so the stack this
     // command brings up has no root-owned CA material left by an earlier
     // rotation or manual init. Runs after `up` so the step-ca server
-    // image it reuses exists (loaded from archive or built by `up`).
+    // image it reuses exists (pulled by `up`, or loaded from the archive
+    // on the air-gapped path).
     if should_sweep_secrets_ownership(&args.services, &args.compose_file.compose_file, messages)? {
         let image = resolve_stepca_image(&args.compose_file.compose_file, messages)?;
         sweep_secrets_ownership(&secrets_dir, &image, messages)?;
@@ -727,10 +730,10 @@ fn build_ownership_sweep_args<'a>(
 /// inspecting the container Compose created for it.
 ///
 /// Reusing exactly that image is what keeps the sweep from introducing
-/// any image a flow did not already bring up: it is loaded from the
-/// archive on the air-gapped path and built by `up --build` on the
-/// fresh-source path, and in both the sweep runs only after `up`, so the
-/// image already exists.
+/// any image a flow did not already bring up: it is pulled by `up` on
+/// the networked path and loaded from the archive on the air-gapped
+/// path, and in both the sweep runs only after `up`, so the image
+/// already exists.
 fn resolve_stepca_image(compose_file: &Path, messages: &Messages) -> Result<String> {
     let container_id =
         docker_compose_output(compose_file, None, &["ps", "-a", "-q", "step-ca"], messages)?;
