@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -9,7 +10,9 @@ use super::helpers::{
     confirm_action, ensure_file_exists, restart_compose_service, restart_container,
     wait_for_rendered_file, write_secret_file,
 };
-use super::{OPENBAO_AGENT_STEPCA_CONTAINER, RENDERED_FILE_TIMEOUT, RotateContext};
+use super::{
+    OPENBAO_AGENT_STEPCA_CONTAINER, RENDERED_FILE_TIMEOUT, RotateContext, STEP_CA_HELPER_IMAGE,
+};
 use crate::cli::args::RotateStepcaPasswordArgs;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{PATH_STEPCA_PASSWORD, SECRET_BYTES, to_container_path};
@@ -39,9 +42,28 @@ pub(super) async fn rotate_stepca_password(
     let root_key = ctx.paths.stepca_root_key();
     let intermediate_key = ctx.paths.stepca_intermediate_key();
 
+    // Keep the local "missing file" preflight first, before any container
+    // runs: an uninitialized or broken tree must fail with a clear local
+    // error rather than pulling/running the helper image. This mirrors the
+    // CA rotation flow, which also sweeps only after its Phase 0
+    // `ensure_file_exists` checks.
     ensure_file_exists(&password_path, messages)?;
     ensure_file_exists(&root_key, messages)?;
     ensure_file_exists(&intermediate_key, messages)?;
+
+    // Converge secrets ownership before re-encrypting any key in place.
+    // `step crypto change-pass` now runs as the secrets-directory owner
+    // (below), so a key left root-owned by an earlier `--user root`
+    // rotation would otherwise become unreadable to it. The sweep repairs
+    // that first, keeping this flow working exactly as it does today, and
+    // is a no-op when ownership is already correct. It reuses the
+    // `smallstep/step-ca` image the `step` helpers already run, so it adds
+    // no new dependency.
+    crate::commands::infra::sweep_secrets_ownership(
+        ctx.paths.secrets_dir(),
+        STEP_CA_HELPER_IMAGE,
+        messages,
+    )?;
 
     fs_util::ensure_secrets_dir(secrets_dir).await?;
     write_secret_file(&new_password_path, &new_password, messages).await?;
@@ -101,13 +123,20 @@ pub(super) fn change_stepca_passphrase(
     let mount_root = fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let mount = format!("{}:/home/step", mount_root.display());
+    // Run as the owner of secrets_dir so the re-encrypted key file matches
+    // host ownership, keeping every `step` helper container in agreement
+    // with the OpenBao Agent sidecars that render into the same directory
+    // as that owner.
+    let meta = fs::metadata(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let user_arg = format!("{}:{}", meta.uid(), meta.gid());
     let key_container = to_container_path(secrets_dir, key_path, "/home/step")?;
     let pwd_container = to_container_path(secrets_dir, current_password, "/home/step")?;
     let new_pwd_container = to_container_path(secrets_dir, new_password, "/home/step")?;
     let args = vec![
         "run",
         "--user",
-        "root",
+        &user_arg,
         "--rm",
         "-v",
         &*mount,
@@ -171,10 +200,14 @@ mod tests {
         let args: Vec<&str> = logged_args.lines().collect();
         let mount_root = fs::canonicalize(&secrets_dir).expect("canonicalize secrets dir");
         let expected_mount = format!("{}:/home/step", mount_root.display());
+        // The container must run as the secrets-directory owner, not root,
+        // so the re-encrypted key stays host-owned like the rest of the tree.
+        let meta = fs::metadata(&secrets_dir).expect("stat secrets dir");
+        let expected_user = format!("{}:{}", meta.uid(), meta.gid());
         let expected = vec![
             "run",
             "--user",
-            "root",
+            expected_user.as_str(),
             "--rm",
             "-v",
             expected_mount.as_str(),

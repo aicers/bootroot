@@ -730,6 +730,40 @@ assert_fingerprint_changed() {
   fi
 }
 
+# Simulates a legacy host: CA keys left root-owned by a pre-#716 rotation
+# (or the old `--user root` manual-init example), with the secrets/
+# directory itself still host-owned. Only the keys go root-owned — the
+# certs stay host-owned so the OpenBao client can still read the trust
+# bundle before the rotation's ownership sweep runs. A CA-touching
+# rotation must converge this back to owner-owned.
+seed_root_owned_ca_keys() {
+  local cid img
+  cid="$(docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -a -q step-ca | tr -d '\n')"
+  [ -n "$cid" ] || fail "step-ca container not found for root-owned seeding"
+  img="$(docker inspect --format '{{.Config.Image}}' "$cid")"
+  [ -n "$img" ] || fail "could not resolve step-ca image for root-owned seeding"
+  docker run --rm --user root -v "$SECRETS_DIR:/mnt" "$img" \
+    chown 0:0 /mnt/secrets/root_ca_key /mnt/secrets/intermediate_ca_key \
+    >>"$RUN_LOG" 2>&1 || fail "failed to seed root-owned CA keys"
+}
+
+# Asserts that no entry under secrets/ is root-owned. Every `step` helper
+# container now runs as the secrets-directory owner and the ownership
+# sweep repairs any legacy root-owned material, so after a CA-touching
+# rotation the tree must be fully owner-owned.
+assert_no_root_owned_secrets() {
+  local label="$1"
+  local root_owned
+  root_owned="$(find "$SECRETS_DIR" -uid 0 -print 2>/dev/null || true)"
+  if [ -n "$root_owned" ]; then
+    {
+      echo "root-owned entries under secrets/ after ${label}:"
+      echo "$root_owned"
+    } >>"$RUN_LOG"
+    fail "root-owned entries remain under secrets/ after ${label}"
+  fi
+}
+
 copy_remote_materials() {
   local control_service_dir="$SECRETS_DIR/services/$REMOTE_SERVICE"
   local remote_service_dir="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE"
@@ -908,6 +942,12 @@ run_rotations_with_verification() {
   assert_fingerprint_changed "$WEB_SERVICE" "initial" "after-responder-hmac"
   assert_fingerprint_changed "$REMOTE_SERVICE" "initial" "after-responder-hmac"
 
+  # Legacy-host simulation: leave the CA keys root-owned before rotating,
+  # as a host that rotated (or ran the documented manual init) before #716
+  # would. The rotation must still succeed and converge ownership.
+  log_phase "seed-root-owned-ca-keys"
+  seed_root_owned_ca_keys
+
   log_phase "rotate-stepca-password"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
@@ -923,6 +963,10 @@ run_rotations_with_verification() {
   assert_fingerprint_changed "$EDGE_SERVICE" "after-responder-hmac" "after-stepca-password"
   assert_fingerprint_changed "$WEB_SERVICE" "after-responder-hmac" "after-stepca-password"
   assert_fingerprint_changed "$REMOTE_SERVICE" "after-responder-hmac" "after-stepca-password"
+  # step-ca password rotation re-encrypts the CA keys in place. It now
+  # runs as the secrets-directory owner (after the ownership sweep), so no
+  # key may be left root-owned.
+  assert_no_root_owned_secrets "rotate stepca-password"
 
   log_phase "rotate-db"
   # Build admin DSN from ca.json so the password matches the current
@@ -952,6 +996,14 @@ run_rotations_with_verification() {
   assert_fingerprint_changed "$WEB_SERVICE" "after-stepca-password" "after-db"
   assert_fingerprint_changed "$REMOTE_SERVICE" "after-stepca-password" "after-db"
 
+  # Reseed root-owned CA keys before CA rotation. The earlier
+  # `rotate stepca-password` already converged the tree, so without
+  # reseeding here the CA rotation would run on an already-repaired tree
+  # and would not exercise the sweep's placement in `rotate ca-key`
+  # (before its host-side Phase 1 backup reads the keys).
+  log_phase "reseed-root-owned-ca-keys"
+  seed_root_owned_ca_keys
+
   log_phase "rotate-ca-key"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
@@ -967,6 +1019,10 @@ run_rotations_with_verification() {
   assert_fingerprint_changed "$EDGE_SERVICE" "after-db" "after-ca-key"
   assert_fingerprint_changed "$WEB_SERVICE" "after-db" "after-ca-key"
   assert_fingerprint_changed "$REMOTE_SERVICE" "after-db" "after-ca-key"
+  # CA rotation reads (Phase 1 host-side backup) and rewrites the CA keys
+  # as the secrets-directory owner after the ownership sweep, so the
+  # reseeded root-owned keys must be converged back to owner-owned.
+  assert_no_root_owned_secrets "rotate ca-key"
 
   log_phase "rotate-ca-key-full"
   run_bootroot rotate \

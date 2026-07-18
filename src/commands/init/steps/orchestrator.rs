@@ -1110,8 +1110,12 @@ async fn rebuilt_admin_dsn_for_kv(
     )?))
 }
 
-/// Fixes file ownership and permissions in the secrets directory after
-/// `step ca init` which runs as root inside Docker.
+/// Normalises file and directory modes under the secrets directory to
+/// the expected 0700 (directories) / 0600 (key material) values.
+///
+/// This adjusts modes only; it does not change ownership. Every `step`
+/// helper container already runs as the secrets-directory owner, so the
+/// material it creates is host-owned and needs only its modes tightened.
 async fn fix_secrets_permissions(secrets_dir: &Path) -> Result<()> {
     fix_permissions_recursive(secrets_dir).await
 }

@@ -58,7 +58,10 @@ bootroot infra up
 mkdir -p secrets
 printf "%s" "<your-password>" > secrets/password.txt
 
-docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
+# ./secrets 디렉터리 소유자로 컨테이너에서 init 실행(예시)
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v $(pwd)/secrets:/home/step smallstep/step-ca \
   step ca init \
   --name "Bootroot CA" \
   --provisioner "admin" \
@@ -68,6 +71,15 @@ docker run --user root --rm -v $(pwd)/secrets:/home/step smallstep/step-ca \
   --provisioner-password-file /home/step/password.txt \
   --acme
 ```
+
+컨테이너는 `root`가 아니라 `secrets/` 디렉터리 소유자로 실행하세요.
+`--user $(id -u):$(id -g)`는 여러분 자신의 uid/gid를 사용하며, 위의
+`mkdir`로 `secrets/`를 직접 소유하게 되므로 올바른 값입니다. Bootroot가
+`secrets/`에 대해 실행하는 모든 것 — `password.txt`와 `config/ca.json`을
+렌더링하는 OpenBao Agent 사이드카, 그리고 모든 `step` 헬퍼 컨테이너 —
+은 그 디렉터리 소유자로 실행됩니다. 따라서 `root`로 생성된 자료는
+나머지 트리와 어긋나게 됩니다. Bootroot는 이제 다음 실행 시 이런 어긋남을
+복구하지만, 수동 경로에서 애초에 문제를 만들지 않는 것이 좋습니다.
 
 `<your-password>`는 CA 키를 보호(암호화)하는 비밀번호입니다. 운영에서는
 충분히 강한 비밀번호로 설정하고, 해당 파일은 외부에 노출되지 않도록

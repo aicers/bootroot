@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -10,7 +11,7 @@ use super::helpers::{
 };
 use super::{
     INTERMEDIATE_CA_COMMON_NAME, OPENBAO_AGENT_RESPONDER_CONTAINER, OPENBAO_AGENT_STEPCA_CONTAINER,
-    ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome,
+    ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome, STEP_CA_HELPER_IMAGE,
 };
 use crate::cli::args::{RotateCaKeyArgs, RotateForceReissueArgs, RotateSkipPhase};
 use crate::commands::infra::run_docker;
@@ -107,6 +108,21 @@ pub(super) async fn rotate_ca_key(
             phase: 0,
         }
     };
+
+    // Converge secrets ownership before reading or rewriting any key
+    // material. A host that rotated (or ran the documented manual init)
+    // before this change can carry root-owned keys the invoking user
+    // cannot even read, which would fail the host-side Phase 1 backup
+    // below and, on resume, the later key reads. The sweep repairs that in
+    // place and is a no-op when ownership is already correct. It reuses the
+    // `smallstep/step-ca` image the `step` helpers already run, so it adds
+    // no new dependency. Runs unconditionally (not gated on `start_phase`)
+    // so a resumed rotation converges too.
+    crate::commands::infra::sweep_secrets_ownership(
+        ctx.paths.secrets_dir(),
+        STEP_CA_HELPER_IMAGE,
+        messages,
+    )?;
 
     // Phase 1 — Backup
     if start_phase < 1 {
@@ -399,18 +415,27 @@ async fn concat_unique_ca_certs(
     Ok(bundle)
 }
 
-fn generate_new_root(ctx: &RotateContext, messages: &Messages) -> Result<()> {
-    let mount_root = fs::canonicalize(ctx.paths.secrets_dir()).with_context(|| {
-        messages.error_resolve_path_failed(&ctx.paths.secrets_dir().display().to_string())
-    })?;
-    let mount = format!("{}:/home/step", mount_root.display());
-    let args = vec![
+/// Resolves the `--user <uid>:<gid>` value for a `step` helper container
+/// from the owner of `secrets_dir`. Every `step` subcommand bootroot runs
+/// against `secrets/` runs as that owner so the material it writes matches
+/// the host ownership kept by the `OpenBao` Agent sidecars — never `root`.
+fn owner_user_arg(secrets_dir: &Path, messages: &Messages) -> Result<String> {
+    let meta = fs::metadata(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    Ok(format!("{}:{}", meta.uid(), meta.gid()))
+}
+
+/// Builds the `docker run` argv that regenerates the root CA as the
+/// secrets-directory owner. Kept pure so tests can assert it carries
+/// `--user <uid>:<gid>` rather than `--user root`.
+fn generate_root_docker_args(mount: &str, user_arg: &str) -> Vec<String> {
+    [
         "run",
         "--user",
-        "root",
+        user_arg,
         "--rm",
         "-v",
-        &mount,
+        mount,
         "smallstep/step-ca",
         "step",
         "certificate",
@@ -423,23 +448,23 @@ fn generate_new_root(ctx: &RotateContext, messages: &Messages) -> Result<()> {
         "--password-file",
         "/home/step/password.txt",
         "--force",
-    ];
-    run_docker(&args, "docker step certificate create (root)", messages)?;
-    Ok(())
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
-fn generate_new_intermediate(ctx: &RotateContext, messages: &Messages) -> Result<()> {
-    let mount_root = fs::canonicalize(ctx.paths.secrets_dir()).with_context(|| {
-        messages.error_resolve_path_failed(&ctx.paths.secrets_dir().display().to_string())
-    })?;
-    let mount = format!("{}:/home/step", mount_root.display());
-    let args = vec![
+/// Builds the `docker run` argv that regenerates the intermediate CA as
+/// the secrets-directory owner. Kept pure so tests can assert it carries
+/// `--user <uid>:<gid>` rather than `--user root`.
+fn generate_intermediate_docker_args(mount: &str, user_arg: &str) -> Vec<String> {
+    [
         "run",
         "--user",
-        "root",
+        user_arg,
         "--rm",
         "-v",
-        &mount,
+        mount,
         "smallstep/step-ca",
         "step",
         "certificate",
@@ -458,8 +483,33 @@ fn generate_new_intermediate(ctx: &RotateContext, messages: &Messages) -> Result
         "--ca-password-file",
         "/home/step/password.txt",
         "--force",
-    ];
-    run_docker(&args, "docker step certificate create", messages)?;
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn generate_new_root(ctx: &RotateContext, messages: &Messages) -> Result<()> {
+    let secrets_dir = ctx.paths.secrets_dir();
+    let mount_root = fs::canonicalize(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let mount = format!("{}:/home/step", mount_root.display());
+    let user_arg = owner_user_arg(secrets_dir, messages)?;
+    let args = generate_root_docker_args(&mount, &user_arg);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_docker(&arg_refs, "docker step certificate create (root)", messages)?;
+    Ok(())
+}
+
+fn generate_new_intermediate(ctx: &RotateContext, messages: &Messages) -> Result<()> {
+    let secrets_dir = ctx.paths.secrets_dir();
+    let mount_root = fs::canonicalize(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let mount = format!("{}:/home/step", mount_root.display());
+    let user_arg = owner_user_arg(secrets_dir, messages)?;
+    let args = generate_intermediate_docker_args(&mount, &user_arg);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_docker(&arg_refs, "docker step certificate create", messages)?;
     Ok(())
 }
 
@@ -1378,6 +1428,50 @@ mod tests {
         let mut params = CertificateParams::new(vec![cn.to_string()]).expect("leaf params");
         params.distinguished_name.push(DnType::CommonName, cn);
         params.signed_by(&key, issuer).expect("sign leaf").pem()
+    }
+
+    /// The root-CA regeneration container must run as the secrets-directory
+    /// owner, so the `--user` value is the resolved `uid:gid` and never
+    /// `root` — otherwise the regenerated key would land root-owned.
+    #[test]
+    fn generate_root_docker_args_run_as_owner_not_root() {
+        let args = generate_root_docker_args("/host/secrets:/home/step", "1000:1000");
+        let user_pos = args
+            .iter()
+            .position(|a| a == "--user")
+            .expect("--user present");
+        assert_eq!(
+            args.get(user_pos + 1).map(String::as_str),
+            Some("1000:1000")
+        );
+        assert!(!args.iter().any(|a| a == "root"));
+    }
+
+    /// The intermediate-CA regeneration container must likewise run as the
+    /// secrets-directory owner rather than `root`.
+    #[test]
+    fn generate_intermediate_docker_args_run_as_owner_not_root() {
+        let args = generate_intermediate_docker_args("/host/secrets:/home/step", "1000:1000");
+        let user_pos = args
+            .iter()
+            .position(|a| a == "--user")
+            .expect("--user present");
+        assert_eq!(
+            args.get(user_pos + 1).map(String::as_str),
+            Some("1000:1000")
+        );
+        assert!(!args.iter().any(|a| a == "root"));
+    }
+
+    /// `owner_user_arg` resolves the `uid:gid` from the secrets directory
+    /// owner. In tests that is the invoking user, which is not root.
+    #[test]
+    fn owner_user_arg_resolves_directory_owner() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let user_arg = owner_user_arg(dir.path(), &messages).expect("owner uid:gid");
+        assert!(user_arg.contains(':'));
+        assert_ne!(user_arg, "root");
     }
 
     /// Regression for issue #619: in a mixed registry where one service
