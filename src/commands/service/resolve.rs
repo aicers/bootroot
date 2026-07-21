@@ -225,7 +225,10 @@ fn resolve_secret_id_path_override(
 /// `state.secrets_dir()`: the resolved path must lie **outside** the
 /// root-owned secrets tree (the non-root agent cannot traverse into it),
 /// and its parent directory (operator-provisioned, agent-owned) must
-/// already exist. A no-op when no override was supplied.
+/// already exist. Containment is checked both lexically and — because the
+/// writers follow symlinks in the parent — against the canonicalized
+/// parent, so a parent spelled outside the tree but symlinked into it is
+/// rejected. A no-op when no override was supplied.
 pub(crate) fn validate_secret_id_path_override(
     override_path: Option<&Path>,
     secrets_dir: &Path,
@@ -247,16 +250,44 @@ pub(crate) fn validate_secret_id_path_override(
             &secrets_dir.display().to_string(),
         ));
     }
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    match parent {
-        Some(parent) if parent.is_dir() => Ok(()),
-        Some(parent) => anyhow::bail!(
-            messages.error_service_secret_id_path_parent_missing(&parent.display().to_string())
-        ),
-        None => anyhow::bail!(
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        anyhow::bail!(
             messages.error_service_secret_id_path_parent_missing(&path.display().to_string())
-        ),
+        );
+    };
+    if !parent.is_dir() {
+        anyhow::bail!(
+            messages.error_service_secret_id_path_parent_missing(&parent.display().to_string())
+        );
     }
+    // The lexical `path_is_within` check above only inspects the spelling,
+    // but the override writers create `secret_id`/`role_id` inside `parent`
+    // after following any symlinks in it. A parent spelled outside the tree
+    // but symlinked into it (e.g. `/tmp/link -> <secrets_dir>/services/foo`)
+    // would land the credentials in the root-owned tree the non-root agent
+    // cannot traverse, chowned to that tree's owner — the exact non-functional
+    // layout the override exists to reject. Canonicalize the (already-existing)
+    // parent and the secrets tree so a symlinked parent that resolves into the
+    // tree is rejected regardless of how it is spelled.
+    let canonical_parent = parent.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize override parent {}",
+            parent.display()
+        )
+    })?;
+    let canonical_secrets = match secrets_dir.canonicalize() {
+        Ok(dir) => dir,
+        Err(_) => bootroot::fs_util::absolute_lexical(secrets_dir).with_context(|| {
+            format!("failed to normalize secrets dir {}", secrets_dir.display())
+        })?,
+    };
+    if canonical_parent.starts_with(&canonical_secrets) {
+        anyhow::bail!(messages.error_service_secret_id_path_inside_secrets_dir(
+            &path.display().to_string(),
+            &secrets_dir.display().to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolves `--cert-group` for `service add` based on the deployment
@@ -1120,6 +1151,26 @@ mod tests {
         std::fs::create_dir_all(&agent_dir).unwrap();
         let target = agent_dir.join("secret_id");
         validate_secret_id_path_override(Some(&target), &secrets_dir, &messages).unwrap();
+    }
+
+    #[test]
+    fn validate_secret_id_path_override_rejects_symlinked_parent_into_secrets_dir() {
+        let messages = Messages::new("en").unwrap();
+        let dir = tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let inside = secrets_dir.join("services/foo");
+        std::fs::create_dir_all(&inside).unwrap();
+        // A parent spelled outside the tree but symlinked into it: the
+        // lexical check passes, but canonicalization must still reject it.
+        let link = dir.path().join("agent-link");
+        std::os::unix::fs::symlink(&inside, &link).unwrap();
+        let target = link.join("secret_id");
+        let err =
+            validate_secret_id_path_override(Some(&target), &secrets_dir, &messages).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must resolve outside the root-owned secrets tree")
+        );
     }
 
     #[test]

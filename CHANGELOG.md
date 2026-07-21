@@ -747,8 +747,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - The override is rejected with `remote-bootstrap` delivery, when its
     final path component is `role_id` (it would collide with the derived
     sibling), or when it resolves inside `<secrets_dir>` (the non-root
-    agent cannot traverse the root-owned tree). Without the flag,
-    behaviour is unchanged: the files land under
+    agent cannot traverse the root-owned tree). The secrets-tree
+    containment check is both lexical and symlink-aware: the override's
+    already-existing parent directory is canonicalized before comparison,
+    so a parent spelled outside the tree but symlinked into it (e.g.
+    `/tmp/link -> <secrets_dir>/services/foo`) is rejected rather than
+    silently landing the credentials in the root-owned tree. Without the
+    flag, behaviour is unchanged: the files land under
     `<secrets_dir>/services/<svc>/`, root-owned `0600`.
 - `bootroot infra install` now supports a prebuilt / air-gapped install
   with no source tree and no network at install time (#704):
