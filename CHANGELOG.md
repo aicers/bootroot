@@ -721,15 +721,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   truth persisted to the state entry, and it is threaded through every
   writer and renderer — the origin `secret_id`/`role_id` writes, the
   local `[openbao]` agent config, the `eab.json` provisioner, rotation
-  (`rotate approle-secret-id`, including its missing-`role_id`
-  recovery), the preview/print-only/apply summary, and
-  `service remove --delete-artifacts` cleanup.
+  (`rotate approle-secret-id`, including its missing-`role_id` and
+  missing-`secret_id` recovery), the preview/print-only/apply summary,
+  and `service remove --delete-artifacts` cleanup.
   - The relocated files are chowned to the agent-owning parent directory
     and written mode `0600`. `secret_id`/`role_id` are created
     no-clobber and never follow a final-component symlink; `eab.json`,
     refreshed on every sync, is symlink-safe but legitimately
     overwritten. The operator provisions the (agent-owned) target
     directory beforehand; bootroot never creates, chmods, or chowns it.
+  - Rotation recreates a *removed* relocated `secret_id` through the same
+    parent-owner writer as its missing-`role_id` recovery, so the fresh
+    file lands agent-owned rather than owned by the (root) rotate
+    process; an existing `secret_id` is still rewritten in place with its
+    uid/gid preserved.
+  - When the override `secret_id` write fails on `service add` (e.g. a
+    stale pre-existing file trips the no-clobber guard), the freshly
+    created `role_id` is rolled back, so a retry after clearing the stale
+    file is not blocked by bootroot's own leftover `role_id`.
   - The override is rejected with `remote-bootstrap` delivery, when its
     final path component is `role_id` (it would collide with the derived
     sibling), or when it resolves inside `<secrets_dir>` (the non-root

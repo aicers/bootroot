@@ -81,6 +81,38 @@ fn role_id_sibling_path(secret_id_path: &Path) -> std::path::PathBuf {
         .join(SERVICE_ROLE_ID_FILENAME)
 }
 
+/// Writes the origin `role_id` and `secret_id` credential files, rolling
+/// back a freshly-created override `role_id` if the `secret_id` write
+/// fails.
+///
+/// For an override both files are created no-clobber, so a stale
+/// pre-existing `secret_id` fails after a fresh `role_id` was already
+/// written. At that point no state entry exists yet and
+/// `service remove --delete-artifacts` has nothing to clean, so a retry
+/// would trip the no-clobber guard on our own leftover `role_id`.
+/// Removing it on failure lets the operator re-add once the stale
+/// `secret_id` is cleared. The default (no-override) path overwrites, so
+/// it never fails here; the rollback is gated on `is_override`.
+async fn write_origin_credential_files(
+    role_id_path: &Path,
+    secret_id_path: &Path,
+    role_id: &str,
+    secret_id: &str,
+    is_override: bool,
+    messages: &Messages,
+) -> Result<()> {
+    approle::write_role_id_file(role_id_path, role_id, is_override, messages).await?;
+    if let Err(err) =
+        approle::write_secret_id_file(secret_id_path, secret_id, is_override, messages).await
+    {
+        if is_override {
+            let _ = tokio::fs::remove_file(role_id_path).await;
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Reports whether two local agent-config paths name the same file.
 /// Paths resolved by this binary are stored absolute and lexically
 /// normalized, so a literal comparison covers equivalent spellings;
@@ -384,15 +416,10 @@ async fn run_service_add_apply(
     let is_override = resolved.secret_id_path_override.is_some();
     let secret_id_path = resolved_secret_id_path(resolved, secrets_dir);
     let role_id_path = role_id_sibling_path(&secret_id_path);
-    approle::write_role_id_file(
+    write_origin_credential_files(
         &role_id_path,
-        &approle_result.role_id,
-        is_override,
-        messages,
-    )
-    .await?;
-    approle::write_secret_id_file(
         &secret_id_path,
+        &approle_result.role_id,
         &approle_result.secret_id,
         is_override,
         messages,
@@ -1135,15 +1162,84 @@ fn is_policy_only_mismatch(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) 
 mod tests {
     use std::path::PathBuf;
 
+    use tempfile::tempdir;
+
     use super::resolve::ResolvedServiceAdd;
     use super::{
         ServiceAppRoleMaterialized, build_secret_id_options, build_service_entry,
         build_service_entry_from_role, display_policy_value, display_wrap_ttl,
         is_idempotent_remote_rerun, is_policy_only_mismatch, non_policy_fields_match,
-        policy_fields_match,
+        policy_fields_match, write_origin_credential_files,
     };
-    use crate::i18n::Messages;
+    use crate::i18n::{Messages, test_messages};
     use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry};
+
+    /// An override `service add` writes `role_id` then `secret_id`, both
+    /// no-clobber. A stale pre-existing `secret_id` must fail the add
+    /// *and* roll back the fresh `role_id` — otherwise, with no state
+    /// entry yet and no `--delete-artifacts` path, a retry would trip the
+    /// no-clobber guard on our own leftover `role_id`.
+    #[tokio::test]
+    async fn write_origin_credential_files_override_rolls_back_role_id_on_stale_secret_id() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent").join("svc");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let role_id_path = agent_dir.join("role_id");
+        let secret_id_path = agent_dir.join("secret_id");
+        // A stale secret_id from a prior, uncleaned registration.
+        std::fs::write(&secret_id_path, "stale").unwrap();
+        let messages = test_messages();
+
+        let err = write_origin_credential_files(
+            &role_id_path,
+            &secret_id_path,
+            "rid",
+            "sid",
+            true,
+            &messages,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Refusing to overwrite"),
+            "a stale override secret_id must be a no-clobber error, got: {err:#}"
+        );
+        assert!(
+            !role_id_path.exists(),
+            "the fresh role_id must be rolled back so a retry is not blocked by our own leftover"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&secret_id_path).unwrap(),
+            "stale",
+            "the stale secret_id must be left untouched"
+        );
+    }
+
+    /// The happy override path writes both credential files with no
+    /// rollback.
+    #[tokio::test]
+    async fn write_origin_credential_files_override_writes_both() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent").join("svc");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let role_id_path = agent_dir.join("role_id");
+        let secret_id_path = agent_dir.join("secret_id");
+        let messages = test_messages();
+
+        write_origin_credential_files(
+            &role_id_path,
+            &secret_id_path,
+            "rid",
+            "sid",
+            true,
+            &messages,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&role_id_path).unwrap(), "rid");
+        assert_eq!(std::fs::read_to_string(&secret_id_path).unwrap(), "sid");
+    }
 
     fn sample_resolved() -> ResolvedServiceAdd {
         ResolvedServiceAdd {

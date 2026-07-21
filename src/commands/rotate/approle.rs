@@ -711,8 +711,14 @@ async fn ensure_role_id_file(
 /// re-asserts the directory via `ensure_secrets_dir` before the atomic
 /// write. For a relocated (`--secret-id-path` override) path the
 /// directory is operator-provisioned and agent-owned, so it must **not**
-/// be re-moded: the write goes straight through `atomic_write`, which
-/// preserves the existing (agent) uid/gid and re-applies mode `0600`.
+/// be re-moded. When the relocated `secret_id` still exists the write
+/// goes through `atomic_write`, which preserves the existing (agent)
+/// uid/gid and re-applies mode `0600`. When it has been removed,
+/// `atomic_write` would create it owned by the rotate process — root for
+/// the control CLI — re-breaking the non-root agent, so a missing
+/// override `secret_id` is recreated through the parent-owner credential
+/// writer instead, mirroring how [`ensure_role_id_file`] recovers a
+/// missing `role_id` agent-owned rather than root-owned.
 async fn write_service_secret_id_file(
     secret_id_path: &Path,
     secret_id: &str,
@@ -721,11 +727,19 @@ async fn write_service_secret_id_file(
 ) -> Result<()> {
     let is_override = !fs_util::path_is_within(secret_id_path, secrets_dir).unwrap_or(true);
     if is_override {
-        fs_util::atomic_write(secret_id_path, secret_id.as_bytes(), fs_util::KEY_FILE_MODE)
-            .await
-            .with_context(|| {
-                messages.error_write_file_failed(&secret_id_path.display().to_string())
-            })?;
+        if secret_id_path.exists() {
+            fs_util::atomic_write(secret_id_path, secret_id.as_bytes(), fs_util::KEY_FILE_MODE)
+                .await
+                .with_context(|| {
+                    messages.error_write_file_failed(&secret_id_path.display().to_string())
+                })?;
+        } else {
+            fs_util::create_owned_credential_noclobber(secret_id_path, secret_id.as_bytes())
+                .await
+                .with_context(|| {
+                    messages.error_write_file_failed(&secret_id_path.display().to_string())
+                })?;
+        }
     } else {
         write_secret_id_atomic(secret_id_path, secret_id, messages).await?;
     }
@@ -1292,6 +1306,42 @@ mod tests {
             0o750,
             "rotation must not re-mode the operator directory"
         );
+    }
+
+    /// A relocated `secret_id` that has been removed must be recreated
+    /// through the parent-owner credential writer, not `atomic_write`:
+    /// the fresh file must be chowned to the agent-owning parent, not
+    /// left owned by the (root) rotate process, or a later recovery
+    /// re-breaks the non-root agent. Gated on a supplementary gid.
+    #[tokio::test]
+    async fn write_service_secret_id_file_override_missing_recreates_agent_owned() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().expect("tempdir");
+        let secrets_dir = dir.path().join("secrets");
+        let agent_dir = dir.path().join("agent").join("svc");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::os::unix::fs::chown(&agent_dir, None, Some(gid))
+            .expect("test process must be able to chgrp the agent dir");
+        // The relocated secret_id does not exist (it was removed).
+        let secret_id_path = agent_dir.join("secret_id");
+        let messages = test_messages();
+
+        write_service_secret_id_file(&secret_id_path, "fresh", &secrets_dir, &messages)
+            .await
+            .expect("missing override secret_id must be recreated");
+
+        assert_eq!(fs::read_to_string(&secret_id_path).unwrap(), "fresh");
+        let meta = fs::metadata(&secret_id_path).unwrap();
+        assert_eq!(
+            meta.gid(),
+            gid,
+            "a recreated override secret_id must be chowned to the agent-owning parent, not root"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
     /// The default (secrets-tree) rotation still (re)creates the service
