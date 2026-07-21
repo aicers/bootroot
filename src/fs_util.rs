@@ -1,6 +1,6 @@
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tokio::fs;
@@ -9,6 +9,248 @@ use crate::cert_group::{self, CA_BUNDLE_FILE_MODE, CertGroupPolicy};
 
 pub const KEY_FILE_MODE: u32 = 0o600;
 const SECRETS_DIR_MODE: u32 = 0o700;
+
+/// Returns the absolute, lexically-normalized form of `path`: it is made
+/// absolute against the process cwd and its `.`/`..` components are
+/// resolved textually, without touching the filesystem or following
+/// symlinks.
+///
+/// Used to compare an operator-supplied `--secret-id-path` override
+/// against the secrets-tree prefix so equivalent spellings classify
+/// identically.
+///
+/// # Errors
+/// Returns an error if the current directory cannot be resolved (needed
+/// to absolutize a relative input).
+pub fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+/// Reports whether `candidate` resolves inside `prefix`, comparing both
+/// after [`absolute_lexical`] normalization. Comparison is component-wise
+/// (`/a/bc` is not inside `/a/b`).
+///
+/// # Errors
+/// Returns an error if either path cannot be absolutized (see
+/// [`absolute_lexical`]).
+pub fn path_is_within(candidate: &Path, prefix: &Path) -> std::io::Result<bool> {
+    Ok(absolute_lexical(candidate)?.starts_with(absolute_lexical(prefix)?))
+}
+
+/// Stages `contents` into a fresh file inside the parent directory of
+/// `path`, chowns it to the parent directory's owner, applies mode
+/// `0600`, and links it into place **without** following or replacing
+/// anything already present at the final path component.
+///
+/// This is the override-path writer for a service's `secret_id` and its
+/// sibling `role_id`, which live in an operator-provisioned,
+/// agent-owned directory outside the root-owned secrets tree. The
+/// parent must already exist — this never creates, chmods, or chowns
+/// the directory. A root process creating a fresh file inside an
+/// agent-owned directory would otherwise leave it root-owned (ownership
+/// is not inherited), so the fresh file is chowned to the parent's
+/// uid/gid, leaving the co-located non-root agent able to read
+/// `role_id` and rewrite `secret_id`. A pre-existing regular file or a
+/// symlink planted at the target is a hard error (no-clobber), so a
+/// lower-privileged user cannot redirect the root write or have a stale
+/// credential silently clobbered.
+///
+/// # Errors
+/// Returns an error if `path` is not absolute, has no parent, the
+/// parent is missing or not a directory, the temp file cannot be
+/// created/written/permissioned/chowned, or the target already exists.
+pub async fn create_owned_credential_noclobber(path: &Path, contents: &[u8]) -> Result<()> {
+    write_owned_impl(path, contents, KEY_FILE_MODE, false).await
+}
+
+/// Like [`create_owned_credential_noclobber`] but atomically *replaces*
+/// an existing file. Used for a relocated `eab.json`, which is
+/// (re)written on every sync. The fresh file is still chowned to the
+/// parent owner, and the rename replaces the target name rather than
+/// following a symlink planted at it.
+///
+/// # Errors
+/// Returns an error under the same conditions as
+/// [`create_owned_credential_noclobber`], except that an existing
+/// regular file at the target is replaced instead of rejected.
+pub async fn write_owned_file_replace(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    write_owned_impl(path, contents, mode, true).await
+}
+
+/// Atomically rewrites an existing override credential file in place,
+/// preserving its uid/gid and re-applying `mode`, while refusing to
+/// follow a symlink planted at the final path component.
+///
+/// This is the rotation-time writer for a relocated `secret_id` that
+/// still exists. It differs from [`atomic_write`] in reading the
+/// destination's ownership through `symlink_metadata` (which does not
+/// follow a symlink) and rejecting a symlink outright. A lower-privileged
+/// user who plants a symlink at the credential path — pointing at a
+/// root-owned file — must not be able to make the root rewrite either
+/// follow it or copy that file's root ownership onto the replacement,
+/// which would re-break the non-root agent. The atomic rename replaces
+/// the target name (it never follows the link) and the ownership read is
+/// taken from the real file, so a swap after the check cannot escalate.
+///
+/// # Errors
+/// Returns an error if the destination is a symlink, is missing, its
+/// metadata cannot be read, or the staged file cannot be
+/// created/written/permissioned/chowned/renamed.
+pub async fn atomic_rewrite_owned_no_symlink(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<()> {
+    let dest = path.to_path_buf();
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        // `symlink_metadata` does not follow the final component, so it
+        // both detects a planted symlink and reads the *real* file's
+        // uid/gid (never a root-owned symlink target's).
+        let meta = std::fs::symlink_metadata(&dest)
+            .with_context(|| format!("Failed to stat override credential {}", dest.display()))?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "Refusing to rewrite a symlink at override credential path: {}",
+                dest.display()
+            );
+        }
+        let (uid, gid) = (meta.uid(), meta.gid());
+
+        let mut tmp = tempfile::NamedTempFile::new_in(&parent)
+            .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
+        tmp.as_file_mut()
+            .write_all(&payload)
+            .with_context(|| format!("Failed to write temp file for {}", dest.display()))?;
+        tmp.as_file_mut()
+            .sync_all()
+            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
+            || {
+                format!(
+                    "Failed to set mode {mode:o} on temp file for {}",
+                    dest.display()
+                )
+            },
+        )?;
+        std::os::unix::fs::chown(tmp.path(), Some(uid), Some(gid)).with_context(|| {
+            format!(
+                "Failed to preserve uid={uid} gid={gid} on {}",
+                dest.display()
+            )
+        })?;
+        // `persist` replaces the target *name* via rename(2), which does
+        // not traverse a symlink at the final component, so even a
+        // post-check swap cannot redirect the write.
+        tmp.persist(&dest).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to rename temp file to {}: {}",
+                dest.display(),
+                e.error
+            )
+        })?;
+        Ok(())
+    })
+    .await
+    .context("Owned credential rewrite task panicked")?
+}
+
+async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, replace: bool) -> Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "Override credential path must be absolute: {}",
+            path.display()
+        );
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Override credential path has no parent directory: {}",
+                path.display()
+            )
+        })?
+        .to_path_buf();
+    let dest = path.to_path_buf();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let parent_meta = std::fs::metadata(&parent).with_context(|| {
+            format!(
+                "Override credential parent directory is missing: {}",
+                parent.display()
+            )
+        })?;
+        if !parent_meta.is_dir() {
+            anyhow::bail!(
+                "Override credential parent is not a directory: {}",
+                parent.display()
+            );
+        }
+        let (uid, gid) = (parent_meta.uid(), parent_meta.gid());
+
+        let mut tmp = tempfile::NamedTempFile::new_in(&parent)
+            .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
+        tmp.as_file_mut()
+            .write_all(&payload)
+            .with_context(|| format!("Failed to write temp file for {}", dest.display()))?;
+        tmp.as_file_mut()
+            .sync_all()
+            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
+            || {
+                format!(
+                    "Failed to set mode {mode:o} on temp file for {}",
+                    dest.display()
+                )
+            },
+        )?;
+        std::os::unix::fs::chown(tmp.path(), Some(uid), Some(gid)).with_context(|| {
+            format!(
+                "Failed to chown temp file for {} to uid={uid} gid={gid}",
+                dest.display()
+            )
+        })?;
+        if replace {
+            tmp.persist(&dest).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to rename temp file to {}: {}",
+                    dest.display(),
+                    e.error
+                )
+            })?;
+        } else {
+            // `persist_noclobber` fails if the target name already exists
+            // — a regular file *or* a planted symlink — so a root write is
+            // never redirected or a stale credential silently overwritten.
+            tmp.persist_noclobber(&dest).map_err(|e| {
+                anyhow::anyhow!(
+                    "Refusing to overwrite an existing file at {}: {}",
+                    dest.display(),
+                    e.error
+                )
+            })?;
+        }
+        Ok(())
+    })
+    .await
+    .context("Owned credential write task panicked")?
+}
 
 /// Writes `contents` to `path` atomically by staging it in a sibling
 /// temp file and `rename(2)`ing into place.
@@ -533,6 +775,185 @@ mod tests {
             "expected only the final file, got {entries:?}"
         );
         assert_eq!(entries[0], "agent.toml");
+    }
+
+    #[test]
+    fn path_is_within_matches_component_boundaries() {
+        assert!(path_is_within(Path::new("/a/b/c"), Path::new("/a/b")).unwrap());
+        assert!(path_is_within(Path::new("/a/b"), Path::new("/a/b")).unwrap());
+        // `/a/bc` must not count as inside `/a/b` (component-wise).
+        assert!(!path_is_within(Path::new("/a/bc"), Path::new("/a/b")).unwrap());
+        // Lexical `..` is resolved before the comparison.
+        assert!(!path_is_within(Path::new("/a/b/../c/secret_id"), Path::new("/a/b")).unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_owned_credential_noclobber_writes_0600_and_rejects_reuse() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("agent-svc").join("secret_id");
+        std::fs::create_dir(target.parent().unwrap()).unwrap();
+
+        create_owned_credential_noclobber(&target, b"sid-1")
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "sid-1");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, KEY_FILE_MODE);
+
+        // A pre-existing regular file at the target is a hard error.
+        let err = create_owned_credential_noclobber(&target, b"sid-2")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Refusing to overwrite"),
+            "no-clobber must reject an existing file, got: {err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).await.unwrap(),
+            "sid-1",
+            "the original file must be left untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_owned_credential_noclobber_rejects_non_absolute() {
+        let err = create_owned_credential_noclobber(Path::new("relative/secret_id"), b"x")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("must be absolute"));
+    }
+
+    #[tokio::test]
+    async fn create_owned_credential_noclobber_rejects_missing_parent() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("nope").join("secret_id");
+        let err = create_owned_credential_noclobber(&target, b"x")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("parent directory is missing"));
+    }
+
+    #[tokio::test]
+    async fn create_owned_credential_noclobber_refuses_symlink_at_target() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("agent-svc");
+        std::fs::create_dir(&parent).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "victim").unwrap();
+        let target = parent.join("secret_id");
+        std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+
+        let err = create_owned_credential_noclobber(&target, b"sid")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Refusing to overwrite"),
+            "a planted symlink must not be followed, got: {err:#}"
+        );
+        // The symlink target must be untouched (write not redirected).
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "victim");
+    }
+
+    /// Rotation's in-place rewrite must refuse a symlink planted at the
+    /// credential path and never redirect the write through it.
+    #[tokio::test]
+    async fn atomic_rewrite_owned_no_symlink_rejects_symlink() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("agent-svc");
+        std::fs::create_dir(&parent).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "victim").unwrap();
+        let target = parent.join("secret_id");
+        std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+
+        let err = atomic_rewrite_owned_no_symlink(&target, b"new", KEY_FILE_MODE)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Refusing to rewrite a symlink"),
+            "a planted symlink must be rejected, got: {err:#}"
+        );
+        // The symlink target must be untouched (write not redirected).
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "victim");
+    }
+
+    /// The in-place rewrite preserves the existing file's uid/gid and
+    /// re-applies `0600`. Gated on a supplementary gid being available.
+    #[tokio::test]
+    async fn atomic_rewrite_owned_no_symlink_preserves_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(gid) = crate::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("agent-svc");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("secret_id");
+        std::fs::write(&target, "old").unwrap();
+        std::os::unix::fs::chown(&target, None, Some(gid))
+            .expect("test process must be able to chgrp the seeded file");
+        let pre_uid = std::fs::metadata(&target).unwrap().uid();
+
+        atomic_rewrite_owned_no_symlink(&target, b"new", KEY_FILE_MODE)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(meta.gid(), gid, "rewrite must preserve the existing gid");
+        assert_eq!(
+            meta.uid(),
+            pre_uid,
+            "rewrite must preserve the existing uid"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, KEY_FILE_MODE);
+    }
+
+    #[tokio::test]
+    async fn write_owned_file_replace_overwrites() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("agent-svc").join("eab.json");
+        std::fs::create_dir(target.parent().unwrap()).unwrap();
+
+        write_owned_file_replace(&target, b"first", KEY_FILE_MODE)
+            .await
+            .unwrap();
+        write_owned_file_replace(&target, b"second", KEY_FILE_MODE)
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "second");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, KEY_FILE_MODE);
+    }
+
+    /// The fresh override file must be chowned to the parent directory's
+    /// owner (a root-created file does not inherit directory ownership),
+    /// so a co-located non-root agent can read/rewrite it. Gated on a
+    /// supplementary gid being available, like the other ownership tests.
+    #[tokio::test]
+    async fn create_owned_credential_noclobber_chowns_to_parent_owner() {
+        let Some(gid) = crate::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("agent-svc");
+        std::fs::create_dir(&parent).unwrap();
+        std::os::unix::fs::chown(&parent, None, Some(gid))
+            .expect("test process must be able to chgrp the parent to a supplementary gid");
+        let target = parent.join("role_id");
+
+        create_owned_credential_noclobber(&target, b"rid")
+            .await
+            .unwrap();
+
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            meta.gid(),
+            gid,
+            "fresh file must be chowned to the parent gid"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, KEY_FILE_MODE);
     }
 
     /// Under an active `--cert-group` policy, the bundle file must be

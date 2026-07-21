@@ -1299,6 +1299,17 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long)]
     pub(crate) key_path: Option<PathBuf>,
 
+    /// Absolute path to write the service `secret_id` to (local-file
+    /// delivery only). Relocates `secret_id`, its sibling `role_id`, and
+    /// `eab.json` outside the root-owned secrets tree, owned by the
+    /// agent account, so a co-located non-root `bootroot-agent` can read
+    /// `role_id`/`eab.json` and rewrite `secret_id`. The parent
+    /// directory must already exist, be agent-owned, and resolve outside
+    /// the secrets tree. Omit to keep the default under
+    /// `<secrets_dir>/services/<svc>/`.
+    #[arg(long)]
+    pub(crate) secret_id_path: Option<PathBuf>,
+
     /// Instance ID (required)
     #[arg(long)]
     pub(crate) instance_id: Option<String>,

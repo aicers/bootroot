@@ -50,6 +50,114 @@ pub(crate) fn service_eab_file_path(secret_id_path: &Path) -> std::path::PathBuf
         .join(SERVICE_EAB_FILENAME)
 }
 
+/// Returns the default secrets-tree `secret_id` location for a service,
+/// used when the operator did not pass `--secret-id-path`.
+fn default_service_secret_id_path(secrets_dir: &Path, service_name: &str) -> std::path::PathBuf {
+    secrets_dir
+        .join(SERVICE_SECRET_DIR)
+        .join(service_name)
+        .join(SERVICE_SECRET_ID_FILENAME)
+}
+
+/// Resolves the effective `secret_id` path for a service: the operator's
+/// absolute `--secret-id-path` override when supplied, otherwise the
+/// default under `<secrets_dir>/services/<svc>/`. This single value is
+/// the source of truth persisted to `entry.approle.secret_id_path`.
+fn resolved_secret_id_path(
+    resolved: &ResolvedServiceAdd,
+    secrets_dir: &Path,
+) -> std::path::PathBuf {
+    resolved
+        .secret_id_path_override
+        .clone()
+        .unwrap_or_else(|| default_service_secret_id_path(secrets_dir, &resolved.service_name))
+}
+
+/// Derives the sibling `role_id` path for a resolved `secret_id` path.
+fn role_id_sibling_path(secret_id_path: &Path) -> std::path::PathBuf {
+    secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(SERVICE_ROLE_ID_FILENAME)
+}
+
+/// Writes the origin `role_id` and `secret_id` credential files, rolling
+/// back a freshly-created override `role_id` if the `secret_id` write
+/// fails.
+///
+/// For an override both files are created no-clobber, so a stale
+/// pre-existing `secret_id` fails after a fresh `role_id` was already
+/// written. At that point no state entry exists yet and
+/// `service remove --delete-artifacts` has nothing to clean, so a retry
+/// would trip the no-clobber guard on our own leftover `role_id`.
+/// Removing it on failure lets the operator re-add once the stale
+/// `secret_id` is cleared. The default (no-override) path overwrites, so
+/// it never fails here; the rollback is gated on `is_override`.
+async fn write_origin_credential_files(
+    role_id_path: &Path,
+    secret_id_path: &Path,
+    role_id: &str,
+    secret_id: &str,
+    is_override: bool,
+    messages: &Messages,
+) -> Result<()> {
+    approle::write_role_id_file(role_id_path, role_id, is_override, messages).await?;
+    if let Err(err) =
+        approle::write_secret_id_file(secret_id_path, secret_id, is_override, messages).await
+    {
+        if is_override {
+            let _ = tokio::fs::remove_file(role_id_path).await;
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Rolls back the freshly-created override `role_id`/`secret_id` files if
+/// `service add` aborts before the state entry is persisted.
+///
+/// The two override credentials are created no-clobber. Once written,
+/// several later `service add` steps can still fail (KV sync, local
+/// config/EAB/CA-bundle rendering, the state save). If any does, no
+/// state entry exists yet, so `service remove --delete-artifacts` cannot
+/// reach the relocated files and a retry would trip the no-clobber guard
+/// on bootroot's own leftover. This guard removes them on any such early
+/// return; a successful save calls [`Self::disarm`] so they persist. Only
+/// the no-clobber credentials need rollback — `eab.json`/`agent.toml`/CA
+/// bundle are overwrite-able and never block a re-add. The default
+/// (no-override) path stores its files under the secrets tree, which
+/// service removal reclaims, so the guard is only armed for an override.
+struct OverrideCredentialRollback<'a> {
+    role_id_path: &'a Path,
+    secret_id_path: &'a Path,
+    armed: bool,
+}
+
+impl<'a> OverrideCredentialRollback<'a> {
+    fn armed(role_id_path: &'a Path, secret_id_path: &'a Path) -> Self {
+        Self {
+            role_id_path,
+            secret_id_path,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OverrideCredentialRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort synchronous cleanup on the error path; `Drop`
+            // cannot be async, and a single unlink is negligible.
+            let _ = std::fs::remove_file(self.secret_id_path);
+            let _ = std::fs::remove_file(self.role_id_path);
+        }
+    }
+}
+
 /// Reports whether two local agent-config paths name the same file.
 /// Paths resolved by this binary are stored absolute and lexically
 /// normalized, so a literal comparison covers equivalent spellings;
@@ -137,6 +245,11 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let resolved = resolve::resolve_service_add_args(args, messages, preview)?;
 
     resolve::validate_service_add(&resolved, messages)?;
+    resolve::validate_secret_id_path_override(
+        resolved.secret_id_path_override.as_deref(),
+        state.secrets_dir(),
+        messages,
+    )?;
 
     if let Some(ref ttl) = resolved.secret_id_ttl {
         if let Some(warning) = validate_secret_id_ttl(ttl, messages)? {
@@ -224,11 +337,7 @@ async fn run_service_add_preview(
     messages: &Messages,
 ) {
     let preview_entry = build_preview_service_entry(resolved, state);
-    let preview_secret_id_path = state
-        .secrets_dir()
-        .join(SERVICE_SECRET_DIR)
-        .join(&resolved.service_name)
-        .join(SERVICE_SECRET_ID_FILENAME);
+    let preview_secret_id_path = resolved_secret_id_path(resolved, state.secrets_dir());
     let mut note = messages.service_summary_preview_mode().to_string();
     let mut trusted_ca_sha256: Option<Vec<String>> = None;
     let Some(auth) = resolved.runtime_auth.as_ref() else {
@@ -342,20 +451,32 @@ async fn run_service_add_apply(
     )
     .await?;
     let secrets_dir = state.secrets_dir();
-    approle::write_role_id_file(
-        secrets_dir,
-        &resolved.service_name,
+    // The resolved `secret_id` path is the single source of truth for
+    // this add: the origin writes, the local config renderer, and the
+    // persisted state entry all use this same in-memory value (the state
+    // entry does not exist yet, so nothing reads it "from state"). For an
+    // operator `--secret-id-path` override it is the absolute path,
+    // agent-owned outside the secrets tree; otherwise the default under
+    // `<secrets_dir>/services/<svc>/`.
+    let is_override = resolved.secret_id_path_override.is_some();
+    let secret_id_path = resolved_secret_id_path(resolved, secrets_dir);
+    let role_id_path = role_id_sibling_path(&secret_id_path);
+    write_origin_credential_files(
+        &role_id_path,
+        &secret_id_path,
         &approle_result.role_id,
-        messages,
-    )
-    .await?;
-    let secret_id_path = approle::write_secret_id_file(
-        secrets_dir,
-        &resolved.service_name,
         &approle_result.secret_id,
+        is_override,
         messages,
     )
     .await?;
+    // From here through `state.save`, any failure leaves the no-clobber
+    // override credentials orphaned with no state entry to clean them up,
+    // so a retry would trip the no-clobber guard. Arm a rollback that
+    // removes them on an early return; it is disarmed once the entry is
+    // persisted.
+    let mut credential_rollback =
+        is_override.then(|| OverrideCredentialRollback::armed(&role_id_path, &secret_id_path));
     let service_sync_material = secrets::sync_service_kv_bundle(
         &client,
         state,
@@ -409,6 +530,11 @@ async fn run_service_add_apply(
     state
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
+    // The entry is persisted, so `service remove --delete-artifacts` can
+    // now reach the relocated files; keep them.
+    if let Some(rollback) = credential_rollback.as_mut() {
+        rollback.disarm();
+    }
 
     register_dns_alias(state, messages)?;
 
@@ -1043,11 +1169,7 @@ pub(crate) fn display_wrap_ttl(value: Option<&str>, messages: &Messages) -> Stri
 }
 
 fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile) -> ServiceEntry {
-    let preview_secret_id_path = state
-        .secrets_dir()
-        .join(SERVICE_SECRET_DIR)
-        .join(&resolved.service_name)
-        .join(SERVICE_SECRET_ID_FILENAME);
+    let preview_secret_id_path = resolved_secret_id_path(resolved, state.secrets_dir());
     build_service_entry_from_role(
         resolved,
         ServiceRoleEntry {
@@ -1097,15 +1219,129 @@ fn is_policy_only_mismatch(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) 
 mod tests {
     use std::path::PathBuf;
 
+    use tempfile::tempdir;
+
     use super::resolve::ResolvedServiceAdd;
     use super::{
-        ServiceAppRoleMaterialized, build_secret_id_options, build_service_entry,
-        build_service_entry_from_role, display_policy_value, display_wrap_ttl,
+        OverrideCredentialRollback, ServiceAppRoleMaterialized, build_secret_id_options,
+        build_service_entry, build_service_entry_from_role, display_policy_value, display_wrap_ttl,
         is_idempotent_remote_rerun, is_policy_only_mismatch, non_policy_fields_match,
-        policy_fields_match,
+        policy_fields_match, write_origin_credential_files,
     };
-    use crate::i18n::Messages;
+    use crate::i18n::{Messages, test_messages};
     use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry};
+
+    /// An override `service add` writes `role_id` then `secret_id`, both
+    /// no-clobber. A stale pre-existing `secret_id` must fail the add
+    /// *and* roll back the fresh `role_id` — otherwise, with no state
+    /// entry yet and no `--delete-artifacts` path, a retry would trip the
+    /// no-clobber guard on our own leftover `role_id`.
+    #[tokio::test]
+    async fn write_origin_credential_files_override_rolls_back_role_id_on_stale_secret_id() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent").join("svc");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let role_id_path = agent_dir.join("role_id");
+        let secret_id_path = agent_dir.join("secret_id");
+        // A stale secret_id from a prior, uncleaned registration.
+        std::fs::write(&secret_id_path, "stale").unwrap();
+        let messages = test_messages();
+
+        let err = write_origin_credential_files(
+            &role_id_path,
+            &secret_id_path,
+            "rid",
+            "sid",
+            true,
+            &messages,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Refusing to overwrite"),
+            "a stale override secret_id must be a no-clobber error, got: {err:#}"
+        );
+        assert!(
+            !role_id_path.exists(),
+            "the fresh role_id must be rolled back so a retry is not blocked by our own leftover"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&secret_id_path).unwrap(),
+            "stale",
+            "the stale secret_id must be left untouched"
+        );
+    }
+
+    /// The happy override path writes both credential files with no
+    /// rollback.
+    #[tokio::test]
+    async fn write_origin_credential_files_override_writes_both() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent").join("svc");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let role_id_path = agent_dir.join("role_id");
+        let secret_id_path = agent_dir.join("secret_id");
+        let messages = test_messages();
+
+        write_origin_credential_files(
+            &role_id_path,
+            &secret_id_path,
+            "rid",
+            "sid",
+            true,
+            &messages,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&role_id_path).unwrap(), "rid");
+        assert_eq!(std::fs::read_to_string(&secret_id_path).unwrap(), "sid");
+    }
+
+    /// An armed rollback that is dropped without being disarmed (an early
+    /// `service add` failure after the credential writes) removes both
+    /// override credential files, so a retry is not blocked by the
+    /// no-clobber guard on bootroot's own orphaned leftovers.
+    #[test]
+    fn override_credential_rollback_removes_files_when_armed() {
+        let dir = tempdir().unwrap();
+        let role_id_path = dir.path().join("role_id");
+        let secret_id_path = dir.path().join("secret_id");
+        std::fs::write(&role_id_path, "rid").unwrap();
+        std::fs::write(&secret_id_path, "sid").unwrap();
+
+        drop(OverrideCredentialRollback::armed(
+            &role_id_path,
+            &secret_id_path,
+        ));
+
+        assert!(!role_id_path.exists(), "armed rollback must remove role_id");
+        assert!(
+            !secret_id_path.exists(),
+            "armed rollback must remove secret_id"
+        );
+    }
+
+    /// A disarmed rollback (a successful state save) leaves both files in
+    /// place.
+    #[test]
+    fn override_credential_rollback_keeps_files_when_disarmed() {
+        let dir = tempdir().unwrap();
+        let role_id_path = dir.path().join("role_id");
+        let secret_id_path = dir.path().join("secret_id");
+        std::fs::write(&role_id_path, "rid").unwrap();
+        std::fs::write(&secret_id_path, "sid").unwrap();
+
+        let mut rollback = OverrideCredentialRollback::armed(&role_id_path, &secret_id_path);
+        rollback.disarm();
+        drop(rollback);
+
+        assert!(role_id_path.exists(), "disarmed rollback must keep role_id");
+        assert!(
+            secret_id_path.exists(),
+            "disarmed rollback must keep secret_id"
+        );
+    }
 
     fn sample_resolved() -> ResolvedServiceAdd {
         ResolvedServiceAdd {
@@ -1127,6 +1363,7 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+            secret_id_path_override: None,
         }
     }
 

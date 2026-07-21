@@ -726,6 +726,17 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--agent-config`: bootroot-agent config path
 - `--cert-path`: certificate output path
 - `--key-path`: private key output path
+- `--secret-id-path`: absolute path to write the service `secret_id` to
+  (`local-file` delivery only). Relocates `secret_id`, its sibling
+  `role_id`, and `eab.json` out of the root-owned `<secrets_dir>/services/<svc>/`
+  tree and into an operator-provisioned directory owned by the agent
+  account, so a co-located non-root `bootroot-agent` can read
+  `role_id`/`eab.json` and rewrite `secret_id`. The parent directory must
+  already exist, be agent-owned, and resolve outside `<secrets_dir>`.
+  Rejected with `remote-bootstrap` delivery, when the final path
+  component is `role_id` (it would collide with the derived sibling), or
+  when it resolves inside `<secrets_dir>`. Omit to keep the default under
+  `<secrets_dir>/services/<svc>/`.
 - `--instance-id`: service instance_id
   - Must be numeric (`001`, `42`, ...)
 - `--auth-mode`: runtime auth mode (`auto`, `root`, `approle`, default `auto`)

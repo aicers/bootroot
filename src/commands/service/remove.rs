@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 use bootroot::trust_bootstrap::remove_managed_service_profile;
 
-use super::{REMOTE_BOOTSTRAP_DIR, SERVICE_SECRET_DIR};
+use super::{
+    REMOTE_BOOTSTRAP_DIR, SERVICE_ROLE_ID_FILENAME, SERVICE_SECRET_DIR, service_eab_file_path,
+};
 use crate::cli::args::ServiceRemoveArgs;
 use crate::cli::prompt::Prompt;
 use crate::commands::constants::SERVICE_KV_BASE;
@@ -252,7 +254,24 @@ fn build_artifact_plan(state: &StateFile, entry: &ServiceEntry) -> ArtifactPlan 
             .join(REMOTE_BOOTSTRAP_DIR)
             .join(&entry.service_name),
     ];
-    let files = vec![entry.cert_path.clone(), entry.key_path.clone()];
+    let mut files = vec![entry.cert_path.clone(), entry.key_path.clone()];
+    // A `--secret-id-path` override relocates `secret_id`, its sibling
+    // `role_id`, and `eab.json` outside the default `<secrets_dir>/
+    // services/<svc>` directory removed above, so clean those individual
+    // files up too — otherwise a remove-then-re-add to the same override
+    // location hits the no-clobber guard. The operator-owned parent
+    // directory (which bootroot did not create) is left in place.
+    let secret_id_path = &entry.approle.secret_id_path;
+    let relocated = !bootroot::fs_util::path_is_within(secret_id_path, secrets_dir).unwrap_or(true);
+    if relocated {
+        let role_id_path = secret_id_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(SERVICE_ROLE_ID_FILENAME);
+        files.push(secret_id_path.clone());
+        files.push(role_id_path);
+        files.push(service_eab_file_path(secret_id_path));
+    }
     ArtifactPlan {
         dirs,
         files,
@@ -568,6 +587,40 @@ mod tests {
             reloaded.services.contains_key("svc"),
             "entry must survive on disk when the alias reconcile fails"
         );
+    }
+
+    #[test]
+    fn build_artifact_plan_default_omits_relocated_credential_files() {
+        let state = sample_state();
+        // Default secret_id under the secrets tree (sample_entry uses "/s",
+        // but override detection compares against secrets_dir "secrets").
+        let mut entry = sample_entry("svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = state
+            .secrets_dir()
+            .join("services")
+            .join("svc")
+            .join("secret_id");
+        let plan = build_artifact_plan(&state, &entry);
+        // Only the cert and key files, plus the two service dirs.
+        assert_eq!(
+            plan.files,
+            vec![entry.cert_path.clone(), entry.key_path.clone()]
+        );
+    }
+
+    #[test]
+    fn build_artifact_plan_override_deletes_relocated_credential_files() {
+        let state = sample_state();
+        let mut entry = sample_entry("svc", DeliveryMode::LocalFile);
+        let agent_dir = PathBuf::from("/etc/agent/svc");
+        entry.approle.secret_id_path = agent_dir.join("secret_id");
+        let plan = build_artifact_plan(&state, &entry);
+
+        assert!(plan.files.contains(&agent_dir.join("secret_id")));
+        assert!(plan.files.contains(&agent_dir.join("role_id")));
+        assert!(plan.files.contains(&agent_dir.join("eab.json")));
+        // The operator-owned parent directory is not scheduled for removal.
+        assert!(!plan.dirs.contains(&agent_dir));
     }
 
     #[test]

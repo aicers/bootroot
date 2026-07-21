@@ -56,12 +56,30 @@ impl SharedEab {
 /// Returns an error when the parent directory, the existing file, or the write
 /// cannot be created, read, or written.
 pub async fn write_eab_file(path: &Path, kid: &str, hmac: &str) -> anyhow::Result<bool> {
+    write_key_file(path, &serialize_eab_payload(kid, hmac)?).await
+}
+
+/// Serializes EAB credentials into the exact newline-terminated pretty
+/// `{ "kid", "hmac" }` JSON that [`write_eab_file`] persists.
+///
+/// Exposed so a local-file `service add` that relocates `eab.json`
+/// outside the secrets tree can write byte-identical content through an
+/// ownership-preserving, symlink-safe writer without re-implementing —
+/// and drifting from — the on-disk shape.
+///
+/// # Errors
+/// Returns an error if the credentials cannot be serialized to JSON.
+pub fn serialize_eab_payload(kid: &str, hmac: &str) -> anyhow::Result<String> {
     let payload = serde_json::to_string_pretty(&serde_json::json!({
         "kid": kid,
         "hmac": hmac,
     }))
     .context("Failed to serialize EAB credentials")?;
-    write_key_file(path, &payload).await
+    Ok(if payload.ends_with('\n') {
+        payload
+    } else {
+        format!("{payload}\n")
+    })
 }
 
 /// Writes `contents` (newline-terminated) to a `0o600` key file idempotently,

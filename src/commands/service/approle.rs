@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
@@ -6,10 +6,7 @@ use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 use bootroot::trust_bootstrap::SERVICE_REISSUE_KV_SUFFIX;
 use tokio::fs;
 
-use super::{
-    SERVICE_ROLE_ID_FILENAME, SERVICE_ROLE_PREFIX, SERVICE_SECRET_DIR, SERVICE_SECRET_ID_FILENAME,
-    ServiceAppRoleMaterialized,
-};
+use super::{SERVICE_ROLE_PREFIX, ServiceAppRoleMaterialized};
 use crate::commands::constants::SERVICE_KV_BASE;
 use crate::commands::init::{SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
@@ -112,40 +109,120 @@ pub(super) fn service_policy_name(service_name: &str) -> String {
 }
 
 pub(super) async fn write_secret_id_file(
-    secrets_dir: &Path,
-    service_name: &str,
+    secret_id_path: &Path,
     secret_id: &str,
+    is_override: bool,
     messages: &Messages,
-) -> Result<PathBuf> {
-    let service_dir = secrets_dir.join(SERVICE_SECRET_DIR).join(service_name);
-    fs_util::ensure_secrets_dir(&service_dir).await?;
-    let secret_path = service_dir.join(SERVICE_SECRET_ID_FILENAME);
-    fs::write(&secret_path, secret_id)
-        .await
-        .with_context(|| messages.error_write_file_failed(&secret_path.display().to_string()))?;
-    fs_util::set_key_permissions(&secret_path).await?;
-    Ok(secret_path)
+) -> Result<()> {
+    write_service_credential_file(secret_id_path, secret_id, is_override, messages).await
 }
 
 pub(super) async fn write_role_id_file(
-    secrets_dir: &Path,
-    service_name: &str,
+    role_id_path: &Path,
     role_id: &str,
+    is_override: bool,
     messages: &Messages,
-) -> Result<PathBuf> {
-    let service_dir = secrets_dir.join(SERVICE_SECRET_DIR).join(service_name);
-    fs_util::ensure_secrets_dir(&service_dir).await?;
-    let role_path = service_dir.join(SERVICE_ROLE_ID_FILENAME);
-    fs::write(&role_path, role_id)
-        .await
-        .with_context(|| messages.error_write_file_failed(&role_path.display().to_string()))?;
-    fs_util::set_key_permissions(&role_path).await?;
-    Ok(role_path)
+) -> Result<()> {
+    write_service_credential_file(role_id_path, role_id, is_override, messages).await
+}
+
+/// Writes a freshly-minted service credential (`secret_id` or its
+/// sibling `role_id`) to `path`.
+///
+/// For the default secrets-tree location bootroot owns the directory:
+/// it is created `0700`, and the file is plainly (over)written `0600`,
+/// replacing any stale file left by a previously removed service. For an
+/// operator `--secret-id-path` override the directory is agent-owned and
+/// sits outside the secrets tree, so the write goes through the hardened
+/// path in [`fs_util::create_owned_credential_noclobber`]: the parent
+/// must already exist, the fresh file is chowned to the agent-owning
+/// parent, mode `0600`, created no-clobber, and never follows a
+/// final-component symlink.
+async fn write_service_credential_file(
+    path: &Path,
+    contents: &str,
+    is_override: bool,
+    messages: &Messages,
+) -> Result<()> {
+    if is_override {
+        fs_util::create_owned_credential_noclobber(path, contents.as_bytes())
+            .await
+            .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    } else {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        fs_util::ensure_secrets_dir(parent).await?;
+        fs::write(path, contents)
+            .await
+            .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+        fs_util::set_key_permissions(path).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::tempdir;
+
     use super::*;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The default (no-override) write creates the secrets-tree directory
+    /// `0700`, writes the file `0600`, and — unlike the override path —
+    /// overwrites a stale file left by a previously removed service.
+    #[tokio::test]
+    async fn write_secret_id_file_default_creates_dir_and_overwrites() {
+        let dir = tempdir().unwrap();
+        let secret_id_path = dir
+            .path()
+            .join("secrets")
+            .join("services")
+            .join("svc")
+            .join("secret_id");
+        let messages = crate::i18n::test_messages();
+
+        write_secret_id_file(&secret_id_path, "sid-1", false, &messages)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&secret_id_path).unwrap(), "sid-1");
+        assert_eq!(mode_of(&secret_id_path), fs_util::KEY_FILE_MODE);
+        assert_eq!(mode_of(secret_id_path.parent().unwrap()), 0o700);
+
+        // The default path overwrites a stale file, as before.
+        write_secret_id_file(&secret_id_path, "sid-2", false, &messages)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&secret_id_path).unwrap(), "sid-2");
+    }
+
+    /// The override write requires an existing parent, produces a `0600`
+    /// file, and refuses to clobber a pre-existing regular file.
+    #[tokio::test]
+    async fn write_role_id_file_override_is_0600_and_noclobber() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent").join("svc");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let role_id_path = agent_dir.join("role_id");
+        let messages = crate::i18n::test_messages();
+
+        write_role_id_file(&role_id_path, "rid", true, &messages)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&role_id_path).unwrap(), "rid");
+        assert_eq!(mode_of(&role_id_path), fs_util::KEY_FILE_MODE);
+
+        let err = write_role_id_file(&role_id_path, "rid-2", true, &messages)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Refusing to overwrite"),
+            "override role_id write must be no-clobber, got: {err:#}"
+        );
+    }
 
     #[test]
     fn service_policy_grants_write_only_on_reissue_path() {
