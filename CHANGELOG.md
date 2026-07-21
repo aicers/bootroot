@@ -733,12 +733,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - Rotation recreates a *removed* relocated `secret_id` through the same
     parent-owner writer as its missing-`role_id` recovery, so the fresh
     file lands agent-owned rather than owned by the (root) rotate
-    process; an existing `secret_id` is still rewritten in place with its
-    uid/gid preserved.
-  - When the override `secret_id` write fails on `service add` (e.g. a
-    stale pre-existing file trips the no-clobber guard), the freshly
-    created `role_id` is rolled back, so a retry after clearing the stale
-    file is not blocked by bootroot's own leftover `role_id`.
+    process; an existing relocated `secret_id` is rewritten in place with
+    its uid/gid preserved through a symlink-rejecting writer, so a symlink
+    planted at the credential path cannot redirect the root write or
+    re-own the replacement to a root-owned symlink target.
+  - When any `service add` step after the no-clobber override credential
+    writes fails before the state entry is saved (a stale pre-existing
+    file tripping the no-clobber guard, KV sync, local config/EAB/CA-
+    bundle rendering, or the state save itself), the freshly created
+    `role_id`/`secret_id` are rolled back, so a retry is never blocked by
+    bootroot's own orphaned leftovers left with no `--delete-artifacts`
+    path to clean them.
   - The override is rejected with `remote-bootstrap` delivery, when its
     final path component is `role_id` (it would collide with the derived
     sibling), or when it resolves inside `<secrets_dir>` (the non-root

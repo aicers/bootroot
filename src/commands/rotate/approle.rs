@@ -712,8 +712,10 @@ async fn ensure_role_id_file(
 /// write. For a relocated (`--secret-id-path` override) path the
 /// directory is operator-provisioned and agent-owned, so it must **not**
 /// be re-moded. When the relocated `secret_id` still exists the write
-/// goes through `atomic_write`, which preserves the existing (agent)
-/// uid/gid and re-applies mode `0600`. When it has been removed,
+/// goes through `atomic_rewrite_owned_no_symlink`, which preserves the
+/// existing (agent) uid/gid and re-applies mode `0600` while refusing to
+/// follow a symlink planted at the final path component (so a redirected
+/// root write cannot re-own it). When it has been removed,
 /// `atomic_write` would create it owned by the rotate process — root for
 /// the control CLI — re-breaking the non-root agent, so a missing
 /// override `secret_id` is recreated through the parent-owner credential
@@ -728,11 +730,22 @@ async fn write_service_secret_id_file(
     let is_override = !fs_util::path_is_within(secret_id_path, secrets_dir).unwrap_or(true);
     if is_override {
         if secret_id_path.exists() {
-            fs_util::atomic_write(secret_id_path, secret_id.as_bytes(), fs_util::KEY_FILE_MODE)
-                .await
-                .with_context(|| {
-                    messages.error_write_file_failed(&secret_id_path.display().to_string())
-                })?;
+            // `atomic_write` reads the destination owner through
+            // `metadata`, which follows a final-component symlink: a
+            // symlink planted by the lower-privileged agent account and
+            // pointing at a root-owned file would make the replacement
+            // root-owned `0600` in the agent directory, re-breaking the
+            // non-root agent. Rewrite through the symlink-rejecting,
+            // owner-preserving writer instead.
+            fs_util::atomic_rewrite_owned_no_symlink(
+                secret_id_path,
+                secret_id.as_bytes(),
+                fs_util::KEY_FILE_MODE,
+            )
+            .await
+            .with_context(|| {
+                messages.error_write_file_failed(&secret_id_path.display().to_string())
+            })?;
         } else {
             fs_util::create_owned_credential_noclobber(secret_id_path, secret_id.as_bytes())
                 .await
@@ -1342,6 +1355,37 @@ mod tests {
             "a recreated override secret_id must be chowned to the agent-owning parent, not root"
         );
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// A relocated `secret_id` that is a symlink (planted by the
+    /// lower-privileged agent account, e.g. pointing at a root-owned
+    /// file) must be rejected on rotation rather than followed — a
+    /// followed rewrite would re-own the replacement to the symlink
+    /// target's owner and re-break the non-root agent.
+    #[tokio::test]
+    async fn write_service_secret_id_file_override_rejects_symlink() {
+        let dir = tempdir().expect("tempdir");
+        let secrets_dir = dir.path().join("secrets");
+        let agent_dir = dir.path().join("agent").join("svc");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "victim").expect("seed victim");
+        let secret_id_path = agent_dir.join("secret_id");
+        std::os::unix::fs::symlink(&victim, &secret_id_path).expect("plant symlink");
+        let messages = test_messages();
+
+        let err = write_service_secret_id_file(&secret_id_path, "new", &secrets_dir, &messages)
+            .await
+            .expect_err("a symlinked relocated secret_id must be rejected");
+        assert!(
+            format!("{err:#}").contains("Refusing to rewrite a symlink"),
+            "expected a symlink rejection, got: {err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "victim",
+            "the symlink target must be untouched"
+        );
     }
 
     /// The default (secrets-tree) rotation still (re)creates the service

@@ -88,6 +88,88 @@ pub async fn write_owned_file_replace(path: &Path, contents: &[u8], mode: u32) -
     write_owned_impl(path, contents, mode, true).await
 }
 
+/// Atomically rewrites an existing override credential file in place,
+/// preserving its uid/gid and re-applying `mode`, while refusing to
+/// follow a symlink planted at the final path component.
+///
+/// This is the rotation-time writer for a relocated `secret_id` that
+/// still exists. It differs from [`atomic_write`] in reading the
+/// destination's ownership through `symlink_metadata` (which does not
+/// follow a symlink) and rejecting a symlink outright. A lower-privileged
+/// user who plants a symlink at the credential path — pointing at a
+/// root-owned file — must not be able to make the root rewrite either
+/// follow it or copy that file's root ownership onto the replacement,
+/// which would re-break the non-root agent. The atomic rename replaces
+/// the target name (it never follows the link) and the ownership read is
+/// taken from the real file, so a swap after the check cannot escalate.
+///
+/// # Errors
+/// Returns an error if the destination is a symlink, is missing, its
+/// metadata cannot be read, or the staged file cannot be
+/// created/written/permissioned/chowned/renamed.
+pub async fn atomic_rewrite_owned_no_symlink(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<()> {
+    let dest = path.to_path_buf();
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        // `symlink_metadata` does not follow the final component, so it
+        // both detects a planted symlink and reads the *real* file's
+        // uid/gid (never a root-owned symlink target's).
+        let meta = std::fs::symlink_metadata(&dest)
+            .with_context(|| format!("Failed to stat override credential {}", dest.display()))?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "Refusing to rewrite a symlink at override credential path: {}",
+                dest.display()
+            );
+        }
+        let (uid, gid) = (meta.uid(), meta.gid());
+
+        let mut tmp = tempfile::NamedTempFile::new_in(&parent)
+            .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
+        tmp.as_file_mut()
+            .write_all(&payload)
+            .with_context(|| format!("Failed to write temp file for {}", dest.display()))?;
+        tmp.as_file_mut()
+            .sync_all()
+            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
+            || {
+                format!(
+                    "Failed to set mode {mode:o} on temp file for {}",
+                    dest.display()
+                )
+            },
+        )?;
+        std::os::unix::fs::chown(tmp.path(), Some(uid), Some(gid)).with_context(|| {
+            format!(
+                "Failed to preserve uid={uid} gid={gid} on {}",
+                dest.display()
+            )
+        })?;
+        // `persist` replaces the target *name* via rename(2), which does
+        // not traverse a symlink at the final component, so even a
+        // post-check swap cannot redirect the write.
+        tmp.persist(&dest).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to rename temp file to {}: {}",
+                dest.display(),
+                e.error
+            )
+        })?;
+        Ok(())
+    })
+    .await
+    .context("Owned credential rewrite task panicked")?
+}
+
 async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, replace: bool) -> Result<()> {
     if !path.is_absolute() {
         anyhow::bail!(
@@ -770,6 +852,62 @@ mod tests {
         );
         // The symlink target must be untouched (write not redirected).
         assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "victim");
+    }
+
+    /// Rotation's in-place rewrite must refuse a symlink planted at the
+    /// credential path and never redirect the write through it.
+    #[tokio::test]
+    async fn atomic_rewrite_owned_no_symlink_rejects_symlink() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("agent-svc");
+        std::fs::create_dir(&parent).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "victim").unwrap();
+        let target = parent.join("secret_id");
+        std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+
+        let err = atomic_rewrite_owned_no_symlink(&target, b"new", KEY_FILE_MODE)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Refusing to rewrite a symlink"),
+            "a planted symlink must be rejected, got: {err:#}"
+        );
+        // The symlink target must be untouched (write not redirected).
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "victim");
+    }
+
+    /// The in-place rewrite preserves the existing file's uid/gid and
+    /// re-applies `0600`. Gated on a supplementary gid being available.
+    #[tokio::test]
+    async fn atomic_rewrite_owned_no_symlink_preserves_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(gid) = crate::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("agent-svc");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("secret_id");
+        std::fs::write(&target, "old").unwrap();
+        std::os::unix::fs::chown(&target, None, Some(gid))
+            .expect("test process must be able to chgrp the seeded file");
+        let pre_uid = std::fs::metadata(&target).unwrap().uid();
+
+        atomic_rewrite_owned_no_symlink(&target, b"new", KEY_FILE_MODE)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(meta.gid(), gid, "rewrite must preserve the existing gid");
+        assert_eq!(
+            meta.uid(),
+            pre_uid,
+            "rewrite must preserve the existing uid"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, KEY_FILE_MODE);
     }
 
     #[tokio::test]
