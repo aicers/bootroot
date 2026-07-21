@@ -31,6 +31,10 @@ pub(super) async fn apply_local_service_configs(
     openbao_url: &str,
     messages: &Messages,
 ) -> Result<LocalApplyResult> {
+    // The relocation flag is fully determined by whether the operator
+    // supplied `--secret-id-path`; `secret_id_path` is the matching
+    // resolved value, so deriving it here keeps the two in lock-step.
+    let is_override = resolved.secret_id_path_override.is_some();
     let profile = render_managed_profile_block(resolved);
     let ca_bundle_path = resolved
         .cert_path
@@ -134,8 +138,14 @@ pub(super) async fn apply_local_service_configs(
         messages,
     )
     .await?;
-    let eab_path =
-        provision_local_eab_file(secrets_dir, secret_id_path, sync_material, messages).await?;
+    let eab_path = provision_local_eab_file(
+        secrets_dir,
+        secret_id_path,
+        is_override,
+        sync_material,
+        messages,
+    )
+    .await?;
     // `service add` is the authoritative writer for the operator's
     // `agent.toml`; create its parent chain if missing so callers do not
     // have to keep a separate `mkdir -p` in sync with `--agent-config`.
@@ -292,6 +302,7 @@ fn state_path_basename(service_name: &str) -> String {
 async fn provision_local_eab_file(
     secrets_dir: &Path,
     secret_id_path: &Path,
+    is_override: bool,
     sync_material: &ServiceSyncMaterial,
     messages: &Messages,
 ) -> Result<PathBuf> {
@@ -302,11 +313,7 @@ async fn provision_local_eab_file(
         sync_material.eab_hmac.as_deref(),
     ) {
         (Some(kid), Some(hmac)) if !kid.is_empty() && !hmac.is_empty() => {
-            bootroot::eab::write_eab_file(&eab_path, kid, hmac)
-                .await
-                .with_context(|| {
-                    messages.error_write_file_failed(&eab_path.display().to_string())
-                })?;
+            write_local_eab_file(&eab_path, kid, hmac, is_override, messages).await?;
         }
         _ => {
             bootroot::eab::remove_eab_file(&eab_path)
@@ -317,6 +324,38 @@ async fn provision_local_eab_file(
         }
     }
     Ok(eab_path)
+}
+
+/// Writes the service `eab.json` at `path`.
+///
+/// For the default secrets-tree location this delegates to the shared
+/// [`bootroot::eab::write_eab_file`]. For a relocated (override) path,
+/// which lives in the operator-provisioned, agent-owned directory, the
+/// same byte-identical payload is written through
+/// [`fs_util::write_owned_file_replace`] so the fresh file is chowned to
+/// the agent-owning parent, stays `0600` and symlink-safe, and — unlike
+/// `secret_id`/`role_id` — is legitimately overwritten on every sync.
+/// The shared writer's ownership/`ensure_secrets_dir` semantics are left
+/// intact for remote and agent callers.
+async fn write_local_eab_file(
+    path: &Path,
+    kid: &str,
+    hmac: &str,
+    is_override: bool,
+    messages: &Messages,
+) -> Result<()> {
+    if is_override {
+        let payload = bootroot::eab::serialize_eab_payload(kid, hmac)
+            .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+        fs_util::write_owned_file_replace(path, payload.as_bytes(), fs_util::KEY_FILE_MODE)
+            .await
+            .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    } else {
+        bootroot::eab::write_eab_file(path, kid, hmac)
+            .await
+            .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    }
+    Ok(())
 }
 
 /// Pre-seeds the public CA bundle on disk so the agent can verify TLS
@@ -442,6 +481,7 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+            secret_id_path_override: None,
         }
     }
 
@@ -800,9 +840,10 @@ mod tests {
         let mut material = test_sync_material();
         material.eab_kid = Some("kid-1".to_string());
         material.eab_hmac = Some("hmac-1".to_string());
-        let eab_path = provision_local_eab_file(secrets_dir, &secret_id_path, &material, &messages)
-            .await
-            .unwrap();
+        let eab_path =
+            provision_local_eab_file(secrets_dir, &secret_id_path, false, &material, &messages)
+                .await
+                .unwrap();
         assert_eq!(
             eab_path,
             secrets_dir.join("services/edge-proxy/eab.json"),
@@ -816,13 +857,63 @@ mod tests {
         assert_eq!(creds.hmac, "hmac-1");
 
         let cleared = test_sync_material();
-        provision_local_eab_file(secrets_dir, &secret_id_path, &cleared, &messages)
+        provision_local_eab_file(secrets_dir, &secret_id_path, false, &cleared, &messages)
             .await
             .unwrap();
         assert!(
             !eab_path.exists(),
             "stale eab.json must be removed when KV holds no EAB"
         );
+    }
+
+    /// An override (relocated) `secret_id_path` places `eab.json` in the
+    /// operator-provisioned, agent-owned directory, chowned to that
+    /// account and `0600`, without re-moding the directory. Gated on a
+    /// supplementary gid being available, like the other ownership tests.
+    #[tokio::test]
+    async fn test_provision_local_eab_file_override_is_agent_owned() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let agent_dir = dir.path().join("agent").join("edge-proxy");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::os::unix::fs::chown(&agent_dir, None, Some(gid))
+            .expect("test process must be able to chgrp the override dir");
+        std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let secret_id_path = agent_dir.join("secret_id");
+        let messages = crate::i18n::test_messages();
+
+        let mut material = test_sync_material();
+        material.eab_kid = Some("kid-1".to_string());
+        material.eab_hmac = Some("hmac-1".to_string());
+        let eab_path =
+            provision_local_eab_file(&secrets_dir, &secret_id_path, true, &material, &messages)
+                .await
+                .unwrap();
+
+        assert_eq!(eab_path, agent_dir.join("eab.json"));
+        let meta = std::fs::metadata(&eab_path).unwrap();
+        assert_eq!(
+            meta.gid(),
+            gid,
+            "override eab.json must be chowned to the agent gid"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, fs_util::KEY_FILE_MODE);
+        assert_eq!(
+            std::fs::metadata(&agent_dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "override eab provisioning must not re-mode the operator directory"
+        );
+        let creds = bootroot::eab::load_credentials(None, None, Some(eab_path))
+            .await
+            .unwrap()
+            .expect("credentials must round-trip");
+        assert_eq!(creds.kid, "kid-1");
+        assert_eq!(creds.hmac, "hmac-1");
     }
 
     /// Empty-string EAB values (the KV "cleared" shape written by
@@ -838,9 +929,10 @@ mod tests {
         let mut material = test_sync_material();
         material.eab_kid = Some(String::new());
         material.eab_hmac = Some(String::new());
-        let eab_path = provision_local_eab_file(secrets_dir, &secret_id_path, &material, &messages)
-            .await
-            .unwrap();
+        let eab_path =
+            provision_local_eab_file(secrets_dir, &secret_id_path, false, &material, &messages)
+                .await
+                .unwrap();
         assert!(
             !eab_path.exists(),
             "empty-string EAB must not produce an eab.json"

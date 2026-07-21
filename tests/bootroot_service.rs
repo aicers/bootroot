@@ -164,6 +164,333 @@ async fn test_app_add_writes_state_and_secret() {
     assert_local_fast_poll_artifacts(temp_dir.path(), &agent_config, "edge-proxy");
 }
 
+/// Issue #722 — a local-file `service add --secret-id-path <abs>`
+/// relocates `secret_id`, its sibling `role_id`, and `eab.json` into the
+/// operator-provisioned directory (outside `<secrets_dir>`), and the
+/// state entry, the generated `[openbao]` config, and the summary all
+/// report the relocated paths. Nothing is left in the default
+/// secrets-tree location.
+// The single end-to-end fixture asserts across every relocated seam
+// (files, state, config, summary), which pushes it past the default
+// 100-line threshold; CLAUDE.md treats `too_many_lines` loosely, so keep
+// it whole rather than fragmenting the flow.
+#[allow(clippy::too_many_lines)]
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_secret_id_path_override_relocates_credentials() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+    // Operator-provisioned, agent-owned credential directory outside the
+    // root-owned `<secrets_dir>` tree.
+    let agent_dir = temp_dir.path().join("agent").join("edge-proxy");
+    fs::create_dir_all(&agent_dir).expect("create agent dir");
+    let override_secret_id = agent_dir.join("secret_id");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--secret-id-path",
+            override_secret_id.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The summary reports the relocated secret_id path, not the default.
+    assert!(
+        stdout.contains(&override_secret_id.display().to_string()),
+        "summary must report the relocated secret_id path: {stdout}"
+    );
+
+    // secret_id, sibling role_id, and eab.json land in the override dir,
+    // all 0600.
+    let assert_0600 = |path: &std::path::Path| {
+        let mode = fs::metadata(path)
+            .unwrap_or_else(|_| panic!("metadata for {}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{} must be 0600", path.display());
+    };
+    assert_eq!(
+        fs::read_to_string(&override_secret_id).expect("read relocated secret_id"),
+        "secret-edge-proxy"
+    );
+    assert_0600(&override_secret_id);
+    let override_role_id = agent_dir.join("role_id");
+    assert_eq!(
+        fs::read_to_string(&override_role_id).expect("read relocated role_id"),
+        "role-edge-proxy"
+    );
+    assert_0600(&override_role_id);
+    let override_eab = agent_dir.join("eab.json");
+    let eab: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&override_eab).expect("read relocated eab.json"))
+            .expect("parse eab.json");
+    assert_eq!(eab["kid"], "test-kid");
+    assert_eq!(eab["hmac"], "test-hmac");
+    assert_0600(&override_eab);
+
+    // The default secrets-tree location holds nothing for this service.
+    let default_dir = temp_dir
+        .path()
+        .join("secrets")
+        .join("services")
+        .join("edge-proxy");
+    assert!(
+        !default_dir.join("secret_id").exists()
+            && !default_dir.join("role_id").exists()
+            && !default_dir.join("eab.json").exists(),
+        "no credential may be written under the default secrets tree when overridden"
+    );
+
+    // State records the relocated secret_id path as the source of truth.
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp_dir.path().join("state.json")).expect("read state.json"),
+    )
+    .expect("parse state.json");
+    assert_eq!(
+        state["services"]["edge-proxy"]["approle"]["secret_id_path"],
+        override_secret_id.to_string_lossy().as_ref()
+    );
+
+    // The generated [openbao] config points the agent at the relocated
+    // role_id/secret_id.
+    let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
+    let doc: toml_edit::DocumentMut = agent_contents.parse().expect("agent.toml must parse");
+    let openbao = doc
+        .get("openbao")
+        .and_then(toml_edit::Item::as_table)
+        .expect("agent.toml must contain an [openbao] table");
+    let get = |key: &str| {
+        openbao
+            .get(key)
+            .and_then(toml_edit::Item::as_str)
+            .unwrap_or_else(|| panic!("[openbao].{key} must be a string"))
+    };
+    assert_eq!(
+        std::path::Path::new(get("secret_id_path")),
+        override_secret_id
+    );
+    assert_eq!(std::path::Path::new(get("role_id_path")), override_role_id);
+}
+
+/// Issue #722 — `--secret-id-path` is local-file only; passing it with
+/// `--delivery-mode remote-bootstrap` is rejected before any `OpenBao`
+/// interaction.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_secret_id_path_rejected_with_remote_bootstrap() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    fs::write(&agent_config, "# config").expect("write agent config");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    let agent_dir = temp_dir.path().join("agent").join("edge-proxy");
+    fs::create_dir_all(&agent_dir).expect("create agent dir");
+
+    write_state_file(temp_dir.path(), "http://127.0.0.1:1").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--delivery-mode",
+            "remote-bootstrap",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--secret-id-path",
+            agent_dir.join("secret_id").to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    assert!(
+        !output.status.success(),
+        "remote-bootstrap override must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("only honoured for local-file delivery"),
+        "stderr must explain the local-file restriction: {stderr}"
+    );
+}
+
+/// Issue #722 — a `--secret-id-path` whose final component is `role_id`
+/// (which would collide with the derived sibling) is rejected.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_secret_id_path_rejected_role_id_final_component() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    let agent_dir = temp_dir.path().join("agent").join("edge-proxy");
+    fs::create_dir_all(&agent_dir).expect("create agent dir");
+
+    write_state_file(temp_dir.path(), "http://127.0.0.1:1").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--secret-id-path",
+            agent_dir.join("role_id").to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    assert!(!output.status.success(), "role_id-final override must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must not end in `role_id`"),
+        "stderr must explain the role_id collision: {stderr}"
+    );
+}
+
+/// Issue #722 — a `--secret-id-path` that resolves inside the root-owned
+/// `<secrets_dir>` tree (which the non-root agent cannot traverse) is
+/// rejected.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_secret_id_path_rejected_inside_secrets_dir() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    // Canonicalize so the absolute `inside` path shares the same prefix
+    // the child process derives from its resolved cwd (macOS resolves the
+    // `/var` -> `/private/var` symlink in `getcwd()`); the containment
+    // check is lexical, so the two spellings must agree.
+    let root = temp_dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize temp dir");
+    let agent_config = root.join("agent.toml");
+    let cert_path = root.join("certs").join("edge-proxy.crt");
+    let key_path = root.join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+    // An absolute path that resolves inside the state's `secrets_dir`
+    // (relative "secrets", so under the working dir).
+    let inside = root
+        .join("secrets")
+        .join("services")
+        .join("edge-proxy")
+        .join("secret_id");
+    fs::create_dir_all(inside.parent().unwrap()).expect("create inside dir");
+
+    write_state_file(&root, "http://127.0.0.1:1").expect("write state.json");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(&root)
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--secret-id-path",
+            inside.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    assert!(
+        !output.status.success(),
+        "inside-secrets-dir override must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must resolve outside the root-owned secrets tree"),
+        "stderr must explain the secrets-tree restriction: {stderr}"
+    );
+}
+
 /// Issue #702 — `service add` may arm a `--reload-style` preset and a
 /// `--post-renew-command` custom hook together. Both must be persisted to
 /// state and rendered into `agent.toml` in the deterministic "preset

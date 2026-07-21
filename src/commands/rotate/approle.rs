@@ -323,7 +323,7 @@ async fn rotate_service_secret_id_once(
         .clone();
     let is_remote = matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap);
     if !is_remote {
-        ensure_role_id_file(&entry, client, messages).await?;
+        ensure_role_id_file(&entry, ctx.state.secrets_dir(), client, messages).await?;
     }
     let secret_id_options = SecretIdOptions {
         ttl: entry.approle.secret_id_ttl.clone(),
@@ -349,7 +349,13 @@ async fn rotate_service_secret_id_once(
     // agent's fast-poll loop re-reads the `secret_id` file on every
     // AppRole re-login, so no process signal or sidecar reload follows.
     if !is_remote {
-        write_secret_id_atomic(&entry.approle.secret_id_path, &new_secret_id, messages).await?;
+        write_service_secret_id_file(
+            &entry.approle.secret_id_path,
+            &new_secret_id,
+            ctx.state.secrets_dir(),
+            messages,
+        )
+        .await?;
     }
     let has_cidr_binding = entry.approle.token_bound_cidrs.is_some();
     if !has_cidr_binding {
@@ -645,8 +651,22 @@ fn print_cidr_binding_decision(
     }
 }
 
+/// Recreates a service's `role_id` file from `OpenBao` when it is
+/// missing (a no-op when it is already present).
+///
+/// The file location follows the configured `secret_id_path`: for the
+/// default secrets-tree layout bootroot owns the directory, so it is
+/// created via `ensure_secrets_dir` and the recreated `role_id` is
+/// root-owned `0600`, unchanged. For a relocated (`--secret-id-path`
+/// override) path the directory is operator-provisioned and agent-owned
+/// outside the secrets tree: the recovery must **not** create, chmod, or
+/// chown that directory (`ensure_secrets_dir` would re-mode it), so it
+/// requires the parent to already exist and writes an agent-owned
+/// `0600` file chowned to the parent owner — otherwise a later recovery
+/// would re-break the non-root agent with a root-owned `role_id`.
 async fn ensure_role_id_file(
     entry: &ServiceEntry,
+    secrets_dir: &Path,
     client: &OpenBaoClient,
     messages: &Messages,
 ) -> Result<()> {
@@ -663,11 +683,52 @@ async fn ensure_role_id_file(
         .read_role_id(&entry.approle.role_name)
         .await
         .with_context(|| messages.error_openbao_role_id_failed())?;
-    fs_util::ensure_secrets_dir(service_dir).await?;
-    tokio::fs::write(&role_id_path, role_id)
-        .await
-        .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
-    fs_util::set_key_permissions(&role_id_path).await?;
+    // Classify by whether the credential path resolves inside the
+    // root-owned secrets tree; an override always resolves outside it.
+    let is_override =
+        !fs_util::path_is_within(&entry.approle.secret_id_path, secrets_dir).unwrap_or(true);
+    if is_override {
+        fs_util::create_owned_credential_noclobber(&role_id_path, role_id.as_bytes())
+            .await
+            .with_context(|| {
+                messages.error_write_file_failed(&role_id_path.display().to_string())
+            })?;
+    } else {
+        fs_util::ensure_secrets_dir(service_dir).await?;
+        tokio::fs::write(&role_id_path, role_id)
+            .await
+            .with_context(|| {
+                messages.error_write_file_failed(&role_id_path.display().to_string())
+            })?;
+        fs_util::set_key_permissions(&role_id_path).await?;
+    }
+    Ok(())
+}
+
+/// Rewrites a local-file service's `secret_id` in place during rotation.
+///
+/// For the default secrets-tree location `write_secret_id_atomic`
+/// re-asserts the directory via `ensure_secrets_dir` before the atomic
+/// write. For a relocated (`--secret-id-path` override) path the
+/// directory is operator-provisioned and agent-owned, so it must **not**
+/// be re-moded: the write goes straight through `atomic_write`, which
+/// preserves the existing (agent) uid/gid and re-applies mode `0600`.
+async fn write_service_secret_id_file(
+    secret_id_path: &Path,
+    secret_id: &str,
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let is_override = !fs_util::path_is_within(secret_id_path, secrets_dir).unwrap_or(true);
+    if is_override {
+        fs_util::atomic_write(secret_id_path, secret_id.as_bytes(), fs_util::KEY_FILE_MODE)
+            .await
+            .with_context(|| {
+                messages.error_write_file_failed(&secret_id_path.display().to_string())
+            })?;
+    } else {
+        write_secret_id_atomic(secret_id_path, secret_id, messages).await?;
+    }
     Ok(())
 }
 
@@ -1095,6 +1156,164 @@ mod tests {
         assert!(
             !ctx.state_file.exists(),
             "state.json must not be rewritten when its entries are already current"
+        );
+    }
+
+    /// Mounts a role-id read for the given role name.
+    fn mount_role_id_mock(role: &str, role_id: &str) -> Mock {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/auth/approle/role/{role}/role-id")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "role_id": role_id }
+            })))
+    }
+
+    /// A relocated (`--secret-id-path` override) service that is missing
+    /// its `role_id` must have it recreated **agent-owned** in the
+    /// operator-provisioned directory, without re-moding that directory
+    /// (no `ensure_secrets_dir`), or a later recovery re-breaks the agent.
+    #[tokio::test]
+    async fn ensure_role_id_file_override_recreates_without_remoding_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let secrets_dir = dir.path().join("secrets");
+        let agent_dir = dir.path().join("agent").join("svc");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        // Operator-provisioned dir mode; the override recovery must not
+        // touch it (ensure_secrets_dir would force it to 0700).
+        fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("set agent dir mode");
+
+        let server = MockServer::start().await;
+        mount_role_id_mock(&service_role_name("svc"), "svc-role-id")
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut entry = make_service_entry(dir.path(), "svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = agent_dir.join("secret_id");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("scoped-token".to_string());
+        let messages = test_messages();
+        ensure_role_id_file(&entry, &secrets_dir, &client, &messages)
+            .await
+            .expect("override role_id recovery should succeed");
+
+        let role_id_path = agent_dir.join(ROLE_ID_FILENAME);
+        assert_eq!(
+            fs::read_to_string(&role_id_path).expect("role_id written"),
+            "svc-role-id"
+        );
+        assert_eq!(
+            fs::metadata(&role_id_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "recreated role_id must be 0600"
+        );
+        assert_eq!(
+            fs::metadata(&agent_dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "override recovery must not re-mode the operator directory"
+        );
+    }
+
+    /// The default (secrets-tree) recovery keeps creating the directory
+    /// via `ensure_secrets_dir` and writing a root-owned `0600` file.
+    #[tokio::test]
+    async fn ensure_role_id_file_default_creates_secrets_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let secrets_dir = dir.path().join("secrets");
+        let service_dir = secrets_dir.join("services").join("svc");
+
+        let server = MockServer::start().await;
+        mount_role_id_mock(&service_role_name("svc"), "svc-role-id")
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut entry = make_service_entry(dir.path(), "svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = service_dir.join("secret_id");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("scoped-token".to_string());
+        let messages = test_messages();
+        ensure_role_id_file(&entry, &secrets_dir, &client, &messages)
+            .await
+            .expect("default role_id recovery should succeed");
+
+        let role_id_path = service_dir.join(ROLE_ID_FILENAME);
+        assert_eq!(
+            fs::read_to_string(&role_id_path).expect("role_id written"),
+            "svc-role-id"
+        );
+        assert_eq!(
+            fs::metadata(&service_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "default recovery creates the secrets tree 0700"
+        );
+    }
+
+    /// Rotating a relocated `secret_id` writes it to the configured
+    /// location, preserves the existing (agent) uid/gid at `0600`, and
+    /// must not re-mode the operator-owned directory. Gated on a
+    /// supplementary gid, like the other ownership tests.
+    #[tokio::test]
+    async fn write_service_secret_id_file_override_preserves_owner_and_parent_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().expect("tempdir");
+        let secrets_dir = dir.path().join("secrets");
+        let agent_dir = dir.path().join("agent").join("svc");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o750))
+            .expect("set agent dir mode");
+        let secret_id_path = agent_dir.join("secret_id");
+        fs::write(&secret_id_path, "old").expect("seed secret_id");
+        std::os::unix::fs::chown(&secret_id_path, None, Some(gid))
+            .expect("test process must be able to chgrp the seeded secret_id");
+        let messages = test_messages();
+
+        write_service_secret_id_file(&secret_id_path, "new", &secrets_dir, &messages)
+            .await
+            .expect("override secret_id rotation should succeed");
+
+        assert_eq!(fs::read_to_string(&secret_id_path).unwrap(), "new");
+        let meta = fs::metadata(&secret_id_path).unwrap();
+        assert_eq!(meta.gid(), gid, "rotation must preserve the agent gid");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&agent_dir).unwrap().permissions().mode() & 0o777,
+            0o750,
+            "rotation must not re-mode the operator directory"
+        );
+    }
+
+    /// The default (secrets-tree) rotation still (re)creates the service
+    /// directory `0700` via `ensure_secrets_dir`.
+    #[tokio::test]
+    async fn write_service_secret_id_file_default_creates_secrets_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let secrets_dir = dir.path().join("secrets");
+        let service_dir = secrets_dir.join("services").join("svc");
+        let secret_id_path = service_dir.join("secret_id");
+        let messages = test_messages();
+
+        write_service_secret_id_file(&secret_id_path, "sid", &secrets_dir, &messages)
+            .await
+            .expect("default secret_id rotation should succeed");
+
+        assert_eq!(fs::read_to_string(&secret_id_path).unwrap(), "sid");
+        assert_eq!(
+            fs::metadata(&service_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
         );
     }
 

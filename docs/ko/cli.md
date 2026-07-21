@@ -714,6 +714,16 @@ post-renew 훅이 컨테이너를 리로드합니다
 - `--agent-config`: bootroot-agent 설정 파일 경로
 - `--cert-path`: 인증서 출력 경로
 - `--key-path`: 개인키 출력 경로
+- `--secret-id-path`: 서비스 `secret_id`를 기록할 절대 경로(`local-file`
+  전달 방식에서만 적용). `secret_id`, 형제 `role_id`, `eab.json`을 root
+  소유 `<secrets_dir>/services/<svc>/` 트리 밖의 에이전트 계정 소유
+  디렉터리로 재배치하여, 같은 호스트의 비-root `bootroot-agent`가
+  `role_id`/`eab.json`을 읽고 `secret_id`를 다시 쓸 수 있도록 합니다.
+  상위 디렉터리는 미리 존재하고 에이전트 소유여야 하며 `<secrets_dir>`
+  밖으로 해석되어야 합니다. `remote-bootstrap` 전달 방식, 마지막 경로
+  구성요소가 `role_id`인 경우(파생된 형제 파일과 충돌), 또는
+  `<secrets_dir>` 내부로 해석되는 경우에는 거부됩니다. 생략하면 기본값인
+  `<secrets_dir>/services/<svc>/` 아래에 유지됩니다.
 - `--instance-id`: 서비스 instance_id
   - 숫자만 허용됩니다 (`001`, `42` 등)
 - `--auth-mode`: 런타임 인증 모드 (`auto`, `root`, `approle`, 기본값 `auto`)

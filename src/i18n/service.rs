@@ -26,6 +26,45 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_service_secret_id_path_requires_local_file(&self) -> &'static str {
+        self.strings()
+            .error_service_secret_id_path_requires_local_file
+    }
+
+    pub(crate) fn error_service_secret_id_path_not_absolute(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_service_secret_id_path_not_absolute,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_service_secret_id_path_role_id_collision(&self, value: &str) -> String {
+        format_template(
+            self.strings()
+                .error_service_secret_id_path_role_id_collision,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_service_secret_id_path_inside_secrets_dir(
+        &self,
+        value: &str,
+        secrets_dir: &str,
+    ) -> String {
+        format_template(
+            self.strings()
+                .error_service_secret_id_path_inside_secrets_dir,
+            &[("value", value), ("secrets_dir", secrets_dir)],
+        )
+    }
+
+    pub(crate) fn error_service_secret_id_path_parent_missing(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_service_secret_id_path_parent_missing,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn error_service_policy_mismatch(&self) -> &'static str {
         self.strings().error_service_policy_mismatch
     }

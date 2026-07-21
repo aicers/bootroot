@@ -711,6 +711,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot service add` gained a `--secret-id-path <ABSOLUTE_PATH>`
+  override for `local-file` delivery (#722). It relocates the service's
+  `secret_id`, its sibling `role_id`, and (when EAB is configured)
+  `eab.json` out of the root-owned `<secrets_dir>/services/<svc>/` tree
+  and into an operator-provisioned directory owned by the agent account,
+  so a co-located non-root `bootroot-agent` can read `role_id`/`eab.json`
+  and rewrite `secret_id`. The resolved path is the single source of
+  truth persisted to the state entry, and it is threaded through every
+  writer and renderer — the origin `secret_id`/`role_id` writes, the
+  local `[openbao]` agent config, the `eab.json` provisioner, rotation
+  (`rotate approle-secret-id`, including its missing-`role_id`
+  recovery), the preview/print-only/apply summary, and
+  `service remove --delete-artifacts` cleanup.
+  - The relocated files are chowned to the agent-owning parent directory
+    and written mode `0600`. `secret_id`/`role_id` are created
+    no-clobber and never follow a final-component symlink; `eab.json`,
+    refreshed on every sync, is symlink-safe but legitimately
+    overwritten. The operator provisions the (agent-owned) target
+    directory beforehand; bootroot never creates, chmods, or chowns it.
+  - The override is rejected with `remote-bootstrap` delivery, when its
+    final path component is `role_id` (it would collide with the derived
+    sibling), or when it resolves inside `<secrets_dir>` (the non-root
+    agent cannot traverse the root-owned tree). Without the flag,
+    behaviour is unchanged: the files land under
+    `<secrets_dir>/services/<svc>/`, root-owned `0600`.
 - `bootroot infra install` now supports a prebuilt / air-gapped install
   with no source tree and no network at install time (#704):
   - A new `--no-build` flag runs `docker compose up --no-build --pull never`

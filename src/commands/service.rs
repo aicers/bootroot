@@ -50,6 +50,37 @@ pub(crate) fn service_eab_file_path(secret_id_path: &Path) -> std::path::PathBuf
         .join(SERVICE_EAB_FILENAME)
 }
 
+/// Returns the default secrets-tree `secret_id` location for a service,
+/// used when the operator did not pass `--secret-id-path`.
+fn default_service_secret_id_path(secrets_dir: &Path, service_name: &str) -> std::path::PathBuf {
+    secrets_dir
+        .join(SERVICE_SECRET_DIR)
+        .join(service_name)
+        .join(SERVICE_SECRET_ID_FILENAME)
+}
+
+/// Resolves the effective `secret_id` path for a service: the operator's
+/// absolute `--secret-id-path` override when supplied, otherwise the
+/// default under `<secrets_dir>/services/<svc>/`. This single value is
+/// the source of truth persisted to `entry.approle.secret_id_path`.
+fn resolved_secret_id_path(
+    resolved: &ResolvedServiceAdd,
+    secrets_dir: &Path,
+) -> std::path::PathBuf {
+    resolved
+        .secret_id_path_override
+        .clone()
+        .unwrap_or_else(|| default_service_secret_id_path(secrets_dir, &resolved.service_name))
+}
+
+/// Derives the sibling `role_id` path for a resolved `secret_id` path.
+fn role_id_sibling_path(secret_id_path: &Path) -> std::path::PathBuf {
+    secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(SERVICE_ROLE_ID_FILENAME)
+}
+
 /// Reports whether two local agent-config paths name the same file.
 /// Paths resolved by this binary are stored absolute and lexically
 /// normalized, so a literal comparison covers equivalent spellings;
@@ -137,6 +168,11 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let resolved = resolve::resolve_service_add_args(args, messages, preview)?;
 
     resolve::validate_service_add(&resolved, messages)?;
+    resolve::validate_secret_id_path_override(
+        resolved.secret_id_path_override.as_deref(),
+        state.secrets_dir(),
+        messages,
+    )?;
 
     if let Some(ref ttl) = resolved.secret_id_ttl {
         if let Some(warning) = validate_secret_id_ttl(ttl, messages)? {
@@ -224,11 +260,7 @@ async fn run_service_add_preview(
     messages: &Messages,
 ) {
     let preview_entry = build_preview_service_entry(resolved, state);
-    let preview_secret_id_path = state
-        .secrets_dir()
-        .join(SERVICE_SECRET_DIR)
-        .join(&resolved.service_name)
-        .join(SERVICE_SECRET_ID_FILENAME);
+    let preview_secret_id_path = resolved_secret_id_path(resolved, state.secrets_dir());
     let mut note = messages.service_summary_preview_mode().to_string();
     let mut trusted_ca_sha256: Option<Vec<String>> = None;
     let Some(auth) = resolved.runtime_auth.as_ref() else {
@@ -342,17 +374,27 @@ async fn run_service_add_apply(
     )
     .await?;
     let secrets_dir = state.secrets_dir();
+    // The resolved `secret_id` path is the single source of truth for
+    // this add: the origin writes, the local config renderer, and the
+    // persisted state entry all use this same in-memory value (the state
+    // entry does not exist yet, so nothing reads it "from state"). For an
+    // operator `--secret-id-path` override it is the absolute path,
+    // agent-owned outside the secrets tree; otherwise the default under
+    // `<secrets_dir>/services/<svc>/`.
+    let is_override = resolved.secret_id_path_override.is_some();
+    let secret_id_path = resolved_secret_id_path(resolved, secrets_dir);
+    let role_id_path = role_id_sibling_path(&secret_id_path);
     approle::write_role_id_file(
-        secrets_dir,
-        &resolved.service_name,
+        &role_id_path,
         &approle_result.role_id,
+        is_override,
         messages,
     )
     .await?;
-    let secret_id_path = approle::write_secret_id_file(
-        secrets_dir,
-        &resolved.service_name,
+    approle::write_secret_id_file(
+        &secret_id_path,
         &approle_result.secret_id,
+        is_override,
         messages,
     )
     .await?;
@@ -1043,11 +1085,7 @@ pub(crate) fn display_wrap_ttl(value: Option<&str>, messages: &Messages) -> Stri
 }
 
 fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile) -> ServiceEntry {
-    let preview_secret_id_path = state
-        .secrets_dir()
-        .join(SERVICE_SECRET_DIR)
-        .join(&resolved.service_name)
-        .join(SERVICE_SECRET_ID_FILENAME);
+    let preview_secret_id_path = resolved_secret_id_path(resolved, state.secrets_dir());
     build_service_entry_from_role(
         resolved,
         ServiceRoleEntry {
@@ -1127,6 +1165,7 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+            secret_id_path_override: None,
         }
     }
 

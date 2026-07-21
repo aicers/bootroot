@@ -51,6 +51,12 @@ pub(crate) struct ResolvedServiceAdd {
     /// operator did not opt into the group-readable cert policy and
     /// the agent preserves the host-local default. See issue #593.
     pub(crate) cert_group_gid: Option<u32>,
+    /// Operator-supplied absolute `--secret-id-path` override
+    /// (local-file delivery only). `None` keeps the default location
+    /// under `<secrets_dir>/services/<svc>/`. When `Some`, `secret_id`,
+    /// its sibling `role_id`, and `eab.json` are relocated there, owned
+    /// by the agent account. See issue #722.
+    pub(crate) secret_id_path_override: Option<PathBuf>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -154,6 +160,9 @@ pub(super) fn resolve_service_add_args(
 
     let cert_group_gid = resolve_cert_group_for_add(args, delivery_mode, messages)?;
 
+    let secret_id_path_override =
+        resolve_secret_id_path_override(args.secret_id_path.as_deref(), delivery_mode, messages)?;
+
     Ok(ResolvedServiceAdd {
         service_name,
         delivery_mode,
@@ -173,7 +182,81 @@ pub(super) fn resolve_service_add_args(
         agent_server,
         agent_responder_url,
         cert_group_gid,
+        secret_id_path_override,
     })
+}
+
+/// Filename of a service's `role_id`, always derived as the `secret_id`
+/// sibling. Kept here so the override collision guard rejects a
+/// `--secret-id-path` whose final component matches it.
+const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
+
+/// Resolves the `--secret-id-path` override, applying the checks that do
+/// not require `state`: it is honoured for local-file delivery only, must
+/// be absolute, and must not end in `role_id` (which would collide with
+/// the derived sibling `role_id` file). The secrets-tree containment and
+/// parent-existence checks need `state.secrets_dir()` and run later in
+/// [`validate_secret_id_path_override`].
+fn resolve_secret_id_path_override(
+    value: Option<&Path>,
+    delivery_mode: DeliveryMode,
+    messages: &Messages,
+) -> Result<Option<PathBuf>> {
+    let Some(path) = value else {
+        return Ok(None);
+    };
+    if !matches!(delivery_mode, DeliveryMode::LocalFile) {
+        anyhow::bail!(messages.error_service_secret_id_path_requires_local_file());
+    }
+    if !path.is_absolute() {
+        anyhow::bail!(
+            messages.error_service_secret_id_path_not_absolute(&path.display().to_string())
+        );
+    }
+    if path.file_name().and_then(|name| name.to_str()) == Some(SERVICE_ROLE_ID_FILENAME) {
+        anyhow::bail!(
+            messages.error_service_secret_id_path_role_id_collision(&path.display().to_string())
+        );
+    }
+    Ok(Some(path.to_path_buf()))
+}
+
+/// Applies the `--secret-id-path` override checks that need
+/// `state.secrets_dir()`: the resolved path must lie **outside** the
+/// root-owned secrets tree (the non-root agent cannot traverse into it),
+/// and its parent directory (operator-provisioned, agent-owned) must
+/// already exist. A no-op when no override was supplied.
+pub(crate) fn validate_secret_id_path_override(
+    override_path: Option<&Path>,
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let Some(path) = override_path else {
+        return Ok(());
+    };
+    let within = bootroot::fs_util::path_is_within(path, secrets_dir).with_context(|| {
+        format!(
+            "failed to compare {} against secrets dir {}",
+            path.display(),
+            secrets_dir.display()
+        )
+    })?;
+    if within {
+        anyhow::bail!(messages.error_service_secret_id_path_inside_secrets_dir(
+            &path.display().to_string(),
+            &secrets_dir.display().to_string(),
+        ));
+    }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    match parent {
+        Some(parent) if parent.is_dir() => Ok(()),
+        Some(parent) => anyhow::bail!(
+            messages.error_service_secret_id_path_parent_missing(&parent.display().to_string())
+        ),
+        None => anyhow::bail!(
+            messages.error_service_secret_id_path_parent_missing(&path.display().to_string())
+        ),
+    }
 }
 
 /// Resolves `--cert-group` for `service add` based on the deployment
@@ -540,6 +623,7 @@ mod tests {
             agent_config: None,
             cert_path: None,
             key_path: None,
+            secret_id_path: None,
             instance_id: None,
             agent_email: None,
             agent_server: None,
@@ -930,6 +1014,112 @@ mod tests {
         let target = tmp.path().join("agent.toml");
 
         validate_path(&target, false, &messages).expect("existing parent must be accepted");
+    }
+
+    #[test]
+    fn resolve_secret_id_path_override_none_is_ok() {
+        let messages = Messages::new("en").unwrap();
+        assert!(
+            resolve_secret_id_path_override(None, DeliveryMode::LocalFile, &messages)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_secret_id_path_override_rejects_remote_bootstrap() {
+        let messages = Messages::new("en").unwrap();
+        let err = resolve_secret_id_path_override(
+            Some(Path::new("/etc/agent/svc/secret_id")),
+            DeliveryMode::RemoteBootstrap,
+            &messages,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only honoured for local-file delivery")
+        );
+    }
+
+    #[test]
+    fn resolve_secret_id_path_override_rejects_relative() {
+        let messages = Messages::new("en").unwrap();
+        let err = resolve_secret_id_path_override(
+            Some(Path::new("relative/secret_id")),
+            DeliveryMode::LocalFile,
+            &messages,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn resolve_secret_id_path_override_rejects_role_id_final_component() {
+        let messages = Messages::new("en").unwrap();
+        let err = resolve_secret_id_path_override(
+            Some(Path::new("/etc/agent/svc/role_id")),
+            DeliveryMode::LocalFile,
+            &messages,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must not end in `role_id`"));
+    }
+
+    #[test]
+    fn resolve_secret_id_path_override_accepts_absolute_local_file() {
+        let messages = Messages::new("en").unwrap();
+        let resolved = resolve_secret_id_path_override(
+            Some(Path::new("/etc/agent/svc/secret_id")),
+            DeliveryMode::LocalFile,
+            &messages,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some(Path::new("/etc/agent/svc/secret_id"))
+        );
+    }
+
+    #[test]
+    fn validate_secret_id_path_override_none_is_ok() {
+        let messages = Messages::new("en").unwrap();
+        validate_secret_id_path_override(None, Path::new("/var/lib/bootroot/secrets"), &messages)
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_secret_id_path_override_rejects_inside_secrets_dir() {
+        let messages = Messages::new("en").unwrap();
+        let secrets_dir = Path::new("/var/lib/bootroot/secrets");
+        let inside = secrets_dir.join("services/foo/secret_id");
+        let err =
+            validate_secret_id_path_override(Some(&inside), secrets_dir, &messages).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must resolve outside the root-owned secrets tree")
+        );
+    }
+
+    #[test]
+    fn validate_secret_id_path_override_rejects_missing_parent() {
+        let messages = Messages::new("en").unwrap();
+        let dir = tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let missing = dir.path().join("no-such-dir").join("secret_id");
+        let err =
+            validate_secret_id_path_override(Some(&missing), &secrets_dir, &messages).unwrap_err();
+        assert!(err.to_string().contains("parent directory does not exist"));
+    }
+
+    #[test]
+    fn validate_secret_id_path_override_accepts_outside_with_existing_parent() {
+        let messages = Messages::new("en").unwrap();
+        let dir = tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let agent_dir = dir.path().join("agent").join("svc");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let target = agent_dir.join("secret_id");
+        validate_secret_id_path_override(Some(&target), &secrets_dir, &messages).unwrap();
     }
 
     #[test]
