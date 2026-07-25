@@ -173,7 +173,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
     // InfraCert operates on local files and Docker only — it must not
     // require an OpenBao connection so it can fix a broken/expired cert.
     if let RotateCommand::InfraCert(_) = &args.command {
-        infra_cert::rotate_infra_certs(&mut ctx, args.yes, messages)?;
+        infra_cert::rotate_infra_certs(&mut ctx, args.yes, messages).await?;
         return Ok(RotateOutcome::Completed);
     }
 

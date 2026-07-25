@@ -257,8 +257,12 @@ pub(in crate::commands::init) fn record_openbao_infra_cert(
         key_path,
         sans,
         renew_before: OPENBAO_TLS_DEFAULT_RENEW_BEFORE.to_string(),
-        reload_strategy: ReloadStrategy::ContainerRestart {
+        // SIGHUP reloads the listener cert in place; a restart would bring
+        // the container back sealed (Shamir seal, in-memory master key)
+        // and the rotate path never unseals. See issue #727.
+        reload_strategy: ReloadStrategy::ContainerSignal {
             container_name: OPENBAO_CONTAINER_NAME.to_string(),
+            signal: "SIGHUP".to_string(),
         },
         issued_at: Some(now),
         expires_at: None,
@@ -461,8 +465,9 @@ mod tests {
         let entry = &state.infra_certs[OPENBAO_INFRA_CERT_KEY];
         assert_eq!(
             entry.reload_strategy,
-            ReloadStrategy::ContainerRestart {
+            ReloadStrategy::ContainerSignal {
                 container_name: OPENBAO_CONTAINER_NAME.to_string(),
+                signal: "SIGHUP".to_string(),
             }
         );
         assert!(entry.issued_at.is_some());

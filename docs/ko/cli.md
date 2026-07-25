@@ -1518,8 +1518,13 @@ secret_id를 변경하지 않습니다.
 `--secrets-dir`, `--yes`뿐입니다. OpenBao 인증 플래그(`--auth-mode`,
 `--root-token` / `--root-token-file`, `--approle-*`), OpenBao 연결
 플래그(`--openbao-url`, `--kv-mount`), `--show-secrets`는 받아들이기만
-하고 사용되지 않습니다(이 명령은 OpenBao 호출 이전 단계에서 분기되어
-종료합니다).
+하고 사용되지 않습니다. 이 명령은 **인증된** OpenBao 호출 이전
+단계에서 분기됩니다. OpenBao와의 유일한 접점은 `openbao` 인증서
+재로드를 검증하기 위한 인증 없는 TLS 핸드셰이크(아래 동작 참조)이며,
+토큰·인증 모드·인증된 API 호출을 사용하지 않습니다. `--openbao-url`은
+여전히 동작에 영향을 주지 않습니다. 프로브 대상은 플래그가 아니라
+`state.json`의 `openbao_url`(즉 `bootroot init`이 기록한 바인딩 유래의
+로컬 리스너 URL)에서 읽습니다.
 
 동작:
 
@@ -1541,11 +1546,28 @@ secret_id를 변경하지 않습니다.
     `<secrets-dir>/bootroot-http01/tls/server.key`에 기록합니다.
     두 파일 모두 기록 후 `chmod 0600`이 적용됩니다.
 - 항목별 재발급이 성공하면 해당 항목의 `issued_at`이 갱신되고,
-  `reload_strategy`가 실행되어 영향 받는 컨테이너가 새 자료를
-  인식하도록 합니다:
-  - `ContainerRestart` (OpenBao) → `docker restart <container>`
-  - `ContainerSignal` (HTTP-01 admin) → `docker kill -s SIGHUP
-    <container>`
+  재로드 전략이 실행되어 영향 받는 컨테이너가 새 자료를 인식하도록
+  합니다. 알려진 인프라 인증서 키에 대해서는 기록된 항목을 신뢰하지
+  않고 코드에서 실효 전략을 결정하며, 결정된 값을 항목에 다시 기록해
+  오래된 기록이 한 번의 실행으로 수렴하도록 합니다:
+  - `openbao` → `ContainerSignal` → `docker kill -s SIGHUP
+    <container>`. 이 항목에 대해서는 재시작을 절대 실행하지 않습니다.
+    기본 Shamir 봉인에서 재시작은 OpenBao를 다시 **봉인된** 상태로
+    되돌리고 rotate 경로는 봉인을 해제하지 않으므로, 대신 `SIGHUP`로
+    리스너 인증서를 제자리에서 재로드합니다. 기존 `state.json`에 아직
+    `ContainerRestart`가 남아 있어도 이를 무시하고 시그널로
+    정규화합니다.
+  - `bootroot-http01` (HTTP-01 admin) → `ContainerSignal` → `docker
+    kill -s SIGHUP <container>`
+- `openbao` 컨테이너에 시그널을 보낸 뒤, 명령은 교체가 실제로
+  적용되었는지 검증합니다. state에 기록된 OpenBao 리스너로 인증 없는
+  TLS 연결을 열어 리스너가 제시하는 leaf 인증서를 읽고, 방금 기록한
+  인증서 파일의 SHA-256 지문과 비교합니다. 재로드 지연을 흡수하기
+  위해 제한된 기한 내에서 재시도합니다. 기한이 지나도 제공되는 leaf가
+  여전히 다르거나 리스너에 연결할 수 없으면, 항목 이름을 포함하고 두
+  경우를 구분하는 메시지와 함께 실패합니다. 이 검증은 `openbao`
+  항목에만 적용되며, `bootroot-http01` 항목에는 재로드 후 검증이
+  없습니다.
 - 모든 항목 처리가 끝나면 갱신된 `infra_certs` 맵을 `state.json`에
   다시 저장합니다.
 
@@ -1572,6 +1594,15 @@ secret_id를 변경하지 않습니다.
   단계는 항목 이름으로 감싸지지 않아 영향 받은 컨테이너와 시그널/
   재시작 동작만을 식별합니다. 두 경우 모두 원인을 해소한 뒤 다시
   실행할 수 있습니다.
+- OpenBao 재로드 검증 실패(`openbao` 항목에만 해당). 시그널 이후에도
+  제한된 기한이 만료될 때까지 제공되는 leaf가 방금 기록한 인증서와
+  다르거나, 리스너에 아예 연결할 수 없는 경우입니다. 두 경우는 항목
+  이름을 포함한 서로 구분되는 실무적 메시지로 나타납니다. 이 실패는
+  루프 종료 시점의 state 저장 이전에 중단되므로, 해당 실행에서는
+  `state.json`이 기록되지 않은 채로 남습니다.
+- state 내부 불일치: `openbao` 항목은 존재하지만 `state.json`의
+  `openbao_url`이 사용할 수 있는 `https` URL이 아닌 경우. 검증을 조용히
+  건너뛰지 않고 명령이 실패합니다.
 
 예시:
 
