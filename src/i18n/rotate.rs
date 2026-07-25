@@ -564,9 +564,34 @@ impl Messages {
         )
     }
 
+    pub(crate) fn info_infra_tls_verified(&self, name: &str) -> String {
+        format_template(self.strings().info_infra_tls_verified, &[("name", name)])
+    }
+
     pub(crate) fn error_infra_tls_renew_failed(&self, name: &str) -> String {
         format_template(
             self.strings().error_infra_tls_renew_failed,
+            &[("name", name)],
+        )
+    }
+
+    pub(crate) fn error_infra_tls_openbao_url_not_https(&self, url: &str) -> String {
+        format_template(
+            self.strings().error_infra_tls_openbao_url_not_https,
+            &[("url", url)],
+        )
+    }
+
+    pub(crate) fn error_infra_tls_probe_unreachable(&self, name: &str, addr: &str) -> String {
+        format_template(
+            self.strings().error_infra_tls_probe_unreachable,
+            &[("name", name), ("addr", addr)],
+        )
+    }
+
+    pub(crate) fn error_infra_tls_probe_mismatch(&self, name: &str) -> String {
+        format_template(
+            self.strings().error_infra_tls_probe_mismatch,
             &[("name", name)],
         )
     }

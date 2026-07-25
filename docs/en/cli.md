@@ -1580,13 +1580,19 @@ is added — only the per-key dispatch arm.
 
 No subcommand-specific arguments. Honors the global `--yes` to skip
 the confirmation prompt. The command accepts the common `bootroot
-rotate` flag surface, but short-circuits before any OpenBao
-interaction, so only `--state-file`, `--compose-file`,
+rotate` flag surface, but short-circuits before any **authenticated**
+OpenBao interaction, so only `--state-file`, `--compose-file`,
 `--secrets-dir`, and `--yes` actually influence behavior. The
 OpenBao auth flags (`--auth-mode`, `--root-token` /
 `--root-token-file`, `--approle-*`), the OpenBao connection flags
 (`--openbao-url`, `--kv-mount`), and `--show-secrets` are accepted
-but unused.
+but unused. The only OpenBao contact is an unauthenticated TLS
+handshake used to verify the `openbao` certificate reload (see the
+Behavior section); it involves no token, auth mode, or authenticated
+API call. `--openbao-url` still does not influence behavior: the
+probe target is read from `state.json` → `openbao_url` (the
+bind-derived local listener URL written by `bootroot init`), never
+from the flag.
 
 Behavior:
 
@@ -1611,11 +1617,30 @@ Behavior:
     `<secrets-dir>/bootroot-http01/tls/server.key`. Both files are
     `chmod 0600`'d after write.
 - After each successful reissue the entry's `issued_at` is
-  refreshed and the entry's `reload_strategy` runs so the affected
-  container picks up the new material:
-  - `ContainerRestart` (OpenBao) → `docker restart <container>`.
-  - `ContainerSignal` (HTTP-01 admin) → `docker kill -s SIGHUP
-    <container>`.
+  refreshed and the reload strategy runs so the affected container
+  picks up the new material. For known infra-cert keys the effective
+  strategy is resolved in code, not trusted from the recorded entry,
+  and the resolved value is written back to the entry so a stale
+  record converges after one run:
+  - `openbao` → `ContainerSignal` → `docker kill -s SIGHUP
+    <container>`. A restart is never issued for this entry: under the
+    default Shamir seal a restart brings OpenBao back **sealed** and
+    the rotate path never unseals, so the listener certificate is
+    reloaded in place via `SIGHUP` instead. Any `ContainerRestart`
+    still recorded in an existing `state.json` is overridden and
+    normalized to the signal.
+  - `bootroot-http01` (HTTP-01 admin) → `ContainerSignal` → `docker
+    kill -s SIGHUP <container>`.
+- After signalling the `openbao` container, the command verifies the
+  swap took effect: it opens an unauthenticated TLS connection to the
+  state-resident OpenBao listener, reads the leaf certificate the
+  listener presents, and compares its SHA-256 fingerprint against the
+  certificate file just written. It retries within a bounded deadline
+  to absorb reload latency. If the served leaf still differs when the
+  deadline expires, or the listener cannot be reached, the command
+  fails with a message that names the entry and distinguishes the two
+  cases. This check applies only to the `openbao` entry; the
+  `bootroot-http01` entry gets no post-reload verification.
 - Once every entry has been processed, the updated `infra_certs`
   map is persisted back to `state.json`.
 
@@ -1646,6 +1671,16 @@ Failure conditions:
   only the affected container and signal/restart operation. In
   either case the operator can re-run after fixing the
   underlying cause.
+- OpenBao reload-verification failure (`openbao` entry only). After
+  the signal, the served leaf still differs from the freshly written
+  certificate when the bounded deadline expires, or the listener
+  cannot be reached at all. The two cases surface as distinct,
+  actionable messages that name the entry. This bails before the
+  end-of-loop state save, so a probe failure leaves `state.json`
+  unwritten for that run.
+- Internally inconsistent state: an `openbao` entry is present but
+  `state.json` → `openbao_url` is not a usable `https` URL. The
+  command fails rather than silently skipping verification.
 
 Examples:
 

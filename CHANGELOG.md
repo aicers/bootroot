@@ -112,6 +112,36 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `rotate infra-cert` leaving `OpenBao` sealed by reloading its TLS
+  certificate via `SIGHUP` instead of restarting the container (#727).
+  The `openbao` infra-cert entry previously reloaded with
+  `ContainerRestart` → `docker restart bootroot-openbao`, but under the
+  default Shamir seal (in-memory master key, no `seal` stanza) a restart
+  always brings the container back **sealed**, and the rotate path never
+  unseals — so a `rotate infra-cert --yes` from a cron entry or systemd
+  timer silently sealed the vault while exiting 0, stalling AppRole
+  logins and certificate issuance until a manual unseal.
+  - `bootroot init` now records the `openbao` entry with
+    `ContainerSignal { container_name: "bootroot-openbao", signal:
+    "SIGHUP" }`, and the rotate path resolves the effective reload
+    strategy for known infra-cert keys **in code** rather than trusting
+    the stored value, so a host whose `state.json` still records
+    `ContainerRestart` is signalled — never restarted — and the entry is
+    normalized to the signal strategy on the first run.
+  - After signalling, the command verifies the swap took effect: it opens
+    an unauthenticated TLS handshake to the state-resident `OpenBao`
+    listener (`state.json` → `openbao_url`, never the `--openbao-url`
+    override), reads the leaf the listener presents, and compares its
+    SHA-256 fingerprint against the certificate file just written. The
+    handshake is used solely for this byte comparison — no token, auth
+    mode, chain building, or hostname validation. It retries within a
+    bounded deadline and fails with distinct, actionable messages when
+    the served leaf still differs or the listener cannot be reached, so a
+    delivered-but-ignored signal can no longer serve a stale certificate
+    silently for up to a year. A present `openbao` entry with a non-`https`
+    state URL fails as an internally inconsistent state rather than
+    skipping verification. The `bootroot-http01` entry's `SIGHUP` reload
+    is unchanged and gains no verification.
 - Fixed the two infra `OpenBao` Agents
   (`bootroot-openbao-agent-stepca` / `-responder`) being unable to
   authenticate to a native-TLS `OpenBao` provisioned via
