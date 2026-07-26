@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bootroot::acme::responder_client;
+use bootroot::acme::responder_client::{self, ResponderReadyError};
 use bootroot::fs_util;
 
 use super::super::constants::openbao_constants::PATH_RESPONDER_HMAC;
@@ -17,6 +18,11 @@ use crate::cli::args::{InitArgs, InitSkipPhase};
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::infra::run_docker;
 use crate::i18n::Messages;
+
+/// Throwaway token registered by the init-time responder check.
+const RESPONDER_CHECK_TOKEN: &str = "bootroot-init-check";
+/// Key authorization served for [`RESPONDER_CHECK_TOKEN`].
+const RESPONDER_CHECK_KEY_AUTHORIZATION: &str = "bootroot-init-check.key";
 
 pub(super) async fn write_responder_files(
     secrets_dir: &Path,
@@ -215,30 +221,240 @@ pub(super) async fn verify_responder(
             ca_pem: pem,
             ca_pins: &[],
         });
-    responder_client::register_http01_token_with(
-        responder_url,
-        &secrets.http_hmac,
-        args.responder_timeout_secs,
-        "bootroot-init-check",
-        "bootroot-init-check.key",
-        DEFAULT_RESPONDER_TOKEN_TTL_SECS,
-        trust.as_ref(),
+    let registration = responder_client::ResponderRegistration {
+        base_url: responder_url,
+        hmac_secret: &secrets.http_hmac,
+        timeout_secs: args.responder_timeout_secs,
+        token: RESPONDER_CHECK_TOKEN,
+        key_authorization: RESPONDER_CHECK_KEY_AUTHORIZATION,
+        ttl_secs: DEFAULT_RESPONDER_TOKEN_TTL_SECS,
+        trust: trust.as_ref(),
+    };
+    // The responder may still be binding its admin port when init reaches
+    // this check, and a refused connection returns instantly rather than
+    // waiting out the per-request timeout.  Wait for it to start serving,
+    // but only for a transport failure: an answer with a non-success status
+    // is a wrong URL or a wrong HMAC and fails immediately.
+    responder_client::register_http01_token_until_ready(
+        &registration,
+        Duration::from_secs(args.responder_ready_timeout_secs),
     )
     .await
+    .map_err(|error| responder_ready_error(&error, messages))
     .with_context(|| messages.error_responder_check_failed())?;
     Ok(ResponderCheck::Ok)
+}
+
+/// Renders a readiness failure as the localized message that matches its
+/// cause, so an operator is sent to the container and its published port or
+/// to the responder URL and HMAC — never to both at once.
+fn responder_ready_error(error: &ResponderReadyError, messages: &Messages) -> anyhow::Error {
+    match error {
+        ResponderReadyError::ZeroBudget => {
+            anyhow::anyhow!(messages.error_responder_ready_timeout_invalid())
+        }
+        ResponderReadyError::Unreachable {
+            endpoint,
+            elapsed_secs,
+            last_error,
+        } => anyhow::anyhow!(messages.error_responder_unreachable(
+            endpoint,
+            &elapsed_secs.to_string(),
+            last_error,
+        )),
+        ResponderReadyError::Rejected {
+            endpoint,
+            status,
+            body,
+        } => {
+            anyhow::anyhow!(messages.error_responder_rejected(endpoint, &status.to_string(), body))
+        }
+        ResponderReadyError::Setup(message) => anyhow::anyhow!(message.clone()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Instant;
 
     use tempfile::tempdir;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::super::super::constants::DEFAULT_RESPONDER_ADMIN_URL;
     use super::super::super::paths::{compose_has_responder, resolve_responder_url};
     use super::super::test_support::{default_init_args, test_messages};
     use super::*;
+
+    const TEST_HMAC: &str = "hmac-123";
+
+    fn test_secrets() -> InitSecrets {
+        InitSecrets {
+            stepca_password: "password".to_string(),
+            db_dsn: "postgres://localhost/bootroot".to_string(),
+            http_hmac: TEST_HMAC.to_string(),
+            eab: None,
+        }
+    }
+
+    /// The bug this check guards against: a responder that is still binding
+    /// its admin port when `init` reaches the check must be waited out
+    /// rather than failing an otherwise working install.
+    #[tokio::test]
+    async fn test_verify_responder_waits_for_a_responder_that_starts_late() {
+        const BIND_DELAY: Duration = Duration::from_millis(700);
+
+        // Reserve a loopback address and free it, so attempts before the
+        // re-bind get the connection-refused the fix must treat as
+        // retryable rather than terminal.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve address");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(BIND_DELAY).await;
+            let listener = std::net::TcpListener::bind(addr).expect("re-bind reserved address");
+            let server = MockServer::builder().listener(listener).start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+                .mount(&server)
+                .await;
+            // `server` owns the listener, so this task must never finish:
+            // returning would drop it and close the port again.
+            std::future::pending::<()>().await;
+        });
+
+        let temp_dir = tempdir().unwrap();
+        let mut args = default_init_args();
+        args.responder_ready_timeout_secs = 30;
+
+        let check = verify_responder(
+            Some(&format!("http://{addr}")),
+            &args,
+            &test_messages(),
+            &test_secrets(),
+            temp_dir.path(),
+        )
+        .await
+        .expect("a responder that binds within the budget must not fail the check");
+
+        assert!(matches!(check, ResponderCheck::Ok));
+    }
+
+    /// A responder that answers is a URL or HMAC problem, so the check must
+    /// fail on the first answer instead of spending the readiness budget.
+    #[tokio::test]
+    async fn test_verify_responder_fails_fast_on_non_success_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Invalid signature"))
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempdir().unwrap();
+        let mut args = default_init_args();
+        args.responder_ready_timeout_secs = 30;
+        let uri = server.uri();
+
+        let started = Instant::now();
+        let err = verify_responder(
+            Some(&uri),
+            &args,
+            &test_messages(),
+            &test_secrets(),
+            temp_dir.path(),
+        )
+        .await
+        .expect_err("a non-success status must fail the check");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the readiness budget must not be consumed, waited {elapsed:?}"
+        );
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("401") && rendered.contains(&uri),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            rendered.contains(&test_messages().error_responder_check_failed().to_string()),
+            "unexpected error: {rendered}"
+        );
+        let received = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert_eq!(
+            received.len(),
+            1,
+            "a responder that answered must not be asked twice"
+        );
+    }
+
+    /// `--responder-url` reaches the check verbatim, so a URL that can never
+    /// be turned into a request must be reported as such rather than polled
+    /// for the whole readiness budget.
+    #[tokio::test]
+    async fn test_verify_responder_fails_fast_on_a_malformed_url() {
+        const MALFORMED_URL: &str = "127.0.0.1:8080";
+
+        let temp_dir = tempdir().unwrap();
+        let mut args = default_init_args();
+        args.responder_ready_timeout_secs = 30;
+
+        let started = Instant::now();
+        let err = verify_responder(
+            Some(MALFORMED_URL),
+            &args,
+            &test_messages(),
+            &test_secrets(),
+            temp_dir.path(),
+        )
+        .await
+        .expect_err("a malformed responder URL must fail the check");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the readiness budget must not be consumed, waited {elapsed:?}"
+        );
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(MALFORMED_URL),
+            "unexpected error: {rendered}"
+        );
+        // Both the unreachable message and the zero-budget one name the
+        // readiness flag, in either locale.  A request that was never built
+        // is neither, so pointing the operator at the budget would be wrong.
+        assert!(
+            !rendered.contains("--responder-ready-timeout-secs"),
+            "a request that was never built is not a readiness problem: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_responder_rejects_zero_ready_timeout() {
+        let temp_dir = tempdir().unwrap();
+        let mut args = default_init_args();
+        args.responder_ready_timeout_secs = 0;
+
+        let err = verify_responder(
+            Some("http://127.0.0.1:1"),
+            &args,
+            &test_messages(),
+            &test_secrets(),
+            temp_dir.path(),
+        )
+        .await
+        .expect_err("a zero readiness budget must be rejected");
+
+        assert!(
+            format!("{err:#}").contains("--responder-ready-timeout-secs"),
+            "unexpected error: {err:#}"
+        );
+    }
 
     #[tokio::test]
     async fn test_write_responder_files_writes_template_and_config() {

@@ -351,7 +351,20 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 - `--db-timeout-secs`: DB 연결 타임아웃(초, 기본값 `2`)
 - `--http-hmac`: HTTP-01 responder HMAC (환경 변수: `HTTP01_HMAC`)
 - `--responder-url`: HTTP-01 responder 관리자 URL (선택, 환경 변수: `HTTP01_RESPONDER_URL`)
-- `--responder-timeout-secs`: responder 요청 타임아웃(초, 기본값 `5`)
+- `--responder-timeout-secs`: responder에 보내는 *요청 하나*가 허용되는
+  최대 시간(초, 기본값 `5`)
+- `--responder-ready-timeout-secs`: responder가 응답을 시작할 때까지
+  `init`이 기다리는 시간(초, 기본값 `60`). responder 점검은 연결이
+  거부되는 동안(컨테이너가 아직 관리자 포트를 바인딩하지 못한 상태)
+  500 ms 간격으로 등록 요청을 재시도합니다. 이 경우
+  `--responder-timeout-secs`를 늘려도 소용이 없습니다. 거부된 연결은
+  요청 타임아웃을 기다리지 않고 즉시 실패하기 때문입니다. 반대로
+  responder가 *응답*하면서 실패 상태 코드를 반환하면 이 예산을 쓰지 않고
+  즉시 실패합니다. 기동이 느린 것이 아니라 responder URL이나 HMAC이
+  잘못된 것이기 때문입니다. 이 예산은 재시도 사이의 간격만이 아니라 대기
+  전체를 제한합니다. 예산이 만료되는 순간 아직 진행 중이던 요청은 중단되므로,
+  `--responder-timeout-secs`를 이 값보다 크게 설정해도 `init`이 이 값보다
+  오래 기다리지는 않습니다.
 - `--stepca-provisioner`: step-ca ACME provisioner 이름 (기본값 `acme`)
 - `--cert-duration`: `ca.json` / `ca.json.ctmpl`에서
   `--stepca-provisioner`가 가리키는 ACME provisioner에 삽입되는

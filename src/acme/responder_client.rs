@@ -1,12 +1,21 @@
+use std::error::Error as StdError;
+use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
+use tokio::time::{Instant, sleep, timeout_at};
 
 use super::http01_protocol::{HEADER_SIGNATURE, HEADER_TIMESTAMP, Http01HmacSigner};
 use crate::config::Settings;
 
 const DEFAULT_ADMIN_PATH: &str = "/admin/http01";
+/// Delay between readiness attempts while the responder refuses connections.
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Stands in for the last transport error when the readiness budget ran out
+/// while an attempt was still in flight, so no attempt ever reported one.
+const ATTEMPT_STILL_IN_FLIGHT: &str =
+    "the request was still in flight when the readiness budget ran out";
 
 /// Trust parameters for TLS-pinned responder connections.
 ///
@@ -17,6 +26,87 @@ pub struct ResponderTrust<'a> {
     pub ca_pem: &'a str,
     /// SHA-256 certificate fingerprints to enforce (may be empty).
     pub ca_pins: &'a [String],
+}
+
+/// Everything one registration request needs, so the readiness wait can
+/// replay the very same call without a long argument list.
+pub struct ResponderRegistration<'a> {
+    /// Responder admin base URL, with or without a trailing slash.
+    pub base_url: &'a str,
+    /// Shared HMAC secret used to sign the request.
+    pub hmac_secret: &'a str,
+    /// Per-request timeout in seconds.
+    pub timeout_secs: u64,
+    /// HTTP-01 challenge token to register.
+    pub token: &'a str,
+    /// Key authorization served for `token`.
+    pub key_authorization: &'a str,
+    /// Lifetime of the registration in seconds.
+    pub ttl_secs: u64,
+    /// TLS trust anchors, required for `https://` responders.
+    pub trust: Option<&'a ResponderTrust<'a>>,
+}
+
+/// Outcome of a single registration attempt against the responder.
+///
+/// The variants exist so callers can distinguish "the responder could not be
+/// reached" — which may simply mean it has not finished binding its admin
+/// port — from "the responder answered and refused", which is a
+/// configuration error that no amount of waiting fixes.
+#[derive(Debug, thiserror::Error)]
+pub enum RegisterError {
+    /// The request could not even be built (bad system time, missing TLS
+    /// trust anchor, unusable CA bundle, a responder URL with no scheme or
+    /// with one `reqwest` does not speak).  Never retryable.
+    #[error("{0}")]
+    Setup(String),
+    /// The request never reached the responder.  The payload is the full
+    /// error chain, because the root cause (connection refused versus a TLS
+    /// trust or pin failure) is what tells a slow start apart from a
+    /// misconfiguration.
+    #[error("Failed to register HTTP-01 token: {0}")]
+    Transport(String),
+    /// The responder answered with a non-success status.
+    #[error("Responder returned {status}: {body}")]
+    Status {
+        /// Status line returned by the responder.
+        status: StatusCode,
+        /// Response body, truncated by the responder itself if at all.
+        body: String,
+    },
+}
+
+/// Terminal outcome of a bounded readiness wait for the responder.
+#[derive(Debug, thiserror::Error)]
+pub enum ResponderReadyError {
+    /// The readiness budget was zero, so no attempt could ever be made.
+    #[error("Responder readiness timeout must be greater than 0 seconds")]
+    ZeroBudget,
+    /// The readiness budget ran out with every attempt failing in transport.
+    #[error(
+        "HTTP-01 responder at {endpoint} was still unreachable after {elapsed_secs}s: {last_error}"
+    )]
+    Unreachable {
+        /// Admin endpoint that was polled.
+        endpoint: String,
+        /// Seconds actually spent waiting.
+        elapsed_secs: u64,
+        /// Error chain of the last failed attempt.
+        last_error: String,
+    },
+    /// The responder answered with a non-success status.
+    #[error("HTTP-01 responder at {endpoint} returned {status}: {body}")]
+    Rejected {
+        /// Admin endpoint that answered.
+        endpoint: String,
+        /// Status returned by the responder.
+        status: StatusCode,
+        /// Response body.
+        body: String,
+    },
+    /// The request could not be built at all.
+    #[error("{0}")]
+    Setup(String),
 }
 
 #[derive(serde::Serialize)]
@@ -61,7 +151,8 @@ pub async fn register_http01_token(
         ttl_secs,
         trust.as_ref(),
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Reads the CA bundle PEM from disk when `TrustSettings::ca_bundle_path` is set.
@@ -81,8 +172,13 @@ fn read_ca_pem_from_trust(trust: &crate::config::TrustSettings) -> Result<Option
 /// and `trust` is `None`, the call fails with a clear error rather than
 /// falling back to the system trust store.
 ///
+/// Sends exactly one request; callers that need to tolerate a responder that
+/// has not finished starting use [`register_http01_token_until_ready`].
+///
 /// # Errors
-/// Returns an error if the request cannot be sent or the responder rejects it.
+/// Returns [`RegisterError::Transport`] if the request cannot be sent,
+/// [`RegisterError::Status`] if the responder answers with a non-success
+/// status, and [`RegisterError::Setup`] if the request cannot be built.
 pub async fn register_http01_token_with(
     base_url: &str,
     hmac_secret: &str,
@@ -91,44 +187,229 @@ pub async fn register_http01_token_with(
     key_authorization: &str,
     ttl_secs: u64,
     trust: Option<&ResponderTrust<'_>>,
-) -> Result<()> {
-    let url = base_url.trim_end_matches('/');
-    let endpoint = format!("{url}{DEFAULT_ADMIN_PATH}");
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| anyhow::anyhow!("Failed to read system time: {e}"))?
-        .as_secs();
-    let timestamp = i64::try_from(timestamp)
-        .map_err(|_| anyhow::anyhow!("System time is too large for timestamp"))?;
-
-    let signer = Http01HmacSigner::new(hmac_secret);
-    let signature = signer.sign_request(timestamp, token, key_authorization, ttl_secs);
-
-    let client = build_responder_client(base_url, timeout_secs, trust)?;
-
-    let body = RegisterRequest {
+) -> Result<(), RegisterError> {
+    register_once(&ResponderRegistration {
+        base_url,
+        hmac_secret,
+        timeout_secs,
         token,
         key_authorization,
         ttl_secs,
+        trust,
+    })
+    .await
+}
+
+/// Registers an HTTP-01 token, retrying while the responder is unreachable.
+///
+/// Retries only the transport failure — a responder that has not yet bound
+/// its admin port — at a fixed 500 ms interval until `ready_timeout` is
+/// spent.  A non-success status means the URL or the HMAC is wrong, so it
+/// fails immediately without consuming the budget.
+///
+/// `ready_timeout` bounds the entire wait rather than only the gaps between
+/// attempts: an attempt still in flight when the budget expires is cut off
+/// there, so a `timeout_secs` longer than `ready_timeout` cannot stretch the
+/// wait past it.
+///
+/// Every attempt signs its own request, so a wait longer than the
+/// responder's `max_skew_secs` never turns into a skew rejection.
+///
+/// # Errors
+/// Returns [`ResponderReadyError::ZeroBudget`] for an empty budget,
+/// [`ResponderReadyError::Unreachable`] when the budget is exhausted,
+/// [`ResponderReadyError::Rejected`] on a non-success status, and
+/// [`ResponderReadyError::Setup`] when the request cannot be built.
+pub async fn register_http01_token_until_ready(
+    registration: &ResponderRegistration<'_>,
+    ready_timeout: Duration,
+) -> Result<(), ResponderReadyError> {
+    // Reject an empty budget before anything else, so the operator hears
+    // about the unusable flag rather than about whatever the first attempt
+    // would have tripped over.
+    if ready_timeout.is_zero() {
+        return Err(ResponderReadyError::ZeroBudget);
+    }
+    let endpoint = admin_endpoint(registration.base_url);
+    // Build the client up front: it is the only part of an attempt that
+    // cannot fail because of a slow responder, so a bad TLS trust anchor
+    // must not be re-tried once per poll interval.
+    let client = build_responder_client(
+        registration.base_url,
+        registration.timeout_secs,
+        registration.trust,
+    )
+    .map_err(|e| ResponderReadyError::Setup(format!("{e:#}")))?;
+    wait_for_registration(&endpoint, ready_timeout, || {
+        send_registration(registration, &client)
+    })
+    .await
+}
+
+/// Drives `attempt` until it succeeds, fails terminally, or the readiness
+/// budget runs out.
+async fn wait_for_registration<F, Fut>(
+    endpoint: &str,
+    ready_timeout: Duration,
+    mut attempt: F,
+) -> Result<(), ResponderReadyError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), RegisterError>>,
+{
+    if ready_timeout.is_zero() {
+        return Err(ResponderReadyError::ZeroBudget);
+    }
+
+    let start = Instant::now();
+    let deadline = start + ready_timeout;
+    let mut last_error: Option<String> = None;
+    loop {
+        // The budget bounds the whole wait, not just the gaps between
+        // attempts.  An attempt is only started while the deadline is still
+        // ahead and is cut off when it arrives, so a per-request timeout
+        // larger than the budget cannot stretch the wait, and an answer that
+        // only arrives past the deadline is not accepted.
+        if Instant::now() >= deadline {
+            return Err(budget_exhausted(endpoint, start.elapsed(), last_error));
+        }
+        match timeout_at(deadline, attempt()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(RegisterError::Transport(error))) => last_error = Some(error),
+            Ok(Err(RegisterError::Status { status, body })) => {
+                return Err(ResponderReadyError::Rejected {
+                    endpoint: endpoint.to_string(),
+                    status,
+                    body,
+                });
+            }
+            Ok(Err(RegisterError::Setup(message))) => {
+                return Err(ResponderReadyError::Setup(message));
+            }
+            Err(_) => return Err(budget_exhausted(endpoint, start.elapsed(), last_error)),
+        }
+
+        sleep(READINESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
+}
+
+/// Builds the budget-exhausted error, naming the endpoint, how long the wait
+/// really lasted, and the last transport failure seen.
+///
+/// `last_error` is `None` only when the budget ran out before any attempt
+/// finished, which is what a `--responder-timeout-secs` longer than the
+/// readiness budget looks like from here.
+fn budget_exhausted(
+    endpoint: &str,
+    elapsed: Duration,
+    last_error: Option<String>,
+) -> ResponderReadyError {
+    ResponderReadyError::Unreachable {
+        endpoint: endpoint.to_string(),
+        elapsed_secs: elapsed.as_secs(),
+        last_error: last_error.unwrap_or_else(|| ATTEMPT_STILL_IN_FLIGHT.to_string()),
+    }
+}
+
+/// Builds the admin endpoint URL for a responder base URL.
+fn admin_endpoint(base_url: &str) -> String {
+    let url = base_url.trim_end_matches('/');
+    format!("{url}{DEFAULT_ADMIN_PATH}")
+}
+
+/// Builds a client and sends exactly one registration request with it.
+async fn register_once(registration: &ResponderRegistration<'_>) -> Result<(), RegisterError> {
+    let client = build_responder_client(
+        registration.base_url,
+        registration.timeout_secs,
+        registration.trust,
+    )
+    .map_err(|e| RegisterError::Setup(format!("{e:#}")))?;
+    send_registration(registration, &client).await
+}
+
+/// Sends exactly one registration request over `client`.
+///
+/// The timestamp and the signature are computed here rather than by the
+/// caller, so every retry of the readiness wait carries fresh credentials.
+async fn send_registration(
+    registration: &ResponderRegistration<'_>,
+    client: &Client,
+) -> Result<(), RegisterError> {
+    let endpoint = admin_endpoint(registration.base_url);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| RegisterError::Setup(format!("Failed to read system time: {e}")))?
+        .as_secs();
+    let timestamp = i64::try_from(timestamp)
+        .map_err(|_| RegisterError::Setup("System time is too large for timestamp".to_string()))?;
+
+    let signer = Http01HmacSigner::new(registration.hmac_secret);
+    let signature = signer.sign_request(
+        timestamp,
+        registration.token,
+        registration.key_authorization,
+        registration.ttl_secs,
+    );
+
+    let body = RegisterRequest {
+        token: registration.token,
+        key_authorization: registration.key_authorization,
+        ttl_secs: registration.ttl_secs,
     };
 
     let response = client
-        .post(endpoint)
+        .post(endpoint.as_str())
         .header(HEADER_TIMESTAMP, timestamp.to_string())
         .header(HEADER_SIGNATURE, signature)
         .json(&body)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to register HTTP-01 token: {e}"))?;
+        .map_err(|e| classify_send_error(&endpoint, &e))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Responder returned {status}: {body}");
+        return Err(RegisterError::Status { status, body });
     }
 
     Ok(())
+}
+
+/// Sorts a failed `send()` into the retryable bucket or the terminal one.
+///
+/// `reqwest` reports a request it never even built — a responder URL with no
+/// scheme, or with a scheme it does not speak — from `send()` just like a
+/// refused connection.  Waiting on one is waiting on a request that can never
+/// be sent, so builder failures are [`RegisterError::Setup`] and stay out of
+/// the readiness budget.
+fn classify_send_error(endpoint: &str, error: &reqwest::Error) -> RegisterError {
+    if error.is_builder() {
+        return RegisterError::Setup(format!(
+            "Failed to build the HTTP-01 registration request for {endpoint}: {}",
+            error_chain(error)
+        ));
+    }
+    RegisterError::Transport(error_chain(error))
+}
+
+/// Renders an error and its sources as a single `a: b: c` line.
+///
+/// `reqwest` reports every send failure as the same "error sending request"
+/// message and hides the real cause — connection refused, TLS trust failure,
+/// pin mismatch — one level down, so the chain is what an operator needs.
+fn error_chain(error: &dyn StdError) -> String {
+    use std::fmt::Write;
+
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let _ = write!(rendered, ": {cause}");
+        source = cause.source();
+    }
+    rendered
 }
 
 /// Builds a [`Client`] for the responder admin API.
@@ -165,11 +446,20 @@ fn build_responder_client(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     use super::*;
     use crate::acme::http01_protocol::{Http01HmacSigner, signature_payload};
+
+    const TEST_ENDPOINT: &str = "http://responder.test:8080/admin/http01";
+    const TEST_HMAC: &str = "test-secret";
+    /// Freshness window enforced by [`FreshnessResponder`]; must stay well
+    /// below the delay before the late listener binds.
+    const TEST_MAX_SKEW_SECS: i64 = 1;
 
     #[derive(serde::Deserialize)]
     struct ReceivedRequest {
@@ -184,41 +474,112 @@ mod tests {
 
     impl Respond for SignatureResponder {
         fn respond(&self, request: &Request) -> ResponseTemplate {
-            let Some(timestamp) = request.headers.get(HEADER_TIMESTAMP) else {
-                return ResponseTemplate::new(400).set_body_string("Missing timestamp");
-            };
-            let Some(signature) = request.headers.get(HEADER_SIGNATURE) else {
-                return ResponseTemplate::new(400).set_body_string("Missing signature");
-            };
+            verify_signed_request(&self.secret, request, None)
+        }
+    }
 
-            let Some(timestamp) = timestamp
-                .to_str()
-                .ok()
-                .and_then(|value| value.parse::<i64>().ok())
-            else {
-                return ResponseTemplate::new(400).set_body_string("Invalid timestamp");
-            };
+    /// Signature responder that also mirrors the production responder's
+    /// `within_skew` rule, so a request signed once and replayed later is
+    /// rejected exactly as the real responder rejects it.
+    struct FreshnessResponder {
+        secret: String,
+        max_skew_secs: i64,
+    }
 
-            let Ok(body) = serde_json::from_slice::<ReceivedRequest>(&request.body) else {
-                return ResponseTemplate::new(400).set_body_string("Invalid JSON");
-            };
+    impl Respond for FreshnessResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            verify_signed_request(&self.secret, request, Some(self.max_skew_secs))
+        }
+    }
 
-            let payload = signature_payload(
-                timestamp,
-                &body.token,
-                &body.key_authorization,
-                body.ttl_secs,
-            );
-            let expected = Http01HmacSigner::new(&self.secret).sign_payload(&payload);
+    fn verify_signed_request(
+        secret: &str,
+        request: &Request,
+        max_skew_secs: Option<i64>,
+    ) -> ResponseTemplate {
+        let Some(timestamp) = request.headers.get(HEADER_TIMESTAMP) else {
+            return ResponseTemplate::new(400).set_body_string("Missing timestamp");
+        };
+        let Some(signature) = request.headers.get(HEADER_SIGNATURE) else {
+            return ResponseTemplate::new(400).set_body_string("Missing signature");
+        };
 
-            let Ok(signature) = signature.to_str() else {
-                return ResponseTemplate::new(400).set_body_string("Invalid signature");
-            };
-            if expected != signature {
-                return ResponseTemplate::new(401).set_body_string("Invalid signature");
+        let Some(timestamp) = timestamp
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            return ResponseTemplate::new(400).set_body_string("Invalid timestamp");
+        };
+
+        let Ok(body) = serde_json::from_slice::<ReceivedRequest>(&request.body) else {
+            return ResponseTemplate::new(400).set_body_string("Invalid JSON");
+        };
+
+        let payload = signature_payload(
+            timestamp,
+            &body.token,
+            &body.key_authorization,
+            body.ttl_secs,
+        );
+        let expected = Http01HmacSigner::new(secret).sign_payload(&payload);
+
+        let Ok(signature) = signature.to_str() else {
+            return ResponseTemplate::new(400).set_body_string("Invalid signature");
+        };
+        if expected != signature {
+            return ResponseTemplate::new(401).set_body_string("Invalid signature");
+        }
+
+        if let Some(max_skew_secs) = max_skew_secs {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is after the unix epoch")
+                .as_secs();
+            let now = i64::try_from(now).expect("system time fits in i64");
+            if (now - timestamp).abs() > max_skew_secs {
+                return ResponseTemplate::new(401).set_body_string("Stale timestamp");
             }
+        }
 
-            ResponseTemplate::new(200).set_body_string("ok")
+        ResponseTemplate::new(200).set_body_string("ok")
+    }
+
+    /// Reserves a loopback address, frees it so early connections are
+    /// refused, and re-binds a mock responder on that same address after
+    /// `delay`.  Returns the responder base URL.
+    fn spawn_late_responder<R: Respond + 'static>(delay: Duration, responder: R) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve address");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let listener = std::net::TcpListener::bind(addr).expect("re-bind reserved address");
+            let server = MockServer::builder().listener(listener).start().await;
+            Mock::given(method("POST"))
+                .and(path(DEFAULT_ADMIN_PATH))
+                .respond_with(responder)
+                .mount(&server)
+                .await;
+            // Never return: `server` owns the listener, so completing this
+            // task would drop it and close the port again.  The task dies
+            // with the test's runtime.
+            std::future::pending::<()>().await;
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn test_registration<'a>(base_url: &'a str, token: &'a str) -> ResponderRegistration<'a> {
+        ResponderRegistration {
+            base_url,
+            hmac_secret: TEST_HMAC,
+            timeout_secs: 5,
+            token,
+            key_authorization: "readiness.key",
+            ttl_secs: 60,
+            trust: None,
         }
     }
 
@@ -565,5 +926,434 @@ mod tests {
             err.to_string().contains("Failed to register HTTP-01 token"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A responder that only starts answering after a few attempts must be
+    /// waited out rather than treated as a terminal failure.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_registration_retries_transport_failures() {
+        const FAILURES: usize = 3;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&calls);
+        wait_for_registration(TEST_ENDPOINT, Duration::from_secs(30), move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) < FAILURES {
+                    Err(RegisterError::Transport("connection refused".to_string()))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .expect("a responder that becomes ready within the budget must succeed");
+
+        assert_eq!(calls.load(Ordering::SeqCst), FAILURES + 1);
+    }
+
+    /// A non-success status is a wrong URL or a wrong HMAC: it must fail on
+    /// the first answer instead of burning the readiness budget.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_registration_aborts_on_non_success_status() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&calls);
+        let start = Instant::now();
+        let err = wait_for_registration(TEST_ENDPOINT, Duration::from_secs(30), move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(RegisterError::Status {
+                    status: StatusCode::UNAUTHORIZED,
+                    body: "Invalid signature".to_string(),
+                })
+            }
+        })
+        .await
+        .expect_err("a non-success status must fail immediately");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        let ResponderReadyError::Rejected { status, body, .. } = &err else {
+            panic!("expected a rejection, got: {err:?}");
+        };
+        assert_eq!(*status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "Invalid signature");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_registration_gives_up_after_budget() {
+        const BUDGET: Duration = Duration::from_secs(5);
+
+        let start = Instant::now();
+        let err = wait_for_registration(TEST_ENDPOINT, BUDGET, || async {
+            Err(RegisterError::Transport(
+                "error sending request: connection refused".to_string(),
+            ))
+        })
+        .await
+        .expect_err("an unreachable responder must exhaust the budget");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= BUDGET && elapsed < BUDGET + READINESS_POLL_INTERVAL,
+            "waited {elapsed:?}, expected roughly {BUDGET:?}"
+        );
+        let ResponderReadyError::Unreachable {
+            endpoint,
+            elapsed_secs,
+            last_error,
+        } = &err
+        else {
+            panic!("expected an unreachable responder, got: {err:?}");
+        };
+        assert_eq!(endpoint, TEST_ENDPOINT);
+        assert_eq!(*elapsed_secs, BUDGET.as_secs());
+        assert!(last_error.contains("connection refused"));
+
+        let message = err.to_string();
+        assert!(message.contains(TEST_ENDPOINT), "no endpoint in: {message}");
+        assert!(message.contains("5s"), "no elapsed wait in: {message}");
+        assert!(
+            message.contains("connection refused"),
+            "no transport cause in: {message}"
+        );
+    }
+
+    /// The budget bounds the whole wait, so an attempt that would only answer
+    /// past the deadline is cut off there instead of being accepted late.
+    /// This is the case where `--responder-timeout-secs` outlasts
+    /// `--responder-ready-timeout-secs`.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_registration_cuts_off_an_attempt_at_the_deadline() {
+        const BUDGET: Duration = Duration::from_secs(2);
+        const ATTEMPT_DURATION: Duration = Duration::from_secs(10);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&calls);
+        let start = Instant::now();
+        let err = wait_for_registration(TEST_ENDPOINT, BUDGET, move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                sleep(ATTEMPT_DURATION).await;
+                Ok(())
+            }
+        })
+        .await
+        .expect_err("an answer arriving past the deadline must not be accepted");
+
+        assert_eq!(start.elapsed(), BUDGET, "the budget must bound the wait");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let ResponderReadyError::Unreachable {
+            elapsed_secs,
+            last_error,
+            ..
+        } = &err
+        else {
+            panic!("expected an unreachable responder, got: {err:?}");
+        };
+        assert_eq!(*elapsed_secs, BUDGET.as_secs());
+        assert_eq!(last_error, ATTEMPT_STILL_IN_FLIGHT);
+    }
+
+    /// When an attempt is cut off at the deadline, the transport error of the
+    /// attempt that did finish is still what the operator is shown.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_registration_keeps_the_last_transport_error() {
+        const BUDGET: Duration = Duration::from_secs(2);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&calls);
+        let err = wait_for_registration(TEST_ENDPOINT, BUDGET, move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(RegisterError::Transport("connection refused".to_string()));
+                }
+                // Outlasts the remaining budget, so this attempt is cut off.
+                sleep(BUDGET * 2).await;
+                Ok(())
+            }
+        })
+        .await
+        .expect_err("the budget must be exhausted");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let ResponderReadyError::Unreachable { last_error, .. } = &err else {
+            panic!("expected an unreachable responder, got: {err:?}");
+        };
+        assert_eq!(last_error, "connection refused");
+    }
+
+    /// The two terminal outcomes must be told apart by matching on the type,
+    /// never by inspecting the rendered message.
+    #[tokio::test(start_paused = true)]
+    async fn test_terminal_readiness_errors_are_distinct_variants() {
+        let unreachable = wait_for_registration(TEST_ENDPOINT, Duration::from_secs(1), || async {
+            Err(RegisterError::Transport("connection refused".to_string()))
+        })
+        .await
+        .expect_err("unreachable responder");
+        let rejected = wait_for_registration(TEST_ENDPOINT, Duration::from_secs(1), || async {
+            Err(RegisterError::Status {
+                status: StatusCode::NOT_FOUND,
+                body: String::new(),
+            })
+        })
+        .await
+        .expect_err("rejecting responder");
+
+        assert!(matches!(
+            unreachable,
+            ResponderReadyError::Unreachable { .. }
+        ));
+        assert!(matches!(rejected, ResponderReadyError::Rejected { .. }));
+        assert_ne!(
+            std::mem::discriminant(&unreachable),
+            std::mem::discriminant(&rejected)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_registration_rejects_zero_budget() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&calls);
+        let err = wait_for_registration(TEST_ENDPOINT, Duration::ZERO, move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .expect_err("a zero readiness budget must be rejected");
+
+        assert!(matches!(err, ResponderReadyError::ZeroBudget));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            err.to_string().contains("greater than 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// End-to-end over a real socket: the responder is not listening when the
+    /// wait starts, so early attempts are refused, and starts serving partway
+    /// through the budget.
+    #[tokio::test]
+    async fn test_register_until_ready_waits_for_late_listener() {
+        const BIND_DELAY: Duration = Duration::from_millis(700);
+
+        let base_url = spawn_late_responder(
+            BIND_DELAY,
+            SignatureResponder {
+                secret: TEST_HMAC.to_string(),
+            },
+        );
+
+        // The single-shot entry point sees the same socket as unreachable,
+        // and classifies it as the retryable transport failure.
+        let err = register_http01_token_with(
+            &base_url,
+            TEST_HMAC,
+            5,
+            "readiness",
+            "readiness.key",
+            60,
+            None,
+        )
+        .await
+        .expect_err("nothing is listening yet");
+        assert!(
+            matches!(err, RegisterError::Transport(_)),
+            "connection refused must be a transport failure, got: {err:?}"
+        );
+
+        register_http01_token_until_ready(
+            &test_registration(&base_url, "readiness"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a responder that binds within the budget must be waited out");
+    }
+
+    /// A request that cannot even be built is not a slow start, so the
+    /// readiness budget must not absorb it.
+    #[tokio::test(start_paused = true)]
+    async fn test_register_until_ready_fails_fast_without_trust() {
+        let registration = ResponderRegistration {
+            base_url: "https://responder.internal:8080",
+            hmac_secret: TEST_HMAC,
+            timeout_secs: 5,
+            token: "tok",
+            key_authorization: "tok.key",
+            ttl_secs: 60,
+            trust: None,
+        };
+
+        let start = Instant::now();
+        let err = register_http01_token_until_ready(&registration, Duration::from_mins(1))
+            .await
+            .expect_err("HTTPS without trust should fail");
+
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(matches!(err, ResponderReadyError::Setup(_)));
+        assert!(
+            err.to_string().contains("HTTPS responder URL requires"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A responder URL `reqwest` cannot turn into a request fails from
+    /// `send()` exactly like a refused connection does, but no amount of
+    /// waiting will ever make it sendable, so it must not reach the loop.
+    #[tokio::test(start_paused = true)]
+    async fn test_register_until_ready_fails_fast_on_a_malformed_url() {
+        // A missing scheme (the operator typo) and a scheme reqwest does not
+        // speak: the first fails to parse as a URL at all, the second parses
+        // and is then rejected.  Both surface as builder errors from `send()`.
+        for base_url in ["127.0.0.1:8080", "responder.internal:8080"] {
+            let registration = ResponderRegistration {
+                base_url,
+                hmac_secret: TEST_HMAC,
+                timeout_secs: 5,
+                token: "tok",
+                key_authorization: "tok.key",
+                ttl_secs: 60,
+                trust: None,
+            };
+
+            let start = Instant::now();
+            let err = register_http01_token_until_ready(&registration, Duration::from_mins(1))
+                .await
+                .expect_err("a malformed responder URL must fail");
+
+            assert_eq!(
+                start.elapsed(),
+                Duration::ZERO,
+                "{base_url} must not consume the readiness budget"
+            );
+            assert!(
+                matches!(err, ResponderReadyError::Setup(_)),
+                "unexpected error for {base_url}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(&admin_endpoint(base_url)),
+                "the message must name the endpoint it could not build: {err}"
+            );
+        }
+    }
+
+    /// The single-shot entry point makes the same distinction, so the
+    /// classification lives with the send rather than with the loop.
+    #[tokio::test]
+    async fn test_register_once_reports_a_malformed_url_as_setup() {
+        let err =
+            register_http01_token_with("127.0.0.1:8080", TEST_HMAC, 5, "tok", "tok.key", 60, None)
+                .await
+                .expect_err("a malformed responder URL must fail");
+
+        assert!(
+            matches!(err, RegisterError::Setup(_)),
+            "a request that was never built is not a transport failure: {err:?}"
+        );
+    }
+
+    /// An unusable budget is the operator's own flag, so it must be reported
+    /// ahead of anything the first attempt would have tripped over.
+    #[tokio::test(start_paused = true)]
+    async fn test_register_until_ready_reports_zero_budget_first() {
+        let registration = ResponderRegistration {
+            base_url: "https://responder.internal:8080",
+            hmac_secret: TEST_HMAC,
+            timeout_secs: 5,
+            token: "tok",
+            key_authorization: "tok.key",
+            ttl_secs: 60,
+            trust: None,
+        };
+
+        let err = register_http01_token_until_ready(&registration, Duration::ZERO)
+            .await
+            .expect_err("a zero readiness budget must be rejected");
+
+        assert!(
+            matches!(err, ResponderReadyError::ZeroBudget),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Every attempt must carry its own timestamp and signature: the mock
+    /// enforces freshness the way the responder's `within_skew` does, so a
+    /// request signed once before the loop would be rejected as stale by the
+    /// time the responder starts answering.
+    #[tokio::test]
+    async fn test_register_until_ready_signs_every_attempt() {
+        /// Longer than [`TEST_MAX_SKEW_SECS`], so a request signed before the
+        /// loop would be stale by the time the responder answers.  Kept off a
+        /// multiple of [`READINESS_POLL_INTERVAL`] so no attempt can land in
+        /// the instant between the re-bind and the mock being mounted.
+        const BIND_DELAY: Duration = Duration::from_millis(2_300);
+
+        let base_url = spawn_late_responder(
+            BIND_DELAY,
+            FreshnessResponder {
+                secret: TEST_HMAC.to_string(),
+                max_skew_secs: TEST_MAX_SKEW_SECS,
+            },
+        );
+
+        register_http01_token_until_ready(
+            &test_registration(&base_url, "resigned"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("each attempt must carry a freshly computed timestamp and signature");
+
+        // Guard against the assertion above passing vacuously: a request
+        // signed as long ago as the wait lasted really is refused.
+        let stale_offset =
+            -i64::try_from(BIND_DELAY.as_secs()).expect("bind delay fits in i64") - 1;
+        let status = post_with_timestamp_offset(&base_url, stale_offset)
+            .await
+            .expect("the responder is serving by now");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the mock must enforce freshness for the previous assertion to mean anything"
+        );
+    }
+
+    /// Sends one correctly signed registration whose timestamp is shifted by
+    /// `offset_secs`, and returns the status the responder answered with.
+    async fn post_with_timestamp_offset(
+        base_url: &str,
+        offset_secs: i64,
+    ) -> Result<StatusCode, reqwest::Error> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the unix epoch")
+            .as_secs();
+        let timestamp = i64::try_from(now).expect("system time fits in i64") + offset_secs;
+        let signature = Http01HmacSigner::new(TEST_HMAC).sign_request(
+            timestamp,
+            "resigned",
+            "resigned.key",
+            60,
+        );
+        let body = RegisterRequest {
+            token: "resigned",
+            key_authorization: "resigned.key",
+            ttl_secs: 60,
+        };
+
+        let response = Client::new()
+            .post(admin_endpoint(base_url))
+            .header(HEADER_TIMESTAMP, timestamp.to_string())
+            .header(HEADER_SIGNATURE, signature)
+            .json(&body)
+            .send()
+            .await?;
+        Ok(response.status())
     }
 }

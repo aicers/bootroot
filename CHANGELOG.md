@@ -112,6 +112,44 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot init` failing an otherwise working install when the
+  HTTP-01 responder had not finished binding its admin port (#729). The
+  responder check fired a single registration request as soon as the
+  container reported started and treated any transport failure as
+  terminal, so a host slow enough to delay the first bind past that one
+  attempt rolled the install back. `--responder-timeout-secs` could not
+  absorb the gap: a refused connection fails instantly instead of
+  waiting out the per-request timeout, so raising it changed nothing.
+  - The check now retries while the responder is unreachable, bounded by
+    the new `--responder-ready-timeout-secs` (default `60`, polled every
+    500 ms). It answers a different question from
+    `--responder-timeout-secs`, which keeps its meaning (how long one
+    request may take) and its default of `5`. A value of `0` is
+    rejected. The budget bounds the whole wait rather than only the gaps
+    between retries: an attempt still in flight when it expires is cut
+    off, so a per-request timeout larger than the readiness budget
+    cannot stretch the wait past it, and an answer that arrives after
+    the deadline is not accepted.
+  - A responder that *answers* with a non-success status still fails on
+    the first reply, without consuming the readiness budget: that is a
+    wrong responder URL or a wrong HMAC, and retrying it would turn an
+    instant configuration error into a long hang.
+  - Every attempt is signed inside the request, so a readiness budget
+    longer than the responder's `max_skew_secs` cannot degrade into a
+    spurious skew rejection of a replayed pre-signed request.
+  - The two failures are now distinct errors rather than one opaque
+    transport string. Budget exhaustion names the endpoint, the elapsed
+    wait, and the last transport error — the cause an operator needs to
+    tell a slow start from a TLS trust or pin failure on an `https://`
+    responder — while a rejection points at the responder URL and the
+    HMAC instead. Only `init`'s check waits; `register_http01_token` on
+    the ACME issuance path keeps single-shot semantics.
+  - A `--responder-url` that cannot be turned into a request at all — no
+    scheme, or a scheme the HTTP client does not speak — fails
+    immediately as a request-build error. Such a request is reported the
+    same way as a refused connection, but it can never be sent, so it
+    stays out of the readiness budget instead of being polled for a
+    minute.
 - Fixed `rotate infra-cert` leaving `OpenBao` sealed by reloading its TLS
   certificate via `SIGHUP` instead of restarting the container (#727).
   The `openbao` infra-cert entry previously reloaded with

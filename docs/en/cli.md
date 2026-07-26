@@ -359,7 +359,20 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--http-hmac`: HTTP-01 responder HMAC (environment variable: `HTTP01_HMAC`)
 - `--responder-url`: HTTP-01 responder admin URL (optional, environment
   variable: `HTTP01_RESPONDER_URL`)
-- `--responder-timeout-secs`: responder timeout (seconds, default `5`)
+- `--responder-timeout-secs`: how long a *single* request to the responder
+  may take before it is aborted (seconds, default `5`)
+- `--responder-ready-timeout-secs`: how long `init` waits for the responder
+  to start serving at all (seconds, default `60`). The responder check
+  retries its registration every 500 ms for up to this long while the
+  connection is refused — a container that has not finished binding its
+  admin port. Raising `--responder-timeout-secs` does not help there,
+  because a refused connection fails instantly instead of waiting out the
+  request timeout. A responder that *answers* with a non-success status
+  fails the check immediately, without consuming this budget: that is a
+  wrong responder URL or a wrong HMAC, not a slow start. This budget bounds
+  the whole wait, not just the gaps between retries: a request still in
+  flight when it expires is aborted, so setting `--responder-timeout-secs`
+  higher than this value cannot make `init` wait longer than it.
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
 - `--cert-duration`: `defaultTLSCertDuration` embedded in the ACME
   provisioner named by `--stepca-provisioner` in `ca.json` /

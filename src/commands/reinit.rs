@@ -970,6 +970,7 @@ fn init_args_for_reinit(
         http_hmac: None,
         responder_url: None,
         responder_timeout_secs: 5,
+        responder_ready_timeout_secs: 60,
         stepca_provisioner,
         cert_duration,
         eab_kid: None,

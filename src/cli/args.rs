@@ -1118,6 +1118,10 @@ pub(crate) struct InitArgs {
     #[arg(long, default_value_t = 5)]
     pub(crate) responder_timeout_secs: u64,
 
+    /// How long to wait for the HTTP-01 responder to start serving (seconds)
+    #[arg(long, default_value_t = 60)]
+    pub(crate) responder_ready_timeout_secs: u64,
+
     /// step-ca ACME provisioner name
     #[arg(long, default_value = DEFAULT_STEPCA_PROVISIONER)]
     pub(crate) stepca_provisioner: String,
@@ -1851,6 +1855,34 @@ mod tests {
         let cli = Cli::parse_from(["bootroot", "init"]);
         match cli.command {
             CliCommand::Init(args) => assert!(args.rotate_bound_cidrs.is_empty()),
+            _ => panic!("expected Init command"),
+        }
+    }
+
+    /// The two responder timeouts answer different questions — how long one
+    /// request may take, versus how long the responder may take to exist at
+    /// all — so their defaults are pinned together to keep a future edit
+    /// from quietly collapsing them into one value.
+    #[test]
+    fn test_cli_init_responder_timeout_defaults() {
+        let cli = Cli::parse_from(["bootroot", "init"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert_eq!(args.responder_timeout_secs, 5);
+                assert_eq!(args.responder_ready_timeout_secs, 60);
+            }
+            _ => panic!("expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_init_accepts_responder_ready_timeout_override() {
+        let cli = Cli::parse_from(["bootroot", "init", "--responder-ready-timeout-secs", "180"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert_eq!(args.responder_ready_timeout_secs, 180);
+                assert_eq!(args.responder_timeout_secs, 5);
+            }
             _ => panic!("expected Init command"),
         }
     }
