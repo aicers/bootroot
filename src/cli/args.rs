@@ -1859,6 +1859,34 @@ mod tests {
         }
     }
 
+    /// The two responder timeouts answer different questions — how long one
+    /// request may take, versus how long the responder may take to exist at
+    /// all — so their defaults are pinned together to keep a future edit
+    /// from quietly collapsing them into one value.
+    #[test]
+    fn test_cli_init_responder_timeout_defaults() {
+        let cli = Cli::parse_from(["bootroot", "init"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert_eq!(args.responder_timeout_secs, 5);
+                assert_eq!(args.responder_ready_timeout_secs, 60);
+            }
+            _ => panic!("expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_init_accepts_responder_ready_timeout_override() {
+        let cli = Cli::parse_from(["bootroot", "init", "--responder-ready-timeout-secs", "180"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert_eq!(args.responder_ready_timeout_secs, 180);
+                assert_eq!(args.responder_timeout_secs, 5);
+            }
+            _ => panic!("expected Init command"),
+        }
+    }
+
     #[test]
     fn test_cli_parses_rotate_openbao_recovery() {
         let cli = Cli::parse_from([
