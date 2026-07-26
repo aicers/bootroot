@@ -779,6 +779,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot infra install` accepts `--openbao-host-port`,
+  `--stepca-host-port` and `--http01-admin-host-port`, so the OpenBao,
+  step-ca and HTTP-01 responder host-side ports are configurable the way
+  `--postgres-host-port` already was (#731). Both compose files now
+  publish `127.0.0.1:${OPENBAO_HOST_PORT:-8200}:8200`,
+  `127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000` and
+  `127.0.0.1:${HTTP01_ADMIN_HOST_PORT:-8080}:8080`, and each value
+  resolves with the precedence Docker Compose itself applies: the flag,
+  else the process environment, else `<compose-dir>/.env`, else today's
+  default. A supplied flag is upserted into `.env` and injected into the
+  `docker compose` subprocesses so it wins over an inherited shell
+  variable. The `infra install` port preflight now pre-binds the
+  *resolved* ports instead of the literals 8200 / 9000 / 8080, which
+  previously refused a second bootroot instance on the host even when
+  the caller staged its own compose file, and each remediation message
+  names the busy port, the `.env` variable and the flag. Defaults are
+  unchanged, publication stays loopback-only, and the `--*-bind` flags
+  keep their existing semantics. When the OpenBao host port moves and
+  `--openbao-url` is left at its default, `infra install`, `init`,
+  `status` and `reinit` follow it automatically (a recorded non-loopback
+  OpenBao bind intent still wins during `reinit`); step-ca and HTTP-01
+  client URLs are not derived and still need `--responder-url` /
+  `--agent-server` / `--agent-responder-url`. Container names in the
+  shipped compose files remain fixed.
+
 - `bootroot service add` gained a `--secret-id-path <ABSOLUTE_PATH>`
   override for `local-file` delivery (#722). It relocates the service's
   `secret_id`, its sibling `role_id`, and (when EAB is configured)

@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::cli::args::StatusArgs;
+use crate::commands::compose_file::compose_file_dir;
 use crate::commands::infra::{
     ContainerReadiness, collect_container_failures, collect_readiness, default_infra_services,
 };
@@ -14,6 +15,7 @@ use crate::commands::init::{
     APPROLE_BOOTROOT_STEPCA, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
     PATH_STEPCA_PASSWORD, SECRET_ID_TTL, parse_ttl_to_secs,
 };
+use crate::commands::openbao_url::effective_openbao_url;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -28,12 +30,11 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
     } else {
         None
     };
+    let openbao_url = status_openbao_url(args);
     let mut client = match state.as_ref().map(StateFile::secrets_dir) {
-        Some(secrets_dir) => {
-            OpenBaoClient::with_local_trust(&args.openbao.openbao_url, secrets_dir)
-                .with_context(|| messages.error_openbao_client_create_failed())?
-        }
-        None => OpenBaoClient::new(&args.openbao.openbao_url)
+        Some(secrets_dir) => OpenBaoClient::with_local_trust(&openbao_url, secrets_dir)
+            .with_context(|| messages.error_openbao_client_create_failed())?,
+        None => OpenBaoClient::new(&openbao_url)
             .with_context(|| messages.error_openbao_client_create_failed())?,
     };
     let openbao_health = client
@@ -122,6 +123,20 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
     }
 
     Ok(())
+}
+
+/// Returns the `OpenBao` endpoint `status` reports on.
+///
+/// Talks to the host port this compose stack publishes rather than the
+/// CLI default's literal 8200, which on a shared host would report
+/// another bootroot instance's `OpenBao`.  An explicit `--openbao-url`
+/// is still honoured verbatim.
+fn status_openbao_url(args: &StatusArgs) -> String {
+    effective_openbao_url(
+        &args.openbao.openbao_url,
+        &compose_file_dir(&args.compose.compose_file),
+        None,
+    )
 }
 
 fn load_service_statuses(messages: &Messages) -> Result<Vec<ServiceStatusEntry>> {
@@ -371,6 +386,45 @@ mod tests {
             last_secret_id_rotation: last_secret_id_rotation.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    fn status_args(compose_file: std::path::PathBuf, openbao_url: &str) -> StatusArgs {
+        StatusArgs {
+            compose: crate::cli::args::ComposeFileArgs { compose_file },
+            openbao: crate::cli::args::OpenBaoArgs {
+                openbao_url: openbao_url.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            root_token: crate::cli::args::RootTokenArgs { root_token: None },
+        }
+    }
+
+    /// Closes #731: `status` follows a non-default `OPENBAO_HOST_PORT`
+    /// recorded in the compose directory's `.env`.
+    #[test]
+    fn status_openbao_url_follows_the_configured_host_port() {
+        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").expect("write .env");
+        let args = status_args(
+            dir.path().join("docker-compose.yml"),
+            crate::commands::init::DEFAULT_OPENBAO_URL,
+        );
+        assert_eq!(status_openbao_url(&args), "http://localhost:18200");
+    }
+
+    /// Closes #731: an operator-supplied `--openbao-url` is used
+    /// verbatim, whatever the configured host port is.
+    #[test]
+    fn status_openbao_url_honours_an_explicit_url() {
+        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").expect("write .env");
+        let args = status_args(
+            dir.path().join("docker-compose.yml"),
+            "https://openbao.internal:8200",
+        );
+        assert_eq!(status_openbao_url(&args), "https://openbao.internal:8200");
     }
 
     fn rfc3339(ts: OffsetDateTime) -> String {

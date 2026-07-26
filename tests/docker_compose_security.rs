@@ -11,6 +11,41 @@ fn postgres_port_is_bound_to_localhost_by_default() {
     );
 }
 
+/// The host-side port of every core service is interpolated so two
+/// bootroot instances can share a host (issue #731), and `infra install`'s
+/// preflight resolves the same `(variable, default)` pairs rather than
+/// parsing the YAML. Drift between the two silently reintroduces the
+/// collision the preflight is meant to diagnose.
+const INTERPOLATED_PORT_MAPPINGS: [&str; 3] = [
+    r#""127.0.0.1:${OPENBAO_HOST_PORT:-8200}:8200""#,
+    r#""127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000""#,
+    r#""127.0.0.1:${HTTP01_ADMIN_HOST_PORT:-8080}:8080""#,
+];
+
+#[test]
+fn core_service_host_ports_are_interpolated_with_todays_defaults() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.yml");
+    let compose = fs::read_to_string(compose_path).expect("read docker-compose.yml");
+    for mapping in INTERPOLATED_PORT_MAPPINGS {
+        assert!(
+            compose.contains(mapping),
+            "docker-compose.yml must publish {mapping} verbatim (issue #731)"
+        );
+    }
+}
+
+#[test]
+fn deploy_core_service_host_ports_are_interpolated_with_todays_defaults() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.deploy.yml");
+    let compose = fs::read_to_string(compose_path).expect("read docker-compose.deploy.yml");
+    for mapping in INTERPOLATED_PORT_MAPPINGS {
+        assert!(
+            compose.contains(mapping),
+            "docker-compose.deploy.yml must publish {mapping} verbatim (issue #731)"
+        );
+    }
+}
+
 #[test]
 fn postgres_volume_uses_postgresql_root_for_postgres_18() {
     let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.yml");

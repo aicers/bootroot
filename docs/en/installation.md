@@ -216,6 +216,25 @@ single-host guardrails:
   `127.0.0.1:5433:5432` — the published default; override with
   `POSTGRES_HOST_PORT`), not `0.0.0.0` or bare `5433:5432`.
 
+The same applies to the other core services: `docker-compose.yml` and
+`docker-compose.deploy.yml` publish `127.0.0.1:${OPENBAO_HOST_PORT:-8200}:8200`,
+`127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000` and
+`127.0.0.1:${HTTP01_ADMIN_HOST_PORT:-8080}:8080`. Only the host-side port
+number is configurable — set the variable in `<compose-dir>/.env` or in the
+process environment, or pass `--openbao-host-port` / `--stepca-host-port` /
+`--http01-admin-host-port` to `bootroot infra install`, which upserts it into
+`.env` for you. So the "ports that must be free" list (8200, 9000, 8080, 5433)
+is a set of defaults, not a requirement, and two bootroot instances can share a
+host once each also has its own container names (the shipped compose files pin
+those, so the second instance needs its own compose file).
+
+`bootroot init`, `bootroot status` and `bootroot reinit` pick up a non-default
+OpenBao host port automatically whenever `--openbao-url` is left at its default.
+step-ca and HTTP-01 client URLs are not derived from their host ports: pass
+`--responder-url`, `--agent-server` and `--agent-responder-url` explicitly when
+those services run on non-default ports. See `docs/en/cli.md` for the full
+resolution order.
+
 If these conditions are violated, `bootroot init`, `bootroot infra up`, and
 `bootroot rotate db` fail fast.
 

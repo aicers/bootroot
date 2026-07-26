@@ -218,6 +218,28 @@ DB DSN이 `secrets/config/ca.json`에 자동으로 기록됩니다.
   `POSTGRES_HOST_PORT`로 재정의 가능).
   `0.0.0.0` 바인딩 또는 `5433:5432` 형태는 허용되지 않습니다.
 
+다른 핵심 서비스도 마찬가지입니다. `docker-compose.yml`과
+`docker-compose.deploy.yml`은
+`127.0.0.1:${OPENBAO_HOST_PORT:-8200}:8200`,
+`127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000`,
+`127.0.0.1:${HTTP01_ADMIN_HOST_PORT:-8080}:8080`으로 게시합니다.
+설정 가능한 것은 호스트 측 포트 번호뿐이며, `<compose-dir>/.env`나
+프로세스 환경 변수에 값을 지정하거나 `bootroot infra install`에
+`--openbao-host-port` / `--stepca-host-port` /
+`--http01-admin-host-port`를 전달하면 됩니다(이 경우 `.env`에도
+자동으로 upsert됩니다). 따라서 "비어 있어야 하는 포트"
+목록(8200, 9000, 8080, 5433)은 요구 사항이 아니라 기본값이며,
+컨테이너 이름까지 분리하면 두 개의 bootroot 인스턴스가 한 호스트를
+공유할 수 있습니다(배포되는 compose 파일은 컨테이너 이름이 고정되어
+있으므로 두 번째 인스턴스는 자체 compose 파일이 필요합니다).
+
+`--openbao-url`을 기본값으로 두면 `bootroot init`, `bootroot status`,
+`bootroot reinit`이 기본값이 아닌 OpenBao 호스트 포트를 자동으로
+반영합니다. step-ca와 HTTP-01 클라이언트 URL은 호스트 포트에서
+유도되지 않으므로, 해당 서비스가 기본값이 아닌 포트로 동작한다면
+`--responder-url`, `--agent-server`, `--agent-responder-url`을 직접
+전달해야 합니다. 전체 우선순위는 `docs/ko/cli.md`를 참고하세요.
+
 위 조건을 위반하면 `bootroot init`, `bootroot infra up`,
 `bootroot rotate db`는 즉시 실패합니다.
 

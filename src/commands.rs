@@ -10,6 +10,7 @@ pub(crate) mod init;
 pub(crate) mod monitoring;
 pub(crate) mod openbao_auth;
 pub(crate) mod openbao_unseal;
+pub(crate) mod openbao_url;
 pub(crate) mod reinit;
 pub(crate) mod rotate;
 pub(crate) mod service;

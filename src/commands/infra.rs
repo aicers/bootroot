@@ -5,6 +5,11 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bootroot::db::POSTGRES_HOST_PORT_ENV;
+use bootroot::host_port::{
+    HTTP01_ADMIN_HOST_PORT_ENV, OPENBAO_HOST_PORT_ENV, STEPCA_HOST_PORT_ENV,
+    resolve_http01_admin_host_port, resolve_openbao_host_port, resolve_stepca_host_port,
+};
 use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::{InfraInstallArgs, InfraUpArgs};
@@ -30,6 +35,7 @@ use crate::commands::init::{
     compose_has_stepca,
 };
 use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unseal_keys_from_file};
+use crate::commands::openbao_url::effective_openbao_url;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -139,11 +145,13 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
 
     // Derive the effective OpenBao URL.  When the non-loopback override
     // is active, OpenBao listens on the bind address with TLS, so the
-    // default http://localhost:8200 no longer reaches it.
+    // default http://localhost:8200 no longer reaches it.  Otherwise
+    // OpenBao is on loopback, where a configured host port moves it —
+    // the unseal helpers below would talk to nothing without this.
     let effective_openbao_url = if openbao_override.is_some() {
         effective_openbao_url_from_state(&state_path).unwrap_or_else(|| args.openbao_url.clone())
     } else {
-        args.openbao_url.clone()
+        crate::commands::openbao_url::effective_openbao_url(&args.openbao_url, compose_dir, None)
     };
 
     let loaded_archives = if let Some(dir) = args.image_archive_dir.as_deref() {
@@ -435,6 +443,17 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     }
     println!("{}", messages.infra_install_dirs_created());
 
+    // Resolve the host-side published ports once: the preflight binds
+    // them, the `.env` upsert and the compose subprocess environment
+    // below propagate the flag-supplied ones, and the OpenBao port
+    // decides the endpoint recorded in `state.json`.
+    let host_ports = HostPorts::resolve(args, compose_dir);
+    let host_port_entries = host_port_flag_entries(args);
+    // The install-time OpenBao endpoint.  `infra install` always brings
+    // OpenBao up on loopback (any `--openbao-bind` override is deferred
+    // to `infra up` / `init`), so only the host port moves here.
+    let openbao_url = effective_openbao_url(&args.openbao_url, compose_dir, args.openbao_host_port);
+
     // Generate compose override and persist bind intent when the operator
     // opts into a non-loopback OpenBao address.  The override is NOT
     // applied yet — OpenBao starts on 127.0.0.1:8200 as usual.  The
@@ -446,12 +465,12 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
             compose_dir,
             bind_addr,
             args.openbao_advertise_addr.as_deref(),
-            &args.openbao_url,
+            &openbao_url,
             messages,
         )?;
         println!("{}", messages.info_openbao_bind_intent_recorded(bind_addr));
     } else {
-        clear_openbao_bind_intent(compose_dir, &args.openbao_url, messages)?;
+        clear_openbao_bind_intent(compose_dir, &openbao_url, messages)?;
     }
 
     if let Some(ref bind_addr) = http01_admin_bind {
@@ -460,7 +479,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
             compose_dir,
             bind_addr,
             args.http01_admin_advertise_addr.as_deref(),
-            &args.openbao_url,
+            &openbao_url,
             messages,
         )?;
         println!(
@@ -476,12 +495,21 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         save_stepca_bind_intent(
             bind_addr,
             args.stepca_advertise_addr.as_deref(),
-            &args.openbao_url,
+            &openbao_url,
             messages,
         )?;
         println!("{}", messages.info_stepca_bind_intent_recorded(bind_addr));
     } else {
         clear_stepca_bind_intent(compose_dir, messages)?;
+    }
+
+    // A host-port-derived endpoint has to reach a pre-existing
+    // `state.json` even when none of the intent writers above rewrote
+    // it.  Gated on the derivation actually having fired so an
+    // operator-supplied `--openbao-url` is never persisted where it
+    // would not have been before.
+    if openbao_url != args.openbao_url {
+        sync_state_openbao_url_to(&StateFile::default_path(), &openbao_url, messages)?;
     }
 
     // Docker Compose reads .env from the compose file's directory.
@@ -490,41 +518,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     // owned by a non-default uid is readable. `secrets_dir` was just
     // created (or already existed) above, so its owner is the intended one.
     let stepca_user = stepca_user_from_secrets_dir(&secrets_dir, messages)?;
-    if env_path.exists() {
-        // Existing deployment: upsert the step-ca uid/gid so a host whose
-        // `.env` predates this variable still runs step-ca as the `secrets/`
-        // owner rather than the 1000:1000 interpolation default.
-        crate::commands::dotenv::update_dotenv_key(
-            &env_path,
-            STEPCA_USER_ENV_KEY,
-            &stepca_user,
-            messages,
-        )?;
-        if let Some(port) = args.postgres_host_port {
-            crate::commands::dotenv::update_dotenv_key(
-                &env_path,
-                "POSTGRES_HOST_PORT",
-                &port.to_string(),
-                messages,
-            )?;
-        }
-    } else {
-        let postgres_password = bootroot::utils::generate_secret(32)
-            .with_context(|| messages.error_generate_secret_failed())?;
-        let mut entries: Vec<(&str, &str)> = vec![
-            ("POSTGRES_USER", DEFAULT_POSTGRES_USER),
-            ("POSTGRES_PASSWORD", &postgres_password),
-            ("POSTGRES_DB", DEFAULT_POSTGRES_DB),
-            ("GRAFANA_ADMIN_PASSWORD", DEFAULT_GRAFANA_ADMIN_PASSWORD),
-            (STEPCA_USER_ENV_KEY, &stepca_user),
-        ];
-        let host_port_str = args.postgres_host_port.map(|p| p.to_string());
-        if let Some(ref s) = host_port_str {
-            entries.push(("POSTGRES_HOST_PORT", s));
-        }
-        write_dotenv(&env_path, &entries, messages)?;
-        println!("{}", messages.infra_install_env_written());
-    }
+    write_install_dotenv(&env_path, &stepca_user, &host_port_entries, messages)?;
 
     // Pre-bind the host-side ports the active compose stack will publish
     // so that a collision aborts before `docker compose up` half-creates
@@ -539,10 +533,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     // bind is still on 127.0.0.1; the preflight must check those
     // localhost ports regardless of whether an override intent was
     // recorded.
-    let postgres_host_port = args
-        .postgres_host_port
-        .unwrap_or_else(|| bootroot::db::resolve_postgres_host_port(compose_dir));
-    preflight_compose_published_ports(&args.services, postgres_host_port)?;
+    preflight_compose_published_ports(&args.services, host_ports)?;
 
     // Load local images or pull + build.
     let loaded_archives = if let Some(dir) = args.image_archive_dir.as_deref() {
@@ -554,17 +545,13 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     let compose_str = args.compose_file.compose_file.to_string_lossy();
     let svc_refs: Vec<&str> = args.services.iter().map(String::as_str).collect();
 
-    // Build the compose process environment.  When the operator passed
-    // `--postgres-host-port`, override any inherited `POSTGRES_HOST_PORT`
-    // for the compose subprocess so the flag wins regardless of shell
-    // env (Docker Compose otherwise prefers shell env over `.env`).
-    let host_port_env: Vec<(String, String)> = args
-        .postgres_host_port
-        .map(|p| vec![("POSTGRES_HOST_PORT".to_string(), p.to_string())])
-        .unwrap_or_default();
-    let host_port_env_refs: Vec<(&str, &str)> = host_port_env
+    // Build the compose process environment.  When the operator passed a
+    // `--*-host-port` flag, override any inherited value of the matching
+    // variable for the compose subprocess so the flag wins regardless of
+    // shell env (Docker Compose otherwise prefers shell env over `.env`).
+    let host_port_env_refs: Vec<(&str, &str)> = host_port_entries
         .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .map(|(key, value)| (*key, value.as_str()))
         .collect();
 
     if should_pull_before_up(loaded_archives, args.no_build) {
@@ -836,6 +823,120 @@ fn preflight_host_port(host: &str, port: u16, remediation: &str) -> Result<()> {
     }
 }
 
+/// Host-side published ports of the four core services, each resolved
+/// with the precedence Docker Compose itself applies to the matching
+/// `${*_HOST_PORT:-<default>}` interpolation in the compose file: the
+/// `infra install` flag, else the process environment, else
+/// `<compose_dir>/.env`, else the compile-time default.
+#[derive(Debug, Clone, Copy)]
+struct HostPorts {
+    postgres: u16,
+    openbao: u16,
+    stepca: u16,
+    http01_admin: u16,
+}
+
+impl HostPorts {
+    /// Resolves every core service's host-side published port for an
+    /// `infra install` run.
+    fn resolve(args: &InfraInstallArgs, compose_dir: &Path) -> Self {
+        Self {
+            postgres: args
+                .postgres_host_port
+                .unwrap_or_else(|| bootroot::db::resolve_postgres_host_port(compose_dir)),
+            openbao: args
+                .openbao_host_port
+                .unwrap_or_else(|| resolve_openbao_host_port(compose_dir)),
+            stepca: args
+                .stepca_host_port
+                .unwrap_or_else(|| resolve_stepca_host_port(compose_dir)),
+            http01_admin: args
+                .http01_admin_host_port
+                .unwrap_or_else(|| resolve_http01_admin_host_port(compose_dir)),
+        }
+    }
+}
+
+/// Creates or updates the compose `.env` that `infra install` leaves
+/// behind.
+///
+/// On an existing `.env` only the keys this command owns are upserted,
+/// so operator-authored entries (and the `PostgreSQL` credentials a
+/// previous install generated) survive untouched.  A fresh `.env` gets
+/// the full set, including a newly generated `PostgreSQL` password.
+///
+/// `host_port_entries` carries only the host-port flags the operator
+/// supplied — see [`host_port_flag_entries`]; an unset flag leaves the
+/// variable absent so the compose interpolation default applies.
+fn write_install_dotenv(
+    env_path: &Path,
+    stepca_user: &str,
+    host_port_entries: &[(&'static str, String)],
+    messages: &Messages,
+) -> Result<()> {
+    if env_path.exists() {
+        // Existing deployment: upsert the step-ca uid/gid so a host whose
+        // `.env` predates this variable still runs step-ca as the `secrets/`
+        // owner rather than the 1000:1000 interpolation default.
+        crate::commands::dotenv::update_dotenv_key(
+            env_path,
+            STEPCA_USER_ENV_KEY,
+            stepca_user,
+            messages,
+        )?;
+        for (key, value) in host_port_entries {
+            crate::commands::dotenv::update_dotenv_key(env_path, key, value, messages)?;
+        }
+        return Ok(());
+    }
+    let postgres_password = bootroot::utils::generate_secret(32)
+        .with_context(|| messages.error_generate_secret_failed())?;
+    let mut entries: Vec<(&str, &str)> = vec![
+        ("POSTGRES_USER", DEFAULT_POSTGRES_USER),
+        ("POSTGRES_PASSWORD", &postgres_password),
+        ("POSTGRES_DB", DEFAULT_POSTGRES_DB),
+        ("GRAFANA_ADMIN_PASSWORD", DEFAULT_GRAFANA_ADMIN_PASSWORD),
+        (STEPCA_USER_ENV_KEY, stepca_user),
+    ];
+    entries.extend(
+        host_port_entries
+            .iter()
+            .map(|(key, value)| (*key, value.as_str())),
+    );
+    write_dotenv(env_path, &entries, messages)?;
+    println!("{}", messages.infra_install_env_written());
+    Ok(())
+}
+
+/// Returns the `(variable, value)` pairs for the host-port flags the
+/// operator actually supplied.
+///
+/// The same list feeds both durable records of the choice: the `.env`
+/// upsert Docker Compose reads on every later invocation, and the
+/// environment of the `docker compose` subprocesses this install spawns
+/// (where it must win over an inherited shell variable, which Compose
+/// would otherwise prefer over `.env`).
+fn host_port_flag_entries(args: &InfraInstallArgs) -> Vec<(&'static str, String)> {
+    [
+        (POSTGRES_HOST_PORT_ENV, args.postgres_host_port),
+        (OPENBAO_HOST_PORT_ENV, args.openbao_host_port),
+        (STEPCA_HOST_PORT_ENV, args.stepca_host_port),
+        (HTTP01_ADMIN_HOST_PORT_ENV, args.http01_admin_host_port),
+    ]
+    .into_iter()
+    .filter_map(|(key, port)| port.map(|port| (key, port.to_string())))
+    .collect()
+}
+
+/// Builds the remediation sentence appended to a failed port pre-bind.
+///
+/// Names the concrete port plus both ways of moving it — the `.env`
+/// variable and the `infra install` flag — so the operator does not have
+/// to look either up.
+fn host_port_remediation(port: u16, env_key: &str, flag: &str) -> String {
+    format!("free port {port}, set {env_key}=<unused-port> in .env, or pass {flag} <unused-port>")
+}
+
 /// Pre-binds every host-side port the active compose stack will publish.
 /// The bound services list is derived from `services` so a partial install
 /// (e.g. `--services openbao`) only checks the ports it will actually
@@ -847,40 +948,32 @@ fn preflight_host_port(host: &str, port: u16, remediation: &str) -> Result<()> {
 /// layered in until `infra up` / `init`.  So the install-time bind is
 /// always on 127.0.0.1, and the preflight always checks the localhost
 /// ports regardless of any recorded override intent.
-fn preflight_compose_published_ports(services: &[String], postgres_host_port: u16) -> Result<()> {
-    // Static map of compose-declared host ports for the core services.
-    // Kept in sync with docker-compose.yml — adding a published port to
-    // a core service requires a matching entry here.
-    let postgres_remediation = format!(
-        "free port {postgres_host_port}, set POSTGRES_HOST_PORT=<unused-port> in .env, \
-         or pass --postgres-host-port <unused-port>"
-    );
-    let openbao_remediation = "free port 8200 or stop the conflicting listener before retrying \
-         `bootroot infra install`"
-        .to_string();
-    let stepca_remediation = "free port 9000 or stop the conflicting listener before retrying \
-         `bootroot infra install`"
-        .to_string();
-    let http01_remediation = "free port 8080 or stop the conflicting listener before retrying \
-         `bootroot infra install`"
-        .to_string();
-
+fn preflight_compose_published_ports(services: &[String], ports: HostPorts) -> Result<()> {
+    // Every core service publishes its host port through a
+    // `${*_HOST_PORT:-<default>}` interpolation, so the preflight binds
+    // the *resolved* port rather than a constant. Adding a published
+    // port to a core service requires a matching arm here.
     for service in services {
-        match service.as_str() {
-            "postgres" => {
-                preflight_host_port("127.0.0.1", postgres_host_port, &postgres_remediation)?;
-            }
-            "openbao" => {
-                preflight_host_port("127.0.0.1", 8200, &openbao_remediation)?;
-            }
-            "step-ca" => {
-                preflight_host_port("127.0.0.1", 9000, &stepca_remediation)?;
-            }
-            "bootroot-http01" => {
-                preflight_host_port("127.0.0.1", 8080, &http01_remediation)?;
-            }
-            _ => {}
-        }
+        let (port, env_key, flag) = match service.as_str() {
+            "postgres" => (
+                ports.postgres,
+                POSTGRES_HOST_PORT_ENV,
+                "--postgres-host-port",
+            ),
+            "openbao" => (ports.openbao, OPENBAO_HOST_PORT_ENV, "--openbao-host-port"),
+            "step-ca" => (ports.stepca, STEPCA_HOST_PORT_ENV, "--stepca-host-port"),
+            RESPONDER_SERVICE_NAME => (
+                ports.http01_admin,
+                HTTP01_ADMIN_HOST_PORT_ENV,
+                "--http01-admin-host-port",
+            ),
+            _ => continue,
+        };
+        preflight_host_port(
+            "127.0.0.1",
+            port,
+            &host_port_remediation(port, env_key, flag),
+        )?;
     }
     Ok(())
 }
@@ -1422,6 +1515,10 @@ fn clear_openbao_bind_intent_to(
     }
     let mut state = StateFile::load(state_path)?;
     if state.openbao_bind_addr.is_none() {
+        // Nothing to clear.  A moved OpenBao host port still has to
+        // reach the recorded endpoint; `sync_state_openbao_url_to`
+        // handles that after every intent writer has run, so that this
+        // early return keeps `state.json` untouched on a plain install.
         return Ok(());
     }
     state.openbao_bind_addr = None;
@@ -1499,6 +1596,11 @@ fn save_http01_admin_bind_intent_to(
             ..Default::default()
         }
     };
+    // Record the install-time OpenBao endpoint on the pre-existing-state
+    // path too: it carries the resolved OpenBao host port, and the
+    // openbao arm of `run_infra_install` has already reset the URL for
+    // any bind intent by the time this runs.
+    state.openbao_url = openbao_url.to_string();
     state.http01_admin_bind_addr = Some(bind_addr.to_string());
     state.http01_admin_advertise_addr = advertise_addr.map(str::to_string);
     // Clear stale infra-cert entry — the previous cert has the wrong
@@ -1612,8 +1714,44 @@ fn save_stepca_bind_intent_to(
             ..Default::default()
         }
     };
+    // Record the install-time OpenBao endpoint on the pre-existing-state
+    // path too: it carries the resolved OpenBao host port, and the
+    // openbao arm of `run_infra_install` has already reset the URL for
+    // any bind intent by the time this runs.
+    state.openbao_url = openbao_url.to_string();
     state.stepca_bind_addr = Some(bind_addr.to_string());
     state.stepca_advertise_addr = advertise_addr.map(str::to_string);
+    state
+        .save(state_path)
+        .with_context(|| messages.error_serialize_state_failed())
+}
+
+/// Points an existing `state.json` at the `OpenBao` endpoint this
+/// install publishes.
+///
+/// Runs after the bind-intent writers, which already record the endpoint
+/// on every path except one: `clear_openbao_bind_intent_to` returns early
+/// when there is no intent to clear, so a `state.json` written by an
+/// earlier `init` would keep the old port after the operator moved
+/// `OPENBAO_HOST_PORT`.
+///
+/// Deliberately a no-op when no state file exists.  `.env` is the durable
+/// record of the host port, and creating a state file here would make the
+/// next `bootroot init` prompt to overwrite existing state after what is
+/// otherwise a fresh install.
+fn sync_state_openbao_url_to(
+    state_path: &Path,
+    openbao_url: &str,
+    messages: &Messages,
+) -> Result<()> {
+    if !state_path.exists() {
+        return Ok(());
+    }
+    let mut state = StateFile::load(state_path)?;
+    if state.openbao_url == openbao_url {
+        return Ok(());
+    }
+    state.openbao_url = openbao_url.to_string();
     state
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())
@@ -2191,15 +2329,397 @@ mod tests {
             // Port already in use on this host (e.g. a real openbao
             // running locally); the preflight must still detect the
             // collision rather than skip it.
-            let err = preflight_compose_published_ports(&["openbao".to_string()], 5433)
-                .expect_err("preflight must abort when 8200 is busy");
+            let err =
+                preflight_compose_published_ports(&["openbao".to_string()], default_host_ports())
+                    .expect_err("preflight must abort when 8200 is busy");
             assert!(err.to_string().contains("8200"), "{err}");
             return;
         }
         drop(listener);
         // 8200 free: the preflight succeeds without any "override skip".
-        preflight_compose_published_ports(&["openbao".to_string()], 5433)
+        preflight_compose_published_ports(&["openbao".to_string()], default_host_ports())
             .expect("free 8200 must pass preflight");
+    }
+
+    /// The compose-declared defaults, for tests that only exercise one
+    /// service and want the rest left alone.
+    fn default_host_ports() -> HostPorts {
+        HostPorts {
+            postgres: bootroot::db::DEFAULT_POSTGRES_HOST_PORT,
+            openbao: bootroot::host_port::DEFAULT_OPENBAO_HOST_PORT,
+            stepca: bootroot::host_port::DEFAULT_STEPCA_HOST_PORT,
+            http01_admin: bootroot::host_port::DEFAULT_HTTP01_ADMIN_HOST_PORT,
+        }
+    }
+
+    /// `infra install` args with every optional field unset, so a test
+    /// can set just the ones it exercises.
+    fn install_args(compose_file: PathBuf) -> InfraInstallArgs {
+        InfraInstallArgs {
+            compose_file: crate::cli::args::ComposeFileArgs { compose_file },
+            services: default_infra_services(),
+            image_archive_dir: None,
+            restart_policy: "always".to_string(),
+            openbao_url: "http://localhost:8200".to_string(),
+            openbao_bind: None,
+            openbao_tls_required: false,
+            openbao_bind_wildcard: false,
+            openbao_advertise_addr: None,
+            http01_admin_bind: None,
+            http01_admin_tls_required: false,
+            http01_admin_bind_wildcard: false,
+            http01_admin_advertise_addr: None,
+            stepca_bind: None,
+            stepca_bind_wildcard: false,
+            stepca_advertise_addr: None,
+            postgres_host_port: None,
+            openbao_host_port: None,
+            stepca_host_port: None,
+            http01_admin_host_port: None,
+            no_build: false,
+        }
+    }
+
+    /// Replaces one service's port in an otherwise-default `HostPorts`.
+    fn host_ports_with(service: &str, port: u16) -> HostPorts {
+        let mut ports = default_host_ports();
+        match service {
+            "openbao" => ports.openbao = port,
+            "step-ca" => ports.stepca = port,
+            RESPONDER_SERVICE_NAME => ports.http01_admin = port,
+            other => panic!("unexpected service {other}"),
+        }
+        ports
+    }
+
+    /// Returns a port that was free a moment ago.  Callers must tolerate
+    /// the ephemeral-port allocator handing it to somebody else, exactly
+    /// as `preflight_host_port_succeeds_when_free` does.
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr").port()
+    }
+
+    /// The three services this issue parameterised, with the `.env`
+    /// variable and flag their remediation must name.
+    fn parameterised_services() -> [(&'static str, &'static str, &'static str); 3] {
+        [
+            ("openbao", OPENBAO_HOST_PORT_ENV, "--openbao-host-port"),
+            ("step-ca", STEPCA_HOST_PORT_ENV, "--stepca-host-port"),
+            (
+                RESPONDER_SERVICE_NAME,
+                HTTP01_ADMIN_HOST_PORT_ENV,
+                "--http01-admin-host-port",
+            ),
+        ]
+    }
+
+    /// Closes #731: the preflight binds the *resolved* host port, not
+    /// the compose default, so an install onto a moved port aborts on a
+    /// collision with that port.  The diagnostic names the port and both
+    /// ways of moving it.
+    #[test]
+    fn preflight_aborts_on_a_listener_on_the_resolved_port() {
+        for (service, env_key, flag) in parameterised_services() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sentinel");
+            let port = listener.local_addr().expect("addr").port();
+            let err = preflight_compose_published_ports(
+                &[service.to_string()],
+                host_ports_with(service, port),
+            )
+            .expect_err("a listener on the resolved port must abort the install");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&port.to_string()),
+                "{service} diagnostic must name the resolved port, got: {msg}"
+            );
+            assert!(
+                msg.contains(env_key),
+                "{service} diagnostic must name {env_key}, got: {msg}"
+            );
+            assert!(
+                msg.contains(flag),
+                "{service} diagnostic must name {flag}, got: {msg}"
+            );
+            drop(listener);
+        }
+    }
+
+    /// Closes #731: with the host port moved, a listener on the *default*
+    /// port is no longer the install's business.  Holding the default
+    /// port here (or finding it already held, which is the same
+    /// observation) must not make the preflight abort.
+    #[test]
+    fn preflight_ignores_the_default_port_once_the_resolved_port_differs() {
+        for (service, _, _) in parameterised_services() {
+            let default_port = match service {
+                "openbao" => bootroot::host_port::DEFAULT_OPENBAO_HOST_PORT,
+                "step-ca" => bootroot::host_port::DEFAULT_STEPCA_HOST_PORT,
+                _ => bootroot::host_port::DEFAULT_HTTP01_ADMIN_HOST_PORT,
+            };
+            // Either we hold the default port for the duration of the
+            // check, or somebody else already does.
+            let _sentinel = std::net::TcpListener::bind(("127.0.0.1", default_port)).ok();
+            // Retry to absorb the ephemeral-port allocator handing our
+            // just-released port to another process.
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut passed = false;
+            for _ in 0..16 {
+                let resolved = free_port();
+                assert_ne!(resolved, default_port, "ephemeral port must differ");
+                match preflight_compose_published_ports(
+                    &[service.to_string()],
+                    host_ports_with(service, resolved),
+                ) {
+                    Ok(()) => {
+                        passed = true;
+                        break;
+                    }
+                    Err(err) => last_err = Some(err),
+                }
+            }
+            assert!(
+                passed,
+                "{service} preflight must ignore the default port: {}",
+                last_err.expect("at least one attempt failed")
+            );
+        }
+    }
+
+    /// Closes #731: `HostPorts::resolve` follows flag → process env →
+    /// `.env` → compile-time default, per service.
+    #[test]
+    fn host_ports_resolve_prefers_the_flag_then_the_env_file() {
+        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "OPENBAO_HOST_PORT=18200\nSTEPCA_HOST_PORT=19000\n",
+        )
+        .unwrap();
+        let mut args = install_args(dir.path().join("docker-compose.yml"));
+        args.openbao_host_port = Some(28200);
+        let ports = HostPorts::resolve(&args, dir.path());
+        assert_eq!(ports.openbao, 28200, "the flag wins");
+        assert_eq!(ports.stepca, 19000, "`.env` is consulted");
+        assert_eq!(
+            ports.http01_admin,
+            bootroot::host_port::DEFAULT_HTTP01_ADMIN_HOST_PORT,
+            "an unconfigured service keeps the compose default"
+        );
+    }
+
+    /// Closes #731: only the flags the operator actually supplied are
+    /// propagated to `.env` and to the compose subprocess environment.
+    #[test]
+    fn host_port_flag_entries_lists_only_supplied_flags() {
+        let mut args = install_args(PathBuf::from("docker-compose.yml"));
+        assert!(
+            host_port_flag_entries(&args).is_empty(),
+            "no flags supplied means no entries"
+        );
+        args.postgres_host_port = Some(15433);
+        args.openbao_host_port = Some(18200);
+        args.stepca_host_port = Some(19000);
+        args.http01_admin_host_port = Some(18080);
+        let entries = host_port_flag_entries(&args);
+        assert_eq!(
+            entries,
+            vec![
+                (POSTGRES_HOST_PORT_ENV, "15433".to_string()),
+                (OPENBAO_HOST_PORT_ENV, "18200".to_string()),
+                (STEPCA_HOST_PORT_ENV, "19000".to_string()),
+                (HTTP01_ADMIN_HOST_PORT_ENV, "18080".to_string()),
+            ]
+        );
+    }
+
+    /// Closes #731: the host-port flags are upserted into an existing
+    /// `.env` without disturbing the other keys in it.
+    #[test]
+    fn install_dotenv_upserts_host_ports_into_an_existing_env() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        std::fs::write(
+            &env_path,
+            "POSTGRES_PASSWORD=keepme\nOPENBAO_HOST_PORT=8200\nOPERATOR_KEY=untouched\n",
+        )
+        .unwrap();
+        let entries = vec![
+            (OPENBAO_HOST_PORT_ENV, "18200".to_string()),
+            (STEPCA_HOST_PORT_ENV, "19000".to_string()),
+            (HTTP01_ADMIN_HOST_PORT_ENV, "18080".to_string()),
+        ];
+        write_install_dotenv(&env_path, "1000:1000", &entries, &messages).unwrap();
+        let contents = std::fs::read_to_string(&env_path).unwrap();
+        assert!(
+            contents.contains("OPENBAO_HOST_PORT=18200"),
+            "existing key must be rewritten, got: {contents}"
+        );
+        assert!(
+            contents.contains("STEPCA_HOST_PORT=19000")
+                && contents.contains("HTTP01_ADMIN_HOST_PORT=18080"),
+            "absent keys must be appended, got: {contents}"
+        );
+        assert!(
+            contents.contains("POSTGRES_PASSWORD=keepme")
+                && contents.contains("OPERATOR_KEY=untouched"),
+            "unrelated keys must survive, got: {contents}"
+        );
+        assert!(
+            contents.contains("BOOTROOT_STEPCA_USER=1000:1000"),
+            "the step-ca uid/gid upsert must still happen, got: {contents}"
+        );
+    }
+
+    /// Closes #731: the same flags land in a freshly written `.env`,
+    /// alongside the generated `PostgreSQL` credentials.
+    #[test]
+    fn install_dotenv_writes_host_ports_into_a_fresh_env() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        let entries = vec![
+            (POSTGRES_HOST_PORT_ENV, "15433".to_string()),
+            (OPENBAO_HOST_PORT_ENV, "18200".to_string()),
+            (STEPCA_HOST_PORT_ENV, "19000".to_string()),
+            (HTTP01_ADMIN_HOST_PORT_ENV, "18080".to_string()),
+        ];
+        write_install_dotenv(&env_path, "1000:1000", &entries, &messages).unwrap();
+        let contents = std::fs::read_to_string(&env_path).unwrap();
+        for expected in [
+            "POSTGRES_HOST_PORT=15433",
+            "OPENBAO_HOST_PORT=18200",
+            "STEPCA_HOST_PORT=19000",
+            "HTTP01_ADMIN_HOST_PORT=18080",
+            "POSTGRES_USER=step",
+        ] {
+            assert!(
+                contents.contains(expected),
+                "fresh .env must contain {expected}, got: {contents}"
+            );
+        }
+    }
+
+    /// Closes #731: an unset flag leaves its variable out of `.env`
+    /// entirely, so the compose interpolation default applies.
+    #[test]
+    fn install_dotenv_omits_unsupplied_host_ports() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        write_install_dotenv(&env_path, "1000:1000", &[], &messages).unwrap();
+        let contents = std::fs::read_to_string(&env_path).unwrap();
+        assert!(
+            !contents.contains("OPENBAO_HOST_PORT"),
+            "unset flags must not be written, got: {contents}"
+        );
+    }
+
+    /// Closes #731: a resolved `OpenBao` host port reaches a pre-existing
+    /// `state.json` even when no bind intent was touched.
+    #[test]
+    fn sync_state_openbao_url_updates_an_existing_state_file() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        };
+        state.save(&state_path).unwrap();
+
+        sync_state_openbao_url_to(&state_path, "http://localhost:18200", &messages).unwrap();
+
+        let reloaded = StateFile::load(&state_path).unwrap();
+        assert_eq!(reloaded.openbao_url, "http://localhost:18200");
+    }
+
+    /// Closes #731: a host-port-only install must not start writing a
+    /// `state.json` where it writes none today — that would make the
+    /// next `bootroot init` prompt to overwrite existing state.
+    #[test]
+    fn sync_state_openbao_url_creates_no_state_file() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+
+        sync_state_openbao_url_to(&state_path, "http://localhost:18200", &messages).unwrap();
+
+        assert!(
+            !state_path.exists(),
+            "no state file may be created by the host-port sync"
+        );
+    }
+
+    /// Closes #731: the http01 and step-ca savers record the
+    /// install-time `OpenBao` endpoint on the pre-existing-state path too,
+    /// not just when they create the file.
+    #[test]
+    fn bind_intent_savers_record_the_resolved_openbao_url() {
+        let messages = crate::i18n::test_messages();
+        let moved_url = "http://localhost:18200";
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        }
+        .save(&state_path)
+        .unwrap();
+        save_http01_admin_bind_intent_to(
+            &state_path,
+            dir.path(),
+            "192.168.1.10:8080",
+            None,
+            moved_url,
+            &messages,
+        )
+        .unwrap();
+        assert_eq!(
+            StateFile::load(&state_path).unwrap().openbao_url,
+            moved_url,
+            "http01 saver must record the resolved URL on an existing state file"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        }
+        .save(&state_path)
+        .unwrap();
+        save_stepca_bind_intent_to(&state_path, "192.168.1.10:9000", None, moved_url, &messages)
+            .unwrap();
+        assert_eq!(
+            StateFile::load(&state_path).unwrap().openbao_url,
+            moved_url,
+            "step-ca saver must record the resolved URL on an existing state file"
+        );
+
+        // Fresh-state path, for both savers.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        save_openbao_bind_intent_to(
+            &state_path,
+            dir.path(),
+            "192.168.1.10:8200",
+            None,
+            moved_url,
+            &messages,
+        )
+        .unwrap();
+        assert_eq!(
+            StateFile::load(&state_path).unwrap().openbao_url,
+            moved_url,
+            "a newly created state file must carry the resolved URL"
+        );
     }
 
     #[test]
@@ -4311,6 +4831,9 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             stepca_bind_wildcard: false,
             stepca_advertise_addr: None,
             postgres_host_port: None,
+            openbao_host_port: None,
+            stepca_host_port: None,
+            http01_admin_host_port: None,
             no_build: false,
         };
         let err = run_infra_install(&args, &messages).unwrap_err();

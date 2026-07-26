@@ -17,6 +17,7 @@ use crate::commands::compose_file::compose_file_dir;
 use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::commands::infra::run_infra_up;
 use crate::commands::init::{OPENBAO_CONTAINER_NAME, compose_has_openbao, prompt_yes_no, run_init};
+use crate::commands::openbao_url::effective_openbao_url;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -76,6 +77,16 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //    init pass URL is derived from the snapshotted `openbao_bind_addr`
     //    in `init_args_for_reinit` when present.
     reject_explicit_openbao_url(&args.openbao.openbao_url, messages)?;
+
+    // The check above guarantees the CLI default, so this only ever
+    // fills in the configured OpenBao host port. It feeds the
+    // intermediate `state.json` and the `infra up` unseal client; the
+    // second init pass derives its own URL in `init_args_for_reinit`,
+    // where a snapshotted non-loopback bind intent outranks the port.
+    let openbao = OpenBaoArgs {
+        openbao_url: effective_openbao_url(&args.openbao.openbao_url, &compose_dir, None),
+        kv_mount: args.openbao.kv_mount.clone(),
+    };
 
     // 2. Scope check: refuse external OpenBao / project mismatch.
     verify_compose_managed_openbao(
@@ -160,7 +171,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     write_minimal_state(
         &state_path,
         &snapshot,
-        &args.openbao,
+        &openbao,
         &effective_secrets_dir,
         messages,
     )?;
@@ -173,7 +184,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         services: vec![OPENBAO_COMPOSE_SERVICE.to_string()],
         image_archive_dir: None,
         restart_policy: "always".to_string(),
-        openbao_url: args.openbao.openbao_url.clone(),
+        openbao_url: openbao.openbao_url.clone(),
         openbao_unseal_from_file: None,
     };
     run_infra_up(&infra_args, messages).await?;
@@ -933,10 +944,21 @@ fn init_args_for_reinit(
     effective_secrets_dir: &Path,
 ) -> Box<InitArgs> {
     let mut openbao = args.openbao.clone();
-    if openbao.openbao_url == crate::commands::init::DEFAULT_OPENBAO_URL
-        && let Some(bind) = snapshot.openbao_bind_addr.as_deref()
-    {
-        openbao.openbao_url = client_url_from_bind_addr(bind);
+    if openbao.openbao_url == crate::commands::init::DEFAULT_OPENBAO_URL {
+        // A snapshotted non-loopback bind outranks the host port: the
+        // restored deployment serves on the bind address, and the
+        // host-port publication in the base compose file is not what
+        // the second init pass has to reach.  Order matters — deriving
+        // the host-port URL first would break this equality check and
+        // silently point a destructive recovery at a dead endpoint.
+        openbao.openbao_url = match snapshot.openbao_bind_addr.as_deref() {
+            Some(bind) => client_url_from_bind_addr(bind),
+            None => effective_openbao_url(
+                &openbao.openbao_url,
+                &compose_file_dir(&args.compose.compose_file),
+                None,
+            ),
+        };
     }
     let db_dsn = preserved_db_dsn_from_ca_json(effective_secrets_dir);
     let stepca_provisioner = preserved_stepca_provisioner_from_ca_json(effective_secrets_dir)
@@ -1972,6 +1994,82 @@ mod tests {
         assert_eq!(
             init_args.openbao.openbao_url, "https://192.168.1.10:8200",
             "non-loopback bind intent must drive the init client URL"
+        );
+    }
+
+    /// Closes #731: with no snapshotted `openbao_bind_addr`, the second
+    /// init pass targets the configured `OpenBao` host port instead of the
+    /// CLI default's literal 8200.
+    #[test]
+    fn init_args_for_reinit_carries_the_resolved_host_port() {
+        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").unwrap();
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs {
+                secrets_dir: PathBuf::from("secrets"),
+            },
+            compose: ComposeFileArgs {
+                compose_file: dir.path().join("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &DeploymentIntent::default(),
+            &reinit_args.secrets_dir.secrets_dir,
+        );
+        assert_eq!(init_args.openbao.openbao_url, "http://localhost:18200");
+    }
+
+    /// Closes #731: a snapshotted non-loopback bind intent outranks the
+    /// host port.  Deriving the host-port URL first would break the
+    /// `DEFAULT_OPENBAO_URL` equality gate and silently point a
+    /// destructive recovery at an endpoint that no longer serves.
+    #[test]
+    fn init_args_for_reinit_prefers_the_bind_addr_over_the_host_port() {
+        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").unwrap();
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs {
+                secrets_dir: PathBuf::from("secrets"),
+            },
+            compose: ComposeFileArgs {
+                compose_file: dir.path().join("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let snapshot = DeploymentIntent {
+            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
+            ..DeploymentIntent::default()
+        };
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &snapshot,
+            &reinit_args.secrets_dir.secrets_dir,
+        );
+        assert_eq!(
+            init_args.openbao.openbao_url, "https://192.168.1.10:8200",
+            "a recorded non-loopback bind intent must win over the host port"
         );
     }
 

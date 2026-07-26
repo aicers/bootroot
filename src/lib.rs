@@ -10,6 +10,7 @@ pub mod db;
 pub mod eab;
 pub mod fs_util;
 pub mod hooks;
+pub mod host_port;
 pub mod input_validation;
 pub mod kv_payload;
 pub mod locale;
