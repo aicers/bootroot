@@ -91,15 +91,21 @@ pub fn resolve_http01_admin_host_port(compose_dir: &Path) -> u16 {
 /// value is empty — every one of which means "fall through to the next
 /// source" for the callers above.  Surrounding single or double quotes
 /// are stripped, matching how Compose reads its `.env`.
+///
+/// A line carrying no `=` is skipped rather than ending the scan, so a
+/// stray operator-authored line cannot hide the keys below it and leave
+/// the preflight binding a port Compose never publishes.
 #[must_use]
-pub fn read_env_file_value(compose_dir: &Path, key: &str) -> Option<String> {
+fn read_env_file_value(compose_dir: &Path, key: &str) -> Option<String> {
     let contents = std::fs::read_to_string(compose_dir.join(".env")).ok()?;
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let (k, v) = trimmed.split_once('=')?;
+        let Some((k, v)) = trimmed.split_once('=') else {
+            continue;
+        };
         if k.trim() != key {
             continue;
         }
@@ -294,5 +300,20 @@ mod tests {
             read_env_file_value(dir.path(), "QUOTED").as_deref(),
             Some("7")
         );
+    }
+
+    /// A line carrying no `=` must not hide the keys after it — that
+    /// would silently drop the resolver back to the compile-time
+    /// default and preflight a port Compose never publishes.
+    #[test]
+    fn env_file_line_without_a_separator_does_not_end_the_scan() {
+        let _guard = EnvGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".env"),
+            "MALFORMED\nOPENBAO_HOST_PORT=18200\n",
+        )
+        .expect("write .env");
+        assert_eq!(resolve_openbao_host_port(dir.path()), 18200);
     }
 }
