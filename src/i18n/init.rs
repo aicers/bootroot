@@ -216,6 +216,38 @@ impl Messages {
         self.strings().error_responder_check_failed
     }
 
+    pub(crate) fn error_responder_unreachable(
+        &self,
+        endpoint: &str,
+        elapsed: &str,
+        error: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_responder_unreachable,
+            &[
+                ("endpoint", endpoint),
+                ("elapsed", elapsed),
+                ("error", error),
+            ],
+        )
+    }
+
+    pub(crate) fn error_responder_rejected(
+        &self,
+        endpoint: &str,
+        status: &str,
+        body: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_responder_rejected,
+            &[("endpoint", endpoint), ("status", status), ("body", body)],
+        )
+    }
+
+    pub(crate) fn error_responder_ready_timeout_invalid(&self) -> &'static str {
+        self.strings().error_responder_ready_timeout_invalid
+    }
+
     pub(crate) fn error_state_missing(&self) -> &'static str {
         self.strings().error_state_missing
     }

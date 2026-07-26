@@ -1118,6 +1118,10 @@ pub(crate) struct InitArgs {
     #[arg(long, default_value_t = 5)]
     pub(crate) responder_timeout_secs: u64,
 
+    /// How long to wait for the HTTP-01 responder to start serving (seconds)
+    #[arg(long, default_value_t = 60)]
+    pub(crate) responder_ready_timeout_secs: u64,
+
     /// step-ca ACME provisioner name
     #[arg(long, default_value = DEFAULT_STEPCA_PROVISIONER)]
     pub(crate) stepca_provisioner: String,

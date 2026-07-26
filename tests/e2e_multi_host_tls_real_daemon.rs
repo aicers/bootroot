@@ -767,6 +767,7 @@ async fn register_http01_with_trust(
         Some(&trust),
     )
     .await
+    .map_err(anyhow::Error::from)
 }
 
 async fn verify_registered_token_served(listen_addr: &str) -> String {

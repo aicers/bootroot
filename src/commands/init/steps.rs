@@ -632,6 +632,7 @@ pub(super) mod test_support {
             http_hmac: None,
             responder_url: None,
             responder_timeout_secs: 5,
+            responder_ready_timeout_secs: 60,
             stepca_provisioner: DEFAULT_STEPCA_PROVISIONER.to_string(),
             cert_duration: DEFAULT_CERT_DURATION.to_string(),
             eab_kid: None,
