@@ -78,7 +78,7 @@ If you see `dial tcp 127.0.0.1:5432: connect: connection refused`, DSN host in
 - step-ca must reach responder `:80`
 - responder admin API (`:8080`) path must be correct
 
-The `init` responder check reports two distinct failures, and they point at
+The `init` responder check reports its failures distinctly, and they point at
 different things:
 
 - *"never accepted a connection within Ns"* — the responder never answered.
@@ -93,6 +93,10 @@ different things:
 - *"answered `<status>`"* — the responder is reachable and refused the
   request, so waiting longer cannot help. Check `--responder-url` and the
   HMAC secret; a `401` is a signature mismatch.
+- *"Failed to build the HTTP-01 registration request"* — the request was
+  never sent, so nothing was waited on. The endpoint in the message is what
+  `--responder-url` produced; a missing `http://` prefix is the usual cause.
+  Raising either timeout has no effect on this one.
 
 ## `bootroot service add` result differs from expectation
 

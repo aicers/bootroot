@@ -56,7 +56,8 @@ pub struct ResponderRegistration<'a> {
 #[derive(Debug, thiserror::Error)]
 pub enum RegisterError {
     /// The request could not even be built (bad system time, missing TLS
-    /// trust anchor, unusable CA bundle).  Never retryable.
+    /// trust anchor, unusable CA bundle, a responder URL with no scheme or
+    /// with one `reqwest` does not speak).  Never retryable.
     #[error("{0}")]
     Setup(String),
     /// The request never reached the responder.  The payload is the full
@@ -360,13 +361,13 @@ async fn send_registration(
     };
 
     let response = client
-        .post(endpoint)
+        .post(endpoint.as_str())
         .header(HEADER_TIMESTAMP, timestamp.to_string())
         .header(HEADER_SIGNATURE, signature)
         .json(&body)
         .send()
         .await
-        .map_err(|e| RegisterError::Transport(error_chain(&e)))?;
+        .map_err(|e| classify_send_error(&endpoint, &e))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -375,6 +376,23 @@ async fn send_registration(
     }
 
     Ok(())
+}
+
+/// Sorts a failed `send()` into the retryable bucket or the terminal one.
+///
+/// `reqwest` reports a request it never even built — a responder URL with no
+/// scheme, or with a scheme it does not speak — from `send()` just like a
+/// refused connection.  Waiting on one is waiting on a request that can never
+/// be sent, so builder failures are [`RegisterError::Setup`] and stay out of
+/// the readiness budget.
+fn classify_send_error(endpoint: &str, error: &reqwest::Error) -> RegisterError {
+    if error.is_builder() {
+        return RegisterError::Setup(format!(
+            "Failed to build the HTTP-01 registration request for {endpoint}: {}",
+            error_chain(error)
+        ));
+    }
+    RegisterError::Transport(error_chain(error))
 }
 
 /// Renders an error and its sources as a single `a: b: c` line.
@@ -1183,6 +1201,61 @@ mod tests {
         assert!(
             err.to_string().contains("HTTPS responder URL requires"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A responder URL `reqwest` cannot turn into a request fails from
+    /// `send()` exactly like a refused connection does, but no amount of
+    /// waiting will ever make it sendable, so it must not reach the loop.
+    #[tokio::test(start_paused = true)]
+    async fn test_register_until_ready_fails_fast_on_a_malformed_url() {
+        // A missing scheme (the operator typo) and a scheme reqwest does not
+        // speak: the first fails to parse as a URL at all, the second parses
+        // and is then rejected.  Both surface as builder errors from `send()`.
+        for base_url in ["127.0.0.1:8080", "responder.internal:8080"] {
+            let registration = ResponderRegistration {
+                base_url,
+                hmac_secret: TEST_HMAC,
+                timeout_secs: 5,
+                token: "tok",
+                key_authorization: "tok.key",
+                ttl_secs: 60,
+                trust: None,
+            };
+
+            let start = Instant::now();
+            let err = register_http01_token_until_ready(&registration, Duration::from_mins(1))
+                .await
+                .expect_err("a malformed responder URL must fail");
+
+            assert_eq!(
+                start.elapsed(),
+                Duration::ZERO,
+                "{base_url} must not consume the readiness budget"
+            );
+            assert!(
+                matches!(err, ResponderReadyError::Setup(_)),
+                "unexpected error for {base_url}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(&admin_endpoint(base_url)),
+                "the message must name the endpoint it could not build: {err}"
+            );
+        }
+    }
+
+    /// The single-shot entry point makes the same distinction, so the
+    /// classification lives with the send rather than with the loop.
+    #[tokio::test]
+    async fn test_register_once_reports_a_malformed_url_as_setup() {
+        let err =
+            register_http01_token_with("127.0.0.1:8080", TEST_HMAC, 5, "tok", "tok.key", 60, None)
+                .await
+                .expect_err("a malformed responder URL must fail");
+
+        assert!(
+            matches!(err, RegisterError::Setup(_)),
+            "a request that was never built is not a transport failure: {err:?}"
         );
     }
 

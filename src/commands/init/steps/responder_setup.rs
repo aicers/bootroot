@@ -393,6 +393,47 @@ mod tests {
         );
     }
 
+    /// `--responder-url` reaches the check verbatim, so a URL that can never
+    /// be turned into a request must be reported as such rather than polled
+    /// for the whole readiness budget.
+    #[tokio::test]
+    async fn test_verify_responder_fails_fast_on_a_malformed_url() {
+        const MALFORMED_URL: &str = "127.0.0.1:8080";
+
+        let temp_dir = tempdir().unwrap();
+        let mut args = default_init_args();
+        args.responder_ready_timeout_secs = 30;
+
+        let started = Instant::now();
+        let err = verify_responder(
+            Some(MALFORMED_URL),
+            &args,
+            &test_messages(),
+            &test_secrets(),
+            temp_dir.path(),
+        )
+        .await
+        .expect_err("a malformed responder URL must fail the check");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the readiness budget must not be consumed, waited {elapsed:?}"
+        );
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(MALFORMED_URL),
+            "unexpected error: {rendered}"
+        );
+        // Both the unreachable message and the zero-budget one name the
+        // readiness flag, in either locale.  A request that was never built
+        // is neither, so pointing the operator at the budget would be wrong.
+        assert!(
+            !rendered.contains("--responder-ready-timeout-secs"),
+            "a request that was never built is not a readiness problem: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn test_verify_responder_rejects_zero_ready_timeout() {
         let temp_dir = tempdir().unwrap();

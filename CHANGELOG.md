@@ -144,6 +144,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     responder — while a rejection points at the responder URL and the
     HMAC instead. Only `init`'s check waits; `register_http01_token` on
     the ACME issuance path keeps single-shot semantics.
+  - A `--responder-url` that cannot be turned into a request at all — no
+    scheme, or a scheme the HTTP client does not speak — fails
+    immediately as a request-build error. Such a request is reported the
+    same way as a refused connection, but it can never be sent, so it
+    stays out of the readiness budget instead of being polled for a
+    minute.
 - Fixed `rotate infra-cert` leaving `OpenBao` sealed by reloading its TLS
   certificate via `SIGHUP` instead of restarting the container (#727).
   The `openbao` infra-cert entry previously reloaded with
