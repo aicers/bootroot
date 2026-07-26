@@ -382,6 +382,15 @@ mod tests {
             rendered.contains(&test_messages().error_responder_check_failed().to_string()),
             "unexpected error: {rendered}"
         );
+        let received = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert_eq!(
+            received.len(),
+            1,
+            "a responder that answered must not be asked twice"
+        );
     }
 
     #[tokio::test]

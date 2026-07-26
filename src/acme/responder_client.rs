@@ -202,9 +202,8 @@ pub async fn register_http01_token_with(
 /// spent.  A non-success status means the URL or the HMAC is wrong, so it
 /// fails immediately without consuming the budget.
 ///
-/// Every attempt goes through [`register_http01_token_with`], which computes
-/// its own timestamp and signature, so a wait longer than the responder's
-/// `max_skew_secs` never turns into a skew rejection.
+/// Every attempt signs its own request, so a wait longer than the
+/// responder's `max_skew_secs` never turns into a skew rejection.
 ///
 /// # Errors
 /// Returns [`ResponderReadyError::ZeroBudget`] for an empty budget,
@@ -215,6 +214,12 @@ pub async fn register_http01_token_until_ready(
     registration: &ResponderRegistration<'_>,
     ready_timeout: Duration,
 ) -> Result<(), ResponderReadyError> {
+    // Reject an empty budget before anything else, so the operator hears
+    // about the unusable flag rather than about whatever the first attempt
+    // would have tripped over.
+    if ready_timeout.is_zero() {
+        return Err(ResponderReadyError::ZeroBudget);
+    }
     let endpoint = admin_endpoint(registration.base_url);
     // Build the client up front: it is the only part of an attempt that
     // cannot fail because of a slow responder, so a bad TLS trust anchor
@@ -347,11 +352,11 @@ async fn send_registration(
 /// message and hides the real cause — connection refused, TLS trust failure,
 /// pin mismatch — one level down, so the chain is what an operator needs.
 fn error_chain(error: &dyn StdError) -> String {
+    use std::fmt::Write;
+
     let mut rendered = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {
-        use std::fmt::Write;
-
         let _ = write!(rendered, ": {cause}");
         source = cause.source();
     }
@@ -1081,6 +1086,30 @@ mod tests {
         assert!(
             err.to_string().contains("HTTPS responder URL requires"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// An unusable budget is the operator's own flag, so it must be reported
+    /// ahead of anything the first attempt would have tripped over.
+    #[tokio::test(start_paused = true)]
+    async fn test_register_until_ready_reports_zero_budget_first() {
+        let registration = ResponderRegistration {
+            base_url: "https://responder.internal:8080",
+            hmac_secret: TEST_HMAC,
+            timeout_secs: 5,
+            token: "tok",
+            key_authorization: "tok.key",
+            ttl_secs: 60,
+            trust: None,
+        };
+
+        let err = register_http01_token_until_ready(&registration, Duration::ZERO)
+            .await
+            .expect_err("a zero readiness budget must be rejected");
+
+        assert!(
+            matches!(err, ResponderReadyError::ZeroBudget),
+            "unexpected error: {err:?}"
         );
     }
 
