@@ -198,7 +198,7 @@ pub async fn register_http01_token_with(
 /// Registers an HTTP-01 token, retrying while the responder is unreachable.
 ///
 /// Retries only the transport failure — a responder that has not yet bound
-/// its admin port — at [`READINESS_POLL_INTERVAL`] until `ready_timeout` is
+/// its admin port — at a fixed 500 ms interval until `ready_timeout` is
 /// spent.  A non-success status means the URL or the HMAC is wrong, so it
 /// fails immediately without consuming the budget.
 ///
@@ -508,10 +508,10 @@ mod tests {
                 .respond_with(responder)
                 .mount(&server)
                 .await;
-            // Hold the server so the listener stays up until the test ends;
-            // dropping it here would close the port again.
+            // Never return: `server` owns the listener, so completing this
+            // task would drop it and close the port again.  The task dies
+            // with the test's runtime.
             std::future::pending::<()>().await;
-            drop(server);
         });
 
         format!("http://{addr}")

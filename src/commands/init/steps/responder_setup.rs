@@ -298,6 +298,50 @@ mod tests {
         }
     }
 
+    /// The bug this check guards against: a responder that is still binding
+    /// its admin port when `init` reaches the check must be waited out
+    /// rather than failing an otherwise working install.
+    #[tokio::test]
+    async fn test_verify_responder_waits_for_a_responder_that_starts_late() {
+        const BIND_DELAY: Duration = Duration::from_millis(700);
+
+        // Reserve a loopback address and free it, so attempts before the
+        // re-bind get the connection-refused the fix must treat as
+        // retryable rather than terminal.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve address");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(BIND_DELAY).await;
+            let listener = std::net::TcpListener::bind(addr).expect("re-bind reserved address");
+            let server = MockServer::builder().listener(listener).start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+                .mount(&server)
+                .await;
+            // `server` owns the listener, so this task must never finish:
+            // returning would drop it and close the port again.
+            std::future::pending::<()>().await;
+        });
+
+        let temp_dir = tempdir().unwrap();
+        let mut args = default_init_args();
+        args.responder_ready_timeout_secs = 30;
+
+        let check = verify_responder(
+            Some(&format!("http://{addr}")),
+            &args,
+            &test_messages(),
+            &test_secrets(),
+            temp_dir.path(),
+        )
+        .await
+        .expect("a responder that binds within the budget must not fail the check");
+
+        assert!(matches!(check, ResponderCheck::Ok));
+    }
+
     /// A responder that answers is a URL or HMAC problem, so the check must
     /// fail on the first answer instead of spending the readiness budget.
     #[tokio::test]

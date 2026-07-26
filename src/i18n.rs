@@ -663,4 +663,49 @@ mod tests {
             "  - nginx: running"
         );
     }
+
+    /// The responder readiness failures are the operator's only clue about
+    /// what to look at, so every locale must actually substitute their
+    /// values.  A misspelled placeholder in one table would otherwise ship a
+    /// literal `{endpoint}` and drop the cause the message exists to carry.
+    #[test]
+    fn responder_failure_templates_substitute_in_every_locale() {
+        const ENDPOINT: &str = "http://127.0.0.1:8080/admin/http01";
+        const ELAPSED: &str = "60";
+        const TRANSPORT_ERROR: &str = "tcp connect error: Connection refused";
+        const STATUS: &str = "401 Unauthorized";
+        const BODY: &str = "Invalid signature";
+
+        for locale in ["en", "ko"] {
+            let messages = Messages::new(locale).unwrap();
+
+            let unreachable =
+                messages.error_responder_unreachable(ENDPOINT, ELAPSED, TRANSPORT_ERROR);
+            for value in [ENDPOINT, ELAPSED, TRANSPORT_ERROR] {
+                assert!(
+                    unreachable.contains(value),
+                    "{locale} unreachable message dropped {value:?}: {unreachable}"
+                );
+            }
+
+            let rejected = messages.error_responder_rejected(ENDPOINT, STATUS, BODY);
+            for value in [ENDPOINT, STATUS, BODY] {
+                assert!(
+                    rejected.contains(value),
+                    "{locale} rejected message dropped {value:?}: {rejected}"
+                );
+            }
+
+            for rendered in [&unreachable, &rejected] {
+                assert!(
+                    !rendered.contains('{'),
+                    "{locale} left an unsubstituted placeholder: {rendered}"
+                );
+            }
+
+            // The two must not read alike: they send an operator to the
+            // container and its published port versus the URL and the HMAC.
+            assert_ne!(unreachable, rejected);
+        }
+    }
 }
