@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use reqwest::{Client, StatusCode};
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout_at};
 
 use super::http01_protocol::{HEADER_SIGNATURE, HEADER_TIMESTAMP, Http01HmacSigner};
 use crate::config::Settings;
@@ -12,6 +12,10 @@ use crate::config::Settings;
 const DEFAULT_ADMIN_PATH: &str = "/admin/http01";
 /// Delay between readiness attempts while the responder refuses connections.
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Stands in for the last transport error when the readiness budget ran out
+/// while an attempt was still in flight, so no attempt ever reported one.
+const ATTEMPT_STILL_IN_FLIGHT: &str =
+    "the request was still in flight when the readiness budget ran out";
 
 /// Trust parameters for TLS-pinned responder connections.
 ///
@@ -202,6 +206,11 @@ pub async fn register_http01_token_with(
 /// spent.  A non-success status means the URL or the HMAC is wrong, so it
 /// fails immediately without consuming the budget.
 ///
+/// `ready_timeout` bounds the entire wait rather than only the gaps between
+/// attempts: an attempt still in flight when the budget expires is cut off
+/// there, so a `timeout_secs` longer than `ready_timeout` cannot stretch the
+/// wait past it.
+///
 /// Every attempt signs its own request, so a wait longer than the
 /// responder's `max_skew_secs` never turns into a skew rejection.
 ///
@@ -252,31 +261,53 @@ where
     }
 
     let start = Instant::now();
+    let deadline = start + ready_timeout;
+    let mut last_error: Option<String> = None;
     loop {
-        let last_error = match attempt().await {
-            Ok(()) => return Ok(()),
-            Err(RegisterError::Transport(error)) => error,
-            Err(RegisterError::Status { status, body }) => {
+        // The budget bounds the whole wait, not just the gaps between
+        // attempts.  An attempt is only started while the deadline is still
+        // ahead and is cut off when it arrives, so a per-request timeout
+        // larger than the budget cannot stretch the wait, and an answer that
+        // only arrives past the deadline is not accepted.
+        if Instant::now() >= deadline {
+            return Err(budget_exhausted(endpoint, start.elapsed(), last_error));
+        }
+        match timeout_at(deadline, attempt()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(RegisterError::Transport(error))) => last_error = Some(error),
+            Ok(Err(RegisterError::Status { status, body })) => {
                 return Err(ResponderReadyError::Rejected {
                     endpoint: endpoint.to_string(),
                     status,
                     body,
                 });
             }
-            Err(RegisterError::Setup(message)) => {
+            Ok(Err(RegisterError::Setup(message))) => {
                 return Err(ResponderReadyError::Setup(message));
             }
-        };
-
-        let elapsed = start.elapsed();
-        if elapsed >= ready_timeout {
-            return Err(ResponderReadyError::Unreachable {
-                endpoint: endpoint.to_string(),
-                elapsed_secs: elapsed.as_secs(),
-                last_error,
-            });
+            Err(_) => return Err(budget_exhausted(endpoint, start.elapsed(), last_error)),
         }
-        sleep(READINESS_POLL_INTERVAL.min(ready_timeout.saturating_sub(elapsed))).await;
+
+        sleep(READINESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
+}
+
+/// Builds the budget-exhausted error, naming the endpoint, how long the wait
+/// really lasted, and the last transport failure seen.
+///
+/// `last_error` is `None` only when the budget ran out before any attempt
+/// finished, which is what a `--responder-timeout-secs` longer than the
+/// readiness budget looks like from here.
+fn budget_exhausted(
+    endpoint: &str,
+    elapsed: Duration,
+    last_error: Option<String>,
+) -> ResponderReadyError {
+    ResponderReadyError::Unreachable {
+        endpoint: endpoint.to_string(),
+        elapsed_secs: elapsed.as_secs(),
+        last_error: last_error.unwrap_or_else(|| ATTEMPT_STILL_IN_FLIGHT.to_string()),
     }
 }
 
@@ -969,6 +1000,72 @@ mod tests {
             message.contains("connection refused"),
             "no transport cause in: {message}"
         );
+    }
+
+    /// The budget bounds the whole wait, so an attempt that would only answer
+    /// past the deadline is cut off there instead of being accepted late.
+    /// This is the case where `--responder-timeout-secs` outlasts
+    /// `--responder-ready-timeout-secs`.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_registration_cuts_off_an_attempt_at_the_deadline() {
+        const BUDGET: Duration = Duration::from_secs(2);
+        const ATTEMPT_DURATION: Duration = Duration::from_secs(10);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&calls);
+        let start = Instant::now();
+        let err = wait_for_registration(TEST_ENDPOINT, BUDGET, move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                sleep(ATTEMPT_DURATION).await;
+                Ok(())
+            }
+        })
+        .await
+        .expect_err("an answer arriving past the deadline must not be accepted");
+
+        assert_eq!(start.elapsed(), BUDGET, "the budget must bound the wait");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let ResponderReadyError::Unreachable {
+            elapsed_secs,
+            last_error,
+            ..
+        } = &err
+        else {
+            panic!("expected an unreachable responder, got: {err:?}");
+        };
+        assert_eq!(*elapsed_secs, BUDGET.as_secs());
+        assert_eq!(last_error, ATTEMPT_STILL_IN_FLIGHT);
+    }
+
+    /// When an attempt is cut off at the deadline, the transport error of the
+    /// attempt that did finish is still what the operator is shown.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_registration_keeps_the_last_transport_error() {
+        const BUDGET: Duration = Duration::from_secs(2);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&calls);
+        let err = wait_for_registration(TEST_ENDPOINT, BUDGET, move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(RegisterError::Transport("connection refused".to_string()));
+                }
+                // Outlasts the remaining budget, so this attempt is cut off.
+                sleep(BUDGET * 2).await;
+                Ok(())
+            }
+        })
+        .await
+        .expect_err("the budget must be exhausted");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let ResponderReadyError::Unreachable { last_error, .. } = &err else {
+            panic!("expected an unreachable responder, got: {err:?}");
+        };
+        assert_eq!(last_error, "connection refused");
     }
 
     /// The two terminal outcomes must be told apart by matching on the type,

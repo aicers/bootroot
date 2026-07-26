@@ -125,7 +125,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     500 ms). It answers a different question from
     `--responder-timeout-secs`, which keeps its meaning (how long one
     request may take) and its default of `5`. A value of `0` is
-    rejected.
+    rejected. The budget bounds the whole wait rather than only the gaps
+    between retries: an attempt still in flight when it expires is cut
+    off, so a per-request timeout larger than the readiness budget
+    cannot stretch the wait past it, and an answer that arrives after
+    the deadline is not accepted.
   - A responder that *answers* with a non-success status still fails on
     the first reply, without consuming the readiness budget: that is a
     wrong responder URL or a wrong HMAC, and retrying it would turn an

@@ -361,7 +361,10 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   요청 타임아웃을 기다리지 않고 즉시 실패하기 때문입니다. 반대로
   responder가 *응답*하면서 실패 상태 코드를 반환하면 이 예산을 쓰지 않고
   즉시 실패합니다. 기동이 느린 것이 아니라 responder URL이나 HMAC이
-  잘못된 것이기 때문입니다.
+  잘못된 것이기 때문입니다. 이 예산은 재시도 사이의 간격만이 아니라 대기
+  전체를 제한합니다. 예산이 만료되는 순간 아직 진행 중이던 요청은 중단되므로,
+  `--responder-timeout-secs`를 이 값보다 크게 설정해도 `init`이 이 값보다
+  오래 기다리지는 않습니다.
 - `--stepca-provisioner`: step-ca ACME provisioner 이름 (기본값 `acme`)
 - `--cert-duration`: `ca.json` / `ca.json.ctmpl`에서
   `--stepca-provisioner`가 가리키는 ACME provisioner에 삽입되는

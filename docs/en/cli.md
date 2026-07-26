@@ -369,7 +369,10 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   because a refused connection fails instantly instead of waiting out the
   request timeout. A responder that *answers* with a non-success status
   fails the check immediately, without consuming this budget: that is a
-  wrong responder URL or a wrong HMAC, not a slow start.
+  wrong responder URL or a wrong HMAC, not a slow start. This budget bounds
+  the whole wait, not just the gaps between retries: a request still in
+  flight when it expires is aborted, so setting `--responder-timeout-secs`
+  higher than this value cannot make `init` wait longer than it.
 - `--stepca-provisioner`: step-ca ACME provisioner name (default `acme`)
 - `--cert-duration`: `defaultTLSCertDuration` embedded in the ACME
   provisioner named by `--stepca-provisioner` in `ca.json` /
