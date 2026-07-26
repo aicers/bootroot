@@ -1119,7 +1119,11 @@ mod tests {
     /// time the responder starts answering.
     #[tokio::test]
     async fn test_register_until_ready_signs_every_attempt() {
-        const BIND_DELAY: Duration = Duration::from_millis(2_500);
+        /// Longer than [`TEST_MAX_SKEW_SECS`], so a request signed before the
+        /// loop would be stale by the time the responder answers.  Kept off a
+        /// multiple of [`READINESS_POLL_INTERVAL`] so no attempt can land in
+        /// the instant between the re-bind and the mock being mounted.
+        const BIND_DELAY: Duration = Duration::from_millis(2_300);
 
         let base_url = spawn_late_responder(
             BIND_DELAY,
