@@ -51,6 +51,13 @@ pub(crate) fn reinit_recovery_script_path() -> PathBuf {
         .join("run-reinit-recovery.sh")
 }
 
+pub(crate) fn stepca_san_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("impl")
+        .join("run-stepca-san.sh")
+}
+
 pub(crate) fn baseline_scenario_path(file_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

@@ -41,6 +41,10 @@ pub(crate) const OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME: &str =
     "docker-compose.openbao-agent.override.yml";
 pub(crate) const OPENBAO_AGENT_STEPCA_SERVICE: &str = "openbao-agent-stepca";
 pub(crate) const OPENBAO_AGENT_RESPONDER_SERVICE: &str = "openbao-agent-responder";
+/// Container name pinned by the agent compose override, so the sidecar
+/// can be restarted by name without knowing where the override lives.
+pub(crate) const OPENBAO_AGENT_STEPCA_CONTAINER_NAME: &str = "bootroot-openbao-agent-stepca";
+pub(crate) const OPENBAO_AGENT_RESPONDER_CONTAINER_NAME: &str = "bootroot-openbao-agent-responder";
 pub(crate) const DEFAULT_DB_USER: &str = "stepca";
 pub(crate) const DEFAULT_DB_NAME: &str = "stepca";
 pub(crate) const CA_CERTS_DIR: &str = "certs";

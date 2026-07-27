@@ -112,6 +112,61 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed off-host certificate issuance failing against a step-ca that
+  `infra install --stepca-bind` published on a non-loopback address
+  (#733). `step ca init` was invoked with a compile-time `--dns`
+  constant, so step-ca's own serving certificate carried only
+  `localhost`, `bootroot-ca` and `stepca.internal` — never the address
+  it was published on. Any consumer that is not on the bootroot host had
+  to reach the ACME directory by that address and TLS verification
+  failed there (`no alternative certificate subject name matches target
+  host name`), a hard stop for every off-host consumer installed through
+  the remote-bootstrap path even when the bind, the trust anchor, the
+  routing and the HTTP-01 responder were all correct.
+  - `bootroot init` now derives step-ca's name set from the recorded
+    `stepca_bind_addr` / `stepca_advertise_addr` with the same semantics
+    `build_openbao_tls_sans` already applies to the OpenBao listener
+    certificate: always the three default names, plus the bind address's
+    IP, plus the advertise address's IP when one is recorded. An IPv4
+    wildcard bind contributes `127.0.0.1` and an IPv6 wildcard
+    contributes `::1` plus `127.0.0.1`; `0.0.0.0`, `::` and `::0` are
+    never emitted, and no name appears twice. IP entries land in the
+    certificate as `iPAddress` SANs, so `curl --cacert <ca-bundle>
+    https://<ip>:9000/acme/acme/directory` verifies without a hostname
+    override.
+  - On a fresh install the derived set becomes the `step ca init --dns`
+    value. On an already-initialized CA — where `step ca init` must not
+    re-run — `init` reconciles the top-level `dnsNames` in
+    `secrets/config/ca.json` and restarts the step-ca service so it
+    re-issues its serving leaf from the updated configuration. The
+    rewrite parses and re-serialises the document, so `db`, every
+    provisioner entry and any unmodelled key survive untouched, and the
+    root and intermediate keys are never rewritten: previously issued
+    certificates and distributed CA bundles stay valid.
+  - The repair also covers the step-ca OpenBao Agent sidecar, which
+    re-renders `ca.json` from `templates/ca.json.ctmpl` every render
+    interval and would otherwise put the pre-repair name set straight
+    back. `init` stamps the derived names into the regenerated template
+    (rather than inheriting whatever `ca.json` holds at that moment,
+    which a render may already have clobbered), restarts the sidecar so
+    it loads that template, and only then re-asserts the on-disk
+    `dnsNames`. Without this the SAN set looked correct for a few
+    seconds and step-ca dropped the address SAN again on its next
+    restart. The regenerated template and the sidecar restart are
+    covered by the same `init` rollback as `ca.json`: a failure in a
+    later step restores both files and puts the sidecar back on the
+    restored template, so a rolled-back `ca.json` cannot be re-rendered
+    into the new name set moments later.
+  - Reconciliation works in both directions: with no bind intent
+    recorded — including after a loopback reinstall clears a previous
+    one — `dnsNames` comes back to exactly `localhost`, `bootroot-ca`
+    and `stepca.internal`. A repeat `init` with the same recorded intent
+    leaves `ca.json` unchanged and skips the restart.
+  - Changing the bind on an installed system therefore requires
+    re-running `bootroot init` to take effect; `infra install` only
+    records the intent. Documented in the `--stepca-bind` /
+    `--stepca-advertise-addr` sections of `docs/{en,ko}/cli.md` and
+    `docs/{en,ko}/remote-bootstrap.md`.
 - Fixed `bootroot init` failing an otherwise working install when the
   HTTP-01 responder had not finished binding its admin port (#729). The
   responder check fired a single registration request as soon as the
