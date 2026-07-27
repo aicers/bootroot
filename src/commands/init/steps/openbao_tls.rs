@@ -10,8 +10,15 @@ use crate::commands::init::{
     OPENBAO_TLS_CONTAINER_KEY_PATH, OPENBAO_TLS_DEFAULT_NOT_AFTER,
     OPENBAO_TLS_DEFAULT_RENEW_BEFORE, OPENBAO_TLS_KEY_PATH,
 };
+use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
 use crate::i18n::Messages;
 use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
+
+/// Container-side mount point of the `OpenBao` TLS output directory.
+///
+/// `step certificate create` writes `server.{crt,key}` under it, and the
+/// chown that precedes it re-owns exactly this path.
+const OPENBAO_TLS_OUTPUT_MOUNT: &str = "/output";
 
 /// Issues an `OpenBao` TLS server certificate signed by the local
 /// step-ca intermediate CA.
@@ -35,17 +42,22 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
     let secrets_mount = format!("{}:/home/step", mount_root.display());
 
     let tls_dir = compose_dir.join("openbao").join("tls");
+    reject_symlinked_tls_output_dir(&tls_dir, messages)?;
     std::fs::create_dir_all(&tls_dir)
         .with_context(|| messages.error_write_file_failed(&tls_dir.display().to_string()))?;
     let tls_mount_root = std::fs::canonicalize(&tls_dir)
         .with_context(|| messages.error_resolve_path_failed(&tls_dir.display().to_string()))?;
-    let tls_mount = format!("{}:/output", tls_mount_root.display());
+    let tls_mount = format!("{}:{OPENBAO_TLS_OUTPUT_MOUNT}", tls_mount_root.display());
 
     let meta = std::fs::metadata(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let user_arg = format!("{}:{}", meta.uid(), meta.gid());
 
+    chown_tls_output_dir(&tls_mount, &user_arg, messages)?;
+
     let intermediate_cert = format!("/home/step/{CA_CERTS_DIR}/{CA_INTERMEDIATE_CERT_FILENAME}");
+    let output_cert = format!("{OPENBAO_TLS_OUTPUT_MOUNT}/server.crt");
+    let output_key = format!("{OPENBAO_TLS_OUTPUT_MOUNT}/server.key");
     let mut args: Vec<&str> = vec![
         "run",
         "--user",
@@ -55,13 +67,13 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
         &secrets_mount,
         "-v",
         &tls_mount,
-        "smallstep/step-ca:0.30.2",
+        STEP_CA_HELPER_IMAGE,
         "step",
         "certificate",
         "create",
         "openbao.internal",
-        "/output/server.crt",
-        "/output/server.key",
+        &output_cert,
+        &output_key,
         "--ca",
         &intermediate_cert,
         "--ca-key",
@@ -97,6 +109,100 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
         messages.info_openbao_tls_provisioned(&cert_path.display().to_string())
     );
     Ok(())
+}
+
+/// Refuses to proceed when `openbao/tls` is itself a symlink.
+///
+/// The bind-mount source is produced with `std::fs::canonicalize`, which
+/// resolves the final component too, so a symlink planted at
+/// `<compose_dir>/openbao/tls` would make both containers act on the link
+/// target instead: the root helper would `chown -R` that target, and
+/// `step certificate create` would write `server.{crt,key}` into it.
+/// `--no-dereference` guards links found *inside* the mounted tree; it
+/// cannot guard a mount root that was already resolved elsewhere.
+/// bootroot only ever creates this path with `create_dir_all`, so a
+/// symlink here is never a shape it produces, and refusing it keeps the
+/// mount pinned to `openbao/tls` itself while still allowing legitimate
+/// symlinks anywhere above it (a symlinked state directory, `/var` on
+/// macOS) to resolve as before.
+fn reject_symlinked_tls_output_dir(tls_dir: &Path, messages: &Messages) -> Result<()> {
+    // `symlink_metadata` does not follow the final component; a missing
+    // path is the normal first-issuance case and is left to
+    // `create_dir_all`.
+    match std::fs::symlink_metadata(tls_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!(
+                messages.error_openbao_tls_output_dir_symlink(&tls_dir.display().to_string())
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| messages.error_resolve_path_failed(&tls_dir.display().to_string())),
+    }
+}
+
+/// Builds the `docker run` argv for the TLS output-directory chown.
+///
+/// Kept pure so tests can assert it mounts ONLY the `openbao/tls`
+/// directory and uses `--no-dereference`, so `chown -R` never follows a
+/// symlink out of that mount.  Mirrors `build_ownership_sweep_args` in
+/// `crate::commands::infra`.
+fn build_tls_output_chown_args<'a>(
+    mount: &'a str,
+    user_arg: &'a str,
+    image: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "run",
+        "--rm",
+        // Intentional root: this container runs `chown`, NOT a `step`
+        // subcommand.  Only root can re-own a directory a previous
+        // root-running bootroot created, and only root can chown to an
+        // arbitrary uid at all, so an in-process chown cannot do this job
+        // when bootroot runs as the (non-root) secrets owner.
+        "--user",
+        "root",
+        // Run `chown` directly instead of through the image's default
+        // entrypoint, which would otherwise print a spurious "there is no
+        // ca.json config file" warning: this container deliberately
+        // mounts only the TLS output directory, not `/home/step`.
+        "--entrypoint",
+        "chown",
+        "-v",
+        mount,
+        image,
+        "-R",
+        // Change the symlink itself rather than its referent, so the
+        // chown never follows a link out of the mounted directory.
+        "--no-dereference",
+        user_arg,
+        OPENBAO_TLS_OUTPUT_MOUNT,
+    ]
+}
+
+/// Re-owns `openbao/tls` and everything in it to `user_arg` via a
+/// one-shot root container, so the `step` helper that runs next as that
+/// same uid can write `server.{crt,key}` into it.
+///
+/// The directory is created by the host bootroot process and its files
+/// are written inside the step container, so both freeze the owner of
+/// the issuance that first created them.  `openbao/tls` is a sibling of
+/// `secrets/`, not a child, so the secrets-ownership sweep never reaches
+/// it: once `secrets/` is re-owned to a different uid, a re-issuance
+/// runs as the new uid against a directory and files still owned by the
+/// old one and fails with `permission denied`.  See issue #739.
+///
+/// Reuses the image the `step certificate create` container runs in the
+/// very next statement, so no extra image or pull is introduced.  The
+/// chown is a no-op when ownership is already correct.
+fn chown_tls_output_dir(tls_mount: &str, user_arg: &str, messages: &Messages) -> Result<()> {
+    let args = build_tls_output_chown_args(tls_mount, user_arg, STEP_CA_HELPER_IMAGE);
+    // Same context as the `step certificate create` call this precedes:
+    // the chown is part of the issuance, so a failure here has to name
+    // the step that failed and not just the docker command.
+    run_docker(&args, "docker openbao tls output chown", messages)
+        .with_context(|| messages.error_openbao_tls_provision_failed())
 }
 
 /// Sets cert + key to modes the `OpenBao` container can read.
@@ -355,8 +461,31 @@ pub(crate) fn reissue_openbao_tls_cert(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
 
     use super::*;
+    use crate::commands::rotate::test_support::{
+        ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
+    };
+
+    /// Fake `docker` that *appends* one line per invocation, unlike the
+    /// shared helper which truncates: the ordering of the two containers
+    /// this file runs is exactly what the wiring test below pins.
+    ///
+    /// `exit_code` is returned by every invocation, so a non-zero value
+    /// makes the first container this file runs — the chown — fail.
+    fn write_appending_fake_docker(path: &Path, exit_code: u8) {
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+{{ printf '%s ' "$@"; printf '\n'; }} >> "${{BOOTROOT_TEST_DOCKER_ARGS:?missing log path}}"
+exit {exit_code}
+"#
+        );
+        fs::write(path, script).expect("fake docker script should be written");
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("fake docker script should be executable");
+    }
 
     #[test]
     fn build_sans_includes_specific_ip() {
@@ -521,6 +650,223 @@ mod tests {
         // can run after a subsequent `--openbao-bind` reinstall cycle.
         assert!(content.contains("audit {"));
         assert!(content.contains("file_path = \"/openbao/audit/audit.log\""));
+    }
+
+    /// The chown container must mount ONLY the `openbao/tls` directory and
+    /// chown with `--no-dereference` so it never follows a symlink out of
+    /// the mount.  It is deliberately the one root container on this path.
+    #[test]
+    fn build_tls_output_chown_args_scoped_and_no_symlink_following() {
+        let mount = "/host/bootroot/openbao/tls:/output";
+        let args = build_tls_output_chown_args(mount, "100:1000", STEP_CA_HELPER_IMAGE);
+        let image_pos = args
+            .iter()
+            .position(|a| *a == STEP_CA_HELPER_IMAGE)
+            .expect("image");
+
+        // Exactly one bind mount, and it is the TLS output directory.
+        let mounts: Vec<&&str> = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .filter_map(|(a, b)| (*a == "-v").then_some(b))
+            .collect();
+        assert_eq!(mounts, vec![&mount]);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains(":/home/step") || a.contains(":/secrets") || *a == "/"),
+            "nothing above openbao/tls is reachable from inside the container"
+        );
+
+        // The chown overrides the image entrypoint so it runs `chown`
+        // directly, never the step-ca init path that would warn about a
+        // missing ca.json under the (deliberately unmounted) /home/step.
+        let ep_pos = args
+            .iter()
+            .position(|a| *a == "--entrypoint")
+            .expect("--entrypoint");
+        assert_eq!(args.get(ep_pos + 1), Some(&"chown"));
+        assert!(ep_pos < image_pos, "--entrypoint precedes the image");
+
+        // chown recurses but does not dereference symlinks.
+        assert!(args.contains(&"-R"));
+        assert!(args.contains(&"--no-dereference"));
+
+        // The ownership is the resolved secrets owner, never a fixed uid.
+        assert!(args.contains(&"100:1000"));
+
+        // Only root can chown to an arbitrary uid.
+        let user_pos = args.iter().position(|a| *a == "--user").expect("--user");
+        assert_eq!(args.get(user_pos + 1), Some(&"root"));
+
+        // The chown target is the container-side mount point, nothing
+        // outside it.
+        assert_eq!(args.last(), Some(&OPENBAO_TLS_OUTPUT_MOUNT));
+    }
+
+    /// The argv builder is only worth anything if the certificate write
+    /// actually runs it, and runs it *first*: a chown that landed after
+    /// `step certificate create` would repair the ownership of files the
+    /// container was never able to write. See issue #739.
+    #[test]
+    fn issue_openbao_tls_cert_chowns_output_dir_before_creating_the_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).unwrap();
+        write_appending_fake_docker(&bin_dir.join("docker"), 0);
+
+        let compose_dir = dir.path().join("compose");
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).unwrap();
+        // The fake docker no-ops `step certificate create`, so the files
+        // the host-side chmod expects have to exist up front.
+        let tls_dir = compose_dir.join("openbao").join("tls");
+        fs::create_dir_all(&tls_dir).unwrap();
+        fs::write(tls_dir.join("server.crt"), "cert").unwrap();
+        fs::write(tls_dir.join("server.key"), "key").unwrap();
+
+        let args_log = dir.path().join("docker_args.log");
+        let messages = crate::i18n::test_messages();
+
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
+
+        issue_openbao_tls_cert(&compose_dir, &secrets_dir, &["openbao.internal"], &messages)
+            .expect("issuing the certificate must succeed against the fake docker");
+
+        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        let invocations: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            invocations.len(),
+            2,
+            "expected the chown and the certificate write, got: {log}"
+        );
+        let chown = invocations.first().expect("chown invocation");
+        let create = invocations.get(1).expect("certificate create invocation");
+        assert!(
+            chown.contains("--entrypoint chown ") && chown.contains("--no-dereference"),
+            "the first container must be the scoped chown, got: {chown}"
+        );
+        let expected_mount = format!(
+            "{}:{OPENBAO_TLS_OUTPUT_MOUNT}",
+            std::fs::canonicalize(&tls_dir).unwrap().display()
+        );
+        assert!(
+            chown.contains(&expected_mount),
+            "the chown must mount the TLS output directory, got: {chown}"
+        );
+        assert!(
+            create.contains("certificate create"),
+            "the second container must be the certificate write, got: {create}"
+        );
+
+        // The 0644 outcome the OpenBao container's `:ro` mount depends on
+        // must survive the added chown.
+        for file in ["server.crt", "server.key"] {
+            let mode = fs::metadata(tls_dir.join(file))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o644, "{file} must stay world-readable");
+        }
+    }
+
+    /// A chown that failed must abort the issuance rather than let the
+    /// `step` container run into the very `permission denied` the chown
+    /// exists to prevent, and the error has to name the failing step —
+    /// a bare docker-command failure would leave an operator guessing.
+    /// See issue #739.
+    #[test]
+    fn issue_openbao_tls_cert_aborts_when_the_chown_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).unwrap();
+        write_appending_fake_docker(&bin_dir.join("docker"), 1);
+
+        let compose_dir = dir.path().join("compose");
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).unwrap();
+
+        let args_log = dir.path().join("docker_args.log");
+        let messages = crate::i18n::test_messages();
+
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
+
+        let error =
+            issue_openbao_tls_cert(&compose_dir, &secrets_dir, &["openbao.internal"], &messages)
+                .expect_err("a failing chown must fail the issuance");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains(messages.error_openbao_tls_provision_failed()),
+            "the chown failure must be reported as a failed issuance, got: {chain}"
+        );
+
+        // Exactly one container ran: the certificate write never started.
+        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "the certificate write must not run after a failed chown, got: {log}"
+        );
+        assert!(
+            !log.contains("certificate create"),
+            "the certificate write must not run after a failed chown, got: {log}"
+        );
+    }
+
+    /// `canonicalize` resolves the final component, so a symlink at
+    /// `openbao/tls` would silently relocate the bind-mount source: the
+    /// root helper would `chown -R` the link target and `step certificate
+    /// create` would write the key into it, both outside the directory
+    /// the mount is supposed to be pinned to.  `--no-dereference` only
+    /// covers links *inside* the mount, so the path itself has to be
+    /// refused before anything is mounted.
+    #[test]
+    fn issue_openbao_tls_cert_refuses_a_symlinked_output_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).unwrap();
+        write_appending_fake_docker(&bin_dir.join("docker"), 0);
+
+        let compose_dir = dir.path().join("compose");
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).unwrap();
+
+        // Somewhere a chown -R must never reach.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let tls_dir = compose_dir.join("openbao").join("tls");
+        fs::create_dir_all(tls_dir.parent().expect("openbao dir")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &tls_dir).unwrap();
+
+        let args_log = dir.path().join("docker_args.log");
+        let messages = crate::i18n::test_messages();
+
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
+
+        let error =
+            issue_openbao_tls_cert(&compose_dir, &secrets_dir, &["openbao.internal"], &messages)
+                .expect_err("a symlinked output directory must fail the issuance");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains(&tls_dir.display().to_string()),
+            "the error must name the refused path, got: {chain}"
+        );
+
+        // No container ran at all: neither the chown nor the write.
+        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        assert!(
+            log.trim().is_empty(),
+            "nothing may be mounted for a symlinked output directory, got: {log}"
+        );
+        // The symlink target is untouched.
+        assert!(elsewhere.read_dir().unwrap().next().is_none());
     }
 
     #[test]
