@@ -45,7 +45,7 @@ const TLS_PROBE_DELAY: Duration = Duration::from_millis(500);
 /// operator actually pointed `init` at, instead of a generic "still
 /// sealed".
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum UnsealKeySource {
+enum UnsealKeySource {
     /// The keys this `init` run already holds — the fresh-install case,
     /// where `init` itself initialised the vault (or the operator passed
     /// `--unseal-key` / answered the bootstrap prompt).
@@ -72,7 +72,7 @@ impl UnsealKeySource {
 /// An unseal key source that has been confirmed available, with its
 /// material already read where the source is a file.
 #[derive(Debug)]
-pub(super) struct PreparedUnsealKeys {
+struct PreparedUnsealKeys {
     source: UnsealKeySource,
     /// Empty exactly for [`UnsealKeySource::Prompt`].
     keys: Vec<String>,
@@ -110,7 +110,7 @@ pub(super) struct UnsealKeyInputs<'a> {
 ///
 /// Returns an error when the selected source cannot be read, and when
 /// every source is absent.
-pub(super) fn prepare_unseal_keys(
+fn prepare_unseal_keys(
     inputs: &UnsealKeyInputs<'_>,
     messages: &Messages,
 ) -> Result<PreparedUnsealKeys> {
@@ -160,10 +160,7 @@ fn read_prepared_keys(path: &Path, messages: &Messages) -> Result<PreparedUnseal
 /// this very invocation is the one adding the `openbao-exposed`
 /// override.  Both files stay on the command line so the published bind
 /// address is unchanged by the recreate.
-pub(super) fn openbao_recreate_docker_args(
-    compose_file: &Path,
-    override_path: &Path,
-) -> Vec<String> {
+fn openbao_recreate_docker_args(compose_file: &Path, override_path: &Path) -> Vec<String> {
     vec![
         "compose".to_string(),
         "-f".to_string(),
@@ -179,15 +176,15 @@ pub(super) fn openbao_recreate_docker_args(
 
 /// The plaintext → TLS transition of the `OpenBao` listener.
 pub(super) struct OpenBaoTlsTransition<'a> {
-    pub(super) compose_file: &'a Path,
-    pub(super) override_path: &'a Path,
+    compose_file: &'a Path,
+    override_path: &'a Path,
     /// The URL that is about to be written to `state.openbao_url`, i.e.
     /// `client_url_from_bind_addr(&bind_addr)` — never the advertise
     /// address, which local commands must not depend on.
-    pub(super) https_url: &'a str,
-    pub(super) secrets_dir: &'a Path,
-    pub(super) probe_attempts: u32,
-    pub(super) probe_delay: Duration,
+    https_url: &'a str,
+    secrets_dir: &'a Path,
+    probe_attempts: u32,
+    probe_delay: Duration,
 }
 
 impl<'a> OpenBaoTlsTransition<'a> {
