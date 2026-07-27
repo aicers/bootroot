@@ -87,6 +87,54 @@ impl Messages {
         )
     }
 
+    pub(crate) fn openbao_unseal_source_in_memory(&self) -> &'static str {
+        self.strings().openbao_unseal_source_in_memory
+    }
+
+    pub(crate) fn openbao_unseal_source_prompt(&self) -> &'static str {
+        self.strings().openbao_unseal_source_prompt
+    }
+
+    pub(crate) fn init_openbao_tls_recreate(&self) -> &'static str {
+        self.strings().init_openbao_tls_recreate
+    }
+
+    pub(crate) fn init_openbao_tls_verified(&self, url: &str) -> String {
+        format_template(self.strings().init_openbao_tls_verified, &[("url", url)])
+    }
+
+    pub(crate) fn init_openbao_already_unsealed(&self) -> &'static str {
+        self.strings().init_openbao_already_unsealed
+    }
+
+    pub(crate) fn init_openbao_unseal_from_source(&self, source: &str) -> String {
+        format_template(
+            self.strings().init_openbao_unseal_from_source,
+            &[("source", source)],
+        )
+    }
+
+    pub(crate) fn error_openbao_tls_probe_failed(&self, url: &str) -> String {
+        format_template(
+            self.strings().error_openbao_tls_probe_failed,
+            &[("url", url)],
+        )
+    }
+
+    pub(crate) fn error_openbao_unseal_source_unavailable(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_openbao_unseal_source_unavailable,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_openbao_unseal_source_still_sealed(&self, source: &str) -> String {
+        format_template(
+            self.strings().error_openbao_unseal_source_still_sealed,
+            &[("source", source)],
+        )
+    }
+
     pub(crate) fn prompt_unseal_threshold(&self) -> &'static str {
         self.strings().prompt_unseal_threshold
     }

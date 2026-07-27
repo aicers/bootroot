@@ -659,6 +659,42 @@ delivery) no longer applies. In that case, a separate remote auth-setup process
 is required for AppRole credential delivery and agent startup, and this
 topology is outside the `bootroot` CLI automation scope.
 
+### OpenBao TLS transition for a non-loopback bind
+
+When `state.json` records a non-loopback OpenBao bind intent (written by
+`infra install --openbao-bind`), `init` switches the OpenBao listener
+from plaintext to TLS at the end of the run: it issues the listener
+certificate, rewrites `openbao/openbao.hcl`, and then
+
+1. recreates the OpenBao container unconditionally, because
+   `openbao.hcl` is a bind-mounted file whose contents Compose does not
+   hash — without a forced recreate the process would keep serving
+   plaintext from its old configuration whenever the
+   `openbao-exposed` override had already been applied,
+2. confirms the live listener answers an OpenBao API request over TLS at
+   exactly the URL about to be recorded, verifying against the local
+   step-ca trust bundle,
+3. unseals the vault, which the recreate left sealed, and only then
+4. records the `https://` URL in `state.json` and starts the two infra
+   OpenBao Agent containers.
+
+Because the container is recreated, `init` needs unseal keys. It takes
+them from exactly one source, in this order, and skips a source only
+when it is absent:
+
+1. the keys the run already holds (a fresh install, `--unseal-key`, or
+   the keys entered at the bootstrap unseal prompt),
+2. `--openbao-unseal-from-file <path>`,
+3. `secrets/openbao/unseal-keys.txt` (written by `init
+   --save-unseal-keys` or `bootroot openbao save-unseal-keys`),
+4. an interactive prompt, when stdin is a terminal.
+
+A source that is present but unusable — unreadable, empty, or holding
+keys that leave the vault sealed — fails the run and is named in the
+error rather than falling through to the next source. When no source is
+available at all, `init` fails **before** recreating the container, so
+the running OpenBao is left untouched.
+
 ### Failure conditions
 
 The command is considered failed when:
@@ -667,6 +703,9 @@ The command is considered failed when:
 - OpenBao init/unseal/auth failures
 - responder check failures (when enabled)
 - step-ca init failures
+- OpenBao TLS transition failures for a non-loopback bind: no unseal key
+  source available, an unusable key source, a listener that does not
+  answer over TLS at the recorded URL, or a vault that stays sealed
 
 ### Examples
 

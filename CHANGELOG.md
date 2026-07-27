@@ -112,6 +112,62 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot init` recording an `https://` OpenBao URL against a
+  listener that was still serving plaintext (#737). The OpenBao TLS
+  transition rewrote `openbao/openbao.hcl` and then brought the
+  container up with a plain `docker compose up -d openbao`. That file is
+  bind-mounted, so Compose does not hash its contents and only recreates
+  the container when the *compose configuration* changed — which on this
+  path meant only when `init` itself was the one adding the
+  `openbao-exposed` override. Any caller that applied the override
+  first (for example to verify control-plane reachability from another
+  host before a destructive one-shot) silently disarmed the reload:
+  `up -d` became a no-op, the process kept serving plaintext, and
+  `state.json` advanced to `https://` regardless, so the next command
+  died on AppRole login with `received corrupt message of type
+  InvalidContentType`. The static `validate_openbao_tls` check could not
+  catch it — the HCL and the certificate on disk were both correct; the
+  running process was what was stale.
+  - The bring-up now passes `--force-recreate`, so the freshly written
+    `openbao.hcl` and the freshly issued certificate are always what the
+    process loads. Both the base compose file and the `openbao-exposed`
+    override stay applied, so the published bind address is unchanged.
+    The same no-op also meant that re-running `init` to re-issue the
+    listener certificate with new SANs left the old certificate being
+    served; that is fixed by the same change.
+  - `state.openbao_url` advances to the HTTPS URL only after the live
+    listener has answered an OpenBao API request over TLS at exactly
+    that URL, using a client anchored on the local step-ca root and
+    intermediate bundles (verification is never disabled). A listener
+    still answering plaintext fails `init` and triggers the existing
+    rollback on the pre-TLS plaintext URL.
+  - `init` now unseals OpenBao after the recreate instead of returning
+    success against a vault no following command can use. `SIGHUP` is
+    not an option here: it reloads the certificate of a listener that
+    already terminates TLS, it does not turn a plaintext listener into a
+    TLS one, so the initial enable needs the process restarted and
+    `init` has to own the unseal that follows. Keys come from exactly
+    one source — the keys the run already holds, then
+    `--openbao-unseal-from-file`, then
+    `secrets/openbao/unseal-keys.txt`, then an interactive prompt when
+    stdin is a terminal — and a source is skipped only when it is
+    absent. A source that is present but unusable is named in the error
+    instead of falling through. The availability check runs *before* the
+    recreate, so a run that cannot unseal fails without knocking a live
+    deployment into a sealed state, and rollback then leaves the running
+    container alone. Nothing submits keys when the vault already reports
+    itself unsealed.
+  - The deferred infra OpenBao Agent compose override is applied only
+    after both new gates pass, so the two sidecars never start against a
+    plaintext or sealed OpenBao.
+  - `scripts/impl/run-reinit-recovery.sh` no longer replays the
+    summary's unseal keys by hand after the bootstrap `init`; it asserts
+    that the vault is unsealed when `init` returns. A new
+    `openbao-tls-no-delta` Docker E2E scenario reproduces the
+    already-applied-override precondition and is registered in both the
+    `test-docker-e2e-matrix` CI job and
+    `scripts/preflight/ci/e2e-matrix.sh`.
+
 - Fixed off-host certificate issuance failing against a step-ca that
   `infra install --stepca-bind` published on a non-loopback address
   (#733). `step ca init` was invoked with a compile-time `--dns`

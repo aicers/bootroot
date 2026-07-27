@@ -9,7 +9,7 @@ PR 필수 CI(`.github/workflows/ci.yml`)는 다음을 실행합니다.
 
 - `test-core`: 단위/통합 스모크 경로
 - `test-docker-e2e-matrix`: 전체 흐름 + 회전/복구 Docker E2E 조합 검증
-  (5개 시나리오가 matrix 전략으로 병렬 실행)
+  (8개 시나리오가 matrix 전략으로 병렬 실행)
 
 확장 E2E(`.github/workflows/e2e-extended.yml`)는 별도 실행됩니다.
 
@@ -65,12 +65,18 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - 원격 전달 E2E 시나리오 (`no-hosts`)
 - 원격 전달 E2E 시나리오 (`hosts`)
 - rotation/recovery matrix (`secret_id,eab,responder_hmac,trust_sync`)
+- reinit 복구
+- step-ca 인증서 SAN
+- compose 델타 없는 OpenBao TLS 전환
 
 주요 스크립트:
 
 - `scripts/impl/run-local-lifecycle.sh`
 - `scripts/impl/run-remote-lifecycle.sh`
 - `scripts/impl/run-rotation-recovery.sh`
+- `scripts/impl/run-reinit-recovery.sh`
+- `scripts/impl/run-stepca-san.sh`
+- `scripts/impl/run-openbao-tls-no-delta.sh`
 
 확장 워크플로는 다음을 검증합니다.
 

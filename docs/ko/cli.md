@@ -654,6 +654,39 @@ OpenBao와 step-ca/responder가 서로 다른 머신에 배치되면, 이 섹션
 절차가 필요하며, 해당 토폴로지는 `bootroot` CLI 자동화 범위에 포함되지
 않습니다.
 
+### 비루프백 바인드의 OpenBao TLS 전환
+
+`state.json`에 비루프백 OpenBao 바인드 의도가 기록되어 있으면
+(`infra install --openbao-bind`이 기록), `init`은 실행 마지막에 OpenBao
+리스너를 평문에서 TLS로 전환합니다. 리스너 인증서를 발급하고
+`openbao/openbao.hcl`을 다시 쓴 뒤 다음을 수행합니다.
+
+1. OpenBao 컨테이너를 무조건 재생성합니다. `openbao.hcl`은 바인드 마운트
+   파일이라 Compose가 내용을 해시하지 않으므로, 강제 재생성이 없으면
+   `openbao-exposed` 오버라이드가 이미 적용된 경우 프로세스가 이전 설정
+   그대로 평문을 계속 서비스합니다.
+2. 기록 예정인 URL에서 실제 리스너가 TLS로 OpenBao API 요청에 응답하는지
+   로컬 step-ca 신뢰 번들로 검증합니다.
+3. 재생성으로 다시 봉인된 볼트를 언실합니다.
+4. 그 다음에야 `state.json`에 `https://` URL을 기록하고 두 개의 infra
+   OpenBao Agent 컨테이너를 기동합니다.
+
+컨테이너가 재생성되므로 `init`에는 언실 키가 필요합니다. 다음 순서로
+정확히 한 곳에서만 키를 가져오며, 해당 소스가 **없을 때만** 다음으로
+넘어갑니다.
+
+1. 이번 실행이 이미 보유한 키(신규 설치, `--unseal-key`, 부트스트랩 언실
+   프롬프트로 입력한 키)
+2. `--openbao-unseal-from-file <경로>`
+3. `secrets/openbao/unseal-keys.txt` (`init --save-unseal-keys` 또는
+   `bootroot openbao save-unseal-keys`가 기록)
+4. stdin이 터미널일 때의 대화형 입력
+
+존재하지만 사용할 수 없는 소스(읽기 실패, 빈 파일, 적용해도 봉인이 풀리지
+않는 키)는 다음 소스로 넘어가지 않고 해당 소스를 명시한 오류로 실패합니다.
+사용할 수 있는 소스가 하나도 없으면 `init`은 컨테이너를 재생성하기 **전에**
+실패하므로 실행 중인 OpenBao는 그대로 유지됩니다.
+
 ### 실패 조건
 
 다음 조건이면 실패로 판정합니다.
@@ -662,6 +695,9 @@ OpenBao와 step-ca/responder가 서로 다른 머신에 배치되면, 이 섹션
 - OpenBao 초기화/언실/인증 실패
 - responder 체크 실패(옵션 사용 시)
 - step-ca 초기화 실패
+- 비루프백 바인드의 OpenBao TLS 전환 실패: 사용할 수 있는 언실 키 소스
+  없음, 사용할 수 없는 키 소스, 기록 대상 URL에서 TLS로 응답하지 않는
+  리스너, 언실되지 않은 볼트
 
 ### 예시
 

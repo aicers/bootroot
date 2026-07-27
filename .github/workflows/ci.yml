@@ -411,6 +411,10 @@ jobs:
             script: run-stepca-san.sh
             resolution: ""
             artifact: ci-stepca-san
+          - label: openbao-tls-no-delta
+            script: run-openbao-tls-no-delta.sh
+            resolution: ""
+            artifact: ci-openbao-tls-no-delta
     steps:
       - uses: actions/checkout@v7
 
@@ -427,7 +431,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Local arms run the daemon-only model: every service agent is
@@ -513,6 +517,24 @@ jobs:
               [ -f "$f" ] && { echo "--- $(basename "$f") ---"; tail -n 120 "$f"; } || true
             done
             [ -f "$ARTIFACT_DIR/ca-json-dns-names.log" ] && cat "$ARTIFACT_DIR/ca-json-dns-names.log" || true
+            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
+            exit 1
+          }
+
+      - name: Run E2E scenario (OpenBao TLS no-delta)
+        if: matrix.scenario.label == 'openbao-tls-no-delta'
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          COMPOSE_PROJECT_NAME="bootroot-e2e-ci-openbao-tls-no-delta-${GITHUB_RUN_ID}" \
+          SECRETS_DIR="$(pwd)/secrets" \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          ./scripts/impl/run-openbao-tls-no-delta.sh || {
+            echo "openbao-tls-no-delta failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
+            [ -f "$ARTIFACT_DIR/init.raw.log" ] && tail -n 200 "$ARTIFACT_DIR/init.raw.log" || true
+            [ -f "$ARTIFACT_DIR/openbao-bao-status.log" ] && cat "$ARTIFACT_DIR/openbao-bao-status.log" || true
             [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
             exit 1
           }
