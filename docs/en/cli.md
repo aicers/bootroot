@@ -307,6 +307,13 @@ so it re-issues its serving certificate from the updated configuration.
 `secrets/secrets/intermediate_ca_key` are untouched, so previously
 issued certificates and distributed CA bundles stay valid.
 
+The same `init` also regenerates `templates/ca.json.ctmpl` with the
+derived names and restarts the `bootroot-openbao-agent-stepca` sidecar
+onto it. The sidecar re-renders `ca.json` from that template on a fixed
+interval, so without the restart it would put the pre-repair name set
+back within seconds and step-ca would drop the address SAN on its next
+restart.
+
 ### Outputs
 
 - Generated `.env` file with random PostgreSQL credentials

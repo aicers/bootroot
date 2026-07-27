@@ -16,7 +16,10 @@ mod unix_integration {
     /// carries the bind intent, and an already-initialized CA repaired
     /// by a second `bootroot init` — and asserts the presented
     /// certificate carries an `IP Address` SAN plus a working
-    /// `curl --cacert` fetch of the ACME directory.
+    /// `curl --cacert` fetch of the ACME directory.  The repair path
+    /// additionally re-checks the name set after a full `OpenBao` Agent
+    /// render interval, because the step-ca sidecar re-renders `ca.json`
+    /// from its template and would otherwise silently regress it.
     #[test]
     #[ignore = "Requires local Docker and a non-loopback bind host for step-ca SAN validation"]
     fn docker_stepca_san_bind_and_repair() -> Result<()> {
@@ -56,6 +59,7 @@ mod unix_integration {
             "scenario-b-install-bind",
             "scenario-b-init-repair",
             "scenario-b-assert",
+            "scenario-b-assert-stable",
         ] {
             assert!(
                 phases.contains(&format!("\"phase\":\"{phase}\"")),

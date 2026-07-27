@@ -8,7 +8,8 @@ use bootroot::fs_util;
 use super::super::constants::openbao_constants::{PATH_STEPCA_DB, PATH_STEPCA_PASSWORD};
 use super::super::constants::{
     DEFAULT_CA_ADDRESS, DEFAULT_CA_DNS, DEFAULT_CA_NAME, DEFAULT_CA_PROVISIONER,
-    RESPONDER_TEMPLATE_DIR, STEPCA_CA_JSON_TEMPLATE_NAME, STEPCA_PASSWORD_TEMPLATE_NAME,
+    OPENBAO_AGENT_STEPCA_CONTAINER_NAME, RESPONDER_TEMPLATE_DIR, STEPCA_CA_JSON_TEMPLATE_NAME,
+    STEPCA_PASSWORD_TEMPLATE_NAME,
 };
 use super::super::paths::StepCaTemplatePaths;
 use super::super::types::StepCaInitResult;
@@ -34,11 +35,21 @@ const LOOPBACK_IPV6: &str = "::1";
 /// an IP become `iPAddress` SANs, the rest become `dNSName` SANs.
 const CA_JSON_DNS_NAMES_KEY: &str = "dnsNames";
 
+/// Writes the `OpenBao` Agent templates step-ca renders its runtime
+/// configuration from.
+///
+/// `dns_names` is stamped into the generated `ca.json.ctmpl` rather than
+/// inherited from whatever `ca.json` holds when this runs: the step-ca
+/// agent sidecar re-renders `ca.json` from the *previous* template on
+/// its own schedule, so a render landing between the reconciliation and
+/// this call would otherwise bake the stale name set back into the new
+/// template and make the regression permanent (issue #733).
 pub(super) async fn write_stepca_templates(
     secrets_dir: &Path,
     kv_mount: &str,
     cert_duration: &str,
     provisioner: &str,
+    dns_names: &[String],
     messages: &Messages,
 ) -> Result<StepCaTemplatePaths> {
     let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
@@ -62,6 +73,7 @@ pub(super) async fn write_stepca_templates(
         kv_mount,
         cert_duration,
         provisioner,
+        dns_names,
         messages,
     )?;
     let ca_json_template_path = templates_dir.join(STEPCA_CA_JSON_TEMPLATE_NAME);
@@ -89,12 +101,14 @@ fn build_ca_json_template(
     kv_mount: &str,
     cert_duration: &str,
     provisioner: &str,
+    dns_names: &[String],
     messages: &Messages,
 ) -> Result<String> {
     const PLACEHOLDER: &str = "__BOOTROOT_CTMPL_DB__";
 
     let mut value: serde_json::Value =
         serde_json::from_str(contents).context(messages.error_parse_ca_json_failed())?;
+    set_ca_json_dns_names(&mut value, dns_names);
     let db = value
         .get_mut("db")
         .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
@@ -382,6 +396,59 @@ pub(super) async fn update_ca_json_with_backup(
     })
 }
 
+/// Re-applies `dns_names` to `ca.json`'s top-level `dnsNames`, returning
+/// whether the file had drifted.
+///
+/// `update_ca_json_with_backup` already writes the reconciled set, but
+/// the step-ca `OpenBao` Agent sidecar re-renders `ca.json` from its
+/// template on a fixed interval and can clobber that write moments
+/// later.  The orchestrator calls this once the sidecar has been
+/// restarted onto the regenerated template, so the file `init` leaves
+/// behind — and every later render — carries the same name set.  No
+/// backup is taken: the rollback entry from `update_ca_json_with_backup`
+/// already holds the pre-`init` document.
+pub(super) async fn reconcile_ca_json_dns_names(
+    secrets_dir: &Path,
+    dns_names: &[String],
+    messages: &Messages,
+) -> Result<bool> {
+    let path = secrets_dir.join("config").join("ca.json");
+    let contents = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&contents).context(messages.error_parse_ca_json_failed())?;
+    if !set_ca_json_dns_names(&mut value, dns_names) {
+        return Ok(false);
+    }
+    let updated =
+        serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
+    tokio::fs::write(&path, updated)
+        .await
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    Ok(true)
+}
+
+/// Restarts the step-ca `OpenBao` Agent sidecar so it loads the
+/// regenerated `ca.json.ctmpl`.
+///
+/// The sidecar reads its templates at start-up and then re-renders
+/// `ca.json` from them every render interval, so a sidecar left running
+/// across an `init` that changed `dnsNames` would keep writing the
+/// pre-`init` name set back over the reconciled file.
+///
+/// Returns `false` when the container is absent — a fresh install has no
+/// sidecar yet, and that is not a failure.  Output is discarded so the
+/// absent-container case adds no noise to the `init` transcript.
+pub(super) fn restart_stepca_openbao_agent() -> bool {
+    std::process::Command::new("docker")
+        .args(["restart", OPENBAO_AGENT_STEPCA_CONTAINER_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Runs `step ca init` when the CA does not exist yet.
 ///
 /// `dns_names` becomes the `--dns` value, so a freshly created CA
@@ -472,9 +539,11 @@ mod tests {
         .unwrap();
 
         let messages = test_messages();
-        let paths = write_stepca_templates(&secrets_dir, "secret", "48h", "acme", &messages)
-            .await
-            .unwrap();
+        let dns_names = build_stepca_ca_dns_names(None, None);
+        let paths =
+            write_stepca_templates(&secrets_dir, "secret", "48h", "acme", &dns_names, &messages)
+                .await
+                .unwrap();
         let password_template = fs::read_to_string(&paths.password_template_path).unwrap();
         let ca_json_template = fs::read_to_string(&paths.ca_json_template_path).unwrap();
 
@@ -854,9 +923,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let paths = write_stepca_templates(&secrets_dir, "secret", "48h", "acme", &messages)
-            .await
-            .unwrap();
+        let paths =
+            write_stepca_templates(&secrets_dir, "secret", "48h", "acme", &dns_names, &messages)
+                .await
+                .unwrap();
 
         // The .ctmpl embeds a raw Go template directive in place of the
         // DSN string, so it is not valid JSON — compare the rendered
@@ -882,5 +952,65 @@ mod tests {
             template.contains(dns_block),
             "ca.json.ctmpl dnsNames must match the on-disk ca.json exactly"
         );
+    }
+
+    /// The step-ca `OpenBao` Agent sidecar re-renders `ca.json` from the
+    /// previous template on its own schedule, so the reconciled file can
+    /// be clobbered between `update_ca_json_with_backup` and the template
+    /// write.  The regenerated template must still carry the derived name
+    /// set, or the stale one would be baked back in permanently.
+    #[tokio::test]
+    async fn stepca_template_carries_dns_names_when_ca_json_was_clobbered() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        // Stands in for an agent render that landed after the
+        // reconciliation: the pre-#733 name set is back on disk.
+        write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
+        let messages = test_messages();
+        let dns_names = build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None);
+
+        let paths =
+            write_stepca_templates(&secrets_dir, "secret", "48h", "acme", &dns_names, &messages)
+                .await
+                .unwrap();
+
+        let template = fs::read_to_string(&paths.ca_json_template_path).unwrap();
+        assert!(
+            template.contains("\"192.168.139.144\""),
+            "the template must carry the derived name set, not the on-disk one"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_ca_json_dns_names_repairs_a_clobbered_file() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
+        let messages = test_messages();
+        let dns_names = build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None);
+
+        let changed = reconcile_ca_json_dns_names(&secrets_dir, &dns_names, &messages)
+            .await
+            .unwrap();
+        assert!(changed);
+        let after = read_ca_json(&secrets_dir);
+        assert_eq!(dns_names_of(&after), dns_names);
+        // Only `dnsNames` moves: the `db` section and unmodelled keys are
+        // left exactly as the caller's earlier ca.json patch produced them.
+        assert_eq!(after["db"]["type"].as_str().unwrap(), "badger");
+        assert_eq!(after["db"]["dataSource"].as_str().unwrap(), "/home/step/db");
+        assert_eq!(
+            after["bootrootUnknownKey"]["nested"],
+            serde_json::json!([1, 2, 3])
+        );
+
+        let changed_again = reconcile_ca_json_dns_names(&secrets_dir, &dns_names, &messages)
+            .await
+            .unwrap();
+        assert!(
+            !changed_again,
+            "an already-reconciled ca.json must not be rewritten"
+        );
+        assert_eq!(read_ca_json(&secrets_dir), after);
     }
 }

@@ -48,6 +48,12 @@ OPENBAO_READY_ATTEMPTS="${OPENBAO_READY_ATTEMPTS:-40}"
 OPENBAO_READY_DELAY_SECS="${OPENBAO_READY_DELAY_SECS:-2}"
 STEPCA_READY_ATTEMPTS="${STEPCA_READY_ATTEMPTS:-40}"
 STEPCA_READY_DELAY_SECS="${STEPCA_READY_DELAY_SECS:-3}"
+CA_JSON_ATTEMPTS="${CA_JSON_ATTEMPTS:-10}"
+CA_JSON_DELAY_SECS="${CA_JSON_DELAY_SECS:-2}"
+# Must exceed the OpenBao Agent render interval bootroot writes into the
+# sidecar config (`STATIC_SECRET_RENDER_INTERVAL`, 30s), so at least one
+# full render cycle is observed before the stability re-check.
+STEPCA_RENDER_STABILITY_SECS="${STEPCA_RENDER_STABILITY_SECS:-40}"
 
 PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUN_LOG="$ARTIFACT_DIR/run.log"
@@ -293,15 +299,29 @@ assert_acme_directory_reachable() {
   fail "[$label] curl --cacert could not fetch https://${STEPCA_BIND_ADDR}/acme/acme/directory (see $out)"
 }
 
+# `ca.json` is co-owned: bootroot writes it during `init`, and the
+# step-ca OpenBao Agent sidecar re-renders it from `ca.json.ctmpl` every
+# render interval.  A short retry absorbs a render landing between
+# `init` returning and this read; it does NOT absorb a stale render,
+# because a sidecar still holding the previous template would never
+# produce the expected set (which is what
+# `assert_ca_json_dns_names_stable` pins down).
 assert_ca_json_dns_names() {
   local label="$1"
   shift
   local ca_json="$SECRETS_DIR/config/ca.json"
-  [ -f "$ca_json" ] || fail "[$label] missing $ca_json"
   local expected
   expected="$(printf '%s\n' "$@" | jq -R . | jq -s -c .)"
-  local actual
-  actual="$(jq -c '.dnsNames' "$ca_json")"
+  local actual=""
+  local attempt
+  for attempt in $(seq 1 "$CA_JSON_ATTEMPTS"); do
+    if [ -f "$ca_json" ]; then
+      actual="$(jq -c '.dnsNames' "$ca_json" 2>/dev/null || true)"
+      [ "$expected" = "$actual" ] && break
+    fi
+    sleep "$CA_JSON_DELAY_SECS"
+  done
+  [ -f "$ca_json" ] || fail "[$label] missing $ca_json"
   if [ "$expected" != "$actual" ]; then
     fail "[$label] ca.json dnsNames mismatch: expected $expected got $actual"
   fi
@@ -314,6 +334,21 @@ assert_ca_json_dns_names() {
     grep -q "\"$name\"" "$ctmpl" \
       || fail "[$label] ca.json.ctmpl does not carry dnsNames entry '$name'"
   done
+}
+
+# Re-checks the name set after a full agent render interval has elapsed.
+#
+# This is the assertion that actually proves the repair sticks: the
+# step-ca sidecar keeps rendering `ca.json` from the template it loaded
+# at start-up, so an `init` that rewrote `ca.json` without also
+# regenerating the template and restarting the sidecar would look
+# correct for a few seconds and then silently regress — and step-ca
+# would drop the address SAN on its next restart.
+assert_ca_json_dns_names_stable() {
+  local label="$1"
+  shift
+  sleep "$STEPCA_RENDER_STABILITY_SECS"
+  assert_ca_json_dns_names "$label" "$@"
 }
 
 snapshot_ca_fingerprints() {
@@ -500,6 +535,12 @@ scenario_b_repair_initialized_ca() {
   # The bundle captured before the repair — what an already-provisioned
   # consumer holds — still validates the chain step-ca presents.
   assert_acme_directory_reachable "scenario-b" "$SNAPSHOT_DIR/scenario-b/ca-bundle.pem"
+
+  log_phase "scenario-b-assert-stable"
+  # The repair must survive the step-ca sidecar's next render: the agent
+  # was already running with the pre-repair template when `init` started.
+  assert_ca_json_dns_names_stable "scenario-b-stable" \
+    "localhost" "bootroot-ca" "stepca.internal" "$STEPCA_BIND_HOST"
 }
 
 # ---------------------------------------------------------------------------

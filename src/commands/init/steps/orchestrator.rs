@@ -33,8 +33,9 @@ use super::responder_setup::{
 };
 use super::secrets::{maybe_register_eab, resolve_init_secrets};
 use super::stepca_setup::{
-    ensure_step_ca_initialized, resolve_stepca_ca_dns_names, update_ca_json_with_backup,
-    write_password_file_with_backup, write_stepca_templates,
+    ensure_step_ca_initialized, reconcile_ca_json_dns_names, resolve_stepca_ca_dns_names,
+    restart_stepca_openbao_agent, update_ca_json_with_backup, write_password_file_with_backup,
+    write_stepca_templates,
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
@@ -478,10 +479,10 @@ async fn run_init_inner(
         fix_secrets_permissions(&secrets_dir).await?;
     }
 
-    // Runs before `write_stepca_templates` reads ca.json, so the
-    // generated `ca.json.ctmpl` carries the same `dnsNames` and the
-    // OpenBao-Agent-rendered copy inside the container cannot regress
-    // the name set on the next agent render.
+    // Reconciles the `db` section, the ACME provisioner's cert duration
+    // and the top-level `dnsNames`.  Runs before `write_stepca_templates`
+    // so the generated `ca.json.ctmpl` is built from the patched document
+    // (notably `db.type`).
     let ca_json_update = update_ca_json_with_backup(
         &secrets_dir,
         &secrets.db_dsn,
@@ -493,6 +494,34 @@ async fn run_init_inner(
     .await?;
     let stepca_dns_names_changed = ca_json_update.dns_names_changed;
     rollback.ca_json_backup = Some(ca_json_update.rollback);
+
+    // The templates are written here — before step-ca is restarted —
+    // because on an already-initialized system the step-ca OpenBao Agent
+    // sidecar is already running and re-renders ca.json from the
+    // *previous* `ca.json.ctmpl` every render interval.  Regenerating the
+    // template first, then restarting the sidecar onto it, then
+    // re-asserting the on-disk file is the only ordering in which no
+    // render can put the stale name set back, and step-ca is restarted
+    // last so it reads the settled document (issue #733).
+    let stepca_templates = write_stepca_templates(
+        &secrets_dir,
+        &args.openbao.kv_mount,
+        &args.cert_duration,
+        &args.stepca_provisioner,
+        &stepca_dns_names,
+        messages,
+    )
+    .await?;
+
+    if stepca_dns_names_changed {
+        // On a fresh install the sidecar does not exist yet (and
+        // `step ca init --dns` already produced the right name set, so
+        // this branch is normally not taken there).  `docker restart`
+        // returns only once the old process is gone, so the re-assert
+        // below cannot race a render from it.
+        restart_stepca_openbao_agent();
+        reconcile_ca_json_dns_names(&secrets_dir, &stepca_dns_names, messages).await?;
+    }
 
     if step_ca_result == super::super::types::StepCaInitResult::Initialized
         || stepca_dns_names_changed
@@ -543,14 +572,6 @@ async fn run_init_inner(
         ];
         run_docker(&up_args, "docker compose up -d step-ca (exposed)", messages)?;
     }
-    let stepca_templates = write_stepca_templates(
-        &secrets_dir,
-        &args.openbao.kv_mount,
-        &args.cert_duration,
-        &args.stepca_provisioner,
-        messages,
-    )
-    .await?;
     let compose_has_responder = compose_has_responder(&args.compose.compose_file, messages)?;
     let responder_tls_enabled =
         compose_has_responder && has_http01_admin_bind_intent(&StateFile::default_path())?;

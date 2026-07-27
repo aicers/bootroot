@@ -142,9 +142,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     rewrite parses and re-serialises the document, so `db`, every
     provisioner entry and any unmodelled key survive untouched, and the
     root and intermediate keys are never rewritten: previously issued
-    certificates and distributed CA bundles stay valid. The
-    reconciliation runs before `templates/ca.json.ctmpl` is generated,
-    so an OpenBao-Agent render cannot regress the name set.
+    certificates and distributed CA bundles stay valid.
+  - The repair also covers the step-ca OpenBao Agent sidecar, which
+    re-renders `ca.json` from `templates/ca.json.ctmpl` every render
+    interval and would otherwise put the pre-repair name set straight
+    back. `init` stamps the derived names into the regenerated template
+    (rather than inheriting whatever `ca.json` holds at that moment,
+    which a render may already have clobbered), restarts the sidecar so
+    it loads that template, and only then re-asserts the on-disk
+    `dnsNames`. Without this the SAN set looked correct for a few
+    seconds and step-ca dropped the address SAN again on its next
+    restart.
   - Reconciliation works in both directions: with no bind intent
     recorded — including after a loopback reinstall clears a previous
     one — `dnsNames` comes back to exactly `localhost`, `bootroot-ca`

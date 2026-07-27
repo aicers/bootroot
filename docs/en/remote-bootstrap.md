@@ -629,7 +629,11 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
     restarts step-ca so it re-issues its serving certificate from the
     updated configuration. `step ca init` is not re-run and the root and
     intermediate keys are untouched, so every previously issued
-    certificate and every distributed CA bundle stays valid.
+    certificate and every distributed CA bundle stays valid. `init` also
+    regenerates `templates/ca.json.ctmpl` and restarts the
+    `bootroot-openbao-agent-stepca` sidecar onto it, because that
+    sidecar re-renders `ca.json` on a fixed interval and would otherwise
+    restore the pre-repair name set within seconds.
 - Re-running `infra install` without `--stepca-bind` clears the stored
     intent, removes the override, and reverts to the loopback publish.
     The next `bootroot init` reconciles `dnsNames` back to exactly the

@@ -607,7 +607,12 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
     새 이름 세트로 조정하고 step-ca를 재시작하여 갱신된 설정으로 서빙
     인증서를 다시 발급하게 합니다. `step ca init`은 다시 실행되지 않고
     루트·중간 키도 손대지 않으므로, 기존에 발급된 인증서와 배포된 CA
-    번들은 모두 유효한 상태로 유지됩니다.
+    번들은 모두 유효한 상태로 유지됩니다. 또한 `init`은
+    `templates/ca.json.ctmpl`을 다시 생성하고
+    `bootroot-openbao-agent-stepca` 사이드카를 재시작하여 새 템플릿을
+    읽게 합니다. 이 사이드카는 일정 주기마다 `ca.json`을 다시
+    렌더링하므로, 그렇게 하지 않으면 몇 초 만에 이전 이름 세트가
+    되돌아옵니다.
 - `--stepca-bind` 없이 `infra install`을 다시 실행하면 저장된 의도가
     삭제되고 오버라이드가 제거되어 루프백 게시로 되돌아갑니다. 이후
     `bootroot init`은 `dnsNames`를 정확히 기본 이름 세 개로 되돌립니다.

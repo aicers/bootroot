@@ -17,9 +17,10 @@ use super::super::constants::openbao_constants::{
 };
 use super::super::constants::{
     CA_BUNDLE_FILENAME, CA_CERTS_DIR, OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME,
-    OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR, OPENBAO_AGENT_RESPONDER_DIR,
-    OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME, OPENBAO_AGENT_SECRET_ID_NAME,
-    OPENBAO_AGENT_STEPCA_DIR, OPENBAO_AGENT_STEPCA_SERVICE,
+    OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR, OPENBAO_AGENT_RESPONDER_CONTAINER_NAME,
+    OPENBAO_AGENT_RESPONDER_DIR, OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME,
+    OPENBAO_AGENT_SECRET_ID_NAME, OPENBAO_AGENT_STEPCA_CONTAINER_NAME, OPENBAO_AGENT_STEPCA_DIR,
+    OPENBAO_AGENT_STEPCA_SERVICE,
 };
 use super::super::paths::{
     OpenBaoAgentPaths, StepCaTemplatePaths, compose_has_openbao, resolve_openbao_agent_addr,
@@ -860,7 +861,7 @@ async fn write_openbao_agent_compose_override(
 services:
   {stepca_service}:
     image: {agent_image}
-    container_name: bootroot-openbao-agent-stepca
+    container_name: {stepca_container}
     user: "{user}"
     restart: always
     command: ["agent", "-config=/openbao/secrets/openbao/stepca/agent.hcl"]
@@ -870,7 +871,7 @@ services:
       - {secrets_path}:/openbao/secrets
   {responder_service}:
     image: {agent_image}
-    container_name: bootroot-openbao-agent-responder
+    container_name: {responder_container}
     user: "{user}"
     restart: always
     command: ["agent", "-config=/openbao/secrets/openbao/responder/agent.hcl"]
@@ -881,6 +882,8 @@ services:
 "#,
         stepca_service = OPENBAO_AGENT_STEPCA_SERVICE,
         responder_service = OPENBAO_AGENT_RESPONDER_SERVICE,
+        stepca_container = OPENBAO_AGENT_STEPCA_CONTAINER_NAME,
+        responder_container = OPENBAO_AGENT_RESPONDER_CONTAINER_NAME,
         agent_image = OPENBAO_AGENT_IMAGE,
         depends_on = depends_on,
         openbao_addr = openbao_addr,
@@ -991,7 +994,7 @@ mod tests {
 
         let messages = test_messages();
         let stepca_templates =
-            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &messages)
+            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &[], &messages)
                 .await
                 .unwrap();
         let responder_paths =
@@ -1067,7 +1070,7 @@ mod tests {
 
         let messages = test_messages();
         let stepca_templates =
-            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &messages)
+            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &[], &messages)
                 .await
                 .unwrap();
         let responder_paths =
