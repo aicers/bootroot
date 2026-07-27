@@ -201,6 +201,27 @@ bootroot service add --service-name <name> --delivery-mode remote-bootstrap ...
 - 시스템 trust 또는 `trust.ca_bundle_path`가 올바른지 확인
 - 임시 진단 용도로만 `bootroot-agent --insecure` 사용 (운영 비권장)
 
+### `rotate infra-cert`가 `permission denied`로 실패 (이전 빌드)
+
+`bootroot rotate infra-cert`가 `bootroot-http01`은 갱신한 뒤
+`openbao`에서 `open /output/server.key: permission denied`로 실패한다면,
+`init` 실행 이후 배포의 `secrets/` 디렉터리 소유자가 바뀐 것입니다.
+OpenBao TLS 인증서는 `secrets/`의 소유자로 실행되는 `step` 컨테이너가
+기록하지만, 출력 디렉터리 `<compose-dir>/openbao/tls`는 `secrets/`의
+*형제* 경로이므로 secrets 트리와 함께 옮겨가지 않고 `init`이 실행되던
+uid를 그대로 유지합니다.
+
+이슈 #739 수정이 포함된 빌드로 업그레이드하십시오. 이제 모든 발급은 인증서를
+기록하기 전에 `<compose-dir>/openbao/tls`를 확인된 `secrets/` 소유자로
+chown합니다. 이전 빌드에서는 디렉터리를 직접 다시 소유시킨 뒤 회전을
+재실행하십시오.
+
+```bash
+sudo chown -R -h "$(stat -c '%u:%g' /path/to/secrets)" \
+  /path/to/compose-dir/openbao/tls
+bootroot rotate infra-cert --yes
+```
+
 ### 발급 직후 호환성 자동 강화 실패
 
 ## 회전 후 FD 비동기 문제 (이슈 #614)
