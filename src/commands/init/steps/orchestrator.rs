@@ -1409,14 +1409,25 @@ mod tests {
     use super::super::test_support::{default_init_args, test_messages};
     use super::*;
 
-    fn plan_with(password: bool, ca_json: bool, state: bool) -> InitPlan {
+    /// Every pre-flight condition an `InitPlan` can carry, so
+    /// `plan_with(ALL_ARTIFACTS)` reads as "all three files exist".
+    const ALL_ARTIFACTS: &[PreflightPrompt] = &[
+        PreflightPrompt::OverwritePassword,
+        PreflightPrompt::OverwriteCaJson,
+        PreflightPrompt::OverwriteState,
+    ];
+
+    /// Builds a plan whose overwrite conditions hold for exactly the
+    /// artifacts in `existing`, naming each condition rather than
+    /// relying on the reader to track positional booleans.
+    fn plan_with(existing: &[PreflightPrompt]) -> InitPlan {
         InitPlan {
             openbao_url: "http://localhost:8200".to_string(),
             kv_mount: "secret".to_string(),
             secrets_dir: std::path::PathBuf::from("secrets"),
-            overwrite_password: password,
-            overwrite_ca_json: ca_json,
-            overwrite_state: state,
+            overwrite_password: existing.contains(&PreflightPrompt::OverwritePassword),
+            overwrite_ca_json: existing.contains(&PreflightPrompt::OverwriteCaJson),
+            overwrite_state: existing.contains(&PreflightPrompt::OverwriteState),
         }
     }
 
@@ -1425,7 +1436,7 @@ mod tests {
     #[test]
     fn preflight_prompts_asks_nothing_when_no_condition_holds() {
         let args = default_init_args();
-        assert!(preflight_prompts(&args, &plan_with(false, false, false)).is_empty());
+        assert!(preflight_prompts(&args, &plan_with(&[])).is_empty());
 
         // Closes #735: a flag whose condition does not hold is a silent
         // no-op, not an error and not a behaviour change.
@@ -1434,7 +1445,7 @@ mod tests {
         args.overwrite_ca_json = true;
         args.overwrite_state = true;
         args.confirm_db_provision = true;
-        assert!(preflight_prompts(&args, &plan_with(false, false, false)).is_empty());
+        assert!(preflight_prompts(&args, &plan_with(&[])).is_empty());
     }
 
     /// Every condition holds and no flag answers it: all four prompts
@@ -1444,7 +1455,7 @@ mod tests {
         let mut args = default_init_args();
         args.enable.push(InitFeature::DbProvision);
         assert_eq!(
-            preflight_prompts(&args, &plan_with(true, true, true)),
+            preflight_prompts(&args, &plan_with(ALL_ARTIFACTS)),
             vec![
                 PreflightPrompt::OverwritePassword,
                 PreflightPrompt::OverwriteCaJson,
@@ -1458,7 +1469,7 @@ mod tests {
     /// caller that sets one still gets asked about the other three.
     #[test]
     fn preflight_prompts_flags_suppress_only_their_own_prompt() {
-        let plan = plan_with(true, true, true);
+        let plan = plan_with(ALL_ARTIFACTS);
         let all = [
             PreflightPrompt::OverwritePassword,
             PreflightPrompt::OverwriteCaJson,
@@ -1496,7 +1507,7 @@ mod tests {
         args.overwrite_state = true;
         args.confirm_db_provision = true;
         assert!(
-            preflight_prompts(&args, &plan_with(true, true, true)).is_empty(),
+            preflight_prompts(&args, &plan_with(ALL_ARTIFACTS)).is_empty(),
             "all four flags together must leave no prompt to read from stdin"
         );
     }
@@ -1506,7 +1517,7 @@ mod tests {
     /// not answer any overwrite prompt.
     #[test]
     fn preflight_prompts_overwrite_and_db_provision_flags_stay_disjoint() {
-        let plan = plan_with(true, true, true);
+        let plan = plan_with(ALL_ARTIFACTS);
 
         let mut args = default_init_args();
         args.enable.push(InitFeature::DbProvision);
@@ -1537,7 +1548,7 @@ mod tests {
     /// file: `--confirm-db-provision` alone never enables it.
     #[test]
     fn preflight_prompts_db_provision_follows_the_feature() {
-        let plan = plan_with(false, false, false);
+        let plan = plan_with(&[]);
 
         let args = default_init_args();
         assert!(preflight_prompts(&args, &plan).is_empty());
@@ -1560,7 +1571,7 @@ mod tests {
         let mut args = default_init_args();
         args.enable.push(InitFeature::DbProvision);
         args.reinit_mode = true;
-        assert!(preflight_prompts(&args, &plan_with(true, true, true)).is_empty());
+        assert!(preflight_prompts(&args, &plan_with(ALL_ARTIFACTS)).is_empty());
     }
 
     /// Each prompt renders its own message, so the loop in
