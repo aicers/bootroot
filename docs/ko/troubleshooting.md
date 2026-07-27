@@ -222,6 +222,16 @@ sudo chown -R -h "$(stat -c '%u:%g' /path/to/secrets)" \
 bootroot rotate infra-cert --yes
 ```
 
+수정이 포함된 빌드에서는 발급이 `Refusing to use a symlink as the
+OpenBao TLS output directory`로 중단될 수 있습니다. 이는
+`<compose-dir>/openbao/tls`가 실제 디렉터리가 아니라 심볼릭 링크라는
+뜻입니다. bootroot는 이 경로를 링크로 만들지 않으며, 마운트 원본
+경로가 최종 구성요소까지 해석되어 root chown과 인증서 기록이 모두 링크
+대상 안에서 일어나게 되므로 이를 거부합니다. 링크를 실제 디렉터리로
+교체한 뒤(대상에 현재 사용 중인 `server.{crt,key}`가 있다면 함께
+옮깁니다) 다시 실행하십시오. `openbao/tls`보다 *상위* 경로의 심볼릭
+링크는 문제가 없으며 기존과 동일하게 해석됩니다.
+
 ### 발급 직후 호환성 자동 강화 실패
 
 ## 회전 후 FD 비동기 문제 (이슈 #614)

@@ -516,6 +516,7 @@ pub(crate) struct Strings {
     pub(crate) info_openbao_hcl_tls_written: &'static str,
     pub(crate) info_openbao_hcl_tls_reverted: &'static str,
     pub(crate) error_openbao_tls_provision_failed: &'static str,
+    pub(crate) error_openbao_tls_output_dir_symlink: &'static str,
     pub(crate) error_openbao_hcl_write_failed: &'static str,
     pub(crate) info_http01_admin_tls_reverted: &'static str,
     pub(crate) info_http01_admin_tls_provisioned: &'static str,

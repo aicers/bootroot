@@ -42,6 +42,7 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
     let secrets_mount = format!("{}:/home/step", mount_root.display());
 
     let tls_dir = compose_dir.join("openbao").join("tls");
+    reject_symlinked_tls_output_dir(&tls_dir, messages)?;
     std::fs::create_dir_all(&tls_dir)
         .with_context(|| messages.error_write_file_failed(&tls_dir.display().to_string()))?;
     let tls_mount_root = std::fs::canonicalize(&tls_dir)
@@ -108,6 +109,37 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
         messages.info_openbao_tls_provisioned(&cert_path.display().to_string())
     );
     Ok(())
+}
+
+/// Refuses to proceed when `openbao/tls` is itself a symlink.
+///
+/// The bind-mount source is produced with `std::fs::canonicalize`, which
+/// resolves the final component too, so a symlink planted at
+/// `<compose_dir>/openbao/tls` would make both containers act on the link
+/// target instead: the root helper would `chown -R` that target, and
+/// `step certificate create` would write `server.{crt,key}` into it.
+/// `--no-dereference` guards links found *inside* the mounted tree; it
+/// cannot guard a mount root that was already resolved elsewhere.
+/// bootroot only ever creates this path with `create_dir_all`, so a
+/// symlink here is never a shape it produces, and refusing it keeps the
+/// mount pinned to `openbao/tls` itself while still allowing legitimate
+/// symlinks anywhere above it (a symlinked state directory, `/var` on
+/// macOS) to resolve as before.
+fn reject_symlinked_tls_output_dir(tls_dir: &Path, messages: &Messages) -> Result<()> {
+    // `symlink_metadata` does not follow the final component; a missing
+    // path is the normal first-issuance case and is left to
+    // `create_dir_all`.
+    match std::fs::symlink_metadata(tls_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!(
+                messages.error_openbao_tls_output_dir_symlink(&tls_dir.display().to_string())
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| messages.error_resolve_path_failed(&tls_dir.display().to_string())),
+    }
 }
 
 /// Builds the `docker run` argv for the TLS output-directory chown.
@@ -784,6 +816,57 @@ exit {exit_code}
             !log.contains("certificate create"),
             "the certificate write must not run after a failed chown, got: {log}"
         );
+    }
+
+    /// `canonicalize` resolves the final component, so a symlink at
+    /// `openbao/tls` would silently relocate the bind-mount source: the
+    /// root helper would `chown -R` the link target and `step certificate
+    /// create` would write the key into it, both outside the directory
+    /// the mount is supposed to be pinned to.  `--no-dereference` only
+    /// covers links *inside* the mount, so the path itself has to be
+    /// refused before anything is mounted.
+    #[test]
+    fn issue_openbao_tls_cert_refuses_a_symlinked_output_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).unwrap();
+        write_appending_fake_docker(&bin_dir.join("docker"), 0);
+
+        let compose_dir = dir.path().join("compose");
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).unwrap();
+
+        // Somewhere a chown -R must never reach.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let tls_dir = compose_dir.join("openbao").join("tls");
+        fs::create_dir_all(tls_dir.parent().expect("openbao dir")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &tls_dir).unwrap();
+
+        let args_log = dir.path().join("docker_args.log");
+        let messages = crate::i18n::test_messages();
+
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
+
+        let error =
+            issue_openbao_tls_cert(&compose_dir, &secrets_dir, &["openbao.internal"], &messages)
+                .expect_err("a symlinked output directory must fail the issuance");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains(&tls_dir.display().to_string()),
+            "the error must name the refused path, got: {chain}"
+        );
+
+        // No container ran at all: neither the chown nor the write.
+        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        assert!(
+            log.trim().is_empty(),
+            "nothing may be mounted for a symlinked output directory, got: {log}"
+        );
+        // The symlink target is untouched.
+        assert!(elsewhere.read_dir().unwrap().next().is_none());
     }
 
     #[test]

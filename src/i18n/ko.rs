@@ -505,6 +505,7 @@ pub(super) static STRINGS: Strings = Strings {
     info_openbao_hcl_tls_written: "TLS 구성으로 OpenBao HCL이 업데이트되었습니다",
     info_openbao_hcl_tls_reverted: "OpenBao HCL이 평문으로 복원되었습니다 (TLS 비활성화)",
     error_openbao_tls_provision_failed: "OpenBao TLS 서버 인증서 발급에 실패했습니다",
+    error_openbao_tls_output_dir_symlink: "OpenBao TLS 출력 디렉터리가 심볼릭 링크이므로 사용을 거부합니다: {path}",
     error_openbao_hcl_write_failed: "OpenBao HCL 구성 파일 작성에 실패했습니다",
     info_http01_admin_tls_reverted: "응답기 구성이 평문으로 복원되었습니다 (다음 init까지 TLS 비활성화)",
     info_http01_admin_tls_provisioned: "HTTP-01 관리자 API TLS 서버 인증서 발급됨: {path}",

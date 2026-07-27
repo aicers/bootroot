@@ -531,6 +531,13 @@ impl Messages {
         self.strings().error_openbao_tls_provision_failed
     }
 
+    pub(crate) fn error_openbao_tls_output_dir_symlink(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_openbao_tls_output_dir_symlink,
+            &[("path", path)],
+        )
+    }
+
     pub(crate) fn error_openbao_hcl_write_failed(&self) -> &'static str {
         self.strings().error_openbao_hcl_write_failed
     }

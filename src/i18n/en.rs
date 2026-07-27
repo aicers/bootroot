@@ -505,6 +505,7 @@ pub(super) static STRINGS: Strings = Strings {
     info_openbao_hcl_tls_written: "OpenBao HCL updated with TLS configuration",
     info_openbao_hcl_tls_reverted: "OpenBao HCL restored to plaintext (TLS disabled)",
     error_openbao_tls_provision_failed: "Failed to issue OpenBao TLS server certificate",
+    error_openbao_tls_output_dir_symlink: "Refusing to use a symlink as the OpenBao TLS output directory: {path}",
     error_openbao_hcl_write_failed: "Failed to write OpenBao HCL configuration",
     info_http01_admin_tls_reverted: "Responder config restored to plaintext (TLS disabled until next init)",
     info_http01_admin_tls_provisioned: "HTTP-01 admin API TLS server certificate issued: {path}",

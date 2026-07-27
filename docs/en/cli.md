@@ -1795,7 +1795,13 @@ Behavior:
     The container mounts only that directory, runs `chown -R
     --no-dereference`, and reuses the same `smallstep/step-ca` image as
     the certificate write, so it introduces no new image and is a no-op
-    when ownership is already correct. Both files are then
+    when ownership is already correct. If `<compose-dir>/openbao/tls`
+    is itself a symlink, the issuance is refused before anything is
+    mounted (`Refusing to use a symlink as the OpenBao TLS output
+    directory`): the mount source is resolved, so a link there would
+    move both the chown and the certificate write onto its target.
+    bootroot only ever creates that path as a real directory; symlinks
+    anywhere above it resolve as before. Both files are then
     `chmod 0644`'d so the in-container `openbao` user (which is in
     neither the runner's primary group nor any shared group) can
     read them via the "other" permission bits.

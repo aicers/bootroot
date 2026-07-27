@@ -134,7 +134,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   no new image or pull is introduced, and the chown is a no-op when
   ownership is already correct. Both `init` and `rotate infra-cert`
   reach the same code path, so a first issuance on a root-owned tree
-  behaves exactly as before.
+  behaves exactly as before. A symlink planted at
+  `<compose-dir>/openbao/tls` itself is refused before anything is
+  mounted: the bind-mount source is resolved to its final component, so
+  a link there would relocate both the root chown and the certificate
+  write onto its target, which `--no-dereference` (which only covers
+  links found *inside* the mount) cannot prevent.
 - Fixed `bootroot init` recording an `https://` OpenBao URL against a
   listener that was still serving plaintext (#737). The OpenBao TLS
   transition rewrote `openbao/openbao.hcl` and then brought the

@@ -225,6 +225,16 @@ sudo chown -R -h "$(stat -c '%u:%g' /path/to/secrets)" \
 bootroot rotate infra-cert --yes
 ```
 
+On a fixed build the issuance can instead stop with `Refusing to use a
+symlink as the OpenBao TLS output directory`. That means
+`<compose-dir>/openbao/tls` is a symlink rather than a real directory.
+bootroot never creates it that way, and it refuses to act on one because
+the bind-mount source is resolved to its final component, which would
+put both the root chown and the certificate write inside the link's
+target. Replace the link with a real directory (moving its contents if
+the target holds the live `server.{crt,key}`) and rerun. Symlinks
+anywhere *above* `openbao/tls` are fine and resolve as before.
+
 ## Silent rotation FD desync (issue #614)
 
 After `bootroot rotate ca-key` or `bootroot rotate force-reissue`,
