@@ -58,6 +58,13 @@ pub(crate) fn stepca_san_script_path() -> PathBuf {
         .join("run-stepca-san.sh")
 }
 
+pub(crate) fn openbao_tls_no_delta_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("impl")
+        .join("run-openbao-tls-no-delta.sh")
+}
+
 pub(crate) fn baseline_scenario_path(file_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

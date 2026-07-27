@@ -60,6 +60,15 @@ pub(crate) struct Strings {
     pub(crate) error_rn_cidrs_clear_on_add: &'static str,
     pub(crate) prompt_openbao_unseal_from_file_confirm: &'static str,
     pub(crate) error_openbao_unseal_file_empty: &'static str,
+    pub(crate) openbao_unseal_source_in_memory: &'static str,
+    pub(crate) openbao_unseal_source_prompt: &'static str,
+    pub(crate) init_openbao_tls_recreate: &'static str,
+    pub(crate) init_openbao_tls_verified: &'static str,
+    pub(crate) init_openbao_already_unsealed: &'static str,
+    pub(crate) init_openbao_unseal_from_source: &'static str,
+    pub(crate) error_openbao_tls_probe_failed: &'static str,
+    pub(crate) error_openbao_unseal_source_unavailable: &'static str,
+    pub(crate) error_openbao_unseal_source_still_sealed: &'static str,
     pub(crate) prompt_unseal_threshold: &'static str,
     pub(crate) prompt_unseal_key: &'static str,
     pub(crate) prompt_stepca_password: &'static str,
@@ -706,6 +715,55 @@ mod tests {
             // The two must not read alike: they send an operator to the
             // container and its published port versus the URL and the HMAC.
             assert_ne!(unreachable, rejected);
+        }
+    }
+
+    /// The `OpenBao` TLS-transition messages (#737) are what an operator
+    /// gets when `init` refuses to record an HTTPS URL, and each one
+    /// carries the single value that makes it actionable — the probed
+    /// URL, the key file, the key source.  A misspelled placeholder in
+    /// one locale would ship a literal `{url}` and drop exactly that.
+    #[test]
+    fn openbao_tls_transition_templates_substitute_in_every_locale() {
+        const URL: &str = "https://172.17.0.1:8200";
+        const KEYS_PATH: &str = "/srv/bootroot/secrets/openbao/unseal-keys.txt";
+        const SOURCE: &str = "/srv/bootroot/keys/shares.txt";
+
+        for locale in ["en", "ko"] {
+            let messages = Messages::new(locale).unwrap();
+
+            let cases = [
+                (messages.init_openbao_tls_verified(URL), URL),
+                (messages.error_openbao_tls_probe_failed(URL), URL),
+                (
+                    messages.error_openbao_unseal_source_unavailable(KEYS_PATH),
+                    KEYS_PATH,
+                ),
+                (messages.init_openbao_unseal_from_source(SOURCE), SOURCE),
+                (
+                    messages.error_openbao_unseal_source_still_sealed(SOURCE),
+                    SOURCE,
+                ),
+            ];
+
+            for (rendered, value) in &cases {
+                assert!(
+                    rendered.contains(value),
+                    "{locale} message dropped {value:?}: {rendered}"
+                );
+                assert!(
+                    !rendered.contains('{'),
+                    "{locale} left an unsubstituted placeholder: {rendered}"
+                );
+            }
+
+            // The missing-source error is the one that has to name every
+            // way of supplying keys, not just the default file.
+            let unavailable = messages.error_openbao_unseal_source_unavailable(KEYS_PATH);
+            assert!(
+                unavailable.contains("--openbao-unseal-from-file"),
+                "{locale} missing-source error does not name the flag: {unavailable}"
+            );
         }
     }
 }

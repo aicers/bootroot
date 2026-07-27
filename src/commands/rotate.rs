@@ -258,6 +258,12 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
     Ok(RotateOutcome::Completed)
 }
 
+/// Shared test harness for commands that shell out to `docker`.
+///
+/// The fake-`docker` script and the environment scoping around it are
+/// `pub(in crate::commands)` rather than `pub(super)` because the
+/// `OpenBao` TLS transition in `init` asserts on the docker argv it
+/// emits with the same harness.
 #[cfg(test)]
 pub(super) mod test_support {
     use std::env;
@@ -269,16 +275,16 @@ pub(super) mod test_support {
     pub(super) use crate::i18n::test_messages;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-    pub(super) const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
+    pub(in crate::commands) const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
     pub(super) const TEST_DOCKER_EXIT_ENV: &str = "BOOTROOT_TEST_DOCKER_EXIT";
 
-    pub(super) struct ScopedEnvVar {
+    pub(in crate::commands) struct ScopedEnvVar {
         key: &'static str,
         previous: Option<OsString>,
     }
 
     impl ScopedEnvVar {
-        pub(super) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        pub(in crate::commands) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
             let previous = env::var_os(key);
             // SAFETY: Tests hold ENV_LOCK while mutating process environment.
             unsafe {
@@ -301,13 +307,13 @@ pub(super) mod test_support {
         }
     }
 
-    pub(super) fn env_lock() -> MutexGuard<'static, ()> {
+    pub(in crate::commands) fn env_lock() -> MutexGuard<'static, ()> {
         ENV_LOCK
             .lock()
             .expect("environment lock must not be poisoned")
     }
 
-    pub(super) fn write_fake_docker_script(path: &Path) {
+    pub(in crate::commands) fn write_fake_docker_script(path: &Path) {
         let script = r#"#!/bin/sh
 set -eu
 printf '%s\n' "$@" > "${BOOTROOT_TEST_DOCKER_ARGS:?missing log path}"
@@ -328,7 +334,7 @@ exit 0
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    pub(super) fn path_with_prepend(bin_dir: &Path) -> OsString {
+    pub(in crate::commands) fn path_with_prepend(bin_dir: &Path) -> OsString {
         let mut paths = vec![bin_dir.to_path_buf()];
         if let Some(existing) = env::var_os("PATH") {
             paths.extend(env::split_paths(&existing));

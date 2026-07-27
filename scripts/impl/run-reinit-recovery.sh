@@ -238,62 +238,33 @@ wait_for_openbao_listening() {
   fail "OpenBao did not become reachable at $url"
 }
 
-# Unseals via `docker exec` against the in-container CLI so the helper
-# does not depend on the host-published port being routable.  The
-# `--openbao-bind` flow publishes OpenBao on a non-loopback host IP
-# (docker0 gateway by default), and CI runners have occasionally
-# proven unreliable about reaching that host IP between port
-# rebinds during `init`'s TLS recreate.  Talking to OpenBao from
-# inside the container sidesteps that flake entirely.
-unseal_openbao_from_summary() {
-  local container="${OPENBAO_CONTAINER_NAME}"
-  # Wait for the OpenBao API inside the container to become responsive
-  # before submitting unseal keys.  `init`'s TLS recreate leaves the
-  # container Started before the OpenBao process is fully listening.
-  # `bao status` exits 0 when unsealed and 2 when sealed-but-reachable;
-  # both states mean the listener is up and the unseal call is safe.
-  local probe_attempt
-  for probe_attempt in $(seq 1 "$OPENBAO_READY_ATTEMPTS"); do
-    local probe_rc=0
-    docker exec -e BAO_ADDR="https://127.0.0.1:8200" \
-      -e BAO_SKIP_VERIFY=true "$container" \
-      bao status -format=json >/dev/null 2>&1 || probe_rc=$?
-    if [ "$probe_rc" = "0" ] || [ "$probe_rc" = "2" ]; then
-      break
-    fi
-    sleep "$OPENBAO_READY_DELAY_SECS"
-  done
-  # `bootroot init` always uses Shamir threshold=2; the summary JSON
-  # does not record the threshold so feed the first two keys.
-  local threshold=2
-  local i
-  for i in $(seq 0 $((threshold - 1))); do
-    local key
-    key="$(jq -r ".unseal_keys[$i] // empty" "$INIT_SUMMARY_JSON")"
-    [ -n "$key" ] || fail "missing unseal key $i in $INIT_SUMMARY_JSON"
-    if ! docker exec -e BAO_ADDR="https://127.0.0.1:8200" \
-        -e BAO_SKIP_VERIFY=true "$container" \
-        bao operator unseal "$key" >/dev/null 2>>"$RUN_LOG"; then
-      fail "bao operator unseal failed (key $i)"
-    fi
-  done
-  local attempt
-  for attempt in $(seq 1 "$OPENBAO_READY_ATTEMPTS"); do
-    # `bao status` exits 0 when unsealed, 2 when sealed-but-reachable.
-    # Use the exit code directly: jq's `//` alternative operator treats
-    # boolean `false` as nullish, so `.sealed // "true"` would return
-    # "true" for both sealed and unsealed states and the loop would
-    # never break.
-    local status_rc=0
-    docker exec -e BAO_ADDR="https://127.0.0.1:8200" \
-      -e BAO_SKIP_VERIFY=true "$container" \
-      bao status -format=json >/dev/null 2>&1 || status_rc=$?
-    if [ "$status_rc" = "0" ]; then
-      return 0
-    fi
-    sleep "$OPENBAO_READY_DELAY_SECS"
-  done
-  fail "OpenBao did not unseal within timeout via docker exec"
+# Asserts that `bootroot init` left the vault unsealed (#737).
+#
+# `init`'s TLS post-processing recreates the OpenBao container, which
+# brings the Shamir-sealed vault back sealed, so `init` owns the unseal
+# that follows.  This harness used to replay the summary's unseal keys
+# by hand here; it asserts instead, because a sealed vault at this point
+# is exactly the bug — the next `bootroot` command would fail AppRole
+# login with "Vault is sealed".
+#
+# Queried via `docker exec` against the in-container CLI so the
+# assertion does not depend on the host-published non-loopback port
+# being routable from the runner, and so a host networking blip cannot
+# be mistaken for a sealed vault.  `bao status` exits 0 when unsealed
+# and 2 when sealed-but-reachable.
+assert_openbao_unsealed_after_init() {
+  local status_rc=0
+  docker exec -e BAO_ADDR="https://127.0.0.1:8200" \
+    -e BAO_SKIP_VERIFY=true "$OPENBAO_CONTAINER_NAME" \
+    bao status -format=json >"$ARTIFACT_DIR/openbao-status-post-init.json" 2>>"$RUN_LOG" \
+    || status_rc=$?
+  if [ "$status_rc" != "0" ]; then
+    {
+      echo "bao status after init (rc=${status_rc}):"
+      cat "$ARTIFACT_DIR/openbao-status-post-init.json" || true
+    } >>"$RUN_LOG"
+    fail "OpenBao is not unsealed after init returned (bao status rc=${status_rc}); init must unseal after the TLS recreate"
+  fi
 }
 
 wait_for_postgres_admin() {
@@ -498,14 +469,11 @@ run_bootstrap_init() {
   [ -n "$RUNTIME_SERVICE_ADD_ROLE_ID" ] || fail "failed to parse runtime_service_add role_id"
   [ -n "$RUNTIME_SERVICE_ADD_SECRET_ID" ] || fail "failed to parse runtime_service_add secret_id"
 
-  # The TLS post-processing step recreates the OpenBao container, which
-  # comes back sealed; `init` does not auto-unseal afterwards.  Without
-  # this `service add` would fail with "Vault is sealed" on AppRole
-  # login.  Replay the unseal keys captured in the bootstrap summary.
-  # Talks to OpenBao via `docker exec` so the unseal does not race
-  # against the host-side port publish coming back up after the
-  # recreate.
-  unseal_openbao_from_summary
+  # `init` recreates the OpenBao container for the TLS transition and
+  # unseals it again before returning (#737), so `service add` below
+  # must work with no manual unseal step.  Assert that contract here
+  # rather than papering over a sealed vault.
+  assert_openbao_unsealed_after_init
 
   # `service add` connects to OpenBao via state.openbao_url, which
   # `bootroot init` set to `https://${OPENBAO_BIND_ADDR}`.  Make sure

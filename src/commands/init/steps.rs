@@ -3,6 +3,7 @@ mod database;
 pub(crate) mod http01_admin_tls;
 mod openbao_setup;
 pub(crate) mod openbao_tls;
+mod openbao_transition;
 mod orchestrator;
 mod prompts;
 mod responder_setup;
@@ -69,6 +70,15 @@ pub(super) struct InitRollback {
     /// one in memory.
     pub(super) stepca_agent_restarted: bool,
     pub(super) hcl_backup: Option<RollbackFile>,
+    /// Whether this run recreated the `OpenBao` container to load the
+    /// TLS listener configuration.  Rollback recreates it from the base
+    /// compose file only when this run did, so a failure *before* the
+    /// recreate — the unseal-key availability pre-check is the one that
+    /// can fire there — leaves the running process untouched.  The
+    /// rewritten `openbao.hcl` is a bind-mounted file the process has
+    /// not read at that point, and restoring it above is enough to undo
+    /// the run.
+    pub(super) openbao_recreated: bool,
     pub(super) tls_artifacts: Vec<PathBuf>,
     pub(super) compose_file: Option<PathBuf>,
     /// Responder config backup for rolling back TLS-enabled config.
@@ -111,7 +121,7 @@ impl InitRollback {
                 eprintln!("Rollback: failed to remove {}: {err}", artifact.display());
             }
         }
-        if self.hcl_backup.is_some()
+        if self.openbao_recreated
             && let Some(compose_file) = &self.compose_file
         {
             // Use `up -d` (not `restart`) so Docker Compose recreates
@@ -121,6 +131,11 @@ impl InitRollback {
             // preserves port bindings from the applied override, which
             // would leave OpenBao on plaintext HTTP at a non-loopback
             // address.
+            //
+            // Gated on this run having recreated the container: the
+            // forward path can fail before that (no unseal key source is
+            // available), and tearing down a container this run never
+            // touched would knock a healthy deployment offline.
             let args = rollback_openbao_docker_args(compose_file);
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             if let Err(err) = crate::commands::infra::run_docker(
@@ -674,6 +689,61 @@ mod rollback_tests {
         assert!(
             args.iter().any(|a| a.ends_with("agent.override.yml")),
             "rollback must pass the agent override so its services are defined: {args:?}"
+        );
+    }
+
+    /// Regression (#737): rollback must not recreate the `OpenBao`
+    /// container when this run never did.  The unseal-key availability
+    /// pre-check runs after the HCL rewrite but before the recreate, so
+    /// a run that fails there has only touched a bind-mounted file the
+    /// process has not read — recreating would knock a healthy
+    /// deployment into a sealed state for nothing.
+    #[test]
+    fn rollback_skips_openbao_recreate_when_this_run_did_not_recreate() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        use crate::commands::rotate::test_support::{
+            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
+            write_fake_docker_script,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+
+        let hcl_path = dir.path().join("openbao.hcl");
+        fs::write(&hcl_path, "tls_cert_file = ...\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
+
+        let rollback = InitRollback {
+            hcl_backup: Some(RollbackFile {
+                path: hcl_path.clone(),
+                original: Some("tls_disable = 1\n".to_string()),
+            }),
+            compose_file: Some(PathBuf::from("docker-compose.yml")),
+            openbao_recreated: false,
+            ..Default::default()
+        };
+
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        runtime.block_on(rollback.rollback(&client, "secret", &messages));
+
+        assert_eq!(
+            fs::read_to_string(&hcl_path).unwrap(),
+            "tls_disable = 1\n",
+            "the plaintext HCL must still be restored"
+        );
+        assert!(
+            !args_log.exists(),
+            "rollback must not run docker against a container this run never recreated"
         );
     }
 

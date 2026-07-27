@@ -1051,7 +1051,7 @@ fn resolve_effective_secrets_dir(state_path: &Path, compose_dir: &Path) -> Optio
 /// step-ca on the non-loopback TLS path.  Falls back to
 /// [`OpenBaoClient::new`] for the plaintext-loopback / fresh-install
 /// path where no bundle exists yet.
-fn build_openbao_client(
+pub(crate) fn build_openbao_client(
     openbao_url: &str,
     secrets_dir: Option<&Path>,
     messages: &Messages,
@@ -1076,16 +1076,36 @@ fn build_openbao_client(
 /// `UnknownIssuer` when the trust bundle is wrong) rather than a
 /// generic "API never became reachable" message.
 async fn wait_for_openbao_api_reachable(client: &OpenBaoClient, messages: &Messages) -> Result<()> {
-    for attempt in 0..OPENBAO_API_WAIT_ATTEMPTS {
+    wait_for_openbao_api_reachable_within(
+        client,
+        OPENBAO_API_WAIT_ATTEMPTS,
+        OPENBAO_API_WAIT_DELAY,
+        messages,
+    )
+    .await
+}
+
+/// [`wait_for_openbao_api_reachable`] with an explicit budget.
+///
+/// The `OpenBao` TLS transition in `init` polls the same endpoint but
+/// needs its own bound so the probe stays diagnosable in tests.
+pub(crate) async fn wait_for_openbao_api_reachable_within(
+    client: &OpenBaoClient,
+    attempts: u32,
+    delay: Duration,
+    messages: &Messages,
+) -> Result<()> {
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
         match client.seal_status().await {
             Ok(_) => return Ok(()),
             Err(err) => {
-                if attempt + 1 == OPENBAO_API_WAIT_ATTEMPTS {
+                if attempt + 1 == attempts {
                     return Err(err).with_context(|| messages.error_openbao_seal_status_failed());
                 }
             }
         }
-        tokio::time::sleep(OPENBAO_API_WAIT_DELAY).await;
+        tokio::time::sleep(delay).await;
     }
     unreachable!("loop above returns on every iteration")
 }

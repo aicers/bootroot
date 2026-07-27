@@ -21,6 +21,7 @@ Runs the same Docker E2E matrix steps used in CI:
 5) rotation/recovery full matrix
 6) reinit recovery
 7) step-ca certificate SANs
+8) OpenBao TLS transition with no compose delta
 
 Options:
   --skip-hosts  Skip hosts steps (useful when sudo -n is unavailable locally)
@@ -169,6 +170,13 @@ SECRETS_DIR="$ROOT_DIR/secrets" \
 BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 "$ROOT_DIR/scripts/impl/run-stepca-san.sh"
 
+echo "[ci-local-e2e] run OpenBao TLS no-delta (issue #737)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-openbao-tls-no-delta-${RUN_ID}" \
+COMPOSE_PROJECT_NAME="bootroot-e2e-ci-openbao-tls-no-delta-${RUN_ID}" \
+SECRETS_DIR="$ROOT_DIR/secrets" \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+"$ROOT_DIR/scripts/impl/run-openbao-tls-no-delta.sh"
+
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}"
@@ -178,3 +186,4 @@ echo "  - $ROOT_DIR/tmp/e2e/ci-remote-hosts-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-rotation-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-reinit-recovery-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-stepca-san-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-openbao-tls-no-delta-${RUN_ID}"

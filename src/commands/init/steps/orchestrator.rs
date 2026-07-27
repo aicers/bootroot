@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -26,6 +27,7 @@ use super::openbao_tls::{
     build_openbao_tls_sans, issue_openbao_tls_cert, record_openbao_infra_cert,
     write_openbao_hcl_with_tls,
 };
+use super::openbao_transition::{OpenBaoTlsTransition, UnsealKeyInputs};
 use super::prompts::{confirm_overwrite, should_confirm};
 use super::responder_setup::{
     apply_responder_compose_override, verify_responder, write_responder_compose_override,
@@ -55,6 +57,7 @@ use crate::commands::init::{
     HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
     OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_KEY_PATH, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
 };
+use crate::commands::openbao_unseal::unseal_keys_path;
 use crate::commands::openbao_url::effective_openbao_url;
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -860,28 +863,57 @@ async fn run_init_inner(
         validate_openbao_override_scope(&override_path, messages)?;
         validate_openbao_override_binding(&override_path, &bind_addr, messages)?;
         validate_openbao_tls(compose_dir, &args.secrets_dir.secrets_dir, messages)?;
-        let compose_str = args.compose.compose_file.to_string_lossy();
-        let override_str = override_path.to_string_lossy();
-        let up_args = [
-            "compose",
-            "-f",
-            &*compose_str,
-            "-f",
-            &*override_str,
-            "up",
-            "-d",
-            "openbao",
-        ];
-        run_docker(&up_args, "docker compose up -d openbao", messages)?;
 
-        // Persist the CN-side HTTPS URL and infra_certs entry now
-        // that TLS is validated and the non-loopback override is
-        // applied.  Always derive from bind_addr (which maps
-        // wildcards to loopback via `client_url_from_bind_addr`)
-        // so that local commands (auto-unseal, service, rotate)
-        // never depend on the external advertise address being
-        // hairpin-reachable.  The advertise address is consumed
-        // separately by remote bootstrap artifact generation.
+        // The URL that is about to be recorded, and therefore the URL
+        // the listener has to answer on.  Always derived from bind_addr
+        // (which maps wildcards to loopback via
+        // `client_url_from_bind_addr`) so that local commands
+        // (auto-unseal, service, rotate) never depend on the external
+        // advertise address being hairpin-reachable.  The advertise
+        // address is consumed separately by remote bootstrap artifact
+        // generation.
+        let https_url = client_url_from_bind_addr(&bind_addr);
+
+        // Recreate OpenBao onto the rewritten HCL, confirm the listener
+        // really answers over TLS at that URL, and unseal it.  All three
+        // are one unit: `openbao.hcl` is bind-mounted, so a plain
+        // `up -d` reloads nothing unless the compose configuration
+        // changed; the recreate that does reload it brings the
+        // Shamir-sealed vault back sealed; and only a TLS request to the
+        // live listener proves the transition actually happened
+        // (issue #737).
+        //
+        // `rollback.openbao_recreated` is flipped from inside the
+        // transition, at the moment the recreate is dispatched: a
+        // failure in the probe or the unseal must roll the container
+        // back to the base compose file, while a failure in the
+        // availability pre-check — which runs before any Docker call —
+        // must leave the running OpenBao alone.
+        let transition = OpenBaoTlsTransition::new(
+            &args.compose.compose_file,
+            &override_path,
+            &https_url,
+            &args.secrets_dir.secrets_dir,
+        );
+        transition
+            .run(
+                &UnsealKeyInputs {
+                    in_memory: &bootstrap.unseal_keys,
+                    explicit_file: args.openbao_unseal_from_file.as_deref(),
+                    default_file: unseal_keys_path(&args.secrets_dir.secrets_dir),
+                    interactive: std::io::stdin().is_terminal(),
+                },
+                &mut rollback.openbao_recreated,
+                messages,
+            )
+            .await?;
+
+        // Persist the CN-side HTTPS URL and infra_certs entry now that
+        // the live listener has answered an OpenBao API request over
+        // TLS at exactly this URL and the vault is unsealed.  A
+        // listener still serving plaintext never reaches this line: the
+        // probe above fails and the run rolls back on the plaintext URL
+        // `write_state_file` already recorded.
         //
         // Snapshot the pre-TLS `state.json` (still the plaintext URL,
         // no infra cert entries) before persisting the HTTPS URL, so
@@ -896,7 +928,7 @@ async fn run_init_inner(
                 None
             },
         });
-        state.openbao_url = client_url_from_bind_addr(&bind_addr);
+        state.openbao_url = https_url;
         state
             .save(&state_path)
             .with_context(|| messages.error_serialize_state_failed())?;
