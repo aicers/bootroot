@@ -210,12 +210,58 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
   Overrides `POSTGRES_HOST_PORT` from `.env` and the process
   environment. When unset, the published default is **5433** so
   bootroot does not claim the conventional 5432 out of the box.
+- `--openbao-host-port <N>`: host-side OpenBao published port.
+  Overrides `OPENBAO_HOST_PORT` from `.env` and the process
+  environment. Default **8200**.
+- `--stepca-host-port <N>`: host-side step-ca published port.
+  Overrides `STEPCA_HOST_PORT` from `.env` and the process
+  environment. Default **9000**.
+- `--http01-admin-host-port <N>`: host-side HTTP-01 responder admin API
+  published port. Overrides `HTTP01_ADMIN_HOST_PORT` from `.env` and the
+  process environment. Default **8080**.
+
+#### Host-side published ports
+
+All four core services publish through a compose interpolation
+(`${OPENBAO_HOST_PORT:-8200}`, `${STEPCA_HOST_PORT:-9000}`,
+`${HTTP01_ADMIN_HOST_PORT:-8080}`, `${POSTGRES_HOST_PORT:-5433}`), so
+two bootroot instances can share a host. Each value is resolved with the
+same precedence Docker Compose applies: the flag, else the process
+environment, else `<compose-dir>/.env`, else the compile-time default.
+An unparseable value falls through to the next source. A flag that is
+supplied is upserted into `<compose-dir>/.env` and injected into the
+`docker compose` subprocesses, so it wins over an inherited shell
+variable.
+
+Only the host-side port number is configurable. The publication stays
+loopback-only (`127.0.0.1:`); non-loopback publication remains the job
+of `--openbao-bind` / `--stepca-bind` / `--http01-admin-bind`, which
+carry their own port for the override files they write. The two are
+independent and may both be supplied. Container names in the shipped
+compose files are still fixed, so a second instance on the same host
+needs its own compose file for those.
+
+A non-default OpenBao host port is picked up automatically: `bootroot
+init`, `bootroot status`, `bootroot reinit`, and `infra install`'s own
+`state.json` writes derive the OpenBao URL from it whenever
+`--openbao-url` is left at its default `http://localhost:8200`. An
+explicitly supplied `--openbao-url` is always used verbatim, and a
+recorded non-loopback OpenBao bind intent still wins over the host port
+during `reinit`. `rotate` and `service` read `state.openbao_url`, so
+they follow once `init` has recorded it.
+
+step-ca and HTTP-01 client URLs are **not** derived from their host
+ports. A deployment running step-ca or the responder on a non-default
+host port must pass `--responder-url`, `--agent-server` and
+`--agent-responder-url` explicitly.
 
 Before invoking `docker compose up`, `infra install` runs a TCP bind
 preflight on every host-side port the active compose stack publishes
-(`PostgreSQL`, `OpenBao`, `step-ca`, `bootroot-http01`). On collision
+(`PostgreSQL`, `OpenBao`, `step-ca`, `bootroot-http01`), using the
+resolved port for each — not the compose default. On collision
 it aborts with the busy port, a best-effort PID/command hint via
-`lsof`, and the recommended remediation, instead of leaving earlier
+`lsof`, and the recommended remediation naming both the `.env`
+variable and the flag, instead of leaving earlier
 services running while a later one fails to bind (#588 §4). The
 preflight always checks the localhost ports because `infra install`
 runs `docker compose up` against the base compose file only —

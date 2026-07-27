@@ -7,9 +7,19 @@ environment may differ.
 ## Prerequisites
 
 - Docker/Docker Compose installed
-- Ports 80/443/8200/9000/5433/8080 available (host-side `PostgreSQL`
-  publishes on 5433 by default; override with `POSTGRES_HOST_PORT` or
-  `bootroot infra install --postgres-host-port <N>`)
+- Ports 80/443/8200/9000/5433/8080 available. Every core service's
+  host-side port is overridable, so this list is the default rather
+  than a requirement: `OPENBAO_HOST_PORT` /
+  `--openbao-host-port` (8200), `STEPCA_HOST_PORT` /
+  `--stepca-host-port` (9000), `POSTGRES_HOST_PORT` /
+  `--postgres-host-port` (5433) and `HTTP01_ADMIN_HOST_PORT` /
+  `--http01-admin-host-port` (8080), each set in `<compose-dir>/.env`,
+  in the process environment, or on `bootroot infra install`. Ports
+  80/443 belong to the ACME HTTP-01 challenge and are not part of this
+  set. A non-default OpenBao host port is picked up automatically by
+  `init`, `status` and `reinit`; step-ca and HTTP-01 client URLs are
+  not derived and need `--responder-url` / `--agent-server` /
+  `--agent-responder-url`
 
 The Docker daemon should be configured to **start on reboot**. bootroot's
 containers use restart policies, but Docker itself must be managed by the OS

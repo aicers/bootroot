@@ -7,9 +7,19 @@
 ## 사전 준비
 
 - Docker/Docker Compose 설치
-- 80/443/8200/9000/5433/8080 포트 사용 가능 (호스트 측 `PostgreSQL`은
-  기본값 5433을 사용합니다. `POSTGRES_HOST_PORT` 또는
-  `bootroot infra install --postgres-host-port <N>`로 재정의 가능)
+- 80/443/8200/9000/5433/8080 포트 사용 가능. 핵심 서비스의 호스트 측
+  포트는 모두 재정의할 수 있으므로 이 목록은 요구 사항이 아니라
+  기본값입니다. `OPENBAO_HOST_PORT` / `--openbao-host-port`(8200),
+  `STEPCA_HOST_PORT` / `--stepca-host-port`(9000),
+  `POSTGRES_HOST_PORT` / `--postgres-host-port`(5433),
+  `HTTP01_ADMIN_HOST_PORT` / `--http01-admin-host-port`(8080)을
+  `<compose-dir>/.env`, 프로세스 환경 변수, 또는
+  `bootroot infra install` 플래그로 지정하면 됩니다. 80/443은 ACME
+  HTTP-01 챌린지용이며 이 목록과 별개입니다. 기본값이 아닌 OpenBao
+  호스트 포트는 `init`, `status`, `reinit`이 자동으로 반영합니다.
+  step-ca와 HTTP-01 클라이언트 URL은 유도되지 않으므로
+  `--responder-url` / `--agent-server` / `--agent-responder-url`을
+  직접 지정해야 합니다
 
 Docker 데몬은 **재부팅 시 자동 시작**되도록 설정되어 있어야 합니다.
 bootroot가 제공하는 컨테이너들은 `restart` 정책으로 자동 재기동되지만,

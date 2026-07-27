@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -37,6 +38,7 @@ use super::stepca_setup::{
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
+use crate::commands::compose_file::compose_file_dir;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::guardrails::{
     client_url_from_bind_addr, ensure_all_services_localhost_binding, validate_http01_admin_tls,
@@ -52,10 +54,40 @@ use crate::commands::init::{
     HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
     OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_KEY_PATH, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
 };
+use crate::commands::openbao_url::effective_openbao_url;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
+/// Returns `args` with `openbao_url` rewritten to the endpoint the
+/// configured `OpenBao` host port publishes, borrowing them unchanged
+/// when the CLI value already names it.
+///
+/// Only the port is derived: `infra install` resets `OpenBao` to
+/// plaintext loopback even when a non-loopback bind intent is recorded,
+/// and `run_init_inner`'s own bind-intent-gated branch takes over once
+/// the TLS certificate has been issued.
+fn args_with_effective_openbao_url(args: &InitArgs) -> Cow<'_, InitArgs> {
+    let compose_dir = compose_file_dir(&args.compose.compose_file);
+    let url = effective_openbao_url(&args.openbao.openbao_url, &compose_dir, None);
+    if url == args.openbao.openbao_url {
+        return Cow::Borrowed(args);
+    }
+    let mut resolved = args.clone();
+    resolved.openbao.openbao_url = url;
+    Cow::Owned(resolved)
+}
+
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
+    // Point the whole init flow at the OpenBao host port the compose
+    // stack actually publishes.  The first client below is built before
+    // any `state.json` value is consulted, so without this a second
+    // bootroot instance on the same host would health-check — and then
+    // initialise against — the first instance's OpenBao.  An
+    // operator-supplied `--openbao-url` is left untouched, as is the
+    // later bind-intent-gated rewrite in `run_init_inner`.
+    let resolved = args_with_effective_openbao_url(args);
+    let args = resolved.as_ref();
+
     if let Some(warning) = validate_secret_id_ttl(&args.secret_id_ttl, messages)? {
         eprintln!("{warning}");
     }
@@ -1304,6 +1336,43 @@ mod tests {
         assert!(
             msg.contains("--root-token") && msg.contains("--openbao-only"),
             "diagnostic must name the recovery options, got: {msg}"
+        );
+    }
+
+    /// Closes #731: `init` builds its first `OpenBaoClient` before any
+    /// `state.json` value is consulted, so the CLI default has to pick
+    /// up a non-default `OPENBAO_HOST_PORT` from the compose
+    /// directory's `.env`.  Without this a second bootroot instance on
+    /// the same host would initialise against the first one's `OpenBao`.
+    #[test]
+    fn init_args_follow_the_configured_openbao_host_port() {
+        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").expect("write .env");
+        let mut args = default_init_args();
+        args.compose.compose_file = dir.path().join("docker-compose.yml");
+        let resolved = args_with_effective_openbao_url(&args);
+        assert_eq!(resolved.openbao.openbao_url, "http://localhost:18200");
+    }
+
+    /// Closes #731: an operator-supplied `--openbao-url` is used
+    /// verbatim, and the unchanged case borrows instead of cloning.
+    #[test]
+    fn init_args_keep_an_explicit_openbao_url() {
+        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").expect("write .env");
+        let mut args = default_init_args();
+        args.compose.compose_file = dir.path().join("docker-compose.yml");
+        args.openbao.openbao_url = "https://openbao.internal:8200".to_string();
+        let resolved = args_with_effective_openbao_url(&args);
+        assert_eq!(
+            resolved.openbao.openbao_url,
+            "https://openbao.internal:8200"
+        );
+        assert!(
+            matches!(resolved, Cow::Borrowed(_)),
+            "an unchanged URL must not clone the args"
         );
     }
 

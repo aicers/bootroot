@@ -206,12 +206,58 @@ bootroot infra up
   `.env`의 `POSTGRES_HOST_PORT`와 프로세스 환경 변수보다 우선합니다.
   미지정 시 게시 기본값은 **5433**으로, 통상적인 5432 포트는
   운영자 측 애플리케이션 DB가 사용할 수 있도록 비워 둡니다.
+- `--openbao-host-port <N>`: 호스트 측 OpenBao 게시 포트입니다.
+  `.env`의 `OPENBAO_HOST_PORT`와 프로세스 환경 변수보다 우선합니다.
+  기본값은 **8200**입니다.
+- `--stepca-host-port <N>`: 호스트 측 step-ca 게시 포트입니다.
+  `.env`의 `STEPCA_HOST_PORT`와 프로세스 환경 변수보다 우선합니다.
+  기본값은 **9000**입니다.
+- `--http01-admin-host-port <N>`: 호스트 측 HTTP-01 응답기 admin API
+  게시 포트입니다. `.env`의 `HTTP01_ADMIN_HOST_PORT`와 프로세스 환경
+  변수보다 우선합니다. 기본값은 **8080**입니다.
+
+#### 호스트 측 게시 포트
+
+네 개의 핵심 서비스는 모두 compose 보간
+(`${OPENBAO_HOST_PORT:-8200}`, `${STEPCA_HOST_PORT:-9000}`,
+`${HTTP01_ADMIN_HOST_PORT:-8080}`, `${POSTGRES_HOST_PORT:-5433}`)을
+통해 포트를 게시하므로, 두 개의 bootroot 인스턴스가 한 호스트를
+공유할 수 있습니다. 각 값은 Docker Compose와 동일한 우선순위로
+결정됩니다. 플래그 → 프로세스 환경 변수 → `<compose-dir>/.env` →
+컴파일 시 기본값 순이며, 파싱할 수 없는 값은 다음 소스로 넘어갑니다.
+플래그를 지정하면 그 값이 `<compose-dir>/.env`에 upsert되고
+`docker compose` 하위 프로세스 환경에도 주입되므로, 셸에서 상속된
+변수보다 우선합니다.
+
+설정 가능한 것은 호스트 측 포트 번호뿐입니다. 게시는 계속
+루프백 전용(`127.0.0.1:`)이며, 비루프백 게시는 여전히
+`--openbao-bind` / `--stepca-bind` / `--http01-admin-bind`의 역할로,
+이들 플래그는 자신이 작성하는 override 파일용 포트를 따로 지닙니다.
+두 계열은 독립적이므로 함께 지정할 수 있습니다. 배포되는 compose
+파일의 컨테이너 이름은 여전히 고정되어 있으므로, 같은 호스트의 두
+번째 인스턴스는 자체 compose 파일이 필요합니다.
+
+기본값이 아닌 OpenBao 호스트 포트는 자동으로 반영됩니다.
+`--openbao-url`을 기본값 `http://localhost:8200` 그대로 두면
+`bootroot init`, `bootroot status`, `bootroot reinit`, 그리고
+`infra install`이 기록하는 `state.json`이 모두 그 포트로 OpenBao URL을
+유도합니다. 명시적으로 지정한 `--openbao-url`은 항상 그대로 사용되며,
+`reinit`에서는 기록된 비루프백 OpenBao 바인드 의도가 호스트 포트보다
+우선합니다. `rotate`와 `service`는 `state.openbao_url`을 읽으므로
+`init`이 값을 기록하면 자동으로 따라갑니다.
+
+step-ca와 HTTP-01 클라이언트 URL은 호스트 포트에서 유도되지
+**않습니다**. step-ca나 응답기를 기본값이 아닌 호스트 포트로 실행하는
+배포에서는 `--responder-url`, `--agent-server`,
+`--agent-responder-url`을 명시적으로 전달해야 합니다.
 
 `docker compose up` 호출 전, `infra install`은 활성 compose
 스택이 게시하는 모든 호스트 측 포트(`PostgreSQL`, `OpenBao`,
 `step-ca`, `bootroot-http01`)에 대해 TCP 바인드 사전 점검을
-수행합니다. 충돌 시 사용 중인 포트와 `lsof` 기반의 PID/명령
-힌트, 권장 조치를 표시한 뒤 즉시 중단되어, 일부 서비스가 바인드에
+수행합니다. 이때 compose 기본값이 아니라 각 서비스의 결정된
+포트를 검사합니다. 충돌 시 사용 중인 포트와 `lsof` 기반의 PID/명령
+힌트, 그리고 `.env` 변수와 플래그를 모두 안내하는 권장 조치를
+표시한 뒤 즉시 중단되어, 일부 서비스가 바인드에
 실패한 채 다른 서비스만 실행되는 부분 상태를 방지합니다(#588 §4).
 `infra install`은 베이스 compose 파일로만 `docker compose up`을
 호출하므로(즉, `--openbao-bind` / `--http01-admin-bind` /

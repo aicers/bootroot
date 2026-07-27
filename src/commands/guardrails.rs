@@ -1392,6 +1392,44 @@ mod tests {
         assert!(!is_single_host_db_host("10.0.0.15"));
     }
 
+    /// Closes #731: the shipped compose files publish their core
+    /// services through `${*_HOST_PORT:-<default>}` interpolations.  The
+    /// loopback guardrail keys off the `127.0.0.1:` prefix, which the
+    /// interpolation leaves in place, so both files must still pass.
+    #[test]
+    fn shipped_compose_files_pass_the_localhost_binding_guardrail() {
+        let messages = crate::i18n::test_messages();
+        for name in ["docker-compose.yml", "docker-compose.deploy.yml"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            ensure_all_services_localhost_binding(&path, &messages)
+                .unwrap_or_else(|err| panic!("{name} must pass the guardrail: {err}"));
+        }
+    }
+
+    /// Closes #731: interpolating the host port must not weaken the
+    /// guardrail — a non-loopback publication is still rejected for each
+    /// guarded service.
+    #[test]
+    fn interpolated_host_port_without_loopback_prefix_is_still_unsafe() {
+        for (service, mapping) in [
+            ("postgres:", "${POSTGRES_HOST_PORT:-5433}:5432"),
+            ("openbao:", "0.0.0.0:${OPENBAO_HOST_PORT:-8200}:8200"),
+            (
+                "bootroot-http01:",
+                "0.0.0.0:${HTTP01_ADMIN_HOST_PORT:-8080}:8080",
+            ),
+        ] {
+            let name = service.trim_end_matches(':');
+            let compose = format!(
+                "services:\n  {name}:\n    image: example\n    ports:\n      - \"{mapping}\"\n"
+            );
+            assert!(
+                has_unsafe_port_binding_for_service(&compose, service),
+                "{mapping} must still be rejected for {service}"
+            );
+        }
+    }
+
     #[test]
     fn has_unsafe_postgres_port_binding_accepts_localhost_bind() {
         let compose = r#"

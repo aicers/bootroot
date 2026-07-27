@@ -21,7 +21,7 @@ services:
     container_name: bootroot-openbao
     restart: always
     ports:
-      - "127.0.0.1:8200:8200"
+      - "127.0.0.1:${OPENBAO_HOST_PORT:-8200}:8200"
     expose:
       - "9101"
     volumes:
@@ -65,7 +65,7 @@ services:
     depends_on:
       - postgres
     ports:
-      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000"
     expose:
       - "9102"
     # The official image ships a HEALTHCHECK that runs `step ca health`
@@ -89,7 +89,7 @@ services:
     container_name: bootroot-http01
     restart: always
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${HTTP01_ADMIN_HOST_PORT:-8080}:8080"
     volumes:
       - ./responder.toml.compose:/app/responder.toml:ro
     command:

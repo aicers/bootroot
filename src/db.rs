@@ -164,7 +164,7 @@ pub fn for_host_runtime_with_port(dsn: &str, port: u16) -> Result<String> {
 }
 
 /// Resolves the host-side `PostgreSQL` port with the same precedence Docker
-/// Compose uses for `${POSTGRES_HOST_PORT:-5432}` in the compose file port
+/// Compose uses for `${POSTGRES_HOST_PORT:-5433}` in the compose file port
 /// mapping:
 ///
 /// 1. process environment `POSTGRES_HOST_PORT` (non-empty), else
@@ -174,48 +174,16 @@ pub fn for_host_runtime_with_port(dsn: &str, port: u16) -> Result<String> {
 /// A present-but-unparseable value falls through to the next source rather
 /// than erroring — the caller is translating a DSN, not validating the
 /// environment.
+///
+/// Thin wrapper over the shared resolver in [`crate::host_port`], which the
+/// other core services use through their own resolvers.
 #[must_use]
 pub fn resolve_postgres_host_port(compose_dir: &Path) -> u16 {
-    if let Ok(value) = std::env::var(POSTGRES_HOST_PORT_ENV)
-        && !value.is_empty()
-        && let Ok(port) = value.parse::<u16>()
-    {
-        return port;
-    }
-    if let Some(port) = read_env_file_value(compose_dir, POSTGRES_HOST_PORT_ENV)
-        .and_then(|value| value.parse::<u16>().ok())
-    {
-        return port;
-    }
-    DEFAULT_POSTGRES_HOST_PORT
-}
-
-fn read_env_file_value(compose_dir: &Path, key: &str) -> Option<String> {
-    let contents = std::fs::read_to_string(compose_dir.join(".env")).ok()?;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let (k, v) = trimmed.split_once('=')?;
-        if k.trim() != key {
-            continue;
-        }
-        let value = v.trim();
-        let stripped = if value.len() >= 2
-            && ((value.starts_with('"') && value.ends_with('"'))
-                || (value.starts_with('\'') && value.ends_with('\'')))
-        {
-            &value[1..value.len() - 1]
-        } else {
-            value
-        };
-        if stripped.is_empty() {
-            return None;
-        }
-        return Some(stripped.to_string());
-    }
-    None
+    crate::host_port::resolve_host_port(
+        compose_dir,
+        POSTGRES_HOST_PORT_ENV,
+        DEFAULT_POSTGRES_HOST_PORT,
+    )
 }
 
 /// Returns the admin DSN that should be persisted to KV after running

@@ -911,6 +911,27 @@ pub(crate) struct InfraInstallArgs {
     #[arg(long = "postgres-host-port")]
     pub(crate) postgres_host_port: Option<u16>,
 
+    /// Host-side `OpenBao` published port. Overrides `OPENBAO_HOST_PORT`
+    /// from `.env` and the process environment. The publication stays
+    /// loopback-only; only the host-side port number changes.
+    /// When unset, the published default is 8200.
+    #[arg(long = "openbao-host-port")]
+    pub(crate) openbao_host_port: Option<u16>,
+
+    /// Host-side step-ca published port. Overrides `STEPCA_HOST_PORT`
+    /// from `.env` and the process environment. The publication stays
+    /// loopback-only; only the host-side port number changes.
+    /// When unset, the published default is 9000.
+    #[arg(long = "stepca-host-port")]
+    pub(crate) stepca_host_port: Option<u16>,
+
+    /// Host-side HTTP-01 responder admin API published port. Overrides
+    /// `HTTP01_ADMIN_HOST_PORT` from `.env` and the process environment.
+    /// The publication stays loopback-only; only the host-side port
+    /// number changes. When unset, the published default is 8080.
+    #[arg(long = "http01-admin-host-port")]
+    pub(crate) http01_admin_host_port: Option<u16>,
+
     /// Skip building images: run `docker compose up --no-build` so the
     /// already-loaded image is used as-is and the command fails loudly
     /// when a tagged image is absent. The default builds the local
@@ -1027,7 +1048,7 @@ pub(crate) enum InitSkipPhase {
 // exclusivity (`conflicts_with`) and `requires = "summary_json"`
 // constraints that this surface relies on.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub(crate) struct InitArgs {
     #[command(flatten)]
     pub(crate) openbao: OpenBaoArgs,
