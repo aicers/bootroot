@@ -206,6 +206,21 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
   `openbao_url` remains at the install-time loopback URL
   until `bootroot init` rewrites it to the bind-derived
   HTTPS URL after TLS validation.
+- `--stepca-bind <IP>:<port>`: publish step-ca's ACME directory on a
+  non-loopback address for multi-host deployments (optional). Records
+  `stepca_bind_addr` in state and generates a compose override at
+  `secrets/step-ca/docker-compose.stepca-exposed.yml`. The override is
+  **not** applied during `infra install`; `bootroot init` and `infra up`
+  apply it. Default remains `127.0.0.1:9000`. There is no
+  `--stepca-tls-required` companion — step-ca's ACME directory always
+  terminates TLS. The address also becomes a SAN on step-ca's own
+  certificate; see below.
+- `--stepca-bind-wildcard`: required confirmation flag when
+  `--stepca-bind` uses a wildcard address (`0.0.0.0` or `[::]`).
+- `--stepca-advertise-addr <IP>:<port>`: required when `--stepca-bind`
+  uses a wildcard address. Records the routable ACME directory address
+  in `state.json` as `stepca_advertise_addr`. Must be a specific IP,
+  and is rejected alongside a specific (non-wildcard) bind.
 - `--postgres-host-port <N>`: host-side `PostgreSQL` published port.
   Overrides `POSTGRES_HOST_PORT` from `.env` and the process
   environment. When unset, the published default is **5433** so
@@ -268,6 +283,29 @@ runs `docker compose up` against the base compose file only —
 `--openbao-bind` / `--http01-admin-bind` / `--stepca-bind` write
 override files for `infra up` / `init` but are not layered into the
 install-time `up`.
+
+#### step-ca certificate SANs
+
+`--stepca-bind` and `--stepca-advertise-addr` do more than move the
+publish: `bootroot init` derives step-ca's own serving-certificate name
+set from them. The set is always the three defaults (`localhost`,
+`bootroot-ca`, `stepca.internal`) plus the bind address's IP, plus the
+advertise address's IP when one is recorded. A wildcard bind
+contributes `127.0.0.1` (and `::1` for `[::]` / `[::0]`) rather than
+the wildcard itself, and no name is ever emitted twice. IP entries land
+in the certificate as `IP Address` SANs, so an off-host consumer can
+verify `https://<IP>:9000/acme/acme/directory` against the distributed
+CA bundle without a hostname override.
+
+Changing the bind on an installed system requires re-running `bootroot
+init` to take effect. `infra install` only records the intent; the
+following `init` reconciles `secrets/config/ca.json`'s top-level
+`dnsNames` to the derived set — in both directions, so clearing the
+intent restores exactly the three default names — and restarts step-ca
+so it re-issues its serving certificate from the updated configuration.
+`step ca init` is not re-run and `secrets/secrets/root_ca_key` /
+`secrets/secrets/intermediate_ca_key` are untouched, so previously
+issued certificates and distributed CA bundles stay valid.
 
 ### Outputs
 

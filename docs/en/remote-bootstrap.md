@@ -609,8 +609,31 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 - Unlike the OpenBao and HTTP-01 admin flags there is no
     `--stepca-tls-required` acknowledgement: step-ca's ACME directory
     always terminates TLS with the step-ca certificate.
+- **Both addresses become SANs on step-ca's own certificate.**
+    `bootroot init` derives step-ca's `dnsNames` from the recorded
+    intent: the three defaults (`localhost`, `bootroot-ca`,
+    `stepca.internal`) plus the bind address's IP, plus the advertise
+    address's IP when one is recorded. A wildcard bind contributes
+    `127.0.0.1` (and `::1` for `[::]` / `[::0]`) instead of the
+    wildcard itself. IP entries land in the certificate as `IP Address`
+    SANs, so an off-host consumer can verify
+    `https://<IP>:9000/acme/acme/directory` against the distributed CA
+    bundle without a hostname override. Without this, TLS verification
+    fails at the published address and off-host certificate issuance
+    cannot complete even though the bind, the trust anchor, the routing
+    and the HTTP-01 responder are all correct.
+- **Changing the bind on an installed system requires re-running
+    `bootroot init` to take effect.** `infra install --stepca-bind`
+    only records the intent; the following `init` reconciles
+    `secrets/config/ca.json`'s `dnsNames` to the new name set and
+    restarts step-ca so it re-issues its serving certificate from the
+    updated configuration. `step ca init` is not re-run and the root and
+    intermediate keys are untouched, so every previously issued
+    certificate and every distributed CA bundle stays valid.
 - Re-running `infra install` without `--stepca-bind` clears the stored
     intent, removes the override, and reverts to the loopback publish.
+    The next `bootroot init` reconciles `dnsNames` back to exactly the
+    three default names.
 - The flag manages the bundled step-ca service only. `infra install`
     rejects `--stepca-bind` when the compose file declares no `step-ca`
     service (e.g. an external-CA topology), mirroring the

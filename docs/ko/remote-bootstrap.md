@@ -590,8 +590,27 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 - OpenBao / HTTP-01 관리자 플래그와 달리 `--stepca-tls-required`
     확인 플래그는 없습니다. step-ca의 ACME 디렉터리는 항상 step-ca
     인증서로 TLS를 종단하기 때문입니다.
+- **두 주소는 step-ca 자체 인증서의 SAN이 됩니다.** `bootroot init`은
+    기록된 의도로부터 step-ca의 `dnsNames`를 유도합니다. 기본 이름 세
+    개(`localhost`, `bootroot-ca`, `stepca.internal`)에 바인드 주소의
+    IP를 더하고, advertise 주소가 기록되어 있으면 그 IP도 더합니다.
+    와일드카드 바인드는 와일드카드 자체 대신 `127.0.0.1`(그리고 `[::]`
+    / `[::0]`의 경우 `::1`)을 제공합니다. IP 항목은 인증서에
+    `IP Address` SAN으로 기록되므로, 호스트 외부 소비자가 배포된 CA
+    번들만으로 `https://<IP>:9000/acme/acme/directory`를 호스트 이름
+    우회 없이 검증할 수 있습니다. 이 처리가 없으면 게시된 주소에서 TLS
+    검증이 실패하여, 바인드·신뢰 앵커·라우팅·HTTP-01 응답기가 모두
+    정상이어도 호스트 외부 인증서 발급을 완료할 수 없습니다.
+- **이미 설치된 시스템에서 바인드를 변경하려면 `bootroot init`을 다시
+    실행해야 반영됩니다.** `infra install --stepca-bind`는 의도만
+    기록하며, 뒤따르는 `init`이 `secrets/config/ca.json`의 `dnsNames`를
+    새 이름 세트로 조정하고 step-ca를 재시작하여 갱신된 설정으로 서빙
+    인증서를 다시 발급하게 합니다. `step ca init`은 다시 실행되지 않고
+    루트·중간 키도 손대지 않으므로, 기존에 발급된 인증서와 배포된 CA
+    번들은 모두 유효한 상태로 유지됩니다.
 - `--stepca-bind` 없이 `infra install`을 다시 실행하면 저장된 의도가
-    삭제되고 오버라이드가 제거되어 루프백 게시로 되돌아갑니다.
+    삭제되고 오버라이드가 제거되어 루프백 게시로 되돌아갑니다. 이후
+    `bootroot init`은 `dnsNames`를 정확히 기본 이름 세 개로 되돌립니다.
 - 이 플래그는 번들 step-ca 서비스만 관리합니다. compose 파일에
     `step-ca` 서비스가 선언되어 있지 않으면(예: 외부 CA 토폴로지)
     `infra install`은 `--http01-admin-bind` 가드와 동일하게

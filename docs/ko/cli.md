@@ -202,6 +202,21 @@ bootroot infra up
   저장됩니다. CN 측 `openbao_url`은 TLS 검증 후
   `bootroot init`이 바인드 주소 기반 HTTPS URL로 다시
   작성할 때까지 설치 시 루프백 URL로 유지됩니다.
+- `--stepca-bind <IP>:<port>`: 다중 호스트 배포를 위해 step-ca의 ACME
+  디렉터리를 비루프백 주소로 게시합니다(선택). `state.json`에
+  `stepca_bind_addr`를 기록하고 compose 오버라이드를
+  `secrets/step-ca/docker-compose.stepca-exposed.yml`에 생성합니다.
+  오버라이드는 `infra install` 시점에는 적용되지 **않고**
+  `bootroot init`과 `infra up`이 적용합니다. 기본값은
+  `127.0.0.1:9000` 그대로입니다. step-ca의 ACME 디렉터리는 항상 TLS를
+  종단하므로 `--stepca-tls-required` 동반 플래그는 없습니다. 이 주소는
+  step-ca 자체 인증서의 SAN이 되기도 합니다(아래 참조).
+- `--stepca-bind-wildcard`: `--stepca-bind`에 와일드카드
+  주소(`0.0.0.0` 또는 `[::]`)를 사용할 때 필요한 확인 플래그입니다.
+- `--stepca-advertise-addr <IP>:<port>`: `--stepca-bind`에 와일드카드
+  주소를 사용할 때 필수입니다. 라우팅 가능한 ACME 디렉터리 주소를
+  `state.json`에 `stepca_advertise_addr`로 기록합니다. 특정 IP여야
+  하며, 와일드카드가 아닌 구체적 바인드와 함께 지정하면 거부됩니다.
 - `--postgres-host-port <N>`: 호스트 측 `PostgreSQL` 게시 포트입니다.
   `.env`의 `POSTGRES_HOST_PORT`와 프로세스 환경 변수보다 우선합니다.
   미지정 시 게시 기본값은 **5433**으로, 통상적인 5432 포트는
@@ -265,6 +280,30 @@ step-ca와 HTTP-01 클라이언트 URL은 호스트 포트에서 유도되지
 파일은 `infra up` / `init` 단계에서만 적용되고 설치 시점에는
 적용되지 않음), 사전 점검은 오버라이드 의도가 기록되어 있어도
 항상 로컬호스트 포트를 검사합니다.
+
+#### step-ca 인증서 SAN
+
+`--stepca-bind`와 `--stepca-advertise-addr`는 게시 위치만 바꾸는 것이
+아닙니다. `bootroot init`이 이 값들로부터 step-ca 자체 서빙 인증서의
+이름 세트를 유도합니다. 세트는 항상 기본 이름 세
+개(`localhost`, `bootroot-ca`, `stepca.internal`)에 바인드 주소의
+IP를 더하고, advertise 주소가 기록되어 있으면 그 IP도 더한 것입니다.
+와일드카드 바인드는 와일드카드 자체 대신 `127.0.0.1`(그리고 `[::]` /
+`[::0]`의 경우 `::1`)을 제공하며, 같은 이름이 중복 기록되는 일은
+없습니다. IP 항목은 인증서에 `IP Address` SAN으로 기록되므로, 호스트
+외부 소비자가 배포된 CA 번들만으로
+`https://<IP>:9000/acme/acme/directory`를 호스트 이름 우회 없이
+검증할 수 있습니다.
+
+이미 설치된 시스템에서 바인드를 변경하려면 `bootroot init`을 다시
+실행해야 반영됩니다. `infra install`은 의도만 기록하며, 뒤따르는
+`init`이 `secrets/config/ca.json`의 최상위 `dnsNames`를 유도된 세트로
+조정하고(양방향으로 조정하므로 의도를 지우면 기본 이름 세 개로
+정확히 복원됩니다) step-ca를 재시작하여 갱신된 설정으로 서빙 인증서를
+다시 발급하게 합니다. `step ca init`은 다시 실행되지 않고
+`secrets/secrets/root_ca_key` / `secrets/secrets/intermediate_ca_key`도
+손대지 않으므로, 기존 발급 인증서와 배포된 CA 번들은 유효한 상태로
+유지됩니다.
 
 ### 출력
 
