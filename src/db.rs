@@ -175,8 +175,8 @@ pub fn for_host_runtime_with_port(dsn: &str, port: u16) -> Result<String> {
 /// than erroring — the caller is translating a DSN, not validating the
 /// environment.
 ///
-/// Thin wrapper over [`crate::host_port::resolve_host_port`], which the
-/// other core services share.
+/// Thin wrapper over the shared resolver in [`crate::host_port`], which the
+/// other core services use through their own resolvers.
 #[must_use]
 pub fn resolve_postgres_host_port(compose_dir: &Path) -> u16 {
     crate::host_port::resolve_host_port(

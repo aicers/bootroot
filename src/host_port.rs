@@ -10,22 +10,25 @@
 
 use std::path::Path;
 
-/// Environment variable that controls `OpenBao`'s host-side published port.
+/// Names the environment variable that controls `OpenBao`'s host-side
+/// published port.
 pub const OPENBAO_HOST_PORT_ENV: &str = "OPENBAO_HOST_PORT";
-/// Fallback `OpenBao` host port when `OPENBAO_HOST_PORT` is unset.
+/// Defines the `OpenBao` host port used when `OPENBAO_HOST_PORT` is unset.
 ///
 /// Matches the published default in `docker-compose.yml`.
 pub const DEFAULT_OPENBAO_HOST_PORT: u16 = 8200;
-/// Environment variable that controls step-ca's host-side published port.
+/// Names the environment variable that controls step-ca's host-side
+/// published port.
 pub const STEPCA_HOST_PORT_ENV: &str = "STEPCA_HOST_PORT";
-/// Fallback step-ca host port when `STEPCA_HOST_PORT` is unset.
+/// Defines the step-ca host port used when `STEPCA_HOST_PORT` is unset.
 ///
 /// Matches the published default in `docker-compose.yml`.
 pub const DEFAULT_STEPCA_HOST_PORT: u16 = 9000;
-/// Environment variable that controls the HTTP-01 responder admin API's
-/// host-side published port.
+/// Names the environment variable that controls the HTTP-01 responder admin
+/// API's host-side published port.
 pub const HTTP01_ADMIN_HOST_PORT_ENV: &str = "HTTP01_ADMIN_HOST_PORT";
-/// Fallback HTTP-01 admin host port when `HTTP01_ADMIN_HOST_PORT` is unset.
+/// Defines the HTTP-01 admin host port used when `HTTP01_ADMIN_HOST_PORT` is
+/// unset.
 ///
 /// Matches the published default in `docker-compose.yml`.
 pub const DEFAULT_HTTP01_ADMIN_HOST_PORT: u16 = 8080;
@@ -40,8 +43,12 @@ pub const DEFAULT_HTTP01_ADMIN_HOST_PORT: u16 = 8080;
 /// A present-but-unparseable value falls through to the next source
 /// rather than erroring — the caller is deriving an endpoint, not
 /// validating the environment.
+///
+/// Crate-internal: the exported surface is the per-service resolvers
+/// below, which pin the `(key, default)` pair to what the compose files
+/// actually interpolate.
 #[must_use]
-pub fn resolve_host_port(compose_dir: &Path, key: &str, default: u16) -> u16 {
+pub(crate) fn resolve_host_port(compose_dir: &Path, key: &str, default: u16) -> u16 {
     if let Ok(value) = std::env::var(key)
         && !value.is_empty()
         && let Ok(port) = value.parse::<u16>()
@@ -56,8 +63,10 @@ pub fn resolve_host_port(compose_dir: &Path, key: &str, default: u16) -> u16 {
     default
 }
 
-/// Resolves the host-side `OpenBao` port.  See [`resolve_host_port`] for
-/// the precedence rules.
+/// Resolves the host-side `OpenBao` port: process environment
+/// [`OPENBAO_HOST_PORT_ENV`] (non-empty), else the same key from
+/// `compose_dir/.env`, else [`DEFAULT_OPENBAO_HOST_PORT`].  An
+/// unparseable value falls through to the next source.
 #[must_use]
 pub fn resolve_openbao_host_port(compose_dir: &Path) -> u16 {
     resolve_host_port(
@@ -67,15 +76,19 @@ pub fn resolve_openbao_host_port(compose_dir: &Path) -> u16 {
     )
 }
 
-/// Resolves the host-side step-ca port.  See [`resolve_host_port`] for
-/// the precedence rules.
+/// Resolves the host-side step-ca port: process environment
+/// [`STEPCA_HOST_PORT_ENV`] (non-empty), else the same key from
+/// `compose_dir/.env`, else [`DEFAULT_STEPCA_HOST_PORT`].  An unparseable
+/// value falls through to the next source.
 #[must_use]
 pub fn resolve_stepca_host_port(compose_dir: &Path) -> u16 {
     resolve_host_port(compose_dir, STEPCA_HOST_PORT_ENV, DEFAULT_STEPCA_HOST_PORT)
 }
 
-/// Resolves the host-side HTTP-01 admin API port.  See
-/// [`resolve_host_port`] for the precedence rules.
+/// Resolves the host-side HTTP-01 admin API port: process environment
+/// [`HTTP01_ADMIN_HOST_PORT_ENV`] (non-empty), else the same key from
+/// `compose_dir/.env`, else [`DEFAULT_HTTP01_ADMIN_HOST_PORT`].  An
+/// unparseable value falls through to the next source.
 #[must_use]
 pub fn resolve_http01_admin_host_port(compose_dir: &Path) -> u16 {
     resolve_host_port(

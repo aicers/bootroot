@@ -823,8 +823,8 @@ fn preflight_host_port(host: &str, port: u16, remediation: &str) -> Result<()> {
     }
 }
 
-/// Host-side published ports of the four core services, each resolved
-/// with the precedence Docker Compose itself applies to the matching
+/// Carries the host-side published ports of the four core services, each
+/// resolved with the precedence Docker Compose itself applies to the matching
 /// `${*_HOST_PORT:-<default>}` interpolation in the compose file: the
 /// `infra install` flag, else the process environment, else
 /// `<compose_dir>/.env`, else the compile-time default.
