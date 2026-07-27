@@ -526,6 +526,35 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   fallback is also suppressed (the keys are already in the summary
   JSON, and echoing would leak them into CI logs). Conflicts with
   `--save-unseal-keys` (#603).
+- `--overwrite-password`: skip the "Overwrite password.txt?" prompt and
+  overwrite the file. Equivalent to answering `y` at the prompt. Silent
+  no-op when `<secrets_dir>/password.txt` does not exist (#735).
+- `--overwrite-ca-json`: skip the "Overwrite ca.json?" prompt and
+  overwrite the file. Equivalent to answering `y` at the prompt. Silent
+  no-op when `<secrets_dir>/config/ca.json` does not exist (#735).
+- `--overwrite-state`: skip the "Overwrite state.json?" prompt and
+  overwrite the file. Equivalent to answering `y` at the prompt. Silent
+  no-op when `state.json` does not exist. Needed by automated installs:
+  `infra install --stepca-bind`/`--openbao-bind` writes `state.json`
+  itself to record the bind intent, so the file `init` asks about is
+  the intent the same run recorded seconds earlier — and deleting it
+  instead would drop the intent that `init` derives step-ca's
+  certificate SANs from (#735).
+- `--confirm-db-provision`: skip the "Provision PostgreSQL
+  role/database?" prompt and provision. Equivalent to answering `y` at
+  the prompt. Does not enable the feature — a silent no-op unless
+  `--enable db-provision` is also passed (#735).
+
+The four flags above are mutually independent: each suppresses exactly
+its own prompt, none implies another, and without them the prompts fire
+as before (an empty or non-`y` answer still cancels the run).
+`--reinit-mode` continues to suppress all four on its own, so
+`reinit --yes` stays non-interactive. Set the flags that apply and
+`init` clears its pre-flight confirmations with stdin closed; the other
+prompts on the run still need their own flags (`--no-eab` or
+`--eab-kid`/`--eab-hmac`, `--save-unseal-keys` or
+`--no-save-unseal-keys`, and `--root-token`/`--unseal-key` where the
+OpenBao state requires them).
 
 If a previous `init` failed mid-flight and rolled back, OpenBao may
 remain initialised in its volume while bootroot has no usable root

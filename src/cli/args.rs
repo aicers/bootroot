@@ -1041,8 +1041,10 @@ pub(crate) enum InitSkipPhase {
 
 // Each boolean flag corresponds to an explicit, per-prompt
 // non-interactive opt-out on the `init` surface (`--no-eab`,
-// `--save-unseal-keys`, `--no-save-unseal-keys`, plus the internal
-// `reinit_mode`).  Per the project pattern (#588 §3b), `init` uses
+// `--save-unseal-keys`, `--no-save-unseal-keys`,
+// `--overwrite-password`, `--overwrite-ca-json`, `--overwrite-state`,
+// `--confirm-db-provision`, plus the internal `reinit_mode`).  Per the
+// project pattern (#588 §3b), `init` uses
 // per-prompt explicit flags rather than a global `--yes`, so refactoring
 // them into a single state enum would obscure the clap-level mutual
 // exclusivity (`conflicts_with`) and `requires = "summary_json"`
@@ -1185,6 +1187,33 @@ pub(crate) struct InitArgs {
         conflicts_with = "save_unseal_keys"
     )]
     pub(crate) no_save_unseal_keys: bool,
+
+    /// Skip the "Overwrite password.txt?" prompt and overwrite the file.
+    /// Equivalent to answering `y` at that prompt.  No-op when
+    /// `<secrets_dir>/password.txt` does not exist.
+    #[arg(long = "overwrite-password")]
+    pub(crate) overwrite_password: bool,
+
+    /// Skip the "Overwrite ca.json?" prompt and overwrite the file.
+    /// Equivalent to answering `y` at that prompt.  No-op when
+    /// `<secrets_dir>/config/ca.json` does not exist.
+    #[arg(long = "overwrite-ca-json")]
+    pub(crate) overwrite_ca_json: bool,
+
+    /// Skip the "Overwrite state.json?" prompt and overwrite the file.
+    /// Equivalent to answering `y` at that prompt.  No-op when
+    /// `state.json` does not exist.  Needed by automated installs, where
+    /// the `state.json` in place is the bind intent that `infra install
+    /// --stepca-bind` / `--openbao-bind` recorded moments earlier.
+    #[arg(long = "overwrite-state")]
+    pub(crate) overwrite_state: bool,
+
+    /// Skip the "Provision `PostgreSQL` role/database?" prompt and
+    /// provision.  Equivalent to answering `y` at that prompt.  Does not
+    /// enable the feature: no-op unless `--enable db-provision` is also
+    /// passed.
+    #[arg(long = "confirm-db-provision")]
+    pub(crate) confirm_db_provision: bool,
 
     /// Internal: invoked from `bootroot reinit`.  Suppresses overwrite
     /// prompts for files that the reinit caller has already decided to
@@ -2139,6 +2168,80 @@ mod tests {
             result.is_err(),
             "--save-unseal-keys and --no-save-unseal-keys must be mutually exclusive"
         );
+    }
+
+    /// Closes #735: each pre-flight confirmation flag parses on its own
+    /// and leaves the other three unset — none implies another.
+    #[test]
+    fn test_cli_parses_init_preflight_confirmation_flags_individually() {
+        for (flag, pick) in [
+            ("--overwrite-password", 0),
+            ("--overwrite-ca-json", 1),
+            ("--overwrite-state", 2),
+            ("--confirm-db-provision", 3),
+        ] {
+            let cli = Cli::parse_from(["bootroot", "init", flag]);
+            match cli.command {
+                CliCommand::Init(args) => {
+                    let set = [
+                        args.overwrite_password,
+                        args.overwrite_ca_json,
+                        args.overwrite_state,
+                        args.confirm_db_provision,
+                    ];
+                    for (index, value) in set.iter().enumerate() {
+                        assert_eq!(
+                            *value,
+                            index == pick,
+                            "{flag} must set only its own field (index {index})"
+                        );
+                    }
+                }
+                _ => panic!("expected init"),
+            }
+        }
+    }
+
+    /// All four pre-flight confirmation flags are mutually independent,
+    /// so clap must accept them together with no conflict.
+    #[test]
+    fn test_cli_parses_init_all_preflight_confirmation_flags_together() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "init",
+            "--overwrite-password",
+            "--overwrite-ca-json",
+            "--overwrite-state",
+            "--confirm-db-provision",
+            "--enable",
+            "db-provision",
+        ]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert!(args.overwrite_password);
+                assert!(args.overwrite_ca_json);
+                assert!(args.overwrite_state);
+                assert!(args.confirm_db_provision);
+                assert!(args.has_feature(InitFeature::DbProvision));
+            }
+            _ => panic!("expected init"),
+        }
+    }
+
+    /// Default `init` leaves all four pre-flight confirmation flags
+    /// false — the interactive prompt path stays unchanged.
+    #[test]
+    fn test_cli_init_default_preflight_confirmation_flags_unset() {
+        let cli = Cli::parse_from(["bootroot", "init"]);
+        match cli.command {
+            CliCommand::Init(args) => {
+                assert!(!args.overwrite_password);
+                assert!(!args.overwrite_ca_json);
+                assert!(!args.overwrite_state);
+                assert!(!args.confirm_db_provision);
+            }
+            _ => panic!("expected init"),
+        }
     }
 
     /// Default `init` (no save-unseal-keys flag) leaves both fields

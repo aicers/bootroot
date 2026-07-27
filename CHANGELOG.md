@@ -834,6 +834,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot init` accepts `--overwrite-password`, `--overwrite-ca-json`,
+  `--overwrite-state` and `--confirm-db-provision`, one per confirmation
+  in the pre-flight block that previously could only be answered from a
+  TTY (#735). Each flag answers exactly its own prompt as if the
+  operator had typed `y`; the four are mutually independent, none
+  implies another, and passing one whose condition does not hold (an
+  overwrite flag for a file that is not there, or
+  `--confirm-db-provision` without `--enable db-provision`) is a silent
+  no-op rather than an error. Without them nothing changes: the prompts
+  still fire and an empty or non-`y` answer still cancels the run, and
+  `--reinit-mode` keeps suppressing all four on its own so
+  `reinit --yes` stays non-interactive. This unblocks automated
+  installs, which previously had to either let `init` cancel — after
+  `bootstrap_openbao` had already initialised OpenBao and minted a root
+  token — or delete the `state.json` that `infra install --stepca-bind`
+  / `--openbao-bind` had written seconds earlier to record the bind
+  intent. That intent is what `init` derives step-ca's certificate SANs
+  from (#733), so dropping it left the CA serving a certificate without
+  the address it is published on and every off-host consumer failing TLS
+  hostname verification. Documented in the `init` section of
+  `docs/{en,ko}/cli.md`.
+
 - `bootroot infra install` accepts `--openbao-host-port`,
   `--stepca-host-port` and `--http01-admin-host-port`, so the OpenBao,
   step-ca and HTTP-01 responder host-side ports are configurable the way
