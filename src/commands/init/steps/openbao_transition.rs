@@ -71,11 +71,23 @@ impl UnsealKeySource {
 
 /// An unseal key source that has been confirmed available, with its
 /// material already read where the source is a file.
-#[derive(Debug)]
 struct PreparedUnsealKeys {
     source: UnsealKeySource,
     /// Empty exactly for [`UnsealKeySource::Prompt`].
     keys: Vec<String>,
+}
+
+/// Redacts the key material.  `Debug` is required — `expect_err` on a
+/// `Result<PreparedUnsealKeys>` needs it — but a derived one would put
+/// live unseal keys into any panic message or `{:?}` that ever touches
+/// this struct.
+impl std::fmt::Debug for PreparedUnsealKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedUnsealKeys")
+            .field("source", &self.source)
+            .field("keys", &format_args!("<{} redacted>", self.keys.len()))
+            .finish()
+    }
 }
 
 /// The candidate unseal key sources, in the order they are consulted.
