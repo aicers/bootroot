@@ -55,6 +55,8 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
     chown_tls_output_dir(&tls_mount, &user_arg, messages)?;
 
     let intermediate_cert = format!("/home/step/{CA_CERTS_DIR}/{CA_INTERMEDIATE_CERT_FILENAME}");
+    let output_cert = format!("{OPENBAO_TLS_OUTPUT_MOUNT}/server.crt");
+    let output_key = format!("{OPENBAO_TLS_OUTPUT_MOUNT}/server.key");
     let mut args: Vec<&str> = vec![
         "run",
         "--user",
@@ -69,8 +71,8 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
         "certificate",
         "create",
         "openbao.internal",
-        "/output/server.crt",
-        "/output/server.key",
+        &output_cert,
+        &output_key,
         "--ca",
         &intermediate_cert,
         "--ca-key",

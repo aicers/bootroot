@@ -387,9 +387,12 @@ reown_secrets_tree() {
   if [ "$before_uid" = "$REOWN_UID" ]; then
     fail "secrets/ is already owned by uid ${REOWN_UID}; the re-own would be a no-op (set REOWN_UID to a different uid)"
   fi
+  # Armed before the chown, not after: a `chown -R` that fails partway
+  # has already stranded part of the tree on the foreign uid, and only
+  # `restore_ownership` can hand it back.
+  OWNERSHIP_CHANGED=1
   run_sudo chown -R -h "${REOWN_UID}:${REOWN_GID}" "$SECRETS_DIR" \
     || fail "failed to re-own $SECRETS_DIR to ${REOWN_UID}:${REOWN_GID}"
-  OWNERSHIP_CHANGED=1
   {
     echo "secrets/ re-owned: ${before_uid} -> ${REOWN_UID}:${REOWN_GID}"
     ls -ln "$OPENBAO_REPO_TLS_DIR" 2>/dev/null || true
