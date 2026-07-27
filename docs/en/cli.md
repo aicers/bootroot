@@ -1785,7 +1785,17 @@ Behavior:
   dispatched function, not by the entry's `cert_path` / `key_path`:
   - `openbao` → re-issues the OpenBao server cert and writes it to
     `<compose-dir>/openbao/tls/server.crt` and
-    `<compose-dir>/openbao/tls/server.key`. Both files are then
+    `<compose-dir>/openbao/tls/server.key`. Before the write, a
+    one-shot root container chowns `<compose-dir>/openbao/tls` and
+    everything in it to the same `uid:gid` the `step` container runs
+    as — the owner of `<secrets-dir>`. That directory is a *sibling*
+    of `<secrets-dir>`, so it does not move with the secrets tree when
+    an operator re-owns it; without the chown a re-issuance after such
+    a change fails with `open /output/server.key: permission denied`.
+    The container mounts only that directory, runs `chown -R
+    --no-dereference`, and reuses the same `smallstep/step-ca` image as
+    the certificate write, so it introduces no new image and is a no-op
+    when ownership is already correct. Both files are then
     `chmod 0644`'d so the in-container `openbao` user (which is in
     neither the runner's primary group nor any shared group) can
     read them via the "other" permission bits.

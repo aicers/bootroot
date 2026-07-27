@@ -68,6 +68,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - reinit 복구
 - step-ca 인증서 SAN
 - compose 델타 없는 OpenBao TLS 전환
+- `secrets/` 소유자 변경 이후 OpenBao TLS 인증서 재발급
 
 주요 스크립트:
 
@@ -77,6 +78,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `scripts/impl/run-reinit-recovery.sh`
 - `scripts/impl/run-stepca-san.sh`
 - `scripts/impl/run-openbao-tls-no-delta.sh`
+- `scripts/impl/run-openbao-tls-reown.sh`
 
 확장 워크플로는 다음을 검증합니다.
 

@@ -112,6 +112,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot rotate infra-cert` failing with `open
+  /output/server.key: permission denied` on a deployment whose
+  `secrets/` directory changed owner after `init` (#739). The OpenBao
+  TLS certificate is written by a `step` container that runs as the
+  owner of `secrets/`, but its output directory `openbao/tls` is a
+  *sibling* of `secrets/`, not a child: it keeps the uid the host
+  bootroot process created it with, and its files keep the uid the
+  container wrote them as. The secrets-ownership sweep mounts only
+  `secrets/`, so nothing moved `openbao/tls` when an operator or an
+  external installer re-owned the secrets tree — the supported shape
+  that lets the OpenBao Agent sidecars run under a different uid. The
+  next re-issuance then ran as the new uid against a directory and files
+  still owned by the old one and could neither replace `server.key` nor
+  write into the directory. `issue_openbao_tls_cert` now chowns
+  `openbao/tls` recursively to the same `uid:gid` it resolves from
+  `secrets/` for `--user`, in a one-shot root container that mounts only
+  that directory and passes `--no-dereference` so the chown can never
+  follow a symlink out of it. The container reuses the
+  `smallstep/step-ca:0.30.2` image the certificate write already runs, so
+  no new image or pull is introduced, and the chown is a no-op when
+  ownership is already correct. Both `init` and `rotate infra-cert`
+  reach the same code path, so a first issuance on a root-owned tree
+  behaves exactly as before.
 - Fixed `bootroot init` recording an `https://` OpenBao URL against a
   listener that was still serving plaintext (#737). The OpenBao TLS
   transition rewrote `openbao/openbao.hcl` and then brought the

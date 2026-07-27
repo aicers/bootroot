@@ -1715,7 +1715,17 @@ secret_id를 변경하지 않습니다.
   고정되며, 항목의 `cert_path` / `key_path` 값과는 무관합니다:
   - `openbao` → OpenBao 서버 인증서를 새로 발급해
     `<compose-dir>/openbao/tls/server.crt` 및
-    `<compose-dir>/openbao/tls/server.key`에 기록합니다. 두 파일은
+    `<compose-dir>/openbao/tls/server.key`에 기록합니다. 기록에 앞서
+    일회성 root 컨테이너가 `<compose-dir>/openbao/tls`와 그 안의 모든
+    파일을 `step` 컨테이너가 실행되는 것과 같은 `uid:gid`, 즉
+    `<secrets-dir>`의 소유자로 변경합니다. 이 디렉터리는
+    `<secrets-dir>`의 *형제* 경로이므로 운영자가 secrets 트리의
+    소유자를 바꾸어도 함께 옮겨가지 않으며, 이 chown이 없으면 소유자
+    변경 이후의 재발급이 `open /output/server.key: permission denied`로
+    실패합니다. 이 컨테이너는 해당 디렉터리만 마운트하고 `chown -R
+    --no-dereference`를 실행하며, 인증서 발급과 동일한
+    `smallstep/step-ca` 이미지를 재사용하므로 새로운 이미지 의존이
+    없고 소유자가 이미 올바르면 아무 일도 하지 않습니다. 두 파일은
     `chmod 0644`로 설정되어, 컨테이너 내부의 `openbao` 유저(러너의
     기본 그룹이나 공유 그룹에 속하지 않음)가 "other" 권한 비트로
     파일을 읽을 수 있도록 합니다.

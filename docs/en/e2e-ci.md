@@ -70,6 +70,7 @@ PR-critical Docker test set validates:
 - reinit recovery
 - step-ca certificate SANs
 - OpenBao TLS transition with no compose delta
+- OpenBao TLS re-issuance after `secrets/` is re-owned
 
 Primary scripts:
 
@@ -79,6 +80,7 @@ Primary scripts:
 - `scripts/impl/run-reinit-recovery.sh`
 - `scripts/impl/run-stepca-san.sh`
 - `scripts/impl/run-openbao-tls-no-delta.sh`
+- `scripts/impl/run-openbao-tls-reown.sh`
 
 Extended workflow validates:
 
