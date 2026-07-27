@@ -57,6 +57,17 @@ pub(super) struct InitRollback {
     pub(super) written_kv_paths: Vec<String>,
     pub(super) password_backup: Option<RollbackFile>,
     pub(super) ca_json_backup: Option<RollbackFile>,
+    /// Snapshot of `templates/ca.json.ctmpl` taken before `init`
+    /// regenerates it.  `ca.json` is co-owned: the step-ca `OpenBao`
+    /// Agent sidecar re-renders it from this template every render
+    /// interval, so restoring `ca.json` alone would be undone by the
+    /// next render.  Restored together with `ca_json_backup`.
+    pub(super) stepca_ca_json_template_backup: Option<RollbackFile>,
+    /// Whether `init` restarted the step-ca `OpenBao` Agent sidecar onto
+    /// the regenerated template.  When set, rollback restarts it again
+    /// so it reloads the restored template instead of holding the new
+    /// one in memory.
+    pub(super) stepca_agent_restarted: bool,
     pub(super) hcl_backup: Option<RollbackFile>,
     pub(super) tls_artifacts: Vec<PathBuf>,
     pub(super) compose_file: Option<PathBuf>,
@@ -208,10 +219,39 @@ impl InitRollback {
         {
             eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
         }
+        self.restore_stepca_ca_json(messages);
+    }
+
+    /// Restores `ca.json` together with the Agent template it is
+    /// re-rendered from, and puts the sidecar back on that template.
+    ///
+    /// The three are one unit: the step-ca `OpenBao` Agent sidecar
+    /// re-renders `ca.json` from `templates/ca.json.ctmpl` every render
+    /// interval, so restoring `ca.json` alone would be undone by the next
+    /// render from a template that still carries the new `dnsNames`
+    /// (issue #733).  The template goes back first so that a render
+    /// triggered by the restart already produces the pre-`init` name set,
+    /// and `ca.json` goes back after it so the file left on disk is the
+    /// pre-`init` document either way.
+    fn restore_stepca_ca_json(&self, messages: &Messages) {
+        if let Some(file) = &self.stepca_ca_json_template_backup
+            && let Err(err) = rollback_file(file, messages)
+        {
+            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
+        }
         if let Some(file) = &self.ca_json_backup
             && let Err(err) = rollback_file(file, messages)
         {
             eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
+        }
+        // The sidecar loads its templates at start-up, so one that `init`
+        // restarted onto the regenerated template keeps rendering the new
+        // name set until it is restarted again.  Skipped when `init` never
+        // restarted it, and a failure is ignored for the same reason as in
+        // the forward path: on a fresh install the container does not
+        // exist, and the TLS rollback above may already have removed it.
+        if self.stepca_agent_restarted {
+            stepca_setup::restart_stepca_openbao_agent();
         }
     }
 }
@@ -390,6 +430,96 @@ mod rollback_tests {
         assert!(
             !hcl_path.exists(),
             "HCL file must be removed when original was absent"
+        );
+    }
+
+    /// Regression (#733): rollback must restore `ca.json.ctmpl`
+    /// alongside `ca.json`.  `init` regenerates the template with the
+    /// derived `dnsNames` and restarts the step-ca `OpenBao` Agent
+    /// sidecar onto it; restoring only `ca.json` would leave the sidecar
+    /// rendering the new name set back over the restored file at its
+    /// next interval, so a failed `init` would not actually be undone.
+    #[tokio::test]
+    async fn rollback_restores_stepca_ca_json_template_with_ca_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+
+        let config_dir = dir.path().join("config");
+        let templates_dir = dir.path().join("templates");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&templates_dir).unwrap();
+
+        let ca_json_path = config_dir.join("ca.json");
+        let template_path = templates_dir.join("ca.json.ctmpl");
+        let original_ca_json = r#"{"dnsNames":["localhost"]}"#;
+        let original_template = r#"{"dnsNames":["localhost"],"db":{}}"#;
+        // Simulate the post-rewrite state: both carry the derived IP.
+        std::fs::write(&ca_json_path, r#"{"dnsNames":["localhost","10.0.0.5"]}"#).unwrap();
+        std::fs::write(
+            &template_path,
+            r#"{"dnsNames":["localhost","10.0.0.5"],"db":{}}"#,
+        )
+        .unwrap();
+
+        let rollback = InitRollback {
+            ca_json_backup: Some(RollbackFile {
+                path: ca_json_path.clone(),
+                original: Some(original_ca_json.to_string()),
+            }),
+            stepca_ca_json_template_backup: Some(RollbackFile {
+                path: template_path.clone(),
+                original: Some(original_template.to_string()),
+            }),
+            // `false` keeps the docker restart out of the unit test; the
+            // forward path sets it whenever it restarts the sidecar.
+            stepca_agent_restarted: false,
+            compose_file: None,
+            ..Default::default()
+        };
+
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&ca_json_path).unwrap(),
+            original_ca_json,
+            "ca.json must be restored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&template_path).unwrap(),
+            original_template,
+            "ca.json.ctmpl must be restored so the sidecar cannot re-render the new dnsNames"
+        );
+    }
+
+    /// A fresh install has no `ca.json.ctmpl` before `init`; the
+    /// snapshot's `original: None` must roll back to "no template"
+    /// rather than leaving the generated one behind.
+    #[tokio::test]
+    async fn rollback_removes_stepca_ca_json_template_when_original_was_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+
+        let templates_dir = dir.path().join("templates");
+        std::fs::create_dir_all(&templates_dir).unwrap();
+        let template_path = templates_dir.join("ca.json.ctmpl");
+        std::fs::write(&template_path, "generated").unwrap();
+
+        let rollback = InitRollback {
+            stepca_ca_json_template_backup: Some(RollbackFile {
+                path: template_path.clone(),
+                original: None,
+            }),
+            compose_file: None,
+            ..Default::default()
+        };
+
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        assert!(
+            !template_path.exists(),
+            "a template created by init must be removed when none existed before"
         );
     }
 

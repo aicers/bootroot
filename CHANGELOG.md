@@ -152,7 +152,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     it loads that template, and only then re-asserts the on-disk
     `dnsNames`. Without this the SAN set looked correct for a few
     seconds and step-ca dropped the address SAN again on its next
-    restart.
+    restart. The regenerated template and the sidecar restart are
+    covered by the same `init` rollback as `ca.json`: a failure in a
+    later step restores both files and puts the sidecar back on the
+    restored template, so a rolled-back `ca.json` cannot be re-rendered
+    into the new name set moments later.
   - Reconciliation works in both directions: with no bind intent
     recorded — including after a loopback reinstall clears a previous
     one — `dnsNames` comes back to exactly `localhost`, `bootroot-ca`

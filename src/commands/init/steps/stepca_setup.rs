@@ -90,6 +90,32 @@ pub(super) async fn write_stepca_templates(
     })
 }
 
+/// Snapshots `templates/ca.json.ctmpl` for the `init` rollback.
+///
+/// Must be called before `write_stepca_templates` regenerates the file.
+/// `ca.json` is co-owned with the step-ca `OpenBao` Agent sidecar, which
+/// re-renders it from this template, so the rollback entry for `ca.json`
+/// is only durable when the template is restored alongside it.  A
+/// missing template yields `original: None`, which rolls back to "no
+/// template" — the correct pre-`init` state on a fresh install.
+pub(super) async fn snapshot_stepca_ca_json_template(
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<RollbackFile> {
+    let path = secrets_dir
+        .join(RESPONDER_TEMPLATE_DIR)
+        .join(STEPCA_CA_JSON_TEMPLATE_NAME);
+    let original = match tokio::fs::read_to_string(&path).await {
+        Ok(contents) => Some(contents),
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err)
+                .with_context(|| messages.error_read_file_failed(&path.display().to_string()));
+        }
+    };
+    Ok(RollbackFile { path, original })
+}
+
 fn build_password_template(kv_mount: &str) -> String {
     format!(
         r#"{{{{ with secret "{kv_mount}/data/{PATH_STEPCA_PASSWORD}" }}}}{{{{ .Data.data.value }}}}{{{{ end }}}}"#
@@ -1012,5 +1038,37 @@ mod tests {
             "an already-reconciled ca.json must not be rewritten"
         );
         assert_eq!(read_ca_json(&secrets_dir), after);
+    }
+
+    /// The snapshot feeding the init rollback must capture the template
+    /// as it stood *before* `write_stepca_templates` regenerates it, and
+    /// must report "no template" rather than failing on a fresh install.
+    #[tokio::test]
+    async fn snapshot_stepca_ca_json_template_captures_pre_init_state() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
+        let messages = test_messages();
+
+        let fresh = snapshot_stepca_ca_json_template(&secrets_dir, &messages)
+            .await
+            .unwrap();
+        assert!(
+            fresh.original.is_none(),
+            "a fresh install has no template to restore"
+        );
+
+        let dns_names = build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None);
+        write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &dns_names, &messages)
+            .await
+            .unwrap();
+        let existing = tokio::fs::read_to_string(&fresh.path).await.unwrap();
+
+        // A second init snapshots the template the sidecar is currently
+        // rendering from, which is what rollback has to put back.
+        let before_rewrite = snapshot_stepca_ca_json_template(&secrets_dir, &messages)
+            .await
+            .unwrap();
+        assert_eq!(before_rewrite.original.as_deref(), Some(existing.as_str()));
     }
 }

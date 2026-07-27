@@ -34,8 +34,8 @@ use super::responder_setup::{
 use super::secrets::{maybe_register_eab, resolve_init_secrets};
 use super::stepca_setup::{
     ensure_step_ca_initialized, reconcile_ca_json_dns_names, resolve_stepca_ca_dns_names,
-    restart_stepca_openbao_agent, update_ca_json_with_backup, write_password_file_with_backup,
-    write_stepca_templates,
+    restart_stepca_openbao_agent, snapshot_stepca_ca_json_template, update_ca_json_with_backup,
+    write_password_file_with_backup, write_stepca_templates,
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
@@ -503,6 +503,12 @@ async fn run_init_inner(
     // re-asserting the on-disk file is the only ordering in which no
     // render can put the stale name set back, and step-ca is restarted
     // last so it reads the settled document (issue #733).
+    //
+    // Snapshot the template before it is regenerated: `ca.json` is
+    // co-owned with the sidecar, so `rollback.ca_json_backup` is only
+    // durable if the template it is re-rendered from is restored with it.
+    rollback.stepca_ca_json_template_backup =
+        Some(snapshot_stepca_ca_json_template(&secrets_dir, messages).await?);
     let stepca_templates = write_stepca_templates(
         &secrets_dir,
         &args.openbao.kv_mount,
@@ -519,6 +525,11 @@ async fn run_init_inner(
         // this branch is normally not taken there).  `docker restart`
         // returns only once the old process is gone, so the re-assert
         // below cannot race a render from it.
+        //
+        // Record the restart before performing it so that a rollback
+        // triggered by a later failure restarts the sidecar back onto the
+        // template it restores, even if the restart itself half-succeeded.
+        rollback.stepca_agent_restarted = true;
         restart_stepca_openbao_agent();
         reconcile_ca_json_dns_names(&secrets_dir, &stepca_dns_names, messages).await?;
     }

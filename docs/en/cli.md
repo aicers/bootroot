@@ -314,6 +314,12 @@ interval, so without the restart it would put the pre-repair name set
 back within seconds and step-ca would drop the address SAN on its next
 restart.
 
+If a later step of the same `init` fails, the rollback restores
+`ca.json` and `templates/ca.json.ctmpl` together and restarts the
+sidecar back onto the restored template, so the pre-`init` name set is
+what survives — the template and the sidecar are covered by the same
+rollback as `ca.json` rather than left one step ahead of it.
+
 ### Outputs
 
 - Generated `.env` file with random PostgreSQL credentials
