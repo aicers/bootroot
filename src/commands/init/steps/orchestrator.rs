@@ -26,7 +26,7 @@ use super::openbao_tls::{
     build_openbao_tls_sans, issue_openbao_tls_cert, record_openbao_infra_cert,
     write_openbao_hcl_with_tls,
 };
-use super::prompts::confirm_overwrite;
+use super::prompts::{confirm_overwrite, should_confirm};
 use super::responder_setup::{
     apply_responder_compose_override, verify_responder, write_responder_compose_override,
     write_responder_files,
@@ -335,6 +335,67 @@ async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// One of the confirmations init asks before it starts writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreflightPrompt {
+    OverwritePassword,
+    OverwriteCaJson,
+    OverwriteState,
+    DbProvision,
+}
+
+impl PreflightPrompt {
+    fn message(self, messages: &Messages) -> &str {
+        match self {
+            Self::OverwritePassword => messages.prompt_confirm_overwrite_password(),
+            Self::OverwriteCaJson => messages.prompt_confirm_overwrite_ca_json(),
+            Self::OverwriteState => messages.prompt_confirm_overwrite_state(),
+            Self::DbProvision => messages.prompt_confirm_db_provision(),
+        }
+    }
+}
+
+/// Decides which pre-flight confirmations `run_init_inner` must ask, in
+/// the order it asks them.
+///
+/// Each prompt is gated on its own condition (file existence for the
+/// three overwrite prompts, the `db-provision` feature for the fourth)
+/// and answered non-interactively by its own flag alone, so no flag
+/// implies another.  Under reinit mode the operator has already
+/// authorized destructive recovery at the `reinit` level, and reinit
+/// explicitly preserves `password.txt`, `ca.json`, and the
+/// (just-rewritten) `state.json` — suppressing all four keeps
+/// `reinit --yes` non-interactive.
+fn preflight_prompts(args: &InitArgs, plan: &InitPlan) -> Vec<PreflightPrompt> {
+    let reinit = args.reinit_mode;
+    [
+        (
+            PreflightPrompt::OverwritePassword,
+            plan.overwrite_password,
+            args.overwrite_password,
+        ),
+        (
+            PreflightPrompt::OverwriteCaJson,
+            plan.overwrite_ca_json,
+            args.overwrite_ca_json,
+        ),
+        (
+            PreflightPrompt::OverwriteState,
+            plan.overwrite_state,
+            args.overwrite_state,
+        ),
+        (
+            PreflightPrompt::DbProvision,
+            args.has_feature(InitFeature::DbProvision),
+            args.confirm_db_provision,
+        ),
+    ]
+    .into_iter()
+    .filter(|&(_, condition, confirmed)| should_confirm(condition, confirmed, reinit))
+    .map(|(prompt, _, _)| prompt)
+    .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 // Keep init flow in one place to preserve ordering across subsystems.
 async fn run_init_inner(
@@ -362,23 +423,8 @@ async fn run_init_inner(
         overwrite_state,
     };
     print_init_plan(&plan, messages);
-    // Under reinit mode the operator has already authorized destructive
-    // recovery at the `reinit` level, and reinit explicitly preserves
-    // `password.txt`, `ca.json`, and the (just-rewritten) `state.json`.
-    // Skipping these prompts keeps `reinit --yes` non-interactive.
-    if !args.reinit_mode {
-        if overwrite_password {
-            confirm_overwrite(messages.prompt_confirm_overwrite_password(), messages)?;
-        }
-        if overwrite_ca_json {
-            confirm_overwrite(messages.prompt_confirm_overwrite_ca_json(), messages)?;
-        }
-        if overwrite_state {
-            confirm_overwrite(messages.prompt_confirm_overwrite_state(), messages)?;
-        }
-        if args.has_feature(InitFeature::DbProvision) {
-            confirm_overwrite(messages.prompt_confirm_db_provision(), messages)?;
-        }
+    for prompt in preflight_prompts(args, &plan) {
+        confirm_overwrite(prompt.message(messages), messages)?;
     }
 
     // Load .env into the process environment so that
@@ -1362,6 +1408,132 @@ fn validate_http01_exposed_override_for_init(
 mod tests {
     use super::super::test_support::{default_init_args, test_messages};
     use super::*;
+
+    fn plan_with(password: bool, ca_json: bool, state: bool) -> InitPlan {
+        InitPlan {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: std::path::PathBuf::from("secrets"),
+            overwrite_password: password,
+            overwrite_ca_json: ca_json,
+            overwrite_state: state,
+        }
+    }
+
+    /// Nothing on disk and no `db-provision`: the pre-flight block asks
+    /// nothing, whatever the new flags say.
+    #[test]
+    fn preflight_prompts_asks_nothing_when_no_condition_holds() {
+        let args = default_init_args();
+        assert!(preflight_prompts(&args, &plan_with(false, false, false)).is_empty());
+
+        // Closes #735: a flag whose condition does not hold is a silent
+        // no-op, not an error and not a behaviour change.
+        let mut args = default_init_args();
+        args.overwrite_password = true;
+        args.overwrite_ca_json = true;
+        args.overwrite_state = true;
+        args.confirm_db_provision = true;
+        assert!(preflight_prompts(&args, &plan_with(false, false, false)).is_empty());
+    }
+
+    /// Every condition holds and no flag answers it: all four prompts
+    /// fire, in the order init has always asked them.
+    #[test]
+    fn preflight_prompts_asks_all_four_without_flags() {
+        let mut args = default_init_args();
+        args.enable.push(InitFeature::DbProvision);
+        assert_eq!(
+            preflight_prompts(&args, &plan_with(true, true, true)),
+            vec![
+                PreflightPrompt::OverwritePassword,
+                PreflightPrompt::OverwriteCaJson,
+                PreflightPrompt::OverwriteState,
+                PreflightPrompt::DbProvision,
+            ]
+        );
+    }
+
+    /// Closes #735: each flag suppresses exactly its own prompt, so a
+    /// caller that sets one still gets asked about the other three.
+    #[test]
+    fn preflight_prompts_flags_suppress_only_their_own_prompt() {
+        let plan = plan_with(true, true, true);
+        let all = [
+            PreflightPrompt::OverwritePassword,
+            PreflightPrompt::OverwriteCaJson,
+            PreflightPrompt::OverwriteState,
+            PreflightPrompt::DbProvision,
+        ];
+
+        for suppressed in all {
+            let mut args = default_init_args();
+            args.enable.push(InitFeature::DbProvision);
+            match suppressed {
+                PreflightPrompt::OverwritePassword => args.overwrite_password = true,
+                PreflightPrompt::OverwriteCaJson => args.overwrite_ca_json = true,
+                PreflightPrompt::OverwriteState => args.overwrite_state = true,
+                PreflightPrompt::DbProvision => args.confirm_db_provision = true,
+            }
+            let expected: Vec<_> = all.iter().copied().filter(|&p| p != suppressed).collect();
+            assert_eq!(
+                preflight_prompts(&args, &plan),
+                expected,
+                "{suppressed:?} must suppress only its own prompt"
+            );
+        }
+    }
+
+    /// The db-provision confirmation is gated on the feature, not on any
+    /// file: `--confirm-db-provision` alone never enables it.
+    #[test]
+    fn preflight_prompts_db_provision_follows_the_feature() {
+        let plan = plan_with(false, false, false);
+
+        let args = default_init_args();
+        assert!(preflight_prompts(&args, &plan).is_empty());
+
+        let mut args = default_init_args();
+        args.enable.push(InitFeature::DbProvision);
+        assert_eq!(
+            preflight_prompts(&args, &plan),
+            vec![PreflightPrompt::DbProvision]
+        );
+
+        args.confirm_db_provision = true;
+        assert!(preflight_prompts(&args, &plan).is_empty());
+    }
+
+    /// `--reinit-mode` suppresses all four prompts on its own, so
+    /// `reinit --yes` stays non-interactive without the new flags.
+    #[test]
+    fn preflight_prompts_reinit_mode_suppresses_everything() {
+        let mut args = default_init_args();
+        args.enable.push(InitFeature::DbProvision);
+        args.reinit_mode = true;
+        assert!(preflight_prompts(&args, &plan_with(true, true, true)).is_empty());
+    }
+
+    /// Each prompt renders its own message, so the loop in
+    /// `run_init_inner` cannot ask about the wrong file.
+    #[test]
+    fn preflight_prompt_messages_are_distinct() {
+        let messages = test_messages();
+        let rendered = [
+            PreflightPrompt::OverwritePassword.message(&messages),
+            PreflightPrompt::OverwriteCaJson.message(&messages),
+            PreflightPrompt::OverwriteState.message(&messages),
+            PreflightPrompt::DbProvision.message(&messages),
+        ];
+        assert_eq!(
+            rendered
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            rendered.len(),
+            "each pre-flight prompt must render its own message"
+        );
+    }
 
     /// Closes #588 §5a: when `OpenBao` is already initialised but no
     /// usable root token is supplied, `init` must abort with the

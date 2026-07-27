@@ -770,6 +770,10 @@ pub(super) mod test_support {
             no_eab: false,
             save_unseal_keys: false,
             no_save_unseal_keys: false,
+            overwrite_password: false,
+            overwrite_ca_json: false,
+            overwrite_state: false,
+            confirm_db_provision: false,
             reinit_mode: false,
             root_token_output: None,
         }

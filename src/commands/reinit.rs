@@ -1000,6 +1000,12 @@ fn init_args_for_reinit(
         no_eab: args.no_eab,
         save_unseal_keys: false,
         no_save_unseal_keys: false,
+        // `reinit_mode` already suppresses the four pre-flight
+        // confirmations, so reinit never needs the per-prompt flags.
+        overwrite_password: false,
+        overwrite_ca_json: false,
+        overwrite_state: false,
+        confirm_db_provision: false,
         reinit_mode: true,
         root_token_output: args.root_token_output.clone(),
     })

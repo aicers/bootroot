@@ -392,10 +392,11 @@ run_first_init() {
   wait_for_postgres_admin
   wait_for_openbao_listening "http://127.0.0.1:8200"
   # `infra install` writes state.json (to record the bind intent) before
-  # init runs, so init's overwrite-state prompt fires under
-  # default-yes-no semantics.  Pipe `y` answers to clear that prompt and
-  # any ca.json / password.txt prompt on rerun.
-  if ! printf 'y\ny\ny\n' | BOOTROOT_LANG=en run_bootroot init \
+  # init runs, so init's overwrite-state prompt fires; ca.json and
+  # password.txt prompt too on a rerun, and `db-provision` adds its own
+  # confirmation.  Answer all four with their per-prompt flags and run
+  # with stdin closed, which proves the run needs no TTY (#735).
+  if ! BOOTROOT_LANG=en run_bootroot init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$summary_json" \
@@ -404,10 +405,14 @@ run_first_init() {
     --http-hmac "$DEFAULT_HTTP_HMAC" \
     --no-eab \
     --save-unseal-keys \
+    --overwrite-password \
+    --overwrite-ca-json \
+    --overwrite-state \
+    --confirm-db-provision \
     --db-user "step" \
     --db-name "stepca" \
     --responder-url "http://localhost:8080" \
-    --skip responder-check >"$raw_log" 2>&1; then
+    --skip responder-check </dev/null >"$raw_log" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"
       tail -n 200 "$raw_log" || true
@@ -436,7 +441,11 @@ run_second_init() {
 
   wait_for_postgres_admin
   wait_for_openbao_listening "http://127.0.0.1:8200"
-  if ! printf 'y\ny\ny\n' | BOOTROOT_LANG=en run_bootroot init \
+  # `db-provision` is off here, so `--confirm-db-provision` is
+  # deliberately not passed: the three overwrite flags are enough to run
+  # with stdin closed, which also shows the confirmation flag is
+  # independent of the feature rather than implied by it (#735).
+  if ! BOOTROOT_LANG=en run_bootroot init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$summary_json" \
@@ -448,8 +457,11 @@ run_second_init() {
     --db-dsn "$db_dsn" \
     --no-eab \
     --save-unseal-keys \
+    --overwrite-password \
+    --overwrite-ca-json \
+    --overwrite-state \
     --responder-url "http://localhost:8080" \
-    --skip responder-check >"$raw_log" 2>&1; then
+    --skip responder-check </dev/null >"$raw_log" 2>&1; then
     {
       echo "second bootroot init failed (raw tail):"
       tail -n 200 "$raw_log" || true

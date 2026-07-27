@@ -518,6 +518,37 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   stdout으로 평문 출력하는 경로도 함께 억제되어(요약 JSON에
   이미 들어 있고, CI 로그로 유출될 위험을 차단) 출력되지 않습니다.
   `--save-unseal-keys`와 함께 사용할 수 없습니다(#603).
+- `--overwrite-password`: "Overwrite password.txt?" 프롬프트를 건너뛰고
+  파일을 덮어씁니다. 프롬프트에 `y`를 입력한 것과 동등합니다.
+  `<secrets_dir>/password.txt`가 없으면 아무 일도 하지 않습니다(#735).
+- `--overwrite-ca-json`: "Overwrite ca.json?" 프롬프트를 건너뛰고
+  파일을 덮어씁니다. 프롬프트에 `y`를 입력한 것과 동등합니다.
+  `<secrets_dir>/config/ca.json`이 없으면 아무 일도 하지
+  않습니다(#735).
+- `--overwrite-state`: "Overwrite state.json?" 프롬프트를 건너뛰고
+  파일을 덮어씁니다. 프롬프트에 `y`를 입력한 것과 동등합니다.
+  `state.json`이 없으면 아무 일도 하지 않습니다. 자동화된 설치에
+  필요합니다: `infra install --stepca-bind`/`--openbao-bind`가 바인드
+  의도를 기록하려고 `state.json`을 직접 쓰므로, `init`이 묻는 파일은
+  같은 실행이 몇 초 전에 기록한 그 의도입니다. 대신 파일을 지우면
+  `init`이 step-ca 인증서 SAN을 유도하는 근거인 의도가 사라집니다
+  (#735).
+- `--confirm-db-provision`: "Provision PostgreSQL role/database?"
+  프롬프트를 건너뛰고 프로비저닝을 진행합니다. 프롬프트에 `y`를 입력한
+  것과 동등합니다. 이 플래그가 기능을 켜지는 않으므로
+  `--enable db-provision`을 함께 주지 않으면 아무 일도 하지
+  않습니다(#735).
+
+위 네 플래그는 서로 독립적입니다. 각 플래그는 자기 프롬프트만
+억제하며 다른 플래그를 함의하지 않고, 플래그가 없으면 프롬프트는
+종전대로 동작합니다(빈 입력이나 `y`가 아닌 답은 여전히 실행을
+취소합니다). `--reinit-mode`는 지금처럼 네 프롬프트를 단독으로
+억제하므로 `reinit --yes`는 계속 비대화형입니다. 해당하는 플래그를
+지정하면 `init`은 stdin이 닫힌 상태에서도 사전 확인 단계를 통과합니다.
+같은 실행의 다른 프롬프트에는 각자의 플래그가 여전히 필요합니다
+(`--no-eab` 또는 `--eab-kid`/`--eab-hmac`, `--save-unseal-keys` 또는
+`--no-save-unseal-keys`, OpenBao 상태에 따라
+`--root-token`/`--unseal-key`).
 
 이전 `init`이 중간에 실패하고 롤백되었다면 OpenBao는 볼륨에 초기화된
 상태로 남아 있는 반면 bootroot에는 사용 가능한 root token이 없을 수
