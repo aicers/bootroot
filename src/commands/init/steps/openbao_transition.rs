@@ -289,10 +289,17 @@ async fn ensure_unsealed(
     };
 
     for key in &keys {
+        // A key `OpenBao` rejects outright is the same "present but
+        // unusable" source as one that leaves the vault sealed — a stale
+        // share from a previous Shamir set is the common case, and it
+        // fails on the submit rather than on the seal-status check below.
+        // Name the source on that path too, so the operator is not left
+        // with a bare transport error for a key file they can go fix.
         let status = client
             .unseal(key)
             .await
-            .with_context(|| messages.error_openbao_unseal_failed())?;
+            .with_context(|| messages.error_openbao_unseal_failed())
+            .with_context(|| messages.error_openbao_unseal_source_still_sealed(&source))?;
         if !status.sealed {
             return Ok(());
         }
@@ -630,6 +637,52 @@ mod tests {
         assert!(
             rendered.contains(&key_file.display().to_string()),
             "the error must name the key source: {rendered}"
+        );
+    }
+
+    /// A key `OpenBao` rejects outright — a stale share from a previous
+    /// Shamir set — fails on the submit, before the seal-status check
+    /// that names the source.  That path has to name the source too:
+    /// a bare transport error does not tell the operator which key file
+    /// to go fix.
+    #[tokio::test]
+    async fn keys_openbao_rejects_name_their_source() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/seal-status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sealed": true})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/unseal"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(
+                    serde_json::json!({"errors": ["unseal failed, invalid key share"]}),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+        let key_file = PathBuf::from("/tmp/bootroot-test/stale-unseal-keys.txt");
+        let prepared = PreparedUnsealKeys {
+            source: UnsealKeySource::File(key_file.clone()),
+            keys: vec!["stale-share".to_string()],
+        };
+        let err = ensure_unsealed(&client, prepared, &test_messages())
+            .await
+            .expect_err("OpenBao rejects the key");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&key_file.display().to_string()),
+            "the error must name the key source: {rendered}"
+        );
+        assert!(
+            rendered.contains("invalid key share"),
+            "the error must still surface OpenBao's own diagnostic: {rendered}"
         );
     }
 
