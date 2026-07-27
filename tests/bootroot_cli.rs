@@ -106,6 +106,22 @@ fn test_help_lists_subcommands() {
     assert!(stdout.contains("verify"));
 }
 
+/// Closes #735: every pre-flight confirmation flag is discoverable from
+/// `init --help`, so an operator automating the install can find them.
+#[test]
+fn test_init_help_lists_preflight_confirmation_flags() {
+    let (stdout, _stderr, code) = run(&["init", "--help"]);
+    assert_eq!(code, 0);
+    for flag in [
+        "--overwrite-password",
+        "--overwrite-ca-json",
+        "--overwrite-state",
+        "--confirm-db-provision",
+    ] {
+        assert!(stdout.contains(flag), "init --help must document {flag}");
+    }
+}
+
 #[test]
 fn test_status_command_message() {
     let (stdout, _stderr, code) = run(&["--help"]);

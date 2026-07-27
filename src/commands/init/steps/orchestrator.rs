@@ -1484,6 +1484,55 @@ mod tests {
         }
     }
 
+    /// Closes #735: the whole pre-flight block clears with every
+    /// condition holding once all four flags are set, which is what lets
+    /// an automated install run `init` with stdin closed.
+    #[test]
+    fn preflight_prompts_all_flags_clear_every_prompt() {
+        let mut args = default_init_args();
+        args.enable.push(InitFeature::DbProvision);
+        args.overwrite_password = true;
+        args.overwrite_ca_json = true;
+        args.overwrite_state = true;
+        args.confirm_db_provision = true;
+        assert!(
+            preflight_prompts(&args, &plan_with(true, true, true)).is_empty(),
+            "all four flags together must leave no prompt to read from stdin"
+        );
+    }
+
+    /// Closes #735: the three overwrite flags alone do not answer the
+    /// db-provision confirmation, and `--confirm-db-provision` alone does
+    /// not answer any overwrite prompt.
+    #[test]
+    fn preflight_prompts_overwrite_and_db_provision_flags_stay_disjoint() {
+        let plan = plan_with(true, true, true);
+
+        let mut args = default_init_args();
+        args.enable.push(InitFeature::DbProvision);
+        args.overwrite_password = true;
+        args.overwrite_ca_json = true;
+        args.overwrite_state = true;
+        assert_eq!(
+            preflight_prompts(&args, &plan),
+            vec![PreflightPrompt::DbProvision],
+            "the overwrite flags must not answer the db-provision confirmation"
+        );
+
+        let mut args = default_init_args();
+        args.enable.push(InitFeature::DbProvision);
+        args.confirm_db_provision = true;
+        assert_eq!(
+            preflight_prompts(&args, &plan),
+            vec![
+                PreflightPrompt::OverwritePassword,
+                PreflightPrompt::OverwriteCaJson,
+                PreflightPrompt::OverwriteState,
+            ],
+            "--confirm-db-provision must not answer any overwrite prompt"
+        );
+    }
+
     /// The db-provision confirmation is gated on the feature, not on any
     /// file: `--confirm-db-provision` alone never enables it.
     #[test]

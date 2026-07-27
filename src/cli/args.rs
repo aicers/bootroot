@@ -1204,7 +1204,7 @@ pub(crate) struct InitArgs {
     /// Equivalent to answering `y` at that prompt.  No-op when
     /// `state.json` does not exist.  Needed by automated installs, where
     /// the `state.json` in place is the bind intent that `infra install
-    /// --stepca-bind` / `--openbao-bind` recorded moments earlier
+    /// --stepca-bind` / `--openbao-bind` recorded moments earlier.
     #[arg(long = "overwrite-state")]
     pub(crate) overwrite_state: bool,
 
