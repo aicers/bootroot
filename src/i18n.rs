@@ -717,4 +717,53 @@ mod tests {
             assert_ne!(unreachable, rejected);
         }
     }
+
+    /// The `OpenBao` TLS-transition messages (#737) are what an operator
+    /// gets when `init` refuses to record an HTTPS URL, and each one
+    /// carries the single value that makes it actionable — the probed
+    /// URL, the key file, the key source.  A misspelled placeholder in
+    /// one locale would ship a literal `{url}` and drop exactly that.
+    #[test]
+    fn openbao_tls_transition_templates_substitute_in_every_locale() {
+        const URL: &str = "https://172.17.0.1:8200";
+        const KEYS_PATH: &str = "/srv/bootroot/secrets/openbao/unseal-keys.txt";
+        const SOURCE: &str = "/srv/bootroot/keys/shares.txt";
+
+        for locale in ["en", "ko"] {
+            let messages = Messages::new(locale).unwrap();
+
+            let cases = [
+                (messages.init_openbao_tls_verified(URL), URL),
+                (messages.error_openbao_tls_probe_failed(URL), URL),
+                (
+                    messages.error_openbao_unseal_source_unavailable(KEYS_PATH),
+                    KEYS_PATH,
+                ),
+                (messages.init_openbao_unseal_from_source(SOURCE), SOURCE),
+                (
+                    messages.error_openbao_unseal_source_still_sealed(SOURCE),
+                    SOURCE,
+                ),
+            ];
+
+            for (rendered, value) in &cases {
+                assert!(
+                    rendered.contains(value),
+                    "{locale} message dropped {value:?}: {rendered}"
+                );
+                assert!(
+                    !rendered.contains('{'),
+                    "{locale} left an unsubstituted placeholder: {rendered}"
+                );
+            }
+
+            // The missing-source error is the one that has to name every
+            // way of supplying keys, not just the default file.
+            let unavailable = messages.error_openbao_unseal_source_unavailable(KEYS_PATH);
+            assert!(
+                unavailable.contains("--openbao-unseal-from-file"),
+                "{locale} missing-source error does not name the flag: {unavailable}"
+            );
+        }
+    }
 }

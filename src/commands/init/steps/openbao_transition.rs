@@ -615,6 +615,46 @@ mod tests {
         server.verify().await;
     }
 
+    /// The happy path the whole module exists for: the recreate left the
+    /// vault sealed, the prepared keys open it, and submission stops at
+    /// the share that crosses the threshold rather than pushing the rest
+    /// of the set at a vault that no longer needs them.
+    #[tokio::test]
+    async fn sealed_vault_is_unsealed_from_the_prepared_keys() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/seal-status"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"sealed": true, "t": 2, "n": 3})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/unseal"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sealed": false})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+        let prepared = PreparedUnsealKeys {
+            source: UnsealKeySource::InMemory,
+            keys: vec![
+                "memory-key-1".to_string(),
+                "memory-key-2".to_string(),
+                "memory-key-3".to_string(),
+            ],
+        };
+        ensure_unsealed(&client, prepared, &test_messages())
+            .await
+            .expect("the prepared keys unseal the vault");
+
+        server.verify().await;
+    }
+
     /// Keys that leave the vault sealed are a *present but unusable*
     /// source, and the error has to name it.
     #[tokio::test]
