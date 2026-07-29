@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::constants::{RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, default_responder_admin_url};
+use super::constants::{
+    OPENBAO_CONTAINER_PORT, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
+    default_responder_admin_url,
+};
 use crate::cli::args::InitArgs;
 use crate::commands::constants::{RESPONDER_SERVICE_NAME, STEPCA_SERVICE_NAME};
 use crate::commands::guardrails::parse_hcl_string_value;
@@ -162,13 +165,20 @@ fn responder_tls_configured(secrets_dir: &Path) -> Result<bool> {
 /// Rewrites an `OpenBao` URL so that Docker-network containers can reach
 /// the server via its container name.
 ///
-/// When `compose_has_openbao` is `true`, the host portion of `openbao_url`
-/// is unconditionally replaced with `openbao_container` — the install's
-/// own `OpenBao` container name, which is what resolves inside the
-/// compose network — while the scheme and port are preserved.  This
-/// covers loopback addresses (`localhost`, `127.0.0.1`) as well as
-/// specific bind IPs (`192.168.1.10`) that the host uses but that are
-/// unreachable from sibling containers on the Docker bridge network.
+/// When `compose_has_openbao` is `true`, the authority of `openbao_url`
+/// is replaced with `openbao_container` — the install's own `OpenBao`
+/// container name — on [`OPENBAO_CONTAINER_PORT`], while the scheme is
+/// preserved.  This covers loopback addresses (`localhost`, `127.0.0.1`)
+/// as well as specific bind IPs (`192.168.1.10`) that the host uses but
+/// that are unreachable from sibling containers on the Docker bridge
+/// network.
+///
+/// The port is replaced rather than carried over because the URL is the
+/// *host's* view: `--openbao-host-port` moves the published port so two
+/// installs can share a host, while the container side stays 8200.
+/// Carrying the host port over would point the agents at a port nothing
+/// listens on inside the network — which every non-default instance
+/// hits, since a co-located install cannot keep the default publish.
 pub(crate) fn resolve_openbao_agent_addr(
     openbao_url: &str,
     compose_has_openbao: bool,
@@ -177,20 +187,10 @@ pub(crate) fn resolve_openbao_agent_addr(
     if !compose_has_openbao {
         return openbao_url.to_string();
     }
-    let Some((scheme, after_scheme)) = openbao_url.split_once("://") else {
+    let Some((scheme, _)) = openbao_url.split_once("://") else {
         return openbao_url.to_string();
     };
-    // For IPv6 addresses like [::1]:8200 the port follows ']:', for
-    // IPv4 / hostnames like 192.168.1.10:8200 it follows ':'.
-    let port = if let Some(bracket_pos) = after_scheme.find(']') {
-        after_scheme.get(bracket_pos + 2..)
-    } else {
-        after_scheme.split_once(':').map(|(_, p)| p)
-    };
-    match port {
-        Some(p) => format!("{scheme}://{openbao_container}:{p}"),
-        None => format!("{scheme}://{openbao_container}"),
-    }
+    format!("{scheme}://{openbao_container}:{OPENBAO_CONTAINER_PORT}")
 }
 
 #[cfg(test)]
@@ -203,11 +203,48 @@ mod tests {
     fn openbao_agent_addr_uses_the_instance_container_name() {
         assert_eq!(
             resolve_openbao_agent_addr("http://localhost:8200", true, "insight-openbao"),
-            "https://insight-openbao:8200".replace("https", "http")
+            "http://insight-openbao:8200"
         );
         assert_eq!(
             resolve_openbao_agent_addr("https://192.168.1.10:8200", true, "insight-openbao"),
             "https://insight-openbao:8200"
+        );
+    }
+
+    /// The URL is the host's view of `OpenBao`, and a co-located install
+    /// cannot keep the default publish — so the agents' address must be
+    /// the container port, not whatever `--openbao-host-port` moved the
+    /// published one to.  Carrying it over pointed every non-default
+    /// instance's sidecars at a port nothing listens on in-network.
+    #[test]
+    fn openbao_agent_addr_uses_the_container_port_not_the_host_port() {
+        for url in [
+            "http://localhost:28200",
+            "http://127.0.0.1:28200",
+            "https://192.168.1.10:28200",
+            "https://[fd12::1]:28200",
+        ] {
+            assert_eq!(
+                resolve_openbao_agent_addr(url, true, "insight-openbao")
+                    .rsplit_once(':')
+                    .map(|(_, port)| port),
+                Some("8200"),
+                "{url} must resolve to the in-network OpenBao port"
+            );
+        }
+        assert_eq!(
+            resolve_openbao_agent_addr("http://localhost:28200", true, "insight-openbao"),
+            "http://insight-openbao:8200"
+        );
+    }
+
+    /// An external `OpenBao` is not on the compose network, so its URL —
+    /// host, port and all — is passed through untouched.
+    #[test]
+    fn openbao_agent_addr_preserves_an_external_url_verbatim() {
+        assert_eq!(
+            resolve_openbao_agent_addr("https://vault.example.com:28200", false, "insight-openbao"),
+            "https://vault.example.com:28200"
         );
     }
 

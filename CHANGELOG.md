@@ -112,6 +112,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed the two OpenBao Agent sidecars never authenticating on an
+  install that moved its published OpenBao port. The agents reach
+  OpenBao by container name on the compose network, and the address they
+  were given carried over the port from the URL bootroot was handed —
+  which is the *host's* view. `--openbao-host-port` moves that publish
+  while the container side stays 8200, so the sidecars dialled
+  `<instance>-openbao:<host port>`, where nothing listens, and looped on
+  `connection refused` without ever rendering a template. The in-network
+  address now always uses the container port. Every co-located install
+  hit this, since a second instance on one host cannot keep the default
+  publish. An external (non-compose) OpenBao URL is still passed through
+  verbatim, port included.
 - Fixed `bootroot rotate infra-cert` failing with `open
   /output/server.key: permission denied` on a deployment whose
   `secrets/` directory changed owner after `init` (#739). The OpenBao

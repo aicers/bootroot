@@ -30,6 +30,15 @@ pub(crate) const SECRET_BYTES: usize = 32;
 pub(crate) const DEFAULT_RESPONDER_TOKEN_TTL_SECS: u64 = 60;
 /// Port the responder publishes its admin API on inside the network.
 const RESPONDER_ADMIN_PORT: u16 = 8080;
+/// Port the `OpenBao` container listens on inside the network.
+///
+/// Fixed, unlike the host-side publish, which `--openbao-host-port` moves
+/// so two installs can share a host: the compose port mappings, the
+/// `openbao.hcl` listener and the non-loopback bind override all pin the
+/// container side to this port. Anything addressing `OpenBao` by
+/// container name is on the compose network and must use it rather than
+/// whatever host port the URL it was handed carries.
+pub(in crate::commands::init) const OPENBAO_CONTAINER_PORT: u16 = 8200;
 pub(crate) const RESPONDER_TEMPLATE_DIR: &str = "templates";
 pub(crate) const RESPONDER_TEMPLATE_NAME: &str = "responder.toml.ctmpl";
 pub(crate) const RESPONDER_CONFIG_DIR: &str = "responder";
