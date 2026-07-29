@@ -15,9 +15,9 @@ use super::super::paths::{ResponderPaths, compose_has_responder};
 use super::super::types::ResponderCheck;
 use super::InitSecrets;
 use crate::cli::args::{InitArgs, InitSkipPhase};
-use crate::commands::compose_project::{compose_args, resolve_compose_project};
+use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
-use crate::commands::infra::run_docker;
+use crate::commands::infra::run_compose;
 use crate::i18n::Messages;
 
 /// Throwaway token registered by the init-time responder check.
@@ -170,7 +170,7 @@ pub(super) fn apply_responder_compose_override(
     override_path: &Path,
     messages: &Messages,
 ) -> Result<()> {
-    let project = resolve_compose_project(compose_file, None, messages)?;
+    let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
     let compose_str = compose_file.to_string_lossy();
     let override_str = override_path.to_string_lossy();
     // `--no-deps` mirrors `apply_openbao_agent_compose_override`: the
@@ -180,13 +180,12 @@ pub(super) fn apply_responder_compose_override(
     // host-port publish.  Subsequent KV calls against the bind URL
     // would then fail with `Connection refused`.  See the comment on
     // that helper for the reinit-recovery scenario that exercises this.
-    let args = compose_args(
-        &project,
+    let invocation = identity.compose(
         &[&compose_str, &override_str],
         None,
         &["up", "-d", "--no-deps", RESPONDER_SERVICE_NAME],
     );
-    run_docker(&args, "docker compose responder override", messages)?;
+    run_compose(&invocation, "docker compose responder override", messages)?;
     Ok(())
 }
 
@@ -279,7 +278,7 @@ mod tests {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::super::super::constants::DEFAULT_RESPONDER_ADMIN_URL;
+    use super::super::super::constants::default_responder_admin_url;
     use super::super::super::paths::{compose_has_responder, resolve_responder_url};
     use super::super::test_support::{default_init_args, test_messages};
     use super::*;
@@ -587,8 +586,8 @@ services:
         let compose_has_responder =
             compose_has_responder(&args.compose.compose_file, &test_messages())
                 .expect("compose check");
-        let responder_url =
-            resolve_responder_url(&args, compose_has_responder).expect("resolve responder url");
+        let responder_url = resolve_responder_url(&args, compose_has_responder, "insight-http01")
+            .expect("resolve responder url");
         assert!(responder_url.is_none());
     }
 
@@ -611,8 +610,12 @@ services:
         let compose_has_responder =
             compose_has_responder(&args.compose.compose_file, &test_messages())
                 .expect("compose check");
-        let responder_url =
-            resolve_responder_url(&args, compose_has_responder).expect("resolve responder url");
-        assert_eq!(responder_url.as_deref(), Some(DEFAULT_RESPONDER_ADMIN_URL));
+        let responder_url = resolve_responder_url(&args, compose_has_responder, "insight-http01")
+            .expect("resolve responder url");
+        assert_eq!(
+            responder_url.as_deref(),
+            Some(default_responder_admin_url("insight-http01").as_str()),
+            "the responder admin URL must name this instance's own container"
+        );
     }
 }

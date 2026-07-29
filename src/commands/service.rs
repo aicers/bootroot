@@ -15,7 +15,7 @@ use crate::cli::output::{
     ServiceAddAppliedPaths, ServiceAddPlan, ServiceAddRemoteBootstrap, ServiceAddSummaryOptions,
     print_service_add_plan, print_service_add_summary, print_service_info_summary,
 };
-use crate::commands::compose_project::resolve_compose_project_for_dir;
+use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::DEFAULT_SECRET_ID_WRAP_TTL;
 use crate::commands::dns_alias::register_dns_alias;
 use crate::commands::init::validate_secret_id_ttl;
@@ -540,8 +540,8 @@ async fn run_service_add_apply(
     // `service add` takes no compose file, so the project comes from the
     // `.env` in the process working directory — the same place these
     // commands already resolve `state.json` from.
-    let project = resolve_compose_project_for_dir(Path::new("."), None, messages)?;
-    register_dns_alias(state, &project, messages)?;
+    let identity = ComposeIdentity::resolve_for_dir(Path::new("."), None, messages)?;
+    register_dns_alias(state, &identity, messages)?;
 
     print_service_add_apply_summary(
         &entry,

@@ -2,15 +2,16 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{
-    compose_has_responder, confirm_action, reload_compose_service, restart_container,
+    compose_has_responder, confirm_action, reload_compose_service, restart_openbao_agent,
     wait_for_rendered_file,
 };
-use super::{OPENBAO_AGENT_RESPONDER_CONTAINER, RENDERED_FILE_TIMEOUT, RotateContext};
+use super::{RENDERED_FILE_TIMEOUT, RotateContext};
 use crate::cli::args::RotateResponderHmacArgs;
 use crate::commands::constants::{
     RESPONDER_SERVICE_NAME, SERVICE_KV_BASE, SERVICE_RESPONDER_HMAC_KEY,
     SERVICE_RESPONDER_HMAC_KV_SUFFIX,
 };
+use crate::commands::container_name::BootrootContainer;
 use crate::commands::init::{PATH_RESPONDER_HMAC, SECRET_BYTES};
 use crate::i18n::Messages;
 
@@ -43,7 +44,11 @@ pub(super) async fn rotate_responder_hmac(
     sync_service_responder_hmac_payloads(ctx, client, &hmac, messages).await?;
 
     let responder_path = ctx.paths.responder_config();
-    restart_container(OPENBAO_AGENT_RESPONDER_CONTAINER, messages)?;
+    restart_openbao_agent(
+        &ctx.compose_file,
+        BootrootContainer::OpenBaoAgentResponder,
+        messages,
+    )?;
     wait_for_rendered_file(&responder_path, &hmac, RENDERED_FILE_TIMEOUT, messages).await?;
 
     // Service agents (local host daemons and remote alike) pick up the

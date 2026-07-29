@@ -18,12 +18,27 @@ pub(crate) const DEFAULT_CA_NAME: &str = "Bootroot CA";
 /// the ACME provisioner created by step-ca matches the name the
 /// patcher looks up.
 pub(crate) const DEFAULT_CA_PROVISIONER: &str = "admin";
-pub(crate) const DEFAULT_CA_DNS: &str = "localhost,bootroot-ca,stepca.internal";
+/// DNS names step-ca's certificate carries besides its own container
+/// name.
+///
+/// `localhost` and `stepca.internal` are fixed; the third entry is the
+/// step-ca container name, which follows the install identity and is
+/// spliced in between them by [`default_ca_dns_names`].
+const DEFAULT_CA_DNS_FIXED: [&str; 2] = ["localhost", "stepca.internal"];
 pub(crate) const DEFAULT_CA_ADDRESS: &str = ":9000";
 pub(crate) const SECRET_BYTES: usize = 32;
 pub(crate) const DEFAULT_RESPONDER_TOKEN_TTL_SECS: u64 = 60;
-// Keep "bootroot-http01" in sync with RESPONDER_SERVICE_NAME.
-pub(crate) const DEFAULT_RESPONDER_ADMIN_URL: &str = "http://bootroot-http01:8080";
+/// Port the responder publishes its admin API on inside the network.
+const RESPONDER_ADMIN_PORT: u16 = 8080;
+/// Port the `OpenBao` container listens on inside the network.
+///
+/// Fixed, unlike the host-side publish, which `--openbao-host-port` moves
+/// so two installs can share a host: the compose port mappings, the
+/// `openbao.hcl` listener and the non-loopback bind override all pin the
+/// container side to this port. Anything addressing `OpenBao` by
+/// container name is on the compose network and must use it rather than
+/// whatever host port the URL it was handed carries.
+pub(in crate::commands::init) const OPENBAO_CONTAINER_PORT: u16 = 8200;
 pub(crate) const RESPONDER_TEMPLATE_DIR: &str = "templates";
 pub(crate) const RESPONDER_TEMPLATE_NAME: &str = "responder.toml.ctmpl";
 pub(crate) const RESPONDER_CONFIG_DIR: &str = "responder";
@@ -41,10 +56,6 @@ pub(crate) const OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME: &str =
     "docker-compose.openbao-agent.override.yml";
 pub(crate) const OPENBAO_AGENT_STEPCA_SERVICE: &str = "openbao-agent-stepca";
 pub(crate) const OPENBAO_AGENT_RESPONDER_SERVICE: &str = "openbao-agent-responder";
-/// Container name pinned by the agent compose override, so the sidecar
-/// can be restarted by name without knowing where the override lives.
-pub(crate) const OPENBAO_AGENT_STEPCA_CONTAINER_NAME: &str = "bootroot-openbao-agent-stepca";
-pub(crate) const OPENBAO_AGENT_RESPONDER_CONTAINER_NAME: &str = "bootroot-openbao-agent-responder";
 pub(crate) const DEFAULT_DB_USER: &str = "stepca";
 pub(crate) const DEFAULT_DB_NAME: &str = "stepca";
 pub(crate) const CA_CERTS_DIR: &str = "certs";
@@ -63,7 +74,6 @@ pub(crate) const RESPONDER_TLS_KEY_CONTAINER_PATH: &str = "/app/bootroot-http01/
 pub(crate) const OPENBAO_TLS_CONTAINER_CERT_PATH: &str = "/openbao/config/tls/server.crt";
 pub(crate) const OPENBAO_TLS_CONTAINER_KEY_PATH: &str = "/openbao/config/tls/server.key";
 pub(crate) const OPENBAO_HCL_PATH: &str = "openbao/openbao.hcl";
-pub(crate) const OPENBAO_CONTAINER_NAME: &str = "bootroot-openbao";
 pub(crate) const OPENBAO_INFRA_CERT_KEY: &str = "openbao";
 pub(crate) const OPENBAO_TLS_DEFAULT_NOT_AFTER: &str = "8760h";
 pub(crate) const OPENBAO_TLS_DEFAULT_RENEW_BEFORE: &str = "720h";
@@ -73,6 +83,25 @@ pub(crate) const HTTP01_ADMIN_TLS_CERT_REL_PATH: &str = "bootroot-http01/tls/ser
 pub(crate) const HTTP01_ADMIN_TLS_KEY_REL_PATH: &str = "bootroot-http01/tls/server.key";
 pub(crate) const HTTP01_ADMIN_TLS_DEFAULT_NOT_AFTER: &str = "8760h";
 pub(crate) const HTTP01_ADMIN_TLS_DEFAULT_RENEW_BEFORE: &str = "720h";
+
+/// Returns step-ca's `dnsNames` list for an install whose step-ca
+/// container is `ca_container`.
+///
+/// `localhost` and `stepca.internal` are not container names and stay
+/// fixed; only the middle entry follows the install identity.
+pub(crate) fn default_ca_dns_names(ca_container: &str) -> Vec<String> {
+    let [localhost, internal] = DEFAULT_CA_DNS_FIXED;
+    vec![
+        localhost.to_string(),
+        ca_container.to_string(),
+        internal.to_string(),
+    ]
+}
+
+/// Returns the in-network admin API URL of `responder_container`.
+pub(crate) fn default_responder_admin_url(responder_container: &str) -> String {
+    format!("http://{responder_container}:{RESPONDER_ADMIN_PORT}")
+}
 
 pub(crate) mod openbao_constants {
     pub(crate) const INIT_SECRET_SHARES: u8 = 3;
@@ -153,35 +182,83 @@ pub(crate) mod openbao_constants {
 
 #[cfg(test)]
 mod tests {
-    use super::{OPENBAO_AGENT_RESPONDER_CONTAINER_NAME, OPENBAO_AGENT_STEPCA_CONTAINER_NAME};
+    use super::{default_ca_dns_names, default_responder_admin_url};
     use crate::commands::compose_project::{
         DEFAULT_INSTANCE_NAME, DNS_LABEL_LIMIT, LONGEST_CONTAINER_NAME_SUFFIX,
         MAX_INSTANCE_NAME_LEN,
     };
+    use crate::commands::container_name::BootrootContainer;
 
-    /// Reads the `container_name:` values the tree declares today.
+    /// The interpolation prefix every `container_name:` in the shipped
+    /// compose files now carries.
+    const CONTAINER_NAME_INTERPOLATION: &str = "${BOOTROOT_INSTANCE:-bootroot}";
+
+    /// Reads the `container_name:` suffixes the compose files declare.
+    ///
+    /// Each value is `${BOOTROOT_INSTANCE:-bootroot}<suffix>`, so the
+    /// suffix is what has to agree with [`BootrootContainer`].
     ///
     /// Precedent: `shipped_compose_files_pass_the_localhost_binding_guardrail`
     /// in `commands/guardrails.rs` reaches the checked-in compose files
     /// the same way.
-    fn declared_container_names() -> Vec<String> {
+    fn declared_container_name_suffixes() -> Vec<String> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut names = Vec::new();
+        let mut suffixes = Vec::new();
         for file in ["docker-compose.yml", "docker-compose.deploy.yml"] {
             let contents =
                 std::fs::read_to_string(root.join(file)).expect("compose file must be readable");
             for line in contents.lines() {
                 if let Some(value) = line.trim().strip_prefix("container_name:") {
-                    names.push(value.trim().to_string());
+                    let value = value.trim();
+                    let suffix = value
+                        .strip_prefix(CONTAINER_NAME_INTERPOLATION)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "`container_name: {value}` in {file} must interpolate the \
+                                 instance name as `{CONTAINER_NAME_INTERPOLATION}<suffix>`"
+                            )
+                        });
+                    suffixes.push(suffix.to_string());
                 }
             }
         }
+        suffixes
+    }
+
+    /// The compose files and [`BootrootContainer`] are two declarations
+    /// of the same names; a container added to one and not the other
+    /// would escape the identity derivation (and the length limit below).
+    #[test]
+    fn compose_container_names_come_from_the_shared_derivation() {
+        let declared = declared_container_name_suffixes();
+        assert!(
+            declared.len() >= 14,
+            "expected seven services in each of the two compose files, got {declared:?}"
+        );
+        let known: Vec<&str> = BootrootContainer::ALL
+            .iter()
+            .map(|container| container.suffix())
+            .collect();
+        for suffix in &declared {
+            assert!(
+                known.contains(&suffix.as_str()),
+                "compose declares container suffix `{suffix}`, which \
+                 `BootrootContainer` does not know about"
+            );
+        }
         // The two sidecars are pinned by the generated OpenBao agent
-        // override rather than by a checked-in compose file, so they have
-        // to be added by hand — and one of them is the longest name.
-        names.push(OPENBAO_AGENT_STEPCA_CONTAINER_NAME.to_string());
-        names.push(OPENBAO_AGENT_RESPONDER_CONTAINER_NAME.to_string());
-        names
+        // override rather than by a checked-in compose file, so they are
+        // legitimately absent from `declared`.
+        for container in [
+            BootrootContainer::OpenBaoAgentStepCa,
+            BootrootContainer::OpenBaoAgentResponder,
+        ] {
+            assert!(
+                !declared.contains(&container.suffix().to_string()),
+                "{container:?} is pinned by the generated agent override, \
+                 not by a checked-in compose file"
+            );
+        }
     }
 
     /// The 39-character instance-name limit is derived from the container
@@ -192,18 +269,11 @@ mod tests {
     /// the limit wrong.
     #[test]
     fn instance_name_limit_leaves_room_for_every_container_name_suffix() {
-        let names = declared_container_names();
-        assert!(
-            names.len() >= 9,
-            "expected the seven compose services plus two sidecars, got {names:?}"
-        );
-        let mut longest = 0;
-        for name in &names {
-            let suffix = name.strip_prefix(DEFAULT_INSTANCE_NAME).unwrap_or_else(|| {
-                panic!("container name `{name}` does not start with `{DEFAULT_INSTANCE_NAME}`")
-            });
-            longest = longest.max(suffix.len());
-        }
+        let longest = BootrootContainer::ALL
+            .iter()
+            .map(|container| container.suffix().len())
+            .max()
+            .expect("the container set is never empty");
         assert_eq!(
             longest,
             LONGEST_CONTAINER_NAME_SUFFIX.len(),
@@ -217,19 +287,31 @@ mod tests {
         );
     }
 
-    /// `commands/rotate.rs` re-declares the two sidecar container names
-    /// instead of importing them.  The derivation above reads the
-    /// originals, so the duplicates have to stay equal to them or the
-    /// limit would be derived from names `rotate` does not use.
+    /// Only the container-name element of step-ca's DNS list follows the
+    /// identity; `localhost` and `stepca.internal` are not container
+    /// names and must survive untouched.
     #[test]
-    fn rotate_sidecar_container_names_match_the_originals() {
+    fn ca_dns_names_scope_only_the_container_name() {
+        let default = BootrootContainer::StepCa.name(DEFAULT_INSTANCE_NAME);
         assert_eq!(
-            crate::commands::rotate::OPENBAO_AGENT_STEPCA_CONTAINER,
-            OPENBAO_AGENT_STEPCA_CONTAINER_NAME
+            default_ca_dns_names(&default),
+            vec!["localhost", "bootroot-ca", "stepca.internal"]
         );
         assert_eq!(
-            crate::commands::rotate::OPENBAO_AGENT_RESPONDER_CONTAINER,
-            OPENBAO_AGENT_RESPONDER_CONTAINER_NAME
+            default_ca_dns_names(&BootrootContainer::StepCa.name("insight")),
+            vec!["localhost", "insight-ca", "stepca.internal"]
+        );
+    }
+
+    #[test]
+    fn responder_admin_url_follows_the_container_name() {
+        assert_eq!(
+            default_responder_admin_url(&BootrootContainer::Http01.name(DEFAULT_INSTANCE_NAME)),
+            "http://bootroot-http01:8080"
+        );
+        assert_eq!(
+            default_responder_admin_url(&BootrootContainer::Http01.name("insight")),
+            "http://insight-http01:8080"
         );
     }
 }

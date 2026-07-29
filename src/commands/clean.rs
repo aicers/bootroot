@@ -5,8 +5,9 @@ use anyhow::{Context, Result};
 
 use crate::cli::args::CleanArgs;
 use crate::commands::compose_file::compose_file_dir;
-use crate::commands::compose_project::{compose_args, resolve_compose_project_for_dir};
-use crate::commands::infra::run_docker;
+use crate::commands::compose_project::ComposeIdentity;
+use crate::commands::container_name::BootrootContainer;
+use crate::commands::infra::{run_compose, run_docker};
 use crate::commands::init::prompt_yes_no;
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -46,7 +47,7 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
     let compose_dir = compose_dir.as_path();
 
     let compose_str = args.compose_file.compose_file.to_string_lossy();
-    let project = resolve_compose_project_for_dir(compose_dir, None, messages)?;
+    let identity = ComposeIdentity::resolve_for_dir(compose_dir, None, messages)?;
     let mut down_files: Vec<&str> = vec![&compose_str];
 
     let agent_override_path = compose_dir.join(OPENBAO_AGENT_OVERRIDE);
@@ -61,13 +62,8 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
         down_files.push(&exposed_override_str);
     }
 
-    let down_args = compose_args(
-        &project,
-        &down_files,
-        None,
-        &["down", "-v", "--remove-orphans"],
-    );
-    run_docker(&down_args, "docker compose down", messages)?;
+    let down = identity.compose(&down_files, None, &["down", "-v", "--remove-orphans"]);
+    run_compose(&down, "docker compose down", messages)?;
 
     remove_clean_artifacts(compose_dir, &StateFile::default_path(), messages)?;
 
@@ -86,7 +82,14 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
 /// `OpenBao` state without losing application DB / step-ca state.
 /// See issue #588 §5b.
 fn run_clean_openbao_only(args: &CleanArgs, messages: &Messages) -> Result<()> {
-    if !args.yes && !prompt_yes_no(messages.clean_confirm_openbao_only(), messages)? {
+    let identity = ComposeIdentity::resolve(&args.compose_file.compose_file, None, messages)?;
+    let openbao_container = identity.container(BootrootContainer::OpenBao);
+    if !args.yes
+        && !prompt_yes_no(
+            &messages.clean_confirm_openbao_only(&openbao_container),
+            messages,
+        )?
+    {
         anyhow::bail!(messages.error_operation_cancelled());
     }
     remove_openbao_container_and_volumes(&args.compose_file.compose_file, messages)?;
@@ -112,19 +115,19 @@ pub(crate) fn remove_openbao_container_and_volumes(
     // known without asking the daemon: every invocation passes an
     // explicit `-p` derived from this same resolver, so the removal and
     // the next `docker compose up` cannot disagree.
-    let project = resolve_compose_project_for_dir(compose_dir, None, messages)?;
+    let identity = ComposeIdentity::resolve_for_dir(compose_dir, None, messages)?;
 
-    let stop_args = compose_args(&project, &[&compose_str], None, &["stop", "openbao"]);
-    let _ = run_docker(&stop_args, "docker compose stop openbao", messages);
-    let rm_args = compose_args(&project, &[&compose_str], None, &["rm", "-fsv", "openbao"]);
-    run_docker(&rm_args, "docker compose rm openbao", messages)?;
+    let stop = identity.compose(&[&compose_str], None, &["stop", "openbao"]);
+    let _ = run_compose(&stop, "docker compose stop openbao", messages);
+    let rm = identity.compose(&[&compose_str], None, &["rm", "-fsv", "openbao"]);
+    run_compose(&rm, "docker compose rm openbao", messages)?;
 
     // Remove ONLY the openbao-owned named volumes. `docker compose down
     // -v` removes every named volume in the compose file regardless of
     // any positional service argument and would wipe `postgres-data`,
     // `prometheus-data`, `grafana-data` along with openbao's volumes.
     for vol in OPENBAO_NAMED_VOLUMES {
-        let full = format!("{project}_{vol}");
+        let full = format!("{}_{vol}", identity.project());
         let vol_args = ["volume", "rm", "-f", full.as_str()];
         run_docker(&vol_args, &format!("docker volume rm {full}"), messages)?;
     }
@@ -205,6 +208,7 @@ fn remove_file_if_exists(path: &Path, messages: &Messages) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::compose_project::resolve_compose_project_for_dir;
     use crate::commands::compose_project::test_env::{ComposeProjectEnv, env_lock};
     use crate::i18n::Messages;
 

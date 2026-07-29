@@ -232,8 +232,8 @@ process environment, or pass `--openbao-host-port` / `--stepca-host-port` /
 `--http01-admin-host-port` to `bootroot infra install`, which upserts it into
 `.env` for you. So the "ports that must be free" list (8200, 9000, 8080, 5433)
 is a set of defaults, not a requirement, and two bootroot instances can share a
-host once each also has its own container names (the shipped compose files pin
-those, so the second instance needs its own compose file).
+host: the shipped compose files derive their container names from the recorded
+`--instance-name`, so the second instance needs no compose file of its own.
 
 `bootroot init`, `bootroot status` and `bootroot reinit` pick up a non-default
 OpenBao host port automatically whenever `--openbao-url` is left at its default.

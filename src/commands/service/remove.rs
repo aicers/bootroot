@@ -10,7 +10,7 @@ use super::{
 };
 use crate::cli::args::ServiceRemoveArgs;
 use crate::cli::prompt::Prompt;
-use crate::commands::compose_project::resolve_compose_project_for_dir;
+use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::SERVICE_KV_BASE;
 use crate::commands::dns_alias::reconcile_dns_aliases;
 use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
@@ -175,12 +175,12 @@ pub(crate) async fn run_service_remove(
     // deregistration, not a post-persist afterthought.
     // As in `service add`: no compose file argument, so the project comes
     // from the `.env` in the process working directory.
-    let project = resolve_compose_project_for_dir(Path::new("."), None, messages)?;
+    let identity = ComposeIdentity::resolve_for_dir(Path::new("."), None, messages)?;
     finalize_removal(
         &mut state,
         &state_path,
         &args.service_name,
-        |post_removal| reconcile_dns_aliases(post_removal, &project, messages),
+        |post_removal| reconcile_dns_aliases(post_removal, &identity, messages),
         messages,
     )?;
 

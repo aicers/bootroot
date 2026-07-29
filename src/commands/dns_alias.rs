@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 
 use crate::commands::clean::{COMPOSE_PROJECT_LABEL, COMPOSE_SERVICE_LABEL};
+use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
+use crate::commands::container_name::BootrootContainer;
 use crate::commands::infra::{docker_output, run_docker};
 use crate::i18n::Messages;
 use crate::state::{ServiceEntry, StateFile};
@@ -33,14 +35,14 @@ pub(crate) fn collect_dns_aliases(state: &StateFile) -> Vec<String> {
 /// it on its Docker network with the full alias set.
 pub(crate) fn register_dns_alias(
     state: &StateFile,
-    project: &str,
+    identity: &ComposeIdentity,
     messages: &Messages,
 ) -> Result<()> {
     let aliases = collect_dns_aliases(state);
     if aliases.is_empty() {
         return Ok(());
     }
-    apply_dns_aliases(&aliases, project, messages)
+    apply_dns_aliases(&aliases, identity, messages)
 }
 
 /// Refreshes the responder's HTTP-01 alias set from `state.json`,
@@ -56,11 +58,11 @@ pub(crate) fn register_dns_alias(
 /// alias in place.
 pub(crate) fn reconcile_dns_aliases(
     state: &StateFile,
-    project: &str,
+    identity: &ComposeIdentity,
     messages: &Messages,
 ) -> Result<()> {
     let aliases = collect_dns_aliases(state);
-    apply_dns_aliases(&aliases, project, messages)
+    apply_dns_aliases(&aliases, identity, messages)
 }
 
 /// Replays all DNS aliases from `state.json` onto the running
@@ -70,15 +72,19 @@ pub(crate) fn reconcile_dns_aliases(
 /// lost during a container restart.
 pub(crate) fn replay_dns_aliases(
     state: &StateFile,
-    project: &str,
+    identity: &ComposeIdentity,
     messages: &Messages,
 ) -> Result<()> {
     let aliases = collect_dns_aliases(state);
     if aliases.is_empty() {
         return Ok(());
     }
-    println!("{}", messages.dns_alias_replaying(aliases.len()));
-    apply_dns_aliases(&aliases, project, messages)
+    let container = identity.container(BootrootContainer::Http01);
+    println!(
+        "{}",
+        messages.dns_alias_replaying(aliases.len(), &container)
+    );
+    apply_dns_aliases(&aliases, identity, messages)
 }
 
 /// Applies all DNS aliases to the `bootroot-http01` container at runtime.
@@ -92,9 +98,17 @@ pub(crate) fn replay_dns_aliases(
 /// to the network (including when aliases could not be applied).
 /// Returns `Err` only when the container is left detached from the
 /// network (disconnect succeeded but both reconnect and rollback failed).
-fn apply_dns_aliases(aliases: &[String], project: &str, messages: &Messages) -> Result<()> {
-    let Some(container_id) = find_responder_container(project, messages)? else {
-        eprintln!("{}", messages.dns_alias_responder_not_running());
+fn apply_dns_aliases(
+    aliases: &[String],
+    identity: &ComposeIdentity,
+    messages: &Messages,
+) -> Result<()> {
+    // The operator-facing half of this function names the container the
+    // recovery command has to target, which is this install's responder
+    // and not the default instance's.
+    let container = identity.container(BootrootContainer::Http01);
+    let Some(container_id) = find_responder_container(identity.project(), messages)? else {
+        eprintln!("{}", messages.dns_alias_responder_not_running(&container));
         return Ok(());
     };
     let Ok(network) = find_container_network(&container_id, messages) else {
@@ -130,7 +144,7 @@ fn apply_dns_aliases(aliases: &[String], project: &str, messages: &Messages) -> 
     if let Err(err) = run_docker(&args, "docker network connect", messages) {
         // Reconnect failed — attempt rollback to restore network
         // connectivity without aliases so the responder stays reachable.
-        eprintln!("{}", messages.dns_alias_connect_rollback());
+        eprintln!("{}", messages.dns_alias_connect_rollback(&container));
         if let Err(rollback_err) = run_docker(
             &[
                 "network",
@@ -148,9 +162,9 @@ fn apply_dns_aliases(aliases: &[String], project: &str, messages: &Messages) -> 
             // not report success.
             eprintln!(
                 "{}",
-                messages.dns_alias_rollback_failed(&network, &rollback_err.to_string())
+                messages.dns_alias_rollback_failed(&container, &network, &rollback_err.to_string())
             );
-            return Err(err).with_context(|| messages.dns_alias_connect_failed());
+            return Err(err).with_context(|| messages.dns_alias_connect_failed(&container));
         }
         // Rollback succeeded — connectivity is restored but aliases
         // were not applied.  Warn and return Ok so the caller can

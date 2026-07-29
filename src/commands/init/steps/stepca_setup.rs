@@ -7,9 +7,8 @@ use bootroot::fs_util;
 
 use super::super::constants::openbao_constants::{PATH_STEPCA_DB, PATH_STEPCA_PASSWORD};
 use super::super::constants::{
-    DEFAULT_CA_ADDRESS, DEFAULT_CA_DNS, DEFAULT_CA_NAME, DEFAULT_CA_PROVISIONER,
-    OPENBAO_AGENT_STEPCA_CONTAINER_NAME, RESPONDER_TEMPLATE_DIR, STEPCA_CA_JSON_TEMPLATE_NAME,
-    STEPCA_PASSWORD_TEMPLATE_NAME,
+    DEFAULT_CA_ADDRESS, DEFAULT_CA_NAME, DEFAULT_CA_PROVISIONER, RESPONDER_TEMPLATE_DIR,
+    STEPCA_CA_JSON_TEMPLATE_NAME, STEPCA_PASSWORD_TEMPLATE_NAME, default_ca_dns_names,
 };
 use super::super::paths::StepCaTemplatePaths;
 use super::super::types::StepCaInitResult;
@@ -261,8 +260,11 @@ fn is_wildcard(ip: &str) -> bool {
 
 /// Builds the name set for step-ca's own serving certificate.
 ///
-/// Always carries the three `DEFAULT_CA_DNS` names so that in-network
-/// consumers keep verifying by container name.  A specific bind address
+/// Always carries the three `default_ca_dns_names` entries — `localhost`,
+/// this install's own step-ca container name and `stepca.internal` — so
+/// that in-network consumers keep verifying by container name.  Only the
+/// container name follows the install identity; the other two are not
+/// container names.  A specific bind address
 /// contributes its IP; an IPv4 wildcard bind maps to `127.0.0.1` and an
 /// IPv6 wildcard to `::1` plus `127.0.0.1`; a recorded advertise
 /// address contributes its IP too.  Wildcard literals are never emitted
@@ -275,8 +277,9 @@ fn is_wildcard(ip: &str) -> bool {
 pub(super) fn build_stepca_ca_dns_names(
     bind_addr: Option<&str>,
     advertise_addr: Option<&str>,
+    ca_container: &str,
 ) -> Vec<String> {
-    let mut names: Vec<String> = DEFAULT_CA_DNS.split(',').map(str::to_string).collect();
+    let mut names: Vec<String> = default_ca_dns_names(ca_container);
 
     if let Some(ip) = bind_addr.and_then(addr_ip) {
         match ip {
@@ -305,14 +308,18 @@ pub(super) fn build_stepca_ca_dns_names(
 /// no bind intent is recorded — including after a loopback reinstall
 /// cleared a previous intent, which is what makes the reconciliation
 /// below shrink `dnsNames` back to the defaults.
-pub(super) fn resolve_stepca_ca_dns_names(state_path: &Path) -> Result<Vec<String>> {
+pub(super) fn resolve_stepca_ca_dns_names(
+    state_path: &Path,
+    ca_container: &str,
+) -> Result<Vec<String>> {
     if !state_path.exists() {
-        return Ok(build_stepca_ca_dns_names(None, None));
+        return Ok(build_stepca_ca_dns_names(None, None, ca_container));
     }
     let state = StateFile::load(state_path)?;
     Ok(build_stepca_ca_dns_names(
         state.stepca_bind_addr.as_deref(),
         state.stepca_advertise_addr.as_deref(),
+        ca_container,
     ))
 }
 
@@ -463,12 +470,15 @@ pub(super) async fn reconcile_ca_json_dns_names(
 /// across an `init` that changed `dnsNames` would keep writing the
 /// pre-`init` name set back over the reconciled file.
 ///
+/// `container` is this install's own sidecar, so a second install on the
+/// same host is never restarted from here.
+///
 /// Returns `false` when the container is absent — a fresh install has no
 /// sidecar yet, and that is not a failure.  Output is discarded so the
 /// absent-container case adds no noise to the `init` transcript.
-pub(super) fn restart_stepca_openbao_agent() -> bool {
+pub(super) fn restart_stepca_openbao_agent(container: &str) -> bool {
     std::process::Command::new("docker")
-        .args(["restart", OPENBAO_AGENT_STEPCA_CONTAINER_NAME])
+        .args(["restart", container])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -550,6 +560,48 @@ mod tests {
     use super::super::test_support::test_messages;
     use super::*;
 
+    /// The step-ca container name a default install renders.
+    const DEFAULT_CA_CONTAINER: &str = "bootroot-ca";
+
+    /// Only the container-name element follows the install identity;
+    /// `localhost` and `stepca.internal` are not container names.
+    #[test]
+    fn dns_names_scope_only_the_container_name_to_the_instance() {
+        let names = build_stepca_ca_dns_names(None, None, "insight-ca");
+        assert_eq!(names, vec!["localhost", "insight-ca", "stepca.internal"]);
+        assert!(!names.contains(&DEFAULT_CA_CONTAINER.to_string()));
+    }
+
+    /// The restart bypasses Compose, so nothing but the name it is
+    /// handed decides which install's sidecar goes down.  It used to
+    /// inline a default-instance literal, which on a non-default
+    /// instance restarted a co-located default install's sidecar.
+    #[test]
+    fn restarting_the_stepca_sidecar_names_the_container_it_is_given() {
+        use crate::commands::rotate::test_support::{
+            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
+            write_fake_docker_script,
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
+
+        assert!(restart_stepca_openbao_agent("insight-openbao-agent-stepca"));
+
+        let logged = fs::read_to_string(&args_log).expect("read docker args");
+        assert_eq!(
+            logged.lines().collect::<Vec<&str>>(),
+            vec!["restart", "insight-openbao-agent-stepca"]
+        );
+    }
+
     #[tokio::test]
     async fn test_write_stepca_templates_writes_templates() {
         let temp_dir = tempdir().unwrap();
@@ -565,7 +617,7 @@ mod tests {
         .unwrap();
 
         let messages = test_messages();
-        let dns_names = build_stepca_ca_dns_names(None, None);
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
         let paths =
             write_stepca_templates(&secrets_dir, "secret", "48h", "acme", &dns_names, &messages)
                 .await
@@ -649,7 +701,7 @@ mod tests {
         fs::write(secrets_dir.join("secrets").join("root_ca_key"), "").unwrap();
         fs::write(secrets_dir.join("secrets").join("intermediate_ca_key"), "").unwrap();
 
-        let dns_names = build_stepca_ca_dns_names(None, None);
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
         let result =
             ensure_step_ca_initialized(&secrets_dir, &dns_names, &test_messages()).unwrap();
         assert_eq!(result, StepCaInitResult::Skipped);
@@ -661,7 +713,7 @@ mod tests {
         let secrets_dir = temp_dir.path().join("secrets");
         fs::create_dir_all(&secrets_dir).unwrap();
 
-        let dns_names = build_stepca_ca_dns_names(None, None);
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
         let err =
             ensure_step_ca_initialized(&secrets_dir, &dns_names, &test_messages()).unwrap_err();
         assert!(err.to_string().contains("step-ca password file not found"));
@@ -700,13 +752,14 @@ mod tests {
 
     #[test]
     fn build_ca_dns_names_defaults_without_bind_intent() {
-        let names = build_stepca_ca_dns_names(None, None);
+        let names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
         assert_eq!(names, vec!["localhost", "bootroot-ca", "stepca.internal"]);
     }
 
     #[test]
     fn build_ca_dns_names_includes_specific_ipv4() {
-        let names = build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None);
+        let names =
+            build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None, DEFAULT_CA_CONTAINER);
         assert!(names.contains(&"localhost".to_string()));
         assert!(names.contains(&"bootroot-ca".to_string()));
         assert!(names.contains(&"stepca.internal".to_string()));
@@ -715,20 +768,20 @@ mod tests {
 
     #[test]
     fn build_ca_dns_names_includes_specific_ipv6() {
-        let names = build_stepca_ca_dns_names(Some("[fd12::1]:9000"), None);
+        let names = build_stepca_ca_dns_names(Some("[fd12::1]:9000"), None, DEFAULT_CA_CONTAINER);
         assert!(names.contains(&"fd12::1".to_string()));
     }
 
     #[test]
     fn build_ca_dns_names_ipv4_wildcard_maps_to_loopback() {
-        let names = build_stepca_ca_dns_names(Some("0.0.0.0:9000"), None);
+        let names = build_stepca_ca_dns_names(Some("0.0.0.0:9000"), None, DEFAULT_CA_CONTAINER);
         assert!(names.contains(&"127.0.0.1".to_string()));
         assert!(!names.contains(&"0.0.0.0".to_string()));
     }
 
     #[test]
     fn build_ca_dns_names_ipv6_wildcard_maps_to_both_loopbacks() {
-        let names = build_stepca_ca_dns_names(Some("[::]:9000"), None);
+        let names = build_stepca_ca_dns_names(Some("[::]:9000"), None, DEFAULT_CA_CONTAINER);
         assert!(
             names.contains(&"::1".to_string()),
             "IPv6 wildcard must include the IPv6 loopback"
@@ -742,7 +795,7 @@ mod tests {
 
     #[test]
     fn build_ca_dns_names_ipv6_zero_wildcard_maps_to_both_loopbacks() {
-        let names = build_stepca_ca_dns_names(Some("[::0]:9000"), None);
+        let names = build_stepca_ca_dns_names(Some("[::0]:9000"), None, DEFAULT_CA_CONTAINER);
         assert!(names.contains(&"::1".to_string()));
         assert!(names.contains(&"127.0.0.1".to_string()));
         assert!(!names.contains(&"::0".to_string()));
@@ -750,7 +803,11 @@ mod tests {
 
     #[test]
     fn build_ca_dns_names_wildcard_with_advertise_addr() {
-        let names = build_stepca_ca_dns_names(Some("0.0.0.0:9000"), Some("192.168.139.144:9000"));
+        let names = build_stepca_ca_dns_names(
+            Some("0.0.0.0:9000"),
+            Some("192.168.139.144:9000"),
+            DEFAULT_CA_CONTAINER,
+        );
         assert!(names.contains(&"127.0.0.1".to_string()));
         assert!(
             names.contains(&"192.168.139.144".to_string()),
@@ -761,8 +818,11 @@ mod tests {
 
     #[test]
     fn build_ca_dns_names_advertise_equal_to_bind_is_not_duplicated() {
-        let names =
-            build_stepca_ca_dns_names(Some("192.168.139.144:9000"), Some("192.168.139.144:9000"));
+        let names = build_stepca_ca_dns_names(
+            Some("192.168.139.144:9000"),
+            Some("192.168.139.144:9000"),
+            DEFAULT_CA_CONTAINER,
+        );
         let count = names.iter().filter(|n| *n == "192.168.139.144").count();
         assert_eq!(count, 1, "advertise IP must not be duplicated");
     }
@@ -775,12 +835,12 @@ mod tests {
         let defaults = vec!["localhost", "bootroot-ca", "stepca.internal"];
         for malformed in ["", "192.168.139.144", ":9000", "[]:9000"] {
             assert_eq!(
-                build_stepca_ca_dns_names(Some(malformed), None),
+                build_stepca_ca_dns_names(Some(malformed), None, DEFAULT_CA_CONTAINER),
                 defaults,
                 "malformed bind {malformed:?} must contribute no name"
             );
             assert_eq!(
-                build_stepca_ca_dns_names(None, Some(malformed)),
+                build_stepca_ca_dns_names(None, Some(malformed), DEFAULT_CA_CONTAINER),
                 defaults,
                 "malformed advertise {malformed:?} must contribute no name"
             );
@@ -793,7 +853,11 @@ mod tests {
     #[test]
     fn build_ca_dns_names_drops_wildcard_advertise_addr() {
         for wildcard in ["0.0.0.0:9000", "[::]:9000", "[::0]:9000"] {
-            let names = build_stepca_ca_dns_names(Some("192.168.139.144:9000"), Some(wildcard));
+            let names = build_stepca_ca_dns_names(
+                Some("192.168.139.144:9000"),
+                Some(wildcard),
+                DEFAULT_CA_CONTAINER,
+            );
             assert!(
                 !names
                     .iter()
@@ -806,7 +870,9 @@ mod tests {
     #[test]
     fn resolve_ca_dns_names_defaults_when_state_missing() {
         let temp_dir = tempdir().unwrap();
-        let names = resolve_stepca_ca_dns_names(&temp_dir.path().join("state.json")).unwrap();
+        let names =
+            resolve_stepca_ca_dns_names(&temp_dir.path().join("state.json"), DEFAULT_CA_CONTAINER)
+                .unwrap();
         assert_eq!(names, vec!["localhost", "bootroot-ca", "stepca.internal"]);
     }
 
@@ -821,7 +887,7 @@ mod tests {
         };
         state.save(&state_path).unwrap();
 
-        let names = resolve_stepca_ca_dns_names(&state_path).unwrap();
+        let names = resolve_stepca_ca_dns_names(&state_path, DEFAULT_CA_CONTAINER).unwrap();
         assert!(names.contains(&"127.0.0.1".to_string()));
         assert!(names.contains(&"192.168.139.144".to_string()));
     }
@@ -832,7 +898,8 @@ mod tests {
         let secrets_dir = temp_dir.path().join("secrets");
         write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
         let messages = test_messages();
-        let dns_names = build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None);
+        let dns_names =
+            build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None, DEFAULT_CA_CONTAINER);
 
         let first = update_ca_json_with_backup(
             &secrets_dir,
@@ -911,7 +978,7 @@ mod tests {
             }"#,
         );
         let messages = test_messages();
-        let dns_names = build_stepca_ca_dns_names(None, None);
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
 
         let update = update_ca_json_with_backup(
             &secrets_dir,
@@ -937,7 +1004,11 @@ mod tests {
         let secrets_dir = temp_dir.path().join("secrets");
         write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
         let messages = test_messages();
-        let dns_names = build_stepca_ca_dns_names(Some("0.0.0.0:9000"), Some("10.1.2.3:9000"));
+        let dns_names = build_stepca_ca_dns_names(
+            Some("0.0.0.0:9000"),
+            Some("10.1.2.3:9000"),
+            DEFAULT_CA_CONTAINER,
+        );
 
         update_ca_json_with_backup(
             &secrets_dir,
@@ -993,7 +1064,8 @@ mod tests {
         // reconciliation: the pre-#733 name set is back on disk.
         write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
         let messages = test_messages();
-        let dns_names = build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None);
+        let dns_names =
+            build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None, DEFAULT_CA_CONTAINER);
 
         let paths =
             write_stepca_templates(&secrets_dir, "secret", "48h", "acme", &dns_names, &messages)
@@ -1013,7 +1085,8 @@ mod tests {
         let secrets_dir = temp_dir.path().join("secrets");
         write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
         let messages = test_messages();
-        let dns_names = build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None);
+        let dns_names =
+            build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None, DEFAULT_CA_CONTAINER);
 
         let changed = reconcile_ca_json_dns_names(&secrets_dir, &dns_names, &messages)
             .await
@@ -1058,7 +1131,8 @@ mod tests {
             "a fresh install has no template to restore"
         );
 
-        let dns_names = build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None);
+        let dns_names =
+            build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None, DEFAULT_CA_CONTAINER);
         write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &dns_names, &messages)
             .await
             .unwrap();

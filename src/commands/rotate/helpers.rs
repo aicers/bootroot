@@ -6,8 +6,9 @@ use bootroot::fs_util;
 
 use super::RENDERED_FILE_POLL_INTERVAL;
 use crate::cli::prompt::Prompt;
-use crate::commands::compose_project::{compose_args, resolve_compose_project};
-use crate::commands::infra::run_docker;
+use crate::commands::compose_project::ComposeIdentity;
+use crate::commands::container_name::{BootrootContainer, resolve_container_name};
+use crate::commands::infra::{run_compose, run_docker};
 use crate::i18n::Messages;
 use crate::state::ServiceEntry;
 
@@ -90,20 +91,32 @@ pub(super) fn restart_container(container: &str, messages: &Messages) -> Result<
     run_docker(&args, &format!("docker restart {container}"), messages)
 }
 
+/// Restarts one of the `OpenBao` Agent sidecars so it re-renders its
+/// templates against the value this rotation just wrote.
+///
+/// The sidecars are addressed by name and therefore bypass Compose's
+/// `-p` project scoping, so the name has to come from the identity
+/// recorded beside the compose file the command was handed.  A literal
+/// would restart a co-located default install's sidecar instead — or
+/// fail on a name that does not exist for this install at all.
+pub(super) fn restart_openbao_agent(
+    compose_file: &Path,
+    container: BootrootContainer,
+    messages: &Messages,
+) -> Result<()> {
+    let name = resolve_container_name(compose_file, container, messages)?;
+    restart_container(&name, messages)
+}
+
 pub(super) fn restart_compose_service(
     compose_file: &Path,
     service: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let project = resolve_compose_project(compose_file, None, messages)?;
+    let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
     let compose_str = compose_file.to_string_lossy();
-    let args = compose_args(
-        &project,
-        &[compose_str.as_ref()],
-        None,
-        &["restart", service],
-    );
-    run_docker(&args, "docker compose restart", messages)
+    let invocation = identity.compose(&[compose_str.as_ref()], None, &["restart", service]);
+    run_compose(&invocation, "docker compose restart", messages)
 }
 
 pub(super) fn reload_compose_service(
@@ -111,15 +124,14 @@ pub(super) fn reload_compose_service(
     service: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let project = resolve_compose_project(compose_file, None, messages)?;
+    let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
     let compose_str = compose_file.to_string_lossy();
-    let args = compose_args(
-        &project,
+    let invocation = identity.compose(
         &[compose_str.as_ref()],
         None,
         &["kill", "-s", "HUP", service],
     );
-    run_docker(&args, "docker compose kill", messages)
+    run_compose(&invocation, "docker compose kill", messages)
 }
 
 pub(super) async fn wait_for_rendered_file(
@@ -185,8 +197,98 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::super::test_support::test_messages;
+    use super::super::test_support::{
+        ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend, test_messages,
+        write_fake_docker_script,
+    };
     use super::*;
+    use crate::commands::compose_project::DEFAULT_INSTANCE_NAME;
+
+    /// Runs `restart_openbao_agent` against a fake `docker` on `PATH`
+    /// and returns the argument vector it was given.
+    fn restart_args(instance: &str, container: BootrootContainer) -> Vec<String> {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        std::fs::write(
+            dir.path().join(".env"),
+            format!("BOOTROOT_INSTANCE={instance}\n"),
+        )
+        .expect("write .env");
+        restart_openbao_agent(
+            &dir.path().join("docker-compose.yml"),
+            container,
+            &test_messages(),
+        )
+        .expect("restarting the sidecar must succeed");
+
+        std::fs::read_to_string(&args_log)
+            .expect("read docker args")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The sidecars bypass Compose's project scoping, so `rotate db` and
+    /// `rotate stepca-password` — which both restart the step-ca agent
+    /// so it re-renders `ca.json` / `password.txt` — must name the
+    /// container of the install they were pointed at.  A default-named
+    /// literal would restart a co-located default install's sidecar.
+    #[test]
+    fn restarting_the_stepca_agent_names_the_recorded_instance() {
+        assert_eq!(
+            restart_args("insight", BootrootContainer::OpenBaoAgentStepCa),
+            vec!["restart", "insight-openbao-agent-stepca"]
+        );
+    }
+
+    /// `rotate responder-hmac` restarts the other sidecar, so the two
+    /// kinds must not be interchangeable.
+    #[test]
+    fn restarting_the_responder_agent_names_the_recorded_instance() {
+        assert_eq!(
+            restart_args("insight", BootrootContainer::OpenBaoAgentResponder),
+            vec!["restart", "insight-openbao-agent-responder"]
+        );
+    }
+
+    /// An install that declared no identity keeps the historical names,
+    /// which is what leaves the `bootroot-*` literals across `scripts/`,
+    /// `tests/` and `docs/` correct.
+    #[test]
+    fn restarting_a_sidecar_without_a_recorded_identity_keeps_the_default_name() {
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).expect("create bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+
+        restart_openbao_agent(
+            &dir.path().join("docker-compose.yml"),
+            BootrootContainer::OpenBaoAgentStepCa,
+            &test_messages(),
+        )
+        .expect("restarting the sidecar must succeed");
+
+        // Spelled through the derivation rather than as a literal: a
+        // bare default-instance sidecar name in `src/` is what
+        // `container_name`'s single-declaration guard forbids.
+        let expected = BootrootContainer::OpenBaoAgentStepCa.name(DEFAULT_INSTANCE_NAME);
+        let logged = std::fs::read_to_string(&args_log).expect("read docker args");
+        assert_eq!(
+            logged.lines().collect::<Vec<&str>>(),
+            vec!["restart", expected.as_str()]
+        );
+    }
 
     #[tokio::test]
     async fn write_secret_id_atomic_overwrites_contents() {

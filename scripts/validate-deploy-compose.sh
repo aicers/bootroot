@@ -12,11 +12,28 @@ cd "$ROOT_DIR"
 
 COMPOSE_FILE="docker-compose.deploy.yml"
 
+# `container_name:` interpolates BOOTROOT_INSTANCE, which Compose reads
+# from the process environment and from the project directory's `.env` —
+# gitignored, and holding a recorded instance name in any workspace where
+# `infra install --instance-name` has run. The default-name assertions
+# below would fail there, so the render is isolated from both: an
+# explicit `--env-file` replaces `.env`, and `env -u` clears the process
+# variable. The env file also carries the two secrets the compose file
+# requires to interpolate at all.
+TMP_DIR="$(mktemp -d)"
+cleanup() { rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
+
+ENV_FILE="$TMP_DIR/render.env"
+cat >"$ENV_FILE" <<'EOF'
+POSTGRES_PASSWORD=validate-only
+GRAFANA_ADMIN_PASSWORD=validate-only
+EOF
+
 echo "[validate-deploy-compose] rendering $COMPOSE_FILE"
 rendered="$(
-  POSTGRES_PASSWORD="validate-only" \
-  GRAFANA_ADMIN_PASSWORD="validate-only" \
-  docker compose -f "$COMPOSE_FILE" config
+  env -u BOOTROOT_INSTANCE \
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config
 )"
 
 if grep -qE '^\s*build:' <<<"$rendered"; then
@@ -40,9 +57,8 @@ echo "[validate-deploy-compose] OK: no build: contexts; default services present
 # openbao/openbao.hcl and responder.toml.compose — with no source tree
 # present. `infra install` itself would create .env, secrets/, and certs/;
 # here we pre-create them so `docker compose config` renders cleanly.
-STAGE_DIR="$(mktemp -d)"
-cleanup() { rm -rf "$STAGE_DIR"; }
-trap cleanup EXIT
+STAGE_DIR="$TMP_DIR/stage"
+mkdir -p "$STAGE_DIR"
 
 echo "[validate-deploy-compose] staging smoke in $STAGE_DIR"
 cp "$COMPOSE_FILE" "$STAGE_DIR/"

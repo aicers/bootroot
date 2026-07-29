@@ -881,6 +881,27 @@ mod tests {
         assert_eq!(hooks[0].args, vec!["restart", "my-ctr"]);
     }
 
+    /// Reload hooks name containers belonging to the products bootroot
+    /// manages, not to bootroot itself, so the install identity must
+    /// never be prefixed onto them.  A sweep that instance-scoped every
+    /// `["restart", …]` vector would corrupt working operator
+    /// configuration.
+    #[test]
+    fn resolve_hooks_pass_the_operator_supplied_container_through_verbatim() {
+        for container in [
+            "aimer-web-next-app-1",
+            "bootroot-openbao",
+            "insight-openbao-agent-stepca",
+        ] {
+            let mut args = empty_args();
+            args.reload_style = Some(ReloadStyle::DockerRestart);
+            args.reload_target = Some(container.to_string());
+
+            let hooks = resolve_post_renew_hooks(&args).unwrap();
+            assert_eq!(hooks[0].args, vec!["restart", container]);
+        }
+    }
+
     #[test]
     fn resolve_hooks_none_preset_returns_empty() {
         let mut args = empty_args();

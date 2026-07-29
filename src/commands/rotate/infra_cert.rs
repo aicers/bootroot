@@ -11,9 +11,11 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use super::RotateContext;
 use super::helpers::{confirm_action, try_restart_container};
 use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_project::ComposeIdentity;
+use crate::commands::container_name::BootrootContainer;
 use crate::commands::init::{
-    HTTP01_ADMIN_INFRA_CERT_KEY, OPENBAO_CONTAINER_NAME, OPENBAO_INFRA_CERT_KEY,
-    OPENBAO_TLS_CERT_PATH, reissue_http01_admin_tls_cert, reissue_openbao_tls_cert,
+    HTTP01_ADMIN_INFRA_CERT_KEY, OPENBAO_INFRA_CERT_KEY, OPENBAO_TLS_CERT_PATH,
+    reissue_http01_admin_tls_cert, reissue_openbao_tls_cert,
 };
 use crate::i18n::Messages;
 use crate::state::{InfraCertEntry, ReloadStrategy};
@@ -56,6 +58,11 @@ pub(super) async fn rotate_infra_certs(
 
     let state_file = ctx.state_file.clone();
     let compose_dir = compose_file_dir(&ctx.compose_file);
+    // Both the SAN fallbacks and the reload strategies name containers,
+    // so they follow the recorded instance rather than a fixed literal.
+    let identity = ComposeIdentity::resolve(&ctx.compose_file, None, messages)?;
+    let openbao_container = identity.container(BootrootContainer::OpenBao);
+    let responder_container = identity.container(BootrootContainer::Http01);
 
     let entries: Vec<(String, InfraCertEntry)> = ctx
         .state
@@ -65,14 +72,24 @@ pub(super) async fn rotate_infra_certs(
         .collect();
 
     for (name, entry) in &entries {
-        dispatch_reissue(name, &compose_dir, ctx.paths.secrets_dir(), entry, messages)
-            .with_context(|| messages.error_infra_tls_renew_failed(name))?;
+        dispatch_reissue(
+            name,
+            &compose_dir,
+            ctx.paths.secrets_dir(),
+            entry,
+            &ContainerNames {
+                openbao: &openbao_container,
+                responder: &responder_container,
+            },
+            messages,
+        )
+        .with_context(|| messages.error_infra_tls_renew_failed(name))?;
 
         // Resolve the reload strategy in code, not from the stored entry:
         // an already-initialized host (or a reinit that carried the
         // snapshot forward) may still record `ContainerRestart` for the
         // `openbao` key, which reseals the vault. See issue #727.
-        let strategy = resolve_reload_strategy(name, entry);
+        let strategy = resolve_reload_strategy(name, entry, &openbao_container);
 
         if let Some(state_entry) = ctx.state.infra_certs.get_mut(name) {
             state_entry.issued_at = Some(
@@ -120,14 +137,25 @@ pub(super) async fn rotate_infra_certs(
 /// what the entry recorded, so a host whose `state.json` still carries
 /// `ContainerRestart` never reseals its vault on rotation. Other keys
 /// keep the strategy the entry recorded.
-fn resolve_reload_strategy(name: &str, entry: &InfraCertEntry) -> ReloadStrategy {
+fn resolve_reload_strategy(
+    name: &str,
+    entry: &InfraCertEntry,
+    openbao_container: &str,
+) -> ReloadStrategy {
     match name {
         OPENBAO_INFRA_CERT_KEY => ReloadStrategy::ContainerSignal {
-            container_name: OPENBAO_CONTAINER_NAME.to_string(),
+            container_name: openbao_container.to_string(),
             signal: OPENBAO_RELOAD_SIGNAL.to_string(),
         },
         _ => entry.reload_strategy.clone(),
     }
+}
+
+/// The container names an infra-cert re-issuance needs, resolved once
+/// from the install identity rather than per dispatch arm.
+struct ContainerNames<'a> {
+    openbao: &'a str,
+    responder: &'a str,
 }
 
 /// Dispatches certificate re-issuance by infra-cert key.
@@ -140,13 +168,20 @@ fn dispatch_reissue(
     compose_dir: &Path,
     secrets_dir: &Path,
     entry: &InfraCertEntry,
+    containers: &ContainerNames<'_>,
     messages: &Messages,
 ) -> Result<()> {
     match name {
-        OPENBAO_INFRA_CERT_KEY => {
-            reissue_openbao_tls_cert(compose_dir, secrets_dir, entry, messages)
+        OPENBAO_INFRA_CERT_KEY => reissue_openbao_tls_cert(
+            compose_dir,
+            secrets_dir,
+            entry,
+            containers.openbao,
+            messages,
+        ),
+        HTTP01_ADMIN_INFRA_CERT_KEY => {
+            reissue_http01_admin_tls_cert(secrets_dir, entry, containers.responder, messages)
         }
-        HTTP01_ADMIN_INFRA_CERT_KEY => reissue_http01_admin_tls_cert(secrets_dir, entry, messages),
         _ => bail!("Unknown infra cert key: {name}"),
     }
 }
@@ -405,11 +440,14 @@ mod tests {
     use crate::commands::init::{
         HTTP01_ADMIN_INFRA_CERT_KEY, HTTP01_ADMIN_TLS_CERT_REL_PATH,
         HTTP01_ADMIN_TLS_DEFAULT_RENEW_BEFORE, HTTP01_ADMIN_TLS_KEY_REL_PATH,
-        OPENBAO_CONTAINER_NAME, OPENBAO_INFRA_CERT_KEY, OPENBAO_TLS_CERT_PATH,
-        OPENBAO_TLS_DEFAULT_RENEW_BEFORE, OPENBAO_TLS_KEY_PATH,
+        OPENBAO_INFRA_CERT_KEY, OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_DEFAULT_RENEW_BEFORE,
+        OPENBAO_TLS_KEY_PATH,
     };
     use crate::commands::rotate::run_rotate;
     use crate::state::StateFile;
+
+    /// The `OpenBao` container name a default install renders.
+    const DEFAULT_OPENBAO_CONTAINER: &str = "bootroot-openbao";
 
     fn make_openbao_infra_entry(compose_dir: &std::path::Path) -> InfraCertEntry {
         InfraCertEntry {
@@ -422,7 +460,7 @@ mod tests {
             ],
             renew_before: OPENBAO_TLS_DEFAULT_RENEW_BEFORE.to_string(),
             reload_strategy: ReloadStrategy::ContainerRestart {
-                container_name: OPENBAO_CONTAINER_NAME.to_string(),
+                container_name: DEFAULT_OPENBAO_CONTAINER.to_string(),
             },
             issued_at: None,
             expires_at: None,
@@ -610,7 +648,7 @@ mod tests {
         assert_eq!(
             entry.reload_strategy,
             ReloadStrategy::ContainerSignal {
-                container_name: OPENBAO_CONTAINER_NAME.to_string(),
+                container_name: DEFAULT_OPENBAO_CONTAINER.to_string(),
                 signal: "SIGHUP".to_string(),
             },
             "state must record the signal strategy after normalization"
@@ -870,6 +908,75 @@ mod tests {
         );
         // The HTTP-01 admin entry gets no post-reload verification, so no
         // openbao_url is consulted and no probe runs.
+    }
+
+    /// The `openbao` key's strategy is resolved in code rather than read
+    /// from the entry, so it has to name *this* install's container
+    /// while keeping the signal variant a restart would break (#727).
+    #[test]
+    fn openbao_reload_strategy_names_the_instance_container() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut entry = make_openbao_infra_entry(dir.path());
+        // Deliberately stale: an older `state.json` may still record a
+        // restart against the default instance's container.
+        entry.reload_strategy = ReloadStrategy::ContainerRestart {
+            container_name: DEFAULT_OPENBAO_CONTAINER.to_string(),
+        };
+        let strategy = resolve_reload_strategy(OPENBAO_INFRA_CERT_KEY, &entry, "insight-openbao");
+        assert_eq!(
+            strategy,
+            ReloadStrategy::ContainerSignal {
+                container_name: "insight-openbao".to_string(),
+                signal: OPENBAO_RELOAD_SIGNAL.to_string(),
+            }
+        );
+        assert_eq!(
+            strategy.to_string(),
+            "container_signal(insight-openbao, SIGHUP)"
+        );
+    }
+
+    /// Every other key keeps the strategy its entry recorded, which is
+    /// where the http01 admin container name comes from.
+    #[test]
+    fn non_openbao_reload_strategy_is_taken_from_the_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut entry = make_http01_admin_infra_entry(dir.path());
+        entry.reload_strategy = ReloadStrategy::ContainerSignal {
+            container_name: "insight-http01".to_string(),
+            signal: "SIGHUP".to_string(),
+        };
+        let strategy =
+            resolve_reload_strategy(HTTP01_ADMIN_INFRA_CERT_KEY, &entry, "insight-openbao");
+        assert_eq!(
+            strategy.to_string(),
+            "container_signal(insight-http01, SIGHUP)"
+        );
+    }
+
+    /// The signal has to reach the instance's own responder container,
+    /// not a co-located install's.
+    #[test]
+    fn container_signal_addresses_the_named_container() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("bin dir");
+        write_fake_docker_script(&bin_dir.join("docker"));
+        let args_log = dir.path().join("docker_args.log");
+
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
+
+        execute_reload_strategy(&ReloadStrategy::ContainerSignal {
+            container_name: "insight-http01".to_string(),
+            signal: "SIGHUP".to_string(),
+        })
+        .expect("signalling must succeed against the fake docker");
+
+        let logged = fs::read_to_string(&args_log).expect("read docker args");
+        let logged_args: Vec<&str> = logged.lines().collect();
+        assert_eq!(logged_args, vec!["kill", "-s", "SIGHUP", "insight-http01"]);
     }
 
     /// An empty `infra_certs` map is a no-op: the command prints the

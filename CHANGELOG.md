@@ -112,6 +112,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed the two OpenBao Agent sidecars never authenticating on an
+  install that moved its published OpenBao port. The agents reach
+  OpenBao by container name on the compose network, and the address they
+  were given carried over the port from the URL bootroot was handed —
+  which is the *host's* view. `--openbao-host-port` moves that publish
+  while the container side stays 8200, so the sidecars dialled
+  `<instance>-openbao:<host port>`, where nothing listens, and looped on
+  `connection refused` without ever rendering a template. The in-network
+  address now always uses the container port. Every co-located install
+  hit this, since a second instance on one host cannot keep the default
+  publish. An external (non-compose) OpenBao URL is still passed through
+  verbatim, port included.
 - Fixed `bootroot rotate infra-cert` failing with `open
   /output/server.key: permission denied` on a deployment whose
   `secrets/` directory changed owner after `init` (#739). The OpenBao
@@ -933,10 +945,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `init`, `reinit`, `clean`, `ca restart`, `rotate infra-cert`,
   `monitoring up`/`status`/`down` — reads the project back from the
   `.env` beside the compose file it was handed, with no flag of its own
-  and regardless of the process working directory. Container names are
-  still literal, so a second co-located install with a distinct identity
-  now fails loudly with Docker's container-name-already-in-use error
-  instead of cannibalising the first. (Closes #745)
+  and regardless of the process working directory. (Closes #745)
 - `bootroot init` accepts `--overwrite-password`, `--overwrite-ca-json`,
   `--overwrite-state` and `--confirm-db-provision`, one per confirmation
   in the pre-flight block that previously could only be answered from a
@@ -1840,6 +1849,61 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Container names, in-network DNS names and certificate SANs now follow
+  the recorded install identity instead of being literal `bootroot-*`
+  strings, so two installs can actually coexist on one host. Container
+  names are global to the Docker daemon, so the `-p` project scoping
+  added for #745 did not reach them: a second install with a distinct
+  identity still collided on `bootroot-openbao` and the rest. Each
+  `container_name:` in `docker-compose.yml` and
+  `docker-compose.deploy.yml` is now
+  `${BOOTROOT_INSTANCE:-bootroot}-<suffix>`, the generated OpenBao Agent
+  override names its two sidecars the same way, and every place bootroot
+  addresses one of its own containers by name — `reinit`'s scope check,
+  the `rotate` sidecar restarts, the persisted `container_signal` reload
+  strategies, `init`'s step-ca sidecar restart — derives the name from
+  the same identity. So do the in-network references: the OpenBao Agents'
+  `VAULT_ADDR` host, the responder admin URL default, the OpenBao server
+  and HTTP-01 admin certificate SANs, and step-ca's `dnsNames` (whose
+  `localhost` and `stepca.internal` entries are not container names and
+  are unchanged). With `BOOTROOT_INSTANCE` unset or `bootroot`
+  everything renders exactly as before, so the `bootroot-*` literals
+  across `scripts/`, `tests/`, `docs/` and `monitoring/` still match. An
+  install with `--instance-name insight` instead creates
+  `insight-openbao`, `insight-postgres`, `insight-ca`, `insight-http01`,
+  `insight-prometheus`, `insight-grafana`, `insight-grafana-public`,
+  `insight-openbao-agent-stepca` and `insight-openbao-agent-responder`.
+  Compose service names, the `bootroot-http01-responder` image tag, the
+  `secrets/bootroot-http01/tls` path, the `bootroot-http01` infra-cert
+  state key and operator-configured reload hooks are all unchanged.
+  (Closes #746)
+- Every `docker compose` subprocess bootroot spawns now carries
+  `BOOTROOT_INSTANCE=<recorded instance name>` in its child environment.
+  Compose reads the invoking process's environment ahead of the project
+  directory's `.env`, so without the pin an inherited value would
+  silently rename the containers of the install being acted on. The
+  argument vector and that environment now travel as one value that
+  cannot be spawned without it — including the `docker compose ps`
+  readiness probe, `infra install`'s `pull` and `up` alongside their
+  host-port overrides, and `monitoring up` alongside
+  `GRAFANA_ADMIN_PASSWORD`. The pinned value is always the recorded
+  instance, never the Compose project: an exported
+  `COMPOSE_PROJECT_NAME` still scopes the project for one invocation
+  while the containers keep following the recorded identity.
+- `rotate ca` no longer discards the result of its post-phase OpenBao
+  Agent restarts. A failed restart now prints a warning naming the
+  container and the failure, and the phase still completes and persists.
+  Both call sites run after their phase's destructive KV write, and the
+  restart only accelerates a convergence the agents reach unaided at the
+  next 30-second static-secret render, so a hard error there would
+  strand the operator mid-rotation over a self-healing condition.
+- Nine operator-facing messages that named a container now render the
+  resolved instance's container name. The one that mattered most is the
+  `dns_alias` rollback failure, which handed the operator a `docker
+  network connect ... bootroot-http01` recovery command naming a
+  container that does not exist on a non-default instance.
+  `--http01-admin-bind`'s "requires the bootroot-http01 service" error
+  names the compose service, not a container, and is unchanged.
 - All 25 `docker compose` invocation sites now build their argument
   vector through one shared constructor, which is what emits `-p`; a
   test fails when a compose vector is built anywhere else. `clean` and

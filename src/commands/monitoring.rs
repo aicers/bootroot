@@ -1,6 +1,4 @@
-use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -8,19 +6,22 @@ use serde_json::Value;
 use crate::cli::args::{
     MonitoringDownArgs, MonitoringProfile, MonitoringStatusArgs, MonitoringUpArgs,
 };
-use crate::commands::compose_project::{compose_args, resolve_compose_project};
+use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::infra::{
     ContainerReadiness, collect_container_failures, collect_readiness, docker_compose_output,
-    docker_output, run_docker,
+    docker_output, run_compose, run_compose_with_env, run_docker,
 };
 use crate::i18n::Messages;
 
+/// Compose variable carrying the Grafana admin password into `up`.
+const GRAFANA_ADMIN_PASSWORD_ENV: &str = "GRAFANA_ADMIN_PASSWORD";
+
 pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) -> Result<()> {
     let services = monitoring_services(args.profile);
-    let project = resolve_compose_project(&args.compose_file.compose_file, None, messages)?;
+    let identity = ComposeIdentity::resolve(&args.compose_file.compose_file, None, messages)?;
     if monitoring_already_running(
         &args.compose_file.compose_file,
-        &project,
+        &identity,
         args.profile,
         &services,
         messages,
@@ -33,17 +34,13 @@ pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) ->
     let svc_refs: Vec<&str> = services.iter().map(String::as_str).collect();
     let mut up_tail: Vec<&str> = vec!["up", "-d"];
     up_tail.extend(&svc_refs);
-    let up_args = compose_args(&project, &[&compose_str], Some(&profile_str), &up_tail);
-    run_docker_with_env(
-        &up_args,
-        "docker compose up",
-        messages,
-        args.grafana_admin_password.as_deref(),
-    )?;
+    let up = identity.compose(&[&compose_str], Some(&profile_str), &up_tail);
+    let grafana_env = grafana_admin_password_env(args.grafana_admin_password.as_deref());
+    run_compose_with_env(&up, &grafana_env, "docker compose up", messages)?;
 
     let readiness = collect_readiness(
         &args.compose_file.compose_file,
-        &project,
+        &identity,
         Some(&profile_str),
         &services,
         messages,
@@ -59,8 +56,8 @@ pub(crate) fn run_monitoring_status(
     args: &MonitoringStatusArgs,
     messages: &Messages,
 ) -> Result<()> {
-    let project = resolve_compose_project(&args.compose_file.compose_file, None, messages)?;
-    let profiles = detect_running_profiles(&args.compose_file.compose_file, &project, messages)?;
+    let identity = ComposeIdentity::resolve(&args.compose_file.compose_file, None, messages)?;
+    let profiles = detect_running_profiles(&args.compose_file.compose_file, &identity, messages)?;
     if profiles.is_empty() {
         anyhow::bail!(messages.monitoring_status_no_services());
     }
@@ -73,7 +70,7 @@ pub(crate) fn run_monitoring_status(
         let profile_str = profile.to_string();
         let readiness = collect_readiness(
             &args.compose_file.compose_file,
-            &project,
+            &identity,
             Some(&profile_str),
             &services,
             messages,
@@ -123,8 +120,8 @@ pub(crate) fn run_monitoring_status(
 }
 
 pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages) -> Result<()> {
-    let project = resolve_compose_project(&args.compose_file.compose_file, None, messages)?;
-    let profiles = detect_running_profiles(&args.compose_file.compose_file, &project, messages)?;
+    let identity = ComposeIdentity::resolve(&args.compose_file.compose_file, None, messages)?;
+    let profiles = detect_running_profiles(&args.compose_file.compose_file, &identity, messages)?;
     if profiles.is_empty() {
         anyhow::bail!(messages.monitoring_status_no_services());
     }
@@ -136,7 +133,7 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
             let profile_str = profile.to_string();
             let grafana_container_id = docker_compose_output(
                 &args.compose_file.compose_file,
-                &project,
+                &identity,
                 Some(&profile_str),
                 &["ps", "-q", grafana_service],
                 messages,
@@ -163,13 +160,13 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
 
         let mut stop_tail: Vec<&str> = vec!["stop"];
         stop_tail.extend(&svc_refs);
-        let stop_args = compose_args(&project, &[&compose_str], Some(&profile_str), &stop_tail);
-        run_docker(&stop_args, "docker compose stop", messages)?;
+        let stop = identity.compose(&[&compose_str], Some(&profile_str), &stop_tail);
+        run_compose(&stop, "docker compose stop", messages)?;
 
         let mut rm_tail: Vec<&str> = vec!["rm", "-f"];
         rm_tail.extend(&svc_refs);
-        let rm_args = compose_args(&project, &[&compose_str], Some(&profile_str), &rm_tail);
-        run_docker(&rm_args, "docker compose rm", messages)?;
+        let rm = identity.compose(&[&compose_str], Some(&profile_str), &rm_tail);
+        run_compose(&rm, "docker compose rm", messages)?;
     }
 
     if args.reset_grafana_admin_password {
@@ -188,6 +185,17 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
     Ok(())
 }
 
+/// Builds the extra child-environment entries `monitoring up` adds.
+///
+/// `GRAFANA_ADMIN_PASSWORD` travels *alongside* the instance identity
+/// the invocation already pins, never instead of it: the compose file
+/// renders its `container_name:` values from that identity.
+fn grafana_admin_password_env(password: Option<&str>) -> Vec<(&str, &str)> {
+    password
+        .map(|password| vec![(GRAFANA_ADMIN_PASSWORD_ENV, password)])
+        .unwrap_or_default()
+}
+
 fn monitoring_services(profile: MonitoringProfile) -> Vec<String> {
     vec![
         "prometheus".to_string(),
@@ -204,14 +212,14 @@ fn profile_grafana_service(profile: MonitoringProfile) -> &'static str {
 
 fn detect_running_profiles(
     compose_file: &Path,
-    project: &str,
+    identity: &ComposeIdentity,
     messages: &Messages,
 ) -> Result<Vec<MonitoringProfile>> {
     detect_running_profiles_with(|profile, service| {
         let profile_str = profile.to_string();
         let container_id = docker_compose_output(
             compose_file,
-            project,
+            identity,
             Some(&profile_str),
             &["ps", "-q", service],
             messages,
@@ -277,7 +285,7 @@ fn ensure_all_healthy(readiness: &[ContainerReadiness], messages: &Messages) -> 
 
 fn monitoring_already_running(
     compose_file: &Path,
-    project: &str,
+    identity: &ComposeIdentity,
     profile: MonitoringProfile,
     services: &[String],
     messages: &Messages,
@@ -286,7 +294,7 @@ fn monitoring_already_running(
     for service in services {
         let container_id = docker_compose_output(
             compose_file,
-            project,
+            identity,
             Some(&profile_str),
             &["ps", "-q", service],
             messages,
@@ -383,33 +391,43 @@ fn grafana_data_volume_name(container_id: &str, messages: &Messages) -> Result<O
     Ok(None)
 }
 
-/// Runs `docker` with only `GRAFANA_ADMIN_PASSWORD` added to the child
-/// environment.  Generic over the argument type so the `Vec<String>`
-/// that `compose_project::compose_args` produces passes without an
-/// intermediate collect.
-fn run_docker_with_env<S: AsRef<OsStr>>(
-    args: &[S],
-    context: &str,
-    messages: &Messages,
-    grafana_admin_password: Option<&str>,
-) -> Result<()> {
-    let mut command = ProcessCommand::new("docker");
-    command.args(args.iter().map(AsRef::as_ref));
-    if let Some(password) = grafana_admin_password {
-        command.env("GRAFANA_ADMIN_PASSWORD", password);
-    }
-    let status = command
-        .status()
-        .with_context(|| messages.error_command_run_failed(context))?;
-    if !status.success() {
-        anyhow::bail!(messages.error_command_failed_status(context, &status.to_string()));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::compose_project::{ComposeIdentity, INSTANCE_NAME_ENV_KEY};
+
+    /// `monitoring up` is the one flow that adds an environment entry of
+    /// its own; the instance identity has to survive next to it, or the
+    /// stack comes up under another install's container names.
+    #[test]
+    fn monitoring_up_carries_both_the_grafana_password_and_the_instance() {
+        let identity = ComposeIdentity::for_instance("insight");
+        let up = identity.compose(&["docker-compose.yml"], Some("lan"), &["up", "-d"]);
+        let command = up.command(&grafana_admin_password_env(Some("s3cret")));
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(envs.contains(&(
+            INSTANCE_NAME_ENV_KEY.to_string(),
+            Some("insight".to_string())
+        )));
+        assert!(envs.contains(&(
+            GRAFANA_ADMIN_PASSWORD_ENV.to_string(),
+            Some("s3cret".to_string())
+        )));
+    }
+
+    /// With no password supplied the instance is still pinned on its own.
+    #[test]
+    fn monitoring_up_pins_the_instance_without_a_grafana_password() {
+        assert!(grafana_admin_password_env(None).is_empty());
+    }
 
     #[test]
     fn profile_grafana_service_is_profile_specific() {

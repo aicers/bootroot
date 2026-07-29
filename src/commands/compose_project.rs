@@ -9,12 +9,18 @@
 //! invocation is scoped to it with an explicit `-p`.
 
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 use anyhow::Result;
 
 use crate::commands::compose_file::compose_file_dir;
+use crate::commands::container_name::BootrootContainer;
+pub(crate) use crate::commands::container_name::LONGEST_CONTAINER_NAME_SUFFIX;
 use crate::commands::dotenv::read_dotenv;
 use crate::i18n::Messages;
+
+/// The executable every Docker invocation runs.
+const DOCKER_BIN: &str = "docker";
 
 /// The `docker` subcommand every Compose invocation starts with.
 ///
@@ -42,11 +48,6 @@ pub(crate) const DEFAULT_INSTANCE_NAME: &str = "bootroot";
 
 /// Longest DNS label, in octets (RFC 1035).
 pub(crate) const DNS_LABEL_LIMIT: usize = 63;
-
-/// Longest suffix appended to the instance name when container names are
-/// made to follow the identity: `bootroot-openbao-agent-responder` minus
-/// the `bootroot` prefix.
-pub(crate) const LONGEST_CONTAINER_NAME_SUFFIX: &str = "-openbao-agent-responder";
 
 /// Maximum instance-name length.
 ///
@@ -131,17 +132,6 @@ pub(crate) fn resolve_compose_project_for_dir(
     Ok(DEFAULT_INSTANCE_NAME.to_string())
 }
 
-/// [`resolve_compose_project_for_dir`] for callers holding the compose
-/// file itself.  The `.env` consulted is always the one beside that file,
-/// never one in the process working directory.
-pub(crate) fn resolve_compose_project(
-    compose_file: &Path,
-    instance_name: Option<&str>,
-    messages: &Messages,
-) -> Result<String> {
-    resolve_compose_project_for_dir(&compose_file_dir(compose_file), instance_name, messages)
-}
-
 /// Resolves the identity an `infra install` run must record in `.env`.
 ///
 /// Deliberately ignores `COMPOSE_PROJECT_NAME`: that override selects the
@@ -163,15 +153,138 @@ pub(crate) fn resolve_recorded_instance_name(
     Ok(DEFAULT_INSTANCE_NAME.to_string())
 }
 
+/// The identity a compose-driving command operates under.
+///
+/// It carries two values that are equal only by default and must not be
+/// confused: the Compose *project* (`-p`), which an exported
+/// `COMPOSE_PROJECT_NAME` overrides for a single invocation, and the
+/// recorded *instance name*, which every container bootroot creates is
+/// named after.  Resolving them together is what keeps a call site from
+/// reaching for the `project` already in scope where the container
+/// identity is meant — the E2E harness exports project names that are
+/// longer than an instance name may be and would produce oversized,
+/// non-DNS-safe container names.
+#[derive(Debug, Clone)]
+pub(crate) struct ComposeIdentity {
+    project: String,
+    instance_name: String,
+}
+
+impl ComposeIdentity {
+    /// The identity an explicitly named install takes.
+    ///
+    /// `--instance-name` outranks everything either resolver consults,
+    /// so both halves are that name and nothing is read from disk or
+    /// from the environment.  Infallible for the same reason, which is
+    /// what lets the best-effort `init` rollback fall back to the
+    /// default identity without a `Result` to handle.
+    pub(crate) fn for_instance(name: &str) -> Self {
+        Self {
+            project: name.to_string(),
+            instance_name: name.to_string(),
+        }
+    }
+
+    /// Resolves both halves of the identity for a compose directory.
+    pub(crate) fn resolve_for_dir(
+        compose_dir: &Path,
+        instance_name: Option<&str>,
+        messages: &Messages,
+    ) -> Result<Self> {
+        if let Some(name) = instance_name {
+            return Ok(Self::for_instance(name));
+        }
+        Ok(Self {
+            project: resolve_compose_project_for_dir(compose_dir, None, messages)?,
+            instance_name: resolve_recorded_instance_name(compose_dir, None, messages)?,
+        })
+    }
+
+    /// [`ComposeIdentity::resolve_for_dir`] for callers holding the
+    /// compose file itself.
+    pub(crate) fn resolve(
+        compose_file: &Path,
+        instance_name: Option<&str>,
+        messages: &Messages,
+    ) -> Result<Self> {
+        Self::resolve_for_dir(&compose_file_dir(compose_file), instance_name, messages)
+    }
+
+    /// The Compose project every invocation is scoped to with `-p`.
+    pub(crate) fn project(&self) -> &str {
+        &self.project
+    }
+
+    /// Returns the name of one of bootroot's own containers under this
+    /// identity.
+    pub(crate) fn container(&self, container: BootrootContainer) -> String {
+        container.name(&self.instance_name)
+    }
+
+    /// Builds a `docker compose` invocation under this identity.
+    pub(crate) fn compose(
+        &self,
+        files: &[&str],
+        profile: Option<&str>,
+        subcommand: &[&str],
+    ) -> ComposeInvocation {
+        ComposeInvocation {
+            args: compose_args(&self.project, files, profile, subcommand),
+            instance_name: self.instance_name.clone(),
+        }
+    }
+}
+
+/// A `docker compose` invocation: the argument vector together with the
+/// instance identity Compose has to see while it renders the file.
+///
+/// The two travel as one value on purpose.  `container_name:` in the
+/// compose files is an interpolation of `BOOTROOT_INSTANCE`, and Compose
+/// reads the invoking process's environment *ahead of* the project
+/// directory's `.env`, so a vector spawned without the variable pinned
+/// would silently adopt whatever the operator's shell exports — naming
+/// another install's containers.  The argument vector is deliberately
+/// not reachable from outside this module: [`ComposeInvocation::command`]
+/// is the only way to turn one into something spawnable, and it always
+/// sets the variable.
+#[derive(Debug, Clone)]
+pub(crate) struct ComposeInvocation {
+    args: Vec<String>,
+    instance_name: String,
+}
+
+impl ComposeInvocation {
+    /// Builds the `docker` command for this invocation, pinning the
+    /// instance identity in the child environment alongside `extra_env`.
+    ///
+    /// `extra_env` is applied *first* so that the instance pin is the
+    /// last write and wins: `ProcessCommand::env` overwrites, so a
+    /// caller that passed `BOOTROOT_INSTANCE` — by mistake, or by
+    /// forwarding a variable set it did not filter — would otherwise
+    /// rename this invocation's containers out from under the recorded
+    /// identity.  The order is the enforcement; there is no other guard.
+    pub(crate) fn command(&self, extra_env: &[(&str, &str)]) -> ProcessCommand {
+        let mut command = ProcessCommand::new(DOCKER_BIN);
+        command.args(&self.args);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        command.env(INSTANCE_NAME_ENV_KEY, &self.instance_name);
+        command
+    }
+}
+
 /// Builds a `docker compose` argument vector scoped to `project`.
 ///
-/// The single constructor for every Compose invocation bootroot makes.
+/// The single constructor for every Compose invocation bootroot makes,
+/// and private to this module so it can only be reached through
+/// [`ComposeIdentity::compose`], which bundles the environment with it.
 /// `-p` is emitted as a compose-level flag — after the `-f` and
 /// `--profile` arguments, before the subcommand — because Compose only
 /// accepts it there.  Building a vector by hand at a call site instead
 /// would silently fall back to Compose's directory-derived default
 /// project and operate on another install's containers and volumes.
-pub(crate) fn compose_args(
+fn compose_args(
     project: &str,
     files: &[&str],
     profile: Option<&str>,
@@ -218,42 +331,53 @@ pub(crate) mod test_env {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// RAII guard restoring `COMPOSE_PROJECT_NAME` on drop, so a failing
-    /// assertion cannot leave the shared environment mutated.
-    pub(crate) struct ComposeProjectEnv {
+    /// RAII guard restoring a process-global variable on drop, so a
+    /// failing assertion cannot leave the shared environment mutated.
+    pub(crate) struct ScopedEnv {
+        key: &'static str,
         prior: Option<OsString>,
     }
 
-    impl ComposeProjectEnv {
-        /// Sets (or clears) `COMPOSE_PROJECT_NAME` for the duration of a
-        /// test.  Callers must hold [`env_lock`].
-        pub(crate) fn set(value: Option<&str>) -> Self {
-            let prior = std::env::var_os(COMPOSE_PROJECT_NAME_ENV);
+    impl ScopedEnv {
+        /// Sets (or clears) `key` for the duration of a test.  Callers
+        /// must hold [`env_lock`].
+        pub(crate) fn set(key: &'static str, value: Option<&str>) -> Self {
+            let prior = std::env::var_os(key);
             match value {
                 // SAFETY: every call site holds `env_lock()`.
-                Some(value) => unsafe { std::env::set_var(COMPOSE_PROJECT_NAME_ENV, value) },
+                Some(value) => unsafe { std::env::set_var(key, value) },
                 // SAFETY: as above.
-                None => unsafe { std::env::remove_var(COMPOSE_PROJECT_NAME_ENV) },
+                None => unsafe { std::env::remove_var(key) },
             }
-            Self { prior }
+            Self { key, prior }
         }
     }
 
-    impl Drop for ComposeProjectEnv {
+    impl Drop for ScopedEnv {
         fn drop(&mut self) {
             match self.prior.take() {
                 // SAFETY: the caller still holds `env_lock()`.
-                Some(prior) => unsafe { std::env::set_var(COMPOSE_PROJECT_NAME_ENV, prior) },
+                Some(prior) => unsafe { std::env::set_var(self.key, prior) },
                 // SAFETY: as above.
-                None => unsafe { std::env::remove_var(COMPOSE_PROJECT_NAME_ENV) },
+                None => unsafe { std::env::remove_var(self.key) },
             }
+        }
+    }
+
+    /// [`ScopedEnv`] pinned to `COMPOSE_PROJECT_NAME`, the variable most
+    /// of these tests scope.
+    pub(crate) struct ComposeProjectEnv;
+
+    impl ComposeProjectEnv {
+        pub(crate) fn set(value: Option<&str>) -> ScopedEnv {
+            ScopedEnv::set(COMPOSE_PROJECT_NAME_ENV, value)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_env::{ComposeProjectEnv, env_lock};
+    use super::test_env::{ComposeProjectEnv, ScopedEnv, env_lock};
     use super::*;
     use crate::i18n::test_messages;
 
@@ -404,10 +528,10 @@ mod tests {
         write_dotenv_with_instance(&here, "here-instance");
         write_dotenv_with_instance(&there, "there-instance");
 
-        let project =
-            resolve_compose_project(&there.join("docker-compose.yml"), None, &test_messages())
+        let identity =
+            ComposeIdentity::resolve(&there.join("docker-compose.yml"), None, &test_messages())
                 .unwrap();
-        assert_eq!(project, "there-instance");
+        assert_eq!(identity.project(), "there-instance");
     }
 
     /// The recorded identity must ignore `COMPOSE_PROJECT_NAME`: a
@@ -549,6 +673,222 @@ mod tests {
             "readiness probe lost its project scoping: {args:?}"
         );
         assert_eq!(args.last().map(String::as_str), Some("openbao"));
+    }
+
+    /// Collects a built command's argument vector for assertions.
+    fn command_args(command: &ProcessCommand) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Collects a built command's explicitly set environment.
+    fn command_envs(command: &ProcessCommand) -> Vec<(String, Option<String>)> {
+        command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// `container_name:` in the compose files interpolates
+    /// `BOOTROOT_INSTANCE`, so a spawned vector that does not carry it
+    /// renders another install's container names.
+    #[test]
+    fn every_compose_command_carries_the_instance_environment() {
+        let identity = ComposeIdentity {
+            project: "bootroot-e2e-ci-openbao-tls-no-delta-1234567".to_string(),
+            instance_name: "insight".to_string(),
+        };
+        for subcommand in [
+            vec!["up", "-d"],
+            vec!["pull", "--ignore-pull-failures"],
+            vec!["ps", "-q", "openbao"],
+            vec!["down", "-v", "--remove-orphans"],
+        ] {
+            let command = identity
+                .compose(&["docker-compose.yml"], None, &subcommand)
+                .command(&[]);
+            assert_eq!(
+                command_envs(&command),
+                vec![(
+                    INSTANCE_NAME_ENV_KEY.to_string(),
+                    Some("insight".to_string())
+                )],
+                "{subcommand:?} must pin the recorded instance, not the project"
+            );
+        }
+    }
+
+    /// `infra install` adds host-port overrides and `monitoring up` adds
+    /// `GRAFANA_ADMIN_PASSWORD`; neither may displace the instance.
+    #[test]
+    fn caller_supplied_environment_travels_alongside_the_instance() {
+        let identity = ComposeIdentity {
+            project: "insight".to_string(),
+            instance_name: "insight".to_string(),
+        };
+        let command = identity
+            .compose(&["docker-compose.yml"], Some("lan"), &["up", "-d"])
+            .command(&[
+                ("BOOTROOT_OPENBAO_HOST_PORT", "18200"),
+                ("GRAFANA_ADMIN_PASSWORD", "secret"),
+            ]);
+        let envs = command_envs(&command);
+        assert!(envs.contains(&(
+            INSTANCE_NAME_ENV_KEY.to_string(),
+            Some("insight".to_string())
+        )));
+        assert!(envs.contains(&(
+            "BOOTROOT_OPENBAO_HOST_PORT".to_string(),
+            Some("18200".to_string())
+        )));
+        assert!(envs.contains(&(
+            "GRAFANA_ADMIN_PASSWORD".to_string(),
+            Some("secret".to_string())
+        )));
+        assert!(command_args(&command).contains(&"--profile".to_string()));
+    }
+
+    /// `extra_env` must not be able to rename the invocation's
+    /// containers.  A caller passing `BOOTROOT_INSTANCE` — by mistake or
+    /// by forwarding an unfiltered variable set — would otherwise
+    /// silently address another install, which is the whole failure this
+    /// seam exists to close.
+    #[test]
+    fn caller_supplied_environment_cannot_displace_the_instance() {
+        let identity = ComposeIdentity {
+            project: "insight".to_string(),
+            instance_name: "insight".to_string(),
+        };
+        let command = identity
+            .compose(&["docker-compose.yml"], None, &["up", "-d"])
+            .command(&[
+                (INSTANCE_NAME_ENV_KEY, "other"),
+                ("GRAFANA_ADMIN_PASSWORD", "secret"),
+            ]);
+        let envs = command_envs(&command);
+        assert!(
+            envs.contains(&(
+                INSTANCE_NAME_ENV_KEY.to_string(),
+                Some("insight".to_string())
+            )),
+            "the recorded instance must survive a caller-supplied override: {envs:?}"
+        );
+        assert!(
+            !envs.contains(&(INSTANCE_NAME_ENV_KEY.to_string(), Some("other".to_string()))),
+            "the caller's instance value must not reach the child: {envs:?}"
+        );
+        assert!(envs.contains(&(
+            "GRAFANA_ADMIN_PASSWORD".to_string(),
+            Some("secret".to_string())
+        )));
+    }
+
+    /// The guard that makes the property above unbypassable: the
+    /// invocation hands out no argument vector, so `command()` — the one
+    /// method that sets the environment — is the only way to spawn one.
+    /// A new accessor returning the args would let a call site build a
+    /// compose vector and spawn it bare, which is exactly what this
+    /// module exists to prevent.
+    #[test]
+    fn compose_invocation_exposes_only_the_command_builder() {
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("commands")
+                .join("compose_project.rs"),
+        )
+        .expect("this module must be readable");
+        let start = source
+            .find("impl ComposeInvocation {")
+            .expect("the invocation impl block must exist");
+        let block = source
+            .get(start..)
+            .and_then(|rest| rest.find("\n}").map(|end| rest.get(..end)))
+            .flatten()
+            .expect("the invocation impl block must be terminated");
+        // Any visibility wider than private counts: `pub(super)` and
+        // `pub(crate)` reach a call site just as well as `pub`, so
+        // matching one spelling would leave the other a way out.  A
+        // private helper is not a way out and is allowed.
+        let methods: Vec<&str> = block
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("pub"))
+            .filter_map(|line| line.split_once(" fn "))
+            .filter_map(|(_, rest)| rest.split('(').next())
+            .collect();
+        assert_eq!(
+            methods,
+            vec!["command"],
+            "`ComposeInvocation` must expose nothing but `command`, which is \
+             what pins `{INSTANCE_NAME_ENV_KEY}`; found {methods:?}"
+        );
+    }
+
+    /// An inherited `BOOTROOT_INSTANCE` must never reach Compose: it
+    /// would outrank the compose directory's `.env` and rename the
+    /// containers of the install being acted on.
+    #[test]
+    fn recorded_instance_overrides_an_inherited_variable() {
+        let _guard = env_lock();
+        let _project = ComposeProjectEnv::set(None);
+        let _inherited = ScopedEnv::set(INSTANCE_NAME_ENV_KEY, Some("other"));
+        let dir = tempfile::tempdir().unwrap();
+        write_dotenv_with_instance(dir.path(), "insight");
+        let identity =
+            ComposeIdentity::resolve_for_dir(dir.path(), None, &test_messages()).unwrap();
+        // The child value is set unconditionally, so the exported
+        // `other` is replaced rather than inherited.
+        let command = identity
+            .compose(&["docker-compose.yml"], None, &["up", "-d"])
+            .command(&[]);
+        assert_eq!(
+            command_envs(&command),
+            vec![(
+                INSTANCE_NAME_ENV_KEY.to_string(),
+                Some("insight".to_string())
+            )]
+        );
+        assert_eq!(
+            identity.container(BootrootContainer::OpenBao),
+            "insight-openbao"
+        );
+    }
+
+    /// With an exported harness project the stack still has to come up
+    /// as `bootroot-*` containers inside that project.
+    #[test]
+    fn long_compose_project_scopes_the_project_but_not_the_containers() {
+        const HARNESS_PROJECT: &str = "bootroot-e2e-ci-openbao-tls-no-delta-1234567";
+        let _guard = env_lock();
+        let _env = ComposeProjectEnv::set(Some(HARNESS_PROJECT));
+        let dir = tempfile::tempdir().unwrap();
+        write_dotenv_with_instance(dir.path(), DEFAULT_INSTANCE_NAME);
+        let identity =
+            ComposeIdentity::resolve_for_dir(dir.path(), None, &test_messages()).unwrap();
+        assert_eq!(identity.project(), HARNESS_PROJECT);
+        assert_eq!(
+            identity.container(BootrootContainer::OpenBao),
+            "bootroot-openbao"
+        );
+        let command = identity
+            .compose(&["docker-compose.yml"], None, &["up", "-d"])
+            .command(&[]);
+        assert!(command_args(&command).contains(&HARNESS_PROJECT.to_string()));
+        assert_eq!(
+            command_envs(&command),
+            vec![(
+                INSTANCE_NAME_ENV_KEY.to_string(),
+                Some(DEFAULT_INSTANCE_NAME.to_string())
+            )]
+        );
     }
 
     /// Representative of the vectors dispatched through the private

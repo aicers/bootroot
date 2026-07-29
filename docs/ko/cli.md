@@ -270,11 +270,16 @@ bootroot infra up
 프로젝트와 하나의 볼륨 집합을 공유하며, 두 번째 설치가 첫 번째의
 컨테이너를 가져갑니다.
 
-컨테이너 이름은 아직 리터럴(`bootroot-openbao`, `bootroot-ca`, …)이며
-정체성을 따르지 않습니다. 따라서 서로 다른 `--instance-name`으로 같은
-호스트에 두 번째로 설치하면 첫 번째 인스턴스의 컨테이너를 조용히
-가져가는 대신 Docker의 "컨테이너 이름 사용 중" 오류로 명확히 실패하고,
-첫 번째 인스턴스는 그대로 유지됩니다.
+컨테이너 이름도 정체성을 따릅니다. `--instance-name insight`로 설치하면
+`insight-openbao`, `insight-postgres`, `insight-ca`, `insight-http01`,
+`insight-prometheus`, `insight-grafana`, `insight-grafana-public`,
+`insight-openbao-agent-stepca`, `insight-openbao-agent-responder`가
+생성됩니다. 같은 값이 네트워크 내부 DNS 이름이자 인증서 SAN이므로
+OpenBao Agent는 `https://insight-openbao:8200`을 바라보고, 응답기
+관리 API 기본값은 `http://insight-http01:8080`이며, step-ca의
+`dnsNames`에는 그대로인 `localhost`, `stepca.internal`과 함께
+`insight-ca`가 들어갑니다. 정체성을 선언하지 않으면 이전과 똑같이
+`bootroot-*`로 렌더링됩니다.
 
 #### 호스트 측 게시 포트
 
@@ -294,8 +299,8 @@ bootroot infra up
 `--openbao-bind` / `--stepca-bind` / `--http01-admin-bind`의 역할로,
 이들 플래그는 자신이 작성하는 override 파일용 포트를 따로 지닙니다.
 두 계열은 독립적이므로 함께 지정할 수 있습니다. 배포되는 compose
-파일의 컨테이너 이름은 여전히 고정되어 있으므로, 같은 호스트의 두
-번째 인스턴스는 자체 compose 파일이 필요합니다.
+파일은 컨테이너 이름을 기록된 정체성에서 유도하므로, 같은 호스트의
+두 번째 인스턴스에 별도의 compose 파일은 필요하지 않습니다.
 
 기본값이 아닌 OpenBao 호스트 포트는 자동으로 반영됩니다.
 `--openbao-url`을 기본값 `http://localhost:8200` 그대로 두면

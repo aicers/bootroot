@@ -7,13 +7,12 @@ use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{
-    confirm_action, ensure_file_exists, restart_compose_service, restart_container,
+    confirm_action, ensure_file_exists, restart_compose_service, restart_openbao_agent,
     wait_for_rendered_file, write_secret_file,
 };
-use super::{
-    OPENBAO_AGENT_STEPCA_CONTAINER, RENDERED_FILE_TIMEOUT, RotateContext, STEP_CA_HELPER_IMAGE,
-};
+use super::{RENDERED_FILE_TIMEOUT, RotateContext, STEP_CA_HELPER_IMAGE};
 use crate::cli::args::RotateStepcaPasswordArgs;
+use crate::commands::container_name::BootrootContainer;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{PATH_STEPCA_PASSWORD, SECRET_BYTES, to_container_path};
 use crate::i18n::Messages;
@@ -91,7 +90,11 @@ pub(super) async fn rotate_stepca_password(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
-    restart_container(OPENBAO_AGENT_STEPCA_CONTAINER, messages)?;
+    restart_openbao_agent(
+        &ctx.compose_file,
+        BootrootContainer::OpenBaoAgentStepCa,
+        messages,
+    )?;
     wait_for_rendered_file(
         &password_path,
         &new_password,

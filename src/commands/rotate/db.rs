@@ -7,10 +7,11 @@ use bootroot::db::{self, effective_admin_dsn_for_kv, for_compose_runtime, for_ho
 use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{
-    confirm_action, restart_compose_service, restart_container, wait_for_rendered_file,
+    confirm_action, restart_compose_service, restart_openbao_agent, wait_for_rendered_file,
 };
-use super::{OPENBAO_AGENT_STEPCA_CONTAINER, RENDERED_FILE_TIMEOUT, RotateContext};
+use super::{RENDERED_FILE_TIMEOUT, RotateContext};
 use crate::cli::args::RotateDbArgs;
+use crate::commands::container_name::BootrootContainer;
 use crate::commands::guardrails::{ensure_postgres_localhost_binding, ensure_single_host_db_host};
 use crate::commands::init::{PATH_STEPCA_DB, PATH_STEPCA_DB_ADMIN, SECRET_BYTES};
 use crate::i18n::Messages;
@@ -117,7 +118,11 @@ pub(super) async fn rotate_db(
             .await
             .with_context(|| messages.error_openbao_kv_write_failed())?;
     }
-    restart_container(OPENBAO_AGENT_STEPCA_CONTAINER, messages)?;
+    restart_openbao_agent(
+        &ctx.compose_file,
+        BootrootContainer::OpenBaoAgentStepCa,
+        messages,
+    )?;
     wait_for_rendered_file(&ca_json_path, &new_dsn, RENDERED_FILE_TIMEOUT, messages).await?;
 
     restart_compose_service(&ctx.compose_file, "step-ca", messages)?;

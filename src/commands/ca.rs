@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::cli::args::{CaRestartArgs, CaUpdateArgs};
-use crate::commands::compose_project::{compose_args, resolve_compose_project};
-use crate::commands::infra::{collect_container_failures, collect_readiness, run_docker};
+use crate::commands::compose_project::ComposeIdentity;
+use crate::commands::infra::{collect_container_failures, collect_readiness, run_compose};
 use crate::commands::init::{
     RESPONDER_TEMPLATE_DIR, STEPCA_CA_JSON_TEMPLATE_NAME, set_acme_cert_duration,
 };
@@ -58,24 +58,23 @@ pub(crate) fn run_ca_update(args: &CaUpdateArgs, messages: &Messages) -> Result<
 
 pub(crate) fn run_ca_restart(args: &CaRestartArgs, messages: &Messages) -> Result<()> {
     let compose_str = args.compose_file.compose_file.to_string_lossy();
-    let project = resolve_compose_project(&args.compose_file.compose_file, None, messages)?;
-    let restart_args = compose_args(
-        &project,
-        &[&compose_str],
-        None,
-        &["restart", STEP_CA_SERVICE],
-    );
-    run_docker(&restart_args, "docker compose restart step-ca", messages)?;
-    wait_for_stepca_ready(&args.compose_file.compose_file, &project, messages)?;
+    let identity = ComposeIdentity::resolve(&args.compose_file.compose_file, None, messages)?;
+    let restart = identity.compose(&[&compose_str], None, &["restart", STEP_CA_SERVICE]);
+    run_compose(&restart, "docker compose restart step-ca", messages)?;
+    wait_for_stepca_ready(&args.compose_file.compose_file, &identity, messages)?;
     println!("step-ca has been restarted.");
     Ok(())
 }
 
-fn wait_for_stepca_ready(compose_file: &Path, project: &str, messages: &Messages) -> Result<()> {
+fn wait_for_stepca_ready(
+    compose_file: &Path,
+    identity: &ComposeIdentity,
+    messages: &Messages,
+) -> Result<()> {
     let services = [STEP_CA_SERVICE.to_string()];
     let deadline = Instant::now() + READINESS_TIMEOUT;
     loop {
-        let failures = match collect_readiness(compose_file, project, None, &services, messages) {
+        let failures = match collect_readiness(compose_file, identity, None, &services, messages) {
             Ok(readiness) => collect_container_failures(&readiness),
             Err(err) => vec![err.to_string()],
         };

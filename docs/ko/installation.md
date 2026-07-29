@@ -235,10 +235,10 @@ DB DSN이 `secrets/config/ca.json`에 자동으로 기록됩니다.
 `--openbao-host-port` / `--stepca-host-port` /
 `--http01-admin-host-port`를 전달하면 됩니다(이 경우 `.env`에도
 자동으로 upsert됩니다). 따라서 "비어 있어야 하는 포트"
-목록(8200, 9000, 8080, 5433)은 요구 사항이 아니라 기본값이며,
-컨테이너 이름까지 분리하면 두 개의 bootroot 인스턴스가 한 호스트를
-공유할 수 있습니다(배포되는 compose 파일은 컨테이너 이름이 고정되어
-있으므로 두 번째 인스턴스는 자체 compose 파일이 필요합니다).
+목록(8200, 9000, 8080, 5433)은 요구 사항이 아니라 기본값이며, 두 개의
+bootroot 인스턴스가 한 호스트를 공유할 수 있습니다. 배포되는 compose
+파일이 기록된 `--instance-name`에서 컨테이너 이름을 유도하므로 두 번째
+인스턴스에 별도의 compose 파일은 필요하지 않습니다.
 
 `--openbao-url`을 기본값으로 두면 `bootroot init`, `bootroot status`,
 `bootroot reinit`이 기본값이 아닌 OpenBao 호스트 포트를 자동으로

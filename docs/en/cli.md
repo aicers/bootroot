@@ -277,11 +277,17 @@ distinct `--instance-name`. Two installs that both take the default
 identity share one project and one set of volumes, and the second adopts
 the first's containers.
 
-Container names are still literal (`bootroot-openbao`, `bootroot-ca`, …)
-and do not yet follow the identity. A second co-located install with a
-distinct `--instance-name` therefore fails loudly with Docker's
-container-name-already-in-use error rather than silently taking over the
-first instance's containers, and the first instance is left untouched.
+Container names follow the identity too: an install with
+`--instance-name insight` creates `insight-openbao`, `insight-postgres`,
+`insight-ca`, `insight-http01`, `insight-prometheus`,
+`insight-grafana`, `insight-grafana-public`,
+`insight-openbao-agent-stepca` and `insight-openbao-agent-responder`.
+The same value is the in-network DNS name and the certificate SAN, so
+the OpenBao Agents target `https://insight-openbao:8200`, the responder
+admin API defaults to `http://insight-http01:8080`, and step-ca's
+`dnsNames` carry `insight-ca` alongside the unchanged `localhost` and
+`stepca.internal`. With no identity declared everything renders
+`bootroot-*` exactly as before.
 
 #### Host-side published ports
 
@@ -300,9 +306,9 @@ Only the host-side port number is configurable. The publication stays
 loopback-only (`127.0.0.1:`); non-loopback publication remains the job
 of `--openbao-bind` / `--stepca-bind` / `--http01-admin-bind`, which
 carry their own port for the override files they write. The two are
-independent and may both be supplied. Container names in the shipped
-compose files are still fixed, so a second instance on the same host
-needs its own compose file for those.
+independent and may both be supplied. The shipped compose files derive
+their container names from the recorded identity, so a second instance
+on the same host needs no compose file of its own.
 
 A non-default OpenBao host port is picked up automatically: `bootroot
 init`, `bootroot status`, `bootroot reinit`, and `infra install`'s own

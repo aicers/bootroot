@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use super::super::constants::{
     RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME,
 };
-use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, HTTP01_ADMIN_INFRA_CERT_KEY,
@@ -101,19 +100,25 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
 
 /// Builds the SANs list for the HTTP-01 admin API TLS certificate.
 ///
-/// Always includes `responder.internal`, `localhost`, and the Docker
-/// service name.  When a bind address is configured, its IP component
-/// is added as well.  When an advertise address is provided (wildcard
-/// bind), its IP is included so that clients connecting via the
-/// advertised endpoint pass hostname verification.
+/// Always includes `responder.internal`, `localhost`, and
+/// `responder_container` — the install's own responder container name,
+/// which is what the admin API is reached by inside the compose network.
+/// It is deliberately not `RESPONDER_SERVICE_NAME`: that constant is the
+/// compose *service* name, which does not follow the install identity,
+/// so on a non-default instance the certificate would not validate for
+/// the container's own DNS name.  When a bind address is configured, its
+/// IP component is added as well.  When an advertise address is provided
+/// (wildcard bind), its IP is included so that clients connecting via
+/// the advertised endpoint pass hostname verification.
 pub(in crate::commands::init) fn build_http01_admin_tls_sans(
     bind_addr: &str,
     advertise_addr: Option<&str>,
+    responder_container: &str,
 ) -> Vec<String> {
     let mut sans = vec![
         "responder.internal".to_string(),
         "localhost".to_string(),
-        RESPONDER_SERVICE_NAME.to_string(),
+        responder_container.to_string(),
     ];
 
     if let Some((ip_raw, _port)) = bind_addr.rsplit_once(':') {
@@ -156,6 +161,7 @@ pub(in crate::commands::init) fn record_http01_admin_infra_cert(
     state: &mut StateFile,
     secrets_dir: &Path,
     sans: Vec<String>,
+    responder_container: &str,
 ) {
     let cert_path = secrets_dir.join(HTTP01_ADMIN_TLS_CERT_REL_PATH);
     let key_path = secrets_dir.join(HTTP01_ADMIN_TLS_KEY_REL_PATH);
@@ -169,8 +175,11 @@ pub(in crate::commands::init) fn record_http01_admin_infra_cert(
         key_path,
         sans,
         renew_before: HTTP01_ADMIN_TLS_DEFAULT_RENEW_BEFORE.to_string(),
+        // The container name, not the compose service name: `docker kill
+        // -s` addresses the container directly, so on a non-default
+        // instance a service-named strategy would signal nothing.
         reload_strategy: ReloadStrategy::ContainerSignal {
-            container_name: RESPONDER_SERVICE_NAME.to_string(),
+            container_name: responder_container.to_string(),
             signal: "SIGHUP".to_string(),
         },
         issued_at: Some(now),
@@ -193,11 +202,12 @@ fn set_key_permissions_sync(path: &Path) -> Result<()> {
 pub(crate) fn reissue_http01_admin_tls_cert(
     secrets_dir: &Path,
     entry: &InfraCertEntry,
+    responder_container: &str,
     messages: &Messages,
 ) -> Result<()> {
     let san_refs: Vec<&str> = entry.sans.iter().map(String::as_str).collect();
     let sans = if san_refs.is_empty() {
-        vec!["responder.internal", "localhost", RESPONDER_SERVICE_NAME]
+        vec!["responder.internal", "localhost", responder_container]
     } else {
         san_refs
     };
@@ -255,26 +265,98 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    /// The responder container name a default install renders.
+    const DEFAULT_RESPONDER_CONTAINER: &str = "bootroot-http01";
 
     #[test]
     fn build_sans_includes_specific_ip() {
-        let sans = build_http01_admin_tls_sans("192.168.1.10:8080", None);
+        let sans =
+            build_http01_admin_tls_sans("192.168.1.10:8080", None, DEFAULT_RESPONDER_CONTAINER);
         assert!(sans.contains(&"responder.internal".to_string()));
         assert!(sans.contains(&"localhost".to_string()));
-        assert!(sans.contains(&RESPONDER_SERVICE_NAME.to_string()));
+        assert!(sans.contains(&DEFAULT_RESPONDER_CONTAINER.to_string()));
         assert!(sans.contains(&"192.168.1.10".to_string()));
+    }
+
+    /// The admin certificate has to validate for the responder
+    /// container's own DNS name, which follows the install identity —
+    /// unlike the compose service name, which does not.
+    #[test]
+    fn build_sans_carry_the_instance_container_name() {
+        let sans = build_http01_admin_tls_sans("192.168.1.10:8080", None, "insight-http01");
+        assert!(sans.contains(&"insight-http01".to_string()));
+        assert!(
+            !sans.contains(&DEFAULT_RESPONDER_CONTAINER.to_string()),
+            "a non-default instance must not carry the default container name: {sans:?}"
+        );
+        assert!(sans.contains(&"responder.internal".to_string()));
+        assert!(sans.contains(&"localhost".to_string()));
+    }
+
+    /// The renewal path has its own SAN fallback, reached when the
+    /// recorded entry carries none; it must scope the container name too.
+    #[test]
+    fn reissue_falls_back_to_instance_scoped_sans() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        crate::commands::rotate::test_support::write_fake_docker_script(&bin_dir.join("docker"));
+
+        let secrets_dir = dir.path().join("secrets");
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("server.crt"), "cert").unwrap();
+        std::fs::write(tls_dir.join("server.key"), "key").unwrap();
+
+        let entry = InfraCertEntry {
+            cert_path: tls_dir.join("server.crt"),
+            key_path: tls_dir.join("server.key"),
+            sans: Vec::new(),
+            renew_before: HTTP01_ADMIN_TLS_DEFAULT_RENEW_BEFORE.to_string(),
+            reload_strategy: ReloadStrategy::ContainerSignal {
+                container_name: "insight-http01".to_string(),
+                signal: "SIGHUP".to_string(),
+            },
+            issued_at: None,
+            expires_at: None,
+        };
+
+        let args_log = dir.path().join("docker_args.log");
+        let messages = crate::i18n::test_messages();
+        let _lock = crate::commands::rotate::test_support::env_lock();
+        let _path = crate::commands::rotate::test_support::ScopedEnvVar::set(
+            "PATH",
+            crate::commands::rotate::test_support::path_with_prepend(&bin_dir),
+        );
+        let _log = crate::commands::rotate::test_support::ScopedEnvVar::set(
+            crate::commands::rotate::test_support::TEST_DOCKER_ARGS_ENV,
+            &args_log,
+        );
+
+        reissue_http01_admin_tls_cert(&secrets_dir, &entry, "insight-http01", &messages)
+            .expect("re-issuance must succeed against the fake docker");
+
+        let log = std::fs::read_to_string(&args_log).unwrap_or_default();
+        assert!(
+            log.contains("insight-http01"),
+            "the fallback SAN list must name the instance's container, got: {log}"
+        );
     }
 
     #[test]
     fn build_sans_wildcard_adds_loopback() {
-        let sans = build_http01_admin_tls_sans("0.0.0.0:8080", None);
+        let sans = build_http01_admin_tls_sans("0.0.0.0:8080", None, DEFAULT_RESPONDER_CONTAINER);
         assert!(sans.contains(&"127.0.0.1".to_string()));
         assert!(!sans.contains(&"0.0.0.0".to_string()));
     }
 
     #[test]
     fn build_sans_wildcard_with_advertise_addr() {
-        let sans = build_http01_admin_tls_sans("0.0.0.0:8080", Some("192.168.1.10:8080"));
+        let sans = build_http01_admin_tls_sans(
+            "0.0.0.0:8080",
+            Some("192.168.1.10:8080"),
+            DEFAULT_RESPONDER_CONTAINER,
+        );
         assert!(
             sans.contains(&"192.168.1.10".to_string()),
             "advertise addr IP must be included in SANs"
@@ -288,7 +370,11 @@ mod tests {
 
     #[test]
     fn build_sans_ipv6_wildcard_with_advertise_addr() {
-        let sans = build_http01_admin_tls_sans("[::]:8080", Some("[fd12::1]:8080"));
+        let sans = build_http01_admin_tls_sans(
+            "[::]:8080",
+            Some("[fd12::1]:8080"),
+            DEFAULT_RESPONDER_CONTAINER,
+        );
         assert!(
             sans.contains(&"fd12::1".to_string()),
             "advertise addr IPv6 must be included in SANs"
@@ -299,20 +385,24 @@ mod tests {
 
     #[test]
     fn build_sans_advertise_addr_dedup() {
-        let sans = build_http01_admin_tls_sans("192.168.1.10:8080", Some("192.168.1.10:8080"));
+        let sans = build_http01_admin_tls_sans(
+            "192.168.1.10:8080",
+            Some("192.168.1.10:8080"),
+            DEFAULT_RESPONDER_CONTAINER,
+        );
         let count = sans.iter().filter(|s| *s == "192.168.1.10").count();
         assert_eq!(count, 1, "duplicate SANs must not be added");
     }
 
     #[test]
     fn build_sans_ipv6_specific() {
-        let sans = build_http01_admin_tls_sans("[fd12::1]:8080", None);
+        let sans = build_http01_admin_tls_sans("[fd12::1]:8080", None, DEFAULT_RESPONDER_CONTAINER);
         assert!(sans.contains(&"fd12::1".to_string()));
     }
 
     #[test]
     fn build_sans_ipv6_wildcard() {
-        let sans = build_http01_admin_tls_sans("[::]:8080", None);
+        let sans = build_http01_admin_tls_sans("[::]:8080", None, DEFAULT_RESPONDER_CONTAINER);
         assert!(
             sans.contains(&"::1".to_string()),
             "IPv6 wildcard must include IPv6 loopback"
@@ -326,7 +416,7 @@ mod tests {
 
     #[test]
     fn build_sans_ipv6_zero_wildcard() {
-        let sans = build_http01_admin_tls_sans("[::0]:8080", None);
+        let sans = build_http01_admin_tls_sans("[::0]:8080", None, DEFAULT_RESPONDER_CONTAINER);
         assert!(
             sans.contains(&"::1".to_string()),
             "[::0] wildcard must include IPv6 loopback"
@@ -358,13 +448,13 @@ mod tests {
             ..Default::default()
         };
         let sans = vec!["responder.internal".to_string(), "localhost".to_string()];
-        record_http01_admin_infra_cert(&mut state, dir.path(), sans);
+        record_http01_admin_infra_cert(&mut state, dir.path(), sans, "insight-http01");
         assert!(state.infra_certs.contains_key(HTTP01_ADMIN_INFRA_CERT_KEY));
         let entry = &state.infra_certs[HTTP01_ADMIN_INFRA_CERT_KEY];
         assert_eq!(
             entry.reload_strategy,
             ReloadStrategy::ContainerSignal {
-                container_name: RESPONDER_SERVICE_NAME.to_string(),
+                container_name: "insight-http01".to_string(),
                 signal: "SIGHUP".to_string(),
             }
         );

@@ -5,13 +5,11 @@ use bootroot::fs_util;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 
 use super::helpers::{confirm_action, restart_container, write_secret_id_atomic};
-use super::{
-    OPENBAO_AGENT_RESPONDER_CONTAINER, OPENBAO_AGENT_STEPCA_CONTAINER, ROLE_ID_FILENAME,
-    RotateContext,
-};
+use super::{ROLE_ID_FILENAME, RotateContext};
 use crate::cli::args::{InfraRoleTarget, RotateAppRoleSecretIdArgs};
 use crate::cli::output::display_secret;
 use crate::commands::constants::{SERVICE_KV_BASE, SERVICE_SECRET_ID_KEY};
+use crate::commands::container_name::{BootrootContainer, resolve_container_name};
 use crate::commands::init::{
     APPROLE_BOOTROOT_INFRA_ROTATE, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_STEPCA,
     AppRoleLabel, OPENBAO_AGENT_DIR, OPENBAO_AGENT_RESPONDER_DIR, OPENBAO_AGENT_ROLE_ID_NAME,
@@ -398,10 +396,12 @@ fn infra_agent_dir(ctx: &RotateContext, target: InfraRoleTarget) -> PathBuf {
         .join(agent_dir)
 }
 
-fn infra_agent_container(target: InfraRoleTarget) -> &'static str {
+/// Maps an infra role to the `OpenBao` Agent sidecar that consumes its
+/// credential.
+fn infra_agent_container_kind(target: InfraRoleTarget) -> BootrootContainer {
     match target {
-        InfraRoleTarget::Stepca => OPENBAO_AGENT_STEPCA_CONTAINER,
-        InfraRoleTarget::Responder => OPENBAO_AGENT_RESPONDER_CONTAINER,
+        InfraRoleTarget::Stepca => BootrootContainer::OpenBaoAgentStepCa,
+        InfraRoleTarget::Responder => BootrootContainer::OpenBaoAgentResponder,
     }
 }
 
@@ -450,8 +450,12 @@ async fn rotate_infra_approle_secret_id(
         .await
         .with_context(|| messages.error_infra_secret_id_mint_failed(role_name))?;
     write_secret_id_atomic(&secret_id_path, &new_secret_id, messages).await?;
-    let container = infra_agent_container(target);
-    restart_container(container, messages)?;
+    let container = resolve_container_name(
+        &ctx.compose_file,
+        infra_agent_container_kind(target),
+        messages,
+    )?;
+    restart_container(&container, messages)?;
     // The infra roles carry no CIDR binding, so the post-rotation login
     // verification is unconditional (unlike the service flow).
     client
@@ -470,7 +474,7 @@ async fn rotate_infra_approle_secret_id(
     );
     println!(
         "{}",
-        messages.rotate_summary_infra_agent_restarted(container)
+        messages.rotate_summary_infra_agent_restarted(&container)
     );
     println!(
         "{}",
@@ -780,7 +784,6 @@ async fn write_remote_service_secret_id(
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
 
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};
@@ -795,11 +798,15 @@ mod tests {
 
     const RUNTIME_ROTATE_ROLE: &str = "bootroot-runtime-rotate-role";
 
+    /// Builds a rotate context whose compose directory records a
+    /// non-default identity, so every by-name docker call these tests
+    /// observe has to be `insight-*` rather than `bootroot-*`.
     fn make_ctx(dir: &std::path::Path) -> RotateContext {
+        fs::write(dir.join(".env"), "BOOTROOT_INSTANCE=insight\n").expect("write .env");
         RotateContext {
             openbao_url: String::new(),
             kv_mount: "secret".to_string(),
-            compose_file: PathBuf::new(),
+            compose_file: dir.join("docker-compose.yml"),
             state: StateFile {
                 openbao_url: String::new(),
                 kv_mount: "secret".to_string(),
@@ -960,7 +967,7 @@ mod tests {
         }
         let logged = fs::read_to_string(&args_log).expect("read docker args");
         let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(args, vec!["restart", OPENBAO_AGENT_STEPCA_CONTAINER]);
+        assert_eq!(args, vec!["restart", "insight-openbao-agent-stepca"]);
     }
 
     // The env-var lock must be held across the `.await` to prevent
@@ -1019,7 +1026,7 @@ mod tests {
         assert_eq!(role_id, "responder-role-id");
         let logged = fs::read_to_string(&args_log).expect("read docker args");
         let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(args, vec!["restart", OPENBAO_AGENT_RESPONDER_CONTAINER]);
+        assert_eq!(args, vec!["restart", "insight-openbao-agent-responder"]);
     }
 
     // The env-var lock must be held across the `.await` to prevent
