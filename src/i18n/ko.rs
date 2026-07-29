@@ -424,6 +424,8 @@ pub(super) static STRINGS: Strings = Strings {
     dns_alias_connect_recovered: "경고: DNS 별칭 등록에 실패했지만 네트워크 연결이 복원되었습니다. 나중에 `bootroot infra up`을 실행하여 별칭을 적용하세요. ({error})",
     dns_alias_rollback_failed: "심각: 롤백도 실패 — bootroot-http01이 네트워크 {network}에서 분리됨. 수동 복구: docker network connect {network} bootroot-http01 ({error})",
     dns_alias_network_not_found: "컨테이너 {value}에 대한 Docker 네트워크를 찾을 수 없습니다",
+    dns_alias_responder_ambiguous: "compose 프로젝트 `{project}`에 일치하는 HTTP-01 응답기 컨테이너가 {count}개입니다. 임의로 선택하지 않습니다. 오래된 컨테이너를 제거하거나, 다른 인스턴스를 별도의 `--instance-name`으로 다시 설치하세요.",
+    error_instance_name_invalid: "잘못된 --instance-name `{name}`: 소문자 ASCII 문자, 숫자, `-`만 사용할 수 있으며 문자 또는 숫자로 시작하고 최대 {max}자여야 합니다",
     error_service_update_failed: "bootroot service update 실패",
     error_service_update_no_flags: "업데이트 플래그가 지정되지 않았습니다; --secret-id-ttl, --secret-id-wrap-ttl, --no-wrap, --rn-cidrs, --cert-group, --reload-style, 또는 --post-renew-command를 전달하세요",
     service_update_summary: "bootroot service update: 요약",

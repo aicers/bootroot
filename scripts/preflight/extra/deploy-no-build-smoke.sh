@@ -14,6 +14,11 @@ POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:18.4}"
 BOOTROOT_STEP_CA_IMAGE="${BOOTROOT_STEP_CA_IMAGE:-smallstep/step-ca:0.30.2}"
 BOOTROOT_HTTP01_IMAGE="${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:$BOOTROOT_VERSION}"
 
+# The install under test resolves its Compose project from
+# `COMPOSE_PROJECT_NAME` when exported and falls back to the literal
+# `bootroot`, so mirror that order here rather than hard-coding one side.
+COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-bootroot}"
+
 STAGE_DIR="$(mktemp -d)"
 ARCHIVE_DIR="$STAGE_DIR/images"
 SHIM_DIR="$STAGE_DIR/bin"
@@ -35,7 +40,7 @@ cleanup() {
       cd "$STAGE_DIR"
       POSTGRES_PASSWORD=cleanup-only \
         GRAFANA_ADMIN_PASSWORD=cleanup-only \
-        "$REAL_DOCKER" compose -f docker-compose.deploy.yml down -v --remove-orphans \
+        "$REAL_DOCKER" compose -p "$COMPOSE_PROJECT" -f docker-compose.deploy.yml down -v --remove-orphans \
         >/dev/null 2>&1 || true
     )
   fi
@@ -60,11 +65,11 @@ reset_existing_stack() {
   log "stopping any existing bootroot compose stack"
   POSTGRES_PASSWORD=cleanup-only \
     GRAFANA_ADMIN_PASSWORD=cleanup-only \
-    docker compose -f docker-compose.yml down -v --remove-orphans \
+    docker compose -p "$COMPOSE_PROJECT" -f docker-compose.yml down -v --remove-orphans \
     >/dev/null 2>&1 || true
   POSTGRES_PASSWORD=cleanup-only \
     GRAFANA_ADMIN_PASSWORD=cleanup-only \
-    docker compose -f docker-compose.deploy.yml down -v --remove-orphans \
+    docker compose -p "$COMPOSE_PROJECT" -f docker-compose.deploy.yml down -v --remove-orphans \
     >/dev/null 2>&1 || true
 }
 
@@ -153,7 +158,7 @@ assert_no_build_contract() {
     fi
   done
 
-  if ! grep -Eq 'compose -f docker-compose\.deploy\.yml up --no-build --pull never -d openbao postgres step-ca bootroot-http01' "$DOCKER_LOG"; then
+  if ! grep -Eq "compose -f docker-compose\\.deploy\\.yml -p ${COMPOSE_PROJECT} up --no-build --pull never -d openbao postgres step-ca bootroot-http01" "$DOCKER_LOG"; then
     cat "$DOCKER_LOG" >&2
     fail "compose up did not use --no-build --pull never for the default install services"
   fi

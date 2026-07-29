@@ -130,7 +130,7 @@ on_error() {
 # ---------------------------------------------------------------------------
 
 compose() {
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
 }
 
 compose_down() {
@@ -597,13 +597,14 @@ scenario_c_rsync_clone_stale_state() {
   # state.json keeps pointing at a "previous-host" OpenBao that no
   # longer exists locally — the canonical rsync-clone trap.
   docker rm -f "$OPENBAO_CONTAINER_NAME" >/dev/null 2>&1 || true
-  local project_basename
-  project_basename="$(basename "$ROOT_DIR" | tr -c 'a-zA-Z0-9_-' '_' | tr '[:upper:]' '[:lower:]')"
-  # `docker compose` derives the project name from the work-dir
-  # basename when COMPOSE_PROJECT_NAME is unset; the volume is named
-  # <project>_openbao-data.  Honour COMPOSE_PROJECT_NAME when set so
-  # the harness can run under a custom project.
-  local project="${COMPOSE_PROJECT_NAME:-$project_basename}"
+  # bootroot passes an explicit `-p` on every `docker compose`
+  # invocation, resolved from `--instance-name`, then COMPOSE_PROJECT_NAME,
+  # then BOOTROOT_INSTANCE in the compose directory's .env, then the
+  # literal `bootroot`.  The volume is named <project>_openbao-data, so
+  # mirror that order here: honour COMPOSE_PROJECT_NAME when the harness
+  # sets one, otherwise fall back to the same fixed default bootroot
+  # uses.  The work-dir basename is deliberately NOT consulted.
+  local project="${COMPOSE_PROJECT_NAME:-bootroot}"
   for vol in "${project}_openbao-data" "${project}_openbao-audit"; do
     docker volume rm "$vol" >/dev/null 2>&1 || true
   done

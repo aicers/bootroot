@@ -42,14 +42,35 @@ pub(crate) fn write_fake_docker_with_status(
     status: &str,
     health: &str,
 ) -> Result<PathBuf> {
+    // The `ps -q <service>` match walks the argument list instead of
+    // indexing fixed positions: bootroot emits compose-level flags
+    // (`-f`, `--profile`, `-p <project>`) ahead of the subcommand, and
+    // how many there are is not fixed.
     let script = format!(
         r#"#!/bin/sh
 set -eu
 
-if [ "${{1:-}}" = "compose" ] && [ "${{2:-}}" = "-f" ] && [ "${{4:-}}" = "ps" ] && [ "${{5:-}}" = "-q" ]; then
-  service="${{6:-}}"
-  printf "cid-%s" "$service"
-  exit 0
+if [ "${{1:-}}" = "compose" ]; then
+  saw_ps=0
+  saw_q=0
+  service=""
+  for arg in "$@"; do
+    if [ "$saw_q" = "1" ] && [ -z "$service" ]; then
+      service="$arg"
+      continue
+    fi
+    if [ "$arg" = "ps" ]; then
+      saw_ps=1
+      continue
+    fi
+    if [ "$saw_ps" = "1" ] && [ "$arg" = "-q" ]; then
+      saw_q=1
+    fi
+  done
+  if [ "$saw_q" = "1" ] && [ -n "$service" ]; then
+    printf "cid-%s" "$service"
+    exit 0
+  fi
 fi
 
 if [ "${{1:-}}" = "inspect" ]; then

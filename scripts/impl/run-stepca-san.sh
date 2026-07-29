@@ -124,7 +124,7 @@ on_error() {
 # ---------------------------------------------------------------------------
 
 compose() {
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
 }
 
 compose_down() {

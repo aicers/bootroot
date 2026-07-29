@@ -918,6 +918,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot infra install --instance-name <name>` gives an install an
+  explicit identity and threads it through every `docker compose`
+  invocation as `-p <name>`, so two installs on one host stop sharing a
+  Compose project — and therefore volumes. Previously neither compose
+  file set a top-level `name:` and no invocation passed `-p`, so both
+  installs landed in the project Compose derives from the compose
+  directory's basename and the second one adopted the first's containers
+  and volumes silently. The value is validated (lowercase ASCII letters,
+  digits and `-`, starting with a letter or digit, at most 39 characters
+  — derived so `<name>-openbao-agent-responder` fits a 63-octet DNS
+  label) and recorded as `BOOTROOT_INSTANCE` in the compose directory's
+  `.env`. Every other compose-driving command — `status`, `infra up`,
+  `init`, `reinit`, `clean`, `ca restart`, `rotate infra-cert`,
+  `monitoring up`/`status`/`down` — reads the project back from the
+  `.env` beside the compose file it was handed, with no flag of its own
+  and regardless of the process working directory. Container names are
+  still literal, so a second co-located install with a distinct identity
+  now fails loudly with Docker's container-name-already-in-use error
+  instead of cannibalising the first. (Closes #745)
 - `bootroot init` accepts `--overwrite-password`, `--overwrite-ca-json`,
   `--overwrite-state` and `--confirm-db-provision`, one per confirmation
   in the pre-flight block that previously could only be answered from a
@@ -1821,6 +1840,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- All 25 `docker compose` invocation sites now build their argument
+  vector through one shared constructor, which is what emits `-p`; a
+  test fails when a compose vector is built anywhere else. `clean` and
+  `reinit` no longer derive the project from the `bootroot-openbao`
+  container's `com.docker.compose.project` label or from the compose
+  directory's basename — both fold onto the shared resolver, whose order
+  is `--instance-name`, then `COMPOSE_PROJECT_NAME` from the
+  environment, then `BOOTROOT_INSTANCE` from `.env`, then the literal
+  `bootroot`. `reinit` still reads the live container's project label as
+  the "what is" side of its mismatch check, so that check stays a real
+  comparison. An exported `COMPOSE_PROJECT_NAME` still overrides the
+  project for a single invocation, is used verbatim without
+  instance-name validation, and is never recorded — the E2E harness
+  keeps isolating scenarios exactly as before. Only an *exported*
+  variable counts: `init` loads the compose directory's `.env` into its
+  process environment part-way through, and that load now skips
+  `COMPOSE_PROJECT_NAME` so a `.env`-authored value cannot become an
+  override for the second half of the run and split one `init` across two
+  compose projects. One consequence: a fresh install in a directory not
+  named `bootroot` now lands in project `bootroot` rather than the
+  normalised basename.
+- `dns_alias` now filters the HTTP-01 responder lookup on
+  `com.docker.compose.project` as well as the service label, and errors
+  instead of taking the first match when more than one container still
+  matches. (Closes #745)
 - Pinned the `bootroot-http01-responder` builder to
   `rust:1.97.1-slim-bookworm` and dropped the nightly toolchain install.
   The builder previously floated on `rust:slim-bookworm` and then made

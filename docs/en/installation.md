@@ -187,7 +187,14 @@ POSTGRES_USER=step
 POSTGRES_PASSWORD=<random-32-byte-hex>
 POSTGRES_DB=stepca
 GRAFANA_ADMIN_PASSWORD=admin
+BOOTROOT_INSTANCE=bootroot
 ```
+
+`BOOTROOT_INSTANCE` is the install's identity — the Docker Compose
+project every later command operates on. `bootroot infra install
+--instance-name <name>` sets it; every other command reads it back from
+here. See
+[Instance identity and the Compose project](cli.md#instance-identity-and-the-compose-project).
 
 Choose `sslmode` based on your environment:
 

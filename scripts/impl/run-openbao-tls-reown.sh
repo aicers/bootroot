@@ -146,7 +146,7 @@ on_error() {
 # ---------------------------------------------------------------------------
 
 compose() {
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
 }
 
 compose_down() {
@@ -338,7 +338,7 @@ apply_exposed_override() {
   log_phase "apply-override"
   [ -f "$EXPOSED_OVERRIDE_PATH" ] \
     || fail "expected infra install to write $EXPOSED_OVERRIDE_PATH"
-  docker compose -f "$COMPOSE_FILE" -f "$EXPOSED_OVERRIDE_PATH" up -d openbao \
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$EXPOSED_OVERRIDE_PATH" up -d openbao \
     >>"$RUN_LOG" 2>&1 || fail "failed to apply the openbao-exposed override"
   wait_for_openbao_listening "http://${OPENBAO_BIND_ADDR}"
 }

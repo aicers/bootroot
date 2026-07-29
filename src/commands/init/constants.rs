@@ -150,3 +150,86 @@ pub(crate) mod openbao_constants {
     pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
     pub(crate) const PATH_CA_TRUST: &str = "bootroot/ca";
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{OPENBAO_AGENT_RESPONDER_CONTAINER_NAME, OPENBAO_AGENT_STEPCA_CONTAINER_NAME};
+    use crate::commands::compose_project::{
+        DEFAULT_INSTANCE_NAME, DNS_LABEL_LIMIT, LONGEST_CONTAINER_NAME_SUFFIX,
+        MAX_INSTANCE_NAME_LEN,
+    };
+
+    /// Reads the `container_name:` values the tree declares today.
+    ///
+    /// Precedent: `shipped_compose_files_pass_the_localhost_binding_guardrail`
+    /// in `commands/guardrails.rs` reaches the checked-in compose files
+    /// the same way.
+    fn declared_container_names() -> Vec<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut names = Vec::new();
+        for file in ["docker-compose.yml", "docker-compose.deploy.yml"] {
+            let contents =
+                std::fs::read_to_string(root.join(file)).expect("compose file must be readable");
+            for line in contents.lines() {
+                if let Some(value) = line.trim().strip_prefix("container_name:") {
+                    names.push(value.trim().to_string());
+                }
+            }
+        }
+        // The two sidecars are pinned by the generated OpenBao agent
+        // override rather than by a checked-in compose file, so they have
+        // to be added by hand — and one of them is the longest name.
+        names.push(OPENBAO_AGENT_STEPCA_CONTAINER_NAME.to_string());
+        names.push(OPENBAO_AGENT_RESPONDER_CONTAINER_NAME.to_string());
+        names
+    }
+
+    /// The 39-character instance-name limit is derived from the container
+    /// names this tree declares: each becomes `<instance><suffix>`, which
+    /// serves as a DNS name on the compose network and as a certificate
+    /// SAN, so it must fit a 63-octet DNS label.  Adding a longer
+    /// container name later must fail here rather than silently making
+    /// the limit wrong.
+    #[test]
+    fn instance_name_limit_leaves_room_for_every_container_name_suffix() {
+        let names = declared_container_names();
+        assert!(
+            names.len() >= 9,
+            "expected the seven compose services plus two sidecars, got {names:?}"
+        );
+        let mut longest = 0;
+        for name in &names {
+            let suffix = name.strip_prefix(DEFAULT_INSTANCE_NAME).unwrap_or_else(|| {
+                panic!("container name `{name}` does not start with `{DEFAULT_INSTANCE_NAME}`")
+            });
+            longest = longest.max(suffix.len());
+        }
+        assert_eq!(
+            longest,
+            LONGEST_CONTAINER_NAME_SUFFIX.len(),
+            "the longest declared suffix no longer matches \
+             `LONGEST_CONTAINER_NAME_SUFFIX`; update it and the derived limit"
+        );
+        assert!(
+            MAX_INSTANCE_NAME_LEN + longest <= DNS_LABEL_LIMIT,
+            "{MAX_INSTANCE_NAME_LEN} + the longest suffix ({longest}) exceeds \
+             the {DNS_LABEL_LIMIT}-octet DNS label limit"
+        );
+    }
+
+    /// `commands/rotate.rs` re-declares the two sidecar container names
+    /// instead of importing them.  The derivation above reads the
+    /// originals, so the duplicates have to stay equal to them or the
+    /// limit would be derived from names `rotate` does not use.
+    #[test]
+    fn rotate_sidecar_container_names_match_the_originals() {
+        assert_eq!(
+            crate::commands::rotate::OPENBAO_AGENT_STEPCA_CONTAINER,
+            OPENBAO_AGENT_STEPCA_CONTAINER_NAME
+        );
+        assert_eq!(
+            crate::commands::rotate::OPENBAO_AGENT_RESPONDER_CONTAINER,
+            OPENBAO_AGENT_RESPONDER_CONTAINER_NAME
+        );
+    }
+}

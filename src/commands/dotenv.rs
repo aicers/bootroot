@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::commands::compose_project::COMPOSE_PROJECT_NAME_ENV;
 use crate::i18n::Messages;
 
 /// Reads a `.env` file and returns key-value pairs.
@@ -66,12 +67,28 @@ pub(crate) fn write_dotenv(
 /// Only sets variables that are not already present in the process
 /// environment, preserving Docker Compose's precedence semantics (process
 /// env > `.env` file).
+///
+/// [`COMPOSE_PROJECT_NAME_ENV`] is deliberately excluded.  The compose
+/// project resolver reads it from the *invoking* environment, and `init`
+/// resolves the project once before calling this and then lets several
+/// sub-steps re-resolve it afterwards.  Promoting a `.env`-authored value
+/// into the process environment here would make those later resolutions
+/// disagree with the first, so `init` would bring the core services up in
+/// one project and the agent sidecars, the responder override and the
+/// `OpenBao` TLS recreate up in another — a different compose network, so
+/// DNS to step-ca would break.  The key is not otherwise needed: every
+/// compose invocation passes an explicit `-p`, which outranks the
+/// variable, and Compose reads the `.env` beside the compose file for its
+/// own interpolation regardless.
 pub(crate) fn load_dotenv_into_env(path: &Path, messages: &Messages) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
     let map = read_dotenv(path, messages)?;
     for (key, value) in &map {
+        if key == COMPOSE_PROJECT_NAME_ENV {
+            continue;
+        }
         if std::env::var(key).is_err() {
             // SAFETY: called once during single-threaded init setup,
             // before any worker threads are spawned.
@@ -223,6 +240,88 @@ mod tests {
         assert_eq!(std::env::var(&key).unwrap(), "already_set");
 
         // Clean up.
+        unsafe {
+            std::env::remove_var(&key);
+        }
+    }
+
+    /// `init` resolves the compose project once before this load and
+    /// then lets the agent-sidecar override, the responder override, the
+    /// `OpenBao` TLS recreate, the DB-password rotation and rollback
+    /// re-resolve it afterwards.  Promoting a `.env`-authored
+    /// `COMPOSE_PROJECT_NAME` into the process environment would make
+    /// those later resolutions return a different project than the
+    /// first, splitting one `init` run across two compose networks.  The
+    /// resolver's second step reads the *invoking* environment, and a
+    /// `.env` key is not that.
+    #[test]
+    fn load_dotenv_into_env_never_promotes_compose_project_name() {
+        use crate::commands::compose_project::{
+            COMPOSE_PROJECT_NAME_ENV, resolve_compose_project_for_dir,
+            test_env::{ComposeProjectEnv, env_lock},
+        };
+
+        let _guard = env_lock();
+        let _env = ComposeProjectEnv::set(None);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let messages = test_messages();
+        std::fs::write(
+            &path,
+            format!("{COMPOSE_PROJECT_NAME_ENV}=from-dotenv\nBOOTROOT_INSTANCE=insight\n"),
+        )
+        .unwrap();
+
+        let before = resolve_compose_project_for_dir(dir.path(), None, &messages).unwrap();
+        load_dotenv_into_env(&path, &messages).unwrap();
+        let after = resolve_compose_project_for_dir(dir.path(), None, &messages).unwrap();
+
+        assert!(
+            std::env::var(COMPOSE_PROJECT_NAME_ENV).is_err(),
+            "a .env-authored {COMPOSE_PROJECT_NAME_ENV} must not reach the process environment"
+        );
+        assert_eq!(
+            (before.as_str(), after.as_str()),
+            ("insight", "insight"),
+            "the resolved project must not change across the .env load"
+        );
+    }
+
+    /// The exclusion is scoped to that one key: everything else `.env`
+    /// carries still has to reach the process environment, which is the
+    /// whole point of the load (`POSTGRES_PASSWORD` for the DSN builders).
+    #[test]
+    fn load_dotenv_into_env_still_loads_other_keys_alongside_it() {
+        use crate::commands::compose_project::{
+            COMPOSE_PROJECT_NAME_ENV,
+            test_env::{ComposeProjectEnv, env_lock},
+        };
+
+        let _guard = env_lock();
+        let _env = ComposeProjectEnv::set(None);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let messages = test_messages();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let key = format!("DOTENV_ALONGSIDE_{nonce}");
+        std::fs::write(
+            &path,
+            format!("{COMPOSE_PROJECT_NAME_ENV}=from-dotenv\n{key}=from_file\n"),
+        )
+        .unwrap();
+
+        // SAFETY: test-only, unique key avoids interference.
+        unsafe {
+            std::env::remove_var(&key);
+        }
+        load_dotenv_into_env(&path, &messages).unwrap();
+        assert_eq!(std::env::var(&key).unwrap(), "from_file");
+        assert!(std::env::var(COMPOSE_PROJECT_NAME_ENV).is_err());
+
+        // SAFETY: as above.
         unsafe {
             std::env::remove_var(&key);
         }

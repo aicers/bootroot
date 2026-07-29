@@ -129,6 +129,384 @@ fn test_status_command_message() {
     assert!(stdout.contains("status"));
 }
 
+/// Closes #745: `status` reaches Docker only through
+/// `docker compose ps -q`, so the project recorded in the `.env` beside
+/// the compose file is what decides whose containers it reports on. The
+/// fake docker records its argv so the `-p <instance>` scoping is
+/// asserted directly rather than inferred from the summary text.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_status_scopes_compose_to_the_recorded_instance() {
+    use std::env;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use anyhow::Context;
+    use support::{ROOT_TOKEN, stub_openbao};
+    use tempfile::tempdir;
+    use wiremock::MockServer;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let compose_file = temp_dir.path().join("docker-compose.yml");
+    fs::write(&compose_file, "services: {}")
+        .context("write compose file")
+        .unwrap();
+    // The identity `infra install --instance-name insight` would record.
+    fs::write(temp_dir.path().join(".env"), "BOOTROOT_INSTANCE=insight\n")
+        .context("write .env")
+        .unwrap();
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir)
+        .context("create bin dir")
+        .unwrap();
+    let argv_log = temp_dir.path().join("docker-argv.log");
+    let fake_docker = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"{log}"
+
+if [ "${{1:-}}" = "compose" ]; then
+  printf "cid-openbao"
+  exit 0
+fi
+
+if [ "${{1:-}}" = "inspect" ]; then
+  printf "running|healthy"
+  exit 0
+fi
+
+exit 0
+"#,
+        log = argv_log.display()
+    );
+    let docker_path = bin_dir.join("docker");
+    fs::write(&docker_path, fake_docker)
+        .context("write fake docker")
+        .unwrap();
+    fs::set_permissions(&docker_path, fs::Permissions::from_mode(0o700))
+        .context("chmod fake docker")
+        .unwrap();
+
+    let server = MockServer::start().await;
+    stub_openbao(&server).await;
+    write_state_with_service(temp_dir.path()).expect("write state");
+
+    let path = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "status",
+            "--compose-file",
+            compose_file.to_string_lossy().as_ref(),
+            "--openbao-url",
+            &server.uri(),
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .env("PATH", combined_path)
+        // An unset override is what makes the recorded identity decide.
+        .env_remove("COMPOSE_PROJECT_NAME")
+        .output()
+        .expect("run status");
+
+    assert!(output.status.success());
+    let argv = fs::read_to_string(&argv_log).expect("fake docker must have been invoked");
+    let compose_lines: Vec<&str> = argv
+        .lines()
+        .filter(|line| line.starts_with("compose "))
+        .collect();
+    assert!(
+        !compose_lines.is_empty(),
+        "status must drive `docker compose`, got: {argv}"
+    );
+    for line in &compose_lines {
+        assert!(
+            line.contains("-p insight"),
+            "every compose invocation must be scoped to the recorded instance: {line}"
+        );
+    }
+}
+
+/// Test-only fixture for driving `infra install` against a fake `docker`.
+///
+/// The unit tests cover the identity's halves separately — validation,
+/// the `.env` upsert, the resolver's precedence, the argument
+/// constructor.  What only an end-to-end run pins is that
+/// `run_infra_install` wires them together in the right order: the
+/// recorded identity is resolved before the `.env` write and ignores
+/// `COMPOSE_PROJECT_NAME`, while the project the stack is brought up
+/// under is resolved after it and honours the override.
+#[cfg(unix)]
+struct InstallHarness {
+    dir: tempfile::TempDir,
+    compose_file: std::path::PathBuf,
+    bin_dir: std::path::PathBuf,
+    argv_log: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl InstallHarness {
+    fn new() -> Self {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let compose_file = dir.path().join("docker-compose.yml");
+        // No `ports:` at all, so the localhost-binding guardrail passes
+        // and only the resolved `--openbao-host-port` is pre-bound.
+        fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n")
+            .expect("write compose file");
+
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let argv_log = dir.path().join("docker-argv.log");
+        let fake_docker = format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"{log}"
+
+if [ "${{1:-}}" = "compose" ]; then
+  printf "cid-openbao"
+  exit 0
+fi
+
+if [ "${{1:-}}" = "inspect" ]; then
+  printf "running|healthy"
+  exit 0
+fi
+
+exit 0
+"#,
+            log = argv_log.display()
+        );
+        let docker_path = bin_dir.join("docker");
+        fs::write(&docker_path, fake_docker).expect("write fake docker");
+        fs::set_permissions(&docker_path, fs::Permissions::from_mode(0o700))
+            .expect("chmod fake docker");
+
+        Self {
+            dir,
+            compose_file,
+            bin_dir,
+            argv_log,
+        }
+    }
+
+    /// Picks a port that is free right now, so the install's host-port
+    /// pre-bind does not collide with whatever the developer happens to
+    /// be running.
+    fn free_port() -> u16 {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port for probing");
+        listener
+            .local_addr()
+            .expect("probe socket must have an address")
+            .port()
+    }
+
+    fn install(&self, instance_name: Option<&str>, compose_project_name: Option<&str>) -> String {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
+            .current_dir(self.dir.path())
+            .args([
+                "infra",
+                "install",
+                "--compose-file",
+                self.compose_file.to_string_lossy().as_ref(),
+                "--services",
+                "openbao",
+                "--openbao-host-port",
+                &Self::free_port().to_string(),
+            ])
+            .env("PATH", format!("{}:{}", self.bin_dir.display(), path));
+        if let Some(instance_name) = instance_name {
+            command.args(["--instance-name", instance_name]);
+        }
+        match compose_project_name {
+            Some(value) => command.env("COMPOSE_PROJECT_NAME", value),
+            None => command.env_remove("COMPOSE_PROJECT_NAME"),
+        };
+
+        let output = command.output().expect("run infra install");
+        assert!(
+            output.status.success(),
+            "infra install failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(&self.argv_log).expect("fake docker must have been invoked")
+    }
+
+    fn dotenv(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join(".env")).expect("install must write .env")
+    }
+
+    /// Asserts every `docker compose` invocation the run made carried
+    /// `-p <project>`.  A single hand-built vector would show up here as
+    /// a compose line without the flag.
+    fn assert_every_compose_scoped_to(argv: &str, project: &str) {
+        let compose_lines: Vec<&str> = argv
+            .lines()
+            .filter(|line| line.starts_with("compose "))
+            .collect();
+        assert!(
+            !compose_lines.is_empty(),
+            "infra install must drive `docker compose`, got: {argv}"
+        );
+        for line in &compose_lines {
+            assert!(
+                line.contains(&format!("-p {project} ")),
+                "every compose invocation must carry `-p {project}`: {line}"
+            );
+        }
+    }
+}
+
+/// Closes #745: `infra install --instance-name insight` brings the stack
+/// up under project `insight` and records the identity in the `.env`
+/// beside the compose file.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_scopes_compose_to_the_declared_instance() {
+    let harness = InstallHarness::new();
+    let argv = harness.install(Some("insight"), None);
+    InstallHarness::assert_every_compose_scoped_to(&argv, "insight");
+    assert!(
+        harness.dotenv().contains("BOOTROOT_INSTANCE=insight"),
+        "the declared identity must be recorded, got: {}",
+        harness.dotenv()
+    );
+}
+
+/// Closes #745: with no flag and no override, the project is the fixed
+/// literal `bootroot` — not the compose directory's basename, which
+/// here is a random `tempdir` name.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_defaults_to_the_fixed_project() {
+    let harness = InstallHarness::new();
+    let argv = harness.install(None, None);
+    InstallHarness::assert_every_compose_scoped_to(&argv, "bootroot");
+    assert!(harness.dotenv().contains("BOOTROOT_INSTANCE=bootroot"));
+}
+
+/// Closes #745: an exported `COMPOSE_PROJECT_NAME` selects the project
+/// for the invocation — verbatim, and without being validated against
+/// the 39-character instance-name rule — but is never recorded, so the
+/// `.env` still carries the identity the install would have had without
+/// it.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_honours_compose_project_name_without_recording_it() {
+    const HARNESS_PROJECT: &str = "bootroot-e2e-ci-openbao-tls-no-delta-1234567";
+    assert!(HARNESS_PROJECT.len() > 39, "must exceed the instance limit");
+
+    let harness = InstallHarness::new();
+    let argv = harness.install(None, Some(HARNESS_PROJECT));
+    InstallHarness::assert_every_compose_scoped_to(&argv, HARNESS_PROJECT);
+    assert!(
+        harness.dotenv().contains("BOOTROOT_INSTANCE=bootroot"),
+        "the override must not become the identity, got: {}",
+        harness.dotenv()
+    );
+}
+
+/// Closes #745: `--instance-name` outranks an exported
+/// `COMPOSE_PROJECT_NAME`, and a re-run without the flag keeps the
+/// recorded identity rather than resetting it to the default — while the
+/// generated `PostgreSQL` password survives the upsert.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_rerun_preserves_the_recorded_instance() {
+    let harness = InstallHarness::new();
+    let argv = harness.install(Some("insight"), Some("throwaway-project"));
+    InstallHarness::assert_every_compose_scoped_to(&argv, "insight");
+
+    let first_dotenv = harness.dotenv();
+    let password = first_dotenv
+        .lines()
+        .find(|line| line.starts_with("POSTGRES_PASSWORD="))
+        .expect("the first install must generate a PostgreSQL password")
+        .to_string();
+
+    let argv = harness.install(None, None);
+    InstallHarness::assert_every_compose_scoped_to(&argv, "insight");
+
+    let second_dotenv = harness.dotenv();
+    assert_eq!(
+        second_dotenv
+            .lines()
+            .filter(|line| line.starts_with("BOOTROOT_INSTANCE="))
+            .count(),
+        1,
+        "the identity must be upserted, not duplicated: {second_dotenv}"
+    );
+    assert!(second_dotenv.contains("BOOTROOT_INSTANCE=insight"));
+    assert!(
+        second_dotenv.contains(&password),
+        "the generated password must survive the re-run: {second_dotenv}"
+    );
+}
+
+/// Closes #745: an invalid `--instance-name` is rejected with an error
+/// naming the character set and the limit, and nothing is written.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_rejects_invalid_instance_names() {
+    let long_name = "a".repeat(40);
+    for invalid in ["Insight", "in sight", "-insight", "", long_name.as_str()] {
+        let harness = InstallHarness::new();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(harness.dir.path())
+            .args([
+                "infra",
+                "install",
+                "--compose-file",
+                harness.compose_file.to_string_lossy().as_ref(),
+                "--services",
+                "openbao",
+                "--instance-name",
+                invalid,
+            ])
+            .env("PATH", format!("{}:{}", harness.bin_dir.display(), path))
+            .env_remove("COMPOSE_PROJECT_NAME")
+            .output()
+            .expect("run infra install");
+
+        assert!(!output.status.success(), "{invalid:?} must be rejected");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("39"),
+            "{invalid:?} error must name the limit: {stderr}"
+        );
+        assert!(
+            !harness.dir.path().join(".env").exists(),
+            "{invalid:?} must not leave an .env behind"
+        );
+    }
+}
+
+/// A 39-character name is the boundary the limit is derived from, so it
+/// must be accepted end to end rather than only by the validator.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_accepts_the_maximum_length_instance_name() {
+    let name = "a".repeat(39);
+    let harness = InstallHarness::new();
+    let argv = harness.install(Some(&name), None);
+    InstallHarness::assert_every_compose_scoped_to(&argv, &name);
+    assert!(
+        harness
+            .dotenv()
+            .contains(&format!("BOOTROOT_INSTANCE={name}"))
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_status_command_summary() {

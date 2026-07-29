@@ -9,7 +9,7 @@ BOOTROOT_SECRETS_DIR="$ROOT_DIR/secrets"
 
 cleanup() {
   echo "[test-core] cleanup"
-  docker compose "${COMPOSE_FILES[@]}" down 2>/dev/null || true
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" "${COMPOSE_FILES[@]}" down 2>/dev/null || true
 }
 trap cleanup EXIT
 

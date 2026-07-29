@@ -99,7 +99,7 @@ fail() {
 }
 
 compose() {
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
 }
 
 run_bootroot() {
@@ -273,7 +273,7 @@ YAML
   # that recreating bootroot-http01 preserves both the rendered config
   # mount and the DNS aliases.
   local responder_override="$SECRETS_DIR/responder/docker-compose.responder.override.yml"
-  local -a compose_args=(-f "$COMPOSE_FILE" -f "$override")
+  local -a compose_args=(-p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$override")
   if [ -f "$responder_override" ]; then
     compose_args+=(-f "$responder_override")
   fi

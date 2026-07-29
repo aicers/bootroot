@@ -435,6 +435,8 @@ pub(crate) struct Strings {
     pub(crate) dns_alias_connect_recovered: &'static str,
     pub(crate) dns_alias_rollback_failed: &'static str,
     pub(crate) dns_alias_network_not_found: &'static str,
+    pub(crate) dns_alias_responder_ambiguous: &'static str,
+    pub(crate) error_instance_name_invalid: &'static str,
     pub(crate) error_service_update_failed: &'static str,
     pub(crate) error_service_update_no_flags: &'static str,
     pub(crate) service_update_summary: &'static str,

@@ -6,6 +6,7 @@ use bootroot::fs_util;
 
 use super::RENDERED_FILE_POLL_INTERVAL;
 use crate::cli::prompt::Prompt;
+use crate::commands::compose_project::{compose_args, resolve_compose_project};
 use crate::commands::infra::run_docker;
 use crate::i18n::Messages;
 use crate::state::ServiceEntry;
@@ -94,8 +95,14 @@ pub(super) fn restart_compose_service(
     service: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let compose_file = compose_file.to_string_lossy();
-    let args = ["compose", "-f", compose_file.as_ref(), "restart", service];
+    let project = resolve_compose_project(compose_file, None, messages)?;
+    let compose_str = compose_file.to_string_lossy();
+    let args = compose_args(
+        &project,
+        &[compose_str.as_ref()],
+        None,
+        &["restart", service],
+    );
     run_docker(&args, "docker compose restart", messages)
 }
 
@@ -104,16 +111,14 @@ pub(super) fn reload_compose_service(
     service: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let compose_file = compose_file.to_string_lossy();
-    let args = [
-        "compose",
-        "-f",
-        compose_file.as_ref(),
-        "kill",
-        "-s",
-        "HUP",
-        service,
-    ];
+    let project = resolve_compose_project(compose_file, None, messages)?;
+    let compose_str = compose_file.to_string_lossy();
+    let args = compose_args(
+        &project,
+        &[compose_str.as_ref()],
+        None,
+        &["kill", "-s", "HUP", service],
+    );
     run_docker(&args, "docker compose kill", messages)
 }
 
