@@ -2051,8 +2051,10 @@ pub(crate) fn run_compose(
 /// entries.
 ///
 /// The instance identity is not among them: it is pinned by
-/// [`ComposeInvocation::command`] itself, so a caller adding host-port
-/// overrides or `GRAFANA_ADMIN_PASSWORD` cannot displace it or forget it.
+/// [`ComposeInvocation::command`] itself, after `env` is applied, so no
+/// caller can forget it and none can displace it — not the host-port
+/// overrides, not `GRAFANA_ADMIN_PASSWORD`, and not a stray
+/// `BOOTROOT_INSTANCE` entry.
 pub(crate) fn run_compose_with_env(
     invocation: &ComposeInvocation,
     env: &[(&str, &str)],

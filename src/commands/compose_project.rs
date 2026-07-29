@@ -256,13 +256,20 @@ pub(crate) struct ComposeInvocation {
 impl ComposeInvocation {
     /// Builds the `docker` command for this invocation, pinning the
     /// instance identity in the child environment alongside `extra_env`.
+    ///
+    /// `extra_env` is applied *first* so that the instance pin is the
+    /// last write and wins: `ProcessCommand::env` overwrites, so a
+    /// caller that passed `BOOTROOT_INSTANCE` — by mistake, or by
+    /// forwarding a variable set it did not filter — would otherwise
+    /// rename this invocation's containers out from under the recorded
+    /// identity.  The order is the enforcement; there is no other guard.
     pub(crate) fn command(&self, extra_env: &[(&str, &str)]) -> ProcessCommand {
         let mut command = ProcessCommand::new(DOCKER_BIN);
         command.args(&self.args);
-        command.env(INSTANCE_NAME_ENV_KEY, &self.instance_name);
         for (key, value) in extra_env {
             command.env(key, value);
         }
+        command.env(INSTANCE_NAME_ENV_KEY, &self.instance_name);
         command
     }
 }
@@ -746,6 +753,41 @@ mod tests {
             Some("secret".to_string())
         )));
         assert!(command_args(&command).contains(&"--profile".to_string()));
+    }
+
+    /// `extra_env` must not be able to rename the invocation's
+    /// containers.  A caller passing `BOOTROOT_INSTANCE` — by mistake or
+    /// by forwarding an unfiltered variable set — would otherwise
+    /// silently address another install, which is the whole failure this
+    /// seam exists to close.
+    #[test]
+    fn caller_supplied_environment_cannot_displace_the_instance() {
+        let identity = ComposeIdentity {
+            project: "insight".to_string(),
+            instance_name: "insight".to_string(),
+        };
+        let command = identity
+            .compose(&["docker-compose.yml"], None, &["up", "-d"])
+            .command(&[
+                (INSTANCE_NAME_ENV_KEY, "other"),
+                ("GRAFANA_ADMIN_PASSWORD", "secret"),
+            ]);
+        let envs = command_envs(&command);
+        assert!(
+            envs.contains(&(
+                INSTANCE_NAME_ENV_KEY.to_string(),
+                Some("insight".to_string())
+            )),
+            "the recorded instance must survive a caller-supplied override: {envs:?}"
+        );
+        assert!(
+            !envs.contains(&(INSTANCE_NAME_ENV_KEY.to_string(), Some("other".to_string()))),
+            "the caller's instance value must not reach the child: {envs:?}"
+        );
+        assert!(envs.contains(&(
+            "GRAFANA_ADMIN_PASSWORD".to_string(),
+            Some("secret".to_string())
+        )));
     }
 
     /// The guard that makes the property above unbypassable: the
