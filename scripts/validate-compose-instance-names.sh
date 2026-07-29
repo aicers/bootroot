@@ -15,10 +15,21 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# The two secrets the compose files require to interpolate at all. Both
-# are render-only here; nothing is started.
-export POSTGRES_PASSWORD="validate-only"
-export GRAFANA_ADMIN_PASSWORD="validate-only"
+# Compose interpolates from the invoking environment *and* from the
+# project directory's `.env`, which is gitignored and, in any workspace
+# where `infra install --instance-name` has run, records that instance.
+# Unsetting the process variable alone would therefore still render that
+# workspace's names and fail the default-name assertions below. An
+# explicit `--env-file` replaces `.env` entirely, so the render depends
+# on nothing but this file plus what each case exports. It carries the
+# two secrets the compose files require to interpolate at all; both are
+# render-only here, nothing is started.
+ENV_FILE="$(mktemp)"
+trap 'rm -f "$ENV_FILE"' EXIT
+cat >"$ENV_FILE" <<'EOF'
+POSTGRES_PASSWORD=validate-only
+GRAFANA_ADMIN_PASSWORD=validate-only
+EOF
 # The profiles the seven services are spread across: without them
 # `config` omits prometheus and the two grafana services.
 PROFILES=(--profile lan --profile public)
@@ -43,10 +54,16 @@ check_render() {
   local rendered
 
   echo "[validate-compose-instance-names] rendering $* with BOOTROOT_INSTANCE=$label"
+  # The process environment outranks the env file, so exporting the
+  # instance here still wins for the non-default cases, while `env -u`
+  # plus an env file that never mentions the variable is what makes the
+  # "unset" case genuinely unset.
   if [ -n "$instance" ]; then
-    rendered="$(BOOTROOT_INSTANCE="$instance" docker compose "${PROFILES[@]}" "$@" config)"
+    rendered="$(BOOTROOT_INSTANCE="$instance" \
+      docker compose --env-file "$ENV_FILE" "${PROFILES[@]}" "$@" config)"
   else
-    rendered="$(env -u BOOTROOT_INSTANCE docker compose "${PROFILES[@]}" "$@" config)"
+    rendered="$(env -u BOOTROOT_INSTANCE \
+      docker compose --env-file "$ENV_FILE" "${PROFILES[@]}" "$@" config)"
   fi
 
   local suffix
