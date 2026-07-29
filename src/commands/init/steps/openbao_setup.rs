@@ -17,10 +17,9 @@ use super::super::constants::openbao_constants::{
 };
 use super::super::constants::{
     CA_BUNDLE_FILENAME, CA_CERTS_DIR, OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME,
-    OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR, OPENBAO_AGENT_RESPONDER_CONTAINER_NAME,
-    OPENBAO_AGENT_RESPONDER_DIR, OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME,
-    OPENBAO_AGENT_SECRET_ID_NAME, OPENBAO_AGENT_STEPCA_CONTAINER_NAME, OPENBAO_AGENT_STEPCA_DIR,
-    OPENBAO_AGENT_STEPCA_SERVICE,
+    OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR, OPENBAO_AGENT_RESPONDER_DIR,
+    OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME, OPENBAO_AGENT_SECRET_ID_NAME,
+    OPENBAO_AGENT_STEPCA_DIR, OPENBAO_AGENT_STEPCA_SERVICE,
 };
 use super::super::paths::{
     OpenBaoAgentPaths, StepCaTemplatePaths, compose_has_openbao, resolve_openbao_agent_addr,
@@ -31,9 +30,10 @@ use super::ca_certs::{compute_ca_bundle_pem, compute_ca_fingerprints};
 use super::prompts::{confirm_overwrite, prompt_text, prompt_unseal_keys};
 use super::{InitBootstrap, InitRollback, InitSecrets};
 use crate::cli::args::InitArgs;
-use crate::commands::compose_project::{compose_args, resolve_compose_project};
+use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::CA_TRUST_KEY;
-use crate::commands::infra::run_docker;
+use crate::commands::container_name::BootrootContainer;
+use crate::commands::infra::run_compose;
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 
@@ -627,8 +627,13 @@ pub(super) async fn setup_openbao_agents(
     tls_required: bool,
     messages: &Messages,
 ) -> Result<OpenBaoAgentPaths> {
+    let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
     let compose_has_openbao = compose_has_openbao(compose_file, messages)?;
-    let mut openbao_agent_addr = resolve_openbao_agent_addr(openbao_url, compose_has_openbao);
+    let mut openbao_agent_addr = resolve_openbao_agent_addr(
+        openbao_url,
+        compose_has_openbao,
+        &identity.container(BootrootContainer::OpenBao),
+    );
     // The infra agents are generated *before* OpenBao flips to TLS
     // (`orchestrator.rs`), so `openbao_url` — and therefore the resolved
     // agent address — is still `http://`.  When OpenBao is provisioned
@@ -656,6 +661,7 @@ pub(super) async fn setup_openbao_agents(
         compose_file,
         secrets_dir,
         &openbao_agent_addr,
+        &identity,
         messages,
     )
     .await?;
@@ -839,6 +845,7 @@ async fn write_openbao_agent_compose_override(
     compose_file: &Path,
     secrets_dir: &Path,
     openbao_addr: &str,
+    identity: &ComposeIdentity,
     messages: &Messages,
 ) -> Result<Option<PathBuf>> {
     let agent_dir = secrets_dir.join(OPENBAO_AGENT_DIR);
@@ -883,8 +890,8 @@ services:
 "#,
         stepca_service = OPENBAO_AGENT_STEPCA_SERVICE,
         responder_service = OPENBAO_AGENT_RESPONDER_SERVICE,
-        stepca_container = OPENBAO_AGENT_STEPCA_CONTAINER_NAME,
-        responder_container = OPENBAO_AGENT_RESPONDER_CONTAINER_NAME,
+        stepca_container = identity.container(BootrootContainer::OpenBaoAgentStepCa),
+        responder_container = identity.container(BootrootContainer::OpenBaoAgentResponder),
         agent_image = OPENBAO_AGENT_IMAGE,
         depends_on = depends_on,
         openbao_addr = openbao_addr,
@@ -902,7 +909,7 @@ pub(super) fn apply_openbao_agent_compose_override(
     override_path: &Path,
     messages: &Messages,
 ) -> Result<()> {
-    let project = resolve_compose_project(compose_file, None, messages)?;
+    let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
     let compose_str = compose_file.to_string_lossy();
     let override_str = override_path.to_string_lossy();
     // `--no-deps` is load-bearing: the agent override does not include
@@ -916,8 +923,7 @@ pub(super) fn apply_openbao_agent_compose_override(
     // trip: infra-up starts openbao with the preserved exposed
     // override, and the agent compose-up here recreates it back to
     // loopback unless we tell compose to ignore the dependency.
-    let args = compose_args(
-        &project,
+    let invocation = identity.compose(
         &[&compose_str, &override_str],
         None,
         &[
@@ -928,7 +934,11 @@ pub(super) fn apply_openbao_agent_compose_override(
             OPENBAO_AGENT_RESPONDER_SERVICE,
         ],
     );
-    run_docker(&args, "docker compose openbao agent override", messages)?;
+    run_compose(
+        &invocation,
+        "docker compose openbao agent override",
+        messages,
+    )?;
     Ok(())
 }
 
@@ -1153,10 +1163,13 @@ services:
         )
         .unwrap();
 
+        let identity = ComposeIdentity::resolve(&compose_file, Some("insight"), &test_messages())
+            .expect("identity");
         let override_path = write_openbao_agent_compose_override(
             &compose_file,
             &secrets_dir,
             "http://openbao:8200",
+            &identity,
             &test_messages(),
         )
         .await
@@ -1166,6 +1179,16 @@ services:
 
         assert!(contents.contains("openbao-agent-stepca"));
         assert!(contents.contains("openbao-agent-responder"));
+        // The two sidecars are pinned by name, so they follow the
+        // install identity like every other container.
+        assert!(
+            contents.contains("container_name: insight-openbao-agent-stepca"),
+            "agent override must name the instance's own sidecar: {contents}"
+        );
+        assert!(
+            contents.contains("container_name: insight-openbao-agent-responder"),
+            "agent override must name the instance's own sidecar: {contents}"
+        );
         assert!(contents.contains(&secrets_dir.display().to_string()));
         assert!(
             contents.contains("user:"),
@@ -1178,25 +1201,28 @@ services:
 
     #[test]
     fn test_resolve_openbao_agent_addr_replaces_localhost() {
-        let addr = resolve_openbao_agent_addr("http://localhost:8200", true);
+        let addr = resolve_openbao_agent_addr("http://localhost:8200", true, "bootroot-openbao");
         assert_eq!(addr, "http://bootroot-openbao:8200");
     }
 
     #[test]
     fn test_resolve_openbao_agent_addr_replaces_specific_ip() {
-        let addr = resolve_openbao_agent_addr("https://192.168.1.10:8200", true);
+        let addr =
+            resolve_openbao_agent_addr("https://192.168.1.10:8200", true, "bootroot-openbao");
         assert_eq!(addr, "https://bootroot-openbao:8200");
     }
 
     #[test]
     fn test_resolve_openbao_agent_addr_replaces_fqdn() {
-        let addr = resolve_openbao_agent_addr("http://openbao.example.com:8200", true);
+        let addr =
+            resolve_openbao_agent_addr("http://openbao.example.com:8200", true, "bootroot-openbao");
         assert_eq!(addr, "http://bootroot-openbao:8200");
     }
 
     #[test]
     fn test_resolve_openbao_agent_addr_preserves_when_no_compose() {
-        let addr = resolve_openbao_agent_addr("https://192.168.1.10:8200", false);
+        let addr =
+            resolve_openbao_agent_addr("https://192.168.1.10:8200", false, "bootroot-openbao");
         assert_eq!(addr, "https://192.168.1.10:8200");
     }
 

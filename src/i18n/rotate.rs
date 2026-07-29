@@ -546,6 +546,24 @@ impl Messages {
         )
     }
 
+    /// Warns that a post-phase `OpenBao` Agent restart failed.
+    ///
+    /// The restart only accelerates convergence — the agents re-render
+    /// their static secrets within 30 seconds regardless — and both call
+    /// sites run *after* their phase's destructive KV write, so a hard
+    /// error would strand the operator mid-rotation over a self-healing
+    /// condition.
+    pub(crate) fn warning_rotate_ca_agent_restart_failed(
+        &self,
+        container: &str,
+        error: &str,
+    ) -> String {
+        format_template(
+            self.strings().warning_rotate_ca_agent_restart_failed,
+            &[("container", container), ("error", error)],
+        )
+    }
+
     pub(crate) fn rotate_ca_key_phase_skipped(&self, phase: &str) -> String {
         format_template(
             self.strings().rotate_ca_key_phase_skipped,

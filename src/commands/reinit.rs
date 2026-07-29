@@ -15,9 +15,10 @@ use crate::commands::clean::{
 };
 use crate::commands::compose_file::compose_file_dir;
 use crate::commands::compose_project::resolve_compose_project_for_dir;
+use crate::commands::container_name::{BootrootContainer, resolve_container_name};
 use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::commands::infra::run_infra_up;
-use crate::commands::init::{OPENBAO_CONTAINER_NAME, compose_has_openbao, prompt_yes_no, run_init};
+use crate::commands::init::{compose_has_openbao, prompt_yes_no, run_init};
 use crate::commands::openbao_url::effective_openbao_url;
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -89,10 +90,17 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         kv_mount: args.openbao.kv_mount.clone(),
     };
 
+    // The container this install owns.  Everything below that names a
+    // container — the scope check, the plan an operator confirms — is
+    // about this one, never a co-located install's `bootroot-openbao`.
+    let openbao_container =
+        resolve_container_name(compose_file, BootrootContainer::OpenBao, messages)?;
+
     // 2. Scope check: refuse external OpenBao / project mismatch.
     verify_compose_managed_openbao(
         compose_file,
         &compose_dir,
+        &openbao_container,
         &container_exists_via_docker,
         &inspect_label_via_docker,
         messages,
@@ -153,6 +161,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         &mut io::stdout().lock(),
         &snapshot,
         &effective_secrets_dir,
+        &openbao_container,
         messages,
     )
     .with_context(|| messages.error_prompt_write_failed())?;
@@ -290,9 +299,19 @@ pub(crate) fn reject_explicit_openbao_url(openbao_url: &str, messages: &Messages
 }
 
 /// Validates that the compose file declares a local `openbao` service
-/// and that, if a `bootroot-openbao` container exists, BOTH compose
-/// labels are present and match the project derived from this work
-/// directory and the expected `openbao` service.
+/// and that, if this install's own `OpenBao` container exists, BOTH
+/// compose labels are present and match the project derived from this
+/// work directory and the expected `openbao` service.
+///
+/// `openbao_container` is the container name derived from the *recorded
+/// instance*, so the existence question is about this install.  Asking
+/// about a fixed `bootroot-openbao` would be wrong two ways on a
+/// non-default instance: with a default install co-located it answers
+/// "exists" and the label inspections then describe the other install's
+/// container, and with no default install present it answers "absent"
+/// even though this instance's `OpenBao` is running — taking the
+/// stuck-after-`clean` recovery branch that skips the very label checks
+/// that prove the `OpenBao` about to be wiped belongs to this project.
 ///
 /// The existence check is intentionally separate from the label read
 /// because `inspect_label_via_docker` collapses "container missing"
@@ -305,6 +324,7 @@ pub(crate) fn reject_explicit_openbao_url(openbao_url: &str, messages: &Messages
 fn verify_compose_managed_openbao(
     compose_file: &Path,
     compose_dir: &Path,
+    openbao_container: &str,
     container_exists: &dyn Fn(&str) -> Result<bool>,
     inspect: &dyn Fn(&str, &str) -> Result<Option<String>>,
     messages: &Messages,
@@ -315,35 +335,37 @@ fn verify_compose_managed_openbao(
     if !compose_has_openbao(compose_file, messages)? {
         anyhow::bail!(messages.error_reinit_external_openbao(&compose_file.display().to_string()));
     }
-    if container_exists(OPENBAO_CONTAINER_NAME)? {
+    if container_exists(openbao_container)? {
         // When the container exists, the expected project must come
         // from a source independent of the container (env override or
         // compose-dir basename).  Otherwise a mismatched container
         // would never trip the check.
         let expected_project =
             resolve_expected_compose_project_excluding_container(compose_dir, messages)?;
-        let container_project = inspect(OPENBAO_CONTAINER_NAME, COMPOSE_PROJECT_LABEL)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    messages.error_reinit_container_missing_compose_label(COMPOSE_PROJECT_LABEL)
-                )
+        let container_project =
+            inspect(openbao_container, COMPOSE_PROJECT_LABEL)?.ok_or_else(|| {
+                anyhow::anyhow!(messages.error_reinit_container_missing_compose_label(
+                    openbao_container,
+                    COMPOSE_PROJECT_LABEL
+                ))
             })?;
         if container_project != expected_project {
-            anyhow::bail!(
-                messages.error_reinit_container_project_mismatch(
-                    &container_project,
-                    &expected_project,
-                )
-            );
+            anyhow::bail!(messages.error_reinit_container_project_mismatch(
+                openbao_container,
+                &container_project,
+                &expected_project,
+            ));
         }
-        let container_service = inspect(OPENBAO_CONTAINER_NAME, COMPOSE_SERVICE_LABEL)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    messages.error_reinit_container_missing_compose_label(COMPOSE_SERVICE_LABEL)
-                )
+        let container_service =
+            inspect(openbao_container, COMPOSE_SERVICE_LABEL)?.ok_or_else(|| {
+                anyhow::anyhow!(messages.error_reinit_container_missing_compose_label(
+                    openbao_container,
+                    COMPOSE_SERVICE_LABEL
+                ))
             })?;
         if container_service != OPENBAO_COMPOSE_SERVICE {
             anyhow::bail!(messages.error_reinit_container_project_mismatch(
+                openbao_container,
                 &format!("service={container_service}"),
                 OPENBAO_COMPOSE_SERVICE,
             ));
@@ -697,12 +719,17 @@ fn write_reinit_plan<W: Write>(
     out: &mut W,
     snapshot: &DeploymentIntent,
     effective_secrets_dir: &Path,
+    openbao_container: &str,
     messages: &Messages,
 ) -> io::Result<()> {
     let secrets_display = effective_secrets_dir.display().to_string();
     writeln!(out, "{}", messages.reinit_plan_title())?;
     writeln!(out, "{}", messages.reinit_plan_destructive_actions())?;
-    writeln!(out, "{}", messages.reinit_plan_destructive_container())?;
+    writeln!(
+        out,
+        "{}",
+        messages.reinit_plan_destructive_container(openbao_container)
+    )?;
     writeln!(out, "{}", messages.reinit_plan_destructive_volumes())?;
     writeln!(out, "{}", messages.reinit_plan_destructive_state_file())?;
     writeln!(
@@ -1028,6 +1055,9 @@ mod tests {
     use crate::i18n::test_messages;
     use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 
+    /// The `OpenBao` container name a default install renders.
+    const DEFAULT_OPENBAO_CONTAINER: &str = "bootroot-openbao";
+
     fn state_with_intent() -> StateFile {
         let mut infra_certs = BTreeMap::new();
         infra_certs.insert(
@@ -1259,6 +1289,7 @@ mod tests {
         let err = verify_compose_managed_openbao(
             &compose_file,
             dir.path(),
+            DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
@@ -1283,6 +1314,7 @@ mod tests {
         let err = verify_compose_managed_openbao(
             &compose_file,
             dir.path(),
+            DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
@@ -1319,6 +1351,7 @@ mod tests {
         let err = verify_compose_managed_openbao(
             &compose_file,
             &work,
+            DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
@@ -1360,6 +1393,7 @@ mod tests {
             let err = verify_compose_managed_openbao(
                 &compose_file,
                 &work,
+                DEFAULT_OPENBAO_CONTAINER,
                 &container_exists,
                 &inspect,
                 &messages,
@@ -1399,11 +1433,95 @@ mod tests {
         verify_compose_managed_openbao(
             &compose_file,
             &work,
+            DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
         )
         .expect("a container in the recorded instance's project must be accepted");
+    }
+
+    /// With a default install co-located, the existence question must be
+    /// about *this* instance's container.  Asking about `bootroot-openbao`
+    /// would answer "exists" and then inspect the other install's labels.
+    #[test]
+    fn verify_compose_managed_openbao_ignores_a_colocated_default_instance() {
+        let dir = tempdir().unwrap();
+        let work = dir.path().join("stack");
+        fs::create_dir_all(&work).unwrap();
+        let compose_file = work.join("docker-compose.yml");
+        fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
+        let messages = test_messages();
+
+        let queried = std::cell::RefCell::new(Vec::new());
+        let container_exists = |name: &str| -> Result<bool> {
+            queried.borrow_mut().push(name.to_string());
+            // Only the default instance's container is running.
+            Ok(name == DEFAULT_OPENBAO_CONTAINER)
+        };
+        let inspected = std::cell::RefCell::new(Vec::new());
+        let inspect = |name: &str, _: &str| -> Result<Option<String>> {
+            inspected.borrow_mut().push(name.to_string());
+            Ok(None)
+        };
+
+        verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            "insight-openbao",
+            &container_exists,
+            &inspect,
+            &messages,
+        )
+        .expect("the instance's own container is absent, so the recovery branch applies");
+
+        assert_eq!(queried.into_inner(), vec!["insight-openbao"]);
+        assert!(
+            inspected.into_inner().is_empty(),
+            "the co-located default instance's container must never be inspected"
+        );
+    }
+
+    /// The mirror case: this instance's own container is running, so the
+    /// label branch runs and both inspections are about it.
+    #[test]
+    fn verify_compose_managed_openbao_inspects_the_instances_own_container() {
+        let _guard = env_lock();
+        let _env = ComposeProjectEnv::set(None);
+        let dir = tempdir().unwrap();
+        let work = dir.path().join("stack");
+        fs::create_dir_all(&work).unwrap();
+        let compose_file = work.join("docker-compose.yml");
+        fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
+        fs::write(work.join(".env"), "BOOTROOT_INSTANCE=insight\n").unwrap();
+        let messages = test_messages();
+
+        let container_exists = |name: &str| -> Result<bool> { Ok(name == "insight-openbao") };
+        let inspected = std::cell::RefCell::new(Vec::new());
+        let inspect = |name: &str, label: &str| -> Result<Option<String>> {
+            inspected.borrow_mut().push(name.to_string());
+            if label == COMPOSE_PROJECT_LABEL {
+                Ok(Some("insight".to_string()))
+            } else {
+                Ok(Some(OPENBAO_COMPOSE_SERVICE.to_string()))
+            }
+        };
+
+        verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            "insight-openbao",
+            &container_exists,
+            &inspect,
+            &messages,
+        )
+        .expect("the instance's own container carries matching labels");
+
+        assert_eq!(
+            inspected.into_inner(),
+            vec!["insight-openbao", "insight-openbao"],
+            "both label reads must target the instance's own container"
+        );
     }
 
     #[test]
@@ -1421,6 +1539,7 @@ mod tests {
         verify_compose_managed_openbao(
             &compose_file,
             &work,
+            DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
@@ -1448,6 +1567,7 @@ mod tests {
         let err = verify_compose_managed_openbao(
             &compose_file,
             &work,
+            DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
@@ -1486,6 +1606,7 @@ mod tests {
         let result = verify_compose_managed_openbao(
             &compose_file,
             &work,
+            DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
@@ -1523,6 +1644,7 @@ mod tests {
         verify_compose_managed_openbao(
             &compose_file,
             &work,
+            DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
@@ -1560,6 +1682,7 @@ mod tests {
         let result = verify_compose_managed_openbao(
             &compose_file,
             &compose_dir,
+            DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
@@ -1838,8 +1961,14 @@ mod tests {
         let messages = test_messages();
         let mut buf = Vec::new();
         let snapshot = DeploymentIntent::default();
-        write_reinit_plan(&mut buf, &snapshot, Path::new("secrets"), &messages)
-            .expect("write plan");
+        write_reinit_plan(
+            &mut buf,
+            &snapshot,
+            Path::new("secrets"),
+            DEFAULT_OPENBAO_CONTAINER,
+            &messages,
+        )
+        .expect("write plan");
         let rendered = String::from_utf8(buf).expect("utf-8 plan");
 
         // Destructive section + a sentinel destructive action.
@@ -1921,8 +2050,14 @@ mod tests {
                 m
             },
         };
-        write_reinit_plan(&mut buf, &snapshot, Path::new("secrets-custom"), &messages)
-            .expect("write plan");
+        write_reinit_plan(
+            &mut buf,
+            &snapshot,
+            Path::new("secrets-custom"),
+            DEFAULT_OPENBAO_CONTAINER,
+            &messages,
+        )
+        .expect("write plan");
         let rendered = String::from_utf8(buf).expect("utf-8 plan");
 
         // Effective secrets_dir threaded through the destructive +

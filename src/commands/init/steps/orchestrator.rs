@@ -42,8 +42,9 @@ use super::stepca_setup::{
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
 use crate::commands::compose_file::compose_file_dir;
-use crate::commands::compose_project::{compose_args, resolve_compose_project};
+use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
+use crate::commands::container_name::BootrootContainer;
 use crate::commands::guardrails::{
     client_url_from_bind_addr, ensure_all_services_localhost_binding, validate_http01_admin_tls,
     validate_http01_override_binding, validate_http01_override_scope,
@@ -51,7 +52,7 @@ use crate::commands::guardrails::{
 };
 use crate::commands::infra::{
     ensure_init_prereqs_ready, has_http01_admin_bind_intent, has_openbao_bind_intent,
-    resolve_stepca_exposed_override, run_docker,
+    resolve_stepca_exposed_override, run_compose,
 };
 use crate::commands::init::{
     HTTP01_ADMIN_TLS_CERT_REL_PATH, HTTP01_ADMIN_TLS_KEY_REL_PATH,
@@ -446,7 +447,7 @@ async fn run_init_inner(
     // reach the same answer. `load_dotenv_into_env` skips
     // `COMPOSE_PROJECT_NAME` for exactly that reason; see its doc
     // comment.
-    let project = resolve_compose_project(&args.compose.compose_file, None, messages)?;
+    let identity = ComposeIdentity::resolve(&args.compose.compose_file, None, messages)?;
 
     // Load .env into the process environment so that
     // `build_admin_dsn_from_env()` and `build_dsn_from_env()` can discover
@@ -524,8 +525,8 @@ async fn run_init_inner(
     let will_init_stepca = !secrets_dir.join("config").join("ca.json").exists();
     if will_init_stepca {
         let compose_str = args.compose.compose_file.to_string_lossy();
-        let stop_args = compose_args(&project, &[&compose_str], None, &["stop", "step-ca"]);
-        let _ = run_docker(&stop_args, "docker compose stop step-ca", messages);
+        let stop = identity.compose(&[&compose_str], None, &["stop", "step-ca"]);
+        let _ = run_compose(&stop, "docker compose stop step-ca", messages);
     }
     // step-ca's own serving certificate must carry the address
     // `--stepca-bind` publishes it on, otherwise an off-host consumer
@@ -536,7 +537,10 @@ async fn run_init_inner(
     // below consumes; deriving the name set here covers both the fresh
     // `step ca init --dns` path and the already-initialized path, which
     // reconciles `ca.json` instead.
-    let stepca_dns_names = resolve_stepca_ca_dns_names(&StateFile::default_path())?;
+    let stepca_dns_names = resolve_stepca_ca_dns_names(
+        &StateFile::default_path(),
+        &identity.container(BootrootContainer::StepCa),
+    )?;
     let step_ca_result = ensure_step_ca_initialized(&secrets_dir, &stepca_dns_names, messages)?;
     if step_ca_result == super::super::types::StepCaInitResult::Initialized {
         // Fix ownership: step-ca init may create files with different
@@ -595,7 +599,7 @@ async fn run_init_inner(
         // triggered by a later failure restarts the sidecar back onto the
         // template it restores, even if the restart itself half-succeeded.
         rollback.stepca_agent_restarted = true;
-        restart_stepca_openbao_agent();
+        restart_stepca_openbao_agent(&identity.container(BootrootContainer::OpenBaoAgentStepCa));
         reconcile_ca_json_dns_names(&secrets_dir, &stepca_dns_names, messages).await?;
     }
 
@@ -613,8 +617,8 @@ async fn run_init_inner(
         // an installed system.  Gating on the change keeps a repeat
         // `init` with the same recorded intent restart-free.
         let compose_str = args.compose.compose_file.to_string_lossy();
-        let restart_args = compose_args(&project, &[&compose_str], None, &["restart", "step-ca"]);
-        let _ = run_docker(&restart_args, "docker compose restart step-ca", messages);
+        let restart = identity.compose(&[&compose_str], None, &["restart", "step-ca"]);
+        let _ = run_compose(&restart, "docker compose restart step-ca", messages);
     }
     // Apply the step-ca exposed override when a bind intent is stored.
     // `infra install --stepca-bind` records the intent and writes the
@@ -635,13 +639,12 @@ async fn run_init_inner(
     {
         let compose_str = args.compose.compose_file.to_string_lossy();
         let override_str = stepca_override.to_string_lossy();
-        let up_args = compose_args(
-            &project,
+        let up = identity.compose(
             &[&compose_str, &override_str],
             None,
             &["up", "-d", "--no-deps", "step-ca"],
         );
-        run_docker(&up_args, "docker compose up -d step-ca (exposed)", messages)?;
+        run_compose(&up, "docker compose up -d step-ca (exposed)", messages)?;
     }
     let compose_has_responder = compose_has_responder(&args.compose.compose_file, messages)?;
     let responder_tls_enabled =
@@ -708,8 +711,11 @@ async fn run_init_inner(
             .http01_admin_bind_addr
             .as_deref()
             .expect("responder_tls_enabled implies http01_admin_bind_addr is Some");
-        let sans =
-            build_http01_admin_tls_sans(bind_addr, state.http01_admin_advertise_addr.as_deref());
+        let sans = build_http01_admin_tls_sans(
+            bind_addr,
+            state.http01_admin_advertise_addr.as_deref(),
+            &identity.container(BootrootContainer::Http01),
+        );
         let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
         issue_http01_admin_tls_cert(&secrets_dir, &san_refs, messages)?;
         // Track TLS artifacts for rollback cleanup.
@@ -744,14 +750,13 @@ async fn run_init_inner(
             // non-loopback host-port publish.  Reinit-recovery's
             // second init pass would then lose access to the bind URL
             // mid-flow.
-            let up_args = compose_args(
-                &project,
+            let up = identity.compose(
                 &[&compose_str, &config_override_str, &exposed_override_str],
                 None,
                 &["up", "-d", "--no-deps", RESPONDER_SERVICE_NAME],
             );
-            run_docker(
-                &up_args,
+            run_compose(
+                &up,
                 "docker compose up -d responder (tls + exposed)",
                 messages,
             )?;
@@ -767,7 +772,11 @@ async fn run_init_inner(
         messages,
     )
     .await?;
-    let responder_url = resolve_responder_url(args, compose_has_responder)?;
+    let responder_url = resolve_responder_url(
+        args,
+        compose_has_responder,
+        &identity.container(BootrootContainer::Http01),
+    )?;
     let responder_check = verify_responder(
         responder_url.as_deref(),
         args,
@@ -841,7 +850,12 @@ async fn run_init_inner(
         rollback.compose_file = Some(args.compose.compose_file.clone());
 
         // Issue the TLS server certificate and rewrite openbao.hcl.
-        let sans = build_openbao_tls_sans(&bind_addr, state.openbao_advertise_addr.as_deref());
+        let openbao_container = identity.container(BootrootContainer::OpenBao);
+        let sans = build_openbao_tls_sans(
+            &bind_addr,
+            state.openbao_advertise_addr.as_deref(),
+            &openbao_container,
+        );
         let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
         issue_openbao_tls_cert(
             compose_dir,
@@ -862,7 +876,7 @@ async fn run_init_inner(
 
         // Record the infra cert entry in state so the rotation
         // pipeline can renew it.
-        record_openbao_infra_cert(&mut state, compose_dir, sans);
+        record_openbao_infra_cert(&mut state, compose_dir, sans, &openbao_container);
 
         validate_openbao_override_scope(&override_path, messages)?;
         validate_openbao_override_binding(&override_path, &bind_addr, messages)?;
@@ -971,9 +985,13 @@ async fn run_init_inner(
             .http01_admin_bind_addr
             .clone()
             .expect("responder_tls_enabled implies http01_admin_bind_addr is Some");
-        let sans =
-            build_http01_admin_tls_sans(&bind_addr, state.http01_admin_advertise_addr.as_deref());
-        record_http01_admin_infra_cert(&mut state, &secrets_dir, sans);
+        let responder_container = identity.container(BootrootContainer::Http01);
+        let sans = build_http01_admin_tls_sans(
+            &bind_addr,
+            state.http01_admin_advertise_addr.as_deref(),
+            &responder_container,
+        );
+        record_http01_admin_infra_cert(&mut state, &secrets_dir, sans, &responder_container);
         state
             .save(&state_path)
             .with_context(|| messages.error_serialize_state_failed())?;
@@ -1230,10 +1248,10 @@ async fn maybe_rotate_env_db_password(
     )?;
 
     // Restart step-ca to pick up the new DSN from the patched ca.json.
-    let project = resolve_compose_project(compose_file, None, messages)?;
+    let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
     let compose_str = compose_file.to_string_lossy();
-    let restart_args = compose_args(&project, &[&compose_str], None, &["restart", "step-ca"]);
-    let _ = run_docker(&restart_args, "docker compose restart step-ca", messages);
+    let restart = identity.compose(&[&compose_str], None, &["restart", "step-ca"]);
+    let _ = run_compose(&restart, "docker compose restart step-ca", messages);
 
     Ok(Some(new_dsn))
 }

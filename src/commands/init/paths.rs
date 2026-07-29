@@ -2,10 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::constants::{
-    DEFAULT_RESPONDER_ADMIN_URL, OPENBAO_CONTAINER_NAME, RESPONDER_CONFIG_DIR,
-    RESPONDER_CONFIG_NAME,
-};
+use super::constants::{RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, default_responder_admin_url};
 use crate::cli::args::InitArgs;
 use crate::commands::constants::{RESPONDER_SERVICE_NAME, STEPCA_SERVICE_NAME};
 use crate::commands::guardrails::parse_hcl_string_value;
@@ -125,6 +122,7 @@ fn compose_has_top_level_service(yaml: &str, service_name: &str) -> bool {
 pub(crate) fn resolve_responder_url(
     args: &InitArgs,
     compose_has_responder: bool,
+    responder_container: &str,
 ) -> Result<Option<String>> {
     if let Some(responder_url) = args.responder_url.as_ref() {
         return Ok(Some(responder_url.clone()));
@@ -132,14 +130,13 @@ pub(crate) fn resolve_responder_url(
     if !compose_has_responder {
         return Ok(None);
     }
+    let admin_url = default_responder_admin_url(responder_container);
     // When the responder has TLS paths configured, the admin API must
     // be reached via HTTPS.
     if responder_tls_configured(&args.secrets_dir.secrets_dir)? {
-        Ok(Some(
-            DEFAULT_RESPONDER_ADMIN_URL.replace("http://", "https://"),
-        ))
+        Ok(Some(admin_url.replace("http://", "https://")))
     } else {
-        Ok(Some(DEFAULT_RESPONDER_ADMIN_URL.to_string()))
+        Ok(Some(admin_url))
     }
 }
 
@@ -166,12 +163,17 @@ fn responder_tls_configured(secrets_dir: &Path) -> Result<bool> {
 /// the server via its container name.
 ///
 /// When `compose_has_openbao` is `true`, the host portion of `openbao_url`
-/// is unconditionally replaced with [`OPENBAO_CONTAINER_NAME`] while the
-/// scheme and port are preserved.  This covers loopback addresses
-/// (`localhost`, `127.0.0.1`) as well as specific bind IPs
-/// (`192.168.1.10`) that the host uses but that are unreachable from
-/// sibling containers on the Docker bridge network.
-pub(crate) fn resolve_openbao_agent_addr(openbao_url: &str, compose_has_openbao: bool) -> String {
+/// is unconditionally replaced with `openbao_container` — the install's
+/// own `OpenBao` container name, which is what resolves inside the
+/// compose network — while the scheme and port are preserved.  This
+/// covers loopback addresses (`localhost`, `127.0.0.1`) as well as
+/// specific bind IPs (`192.168.1.10`) that the host uses but that are
+/// unreachable from sibling containers on the Docker bridge network.
+pub(crate) fn resolve_openbao_agent_addr(
+    openbao_url: &str,
+    compose_has_openbao: bool,
+    openbao_container: &str,
+) -> String {
     if !compose_has_openbao {
         return openbao_url.to_string();
     }
@@ -186,14 +188,28 @@ pub(crate) fn resolve_openbao_agent_addr(openbao_url: &str, compose_has_openbao:
         after_scheme.split_once(':').map(|(_, p)| p)
     };
     match port {
-        Some(p) => format!("{scheme}://{OPENBAO_CONTAINER_NAME}:{p}"),
-        None => format!("{scheme}://{OPENBAO_CONTAINER_NAME}"),
+        Some(p) => format!("{scheme}://{openbao_container}:{p}"),
+        None => format!("{scheme}://{openbao_container}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The agents reach `OpenBao` by container name on the compose
+    /// network, so the rewritten host has to be this install's own.
+    #[test]
+    fn openbao_agent_addr_uses_the_instance_container_name() {
+        assert_eq!(
+            resolve_openbao_agent_addr("http://localhost:8200", true, "insight-openbao"),
+            "https://insight-openbao:8200".replace("https", "http")
+        );
+        assert_eq!(
+            resolve_openbao_agent_addr("https://192.168.1.10:8200", true, "insight-openbao"),
+            "https://insight-openbao:8200"
+        );
+    }
 
     #[test]
     fn responder_tls_configured_returns_true_when_config_has_tls_paths() {
@@ -315,7 +331,8 @@ services:
 
     #[test]
     fn url_scheme_switches_to_https_when_tls_configured() {
-        let https_url = DEFAULT_RESPONDER_ADMIN_URL.replace("http://", "https://");
+        let https_url =
+            default_responder_admin_url("bootroot-http01").replace("http://", "https://");
         assert_eq!(https_url, "https://bootroot-http01:8080");
     }
 }

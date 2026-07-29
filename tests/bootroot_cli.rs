@@ -245,6 +245,7 @@ struct InstallHarness {
     compose_file: std::path::PathBuf,
     bin_dir: std::path::PathBuf,
     argv_log: std::path::PathBuf,
+    instance_env_log: std::path::PathBuf,
 }
 
 #[cfg(unix)]
@@ -263,12 +264,16 @@ impl InstallHarness {
         let bin_dir = dir.path().join("bin");
         fs::create_dir_all(&bin_dir).expect("create bin dir");
         let argv_log = dir.path().join("docker-argv.log");
+        // Compose renders `container_name:` from `BOOTROOT_INSTANCE`, so
+        // what the child process sees is as load-bearing as the argv.
+        let instance_env_log = dir.path().join("docker-instance-env.log");
         let fake_docker = format!(
             r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >>"{log}"
 
 if [ "${{1:-}}" = "compose" ]; then
+  printf '%s\n' "${{BOOTROOT_INSTANCE-<unset>}}" >>"{env_log}"
   printf "cid-openbao"
   exit 0
 fi
@@ -280,7 +285,8 @@ fi
 
 exit 0
 "#,
-            log = argv_log.display()
+            log = argv_log.display(),
+            env_log = instance_env_log.display()
         );
         let docker_path = bin_dir.join("docker");
         fs::write(&docker_path, fake_docker).expect("write fake docker");
@@ -292,6 +298,7 @@ exit 0
             compose_file,
             bin_dir,
             argv_log,
+            instance_env_log,
         }
     }
 
@@ -308,6 +315,18 @@ exit 0
     }
 
     fn install(&self, instance_name: Option<&str>, compose_project_name: Option<&str>) -> String {
+        self.install_with_inherited_instance(instance_name, compose_project_name, None)
+    }
+
+    /// [`InstallHarness::install`] with an explicit `BOOTROOT_INSTANCE`
+    /// exported into bootroot's own environment, so the test can pin
+    /// that an inherited value never reaches Compose.
+    fn install_with_inherited_instance(
+        &self,
+        instance_name: Option<&str>,
+        compose_project_name: Option<&str>,
+        inherited_instance: Option<&str>,
+    ) -> String {
         let path = std::env::var("PATH").unwrap_or_default();
         let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
         command
@@ -330,6 +349,10 @@ exit 0
             Some(value) => command.env("COMPOSE_PROJECT_NAME", value),
             None => command.env_remove("COMPOSE_PROJECT_NAME"),
         };
+        match inherited_instance {
+            Some(value) => command.env("BOOTROOT_INSTANCE", value),
+            None => command.env_remove("BOOTROOT_INSTANCE"),
+        };
 
         let output = command.output().expect("run infra install");
         assert!(
@@ -343,6 +366,15 @@ exit 0
 
     fn dotenv(&self) -> String {
         std::fs::read_to_string(self.dir.path().join(".env")).expect("install must write .env")
+    }
+
+    /// The `BOOTROOT_INSTANCE` each `docker compose` subprocess saw.
+    fn compose_instance_env(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.instance_env_log)
+            .expect("the fake docker must have logged a compose invocation")
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     /// Asserts every `docker compose` invocation the run made carried
@@ -379,6 +411,49 @@ fn test_infra_install_scopes_compose_to_the_declared_instance() {
         harness.dotenv().contains("BOOTROOT_INSTANCE=insight"),
         "the declared identity must be recorded, got: {}",
         harness.dotenv()
+    );
+    assert!(
+        harness
+            .compose_instance_env()
+            .iter()
+            .all(|value| value == "insight"),
+        "every compose subprocess must render container names from the \
+         declared identity, got: {:?}",
+        harness.compose_instance_env()
+    );
+}
+
+/// Closes #746: an inherited `BOOTROOT_INSTANCE` must never reach
+/// Compose.  Compose reads the invoking environment ahead of the project
+/// directory's `.env`, so without the pin the stack would come up under
+/// another install's container names while `-p` still said `insight`.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_pins_the_recorded_instance_over_an_inherited_one() {
+    let harness = InstallHarness::new();
+    let argv = harness.install_with_inherited_instance(Some("insight"), None, Some("other"));
+    InstallHarness::assert_every_compose_scoped_to(&argv, "insight");
+    let seen = harness.compose_instance_env();
+    assert!(
+        !seen.is_empty() && seen.iter().all(|value| value == "insight"),
+        "the inherited value must never reach Compose, got: {seen:?}"
+    );
+}
+
+/// Closes #746: with an exported harness project the stack is scoped to
+/// that project but the containers still follow the recorded identity —
+/// the project name is not a valid instance name at all.
+#[cfg(unix)]
+#[test]
+fn test_compose_project_override_does_not_rename_the_containers() {
+    const HARNESS_PROJECT: &str = "bootroot-e2e-ci-openbao-tls-no-delta-1234567";
+    let harness = InstallHarness::new();
+    let argv = harness.install(None, Some(HARNESS_PROJECT));
+    InstallHarness::assert_every_compose_scoped_to(&argv, HARNESS_PROJECT);
+    let seen = harness.compose_instance_env();
+    assert!(
+        !seen.is_empty() && seen.iter().all(|value| value == "bootroot"),
+        "container names follow the recorded instance, never the project, got: {seen:?}"
     );
 }
 

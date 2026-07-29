@@ -18,7 +18,7 @@
 services:
   openbao:
     image: ${OPENBAO_IMAGE:-openbao/openbao:2.5.5}
-    container_name: bootroot-openbao
+    container_name: ${BOOTROOT_INSTANCE:-bootroot}-openbao
     restart: always
     ports:
       - "127.0.0.1:${OPENBAO_HOST_PORT:-8200}:8200"
@@ -41,7 +41,7 @@ services:
   # conventional 5432 port; set POSTGRES_HOST_PORT to override.
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:18.4}
-    container_name: bootroot-postgres
+    container_name: ${BOOTROOT_INSTANCE:-bootroot}-postgres
     restart: always
     environment:
       - POSTGRES_USER=step
@@ -54,7 +54,7 @@ services:
 
   step-ca:
     image: ${BOOTROOT_STEP_CA_IMAGE:-smallstep/step-ca:0.30.2}
-    container_name: bootroot-ca
+    container_name: ${BOOTROOT_INSTANCE:-bootroot}-ca
     restart: always
     # Run as the owner of ./secrets so the container can read the key
     # material and OpenBao-Agent-rendered files kept there. `infra install`
@@ -86,7 +86,7 @@ services:
 
   bootroot-http01:
     image: ${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:0.2.0}
-    container_name: bootroot-http01
+    container_name: ${BOOTROOT_INSTANCE:-bootroot}-http01
     restart: always
     ports:
       - "127.0.0.1:${HTTP01_ADMIN_HOST_PORT:-8080}:8080"
@@ -99,7 +99,7 @@ services:
 
   prometheus:
     image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.13.1}
-    container_name: bootroot-prometheus
+    container_name: ${BOOTROOT_INSTANCE:-bootroot}-prometheus
     restart: always
     profiles:
       - lan
@@ -113,7 +113,7 @@ services:
 
   grafana:
     image: ${GRAFANA_IMAGE:-grafana/grafana:13.0.3}
-    container_name: bootroot-grafana
+    container_name: ${BOOTROOT_INSTANCE:-bootroot}-grafana
     restart: always
     profiles:
       - lan
@@ -131,7 +131,7 @@ services:
 
   grafana-public:
     image: ${GRAFANA_IMAGE:-grafana/grafana:13.0.3}
-    container_name: bootroot-grafana-public
+    container_name: ${BOOTROOT_INSTANCE:-bootroot}-grafana-public
     restart: always
     profiles:
       - public

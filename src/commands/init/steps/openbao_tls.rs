@@ -5,10 +5,9 @@ use anyhow::{Context, Result};
 
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
-    CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, OPENBAO_CONTAINER_NAME, OPENBAO_HCL_PATH,
-    OPENBAO_INFRA_CERT_KEY, OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_CONTAINER_CERT_PATH,
-    OPENBAO_TLS_CONTAINER_KEY_PATH, OPENBAO_TLS_DEFAULT_NOT_AFTER,
-    OPENBAO_TLS_DEFAULT_RENEW_BEFORE, OPENBAO_TLS_KEY_PATH,
+    CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, OPENBAO_HCL_PATH, OPENBAO_INFRA_CERT_KEY,
+    OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_CONTAINER_CERT_PATH, OPENBAO_TLS_CONTAINER_KEY_PATH,
+    OPENBAO_TLS_DEFAULT_NOT_AFTER, OPENBAO_TLS_DEFAULT_RENEW_BEFORE, OPENBAO_TLS_KEY_PATH,
 };
 use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
 use crate::i18n::Messages;
@@ -296,19 +295,22 @@ ui = true
 
 /// Builds the SANs list for the `OpenBao` TLS certificate.
 ///
-/// Always includes `openbao.internal` and `localhost`.  When a bind
-/// address is configured, its IP component is added as well.  When an
-/// advertise address is provided (wildcard bind), its IP is included
+/// Always includes `openbao.internal`, `localhost` and
+/// `openbao_container` — the install's own container name, which is the
+/// server's in-network DNS name and therefore has to validate.  When a
+/// bind address is configured, its IP component is added as well.  When
+/// an advertise address is provided (wildcard bind), its IP is included
 /// so that remote nodes connecting via the advertised endpoint pass
 /// hostname verification.
 pub(in crate::commands::init) fn build_openbao_tls_sans(
     bind_addr: &str,
     advertise_addr: Option<&str>,
+    openbao_container: &str,
 ) -> Vec<String> {
     let mut sans = vec![
         "openbao.internal".to_string(),
         "localhost".to_string(),
-        "bootroot-openbao".to_string(),
+        openbao_container.to_string(),
     ];
 
     if let Some((ip_raw, _port)) = bind_addr.rsplit_once(':') {
@@ -350,6 +352,7 @@ pub(in crate::commands::init) fn record_openbao_infra_cert(
     state: &mut StateFile,
     compose_dir: &Path,
     sans: Vec<String>,
+    openbao_container: &str,
 ) {
     let cert_path = compose_dir.join(OPENBAO_TLS_CERT_PATH);
     let key_path = compose_dir.join(OPENBAO_TLS_KEY_PATH);
@@ -367,7 +370,7 @@ pub(in crate::commands::init) fn record_openbao_infra_cert(
         // the container back sealed (Shamir seal, in-memory master key)
         // and the rotate path never unseals. See issue #727.
         reload_strategy: ReloadStrategy::ContainerSignal {
-            container_name: OPENBAO_CONTAINER_NAME.to_string(),
+            container_name: openbao_container.to_string(),
             signal: "SIGHUP".to_string(),
         },
         issued_at: Some(now),
@@ -447,11 +450,12 @@ pub(crate) fn reissue_openbao_tls_cert(
     compose_dir: &Path,
     secrets_dir: &Path,
     entry: &InfraCertEntry,
+    openbao_container: &str,
     messages: &Messages,
 ) -> Result<()> {
     let san_refs: Vec<&str> = entry.sans.iter().map(String::as_str).collect();
     let sans = if san_refs.is_empty() {
-        vec!["openbao.internal", "localhost", "bootroot-openbao"]
+        vec!["openbao.internal", "localhost", openbao_container]
     } else {
         san_refs
     };
@@ -467,6 +471,9 @@ mod tests {
     use crate::commands::rotate::test_support::{
         ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
     };
+
+    /// The `OpenBao` container name a default install renders.
+    const DEFAULT_OPENBAO_CONTAINER: &str = "bootroot-openbao";
 
     /// Fake `docker` that *appends* one line per invocation, unlike the
     /// shared helper which truncates: the ordering of the two containers
@@ -489,29 +496,100 @@ exit {exit_code}
 
     #[test]
     fn build_sans_includes_specific_ip() {
-        let sans = build_openbao_tls_sans("192.168.1.10:8200", None);
+        let sans = build_openbao_tls_sans("192.168.1.10:8200", None, DEFAULT_OPENBAO_CONTAINER);
         assert!(sans.contains(&"openbao.internal".to_string()));
         assert!(sans.contains(&"localhost".to_string()));
-        assert!(sans.contains(&"bootroot-openbao".to_string()));
+        assert!(sans.contains(&DEFAULT_OPENBAO_CONTAINER.to_string()));
         assert!(sans.contains(&"192.168.1.10".to_string()));
+    }
+
+    /// The `OpenBao` server certificate has to validate for the DNS name
+    /// its own container answers to inside the compose network.
+    #[test]
+    fn build_sans_carry_the_instance_container_name() {
+        let sans = build_openbao_tls_sans("192.168.1.10:8200", None, "insight-openbao");
+        assert!(sans.contains(&"insight-openbao".to_string()));
+        assert!(
+            !sans.contains(&DEFAULT_OPENBAO_CONTAINER.to_string()),
+            "a non-default instance must not carry the default container name: {sans:?}"
+        );
+        // The names that are not container names are untouched.
+        assert!(sans.contains(&"openbao.internal".to_string()));
+        assert!(sans.contains(&"localhost".to_string()));
+    }
+
+    /// The renewal path has its own SAN fallback, reached when the
+    /// recorded entry carries none; it must scope the container name too.
+    #[test]
+    fn reissue_falls_back_to_instance_scoped_sans() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).unwrap();
+        write_appending_fake_docker(&bin_dir.join("docker"), 0);
+
+        let compose_dir = dir.path().join("compose");
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).unwrap();
+        let tls_dir = compose_dir.join("openbao").join("tls");
+        fs::create_dir_all(&tls_dir).unwrap();
+        fs::write(tls_dir.join("server.crt"), "cert").unwrap();
+        fs::write(tls_dir.join("server.key"), "key").unwrap();
+
+        let entry = InfraCertEntry {
+            cert_path: tls_dir.join("server.crt"),
+            key_path: tls_dir.join("server.key"),
+            sans: Vec::new(),
+            renew_before: OPENBAO_TLS_DEFAULT_RENEW_BEFORE.to_string(),
+            reload_strategy: ReloadStrategy::ContainerSignal {
+                container_name: "insight-openbao".to_string(),
+                signal: "SIGHUP".to_string(),
+            },
+            issued_at: None,
+            expires_at: None,
+        };
+
+        let args_log = dir.path().join("docker_args.log");
+        let messages = crate::i18n::test_messages();
+        let _lock = env_lock();
+        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
+        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
+
+        reissue_openbao_tls_cert(
+            &compose_dir,
+            &secrets_dir,
+            &entry,
+            "insight-openbao",
+            &messages,
+        )
+        .expect("re-issuance must succeed against the fake docker");
+
+        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        assert!(
+            log.contains("--san insight-openbao"),
+            "the fallback SAN list must name the instance's container, got: {log}"
+        );
+        assert!(
+            !log.contains(&format!("--san {DEFAULT_OPENBAO_CONTAINER}")),
+            "the fallback must not carry the default container name, got: {log}"
+        );
     }
 
     #[test]
     fn build_sans_wildcard_adds_loopback() {
-        let sans = build_openbao_tls_sans("0.0.0.0:8200", None);
+        let sans = build_openbao_tls_sans("0.0.0.0:8200", None, DEFAULT_OPENBAO_CONTAINER);
         assert!(sans.contains(&"127.0.0.1".to_string()));
         assert!(!sans.contains(&"0.0.0.0".to_string()));
     }
 
     #[test]
     fn build_sans_ipv6_specific() {
-        let sans = build_openbao_tls_sans("[fd12::1]:8200", None);
+        let sans = build_openbao_tls_sans("[fd12::1]:8200", None, DEFAULT_OPENBAO_CONTAINER);
         assert!(sans.contains(&"fd12::1".to_string()));
     }
 
     #[test]
     fn build_sans_ipv6_wildcard() {
-        let sans = build_openbao_tls_sans("[::]:8200", None);
+        let sans = build_openbao_tls_sans("[::]:8200", None, DEFAULT_OPENBAO_CONTAINER);
         assert!(
             sans.contains(&"::1".to_string()),
             "IPv6 wildcard must include IPv6 loopback"
@@ -525,7 +603,7 @@ exit {exit_code}
 
     #[test]
     fn build_sans_ipv6_zero_wildcard() {
-        let sans = build_openbao_tls_sans("[::0]:8200", None);
+        let sans = build_openbao_tls_sans("[::0]:8200", None, DEFAULT_OPENBAO_CONTAINER);
         assert!(
             sans.contains(&"::1".to_string()),
             "[::0] wildcard must include IPv6 loopback"
@@ -539,7 +617,11 @@ exit {exit_code}
 
     #[test]
     fn build_sans_wildcard_with_advertise_addr() {
-        let sans = build_openbao_tls_sans("0.0.0.0:8200", Some("192.168.1.10:8200"));
+        let sans = build_openbao_tls_sans(
+            "0.0.0.0:8200",
+            Some("192.168.1.10:8200"),
+            DEFAULT_OPENBAO_CONTAINER,
+        );
         assert!(
             sans.contains(&"127.0.0.1".to_string()),
             "wildcard must include loopback"
@@ -553,7 +635,11 @@ exit {exit_code}
 
     #[test]
     fn build_sans_wildcard_with_ipv6_advertise_addr() {
-        let sans = build_openbao_tls_sans("[::]:8200", Some("[fd12::1]:8200"));
+        let sans = build_openbao_tls_sans(
+            "[::]:8200",
+            Some("[fd12::1]:8200"),
+            DEFAULT_OPENBAO_CONTAINER,
+        );
         assert!(sans.contains(&"::1".to_string()));
         assert!(sans.contains(&"127.0.0.1".to_string()));
         assert!(
@@ -564,7 +650,11 @@ exit {exit_code}
 
     #[test]
     fn build_sans_advertise_addr_not_duplicated() {
-        let sans = build_openbao_tls_sans("192.168.1.10:8200", Some("192.168.1.10:8200"));
+        let sans = build_openbao_tls_sans(
+            "192.168.1.10:8200",
+            Some("192.168.1.10:8200"),
+            DEFAULT_OPENBAO_CONTAINER,
+        );
         let count = sans.iter().filter(|s| *s == "192.168.1.10").count();
         assert_eq!(count, 1, "advertise IP must not be duplicated");
     }
@@ -589,13 +679,13 @@ exit {exit_code}
             ..Default::default()
         };
         let sans = vec!["openbao.internal".to_string(), "localhost".to_string()];
-        record_openbao_infra_cert(&mut state, dir.path(), sans);
+        record_openbao_infra_cert(&mut state, dir.path(), sans, "insight-openbao");
         assert!(state.infra_certs.contains_key(OPENBAO_INFRA_CERT_KEY));
         let entry = &state.infra_certs[OPENBAO_INFRA_CERT_KEY];
         assert_eq!(
             entry.reload_strategy,
             ReloadStrategy::ContainerSignal {
-                container_name: OPENBAO_CONTAINER_NAME.to_string(),
+                container_name: "insight-openbao".to_string(),
                 signal: "SIGHUP".to_string(),
             }
         );

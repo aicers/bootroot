@@ -15,7 +15,7 @@ use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::{InfraInstallArgs, InfraUpArgs};
 use crate::commands::compose_project::{
-    INSTANCE_NAME_ENV_KEY, compose_args, resolve_compose_project, resolve_recorded_instance_name,
+    ComposeIdentity, ComposeInvocation, INSTANCE_NAME_ENV_KEY, resolve_recorded_instance_name,
     validate_instance_name,
 };
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
@@ -82,12 +82,12 @@ const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
 /// reaches the network under an air-gapped install and would silently
 /// substitute a registry image for the preloaded/release payload. Plain
 /// `up` (no `--no-build`) would instead silently build a missing image.
-fn build_compose_up_args(
-    project: &str,
+fn build_compose_up_invocation(
+    identity: &ComposeIdentity,
     compose_str: &str,
     no_build: bool,
     svc_refs: &[&str],
-) -> Vec<String> {
+) -> ComposeInvocation {
     let mut tail: Vec<&str> = vec!["up"];
     if no_build {
         tail.extend(["--no-build", "--pull", "never"]);
@@ -96,7 +96,7 @@ fn build_compose_up_args(
     }
     tail.push("-d");
     tail.extend(svc_refs);
-    compose_args(project, &[compose_str], None, &tail)
+    identity.compose(&[compose_str], None, &tail)
 }
 
 /// Determines whether `infra install` runs the preliminary `docker compose
@@ -179,16 +179,17 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
 
     let compose_str = args.compose_file.compose_file.to_string_lossy();
     let svc_refs: Vec<&str> = args.services.iter().map(String::as_str).collect();
-    // `infra up` has no identity flag of its own: the project comes from
-    // the `.env` beside the compose file it was handed (or an exported
+    // `infra up` has no identity flag of its own: the project and the
+    // recorded instance both come from the `.env` beside the compose
+    // file it was handed (the project additionally honours an exported
     // `COMPOSE_PROJECT_NAME`).
-    let project = resolve_compose_project(&args.compose_file.compose_file, None, messages)?;
+    let identity = ComposeIdentity::resolve(&args.compose_file.compose_file, None, messages)?;
 
     if loaded_archives == 0 {
         let mut pull_tail: Vec<&str> = vec!["pull", "--ignore-pull-failures"];
         pull_tail.extend(&svc_refs);
-        let pull_args = compose_args(&project, &[&compose_str], None, &pull_tail);
-        run_docker(&pull_args, "docker compose pull", messages)?;
+        let pull = identity.compose(&[&compose_str], None, &pull_tail);
+        run_compose(&pull, "docker compose pull", messages)?;
     }
 
     let openbao_override_str = openbao_override
@@ -220,8 +221,8 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     }
     let mut up_tail: Vec<&str> = vec!["up", "-d"];
     up_tail.extend(&svc_refs);
-    let up_args = compose_args(&project, &up_files, None, &up_tail);
-    run_docker(&up_args, "docker compose up", messages)?;
+    let up = identity.compose(&up_files, None, &up_tail);
+    run_compose(&up, "docker compose up", messages)?;
 
     // Converge secrets ownership so an operator who upgrades and then only
     // ever runs `infra up` also repairs any root-owned CA material left by
@@ -234,7 +235,7 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     if should_sweep_secrets_ownership(&args.services, &args.compose_file.compose_file, messages)? {
         let sweep_secrets_dir = resolve_effective_secrets_dir(&state_path, compose_dir)
             .unwrap_or_else(|| compose_dir.join("secrets"));
-        let image = resolve_stepca_image(&args.compose_file.compose_file, &project, messages)?;
+        let image = resolve_stepca_image(&args.compose_file.compose_file, &identity, messages)?;
         sweep_secrets_ownership(&sweep_secrets_dir, &image, messages)?;
     }
 
@@ -282,7 +283,7 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
 
     let readiness = collect_readiness(
         &args.compose_file.compose_file,
-        &project,
+        &identity,
         None,
         &args.services,
         messages,
@@ -305,7 +306,7 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     if state_path.exists()
         && let Ok(state) = StateFile::load(&state_path)
     {
-        replay_dns_aliases(&state, &project, messages)?;
+        replay_dns_aliases(&state, &identity, messages)?;
     }
 
     println!("{}", messages.infra_up_completed());
@@ -580,11 +581,12 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         .map(|(key, value)| (*key, value.as_str()))
         .collect();
 
-    // The project this install acts on.  The declared identity wins, then
-    // an exported `COMPOSE_PROJECT_NAME`, then the identity just recorded
-    // in `.env` — so a harness that exports the variable still gets its
-    // own throwaway project while `.env` keeps the durable identity.
-    let project = resolve_compose_project(
+    // The identity this install acts on.  For the project the declared
+    // identity wins, then an exported `COMPOSE_PROJECT_NAME`, then the
+    // identity just recorded in `.env` — so a harness that exports the
+    // variable still gets its own throwaway project while `.env` keeps
+    // the durable identity every container is named after.
+    let identity = ComposeIdentity::resolve(
         &args.compose_file.compose_file,
         args.instance_name.as_deref(),
         messages,
@@ -593,26 +595,21 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     if should_pull_before_up(loaded_archives, args.no_build) {
         let mut pull_tail: Vec<&str> = vec!["pull", "--ignore-pull-failures"];
         pull_tail.extend(&svc_refs);
-        let pull_args = compose_args(&project, &[&compose_str], None, &pull_tail);
-        run_docker_with_env(
-            &pull_args,
-            &host_port_env_refs,
-            "docker compose pull",
-            messages,
-        )?;
+        let pull = identity.compose(&[&compose_str], None, &pull_tail);
+        run_compose_with_env(&pull, &host_port_env_refs, "docker compose pull", messages)?;
     }
 
     // Default builds the only local image (bootroot-http01); step-ca is the
     // official prebuilt image and is pulled, not built. `--no-build` with
     // `--pull never` uses the pre-loaded images exactly as-is for an
     // air-gapped install, never reaching a registry.
-    let up_args = build_compose_up_args(&project, &compose_str, args.no_build, &svc_refs);
+    let up = build_compose_up_invocation(&identity, &compose_str, args.no_build, &svc_refs);
     let up_label = if args.no_build {
         "docker compose up --no-build --pull never"
     } else {
         "docker compose up --build"
     };
-    run_docker_with_env(&up_args, &host_port_env_refs, up_label, messages)?;
+    run_compose_with_env(&up, &host_port_env_refs, up_label, messages)?;
 
     // Converge secrets ownership before returning so the stack this
     // command brings up has no root-owned CA material left by an earlier
@@ -620,7 +617,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     // image it reuses exists (pulled by `up`, or loaded from the archive
     // on the air-gapped path).
     if should_sweep_secrets_ownership(&args.services, &args.compose_file.compose_file, messages)? {
-        let image = resolve_stepca_image(&args.compose_file.compose_file, &project, messages)?;
+        let image = resolve_stepca_image(&args.compose_file.compose_file, &identity, messages)?;
         sweep_secrets_ownership(&secrets_dir, &image, messages)?;
     }
 
@@ -633,7 +630,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         .collect();
     let readiness = collect_readiness(
         &args.compose_file.compose_file,
-        &project,
+        &identity,
         None,
         &prereq_services,
         messages,
@@ -654,7 +651,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         let stepca_services = vec!["step-ca".to_string()];
         if let Ok(stepca_readiness) = collect_readiness(
             &args.compose_file.compose_file,
-            &project,
+            &identity,
             None,
             &stepca_services,
             messages,
@@ -755,15 +752,19 @@ fn build_ownership_sweep_args<'a>(
 /// path, and in both the sweep runs only after `up`, so the image
 /// already exists.
 ///
-/// `project` is the one the caller just brought the stack up under, not
+/// `identity` is the one the caller just brought the stack up under, not
 /// a freshly resolved one: `infra install --instance-name` outranks the
 /// `COMPOSE_PROJECT_NAME` the resolver would otherwise return, so
 /// re-resolving here would probe a different project than `up` created
 /// and report step-ca as having no container.
-fn resolve_stepca_image(compose_file: &Path, project: &str, messages: &Messages) -> Result<String> {
+fn resolve_stepca_image(
+    compose_file: &Path,
+    identity: &ComposeIdentity,
+    messages: &Messages,
+) -> Result<String> {
     let container_id = docker_compose_output(
         compose_file,
-        project,
+        identity,
         None,
         &["ps", "-a", "-q", "step-ca"],
         messages,
@@ -1076,8 +1077,8 @@ fn best_effort_listening_pid(port: u16) -> Option<String> {
 /// it may not be bootstrapped yet during the `init` flow.
 pub(crate) fn ensure_init_prereqs_ready(compose_file: &Path, messages: &Messages) -> Result<()> {
     let services = vec!["openbao".to_string(), "postgres".to_string()];
-    let project = resolve_compose_project(compose_file, None, messages)?;
-    let readiness = collect_readiness(compose_file, &project, None, &services, messages)?;
+    let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
+    let readiness = collect_readiness(compose_file, &identity, None, &services, messages)?;
     ensure_all_healthy(&readiness, messages)?;
     Ok(())
 }
@@ -1892,7 +1893,7 @@ pub(crate) struct ContainerReadiness {
 
 pub(crate) fn collect_readiness(
     compose_file: &Path,
-    project: &str,
+    identity: &ComposeIdentity,
     profile: Option<&str>,
     services: &[String],
     messages: &Messages,
@@ -1901,7 +1902,7 @@ pub(crate) fn collect_readiness(
     for service in services {
         let container_id = docker_compose_output(
             compose_file,
-            project,
+            identity,
             profile,
             &["ps", "-q", service],
             messages,
@@ -2021,32 +2022,54 @@ fn is_image_archive(path: &Path) -> bool {
     name.to_ascii_lowercase().ends_with(".tar.gz")
 }
 
+/// Runs `docker` with a plain (non-Compose) argument vector.
+///
+/// Generic over the argument type so an owned vector and a borrowed
+/// array both pass without an intermediate collect.  Compose vectors do
+/// not come through here: they carry an environment and go through
+/// [`run_compose`] / [`run_compose_with_env`].
 pub(crate) fn run_docker<S: AsRef<OsStr>>(
     args: &[S],
     context: &str,
     messages: &Messages,
 ) -> Result<()> {
-    run_docker_with_env(args, &[], context, messages)
+    let mut cmd = ProcessCommand::new("docker");
+    cmd.args(args.iter().map(AsRef::as_ref));
+    run_to_completion(&mut cmd, context, messages)
 }
 
-/// Runs `docker` with `args`.
+/// Runs a `docker compose` invocation.
+pub(crate) fn run_compose(
+    invocation: &ComposeInvocation,
+    context: &str,
+    messages: &Messages,
+) -> Result<()> {
+    run_compose_with_env(invocation, &[], context, messages)
+}
+
+/// Runs a `docker compose` invocation with additional child-environment
+/// entries.
 ///
-/// Generic over the argument type so a `docker compose` vector built by
-/// [`crate::commands::compose_project::compose_args`] (`Vec<String>`) and
-/// a plain `docker` argument array (`[&str; N]`) both pass without an
-/// intermediate collect.
-pub(crate) fn run_docker_with_env<S: AsRef<OsStr>>(
-    args: &[S],
+/// The instance identity is not among them: it is pinned by
+/// [`ComposeInvocation::command`] itself, so a caller adding host-port
+/// overrides or `GRAFANA_ADMIN_PASSWORD` cannot displace it or forget it.
+pub(crate) fn run_compose_with_env(
+    invocation: &ComposeInvocation,
     env: &[(&str, &str)],
     context: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let mut cmd = ProcessCommand::new("docker");
-    cmd.args(args.iter().map(AsRef::as_ref));
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let status = cmd
+    run_to_completion(&mut invocation.command(env), context, messages)
+}
+
+/// Spawns `command`, waits for it, and turns a non-zero exit into an
+/// error naming `context`.
+fn run_to_completion(
+    command: &mut ProcessCommand,
+    context: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let status = command
         .status()
         .with_context(|| messages.error_command_run_failed(context))?;
     if !status.success() {
@@ -2060,26 +2083,26 @@ pub(crate) fn run_docker_with_env<S: AsRef<OsStr>>(
 /// This is how the readiness probe reaches Docker (`collect_readiness`
 /// runs `ps -q <service>` per service), so routing it through the shared
 /// constructor is what scopes `status`, `ca restart`, `infra up`,
-/// `infra install` and `monitoring status` to the resolved project.
+/// `infra install` and `monitoring status` to the resolved project and
+/// pins the instance the compose file renders its container names from.
 /// Without it they would report on whichever project Compose defaults to
 /// rather than the one they were pointed at.
 ///
-/// `project` is passed in rather than resolved here so a caller that
+/// `identity` is passed in rather than resolved here so a caller that
 /// already knows it — `infra install`, whose `--instance-name` outranks
 /// everything the resolver would consult — probes the same project it
 /// just brought the stack up under.
 pub(crate) fn docker_compose_output(
     compose_file: &Path,
-    project: &str,
+    identity: &ComposeIdentity,
     profile: Option<&str>,
     args: &[&str],
     messages: &Messages,
 ) -> Result<String> {
     let compose_str = compose_file.to_string_lossy();
-    let scoped_args = compose_args(project, &[compose_str.as_ref()], profile, args);
-    let mut cmd = ProcessCommand::new("docker");
-    cmd.args(&scoped_args);
-    let output = cmd
+    let invocation = identity.compose(&[compose_str.as_ref()], profile, args);
+    let output = invocation
+        .command(&[])
         .output()
         .with_context(|| messages.error_command_run_failed("docker compose"))?;
     if !output.status.success() {
@@ -2222,10 +2245,39 @@ mod tests {
         assert_eq!(args.last(), Some(&OWNERSHIP_SWEEP_MOUNT));
     }
 
+    /// Builds the identity a compose test acts under without touching
+    /// the process environment: an explicit name outranks everything the
+    /// resolver would otherwise consult.
+    fn test_identity(instance: &str) -> ComposeIdentity {
+        ComposeIdentity::resolve_for_dir(
+            Path::new("/nonexistent"),
+            Some(instance),
+            &test_messages(),
+        )
+        .expect("an explicit identity resolves without any I/O")
+    }
+
+    /// Reads an invocation's argument vector back out of the command it
+    /// builds.  `ComposeInvocation` hands out no argument accessor, so
+    /// this is also how production code reaches the vector — through the
+    /// same builder that pins the instance environment.
+    fn invocation_args(invocation: &ComposeInvocation) -> Vec<String> {
+        invocation
+            .command(&[])
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn build_compose_up_args_defaults_to_build() {
         let svc_refs = ["openbao", "postgres"];
-        let args = build_compose_up_args("insight", "docker-compose.yml", false, &svc_refs);
+        let args = invocation_args(&build_compose_up_invocation(
+            &test_identity("insight"),
+            "docker-compose.yml",
+            false,
+            &svc_refs,
+        ));
         assert_eq!(
             args,
             vec![
@@ -2243,10 +2295,68 @@ mod tests {
         );
     }
 
+    /// `infra install` is the one flow that already passed a child
+    /// environment.  The host-port overrides and the instance identity
+    /// have to reach Compose together: the overrides move the published
+    /// ports, the identity names the containers.
+    #[test]
+    fn install_up_carries_both_the_host_ports_and_the_instance() {
+        let host_port_env = [
+            (OPENBAO_HOST_PORT_ENV, "18200"),
+            (POSTGRES_HOST_PORT_ENV, "15432"),
+        ];
+        let up = build_compose_up_invocation(
+            &test_identity("insight"),
+            "docker-compose.yml",
+            false,
+            &["openbao"],
+        );
+        let command = up.command(&host_port_env);
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(envs.contains(&(
+            INSTANCE_NAME_ENV_KEY.to_string(),
+            Some("insight".to_string())
+        )));
+        assert!(envs.contains(&(OPENBAO_HOST_PORT_ENV.to_string(), Some("18200".to_string()))));
+        assert!(envs.contains(&(
+            POSTGRES_HOST_PORT_ENV.to_string(),
+            Some("15432".to_string())
+        )));
+    }
+
+    /// The readiness probe reaches Docker through its own builder, so it
+    /// needs the identity just as much as `up` does — Compose renders
+    /// `container_name:` for `ps` too.
+    #[test]
+    fn the_readiness_probe_vector_carries_the_instance() {
+        let identity = test_identity("insight");
+        let command = identity
+            .compose(&["docker-compose.yml"], None, &["ps", "-q", "openbao"])
+            .command(&[]);
+        let envs: Vec<String> = command
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(envs, vec![INSTANCE_NAME_ENV_KEY]);
+    }
+
     #[test]
     fn build_compose_up_args_no_build_selects_no_build_flag() {
         let svc_refs = ["openbao", "postgres"];
-        let args = build_compose_up_args("insight", "docker-compose.deploy.yml", true, &svc_refs);
+        let args = invocation_args(&build_compose_up_invocation(
+            &test_identity("insight"),
+            "docker-compose.deploy.yml",
+            true,
+            &svc_refs,
+        ));
         assert_eq!(
             args,
             vec![

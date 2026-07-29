@@ -155,8 +155,11 @@ impl Messages {
         self.strings().clean_confirm_certs
     }
 
-    pub(crate) fn clean_confirm_openbao_only(&self) -> &'static str {
-        self.strings().clean_confirm_openbao_only
+    pub(crate) fn clean_confirm_openbao_only(&self, container: &str) -> String {
+        format_template(
+            self.strings().clean_confirm_openbao_only,
+            &[("container", container)],
+        )
     }
 
     pub(crate) fn clean_openbao_only_completed(&self) -> &'static str {
@@ -220,23 +223,32 @@ impl Messages {
         format_template(self.strings().dns_alias_registered, &[("value", alias)])
     }
 
-    pub(crate) fn dns_alias_replaying(&self, count: usize) -> String {
+    pub(crate) fn dns_alias_replaying(&self, count: usize, container: &str) -> String {
         format_template(
             self.strings().dns_alias_replaying,
-            &[("value", &count.to_string())],
+            &[("value", &count.to_string()), ("container", container)],
         )
     }
 
-    pub(crate) fn dns_alias_responder_not_running(&self) -> &'static str {
-        self.strings().dns_alias_responder_not_running
+    pub(crate) fn dns_alias_responder_not_running(&self, container: &str) -> String {
+        format_template(
+            self.strings().dns_alias_responder_not_running,
+            &[("container", container)],
+        )
     }
 
-    pub(crate) fn dns_alias_connect_failed(&self) -> &'static str {
-        self.strings().dns_alias_connect_failed
+    pub(crate) fn dns_alias_connect_failed(&self, container: &str) -> String {
+        format_template(
+            self.strings().dns_alias_connect_failed,
+            &[("container", container)],
+        )
     }
 
-    pub(crate) fn dns_alias_connect_rollback(&self) -> &'static str {
-        self.strings().dns_alias_connect_rollback
+    pub(crate) fn dns_alias_connect_rollback(&self, container: &str) -> String {
+        format_template(
+            self.strings().dns_alias_connect_rollback,
+            &[("container", container)],
+        )
     }
 
     pub(crate) fn dns_alias_connect_recovered(&self, error: &str) -> String {
@@ -246,10 +258,19 @@ impl Messages {
         )
     }
 
-    pub(crate) fn dns_alias_rollback_failed(&self, network: &str, error: &str) -> String {
+    pub(crate) fn dns_alias_rollback_failed(
+        &self,
+        container: &str,
+        network: &str,
+        error: &str,
+    ) -> String {
         format_template(
             self.strings().dns_alias_rollback_failed,
-            &[("network", network), ("error", error)],
+            &[
+                ("container", container),
+                ("network", network),
+                ("error", error),
+            ],
         )
     }
 

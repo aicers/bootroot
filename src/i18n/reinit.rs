@@ -9,8 +9,11 @@ impl Messages {
         self.strings().reinit_plan_destructive_actions
     }
 
-    pub(crate) fn reinit_plan_destructive_container(&self) -> &'static str {
-        self.strings().reinit_plan_destructive_container
+    pub(crate) fn reinit_plan_destructive_container(&self, container: &str) -> String {
+        format_template(
+            self.strings().reinit_plan_destructive_container,
+            &[("container", container)],
+        )
     }
 
     pub(crate) fn reinit_plan_destructive_volumes(&self) -> &'static str {
@@ -162,19 +165,28 @@ impl Messages {
 
     pub(crate) fn error_reinit_container_project_mismatch(
         &self,
+        container: &str,
         actual: &str,
         expected: &str,
     ) -> String {
         format_template(
             self.strings().error_reinit_container_project_mismatch,
-            &[("actual", actual), ("expected", expected)],
+            &[
+                ("container", container),
+                ("actual", actual),
+                ("expected", expected),
+            ],
         )
     }
 
-    pub(crate) fn error_reinit_container_missing_compose_label(&self, label: &str) -> String {
+    pub(crate) fn error_reinit_container_missing_compose_label(
+        &self,
+        container: &str,
+        label: &str,
+    ) -> String {
         format_template(
             self.strings().error_reinit_container_missing_compose_label,
-            &[("label", label)],
+            &[("container", container), ("label", label)],
         )
     }
 

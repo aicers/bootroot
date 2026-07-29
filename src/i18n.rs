@@ -387,6 +387,7 @@ pub(crate) struct Strings {
     pub(crate) rotate_ca_key_phase_generate_root: &'static str,
     pub(crate) rotate_ca_key_current_fingerprints: &'static str,
     pub(crate) rotate_ca_key_phase_skipped: &'static str,
+    pub(crate) warning_rotate_ca_agent_restart_failed: &'static str,
     pub(crate) summary_responder_check_ok: &'static str,
     pub(crate) summary_responder_check_skipped: &'static str,
     pub(crate) summary_db_check_ok: &'static str,
@@ -609,6 +610,73 @@ pub(crate) fn test_messages() -> Messages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nine messages name a container an operator reads or runs.  On a
+    /// non-default instance a hard-coded `bootroot-*` names something
+    /// that does not exist there, so every one of them has to render the
+    /// resolved container name — in both languages.
+    #[test]
+    fn container_naming_messages_render_the_resolved_container() {
+        const OPENBAO: &str = "insight-openbao";
+        const HTTP01: &str = "insight-http01";
+        for locale in ["en", "ko"] {
+            let m = Messages::new(locale).unwrap();
+            let rendered = [
+                m.clean_confirm_openbao_only(OPENBAO),
+                m.dns_alias_replaying(2, HTTP01),
+                m.dns_alias_responder_not_running(HTTP01),
+                m.dns_alias_connect_failed(HTTP01),
+                m.dns_alias_connect_rollback(HTTP01),
+                m.dns_alias_rollback_failed(HTTP01, "bootroot_default", "boom"),
+                m.reinit_plan_destructive_container(OPENBAO),
+                m.error_reinit_container_project_mismatch(OPENBAO, "other", "insight"),
+                m.error_reinit_container_missing_compose_label(
+                    OPENBAO,
+                    "com.docker.compose.project",
+                ),
+            ];
+            for text in &rendered {
+                assert!(
+                    text.contains(OPENBAO) || text.contains(HTTP01),
+                    "{locale}: message does not name the resolved container: {text}"
+                );
+                assert!(
+                    !text.contains("bootroot-openbao") && !text.contains("bootroot-http01"),
+                    "{locale}: message still hard-codes a default container name: {text}"
+                );
+                assert!(!text.contains('{'), "{locale} left a placeholder: {text}");
+            }
+        }
+    }
+
+    /// The recovery command an operator is handed has to name a
+    /// container that exists for their instance.
+    #[test]
+    fn dns_alias_rollback_recovery_command_names_the_instance_container() {
+        for locale in ["en", "ko"] {
+            let m = Messages::new(locale).unwrap();
+            let text = m.dns_alias_rollback_failed("insight-http01", "insight_default", "boom");
+            assert!(
+                text.contains("docker network connect insight_default insight-http01"),
+                "{locale}: {text}"
+            );
+        }
+    }
+
+    /// `error_http01_admin_bind_requires_responder` names the compose
+    /// *service*, which does not follow the install identity, so it must
+    /// keep reading `bootroot-http01`.
+    #[test]
+    fn responder_service_message_still_names_the_service() {
+        for locale in ["en", "ko"] {
+            let m = Messages::new(locale).unwrap();
+            assert!(
+                m.error_http01_admin_bind_requires_responder()
+                    .contains("bootroot-http01"),
+                "{locale}: the compose service name must not be instance-scoped"
+            );
+        }
+    }
 
     #[test]
     fn readiness_entry_templates_identical_across_locales() {

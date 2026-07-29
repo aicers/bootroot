@@ -10,10 +10,12 @@ use super::helpers::{
     try_restart_container,
 };
 use super::{
-    INTERMEDIATE_CA_COMMON_NAME, OPENBAO_AGENT_RESPONDER_CONTAINER, OPENBAO_AGENT_STEPCA_CONTAINER,
-    ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome, STEP_CA_HELPER_IMAGE,
+    INTERMEDIATE_CA_COMMON_NAME, ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome,
+    STEP_CA_HELPER_IMAGE,
 };
 use crate::cli::args::{RotateCaKeyArgs, RotateForceReissueArgs, RotateSkipPhase};
+use crate::commands::compose_project::ComposeIdentity;
+use crate::commands::container_name::BootrootContainer;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
     compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
@@ -228,7 +230,7 @@ pub(super) async fn rotate_ca_key(
         )
         .await?;
 
-        restart_infra_openbao_agents();
+        restart_infra_openbao_agents(ctx, messages);
 
         rot_state.phase = 3;
         update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
@@ -342,7 +344,7 @@ pub(super) async fn rotate_ca_key(
         // Phase-3 transitional pin list (which still includes the
         // retired intermediate) for up to the 30s static-secret render
         // interval. Service agents converge on their own via fast-poll.
-        restart_infra_openbao_agents();
+        restart_infra_openbao_agents(ctx, messages);
 
         rot_state.phase = 6;
         update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
@@ -527,9 +529,56 @@ fn backup_file(src: &Path, dst: &Path, messages: &Messages) -> Result<()> {
 /// Per-service trust propagation is fast-poll's job: each local
 /// host-daemon `bootroot-agent` observes the KV trust update on its next
 /// fast-poll cycle, so no per-service restart happens here.
-fn restart_infra_openbao_agents() {
-    let _ = try_restart_container(OPENBAO_AGENT_STEPCA_CONTAINER);
-    let _ = try_restart_container(OPENBAO_AGENT_RESPONDER_CONTAINER);
+///
+/// The sidecars are addressed by name, bypassing Compose, so the names
+/// come from the recorded instance: a rotation against one install must
+/// never restart a co-located install's sidecar.
+///
+/// A failed restart warns and the phase still completes.  Both call
+/// sites run *after* their phase's destructive KV write, and the restart
+/// is only a convergence accelerator — without it the agents keep
+/// serving the previous pin list until the next 30-second static-secret
+/// render, after which they converge unaided — so a hard error would
+/// strand the operator mid-rotation over a self-healing condition.
+fn restart_infra_openbao_agents(ctx: &RotateContext, messages: &Messages) {
+    restart_infra_openbao_agents_with(ctx, &try_restart_container, messages);
+}
+
+/// [`restart_infra_openbao_agents`] with an injectable restart, so the
+/// warn-and-continue behaviour is exercised without a Docker daemon.
+fn restart_infra_openbao_agents_with(
+    ctx: &RotateContext,
+    restart: &dyn Fn(&str) -> Result<()>,
+    messages: &Messages,
+) {
+    let identity = match ComposeIdentity::resolve(&ctx.compose_file, None, messages) {
+        Ok(identity) => identity,
+        Err(err) => {
+            // Without the identity there is no container to address;
+            // warn naming the compose file and carry on for the same
+            // reason a failed restart does.
+            eprintln!(
+                "{}",
+                messages.warning_rotate_ca_agent_restart_failed(
+                    &ctx.compose_file.display().to_string(),
+                    &err.to_string()
+                )
+            );
+            return;
+        }
+    };
+    for kind in [
+        BootrootContainer::OpenBaoAgentStepCa,
+        BootrootContainer::OpenBaoAgentResponder,
+    ] {
+        let container = identity.container(kind);
+        if let Err(err) = restart(&container) {
+            eprintln!(
+                "{}",
+                messages.warning_rotate_ca_agent_restart_failed(&container, &err.to_string())
+            );
+        }
+    }
 }
 
 /// Outcome for one service entry during phase-5 reissue. Decoupled from
@@ -1051,6 +1100,86 @@ mod tests {
 
     use super::super::test_support::test_messages;
     use super::*;
+
+    /// Builds a rotate context whose compose directory records a
+    /// non-default identity.
+    fn ctx_for_instance(dir: &Path, instance: &str) -> RotateContext {
+        fs::write(dir.join(".env"), format!("BOOTROOT_INSTANCE={instance}\n")).expect("write .env");
+        RotateContext {
+            openbao_url: String::new(),
+            kv_mount: "secret".to_string(),
+            compose_file: dir.join("docker-compose.yml"),
+            state: crate::state::StateFile::default(),
+            paths: super::super::StatePaths::new(dir.join("secrets")),
+            state_dir: dir.to_path_buf(),
+            state_file: dir.join("state.json"),
+        }
+    }
+
+    /// The sidecars are addressed by name, so a rotation against one
+    /// install must restart only that install's containers.
+    #[test]
+    fn infra_agent_restarts_target_the_recorded_instance() {
+        let dir = tempdir().expect("tempdir");
+        let ctx = ctx_for_instance(dir.path(), "insight");
+        let restarted = std::cell::RefCell::new(Vec::new());
+        restart_infra_openbao_agents_with(
+            &ctx,
+            &|container| {
+                restarted.borrow_mut().push(container.to_string());
+                Ok(())
+            },
+            &test_messages(),
+        );
+        assert_eq!(
+            restarted.into_inner(),
+            vec![
+                "insight-openbao-agent-stepca",
+                "insight-openbao-agent-responder"
+            ]
+        );
+    }
+
+    /// A failed restart must not abort the phase: both call sites run
+    /// after their phase's destructive KV write, and the agents converge
+    /// unaided at the next static-secret render.  The operator still has
+    /// to be told, in either language, which container failed.
+    #[test]
+    fn a_failed_infra_agent_restart_warns_and_continues() {
+        let dir = tempdir().expect("tempdir");
+        let ctx = ctx_for_instance(dir.path(), "insight");
+        for locale in ["en", "ko"] {
+            let messages = crate::i18n::Messages::new(locale).expect("locale");
+            let attempted = std::cell::RefCell::new(Vec::new());
+            // Returns unit: a failure inside must not propagate out.
+            restart_infra_openbao_agents_with(
+                &ctx,
+                &|container| {
+                    attempted.borrow_mut().push(container.to_string());
+                    anyhow::bail!("no such container")
+                },
+                &messages,
+            );
+            assert_eq!(
+                attempted.into_inner().len(),
+                2,
+                "{locale}: a failed first restart must not skip the second"
+            );
+            let warning = messages.warning_rotate_ca_agent_restart_failed(
+                "insight-openbao-agent-stepca",
+                "no such container",
+            );
+            assert!(
+                warning.contains("insight-openbao-agent-stepca"),
+                "{warning}"
+            );
+            assert!(warning.contains("no such container"), "{warning}");
+            assert!(
+                !warning.contains('{'),
+                "{locale} left a placeholder: {warning}"
+            );
+        }
+    }
 
     /// Phase 3 must publish a bundle covering both CA generations: the
     /// transitional pin list still trusts the old intermediate, so a
