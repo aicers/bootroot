@@ -135,7 +135,7 @@ on_error() {
 # ---------------------------------------------------------------------------
 
 compose() {
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
 }
 
 compose_down() {
@@ -305,7 +305,7 @@ apply_exposed_override_by_hand() {
   if grep -q 'tls_cert_file' "$OPENBAO_REPO_HCL"; then
     fail "openbao.hcl already carries a TLS listener before init (see $OPENBAO_REPO_HCL)"
   fi
-  docker compose -f "$COMPOSE_FILE" -f "$EXPOSED_OVERRIDE_PATH" up -d openbao \
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$EXPOSED_OVERRIDE_PATH" up -d openbao \
     >>"$RUN_LOG" 2>&1 || fail "failed to apply the openbao-exposed override by hand"
   # The override replaces the base compose port list (`ports: !override`),
   # so from here on OpenBao is published only on the bind address — which

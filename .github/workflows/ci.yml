@@ -317,6 +317,7 @@ jobs:
           # rendered config (with the correct HMAC) is preserved.
           RESPONDER_OVERRIDE="$BOOTROOT_SECRETS_DIR/responder/docker-compose.responder.override.yml"
           docker compose \
+            -p "${COMPOSE_PROJECT_NAME:-bootroot}" \
             -f docker-compose.yml \
             -f "$RESPONDER_OVERRIDE" \
             -f docker-compose.test.yml \
@@ -371,7 +372,9 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker compose -f docker-compose.yml -f docker-compose.test.yml down
+        run: >-
+          docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}"
+          -f docker-compose.yml -f docker-compose.test.yml down
 
   test-docker-e2e-matrix:
     name: Docker E2E (${{ matrix.scenario.label }})

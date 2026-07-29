@@ -11,9 +11,10 @@ use crate::cli::args::{
 };
 use crate::commands::clean::{
     COMPOSE_PROJECT_LABEL, COMPOSE_SERVICE_LABEL, container_exists_via_docker,
-    inspect_label_via_docker, remove_openbao_container_and_volumes, resolve_compose_project,
+    inspect_label_via_docker, remove_openbao_container_and_volumes,
 };
 use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_project::resolve_compose_project_for_dir;
 use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::commands::infra::run_infra_up;
 use crate::commands::init::{OPENBAO_CONTAINER_NAME, compose_has_openbao, prompt_yes_no, run_init};
@@ -319,7 +320,8 @@ fn verify_compose_managed_openbao(
         // from a source independent of the container (env override or
         // compose-dir basename).  Otherwise a mismatched container
         // would never trip the check.
-        let expected_project = resolve_expected_compose_project_excluding_container(compose_dir)?;
+        let expected_project =
+            resolve_expected_compose_project_excluding_container(compose_dir, messages)?;
         let container_project = inspect(OPENBAO_CONTAINER_NAME, COMPOSE_PROJECT_LABEL)?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -351,25 +353,22 @@ fn verify_compose_managed_openbao(
         // only when the compose project can be derived from the work
         // directory; an unresolvable project surfaces here as an
         // actionable error rather than letting reinit proceed.
-        let _ = resolve_expected_compose_project_excluding_container(compose_dir)?;
+        let _ = resolve_expected_compose_project_excluding_container(compose_dir, messages)?;
     }
     Ok(())
 }
 
-/// Derives the expected compose project from the environment override
-/// or the compose-dir basename, ignoring any label that may exist on
-/// the `bootroot-openbao` container.  This is used as the
+/// Derives the expected compose project from the shared resolver — the
 /// "what should be" side of the mismatch check.
-fn resolve_expected_compose_project_excluding_container(compose_dir: &Path) -> Result<String> {
-    if let Ok(env_value) = std::env::var("COMPOSE_PROJECT_NAME")
-        && !env_value.is_empty()
-    {
-        return Ok(env_value);
-    }
-    // Reuse the basename-normalisation half of `resolve_compose_project`
-    // by passing an `inspect` that never returns a label, forcing the
-    // fallback path.
-    resolve_compose_project(compose_dir, &|_, _| Ok(None))
+///
+/// The resolver deliberately never consults the container's own
+/// `com.docker.compose.project` label, so reading that label as the
+/// "what is" side stays a real comparison rather than a tautology.
+fn resolve_expected_compose_project_excluding_container(
+    compose_dir: &Path,
+    messages: &Messages,
+) -> Result<String> {
+    resolve_compose_project_for_dir(compose_dir, None, messages)
 }
 
 /// Subset of `StateFile` fields preserved across a reinit.  Mirrors the
@@ -1017,26 +1016,17 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use anyhow::Result;
     use tempfile::tempdir;
 
     use super::*;
+    // One crate-wide lock: the resolver these tests exercise is also
+    // driven from `clean` and `compose_project`, and a per-module mutex
+    // would let two modules mutate `COMPOSE_PROJECT_NAME` concurrently.
+    use crate::commands::compose_project::test_env::{ComposeProjectEnv, env_lock};
     use crate::i18n::test_messages;
     use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
-
-    /// Serialises tests in this module that mutate process-wide
-    /// environment variables (e.g. `COMPOSE_PROJECT_NAME`).  Rust's
-    /// default test runner spawns multiple threads in the same process,
-    /// so concurrent `env::set_var` calls would otherwise race and the
-    /// project-mismatch test could flake under load.  Mirrors the
-    /// `ENV_LOCK` pattern used in `commands/rotate.rs::test_support`.
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().expect("test env lock must not be poisoned")
-    }
 
     fn state_with_intent() -> StateFile {
         let mut infra_certs = BTreeMap::new();
@@ -1325,9 +1315,7 @@ mod tests {
         // The lock guards process-wide env mutation against parallel
         // tests in this module that also touch `COMPOSE_PROJECT_NAME`.
         let _guard = env_lock();
-        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
-        // SAFETY: env access is serialised by `env_lock` above.
-        unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
+        let _env = ComposeProjectEnv::set(None);
         let err = verify_compose_managed_openbao(
             &compose_file,
             &work,
@@ -1336,11 +1324,86 @@ mod tests {
             &messages,
         )
         .unwrap_err();
-        if let Some(prior) = prior {
-            // SAFETY: still inside the env_lock guard.
-            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
-        }
         assert!(err.to_string().contains("project"), "got: {err}");
+    }
+
+    /// The mismatch refusal must survive folding the expected-project
+    /// derivation onto the shared resolver.  Both `.env` states matter:
+    /// with a recorded identity the resolver returns it, without one it
+    /// returns the fixed default — and in either case a container whose
+    /// project label disagrees still aborts.
+    #[test]
+    fn verify_compose_managed_openbao_rejects_project_mismatch_with_and_without_dotenv() {
+        let messages = test_messages();
+        let container_exists = |_: &str| -> Result<bool> { Ok(true) };
+        let inspect = |_: &str, label: &str| -> Result<Option<String>> {
+            if label == COMPOSE_PROJECT_LABEL {
+                Ok(Some("someone-elses-project".to_string()))
+            } else if label == COMPOSE_SERVICE_LABEL {
+                Ok(Some(OPENBAO_COMPOSE_SERVICE.to_string()))
+            } else {
+                Ok(None)
+            }
+        };
+        let _guard = env_lock();
+        let _env = ComposeProjectEnv::set(None);
+
+        for recorded in [None, Some("insight")] {
+            let dir = tempdir().unwrap();
+            let work = dir.path().join("stack");
+            fs::create_dir_all(&work).unwrap();
+            let compose_file = work.join("docker-compose.yml");
+            fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
+            if let Some(instance) = recorded {
+                fs::write(work.join(".env"), format!("BOOTROOT_INSTANCE={instance}\n")).unwrap();
+            }
+            let err = verify_compose_managed_openbao(
+                &compose_file,
+                &work,
+                &container_exists,
+                &inspect,
+                &messages,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("someone-elses-project"),
+                "recorded={recorded:?}, got: {err}"
+            );
+        }
+    }
+
+    /// The other half of the same fold: a container whose project label
+    /// matches the recorded identity is accepted, so the check is a real
+    /// comparison and not a blanket refusal.
+    #[test]
+    fn verify_compose_managed_openbao_accepts_container_matching_the_recorded_instance() {
+        let messages = test_messages();
+        let container_exists = |_: &str| -> Result<bool> { Ok(true) };
+        let inspect = |_: &str, label: &str| -> Result<Option<String>> {
+            if label == COMPOSE_PROJECT_LABEL {
+                Ok(Some("insight".to_string()))
+            } else if label == COMPOSE_SERVICE_LABEL {
+                Ok(Some(OPENBAO_COMPOSE_SERVICE.to_string()))
+            } else {
+                Ok(None)
+            }
+        };
+        let _guard = env_lock();
+        let _env = ComposeProjectEnv::set(None);
+        let dir = tempdir().unwrap();
+        let work = dir.path().join("stack");
+        fs::create_dir_all(&work).unwrap();
+        let compose_file = work.join("docker-compose.yml");
+        fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
+        fs::write(work.join(".env"), "BOOTROOT_INSTANCE=insight\n").unwrap();
+        verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            &container_exists,
+            &inspect,
+            &messages,
+        )
+        .expect("a container in the recorded instance's project must be accepted");
     }
 
     #[test]
@@ -1419,9 +1482,7 @@ mod tests {
             }
         };
         let _guard = env_lock();
-        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
-        // SAFETY: env access is serialised by `env_lock` above.
-        unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
+        let _env = ComposeProjectEnv::set(None);
         let result = verify_compose_managed_openbao(
             &compose_file,
             &work,
@@ -1429,10 +1490,6 @@ mod tests {
             &inspect,
             &messages,
         );
-        if let Some(prior) = prior {
-            // SAFETY: still inside the env_lock guard.
-            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
-        }
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains(COMPOSE_SERVICE_LABEL),
@@ -1462,21 +1519,15 @@ mod tests {
             }
         };
         let _guard = env_lock();
-        let prior = std::env::var_os("COMPOSE_PROJECT_NAME");
-        // SAFETY: env access is serialised by `env_lock` above.
-        unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
-        let result = verify_compose_managed_openbao(
+        let _env = ComposeProjectEnv::set(None);
+        verify_compose_managed_openbao(
             &compose_file,
             &work,
             &container_exists,
             &inspect,
             &messages,
-        );
-        if let Some(prior) = prior {
-            // SAFETY: still inside the env_lock guard.
-            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
-        }
-        result.expect("should accept existing container with matching compose labels");
+        )
+        .expect("should accept existing container with matching compose labels");
     }
 
     /// Regression for #611: when `--compose-file` is the default
@@ -1490,9 +1541,7 @@ mod tests {
     #[test]
     fn verify_compose_managed_openbao_accepts_default_relative_compose_file() {
         let _guard = env_lock();
-        let prior_env = std::env::var_os("COMPOSE_PROJECT_NAME");
-        // SAFETY: env access is serialised by `env_lock` above.
-        unsafe { std::env::remove_var("COMPOSE_PROJECT_NAME") };
+        let _env = ComposeProjectEnv::set(None);
 
         let dir = tempdir().unwrap();
         fs::write(
@@ -1517,10 +1566,6 @@ mod tests {
         );
 
         std::env::set_current_dir(&original_cwd).unwrap();
-        if let Some(prior) = prior_env {
-            // SAFETY: still inside the env_lock guard.
-            unsafe { std::env::set_var("COMPOSE_PROJECT_NAME", prior) };
-        }
 
         result.expect("default relative --compose-file must not break the scope check");
     }

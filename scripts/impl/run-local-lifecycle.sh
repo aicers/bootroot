@@ -145,7 +145,7 @@ infra_services() {
 
 service_container_id() {
   local service="$1"
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -q "$service" | tr -d '\n'
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -q "$service" | tr -d '\n'
 }
 
 is_service_ready() {
@@ -195,12 +195,12 @@ wait_for_infra_ready() {
 }
 
 compose_down() {
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
 }
 
 capture_artifacts() {
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs bootroot-openbao-agent-stepca >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   docker logs bootroot-openbao-agent-responder >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
 }
@@ -491,7 +491,7 @@ YAML
   # that recreating bootroot-http01 preserves both the rendered config
   # mount and the DNS aliases.
   local responder_override="$SECRETS_DIR/responder/docker-compose.responder.override.yml"
-  local -a compose_args=(-f "$COMPOSE_FILE" -f "$override")
+  local -a compose_args=(-p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$override")
   if [ -f "$responder_override" ]; then
     compose_args+=(-f "$responder_override")
   fi
@@ -738,7 +738,7 @@ assert_fingerprint_changed() {
 # rotation must converge this back to owner-owned.
 seed_root_owned_ca_keys() {
   local cid img
-  cid="$(docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -a -q step-ca | tr -d '\n')"
+  cid="$(docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -a -q step-ca | tr -d '\n')"
   [ -n "$cid" ] || fail "step-ca container not found for root-owned seeding"
   img="$(docker inspect --format '{{.Config.Image}}' "$cid")"
   [ -n "$img" ] || fail "could not resolve step-ca image for root-owned seeding"

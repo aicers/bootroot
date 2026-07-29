@@ -163,6 +163,17 @@ bootroot infra up
 ### 입력
 
 - `--compose-file`: compose 파일 경로 (기본값 `docker-compose.yml`)
+- `--instance-name <name>`: 이 설치본의 정체성 (기본값 `bootroot`).
+  Docker Compose 프로젝트 이름이 되므로, 생성되는 컨테이너에는
+  `com.docker.compose.project=<name>` 레이블이 붙고 볼륨은
+  `<name>_openbao-data`, `<name>_postgres-data` 등으로 만들어집니다.
+  값은 compose 디렉터리의 `.env`에 `BOOTROOT_INSTANCE`로 기록되며,
+  이후 모든 명령(`status`, `infra up`, `init`, `reinit`, `clean`,
+  `rotate`, `monitoring …`)이 자체 플래그 없이 그곳에서 다시 읽습니다.
+  허용 형식: 소문자 ASCII 문자, 숫자, `-`이며 문자 또는 숫자로 시작하고
+  최대 39자입니다(63옥텟 DNS 레이블 안에서 가장 긴 컨테이너 이름
+  접미사를 담을 수 있도록 도출된 한계). 플래그 없이 `infra install`을
+  다시 실행하면 기록된 값을 `bootroot`로 되돌리지 않고 유지합니다.
 - `--services`: 기동 대상 서비스 목록 (기본값 `openbao,postgres,step-ca,bootroot-http01`)
 - `--image-archive-dir`: 로컬 이미지 아카이브 디렉터리(선택).
   설정하면 디렉터리 내 모든 `.tar`/`.tgz`/`.tar.gz` 아카이브를
@@ -230,6 +241,40 @@ bootroot infra up
 - `--http01-admin-host-port <N>`: 호스트 측 HTTP-01 응답기 admin API
   게시 포트입니다. `.env`의 `HTTP01_ADMIN_HOST_PORT`와 프로세스 환경
   변수보다 우선합니다. 기본값은 **8080**입니다.
+
+#### 인스턴스 정체성과 Compose 프로젝트
+
+`--instance-name`은 설치본의 정체성 전체입니다. bootroot는 모든
+`docker compose` 호출에 `-p <name>`으로 전달하므로, 정체성을 선언한
+설치본은 다른 설치본의 프로젝트 — 따라서 볼륨 — 를 더 이상 공유하지
+않습니다.
+
+명령이 대상으로 삼는 프로젝트는 다음 순서로 결정됩니다.
+
+1. `--instance-name` (`infra install`에만 존재);
+2. 호출 환경의 `COMPOSE_PROJECT_NAME`(비어 있지 않은 경우);
+3. 명령에 전달된 compose 파일 옆 `.env`의 `BOOTROOT_INSTANCE`;
+4. 리터럴 `bootroot`.
+
+내보낸 `COMPOSE_PROJECT_NAME`은 단일 호출에 한해 Compose 프로젝트
+이름만 덮어씁니다. 이는 Docker Compose 자체 기능이므로 값이 그대로
+사용되며, `--instance-name` 규칙으로 **검증되지 않고** `.env`에
+**기록되지도 않습니다**. 이 변수를 내보낸 상태로 새로 설치하면 스택은
+내보낸 프로젝트에 생성되지만 기록되는 정체성은 변수가 없었을 때의
+값이므로, 이후 그 스택을 다루는 모든 명령에도 같은 변수를 내보내야
+합니다. 일회성 스택에는 이 변수를(이 저장소의 E2E 하니스가 그렇게
+합니다), 지속적인 설치에는 `--instance-name`을 사용하세요.
+
+한 호스트에 두 bootroot 인스턴스를 함께 두려면 각각에 서로 다른
+`--instance-name`을 지정해야 합니다. 둘 다 기본 정체성을 취하면 하나의
+프로젝트와 하나의 볼륨 집합을 공유하며, 두 번째 설치가 첫 번째의
+컨테이너를 가져갑니다.
+
+컨테이너 이름은 아직 리터럴(`bootroot-openbao`, `bootroot-ca`, …)이며
+정체성을 따르지 않습니다. 따라서 서로 다른 `--instance-name`으로 같은
+호스트에 두 번째로 설치하면 첫 번째 인스턴스의 컨테이너를 조용히
+가져가는 대신 Docker의 "컨테이너 이름 사용 중" 오류로 명확히 실패하고,
+첫 번째 인스턴스는 그대로 유지됩니다.
 
 #### 호스트 측 게시 포트
 
@@ -2120,13 +2165,18 @@ bootroot clean --openbao-only --yes
 ### 동작
 
 - compose 파일이 `openbao` 서비스를 정의하지 않거나 기존
-  `bootroot-openbao` 컨테이너의 compose 라벨이 현재 작업 디렉터리에서
-  파생된 프로젝트와 일치하지 않으면 실행을 거부합니다. 컨테이너가
-  존재하지만 compose 라벨(`com.docker.compose.project`,
-  `com.docker.compose.service`) 중 하나라도 누락된 경우에도 거부합니다 —
-  해당 컨테이너는 이 작업 디렉터리의 compose 프로젝트에 속한다고
-  증명할 수 없으며, `clean --openbao-only` 이후의 stuck 복구 경로로
-  취급해서는 안 됩니다.
+  `bootroot-openbao` 컨테이너의 compose 라벨이 공용 리졸버가 compose
+  디렉터리에 대해 반환한 프로젝트(기록된 `BOOTROOT_INSTANCE`, 내보낸
+  `COMPOSE_PROJECT_NAME`, 또는 `bootroot` 기본값 — `infra install`의
+  "인스턴스 정체성과 Compose 프로젝트" 절 참고)와 일치하지 않으면
+  실행을 거부합니다. 리졸버는 컨테이너 자신의
+  프로젝트 라벨을 절대 참조하지 않으므로 이 비교는 실제 비교로
+  남습니다. 컨테이너가 존재하지만 compose
+  라벨(`com.docker.compose.project`, `com.docker.compose.service`) 중
+  하나라도 누락된 경우에도 거부합니다 — 해당 컨테이너는 이 설치본의
+  compose 프로젝트에 속한다고 증명할 수 없으며,
+  `clean --openbao-only` 이후의 stuck 복구 경로로 취급해서는 안
+  됩니다.
 - 파괴적 동작 전에 `state.json`에서 배포 의도 필드를 스냅샷합니다.
 - 스냅샷이 non-default `secrets_dir`을 기록한 경우 (예: 이전 init이
   `--secrets-dir secrets-custom`으로 실행됨), 스냅샷이 CLI 기본값보다

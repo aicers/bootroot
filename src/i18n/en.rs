@@ -424,6 +424,8 @@ pub(super) static STRINGS: Strings = Strings {
     dns_alias_connect_recovered: "WARNING: DNS alias registration failed but network connectivity was restored. Run `bootroot infra up` to apply aliases later. ({error})",
     dns_alias_rollback_failed: "CRITICAL: rollback also failed — bootroot-http01 is detached from network {network}. Reconnect manually: docker network connect {network} bootroot-http01 ({error})",
     dns_alias_network_not_found: "No Docker network found for container {value}",
+    dns_alias_responder_ambiguous: "{count} HTTP-01 responder containers match compose project `{project}`; refusing to pick one arbitrarily. Remove the stale container, or reinstall the other instance with a distinct `--instance-name`.",
+    error_instance_name_invalid: "Invalid --instance-name `{name}`: use lowercase ASCII letters, digits and `-`, starting with a letter or digit, at most {max} characters",
     error_service_update_failed: "bootroot service update failed",
     error_service_update_no_flags: "No update flags specified; pass --secret-id-ttl, --secret-id-wrap-ttl, --no-wrap, --rn-cidrs, --cert-group, --reload-style, or --post-renew-command",
     service_update_summary: "bootroot service update: summary",

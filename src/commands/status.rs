@@ -7,6 +7,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::cli::args::StatusArgs;
 use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_project::resolve_compose_project;
 use crate::commands::infra::{
     ContainerReadiness, collect_container_failures, collect_readiness, default_infra_services,
 };
@@ -21,7 +22,9 @@ use crate::state::StateFile;
 
 pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result<()> {
     let services = default_infra_services();
-    let readiness = collect_readiness(&args.compose.compose_file, None, &services, messages)?;
+    let compose_file = &args.compose.compose_file;
+    let project = resolve_compose_project(compose_file, None, messages)?;
+    let readiness = collect_readiness(compose_file, &project, None, &services, messages)?;
     let infra_failures = collect_container_failures(&readiness);
 
     let state_path = StateFile::default_path();

@@ -65,7 +65,7 @@ run_cli_tests() {
 
 reset_openbao() {
   log "Resetting OpenBao state"
-  docker compose -f docker-compose.yml -f docker-compose.test.yml down -v --remove-orphans \
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f docker-compose.yml -f docker-compose.test.yml down -v --remove-orphans \
     >/dev/null 2>&1 || true
 }
 

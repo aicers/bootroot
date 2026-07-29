@@ -821,6 +821,20 @@ pub(crate) struct InfraInstallArgs {
     #[command(flatten)]
     pub(crate) compose_file: ComposeFileArgs,
 
+    /// Identity of this install. Names the Docker Compose project, so two
+    /// installs on one host stop sharing containers and volumes. Lowercase
+    /// ASCII letters, digits and `-`, starting with a letter or digit, at
+    /// most 39 characters. Recorded as `BOOTROOT_INSTANCE` in the compose
+    /// directory's `.env`; every later command reads it back from there.
+    /// When unset, a previously recorded identity is kept, otherwise
+    /// `bootroot` applies
+    // `allow_hyphen_values` so a leading `-` reaches the validator and is
+    // rejected with the error naming the allowed character set and the
+    // length limit, rather than clap's generic "unexpected argument" for
+    // what it would otherwise read as a flag.
+    #[arg(long = "instance-name", allow_hyphen_values = true)]
+    pub(crate) instance_name: Option<String>,
+
     /// Comma-separated list of services to start
     #[arg(
         long,
@@ -1631,6 +1645,35 @@ mod tests {
                 assert_eq!(args.services, vec!["openbao", "postgres"]);
             }
             _ => panic!("expected infra up"),
+        }
+    }
+
+    /// A leading `-` is one of the values the identity rules reject, so
+    /// the parser has to hand it to the validator rather than reading it
+    /// as a flag: clap's "unexpected argument" names neither the allowed
+    /// character set nor the length limit, and the operator would be left
+    /// guessing which rule they broke.
+    #[test]
+    fn instance_name_accepts_a_leading_hyphen_for_the_validator_to_reject() {
+        for argv in [
+            vec![
+                "bootroot",
+                "infra",
+                "install",
+                "--instance-name",
+                "-insight",
+            ],
+            vec!["bootroot", "infra", "install", "--instance-name=-insight"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|err| {
+                panic!("{argv:?} must reach the validator, not clap's parse error: {err}")
+            });
+            match cli.command {
+                CliCommand::Infra(InfraCommand::Install(args)) => {
+                    assert_eq!(args.instance_name.as_deref(), Some("-insight"));
+                }
+                _ => panic!("expected infra install"),
+            }
         }
     }
 

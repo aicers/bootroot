@@ -7,7 +7,17 @@ cd "$ROOT_DIR"
 SCENARIO="${1:-all}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-180}"
 TMP_DIR="${TMP_DIR:-$ROOT_DIR/tmp/scenarios}"
-COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.test.yml)
+# bootroot passes an explicit `-p` on every `docker compose` invocation,
+# resolved from COMPOSE_PROJECT_NAME, then BOOTROOT_INSTANCE in the compose
+# directory's .env, then the literal `bootroot`. Pin the same project here so
+# this script and bootroot agree on one set of volumes; letting Compose derive
+# it from this checkout's directory basename would silently split them apart
+# whenever the checkout is not named `bootroot` (a git worktree, say).
+COMPOSE_ARGS=(
+  -p "${COMPOSE_PROJECT_NAME:-bootroot}"
+  -f docker-compose.yml
+  -f docker-compose.test.yml
+)
 AGENT_BIN="${BOOTROOT_AGENT_BIN:-$ROOT_DIR/target/debug/bootroot-agent}"
 AGENT_BUILT=0
 
@@ -106,7 +116,7 @@ published_endpoint() {
 
   # Take the first mapping: a wildcard bind can be listed once per address
   # family, and either entry is reachable over loopback.
-  addr="$($compose_cmd "${COMPOSE_FILES[@]}" port "$service" "$container_port" 2>/dev/null | head -n 1)"
+  addr="$($compose_cmd "${COMPOSE_ARGS[@]}" port "$service" "$container_port" 2>/dev/null | head -n 1)"
   addr="${addr%$'\r'}"
   if [ -z "$addr" ]; then
     fail "$service does not publish container port $container_port; is the stack up?"
@@ -285,7 +295,7 @@ compose_up() {
   local compose_cmd
   compose_cmd="$(detect_compose)"
   log "Starting compose stack"
-  $compose_cmd "${COMPOSE_FILES[@]}" up --build -d
+  $compose_cmd "${COMPOSE_ARGS[@]}" up --build -d
 
   # Read the published endpoints now, while every service is up. Scenarios
   # stop individual services afterwards, and the ports do not move.
@@ -416,7 +426,7 @@ YAML
 
   local compose_cmd
   compose_cmd="$(detect_compose)"
-  $compose_cmd "${COMPOSE_FILES[@]}" -f "$compose_override" up -d bootroot-http01
+  $compose_cmd "${COMPOSE_ARGS[@]}" -f "$compose_override" up -d bootroot-http01
 
   local cfg="$TMP_DIR/agent.toml.multi-example"
   cat <<'TOML' > "$cfg"
@@ -493,7 +503,7 @@ YAML
 
   local compose_cmd
   compose_cmd="$(detect_compose)"
-  $compose_cmd "${COMPOSE_FILES[@]}" -f "$compose_override" up -d bootroot-http01
+  $compose_cmd "${COMPOSE_ARGS[@]}" -f "$compose_override" up -d bootroot-http01
 
   local cfg_local="$TMP_DIR/agent.toml.topology-a.local"
   local cfg_remote1="$TMP_DIR/agent.toml.topology-a.remote1"
@@ -561,7 +571,7 @@ scenario_fail_responder_down() {
 
   local compose_cmd
   compose_cmd="$(detect_compose)"
-  $compose_cmd "${COMPOSE_FILES[@]}" stop bootroot-http01
+  $compose_cmd "${COMPOSE_ARGS[@]}" stop bootroot-http01
 
   local cfg="$ROOT_DIR/agent.toml.compose"
   local output
@@ -573,7 +583,7 @@ scenario_fail_responder_down() {
     fi
   fi
 
-  $compose_cmd "${COMPOSE_FILES[@]}" up -d bootroot-http01
+  $compose_cmd "${COMPOSE_ARGS[@]}" up -d bootroot-http01
   log "responder-down failure ok"
 }
 
@@ -602,7 +612,7 @@ YAML
 
   local compose_cmd
   compose_cmd="$(detect_compose)"
-  $compose_cmd "${COMPOSE_FILES[@]}" -f "$compose_override" up -d bootroot-http01
+  $compose_cmd "${COMPOSE_ARGS[@]}" -f "$compose_override" up -d bootroot-http01
 
   local cfg="$ROOT_DIR/agent.toml.compose"
   local output
@@ -614,7 +624,7 @@ YAML
     fi
   fi
 
-  $compose_cmd "${COMPOSE_FILES[@]}" up -d bootroot-http01
+  $compose_cmd "${COMPOSE_ARGS[@]}" up -d bootroot-http01
   log "hmac-mismatch failure ok"
 }
 
@@ -757,7 +767,7 @@ scenario_fail_step_ca_down() {
 
   local compose_cmd
   compose_cmd="$(detect_compose)"
-  $compose_cmd "${COMPOSE_FILES[@]}" stop step-ca
+  $compose_cmd "${COMPOSE_ARGS[@]}" stop step-ca
 
   local cfg="$ROOT_DIR/agent.toml.compose"
   local output
@@ -771,7 +781,7 @@ scenario_fail_step_ca_down() {
     fi
   fi
 
-  $compose_cmd "${COMPOSE_FILES[@]}" up -d step-ca
+  $compose_cmd "${COMPOSE_ARGS[@]}" up -d step-ca
   log "step-ca-down failure ok"
 }
 
@@ -841,7 +851,7 @@ scenario_fail_db_outage() {
 
   local compose_cmd
   compose_cmd="$(detect_compose)"
-  $compose_cmd "${COMPOSE_FILES[@]}" stop postgres
+  $compose_cmd "${COMPOSE_ARGS[@]}" stop postgres
 
   local cfg="$ROOT_DIR/agent.toml.compose"
   local output
@@ -855,7 +865,7 @@ scenario_fail_db_outage() {
     fi
   fi
 
-  $compose_cmd "${COMPOSE_FILES[@]}" up -d postgres
+  $compose_cmd "${COMPOSE_ARGS[@]}" up -d postgres
   log "db-outage failure ok"
 }
 
@@ -889,7 +899,7 @@ YAML
 
   local compose_cmd
   compose_cmd="$(detect_compose)"
-  $compose_cmd "${COMPOSE_FILES[@]}" -f "$compose_override" up -d step-ca
+  $compose_cmd "${COMPOSE_ARGS[@]}" -f "$compose_override" up -d step-ca
 
   local cfg="$ROOT_DIR/agent.toml.compose"
   local output
@@ -901,7 +911,7 @@ YAML
     fi
   fi
 
-  $compose_cmd "${COMPOSE_FILES[@]}" up -d step-ca
+  $compose_cmd "${COMPOSE_ARGS[@]}" up -d step-ca
   log "eab-required failure ok"
 }
 

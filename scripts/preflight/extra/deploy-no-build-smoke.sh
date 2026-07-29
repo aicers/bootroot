@@ -60,11 +60,11 @@ reset_existing_stack() {
   log "stopping any existing bootroot compose stack"
   POSTGRES_PASSWORD=cleanup-only \
     GRAFANA_ADMIN_PASSWORD=cleanup-only \
-    docker compose -f docker-compose.yml down -v --remove-orphans \
+    docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f docker-compose.yml down -v --remove-orphans \
     >/dev/null 2>&1 || true
   POSTGRES_PASSWORD=cleanup-only \
     GRAFANA_ADMIN_PASSWORD=cleanup-only \
-    docker compose -f docker-compose.deploy.yml down -v --remove-orphans \
+    docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f docker-compose.deploy.yml down -v --remove-orphans \
     >/dev/null 2>&1 || true
 }
 

@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 
@@ -7,6 +8,7 @@ use serde_json::Value;
 use crate::cli::args::{
     MonitoringDownArgs, MonitoringProfile, MonitoringStatusArgs, MonitoringUpArgs,
 };
+use crate::commands::compose_project::{compose_args, resolve_compose_project};
 use crate::commands::infra::{
     ContainerReadiness, collect_container_failures, collect_readiness, docker_compose_output,
     docker_output, run_docker,
@@ -15,8 +17,10 @@ use crate::i18n::Messages;
 
 pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) -> Result<()> {
     let services = monitoring_services(args.profile);
+    let project = resolve_compose_project(&args.compose_file.compose_file, None, messages)?;
     if monitoring_already_running(
         &args.compose_file.compose_file,
+        &project,
         args.profile,
         &services,
         messages,
@@ -27,16 +31,9 @@ pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) ->
     let compose_str = args.compose_file.compose_file.to_string_lossy();
     let profile_str = args.profile.to_string();
     let svc_refs: Vec<&str> = services.iter().map(String::as_str).collect();
-    let mut up_args: Vec<&str> = vec![
-        "compose",
-        "-f",
-        &compose_str,
-        "--profile",
-        &profile_str,
-        "up",
-        "-d",
-    ];
-    up_args.extend(&svc_refs);
+    let mut up_tail: Vec<&str> = vec!["up", "-d"];
+    up_tail.extend(&svc_refs);
+    let up_args = compose_args(&project, &[&compose_str], Some(&profile_str), &up_tail);
     run_docker_with_env(
         &up_args,
         "docker compose up",
@@ -46,6 +43,7 @@ pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) ->
 
     let readiness = collect_readiness(
         &args.compose_file.compose_file,
+        &project,
         Some(&profile_str),
         &services,
         messages,
@@ -61,7 +59,8 @@ pub(crate) fn run_monitoring_status(
     args: &MonitoringStatusArgs,
     messages: &Messages,
 ) -> Result<()> {
-    let profiles = detect_running_profiles(&args.compose_file.compose_file, messages)?;
+    let project = resolve_compose_project(&args.compose_file.compose_file, None, messages)?;
+    let profiles = detect_running_profiles(&args.compose_file.compose_file, &project, messages)?;
     if profiles.is_empty() {
         anyhow::bail!(messages.monitoring_status_no_services());
     }
@@ -74,6 +73,7 @@ pub(crate) fn run_monitoring_status(
         let profile_str = profile.to_string();
         let readiness = collect_readiness(
             &args.compose_file.compose_file,
+            &project,
             Some(&profile_str),
             &services,
             messages,
@@ -123,7 +123,8 @@ pub(crate) fn run_monitoring_status(
 }
 
 pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages) -> Result<()> {
-    let profiles = detect_running_profiles(&args.compose_file.compose_file, messages)?;
+    let project = resolve_compose_project(&args.compose_file.compose_file, None, messages)?;
+    let profiles = detect_running_profiles(&args.compose_file.compose_file, &project, messages)?;
     if profiles.is_empty() {
         anyhow::bail!(messages.monitoring_status_no_services());
     }
@@ -135,6 +136,7 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
             let profile_str = profile.to_string();
             let grafana_container_id = docker_compose_output(
                 &args.compose_file.compose_file,
+                &project,
                 Some(&profile_str),
                 &["ps", "-q", grafana_service],
                 messages,
@@ -159,27 +161,14 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
         let profile_str = profile.to_string();
         let svc_refs: Vec<&str> = services.iter().map(String::as_str).collect();
 
-        let mut stop_args: Vec<&str> = vec![
-            "compose",
-            "-f",
-            &compose_str,
-            "--profile",
-            &profile_str,
-            "stop",
-        ];
-        stop_args.extend(&svc_refs);
+        let mut stop_tail: Vec<&str> = vec!["stop"];
+        stop_tail.extend(&svc_refs);
+        let stop_args = compose_args(&project, &[&compose_str], Some(&profile_str), &stop_tail);
         run_docker(&stop_args, "docker compose stop", messages)?;
 
-        let mut rm_args: Vec<&str> = vec![
-            "compose",
-            "-f",
-            &compose_str,
-            "--profile",
-            &profile_str,
-            "rm",
-            "-f",
-        ];
-        rm_args.extend(&svc_refs);
+        let mut rm_tail: Vec<&str> = vec!["rm", "-f"];
+        rm_tail.extend(&svc_refs);
+        let rm_args = compose_args(&project, &[&compose_str], Some(&profile_str), &rm_tail);
         run_docker(&rm_args, "docker compose rm", messages)?;
     }
 
@@ -215,12 +204,14 @@ fn profile_grafana_service(profile: MonitoringProfile) -> &'static str {
 
 fn detect_running_profiles(
     compose_file: &Path,
+    project: &str,
     messages: &Messages,
 ) -> Result<Vec<MonitoringProfile>> {
     detect_running_profiles_with(|profile, service| {
         let profile_str = profile.to_string();
         let container_id = docker_compose_output(
             compose_file,
+            project,
             Some(&profile_str),
             &["ps", "-q", service],
             messages,
@@ -286,6 +277,7 @@ fn ensure_all_healthy(readiness: &[ContainerReadiness], messages: &Messages) -> 
 
 fn monitoring_already_running(
     compose_file: &Path,
+    project: &str,
     profile: MonitoringProfile,
     services: &[String],
     messages: &Messages,
@@ -294,6 +286,7 @@ fn monitoring_already_running(
     for service in services {
         let container_id = docker_compose_output(
             compose_file,
+            project,
             Some(&profile_str),
             &["ps", "-q", service],
             messages,
@@ -390,14 +383,18 @@ fn grafana_data_volume_name(container_id: &str, messages: &Messages) -> Result<O
     Ok(None)
 }
 
-fn run_docker_with_env(
-    args: &[&str],
+/// Runs `docker` with only `GRAFANA_ADMIN_PASSWORD` added to the child
+/// environment.  Generic over the argument type so the `Vec<String>`
+/// that `compose_project::compose_args` produces passes without an
+/// intermediate collect.
+fn run_docker_with_env<S: AsRef<OsStr>>(
+    args: &[S],
     context: &str,
     messages: &Messages,
     grafana_admin_password: Option<&str>,
 ) -> Result<()> {
     let mut command = ProcessCommand::new("docker");
-    command.args(args);
+    command.args(args.iter().map(AsRef::as_ref));
     if let Some(password) = grafana_admin_password {
         command.env("GRAFANA_ADMIN_PASSWORD", password);
     }

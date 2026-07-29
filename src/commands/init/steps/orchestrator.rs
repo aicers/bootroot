@@ -42,6 +42,7 @@ use super::stepca_setup::{
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
 use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_project::{compose_args, resolve_compose_project};
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::guardrails::{
     client_url_from_bind_addr, ensure_all_services_localhost_binding, validate_http01_admin_tls,
@@ -430,11 +431,26 @@ async fn run_init_inner(
         confirm_overwrite(prompt.message(messages), messages)?;
     }
 
+    let compose_dir = crate::commands::compose_file::compose_file_dir(&args.compose.compose_file);
+    let compose_dir = compose_dir.as_path();
+
+    // `init` has no identity flag: the project comes from the `.env`
+    // `infra install` left beside the compose file (or an exported
+    // `COMPOSE_PROJECT_NAME`), so it acts on the stack it was pointed at.
+    //
+    // Resolved before `.env` is loaded into the process environment, so
+    // that `init` resolves from exactly what `status` and `clean` see.
+    // Several sub-steps below re-resolve the project after that load —
+    // the agent-sidecar and responder overrides, the `OpenBao` TLS
+    // recreate, the DB-password rotation and rollback — so they must all
+    // reach the same answer. `load_dotenv_into_env` skips
+    // `COMPOSE_PROJECT_NAME` for exactly that reason; see its doc
+    // comment.
+    let project = resolve_compose_project(&args.compose.compose_file, None, messages)?;
+
     // Load .env into the process environment so that
     // `build_admin_dsn_from_env()` and `build_dsn_from_env()` can discover
     // the temporary POSTGRES_PASSWORD written by `infra install`.
-    let compose_dir = crate::commands::compose_file::compose_file_dir(&args.compose.compose_file);
-    let compose_dir = compose_dir.as_path();
     crate::commands::dotenv::load_dotenv_into_env(&compose_dir.join(".env"), messages)?;
 
     let (db_dsn, db_dsn_normalization, admin_dsn_for_kv) =
@@ -508,7 +524,7 @@ async fn run_init_inner(
     let will_init_stepca = !secrets_dir.join("config").join("ca.json").exists();
     if will_init_stepca {
         let compose_str = args.compose.compose_file.to_string_lossy();
-        let stop_args = ["compose", "-f", &*compose_str, "stop", "step-ca"];
+        let stop_args = compose_args(&project, &[&compose_str], None, &["stop", "step-ca"]);
         let _ = run_docker(&stop_args, "docker compose stop step-ca", messages);
     }
     // step-ca's own serving certificate must carry the address
@@ -597,7 +613,7 @@ async fn run_init_inner(
         // an installed system.  Gating on the change keeps a repeat
         // `init` with the same recorded intent restart-free.
         let compose_str = args.compose.compose_file.to_string_lossy();
-        let restart_args = ["compose", "-f", &*compose_str, "restart", "step-ca"];
+        let restart_args = compose_args(&project, &[&compose_str], None, &["restart", "step-ca"]);
         let _ = run_docker(&restart_args, "docker compose restart step-ca", messages);
     }
     // Apply the step-ca exposed override when a bind intent is stored.
@@ -619,17 +635,12 @@ async fn run_init_inner(
     {
         let compose_str = args.compose.compose_file.to_string_lossy();
         let override_str = stepca_override.to_string_lossy();
-        let up_args = [
-            "compose",
-            "-f",
-            &*compose_str,
-            "-f",
-            &*override_str,
-            "up",
-            "-d",
-            "--no-deps",
-            "step-ca",
-        ];
+        let up_args = compose_args(
+            &project,
+            &[&compose_str, &override_str],
+            None,
+            &["up", "-d", "--no-deps", "step-ca"],
+        );
         run_docker(&up_args, "docker compose up -d step-ca (exposed)", messages)?;
     }
     let compose_has_responder = compose_has_responder(&args.compose.compose_file, messages)?;
@@ -733,19 +744,12 @@ async fn run_init_inner(
             // non-loopback host-port publish.  Reinit-recovery's
             // second init pass would then lose access to the bind URL
             // mid-flow.
-            let up_args = [
-                "compose",
-                "-f",
-                &*compose_str,
-                "-f",
-                &*config_override_str,
-                "-f",
-                &*exposed_override_str,
-                "up",
-                "-d",
-                "--no-deps",
-                RESPONDER_SERVICE_NAME,
-            ];
+            let up_args = compose_args(
+                &project,
+                &[&compose_str, &config_override_str, &exposed_override_str],
+                None,
+                &["up", "-d", "--no-deps", RESPONDER_SERVICE_NAME],
+            );
             run_docker(
                 &up_args,
                 "docker compose up -d responder (tls + exposed)",
@@ -1226,8 +1230,9 @@ async fn maybe_rotate_env_db_password(
     )?;
 
     // Restart step-ca to pick up the new DSN from the patched ca.json.
+    let project = resolve_compose_project(compose_file, None, messages)?;
     let compose_str = compose_file.to_string_lossy();
-    let restart_args = ["compose", "-f", &*compose_str, "restart", "step-ca"];
+    let restart_args = compose_args(&project, &[&compose_str], None, &["restart", "step-ca"]);
     let _ = run_docker(&restart_args, "docker compose restart step-ca", messages);
 
     Ok(Some(new_dsn))

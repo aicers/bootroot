@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 
+use crate::commands::clean::{COMPOSE_PROJECT_LABEL, COMPOSE_SERVICE_LABEL};
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::infra::{docker_output, run_docker};
 use crate::i18n::Messages;
@@ -30,12 +31,16 @@ pub(crate) fn collect_dns_aliases(state: &StateFile) -> Vec<String> {
 /// Collects all aliases (existing + new) and applies them to the
 /// `bootroot-http01` container by disconnecting and reconnecting
 /// it on its Docker network with the full alias set.
-pub(crate) fn register_dns_alias(state: &StateFile, messages: &Messages) -> Result<()> {
+pub(crate) fn register_dns_alias(
+    state: &StateFile,
+    project: &str,
+    messages: &Messages,
+) -> Result<()> {
     let aliases = collect_dns_aliases(state);
     if aliases.is_empty() {
         return Ok(());
     }
-    apply_dns_aliases(&aliases, messages)
+    apply_dns_aliases(&aliases, project, messages)
 }
 
 /// Refreshes the responder's HTTP-01 alias set from `state.json`,
@@ -49,9 +54,13 @@ pub(crate) fn register_dns_alias(state: &StateFile, messages: &Messages) -> Resu
 /// still reconnect the container with just the base
 /// `bootroot-http01` service alias rather than leaving the orphaned
 /// alias in place.
-pub(crate) fn reconcile_dns_aliases(state: &StateFile, messages: &Messages) -> Result<()> {
+pub(crate) fn reconcile_dns_aliases(
+    state: &StateFile,
+    project: &str,
+    messages: &Messages,
+) -> Result<()> {
     let aliases = collect_dns_aliases(state);
-    apply_dns_aliases(&aliases, messages)
+    apply_dns_aliases(&aliases, project, messages)
 }
 
 /// Replays all DNS aliases from `state.json` onto the running
@@ -59,13 +68,17 @@ pub(crate) fn reconcile_dns_aliases(state: &StateFile, messages: &Messages) -> R
 ///
 /// Intended for use after `infra up` to restore aliases that were
 /// lost during a container restart.
-pub(crate) fn replay_dns_aliases(state: &StateFile, messages: &Messages) -> Result<()> {
+pub(crate) fn replay_dns_aliases(
+    state: &StateFile,
+    project: &str,
+    messages: &Messages,
+) -> Result<()> {
     let aliases = collect_dns_aliases(state);
     if aliases.is_empty() {
         return Ok(());
     }
     println!("{}", messages.dns_alias_replaying(aliases.len()));
-    apply_dns_aliases(&aliases, messages)
+    apply_dns_aliases(&aliases, project, messages)
 }
 
 /// Applies all DNS aliases to the `bootroot-http01` container at runtime.
@@ -79,8 +92,8 @@ pub(crate) fn replay_dns_aliases(state: &StateFile, messages: &Messages) -> Resu
 /// to the network (including when aliases could not be applied).
 /// Returns `Err` only when the container is left detached from the
 /// network (disconnect succeeded but both reconnect and rollback failed).
-fn apply_dns_aliases(aliases: &[String], messages: &Messages) -> Result<()> {
-    let Ok(container_id) = find_responder_container(messages) else {
+fn apply_dns_aliases(aliases: &[String], project: &str, messages: &Messages) -> Result<()> {
+    let Some(container_id) = find_responder_container(project, messages)? else {
         eprintln!("{}", messages.dns_alias_responder_not_running());
         return Ok(());
     };
@@ -152,18 +165,63 @@ fn apply_dns_aliases(aliases: &[String], messages: &Messages) -> Result<()> {
     Ok(())
 }
 
-/// Finds the container ID for the `bootroot-http01` service.
-fn find_responder_container(messages: &Messages) -> Result<String> {
-    let label = format!("com.docker.compose.service={RESPONDER_SERVICE_NAME}");
-    let label_filter = format!("label={label}");
-    let output = docker_output(&["ps", "-q", "-f", &label_filter], messages)?;
-    let id = output.trim().to_string();
-    if id.is_empty() {
-        anyhow::bail!(messages.dns_alias_responder_not_running());
+/// Finds the container ID of `project`'s HTTP-01 responder.
+///
+/// Filtering on the service label alone matches every co-located
+/// instance's responder, and rewiring an arbitrary one would move another
+/// instance's DNS aliases.  The project label narrows the match to this
+/// install; if more than one container still matches, that is a state no
+/// arbitrary choice can make correct, so it is reported rather than
+/// guessed at.
+///
+/// Returns `Ok(None)` when the responder is simply not running — the
+/// caller warns and carries on — and `Err` when the filter is ambiguous,
+/// which is a hard failure rather than something to skip past.
+fn find_responder_container(project: &str, messages: &Messages) -> Result<Option<String>> {
+    let args = responder_lookup_args(project);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Ok(output) = docker_output(&arg_refs, messages) else {
+        return Ok(None);
+    };
+    select_responder_container(&output, project, messages)
+}
+
+/// Builds the `docker ps` argument vector that narrows the responder
+/// lookup to `project`.
+///
+/// Split out from the Docker call so a test can assert the project
+/// filter is actually passed, rather than re-deriving the string it
+/// expects.
+fn responder_lookup_args(project: &str) -> Vec<String> {
+    vec![
+        "ps".to_string(),
+        "-q".to_string(),
+        "-f".to_string(),
+        format!("label={COMPOSE_SERVICE_LABEL}={RESPONDER_SERVICE_NAME}"),
+        "-f".to_string(),
+        format!("label={COMPOSE_PROJECT_LABEL}={project}"),
+    ]
+}
+
+/// Picks the single container ID out of `docker ps -q` output.
+///
+/// Split out from the Docker call so the ambiguity rule is unit-testable
+/// without a daemon.
+fn select_responder_container(
+    output: &str,
+    project: &str,
+    messages: &Messages,
+) -> Result<Option<String>> {
+    let ids: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    match ids.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some((*id).to_string())),
+        _ => anyhow::bail!(messages.dns_alias_responder_ambiguous(ids.len(), project)),
     }
-    // If multiple lines are returned (shouldn't happen in normal usage),
-    // take the first one.
-    Ok(id.lines().next().unwrap_or_default().trim().to_string())
 }
 
 /// Discovers the Docker network the container is attached to.
@@ -190,6 +248,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::i18n::Messages;
     use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry, StateFile};
 
     fn sample_entry(name: &str, instance_id: Option<&str>) -> ServiceEntry {
@@ -217,6 +276,57 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+        }
+    }
+
+    /// The lookup must filter on the compose project as well as the
+    /// service, otherwise a co-located instance's responder matches too
+    /// and `dns_alias` would rewire an arbitrary one.
+    #[test]
+    fn responder_lookup_filters_on_the_project_label() {
+        assert_eq!(
+            responder_lookup_args("insight"),
+            vec![
+                "ps",
+                "-q",
+                "-f",
+                "label=com.docker.compose.service=bootroot-http01",
+                "-f",
+                "label=com.docker.compose.project=insight",
+            ]
+        );
+    }
+
+    #[test]
+    fn responder_lookup_returns_the_single_match() {
+        let messages = crate::i18n::test_messages();
+        let id = select_responder_container("abc123\n", "insight", &messages).unwrap();
+        assert_eq!(id.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn responder_lookup_reports_no_container_as_not_running() {
+        let messages = crate::i18n::test_messages();
+        assert!(
+            select_responder_container("\n  \n", "insight", &messages)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Two matches is a state no arbitrary choice can make correct, so
+    /// it must be an error naming the project rather than "take the
+    /// first line".
+    #[test]
+    fn responder_lookup_errors_on_an_ambiguous_match() {
+        for locale in ["en", "ko"] {
+            let messages = Messages::new(locale).unwrap();
+            let err = select_responder_container("abc123\ndef456\n", "insight", &messages)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("insight"), "{locale}: {err}");
+            assert!(err.contains('2'), "{locale}: {err}");
+            assert!(!err.contains('{'), "{locale} left a placeholder: {err}");
         }
     }
 

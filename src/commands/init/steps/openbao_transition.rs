@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
 use super::prompts::prompt_unseal_keys;
+use crate::commands::compose_project::{compose_args, resolve_compose_project};
 use crate::commands::infra::{
     build_openbao_client, run_docker, wait_for_openbao_api_reachable_within,
 };
@@ -172,18 +173,20 @@ fn read_prepared_keys(path: &Path, messages: &Messages) -> Result<PreparedUnseal
 /// this very invocation is the one adding the `openbao-exposed`
 /// override.  Both files stay on the command line so the published bind
 /// address is unchanged by the recreate.
-fn openbao_recreate_docker_args(compose_file: &Path, override_path: &Path) -> Vec<String> {
-    vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().into_owned(),
-        "-f".to_string(),
-        override_path.to_string_lossy().into_owned(),
-        "up".to_string(),
-        "-d".to_string(),
-        "--force-recreate".to_string(),
-        OPENBAO_SERVICE_NAME.to_string(),
-    ]
+fn openbao_recreate_docker_args(
+    project: &str,
+    compose_file: &Path,
+    override_path: &Path,
+) -> Vec<String> {
+    compose_args(
+        project,
+        &[
+            &compose_file.to_string_lossy(),
+            &override_path.to_string_lossy(),
+        ],
+        None,
+        &["up", "-d", "--force-recreate", OPENBAO_SERVICE_NAME],
+    )
 }
 
 /// The plaintext → TLS transition of the `OpenBao` listener.
@@ -241,9 +244,9 @@ impl<'a> OpenBaoTlsTransition<'a> {
 
         println!("{}", messages.init_openbao_tls_recreate());
         *recreated = true;
-        let args = openbao_recreate_docker_args(self.compose_file, self.override_path);
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_docker(&arg_refs, "docker compose up -d openbao (tls)", messages)?;
+        let project = resolve_compose_project(self.compose_file, None, messages)?;
+        let args = openbao_recreate_docker_args(&project, self.compose_file, self.override_path);
+        run_docker(&args, "docker compose up -d openbao (tls)", messages)?;
 
         let client = self.probe_tls(messages).await?;
         ensure_unsealed(&client, prepared, messages).await
@@ -365,7 +368,7 @@ mod tests {
     fn recreate_args_do_not_depend_on_a_compose_delta() {
         let compose = PathBuf::from("docker-compose.yml");
         let override_path = PathBuf::from("secrets/openbao/docker-compose.openbao-exposed.yml");
-        let args = openbao_recreate_docker_args(&compose, &override_path);
+        let args = openbao_recreate_docker_args("bootroot", &compose, &override_path);
 
         assert!(
             args.contains(&"--force-recreate".to_string()),

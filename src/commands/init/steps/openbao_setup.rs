@@ -31,6 +31,7 @@ use super::ca_certs::{compute_ca_bundle_pem, compute_ca_fingerprints};
 use super::prompts::{confirm_overwrite, prompt_text, prompt_unseal_keys};
 use super::{InitBootstrap, InitRollback, InitSecrets};
 use crate::cli::args::InitArgs;
+use crate::commands::compose_project::{compose_args, resolve_compose_project};
 use crate::commands::constants::CA_TRUST_KEY;
 use crate::commands::infra::run_docker;
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
@@ -901,6 +902,7 @@ pub(super) fn apply_openbao_agent_compose_override(
     override_path: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    let project = resolve_compose_project(compose_file, None, messages)?;
     let compose_str = compose_file.to_string_lossy();
     let override_str = override_path.to_string_lossy();
     // `--no-deps` is load-bearing: the agent override does not include
@@ -914,18 +916,18 @@ pub(super) fn apply_openbao_agent_compose_override(
     // trip: infra-up starts openbao with the preserved exposed
     // override, and the agent compose-up here recreates it back to
     // loopback unless we tell compose to ignore the dependency.
-    let args = [
-        "compose",
-        "-f",
-        &*compose_str,
-        "-f",
-        &*override_str,
-        "up",
-        "-d",
-        "--no-deps",
-        OPENBAO_AGENT_STEPCA_SERVICE,
-        OPENBAO_AGENT_RESPONDER_SERVICE,
-    ];
+    let args = compose_args(
+        &project,
+        &[&compose_str, &override_str],
+        None,
+        &[
+            "up",
+            "-d",
+            "--no-deps",
+            OPENBAO_AGENT_STEPCA_SERVICE,
+            OPENBAO_AGENT_RESPONDER_SERVICE,
+        ],
+    );
     run_docker(&args, "docker compose openbao agent override", messages)?;
     Ok(())
 }

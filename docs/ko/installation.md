@@ -183,7 +183,14 @@ POSTGRES_USER=step
 POSTGRES_PASSWORD=<random-32-byte-hex>
 POSTGRES_DB=stepca
 GRAFANA_ADMIN_PASSWORD=admin
+BOOTROOT_INSTANCE=bootroot
 ```
+
+`BOOTROOT_INSTANCE`는 설치본의 정체성이며, 이후 모든 명령이 대상으로
+삼는 Docker Compose 프로젝트입니다. `bootroot infra install
+--instance-name <name>`으로 설정하고, 다른 모든 명령은 여기서 다시
+읽습니다. 자세한 내용은 [CLI](cli.md)의 "인스턴스 정체성과 Compose
+프로젝트" 절을 참고하세요.
 
 `sslmode`는 환경 정책에 맞게 `disable`, `require`, `verify-full` 중에서
 선택합니다. 운영에서는 `require` 또는 `verify-full`을 권장합니다.

@@ -15,6 +15,7 @@ use super::super::paths::{ResponderPaths, compose_has_responder};
 use super::super::types::ResponderCheck;
 use super::InitSecrets;
 use crate::cli::args::{InitArgs, InitSkipPhase};
+use crate::commands::compose_project::{compose_args, resolve_compose_project};
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::infra::run_docker;
 use crate::i18n::Messages;
@@ -169,6 +170,7 @@ pub(super) fn apply_responder_compose_override(
     override_path: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    let project = resolve_compose_project(compose_file, None, messages)?;
     let compose_str = compose_file.to_string_lossy();
     let override_str = override_path.to_string_lossy();
     // `--no-deps` mirrors `apply_openbao_agent_compose_override`: the
@@ -178,17 +180,12 @@ pub(super) fn apply_responder_compose_override(
     // host-port publish.  Subsequent KV calls against the bind URL
     // would then fail with `Connection refused`.  See the comment on
     // that helper for the reinit-recovery scenario that exercises this.
-    let args = [
-        "compose",
-        "-f",
-        &*compose_str,
-        "-f",
-        &*override_str,
-        "up",
-        "-d",
-        "--no-deps",
-        RESPONDER_SERVICE_NAME,
-    ];
+    let args = compose_args(
+        &project,
+        &[&compose_str, &override_str],
+        None,
+        &["up", "-d", "--no-deps", RESPONDER_SERVICE_NAME],
+    );
     run_docker(&args, "docker compose responder override", messages)?;
     Ok(())
 }

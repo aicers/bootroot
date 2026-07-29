@@ -259,4 +259,18 @@ impl Messages {
             &[("value", container_id)],
         )
     }
+
+    pub(crate) fn dns_alias_responder_ambiguous(&self, count: usize, project: &str) -> String {
+        format_template(
+            self.strings().dns_alias_responder_ambiguous,
+            &[("count", &count.to_string()), ("project", project)],
+        )
+    }
+
+    pub(crate) fn error_instance_name_invalid(&self, name: &str, max: usize) -> String {
+        format_template(
+            self.strings().error_instance_name_invalid,
+            &[("name", name), ("max", &max.to_string())],
+        )
+    }
 }

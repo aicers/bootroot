@@ -24,6 +24,9 @@ pub(crate) use orchestrator::run_init;
 pub(crate) use prompts::prompt_yes_no;
 
 use super::types::EabCredentials;
+use crate::commands::compose_project::{
+    DEFAULT_INSTANCE_NAME, compose_args, resolve_compose_project,
+};
 use crate::i18n::Messages;
 
 pub(super) struct InitBootstrap {
@@ -136,10 +139,12 @@ impl InitRollback {
             // forward path can fail before that (no unseal key source is
             // available), and tearing down a container this run never
             // touched would knock a healthy deployment offline.
-            let args = rollback_openbao_docker_args(compose_file);
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let args = rollback_openbao_docker_args(
+                &rollback_project(compose_file, messages),
+                compose_file,
+            );
             if let Err(err) = crate::commands::infra::run_docker(
-                &arg_refs,
+                &args,
                 "docker compose up -d openbao (rollback)",
                 messages,
             ) {
@@ -156,10 +161,13 @@ impl InitRollback {
         if let Some(override_path) = &self.openbao_agent_compose_override
             && let Some(compose_file) = &self.compose_file
         {
-            let args = rollback_openbao_agent_docker_args(compose_file, override_path);
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let args = rollback_openbao_agent_docker_args(
+                &rollback_project(compose_file, messages),
+                compose_file,
+                override_path,
+            );
             if let Err(err) = crate::commands::infra::run_docker(
-                &arg_refs,
+                &args,
                 "docker compose rm infra agents (rollback)",
                 messages,
             ) {
@@ -200,10 +208,13 @@ impl InitRollback {
                 .as_ref()
                 .filter(|f| f.original.is_some())
                 .and(self.responder_compose_override.as_deref());
-            let args = rollback_responder_docker_args(compose_file, config_override);
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let args = rollback_responder_docker_args(
+                &rollback_project(compose_file, messages),
+                compose_file,
+                config_override,
+            );
             if let Err(err) = crate::commands::infra::run_docker(
-                &arg_refs,
+                &args,
                 "docker compose up -d responder (rollback)",
                 messages,
             ) {
@@ -271,22 +282,32 @@ impl InitRollback {
     }
 }
 
+/// Resolves the Compose project for a rollback invocation.
+///
+/// Rollback is best-effort and reports through `eprintln!` rather than
+/// `Result`, so an unreadable `.env` falls back to the default identity
+/// instead of aborting the teardown half-way: leaving the containers up
+/// would be worse than acting on the default project, which is the one
+/// an install without `--instance-name` created.
+fn rollback_project(compose_file: &std::path::Path, messages: &Messages) -> String {
+    resolve_compose_project(compose_file, None, messages)
+        .unwrap_or_else(|_| DEFAULT_INSTANCE_NAME.to_string())
+}
+
 /// Builds the Docker Compose arguments for undoing the TLS override
 /// during rollback.
 ///
-/// Returns `["compose", "-f", <compose_file>, "up", "-d", "openbao"]`
-/// so that the container is recreated from the base compose config
+/// Returns a `compose -f <compose_file> -p <project> up -d openbao`
+/// vector so that the container is recreated from the base compose config
 /// (without the non-loopback override), ensuring the external port
 /// mapping is removed.
-fn rollback_openbao_docker_args(compose_file: &std::path::Path) -> Vec<String> {
-    vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().into_owned(),
-        "up".to_string(),
-        "-d".to_string(),
-        "openbao".to_string(),
-    ]
+fn rollback_openbao_docker_args(project: &str, compose_file: &std::path::Path) -> Vec<String> {
+    compose_args(
+        project,
+        &[&compose_file.to_string_lossy()],
+        None,
+        &["up", "-d", "openbao"],
+    )
 }
 
 /// Builds the Docker Compose arguments for undoing the responder TLS
@@ -296,47 +317,55 @@ fn rollback_openbao_docker_args(compose_file: &std::path::Path) -> Vec<String> {
 /// its volume mount, but omits the exposed port override so the
 /// container reverts to loopback-only binding.
 fn rollback_responder_docker_args(
+    project: &str,
     compose_file: &std::path::Path,
     config_override: Option<&std::path::Path>,
 ) -> Vec<String> {
-    let mut args = vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().into_owned(),
-    ];
-    if let Some(override_path) = config_override {
-        args.push("-f".to_string());
-        args.push(override_path.to_string_lossy().into_owned());
+    let compose_str = compose_file.to_string_lossy();
+    let override_str = config_override.map(|path| path.to_string_lossy().into_owned());
+    let mut files: Vec<&str> = vec![&compose_str];
+    if let Some(ref override_str) = override_str {
+        files.push(override_str);
     }
-    args.push("up".to_string());
-    args.push("-d".to_string());
-    args.push(crate::commands::constants::RESPONDER_SERVICE_NAME.to_string());
-    args
+    compose_args(
+        project,
+        &files,
+        None,
+        &[
+            "up",
+            "-d",
+            crate::commands::constants::RESPONDER_SERVICE_NAME,
+        ],
+    )
 }
 
 /// Builds the Docker Compose arguments for tearing down the infra
 /// `OpenBao` agents during rollback.
 ///
-/// Returns `["compose", "-f", <compose>, "-f", <override>, "rm", "-s",
-/// "-f", <stepca>, <responder>]` so the two agent containers are
+/// Returns a `compose -f <compose> -f <override> -p <project> rm -s -f
+/// <stepca> <responder>` vector so the two agent containers are
 /// stopped and removed.  They were started with a TLS `VAULT_ADDR`/
 /// `ca_cert` that a rolled-back plaintext `OpenBao` cannot serve.
 fn rollback_openbao_agent_docker_args(
+    project: &str,
     compose_file: &std::path::Path,
     override_path: &std::path::Path,
 ) -> Vec<String> {
-    vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        compose_file.to_string_lossy().into_owned(),
-        "-f".to_string(),
-        override_path.to_string_lossy().into_owned(),
-        "rm".to_string(),
-        "-s".to_string(),
-        "-f".to_string(),
-        super::constants::OPENBAO_AGENT_STEPCA_SERVICE.to_string(),
-        super::constants::OPENBAO_AGENT_RESPONDER_SERVICE.to_string(),
-    ]
+    compose_args(
+        project,
+        &[
+            &compose_file.to_string_lossy(),
+            &override_path.to_string_lossy(),
+        ],
+        None,
+        &[
+            "rm",
+            "-s",
+            "-f",
+            super::constants::OPENBAO_AGENT_STEPCA_SERVICE,
+            super::constants::OPENBAO_AGENT_RESPONDER_SERVICE,
+        ],
+    )
 }
 
 fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
@@ -571,7 +600,7 @@ mod rollback_tests {
         use std::path::PathBuf;
 
         let compose = PathBuf::from("docker-compose.yml");
-        let args = super::rollback_openbao_docker_args(&compose);
+        let args = super::rollback_openbao_docker_args("bootroot", &compose);
 
         assert!(
             args.contains(&"up".to_string()) && args.contains(&"-d".to_string()),
@@ -618,7 +647,7 @@ mod rollback_tests {
             .as_ref()
             .filter(|f| f.original.is_some())
             .and(rollback.responder_compose_override.as_deref());
-        let args = super::rollback_responder_docker_args(&compose, config_override);
+        let args = super::rollback_responder_docker_args("bootroot", &compose, config_override);
 
         assert!(
             !args.iter().any(|a| a.ends_with("override.yml")),
@@ -651,7 +680,7 @@ mod rollback_tests {
             .as_ref()
             .filter(|f| f.original.is_some())
             .and(rollback.responder_compose_override.as_deref());
-        let args = super::rollback_responder_docker_args(&compose, config_override);
+        let args = super::rollback_responder_docker_args("bootroot", &compose, config_override);
 
         assert!(
             args.iter().any(|a| a.ends_with("override.yml")),
@@ -669,9 +698,18 @@ mod rollback_tests {
 
         let compose = PathBuf::from("docker-compose.yml");
         let override_path = PathBuf::from("secrets/openbao/agent.override.yml");
-        let args = super::rollback_openbao_agent_docker_args(&compose, &override_path);
+        let args = super::rollback_openbao_agent_docker_args("bootroot", &compose, &override_path);
 
-        assert_eq!(args.first().map(String::as_str), Some("compose"));
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some(crate::commands::compose_project::DOCKER_COMPOSE_SUBCOMMAND)
+        );
+        // Every rollback vector must carry the project scoping too,
+        // otherwise the teardown would hit Compose's default project.
+        assert!(
+            args.iter().any(|a| a == "-p") && args.iter().any(|a| a == "bootroot"),
+            "rollback must stay scoped to the resolved project: {args:?}"
+        );
         assert!(
             args.contains(&"rm".to_string())
                 && args.contains(&"-s".to_string())

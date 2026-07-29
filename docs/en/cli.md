@@ -168,6 +168,18 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
 ### Inputs
 
 - `--compose-file`: compose file path (default `docker-compose.yml`)
+- `--instance-name <name>`: this install's identity (default `bootroot`).
+  It names the Docker Compose project, so the created containers carry
+  `com.docker.compose.project=<name>` and the created volumes are
+  `<name>_openbao-data`, `<name>_postgres-data`, and so on. The value is
+  recorded as `BOOTROOT_INSTANCE` in the compose directory's `.env`;
+  every later command — `status`, `infra up`, `init`, `reinit`, `clean`,
+  `rotate`, `monitoring …` — reads it back from there and has no flag of
+  its own. Allowed: lowercase ASCII letters, digits and `-`, starting
+  with a letter or digit, at most 39 characters (the limit leaves room
+  for the longest container-name suffix inside a 63-octet DNS label).
+  Re-running `infra install` without the flag keeps the recorded value
+  instead of resetting it to `bootroot`.
 - `--services`: services to start (default `openbao,postgres,step-ca,bootroot-http01`)
 - `--image-archive-dir`: local image archive directory (optional).
   When set, every `.tar`/`.tgz`/`.tar.gz` archive in the directory is
@@ -234,6 +246,42 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
 - `--http01-admin-host-port <N>`: host-side HTTP-01 responder admin API
   published port. Overrides `HTTP01_ADMIN_HOST_PORT` from `.env` and the
   process environment. Default **8080**.
+
+#### Instance identity and the Compose project
+
+`--instance-name` is the whole identity of an install. bootroot passes it
+to every `docker compose` invocation as `-p <name>`, so an install that
+declares one stops sharing another install's project — and therefore its
+volumes.
+
+The project a command acts on is resolved in this order:
+
+1. `--instance-name`, on `infra install` only;
+2. `COMPOSE_PROJECT_NAME` from the invoking environment, when non-empty;
+3. `BOOTROOT_INSTANCE` from the `.env` beside the compose file the
+   command was handed;
+4. the literal `bootroot`.
+
+An exported `COMPOSE_PROJECT_NAME` overrides the Compose project name for
+a single invocation and nothing else. It is Docker Compose's own feature:
+it is used verbatim, is **not** validated against the `--instance-name`
+rules, and is **never** recorded in `.env`. A fresh install run under one
+creates the stack in the exported project but still records the identity
+it would have had without it, so every later command against that stack
+needs the same variable exported. Use it for throwaway stacks (this
+repository's E2E harness does); use `--instance-name` for anything
+durable.
+
+Co-locating two bootroot instances on one host requires giving each a
+distinct `--instance-name`. Two installs that both take the default
+identity share one project and one set of volumes, and the second adopts
+the first's containers.
+
+Container names are still literal (`bootroot-openbao`, `bootroot-ca`, …)
+and do not yet follow the identity. A second co-located install with a
+distinct `--instance-name` therefore fails loudly with Docker's
+container-name-already-in-use error rather than silently taking over the
+first instance's containers, and the first instance is left untouched.
 
 #### Host-side published ports
 
@@ -2219,13 +2267,17 @@ operator-managed runbook for those.
 
 - Refuses to run when the compose file does not declare an
   `openbao` service, or when an existing `bootroot-openbao`
-  container's compose labels do not match the project derived from
-  the current work directory. A container that exists but is missing
-  either compose label (`com.docker.compose.project`,
-  `com.docker.compose.service`) is also rejected — it cannot be
-  proven to belong to this work directory's compose project, and
-  must not be collapsed into the stuck-after-`clean --openbao-only`
-  recovery path.
+  container's compose labels do not match the project the shared
+  resolver returns for the compose directory (the recorded
+  `BOOTROOT_INSTANCE`, an exported `COMPOSE_PROJECT_NAME`, or the
+  `bootroot` default — see
+  [Instance identity and the Compose project](#instance-identity-and-the-compose-project)).
+  The resolver deliberately never consults the container's own project
+  label, so the comparison stays a real one. A container that exists but
+  is missing either compose label (`com.docker.compose.project`,
+  `com.docker.compose.service`) is also rejected — it cannot be proven
+  to belong to this install's compose project, and must not be collapsed
+  into the stuck-after-`clean --openbao-only` recovery path.
 - Snapshots deployment-intent fields from `state.json` (OpenBao /
   HTTP-01 admin bind/advertise addresses, `infra_certs`, `secrets_dir`)
   before any destructive operation.
