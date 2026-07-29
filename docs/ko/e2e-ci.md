@@ -523,6 +523,8 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 | 스크립트 | CI 워크플로 대응 |
 | --- | --- |
 | `scripts/preflight/ci/check.sh` | `ci.yml` → Quality Check |
+| `scripts/validate-deploy-compose.sh` | `ci.yml` → Validate Deploy Compose |
+| `scripts/validate-compose-instance-names.sh` | `ci.yml` → Validate Compose Instance Names |
 | `scripts/preflight/ci/test-core.sh` | `ci.yml` → test-core |
 | `scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` → test-docker-e2e-matrix |
 | `scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` → run-extended |

@@ -93,3 +93,22 @@ fn deploy_compose_has_no_build_contexts() {
         );
     }
 }
+
+// The test overlay (issue #746) is layered as a second `-f` over
+// docker-compose.yml and adds network aliases only. A `container_name:`
+// here would override the base file's `${BOOTROOT_INSTANCE:-bootroot}-*`
+// interpolation with a literal, so the E2E stacks that always layer it
+// would stop following the install identity — silently, because the
+// derivation checks in `src/commands/init/constants.rs` read only the two
+// base compose files.
+#[test]
+fn test_overlay_pins_no_container_name() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.test.yml");
+    let compose = fs::read_to_string(compose_path).expect("read docker-compose.test.yml");
+    for line in compose.lines() {
+        assert!(
+            !line.trim_start().starts_with("container_name:"),
+            "the test overlay must declare no container_name:, found: {line}"
+        );
+    }
+}

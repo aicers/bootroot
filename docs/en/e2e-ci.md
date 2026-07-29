@@ -538,6 +538,8 @@ Or run individual scripts:
 | Script | CI job |
 | --- | --- |
 | `./scripts/preflight/ci/check.sh` | `ci.yml` Quality Check |
+| `./scripts/validate-deploy-compose.sh` | `ci.yml` Validate Deploy Compose |
+| `./scripts/validate-compose-instance-names.sh` | `ci.yml` Validate Compose Instance Names |
 | `./scripts/preflight/ci/test-core.sh` | `ci.yml` Unit & CLI Smoke |
 | `./scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` Docker E2E Matrix |
 | `./scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` Run Extended |
