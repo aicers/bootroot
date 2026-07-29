@@ -401,12 +401,7 @@ mod tests {
     /// stack comes up under another install's container names.
     #[test]
     fn monitoring_up_carries_both_the_grafana_password_and_the_instance() {
-        let identity = ComposeIdentity::resolve_for_dir(
-            Path::new("/nonexistent"),
-            Some("insight"),
-            &crate::i18n::test_messages(),
-        )
-        .expect("an explicit identity resolves without any I/O");
+        let identity = ComposeIdentity::for_instance("insight");
         let up = identity.compose(&["docker-compose.yml"], Some("lan"), &["up", "-d"]);
         let command = up.command(&grafana_admin_password_env(Some("s3cret")));
         let envs: Vec<(String, Option<String>)> = command

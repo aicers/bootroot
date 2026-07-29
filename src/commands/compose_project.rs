@@ -171,15 +171,32 @@ pub(crate) struct ComposeIdentity {
 }
 
 impl ComposeIdentity {
+    /// The identity an explicitly named install takes.
+    ///
+    /// `--instance-name` outranks everything either resolver consults,
+    /// so both halves are that name and nothing is read from disk or
+    /// from the environment.  Infallible for the same reason, which is
+    /// what lets the best-effort `init` rollback fall back to the
+    /// default identity without a `Result` to handle.
+    pub(crate) fn for_instance(name: &str) -> Self {
+        Self {
+            project: name.to_string(),
+            instance_name: name.to_string(),
+        }
+    }
+
     /// Resolves both halves of the identity for a compose directory.
     pub(crate) fn resolve_for_dir(
         compose_dir: &Path,
         instance_name: Option<&str>,
         messages: &Messages,
     ) -> Result<Self> {
+        if let Some(name) = instance_name {
+            return Ok(Self::for_instance(name));
+        }
         Ok(Self {
-            project: resolve_compose_project_for_dir(compose_dir, instance_name, messages)?,
-            instance_name: resolve_recorded_instance_name(compose_dir, instance_name, messages)?,
+            project: resolve_compose_project_for_dir(compose_dir, None, messages)?,
+            instance_name: resolve_recorded_instance_name(compose_dir, None, messages)?,
         })
     }
 
@@ -754,10 +771,16 @@ mod tests {
             .and_then(|rest| rest.find("\n}").map(|end| rest.get(..end)))
             .flatten()
             .expect("the invocation impl block must be terminated");
+        // Any visibility wider than private counts: `pub(super)` and
+        // `pub(crate)` reach a call site just as well as `pub`, so
+        // matching one spelling would leave the other a way out.  A
+        // private helper is not a way out and is allowed.
         let methods: Vec<&str> = block
             .lines()
-            .filter_map(|line| line.trim().strip_prefix("pub(crate) fn "))
-            .filter_map(|rest| rest.split('(').next())
+            .map(str::trim)
+            .filter(|line| line.starts_with("pub"))
+            .filter_map(|line| line.split_once(" fn "))
+            .filter_map(|(_, rest)| rest.split('(').next())
             .collect();
         assert_eq!(
             methods,

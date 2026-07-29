@@ -294,14 +294,8 @@ impl InitRollback {
 /// would be worse than acting on the default project, which is the one
 /// an install without `--instance-name` created.
 fn rollback_identity(compose_file: &std::path::Path, messages: &Messages) -> ComposeIdentity {
-    ComposeIdentity::resolve(compose_file, None, messages).unwrap_or_else(|_| {
-        ComposeIdentity::resolve_for_dir(
-            std::path::Path::new("/nonexistent"),
-            Some(DEFAULT_INSTANCE_NAME),
-            messages,
-        )
-        .unwrap_or_else(|_| unreachable!("an explicit identity resolves without any I/O"))
-    })
+    ComposeIdentity::resolve(compose_file, None, messages)
+        .unwrap_or_else(|_| ComposeIdentity::for_instance(DEFAULT_INSTANCE_NAME))
 }
 
 /// Builds the Docker Compose arguments for undoing the TLS override
@@ -400,12 +394,7 @@ mod rollback_tests {
 
     /// The identity a rollback falls back to when no `.env` is readable.
     fn default_rollback_identity() -> ComposeIdentity {
-        ComposeIdentity::resolve_for_dir(
-            std::path::Path::new("/nonexistent"),
-            Some(DEFAULT_INSTANCE_NAME),
-            &crate::i18n::test_messages(),
-        )
-        .expect("an explicit identity resolves without any I/O")
+        ComposeIdentity::for_instance(DEFAULT_INSTANCE_NAME)
     }
 
     /// Reads a rollback invocation's argument vector back out of the

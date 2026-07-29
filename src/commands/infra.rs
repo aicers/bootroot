@@ -2249,12 +2249,7 @@ mod tests {
     /// the process environment: an explicit name outranks everything the
     /// resolver would otherwise consult.
     fn test_identity(instance: &str) -> ComposeIdentity {
-        ComposeIdentity::resolve_for_dir(
-            Path::new("/nonexistent"),
-            Some(instance),
-            &test_messages(),
-        )
-        .expect("an explicit identity resolves without any I/O")
+        ComposeIdentity::for_instance(instance)
     }
 
     /// Reads an invocation's argument vector back out of the command it

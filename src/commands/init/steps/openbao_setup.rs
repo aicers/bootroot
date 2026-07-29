@@ -1163,8 +1163,7 @@ services:
         )
         .unwrap();
 
-        let identity = ComposeIdentity::resolve(&compose_file, Some("insight"), &test_messages())
-            .expect("identity");
+        let identity = ComposeIdentity::for_instance("insight");
         let override_path = write_openbao_agent_compose_override(
             &compose_file,
             &secrets_dir,

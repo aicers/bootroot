@@ -368,13 +368,7 @@ mod tests {
     fn recreate_args_do_not_depend_on_a_compose_delta() {
         let compose = PathBuf::from("docker-compose.yml");
         let override_path = PathBuf::from("secrets/openbao/docker-compose.openbao-exposed.yml");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let identity = ComposeIdentity::resolve_for_dir(
-            dir.path(),
-            Some("bootroot"),
-            &crate::i18n::test_messages(),
-        )
-        .expect("identity");
+        let identity = ComposeIdentity::for_instance("bootroot");
         let command = openbao_recreate_invocation(&identity, &compose, &override_path).command(&[]);
         let args: Vec<String> = command
             .get_args()
