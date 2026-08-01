@@ -21,6 +21,44 @@
 
 ## `bootroot infra up`/`bootroot init` 단계가 실패할 때
 
+### 두 번째 설치가 "orphan containers for this project"를 보고할 때
+
+증상:
+
+- 이미 bootroot가 동작 중인 호스트에서 `bootroot infra install`을 실행하면
+  Compose가 *첫 번째* 설치본의 컨테이너(대개 OpenBao Agent 사이드카)를
+  가리키며 "Found orphan containers ... for this project" 경고를 출력
+- 기존 `bootroot-*` 컨테이너가 두 번째 설치에 의해 재생성되고, 첫 번째
+  인스턴스의 OpenBao가 sealed 상태로 돌아오거나 비어 있거나 스토리지
+  오류를 냄
+
+원인: 두 설치본이 **같은 Compose 프로젝트**로 해석되어, Compose가 첫
+인스턴스의 컨테이너와 볼륨을 두 번째 설치본의 것으로 취급합니다. 경로는
+두 가지입니다.
+
+- 두 설치본이 하나의 compose 디렉터리를 공유해 같은 `.env`와 같은
+  `BOOTROOT_INSTANCE`를 읽는 경우
+- 셸에 `COMPOSE_PROJECT_NAME`이 내보내져 있는 경우. 이 값은 기록된
+  `BOOTROOT_INSTANCE`보다 우선하므로, 각 `.env`에 무엇이 적혀 있든 두
+  설치본이 모두 그 하나의 프로젝트에 놓입니다.
+
+해결:
+
+- 각 설치본에 서로 다른
+  `bootroot infra install --instance-name <name>`과 자체 compose
+  디렉터리(자체 `.env`, `secrets/`, 생성된 오버라이드)를 주세요.
+  [두 번째 인스턴스를 같은 호스트에 배치하기](installation.md#_3)를
+  참고하세요.
+- 두 설치본을 다루기 전에 `unset COMPOSE_PROJECT_NAME`을 실행하세요.
+- 결과 확인: `docker inspect --format
+  '{{index .Config.Labels "com.docker.compose.project"}}' <name>-openbao`가
+  해당 인스턴스 이름을 출력해야 하며, 두 설치본의 컨테이너 이름, 볼륨
+  이름, 프로젝트 라벨이 겹치지 않아야 합니다.
+
+`-p` 없이 `docker compose down`을 실행해 복구하려 하지 마세요. 디렉터리
+이름에서 유추한 프로젝트를 대상으로 삼게 되므로 같은 실수를 반대 방향으로
+반복하는 셈입니다.
+
 ### OpenBao 관련
 
 - OpenBao가 `sealed` 상태인지 확인하고, 필요 시 unseal 후 재시도

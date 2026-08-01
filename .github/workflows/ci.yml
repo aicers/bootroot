@@ -425,6 +425,10 @@ jobs:
             script: run-openbao-tls-reown.sh
             resolution: ""
             artifact: ci-openbao-tls-reown
+          - label: two-instance
+            script: run-two-instance-isolation.sh
+            resolution: ""
+            artifact: ci-two-instance
     steps:
       - uses: actions/checkout@v7
 
@@ -441,7 +445,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Local arms run the daemon-only model: every service agent is
@@ -567,6 +571,33 @@ jobs:
             done
             [ -f "$ARTIFACT_DIR/openbao-tls-ownership.log" ] && cat "$ARTIFACT_DIR/openbao-tls-ownership.log" || true
             [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
+            exit 1
+          }
+
+      - name: Run E2E scenario (two-instance isolation)
+        if: matrix.scenario.label == 'two-instance'
+        # Deliberately no COMPOSE_PROJECT_NAME: this scenario resolves
+        # each instance's project from that instance's own `.env`, and a
+        # caller-supplied project would collapse both installs into one.
+        # The script derives its own run-scoped instance names from
+        # GITHUB_RUN_ID and picks free host ports itself.
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          ./scripts/impl/run-two-instance-isolation.sh || {
+            echo "two-instance failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
+            for f in "$ARTIFACT_DIR"/init-*.raw.log; do
+              [ -f "$f" ] && { echo "--- $(basename "$f") ---"; tail -n 120 "$f"; } || true
+            done
+            for f in "$ARTIFACT_DIR"/compose-logs-*.log; do
+              [ -f "$f" ] && { echo "--- $(basename "$f") ---"; tail -n 120 "$f"; } || true
+            done
+            for f in "$ARTIFACT_DIR"/snapshots/*.diff; do
+              [ -f "$f" ] && { echo "--- $(basename "$f") ---"; cat "$f"; } || true
+            done
             exit 1
           }
 

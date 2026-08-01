@@ -69,6 +69,8 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - step-ca 인증서 SAN
 - compose 델타 없는 OpenBao TLS 전환
 - `secrets/` 소유자 변경 이후 OpenBao TLS 인증서 재발급
+- 같은 호스트의 두 인스턴스가 서로 독립적으로 유지되는지(설치,
+  컨테이너, 볼륨, 게시 포트, HTTP-01 리스폰더 DNS 별칭)
 
 주요 스크립트:
 
@@ -79,6 +81,16 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `scripts/impl/run-stepca-san.sh`
 - `scripts/impl/run-openbao-tls-no-delta.sh`
 - `scripts/impl/run-openbao-tls-reown.sh`
+- `scripts/impl/run-two-instance-isolation.sh`
+
+`run-two-instance-isolation.sh`는 매트릭스 시나리오 가운데 유일하게
+`COMPOSE_PROJECT_NAME`을 전달받지 **않는** 시나리오입니다. basename이
+같은 두 compose 디렉터리에 두 인스턴스를 설치하고 각 인스턴스의 Compose
+프로젝트를 그 인스턴스 자신의 `.env`에서 해석해야 하므로, 호출자가
+프로젝트 이름을 넘기면 두 인스턴스가 하나로 합쳐집니다. 실행마다
+고유한 `--instance-name` 값을 스스로 만들고 비어 있는 호스트 포트도
+직접 고르며, 모든 정리와 잔여물 확인이 그 이름들로만 한정되므로 기본
+`bootroot` 설치본이 이미 있는 호스트에서도 안전하게 실행할 수 있습니다.
 
 확장 워크플로는 다음을 검증합니다.
 

@@ -235,6 +235,56 @@ is a set of defaults, not a requirement, and two bootroot instances can share a
 host: the shipped compose files derive their container names from the recorded
 `--instance-name`, so the second instance needs no compose file of its own.
 
+### Co-Locating a Second Instance
+
+"No compose file of its own" means no *hand-modified* compose file — not that
+two installs can share one directory. Each instance needs its own compose
+directory holding a copy of the shipped compose file, because everything that
+makes an install distinct lives beside it:
+
+- `.env`, and with it the recorded `BOOTROOT_INSTANCE` that names the Compose
+  project and every container, plus that instance's `POSTGRES_PASSWORD` and its
+  `*_HOST_PORT` entries;
+- `secrets/`, the CA material, rendered config and AppRole credentials that
+  step-ca and the OpenBao Agent sidecars bind-mount;
+- the generated overrides (`secrets/openbao/`, `secrets/responder/`) that
+  `bootroot infra install` and `bootroot init` write.
+
+The compose file also resolves `./openbao`, `./secrets` and
+`./responder.toml.compose` relative to its own directory, so a second directory
+needs `openbao/openbao.hcl` and `responder.toml.compose` alongside the compose
+file. Two installs pointed at one directory would share all of the above and
+land in the same Compose project — the failure this identity exists to prevent.
+
+A minimal second instance therefore looks like:
+
+```bash
+mkdir -p /srv/insight/openbao
+cp docker-compose.yml /srv/insight/
+cp openbao/openbao.hcl /srv/insight/openbao/
+cp responder.toml.compose /srv/insight/
+cd /srv/insight
+bootroot infra install --instance-name insight \
+  --postgres-host-port 5434 --openbao-host-port 8201 \
+  --stepca-host-port 9001 --http01-admin-host-port 8081
+bootroot init --secrets-dir secrets --responder-url http://127.0.0.1:8081
+```
+
+Run every command for an instance from that instance's own directory.
+`bootroot` resolves `state.json` against the process working directory — the
+bare relative path `state.json`, with no `--state-file` override on
+`bootroot service add` — so the working directory decides which state file is
+written, which Compose project is rewired, and which OpenBao is contacted: the
+URL comes from that directory's `state.json`. Running `bootroot service add`
+from the wrong directory registers the service against the wrong instance.
+
+Finally, an exported `COMPOSE_PROJECT_NAME` outranks the recorded
+`BOOTROOT_INSTANCE` (see
+[Instance identity and the Compose project](cli.md#instance-identity-and-the-compose-project)
+for the full order). Leaving one set in a shell silently targets that project
+instead of the instance whose directory you are standing in; unset it before
+working with co-located instances.
+
 `bootroot init`, `bootroot status` and `bootroot reinit` pick up a non-default
 OpenBao host port automatically whenever `--openbao-url` is left at its default.
 step-ca and HTTP-01 client URLs are not derived from their host ports: pass
