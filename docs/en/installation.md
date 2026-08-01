@@ -256,6 +256,15 @@ needs `openbao/openbao.hcl` and `responder.toml.compose` alongside the compose
 file. Two installs pointed at one directory would share all of the above and
 land in the same Compose project — the failure this identity exists to prevent.
 
+What the second directory does *not* get is a build context. `bootroot-http01`
+in `docker-compose.yml` declares `build.context: .` with
+`docker/http01-responder/Dockerfile`, which copies the whole source tree, and
+`bootroot infra install` defaults to `docker compose up --build`. Outside a
+checkout that build has nothing to read, so install the second instance with
+`--no-build` and let it reuse the images the first install already produced:
+`--no-build` implies `--pull never`, and the first install both built
+`bootroot-http01-responder:latest` and pulled the third-party images.
+
 A minimal second instance therefore looks like:
 
 ```bash
@@ -264,7 +273,7 @@ cp docker-compose.yml /srv/insight/
 cp openbao/openbao.hcl /srv/insight/openbao/
 cp responder.toml.compose /srv/insight/
 cd /srv/insight
-bootroot infra install --instance-name insight \
+bootroot infra install --instance-name insight --no-build \
   --postgres-host-port 5434 --openbao-host-port 8201 \
   --stepca-host-port 9001 --http01-admin-host-port 8081
 bootroot init --secrets-dir secrets --responder-url http://127.0.0.1:8081

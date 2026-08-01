@@ -263,6 +263,16 @@ compose 파일은 `./openbao`, `./secrets`,
 향하게 하면 위 항목을 모두 공유하고 같은 Compose 프로젝트에 놓이게
 되는데, 이는 인스턴스 정체성이 막으려는 바로 그 장애입니다.
 
+반면 두 번째 디렉터리에 없는 것은 빌드 컨텍스트입니다.
+`docker-compose.yml`의 `bootroot-http01`은 소스 트리 전체를 복사하는
+`docker/http01-responder/Dockerfile`을 `build.context: .`로 선언하고,
+`bootroot infra install`은 기본적으로 `docker compose up --build`를
+실행합니다. 체크아웃 밖에서는 이 빌드가 읽을 것이 없으므로 두 번째
+인스턴스는 `--no-build`로 설치해 첫 번째 설치가 이미 만들어 둔 이미지를
+재사용하세요. `--no-build`는 `--pull never`를 함의하는데, 첫 번째 설치가
+`bootroot-http01-responder:latest`를 빌드하고 서드파티 이미지도 이미
+받아 두었으므로 조건이 충족됩니다.
+
 최소한의 두 번째 인스턴스 구성은 다음과 같습니다.
 
 ```bash
@@ -271,7 +281,7 @@ cp docker-compose.yml /srv/insight/
 cp openbao/openbao.hcl /srv/insight/openbao/
 cp responder.toml.compose /srv/insight/
 cd /srv/insight
-bootroot infra install --instance-name insight \
+bootroot infra install --instance-name insight --no-build \
   --postgres-host-port 5434 --openbao-host-port 8201 \
   --stepca-host-port 9001 --http01-admin-host-port 8081
 bootroot init --secrets-dir secrets --responder-url http://127.0.0.1:8081
