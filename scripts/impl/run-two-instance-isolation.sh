@@ -123,6 +123,8 @@ HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-40}"
 HEALTH_DELAY_SECS="${HEALTH_DELAY_SECS:-3}"
 SERVE_ATTEMPTS="${SERVE_ATTEMPTS:-30}"
 SERVE_DELAY_SECS="${SERVE_DELAY_SECS:-2}"
+INFRA_READY_ATTEMPTS="${INFRA_READY_ATTEMPTS:-60}"
+INFRA_READY_DELAY_SECS="${INFRA_READY_DELAY_SECS:-2}"
 
 CURRENT_PHASE="startup"
 RUN_ROOT=""
@@ -377,9 +379,48 @@ install_instance() {
     >>"$RUN_LOG" 2>&1 || fail "infra install failed for instance ${name}"
 }
 
+# `infra install` returns once every container reports `running`, which
+# is not the same as the servers inside them accepting connections.
+# `bootroot init` opens with a single-shot `OpenBao` health check and a
+# single-shot database connect — neither retries on `Connection refused`
+# — so the wait belongs here, as it does in every other `scripts/impl/`
+# script.  Both probes are scoped to this instance's own container and
+# its own published port.
+wait_for_openbao_listening() {
+  local name="$1" port="$2" attempt code
+  for attempt in $(seq 1 "$INFRA_READY_ATTEMPTS"); do
+    code="$(curl -kSs -o /dev/null -w '%{http_code}' -m 3 \
+      "http://127.0.0.1:${port}/v1/sys/seal-status" 2>/dev/null || true)"
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+      return 0
+    fi
+    sleep "$INFRA_READY_DELAY_SECS"
+  done
+  docker logs "${name}-openbao" >>"$RUN_LOG" 2>&1 || true
+  fail "instance ${name}'s OpenBao did not answer on port ${port} before init"
+}
+
+wait_for_postgres_admin() {
+  local name="$1" port="$2" attempt
+  for attempt in $(seq 1 "$INFRA_READY_ATTEMPTS"); do
+    # Probe over TCP as well: the initdb bootstrap server listens only on
+    # the Unix socket, so a socket-based `pg_isready` reports ready before
+    # the final server — the one init connects to — is up.
+    if docker exec "${name}-postgres" pg_isready -h 127.0.0.1 -U step -d postgres >/dev/null 2>&1 &&
+      bash -c ": >/dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$INFRA_READY_DELAY_SECS"
+  done
+  docker logs "${name}-postgres" >>"$RUN_LOG" 2>&1 || true
+  fail "instance ${name}'s PostgreSQL did not accept connections on port ${port} before init"
+}
+
 init_instance() {
-  local name="$1" dir="$2" http01="$3"
+  local name="$1" dir="$2" pg="$3" bao="$4" http01="$5"
   log_phase "init-${name}"
+  wait_for_postgres_admin "$name" "$pg"
+  wait_for_openbao_listening "$name" "$bao"
   log "initialising instance ${name}"
   local raw_log="$ARTIFACT_DIR/init-${name}.raw.log"
   # Non-interactive: every prompt has its own flag and stdin is closed.
@@ -909,7 +950,8 @@ main() {
 
   install_instance "$INSTANCE_A" "$DIR_A" \
     "$PORT_A_POSTGRES" "$PORT_A_OPENBAO" "$PORT_A_STEPCA" "$PORT_A_HTTP01"
-  init_instance "$INSTANCE_A" "$DIR_A" "$PORT_A_HTTP01"
+  init_instance "$INSTANCE_A" "$DIR_A" \
+    "$PORT_A_POSTGRES" "$PORT_A_OPENBAO" "$PORT_A_HTTP01"
 
   log_phase "assert-a-installed"
   wait_for_instance_healthy "$INSTANCE_A" "$DIR_A" "after-init"
@@ -938,7 +980,8 @@ main() {
     "$SNAPSHOT_DIR/sentinels-${INSTANCE_A}.txt" "after-b-install"
   wait_for_instance_healthy "$INSTANCE_A" "$DIR_A" "after-b-install"
 
-  init_instance "$INSTANCE_B" "$DIR_B" "$PORT_B_HTTP01"
+  init_instance "$INSTANCE_B" "$DIR_B" \
+    "$PORT_B_POSTGRES" "$PORT_B_OPENBAO" "$PORT_B_HTTP01"
 
   log_phase "assert-b-installed"
   wait_for_instance_healthy "$INSTANCE_B" "$DIR_B" "after-init"

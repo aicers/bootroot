@@ -930,8 +930,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- `scripts/impl/run-two-instance-isolation.sh`, a real-daemon Docker E2E
-  scenario that installs, initialises and verifies two bootroot
+- `scripts/impl/run-two-instance-isolation.sh` (driven by
+  `tests/docker_e2e_two_instance_isolation.rs`), a real-daemon Docker
+  E2E scenario that installs, initialises and verifies two bootroot
   instances on one host and proves they stay independent. The existing
   instance-identity coverage drives a fake `docker` on `PATH` and
   asserts on its argv, which is the wrong level of abstraction for a
