@@ -262,15 +262,23 @@ s.close()')"
   fail "could not allocate a free host port after 200 attempts"
 }
 
+# Allocated per instance immediately before that instance's install.  The
+# bind-to-port-0 result is advisory — the port is free at that instant,
+# not reserved — so the shorter the gap between the pick and `infra
+# install`'s own bind, the smaller the chance an unrelated process claims
+# it in between.  Instance B installs minutes after instance A, which is
+# why the two allocations are not batched.  `PORTS_TAKEN` keeps the later
+# allocation clear of the ports the earlier instance already holds.
 allocate_ports() {
-  local var
-  for var in PORT_A_POSTGRES PORT_A_OPENBAO PORT_A_STEPCA PORT_A_HTTP01 \
-    PORT_B_POSTGRES PORT_B_OPENBAO PORT_B_STEPCA PORT_B_HTTP01; do
+  local side="$1" var suffix
+  for suffix in POSTGRES OPENBAO STEPCA HTTP01; do
+    var="PORT_${side}_${suffix}"
     pick_free_port
     printf -v "$var" '%s' "$PICKED_PORT"
   done
-  log "instance A ports: postgres=${PORT_A_POSTGRES} openbao=${PORT_A_OPENBAO} stepca=${PORT_A_STEPCA} http01=${PORT_A_HTTP01}"
-  log "instance B ports: postgres=${PORT_B_POSTGRES} openbao=${PORT_B_OPENBAO} stepca=${PORT_B_STEPCA} http01=${PORT_B_HTTP01}"
+  local pg="PORT_${side}_POSTGRES" bao="PORT_${side}_OPENBAO"
+  local ca="PORT_${side}_STEPCA" http01="PORT_${side}_HTTP01"
+  log "instance ${side} ports: postgres=${!pg} openbao=${!bao} stepca=${!ca} http01=${!http01}"
 }
 
 # ---------------------------------------------------------------------------
@@ -319,6 +327,11 @@ prepull_third_party_images() {
     docker compose -p "$INSTANCE_A" -f "$DIR_A/$COMPOSE_FILE_NAME" \
     pull openbao postgres step-ca >>"$RUN_LOG" 2>&1 ||
     fail "failed to pre-pull the third-party images"
+  # Resolved here, before the first install, so `remove_run_root`'s chown
+  # fallback can still reach an image when the run fails early — by the
+  # time cleanup runs, the containers it would otherwise be read off are
+  # gone.
+  resolve_helper_image
 }
 
 create_run_root() {
@@ -638,9 +651,22 @@ snapshot_volume_metadata() {
   [ -s "$out" ] || fail "no volumes found for project ${project}"
 }
 
+# Read off the compose file rather than off a running container: the same
+# image the run's own stack uses, but known from before the first install
+# and still known after the last container is gone, which is what the
+# cleanup chown fallback needs.  The two placeholder passwords only
+# satisfy the compose file's `:?` guards; `config` starts nothing.
 resolve_helper_image() {
   [ -n "$HELPER_IMAGE" ] && return 0
-  HELPER_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${INSTANCE_A}-openbao" 2>/dev/null || true)"
+  HELPER_IMAGE="$(POSTGRES_PASSWORD=resolve-only GRAFANA_ADMIN_PASSWORD=resolve-only \
+    BOOTROOT_INSTANCE="$INSTANCE_A" \
+    docker compose -p "$INSTANCE_A" -f "$DIR_A/$COMPOSE_FILE_NAME" \
+    config --images openbao 2>/dev/null | head -n 1)" || true
+  # Falls back to a running container so a `config` that cannot render
+  # (or that `pipefail` trips on `head` closing the pipe) is recoverable
+  # rather than fatal.
+  [ -n "$HELPER_IMAGE" ] ||
+    HELPER_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${INSTANCE_A}-openbao" 2>/dev/null || true)"
   [ -n "$HELPER_IMAGE" ] || fail "could not resolve an image for the sentinel containers"
 }
 
@@ -667,10 +693,8 @@ volume_sentinel_read() {
 
 seed_volume_sentinels() {
   local project="$1" out="$2" volume
-  # Resolved here, in the caller's own shell, so the cleanup chown
-  # fallback can still reach the image after the run's containers are
-  # gone; the read path resolves inside a command substitution and would
-  # only ever set it in a subshell.
+  # Resolved in the caller's own shell: the read path resolves inside a
+  # command substitution and would only ever set the global in a subshell.
   resolve_helper_image
   : >"$out"
   while IFS= read -r volume; do
@@ -955,8 +979,8 @@ main() {
   build_responder_image
   create_run_root
   prepull_third_party_images
-  allocate_ports
 
+  allocate_ports A
   install_instance "$INSTANCE_A" "$DIR_A" \
     "$PORT_A_POSTGRES" "$PORT_A_OPENBAO" "$PORT_A_STEPCA" "$PORT_A_HTTP01"
   init_instance "$INSTANCE_A" "$DIR_A" \
@@ -978,6 +1002,7 @@ main() {
   # dotfile must surface here rather than as a confusing later failure.
   wait_for_instance_healthy "$INSTANCE_A" "$DIR_A" "after-sentinels"
 
+  allocate_ports B
   install_instance "$INSTANCE_B" "$DIR_B" \
     "$PORT_B_POSTGRES" "$PORT_B_OPENBAO" "$PORT_B_STEPCA" "$PORT_B_HTTP01"
 
@@ -999,6 +1024,10 @@ main() {
   assert_instance_serving "$INSTANCE_B" "$PORT_B_OPENBAO" "$PORT_B_STEPCA" \
     "$PORT_B_HTTP01" "after-init"
   wait_for_instance_healthy "$INSTANCE_A" "$DIR_A" "after-b-init"
+  # Re-asserted with both instances up: this is the co-located state the
+  # criterion is about, and the check A got before B existed could not
+  # observe a cross-instance mix-up.
+  assert_openbao_publication "$INSTANCE_A" "$PORT_A_OPENBAO"
 
   assert_instances_disjoint
 

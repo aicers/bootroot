@@ -9,7 +9,7 @@ PR-critical CI (`.github/workflows/ci.yml`) runs:
 
 - `test-core`: unit/integration smoke path
 - `test-docker-e2e-matrix`: Docker E2E test set for end-to-end flow +
-  rotation/recovery (8 scenarios run in parallel via matrix strategy)
+  rotation/recovery (10 scenarios run in parallel via matrix strategy)
 
 Extended E2E (`.github/workflows/e2e-extended.yml`) runs separately:
 
