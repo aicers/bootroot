@@ -727,7 +727,13 @@ assert_volumes_unchanged() {
 # performs — deliberately *not* the un-narrowed service-label-only lookup
 # `verify_dns_aliases` in scripts/preflight/extra/cli-scenarios.sh uses,
 # which is correct for a single-instance script and wrong here.
-responder_container_id() {
+#
+# The result travels through a global for the same reason `PICKED_PORT`
+# does: inside a command substitution `fail`'s `exit` would only leave the
+# subshell, so a missing or ambiguous responder would print its diagnosis
+# and then let the run carry on against an empty container id.
+RESPONDER_ID=""
+resolve_responder_container() {
   local project="$1" ids count
   ids="$(docker ps -q \
     -f "label=com.docker.compose.service=bootroot-http01" \
@@ -736,7 +742,7 @@ responder_container_id() {
   if [ "$count" != "1" ]; then
     fail "expected exactly one responder for project ${project}, found ${count}"
   fi
-  printf '%s' "$ids"
+  RESPONDER_ID="$ids"
 }
 
 # The engine adds the container's own short ID to the alias set; it is
@@ -753,7 +759,8 @@ responder_aliases() {
 
 snapshot_responder_aliases() {
   local project="$1" label="$2"
-  responder_aliases "$(responder_container_id "$project")" \
+  resolve_responder_container "$project"
+  responder_aliases "$RESPONDER_ID" \
     >"$SNAPSHOT_DIR/aliases-${project}-${label}.txt"
 }
 
@@ -803,8 +810,10 @@ assert_alias_containment() {
   local after_rewired="$SNAPSHOT_DIR/aliases-${rewired}-after-${round}.txt"
   local after_other="$SNAPSHOT_DIR/aliases-${other}-after-${round}.txt"
 
-  responder_aliases "$(responder_container_id "$rewired")" >"$after_rewired"
-  responder_aliases "$(responder_container_id "$other")" >"$after_other"
+  resolve_responder_container "$rewired"
+  responder_aliases "$RESPONDER_ID" >"$after_rewired"
+  resolve_responder_container "$other"
+  responder_aliases "$RESPONDER_ID" >"$after_other"
 
   local gained
   gained="$(LC_ALL=C comm -13 "$before_rewired" "$after_rewired" | grep -v '^$' || true)"
