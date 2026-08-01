@@ -23,6 +23,7 @@ Runs the same Docker E2E matrix steps used in CI:
 7) step-ca certificate SANs
 8) OpenBao TLS transition with no compose delta
 9) OpenBao TLS re-issuance after secrets/ is re-owned
+10) two co-located instances stay independent
 
 Options:
   --skip-hosts  Skip hosts steps (useful when sudo -n is unavailable locally)
@@ -185,6 +186,16 @@ SECRETS_DIR="$ROOT_DIR/secrets" \
 BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 "$ROOT_DIR/scripts/impl/run-openbao-tls-reown.sh"
 
+# No COMPOSE_PROJECT_NAME here, unlike the scenarios above: this one has
+# to resolve each instance's project from that instance's own `.env`, and
+# a caller-supplied project name would collapse both instances into one.
+# The script derives its own run-scoped instance names and picks free
+# host ports itself, so it needs no port or secrets wiring either.
+echo "[ci-local-e2e] run two-instance isolation (issue #747)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-two-instance-${RUN_ID}" \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+"$ROOT_DIR/scripts/impl/run-two-instance-isolation.sh"
+
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}"
@@ -196,3 +207,4 @@ echo "  - $ROOT_DIR/tmp/e2e/ci-reinit-recovery-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-stepca-san-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-openbao-tls-no-delta-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-openbao-tls-reown-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-two-instance-${RUN_ID}"

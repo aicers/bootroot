@@ -21,6 +21,43 @@ The most common cause is mixing flags across binaries.
 
 ## `bootroot infra up` / `bootroot init` failures
 
+### A second install reports "orphan containers for this project"
+
+Symptoms:
+
+- `bootroot infra install` on a host that already runs bootroot prints
+  Compose's "Found orphan containers ... for this project" warning, naming
+  the *first* install's containers (typically its OpenBao Agent sidecars)
+- an existing `bootroot-*` container is recreated by the second install, and
+  the first instance's OpenBao comes back sealed, empty, or complaining about
+  its storage
+
+Cause: both installs resolved to the **same Compose project**, so Compose
+treats the first instance's containers and volumes as belonging to the second.
+There are two ways to get there:
+
+- both installs share one compose directory, so both read the same `.env` and
+  the same recorded `BOOTROOT_INSTANCE`;
+- a `COMPOSE_PROJECT_NAME` is exported in the shell. It outranks the recorded
+  `BOOTROOT_INSTANCE`, so both installs land in that one project no matter what
+  each `.env` says.
+
+Fix:
+
+- give each install a distinct `bootroot infra install --instance-name <name>`
+  and its own compose directory (its own `.env`, `secrets/`, and generated
+  overrides). See
+  [Co-Locating a Second Instance](installation.md#co-locating-a-second-instance).
+- `unset COMPOSE_PROJECT_NAME` before running anything against either install.
+- Confirm the result: `docker inspect --format
+  '{{index .Config.Labels "com.docker.compose.project"}}' <name>-openbao`
+  must print that instance's own name, and the two installs' container names,
+  volume names and project labels must not overlap.
+
+Do not try to recover by running `docker compose down` without `-p`: it would
+target whatever project Compose infers from the directory name, which is the
+same mistake in the other direction.
+
 ### OpenBao failures
 
 - Check whether OpenBao is still `sealed` and unseal if needed

@@ -930,6 +930,34 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `scripts/impl/run-two-instance-isolation.sh` (driven by
+  `tests/docker_e2e_two_instance_isolation.rs`), a real-daemon Docker
+  E2E scenario that installs, initialises and verifies two bootroot
+  instances on one host and proves they stay independent. The existing
+  instance-identity coverage drives a fake `docker` on `PATH` and
+  asserts on its argv, which is the wrong level of abstraction for a
+  defect that only manifests with two live Compose projects on one
+  daemon. The script installs into two compose directories that share a
+  basename under different parents — the layout Compose would otherwise
+  derive one default project name from — and asserts, individually, that
+  A's container IDs and volumes survive B's install and teardown
+  (`docker volume inspect` metadata plus a per-run sentinel written into
+  each volume, because a recreated volume reappears under the same
+  name), that the two instances' container names, volume names and
+  `com.docker.compose.project` labels are disjoint, that each instance's
+  published OpenBao port belongs to its own `<instance>-openbao`, and
+  that `service add` on one instance rewires only that instance's
+  HTTP-01 responder aliases — the one cross-instance path that would not
+  announce itself as a Docker name conflict, since both responders carry
+  the same compose service label by design. It sanitises inherited
+  `COMPOSE_PROJECT_NAME` / `BOOTROOT_INSTANCE` and then asserts each
+  resolved project, so an ambient value can neither break the run nor
+  silently reduce it to a single-instance test. Instance names are
+  run-scoped and every teardown and leftover check is driven off those
+  exact names, so the script is safe on a host that already has a
+  default `bootroot` install. Wired into
+  `scripts/preflight/ci/e2e-matrix.sh` and the `test-docker-e2e-matrix`
+  CI job. (Closes #747)
 - `bootroot infra install --instance-name <name>` gives an install an
   explicit identity and threads it through every `docker compose`
   invocation as `-p <name>`, so two installs on one host stop sharing a

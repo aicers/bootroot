@@ -240,6 +240,68 @@ bootroot 인스턴스가 한 호스트를 공유할 수 있습니다. 배포되�
 파일이 기록된 `--instance-name`에서 컨테이너 이름을 유도하므로 두 번째
 인스턴스에 별도의 compose 파일은 필요하지 않습니다.
 
+### 두 번째 인스턴스를 같은 호스트에 배치하기
+
+"별도의 compose 파일이 필요하지 않다"는 것은 *직접 수정한* compose
+파일이 필요 없다는 뜻이며, 두 설치본이 하나의 디렉터리를 공유해도
+된다는 뜻이 아닙니다. 각 인스턴스는 배포된 compose 파일 사본을 담은
+자체 compose 디렉터리가 필요합니다. 설치본을 구분 짓는 요소가 모두
+compose 파일 옆에 놓이기 때문입니다.
+
+- `.env`. Compose 프로젝트와 모든 컨테이너 이름을 결정하는
+  `BOOTROOT_INSTANCE`, 해당 인스턴스의 `POSTGRES_PASSWORD`,
+  `*_HOST_PORT` 항목이 여기에 기록됩니다.
+- `secrets/`. step-ca와 OpenBao Agent 사이드카가 bind-mount하는 CA
+  자재, 렌더링된 설정, AppRole 자격 증명이 들어 있습니다.
+- `bootroot infra install`과 `bootroot init`이 생성하는 오버라이드
+  (`secrets/openbao/`, `secrets/responder/`).
+
+compose 파일은 `./openbao`, `./secrets`,
+`./responder.toml.compose`를 자신의 디렉터리 기준으로 해석하므로 두 번째
+디렉터리에는 compose 파일과 함께 `openbao/openbao.hcl`과
+`responder.toml.compose`도 있어야 합니다. 두 설치본을 한 디렉터리로
+향하게 하면 위 항목을 모두 공유하고 같은 Compose 프로젝트에 놓이게
+되는데, 이는 인스턴스 정체성이 막으려는 바로 그 장애입니다.
+
+반면 두 번째 디렉터리에 없는 것은 빌드 컨텍스트입니다.
+`docker-compose.yml`의 `bootroot-http01`은 소스 트리 전체를 복사하는
+`docker/http01-responder/Dockerfile`을 `build.context: .`로 선언하고,
+`bootroot infra install`은 기본적으로 `docker compose up --build`를
+실행합니다. 체크아웃 밖에서는 이 빌드가 읽을 것이 없으므로 두 번째
+인스턴스는 `--no-build`로 설치해 첫 번째 설치가 이미 만들어 둔 이미지를
+재사용하세요. `--no-build`는 `--pull never`를 함의하는데, 첫 번째 설치가
+`bootroot-http01-responder:latest`를 빌드하고 서드파티 이미지도 이미
+받아 두었으므로 조건이 충족됩니다.
+
+최소한의 두 번째 인스턴스 구성은 다음과 같습니다.
+
+```bash
+mkdir -p /srv/insight/openbao
+cp docker-compose.yml /srv/insight/
+cp openbao/openbao.hcl /srv/insight/openbao/
+cp responder.toml.compose /srv/insight/
+cd /srv/insight
+bootroot infra install --instance-name insight --no-build \
+  --postgres-host-port 5434 --openbao-host-port 8201 \
+  --stepca-host-port 9001 --http01-admin-host-port 8081
+bootroot init --secrets-dir secrets --responder-url http://127.0.0.1:8081
+```
+
+각 인스턴스의 명령은 반드시 해당 인스턴스의 디렉터리에서 실행하세요.
+bootroot는 `state.json`을 프로세스 작업 디렉터리 기준으로 해석합니다
+(`state.json`이라는 상대 경로 그대로이며, `bootroot service add`에는
+`--state-file` 옵션이 없습니다). 따라서 작업 디렉터리가 어떤 상태
+파일에 기록할지, 어떤 Compose 프로젝트를 재구성할지, 어떤 OpenBao에
+접속할지를 모두 결정합니다. OpenBao URL도 그 디렉터리의 `state.json`에서
+가져오기 때문입니다. 잘못된 디렉터리에서 `bootroot service add`를
+실행하면 서비스가 다른 인스턴스에 등록됩니다.
+
+마지막으로, 내보낸 `COMPOSE_PROJECT_NAME`은 기록된
+`BOOTROOT_INSTANCE`보다 우선합니다(전체 우선순위는 [CLI](cli.md)의
+"인스턴스 정체성과 Compose 프로젝트" 절 참고). 셸에 값이 남아 있으면
+현재 서 있는 디렉터리의 인스턴스가 아니라 그 프로젝트를 조용히
+대상으로 삼으므로, 같은 호스트의 여러 인스턴스를 다루기 전에 해제하세요.
+
 `--openbao-url`을 기본값으로 두면 `bootroot init`, `bootroot status`,
 `bootroot reinit`이 기본값이 아닌 OpenBao 호스트 포트를 자동으로
 반영합니다. step-ca와 HTTP-01 클라이언트 URL은 호스트 포트에서
