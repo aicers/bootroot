@@ -32,9 +32,19 @@ compromise into fleet-wide identity minting. RFC-A §6 flags closing this a
 3. it makes the guarantee a **v1 acceptance criterion** with a concrete
    red-team test (§6).
 
-Nothing here changes bootroot's install-time behavior or its existing
-`service add`/`service remove` code paths; it constrains only the
-**runtime** credential the registrar authenticates with.
+It then carries a **second, independent** bootroot change the same runtime
+path needs (§5.5): today `service_name` is both the SAN's service label and
+the sole key of every per-service namespace bootroot owns, which allows a
+component exactly **one** registration deployment-wide. Modules are
+installed per host and may run several instances on one host, so the
+namespace key is split out as **`registration_id`** and the label is left
+plain.
+
+The confinement work (§3–§4, §5.1–§5.4) does not change bootroot's
+install-time behaviour; it constrains only the **runtime** credential the
+registrar authenticates with. The `registration_id` split (§5.5) does touch
+the existing `service add` / `service remove` paths, but is arranged to
+default to today's behaviour so existing registrations need no migration.
 
 ## 2. Current state (grounded, `origin/main` @ `36d61e9`)
 
@@ -262,36 +272,58 @@ These are defense-in-depth **around** the guarantee, not a substitute for it
 ### 5.1 Restricted registrar mint verb
 
 A **restricted, idempotent registrar mint verb** — input
-`(service_name, host, delivery_mode, wrap_ttl, spec)`, output the wrapped
-`BootstrapMaterial`; internally runs the existing `ensure_service_approle`
-derivation under a bootroot-internal privileged credential. The
-`service_name` on the wire is the **`<component>-<host>` identity**
-(e.g. `piglet-host1`, `roxyd-newhost`) — a **single DNS label**; the verb
-**rejects any `service_name` that is not a valid single DNS label** and
-rejects (or has no way to express) a caller-named policy/role body.
-**DNS-label validity is necessary but not sufficient — the verb MUST also
-re-derive the label from the supplied `host` and reject a mismatch.**
-`service_name` and `host` arrive as **independent** wire fields, and nothing
-else ties them together: the collision check below compares the requesting
-`host` against the identity's **stored** host, and that stored value is
-simply whatever the *first* mint supplied. So a buggy or compromised REView
-sending `{ service_name: "piglet-h1", host: "h2" }` mints cleanly and binds
-`piglet-h1 → h2` — after which h1 can **never** install piglet
-(`ServiceNameCollision` forever) and the teardown for h1's label is refused
-with `ServiceHostMismatch`, which REView reads as "this host owns nothing"
-and **discharges**, so the bogus identity is never cleaned up. Therefore the
-verb recomputes `<component>-<flatten(host)>` from the supplied `host` and
-rejects a mismatch with a distinct error **before** the collision check.
-**The flattening rule is defined once, in RFC-A §4, and both sides
-reference it** — REView derives the label with it and the registrar
-re-derives with it; two independent implementations of the flattening would
-fail *every* `Register`, so it must not be restated per repo.
-The verb **also
-rejects a `service_name` whose derived `<component>-<host>` label collides
-with a *different* already-registered host** (the flattening of a hostname
-into a dot-free label is not injective — `h.dc1`/`h.dc2`→`h`, `a.b-c`/
-`a-b.c`→`a-b-c` — RFC-A §4), so two distinct hosts can never be re-issued
-**one** identity. This collision check has three hard requirements, because
+`(service_name, host, instance, delivery_mode, wrap_ttl, spec)`, output the
+wrapped `BootstrapMaterial`; internally runs the existing
+`ensure_service_approle` derivation under a bootroot-internal privileged
+credential.
+
+**[DECISION] The caller supplies the identity's PARTS; the verb derives the
+names.** `service_name` on the wire is the component's **plain keyword**
+(`piglet`, `roxyd`) — a single DNS label, and the verb rejects anything
+that is not one, just as it rejects (or has no way to express) a
+caller-named policy or role body. `host` is the target's single DNS label.
+`instance` is the number REView allocated for that `(component, host)`
+pair, and is absent for a component installed once per host or once per
+deployment. From those the verb **derives the `registration_id`** with
+RFC-A §4's rule and uses it as the namespace key (§5.5); the SAN it
+composes from `service_name`, `host`, `instance` and `domain`.
+
+**[DECISION] `--domain` is read from the LOCAL bootler-rendered file, never
+from the caller.** §2 shows `service add` needs it to compose the SAN, yet
+it is absent from the verb's input above. That is deliberate: the domain is
+a **deployment-wide constant** (one `network.domain` per install, RFC-A §4)
+and the caller is a semi-trusted REView. Taking it from the wire would let
+a compromised manager mint identities under a name suffix of its choosing,
+which the spec safe-set does not cover. bootler renders it onto the
+registrar host in the **same file as the per-component registration
+safe-set** (RFC-A §7), and the verb reads it there. A missing or unreadable
+file is a **hard failure**, not a default: minting under a guessed domain
+would issue a certificate no peer will ever verify. `--instance-id` is
+different — it is genuinely per-installation, so it arrives on the wire as
+`instance` and is rendered three digits zero-padded (RFC-A §4); a component
+whose class has no instance dimension takes the default `001`.
+
+**Deriving rather than accepting removes a failure mode outright.** Were
+the caller to send a composed name instead, a buggy or compromised REView
+sending `{ service_name: "piglet-h1", host: "h2" }` would mint cleanly and
+bind `piglet-h1 → h2` — after which h1 could **never** install piglet
+(`ServiceNameCollision` forever) while the teardown for h1's name was
+refused with `ServiceHostMismatch`, which REView reads as "this host owns
+nothing" and discharges, leaving the bogus identity uncleaned. With the
+composed name derived on this side, there is no caller-supplied value to
+disagree with. **The derivation is defined once, in RFC-A §4, and both
+sides reference it** — REView derives the same names for its own
+bookkeeping and the registrar re-derives them here; two independent
+implementations would fail *every* `Register`, so it must not be restated
+per repo.
+
+The verb **still rejects a derived `registration_id` already bound to a
+*different* host**, because the derivation is **not injective**: component
+names can be prefixes of one another and host labels may themselves contain
+hyphens and digits, so `aimer` on host `web-h1` and `aimer-web` on host
+`h1` — both instance 2 — derive the same `aimer-web-h1-2` (RFC-A §4). Two
+distinct installations must never be re-issued **one** identity. This
+collision check has three hard requirements, because
 the naive control flow is exploitable:
 
 - **(ordering) The collision check runs FIRST — before, and independently
@@ -302,19 +334,20 @@ the naive control flow is exploitable:
   So: probe the existing identity's **bound host**; if it is a *different*
   host, reject (`ServiceNameCollision`) and mint nothing — never fall through
   to the spec-match.
-- **(durable binding) Persist the pre-flattening `host` per identity** in the
-  per-service KV (bootroot keys the registry on the flattened `service_name`
-  alone, §2 — the very cause of the collision), so the check compares the
-  requesting `host` against the identity's **stored** original host and
-  **survives a registrar restart** (otherwise it silently degrades to
-  DNS-label-format-only).
+- **(durable binding) Persist the requesting `host` per identity** in the
+  per-service KV (bootroot keys the registry on the derived
+  `registration_id` alone, §2/§5.5 — the very cause of the collision), so
+  the check compares the requesting `host` against the identity's
+  **stored** host and **survives a registrar restart** (otherwise it
+  silently degrades to shape-validation only).
 - **(atomicity) Serialize the verb — the lock spans mint AND deregister
-  (§5.2) per `service_name`.** The collision-check-then-mint is atomic (a
-  lock, or a compare-and-set on the durable `label → host` record): two
-  concurrent `Register`s that flatten to the same label must not both probe
-  "absent" and both mint (`ensure_service_approle` is idempotent, so the
+  (§5.2) per `registration_id`.** The collision-check-then-mint is atomic (a
+  lock, or a compare-and-set on the durable `registration_id → host`
+  record): two concurrent `Register`s deriving the same `registration_id`
+  must not both probe "absent" and both mint (`ensure_service_approle` is
+  idempotent, so the
   second would otherwise succeed as an update and hand both callers material
-  for one identity). **The same per-`service_name` mutex also serializes
+  for one identity). **The same per-`registration_id` mutex also serializes
   `Deregister`**, so a `Register` and a `Deregister` for one identity never
   interleave (a remove-then-reinstall, or a cleanup-discharge `Deregister`
   racing a resume `Register`, could otherwise interleave
@@ -366,8 +399,9 @@ primary mechanism because it needs no wire change and no `.pkg` at the
 registrar.)
 **`bootroot-service-*` is an internal role/policy naming prefix, NOT the
 input contract** — bootroot derives the role/policy names
-`bootroot-service-<service_name>` itself (`service_policy_name` /
-`SERVICE_ROLE_PREFIX`, §2); the caller never sees or supplies that prefix.
+`bootroot-service-<registration_id>` itself (`service_policy_name` /
+`SERVICE_ROLE_PREFIX`, §2, now keyed on the derived id per §5.5); the caller
+never sees or supplies that prefix.
 **Idempotent re-mint on a matching spec, error on a conflicting one
 (RFC-C §5 / RFC-B §6) — reached only AFTER the collision check passes (same
 bound host):** if the service already exists **for the same host**, **compare
@@ -386,15 +420,18 @@ spec comparison is the added guard.
 
 ### 5.2 Restricted registrar deregister verb
 
-A **restricted registrar deregister verb** — input `(service_name, host)`,
-idempotent, wrapping `run_service_remove`. **It first reads the durable
-`label → host` binding and verifies `stored_host == requested_host` before
-removing anything.** This is essential because `run_service_remove` keys on
-`service_name` **alone** (`remove.rs:74`,
+A **restricted registrar deregister verb** — input
+`(service_name, host, instance)`, idempotent, wrapping
+`run_service_remove`. It derives the `registration_id` from those inputs
+exactly as the mint verb does (§5.1), then **reads the durable
+`registration_id → host` binding and verifies
+`stored_host == requested_host` before removing anything.** This is
+essential because `run_service_remove` keys on the registration name
+**alone** (`remove.rs:74`,
 `require_service_entry(&state, &args.service_name, messages)`), so a bare
 teardown would delete
-whichever host owns the label. If the label is bound to a **different** host
-— the flatten-collision the mint verb rejects (§5.1), yet which a stale
+whichever host owns it. If it is bound to a **different** host
+— the derivation collision the mint verb rejects (§5.1), yet which a stale
 onboarding `cleanup_state` could still drive a teardown for — the deregister
 is **refused with the distinct typed error `ServiceHostMismatch`** (no
 `run_service_remove`, no binding delete), so a `Deregister` for host2 can
@@ -404,9 +441,11 @@ host owns nothing) on `ServiceHostMismatch` but retry on a transient error
 (RFC-C §5, RFC-D2 §4d) — a real owed teardown is never dropped, a genuine
 refusal never loops. Only when the requested host
 **is** the bound host does it call `run_service_remove` **and** remove the
-durable `label → host` binding (`delete_kv_if_present`), so a decommissioned
-host's label is legitimately reusable. It shares the **per-`service_name`
-mutex with the mint verb** (§5.1), so a `Register` and a `Deregister` for one
+durable `registration_id → host` binding (`delete_kv_if_present`), so a
+decommissioned host's id — and, for a module, the instance number REView
+allocated — is legitimately reusable. It shares the
+**per-`registration_id` mutex with the mint verb** (§5.1), so a `Register`
+and a `Deregister` for one
 identity never interleave and the read-verify-delete is atomic under that
 mutex. (An identity **already absent** for the **matching** host is still the
 idempotent `Done` re-drive of RFC-C §5; only a **wrong-host** teardown is
@@ -433,6 +472,83 @@ derivation authority — never issued outside bootroot.
 RFC-A §6's provisioning is then adjusted: bootler provisions the registrar
 credential against **this restricted surface**, not the raw-path policy.
 
+### 5.5 Separate the namespace key from the SAN label: `registration_id`
+
+This is the **second** bootroot-owned change this RFC carries, independent
+of the confinement above. It is what lets a component be installed more
+than once.
+
+**The problem.** Today `service_name` does two jobs at once. It is the
+SAN's second label — so it wants to be the component's plain keyword,
+because REView projects `<instance>.<service>` as an agent's id and matches
+`app_name` against `"piglet"` — **and** it is the sole key of every
+per-service namespace bootroot owns (§2): the registry entry, the AppRole
+and policy names, the paths inside the policy body, the KV namespace, the
+agent-config managed-block markers, the fast-poll state filename, the
+default cert/key filenames, and the remote-bootstrap artifact directory.
+That second job demands deployment-wide uniqueness. **The two demands are
+compatible only while a component is installed exactly once.**
+
+bootler already hit this and chose the key over the label: each host's
+roxyd registers as `roxyd-<host>`, which is why roxyd's SAN reads
+`001.roxyd-h1.h1.<domain>` with the host in it twice. Modules make the
+compromise untenable — they are per-host **and** may run several instances
+on one host, so no single string satisfies both jobs.
+
+**The change.** Split the second job into a new field:
+
+- **`service_name`** keeps only the first job. It is the component's plain
+  keyword and remains the SAN label.
+- **`registration_id`** is the namespace key. **Every consumer listed in §2
+  reads it instead of `service_name`.** It is *not* a certificate field.
+
+**[DECISION] Derivation is owned by RFC-A §4, not restated here.** RFC-A §4
+is the single definition of both the `registration_id` derivation (per
+multiplicity class: `<component>` / `<component>-<host>` /
+`<component>-<host>-<instance>`) and the instance numbering it uses
+(a number scoped by `{service_name}.{hostname}`). Two implementations that
+disagreed would fail every `Register` in the fleet, and only after
+deployment, so bootroot references that rule rather than paraphrasing it.
+The **caller never supplies** `registration_id`: the mint verb derives it
+(§5.1) from the component, the host, and the instance, so there is no
+attacker-chosen value to validate.
+
+**[DECISION] `registration_id` is not a SAN segment, so it is not bound by
+the 63-octet DNS-label limit** — but it is used as an OpenBao path segment,
+an AppRole/policy name, and a filename, so it keeps the same conservative
+charset (lowercase alphanumeric and hyphen) and a bounded length.
+
+**[DECISION] Backward compatibility: `registration_id` defaults to
+`service_name`.** `ServiceEntry`'s existing optional fields already carry
+`#[serde(default)]`, so adding an `Option<String>` is state-format
+compatible, and a registration that omits it behaves exactly as today.
+Every existing singleton — `review`, `aice-web-next`, `aimer` — therefore
+keeps byte-identical OpenBao paths, AppRole and policy names, markers and
+filenames: **no migration.** The values diverge only for roxyd (whose
+`registration_id` is the string it already registers under, so its
+namespace is unchanged and only its **SAN** improves to
+`001.roxyd.h1.<domain>`, requiring a certificate re-issue) and for the
+net-new module registrations.
+
+**[DECISION] The agent profile must carry it too, and that ordering is a
+real hazard.** `bootroot-agent` builds its fast-poll KV paths from the
+profile's service name (§2), so an agent that does not know
+`registration_id` will read the **wrong** paths. `deny_unknown_fields` is
+set only on `TrustSettings` (`src/config.rs`), **not** on the profile — so
+an older agent handed a newer `agent.toml` does not fail loudly; it
+**silently ignores the field and polls the old namespace**. Therefore the
+`[[profiles]]` schema gains `registration_id` (defaulting to the profile's
+`service_name`), and for roxyd — the one existing consumer whose value
+changes — **the agent is upgraded before its configuration is rewritten**.
+Modules are net-new and have no deployed agent, so they are unaffected.
+
+**What does not change.** SAN composition still reads `service_name`,
+`hostname`, `instance_id` and `domain` (§2). REView and roxyd never see
+`registration_id`: REView identifies an agent from the certificate
+(`<instance>.<service>` scoped by host) and drives enrollment with
+`service_name`, `host` and `instance` (RFC-C §5). Nothing outside bootroot
+needs the key.
+
 ## 6. Acceptance criteria
 
 - **Red-team (the core test):** holding only the runtime registrar credential,
@@ -448,37 +564,50 @@ credential against **this restricted surface**, not the raw-path policy.
   host, which can read the daemon's internal credential directly and is
   out of scope per §4.
 - **Functionality preserved:** with the same credential, **minting a service
-  identity `<name>`** (a `<component>-<host>` DNS label, returning wrapped
-  material) succeeds and **creates the internal role/policy
-  `bootroot-service-<name>`**; deregistering it succeeds; both are idempotent
-  (re-mint / re-deregister return success, matching `run_service_remove`'s
-  `_if_present` behavior). The caller passes only `<name>`, never the
-  `bootroot-service-` prefix.
-- **Label is re-derived from `host`, not trusted from the wire:** a `Register`
-  whose `service_name` is not `<component>-<flatten(host)>` for the supplied
-  `host` is **rejected before the collision check**, with a distinct error. A
-  test drives `{ service_name: "piglet-h1", host: "h2" }` as a **first** mint
-  and asserts nothing is minted and no `label → host` binding is written — the
-  case that would otherwise permanently wedge h1's piglet install *and* leave
-  an identity that `Deregister` refuses and REView discharges (§5.1). Both
-  sides derive the label with the **single** flattening rule in RFC-A §4.
-- **Injective identity:** minting a `<component>-<host>` whose derived label
-  collides with a **different** already-registered host is **rejected** — the
+  identity** succeeds and **creates the internal role/policy
+  `bootroot-service-<registration_id>`**; deregistering it succeeds; both are
+  idempotent (re-mint / re-deregister return success, matching
+  `run_service_remove`'s `_if_present` behavior). The caller passes only the
+  identity's parts, never the `bootroot-service-` prefix.
+- **The composed names are DERIVED here, not taken from the wire (§5.1,
+  §5.5):** the verb takes `service_name` (the component's plain keyword),
+  `host` and `instance`, and computes the `registration_id` and the SAN
+  itself, so there is no caller-supplied composed name to disagree with. A
+  test asserts a `Register` carrying **no** `registration_id` and **no**
+  domain still mints under the expected id, with the SAN using the
+  locally-rendered domain and the requested instance; a second asserts that a
+  missing or unreadable rendered file **fails the mint** rather than
+  defaulting to a guessed domain. Both sides derive with the **single** rule
+  in RFC-A §4.
+- **Namespace key vs SAN label (§5.5):** every namespace in §2 — registry
+  entry, AppRole and policy names, policy-body paths, KV namespace,
+  agent-config markers, state filename, default cert/key filenames,
+  remote-bootstrap artifact directory — is keyed on `registration_id`, while
+  the SAN's service label is the plain `service_name`. Tests: **two instances
+  of one component on one host** get distinct registry entries, AppRoles,
+  policies, KV namespaces, state filenames and cert/key paths, and distinct
+  SANs differing only in the instance label; **a registration that omits
+  `registration_id` behaves exactly as today**, so an existing singleton's
+  paths and names are byte-identical (no migration).
+- **Injective identity:** minting a derived `registration_id` that collides
+  with a **different** already-registered host is **rejected** — the
   collision check runs **before** the spec-match, compares against a **durable
   per-identity bound host** (survives registrar restart), and the mint verb is
-  **serialized** so concurrent colliding onboards cannot both mint. Tests cover
-  (a) two hostnames that flatten to the same label onboarded **sequentially**
-  (second refused), (b) the same **concurrently** (exactly one succeeds), and
-  (c) a **restart** between the two (second still refused). A re-mint from the
-  **same** host still succeeds (crash-resume unaffected). **Deregister is
-  host-verified:** it reads the durable `label → host` binding and **refuses**
-  when `requested_host != stored_host` (no `run_service_remove`, no binding
-  delete, §5.2), so a cleanup `Deregister` for a *colliding* host2 can never tear
-  down host1's identity; only a matching host removes the identity and the
-  `label → host` binding (making the label reusable). A test drives
-  `Deregister(service_name, host2)` against a label bound to host1 and asserts it
-  is **refused** and host1's identity survives.
-- **Mint/deregister serialization:** the per-`service_name` mutex spans both
+  **serialized** so concurrent colliding registrations cannot both mint. Tests
+  cover the genuinely non-injective case — `aimer` on host `web-h1` versus
+  `aimer-web` on host `h1`, both instance 2, which derive the same
+  `aimer-web-h1-2` — (a) **sequentially** (second refused), (b)
+  **concurrently** (exactly one succeeds), and (c) with a **restart** between
+  the two (second still refused). A re-mint from the **same** host still
+  succeeds (crash-resume unaffected). **Deregister is host-verified:** it
+  reads the durable `registration_id → host` binding and **refuses** when
+  `requested_host != stored_host` (no `run_service_remove`, no binding delete,
+  §5.2), so a cleanup `Deregister` for a *colliding* host2 can never tear down
+  host1's identity; only a matching host removes the identity and the binding
+  (making the id, and a module's instance number, reusable). A test drives a
+  wrong-host `Deregister` against an id bound to host1 and asserts it is
+  **refused** and host1's identity survives.
+- **Mint/deregister serialization:** the per-`registration_id` mutex spans both
   verbs — a **concurrent `Register` + `Deregister` of the same identity** never
   interleaves into a half-existing identity (role without trust material, or a
   `secret_id` minted on a role being torn down); a red-team test drives both
@@ -517,12 +646,25 @@ credential against **this restricted surface**, not the raw-path policy.
 
 Self-contained issues; dependency order:
 
+0. **The `registration_id` split** (§5.5) — add the field to `ServiceEntry`
+   (`Option<String>`, defaulting to `service_name`) and move **every**
+   namespace listed in §2 onto it: registry key, AppRole and policy names,
+   the policy body's KV paths, the KV namespace, the agent-config managed
+   block markers, the fast-poll state filename, the default cert/key
+   filenames, and the remote-bootstrap artifact directory. Add the matching
+   `[[profiles]]` field so `bootroot-agent` polls the right namespace, and
+   note the rollout order it forces (an older agent silently ignores the
+   field and reads the old paths, §5.5). Derivation is RFC-A §4's rule,
+   referenced not restated. Independent of 1–4 and of the confinement work;
+   this is what admits more than one registration per component.
 1. **Restricted registrar verbs** (§5.1–§5.2) — the mint + deregister
    operations wrapping `ensure_service_approle` / `run_service_remove` under a
    bootroot-internal privileged credential, exposed on the existing daemon
-   (`daemon.rs::run_daemon:68`, §4) with DNS-label / prefix validation, label
-   re-derivation from `host`, and no caller-supplied role/policy body. The
-   delivery form is **decided** (§4), so this has no blocking prerequisite.
+   (`daemon.rs::run_daemon:68`, §4) with DNS-label / prefix validation,
+   **derivation of the `registration_id` and the SAN from the supplied
+   `(service_name, host, instance)` plus the locally-rendered `domain`**, and
+   no caller-supplied role/policy body or composed name. The delivery form is
+   **decided** (§4), so this has no blocking prerequisite; it consumes 0.
 2. **Registrar credential policy** (§5.3) — the scoped policy authorizing only
    invoking the two verbs (NOT the CA/HMAC/EAB reads, which live inside the
    verbs under the bootroot-internal credential — RFC-A §12), **network-confined
