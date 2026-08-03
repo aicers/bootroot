@@ -8,8 +8,8 @@ against `aicers/bootroot` `origin/main` @ `36d61e9` (v0.2.0); re-verify
 before relying.
 
 **Consumed by** bootler RFC-A §6 (which provisions the registrar and states
-"a small, bootroot-owned change is required — a dedicated registrar
-role/policy **and its non-self-propagation guarantee**"), roxyd RFC-B §6
+"a small, bootroot-owned change is required — a **restricted registrar
+surface** **and its non-self-propagation guarantee**"), roxyd RFC-B §6
 (the registrar `node.enroll` handler), and review RFC-D2 §4d (registrar
 orchestration). Those three assume this guarantee exists; this RFC is where
 it is designed.
@@ -19,11 +19,12 @@ it is designed.
 The runtime **registrar** — the bootroot-co-located roxyd — must, long after
 the one-shot bootler CLI is gone, mint (`service add`) and tear down
 (`service remove`) `bootroot-service-*` identities for per-service install
-and host onboarding (RFC-A §6, RFC-B §6). RFC-A §6 grants it a minimal
-OpenBao AppRole policy for exactly that. But that minimal policy, as written,
-still lets its holder **mint another registrar** and turn a single-host
-compromise into fleet-wide identity minting. RFC-A §6 flags closing this a
-**v1 requirement** and punts the mechanism to bootroot. This RFC designs it:
+and host onboarding (RFC-A §6, RFC-B §6). RFC-A §6 documents a minimal
+OpenBao policy as the **authority envelope** those operations exercise. But
+that minimal policy, as written, still lets its holder **mint another
+registrar** and turn one compromised credential into fleet-wide minting.
+RFC-A §6 flags closing this a **v1 requirement** and punts the mechanism to
+bootroot. This RFC designs it:
 
 1. it pins the exact escalation path (§3);
 2. it defines the **non-self-propagation guarantee** and recommends the
@@ -142,15 +143,44 @@ is the registrar's whole purpose, that turns one credential into
 **fleet-wide** identity minting.
 
 **[DECISION] The threat this closes is CREDENTIAL-LEVEL, not a
-root-compromised host.** The holder of the registrar credential need not be
-the registrar process. The realistic cases are a credential that leaks, is
-copied into a backup or a log, or is relayed; an exploited request handler;
-and a compromised REView driving the registrar. What the restricted surface
-buys is that **any** path reaching that credential — including ones not
-foreseen here, and including a later non-root or non-co-located registrar —
-is bounded to minting ordinary `bootroot-service-<name>` identities rather
-than escalating to the authority that mints registrars. It also means
-bootroot's guarantee does not rest on roxyd's code being correct.
+root-compromised host — and it is a NARROWER set than it first appears.**
+The holder of the registrar credential need not be the registrar process,
+but two candidate cases have to be struck honestly before the remaining ones
+carry the argument:
+
+- **An exploited request handler is NOT one of them.** The handler is
+  roxyd's, and roxyd runs as root on this host, so exploiting it *is* root
+  here — the case §4 puts out of scope.
+- **A compromised REView is NOT one of them either.** REView never holds the
+  registrar credential; it can only send `node.enroll` `Register` /
+  `Deregister`. What bounds it is the **verb's input contract** — the
+  bootler-rendered safe-set, the locally-read `domain`, the derivation, the
+  collision check and the shape check (§5.1) — all of which would bound it
+  identically even if the registrar held raw `sys/policies/acl/*` write,
+  because roxyd offers REView no "write this policy body" verb. Those checks
+  matter a great deal (an attacker-chosen `cert_group` hands a service's
+  private key to a chosen group), but they are the **safe-set**, not
+  non-self-propagation. Conflating the two overstates what this section
+  delivers.
+
+What genuinely remains, and is enough:
+
+1. **The guarantee does not rest on roxyd's code being correct.** bootroot
+   stops being one memory-safety bug in a different repository away from
+   fleet-wide identity minting. This is the strongest of the three.
+2. **The offline-copy path is real and is not root on the live host.** A
+   disk image, a filesystem-level backup, or a backup agent's output
+   restored elsewhere yields the credential without anyone ever holding root
+   on the running bootroot host.
+3. **It is the precondition for ever moving the registrar off this host.**
+   While the registrar holds raw ACL authoring, relocating it only moves the
+   escalation; once it holds nothing but a call to a constrained verb,
+   relocation becomes a deployment change rather than a redesign.
+
+In all three the payoff is the same shape: **any** path that reaches the
+credential — including ones not foreseen here — is bounded to minting
+ordinary `bootroot-service-<name>` identities rather than escalating to the
+authority that mints registrars.
 
 **Locating that honestly, because it bounds the claim.** In the v1 placement
 the registrar **is** roxyd, and roxyd runs as **root on the bootroot host**
@@ -227,35 +257,119 @@ per `remove.rs`), so the registrar tears down an identity without holding raw
 `delete` on roles/policies either.
 
 **[DECISION] Threat-model scope — the guarantee bounds the CREDENTIAL, not a
-root-compromised host (honest residual).** §3 frames the threat as "a
-compromise of the one co-located roxyd," and the mechanism keeps the broad
-authority in a bootroot-internal credential **on that same host** while roxyd
-runs as root (RFC-B §2 verifies effective UID 0). Root on the bootroot host
-can read that credential off disk or out of the daemon's address space, so
-against a **full host compromise** the escalation is not removed — the
-attacker obtains the internal credential directly. What the restricted surface
-**does** guarantee is against a *credential-level* attacker: a leaked, copied,
-or relayed registrar credential, an exploited request handler, or a
-compromised REView driving the registrar — none of which can author a policy
-body or a `token_policies` set. That is the realistic and common case, and it
-is what §6's red-team test exercises. Full root compromise of the bootroot
-host is **out of scope** and is bounded instead by co-location: the blast
-radius is the host that already holds the CA-adjacent material, not the fleet
-reached through it. This is a known limitation, stated so no one reads
-"removed by construction" as broader than it is.
+root-compromised host (honest residual).** §3 already locates this: the
+mechanism keeps the broad authority in a bootroot-internal credential **on
+the same host** where roxyd runs as root (RFC-B §2 verifies effective UID 0),
+so root there can read that credential off disk or out of the daemon's
+address space and the escalation is **not** removed against a **full host
+compromise** — the attacker obtains the internal credential directly. What
+the restricted surface **does** guarantee is what §3 enumerates: a
+credential that leaks or is copied off the host (a disk image, a backup),
+independence from roxyd's code being correct, and the ability to relocate the
+registrar later — none of which can author a policy body or a
+`token_policies` set. That is what §6's red-team test exercises. Full root
+compromise of the bootroot host is **out of scope** and is bounded instead by
+co-location: the blast radius is the host that already holds the CA-adjacent
+material, not the fleet reached through it. This is a known limitation,
+stated so no one reads "removed by construction" as broader than it is.
 
 **[DECISION] Delivery of the restricted surface: a bootroot daemon endpoint,
 with the registrar authenticating by mTLS.** The two verbs are exposed on
 bootroot's **existing** host-local daemon (`daemon.rs::run_daemon:68`, already
-running the fast-poll / ACME renewal loop), so no new long-running process is
-introduced. The registrar authenticates to it with an **identity-scoped client
-certificate over localhost**.
+running the fast-poll / ACME renewal loop), so no new long-running **process**
+is introduced. The registrar authenticates to it with an **identity-scoped
+client certificate over localhost**.
+
+**[DECISION] What that costs, stated honestly — "no new process" is not "no
+new server."** Verified against `origin/main` @ `36d61e9`, the following are
+all **net-new**, and an estimate that reads "expose two verbs on a daemon that
+already exists" will be wrong:
+
+- **There is no listener.** `run_daemon` binds nothing; the agent is a pure
+  outbound client (OpenBao HTTPS + ACME). Every `TcpListener::bind` in the
+  crate outside `#[cfg(test)]` belongs to the separate
+  `bootroot-http01-responder` binary or to `commands/infra.rs`'s port probes.
+- **There is no client-certificate verification anywhere in bootroot.** Every
+  rustls configuration in the repo — including the one `ServerConfig`, in the
+  http01 responder — is `with_no_client_auth()`. mTLS **server** support is a
+  capability this codebase does not have today.
+- **A request/response protocol and handler** for the two verbs.
+- **The daemon does not hold the privileged credential the verbs need.**
+  `bootroot-agent` authenticates with the **per-service AppRole** read from
+  `role_id_path` / `secret_id_path` (`src/config.rs`), whose policy is the
+  narrow `bootroot-service-<name>` body; the role/policy-write authority
+  (`POLICY_BOOTROOT_RUNTIME_SERVICE_ADD`) is exercised by the **`bootroot`
+  CLI** process, not the agent. §5.4's credential must be provisioned to the
+  daemon.
+- **`bootroot-agent` is a fleet-wide binary**, running on every service host,
+  not a bootroot-control-host-only daemon. The endpoint must therefore be
+  **conditional** — present only where bootroot itself runs — or it becomes
+  an attack surface on every host in the deployment.
+
+None of this changes the decision; the alternatives below are worse for
+reasons that still hold. It changes the estimate, and it means §5.1-§5.2 are
+specifying a small server, not a callback.
+
+**[DECISION] The daemon SELF-ISSUES and renews the registrar certificate
+under its own internal credential — there is no AppRole in that loop.**
+"Renewal-maintained" needs an actor, and the only renewal machinery bootroot
+has today is the per-service ACME agent loop, which authenticates with a
+`role_id` + `secret_id`. Routing the registrar's certificate through it would
+make the top-level claim — *no `secret_id` at all* (§5.3, §6, RFC-A §6/§12) —
+**false one layer down**, reintroducing precisely the expiring-secret trap
+this design chose the certificate form to escape, and hiding it where it
+would surface months later as an unrelated failure. So the daemon, which
+already holds the privileged internal credential (§5.4) and sits beside the
+CA, issues the registrar's certificate and renews it on its own schedule.
+
+Two consequences worth stating:
+
+- **The identity must be distinguishable from an ordinary service leaf.**
+  `build_csr_params` (`src/acme/flow.rs`) sets **no** `extended_key_usages`
+  today and the SAN shape is fixed to `<instance>.<service>.<host>.<domain>`
+  — a server-shaped identity. Making the registrar "distinct from roxyd's own
+  certificate identity" (RFC-A §6) therefore requires an explicit client
+  identity, not merely another `service add`. Pinning its exact form is
+  implementation work; that it must be distinguishable is a decision.
+- **Lapse is fleet-wide and self-locking, so it must be visible.** A
+  registrar whose certificate has expired cannot call the mint verb, and the
+  mint verb is the only runtime path to a bootroot identity — it **cannot
+  re-mint itself**, and the sole recovery is re-running bootler on that host
+  (the same remedy RFC-A §7 documents for a damaged control-plane host). The
+  daemon therefore surfaces the registrar certificate's remaining lifetime,
+  and a failing renewal is reported rather than discovered when the next
+  install fails.
+
+**[DECISION] The endpoint is a root-owned UNIX-DOMAIN SOCKET, because the
+registrar must authenticate the SERVER too.** Everything above specifies one
+direction — the registrar's client certificate, its identity scoping, which
+endpoints accept it. The other direction was unspecified, and it matters
+because of what the mint verb **returns**: `BootstrapMaterial` carries a
+**`ca_anchor`** (RFC-C §5) that REView relays to a target host and that, for
+onboarding, becomes that host's **mTLS trust root** (RFC-B §7). Anything that
+can impersonate the endpoint injects a CA anchor of its choosing into a
+freshly enrolled service or a freshly joined host.
+
+With a TCP-on-localhost endpoint that is reachable: an unprivileged local
+process can bind a free high loopback port during any window in which the
+daemon is not listening — a restart, a failed start, or a boot-ordering race
+where roxyd comes up before bootrootd — and this is **not** the
+root-compromise case §3 puts out of scope. A **root-owned `0700` unix-domain
+socket** removes the port and the bind race entirely and supplies
+peer-credential authentication for free, while disturbing none of the
+"no new long-running process" rationale above. The registrar's client
+certificate still authenticates the caller; the socket's ownership and path
+authenticate the callee. If a deployment ever needs TCP instead, it MUST pin
+the server certificate, the registrar MUST verify it, and the socket MUST be
+created before roxyd can start (socket activation with an ordering
+dependency).
 
 Why not the alternatives:
 
 - **OpenBao policy-templating** cannot express this surface at all. Every
   requirement in §5.1 is **stateful application logic** — a durable
-  `label → host` binding, a collision check that must run *before* the
+  `registration_id → host` binding, a collision check that must run *before*
+  the
   spec-match, a per-`registration_id` mutex spanning mint **and** deregister,
   validation against a bootler-rendered safe-set file, and re-deriving the
   label from the supplied `host`. An ACL policy matches paths and parameter
@@ -355,17 +469,24 @@ bind `h1-piglet → h2` — after which h1 could **never** install piglet
 refused with `ServiceHostMismatch`, which REView reads as "this host owns
 nothing" and discharges, leaving the bogus identity uncleaned. With the
 composed name derived on this side, there is no caller-supplied value to
-disagree with. **The derivation is defined once, in RFC-A §4, and both
-sides reference it** — REView derives the same names for its own
-bookkeeping and the registrar re-derives them here; two independent
-implementations would fail *every* `Register`, so it must not be restated
-per repo.
+disagree with. **The derivation is defined once, in RFC-A §4** — the
+registrar derives it here, and it is derived **nowhere else**: REView carries
+the parts and records the instance number, never a composed key (RFC-D1 §4d,
+RFC-D2 §4d). Two independent implementations of this rule would fail *every*
+`Register`, so it must not be restated per repo. (REView does compose a
+**peer's SAN** for the Giganto config push and for role corroboration — a
+different composition, over the same parts plus its own copy of the rendered
+`domain`, RFC-D2 §4b/§4c. The two must not be conflated.)
 
 The verb **still rejects a derived `registration_id` already bound to a
-*different* host**, because the derivation is **not injective**: component
-names can be prefixes of one another and host labels may themselves contain
-hyphens and digits, so `aimer` on host `web-h1` and `aimer-web` on host
-`h1-aimer` — derive the same `h1-aimer-web-001` (RFC-A §4). Two
+*different* host**, because the derivation is **not injective in general**:
+component names and host labels both admit hyphens, so two pairs collide
+whenever one component name is `<something>-<another component name>` — with
+components `web` and `aimer-web`, `web` on host `h1-aimer` and `aimer-web` on
+host `h1` derive the same `h1-aimer-web-001` (RFC-A §4). **Today's registry
+happens to contain no such pair**, so the derivation is injective *now*; that
+is a property of the registry's contents, not of the scheme, and it lapses
+the day a component named `web` or `next` is added. Two
 distinct installations must never be re-issued **one** identity. This
 collision check has three hard requirements, because
 the naive control flow is exploitable:
@@ -585,9 +706,23 @@ bound is 131 octets** — the structural maximum of
 `<63-octet host>-<63-octet component>-<3-digit instance>` (RFC-A §4), so it
 is derived rather than picked. **The mint verb enforces it explicitly**
 instead of inferring it from the inputs, since the inputs are what a caller
-controls. Nothing downstream needs a second length check: the longest string
-derived from it, `bootroot-service-<registration_id>` at 148 octets, and the
-default cert/key filenames all stay inside `NAME_MAX` by construction.
+controls. Nothing downstream needs a second length check: the **longest**
+string derived from the key is the fast-poll state filename
+**`bootroot-agent-state-<registration_id>.json`, 157 octets**
+(`src/bin/bootroot-remote/agent_config.rs`, and its twin in
+`src/commands/service/local_config.rs`) — longer than the
+`bootroot-service-<registration_id>` role/policy name at 148 — and 157 is
+inside `NAME_MAX` (255).
+
+**[DECISION] Adopting the bound RELAXES existing checks; it adds none.**
+Several consumers today validate this same field as a **single DNS label,
+≤63 octets** (`src/bin/bootroot-remote/validation.rs`, reached from
+`apply_secret_id.rs` and `bootstrap.rs`; `src/commands/service/resolve.rs`),
+so a 131-octet `registration_id` is **rejected by the code as it stands**.
+Each such check must become "a path-safe key of at most 131 octets" where it
+guards the **namespace key**, and stay the ≤63 DNS-label rule where it guards
+**`service_name` or `hostname`** — those are SAN segments and that limit is
+not ours to relax.
 
 **[DECISION] No migration and no compatibility shim — the product is
 pre-release.** Every registration is (re)created by an install, so the
@@ -629,9 +764,12 @@ belongs here, and it is mostly already present.
 **[DECISION] The tamper-resistant substrate already exists.** bootroot
 **requires** a file-based OpenBao audit device and verifies it at init:
 `verify_audit_file` queries `sys/audit` and fails when no `file`-type device
-is present (`src/openbao.rs:560-600`), the `openbao.hcl` audit stanza is
-checked during TLS setup (`commands/init/steps/openbao_tls.rs:243-247`), and
-the device has its own volume (`openbao-audit`, `commands/clean.rs:34`). So
+is present (`src/openbao.rs:560-602`), and its caller in
+`commands/init/steps/openbao_setup.rs:162-165` propagates that failure, so
+init **aborts** rather than warning. The `openbao.hcl` audit stanza is
+**preserved by the TLS rewrite** (`commands/init/steps/openbao_tls.rs`, with
+tests asserting the rewrite does not drop it), and the device has its own
+volume (`openbao-audit`, `commands/clean.rs:34`). So
 every OpenBao write a mint performs — the policy write, the AppRole create,
 the secret-id issuance, the per-service KV write, and the deletes on
 deregister — is **already** recorded there, under the **bootroot-internal**
@@ -651,7 +789,7 @@ does not carry the argument.** Two gaps:
   so the device cannot answer "who asked for what" — which is the question
   the mint-storm signal is made of.
 
-So the daemon writes **one record per invocation** of either verb, under the
+So the daemon writes a record per invocation of either verb, under the
 bootroot-internal credential and never through the registrar's connection:
 timestamp; verb (`Register` / `Deregister`); the requested
 `(service_name, host, instance)`; the derived `registration_id`; the
@@ -660,16 +798,67 @@ idempotent re-mint, idempotent already-absent, or the specific typed refusal.
 **Refused invocations are recorded exactly like accepted ones**; a record
 covering only successes would miss the probing case above.
 
-**[DECISION] Retention is bounded and stated, not left to the deployment.**
-These records are the only detection for an abuse whose signature is a
-*rate*, so they must outlive the window an operator would look back over:
-rotation is size- and age-bounded, and the retained set covers **at least 90
-days** of normal operation. That is affordable because mints are rare — a
-fleet's steady state produces a handful per install, not a stream.
-**Writing the record is part of the verb, not best-effort:** a mint whose
-record cannot be written is **refused**, because an unrecordable mint is
-precisely the one an attacker wants. (Rotation failure alone does not refuse
-a mint; only an unwritable record does.)
+**[DECISION] The record is written in TWO PHASES, because "unrecordable ⇒
+refused" is otherwise not implementable.** The outcome is only known *after*
+`ensure_service_approle` has written the policy, the AppRole, the per-service
+KV and the durable `registration_id → host` binding. A single
+write-after-the-fact that fails at that point leaves the identity **already
+live in OpenBao** while the caller is told "refused" — and REView's owed
+teardown (RFC-D2 §4d) would then drive a `Deregister` that must itself write
+a record and fails the same way, leaving a live, unrecorded, undeletable
+identity. So, under the per-`registration_id` mutex (§5.1):
+
+1. write an **intent** record — request id, the requested parts, the derived
+   `registration_id`, the registrar certificate identity — **before any
+   OpenBao write**. This is the point at which refusing is free, and a
+   failure here refuses the invocation with nothing yet created.
+2. perform the verb.
+3. append an **outcome** record referencing the same request id.
+
+An intent with no matching outcome is itself an anomaly worth surfacing —
+it is what a crash mid-mint looks like, and what a suppressed outcome would
+look like.
+
+**[DECISION] Both verbs are RATE-LIMITED per client identity, or the audit
+record is the resource the attack exhausts.** With a record required for
+every invocation including refusals, and **no limit anywhere on either verb**
+(RFC-A §6 deferred a per-`(component, host)` ceiling), a compromised REView —
+in the threat model for this very mechanism — floods refused invocations
+(`ServiceInstanceMismatch` is cheapest, refused before any OpenBao work) and
+grows the log without bound. When the filesystem fills, every subsequent mint
+is refused, so **fleet-wide enrollment stops**; worse, the OpenBao file audit
+device this section builds on is **mandatory**, and OpenBao fails requests
+when it cannot write its audit device — so a full disk can stop OpenBao
+serving, which is the renewal path for every certificate in the deployment,
+on the one host that must not be restarted. "Mints are rare in steady state"
+is true of legitimate mints and irrelevant to the attacker. A **ceiling** and
+a **rate limit** are different objects: the first guesses how many instances
+a deployment may legitimately run (rightly deferred), the second bounds how
+fast one client identity may drive the verbs (required here). Repeated
+identical refusals from one identity are additionally **coalesced into a
+counted record within a window**, so the signal survives without the volume.
+
+**[DECISION] Retention is bounded and stated, and the audit store has
+reserved capacity.** These records are the only detection for an abuse whose
+signature is a *rate*, so they must outlive the window an operator would look
+back over: rotation is size- and age-bounded, and the retained set covers
+**at least 90 days** of normal operation. The verb-level records **and** the
+OpenBao audit device live on a **reserved, quota'd filesystem** separate from
+everything else on the bootroot host, with a low-water alarm surfaced through
+the same channel that reports trust-generation lag (RFC-D2 §4a) — a
+fail-closed control with no capacity monitor is a scheduled outage.
+**Writing the record is part of the verb, not best-effort:** an invocation
+whose **intent** record cannot be written is refused (step 1 above), because
+an unrecordable mint is precisely the one an attacker wants. Rotation failure
+alone does not refuse a mint; only an unwritable record does.
+
+**[DECISION] Recorded fields are escaped.** `service_name`, `host` and the
+certificate identity are attacker-influenced strings arriving from a
+semi-trusted caller, and refusals are recorded **including** the "not a DNS
+label" refusal — so the raw untrusted string reaches the log by design. The
+record is written in a structured single-line encoding with escaping, or an
+attacker forges records and breaks the parser on the one artifact this whole
+argument rests on.
 
 ## 6. Acceptance criteria
 
@@ -728,8 +917,9 @@ a mint; only an unwritable record does.)
   collision check runs **before** the spec-match, compares against a **durable
   per-identity bound host** (survives registrar restart), and the mint verb is
   **serialized** so concurrent colliding registrations cannot both mint. Tests
-  cover the genuinely non-injective case — `aimer` on host `web-h1` versus
-  `aimer-web` on host `h1`, both instance 2, which derive the same
+  cover a genuinely colliding pair. Today's registry contains none (§5.1), so
+  the test uses a **synthetic** pair: components `web` and `aimer-web`, with
+  `web` on host `h1-aimer` versus `aimer-web` on host `h1`, both deriving
   `h1-aimer-web-001` — (a) **sequentially** (second refused), (b)
   **concurrently** (exactly one succeeds), and (c) with a **restart** between
   the two (second still refused). A re-mint from the **same** host still
@@ -769,23 +959,59 @@ a mint; only an unwritable record does.)
   read. A test asserts the registrar's identity is rejected at every other
   daemon endpoint, and that no OpenBao credential is provisioned to it.
 - **Audit record (§5.6).** Every invocation of either verb — **accepted and
-  refused alike** — produces one bootroot-side record carrying the timestamp,
+  refused alike** — produces bootroot-side records carrying the timestamp,
   the verb, the requested `(service_name, host, instance)`, the derived
   `registration_id`, the registrar's client-certificate identity, and the
   outcome. Tests: a `ServiceNameCollision` (which performs **no** OpenBao
   write, so the OpenBao audit device alone shows nothing) still produces a
   record; the record survives anything the registrar can do, since it holds no
-  OpenBao credential; and a mint whose record cannot be written is
-  **refused** rather than completing unrecorded. A test also asserts the init
-  check that the file audit device exists (`verify_audit_file`) still holds,
-  since the verb-level record sits on top of it rather than replacing it.
+  OpenBao credential; and the init check that the file audit device exists
+  (`verify_audit_file`) still holds, since the verb-level record sits on top
+  of it rather than replacing it.
+- **Audit two-phase ordering (§5.6).** The **intent** record is written
+  before any OpenBao write and the **outcome** record after, both under the
+  per-`registration_id` mutex. Tests: an invocation whose **intent** record
+  cannot be written is refused **with nothing created in OpenBao** — an
+  implementation that writes one record after the fact and refuses on failure
+  does **not** satisfy this, because it leaves a live identity the caller was
+  told does not exist; and an intent with no outcome (a crash mid-mint) is
+  surfaced as an anomaly rather than being silently equivalent to no
+  invocation.
+- **Verb rate limit + reserved audit capacity (§5.6).** A single client
+  identity driving a flood of **refused** invocations is rate-limited and its
+  repeated identical refusals are coalesced into a counted record; a test
+  asserts the log does not grow proportionally to the flood. The verb-level
+  records and the OpenBao audit device sit on a **reserved, quota'd**
+  filesystem with a low-water alarm, so exhausting them cannot stop OpenBao
+  serving — a test asserts the alarm fires before the quota is reached.
+  Recorded attacker-influenced fields (`service_name`, `host`, certificate
+  identity) are escaped: a test drives a refusal carrying newlines and
+  delimiter characters and asserts the record cannot be forged or made
+  unparseable.
 - **Network confinement + non-expiry intact (§4).** The registrar's certificate
-  is scoped to the registrar identity, the endpoint is reachable only over
-  localhost / the bootroot host's confined network, and the certificate is
-  renewal-maintained — verified by asserting the endpoint refuses a connection
-  from off-host and that renewal keeps the identity valid across the
-  certificate's original lifetime. There is **no registrar `secret_id`**, so
-  there is no expiring secret to rotate.
+  is scoped to the registrar identity, the endpoint is a **root-owned `0700`
+  unix-domain socket** on the bootroot host, and the certificate is renewed by
+  the daemon — verified by asserting the endpoint is unreachable from off-host
+  and from an unprivileged local process, and that renewal keeps the identity
+  valid past the certificate's original lifetime. There is **no registrar
+  `secret_id`**, so there is no expiring secret to rotate — **and a test
+  asserts that holds one layer down**: the renewal path uses the daemon's
+  bootroot-internal credential and **no AppRole**, so an implementation that
+  renews through the per-service ACME agent path (which authenticates with a
+  `role_id` + `secret_id`) does not satisfy this criterion.
+- **The endpoint authenticates itself, not only the caller (§4).** A test
+  asserts an unprivileged local process cannot occupy the endpoint's socket
+  path during a daemon restart or a boot-ordering window, and that the
+  registrar refuses to speak to an endpoint it cannot authenticate. This
+  matters because the mint response carries a **`ca_anchor`** (RFC-C §5) that
+  becomes a newly joined host's trust root (RFC-B §7); an impersonated
+  endpoint injects a CA of its choosing.
+- **Registrar lapse is visible, not silent (§4).** The daemon surfaces the
+  registrar certificate's remaining lifetime and reports a failing renewal. A
+  test asserts a lapsed registrar produces the typed, non-retryable
+  `RegistrarUnavailable` (RFC-C §5) rather than a generic error, since a lapse
+  stops every enrollment in the deployment and the registrar cannot re-mint
+  itself.
 
 ## 7. Issue decomposition (AgentCoop)
 
@@ -817,14 +1043,19 @@ Self-contained issues; dependency order:
    contradicts the component's locally-rendered `multiplicity` class, §5.1),
    and no caller-supplied role/policy body or composed name. The delivery form is
    **decided** (§4), so this has no blocking prerequisite; it consumes 0.
-1a. **Verb-level audit record** (§5.6) — one record per invocation of either
-   verb, accepted **and** refused, written under the bootroot-internal
-   credential with the timestamp, verb, requested
+1a. **Verb-level audit record** (§5.6) — **two-phase** (intent before any
+   OpenBao write, outcome after, both under the per-`registration_id` mutex),
+   for every invocation of either verb, accepted **and** refused, written
+   under the bootroot-internal credential with the timestamp, verb, requested
    `(service_name, host, instance)`, derived `registration_id`, registrar
-   certificate identity and outcome; bounded rotation retaining at least 90
-   days; a mint whose record cannot be written is refused. This is the
-   mechanism RFC-A §6's "detected, not prevented" argument depends on.
-   Depends on 1.
+   certificate identity and outcome; escaped structured encoding; bounded
+   rotation retaining at least 90 days on a **reserved, quota'd** filesystem
+   with a low-water alarm; **per-client-identity rate limiting** on both verbs
+   with coalesced repeated refusals. An invocation whose intent record cannot
+   be written is refused before anything is created. This is the mechanism
+   RFC-A §6's "detected, not prevented" argument depends on, and the rate
+   limit is what stops that mechanism from being the resource an attacker
+   exhausts. Depends on 1.
 2. **Registrar credential policy** (§5.3) — the scoped policy authorizing only
    invoking the two verbs (NOT the CA/HMAC/EAB reads, which live inside the
    verbs under the bootroot-internal credential — RFC-A §12), in the decided
@@ -834,7 +1065,10 @@ Self-contained issues; dependency order:
    so nothing to CIDR-bind and nothing to rotate.
    Depends on 1.
 3. **Bootroot-internal privileged credential** (§5.4) — held by the daemon,
-   never issued out. Depends on 1.
+   never issued out. Also covers the daemon **self-issuing and renewing the
+   registrar's client certificate** under that credential, with **no AppRole
+   in the renewal loop** (§4), and surfacing its remaining lifetime. Depends
+   on 1.
 4. **Red-team + functional tests** (§6) — the escalation-denied and
    functionality-preserved assertions. Depends on 1–3.
 
