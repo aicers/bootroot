@@ -137,12 +137,35 @@ OpenBao API directly and:
    ["<the registrar policy>"] )` — bypassing the code's derived
    `token_policies`, binding the new role to the registrar policy itself.
 
-Either yields a **second registrar**. Because runtime identity minting is the
-registrar's whole purpose, this converts a compromise of the one co-located
-roxyd into **fleet-wide** identity minting. **Co-location and CIDR binding do
-not close this** — the attacker already controls a process *on* the bootroot
-host, inside the bound CIDR. The confinement must be on **what the credential
-can express**, not where it lives.
+Either yields a **second registrar** — and because runtime identity minting
+is the registrar's whole purpose, that turns one credential into
+**fleet-wide** identity minting.
+
+**[DECISION] The threat this closes is CREDENTIAL-LEVEL, not a
+root-compromised host.** The holder of the registrar credential need not be
+the registrar process. The realistic cases are a credential that leaks, is
+copied into a backup or a log, or is relayed; an exploited request handler;
+and a compromised REView driving the registrar. What the restricted surface
+buys is that **any** path reaching that credential — including ones not
+foreseen here, and including a later non-root or non-co-located registrar —
+is bounded to minting ordinary `bootroot-service-<name>` identities rather
+than escalating to the authority that mints registrars. It also means
+bootroot's guarantee does not rest on roxyd's code being correct.
+
+**Locating that honestly, because it bounds the claim.** In the v1 placement
+the registrar **is** roxyd, and roxyd runs as **root on the bootroot host**
+(RFC-B §2 verifies effective UID 0). Root there can read the daemon's
+bootroot-internal credential off disk or out of its address space, so **full
+root compromise of that host is closed by nothing in this RFC** and is out of
+scope — §4 states the same residual, and §6's red-team test is
+credential-level by design. A materially stronger boundary would need the
+registrar to be neither root nor co-located with bootroot: a placement
+change, not a policy one, and not v1 scope.
+
+**Co-location does not close the escalation either** — the attacker already
+controls a process *on* the bootroot host. The confinement must therefore be
+on **what the credential can express**, not on where it lives. That is the
+guarantee §4 defines.
 
 ## 4. The guarantee and the mechanism
 
@@ -193,9 +216,10 @@ defense-in-depth but is not the guarantee.
 role/policy-write capability stays **inside bootroot** — held by a
 bootroot-internal credential the daemon uses, never issued to the registrar.
 bootroot already runs a host-local daemon (`daemon.rs:68`) that is the natural
-host for the mint/deregister endpoint; the registrar authenticates to it (its
-mTLS identity or a scoped AppRole) over localhost. bootroot remains the only
-principal that can write a `bootroot-service-*` role or policy.
+host for the mint/deregister endpoint; the registrar authenticates to it with
+its **mTLS identity** over localhost (the delivery form decided below).
+bootroot remains the only principal that can write a `bootroot-service-*`
+role or policy.
 
 **[DECISION] Deregister rides the same surface.** `node.enroll` `Deregister`
 (RFC-C §5, RFC-B §6) maps to the restricted `run_service_remove` verb (idempotent
@@ -556,7 +580,14 @@ attacker-chosen value to validate.
 **[DECISION] `registration_id` is not a SAN segment, so it is not bound by
 the 63-octet DNS-label limit** — but it is used as an OpenBao path segment,
 an AppRole/policy name, and a filename, so it keeps the same conservative
-charset (lowercase alphanumeric and hyphen) and a bounded length.
+charset (lowercase alphanumeric and hyphen) and a bounded length. **The
+bound is 131 octets** — the structural maximum of
+`<63-octet host>-<63-octet component>-<3-digit instance>` (RFC-A §4), so it
+is derived rather than picked. **The mint verb enforces it explicitly**
+instead of inferring it from the inputs, since the inputs are what a caller
+controls. Nothing downstream needs a second length check: the longest string
+derived from it, `bootroot-service-<registration_id>` at 148 octets, and the
+default cert/key filenames all stay inside `NAME_MAX` by construction.
 
 **[DECISION] No migration and no compatibility shim — the product is
 pre-release.** Every registration is (re)created by an install, so the
@@ -583,6 +614,62 @@ polls a namespace that no longer exists.
 (`<instance>.<service>` scoped by host) and drives enrollment with
 `service_name`, `host` and `instance` (RFC-C §5). Nothing outside bootroot
 needs the key.
+
+### 5.6 Audit record for both verbs
+
+RFC-A §6 rests a live security argument on a mechanism this RFC did not
+supply. A compromised REView's minting capability is bounded in **what** it
+can mint but not in **how often** or **for whom**, so repeated mints and a
+`Deregister` against a live instance are **detected, not prevented** — and
+the detection is an audit trail "on the bootroot side … where the registrar
+cannot erase it." Nothing else in the set provides that: RFC-E §9's record is
+written by REView, so a compromised REView simply omits it. The mechanism
+belongs here, and it is mostly already present.
+
+**[DECISION] The tamper-resistant substrate already exists.** bootroot
+**requires** a file-based OpenBao audit device and verifies it at init:
+`verify_audit_file` queries `sys/audit` and fails when no `file`-type device
+is present (`src/openbao.rs:560-600`), the `openbao.hcl` audit stanza is
+checked during TLS setup (`commands/init/steps/openbao_tls.rs:243-247`), and
+the device has its own volume (`openbao-audit`, `commands/clean.rs:34`). So
+every OpenBao write a mint performs — the policy write, the AppRole create,
+the secret-id issuance, the per-service KV write, and the deletes on
+deregister — is **already** recorded there, under the **bootroot-internal**
+credential. Because the registrar holds **no OpenBao credential at all**
+(§5.3), it can neither forge an entry nor erase one. That is what makes
+RFC-A §6's "the registrar cannot erase it" true rather than aspirational.
+
+**[DECISION] A verb-level record is added on top, because the device alone
+does not carry the argument.** Two gaps:
+
+- **A refused mint writes nothing to OpenBao**, so it leaves no trace at all.
+  `ServiceNameCollision`, `ServiceSpecConflict`, `ServiceInstanceMismatch`
+  and `ServiceHostMismatch` are exactly what an attacker probing the verb
+  generates, and they are invisible in the device.
+- **The device sees paths, not the request.** `host`, `instance` and the
+  registrar's client-certificate identity never appear in an OpenBao write,
+  so the device cannot answer "who asked for what" — which is the question
+  the mint-storm signal is made of.
+
+So the daemon writes **one record per invocation** of either verb, under the
+bootroot-internal credential and never through the registrar's connection:
+timestamp; verb (`Register` / `Deregister`); the requested
+`(service_name, host, instance)`; the derived `registration_id`; the
+registrar client-certificate identity; and the **outcome** — first mint,
+idempotent re-mint, idempotent already-absent, or the specific typed refusal.
+**Refused invocations are recorded exactly like accepted ones**; a record
+covering only successes would miss the probing case above.
+
+**[DECISION] Retention is bounded and stated, not left to the deployment.**
+These records are the only detection for an abuse whose signature is a
+*rate*, so they must outlive the window an operator would look back over:
+rotation is size- and age-bounded, and the retained set covers **at least 90
+days** of normal operation. That is affordable because mints are rare — a
+fleet's steady state produces a handful per install, not a stream.
+**Writing the record is part of the verb, not best-effort:** a mint whose
+record cannot be written is **refused**, because an unrecordable mint is
+precisely the one an attacker wants. (Rotation failure alone does not refuse
+a mint; only an unwritable record does.)
 
 ## 6. Acceptance criteria
 
@@ -628,9 +715,14 @@ needs the key.
   the SAN's service label is the plain `service_name`. Tests: **two instances
   of one component on one host** get distinct registry entries, AppRoles,
   policies, KV namespaces, state filenames and cert/key paths, and distinct
-  SANs differing only in the instance label; **a registration that omits
-  `registration_id` behaves exactly as today**, so an existing singleton's
-  paths and names follow the one key shape, with no legacy arm.
+  SANs differing only in the instance label; and the components with no
+  instance dimension follow that **same one key shape** — a one-per-
+  deployment singleton's `registration_id` is `<component>` (`review`) and a
+  one-per-host component's is `<host>-<component>` (`h1-roxyd`), each
+  **written explicitly**. A test asserts the field is **required**: a
+  registration constructed without it does not exist as a state — there is
+  no `Option`, no `service_name` default, and no legacy arm to exercise
+  (§5.5).
 - **Injective identity:** minting a derived `registration_id` that collides
   with a **different** already-registered host is **rejected** — the
   collision check runs **before** the spec-match, compares against a **durable
@@ -676,6 +768,17 @@ needs the key.
   there is nothing that could grant raw role/policy write or a CA / HMAC / EAB
   read. A test asserts the registrar's identity is rejected at every other
   daemon endpoint, and that no OpenBao credential is provisioned to it.
+- **Audit record (§5.6).** Every invocation of either verb — **accepted and
+  refused alike** — produces one bootroot-side record carrying the timestamp,
+  the verb, the requested `(service_name, host, instance)`, the derived
+  `registration_id`, the registrar's client-certificate identity, and the
+  outcome. Tests: a `ServiceNameCollision` (which performs **no** OpenBao
+  write, so the OpenBao audit device alone shows nothing) still produces a
+  record; the record survives anything the registrar can do, since it holds no
+  OpenBao credential; and a mint whose record cannot be written is
+  **refused** rather than completing unrecorded. A test also asserts the init
+  check that the file audit device exists (`verify_audit_file`) still holds,
+  since the verb-level record sits on top of it rather than replacing it.
 - **Network confinement + non-expiry intact (§4).** The registrar's certificate
   is scoped to the registrar identity, the endpoint is reachable only over
   localhost / the bootroot host's confined network, and the certificate is
@@ -688,15 +791,20 @@ needs the key.
 
 Self-contained issues; dependency order:
 
-0. **The `registration_id` split** (§5.5) — add the field to `ServiceEntry`
-   (`Option<String>`, defaulting to `service_name`) and move **every**
+0. **The `registration_id` split** (§5.5) — add a **required**
+   `registration_id` to `ServiceEntry` — **not** an `Option`, and **not**
+   defaulting to `service_name`: the product is pre-release, so every
+   registration is re-created by re-installing and there is no legacy arm to
+   carry (§5.5). Move **every**
    namespace listed in §2 onto it: registry key, AppRole and policy names,
    the policy body's KV paths, the KV namespace, the agent-config managed
    block markers, the fast-poll state filename, the default cert/key
    filenames, and the remote-bootstrap artifact directory. Add the matching
-   `[[profiles]]` field so `bootroot-agent` polls the right namespace, and
-   note the rollout order it forces (an older agent silently ignores the
-   field and reads the old paths, §5.5). Derivation is RFC-A §4's rule,
+   `[[profiles]]` field so `bootroot-agent` polls the right namespace.
+   Because there is no compatibility arm, an agent and the `agent.toml`
+   written for it move together at install, so **this forces no agent-first
+   rollout order** — there is no window in which an older agent is handed a
+   newer profile (§5.5). Derivation is RFC-A §4's rule,
    referenced not restated. Independent of 1–4 and of the confinement work;
    this is what admits more than one registration per component.
 1. **Restricted registrar verbs** (§5.1–§5.2) — the mint + deregister
@@ -709,12 +817,21 @@ Self-contained issues; dependency order:
    contradicts the component's locally-rendered `multiplicity` class, §5.1),
    and no caller-supplied role/policy body or composed name. The delivery form is
    **decided** (§4), so this has no blocking prerequisite; it consumes 0.
+1a. **Verb-level audit record** (§5.6) — one record per invocation of either
+   verb, accepted **and** refused, written under the bootroot-internal
+   credential with the timestamp, verb, requested
+   `(service_name, host, instance)`, derived `registration_id`, registrar
+   certificate identity and outcome; bounded rotation retaining at least 90
+   days; a mint whose record cannot be written is refused. This is the
+   mechanism RFC-A §6's "detected, not prevented" argument depends on.
+   Depends on 1.
 2. **Registrar credential policy** (§5.3) — the scoped policy authorizing only
    invoking the two verbs (NOT the CA/HMAC/EAB reads, which live inside the
-   verbs under the bootroot-internal credential — RFC-A §12), **network-confined
-   to the bootroot host and non-expiring across runtime in the form the delivery
-   allows** (AppRole: CIDR-bound + `secret_id` rotation; mTLS: identity-scoped
-   cert, localhost-confined endpoint, renewal-maintained — §4/§6).
+   verbs under the bootroot-internal credential — RFC-A §12), in the decided
+   form (§4/§6): an **identity-scoped mTLS client certificate**, the endpoint
+   reachable only over localhost / the bootroot host's confined network, the
+   certificate **renewal-maintained**. There is **no registrar `secret_id`**,
+   so nothing to CIDR-bind and nothing to rotate.
    Depends on 1.
 3. **Bootroot-internal privileged credential** (§5.4) — held by the daemon,
    never issued out. Depends on 1.
