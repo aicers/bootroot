@@ -62,6 +62,36 @@ Nothing here changes bootroot's install-time behavior or its existing
   fast-poll / ACME renewal loop, `fast_poll.rs`) on the bootroot host — an
   existing place a narrow privileged operation can live without inventing a
   new long-running process.
+- **The issued leaf's name is composed from four inputs, and `service add`
+  takes three of them as flags.** A profile's certificate carries exactly one
+  SAN, and the same string as its CN:
+  `<instance_id>.<service_name>.<hostname>.<domain>`
+  (`src/config.rs::profile_domain`, used by
+  `src/acme/flow.rs::build_csr_params`, which sets `subject_alt_names` to that
+  single `DnsName`; re-derived for verification by
+  `src/commands/verify.rs::expected_dns_name`). `ServiceAddArgs`
+  (`src/cli/args.rs`) accordingly takes `--hostname` ("Hostname used for DNS
+  SAN"), `--domain` ("DNS domain for SAN construction"), and `--instance-id`
+  ("required"), and `ServiceEntry` (`src/state.rs`) persists all four fields
+  separately. **`hostname` is validated as a single DNS label**, exactly like
+  `service_name` (`src/i18n/en.rs`, `error_hostname_invalid`;
+  `src/bin/bootroot-remote/validation.rs`), so **no bootroot input accepts a
+  dotted name** — a caller cannot pass an FQDN anywhere in this identity.
+- **The registry keys on `service_name` ALONE, and so does every per-service
+  namespace derived from it.** `state.services` is a
+  `BTreeMap<String, ServiceEntry>` (`src/state.rs`) looked up by name
+  (`require_service_entry`, `src/commands/service/remove.rs`), and the same
+  string names the AppRole and policy (`bootroot-service-<name>`,
+  `src/commands/service/approle.rs`), the KV namespace
+  (`bootroot/services/<name>/…`, `src/trust_bootstrap.rs`,
+  `src/fast_poll.rs`), the policy **body**'s paths
+  (`build_service_policy`), the agent-config managed block markers and the
+  fast-poll state filename (`src/bin/bootroot-remote/agent_config.rs`), the
+  default cert/key filenames, and the remote-bootstrap artifact directory
+  (`src/commands/service/remote_bootstrap.rs`). A registration is therefore
+  unique **per name across the whole deployment**, not per host — which is
+  why bootler registers each host's roxyd as `roxyd-<host>` rather than the
+  static `roxyd`.
 - **CIDR binding exists** — `token_bound_cidrs` is a **`SecretIdOptions`** field
   (`openbao.rs:98`, tested `:1452`) applied at **secret-id issuance**
   (`create_secret_id`), and role-level CIDRs are plumbed through
