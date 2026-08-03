@@ -502,6 +502,14 @@ on one host, so no single string satisfies both jobs.
 - **`registration_id`** is the namespace key. **Every consumer listed in §2
   reads it instead of `service_name`.** It is *not* a certificate field.
 
+**[DECISION] Scope — this exists for the five modules.** `review` and
+`aice-web-next` are installed once per deployment and `roxyd` once per
+host, so their `registration_id` carries no instance segment and their
+registrations are exactly what they are today. Only `piglet`, `giganto`,
+`hog`, `reconverge` and `crusher` take an instance dimension. The field is
+introduced uniformly all the same, because a uniform key is simpler than a
+conditional one and it is what makes the singleton default (below) exact.
+
 **[DECISION] Derivation is owned by RFC-A §4, not restated here.** RFC-A §4
 is the single definition of both the `registration_id` derivation (per
 multiplicity class: `<component>` / `<component>-<host>` /
