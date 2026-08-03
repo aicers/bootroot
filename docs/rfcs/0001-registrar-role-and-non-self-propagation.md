@@ -44,7 +44,8 @@ The confinement work (§3–§4, §5.1–§5.4) does not change bootroot's
 install-time behaviour; it constrains only the **runtime** credential the
 registrar authenticates with. The `registration_id` split (§5.5) does touch
 the existing `service add` / `service remove` paths, but is arranged to
-default to today's behaviour so existing registrations need no migration.
+be a single key shape with no legacy arm — the product is pre-release, so
+registrations are re-created by re-installing rather than migrated.
 
 ## 2. Current state (grounded, `origin/main` @ `36d61e9`)
 
@@ -308,8 +309,8 @@ multiplicity, which bootler provisions in the same local file.** Deriving
 `registration_id` picks one of the three arms by multiplicity class (§5.5),
 so from the parts alone the verb cannot tell a legitimate singleton
 (`review`, no `instance`) from a **module whose `instance` was wrongly
-omitted** (`piglet`, no `instance` → the 2-part `piglet-h1` instead of
-`piglet-h1-1`) — which would mint a valid-but-phantom identity a later
+omitted** (`piglet`, no `instance` → the 2-part `h1-piglet` instead of
+`h1-piglet-001`) — which would mint a valid-but-phantom identity a later
 correct `instance` then duplicates. Since deriving replaced the old "reject
 a caller-composed name" check (below), that gap must not be left open. So
 bootler records each component's **multiplicity class** alongside the domain
@@ -324,8 +325,8 @@ neither substitutes for the other.
 
 **Deriving rather than accepting removes a failure mode outright.** Were
 the caller to send a composed name instead, a buggy or compromised REView
-sending `{ service_name: "piglet-h1", host: "h2" }` would mint cleanly and
-bind `piglet-h1 → h2` — after which h1 could **never** install piglet
+sending `{ service_name: "h1-piglet", host: "h2" }` would mint cleanly and
+bind `h1-piglet → h2` — after which h1 could **never** install piglet
 (`ServiceNameCollision` forever) while the teardown for h1's name was
 refused with `ServiceHostMismatch`, which REView reads as "this host owns
 nothing" and discharges, leaving the bogus identity uncleaned. With the
@@ -340,7 +341,7 @@ The verb **still rejects a derived `registration_id` already bound to a
 *different* host**, because the derivation is **not injective**: component
 names can be prefixes of one another and host labels may themselves contain
 hyphens and digits, so `aimer` on host `web-h1` and `aimer-web` on host
-`h1` — both instance 2 — derive the same `aimer-web-h1-2` (RFC-A §4). Two
+`h1-aimer` — derive the same `h1-aimer-web-001` (RFC-A §4). Two
 distinct installations must never be re-issued **one** identity. This
 collision check has three hard requirements, because
 the naive control flow is exploitable:
@@ -511,8 +512,8 @@ compatible only while a component is installed exactly once.**
 bootler already hit this and chose the key over the label: each host's
 roxyd registers as `roxyd-<host>`, which is why roxyd's SAN reads
 `001.roxyd-h1.h1.<domain>` with the host in it twice. Modules make the
-compromise untenable — they are per-host **and** may run several instances
-on one host, so no single string satisfies both jobs.
+compromise untenable — they are per-host **and** are meant to run several
+instances on one host, so no single string satisfies both jobs.
 
 **The change.** Split the second job into a new field:
 
@@ -523,16 +524,28 @@ on one host, so no single string satisfies both jobs.
 
 **[DECISION] Scope — this exists for the five modules.** `review` and
 `aice-web-next` are installed once per deployment and `roxyd` once per
-host, so their `registration_id` carries no instance segment and their
-registrations are exactly what they are today. Only `piglet`, `giganto`,
-`hog`, `reconverge` and `crusher` take an instance dimension. The field is
-introduced uniformly all the same, because a uniform key is simpler than a
-conditional one and it is what makes the singleton default (below) exact.
+host, so their `registration_id` carries no instance segment. Only
+`piglet`, `giganto`, `hog`, `reconverge` and `crusher` take an instance
+dimension. The field is introduced uniformly all the same, because a
+uniform key is simpler than a conditional one.
+
+**[DECISION] The split ships in v1 even though v1 installs one instance
+per host.** RFC-A §4 pins the instance to `001` for v1 and defers
+allocation — but the split is not deferred with it, because it is the part
+that would be expensive to add later. Without it bootroot keys every
+namespace on `service_name` alone, which admits exactly one registration of
+a component **deployment-wide**; adding instances afterwards would rename
+every AppRole, policy, KV path, marker and filename a module owns. With it,
+a module registers as `<host>-<component>-001` from the first release and
+v2 changes only **which numbers are allowed** — no rename, no re-issued
+certificate, no state conversion. This RFC therefore delivers the key
+shape; it delivers no allocator, and the mint verb simply derives whatever
+`instance` the caller sends (§5.1).
 
 **[DECISION] Derivation is owned by RFC-A §4, not restated here.** RFC-A §4
 is the single definition of both the `registration_id` derivation (per
-multiplicity class: `<component>` / `<component>-<host>` /
-`<component>-<host>-<instance>`) and the instance numbering it uses
+multiplicity class: `<component>` / `<host>-<component>` /
+`<host>-<component>-<instance>`) and the instance numbering it uses
 (a number scoped by `{service_name}.{hostname}`). Two implementations that
 disagreed would fail every `Register` in the fleet, and only after
 deployment, so bootroot references that rule rather than paraphrasing it.
@@ -545,29 +558,24 @@ the 63-octet DNS-label limit** — but it is used as an OpenBao path segment,
 an AppRole/policy name, and a filename, so it keeps the same conservative
 charset (lowercase alphanumeric and hyphen) and a bounded length.
 
-**[DECISION] Backward compatibility: `registration_id` defaults to
-`service_name`.** `ServiceEntry`'s existing optional fields already carry
-`#[serde(default)]`, so adding an `Option<String>` is state-format
-compatible, and a registration that omits it behaves exactly as today.
-Every existing singleton — `review`, `aice-web-next`, `aimer` — therefore
-keeps byte-identical OpenBao paths, AppRole and policy names, markers and
-filenames: **no migration.** The values diverge only for roxyd (whose
-`registration_id` is the string it already registers under, so its
-namespace is unchanged and only its **SAN** improves to
-`001.roxyd.h1.<domain>`, requiring a certificate re-issue) and for the
-net-new module registrations.
+**[DECISION] No migration and no compatibility shim — the product is
+pre-release.** Every registration is (re)created by an install, so the
+change lands by re-installing, not by converting state. `registration_id`
+is therefore a **required** field rather than an `Option` defaulting to
+`service_name`, and nothing has to keep reading the old key: a deployment
+carried across the change is re-provisioned. This deliberately gives up
+byte-identical continuity for the existing singletons (`review`,
+`aice-web-next`, `aimer`) and for roxyd — whose key becomes `<host>-roxyd`
+and whose SAN becomes `001.roxyd.<host>.<domain>` — in exchange for one
+key shape with no legacy arm.
 
-**[DECISION] The agent profile must carry it too, and that ordering is a
-real hazard.** `bootroot-agent` builds its fast-poll KV paths from the
-profile's service name (§2), so an agent that does not know
-`registration_id` will read the **wrong** paths. `deny_unknown_fields` is
-set only on `TrustSettings` (`src/config.rs`), **not** on the profile — so
-an older agent handed a newer `agent.toml` does not fail loudly; it
-**silently ignores the field and polls the old namespace**. Therefore the
-`[[profiles]]` schema gains `registration_id` (defaulting to the profile's
-`service_name`), and for roxyd — the one existing consumer whose value
-changes — **the agent is upgraded before its configuration is rewritten**.
-Modules are net-new and have no deployed agent, so they are unaffected.
+**[DECISION] The agent profile carries it too.** `bootroot-agent` builds
+its fast-poll KV paths from the profile's service name (§2), so the
+`[[profiles]]` schema gains `registration_id` and the agent reads its
+namespace from that. Because there is no compatibility arm, an agent and
+the `agent.toml` written for it move together at install; there is no
+window in which an older agent is handed a newer profile and silently
+polls a namespace that no longer exists.
 
 **What does not change.** SAN composition still reads `service_name`,
 `hostname`, `instance_id` and `domain` (§2). REView and roxyd never see
@@ -622,7 +630,7 @@ needs the key.
   policies, KV namespaces, state filenames and cert/key paths, and distinct
   SANs differing only in the instance label; **a registration that omits
   `registration_id` behaves exactly as today**, so an existing singleton's
-  paths and names are byte-identical (no migration).
+  paths and names follow the one key shape, with no legacy arm.
 - **Injective identity:** minting a derived `registration_id` that collides
   with a **different** already-registered host is **rejected** — the
   collision check runs **before** the spec-match, compares against a **durable
@@ -630,7 +638,7 @@ needs the key.
   **serialized** so concurrent colliding registrations cannot both mint. Tests
   cover the genuinely non-injective case — `aimer` on host `web-h1` versus
   `aimer-web` on host `h1`, both instance 2, which derive the same
-  `aimer-web-h1-2` — (a) **sequentially** (second refused), (b)
+  `h1-aimer-web-001` — (a) **sequentially** (second refused), (b)
   **concurrently** (exactly one succeeds), and (c) with a **restart** between
   the two (second still refused). A re-mint from the **same** host still
   succeeds (crash-resume unaffected). **Deregister is host-verified:** it
