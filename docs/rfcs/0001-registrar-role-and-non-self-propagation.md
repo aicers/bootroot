@@ -1,6 +1,7 @@
 # RFC-F: bootroot — the runtime registrar surface and its non-self-propagation guarantee
 
-Status: draft. This is an **`aicers/bootroot`** in-repo RFC (its first —
+Status: accepted; implementation is decomposed from §7. This is an
+**`aicers/bootroot`** in-repo RFC (its first —
 filing home `docs/rfcs/`). It is the ecosystem install/update set's
 **RFC-F**, the companion that supplies the one **bootroot-owned** change the
 runtime-enrollment design depends on. Current-state claims are verified
