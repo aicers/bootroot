@@ -303,6 +303,22 @@ different — it is genuinely per-installation, so it arrives on the wire as
 `instance` and is rendered three digits zero-padded (RFC-A §4); a component
 whose class has no instance dimension takes the default `001`.
 
+**[DECISION] The verb validates `instance` presence against the component's
+multiplicity, which bootler provisions in the same local file.** Deriving
+`registration_id` picks one of the three arms by multiplicity class (§5.5),
+so from the parts alone the verb cannot tell a legitimate singleton
+(`review`, no `instance`) from a **module whose `instance` was wrongly
+omitted** (`piglet`, no `instance` → the 2-part `piglet-h1` instead of
+`piglet-h1-1`) — which would mint a valid-but-phantom identity a later
+correct `instance` then duplicates. Since deriving replaced the old "reject
+a caller-composed name" check (below), that gap must not be left open. So
+bootler records each component's **multiplicity class** alongside the domain
+and safe-set (RFC-A §6/§7), and the verb **refuses a `Register` whose
+`instance` presence does not match**: present for a many-per-host component,
+absent for a one-per-host or one-per-deployment one. This is the identity
+**shape** check; the host-collision check below is the **uniqueness** check;
+neither substitutes for the other.
+
 **Deriving rather than accepting removes a failure mode outright.** Were
 the caller to send a composed name instead, a buggy or compromised REView
 sending `{ service_name: "piglet-h1", host: "h2" }` would mint cleanly and
@@ -587,6 +603,12 @@ needs the key.
   missing or unreadable rendered file **fails the mint** rather than
   defaulting to a guessed domain. Both sides derive with the **single** rule
   in RFC-A §4.
+- **Identity-shape check (§5.1):** the verb reads the component's
+  bootler-provisioned multiplicity class and **refuses a `Register` whose
+  `instance` presence contradicts it** — a many-per-host component with
+  **no** `instance`, or a one-per-host / one-per-deployment component **with**
+  one. A test drives both mismatches and asserts the mint is refused (no
+  phantom identity created), and asserts the matching shapes still mint.
 - **Namespace key vs SAN label (§5.5):** every namespace in §2 — registry
   entry, AppRole and policy names, policy-body paths, KV namespace,
   agent-config markers, state filename, default cert/key filenames,
@@ -670,8 +692,10 @@ Self-contained issues; dependency order:
    bootroot-internal privileged credential, exposed on the existing daemon
    (`daemon.rs::run_daemon:68`, §4) with DNS-label / prefix validation,
    **derivation of the `registration_id` and the SAN from the supplied
-   `(service_name, host, instance)` plus the locally-rendered `domain`**, and
-   no caller-supplied role/policy body or composed name. The delivery form is
+   `(service_name, host, instance)` plus the locally-rendered `domain`**, the
+   **identity-shape check** (refuse a `Register` whose `instance` presence
+   contradicts the component's locally-rendered `multiplicity` class, §5.1),
+   and no caller-supplied role/policy body or composed name. The delivery form is
    **decided** (§4), so this has no blocking prerequisite; it consumes 0.
 2. **Registrar credential policy** (§5.3) — the scoped policy authorizing only
    invoking the two verbs (NOT the CA/HMAC/EAB reads, which live inside the
