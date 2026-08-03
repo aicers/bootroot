@@ -231,7 +231,7 @@ Why not the alternatives:
 - **OpenBao policy-templating** cannot express this surface at all. Every
   requirement in §5.1 is **stateful application logic** — a durable
   `label → host` binding, a collision check that must run *before* the
-  spec-match, a per-`service_name` mutex spanning mint **and** deregister,
+  spec-match, a per-`registration_id` mutex spanning mint **and** deregister,
   validation against a bootler-rendered safe-set file, and re-deriving the
   label from the supplied `host`. An ACL policy matches paths and parameter
   values; it cannot hold state, order operations, or take a lock.
@@ -314,8 +314,11 @@ correct `instance` then duplicates. Since deriving replaced the old "reject
 a caller-composed name" check (below), that gap must not be left open. So
 bootler records each component's **multiplicity class** alongside the domain
 and safe-set (RFC-A §6/§7), and the verb **refuses a `Register` whose
-`instance` presence does not match**: present for a many-per-host component,
-absent for a one-per-host or one-per-deployment one. This is the identity
+`instance` presence does not match** with the typed
+**`ServiceInstanceMismatch`** (RFC-C §5): present for a many-per-host
+component, absent for a one-per-host or one-per-deployment one. A component
+with **no entry** is refused too, never defaulted — fail-open would restore
+the phantom-identity gap this closes. This is the identity
 **shape** check; the host-collision check below is the **uniqueness** check;
 neither substitutes for the other.
 
@@ -605,7 +608,8 @@ needs the key.
   in RFC-A §4.
 - **Identity-shape check (§5.1):** the verb reads the component's
   bootler-provisioned multiplicity class and **refuses a `Register` whose
-  `instance` presence contradicts it** — a many-per-host component with
+  `instance` presence contradicts it, with `ServiceInstanceMismatch`** — a
+  many-per-host component with
   **no** `instance`, or a one-per-host / one-per-deployment component **with**
   one. A test drives both mismatches and asserts the mint is refused (no
   phantom identity created), and asserts the matching shapes still mint.
