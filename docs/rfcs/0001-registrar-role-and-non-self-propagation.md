@@ -1203,6 +1203,25 @@ Self-contained issues; dependency order:
 4. **Red-team + functional tests** (§6) — the escalation-denied and
    functionality-preserved assertions. Depends on 1–3.
 
+Every issue above that touches the `node.enroll` wire surface reads its
+externally owned spellings — the `Register`/`Deregister` request fields, both
+success response shapes, every typed enroll error with its
+retryable-versus-permanent class, and the closed `RegistrarUnavailable` reason
+set — from **`docs/reference/registrar-wire-contract.md`**, this repository's
+checked-in transcription of RFC-C §5 with its per-item provenance and the
+revision it was read at. That file is the single source of truth for those
+names here: the codec is written against it, the golden fixtures are generated
+from it, and the acceptance arms assert identifiers off it. This RFC names
+individual identifiers where one of its own decisions turns on it — §5.1's
+`ServiceNameCollision` and `ServiceInstanceMismatch`, §5.6's `RegistrarBusy`
+and `PostMintUnrecordable`, §6's test criteria — always citing RFC-C rather
+than defining them, and never as the authoritative set: the spellings, the
+full set and the retryable-versus-permanent classes are looked up in the file,
+not here. Where the file and `aicers/review-protocol` disagree, that
+repository wins and the file is corrected. Like this document it is a
+checked-in, untranslated sibling of the `docs/en/` + `docs/ko/` operator pair
+that `mkdocs.yml` lists in neither locale's nav.
+
 Cross-repo: bootler RFC-A §6 provisioning switches to target this restricted
 surface; roxyd RFC-B §6 and review RFC-D2 §4d call it unchanged (they already
 speak `node.enroll` Register/Deregister and never touched raw OpenBao paths).
