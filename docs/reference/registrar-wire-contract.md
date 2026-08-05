@@ -262,6 +262,11 @@ Six reasons. The source states the set is **closed**.
 only one under which something was minted; `RegistrarUnreachable` is the only
 one the manager produces without any registrar response.
 
+The reasons' order is the source's; that the order *is* the wire encoding comes
+from `RP#218`, on the same terms as §6.1 — `RegistrarUnavailableReason` is its
+own bincode-encoded enum, so reordering it silently remaps already-encoded
+bytes.
+
 ## 7. Recorded properties
 
 Load-bearing facts transcribed as their own rows, so a later upstream change
