@@ -1211,8 +1211,13 @@ set — from **`docs/reference/registrar-wire-contract.md`**, this repository's
 checked-in transcription of RFC-C §5 with its per-item provenance and the
 revision it was read at. That file is the single source of truth for those
 names here: the codec is written against it, the golden fixtures are generated
-from it, and the acceptance arms assert identifiers off it. This RFC does not
-restate them, and where the file and `aicers/review-protocol` disagree, that
+from it, and the acceptance arms assert identifiers off it. This RFC names
+individual identifiers where one of its own decisions turns on it — §5.1's
+`ServiceNameCollision` and `ServiceInstanceMismatch`, §5.6's `RegistrarBusy`
+and `PostMintUnrecordable`, §6's test criteria — always citing RFC-C rather
+than defining them, and never as the authoritative set: the spellings, the
+full set and the retryable-versus-permanent classes are looked up in the file,
+not here. Where the file and `aicers/review-protocol` disagree, that
 repository wins and the file is corrected. Like this document it is a
 checked-in, untranslated sibling of the `docs/en/` + `docs/ko/` operator pair
 that `mkdocs.yml` lists in neither locale's nav.
