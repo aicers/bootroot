@@ -34,6 +34,7 @@ obtained any other way carry their own pointer in the `Provenance` column.
 | `RP#218` | `aicers/review-protocol` | issue [#218](https://github.com/aicers/review-protocol/issues/218) body | Scope / Constraints / Acceptance criteria | body revision of 2026-08-05T00:08:28Z (issue open, unimplemented) |
 | `RFC-F §5.1` | `aicers/bootroot` | `docs/rfcs/0001-registrar-role-and-non-self-propagation.md` | §5.1 Restricted registrar mint verb | this repository, working tree |
 | `RFC-F §5.6` | `aicers/bootroot` | `docs/rfcs/0001-registrar-role-and-non-self-propagation.md` | §5.6 Audit record for both verbs | this repository, working tree |
+| `BR#759` | `aicers/bootroot` | issue [#759](https://github.com/aicers/bootroot/issues/759) body | Scope | this repository's own expectation, **not** transcribed from the source |
 | `bootroot` | `aicers/bootroot` | source paths cited per row | — | this repository, working tree |
 
 The source document has exactly one commit in its history — `7a6c7e2`, the
@@ -55,9 +56,9 @@ version.
 | `NodeEnrollResponse` | enum (response) | review-protocol | `RFC-C §5` |
 | `NodeEnrollError` | enum (typed failure) | review-protocol | `RP#218` |
 | `RegistrarUnavailableReason` | enum (closed reason set) | review-protocol | `RP#218` |
-| `ServiceSpec` | struct | review-protocol (contents externally owned, see §7) | `RFC-C §5` |
+| `ServiceSpec` | struct | review-protocol (contents externally owned, see §8.3) | `RFC-C §5` |
 | `DeliveryMode` | enum | review-protocol | `RFC-C §5` |
-| `BootstrapMaterial` | struct | review-protocol (`ca_anchor` contents bootroot-owned, see §7) | `RFC-C §5` |
+| `BootstrapMaterial` | struct | review-protocol (`ca_anchor` contents bootroot-owned, see §8.1) | `RFC-C §5` |
 | `ReloadHook` | newtype over `String`, opaque | review-protocol | `RP#218` |
 | `CertGroup` | newtype over `String`, opaque | review-protocol | `RP#218` |
 
@@ -91,13 +92,13 @@ name.
 
 | Field | Type | Owner | Notes | Provenance |
 | --- | --- | --- | --- | --- |
-| `service_name` | `String` | review-protocol | The component's plain keyword; a single DNS label (see §6, property `service_name shape`). | `RFC-C §5` |
-| `delivery_mode` | `DeliveryMode` | review-protocol | See §4.5; bootroot's local counterpart in §7. | `RFC-C §5` |
+| `service_name` | `String` | review-protocol | The component's plain keyword; a single DNS label (see §7, property `service_name shape`). | `RFC-C §5` |
+| `delivery_mode` | `DeliveryMode` | review-protocol | See §4.5; bootroot's local counterpart in §8.2. | `RFC-C §5` |
 | `host` | `String` | review-protocol | The target host's single DNS label. | `RFC-C §5` |
 | `instance` | `Option<u32>` | review-protocol | Instance number scoped by `{service_name}.{hostname}`; `None` for a component whose multiplicity class has no instance dimension. | `RFC-C §5` |
 | `spec` | `ServiceSpec` | mirrored field name, externally owned contents (§4.4) | Applied on a first mint and compared on a re-register. | `RFC-C §5` |
 | `wrap_ttl` | `Duration` | review-protocol | *Requested* lifetime of the wrapped material; the registrar MAY clamp it. | `RFC-C §5` |
-| `idempotency_key` | `String` | review-protocol | Correlation handle, not a response cache (see §6). | `RFC-C §5` |
+| `idempotency_key` | `String` | review-protocol | Correlation handle, not a response cache (see §7). | `RFC-C §5` |
 
 ### 4.3 `Deregister` fields
 
@@ -120,15 +121,24 @@ review-protocol nor bootroot. There is deliberately **no** privilege field.
 
 | Field | Type | Owner | Notes | Provenance |
 | --- | --- | --- | --- | --- |
-| `component` | `String` | bootler (`ServiceRegistration`) | Canonical package id. Checked for agreement with the wire `service_name`, not against the safe-set. | `RFC-C §5` |
-| `service_name` | `String` | bootler (`ServiceRegistration`) | The component's plain keyword. Checked for agreement with the wire `service_name`, not against the safe-set. | `RFC-C §5` |
-| `reload` | `ReloadHook` | bootler (`ServiceRegistration`) | Validated against the registrar's rendered safe-set. | `RFC-C §5` |
-| `cert_group` | `Option<CertGroup>` | bootler (`ServiceRegistration`) | Validated against the registrar's rendered safe-set. | `RFC-C §5` |
+| `component` | `String` | bootler (`ServiceRegistration`) | Canonical package id. **Not** validated against the safe-set. | `RFC-C §5` |
+| `service_name` | `String` | bootler (`ServiceRegistration`) | The component's plain keyword. **Not** validated against the safe-set. | `RFC-C §5` |
+| `reload` | `ReloadHook` | bootler (`ServiceRegistration`) | Validated against the registrar's rendered safe-set. | `RFC-C §5`, `RFC-F §5.1` |
+| `cert_group` | `Option<CertGroup>` | bootler (`ServiceRegistration`) | Validated against the registrar's rendered safe-set. | `RFC-C §5`, `RFC-F §5.1` |
 
-Only `reload` and `cert_group` are compared against the rendered safe-set;
-`component` and `service_name` are checked for agreement with the wire
-`service_name`. A codec that narrowed `spec` to an opaque blob, or to the
-safe-set pair alone, would drop a payload two checks depend on.
+What the pinned source states is the safe-set half: `RFC-C §5` and `RFC-F §5.1`
+both say the registrar safe-set validates **`cert_group` and `reload`** and
+name no rule for the other two. **The source states nothing about how
+`component` and `spec.service_name` are checked.** This repository's own
+expectation — that they are compared for agreement with the wire
+`service_name` rather than against the safe-set — is recorded here on
+`BR#759`, not transcribed from the source; if the registrar's verb work
+settles it differently, that is a change to this repository, not a drift from
+review-protocol.
+
+Either way, all four field names ride the wire and a codec must carry them: one
+that narrowed `spec` to an opaque blob, or to the safe-set pair alone, would
+drop a payload the other two checks depend on.
 
 ### 4.5 `DeliveryMode` variants
 
@@ -166,7 +176,7 @@ Four fields.
 | --- | --- | --- | --- | --- |
 | `role_id` | `String` | review-protocol | The service `AppRole` role id. | `RFC-C §5` |
 | `wrapped_secret_id` | `String` | review-protocol | Response-wrapped `secret_id`; single-use, short-TTL, persisted nowhere. | `RFC-C §5` |
-| `ca_anchor` | `Vec<u8>` | mirrored field name, **bootroot-owned contents** (§7) | The CA anchor the target verifies with. | `RFC-C §5` |
+| `ca_anchor` | `Vec<u8>` | mirrored field name, **bootroot-owned contents** (§8.1) | The CA anchor the target verifies with. | `RFC-C §5` |
 | `expires_at` | `DateTime<Utc>` | review-protocol | The **granted absolute deadline** after any registrar clamp — not the requested `wrap_ttl` echoed back. | `RFC-C §5` |
 
 ## 6. Typed enroll errors
