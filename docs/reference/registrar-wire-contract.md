@@ -61,6 +61,7 @@ version.
 | `BootstrapMaterial` | struct | review-protocol (`ca_anchor` contents bootroot-owned, see §8.1) | `RFC-C §5` |
 | `ReloadHook` | newtype over `String`, opaque | review-protocol | `RP#218` |
 | `CertGroup` | newtype over `String`, opaque | review-protocol | `RP#218` |
+| `AgentInfo` | struct (handshake), not part of the `node.enroll` family | review-protocol | `RFC-C §7`, `RFC-C §8` |
 
 `RFC-C §5` names the six typed errors in prose bullets and does **not** spell
 an enclosing enum type for them; `NodeEnrollError` and
