@@ -1,3 +1,7 @@
+<!-- markdownlint-configure-file {
+  "MD013": { "tables": false, "code_blocks": false }
+} -->
+
 # Remote Bootstrap Operator Guide
 
 This guide covers the **remote-bootstrap** delivery mode for services

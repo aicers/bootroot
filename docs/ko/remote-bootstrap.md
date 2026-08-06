@@ -1,3 +1,7 @@
+<!-- markdownlint-configure-file {
+  "MD013": { "tables": false, "code_blocks": false }
+} -->
+
 # 원격 부트스트랩 운영자 가이드
 
 이 가이드는 step-ca, OpenBao, HTTP-01 리스폰더가 동작하는 머신(**제어
