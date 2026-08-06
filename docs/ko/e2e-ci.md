@@ -1,3 +1,7 @@
+<!-- markdownlint-configure-file {
+  "MD013": { "tables": false, "code_blocks": false }
+} -->
+
 # CI/E2E
 
 이 문서는 bootroot의 CI/E2E 검증 구조, 시나리오별 실행 흐름,

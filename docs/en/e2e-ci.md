@@ -1,3 +1,7 @@
+<!-- markdownlint-configure-file {
+  "MD013": { "tables": false, "code_blocks": false }
+} -->
+
 # CI & E2E
 
 This page explains bootroot CI/E2E validation structure, scenario execution

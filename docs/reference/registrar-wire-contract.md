@@ -1,3 +1,7 @@
+<!-- markdownlint-configure-file {
+  "MD013": { "tables": false, "code_blocks": false }
+} -->
+
 # Registrar endpoint wire contract (mirrored)
 
 **Mirror rule.** This repository *mirrors* these names and does not author

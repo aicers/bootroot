@@ -1,13 +1,11 @@
 globs:
-  - "**/*.md"
+- '**/*.md'
 ignores:
-  - "node_modules/**"
-  - "secrets/**"
-  - ".github/**"
-  - ".venv/**"
-  - "target/**"
+- node_modules/**
+- secrets/**
+- .github/**
+- .venv/**
+- target/**
 config:
-  MD013:
-    tables: false
   MD024:
     siblings_only: true
