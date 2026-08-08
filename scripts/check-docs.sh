@@ -31,45 +31,42 @@ esac
 echo "[docs] Build site"
 mkdocs build --strict
 
-# MkDocs drops every dot-prefixed path inside docs_dir from the build, and
-# --strict does not validate that extra_css entries resolve, so an unstyled
-# site builds green. Assert the stylesheets actually reached site/.
-echo "[docs] Verify theme stylesheets reached the site"
-shopt -s nullglob
-installed=(docs/theme/styles/*.css)
-if ((${#installed[@]} == 0)); then
-  echo "Error: docs/theme/styles/ contains no stylesheets" >&2
-  exit 1
-fi
-
-missing=0
-for css in "${installed[@]}"; do
-  published="site/theme/styles/$(basename "$css")"
-  if [[ ! -f "$published" ]]; then
-    echo "Error: $css was not published to $published" >&2
-    missing=1
-  fi
-done
-((missing == 0)) || exit 1
-
-# The stylesheets are only the assets the original bug happened to expose.
-# The wordmark, the tab icon and the Pretendard/Roboto faces are referenced
-# from the built HTML and from the stylesheets' url() rules, and dropping
-# any of them 404s just as silently. Resolve every theme/ reference the
-# site actually makes rather than restating the expected file list, so this
-# keeps holding when docs-theme changes what it ships or excludes.
-echo "[docs] Verify referenced theme assets resolve"
+# Three things have to hold for the site to be styled, and `mkdocs build
+# --strict` checks none of them: the stylesheets must be copied into site/,
+# the pages must actually link them, and every other theme asset they and
+# the pages reference must resolve.
+echo "[docs] Verify the theme reached the site"
 python3 - <<'PY'
+import glob
 import os
 import re
 import sys
 from urllib.parse import unquote, urlparse
 
 SITE = "site"
+STYLES = "docs/theme/styles"
 HTML_REF = re.compile(r'(?:href|src)="([^"]+)"')
 CSS_REF = re.compile(r"url\(\s*['\"]?([^'\")]+)")
+# Matches however a page spells the path: relative from a nested page
+# ("../theme/styles/base.css") or rooted at site_url as 404.html writes it
+# ("/bootroot/theme/styles/base.css").
+STYLE_LINK = re.compile(r"theme/styles/([^/\"'?#]+\.css)")
 
-missing = set()
+errors = []
+
+installed = sorted(os.path.basename(p) for p in glob.glob(f"{STYLES}/*.css"))
+if not installed:
+    print(f"Error: {STYLES}/ contains no stylesheets", file=sys.stderr)
+    sys.exit(1)
+
+# MkDocs drops every dot-prefixed path inside docs_dir from the build, which
+# is how the whole theme went missing while CI stayed green.
+for name in installed:
+    published = os.path.join(SITE, "theme", "styles", name)
+    if not os.path.isfile(published):
+        errors.append(f"{STYLES}/{name} was not published to {published}")
+
+unresolved = set()
 
 
 def check(page, ref):
@@ -84,8 +81,16 @@ def check(page, ref):
     if not target.startswith("theme/"):
         return
     if not os.path.isfile(os.path.join(SITE, target)):
-        missing.add((page, ref, target))
+        unresolved.add((page, ref, target))
 
+
+# The stylesheets are only the assets the original bug happened to expose.
+# The wordmark, the tab icon and the Pretendard/Roboto faces are referenced
+# from the built HTML and from the stylesheets' url() rules, and dropping
+# any of them 404s just as silently. Resolve every theme/ reference the site
+# actually makes rather than restating the expected file list, so this keeps
+# holding when docs-theme changes what it ships or what it excludes.
+linked = {}
 
 for dirpath, _, filenames in os.walk(SITE):
     for name in filenames:
@@ -101,13 +106,39 @@ for dirpath, _, filenames in os.walk(SITE):
             text = handle.read()
         for ref in pattern.findall(text):
             check(page, ref)
+        if name.endswith(".html"):
+            linked[page] = set(STYLE_LINK.findall(text))
 
-for page, ref, target in sorted(missing):
-    print(
-        f"Error: {page} references {ref}, but site/{target} does not exist",
-        file=sys.stderr,
+for page, ref, target in sorted(unresolved):
+    errors.append(f"{page} references {ref}, but site/{target} does not exist")
+
+# Being published is not the same as being linked, and the difference is
+# invisible to both checks above: re-declaring extra_css in mkdocs.yml
+# replaces the list the inherited base provides instead of extending it, yet
+# the dropped stylesheets are still copied into site/ as ordinary docs_dir
+# files. That leaves an unstyled site that resolves every reference it makes
+# because it no longer makes them. Require the pages to link the full set.
+ADVICE = (
+    "check that mkdocs.yml does not re-declare extra_css, which "
+    "replaces the inherited list rather than extending it"
+)
+styled = {page: names for page, names in linked.items() if names}
+if not styled:
+    errors.append(f"no built page links any {STYLES}/ stylesheet; {ADVICE}")
+
+unlinked = {}
+for page, names in styled.items():
+    for name in set(installed) - names:
+        unlinked.setdefault(name, []).append(page)
+for name, pages in sorted(unlinked.items()):
+    errors.append(
+        f"theme/styles/{name} is published but {len(pages)} built page(s) do "
+        f"not link it, e.g. {min(pages)}; {ADVICE}"
     )
-sys.exit(1 if missing else 0)
+
+for error in errors:
+    print(f"Error: {error}", file=sys.stderr)
+sys.exit(1 if errors else 0)
 PY
 
 echo "[docs] done"

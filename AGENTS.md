@@ -120,7 +120,8 @@ before generating code.
 * A change under `docs/` (or to `mkdocs.yml`) MUST pass
   `mkdocs build --strict`. Run `./scripts/check-docs.sh`, which is what CI
   runs: it verifies the vendored theme, builds with `--strict`, and asserts
-  the theme stylesheets and every referenced theme asset reached `site/`.
+  the built pages link the theme stylesheets and that every referenced
+  theme asset reached `site/`.
 * No theme setup is required. The shared docs theme is vendored under
   `docs/theme/` and committed, so a fresh clone builds the manual with no
   network access and no `gh` — only `pip install mkdocs-material

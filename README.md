@@ -137,8 +137,8 @@ Command notes:
   server.
 - `mkdocs build --strict`: builds static files into `site/`.
 - `./scripts/check-docs.sh`: what CI runs — verifies the vendored theme, builds
-  with `--strict`, and asserts the theme stylesheets and every referenced
-  theme asset reached `site/`.
+  with `--strict`, and asserts the built pages link the theme stylesheets and
+  that every referenced theme asset reached `site/`.
 - `./docs/theme/build-docs-pdf.sh en|ko`: builds PDF manuals into `site/pdf/`.
   Needs `pip install mkdocs-with-pdf`.
 

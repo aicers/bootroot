@@ -962,9 +962,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `mkdocs build --strict` and asserts the theme stylesheets reached
   `site/`. It also resolves every `theme/` asset the built HTML and
   stylesheets actually reference, so a dropped wordmark, tab icon or web
-  font fails the check rather than 404ing on the deployed site.
-  `CLAUDE.md` and `AGENTS.md` record the rule that a change under `docs/`
-  must pass this. (Part of #794)
+  font fails the check rather than 404ing on the deployed site, and it
+  requires the built pages to link the full set of installed stylesheets
+  — being copied into `site/` is not the same as being loaded, and
+  re-declaring `extra_css` in `mkdocs.yml` replaces the inherited list
+  rather than extending it, which would otherwise unstyle the site
+  without failing anything. `CLAUDE.md` and `AGENTS.md` record the rule
+  that a change under `docs/` must pass this. (Part of #794)
 - PDF cover text is now configuration rather than code. `mkdocs.yml`
   carries an `extra.pdf` block with `cover_title`, `cover_subtitle`,
   `cover_tagline`, `toc_title`, and `output_basename`, each locale-mapped
