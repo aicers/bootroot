@@ -76,6 +76,15 @@ def check(page, ref):
         return
     base = "" if ref.startswith("/") else os.path.dirname(page)
     target = os.path.normpath(os.path.join(base, parsed.path.lstrip("/")))
+    if ref.startswith("/"):
+        # A rooted ref carries the site_url path prefix ("/bootroot/theme/...")
+        # that site/ itself does not have, so it never matches the "theme/"
+        # test below and would be exempt from this check. 404.html is the one
+        # page MkDocs writes this way, and it references the same stylesheets
+        # as every other page. Re-anchor at the theme/ segment so it counts.
+        head, sep, tail = target.partition("theme/")
+        if sep and (not head or head.endswith("/")):
+            target = sep + tail
     # Only theme assets are this check's business; MkDocs' own --strict
     # already validates internal page links.
     if not target.startswith("theme/"):
