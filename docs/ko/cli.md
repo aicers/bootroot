@@ -96,7 +96,7 @@ EAB 회전을 가져와 `agent.toml`을 재렌더하므로 어느 서비스 호�
 - step-ca/responder를 IP가 아닌 이름으로 접근하면, 관련 호스트들에서
   DNS/hosts 매핑을 일관되게 맞춰야 합니다.
 
-상세 기준과 조건별 설명은 개요의 [/etc/hosts 매핑 설정](index.md#etchosts)을
+상세 기준과 조건별 설명은 개요의 [/etc/hosts 매핑 설정](index.md#etchosts-매핑-설정)을
 참고하세요.
 
 ## bootroot infra up
@@ -532,7 +532,7 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   서비스별 오버라이드는 이후
   `bootroot service add --secret-id-ttl` 또는
   `bootroot service update --secret-id-ttl`로 설정할 수 있습니다.
-  [운영 > SecretID TTL과 회전 주기](operations.md#secretid-ttl)를
+  [운영 > SecretID TTL과 회전 주기](operations.md#secretid-ttl과-회전-주기)를
   참고하세요.
 - `--rotate-bound-cidrs`: 두 rotate AppRole 자격증명
   (`bootroot-runtime-rotate-role`, `bootroot-infra-rotate-role`)을
@@ -892,7 +892,7 @@ EAB 갱신과 `rotate eab-clear`가 해당 에이전트에서 조용히 무시�
   payload를 준비하고, `bootroot-remote bootstrap`이 원격 호스트에
   반영합니다.
 - `--insecure`는 실행 단위 break-glass 오버라이드입니다. 자세한
-  규칙/운영 흐름은 [설정 > 신뢰](configuration.md#_4) 섹션을
+  규칙/운영 흐름은 [설정 > 신뢰](configuration.md#신뢰) 섹션을
   참고하세요.
 
 #### 4-3) preview 모드(`--print-only`/`--dry-run`)

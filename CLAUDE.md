@@ -114,3 +114,26 @@ before generating code.
   when your changes do not affect the Docker lifecycle, E2E scripts, or
   any code paths exercised by the E2E tests (rotation, service add/verify,
   daemon, config, etc.).
+
+## 7. Documentation Build
+
+* A change under `docs/` (or to `mkdocs.yml`) MUST pass
+  `mkdocs build --strict`. Run `./scripts/check-docs.sh`, which is what CI
+  runs: it verifies the vendored theme, builds with `--strict`, and asserts
+  the theme stylesheets reached `site/`.
+* No theme setup is required. The shared docs theme is vendored under
+  `docs/theme/` and committed, so a fresh clone builds the manual with no
+  network access and no `gh` — only `pip install mkdocs-material
+  mkdocs-static-i18n`.
+* Never edit anything under `docs/theme/`. The installer records a content
+  digest in `docs/theme/.meta` and the CI verification step fails on any
+  drift. Changes there belong in
+  [aicers/docs-theme](https://github.com/aicers/docs-theme).
+* To adopt a new theme release, edit `version` in `docs/theme.toml`, run
+  `./scripts/fetch-theme.sh` (needs `gh`), and commit the resulting
+  `docs/theme/`.
+* `mkdocs.yml` inherits `docs/theme/mkdocs-base.yml`. MkDocs merges
+  mappings recursively but replaces lists and scalars wholesale, so do NOT
+  redeclare `theme.features`, `markdown_extensions`, `extra_css`, or
+  `exclude_docs` here — even partially. Doing so silently discards
+  everything the base defines for that key.

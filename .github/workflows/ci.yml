@@ -84,11 +84,6 @@ jobs:
       - name: Install Python Tools
         run: python -m pip install --upgrade pip ruff mkdocs-material mkdocs-static-i18n
 
-      - name: Fetch Docs Theme
-        run: ./scripts/fetch-theme.sh
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Check Rust Formatting
         run: cargo fmt -- --check --config group_imports=StdExternalCrate
 
@@ -119,8 +114,8 @@ jobs:
         with:
           globs: "**/*.md"
 
-      - name: Build Docs
-        run: mkdocs build --strict
+      - name: Check Docs
+        run: ./scripts/check-docs.sh
 
       - name: Validate Deploy Compose
         run: ./scripts/validate-deploy-compose.sh

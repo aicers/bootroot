@@ -1,0 +1,5 @@
+repo = "aicers/docs-theme"
+version = "0.3.0"
+template = "manual"
+digest = "sha256:27db728c040d2e4a66ad216c199e70c1680f3ff45cced983107aec600ad2fe16"
+source = "release"
