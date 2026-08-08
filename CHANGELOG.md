@@ -2141,8 +2141,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the command line after `bootroot infra install`.
 - Replaced local MkDocs theme assets with shared
   [aicers/docs-theme](https://github.com/aicers/docs-theme) `manual`
-  template. Theme version and template are declared in `docs/theme.toml`
-  and fetched at build time via `scripts/fetch-theme.sh`.
+  template. Theme version and template are declared in `docs/theme.toml`.
 
 ## [0.2.0] - 2026-03-28
 
