@@ -1,17 +1,9 @@
+INHERIT: docs/theme/mkdocs-base.yml
 site_name: Bootroot Manual
 site_description: Bootroot user manual (EN/KR)
 repo_url: https://github.com/aicers/bootroot
 site_url: https://example.invalid/bootroot
-
-theme:
-  name: material
-  language: en
-  features:
-    - navigation.tabs
-    - navigation.sections
-    - navigation.tracking
-    - search.highlight
-    - search.suggest
+copyright: Copyright 2026 ClumL Inc.
 
 plugins:
   - search
@@ -59,6 +51,16 @@ plugins:
             CI & E2E: CI/E2E
             Troubleshooting: 문제 해결
 
-extra_css:
-  - .theme/styles/lists.css
-  - .theme/styles/pdf.css
+extra:
+  pdf:
+    cover_title: Bootroot
+    cover_subtitle:
+      en: User Manual
+      ko: 사용자 매뉴얼
+    cover_tagline:
+      en: Technical Installation and Operations Manual
+      ko: 기술 설치 및 운영 매뉴얼
+    toc_title:
+      en: Table of Contents
+      ko: 목차
+    output_basename: bootroot-manual

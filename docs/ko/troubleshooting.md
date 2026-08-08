@@ -47,7 +47,7 @@
 - 각 설치본에 서로 다른
   `bootroot infra install --instance-name <name>`과 자체 compose
   디렉터리(자체 `.env`, `secrets/`, 생성된 오버라이드)를 주세요.
-  [두 번째 인스턴스를 같은 호스트에 배치하기](installation.md#_3)를
+  [두 번째 인스턴스를 같은 호스트에 배치하기](installation.md#두-번째-인스턴스를-같은-호스트에-배치하기)를
   참고하세요.
 - 두 설치본을 다루기 전에 `unset COMPOSE_PROJECT_NAME`을 실행하세요.
 - 결과 확인: `docker inspect --format

@@ -1,0 +1,99 @@
+# Base MkDocs configuration for the "manual" template.
+#
+# Consuming projects INHERIT this file rather than copying settings out
+# of it:
+#
+#   INHERIT: docs/theme/mkdocs-base.yml
+#   site_name: Example Manual
+#   repo_url: https://github.com/aicers/example
+#
+#   plugins:
+#     - search
+#     - i18n:
+#         docs_structure: folder
+#         languages: [...]
+#
+# MkDocs resolves INHERIT relative to the consuming config's directory
+# and deep-merges parent into child with mergedeep.merge(parent, child).
+# Dictionaries merge recursively, but LISTS AND SCALARS ARE REPLACED
+# WHOLESALE. So theme.features, markdown_extensions, extra_css, and the
+# exclude_docs scalar must stay defined in full here; a consumer that
+# sets any of them partially silently discards everything this base
+# provides. Keep site-specific keys (site_name, repo_url, nav, the i18n
+# languages) in the consuming config.
+
+theme:
+  name: material
+  language: en
+  font: false
+  logo: theme/brand.svg
+  favicon: theme/brand-symbol.svg
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: folder
+
+extra_css:
+  - theme/styles/base.css
+  - theme/styles/lists.css
+  - theme/styles/pdf.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.keys
+  - abbr
+  - pymdownx.snippets
+  - toc:
+      permalink: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+
+# Keep the theme machinery out of the published site. Paths are relative
+# to docs_dir; theme/styles/, theme/fonts/, and theme/brand.svg stay
+# published so the browser identity is served from the site itself.
+exclude_docs: |
+  theme/pdf/
+  theme/mkdocs-base.yml
+  theme/build-docs-pdf.sh
+  theme.toml

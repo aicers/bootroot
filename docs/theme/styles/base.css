@@ -1,0 +1,89 @@
+/* Base styles shared across all docs-theme templates.
+ * Template-specific overrides live in templates/<name>/styles/.
+ *
+ * Installs to docs/theme/styles/base.css, with the web fonts alongside
+ * at docs/theme/fonts/. This file carries the theme's browser
+ * typography and the table/diagram rules shared fleet-wide, so a
+ * consumer that inherits mkdocs-base.yml serves its own fonts and needs
+ * no external CDN.
+ */
+
+/* --- Web fonts (served locally; no Google Fonts) --------------------- */
+
+@font-face {
+  font-family: "Pretendard";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(../fonts/Pretendard-Regular.woff2) format("woff2");
+}
+
+@font-face {
+  font-family: "Pretendard";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url(../fonts/Pretendard-Medium.woff2) format("woff2");
+}
+
+@font-face {
+  font-family: "Pretendard";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(../fonts/Pretendard-Bold.woff2) format("woff2");
+}
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(../fonts/Roboto-Regular.woff2) format("woff2");
+}
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url(../fonts/Roboto-Medium.woff2) format("woff2");
+}
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(../fonts/Roboto-Bold.woff2) format("woff2");
+}
+
+/* --- Body typography ------------------------------------------------- */
+
+/* Material composes --md-text-font into --md-text-font-family with its
+ * own sans-serif fallbacks. Pretendard covers both Korean body text and
+ * Latin, which is why it leads the stack.
+ */
+:root {
+  --md-text-font: "Pretendard";
+}
+
+/* --md-code-font is intentionally left unset: no monospace webfont
+ * ships, so code typography is deliberately system-dependent. Material's
+ * built-in fallback (SFMono-Regular, Consolas, Menlo, monospace) is
+ * already what api.css uses for inline code.
+ */
+
+/* --- Shared table/diagram rules -------------------------------------- */
+
+/* A table wider than its container scrolls horizontally instead of
+ * overflowing the page.
+ */
+.md-typeset__table {
+  overflow-x: auto;
+}
+
+/* Center rendered Mermaid diagrams. */
+.md-typeset .mermaid {
+  text-align: center;
+}

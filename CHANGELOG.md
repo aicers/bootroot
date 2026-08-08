@@ -42,6 +42,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Removed
 
+- Removed `scripts/build-docs-pdf.sh`. It was a local fork of the shared
+  PDF builder; `docs-theme` 0.3.0 ships that script and the installer
+  places it at `docs/theme/build-docs-pdf.sh`, so the manual is now built
+  with `./docs/theme/build-docs-pdf.sh en|ko`. The output filenames,
+  `site/pdf/bootroot-manual.<locale>.pdf`, are unchanged. (Part of #794)
 - Removed the demo `bootroot-agent` container: the root `Dockerfile`, the
   `bootroot-agent` service in `docker-compose.yml`, and its break-glass
   overlay in `docker-compose.test.yml` are gone. The image was the only
@@ -112,6 +117,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed the published manual having no styling at all. The theme was
+  installed into a dot-prefixed directory under `docs/`, and MkDocs
+  excludes every dot-prefixed path inside `docs_dir` from the build, so
+  nothing under it ever reached
+  `site/` and both `extra_css` entries returned 404 from
+  <https://aicers.github.io/bootroot/>. `mkdocs build --strict` does not
+  validate that `extra_css` resolves, so CI stayed green throughout. The
+  theme now installs to `docs/theme/`, and `./scripts/check-docs.sh`
+  asserts that every stylesheet under `docs/theme/styles/` is present in
+  the built `site/` tree, which is the check `--strict` does not perform.
+  (Part of #794)
+- Fixed four Korean in-page links that pointed at anchors the previous
+  ASCII-stripping slugify produced (`#_3`, `#_4`, `#etchosts`,
+  `#secretid-ttl`). The inherited `toc` slugify keeps Unicode, so Korean
+  headings now yield anchors that keep their characters; the four links
+  were repointed and twelve links that were already written against
+  Korean anchors — and had been broken all along — now resolve.
+  (Part of #794)
 - Fixed the two OpenBao Agent sidecars never authenticating on an
   install that moved its published OpenBao port. The agents reach
   OpenBao by container name on the compose network, and the address they
@@ -930,6 +953,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `scripts/check-docs.sh`, the documentation build gate both workflows and
+  `scripts/preflight/ci/check.sh` now run. It verifies the vendored theme
+  by re-running the installer — a tree that agrees with `docs/theme.toml`
+  and still matches the digest in `docs/theme/.meta` exits without
+  touching anything, so a hand-edit or a stale vendored tree fails the
+  check instead of producing a silently divergent site — then builds with
+  `mkdocs build --strict` and asserts the theme stylesheets reached
+  `site/`. It also resolves every `theme/` asset the built HTML and
+  stylesheets actually reference, so a dropped wordmark, tab icon or web
+  font fails the check rather than 404ing on the deployed site, and it
+  requires the built pages to link the full set of installed stylesheets
+  — being copied into `site/` is not the same as being loaded, and
+  re-declaring `extra_css` in `mkdocs.yml` replaces the inherited list
+  rather than extending it, which would otherwise unstyle the site
+  without failing anything. `CLAUDE.md` and `AGENTS.md` record the rule
+  that a change under `docs/` must pass this. (Part of #794)
+- PDF cover text is now configuration rather than code. `mkdocs.yml`
+  carries an `extra.pdf` block with `cover_title`, `cover_subtitle`,
+  `cover_tagline`, `toc_title`, and `output_basename`, each locale-mapped
+  where it differs between English and Korean, and a top-level
+  `copyright: Copyright 2026 ClumL Inc.` that serves both the site footer
+  and the PDF cover. Each cover also names the theme that rendered it.
+  (Part of #794)
 - `scripts/impl/run-two-instance-isolation.sh` (driven by
   `tests/docker_e2e_two_instance_isolation.rs`), a real-daemon Docker
   E2E scenario that installs, initialises and verifies two bootroot
@@ -1877,6 +1923,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Adopted `aicers/docs-theme` 0.3.0. The theme is vendored under
+  `docs/theme/` and committed rather than git-ignored, so a fresh clone
+  builds the manual with no network access and no `gh`;
+  `scripts/fetch-theme.sh` is the upstream installer and is now an updater
+  run when `docs/theme.toml` changes its pin, not a build prerequisite.
+  Both workflows dropped their `Fetch Docs Theme` step accordingly.
+  `mkdocs.yml` inherits `docs/theme/mkdocs-base.yml` and keeps only
+  site-specific keys — the `theme:` block and the `extra_css:` list are
+  gone, since MkDocs replaces lists and scalars wholesale when merging an
+  inherited config and redeclaring either would discard what the base
+  defines. (Part of #794)
+- The manual now renders with the markdown extensions the inherited base
+  config enables; bootroot previously declared none. Admonitions,
+  footnotes, task lists, content tabs, a `mermaid` fence, and a
+  Unicode-aware `toc` slugify are active. Two `!!! note` / `!!! warning`
+  blocks in `remote-bootstrap.md` (EN and KO) that had been rendering as
+  literal text now render as admonitions, and Korean headings produce
+  anchors that keep their characters. (Part of #794)
 - Container names, in-network DNS names and certificate SANs now follow
   the recorded install identity instead of being literal `bootroot-*`
   strings, so two installs can actually coexist on one host. Container
@@ -2077,8 +2141,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the command line after `bootroot infra install`.
 - Replaced local MkDocs theme assets with shared
   [aicers/docs-theme](https://github.com/aicers/docs-theme) `manual`
-  template. Theme version and template are declared in `docs/theme.toml`
-  and fetched at build time via `scripts/fetch-theme.sh`.
+  template. Theme version and template are declared in `docs/theme.toml`.
 
 ## [0.2.0] - 2026-03-28
 

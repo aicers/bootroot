@@ -1,0 +1,85 @@
+/* Print guardrails for the browser. The PDF export layers
+ * pdf/styles.scss on top of these rules, so the two must agree on how a
+ * block fragments; a block forbidden to split here and allowed to split
+ * there produces a different page break in each output.
+ */
+
+@media print {
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+
+  /* Splitting a long block beats pushing it whole to the next page and
+   * leaving the current one half empty.
+   */
+  table,
+  pre,
+  blockquote,
+  ul,
+  ol {
+    break-inside: auto;
+    page-break-inside: auto;
+  }
+
+  /* ...but never so that a single item is stranded on either side of the
+   * break. Scoped to top-level lists: chaining the guard through nested
+   * lists over-constrains the break and pushes whole blocks to the next
+   * page.
+   */
+  :not(li) > ul > li:nth-child(-n+2),
+  :not(li) > ol > li:nth-child(-n+2),
+  tbody > tr:nth-child(-n+2) {
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+
+  :not(li) > ul > li:nth-last-child(-n+2),
+  :not(li) > ol > li:nth-last-child(-n+2),
+  tbody > tr:nth-last-child(-n+2) {
+    break-before: avoid;
+    page-break-before: avoid;
+  }
+
+  p,
+  li,
+  pre {
+    orphans: 2;
+    widows: 2;
+  }
+
+  /* A table row moves whole: split, its cells land misaligned either side
+   * of the break. The table around it still splits, one row at a time.
+   */
+  tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* A long word in a cell wraps instead of widening the column past the
+   * page. Only inline code may break mid-token -- a dotted setting name
+   * has no break opportunity of its own, and left unbreakable it sets the
+   * column's minimum width and squeezes the rest into a ribbon. `anywhere`
+   * stays off the cell itself, where it would also chop ordinary words.
+   */
+  th,
+  td {
+    overflow-wrap: break-word;
+  }
+
+  th code,
+  td code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  img {
+    max-width: 100%;
+    height: auto;
+  }
+}

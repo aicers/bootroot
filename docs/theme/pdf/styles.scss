@@ -1,0 +1,407 @@
+$font-size: 12pt;
+$line-height: 1.3;
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 700;
+  src: url("../fonts/Roboto-Bold.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 500;
+  src: url("../fonts/Roboto-Medium.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 400;
+  src: url("../fonts/Roboto-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Pretendard";
+  font-style: normal;
+  font-weight: 700;
+  src: url("../fonts/Pretendard-Bold.woff2") format("woff2");
+  unicode-range: U+AC00-D7A3, U+3130-318F;
+}
+
+@font-face {
+  font-family: "Pretendard";
+  font-style: normal;
+  font-weight: 500;
+  src: url("../fonts/Pretendard-Medium.woff2") format("woff2");
+  unicode-range: U+AC00-D7A3, U+3130-318F;
+}
+
+@font-face {
+  font-family: "Pretendard";
+  font-style: normal;
+  font-weight: 400;
+  src: url("../fonts/Pretendard-Regular.woff2") format("woff2");
+  unicode-range: U+AC00-D7A3, U+3130-318F;
+}
+
+* {
+  font-family: "Roboto", "Pretendard", sans-serif !important;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  font-size: $font-size !important;
+  line-height: $line-height !important;
+}
+
+p,
+li,
+td,
+th {
+  font-size: $font-size !important;
+  line-height: $line-height !important;
+}
+
+ol,
+ul {
+  margin-left: 1.4em !important;
+  padding-left: 0 !important;
+}
+
+ol {
+  list-style-type: decimal !important;
+  list-style-position: outside !important;
+}
+
+ul {
+  list-style-position: outside !important;
+}
+
+code,
+pre {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace !important;
+  font-size: 10pt;
+}
+
+h1 {
+  font-size: 23pt;
+  color: #0077C8;
+}
+
+h2 {
+  font-size: 17.5pt;
+}
+
+h3 {
+  font-size: 13.5pt;
+}
+
+@page {
+  margin: 55px 75px 80px 75px;
+
+  @bottom-center {
+    content: none;
+  }
+
+  @bottom-left {
+    content: string(title);
+    font-size: 9pt;
+    color: #75777B;
+  }
+
+  @bottom-right {
+    content: counter(page);
+    font-size: 10pt;
+    color: #000000;
+  }
+
+  @top-right {
+    content: none;
+  }
+}
+
+@page: first {
+  @bottom-left {
+    content: none;
+  }
+}
+
+#doc-cover {
+  height: 100vh;
+  padding-top: 40px;
+}
+
+div.cover-wrapper {
+  display: flex;
+  align-items: self-start;
+  align-self: stretch;
+  flex-direction: column;
+}
+
+div.logo {
+  width: 245px;
+  height: 34px;
+  margin-bottom: 220px;
+  background-size: contain;
+  background-position: left center;
+  background-repeat: no-repeat;
+}
+
+#doc-cover h1,
+#doc-cover h2 {
+  font-size: 40pt;
+  line-height: 1.08;
+  color: #0077C8;
+  font-weight: 400;
+  margin: 0;
+  border: 0;
+  box-shadow: none;
+  text-decoration: none;
+  border-bottom: 0 !important;
+  padding-bottom: 0;
+}
+
+#doc-cover h1 {
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+
+#doc-cover h2 {
+  margin-bottom: 14px;
+}
+
+div.tagline {
+  color: #75777B;
+  font-size: 18pt;
+  font-weight: 400;
+}
+
+div.cover-footer {
+  position: absolute;
+  bottom: 0;
+}
+
+div.cover-rule {
+  width: 160px;
+  height: 4px;
+  background: #0077C8;
+  margin-bottom: 30px;
+}
+
+p.meta {
+  margin: 0;
+  color: #71717B;
+}
+
+/* Build provenance: which docs-theme rendered this file.  A PDF leaves
+ * the repository that built it, so without this line there is nothing in
+ * the artifact to reproduce a rendering complaint against. */
+p.meta-provenance {
+  color: #B5B5BC;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 16px;
+  letter-spacing: -0.1px;
+  white-space: nowrap;
+  margin: 6px 0 0;
+}
+
+p.meta-copyright {
+  color: #9F9FA9;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 20px;
+  letter-spacing: -0.15px;
+  white-space: nowrap;
+  margin-top: 30px;
+}
+
+article:not(#doc-cover) h1 {
+  font-size: 20pt;
+  font-weight: 500;
+  color: #0077C8 !important;
+  border-bottom: 1px solid #0077C8 !important;
+  padding-bottom: 2px;
+  margin-bottom: 8px;
+}
+
+article:not(#doc-cover) h2 {
+  font-size: 14pt;
+  font-weight: 400;
+  color: #0077C8 !important;
+  border-bottom: 0 !important;
+  margin-top: 36px;
+  margin-bottom: 2px;
+}
+
+article:not(#doc-cover) h3 {
+  font-size: 12pt;
+  font-weight: 500;
+  color: #000000 !important;
+  border-bottom: 0 !important;
+  margin-top: 24px;
+  margin-bottom: 4px;
+}
+
+article:not(#doc-cover) h4 {
+  font-size: 11pt;
+  font-weight: 500;
+}
+
+article:not(#doc-cover) h2+h3 {
+  margin-top: 32px;
+}
+
+article:not(#doc-toc) ol,
+article:not(#doc-toc) ul {
+  padding-left: 1.2em !important;
+}
+
+article:not(#doc-toc) ol>li,
+article:not(#doc-toc) ul>li {
+  text-indent: -0.8em;
+  padding-left: 0.8em;
+}
+
+article#doc-toc>h1 {
+  color: #0077C8;
+  font-size: 24pt;
+  font-weight: 500;
+  box-shadow: none;
+  text-decoration: none;
+  border-bottom: 0 !important;
+  padding-bottom: 0;
+  margin-bottom: 40px;
+  margin-top: 50px;
+}
+
+article#doc-toc>ul {
+  margin-left: 65px !important;
+  padding-left: 0 !important;
+}
+
+article#doc-toc>ul ul {
+  margin-left: 1.2em;
+}
+
+article#doc-toc li {
+  margin: 0;
+}
+
+article#doc-toc li>a {
+  border-bottom: 0;
+  padding-bottom: 0;
+  display: inline-block;
+  line-height: 0.5;
+}
+
+// Chapters (articles) still start on a new page; subsections flow.
+article:not(#doc-cover):not(#doc-toc) section + section {
+  break-before: auto;
+  page-break-before: auto;
+  min-height: auto;
+}
+
+article:not(#doc-cover):not(#doc-toc) :is(h1, h2, h3, h4, h5, h6) {
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+// Only break-inside is relaxed. The inherited break-before: avoid keeps a
+// block attached to the sentence or label that introduces it.
+article:not(#doc-cover):not(#doc-toc) :is(table, pre, blockquote, ul, ol, div.highlight) {
+  break-inside: auto;
+  page-break-inside: auto;
+}
+
+// A block may split, but never so that one item is stranded on either side.
+// Scoped to top-level lists: chaining the guard through nested lists
+// over-constrains the break and pushes whole blocks to the next page.
+article:not(#doc-cover):not(#doc-toc) :not(li) > :is(ul, ol) > li:nth-child(-n+2) {
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+article:not(#doc-cover):not(#doc-toc) :not(li) > :is(ul, ol) > li:nth-last-child(-n+2) {
+  break-before: avoid;
+  page-break-before: avoid;
+}
+
+article:not(#doc-cover):not(#doc-toc) tbody > tr:nth-child(-n+2) {
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+article:not(#doc-cover):not(#doc-toc) tbody > tr:nth-last-child(-n+2) {
+  break-before: avoid;
+  page-break-before: avoid;
+}
+
+// Bordered containers stay whole; splitting them leaves an open box.
+article:not(#doc-cover):not(#doc-toc) :is(div.admonition, div.tabbed-content--wrap) {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+article:not(#doc-cover):not(#doc-toc) :is(p, li, pre) {
+  orphans: 2;
+  widows: 2;
+}
+
+// Material draws the table grid with a custom property that only a
+// browser's colour scheme defines. The PDF render never sets one, so the
+// border collapses to nothing and the table arrives as unruled columns of
+// text: the grid has to be drawn here.
+article:not(#doc-cover):not(#doc-toc) table {
+  width: 100%;
+  margin: 12pt 0;
+  border: 1px solid #D8DEE4;
+  border-collapse: collapse;
+}
+
+// A one-column table stretched to the text width is one narrow column of
+// text beside a page of empty cell, so it keeps its content width.
+article:not(#doc-cover):not(#doc-toc) table:not(:has(tr > :nth-child(2))) {
+  width: auto;
+}
+
+article:not(#doc-cover):not(#doc-toc) :is(th, td) {
+  border: 0;
+  border-right: 1px solid #D8DEE4;
+  border-bottom: 1px solid #D8DEE4;
+  padding: 6pt 7pt;
+  vertical-align: top;
+  overflow-wrap: break-word;
+}
+
+article:not(#doc-cover):not(#doc-toc) :is(th, td):last-child {
+  border-right: 0;
+}
+
+article:not(#doc-cover):not(#doc-toc) th {
+  background-color: #F6F8FA;
+}
+
+// Only inline code may break mid-token. A long dotted setting name has no
+// break opportunity of its own, and left unbreakable it sets the column's
+// minimum width and squeezes every other column into a ribbon. `anywhere`
+// stays off the cell itself: there it also collapses the cell's minimum
+// width, which chops ordinary words -- a `Default` heading came back as
+// `Defau` / `lt` -- and it costs minutes of layout time on a cell holding
+// a page of prose.
+article:not(#doc-cover):not(#doc-toc) :is(th, td) code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+// A row that splits leaves its cells misaligned across the break, so it
+// moves whole. The table around it still splits, one row at a time; a row
+// too tall for a page of its own splits anyway rather than being dropped.
+article:not(#doc-cover):not(#doc-toc) tr {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
