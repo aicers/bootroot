@@ -52,4 +52,62 @@ for css in "${installed[@]}"; do
 done
 ((missing == 0)) || exit 1
 
+# The stylesheets are only the assets the original bug happened to expose.
+# The wordmark, the tab icon and the Pretendard/Roboto faces are referenced
+# from the built HTML and from the stylesheets' url() rules, and dropping
+# any of them 404s just as silently. Resolve every theme/ reference the
+# site actually makes rather than restating the expected file list, so this
+# keeps holding when docs-theme changes what it ships or excludes.
+echo "[docs] Verify referenced theme assets resolve"
+python3 - <<'PY'
+import os
+import re
+import sys
+from urllib.parse import unquote, urlparse
+
+SITE = "site"
+HTML_REF = re.compile(r'(?:href|src)="([^"]+)"')
+CSS_REF = re.compile(r"url\(\s*['\"]?([^'\")]+)")
+
+missing = set()
+
+
+def check(page, ref):
+    ref = unquote(ref.strip())
+    parsed = urlparse(ref)
+    if parsed.scheme or parsed.netloc or not parsed.path:
+        return
+    base = "" if ref.startswith("/") else os.path.dirname(page)
+    target = os.path.normpath(os.path.join(base, parsed.path.lstrip("/")))
+    # Only theme assets are this check's business; MkDocs' own --strict
+    # already validates internal page links.
+    if not target.startswith("theme/"):
+        return
+    if not os.path.isfile(os.path.join(SITE, target)):
+        missing.add((page, ref, target))
+
+
+for dirpath, _, filenames in os.walk(SITE):
+    for name in filenames:
+        path = os.path.join(dirpath, name)
+        page = os.path.relpath(path, SITE)
+        if name.endswith(".html"):
+            pattern = HTML_REF
+        elif name.endswith(".css"):
+            pattern = CSS_REF
+        else:
+            continue
+        with open(path, encoding="utf-8", errors="ignore") as handle:
+            text = handle.read()
+        for ref in pattern.findall(text):
+            check(page, ref)
+
+for page, ref, target in sorted(missing):
+    print(
+        f"Error: {page} references {ref}, but site/{target} does not exist",
+        file=sys.stderr,
+    )
+sys.exit(1 if missing else 0)
+PY
+
 echo "[docs] done"

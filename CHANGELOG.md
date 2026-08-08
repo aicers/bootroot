@@ -960,8 +960,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   touching anything, so a hand-edit or a stale vendored tree fails the
   check instead of producing a silently divergent site — then builds with
   `mkdocs build --strict` and asserts the theme stylesheets reached
-  `site/`. `CLAUDE.md` and `AGENTS.md` record the rule that a change under
-  `docs/` must pass this. (Part of #794)
+  `site/`. It also resolves every `theme/` asset the built HTML and
+  stylesheets actually reference, so a dropped wordmark, tab icon or web
+  font fails the check rather than 404ing on the deployed site.
+  `CLAUDE.md` and `AGENTS.md` record the rule that a change under `docs/`
+  must pass this. (Part of #794)
 - PDF cover text is now configuration rather than code. `mkdocs.yml`
   carries an `extra.pdf` block with `cover_title`, `cover_subtitle`,
   `cover_tagline`, `toc_title`, and `output_basename`, each locale-mapped
