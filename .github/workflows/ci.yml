@@ -62,6 +62,22 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # Ungated and unconditional: AGENTS.md is itself Markdown, so a
+  # documentation-only change is exactly the change that can edit a
+  # generated region.
+  #
+  # No `with:` block. The release to compare against and the blocks to
+  # compare are both read from `.agents/instructions.toml`, so they have one
+  # source rather than two that can disagree, and the apply job that
+  # rewrites them never has to touch `.github/workflows/` -- which the
+  # default GITHUB_TOKEN may not push to. The pin is a release tag rather
+  # than a branch, so an edit upstream reaches this repository through the
+  # pull request that moves it instead of turning every unrelated pull
+  # request red.
+  instructions:
+    name: Instructions
+    uses: aicers/agent-instructions/.github/workflows/check-drift.yml@main
+
   check:
     name: Quality Check
     runs-on: ubuntu-latest
