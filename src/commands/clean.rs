@@ -209,7 +209,6 @@ fn remove_file_if_exists(path: &Path, messages: &Messages) -> Result<()> {
 mod tests {
     use super::*;
     use crate::commands::compose_project::resolve_compose_project_for_dir;
-    use crate::commands::compose_project::test_env::{ComposeProjectEnv, env_lock};
     use crate::i18n::Messages;
 
     // The project-resolution tests below cover what the retired
@@ -261,8 +260,6 @@ mod tests {
     /// recorded identity is what drives the `<project>_<volume>` prefix.
     #[test]
     fn resolve_compose_project_uses_the_recorded_instance() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".env"),
@@ -270,7 +267,7 @@ mod tests {
         )
         .unwrap();
         let project =
-            resolve_compose_project_for_dir(dir.path(), None, &Messages::new("en").unwrap())
+            resolve_compose_project_for_dir(dir.path(), None, None, &Messages::new("en").unwrap())
                 .unwrap();
         assert_eq!(project, "real-project-name");
     }
@@ -280,13 +277,12 @@ mod tests {
     /// targets the same project a fresh `infra install` created.
     #[test]
     fn resolve_compose_project_falls_back_to_the_fixed_default() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("Bootroot.Stack");
         std::fs::create_dir(&dir).unwrap();
         let project =
-            resolve_compose_project_for_dir(&dir, None, &Messages::new("en").unwrap()).unwrap();
+            resolve_compose_project_for_dir(&dir, None, None, &Messages::new("en").unwrap())
+                .unwrap();
         assert_eq!(project, "bootroot");
     }
 
@@ -296,13 +292,15 @@ mod tests {
     /// the stack comes back on another.
     #[test]
     fn resolve_compose_project_honours_env_var_over_the_recorded_instance() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(Some("env-project"));
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "BOOTROOT_INSTANCE=recorded\n").unwrap();
-        let project =
-            resolve_compose_project_for_dir(dir.path(), None, &Messages::new("en").unwrap())
-                .unwrap();
+        let project = resolve_compose_project_for_dir(
+            dir.path(),
+            None,
+            Some("env-project"),
+            &Messages::new("en").unwrap(),
+        )
+        .unwrap();
         assert_eq!(project, "env-project");
     }
 
@@ -312,13 +310,15 @@ mod tests {
     /// `.env` beside it.
     #[test]
     fn resolve_compose_project_handles_dot_relative_compose_dir() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let compose_dir = compose_file_dir(Path::new("docker-compose.yml"));
         assert_eq!(compose_dir, std::path::PathBuf::from("."));
-        let project =
-            resolve_compose_project_for_dir(&compose_dir, None, &Messages::new("en").unwrap())
-                .expect("resolve_compose_project_for_dir must succeed for `.`");
+        let project = resolve_compose_project_for_dir(
+            &compose_dir,
+            None,
+            None,
+            &Messages::new("en").unwrap(),
+        )
+        .expect("resolve_compose_project_for_dir must succeed for `.`");
         assert!(!project.is_empty());
     }
 
@@ -326,12 +326,14 @@ mod tests {
     /// must still win when the compose dir is the helper-normalised `.`.
     #[test]
     fn resolve_compose_project_honours_env_var_for_dot_relative_compose_dir() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(Some("explicit-env-project"));
         let compose_dir = compose_file_dir(Path::new("docker-compose.yml"));
-        let project =
-            resolve_compose_project_for_dir(&compose_dir, None, &Messages::new("en").unwrap())
-                .unwrap();
+        let project = resolve_compose_project_for_dir(
+            &compose_dir,
+            None,
+            Some("explicit-env-project"),
+            &Messages::new("en").unwrap(),
+        )
+        .unwrap();
         assert_eq!(project, "explicit-env-project");
     }
 }

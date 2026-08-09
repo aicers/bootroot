@@ -29,8 +29,18 @@ pub(crate) fn resolve_runtime_auth(
         args,
         allow_root_prompt,
         std::io::stdin().is_terminal(),
+        root_token_from_env().as_deref(),
         messages,
     )
+}
+
+/// Reads `OPENBAO_ROOT_TOKEN` from the invoking environment.
+///
+/// The module's only read of it: [`resolve_root_token`] takes the value
+/// as a parameter so the precedence around it can be exercised without
+/// a process-global environment.
+fn root_token_from_env() -> Option<String> {
+    std::env::var(OPENBAO_ROOT_TOKEN_ENV).ok()
 }
 
 /// Resolves runtime auth, deciding whether the interactive root-token prompt is
@@ -41,9 +51,10 @@ fn resolve_runtime_auth_inner(
     args: &RuntimeAuthArgs,
     allow_root_prompt: bool,
     stdin_is_tty: bool,
+    env_root_token: Option<&str>,
     messages: &Messages,
 ) -> Result<RuntimeAuthResolved> {
-    let root_token = resolve_root_token(args)?;
+    let root_token = resolve_root_token(args, env_root_token)?;
     let approle_role_id = resolve_from_value_or_file(
         args.approle_role_id.as_deref(),
         args.approle_role_id_file.as_deref(),
@@ -90,7 +101,7 @@ fn resolve_runtime_auth_inner(
 pub(crate) fn resolve_runtime_auth_optional(
     args: &RuntimeAuthArgs,
 ) -> Result<Option<RuntimeAuthResolved>> {
-    let root_token = resolve_root_token(args)?;
+    let root_token = resolve_root_token(args, root_token_from_env().as_deref())?;
     let approle_role_id = resolve_from_value_or_file(
         args.approle_role_id.as_deref(),
         args.approle_role_id_file.as_deref(),
@@ -124,14 +135,19 @@ pub(crate) fn resolve_runtime_auth_optional(
     Ok(auth)
 }
 
-/// Resolves the root token from `--root-token-file`, `--root-token`, or the
-/// `OPENBAO_ROOT_TOKEN` env var.  Splitting the env var off the CLI flag lets
-/// us distinguish an explicit `--root-token` from an env-injected value when
-/// detecting conflicts with `--root-token-file`. The clap-level
+/// Resolves the root token from `--root-token-file`, `--root-token`, or
+/// `env_root_token` — what the invoking environment's
+/// `OPENBAO_ROOT_TOKEN` held, per [`root_token_from_env`].  Splitting
+/// the env var off the CLI flag lets us distinguish an explicit
+/// `--root-token` from an env-injected value when detecting conflicts
+/// with `--root-token-file`. The clap-level
 /// `conflicts_with = "root_token"` already rejects the explicit-flag combo at
 /// parse time; we still re-check here for callers that build
 /// `RuntimeAuthArgs` directly (e.g. tests).
-fn resolve_root_token(args: &RuntimeAuthArgs) -> Result<Option<String>> {
+fn resolve_root_token(
+    args: &RuntimeAuthArgs,
+    env_root_token: Option<&str>,
+) -> Result<Option<String>> {
     if let Some(path) = args.root_token_file.as_deref() {
         if args.root_token.is_some() {
             anyhow::bail!("--root-token-file conflicts with --root-token; pass only one of them");
@@ -141,8 +157,8 @@ fn resolve_root_token(args: &RuntimeAuthArgs) -> Result<Option<String>> {
     if let Some(value) = &args.root_token {
         return Ok(Some(value.clone()));
     }
-    match std::env::var(OPENBAO_ROOT_TOKEN_ENV) {
-        Ok(value) if !value.is_empty() => Ok(Some(value)),
+    match env_root_token {
+        Some(value) if !value.is_empty() => Ok(Some(value.to_string())),
         _ => Ok(None),
     }
 }
@@ -231,48 +247,10 @@ fn resolve_from_value_or_file(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use tempfile::tempdir;
 
     use super::*;
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().expect("env lock not poisoned")
-    }
-
-    struct ScopedRootTokenEnv {
-        previous: Option<String>,
-    }
-
-    impl ScopedRootTokenEnv {
-        fn set(value: Option<&str>) -> Self {
-            let previous = std::env::var(OPENBAO_ROOT_TOKEN_ENV).ok();
-            // SAFETY: tests serialise via ENV_LOCK
-            unsafe {
-                match value {
-                    Some(v) => std::env::set_var(OPENBAO_ROOT_TOKEN_ENV, v),
-                    None => std::env::remove_var(OPENBAO_ROOT_TOKEN_ENV),
-                }
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for ScopedRootTokenEnv {
-        fn drop(&mut self) {
-            // SAFETY: tests serialise via ENV_LOCK
-            unsafe {
-                if let Some(prev) = &self.previous {
-                    std::env::set_var(OPENBAO_ROOT_TOKEN_ENV, prev);
-                } else {
-                    std::env::remove_var(OPENBAO_ROOT_TOKEN_ENV);
-                }
-            }
-        }
-    }
 
     fn args_with(root_token: Option<&str>, root_token_file: Option<&Path>) -> RuntimeAuthArgs {
         RuntimeAuthArgs {
@@ -299,86 +277,80 @@ mod tests {
 
     #[test]
     fn root_token_file_overrides_env_when_no_cli_flag() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(Some("env-token"));
         let dir = tempdir().expect("tempdir");
         let path = write_token_file(dir.path(), "root.token", "file-token\n", 0o600);
         let args = args_with(None, Some(&path));
-        let resolved = resolve_root_token(&args).expect("resolve ok");
+        let resolved = resolve_root_token(&args, Some("env-token")).expect("resolve ok");
         assert_eq!(resolved.as_deref(), Some("file-token"));
     }
 
     #[test]
     fn root_token_file_conflicts_with_explicit_root_token_flag() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(None);
         let dir = tempdir().expect("tempdir");
         let path = write_token_file(dir.path(), "root.token", "file-token\n", 0o600);
         let args = args_with(Some("explicit"), Some(&path));
-        let err = resolve_root_token(&args).expect_err("should conflict");
+        let err = resolve_root_token(&args, None).expect_err("should conflict");
         assert!(err.to_string().contains("--root-token-file conflicts"));
     }
 
     #[test]
     fn explicit_root_token_flag_beats_env() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(Some("env-token"));
         let args = args_with(Some("explicit"), None);
-        let resolved = resolve_root_token(&args).expect("resolve ok");
+        let resolved = resolve_root_token(&args, Some("env-token")).expect("resolve ok");
         assert_eq!(resolved.as_deref(), Some("explicit"));
     }
 
     #[test]
     fn env_used_when_no_flag_or_file() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(Some("env-token"));
         let args = args_with(None, None);
-        let resolved = resolve_root_token(&args).expect("resolve ok");
+        let resolved = resolve_root_token(&args, Some("env-token")).expect("resolve ok");
         assert_eq!(resolved.as_deref(), Some("env-token"));
     }
 
     #[test]
     fn no_token_when_nothing_provided() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(None);
         let args = args_with(None, None);
-        let resolved = resolve_root_token(&args).expect("resolve ok");
+        let resolved = resolve_root_token(&args, None).expect("resolve ok");
+        assert!(resolved.is_none());
+    }
+
+    /// `OPENBAO_ROOT_TOKEN=` is how a shell clears the variable for one
+    /// command; an empty value must not become a token that then fails
+    /// authentication with an opaque 403.
+    #[test]
+    fn empty_env_token_is_treated_as_unset() {
+        let args = args_with(None, None);
+        let resolved = resolve_root_token(&args, Some("")).expect("resolve ok");
         assert!(resolved.is_none());
     }
 
     #[cfg(unix)]
     #[test]
     fn root_token_file_mode_0o600_accepted() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(None);
         let dir = tempdir().expect("tempdir");
         let path = write_token_file(dir.path(), "t", "tok\n", 0o600);
         let args = args_with(None, Some(&path));
-        let resolved = resolve_root_token(&args).expect("0o600 ok");
+        let resolved = resolve_root_token(&args, None).expect("0o600 ok");
         assert_eq!(resolved.as_deref(), Some("tok"));
     }
 
     #[cfg(unix)]
     #[test]
     fn root_token_file_mode_0o640_accepted_for_group_sharing() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(None);
         let dir = tempdir().expect("tempdir");
         let path = write_token_file(dir.path(), "t", "tok\n", 0o640);
         let args = args_with(None, Some(&path));
-        let resolved = resolve_root_token(&args).expect("0o640 ok");
+        let resolved = resolve_root_token(&args, None).expect("0o640 ok");
         assert_eq!(resolved.as_deref(), Some("tok"));
     }
 
     #[cfg(unix)]
     #[test]
     fn root_token_file_mode_0o644_rejected() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(None);
         let dir = tempdir().expect("tempdir");
         let path = write_token_file(dir.path(), "t", "tok\n", 0o644);
         let args = args_with(None, Some(&path));
-        let err = resolve_root_token(&args).expect_err("0o644 must fail");
+        let err = resolve_root_token(&args, None).expect_err("0o644 must fail");
         let msg = err.to_string();
         assert!(msg.contains("world-readable"), "msg = {msg}");
         assert!(msg.contains("chmod 0600"), "msg = {msg}");
@@ -386,11 +358,9 @@ mod tests {
 
     #[test]
     fn auto_mode_non_tty_bails_actionable_without_prompting() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(None);
         let messages = Messages::new("en").expect("messages");
         let args = args_with(None, None);
-        let err = resolve_runtime_auth_inner(&args, true, false, &messages)
+        let err = resolve_runtime_auth_inner(&args, true, false, None, &messages)
             .expect_err("non-tty must bail instead of prompting");
         let msg = err.to_string();
         assert!(msg.contains("--root-token"), "msg = {msg}");
@@ -399,12 +369,10 @@ mod tests {
 
     #[test]
     fn root_mode_non_tty_bails_actionable_without_prompting() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(None);
         let messages = Messages::new("en").expect("messages");
         let mut args = args_with(None, None);
         args.auth_mode = AuthMode::Root;
-        let err = resolve_runtime_auth_inner(&args, true, false, &messages)
+        let err = resolve_runtime_auth_inner(&args, true, false, None, &messages)
             .expect_err("non-tty must bail instead of prompting");
         assert_eq!(
             err.to_string(),
@@ -416,14 +384,27 @@ mod tests {
         );
     }
 
+    /// The mirror of the two tests above: with the environment holding
+    /// a token there is nothing to prompt for, so the non-TTY path
+    /// resolves instead of bailing.
+    #[test]
+    fn non_tty_resolves_from_the_env_token() {
+        let messages = Messages::new("en").expect("messages");
+        let args = args_with(None, None);
+        let resolved = resolve_runtime_auth_inner(&args, true, false, Some("env-token"), &messages)
+            .expect("an env token needs no prompt");
+        assert!(matches!(
+            resolved,
+            RuntimeAuthResolved::RootToken(token) if token == "env-token"
+        ));
+    }
+
     #[test]
     fn root_token_file_empty_rejected() {
-        let _lock = env_lock();
-        let _env = ScopedRootTokenEnv::set(None);
         let dir = tempdir().expect("tempdir");
         let path = write_token_file(dir.path(), "t", "   \n", 0o600);
         let args = args_with(None, Some(&path));
-        let err = resolve_root_token(&args).expect_err("empty must fail");
+        let err = resolve_root_token(&args, None).expect_err("empty must fail");
         assert!(err.to_string().contains("empty"));
     }
 }

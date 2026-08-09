@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use anyhow::{Context, Result};
 use bootroot::db::{
     DB_COMPOSE_HOST, DB_HOST_RUNTIME_HOST, DbDsn, build_db_dsn, check_auth_sync, check_tcp,
     effective_admin_dsn_for_kv, for_compose_runtime, parse_db_dsn, provision_db_sync,
-    resolve_postgres_host_port, validate_db_identifier,
+    resolve_postgres_host_port_with_env, validate_db_identifier,
 };
 
 use super::super::constants::{DEFAULT_DB_NAME, DEFAULT_DB_USER, SECRET_BYTES};
@@ -16,9 +17,69 @@ use crate::cli::args::{InitArgs, InitFeature};
 use crate::commands::guardrails::is_single_host_db_host;
 use crate::i18n::Messages;
 
+const POSTGRES_USER_ENV: &str = "POSTGRES_USER";
+const POSTGRES_PASSWORD_ENV: &str = "POSTGRES_PASSWORD";
+const POSTGRES_DB_ENV: &str = "POSTGRES_DB";
+const POSTGRES_HOST_ENV: &str = "POSTGRES_HOST";
+const POSTGRES_PORT_ENV: &str = "POSTGRES_PORT";
+const POSTGRES_SSLMODE_ENV: &str = "POSTGRES_SSLMODE";
+
+/// The `POSTGRES_*` variables the DSN builders below consult.
+///
+/// Read once, at the point `init` has finished loading the compose
+/// `.env` into the process environment, and passed down from there —
+/// so every builder underneath is steered by a value a caller supplies
+/// rather than by process-global state.
+#[derive(Clone, Default)]
+pub(super) struct PostgresEnv {
+    user: Option<String>,
+    password: Option<String>,
+    database: Option<String>,
+    host: Option<String>,
+    port: Option<String>,
+    sslmode: Option<String>,
+    host_port: Option<String>,
+}
+
+impl PostgresEnv {
+    /// Reads the `POSTGRES_*` variables from the process environment.
+    ///
+    /// `init` calls this after `load_dotenv_into_env` has promoted the
+    /// compose `.env`, which is where the `PostgreSQL` credentials
+    /// `infra install` generated live.
+    pub(super) fn from_process_env() -> Self {
+        Self {
+            user: env::var(POSTGRES_USER_ENV).ok(),
+            password: env::var(POSTGRES_PASSWORD_ENV).ok(),
+            database: env::var(POSTGRES_DB_ENV).ok(),
+            host: env::var(POSTGRES_HOST_ENV).ok(),
+            port: env::var(POSTGRES_PORT_ENV).ok(),
+            sslmode: env::var(POSTGRES_SSLMODE_ENV).ok(),
+            host_port: env::var(bootroot::db::POSTGRES_HOST_PORT_ENV).ok(),
+        }
+    }
+}
+
+/// Hand-written so a `#[derive(Debug)]` on anything holding one cannot
+/// print the `PostgreSQL` password.
+impl fmt::Debug for PostgresEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresEnv")
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("database", &self.database)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("sslmode", &self.sslmode)
+            .field("host_port", &self.host_port)
+            .finish()
+    }
+}
+
 pub(super) async fn resolve_db_dsn_for_init(
     args: &InitArgs,
     compose_dir: &Path,
+    postgres_env: &PostgresEnv,
     messages: &Messages,
 ) -> Result<(String, DbDsnNormalization, Option<String>)> {
     // Under reinit mode the preserved `ca.json` runtime DSN is threaded
@@ -42,7 +103,7 @@ pub(super) async fn resolve_db_dsn_for_init(
         anyhow::bail!(messages.error_db_provision_conflict());
     }
     if args.has_feature(InitFeature::DbProvision) && !reinit_preserved_db_dsn {
-        let inputs = resolve_db_provision_inputs(args, compose_dir, messages)?;
+        let inputs = resolve_db_provision_inputs(args, compose_dir, postgres_env, messages)?;
         let admin = parse_db_dsn(&inputs.admin_dsn)
             .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
         ensure_db_host_reachable_from_compose(&admin.host, messages)?;
@@ -91,7 +152,7 @@ pub(super) async fn resolve_db_dsn_for_init(
             Some(admin_dsn_for_kv),
         ));
     }
-    let dsn = resolve_db_dsn(args, messages)?;
+    let dsn = resolve_db_dsn(args, postgres_env, messages)?;
     let parsed =
         parse_db_dsn(&dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
     ensure_db_host_reachable_from_compose(&parsed.host, messages)?;
@@ -118,11 +179,12 @@ struct DbProvisionInputs {
 fn resolve_db_provision_inputs(
     args: &InitArgs,
     compose_dir: &Path,
+    postgres_env: &PostgresEnv,
     messages: &Messages,
 ) -> Result<DbProvisionInputs> {
     let admin_dsn = if let Some(value) = &args.db_admin.admin_dsn {
         value.clone()
-    } else if let Some(value) = build_admin_dsn_from_env(compose_dir) {
+    } else if let Some(value) = build_admin_dsn_from_env(compose_dir, postgres_env) {
         value
     } else {
         prompt_text(&format!("{}: ", messages.prompt_db_admin_dsn()), messages)?
@@ -130,7 +192,7 @@ fn resolve_db_provision_inputs(
     let default_db_name = args
         .db_name
         .clone()
-        .or_else(|| env::var("POSTGRES_DB").ok())
+        .or_else(|| postgres_env.database.clone())
         .unwrap_or_else(|| DEFAULT_DB_NAME.to_string());
     let db_user = if let Some(value) = &args.db_user {
         value.clone()
@@ -166,13 +228,9 @@ fn resolve_db_provision_inputs(
     })
 }
 
-fn build_admin_dsn_from_env(compose_dir: &Path) -> Option<String> {
-    let Ok(user) = env::var("POSTGRES_USER") else {
-        return None;
-    };
-    let Ok(password) = env::var("POSTGRES_PASSWORD") else {
-        return None;
-    };
+fn build_admin_dsn_from_env(compose_dir: &Path, postgres_env: &PostgresEnv) -> Option<String> {
+    let user = postgres_env.user.as_deref()?;
+    let password = postgres_env.password.as_deref()?;
     // `provision_db_sync` connects to PostgreSQL from the host (it shells
     // out via the `postgres` crate, not from inside the compose network),
     // so the auto-derived admin DSN must be host-reachable. Default the
@@ -181,47 +239,47 @@ fn build_admin_dsn_from_env(compose_dir: &Path) -> Option<String> {
     // `${POSTGRES_HOST_PORT:-5433}` in `docker-compose.yml` — process env
     // → `compose_dir/.env` → 5433. `POSTGRES_HOST` / `POSTGRES_PORT`
     // remain explicit overrides for operator-supplied topologies.
-    let host = env::var("POSTGRES_HOST").unwrap_or_else(|_| DB_HOST_RUNTIME_HOST.to_string());
-    let port = env::var("POSTGRES_PORT")
-        .ok()
+    let host = postgres_env.host.as_deref().unwrap_or(DB_HOST_RUNTIME_HOST);
+    let port = postgres_env
+        .port
+        .as_deref()
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or_else(|| resolve_postgres_host_port(compose_dir));
+        .unwrap_or_else(|| {
+            resolve_postgres_host_port_with_env(postgres_env.host_port.as_deref(), compose_dir)
+        });
     // Always connect to the "postgres" database for admin operations.
     // POSTGRES_DB names the application database that will be created,
     // not the admin database used for provisioning.
-    let sslmode = env::var("POSTGRES_SSLMODE").ok();
     Some(build_db_dsn(
-        &user,
-        &password,
-        &host,
+        user,
+        password,
+        host,
         port,
         "postgres",
-        sslmode.as_deref(),
+        postgres_env.sslmode.as_deref(),
     ))
 }
 
-fn resolve_db_dsn(args: &InitArgs, messages: &Messages) -> Result<String> {
+fn resolve_db_dsn(
+    args: &InitArgs,
+    postgres_env: &PostgresEnv,
+    messages: &Messages,
+) -> Result<String> {
     if let Some(dsn) = &args.db_dsn {
         return Ok(dsn.clone());
     }
-    if let Some(dsn) = build_dsn_from_env() {
+    if let Some(dsn) = build_dsn_from_env(postgres_env) {
         return Ok(dsn);
     }
     prompt_text(&format!("{}: ", messages.prompt_db_dsn()), messages)
 }
 
-fn build_dsn_from_env() -> Option<String> {
-    let Ok(user) = env::var("POSTGRES_USER") else {
-        return None;
-    };
-    let Ok(password) = env::var("POSTGRES_PASSWORD") else {
-        return None;
-    };
-    let Ok(db) = env::var("POSTGRES_DB") else {
-        return None;
-    };
-    let host = env::var("POSTGRES_HOST").unwrap_or_else(|_| "postgres".to_string());
-    let port = env::var("POSTGRES_PORT").unwrap_or_else(|_| "5432".to_string());
+fn build_dsn_from_env(postgres_env: &PostgresEnv) -> Option<String> {
+    let user = postgres_env.user.as_deref()?;
+    let password = postgres_env.password.as_deref()?;
+    let db = postgres_env.database.as_deref()?;
+    let host = postgres_env.host.as_deref().unwrap_or(DB_COMPOSE_HOST);
+    let port = postgres_env.port.as_deref().unwrap_or("5432");
     let dsn = format!("postgresql://{user}:{password}@{host}:{port}/{db}?sslmode=disable");
     Some(dsn)
 }
@@ -253,34 +311,57 @@ fn ensure_db_host_reachable_from_compose(host: &str, messages: &Messages) -> Res
 
 #[cfg(test)]
 mod tests {
-    use std::env;
+    use bootroot::db::DEFAULT_POSTGRES_HOST_PORT;
 
-    use super::super::test_support::{default_init_args, env_lock, test_messages};
+    use super::super::test_support::{default_init_args, test_messages};
     use super::*;
+
+    /// The `POSTGRES_*` set an `infra install`-provisioned `.env`
+    /// leaves behind, which is what the builders below see in practice.
+    fn postgres_env(pairs: &[(&str, &str)]) -> PostgresEnv {
+        let mut env = PostgresEnv::default();
+        for (key, value) in pairs {
+            let slot = match *key {
+                POSTGRES_USER_ENV => &mut env.user,
+                POSTGRES_PASSWORD_ENV => &mut env.password,
+                POSTGRES_DB_ENV => &mut env.database,
+                POSTGRES_HOST_ENV => &mut env.host,
+                POSTGRES_PORT_ENV => &mut env.port,
+                POSTGRES_SSLMODE_ENV => &mut env.sslmode,
+                bootroot::db::POSTGRES_HOST_PORT_ENV => &mut env.host_port,
+                other => panic!("{other} is not a POSTGRES_* variable these builders read"),
+            };
+            *slot = Some((*value).to_string());
+        }
+        env
+    }
+
+    /// A nonce-based fixture password.  `CodeQL` flags a literal as a
+    /// hard-coded credential; a per-run value has no relation to a real
+    /// one.
+    fn nonce_password(prefix: &str) -> String {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        format!("{prefix}-{nonce}")
+    }
 
     #[test]
     fn test_resolve_db_dsn_prefers_cli() {
-        let _guard = env_lock();
-        // SAFETY: tests run single-threaded for this scope; vars are restored below.
-        unsafe {
-            env::set_var("POSTGRES_USER", "envuser");
-            env::set_var("POSTGRES_PASSWORD", "envpass");
-            env::set_var("POSTGRES_DB", "envdb");
-        }
+        let env = postgres_env(&[
+            (POSTGRES_USER_ENV, "envuser"),
+            (POSTGRES_PASSWORD_ENV, "envpass"),
+            (POSTGRES_DB_ENV, "envdb"),
+        ]);
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://cliuser:clipass@localhost/db".to_string());
-        let dsn = resolve_db_dsn(&args, &test_messages()).unwrap();
-        unsafe {
-            env::remove_var("POSTGRES_USER");
-            env::remove_var("POSTGRES_PASSWORD");
-            env::remove_var("POSTGRES_DB");
-        }
+        let dsn = resolve_db_dsn(&args, &env, &test_messages()).unwrap();
         assert_eq!(dsn, "postgresql://cliuser:clipass@localhost/db");
     }
 
     #[test]
     fn test_resolve_db_dsn_for_init_rejects_remote_host() {
-        let _guard = env_lock();
         let mut args = default_init_args();
         args.db_dsn =
             Some("postgresql://user:pass@db.internal:5432/stepca?sslmode=disable".to_string());
@@ -290,6 +371,7 @@ mod tests {
             .block_on(resolve_db_dsn_for_init(
                 &args,
                 Path::new("."),
+                &PostgresEnv::default(),
                 &test_messages(),
             ))
             .expect_err("remote db host should fail single-host guardrail");
@@ -301,7 +383,6 @@ mod tests {
 
     #[test]
     fn test_resolve_db_dsn_for_init_normalizes_localhost_to_postgres() {
-        let _guard = env_lock();
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://user:pass@localhost:5432/stepca".to_string());
 
@@ -310,6 +391,7 @@ mod tests {
             .block_on(resolve_db_dsn_for_init(
                 &args,
                 Path::new("."),
+                &PostgresEnv::default(),
                 &test_messages(),
             ))
             .expect("dsn should resolve");
@@ -323,7 +405,6 @@ mod tests {
 
     #[test]
     fn test_resolve_db_dsn_for_init_keeps_postgres_host() {
-        let _guard = env_lock();
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://user:pass@postgres:5432/stepca".to_string());
 
@@ -332,6 +413,7 @@ mod tests {
             .block_on(resolve_db_dsn_for_init(
                 &args,
                 Path::new("."),
+                &PostgresEnv::default(),
                 &test_messages(),
             ))
             .expect("dsn should resolve");
@@ -349,7 +431,6 @@ mod tests {
         // (POSTGRES_HOST_PORT territory) must not leak into the stored
         // compose-internal DSN. Both host and port flip to the compose
         // pair.
-        let _guard = env_lock();
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://user:pass@127.0.0.1:5433/stepca".to_string());
 
@@ -358,6 +439,7 @@ mod tests {
             .block_on(resolve_db_dsn_for_init(
                 &args,
                 Path::new("."),
+                &PostgresEnv::default(),
                 &test_messages(),
             ))
             .expect("dsn should resolve");
@@ -378,41 +460,44 @@ mod tests {
 
     #[test]
     fn test_resolve_db_dsn_uses_env() {
-        let _guard = env_lock();
-        // SAFETY: tests run single-threaded for this scope; vars are restored below.
-        // CodeQL flags "secret" as a hard-coded credential, but this is a test-only
-        // fixture value with no relation to any real credential. Dismiss as false positive.
-        unsafe {
-            env::set_var("POSTGRES_USER", "step");
-            env::set_var("POSTGRES_PASSWORD", "secret");
-            env::set_var("POSTGRES_DB", "stepca");
-            env::set_var("POSTGRES_HOST", "postgres");
-            env::set_var("POSTGRES_PORT", "5432");
-        }
+        // CodeQL flags "secret" as a hard-coded credential, but this is a
+        // test-only fixture value with no relation to any real credential.
+        // Dismiss as false positive.
+        let env = postgres_env(&[
+            (POSTGRES_USER_ENV, "step"),
+            (POSTGRES_PASSWORD_ENV, "secret"),
+            (POSTGRES_DB_ENV, "stepca"),
+            (POSTGRES_HOST_ENV, "postgres"),
+            (POSTGRES_PORT_ENV, "5432"),
+        ]);
         let args = default_init_args();
-        let dsn = resolve_db_dsn(&args, &test_messages()).unwrap();
-        unsafe {
-            env::remove_var("POSTGRES_USER");
-            env::remove_var("POSTGRES_PASSWORD");
-            env::remove_var("POSTGRES_DB");
-            env::remove_var("POSTGRES_HOST");
-            env::remove_var("POSTGRES_PORT");
-        }
+        let dsn = resolve_db_dsn(&args, &env, &test_messages()).unwrap();
         assert_eq!(
             dsn,
             "postgresql://step:secret@postgres:5432/stepca?sslmode=disable"
         );
     }
 
+    /// Without a user, a password and a database name there is nothing
+    /// to build a DSN from, and the resolver must fall through to the
+    /// prompt rather than synthesising one out of the defaults.
+    #[test]
+    fn build_dsn_from_env_needs_the_three_required_variables() {
+        assert!(build_dsn_from_env(&PostgresEnv::default()).is_none());
+        assert!(
+            build_dsn_from_env(&postgres_env(&[
+                (POSTGRES_USER_ENV, "step"),
+                (POSTGRES_PASSWORD_ENV, "secret"),
+            ]))
+            .is_none(),
+            "a missing POSTGRES_DB must not fall back to a default database"
+        );
+    }
+
     #[test]
     fn test_resolve_db_provision_inputs_with_args() {
-        let _guard = env_lock();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let admin_password = format!("admin-{nonce}");
-        let db_password = format!("step-{nonce}");
+        let admin_password = nonce_password("admin");
+        let db_password = nonce_password("step");
         let mut args = default_init_args();
         args.enable.push(InitFeature::DbProvision);
         args.db_admin.admin_dsn = Some(format!(
@@ -422,7 +507,13 @@ mod tests {
         args.db_password = Some(db_password.clone());
         args.db_name = Some("stepdb".to_string());
 
-        let inputs = resolve_db_provision_inputs(&args, Path::new("."), &test_messages()).unwrap();
+        let inputs = resolve_db_provision_inputs(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .unwrap();
         assert_eq!(
             inputs.admin_dsn,
             format!("postgresql://admin:{admin_password}@localhost:5432/postgres?sslmode=disable")
@@ -434,13 +525,8 @@ mod tests {
 
     #[test]
     fn test_resolve_db_provision_inputs_rejects_invalid_identifier() {
-        let _guard = env_lock();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let admin_password = format!("admin-{nonce}");
-        let db_password = format!("step-{nonce}");
+        let admin_password = nonce_password("admin");
+        let db_password = nonce_password("step");
         let mut args = default_init_args();
         args.enable.push(InitFeature::DbProvision);
         args.db_admin.admin_dsn = Some(format!(
@@ -450,7 +536,13 @@ mod tests {
         args.db_password = Some(db_password);
         args.db_name = Some("stepdb".to_string());
 
-        let err = resolve_db_provision_inputs(&args, Path::new("."), &test_messages()).unwrap_err();
+        let err = resolve_db_provision_inputs(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Invalid DB identifier"));
     }
 
@@ -461,16 +553,8 @@ mod tests {
         // admin role. After provision, the role's password is
         // `db_password`, not the value embedded in the original admin
         // DSN — the persisted DSN must reflect that.
-        //
-        // Nonce-based test fixtures sidestep CodeQL's
-        // `rust/hard-coded-cryptographic-value` rule (the values are
-        // generated per run and have no relation to a real credential).
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let old = format!("old-{nonce}");
-        let new = format!("new-{nonce}");
+        let old = nonce_password("old");
+        let new = nonce_password("new");
         let admin_dsn = format!("postgresql://step:{old}@127.0.0.1:5433/postgres?sslmode=disable");
         let resolved = effective_admin_dsn_for_kv(&admin_dsn, "step", &new).unwrap();
         assert_eq!(
@@ -483,13 +567,8 @@ mod tests {
     fn test_effective_admin_dsn_for_kv_unchanged_when_distinct_role() {
         // When admin and runtime are distinct roles, the admin DSN is
         // untouched by provisioning and should be persisted verbatim.
-        // Nonce-based fixtures sidestep CodeQL — see the sibling test.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let admin_pw = format!("admin-{nonce}");
-        let runtime_pw = format!("runtime-{nonce}");
+        let admin_pw = nonce_password("admin");
+        let runtime_pw = nonce_password("runtime");
         let admin_dsn =
             format!("postgresql://admin:{admin_pw}@127.0.0.1:5433/postgres?sslmode=disable");
         let resolved = effective_admin_dsn_for_kv(&admin_dsn, "stepca", &runtime_pw).unwrap();
@@ -498,13 +577,8 @@ mod tests {
 
     #[test]
     fn test_resolve_db_dsn_for_init_rejects_conflict() {
-        let _guard = env_lock();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let admin_password = format!("admin-{nonce}");
-        let db_password = format!("step-{nonce}");
+        let admin_password = nonce_password("admin");
+        let db_password = nonce_password("step");
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://user:pass@localhost/db".to_string());
         args.enable.push(InitFeature::DbProvision);
@@ -520,6 +594,7 @@ mod tests {
             .block_on(resolve_db_dsn_for_init(
                 &args,
                 Path::new("."),
+                &PostgresEnv::default(),
                 &test_messages(),
             ))
             .unwrap_err();
@@ -533,12 +608,7 @@ mod tests {
     /// the already-good `PostgreSQL` role's password is not rotated.
     #[test]
     fn test_resolve_db_dsn_for_init_accepts_preserved_dsn_in_reinit_mode() {
-        let _guard = env_lock();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let preserved_password = format!("preserved-{nonce}");
+        let preserved_password = nonce_password("preserved");
         let mut args = default_init_args();
         args.reinit_mode = true;
         args.db_dsn = Some(format!(
@@ -561,6 +631,7 @@ mod tests {
             .block_on(resolve_db_dsn_for_init(
                 &args,
                 Path::new("."),
+                &PostgresEnv::default(),
                 &test_messages(),
             ))
             .expect("preserved DSN must be accepted under reinit_mode");
@@ -585,31 +656,20 @@ mod tests {
         // `127.0.0.1:5433` (the new published default) rather than the
         // compose-internal `postgres:5432` — `provision_db_sync` runs
         // from the host.
-        let _guard = env_lock();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let password = format!("admin-{nonce}");
+        let password = nonce_password("admin");
         let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: env_lock() serialises env-var-touching tests.
-        unsafe {
-            env::set_var("POSTGRES_USER", "step");
-            env::set_var("POSTGRES_PASSWORD", &password);
-            env::remove_var("POSTGRES_HOST");
-            env::remove_var("POSTGRES_PORT");
-            env::remove_var("POSTGRES_HOST_PORT");
-            env::remove_var("POSTGRES_SSLMODE");
-        }
-        let dsn = build_admin_dsn_from_env(dir.path()).expect("dsn");
-        unsafe {
-            env::remove_var("POSTGRES_USER");
-            env::remove_var("POSTGRES_PASSWORD");
-        }
+        let env = postgres_env(&[
+            (POSTGRES_USER_ENV, "step"),
+            (POSTGRES_PASSWORD_ENV, &password),
+        ]);
+        let dsn = build_admin_dsn_from_env(dir.path(), &env).expect("dsn");
+        let host = DB_HOST_RUNTIME_HOST;
+        let port = DEFAULT_POSTGRES_HOST_PORT;
         assert_eq!(
             dsn,
-            format!("postgresql://step:{password}@127.0.0.1:5433/postgres?sslmode=disable")
+            format!("postgresql://step:{password}@{host}:{port}/postgres?sslmode=disable")
         );
+        assert_eq!((host, port), ("127.0.0.1", 5433));
     }
 
     #[test]
@@ -619,35 +679,41 @@ mod tests {
         // auto-derived admin DSN must honor that (Docker Compose's
         // `${POSTGRES_HOST_PORT:-5433}` precedence: process env →
         // compose_dir/.env → 5433).
-        let _guard = env_lock();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let password = format!("admin-{nonce}");
+        let password = nonce_password("admin");
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join(".env"),
             "POSTGRES_USER=step\nPOSTGRES_HOST_PORT=6543\n",
         )
         .expect("write .env");
-        // SAFETY: env_lock() serialises env-var-touching tests.
-        unsafe {
-            env::set_var("POSTGRES_USER", "step");
-            env::set_var("POSTGRES_PASSWORD", &password);
-            env::remove_var("POSTGRES_HOST");
-            env::remove_var("POSTGRES_PORT");
-            env::remove_var("POSTGRES_HOST_PORT");
-            env::remove_var("POSTGRES_SSLMODE");
-        }
-        let dsn = build_admin_dsn_from_env(dir.path()).expect("dsn");
-        unsafe {
-            env::remove_var("POSTGRES_USER");
-            env::remove_var("POSTGRES_PASSWORD");
-        }
+        let env = postgres_env(&[
+            (POSTGRES_USER_ENV, "step"),
+            (POSTGRES_PASSWORD_ENV, &password),
+        ]);
+        let dsn = build_admin_dsn_from_env(dir.path(), &env).expect("dsn");
         assert_eq!(
             dsn,
             format!("postgresql://step:{password}@127.0.0.1:6543/postgres?sslmode=disable")
+        );
+    }
+
+    /// The process environment still outranks the compose `.env`, which
+    /// is the first step of the `${POSTGRES_HOST_PORT:-5433}`
+    /// precedence.
+    #[test]
+    fn build_admin_dsn_from_env_prefers_the_host_port_variable_over_dotenv() {
+        let password = nonce_password("admin");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "POSTGRES_HOST_PORT=6543\n").expect("write .env");
+        let env = postgres_env(&[
+            (POSTGRES_USER_ENV, "step"),
+            (POSTGRES_PASSWORD_ENV, &password),
+            (bootroot::db::POSTGRES_HOST_PORT_ENV, "6544"),
+        ]);
+        let dsn = build_admin_dsn_from_env(dir.path(), &env).expect("dsn");
+        assert_eq!(
+            dsn,
+            format!("postgresql://step:{password}@127.0.0.1:6544/postgres?sslmode=disable")
         );
     }
 
@@ -656,32 +722,33 @@ mod tests {
         // Explicit POSTGRES_PORT (operator-supplied topology) wins over
         // the resolved POSTGRES_HOST_PORT default — the env var is the
         // historical operator override and stays authoritative.
-        let _guard = env_lock();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let password = format!("admin-{nonce}");
+        let password = nonce_password("admin");
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".env"), "POSTGRES_HOST_PORT=6543\n").expect("write .env");
-        // SAFETY: env_lock() serialises env-var-touching tests.
-        unsafe {
-            env::set_var("POSTGRES_USER", "step");
-            env::set_var("POSTGRES_PASSWORD", &password);
-            env::set_var("POSTGRES_PORT", "7777");
-            env::remove_var("POSTGRES_HOST");
-            env::remove_var("POSTGRES_HOST_PORT");
-            env::remove_var("POSTGRES_SSLMODE");
-        }
-        let dsn = build_admin_dsn_from_env(dir.path()).expect("dsn");
-        unsafe {
-            env::remove_var("POSTGRES_USER");
-            env::remove_var("POSTGRES_PASSWORD");
-            env::remove_var("POSTGRES_PORT");
-        }
+        let env = postgres_env(&[
+            (POSTGRES_USER_ENV, "step"),
+            (POSTGRES_PASSWORD_ENV, &password),
+            (POSTGRES_PORT_ENV, "7777"),
+        ]);
+        let dsn = build_admin_dsn_from_env(dir.path(), &env).expect("dsn");
         assert_eq!(
             dsn,
             format!("postgresql://step:{password}@127.0.0.1:7777/postgres?sslmode=disable")
         );
+    }
+
+    /// The password never reaches a `Debug` rendering, so a struct that
+    /// derives `Debug` around one cannot leak the credential
+    /// `infra install` generated.
+    #[test]
+    fn postgres_env_debug_redacts_the_password() {
+        let password = nonce_password("admin");
+        let env = postgres_env(&[
+            (POSTGRES_USER_ENV, "step"),
+            (POSTGRES_PASSWORD_ENV, &password),
+        ]);
+        let rendered = format!("{env:?}");
+        assert!(!rendered.contains(&password), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 }

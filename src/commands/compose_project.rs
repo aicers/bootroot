@@ -98,7 +98,12 @@ fn recorded_instance_name(compose_dir: &Path, messages: &Messages) -> Result<Opt
 
 /// Returns `COMPOSE_PROJECT_NAME` from the invoking environment when it
 /// is set and non-empty.
-fn compose_project_name_override() -> Option<String> {
+///
+/// The crate's single read of that variable.  Every resolver below takes
+/// the value as a parameter, so the commands at the composition root
+/// call this once and the resolvers stay steerable without the
+/// process-global environment.
+pub(crate) fn compose_project_name_override() -> Option<String> {
     std::env::var(COMPOSE_PROJECT_NAME_ENV)
         .ok()
         .filter(|value| !value.is_empty())
@@ -109,22 +114,24 @@ fn compose_project_name_override() -> Option<String> {
 ///
 /// 1. `instance_name` — the `--instance-name` value, which only
 ///    `infra install` can supply;
-/// 2. `COMPOSE_PROJECT_NAME` from the invoking environment, when
-///    non-empty.  Used verbatim and deliberately not validated: the E2E
-///    harness's per-run project names are longer than an instance name
-///    may be, and they must keep working;
+/// 2. `project_override` — what the invoking environment's
+///    `COMPOSE_PROJECT_NAME` held, per
+///    [`compose_project_name_override`].  Used verbatim and deliberately
+///    not validated: the E2E harness's per-run project names are longer
+///    than an instance name may be, and they must keep working;
 /// 3. `BOOTROOT_INSTANCE` from `<compose dir>/.env`;
 /// 4. the literal [`DEFAULT_INSTANCE_NAME`].
 pub(crate) fn resolve_compose_project_for_dir(
     compose_dir: &Path,
     instance_name: Option<&str>,
+    project_override: Option<&str>,
     messages: &Messages,
 ) -> Result<String> {
     if let Some(name) = instance_name {
         return Ok(name.to_string());
     }
-    if let Some(project) = compose_project_name_override() {
-        return Ok(project);
+    if let Some(project) = project_override.filter(|value| !value.is_empty()) {
+        return Ok(project.to_string());
     }
     if let Some(recorded) = recorded_instance_name(compose_dir, messages)? {
         return Ok(recorded);
@@ -185,17 +192,42 @@ impl ComposeIdentity {
         }
     }
 
-    /// Resolves both halves of the identity for a compose directory.
+    /// Resolves both halves of the identity for a compose directory,
+    /// reading `COMPOSE_PROJECT_NAME` from the invoking environment.
+    ///
+    /// The composition root for that variable: the resolvers underneath
+    /// take it as a parameter.
     pub(crate) fn resolve_for_dir(
         compose_dir: &Path,
         instance_name: Option<&str>,
+        messages: &Messages,
+    ) -> Result<Self> {
+        Self::resolve_for_dir_with_override(
+            compose_dir,
+            instance_name,
+            compose_project_name_override().as_deref(),
+            messages,
+        )
+    }
+
+    /// [`ComposeIdentity::resolve_for_dir`] with the
+    /// `COMPOSE_PROJECT_NAME` override supplied by the caller.
+    fn resolve_for_dir_with_override(
+        compose_dir: &Path,
+        instance_name: Option<&str>,
+        project_override: Option<&str>,
         messages: &Messages,
     ) -> Result<Self> {
         if let Some(name) = instance_name {
             return Ok(Self::for_instance(name));
         }
         Ok(Self {
-            project: resolve_compose_project_for_dir(compose_dir, None, messages)?,
+            project: resolve_compose_project_for_dir(
+                compose_dir,
+                None,
+                project_override,
+                messages,
+            )?,
             instance_name: resolve_recorded_instance_name(compose_dir, None, messages)?,
         })
     }
@@ -306,78 +338,8 @@ fn compose_args(
     args
 }
 
-/// Test-only helpers for the process-global `COMPOSE_PROJECT_NAME`.
-///
-/// One lock for the whole crate: the resolver is exercised from several
-/// modules' tests, and a per-module mutex would let two of them mutate
-/// the same process-global variable concurrently.
-#[cfg(test)]
-pub(crate) mod test_env {
-    use std::ffi::OsString;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
-
-    use super::COMPOSE_PROJECT_NAME_ENV;
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    /// Serialises tests that mutate `COMPOSE_PROJECT_NAME`.
-    ///
-    /// A panicking test poisons the mutex; recovering the guard rather
-    /// than propagating the poison keeps one failure from cascading into
-    /// every other test that touches the variable.
-    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// RAII guard restoring a process-global variable on drop, so a
-    /// failing assertion cannot leave the shared environment mutated.
-    pub(crate) struct ScopedEnv {
-        key: &'static str,
-        prior: Option<OsString>,
-    }
-
-    impl ScopedEnv {
-        /// Sets (or clears) `key` for the duration of a test.  Callers
-        /// must hold [`env_lock`].
-        pub(crate) fn set(key: &'static str, value: Option<&str>) -> Self {
-            let prior = std::env::var_os(key);
-            match value {
-                // SAFETY: every call site holds `env_lock()`.
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                // SAFETY: as above.
-                None => unsafe { std::env::remove_var(key) },
-            }
-            Self { key, prior }
-        }
-    }
-
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match self.prior.take() {
-                // SAFETY: the caller still holds `env_lock()`.
-                Some(prior) => unsafe { std::env::set_var(self.key, prior) },
-                // SAFETY: as above.
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    /// [`ScopedEnv`] pinned to `COMPOSE_PROJECT_NAME`, the variable most
-    /// of these tests scope.
-    pub(crate) struct ComposeProjectEnv;
-
-    impl ComposeProjectEnv {
-        pub(crate) fn set(value: Option<&str>) -> ScopedEnv {
-            ScopedEnv::set(COMPOSE_PROJECT_NAME_ENV, value)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::test_env::{ComposeProjectEnv, ScopedEnv, env_lock};
     use super::*;
     use crate::i18n::test_messages;
 
@@ -443,32 +405,38 @@ mod tests {
 
     #[test]
     fn flag_wins_over_compose_project_name() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(Some("env-project"));
         let dir = tempfile::tempdir().unwrap();
         write_dotenv_with_instance(dir.path(), "recorded");
-        let project =
-            resolve_compose_project_for_dir(dir.path(), Some("flag"), &test_messages()).unwrap();
+        let project = resolve_compose_project_for_dir(
+            dir.path(),
+            Some("flag"),
+            Some("env-project"),
+            &test_messages(),
+        )
+        .unwrap();
         assert_eq!(project, "flag");
     }
 
     #[test]
     fn compose_project_name_wins_over_dotenv() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(Some("env-project"));
         let dir = tempfile::tempdir().unwrap();
         write_dotenv_with_instance(dir.path(), "recorded");
-        let project = resolve_compose_project_for_dir(dir.path(), None, &test_messages()).unwrap();
+        let project = resolve_compose_project_for_dir(
+            dir.path(),
+            None,
+            Some("env-project"),
+            &test_messages(),
+        )
+        .unwrap();
         assert_eq!(project, "env-project");
     }
 
     #[test]
     fn dotenv_wins_over_the_default() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let dir = tempfile::tempdir().unwrap();
         write_dotenv_with_instance(dir.path(), "recorded");
-        let project = resolve_compose_project_for_dir(dir.path(), None, &test_messages()).unwrap();
+        let project =
+            resolve_compose_project_for_dir(dir.path(), None, None, &test_messages()).unwrap();
         assert_eq!(project, "recorded");
     }
 
@@ -477,22 +445,24 @@ mod tests {
     /// named.
     #[test]
     fn default_is_the_fixed_literal_regardless_of_directory_name() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("clumit-insight");
         std::fs::create_dir(&dir).unwrap();
-        let project = resolve_compose_project_for_dir(&dir, None, &test_messages()).unwrap();
+        let project = resolve_compose_project_for_dir(&dir, None, None, &test_messages()).unwrap();
         assert_eq!(project, DEFAULT_INSTANCE_NAME);
     }
 
+    /// `COMPOSE_PROJECT_NAME=` is how a shell clears the variable for
+    /// one command, so an empty value has to fall through exactly as an
+    /// absent one does — both at the read
+    /// ([`compose_project_name_override`]) and at the resolver, which
+    /// is reachable with a value the read never filtered.
     #[test]
     fn empty_compose_project_name_is_treated_as_unset() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(Some(""));
         let dir = tempfile::tempdir().unwrap();
         write_dotenv_with_instance(dir.path(), "recorded");
-        let project = resolve_compose_project_for_dir(dir.path(), None, &test_messages()).unwrap();
+        let project =
+            resolve_compose_project_for_dir(dir.path(), None, Some(""), &test_messages()).unwrap();
         assert_eq!(project, "recorded");
     }
 
@@ -502,13 +472,13 @@ mod tests {
     #[test]
     fn compose_project_name_is_not_validated_as_an_instance_name() {
         const HARNESS_PROJECT: &str = "bootroot-e2e-ci-openbao-tls-no-delta-1234567";
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(Some(HARNESS_PROJECT));
         let messages = test_messages();
         assert!(HARNESS_PROJECT.len() > MAX_INSTANCE_NAME_LEN);
         assert!(validate_instance_name(HARNESS_PROJECT, &messages).is_err());
         let dir = tempfile::tempdir().unwrap();
-        let project = resolve_compose_project_for_dir(dir.path(), None, &messages).unwrap();
+        let project =
+            resolve_compose_project_for_dir(dir.path(), None, Some(HARNESS_PROJECT), &messages)
+                .unwrap();
         assert_eq!(project, HARNESS_PROJECT);
     }
 
@@ -518,8 +488,6 @@ mod tests {
     /// wrong project's volumes.
     #[test]
     fn resolver_reads_the_dotenv_beside_the_given_compose_file() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let root = tempfile::tempdir().unwrap();
         let here = root.path().join("here");
         let there = root.path().join("there");
@@ -538,17 +506,23 @@ mod tests {
     /// throwaway harness project must not become the install's identity.
     #[test]
     fn recorded_identity_ignores_compose_project_name() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(Some("bootroot-e2e-ci-reinit-42"));
+        const HARNESS_PROJECT: &str = "bootroot-e2e-ci-reinit-42";
+        let messages = test_messages();
         let dir = tempfile::tempdir().unwrap();
-        let recorded = resolve_recorded_instance_name(dir.path(), None, &test_messages()).unwrap();
+        // The contrast is the point: the same override that decides the
+        // project has no way into the recorded identity, because
+        // `resolve_recorded_instance_name` does not take one.
+        assert_eq!(
+            resolve_compose_project_for_dir(dir.path(), None, Some(HARNESS_PROJECT), &messages)
+                .unwrap(),
+            HARNESS_PROJECT
+        );
+        let recorded = resolve_recorded_instance_name(dir.path(), None, &messages).unwrap();
         assert_eq!(recorded, DEFAULT_INSTANCE_NAME);
     }
 
     #[test]
     fn recorded_identity_preserves_the_existing_value_without_the_flag() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(Some("bootroot-e2e-ci-reinit-42"));
         let dir = tempfile::tempdir().unwrap();
         write_dotenv_with_instance(dir.path(), "insight");
         let recorded = resolve_recorded_instance_name(dir.path(), None, &test_messages()).unwrap();
@@ -557,8 +531,6 @@ mod tests {
 
     #[test]
     fn recorded_identity_takes_the_flag_over_the_existing_value() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let dir = tempfile::tempdir().unwrap();
         write_dotenv_with_instance(dir.path(), "insight");
         let recorded =
@@ -835,17 +807,24 @@ mod tests {
     /// An inherited `BOOTROOT_INSTANCE` must never reach Compose: it
     /// would outrank the compose directory's `.env` and rename the
     /// containers of the install being acted on.
+    ///
+    /// What closes that is unconditional: `command()` sets the variable
+    /// on every invocation it builds, so whatever the invoking
+    /// environment exported is replaced rather than inherited.  The
+    /// assertion is therefore on the child environment the builder
+    /// declares, which is the only thing the ambient value could have
+    /// competed with.
     #[test]
     fn recorded_instance_overrides_an_inherited_variable() {
-        let _guard = env_lock();
-        let _project = ComposeProjectEnv::set(None);
-        let _inherited = ScopedEnv::set(INSTANCE_NAME_ENV_KEY, Some("other"));
         let dir = tempfile::tempdir().unwrap();
         write_dotenv_with_instance(dir.path(), "insight");
-        let identity =
-            ComposeIdentity::resolve_for_dir(dir.path(), None, &test_messages()).unwrap();
-        // The child value is set unconditionally, so the exported
-        // `other` is replaced rather than inherited.
+        let identity = ComposeIdentity::resolve_for_dir_with_override(
+            dir.path(),
+            None,
+            None,
+            &test_messages(),
+        )
+        .unwrap();
         let command = identity
             .compose(&["docker-compose.yml"], None, &["up", "-d"])
             .command(&[]);
@@ -867,12 +846,15 @@ mod tests {
     #[test]
     fn long_compose_project_scopes_the_project_but_not_the_containers() {
         const HARNESS_PROJECT: &str = "bootroot-e2e-ci-openbao-tls-no-delta-1234567";
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(Some(HARNESS_PROJECT));
         let dir = tempfile::tempdir().unwrap();
         write_dotenv_with_instance(dir.path(), DEFAULT_INSTANCE_NAME);
-        let identity =
-            ComposeIdentity::resolve_for_dir(dir.path(), None, &test_messages()).unwrap();
+        let identity = ComposeIdentity::resolve_for_dir_with_override(
+            dir.path(),
+            None,
+            Some(HARNESS_PROJECT),
+            &test_messages(),
+        )
+        .unwrap();
         assert_eq!(identity.project(), HARNESS_PROJECT);
         assert_eq!(
             identity.container(BootrootContainer::OpenBao),

@@ -16,7 +16,7 @@ use crate::commands::init::{
     APPROLE_BOOTROOT_STEPCA, PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB,
     PATH_STEPCA_PASSWORD, SECRET_ID_TTL, parse_ttl_to_secs,
 };
-use crate::commands::openbao_url::effective_openbao_url;
+use crate::commands::openbao_url::{OPENBAO_HOST_PORT_ENV, effective_openbao_url_with_env};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -135,10 +135,17 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
 /// another bootroot instance's `OpenBao`.  An explicit `--openbao-url`
 /// is still honoured verbatim.
 fn status_openbao_url(args: &StatusArgs) -> String {
-    effective_openbao_url(
+    status_openbao_url_with_env(args, std::env::var(OPENBAO_HOST_PORT_ENV).ok().as_deref())
+}
+
+/// [`status_openbao_url`] with the `OPENBAO_HOST_PORT` value supplied by
+/// the caller instead of read from the process environment.
+fn status_openbao_url_with_env(args: &StatusArgs, host_port_env: Option<&str>) -> String {
+    effective_openbao_url_with_env(
         &args.openbao.openbao_url,
         &compose_file_dir(&args.compose.compose_file),
         None,
+        host_port_env,
     )
 }
 
@@ -406,28 +413,33 @@ mod tests {
     /// recorded in the compose directory's `.env`.
     #[test]
     fn status_openbao_url_follows_the_configured_host_port() {
-        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").expect("write .env");
         let args = status_args(
             dir.path().join("docker-compose.yml"),
             crate::commands::init::DEFAULT_OPENBAO_URL,
         );
-        assert_eq!(status_openbao_url(&args), "http://localhost:18200");
+        assert_eq!(
+            status_openbao_url_with_env(&args, None),
+            "http://localhost:18200"
+        );
     }
 
     /// Closes #731: an operator-supplied `--openbao-url` is used
     /// verbatim, whatever the configured host port is.
     #[test]
     fn status_openbao_url_honours_an_explicit_url() {
-        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").expect("write .env");
         let args = status_args(
             dir.path().join("docker-compose.yml"),
             "https://openbao.internal:8200",
         );
-        assert_eq!(status_openbao_url(&args), "https://openbao.internal:8200");
+        assert_eq!(
+            status_openbao_url_with_env(&args, Some("18201")),
+            "https://openbao.internal:8200",
+            "an explicit --openbao-url outranks every port source"
+        );
     }
 
     fn rfc3339(ts: OffsetDateTime) -> String {
