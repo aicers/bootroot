@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use config::{Config, ConfigError, Environment, File};
+use config::builder::DefaultState;
+use config::{Config, ConfigBuilder, ConfigError, Environment, File};
 use serde::Deserialize;
 
 mod defaults;
@@ -252,21 +253,9 @@ impl Settings {
     /// # Errors
     /// Returns error if configuration parsing fails (e.g. file not found, invalid format).
     pub fn new(config_path: Option<PathBuf>) -> Result<Self, ConfigError> {
-        let mut s = Config::builder();
-
-        // 1. Set Defaults
-        s = defaults::apply_defaults(s)?;
-
-        // 2. Merge File (optional)
-        // If config_path is provided, use it. Otherwise look for "agent.toml"
-        let path = config_path.unwrap_or_else(|| PathBuf::from("agent.toml"));
-
-        // Add file source (required = false, so it doesn't panic if missing)
-        s = s.add_source(File::from(path).required(false));
-
         // 3. Environment Variables (double-underscore for nesting)
         // e.g. BOOTROOT_EMAIL, BOOTROOT_PATHS__CERT, BOOTROOT_DAEMON__RENEW_BEFORE
-        s = s.add_source(
+        let s = Self::file_builder(config_path)?.add_source(
             Environment::with_prefix("BOOTROOT")
                 .separator("__")
                 .try_parsing(true)
@@ -278,6 +267,39 @@ impl Settings {
 
         // 4. Build
         s.build()?.try_deserialize()
+    }
+
+    /// Creates a new `Settings` instance from `config_path` alone, without
+    /// the `BOOTROOT_*` environment overlay that [`Settings::new`] applies.
+    ///
+    /// Use this to assert on what a file actually contains. Reading through
+    /// `new` would let a `BOOTROOT_*` variable in the caller's environment
+    /// replace the value under test, and the only way to rule that out
+    /// there is to empty the environment first — which no process running a
+    /// tokio runtime, an HTTP client, or an env-filtered subscriber can do
+    /// soundly, since `set_var` requires that nothing else be reading.
+    ///
+    /// # Errors
+    /// Returns error if configuration parsing fails (e.g. file not found, invalid format).
+    pub fn from_file(config_path: Option<PathBuf>) -> Result<Self, ConfigError> {
+        Self::file_builder(config_path)?.build()?.try_deserialize()
+    }
+
+    /// Builds the defaults-plus-file layers both constructors share.
+    fn file_builder(
+        config_path: Option<PathBuf>,
+    ) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
+        let mut s = Config::builder();
+
+        // 1. Set Defaults
+        s = defaults::apply_defaults(s)?;
+
+        // 2. Merge File (optional)
+        // If config_path is provided, use it. Otherwise look for "agent.toml"
+        let path = config_path.unwrap_or_else(|| PathBuf::from("agent.toml"));
+
+        // Add file source (required = false, so it doesn't panic if missing)
+        Ok(s.add_source(File::from(path).required(false)))
     }
 
     /// Merges CLI arguments into the settings, overriding values if present.

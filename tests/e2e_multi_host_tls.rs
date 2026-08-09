@@ -127,13 +127,12 @@
 
 #![cfg(unix)]
 
-use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bootroot::acme::responder_client::{
@@ -807,49 +806,29 @@ async fn run_remote_bootstrap(
     cmd.output().await.expect("run bootroot-remote")
 }
 
-/// Shared mutex guarding temporary mutation of `BOOTROOT_*` environment
-/// variables across parallel test threads inside this binary.
-static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
 /// Loads [`Settings`] from the `agent.toml` file that `bootroot-remote
 /// bootstrap` wrote.  This is the production path the RN agent takes at
 /// `src/acme/flow.rs:156` — no test-synthesised trust material is injected;
 /// the CA bundle path and SHA-256 pins are exactly what bootstrap persisted
 /// from the TLS-protected `OpenBao` `/trust` read.
 ///
-/// `Settings::new` merges a `BOOTROOT_*` environment overlay on top of the
-/// file at `src/config.rs:210`, which would otherwise let developer or CI
-/// env vars (e.g. `BOOTROOT_TRUST__CA_BUNDLE_PATH`,
-/// `BOOTROOT_TRUST__TRUSTED_CA_SHA256`,
+/// Loaded through [`Settings::from_file`] rather than [`Settings::new`],
+/// which merges a `BOOTROOT_*` environment overlay on top of the file and
+/// would let a developer or CI variable (e.g.
+/// `BOOTROOT_TRUST__CA_BUNDLE_PATH`, `BOOTROOT_TRUST__TRUSTED_CA_SHA256`,
 /// `BOOTROOT_ACME__HTTP_RESPONDER_URL`) silently replace the values this
-/// test is trying to prove came from the TLS-protected `/trust` read.  The
-/// helper scrubs every `BOOTROOT_*` var under a shared [`ENV_LOCK`] while
-/// building `Settings`, then restores them, so the loaded `Settings`
-/// reflects the bootstrap-written `agent.toml` alone.
+/// test is trying to prove came from the TLS-protected `/trust` read. So
+/// the loaded `Settings` reflects the bootstrap-written `agent.toml`
+/// alone, and this test asserts the file is sufficient rather than
+/// arranging for the environment to be empty first.
 ///
 /// `http_responder_token_ttl_secs` is overridden to keep the admin
 /// registration well below the responder's `max_token_ttl_secs`; everything
 /// security-relevant (URL, HMAC, trust bundle path, pins) comes from the
 /// file on disk.
 fn load_settings_from_bootstrap_output(agent_config_path: &Path) -> Settings {
-    let _guard = ENV_LOCK.lock().expect("env lock not poisoned");
-    let saved: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(k, _)| k.to_str().is_some_and(|key| key.starts_with("BOOTROOT_")))
-        .collect();
-    for (key, _) in &saved {
-        // SAFETY: Tests hold ENV_LOCK while mutating process environment.
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
-    let result = Settings::new(Some(agent_config_path.to_path_buf()));
-    for (key, value) in &saved {
-        // SAFETY: Tests hold ENV_LOCK while mutating process environment.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
-    let mut settings = result.expect("load agent.toml");
+    let mut settings =
+        Settings::from_file(Some(agent_config_path.to_path_buf())).expect("load agent.toml");
     settings.acme.http_responder_token_ttl_secs = TEST_TTL_SECS;
     settings
 }
