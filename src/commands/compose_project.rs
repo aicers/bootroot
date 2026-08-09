@@ -239,7 +239,28 @@ impl ComposeIdentity {
         instance_name: Option<&str>,
         messages: &Messages,
     ) -> Result<Self> {
-        Self::resolve_for_dir(&compose_file_dir(compose_file), instance_name, messages)
+        Self::resolve_with_override(
+            compose_file,
+            instance_name,
+            compose_project_name_override().as_deref(),
+            messages,
+        )
+    }
+
+    /// [`ComposeIdentity::resolve`] with the `COMPOSE_PROJECT_NAME`
+    /// override supplied by the caller.
+    fn resolve_with_override(
+        compose_file: &Path,
+        instance_name: Option<&str>,
+        project_override: Option<&str>,
+        messages: &Messages,
+    ) -> Result<Self> {
+        Self::resolve_for_dir_with_override(
+            &compose_file_dir(compose_file),
+            instance_name,
+            project_override,
+            messages,
+        )
     }
 
     /// The Compose project every invocation is scoped to with `-p`.
@@ -496,9 +517,13 @@ mod tests {
         write_dotenv_with_instance(&here, "here-instance");
         write_dotenv_with_instance(&there, "there-instance");
 
-        let identity =
-            ComposeIdentity::resolve(&there.join("docker-compose.yml"), None, &test_messages())
-                .unwrap();
+        let identity = ComposeIdentity::resolve_with_override(
+            &there.join("docker-compose.yml"),
+            None,
+            None,
+            &test_messages(),
+        )
+        .unwrap();
         assert_eq!(identity.project(), "there-instance");
     }
 
