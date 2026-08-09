@@ -860,21 +860,11 @@ mod rollback_tests {
 #[cfg(test)]
 pub(super) mod test_support {
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use super::super::constants::openbao_constants::SECRET_ID_TTL;
     use super::super::constants::{DEFAULT_CERT_DURATION, DEFAULT_STEPCA_PROVISIONER};
     use crate::cli::args::InitArgs;
     pub(in crate::commands::init::steps) use crate::i18n::test_messages;
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    pub(in crate::commands::init::steps) fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
-    }
 
     pub(in crate::commands::init::steps) fn default_init_args() -> InitArgs {
         InitArgs {

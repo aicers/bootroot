@@ -3,7 +3,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bootroot::db::{self, effective_admin_dsn_for_kv, for_compose_runtime, for_host_runtime};
+use bootroot::db::{
+    self, effective_admin_dsn_for_kv, for_compose_runtime, for_host_runtime_with_port,
+};
 use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{
@@ -42,7 +44,11 @@ pub(super) async fn rotate_db(
     } else {
         read_admin_dsn_from_kv(client, &ctx.kv_mount).await?
     };
-    let admin_dsn = resolve_db_admin_dsn(args, &compose_dir, kv_admin_dsn.as_deref(), messages)?;
+    // The host-side port the compose stack publishes, resolved once
+    // here so the DSN translation below is steered by a value rather
+    // than by the process environment.
+    let host_port = db::resolve_postgres_host_port(&compose_dir);
+    let admin_dsn = resolve_db_admin_dsn(args, host_port, kv_admin_dsn.as_deref(), messages)?;
     let admin = db::parse_db_dsn(&admin_dsn).with_context(|| messages.error_invalid_db_dsn())?;
     ensure_single_host_db_host(&admin.host, messages)?;
     let db_password = match &args.password {
@@ -136,9 +142,15 @@ pub(super) async fn rotate_db(
     Ok(())
 }
 
+/// Resolves the admin DSN `rotate db` provisions with.
+///
+/// `host_port` is the host-side published `PostgreSQL` port, per
+/// [`db::resolve_postgres_host_port`]: the persisted DSN is stored in
+/// compose-internal form and has to be translated to something
+/// reachable from the host this command runs on.
 fn resolve_db_admin_dsn(
     args: &RotateDbArgs,
-    compose_dir: &Path,
+    host_port: u16,
     kv_admin_dsn: Option<&str>,
     messages: &Messages,
 ) -> Result<String> {
@@ -149,11 +161,11 @@ fn resolve_db_admin_dsn(
         return Ok(value.clone());
     }
     // Persisted admin DSN from `init --enable db-provision`. Translate
-    // through `for_host_runtime` so a value that was stored in
+    // through `for_host_runtime_with_port` so a value that was stored in
     // compose-internal form (host `postgres`) becomes reachable from
     // the host where `rotate db` runs.
     if let Some(value) = kv_admin_dsn {
-        return for_host_runtime(value, compose_dir)
+        return for_host_runtime_with_port(value, host_port)
             .with_context(|| messages.error_invalid_db_dsn());
     }
     // Per issue #588 §2: do NOT fall back to `ca.json.db.dataSource`.
@@ -246,16 +258,16 @@ fn parse_ca_json_dsn(contents: &str, messages: &Messages) -> Result<String> {
 mod tests {
     use std::fs;
 
+    use bootroot::db::DEFAULT_POSTGRES_HOST_PORT;
     use tempfile::tempdir;
 
-    use super::super::test_support::{ScopedEnvVar, env_lock, test_messages};
+    use super::super::test_support::test_messages;
     use super::*;
     use crate::cli::args::{DbAdminDsnArgs, DbTimeoutArgs};
 
     #[test]
     fn resolve_db_admin_dsn_uses_cli_arg() {
         let messages = test_messages();
-        let dir = tempdir().expect("tempdir");
         let args = RotateDbArgs {
             admin_dsn: DbAdminDsnArgs {
                 admin_dsn: Some("postgresql://admin:pass@127.0.0.1:15432/postgres".to_string()),
@@ -263,8 +275,8 @@ mod tests {
             password: None,
             timeout: DbTimeoutArgs { timeout_secs: 30 },
         };
-        let resolved =
-            resolve_db_admin_dsn(&args, dir.path(), None, &messages).expect("resolve dsn");
+        let resolved = resolve_db_admin_dsn(&args, DEFAULT_POSTGRES_HOST_PORT, None, &messages)
+            .expect("resolve dsn");
         assert_eq!(resolved, "postgresql://admin:pass@127.0.0.1:15432/postgres");
     }
 
@@ -275,24 +287,17 @@ mod tests {
         // DSN; using it as an admin DSN reproduces the original
         // self-ALTER failure. With no flag and no KV value, fail fast
         // with a message naming the available recovery paths.
-        let _lock = env_lock();
-        let _port_guard = ScopedEnvVar::set("POSTGRES_HOST_PORT", "");
+        //
+        // The resolver takes a port rather than a compose directory, so
+        // there is no longer a path by which a ca.json could be reached
+        // at all; what stays asserted is the error the operator sees.
         let messages = test_messages();
-        let dir = tempdir().expect("tempdir");
-        // Even an existing ca.json must not be silently consumed as an
-        // admin DSN — the file is left in place to confirm no fallthrough.
-        let ca_json = dir.path().join("ca.json");
-        fs::write(
-            &ca_json,
-            r#"{"db":{"type":"postgresql","dataSource":"postgresql://stepca:runtime@postgres:5432/stepca?sslmode=disable"}}"#,
-        )
-        .expect("write ca.json");
         let args = RotateDbArgs {
             admin_dsn: DbAdminDsnArgs { admin_dsn: None },
             password: None,
             timeout: DbTimeoutArgs { timeout_secs: 30 },
         };
-        let err = resolve_db_admin_dsn(&args, dir.path(), None, &messages)
+        let err = resolve_db_admin_dsn(&args, DEFAULT_POSTGRES_HOST_PORT, None, &messages)
             .expect_err("must error when no admin DSN source is available");
         let chained = err
             .chain()
@@ -309,28 +314,35 @@ mod tests {
     fn resolve_db_admin_dsn_prefers_kv_admin() {
         // Closes issue #588 §2: when init persisted the admin DSN to
         // KV, `rotate db` must use it instead of erroring out.
-        let _lock = env_lock();
-        let _port_guard = ScopedEnvVar::set("POSTGRES_HOST_PORT", "");
         let messages = test_messages();
-        let dir = tempdir().expect("tempdir");
         let args = RotateDbArgs {
             admin_dsn: DbAdminDsnArgs { admin_dsn: None },
             password: None,
             timeout: DbTimeoutArgs { timeout_secs: 30 },
         };
         let kv_admin = "postgresql://step:admin@postgres:5432/postgres?sslmode=disable";
-        let resolved = resolve_db_admin_dsn(&args, dir.path(), Some(kv_admin), &messages)
-            .expect("resolve dsn");
+        let resolved =
+            resolve_db_admin_dsn(&args, DEFAULT_POSTGRES_HOST_PORT, Some(kv_admin), &messages)
+                .expect("resolve dsn");
         assert_eq!(
             resolved, "postgresql://step:admin@127.0.0.1:5433/postgres?sslmode=disable",
             "must use the persisted admin DSN, translated to host-side"
+        );
+        assert_eq!(DEFAULT_POSTGRES_HOST_PORT, 5433);
+
+        // The port is what the translation follows, so a different one
+        // has to land in the DSN.
+        let on_another_port =
+            resolve_db_admin_dsn(&args, 6543, Some(kv_admin), &messages).expect("resolve dsn");
+        assert_eq!(
+            on_another_port,
+            "postgresql://step:admin@127.0.0.1:6543/postgres?sslmode=disable"
         );
     }
 
     #[test]
     fn resolve_db_admin_dsn_cli_flag_overrides_kv() {
         let messages = test_messages();
-        let dir = tempdir().expect("tempdir");
         let args = RotateDbArgs {
             admin_dsn: DbAdminDsnArgs {
                 admin_dsn: Some("postgresql://flag:pass@127.0.0.1:9999/postgres".to_string()),
@@ -340,7 +352,7 @@ mod tests {
         };
         let resolved = resolve_db_admin_dsn(
             &args,
-            dir.path(),
+            DEFAULT_POSTGRES_HOST_PORT,
             Some("postgresql://kv:kv@postgres:5432/postgres"),
             &messages,
         )

@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use bootroot::db::POSTGRES_HOST_PORT_ENV;
 use bootroot::host_port::{
     HTTP01_ADMIN_HOST_PORT_ENV, OPENBAO_HOST_PORT_ENV, STEPCA_HOST_PORT_ENV,
-    resolve_http01_admin_host_port, resolve_openbao_host_port, resolve_stepca_host_port,
+    resolve_http01_admin_host_port_with_env, resolve_openbao_host_port_with_env,
+    resolve_stepca_host_port_with_env,
 };
 use bootroot::openbao::OpenBaoClient;
 
@@ -881,23 +882,56 @@ struct HostPorts {
     http01_admin: u16,
 }
 
+/// The `*_HOST_PORT` variables [`HostPorts::resolve`] consults, read
+/// from the invoking environment.
+///
+/// Read once at the composition root and passed down, so the resolution
+/// below is steered by a value rather than by process-global state.
+#[derive(Debug, Clone, Default)]
+struct HostPortEnv {
+    postgres: Option<String>,
+    openbao: Option<String>,
+    stepca: Option<String>,
+    http01_admin: Option<String>,
+}
+
+impl HostPortEnv {
+    fn from_process_env() -> Self {
+        Self {
+            postgres: std::env::var(POSTGRES_HOST_PORT_ENV).ok(),
+            openbao: std::env::var(OPENBAO_HOST_PORT_ENV).ok(),
+            stepca: std::env::var(STEPCA_HOST_PORT_ENV).ok(),
+            http01_admin: std::env::var(HTTP01_ADMIN_HOST_PORT_ENV).ok(),
+        }
+    }
+}
+
 impl HostPorts {
     /// Resolves every core service's host-side published port for an
     /// `infra install` run.
     fn resolve(args: &InfraInstallArgs, compose_dir: &Path) -> Self {
+        Self::resolve_with_env(args, compose_dir, &HostPortEnv::from_process_env())
+    }
+
+    /// [`HostPorts::resolve`] with the `*_HOST_PORT` variables supplied
+    /// by the caller instead of read from the process environment.
+    fn resolve_with_env(args: &InfraInstallArgs, compose_dir: &Path, env: &HostPortEnv) -> Self {
         Self {
-            postgres: args
-                .postgres_host_port
-                .unwrap_or_else(|| bootroot::db::resolve_postgres_host_port(compose_dir)),
-            openbao: args
-                .openbao_host_port
-                .unwrap_or_else(|| resolve_openbao_host_port(compose_dir)),
-            stepca: args
-                .stepca_host_port
-                .unwrap_or_else(|| resolve_stepca_host_port(compose_dir)),
-            http01_admin: args
-                .http01_admin_host_port
-                .unwrap_or_else(|| resolve_http01_admin_host_port(compose_dir)),
+            postgres: args.postgres_host_port.unwrap_or_else(|| {
+                bootroot::db::resolve_postgres_host_port_with_env(
+                    env.postgres.as_deref(),
+                    compose_dir,
+                )
+            }),
+            openbao: args.openbao_host_port.unwrap_or_else(|| {
+                resolve_openbao_host_port_with_env(env.openbao.as_deref(), compose_dir)
+            }),
+            stepca: args.stepca_host_port.unwrap_or_else(|| {
+                resolve_stepca_host_port_with_env(env.stepca.as_deref(), compose_dir)
+            }),
+            http01_admin: args.http01_admin_host_port.unwrap_or_else(|| {
+                resolve_http01_admin_host_port_with_env(env.http01_admin.as_deref(), compose_dir)
+            }),
         }
     }
 }
@@ -2738,7 +2772,6 @@ mod tests {
     /// `.env` → compile-time default, per service.
     #[test]
     fn host_ports_resolve_prefers_the_flag_then_the_env_file() {
-        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".env"),
@@ -2747,13 +2780,56 @@ mod tests {
         .unwrap();
         let mut args = install_args(dir.path().join("docker-compose.yml"));
         args.openbao_host_port = Some(28200);
-        let ports = HostPorts::resolve(&args, dir.path());
+        let env = HostPortEnv {
+            postgres: Some("15432".to_string()),
+            ..HostPortEnv::default()
+        };
+        let ports = HostPorts::resolve_with_env(&args, dir.path(), &env);
         assert_eq!(ports.openbao, 28200, "the flag wins");
+        assert_eq!(
+            ports.postgres, 15432,
+            "the process environment outranks `.env`"
+        );
         assert_eq!(ports.stepca, 19000, "`.env` is consulted");
         assert_eq!(
             ports.http01_admin,
             bootroot::host_port::DEFAULT_HTTP01_ADMIN_HOST_PORT,
             "an unconfigured service keeps the compose default"
+        );
+    }
+
+    /// Each field of [`HostPortEnv`] has to reach its own service.  The
+    /// four resolvers differ only in the `(key, default)` pair they
+    /// carry, so a field wired to the wrong one would still produce a
+    /// plausible port and no other assertion here would notice.
+    #[test]
+    fn host_ports_resolve_routes_each_env_field_to_its_own_service() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every service also has a `.env` value, so a field that failed
+        // to reach its resolver would fall through to a different number
+        // rather than silently matching.
+        std::fs::write(
+            dir.path().join(".env"),
+            "POSTGRES_HOST_PORT=15400\nOPENBAO_HOST_PORT=18400\n\
+             STEPCA_HOST_PORT=19400\nHTTP01_ADMIN_HOST_PORT=18500\n",
+        )
+        .unwrap();
+        let args = install_args(dir.path().join("docker-compose.yml"));
+        let env = HostPortEnv {
+            postgres: Some("15432".to_string()),
+            openbao: Some("18200".to_string()),
+            stepca: Some("19000".to_string()),
+            http01_admin: Some("18080".to_string()),
+        };
+        let ports = HostPorts::resolve_with_env(&args, dir.path(), &env);
+        assert_eq!(
+            (
+                ports.postgres,
+                ports.openbao,
+                ports.stepca,
+                ports.http01_admin
+            ),
+            (15432, 18200, 19000, 18080)
         );
     }
 

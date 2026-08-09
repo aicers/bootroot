@@ -186,6 +186,22 @@ pub fn resolve_postgres_host_port(compose_dir: &Path) -> u16 {
     )
 }
 
+/// [`resolve_postgres_host_port`] with the `POSTGRES_HOST_PORT` value
+/// supplied by the caller instead of read from the process environment.
+///
+/// Lets a caller that already holds the variable — `init`'s DSN
+/// builders, and the tests steering them — drive step 1 of the
+/// precedence without mutating process-global state.
+#[must_use]
+pub fn resolve_postgres_host_port_with_env(env_value: Option<&str>, compose_dir: &Path) -> u16 {
+    crate::host_port::resolve_host_port_with_env(
+        env_value,
+        compose_dir,
+        POSTGRES_HOST_PORT_ENV,
+        DEFAULT_POSTGRES_HOST_PORT,
+    )
+}
+
 /// Returns the admin DSN that should be persisted to KV after running
 /// [`provision_db_sync`].
 ///
@@ -649,18 +665,21 @@ mod tests {
     fn host_compose_round_trip_with_env_file() {
         // Round-trip symmetry: host -> compose -> host returns the original
         // (host, port) pair, with compose_dir/.env providing
-        // POSTGRES_HOST_PORT.
+        // POSTGRES_HOST_PORT.  The `None` is the process environment
+        // holding no value, so the file is what decides.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".env"), "POSTGRES_HOST_PORT=5433\n").expect("write .env");
-        // Ensure process env does not override the file value.
-        let _guard = env_port_guard();
         let host_dsn = "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=disable";
         let compose = for_compose_runtime(host_dsn).unwrap();
         assert_eq!(
             compose,
             "postgresql://step:pw@postgres:5432/stepca?sslmode=disable"
         );
-        let round_trip = for_host_runtime(&compose, dir.path()).unwrap();
+        let round_trip = for_host_runtime_with_port(
+            &compose,
+            resolve_postgres_host_port_with_env(None, dir.path()),
+        )
+        .unwrap();
         assert_eq!(round_trip, host_dsn);
     }
 
@@ -668,21 +687,17 @@ mod tests {
     fn resolve_postgres_host_port_prefers_process_env() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".env"), "POSTGRES_HOST_PORT=9999\n").expect("write .env");
-        let _guard = env_port_guard();
-        // SAFETY: `env_port_guard` serializes POSTGRES_HOST_PORT access and
-        // restores the value on drop.
-        unsafe {
-            std::env::set_var(POSTGRES_HOST_PORT_ENV, "7777");
-        }
-        assert_eq!(resolve_postgres_host_port(dir.path()), 7777);
+        assert_eq!(
+            resolve_postgres_host_port_with_env(Some("7777"), dir.path()),
+            7777
+        );
     }
 
     #[test]
     fn resolve_postgres_host_port_defaults_when_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let _guard = env_port_guard();
         assert_eq!(
-            resolve_postgres_host_port(dir.path()),
+            resolve_postgres_host_port_with_env(None, dir.path()),
             DEFAULT_POSTGRES_HOST_PORT
         );
     }
@@ -695,43 +710,6 @@ mod tests {
             "# comment\nOTHER=1\nPOSTGRES_HOST_PORT=\"5433\"\n",
         )
         .expect("write .env");
-        let _guard = env_port_guard();
-        assert_eq!(resolve_postgres_host_port(dir.path()), 5433);
-    }
-
-    /// Guards `POSTGRES_HOST_PORT` across tests that read/write process env.
-    struct EnvPortGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<String>,
-    }
-
-    impl Drop for EnvPortGuard {
-        fn drop(&mut self) {
-            // SAFETY: restored inside the shared mutex held by `_lock`.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(POSTGRES_HOST_PORT_ENV, value),
-                    None => std::env::remove_var(POSTGRES_HOST_PORT_ENV),
-                }
-            }
-        }
-    }
-
-    fn env_port_guard() -> EnvPortGuard {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let lock = LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var(POSTGRES_HOST_PORT_ENV).ok();
-        // SAFETY: removal is serialized by the mutex above.
-        unsafe {
-            std::env::remove_var(POSTGRES_HOST_PORT_ENV);
-        }
-        EnvPortGuard {
-            _lock: lock,
-            previous,
-        }
+        assert_eq!(resolve_postgres_host_port_with_env(None, dir.path()), 5433);
     }
 }

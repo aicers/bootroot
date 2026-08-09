@@ -14,7 +14,7 @@ use super::super::types::{
 };
 use super::InitRollback;
 use super::RollbackFile;
-use super::database::{check_db_connectivity, resolve_db_dsn_for_init};
+use super::database::{PostgresEnv, check_db_connectivity, resolve_db_dsn_for_init};
 use super::http01_admin_tls::{
     build_http01_admin_tls_sans, issue_http01_admin_tls_cert, record_http01_admin_infra_cert,
 };
@@ -60,7 +60,7 @@ use crate::commands::init::{
     OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_KEY_PATH, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
 };
 use crate::commands::openbao_unseal::unseal_keys_path;
-use crate::commands::openbao_url::effective_openbao_url;
+use crate::commands::openbao_url::{OPENBAO_HOST_PORT_ENV, effective_openbao_url_with_env};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -73,8 +73,26 @@ use crate::state::StateFile;
 /// and `run_init_inner`'s own bind-intent-gated branch takes over once
 /// the TLS certificate has been issued.
 fn args_with_effective_openbao_url(args: &InitArgs) -> Cow<'_, InitArgs> {
+    args_with_effective_openbao_url_with_env(
+        args,
+        std::env::var(OPENBAO_HOST_PORT_ENV).ok().as_deref(),
+    )
+}
+
+/// [`args_with_effective_openbao_url`] with the `OPENBAO_HOST_PORT`
+/// value supplied by the caller instead of read from the process
+/// environment.
+fn args_with_effective_openbao_url_with_env<'a>(
+    args: &'a InitArgs,
+    host_port_env: Option<&str>,
+) -> Cow<'a, InitArgs> {
     let compose_dir = compose_file_dir(&args.compose.compose_file);
-    let url = effective_openbao_url(&args.openbao.openbao_url, &compose_dir, None);
+    let url = effective_openbao_url_with_env(
+        &args.openbao.openbao_url,
+        &compose_dir,
+        None,
+        host_port_env,
+    );
     if url == args.openbao.openbao_url {
         return Cow::Borrowed(args);
     }
@@ -454,8 +472,12 @@ async fn run_init_inner(
     // the temporary POSTGRES_PASSWORD written by `infra install`.
     crate::commands::dotenv::load_dotenv_into_env(&compose_dir.join(".env"), messages)?;
 
+    // Read after the `.env` load above, which is what puts the
+    // `PostgreSQL` credentials `infra install` generated into the
+    // process environment.
+    let postgres_env = PostgresEnv::from_process_env();
     let (db_dsn, db_dsn_normalization, admin_dsn_for_kv) =
-        resolve_db_dsn_for_init(args, compose_dir, messages).await?;
+        resolve_db_dsn_for_init(args, compose_dir, &postgres_env, messages).await?;
     let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
     let db_info = parse_db_dsn(&secrets.db_dsn)
         .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
@@ -1690,26 +1712,29 @@ mod tests {
     /// the same host would initialise against the first one's `OpenBao`.
     #[test]
     fn init_args_follow_the_configured_openbao_host_port() {
-        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").expect("write .env");
         let mut args = default_init_args();
         args.compose.compose_file = dir.path().join("docker-compose.yml");
-        let resolved = args_with_effective_openbao_url(&args);
+        let resolved = args_with_effective_openbao_url_with_env(&args, None);
         assert_eq!(resolved.openbao.openbao_url, "http://localhost:18200");
+        let from_env = args_with_effective_openbao_url_with_env(&args, Some("18201"));
+        assert_eq!(
+            from_env.openbao.openbao_url, "http://localhost:18201",
+            "the process environment outranks the compose `.env`"
+        );
     }
 
     /// Closes #731: an operator-supplied `--openbao-url` is used
     /// verbatim, and the unchanged case borrows instead of cloning.
     #[test]
     fn init_args_keep_an_explicit_openbao_url() {
-        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").expect("write .env");
         let mut args = default_init_args();
         args.compose.compose_file = dir.path().join("docker-compose.yml");
         args.openbao.openbao_url = "https://openbao.internal:8200".to_string();
-        let resolved = args_with_effective_openbao_url(&args);
+        let resolved = args_with_effective_openbao_url_with_env(&args, None);
         assert_eq!(
             resolved.openbao.openbao_url,
             "https://openbao.internal:8200"

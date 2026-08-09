@@ -125,7 +125,7 @@ pub(crate) fn resolve_container_name(
 mod tests {
     use super::*;
     use crate::commands::compose_project::{
-        DEFAULT_INSTANCE_NAME, INSTANCE_NAME_ENV_KEY, test_env,
+        DEFAULT_INSTANCE_NAME, INSTANCE_NAME_ENV_KEY, resolve_compose_project_for_dir,
     };
     use crate::i18n::test_messages;
 
@@ -218,8 +218,6 @@ mod tests {
 
     #[test]
     fn resolve_reads_the_identity_recorded_beside_the_compose_file() {
-        let _guard = test_env::env_lock();
-        let _env = test_env::ComposeProjectEnv::set(None);
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join(".env"),
@@ -302,14 +300,21 @@ mod tests {
     /// than an instance name may be.
     #[test]
     fn resolve_ignores_the_compose_project_override() {
-        let _guard = test_env::env_lock();
-        let _env =
-            test_env::ComposeProjectEnv::set(Some("bootroot-e2e-ci-openbao-tls-no-delta-1234567"));
+        const HARNESS_PROJECT: &str = "bootroot-e2e-ci-openbao-tls-no-delta-1234567";
+        let messages = test_messages();
         let dir = tempfile::tempdir().expect("tempdir");
+        // The same override that selects the Compose project has no
+        // route into the container name: `resolve_container_name` goes
+        // through `resolve_recorded_instance_name`, which takes none.
+        assert_eq!(
+            resolve_compose_project_for_dir(dir.path(), None, Some(HARNESS_PROJECT), &messages)
+                .expect("the override must select the project"),
+            HARNESS_PROJECT
+        );
         let name = resolve_container_name(
             &dir.path().join("docker-compose.yml"),
             BootrootContainer::Http01,
-            &test_messages(),
+            &messages,
         )
         .expect("resolving the container name must succeed");
         assert_eq!(name, "bootroot-http01");

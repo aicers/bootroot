@@ -62,6 +62,25 @@ pub(crate) fn write_dotenv(
     Ok(())
 }
 
+/// Decides which of `entries` [`load_dotenv_into_env`] would apply,
+/// given `is_set`, which answers whether a key already has a value in
+/// the target environment.
+///
+/// The whole decision, split off from the one mutation it feeds so it
+/// can be exercised without a process environment to steer — above all
+/// the [`COMPOSE_PROJECT_NAME_ENV`] exclusion documented below.
+fn dotenv_pairs_to_apply<'a>(
+    entries: &'a BTreeMap<String, String>,
+    is_set: &dyn Fn(&str) -> bool,
+) -> Vec<(&'a str, &'a str)> {
+    entries
+        .iter()
+        .filter(|(key, _)| key.as_str() != COMPOSE_PROJECT_NAME_ENV)
+        .filter(|(key, _)| !is_set(key))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
 /// Loads key-value pairs from a `.env` file into the process environment.
 ///
 /// Only sets variables that are not already present in the process
@@ -85,16 +104,11 @@ pub(crate) fn load_dotenv_into_env(path: &Path, messages: &Messages) -> Result<(
         return Ok(());
     }
     let map = read_dotenv(path, messages)?;
-    for (key, value) in &map {
-        if key == COMPOSE_PROJECT_NAME_ENV {
-            continue;
-        }
-        if std::env::var(key).is_err() {
-            // SAFETY: called once during single-threaded init setup,
-            // before any worker threads are spawned.
-            unsafe {
-                std::env::set_var(key, value);
-            }
+    for (key, value) in dotenv_pairs_to_apply(&map, &|key| std::env::var(key).is_ok()) {
+        // SAFETY: called once during single-threaded init setup,
+        // before any worker threads are spawned.
+        unsafe {
+            std::env::set_var(key, value);
         }
     }
     Ok(())
@@ -194,55 +208,36 @@ mod tests {
         assert_eq!(map.get("B").unwrap(), "keep");
     }
 
-    #[test]
-    fn test_load_dotenv_into_env_sets_missing_vars() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(".env");
-        let messages = test_messages();
-        // Use a unique key to avoid collision with parallel tests.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let key = format!("DOTENV_TEST_{nonce}");
-        std::fs::write(&path, format!("{key}=from_file\n")).unwrap();
+    /// Builds the parsed `.env` a load would be handed.
+    fn entries(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
 
-        // SAFETY: test-only, unique key avoids interference.
-        unsafe {
-            std::env::remove_var(&key);
-        }
-        load_dotenv_into_env(&path, &messages).unwrap();
-        assert_eq!(std::env::var(&key).unwrap(), "from_file");
-
-        // Clean up.
-        unsafe {
-            std::env::remove_var(&key);
-        }
+    /// An environment holding exactly `set`.
+    fn holding(set: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |key: &str| set.contains(&key)
     }
 
     #[test]
-    fn test_load_dotenv_into_env_does_not_overwrite_existing() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(".env");
-        let messages = test_messages();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let key = format!("DOTENV_EXIST_{nonce}");
-        std::fs::write(&path, format!("{key}=from_file\n")).unwrap();
+    fn load_dotenv_applies_keys_the_environment_does_not_hold() {
+        let map = entries(&[("DOTENV_A", "from_file"), ("DOTENV_B", "also_from_file")]);
+        assert_eq!(
+            dotenv_pairs_to_apply(&map, &holding(&[])),
+            vec![("DOTENV_A", "from_file"), ("DOTENV_B", "also_from_file")]
+        );
+    }
 
-        // SAFETY: test-only, unique key avoids interference.
-        unsafe {
-            std::env::set_var(&key, "already_set");
-        }
-        load_dotenv_into_env(&path, &messages).unwrap();
-        assert_eq!(std::env::var(&key).unwrap(), "already_set");
-
-        // Clean up.
-        unsafe {
-            std::env::remove_var(&key);
-        }
+    #[test]
+    fn load_dotenv_does_not_overwrite_a_key_the_environment_already_holds() {
+        let map = entries(&[("DOTENV_A", "from_file"), ("DOTENV_B", "also_from_file")]);
+        assert_eq!(
+            dotenv_pairs_to_apply(&map, &holding(&["DOTENV_A"])),
+            vec![("DOTENV_B", "also_from_file")],
+            "process env > .env file, so an already-set key is left alone"
+        );
     }
 
     /// `init` resolves the compose project once before this load and
@@ -256,35 +251,26 @@ mod tests {
     /// `.env` key is not that.
     #[test]
     fn load_dotenv_into_env_never_promotes_compose_project_name() {
-        use crate::commands::compose_project::{
-            COMPOSE_PROJECT_NAME_ENV, resolve_compose_project_for_dir,
-            test_env::{ComposeProjectEnv, env_lock},
-        };
-
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(".env");
-        let messages = test_messages();
-        std::fs::write(
-            &path,
-            format!("{COMPOSE_PROJECT_NAME_ENV}=from-dotenv\nBOOTROOT_INSTANCE=insight\n"),
-        )
-        .unwrap();
-
-        let before = resolve_compose_project_for_dir(dir.path(), None, &messages).unwrap();
-        load_dotenv_into_env(&path, &messages).unwrap();
-        let after = resolve_compose_project_for_dir(dir.path(), None, &messages).unwrap();
-
+        let map = entries(&[
+            (COMPOSE_PROJECT_NAME_ENV, "from-dotenv"),
+            ("BOOTROOT_INSTANCE", "insight"),
+        ]);
+        let applied = dotenv_pairs_to_apply(&map, &holding(&[]));
         assert!(
-            std::env::var(COMPOSE_PROJECT_NAME_ENV).is_err(),
-            "a .env-authored {COMPOSE_PROJECT_NAME_ENV} must not reach the process environment"
+            !applied
+                .iter()
+                .any(|(key, _)| *key == COMPOSE_PROJECT_NAME_ENV),
+            "a .env-authored {COMPOSE_PROJECT_NAME_ENV} must never be applied: {applied:?}"
         );
-        assert_eq!(
-            (before.as_str(), after.as_str()),
-            ("insight", "insight"),
-            "the resolved project must not change across the .env load"
-        );
+    }
+
+    /// The key is skipped because of what it is, not because something
+    /// else already holds it: an unset `COMPOSE_PROJECT_NAME` is exactly
+    /// the case where a promotion would change the resolved project.
+    #[test]
+    fn compose_project_name_is_excluded_even_when_the_environment_is_empty() {
+        let map = entries(&[(COMPOSE_PROJECT_NAME_ENV, "from-dotenv")]);
+        assert!(dotenv_pairs_to_apply(&map, &holding(&[])).is_empty());
     }
 
     /// The exclusion is scoped to that one key: everything else `.env`
@@ -292,39 +278,14 @@ mod tests {
     /// whole point of the load (`POSTGRES_PASSWORD` for the DSN builders).
     #[test]
     fn load_dotenv_into_env_still_loads_other_keys_alongside_it() {
-        use crate::commands::compose_project::{
-            COMPOSE_PROJECT_NAME_ENV,
-            test_env::{ComposeProjectEnv, env_lock},
-        };
-
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(".env");
-        let messages = test_messages();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time is before UNIX_EPOCH")
-            .as_nanos();
-        let key = format!("DOTENV_ALONGSIDE_{nonce}");
-        std::fs::write(
-            &path,
-            format!("{COMPOSE_PROJECT_NAME_ENV}=from-dotenv\n{key}=from_file\n"),
-        )
-        .unwrap();
-
-        // SAFETY: test-only, unique key avoids interference.
-        unsafe {
-            std::env::remove_var(&key);
-        }
-        load_dotenv_into_env(&path, &messages).unwrap();
-        assert_eq!(std::env::var(&key).unwrap(), "from_file");
-        assert!(std::env::var(COMPOSE_PROJECT_NAME_ENV).is_err());
-
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var(&key);
-        }
+        let map = entries(&[
+            (COMPOSE_PROJECT_NAME_ENV, "from-dotenv"),
+            ("POSTGRES_PASSWORD", "from_file"),
+        ]);
+        assert_eq!(
+            dotenv_pairs_to_apply(&map, &holding(&[])),
+            vec![("POSTGRES_PASSWORD", "from_file")]
+        );
     }
 
     #[test]

@@ -14,12 +14,16 @@ use crate::commands::clean::{
     inspect_label_via_docker, remove_openbao_container_and_volumes,
 };
 use crate::commands::compose_file::compose_file_dir;
-use crate::commands::compose_project::resolve_compose_project_for_dir;
+use crate::commands::compose_project::{
+    compose_project_name_override, resolve_compose_project_for_dir,
+};
 use crate::commands::container_name::{BootrootContainer, resolve_container_name};
 use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::commands::infra::run_infra_up;
 use crate::commands::init::{compose_has_openbao, prompt_yes_no, run_init};
-use crate::commands::openbao_url::effective_openbao_url;
+use crate::commands::openbao_url::{
+    OPENBAO_HOST_PORT_ENV, effective_openbao_url, effective_openbao_url_with_env,
+};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -100,6 +104,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     verify_compose_managed_openbao(
         compose_file,
         &compose_dir,
+        compose_project_name_override().as_deref(),
         &openbao_container,
         &container_exists_via_docker,
         &inspect_label_via_docker,
@@ -206,7 +211,12 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //     `--root-token-output`, if set, is threaded into the init args
     //     so the freshly issued root token is persisted with mode 0600
     //     after init succeeds.
-    let init_args = init_args_for_reinit(args, &snapshot, &effective_secrets_dir);
+    let init_args = init_args_for_reinit(
+        args,
+        &snapshot,
+        &effective_secrets_dir,
+        std::env::var(OPENBAO_HOST_PORT_ENV).ok().as_deref(),
+    );
     run_init(&init_args, messages).await?;
 
     println!("{}", messages.reinit_completed());
@@ -324,6 +334,7 @@ pub(crate) fn reject_explicit_openbao_url(openbao_url: &str, messages: &Messages
 fn verify_compose_managed_openbao(
     compose_file: &Path,
     compose_dir: &Path,
+    project_override: Option<&str>,
     openbao_container: &str,
     container_exists: &dyn Fn(&str) -> Result<bool>,
     inspect: &dyn Fn(&str, &str) -> Result<Option<String>>,
@@ -340,8 +351,11 @@ fn verify_compose_managed_openbao(
         // from a source independent of the container (env override or
         // compose-dir basename).  Otherwise a mismatched container
         // would never trip the check.
-        let expected_project =
-            resolve_expected_compose_project_excluding_container(compose_dir, messages)?;
+        let expected_project = resolve_expected_compose_project_excluding_container(
+            compose_dir,
+            project_override,
+            messages,
+        )?;
         let container_project =
             inspect(openbao_container, COMPOSE_PROJECT_LABEL)?.ok_or_else(|| {
                 anyhow::anyhow!(messages.error_reinit_container_missing_compose_label(
@@ -375,7 +389,11 @@ fn verify_compose_managed_openbao(
         // only when the compose project can be derived from the work
         // directory; an unresolvable project surfaces here as an
         // actionable error rather than letting reinit proceed.
-        let _ = resolve_expected_compose_project_excluding_container(compose_dir, messages)?;
+        let _ = resolve_expected_compose_project_excluding_container(
+            compose_dir,
+            project_override,
+            messages,
+        )?;
     }
     Ok(())
 }
@@ -388,9 +406,10 @@ fn verify_compose_managed_openbao(
 /// "what is" side stays a real comparison rather than a tautology.
 fn resolve_expected_compose_project_excluding_container(
     compose_dir: &Path,
+    project_override: Option<&str>,
     messages: &Messages,
 ) -> Result<String> {
-    resolve_compose_project_for_dir(compose_dir, None, messages)
+    resolve_compose_project_for_dir(compose_dir, None, project_override, messages)
 }
 
 /// Subset of `StateFile` fields preserved across a reinit.  Mirrors the
@@ -964,10 +983,16 @@ fn locate_provisioners(value: &serde_json::Value) -> Option<&Vec<serde_json::Val
 /// be silently reset on every reinit.  See
 /// `preserved_stepca_provisioner_from_ca_json` and
 /// `preserved_cert_duration_from_ca_json`.
+///
+/// `openbao_host_port_env` is what the invoking environment's
+/// `OPENBAO_HOST_PORT` held; it is a parameter so the host-port
+/// derivation below can be exercised without the process-global
+/// variable.
 fn init_args_for_reinit(
     args: &ReinitArgs,
     snapshot: &DeploymentIntent,
     effective_secrets_dir: &Path,
+    openbao_host_port_env: Option<&str>,
 ) -> Box<InitArgs> {
     let mut openbao = args.openbao.clone();
     if openbao.openbao_url == crate::commands::init::DEFAULT_OPENBAO_URL {
@@ -979,10 +1004,11 @@ fn init_args_for_reinit(
         // silently point a destructive recovery at a dead endpoint.
         openbao.openbao_url = match snapshot.openbao_bind_addr.as_deref() {
             Some(bind) => client_url_from_bind_addr(bind),
-            None => effective_openbao_url(
+            None => effective_openbao_url_with_env(
                 &openbao.openbao_url,
                 &compose_file_dir(&args.compose.compose_file),
                 None,
+                openbao_host_port_env,
             ),
         };
     }
@@ -1048,10 +1074,6 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    // One crate-wide lock: the resolver these tests exercise is also
-    // driven from `clean` and `compose_project`, and a per-module mutex
-    // would let two modules mutate `COMPOSE_PROJECT_NAME` concurrently.
-    use crate::commands::compose_project::test_env::{ComposeProjectEnv, env_lock};
     use crate::i18n::test_messages;
     use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 
@@ -1289,6 +1311,7 @@ mod tests {
         let err = verify_compose_managed_openbao(
             &compose_file,
             dir.path(),
+            None,
             DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
@@ -1314,6 +1337,7 @@ mod tests {
         let err = verify_compose_managed_openbao(
             &compose_file,
             dir.path(),
+            None,
             DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
@@ -1343,14 +1367,12 @@ mod tests {
                 Ok(None)
             }
         };
-        // Make sure no stale env override decides the expected project.
-        // The lock guards process-wide env mutation against parallel
-        // tests in this module that also touch `COMPOSE_PROJECT_NAME`.
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
+        // No project override is passed, so the expected project comes
+        // from the work directory alone.
         let err = verify_compose_managed_openbao(
             &compose_file,
             &work,
+            None,
             DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
@@ -1378,8 +1400,6 @@ mod tests {
                 Ok(None)
             }
         };
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
 
         for recorded in [None, Some("insight")] {
             let dir = tempdir().unwrap();
@@ -1393,6 +1413,7 @@ mod tests {
             let err = verify_compose_managed_openbao(
                 &compose_file,
                 &work,
+                None,
                 DEFAULT_OPENBAO_CONTAINER,
                 &container_exists,
                 &inspect,
@@ -1422,8 +1443,6 @@ mod tests {
                 Ok(None)
             }
         };
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let dir = tempdir().unwrap();
         let work = dir.path().join("stack");
         fs::create_dir_all(&work).unwrap();
@@ -1433,12 +1452,66 @@ mod tests {
         verify_compose_managed_openbao(
             &compose_file,
             &work,
+            None,
             DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
         )
         .expect("a container in the recorded instance's project must be accepted");
+    }
+
+    /// The E2E harness exports `COMPOSE_PROJECT_NAME` for a whole
+    /// scenario, and `run_reinit` hands what it held to the verifier.
+    /// The expected project has to follow it — otherwise reinit would
+    /// compare a running harness container against the `.env`-recorded
+    /// identity and refuse to proceed.
+    #[test]
+    fn verify_compose_managed_openbao_expects_the_project_override() {
+        const HARNESS_PROJECT: &str = "bootroot-e2e-ci-reinit-42";
+        let messages = test_messages();
+        let dir = tempdir().unwrap();
+        let work = dir.path().join("stack");
+        fs::create_dir_all(&work).unwrap();
+        let compose_file = work.join("docker-compose.yml");
+        fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
+        fs::write(work.join(".env"), "BOOTROOT_INSTANCE=insight\n").unwrap();
+        let container_exists = |_: &str| -> Result<bool> { Ok(true) };
+        let labelled = |project: &'static str| {
+            move |_: &str, label: &str| -> Result<Option<String>> {
+                if label == COMPOSE_PROJECT_LABEL {
+                    Ok(Some(project.to_string()))
+                } else {
+                    Ok(Some(OPENBAO_COMPOSE_SERVICE.to_string()))
+                }
+            }
+        };
+
+        verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            Some(HARNESS_PROJECT),
+            DEFAULT_OPENBAO_CONTAINER,
+            &container_exists,
+            &labelled(HARNESS_PROJECT),
+            &messages,
+        )
+        .expect("a container in the overridden project must be accepted");
+
+        let err = verify_compose_managed_openbao(
+            &compose_file,
+            &work,
+            Some(HARNESS_PROJECT),
+            DEFAULT_OPENBAO_CONTAINER,
+            &container_exists,
+            &labelled("insight"),
+            &messages,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(HARNESS_PROJECT),
+            "the override must be the expected project, got: {err}"
+        );
     }
 
     /// With a default install co-located, the existence question must be
@@ -1468,6 +1541,7 @@ mod tests {
         verify_compose_managed_openbao(
             &compose_file,
             &work,
+            None,
             "insight-openbao",
             &container_exists,
             &inspect,
@@ -1486,8 +1560,6 @@ mod tests {
     /// label branch runs and both inspections are about it.
     #[test]
     fn verify_compose_managed_openbao_inspects_the_instances_own_container() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let dir = tempdir().unwrap();
         let work = dir.path().join("stack");
         fs::create_dir_all(&work).unwrap();
@@ -1510,6 +1582,7 @@ mod tests {
         verify_compose_managed_openbao(
             &compose_file,
             &work,
+            None,
             "insight-openbao",
             &container_exists,
             &inspect,
@@ -1539,6 +1612,7 @@ mod tests {
         verify_compose_managed_openbao(
             &compose_file,
             &work,
+            None,
             DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
@@ -1567,6 +1641,7 @@ mod tests {
         let err = verify_compose_managed_openbao(
             &compose_file,
             &work,
+            None,
             DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
@@ -1601,11 +1676,10 @@ mod tests {
                 Ok(None)
             }
         };
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         let result = verify_compose_managed_openbao(
             &compose_file,
             &work,
+            None,
             DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
@@ -1639,11 +1713,10 @@ mod tests {
                 Ok(None)
             }
         };
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
         verify_compose_managed_openbao(
             &compose_file,
             &work,
+            None,
             DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
@@ -1654,43 +1727,45 @@ mod tests {
 
     /// Regression for #611: when `--compose-file` is the default
     /// relative `docker-compose.yml`, `run_reinit` derives `compose_dir`
-    /// via [`compose_file_dir`].  The verifier must accept that
-    /// `compose_dir` and complete its scope check without surfacing
-    /// `could not derive compose project name from `.  Exercises the
-    /// container-absent branch (the stuck-after-`clean --openbao-only`
-    /// recovery path) with CWD pointed at a tempdir holding a valid
-    /// compose declaration.
+    /// via [`compose_file_dir`], which normalises a bare filename to
+    /// `.`.  The verifier must accept that `compose_dir` and complete
+    /// its scope check without surfacing `could not derive compose
+    /// project name from `.  Exercises the container-absent branch (the
+    /// stuck-after-`clean --openbao-only` recovery path).
+    ///
+    /// The `.` is what broke; the working directory it happens to name
+    /// is not.  The directory is therefore given to the verifier as a
+    /// parameter, and the normalisation is pinned separately — moving
+    /// the whole process into a tempdir to reproduce it would race every
+    /// other test in the binary, the working directory being
+    /// process-global exactly as the environment is.
     #[test]
     fn verify_compose_managed_openbao_accepts_default_relative_compose_file() {
-        let _guard = env_lock();
-        let _env = ComposeProjectEnv::set(None);
+        assert_eq!(
+            compose_file_dir(Path::new("docker-compose.yml")),
+            PathBuf::from("."),
+            "the default --compose-file must still normalise to `.`"
+        );
+        let messages = test_messages();
+        resolve_expected_compose_project_excluding_container(Path::new("."), None, &messages)
+            .expect("`.` must resolve to a compose project");
 
         let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("docker-compose.yml"),
-            "services:\n  openbao:\n    image: openbao\n",
-        )
-        .unwrap();
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
-        let compose_file = PathBuf::from("docker-compose.yml");
+        let compose_file = dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services:\n  openbao:\n    image: openbao\n").unwrap();
         let compose_dir = compose_file_dir(&compose_file);
-        let messages = test_messages();
         let container_exists = |_: &str| -> Result<bool> { Ok(false) };
         let inspect = |_: &str, _: &str| -> Result<Option<String>> { Ok(None) };
-        let result = verify_compose_managed_openbao(
+        verify_compose_managed_openbao(
             &compose_file,
             &compose_dir,
+            None,
             DEFAULT_OPENBAO_CONTAINER,
             &container_exists,
             &inspect,
             &messages,
-        );
-
-        std::env::set_current_dir(&original_cwd).unwrap();
-
-        result.expect("default relative --compose-file must not break the scope check");
+        )
+        .expect("default relative --compose-file must not break the scope check");
     }
 
     #[test]
@@ -2133,6 +2208,7 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            None,
         );
         assert_eq!(
             init_args.root_token_output,
@@ -2176,6 +2252,7 @@ mod tests {
             &reinit_args,
             &snapshot,
             &reinit_args.secrets_dir.secrets_dir,
+            None,
         );
         assert_eq!(
             init_args.openbao.openbao_url, "https://192.168.1.10:8200",
@@ -2188,7 +2265,6 @@ mod tests {
     /// CLI default's literal 8200.
     #[test]
     fn init_args_for_reinit_carries_the_resolved_host_port() {
-        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
         let dir = tempdir().unwrap();
         fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").unwrap();
         let reinit_args = ReinitArgs {
@@ -2213,8 +2289,20 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            None,
         );
         assert_eq!(init_args.openbao.openbao_url, "http://localhost:18200");
+
+        // Step 1 of the same precedence: what the invoking environment
+        // held outranks the compose `.env`, so a reinit run from a shell
+        // scoped to one instance does not re-init another's `OpenBao`.
+        let from_env = init_args_for_reinit(
+            &reinit_args,
+            &DeploymentIntent::default(),
+            &reinit_args.secrets_dir.secrets_dir,
+            Some("18201"),
+        );
+        assert_eq!(from_env.openbao.openbao_url, "http://localhost:18201");
     }
 
     /// Closes #731: a snapshotted non-loopback bind intent outranks the
@@ -2223,7 +2311,6 @@ mod tests {
     /// destructive recovery at an endpoint that no longer serves.
     #[test]
     fn init_args_for_reinit_prefers_the_bind_addr_over_the_host_port() {
-        let _env = crate::commands::openbao_url::test_env::HostPortEnvGuard::new();
         let dir = tempdir().unwrap();
         fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").unwrap();
         let reinit_args = ReinitArgs {
@@ -2252,6 +2339,7 @@ mod tests {
             &reinit_args,
             &snapshot,
             &reinit_args.secrets_dir.secrets_dir,
+            None,
         );
         assert_eq!(
             init_args.openbao.openbao_url, "https://192.168.1.10:8200",
@@ -2312,6 +2400,7 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            None,
         );
         assert_eq!(
             init_args.db_dsn.as_deref(),
@@ -2351,6 +2440,7 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            None,
         );
         assert!(
             init_args.db_dsn.is_none(),
@@ -2417,6 +2507,7 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            None,
         );
         assert_eq!(
             init_args.stepca_provisioner,
@@ -2462,6 +2553,7 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            None,
         );
         assert_eq!(
             init_args.stepca_provisioner,
@@ -2628,7 +2720,7 @@ mod tests {
         let effective = effective_secrets_dir(&reinit_args, &snapshot);
         assert_eq!(effective, snapshot_secrets);
 
-        let init_args = init_args_for_reinit(&reinit_args, &snapshot, &effective);
+        let init_args = init_args_for_reinit(&reinit_args, &snapshot, &effective, None);
         assert_eq!(
             init_args.secrets_dir.secrets_dir, snapshot_secrets,
             "init args must carry the snapshotted secrets_dir so the \
