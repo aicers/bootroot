@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::commands::infra::run_docker;
+use crate::commands::infra::run_docker_with_exec;
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, OPENBAO_HCL_PATH, OPENBAO_INFRA_CERT_KEY,
     OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_CONTAINER_CERT_PATH, OPENBAO_TLS_CONTAINER_KEY_PATH,
@@ -31,6 +31,7 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
     compose_dir: &Path,
     secrets_dir: &Path,
     sans: &[&str],
+    docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
     let cert_path = compose_dir.join(OPENBAO_TLS_CERT_PATH);
@@ -52,7 +53,7 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let user_arg = format!("{}:{}", meta.uid(), meta.gid());
 
-    chown_tls_output_dir(&tls_mount, &user_arg, messages)?;
+    chown_tls_output_dir(&tls_mount, &user_arg, docker, messages)?;
 
     let intermediate_cert = format!("/home/step/{CA_CERTS_DIR}/{CA_INTERMEDIATE_CERT_FILENAME}");
     let output_cert = format!("{OPENBAO_TLS_OUTPUT_MOUNT}/server.crt");
@@ -94,9 +95,10 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
     }
     args.extend(["--not-after", OPENBAO_TLS_DEFAULT_NOT_AFTER, "--force"]);
 
-    run_docker(
+    run_docker_with_exec(
         &args,
         "docker step certificate create (openbao tls)",
+        docker,
         messages,
     )
     .with_context(|| messages.error_openbao_tls_provision_failed())?;
@@ -195,12 +197,17 @@ fn build_tls_output_chown_args<'a>(
 /// Reuses the image the `step certificate create` container runs in the
 /// very next statement, so no extra image or pull is introduced.  The
 /// chown is a no-op when ownership is already correct.
-fn chown_tls_output_dir(tls_mount: &str, user_arg: &str, messages: &Messages) -> Result<()> {
+fn chown_tls_output_dir(
+    tls_mount: &str,
+    user_arg: &str,
+    docker: &Path,
+    messages: &Messages,
+) -> Result<()> {
     let args = build_tls_output_chown_args(tls_mount, user_arg, STEP_CA_HELPER_IMAGE);
     // Same context as the `step certificate create` call this precedes:
     // the chown is part of the issuance, so a failure here has to name
     // the step that failed and not just the docker command.
-    run_docker(&args, "docker openbao tls output chown", messages)
+    run_docker_with_exec(&args, "docker openbao tls output chown", docker, messages)
         .with_context(|| messages.error_openbao_tls_provision_failed())
 }
 
@@ -451,6 +458,7 @@ pub(crate) fn reissue_openbao_tls_cert(
     secrets_dir: &Path,
     entry: &InfraCertEntry,
     openbao_container: &str,
+    docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
     let san_refs: Vec<&str> = entry.sans.iter().map(String::as_str).collect();
@@ -459,7 +467,7 @@ pub(crate) fn reissue_openbao_tls_cert(
     } else {
         san_refs
     };
-    issue_openbao_tls_cert(compose_dir, secrets_dir, &sans, messages)
+    issue_openbao_tls_cert(compose_dir, secrets_dir, &sans, docker, messages)
 }
 
 #[cfg(test)]
@@ -467,6 +475,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
+    use super::super::test_support::write_self_contained_fake_docker;
     use super::*;
     use crate::commands::rotate::test_support::{
         ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
@@ -559,6 +568,7 @@ exit {exit_code}
             &secrets_dir,
             &entry,
             "insight-openbao",
+            Path::new("docker"),
             &messages,
         )
         .expect("re-issuance must succeed against the fake docker");
@@ -794,6 +804,55 @@ exit {exit_code}
         assert_eq!(args.last(), Some(&OPENBAO_TLS_OUTPUT_MOUNT));
     }
 
+    /// The same wiring, reached through the executable seam instead of
+    /// `PATH`: `issue_openbao_tls_cert` runs whichever program its
+    /// caller named, all the way down through `run_docker`.
+    ///
+    /// This test mutates nothing process-global — no `PATH` edit, no
+    /// variable set, no lock — because the fake it writes carries its
+    /// own argv-log path in its script text.  It is therefore also proof
+    /// that the seam needs no environment mechanism to be usable.
+    #[test]
+    fn issue_openbao_tls_cert_runs_the_supplied_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        let compose_dir = dir.path().join("compose");
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        // The fake no-ops `step certificate create`, so the files the
+        // host-side chmod expects have to exist up front.
+        let tls_dir = compose_dir.join("openbao").join("tls");
+        fs::create_dir_all(&tls_dir).expect("create tls dir");
+        fs::write(tls_dir.join("server.crt"), "cert").expect("write cert");
+        fs::write(tls_dir.join("server.key"), "key").expect("write key");
+
+        issue_openbao_tls_cert(
+            &compose_dir,
+            &secrets_dir,
+            &["openbao.internal"],
+            &fake,
+            &crate::i18n::test_messages(),
+        )
+        .expect("issuing the certificate must succeed against the supplied executable");
+
+        let log = fs::read_to_string(&args_log).expect("read docker args");
+        let invocations: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            invocations.len(),
+            2,
+            "the supplied executable must have run the chown and the certificate write, got: {log}"
+        );
+        assert!(
+            invocations
+                .get(1)
+                .is_some_and(|create| create.contains("certificate create")),
+            "the second invocation must be the certificate write, got: {log}"
+        );
+    }
+
     /// The argv builder is only worth anything if the certificate write
     /// actually runs it, and runs it *first*: a chown that landed after
     /// `step certificate create` would repair the ownership of files the
@@ -822,8 +881,14 @@ exit {exit_code}
         let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
         let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
-        issue_openbao_tls_cert(&compose_dir, &secrets_dir, &["openbao.internal"], &messages)
-            .expect("issuing the certificate must succeed against the fake docker");
+        issue_openbao_tls_cert(
+            &compose_dir,
+            &secrets_dir,
+            &["openbao.internal"],
+            Path::new("docker"),
+            &messages,
+        )
+        .expect("issuing the certificate must succeed against the fake docker");
 
         let log = fs::read_to_string(&args_log).unwrap_or_default();
         let invocations: Vec<&str> = log.lines().collect();
@@ -886,9 +951,14 @@ exit {exit_code}
         let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
         let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
-        let error =
-            issue_openbao_tls_cert(&compose_dir, &secrets_dir, &["openbao.internal"], &messages)
-                .expect_err("a failing chown must fail the issuance");
+        let error = issue_openbao_tls_cert(
+            &compose_dir,
+            &secrets_dir,
+            &["openbao.internal"],
+            Path::new("docker"),
+            &messages,
+        )
+        .expect_err("a failing chown must fail the issuance");
         let chain = format!("{error:#}");
         assert!(
             chain.contains(messages.error_openbao_tls_provision_failed()),
@@ -940,9 +1010,14 @@ exit {exit_code}
         let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
         let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
-        let error =
-            issue_openbao_tls_cert(&compose_dir, &secrets_dir, &["openbao.internal"], &messages)
-                .expect_err("a symlinked output directory must fail the issuance");
+        let error = issue_openbao_tls_cert(
+            &compose_dir,
+            &secrets_dir,
+            &["openbao.internal"],
+            Path::new("docker"),
+            &messages,
+        )
+        .expect_err("a symlinked output directory must fail the issuance");
         let chain = format!("{error:#}");
         assert!(
             chain.contains(&tls_dir.display().to_string()),

@@ -1095,11 +1095,13 @@ async fn wait_for_local_completion(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
     use tempfile::tempdir;
 
     use super::super::test_support::test_messages;
     use super::*;
+    use crate::commands::compose_project::DOCKER_BIN;
 
     /// Builds a rotate context whose compose directory records a
     /// non-default identity.
@@ -1113,6 +1115,7 @@ mod tests {
             paths: super::super::StatePaths::new(dir.join("secrets")),
             state_dir: dir.to_path_buf(),
             state_file: dir.join("state.json"),
+            docker: PathBuf::from(DOCKER_BIN),
         }
     }
 

@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::{RotateArgs, RotateCommand};
+use crate::commands::compose_project::DOCKER_BIN;
 use crate::commands::init::{CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME};
 use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
 use crate::i18n::Messages;
@@ -125,6 +126,12 @@ pub(super) struct RotateContext {
     pub(super) paths: StatePaths,
     pub(super) state_dir: PathBuf,
     pub(super) state_file: PathBuf,
+    /// The `docker` executable every spawn in this rotation runs.
+    ///
+    /// Set once in [`run_rotate`] and only read afterwards, so a test
+    /// that builds a context can point the whole tree at a fake without
+    /// touching `PATH`.
+    pub(super) docker: PathBuf,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -166,6 +173,7 @@ pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result
         paths,
         state_dir,
         state_file: state_path,
+        docker: PathBuf::from(DOCKER_BIN),
     };
 
     // InfraCert operates on local files and Docker only — it must not

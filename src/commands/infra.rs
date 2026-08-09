@@ -16,8 +16,8 @@ use bootroot::openbao::OpenBaoClient;
 
 use crate::cli::args::{InfraInstallArgs, InfraUpArgs};
 use crate::commands::compose_project::{
-    ComposeIdentity, ComposeInvocation, INSTANCE_NAME_ENV_KEY, resolve_recorded_instance_name,
-    validate_instance_name,
+    ComposeIdentity, ComposeInvocation, DOCKER_BIN, INSTANCE_NAME_ENV_KEY,
+    resolve_recorded_instance_name, validate_instance_name,
 };
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::dns_alias::replay_dns_aliases;
@@ -2067,7 +2067,24 @@ pub(crate) fn run_docker<S: AsRef<OsStr>>(
     context: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let mut cmd = ProcessCommand::new("docker");
+    run_docker_with_exec(args, context, Path::new(DOCKER_BIN), messages)
+}
+
+/// Runs the executable `docker` names with a plain (non-Compose)
+/// argument vector.
+///
+/// [`run_docker`] is this function with the default executable
+/// supplied; a caller that has to name the program — a test pointing at
+/// a fake, above all — reaches it through here instead.  A bare program
+/// name carrying no path separator is still resolved against `PATH` by
+/// `Command` itself, so the default loses nothing.
+pub(crate) fn run_docker_with_exec<S: AsRef<OsStr>>(
+    args: &[S],
+    context: &str,
+    docker: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let mut cmd = ProcessCommand::new(docker);
     cmd.args(args.iter().map(AsRef::as_ref));
     run_to_completion(&mut cmd, context, messages)
 }
@@ -2078,7 +2095,19 @@ pub(crate) fn run_compose(
     context: &str,
     messages: &Messages,
 ) -> Result<()> {
-    run_compose_with_env(invocation, &[], context, messages)
+    run_compose_with_exec(invocation, context, Path::new(DOCKER_BIN), messages)
+}
+
+/// Runs a `docker compose` invocation with `docker` as the executable.
+///
+/// [`run_compose`] is this function with the default supplied.
+pub(crate) fn run_compose_with_exec(
+    invocation: &ComposeInvocation,
+    context: &str,
+    docker: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    run_compose_with_env_and_exec(invocation, &[], context, docker, messages)
 }
 
 /// Runs a `docker compose` invocation with additional child-environment
@@ -2095,7 +2124,27 @@ pub(crate) fn run_compose_with_env(
     context: &str,
     messages: &Messages,
 ) -> Result<()> {
-    run_to_completion(&mut invocation.command(env), context, messages)
+    run_compose_with_env_and_exec(invocation, env, context, Path::new(DOCKER_BIN), messages)
+}
+
+/// Runs a `docker compose` invocation with additional child-environment
+/// entries and `docker` as the executable.
+///
+/// [`run_compose_with_env`] is this function with the default supplied.
+/// The instance pin is applied by [`ComposeInvocation::command_with_exec`]
+/// after `env`, exactly as it is on the default path.
+pub(crate) fn run_compose_with_env_and_exec(
+    invocation: &ComposeInvocation,
+    env: &[(&str, &str)],
+    context: &str,
+    docker: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    run_to_completion(
+        &mut invocation.command_with_exec(env, docker),
+        context,
+        messages,
+    )
 }
 
 /// Spawns `command`, waits for it, and turns a non-zero exit into an

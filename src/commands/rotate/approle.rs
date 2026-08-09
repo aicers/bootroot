@@ -455,7 +455,7 @@ async fn rotate_infra_approle_secret_id(
         infra_agent_container_kind(target),
         messages,
     )?;
-    restart_container(&container, messages)?;
+    restart_container(&container, &ctx.docker, messages)?;
     // The infra roles carry no CIDR binding, so the post-rotation login
     // verification is unconditional (unlike the service flow).
     client
@@ -794,6 +794,7 @@ mod tests {
         write_fake_docker_script,
     };
     use super::*;
+    use crate::commands::compose_project::DOCKER_BIN;
     use crate::state::{ServiceRoleEntry, StateFile};
 
     const RUNTIME_ROTATE_ROLE: &str = "bootroot-runtime-rotate-role";
@@ -826,6 +827,7 @@ mod tests {
             paths: super::super::StatePaths::new(dir.join("secrets")),
             state_dir: dir.to_path_buf(),
             state_file: dir.join("state.json"),
+            docker: PathBuf::from(DOCKER_BIN),
         }
     }
 

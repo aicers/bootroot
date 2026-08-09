@@ -47,6 +47,7 @@ pub(super) async fn rotate_responder_hmac(
     restart_openbao_agent(
         &ctx.compose_file,
         BootrootContainer::OpenBaoAgentResponder,
+        &ctx.docker,
         messages,
     )?;
     wait_for_rendered_file(&responder_path, &hmac, RENDERED_FILE_TIMEOUT, messages).await?;

@@ -10,7 +10,7 @@ mod responder_setup;
 mod secrets;
 pub(crate) mod stepca_setup;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::openbao::{InitResponse, OpenBaoClient};
@@ -24,7 +24,9 @@ pub(crate) use orchestrator::run_init;
 pub(crate) use prompts::prompt_yes_no;
 
 use super::types::EabCredentials;
-use crate::commands::compose_project::{ComposeIdentity, ComposeInvocation, DEFAULT_INSTANCE_NAME};
+use crate::commands::compose_project::{
+    ComposeIdentity, ComposeInvocation, DEFAULT_INSTANCE_NAME, DOCKER_BIN,
+};
 use crate::commands::container_name::BootrootContainer;
 use crate::i18n::Messages;
 
@@ -99,15 +101,35 @@ pub(super) struct InitRollback {
     /// restores the pre-TLS `state.json` so it does not keep pointing at
     /// an HTTPS URL / TLS certs after `OpenBao` is recreated on plaintext.
     pub(super) state_backup: Option<RollbackFile>,
+    /// The `docker` executable every spawn in the `init` flow runs.
+    ///
+    /// `None` *is* `docker`: this value comes straight from the derived
+    /// `Default`, with no constructor to fill a bare `PathBuf` in, and
+    /// an empty path would spawn nothing at all.  [`InitRollback::docker`]
+    /// is the one place that resolution happens.
+    pub(super) docker: Option<PathBuf>,
 }
 
 impl InitRollback {
+    /// Returns the executable every `docker` spawn in this run uses.
+    ///
+    /// The single resolution point for the `init` tree's default: a run
+    /// that named no executable gets `docker`.
+    pub(super) fn docker(&self) -> &Path {
+        self.docker.as_deref().unwrap_or(Path::new(DOCKER_BIN))
+    }
+
+    // A linear teardown: each step undoes one forward-path artefact and
+    // reports its own failure without aborting the rest, so splitting it
+    // would only scatter that sequence across helpers.
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn rollback(
         &self,
         client: &OpenBaoClient,
         kv_mount: &str,
         messages: &Messages,
     ) {
+        let docker = self.docker();
         // Restore the HCL and remove TLS artifacts before OpenBao API
         // calls so that a container restart switches OpenBao back to
         // HTTP, letting the original HTTP client reach it for cleanup.
@@ -142,9 +164,10 @@ impl InitRollback {
                 &rollback_identity(compose_file, messages),
                 compose_file,
             );
-            if let Err(err) = crate::commands::infra::run_compose(
+            if let Err(err) = crate::commands::infra::run_compose_with_exec(
                 &invocation,
                 "docker compose up -d openbao (rollback)",
+                docker,
                 messages,
             ) {
                 eprintln!("Rollback: failed to recreate OpenBao: {err}");
@@ -165,9 +188,10 @@ impl InitRollback {
                 compose_file,
                 override_path,
             );
-            if let Err(err) = crate::commands::infra::run_compose(
+            if let Err(err) = crate::commands::infra::run_compose_with_exec(
                 &invocation,
                 "docker compose rm infra agents (rollback)",
+                docker,
                 messages,
             ) {
                 eprintln!("Rollback: failed to remove infra OpenBao agents: {err}");
@@ -212,9 +236,10 @@ impl InitRollback {
                 compose_file,
                 config_override,
             );
-            if let Err(err) = crate::commands::infra::run_compose(
+            if let Err(err) = crate::commands::infra::run_compose_with_exec(
                 &invocation,
                 "docker compose up -d responder (rollback)",
+                docker,
                 messages,
             ) {
                 eprintln!("Rollback: failed to recreate responder: {err}");
@@ -244,7 +269,7 @@ impl InitRollback {
         {
             eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
         }
-        self.restore_stepca_ca_json(messages);
+        self.restore_stepca_ca_json(docker, messages);
     }
 
     /// Restores `ca.json` together with the Agent template it is
@@ -258,7 +283,7 @@ impl InitRollback {
     /// triggered by the restart already produces the pre-`init` name set,
     /// and `ca.json` goes back after it so the file left on disk is the
     /// pre-`init` document either way.
-    fn restore_stepca_ca_json(&self, messages: &Messages) {
+    fn restore_stepca_ca_json(&self, docker: &Path, messages: &Messages) {
         if let Some(file) = &self.stepca_ca_json_template_backup
             && let Err(err) = rollback_file(file, messages)
         {
@@ -281,6 +306,7 @@ impl InitRollback {
             let identity = rollback_identity(compose_file, messages);
             stepca_setup::restart_stepca_openbao_agent(
                 &identity.container(BootrootContainer::OpenBaoAgentStepCa),
+                docker,
             );
         }
     }
@@ -386,6 +412,8 @@ fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
 
 #[cfg(test)]
 mod rollback_tests {
+    use std::path::{Path, PathBuf};
+
     use bootroot::openbao::OpenBaoClient;
 
     use super::{
@@ -607,6 +635,87 @@ mod rollback_tests {
         assert!(
             unrelated.exists(),
             "unrelated files must survive a no-op TLS rollback"
+        );
+    }
+
+    /// The derived `Default` is how production builds this value, so a
+    /// run that names no executable still has to spawn `docker`.  A bare
+    /// `PathBuf` field would default to the empty path and spawn nothing
+    /// at all, which no other assertion in this file would catch.
+    #[test]
+    fn rollback_defaults_to_the_docker_executable() {
+        let rollback = InitRollback {
+            compose_file: None,
+            ..Default::default()
+        };
+
+        assert_eq!(rollback.docker(), Path::new("docker"));
+    }
+
+    /// The seam: a caller that names an executable is the one the
+    /// rollback resolves, and the default is not consulted.
+    #[test]
+    fn rollback_resolves_the_executable_it_was_given() {
+        let rollback = InitRollback {
+            docker: Some(PathBuf::from("/tmp/fake-docker")),
+            ..Default::default()
+        };
+
+        assert_eq!(rollback.docker(), Path::new("/tmp/fake-docker"));
+    }
+
+    /// Resolving the field is only half of it: the resolved program has
+    /// to reach the child.  A rollback that names an executable runs
+    /// *that* one for both spawn shapes it drives — the compose recreate
+    /// through `run_compose_with_exec`, and the sidecar restart through
+    /// `restart_stepca_openbao_agent`'s own `Command`.
+    ///
+    /// Nothing process-global moves here: the fake carries its argv-log
+    /// path in its own script text, which is the property that lets the
+    /// conversion issue delete this file's remaining `PATH` fake.
+    #[tokio::test]
+    async fn rollback_runs_the_executable_it_was_given() {
+        use std::fs;
+
+        use super::test_support::write_self_contained_fake_docker;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        let rollback = InitRollback {
+            docker: Some(fake),
+            compose_file: Some(dir.path().join("docker-compose.yml")),
+            openbao_recreated: true,
+            stepca_agent_restarted: true,
+            ..Default::default()
+        };
+
+        let client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
+        rollback
+            .rollback(&client, "secret", &crate::i18n::test_messages())
+            .await;
+
+        let log = fs::read_to_string(&args_log)
+            .expect("the supplied executable must have run, not `docker` from `PATH`");
+        let invocations: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            invocations.len(),
+            2,
+            "the supplied executable must have run the recreate and the sidecar restart, got: {log}"
+        );
+        assert!(
+            invocations
+                .first()
+                .is_some_and(|recreate| recreate.contains("up -d openbao")),
+            "the first invocation must be the compose recreate, got: {log}"
+        );
+        assert!(
+            invocations
+                .get(1)
+                .is_some_and(|restart| restart.contains("restart ")),
+            "the second invocation must be the sidecar restart, got: {log}"
         );
     }
 
@@ -859,12 +968,38 @@ mod rollback_tests {
 
 #[cfg(test)]
 pub(super) mod test_support {
-    use std::path::PathBuf;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
 
     use super::super::constants::openbao_constants::SECRET_ID_TTL;
     use super::super::constants::{DEFAULT_CERT_DURATION, DEFAULT_STEPCA_PROVISIONER};
     use crate::cli::args::InitArgs;
     pub(in crate::commands::init::steps) use crate::i18n::test_messages;
+
+    /// Writes a fake `docker` that appends one line per invocation to
+    /// `args_log` and reads nothing from its environment.
+    ///
+    /// The log path is baked into the script text at the moment it is
+    /// written, so a test that hands this executable through the docker
+    /// seam gets its argv back without setting a single variable on this
+    /// process — which is the property the seam exists to make possible.
+    pub(in crate::commands::init::steps) fn write_self_contained_fake_docker(
+        path: &Path,
+        args_log: &Path,
+    ) {
+        let log = args_log.display().to_string();
+        assert!(
+            !log.contains('\''),
+            "the log path is interpolated into a single-quoted shell word"
+        );
+        let script = format!(
+            "#!/bin/sh\nset -eu\n{{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\nexit 0\n"
+        );
+        fs::write(path, script).expect("fake docker script should be written");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("fake docker script should be executable");
+    }
 
     pub(in crate::commands::init::steps) fn default_init_args() -> InitArgs {
         InitArgs {

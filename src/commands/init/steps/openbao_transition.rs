@@ -24,9 +24,9 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
 use super::prompts::prompt_unseal_keys;
-use crate::commands::compose_project::{ComposeIdentity, ComposeInvocation};
+use crate::commands::compose_project::{ComposeIdentity, ComposeInvocation, DOCKER_BIN};
 use crate::commands::infra::{
-    build_openbao_client, run_compose, wait_for_openbao_api_reachable_within,
+    build_openbao_client, run_compose_with_exec, wait_for_openbao_api_reachable_within,
 };
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
@@ -197,6 +197,12 @@ pub(super) struct OpenBaoTlsTransition<'a> {
     /// address, which local commands must not depend on.
     https_url: &'a str,
     secrets_dir: &'a Path,
+    /// The `docker` executable the recreate runs.
+    ///
+    /// Set by [`OpenBaoTlsTransition::new`] and only read afterwards, so
+    /// a test can name a fake in the struct-update form its siblings
+    /// already use for `probe_attempts`.
+    docker: &'a Path,
     probe_attempts: u32,
     probe_delay: Duration,
 }
@@ -213,6 +219,7 @@ impl<'a> OpenBaoTlsTransition<'a> {
             override_path,
             https_url,
             secrets_dir,
+            docker: Path::new(DOCKER_BIN),
             probe_attempts: TLS_PROBE_ATTEMPTS,
             probe_delay: TLS_PROBE_DELAY,
         }
@@ -246,7 +253,12 @@ impl<'a> OpenBaoTlsTransition<'a> {
         let identity = ComposeIdentity::resolve(self.compose_file, None, messages)?;
         let invocation =
             openbao_recreate_invocation(&identity, self.compose_file, self.override_path);
-        run_compose(&invocation, "docker compose up -d openbao (tls)", messages)?;
+        run_compose_with_exec(
+            &invocation,
+            "docker compose up -d openbao (tls)",
+            self.docker,
+            messages,
+        )?;
 
         let client = self.probe_tls(messages).await?;
         ensure_unsealed(&client, prepared, messages).await
@@ -346,6 +358,28 @@ mod tests {
 
     const PROBE_ATTEMPTS: u32 = 1;
     const PROBE_DELAY: Duration = Duration::from_millis(1);
+
+    /// `new` is this value's only constructor, so it is the one place
+    /// the default can be got wrong — and the struct-update form is how
+    /// a test names a fake, exactly as its siblings already do for
+    /// `probe_attempts`.
+    #[test]
+    fn the_transition_defaults_to_docker_and_honours_a_named_executable() {
+        let dir = tempdir().expect("temp dir");
+        let compose = dir.path().join("docker-compose.yml");
+        let override_path = dir.path().join("docker-compose.openbao-exposed.yml");
+
+        let default =
+            OpenBaoTlsTransition::new(&compose, &override_path, UNREACHABLE_HTTPS_URL, dir.path());
+        assert_eq!(default.docker, Path::new("docker"));
+
+        let fake = dir.path().join("fake-docker");
+        let named = OpenBaoTlsTransition {
+            docker: &fake,
+            ..OpenBaoTlsTransition::new(&compose, &override_path, UNREACHABLE_HTTPS_URL, dir.path())
+        };
+        assert_eq!(named.docker, fake);
+    }
     /// A port nothing listens on, so the TLS probe fails fast instead of
     /// handshaking with a real server.
     const UNREACHABLE_HTTPS_URL: &str = "https://127.0.0.1:1";

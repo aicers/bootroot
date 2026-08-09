@@ -13,7 +13,7 @@ use super::helpers::{
 use super::{RENDERED_FILE_TIMEOUT, RotateContext, STEP_CA_HELPER_IMAGE};
 use crate::cli::args::RotateStepcaPasswordArgs;
 use crate::commands::container_name::BootrootContainer;
-use crate::commands::infra::run_docker;
+use crate::commands::infra::run_docker_with_exec;
 use crate::commands::init::{PATH_STEPCA_PASSWORD, SECRET_BYTES, to_container_path};
 use crate::i18n::Messages;
 
@@ -72,6 +72,7 @@ pub(super) async fn rotate_stepca_password(
         &password_path,
         &new_password_path,
         &root_key,
+        &ctx.docker,
         messages,
     )?;
     change_stepca_passphrase(
@@ -79,6 +80,7 @@ pub(super) async fn rotate_stepca_password(
         &password_path,
         &new_password_path,
         &intermediate_key,
+        &ctx.docker,
         messages,
     )?;
 
@@ -93,6 +95,7 @@ pub(super) async fn rotate_stepca_password(
     restart_openbao_agent(
         &ctx.compose_file,
         BootrootContainer::OpenBaoAgentStepCa,
+        &ctx.docker,
         messages,
     )?;
     wait_for_rendered_file(
@@ -121,6 +124,7 @@ pub(super) fn change_stepca_passphrase(
     current_password: &Path,
     new_password: &Path,
     key_path: &Path,
+    docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
     let mount_root = fs::canonicalize(secrets_dir)
@@ -154,7 +158,7 @@ pub(super) fn change_stepca_passphrase(
         &*new_pwd_container,
         "-f",
     ];
-    run_docker(&args, "docker step-ca change-pass", messages)?;
+    run_docker_with_exec(&args, "docker step-ca change-pass", docker, messages)?;
     Ok(())
 }
 
@@ -195,6 +199,7 @@ mod tests {
             &current_password,
             &new_password,
             &key_path,
+            Path::new("docker"),
             &test_messages(),
         )
         .expect("change passphrase should succeed");
@@ -245,6 +250,7 @@ mod tests {
             &current_password,
             &new_password,
             &external_key,
+            Path::new("docker"),
             &test_messages(),
         )
         .expect_err("key outside secrets dir must fail");
@@ -279,6 +285,7 @@ mod tests {
             &current_password,
             &new_password,
             &key_path,
+            Path::new("docker"),
             &test_messages(),
         )
         .expect_err("docker failure should bubble up");

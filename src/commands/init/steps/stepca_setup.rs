@@ -476,8 +476,8 @@ pub(super) async fn reconcile_ca_json_dns_names(
 /// Returns `false` when the container is absent — a fresh install has no
 /// sidecar yet, and that is not a failure.  Output is discarded so the
 /// absent-container case adds no noise to the `init` transcript.
-pub(super) fn restart_stepca_openbao_agent(container: &str) -> bool {
-    std::process::Command::new("docker")
+pub(super) fn restart_stepca_openbao_agent(container: &str, docker: &Path) -> bool {
+    std::process::Command::new(docker)
         .args(["restart", container])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -557,7 +557,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::super::test_support::test_messages;
+    use super::super::test_support::{test_messages, write_self_contained_fake_docker};
     use super::*;
 
     /// The step-ca container name a default install renders.
@@ -593,12 +593,40 @@ mod tests {
         let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
         let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
-        assert!(restart_stepca_openbao_agent("insight-openbao-agent-stepca"));
+        assert!(restart_stepca_openbao_agent(
+            "insight-openbao-agent-stepca",
+            Path::new("docker")
+        ));
 
         let logged = fs::read_to_string(&args_log).expect("read docker args");
         assert_eq!(
             logged.lines().collect::<Vec<&str>>(),
             vec!["restart", "insight-openbao-agent-stepca"]
+        );
+    }
+
+    /// The executable seam: the caller names the program, and the child
+    /// that runs is the one it named.
+    ///
+    /// The fake carries its own argv-log path in its script text, so
+    /// nothing here sets a variable on this process or edits `PATH` —
+    /// which is the whole point of taking the executable as a value.
+    #[test]
+    fn restarting_the_stepca_sidecar_runs_the_supplied_executable() {
+        let dir = tempdir().expect("tempdir");
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        assert!(restart_stepca_openbao_agent(
+            "insight-openbao-agent-stepca",
+            &fake
+        ));
+
+        let logged = fs::read_to_string(&args_log).expect("read docker args");
+        assert_eq!(
+            logged.lines().collect::<Vec<&str>>(),
+            vec!["restart insight-openbao-agent-stepca "]
         );
     }
 

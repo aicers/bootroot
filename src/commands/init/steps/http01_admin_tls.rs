@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use super::super::constants::{
     RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME,
 };
-use crate::commands::infra::run_docker;
+use crate::commands::infra::run_docker_with_exec;
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, HTTP01_ADMIN_INFRA_CERT_KEY,
     HTTP01_ADMIN_TLS_CERT_REL_PATH, HTTP01_ADMIN_TLS_DEFAULT_NOT_AFTER,
@@ -24,6 +24,7 @@ use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
     secrets_dir: &Path,
     sans: &[&str],
+    docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
     let cert_path = secrets_dir.join(HTTP01_ADMIN_TLS_CERT_REL_PATH);
@@ -81,9 +82,10 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
     }
     args.extend(["--not-after", HTTP01_ADMIN_TLS_DEFAULT_NOT_AFTER, "--force"]);
 
-    run_docker(
+    run_docker_with_exec(
         &args,
         "docker step certificate create (http01 admin tls)",
+        docker,
         messages,
     )
     .with_context(|| messages.error_http01_admin_tls_provision_failed())?;
@@ -203,6 +205,7 @@ pub(crate) fn reissue_http01_admin_tls_cert(
     secrets_dir: &Path,
     entry: &InfraCertEntry,
     responder_container: &str,
+    docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
     let san_refs: Vec<&str> = entry.sans.iter().map(String::as_str).collect();
@@ -211,7 +214,7 @@ pub(crate) fn reissue_http01_admin_tls_cert(
     } else {
         san_refs
     };
-    issue_http01_admin_tls_cert(secrets_dir, &sans, messages)
+    issue_http01_admin_tls_cert(secrets_dir, &sans, docker, messages)
 }
 
 /// Strips `tls_cert_path` and `tls_key_path` lines from the responder
@@ -333,8 +336,14 @@ mod tests {
             &args_log,
         );
 
-        reissue_http01_admin_tls_cert(&secrets_dir, &entry, "insight-http01", &messages)
-            .expect("re-issuance must succeed against the fake docker");
+        reissue_http01_admin_tls_cert(
+            &secrets_dir,
+            &entry,
+            "insight-http01",
+            Path::new("docker"),
+            &messages,
+        )
+        .expect("re-issuance must succeed against the fake docker");
 
         let log = std::fs::read_to_string(&args_log).unwrap_or_default();
         assert!(
