@@ -39,13 +39,11 @@
 
 #![cfg(unix)]
 
-use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use bootroot::acme::responder_client::{
@@ -722,27 +720,9 @@ async fn assert_cert_chain_valid_under_trust(trusted_pem: &str, port: u16) {
     let _ = response.status();
 }
 
-static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
 fn load_settings_from_bootstrap_output(agent_config_path: &Path) -> Settings {
-    let _guard = ENV_LOCK.lock().expect("env lock not poisoned");
-    let saved: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(k, _)| k.to_str().is_some_and(|key| key.starts_with("BOOTROOT_")))
-        .collect();
-    for (key, _) in &saved {
-        // SAFETY: tests hold ENV_LOCK while mutating process environment.
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
-    let result = Settings::new(Some(agent_config_path.to_path_buf()));
-    for (key, value) in &saved {
-        // SAFETY: tests hold ENV_LOCK while mutating process environment.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
-    let mut settings = result.expect("load agent.toml");
+    let mut settings =
+        Settings::from_file(Some(agent_config_path.to_path_buf())).expect("load agent.toml");
     settings.acme.http_responder_token_ttl_secs = TEST_TTL_SECS;
     settings
 }
