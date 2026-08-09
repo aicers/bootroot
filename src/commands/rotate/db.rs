@@ -127,6 +127,7 @@ pub(super) async fn rotate_db(
     restart_openbao_agent(
         &ctx.compose_file,
         BootrootContainer::OpenBaoAgentStepCa,
+        &ctx.docker,
         messages,
     )?;
     wait_for_rendered_file(&ca_json_path, &new_dsn, RENDERED_FILE_TIMEOUT, messages).await?;

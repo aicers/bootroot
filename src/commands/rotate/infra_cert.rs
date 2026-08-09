@@ -81,6 +81,7 @@ pub(super) async fn rotate_infra_certs(
                 openbao: &openbao_container,
                 responder: &responder_container,
             },
+            &ctx.docker,
             messages,
         )
         .with_context(|| messages.error_infra_tls_renew_failed(name))?;
@@ -105,7 +106,7 @@ pub(super) async fn rotate_infra_certs(
         println!("{}", messages.info_infra_tls_renewed(name));
 
         println!("{}", messages.info_infra_tls_reload(&strategy.to_string()));
-        execute_reload_strategy(&strategy)?;
+        execute_reload_strategy(&strategy, &ctx.docker)?;
 
         // A delivered-but-ignored signal leaves no trace, so confirm the
         // renewed leaf is actually served before the run reports success.
@@ -169,6 +170,7 @@ fn dispatch_reissue(
     secrets_dir: &Path,
     entry: &InfraCertEntry,
     containers: &ContainerNames<'_>,
+    docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
     match name {
@@ -177,17 +179,27 @@ fn dispatch_reissue(
             secrets_dir,
             entry,
             containers.openbao,
+            docker,
             messages,
         ),
-        HTTP01_ADMIN_INFRA_CERT_KEY => {
-            reissue_http01_admin_tls_cert(secrets_dir, entry, containers.responder, messages)
-        }
+        HTTP01_ADMIN_INFRA_CERT_KEY => reissue_http01_admin_tls_cert(
+            secrets_dir,
+            entry,
+            containers.responder,
+            docker,
+            messages,
+        ),
         _ => bail!("Unknown infra cert key: {name}"),
     }
 }
 
 /// Executes a reload strategy after certificate renewal.
-fn execute_reload_strategy(strategy: &ReloadStrategy) -> Result<()> {
+///
+/// `docker` reaches the signal arm only.  The restart arm goes through
+/// [`try_restart_container`], which no test drives and which is shared
+/// with a `&dyn Fn` seam in `rotate::ca`; giving it an executable would
+/// change that callback type for no caller.
+fn execute_reload_strategy(strategy: &ReloadStrategy, docker: &Path) -> Result<()> {
     match strategy {
         ReloadStrategy::ContainerRestart { container_name } => {
             try_restart_container(container_name)
@@ -197,7 +209,7 @@ fn execute_reload_strategy(strategy: &ReloadStrategy) -> Result<()> {
             container_name,
             signal,
         } => {
-            try_signal_container(container_name, signal)
+            try_signal_container(container_name, signal, docker)
                 .with_context(|| format!("Failed to signal container {container_name}"))?;
         }
     }
@@ -205,8 +217,8 @@ fn execute_reload_strategy(strategy: &ReloadStrategy) -> Result<()> {
 }
 
 /// Sends a signal to a Docker container via `docker kill -s`.
-fn try_signal_container(container: &str, signal: &str) -> Result<()> {
-    let status = std::process::Command::new("docker")
+fn try_signal_container(container: &str, signal: &str, docker: &Path) -> Result<()> {
+    let status = std::process::Command::new(docker)
         .args(["kill", "-s", signal, container])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -448,6 +460,35 @@ mod tests {
 
     /// The `OpenBao` container name a default install renders.
     const DEFAULT_OPENBAO_CONTAINER: &str = "bootroot-openbao";
+
+    /// Writes a fake `docker` that appends one line per invocation to
+    /// `args_log` and reads nothing from its environment.
+    ///
+    /// The log path is baked into the script text as it is written, so a
+    /// test handing this executable through the docker seam gets its
+    /// argv back without setting a single variable on this process.
+    /// `init::steps::test_support` carries a twin for the `init` tree.
+    /// The one module both trees can reach, `rotate::test_support`,
+    /// holds the `PATH`-based fake every unconverted test still depends
+    /// on and stays untouched until those conversions land; the `init`
+    /// twin is scoped to its own tree and is not visible here.  The
+    /// duplication is what that costs, and it goes away when the
+    /// conversions are free to rework the shared harness.
+    fn write_self_contained_fake_docker(path: &Path, args_log: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log = args_log.display().to_string();
+        assert!(
+            !log.contains('\''),
+            "the log path is interpolated into a single-quoted shell word"
+        );
+        let script = format!(
+            "#!/bin/sh\nset -eu\n{{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\nexit 0\n"
+        );
+        fs::write(path, script).expect("fake docker script should be written");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("fake docker script should be executable");
+    }
 
     fn make_openbao_infra_entry(compose_dir: &std::path::Path) -> InfraCertEntry {
         InfraCertEntry {
@@ -968,15 +1009,51 @@ mod tests {
         let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
         let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
-        execute_reload_strategy(&ReloadStrategy::ContainerSignal {
-            container_name: "insight-http01".to_string(),
-            signal: "SIGHUP".to_string(),
-        })
+        execute_reload_strategy(
+            &ReloadStrategy::ContainerSignal {
+                container_name: "insight-http01".to_string(),
+                signal: "SIGHUP".to_string(),
+            },
+            Path::new("docker"),
+        )
         .expect("signalling must succeed against the fake docker");
 
         let logged = fs::read_to_string(&args_log).expect("read docker args");
         let logged_args: Vec<&str> = logged.lines().collect();
         assert_eq!(logged_args, vec!["kill", "-s", "SIGHUP", "insight-http01"]);
+    }
+
+    /// The seam at the signal spawn: `execute_reload_strategy` kills the
+    /// container with whichever program its caller named, which in the
+    /// flow is `ctx.docker`.
+    ///
+    /// The test mutates nothing process-global — no `PATH` edit, no
+    /// variable set, no lock — because the fake carries its own
+    /// argv-log path in its script text.  That is the property the seam
+    /// exists to make possible, and the model the conversion of this
+    /// file's remaining `PATH` fakes follows.
+    #[test]
+    fn container_signal_runs_the_supplied_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        execute_reload_strategy(
+            &ReloadStrategy::ContainerSignal {
+                container_name: "insight-http01".to_string(),
+                signal: "SIGHUP".to_string(),
+            },
+            &fake,
+        )
+        .expect("signalling must succeed against the supplied executable");
+
+        let logged = fs::read_to_string(&args_log).expect("read docker args");
+        assert_eq!(
+            logged.lines().collect::<Vec<&str>>(),
+            vec!["kill -s SIGHUP insight-http01 "],
+            "the supplied executable must have received the unchanged argv"
+        );
     }
 
     /// An empty `infra_certs` map is a no-op: the command prints the

@@ -19,8 +19,14 @@ pub(crate) use crate::commands::container_name::LONGEST_CONTAINER_NAME_SUFFIX;
 use crate::commands::dotenv::read_dotenv;
 use crate::i18n::Messages;
 
-/// The executable every Docker invocation runs.
-const DOCKER_BIN: &str = "docker";
+/// The executable every Docker invocation runs when the caller names
+/// none.
+///
+/// The only spelling of the literal the executable seam uses: the
+/// spawn helpers default to it, and the context values production
+/// builds start out holding it.  A spawn site never reads it — it
+/// spawns whatever its caller supplied.
+pub(crate) const DOCKER_BIN: &str = "docker";
 
 /// The `docker` subcommand every Compose invocation starts with.
 ///
@@ -317,7 +323,22 @@ impl ComposeInvocation {
     /// rename this invocation's containers out from under the recorded
     /// identity.  The order is the enforcement; there is no other guard.
     pub(crate) fn command(&self, extra_env: &[(&str, &str)]) -> ProcessCommand {
-        let mut command = ProcessCommand::new(DOCKER_BIN);
+        self.command_with_exec(extra_env, Path::new(DOCKER_BIN))
+    }
+
+    /// Builds the command for this invocation, spawning the executable
+    /// `docker` names rather than whatever `PATH` resolves.
+    ///
+    /// The executable is the only thing that varies: `extra_env`, the
+    /// argument vector and the instance pin behave exactly as they do
+    /// in [`ComposeInvocation::command`], which is this function with
+    /// the default supplied.
+    pub(crate) fn command_with_exec(
+        &self,
+        extra_env: &[(&str, &str)],
+        docker: &Path,
+    ) -> ProcessCommand {
+        let mut command = ProcessCommand::new(docker);
         command.args(&self.args);
         for (key, value) in extra_env {
             command.env(key, value);
@@ -370,6 +391,27 @@ mod tests {
             format!("{INSTANCE_NAME_ENV_KEY}={instance}\n"),
         )
         .expect("write .env");
+    }
+
+    /// The compose spawn site runs whatever the caller named, and
+    /// [`ComposeInvocation::command`] is that call with the default
+    /// supplied — so the program the two build differs only by what was
+    /// asked for, and nothing else about the invocation moves.
+    #[test]
+    fn compose_command_runs_the_supplied_executable() {
+        let identity = ComposeIdentity::for_instance(DEFAULT_INSTANCE_NAME);
+        let invocation = identity.compose(&["docker-compose.yml"], None, &["up", "-d"]);
+
+        let default = invocation.command(&[]);
+        assert_eq!(default.get_program(), "docker");
+
+        let supplied = invocation.command_with_exec(&[], Path::new("/tmp/fake-docker"));
+        assert_eq!(supplied.get_program(), "/tmp/fake-docker");
+        assert_eq!(
+            supplied.get_args().collect::<Vec<_>>(),
+            default.get_args().collect::<Vec<_>>(),
+            "only the executable may differ from the default path"
+        );
     }
 
     #[test]
@@ -788,11 +830,15 @@ mod tests {
     }
 
     /// The guard that makes the property above unbypassable: the
-    /// invocation hands out no argument vector, so `command()` — the one
-    /// method that sets the environment — is the only way to spawn one.
-    /// A new accessor returning the args would let a call site build a
-    /// compose vector and spawn it bare, which is exactly what this
-    /// module exists to prevent.
+    /// invocation hands out no argument vector, so the command builders
+    /// — the only methods that set the environment — are the only way to
+    /// spawn one.  A new accessor returning the args would let a call
+    /// site build a compose vector and spawn it bare, which is exactly
+    /// what this module exists to prevent.
+    ///
+    /// `command_with_exec` is on the list because it is the same builder
+    /// with the executable named; `command` delegates to it, so the
+    /// instance pin is applied once, in one place, on both paths.
     #[test]
     fn compose_invocation_exposes_only_the_command_builder() {
         let source = std::fs::read_to_string(
@@ -823,9 +869,10 @@ mod tests {
             .collect();
         assert_eq!(
             methods,
-            vec!["command"],
-            "`ComposeInvocation` must expose nothing but `command`, which is \
-             what pins `{INSTANCE_NAME_ENV_KEY}`; found {methods:?}"
+            vec!["command", "command_with_exec"],
+            "`ComposeInvocation` must expose nothing but its command \
+             builders, which are what pin `{INSTANCE_NAME_ENV_KEY}`; \
+             found {methods:?}"
         );
     }
 

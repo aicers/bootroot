@@ -8,7 +8,7 @@ use super::RENDERED_FILE_POLL_INTERVAL;
 use crate::cli::prompt::Prompt;
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::container_name::{BootrootContainer, resolve_container_name};
-use crate::commands::infra::{run_compose, run_docker};
+use crate::commands::infra::{run_compose, run_docker_with_exec};
 use crate::i18n::Messages;
 use crate::state::ServiceEntry;
 
@@ -86,9 +86,14 @@ pub(super) async fn write_secret_id_atomic(
     Ok(())
 }
 
-pub(super) fn restart_container(container: &str, messages: &Messages) -> Result<()> {
+pub(super) fn restart_container(container: &str, docker: &Path, messages: &Messages) -> Result<()> {
     let args = ["restart", container];
-    run_docker(&args, &format!("docker restart {container}"), messages)
+    run_docker_with_exec(
+        &args,
+        &format!("docker restart {container}"),
+        docker,
+        messages,
+    )
 }
 
 /// Restarts one of the `OpenBao` Agent sidecars so it re-renders its
@@ -102,10 +107,11 @@ pub(super) fn restart_container(container: &str, messages: &Messages) -> Result<
 pub(super) fn restart_openbao_agent(
     compose_file: &Path,
     container: BootrootContainer,
+    docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
     let name = resolve_container_name(compose_file, container, messages)?;
-    restart_container(&name, messages)
+    restart_container(&name, docker, messages)
 }
 
 pub(super) fn restart_compose_service(
@@ -224,6 +230,7 @@ mod tests {
         restart_openbao_agent(
             &dir.path().join("docker-compose.yml"),
             container,
+            Path::new("docker"),
             &test_messages(),
         )
         .expect("restarting the sidecar must succeed");
@@ -275,6 +282,7 @@ mod tests {
         restart_openbao_agent(
             &dir.path().join("docker-compose.yml"),
             BootrootContainer::OpenBaoAgentStepCa,
+            Path::new("docker"),
             &test_messages(),
         )
         .expect("restarting the sidecar must succeed");

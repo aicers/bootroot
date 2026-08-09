@@ -621,7 +621,10 @@ async fn run_init_inner(
         // triggered by a later failure restarts the sidecar back onto the
         // template it restores, even if the restart itself half-succeeded.
         rollback.stepca_agent_restarted = true;
-        restart_stepca_openbao_agent(&identity.container(BootrootContainer::OpenBaoAgentStepCa));
+        restart_stepca_openbao_agent(
+            &identity.container(BootrootContainer::OpenBaoAgentStepCa),
+            rollback.docker(),
+        );
         reconcile_ca_json_dns_names(&secrets_dir, &stepca_dns_names, messages).await?;
     }
 
@@ -739,7 +742,7 @@ async fn run_init_inner(
             &identity.container(BootrootContainer::Http01),
         );
         let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
-        issue_http01_admin_tls_cert(&secrets_dir, &san_refs, messages)?;
+        issue_http01_admin_tls_cert(&secrets_dir, &san_refs, rollback.docker(), messages)?;
         // Track TLS artifacts for rollback cleanup.
         rollback
             .tls_artifacts
@@ -883,6 +886,7 @@ async fn run_init_inner(
             compose_dir,
             &args.secrets_dir.secrets_dir,
             &san_refs,
+            rollback.docker(),
             messages,
         )?;
 
