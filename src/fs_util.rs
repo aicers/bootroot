@@ -279,60 +279,73 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, replace: bool
 /// permissioned, chowned (when ownership preservation is needed), or
 /// renamed.
 pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    // Owned once, to move into the blocking task. The blocking half
+    // borrows, so this is the only copy either path makes.
+    let dest = path.to_path_buf();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || atomic_write_blocking(&dest, &payload, mode))
+        .await
+        .context("Atomic write task panicked")?
+}
+
+/// The blocking half of [`atomic_write`], for callers that are not async.
+///
+/// Same guarantees, same order: staged in the destination's directory,
+/// written, `sync_all`ed, permissioned, ownership-preserved, renamed.
+/// Callers in an async context use [`atomic_write`] instead, which runs
+/// this on a blocking thread.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_write`].
+pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
-    let dest = path.to_path_buf();
-    let payload = contents.to_vec();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        // Capture the existing destination's uid/gid (if any) so the
-        // rename does not strip operator-meaningful ownership. Missing
-        // file -> None; do not chown the staged file in that case so a
-        // fresh create keeps process default ownership.
-        let existing_owner = std::fs::metadata(&dest).ok().map(|m| (m.uid(), m.gid()));
+    // Capture the existing destination's uid/gid (if any) so the
+    // rename does not strip operator-meaningful ownership. Missing
+    // file -> None; do not chown the staged file in that case so a
+    // fresh create keeps process default ownership.
+    let existing_owner = std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()));
 
-        let mut tmp = tempfile::NamedTempFile::new_in(&parent)
-            .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
-        tmp.as_file_mut()
-            .write_all(&payload)
-            .with_context(|| format!("Failed to write temp file for {}", dest.display()))?;
-        tmp.as_file_mut()
-            .sync_all()
-            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
-            || {
-                format!(
-                    "Failed to set mode {mode:o} on temp file for {}",
-                    dest.display()
-                )
-            },
-        )?;
-        if let Some((dest_uid, dest_gid)) = existing_owner {
-            let tmp_meta = std::fs::metadata(tmp.path())
-                .with_context(|| format!("Failed to stat temp file for {}", dest.display()))?;
-            if tmp_meta.uid() != dest_uid || tmp_meta.gid() != dest_gid {
-                std::os::unix::fs::chown(tmp.path(), Some(dest_uid), Some(dest_gid)).with_context(
-                    || {
-                        format!(
-                            "Failed to preserve existing uid={dest_uid} gid={dest_gid} on {}",
-                            dest.display()
-                        )
-                    },
-                )?;
-            }
-        }
-        tmp.persist(&dest).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to rename temp file to {}: {}",
-                dest.display(),
-                e.error
+    let mut tmp = tempfile::NamedTempFile::new_in(&parent)
+        .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
+    tmp.as_file_mut()
+        .write_all(contents)
+        .with_context(|| format!("Failed to write temp file for {}", path.display()))?;
+    tmp.as_file_mut()
+        .sync_all()
+        .with_context(|| format!("Failed to fsync temp file for {}", path.display()))?;
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
+        || {
+            format!(
+                "Failed to set mode {mode:o} on temp file for {}",
+                path.display()
             )
-        })?;
-        Ok(())
-    })
-    .await
-    .context("Atomic write task panicked")?
+        },
+    )?;
+    if let Some((dest_uid, dest_gid)) = existing_owner {
+        let tmp_meta = std::fs::metadata(tmp.path())
+            .with_context(|| format!("Failed to stat temp file for {}", path.display()))?;
+        if tmp_meta.uid() != dest_uid || tmp_meta.gid() != dest_gid {
+            std::os::unix::fs::chown(tmp.path(), Some(dest_uid), Some(dest_gid)).with_context(
+                || {
+                    format!(
+                        "Failed to preserve existing uid={dest_uid} gid={dest_gid} on {}",
+                        path.display()
+                    )
+                },
+            )?;
+        }
+    }
+    tmp.persist(path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to rename temp file to {}: {}",
+            path.display(),
+            e.error
+        )
+    })?;
+    Ok(())
 }
 
 /// Ensures the secrets directory exists and has secure permissions.
