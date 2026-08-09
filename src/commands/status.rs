@@ -425,6 +425,24 @@ mod tests {
         );
     }
 
+    /// The first step of the `${OPENBAO_HOST_PORT:-8200}` precedence:
+    /// what the invoking environment held outranks the compose `.env`,
+    /// so `status` reaches the instance an operator scoped the shell to
+    /// rather than the one the directory records.
+    #[test]
+    fn status_openbao_url_prefers_the_environment_over_the_env_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "OPENBAO_HOST_PORT=18200\n").expect("write .env");
+        let args = status_args(
+            dir.path().join("docker-compose.yml"),
+            crate::commands::init::DEFAULT_OPENBAO_URL,
+        );
+        assert_eq!(
+            status_openbao_url_with_env(&args, Some("18201")),
+            "http://localhost:18201"
+        );
+    }
+
     /// Closes #731: an operator-supplied `--openbao-url` is used
     /// verbatim, whatever the configured host port is.
     #[test]

@@ -2292,6 +2292,17 @@ mod tests {
             None,
         );
         assert_eq!(init_args.openbao.openbao_url, "http://localhost:18200");
+
+        // Step 1 of the same precedence: what the invoking environment
+        // held outranks the compose `.env`, so a reinit run from a shell
+        // scoped to one instance does not re-init another's `OpenBao`.
+        let from_env = init_args_for_reinit(
+            &reinit_args,
+            &DeploymentIntent::default(),
+            &reinit_args.secrets_dir.secrets_dir,
+            Some("18201"),
+        );
+        assert_eq!(from_env.openbao.openbao_url, "http://localhost:18201");
     }
 
     /// Closes #731: a snapshotted non-loopback bind intent outranks the

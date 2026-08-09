@@ -2798,6 +2798,41 @@ mod tests {
         );
     }
 
+    /// Each field of [`HostPortEnv`] has to reach its own service.  The
+    /// four resolvers differ only in the `(key, default)` pair they
+    /// carry, so a field wired to the wrong one would still produce a
+    /// plausible port and no other assertion here would notice.
+    #[test]
+    fn host_ports_resolve_routes_each_env_field_to_its_own_service() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every service also has a `.env` value, so a field that failed
+        // to reach its resolver would fall through to a different number
+        // rather than silently matching.
+        std::fs::write(
+            dir.path().join(".env"),
+            "POSTGRES_HOST_PORT=15400\nOPENBAO_HOST_PORT=18400\n\
+             STEPCA_HOST_PORT=19400\nHTTP01_ADMIN_HOST_PORT=18500\n",
+        )
+        .unwrap();
+        let args = install_args(dir.path().join("docker-compose.yml"));
+        let env = HostPortEnv {
+            postgres: Some("15432".to_string()),
+            openbao: Some("18200".to_string()),
+            stepca: Some("19000".to_string()),
+            http01_admin: Some("18080".to_string()),
+        };
+        let ports = HostPorts::resolve_with_env(&args, dir.path(), &env);
+        assert_eq!(
+            (
+                ports.postgres,
+                ports.openbao,
+                ports.stepca,
+                ports.http01_admin
+            ),
+            (15432, 18200, 19000, 18080)
+        );
+    }
+
     /// Closes #731: only the flags the operator actually supplied are
     /// propagated to `.env` and to the compose subprocess environment.
     #[test]
