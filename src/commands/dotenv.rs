@@ -67,8 +67,8 @@ pub(crate) fn write_dotenv(
 /// the target environment.
 ///
 /// The whole decision, split off from the one mutation it feeds so it
-/// can be exercised — the exclusion below above all — without a process
-/// environment to steer.
+/// can be exercised without a process environment to steer — above all
+/// the [`COMPOSE_PROJECT_NAME_ENV`] exclusion documented below.
 fn dotenv_pairs_to_apply<'a>(
     entries: &'a BTreeMap<String, String>,
     is_set: &dyn Fn(&str) -> bool,

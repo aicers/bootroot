@@ -287,16 +287,11 @@ mod tests {
         // DSN; using it as an admin DSN reproduces the original
         // self-ALTER failure. With no flag and no KV value, fail fast
         // with a message naming the available recovery paths.
+        //
+        // The resolver takes a port rather than a compose directory, so
+        // there is no longer a path by which a ca.json could be reached
+        // at all; what stays asserted is the error the operator sees.
         let messages = test_messages();
-        let dir = tempdir().expect("tempdir");
-        // Even an existing ca.json must not be silently consumed as an
-        // admin DSN — the file is left in place to confirm no fallthrough.
-        let ca_json = dir.path().join("ca.json");
-        fs::write(
-            &ca_json,
-            r#"{"db":{"type":"postgresql","dataSource":"postgresql://stepca:runtime@postgres:5432/stepca?sslmode=disable"}}"#,
-        )
-        .expect("write ca.json");
         let args = RotateDbArgs {
             admin_dsn: DbAdminDsnArgs { admin_dsn: None },
             password: None,
