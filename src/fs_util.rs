@@ -279,13 +279,30 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, replace: bool
 /// permissioned, chowned (when ownership preservation is needed), or
 /// renamed.
 pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    let dest = path.to_path_buf();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || atomic_write_blocking(&dest, &payload, mode))
+        .await
+        .context("Atomic write task panicked")?
+}
+
+/// The blocking half of [`atomic_write`], for callers that are not async.
+///
+/// Same guarantees, same order: staged in the destination's directory,
+/// written, `sync_all`ed, permissioned, ownership-preserved, renamed.
+/// Callers in an async context use [`atomic_write`] instead, which runs
+/// this on a blocking thread.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_write`].
+pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
     let dest = path.to_path_buf();
     let payload = contents.to_vec();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    {
         // Capture the existing destination's uid/gid (if any) so the
         // rename does not strip operator-meaningful ownership. Missing
         // file -> None; do not chown the staged file in that case so a
@@ -330,9 +347,7 @@ pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()>
             )
         })?;
         Ok(())
-    })
-    .await
-    .context("Atomic write task panicked")?
+    }
 }
 
 /// Ensures the secrets directory exists and has secure permissions.

@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::trust_bootstrap::CA_BUNDLE_PEM_KEY;
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,12 @@ use crate::state::ServiceEntry;
 
 pub(crate) const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
 const ROTATION_STATE_FILENAME: &str = "rotation-state.json";
+
+/// Mode for `rotation-state.json`. Only the rotation command writes
+/// and reads it, so it is created owner-only rather than at whatever
+/// the umask happens to be — and the same mode on both write paths,
+/// so the file does not change permissions depending on which one ran.
+const ROTATION_STATE_MODE: u32 = 0o600;
 
 /// Describes which CA components are included in the rotation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,9 +66,12 @@ pub(crate) fn create_rotation_state(
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(ROTATION_STATE_MODE)
         .open(&path)
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     file.write_all(json.as_bytes())
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    file.sync_all()
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
@@ -74,18 +85,8 @@ pub(crate) fn update_rotation_state(
     let path = rotation_state_path(state_dir);
     let json = serde_json::to_string_pretty(state)
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    let temp_path = state_dir.join(format!(
-        "{ROTATION_STATE_FILENAME}.tmp.{}.{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
-    ));
-    fs::write(&temp_path, json.as_bytes())
-        .with_context(|| messages.error_write_file_failed(&temp_path.display().to_string()))?;
-    fs::rename(&temp_path, &path)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    Ok(())
+    fs_util::atomic_write_blocking(&path, json.as_bytes(), ROTATION_STATE_MODE)
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
 }
 
 /// Loads `rotation-state.json` if it exists. Returns `None` if absent.

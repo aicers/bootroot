@@ -103,6 +103,11 @@ fn log_poll_outcomes(kind: &str, outcomes: &[PollApplyOutcome], needs_relogin: &
 /// renewals but failed to be acknowledged back to `OpenBao`. Missing
 /// entries in `last_reissue_seen_version` mean "never seen a reissue
 /// request".
+/// Mode for the fast-poll state file. It is the agent's own resume
+/// record — nobody else reads it — so it is created owner-only rather
+/// than at whatever the umask happens to be.
+const STATE_FILE_MODE: u32 = 0o600;
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub(crate) struct FastPollState {
     #[serde(default)]
@@ -190,7 +195,9 @@ impl FastPollState {
         }
     }
 
-    /// Persists the state file atomically via a `<path>.tmp` rename.
+    /// Persists the state file atomically, owner-only and flushed: it
+    /// is what the next tick resumes from, so it has to survive a
+    /// power loss rather than merely replace cleanly.
     pub(crate) async fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -202,27 +209,11 @@ impl FastPollState {
                 )
             })?;
         }
-        let tmp_path: PathBuf = {
-            let mut os = path.as_os_str().to_owned();
-            os.push(".tmp");
-            PathBuf::from(os)
-        };
         let body =
             serde_json::to_string_pretty(self).context("Failed to serialize fast-poll state")?;
-        fs::write(&tmp_path, body).await.with_context(|| {
-            format!(
-                "Failed to write fast-poll state tmp file at {}",
-                tmp_path.display()
-            )
-        })?;
-        fs::rename(&tmp_path, path).await.with_context(|| {
-            format!(
-                "Failed to rename {} -> {}",
-                tmp_path.display(),
-                path.display()
-            )
-        })?;
-        Ok(())
+        fs_util::atomic_write(path, body.as_bytes(), STATE_FILE_MODE)
+            .await
+            .with_context(|| format!("Failed to write fast-poll state at {}", path.display()))
     }
 }
 
