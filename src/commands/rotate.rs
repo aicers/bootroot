@@ -542,6 +542,28 @@ mod tests {
         );
     }
 
+    /// An argument-less invocation is the degenerate record, `0\0`, and
+    /// the count is the only thing that separates it from the next one:
+    /// it contributes no fields of its own, so a decoder that scanned
+    /// for a boundary instead of counting would swallow the record after
+    /// it.
+    #[test]
+    fn the_fake_docker_log_frames_an_argument_less_invocation() {
+        let dir = tempdir().expect("tempdir");
+        let args_log = dir.path().join("docker_args.log");
+        let fake = dir.path().join("fake-docker");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        run_fake(&fake, &[]);
+        run_fake(&fake, &["restart", "c"]);
+        run_fake(&fake, &[]);
+
+        assert_eq!(
+            decode_fake_docker_log(&args_log),
+            vec![vec![], vec!["restart".to_string(), "c".to_string()], vec![]]
+        );
+    }
+
     /// `tempfile::tempdir()` can legitimately hand back a path holding
     /// an apostrophe, so the helper quotes rather than rejects one.
     #[test]
