@@ -790,8 +790,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::super::test_support::{
-        ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend, test_messages,
-        write_fake_docker_script,
+        decode_fake_docker_log, test_messages, write_self_contained_fake_docker,
     };
     use super::*;
     use crate::commands::compose_project::DOCKER_BIN;
@@ -802,7 +801,11 @@ mod tests {
     /// Builds a rotate context whose compose directory records a
     /// non-default identity, so every by-name docker call these tests
     /// observe has to be `insight-*` rather than `bootroot-*`.
-    fn make_ctx(dir: &std::path::Path) -> RotateContext {
+    ///
+    /// `docker` is the executable every spawn in the rotation runs, so a
+    /// test that wants the argv — or wants the real `docker` kept out of
+    /// the run — points this at a fake instead of touching `PATH`.
+    fn make_ctx(dir: &std::path::Path, docker: &Path) -> RotateContext {
         fs::write(dir.join(".env"), "BOOTROOT_INSTANCE=insight\n").expect("write .env");
         RotateContext {
             openbao_url: String::new(),
@@ -827,7 +830,7 @@ mod tests {
             paths: super::super::StatePaths::new(dir.join("secrets")),
             state_dir: dir.to_path_buf(),
             state_file: dir.join("state.json"),
-            docker: PathBuf::from(DOCKER_BIN),
+            docker: docker.to_path_buf(),
         }
     }
 
@@ -905,19 +908,12 @@ mod tests {
             })))
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn rotate_infra_writes_secret_id_restarts_agent_and_verifies_login() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         mount_secret_id_mock(APPROLE_BOOTROOT_STEPCA)
@@ -926,7 +922,7 @@ mod tests {
             .await;
         mount_login_mock().expect(1).mount(&server).await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         let stepca_dir = ctx
             .paths
             .secrets_dir()
@@ -967,24 +963,18 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
-        let logged = fs::read_to_string(&args_log).expect("read docker args");
-        let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(args, vec!["restart", "insight-openbao-agent-stepca"]);
+        assert_eq!(
+            decode_fake_docker_log(&args_log),
+            [["restart", "insight-openbao-agent-stepca"]]
+        );
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn rotate_infra_backfills_missing_role_id_file() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1002,7 +992,7 @@ mod tests {
             .await;
         mount_login_mock().mount(&server).await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("scoped-token".to_string());
         let messages = test_messages();
@@ -1026,24 +1016,18 @@ mod tests {
         let role_id = fs::read_to_string(responder_dir.join(OPENBAO_AGENT_ROLE_ID_NAME))
             .expect("role_id backfilled");
         assert_eq!(role_id, "responder-role-id");
-        let logged = fs::read_to_string(&args_log).expect("read docker args");
-        let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(args, vec!["restart", "insight-openbao-agent-responder"]);
+        assert_eq!(
+            decode_fake_docker_log(&args_log),
+            [["restart", "insight-openbao-agent-responder"]]
+        );
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn rotate_infra_permission_denied_hints_at_infra_credential() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1056,7 +1040,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         let stepca_dir = ctx
             .paths
             .secrets_dir()
@@ -1109,7 +1093,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_provisioning_mocks(&server).await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
@@ -1174,7 +1158,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_provisioning_mocks(&server).await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         let label = AppRoleLabel::InfraRotate.to_string();
         ctx.state
             .approles
@@ -1423,7 +1407,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_all_services_empty_registry_is_noop_success() {
         let dir = tempdir().expect("tempdir");
-        let ctx = make_ctx(dir.path());
+        let ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         // No OpenBao requests may happen; an unroutable URL makes any
         // accidental call fail loudly.
         let mut client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
@@ -1434,19 +1418,12 @@ mod tests {
             .expect("an empty service registry must be a no-op success");
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn rotate_all_services_rotates_local_and_remote_targets() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
@@ -1467,7 +1444,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
         ctx.state.services.insert(
             "beta".to_string(),
@@ -1495,19 +1472,12 @@ mod tests {
         );
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn rotate_all_services_continues_after_per_target_failure() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1527,7 +1497,7 @@ mod tests {
             .await;
         mount_login_mock().expect(1).mount(&server).await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
         insert_local_service(&mut ctx, dir.path(), "beta");
 
@@ -1620,19 +1590,12 @@ mod tests {
             .respond_with(response)
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn self_mint_replaces_credential_file_after_successful_run() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
@@ -1652,7 +1615,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
         let credential_path = dir.path().join("rotate-cred").join("secret_id");
         fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
@@ -1699,19 +1662,12 @@ mod tests {
         );
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn self_mint_skipped_with_warning_when_auth_not_file_based() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
@@ -1726,7 +1682,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("runtime-rotate-token".to_string());
@@ -1753,19 +1709,12 @@ mod tests {
         );
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn no_self_mint_under_root_auth() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
@@ -1778,7 +1727,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
@@ -1826,7 +1775,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         insert_local_service(&mut ctx, dir.path(), "alpha");
         let credential_path = dir.path().join("rotate-cred").join("secret_id");
         fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
@@ -1872,19 +1821,12 @@ mod tests {
     // fails its login verification must not replace the working file —
     // the old secret_id stays valid until TTL, so the next run
     // self-heals.
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn self_mint_verify_failure_keeps_old_credential_file() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
@@ -1904,7 +1846,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
         let credential_path = dir.path().join("rotate-cred").join("secret_id");
         fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
@@ -1951,19 +1893,12 @@ mod tests {
         );
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn self_mint_applies_recorded_cidr_binding() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         mount_secret_id_mock(&service_role_name("alpha"))
@@ -1994,7 +1929,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
         ctx.state.rotate_bound_cidrs.insert(
             AppRoleLabel::RuntimeRotate.to_string(),
@@ -2030,19 +1965,12 @@ mod tests {
         );
     }
 
-    // The env-var lock must be held across the `.await` to prevent
-    // parallel tests from seeing a corrupted PATH.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn infra_invocation_self_mints_the_infra_rotate_credential() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake_docker = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let server = MockServer::start().await;
         mount_secret_id_mock(APPROLE_BOOTROOT_STEPCA)
@@ -2062,7 +1990,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), &fake_docker);
         let stepca_dir = ctx
             .paths
             .secrets_dir()
@@ -2113,7 +2041,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_bound_cidrs_rejected_without_root_auth() {
         let dir = tempdir().expect("tempdir");
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         // No OpenBao requests may happen; an unroutable URL makes any
         // accidental call fail loudly.
         let mut client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
@@ -2179,7 +2107,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
@@ -2249,7 +2177,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         let label = AppRoleLabel::InfraRotate.to_string();
         ctx.state
             .approles
@@ -2316,7 +2244,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         let label = AppRoleLabel::InfraRotate.to_string();
         ctx.state
             .approles
@@ -2395,7 +2323,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         ctx.state.rotate_secret_id_ttl = Some("48h".to_string());
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
@@ -2408,7 +2336,7 @@ mod tests {
     #[tokio::test]
     async fn clear_rotate_bound_cidrs_rejected_without_root_auth() {
         let dir = tempdir().expect("tempdir");
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         // No OpenBao requests may happen; an unroutable URL makes any
         // accidental call fail loudly.
         let mut client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
@@ -2445,7 +2373,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut ctx = make_ctx(dir.path());
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         insert_local_service(&mut ctx, dir.path(), "alpha");
 
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");

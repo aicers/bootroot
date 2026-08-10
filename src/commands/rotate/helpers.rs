@@ -204,23 +204,18 @@ mod tests {
     use tempfile::tempdir;
 
     use super::super::test_support::{
-        ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend, test_messages,
-        write_fake_docker_script,
+        decode_fake_docker_log, test_messages, write_self_contained_fake_docker,
     };
     use super::*;
     use crate::commands::compose_project::DEFAULT_INSTANCE_NAME;
 
-    /// Runs `restart_openbao_agent` against a fake `docker` on `PATH`
-    /// and returns the argument vector it was given.
-    fn restart_args(instance: &str, container: BootrootContainer) -> Vec<String> {
+    /// Runs `restart_openbao_agent` against a fake `docker` handed in
+    /// through the executable seam and returns the invocations it saw.
+    fn restart_invocations(instance: &str, container: BootrootContainer) -> Vec<Vec<String>> {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake, &args_log);
 
         std::fs::write(
             dir.path().join(".env"),
@@ -230,16 +225,12 @@ mod tests {
         restart_openbao_agent(
             &dir.path().join("docker-compose.yml"),
             container,
-            Path::new("docker"),
+            &fake,
             &test_messages(),
         )
         .expect("restarting the sidecar must succeed");
 
-        std::fs::read_to_string(&args_log)
-            .expect("read docker args")
-            .lines()
-            .map(str::to_string)
-            .collect()
+        decode_fake_docker_log(&args_log)
     }
 
     /// The sidecars bypass Compose's project scoping, so `rotate db` and
@@ -250,8 +241,8 @@ mod tests {
     #[test]
     fn restarting_the_stepca_agent_names_the_recorded_instance() {
         assert_eq!(
-            restart_args("insight", BootrootContainer::OpenBaoAgentStepCa),
-            vec!["restart", "insight-openbao-agent-stepca"]
+            restart_invocations("insight", BootrootContainer::OpenBaoAgentStepCa),
+            [["restart", "insight-openbao-agent-stepca"]]
         );
     }
 
@@ -260,8 +251,8 @@ mod tests {
     #[test]
     fn restarting_the_responder_agent_names_the_recorded_instance() {
         assert_eq!(
-            restart_args("insight", BootrootContainer::OpenBaoAgentResponder),
-            vec!["restart", "insight-openbao-agent-responder"]
+            restart_invocations("insight", BootrootContainer::OpenBaoAgentResponder),
+            [["restart", "insight-openbao-agent-responder"]]
         );
     }
 
@@ -271,18 +262,14 @@ mod tests {
     #[test]
     fn restarting_a_sidecar_without_a_recorded_identity_keeps_the_default_name() {
         let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log.as_os_str());
+        write_self_contained_fake_docker(&fake, &args_log);
 
         restart_openbao_agent(
             &dir.path().join("docker-compose.yml"),
             BootrootContainer::OpenBaoAgentStepCa,
-            Path::new("docker"),
+            &fake,
             &test_messages(),
         )
         .expect("restarting the sidecar must succeed");
@@ -291,10 +278,9 @@ mod tests {
         // bare default-instance sidecar name in `src/` is what
         // `container_name`'s single-declaration guard forbids.
         let expected = BootrootContainer::OpenBaoAgentStepCa.name(DEFAULT_INSTANCE_NAME);
-        let logged = std::fs::read_to_string(&args_log).expect("read docker args");
         assert_eq!(
-            logged.lines().collect::<Vec<&str>>(),
-            vec!["restart", expected.as_str()]
+            decode_fake_docker_log(&args_log),
+            [["restart", expected.as_str()]]
         );
     }
 

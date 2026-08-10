@@ -168,22 +168,18 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::super::test_support::*;
+    use super::super::test_support::{
+        decode_fake_docker_log, test_messages, write_self_contained_fake_docker,
+        write_self_contained_fake_docker_exiting,
+    };
     use super::*;
 
     #[test]
     fn change_stepca_passphrase_invokes_docker_with_force_and_expected_paths() {
-        let _lock = env_lock();
         let temp = tempdir().expect("tempdir");
-        let bin_dir = temp.path().join("bin");
-        fs::create_dir_all(&bin_dir).expect("bin dir");
-        let docker_path = bin_dir.join("docker");
-        write_fake_docker_script(&docker_path);
-
+        let docker_path = temp.path().join("fake-docker");
         let args_log_path = temp.path().join("docker-args.log");
-        let _path_guard = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args_guard = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log_path.as_os_str());
-        let _exit_guard = ScopedEnvVar::set(TEST_DOCKER_EXIT_ENV, "0");
+        write_self_contained_fake_docker(&docker_path, &args_log_path);
 
         let secrets_dir = temp.path().join("secrets");
         fs::create_dir_all(secrets_dir.join("secrets")).expect("create secrets key dir");
@@ -199,13 +195,12 @@ mod tests {
             &current_password,
             &new_password,
             &key_path,
-            Path::new("docker"),
+            &docker_path,
             &test_messages(),
         )
         .expect("change passphrase should succeed");
 
-        let logged_args = fs::read_to_string(&args_log_path).expect("read logged args");
-        let args: Vec<&str> = logged_args.lines().collect();
+        let invocations = decode_fake_docker_log(&args_log_path);
         let mount_root = fs::canonicalize(&secrets_dir).expect("canonicalize secrets dir");
         let expected_mount = format!("{}:/home/step", mount_root.display());
         // The container must run as the secrets-directory owner, not root,
@@ -230,7 +225,7 @@ mod tests {
             "/home/step/password.txt.new",
             "-f",
         ];
-        assert_eq!(args, expected);
+        assert_eq!(invocations, vec![expected]);
     }
 
     #[test]
@@ -259,17 +254,10 @@ mod tests {
 
     #[test]
     fn change_stepca_passphrase_surfaces_docker_failure_status() {
-        let _lock = env_lock();
         let temp = tempdir().expect("tempdir");
-        let bin_dir = temp.path().join("bin");
-        fs::create_dir_all(&bin_dir).expect("bin dir");
-        let docker_path = bin_dir.join("docker");
-        write_fake_docker_script(&docker_path);
-
+        let docker_path = temp.path().join("fake-docker");
         let args_log_path = temp.path().join("docker-args.log");
-        let _path_guard = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args_guard = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, args_log_path.as_os_str());
-        let _exit_guard = ScopedEnvVar::set(TEST_DOCKER_EXIT_ENV, "7");
+        write_self_contained_fake_docker_exiting(&docker_path, &args_log_path, 7);
 
         let secrets_dir = temp.path().join("secrets");
         fs::create_dir_all(secrets_dir.join("secrets")).expect("create secrets key dir");
@@ -285,7 +273,7 @@ mod tests {
             &current_password,
             &new_password,
             &key_path,
-            Path::new("docker"),
+            &docker_path,
             &test_messages(),
         )
         .expect_err("docker failure should bubble up");

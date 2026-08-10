@@ -440,8 +440,7 @@ mod tests {
     use std::fs;
 
     use super::super::test_support::{
-        ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend, test_messages,
-        write_fake_docker_script,
+        decode_fake_docker_log, test_messages, write_self_contained_fake_docker,
     };
     use super::*;
     use crate::cli::args::{
@@ -455,40 +454,11 @@ mod tests {
         OPENBAO_INFRA_CERT_KEY, OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_DEFAULT_RENEW_BEFORE,
         OPENBAO_TLS_KEY_PATH,
     };
-    use crate::commands::rotate::run_rotate;
+    use crate::commands::rotate::{run_rotate, run_rotate_with_exec};
     use crate::state::StateFile;
 
     /// The `OpenBao` container name a default install renders.
     const DEFAULT_OPENBAO_CONTAINER: &str = "bootroot-openbao";
-
-    /// Writes a fake `docker` that appends one line per invocation to
-    /// `args_log` and reads nothing from its environment.
-    ///
-    /// The log path is baked into the script text as it is written, so a
-    /// test handing this executable through the docker seam gets its
-    /// argv back without setting a single variable on this process.
-    /// `init::steps::test_support` carries a twin for the `init` tree.
-    /// The one module both trees can reach, `rotate::test_support`,
-    /// holds the `PATH`-based fake every unconverted test still depends
-    /// on and stays untouched until those conversions land; the `init`
-    /// twin is scoped to its own tree and is not visible here.  The
-    /// duplication is what that costs, and it goes away when the
-    /// conversions are free to rework the shared harness.
-    fn write_self_contained_fake_docker(path: &Path, args_log: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let log = args_log.display().to_string();
-        assert!(
-            !log.contains('\''),
-            "the log path is interpolated into a single-quoted shell word"
-        );
-        let script = format!(
-            "#!/bin/sh\nset -eu\n{{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\nexit 0\n"
-        );
-        fs::write(path, script).expect("fake docker script should be written");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .expect("fake docker script should be executable");
-    }
 
     fn make_openbao_infra_entry(compose_dir: &std::path::Path) -> InfraCertEntry {
         InfraCertEntry {
@@ -585,10 +555,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let messages = test_messages();
 
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("bin dir");
-        let docker_path = bin_dir.join("docker");
-        write_fake_docker_script(&docker_path);
+        let fake_docker = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let compose_dir = dir.path().join("compose");
         let secrets_dir = dir.path().join("secrets");
@@ -665,13 +634,7 @@ mod tests {
             show_secrets: false,
         };
 
-        let args_log = dir.path().join("docker_args.log");
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
-
-        rt.block_on(run_rotate(&args, &messages))
+        rt.block_on(run_rotate_with_exec(&args, &fake_docker, &messages))
             .expect("run_rotate(InfraCert) must succeed and verify the swap");
 
         // The updated state must have been written back to the
@@ -701,16 +664,22 @@ mod tests {
             "state must not be written to hardcoded state.json"
         );
 
-        // The fake docker log is truncated on every call, so its final
-        // contents are the last docker invocation — the reload signal.
-        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        // The fake keeps every invocation, so the reload signal is
+        // pinned as one whole argv rather than as bytes anywhere in the
+        // log, and the restart check now covers the entire run.
+        let invocations = decode_fake_docker_log(&args_log);
         assert!(
-            log.contains("kill") && log.contains("SIGHUP"),
-            "final docker call must be kill -s SIGHUP, got: {log}"
+            invocations.contains(&vec![
+                "kill".to_string(),
+                "-s".to_string(),
+                "SIGHUP".to_string(),
+                DEFAULT_OPENBAO_CONTAINER.to_string(),
+            ]),
+            "the reload must be kill -s SIGHUP against the openbao container, got: {invocations:?}"
         );
         assert!(
-            !log.contains("restart"),
-            "openbao entry must never trigger docker restart, got: {log}"
+            !invocations.iter().flatten().any(|arg| arg == "restart"),
+            "openbao entry must never trigger docker restart, got: {invocations:?}"
         );
     }
 
@@ -723,10 +692,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let messages = test_messages();
 
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("bin dir");
-        let docker_path = bin_dir.join("docker");
-        write_fake_docker_script(&docker_path);
+        let fake_docker = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let compose_dir = dir.path().join("compose");
         let secrets_dir = dir.path().join("secrets");
@@ -793,15 +761,9 @@ mod tests {
             show_secrets: false,
         };
 
-        let args_log = dir.path().join("docker_args.log");
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
-
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let err = rt
-            .block_on(run_rotate(&args, &messages))
+            .block_on(run_rotate_with_exec(&args, &fake_docker, &messages))
             .expect_err("unreachable probe target must fail the command");
         let chain = format!("{err:#}");
         assert!(
@@ -815,10 +777,10 @@ mod tests {
 
         // The reload signal (`kill`) must have run before the probe, so
         // the container was never restarted.
-        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        let invocations = decode_fake_docker_log(&args_log);
         assert!(
-            !log.contains("restart"),
-            "openbao entry must never trigger docker restart, got: {log}"
+            !invocations.iter().flatten().any(|arg| arg == "restart"),
+            "openbao entry must never trigger docker restart, got: {invocations:?}"
         );
     }
 
@@ -852,10 +814,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let messages = test_messages();
 
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("bin dir");
-        let docker_path = bin_dir.join("docker");
-        write_fake_docker_script(&docker_path);
+        let fake_docker = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake_docker, &args_log);
 
         let compose_dir = dir.path().join("compose");
         let secrets_dir = dir.path().join("secrets");
@@ -920,14 +881,8 @@ mod tests {
             show_secrets: false,
         };
 
-        let args_log = dir.path().join("docker_args.log");
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
-
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(run_rotate(&args, &messages))
+        rt.block_on(run_rotate_with_exec(&args, &fake_docker, &messages))
             .expect("run_rotate(InfraCert) must succeed for http01 admin entry");
 
         let reloaded = StateFile::load(&state_file).expect("state file must be readable");
@@ -942,10 +897,15 @@ mod tests {
 
         // Verify the fake docker received a `kill -s SIGHUP` command
         // (the ContainerSignal reload strategy).
-        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        let invocations = decode_fake_docker_log(&args_log);
         assert!(
-            log.contains("kill") && log.contains("SIGHUP"),
-            "docker must have been called with kill -s SIGHUP, got: {log}"
+            invocations.contains(&vec![
+                "kill".to_string(),
+                "-s".to_string(),
+                "SIGHUP".to_string(),
+                RESPONDER_SERVICE_NAME.to_string(),
+            ]),
+            "docker must have been called with kill -s SIGHUP, got: {invocations:?}"
         );
         // The HTTP-01 admin entry gets no post-reload verification, so no
         // openbao_url is consulted and no probe runs.
@@ -995,43 +955,14 @@ mod tests {
         );
     }
 
-    /// The signal has to reach the instance's own responder container,
-    /// not a co-located install's.
-    #[test]
-    fn container_signal_addresses_the_named_container() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
-        let args_log = dir.path().join("docker_args.log");
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
-
-        execute_reload_strategy(
-            &ReloadStrategy::ContainerSignal {
-                container_name: "insight-http01".to_string(),
-                signal: "SIGHUP".to_string(),
-            },
-            Path::new("docker"),
-        )
-        .expect("signalling must succeed against the fake docker");
-
-        let logged = fs::read_to_string(&args_log).expect("read docker args");
-        let logged_args: Vec<&str> = logged.lines().collect();
-        assert_eq!(logged_args, vec!["kill", "-s", "SIGHUP", "insight-http01"]);
-    }
-
     /// The seam at the signal spawn: `execute_reload_strategy` kills the
     /// container with whichever program its caller named, which in the
-    /// flow is `ctx.docker`.
+    /// flow is `ctx.docker`.  The signal therefore has to reach the
+    /// instance's own responder container, not a co-located install's.
     ///
     /// The test mutates nothing process-global — no `PATH` edit, no
     /// variable set, no lock — because the fake carries its own
-    /// argv-log path in its script text.  That is the property the seam
-    /// exists to make possible, and the model the conversion of this
-    /// file's remaining `PATH` fakes follows.
+    /// argv-log path in its script text.
     #[test]
     fn container_signal_runs_the_supplied_executable() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1048,10 +979,9 @@ mod tests {
         )
         .expect("signalling must succeed against the supplied executable");
 
-        let logged = fs::read_to_string(&args_log).expect("read docker args");
         assert_eq!(
-            logged.lines().collect::<Vec<&str>>(),
-            vec!["kill -s SIGHUP insight-http01 "],
+            decode_fake_docker_log(&args_log),
+            [["kill", "-s", "SIGHUP", "insight-http01"]],
             "the supplied executable must have received the unchanged argv"
         );
     }
