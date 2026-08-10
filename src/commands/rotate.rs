@@ -389,23 +389,39 @@ exit 0
         args_log: &Path,
         exit_code: u8,
     ) {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
 
-        let log = shell_single_quote(&args_log.display().to_string());
-        let script = format!(
-            "#!/bin/sh\nset -eu\nprintf '%s\\0' \"$#\" \"$@\" >> {log}\nexit {exit_code}\n"
-        );
+        // The script is assembled as bytes, not as a `String`: a Unix
+        // path is an arbitrary NUL-free byte sequence, and rendering
+        // `args_log` through `Display` would replace any byte that is
+        // not valid UTF-8, pointing the fake at a different path that
+        // nothing would ever create.
+        let mut script = b"#!/bin/sh\nset -eu\nprintf '%s\\0' \"$#\" \"$@\" >> ".to_vec();
+        script.extend_from_slice(&shell_single_quote(args_log.as_os_str().as_bytes()));
+        script.extend_from_slice(format!("\nexit {exit_code}\n").as_bytes());
         fs::write(path, script).expect("fake docker script should be written");
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .expect("fake docker script should be executable");
     }
 
-    /// Quotes `value` as a single POSIX shell word.
+    /// Quotes `value` as a single POSIX shell word, byte for byte.
     ///
     /// A tempdir path may legally contain `'`, which ends the quoted
     /// word; the usual `'\''` dance closes, escapes and reopens it.
-    fn shell_single_quote(value: &str) -> String {
-        format!("'{}'", value.replace('\'', r"'\''"))
+    /// Every other byte is copied through unchanged, so a path that is
+    /// not UTF-8 reaches the script intact.
+    fn shell_single_quote(value: &[u8]) -> Vec<u8> {
+        let mut quoted = vec![b'\''];
+        for byte in value {
+            if *byte == b'\'' {
+                quoted.extend_from_slice(br"'\''");
+            } else {
+                quoted.push(*byte);
+            }
+        }
+        quoted.push(b'\'');
+        quoted
     }
 
     /// Decodes a log written by [`write_self_contained_fake_docker`],
@@ -572,6 +588,59 @@ mod tests {
         let awkward = dir.path().join("it's a dir");
         fs::create_dir(&awkward).expect("create awkward dir");
         let args_log = awkward.join("docker args.log");
+        let fake = dir.path().join("fake-docker");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        run_fake(&fake, &["restart", "c"]);
+
+        assert_eq!(decode_fake_docker_log(&args_log), [["restart", "c"]]);
+    }
+
+    /// The redirect the fake is written with must hold the log path's
+    /// own bytes. Rendering the path through `Display` instead replaces
+    /// every byte that is not valid UTF-8 with `U+FFFD`, which silently
+    /// aims the fake at a path nothing creates.
+    ///
+    /// This asserts on the script text rather than on running it, so it
+    /// holds on filesystems that would refuse to create the name.
+    #[test]
+    fn the_fake_docker_script_embeds_the_log_path_verbatim() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir().expect("tempdir");
+        let args_log = dir.path().join(OsStr::from_bytes(b"non\xffutf8.log"));
+        let fake = dir.path().join("fake-docker");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        let script = fs::read(&fake).expect("the fake docker script should be readable");
+        let expected = args_log.as_os_str().as_bytes();
+        assert!(
+            script
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "the script must redirect to the log path's own bytes"
+        );
+    }
+
+    /// A Unix path is an arbitrary NUL-free byte sequence, so a tempdir
+    /// rooted below one that is not UTF-8 — which `TMPDIR` can be — must
+    /// still yield a fake that logs where the test reads.
+    ///
+    /// The name is only creatable where the filesystem takes it: APFS
+    /// and other UTF-8-enforcing filesystems reject it with `EILSEQ`,
+    /// and on those the property is unobservable rather than broken.
+    #[test]
+    fn the_fake_docker_handles_a_non_utf8_log_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir().expect("tempdir");
+        let awkward = dir.path().join(OsStr::from_bytes(b"non\xffutf8"));
+        if fs::create_dir(&awkward).is_err() {
+            return;
+        }
+        let args_log = awkward.join("docker_args.log");
         let fake = dir.path().join("fake-docker");
         write_self_contained_fake_docker(&fake, &args_log);
 
