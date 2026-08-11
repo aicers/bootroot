@@ -64,6 +64,21 @@ before generating code.
   that should have tripped the rule, and nothing in the config records
   which was which.
 
+## Shared instruction blocks
+
+- The regions between `<!-- BEGIN shared:... -->` and
+  `<!-- END shared:... -->` in this file are generated from a shared
+  source. Do NOT edit them here. Change the wording upstream and cut a
+  release there; it arrives as a pull request against this repository.
+  An edit made here is overwritten by the next one of those, and turns
+  the drift check red until it lands.
+- `.agent-instructions.toml` records which release those regions came
+  from and which blocks this repository carries. It is source, not tool
+  output: the drift check reads it, the apply rewrites it, and nothing
+  generates it from anything else. Never add it to `.gitignore`, and
+  never untrack it — a repository whose pin cannot be read fails the
+  check outright rather than being read as carrying no blocks.
+
 ## Attribution
 
 - Do NOT add `Co-Authored-By` lines naming an AI (`Claude`, `Codex`,
