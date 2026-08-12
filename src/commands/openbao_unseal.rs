@@ -1,3 +1,4 @@
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -46,42 +47,63 @@ pub(crate) fn delete_unseal_keys(secrets_dir: &Path, messages: &Messages) -> Res
 }
 
 /// Prompts the user for unseal keys via stdin (interactive).
+///
+/// # Errors
+///
+/// Returns an error when stdin reaches EOF before an answer is given,
+/// when the threshold does not parse, or when stdout cannot be flushed.
 pub(crate) fn prompt_unseal_keys_interactive(
     threshold: Option<u32>,
     messages: &Messages,
 ) -> Result<Vec<String>> {
-    use std::io::{self, Write};
+    read_unseal_keys(&mut std::io::stdin().lock(), threshold, messages)
+}
 
+/// Reads the threshold and that many key shares from `input`.
+fn read_unseal_keys(
+    input: &mut dyn BufRead,
+    threshold: Option<u32>,
+    messages: &Messages,
+) -> Result<Vec<String>> {
     let count = match threshold {
         Some(value) if value > 0 => value,
-        _ => {
-            print!("Unseal key threshold (t): ");
-            io::stdout()
-                .flush()
-                .with_context(|| messages.error_prompt_flush_failed())?;
-            let mut input = String::new();
-            io::stdin()
-                .read_line(&mut input)
-                .with_context(|| messages.error_prompt_read_failed())?;
-            input
-                .trim()
-                .parse::<u32>()
-                .context(messages.error_prompt_read_failed())?
-        }
+        _ => prompt_line(input, messages.prompt_unseal_threshold(), messages)?
+            .parse::<u32>()
+            .context(messages.error_invalid_unseal_threshold())?,
     };
-    let mut keys = Vec::with_capacity(count as usize);
+    let capacity =
+        usize::try_from(count).with_context(|| messages.error_invalid_unseal_threshold())?;
+    let mut keys = Vec::with_capacity(capacity);
     for index in 1..=count {
-        print!("Unseal key {index}/{count}: ");
-        io::stdout()
-            .flush()
-            .with_context(|| messages.error_prompt_flush_failed())?;
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .with_context(|| messages.error_prompt_read_failed())?;
-        keys.push(input.trim().to_string());
+        keys.push(prompt_line(
+            input,
+            &messages.prompt_unseal_key(index, count),
+            messages,
+        )?);
     }
     Ok(keys)
+}
+
+/// Writes `prompt` to stdout and reads one trimmed line from `input`.
+///
+/// EOF is not an answer. `read_line` reports it as `Ok(0)`, which is
+/// indistinguishable from a blank line unless the count is checked, and
+/// an unchecked count turns an exhausted stdin into a vector of empty
+/// key shares that `save_unseal_keys` then writes over a real one.
+fn prompt_line(input: &mut dyn BufRead, prompt: &str, messages: &Messages) -> Result<String> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout()
+        .flush()
+        .with_context(|| messages.error_prompt_flush_failed())?;
+    let mut line = String::new();
+    let read = input
+        .read_line(&mut line)
+        .with_context(|| messages.error_prompt_read_failed())?;
+    if read == 0 {
+        anyhow::bail!(messages.error_prompt_eof());
+    }
+    Ok(line.trim().to_string())
 }
 
 /// CLI handler for `bootroot openbao save-unseal-keys`.
@@ -117,6 +139,8 @@ pub(crate) fn read_unseal_keys_from_file(path: &Path, messages: &Messages) -> Re
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -140,5 +164,86 @@ mod tests {
 
         let err = read_unseal_keys_from_file(&file_path, &test_messages()).unwrap_err();
         assert!(err.to_string().contains("Unseal key file is empty"));
+    }
+
+    /// EOF at the threshold prompt is not a blank answer.
+    #[test]
+    fn test_read_unseal_keys_errors_on_eof_at_threshold() {
+        let messages = test_messages();
+        let mut input = Cursor::new("");
+
+        let err = read_unseal_keys(&mut input, None, &messages)
+            .expect_err("EOF at the threshold prompt must error");
+        assert_eq!(err.to_string(), messages.error_prompt_eof());
+    }
+
+    /// The reported destruction path: the threshold is answered and the
+    /// shares are not, so every remaining read hits EOF.  Before the EOF
+    /// check this returned three empty strings, which `save_unseal_keys`
+    /// happily wrote over an existing key file.
+    #[test]
+    fn test_read_unseal_keys_errors_on_eof_after_threshold() {
+        let messages = test_messages();
+        let mut input = Cursor::new("3\n");
+
+        let err = read_unseal_keys(&mut input, None, &messages)
+            .expect_err("EOF at a key-share prompt must error");
+        assert_eq!(err.to_string(), messages.error_prompt_eof());
+    }
+
+    /// EOF partway through the shares errors rather than padding the
+    /// vector with the shares the operator never pasted.
+    #[test]
+    fn test_read_unseal_keys_errors_on_eof_midway() {
+        let messages = test_messages();
+        let mut input = Cursor::new("3\nkey-a\nkey-b\n");
+
+        let err = read_unseal_keys(&mut input, None, &messages)
+            .expect_err("EOF before the last share must error");
+        assert_eq!(err.to_string(), messages.error_prompt_eof());
+    }
+
+    #[test]
+    fn test_read_unseal_keys_reads_threshold_and_shares() {
+        let messages = test_messages();
+        let mut input = Cursor::new("2\n key-a \nkey-b\n");
+
+        let keys = read_unseal_keys(&mut input, None, &messages).expect("keys");
+        assert_eq!(keys, vec!["key-a".to_string(), "key-b".to_string()]);
+    }
+
+    /// A supplied threshold skips the threshold prompt, so the first
+    /// line read is a key share rather than a count.
+    #[test]
+    fn test_read_unseal_keys_skips_threshold_prompt_when_supplied() {
+        let messages = test_messages();
+        let mut input = Cursor::new("key-a\nkey-b\n");
+
+        let keys = read_unseal_keys(&mut input, Some(2), &messages).expect("keys");
+        assert_eq!(keys, vec!["key-a".to_string(), "key-b".to_string()]);
+    }
+
+    /// A threshold that does not parse is an invalid threshold, not a
+    /// read failure.
+    #[test]
+    fn test_read_unseal_keys_errors_on_unparsable_threshold() {
+        let messages = test_messages();
+        let mut input = Cursor::new("abc\n");
+
+        let err = read_unseal_keys(&mut input, None, &messages)
+            .expect_err("a non-numeric threshold must error");
+        assert_eq!(err.to_string(), messages.error_invalid_unseal_threshold());
+    }
+
+    /// A blank line the operator typed is still a blank line: it reaches
+    /// the parse and fails there, distinct from the EOF error above.
+    #[test]
+    fn test_read_unseal_keys_treats_blank_threshold_as_parse_failure() {
+        let messages = test_messages();
+        let mut input = Cursor::new("\n");
+
+        let err = read_unseal_keys(&mut input, None, &messages)
+            .expect_err("a blank threshold must error");
+        assert_eq!(err.to_string(), messages.error_invalid_unseal_threshold());
     }
 }
