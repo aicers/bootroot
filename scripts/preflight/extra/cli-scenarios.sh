@@ -85,7 +85,12 @@ run_init_scenario() {
 
   wait_for_postgres_admin
   log "Running bootroot init"
-  BOOTROOT_LANG=en printf "y\ny\ny\nn\n" | cargo run --bin bootroot -- init \
+  # One answer per prompt this run reaches.  `secrets/` and `state.json`
+  # were removed above, so no overwrite confirmation fires: `y` confirms
+  # the `db-provision` feature, then EAB registration and saving the
+  # unseal keys are both declined.  An answer short of the last prompt
+  # aborts the run — init fails on EOF rather than answering itself.
+  printf "y\nn\nn\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
     --enable auto-generate,show-secrets,db-provision \
     --summary-json "$INIT_SUMMARY_JSON" \
     --http-hmac "$responder_hmac" \

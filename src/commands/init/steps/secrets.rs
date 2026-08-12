@@ -1,3 +1,5 @@
+use std::io::{self, BufRead};
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use bootroot::openbao::OpenBaoClient;
@@ -5,7 +7,7 @@ use bootroot::openbao::OpenBaoClient;
 use super::super::constants::SECRET_BYTES;
 use super::super::constants::openbao_constants::PATH_AGENT_EAB;
 use super::super::types::EabCredentials;
-use super::prompts::{prompt_text, prompt_yes_no};
+use super::prompts::{prompt_text, prompt_yes_no, read_prompt_text};
 use super::{InitRollback, InitSecrets};
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::i18n::Messages;
@@ -134,7 +136,10 @@ pub(super) async fn maybe_register_eab(
         return Ok(None);
     }
     println!("{}", messages.eab_prompt_instructions());
-    let credentials = prompt_eab_with_validation(messages)?;
+    // The lock is a temporary that dies with this statement: holding it
+    // in a local across the `register_eab_secret` await below would make
+    // this future non-`Send`.
+    let credentials = prompt_eab_with_validation(&mut io::stdin().lock(), messages)?;
     register_eab_secret(
         client,
         &args.openbao.kv_mount,
@@ -151,10 +156,18 @@ pub(super) async fn maybe_register_eab(
 /// aborts with Ctrl-C and re-runs `init` (eventually with `--no-eab`).
 /// Coercing blank-to-"no EAB" silently here would leak the same garbage
 /// (kid="", hmac="") into KV that issue #588 §3 closes.
-fn prompt_eab_with_validation(messages: &Messages) -> Result<EabCredentials> {
+///
+/// This is the only `init` prompt that retries, so it is the only one
+/// that needs the reader threaded in: an EOF that the primitive turns
+/// into an error terminates the loop here instead of spinning on an
+/// answer that will never arrive.
+fn prompt_eab_with_validation(
+    input: &mut dyn BufRead,
+    messages: &Messages,
+) -> Result<EabCredentials> {
     loop {
-        let kid = prompt_text(messages.prompt_eab_kid(), messages)?;
-        let hmac = prompt_text(messages.prompt_eab_hmac(), messages)?;
+        let kid = read_prompt_text(input, messages.prompt_eab_kid(), messages)?;
+        let hmac = read_prompt_text(input, messages.prompt_eab_hmac(), messages)?;
         match validate_eab(&kid, &hmac) {
             Ok(creds) => return Ok(creds),
             Err(err) => {
@@ -389,6 +402,51 @@ mod tests {
             !resolved.stepca_password.is_empty(),
             "reinit_mode must auto-generate a fresh step-ca password instead of prompting"
         );
+    }
+
+    /// Regression for the reported symptom: with stdin at EOF the EAB
+    /// prompt used to read `""` for both fields forever, printing the
+    /// validation error once per iteration (gigabytes of it) until the
+    /// process was killed.  It must terminate on the first read instead.
+    #[test]
+    fn prompt_eab_with_validation_errors_on_eof_without_looping() {
+        use std::io::Cursor;
+
+        let messages = test_messages();
+        let err = prompt_eab_with_validation(&mut Cursor::new(""), &messages)
+            .expect_err("EOF must error instead of looping");
+        assert_eq!(err.to_string(), messages.error_prompt_eof());
+    }
+
+    /// The shape a piped answer sequence actually runs out in: the
+    /// `kid` is answered and the `hmac` is not.  A partially answered
+    /// attempt must fail on the missing read rather than complete the
+    /// pair with `""` and retry, which is how the loop used to spin.
+    #[test]
+    fn prompt_eab_with_validation_errors_on_eof_midway_through_a_pair() {
+        use std::io::Cursor;
+
+        let messages = test_messages();
+        let err = prompt_eab_with_validation(&mut Cursor::new("kid-1\n"), &messages)
+            .expect_err("a half-answered pair must error, not retry");
+        assert_eq!(err.to_string(), messages.error_prompt_eof());
+    }
+
+    /// The EOF fix must not turn a recoverable typo into a hard failure:
+    /// a rejected attempt followed by a valid pair still loops once and
+    /// returns the valid credentials.
+    #[test]
+    fn prompt_eab_with_validation_retries_after_a_rejected_attempt() {
+        use std::io::Cursor;
+
+        let messages = test_messages();
+        let hmac = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xCD; 32]);
+        // First attempt: a one-character HMAC, the #588 §3a symptom.
+        let script = format!("kid-1\ny\nkid-2\n{hmac}\n");
+        let creds = prompt_eab_with_validation(&mut Cursor::new(script), &messages)
+            .expect("a rejected attempt must be retried, not fatal");
+        assert_eq!(creds.kid, "kid-2");
+        assert_eq!(creds.hmac, hmac);
     }
 
     #[test]

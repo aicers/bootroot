@@ -26,8 +26,12 @@ echo "[test-core] installing infrastructure"
 cargo run --bin bootroot -- infra install
 
 # --- Zero-config Init (answer n, no show-secrets) ---
+# Two answers, one per prompt this run reaches: decline EAB registration,
+# then decline saving the unseal keys.  The second `n` is what makes the
+# assertion below exercise the declined path deliberately — `init` fails
+# on EOF rather than reading an unanswered prompt as "no".
 echo "[test-core] zero-config init (answer n, no show-secrets)"
-BOOTROOT_LANG=en printf "n\n" | cargo run --bin bootroot -- init \
+printf "n\nn\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
   --enable auto-generate \
   --http-hmac "dev-hmac" \
   --secrets-dir "$BOOTROOT_SECRETS_DIR" \
@@ -46,8 +50,11 @@ cargo run --bin bootroot -- clean -y
 cargo run --bin bootroot -- infra install
 
 # --- CLI Init ---
+# `clean -y` above removed password.txt, ca.json and state.json, so no
+# overwrite confirmation fires here: the two prompts this run reaches
+# are EAB registration and saving the unseal keys, both declined.
 echo "[test-core] CLI init (smoke)"
-BOOTROOT_LANG=en printf "y\ny\ny\nn\n" | cargo run --bin bootroot -- init \
+printf "n\nn\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
   --enable auto-generate,show-secrets \
   --http-hmac "dev-hmac" \
   --secrets-dir "$BOOTROOT_SECRETS_DIR" \

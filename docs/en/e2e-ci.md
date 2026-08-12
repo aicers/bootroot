@@ -159,11 +159,14 @@ bootroot infra install --compose-file "$COMPOSE_FILE"
 # DB credentials are read from .env created by infra install.
 # POSTGRES_HOST and POSTGRES_PORT are set by the script so that
 # build_admin_dsn_from_env() connects via the host-mapped port.
-BOOTROOT_LANG=en printf "y\n" | bootroot init \
+# The piped sequence must answer every prompt the run reaches: init
+# fails on EOF rather than answering an unanswered prompt itself.
+printf "y\ny\ny\n" | BOOTROOT_LANG=en bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets,db-provision \
+  --no-eab \
   --db-user "step" \
   --db-name "stepca" \
   --responder-url "$RESPONDER_URL"
@@ -301,7 +304,7 @@ Actual commands (script excerpt):
 ```bash
 # control node: infra-install / init / service-add
 bootroot infra install --compose-file "$COMPOSE_FILE"
-BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
+printf "y\ny\nn\n" | BOOTROOT_LANG=en bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \
   --eab-hmac "$INIT_EAB_HMAC"

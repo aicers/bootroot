@@ -600,6 +600,18 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
 `--no-save-unseal-keys`, OpenBao 상태에 따라
 `--root-token`/`--unseal-key`).
 
+읽을 입력이 남아 있지 않은 상태에서 프롬프트에 도달하면(stdin이
+닫혔거나 파이프로 넘긴 답변이 모자란 경우) 그 프롬프트는 답변으로
+처리되지 않고 `no input available (stdin reached EOF / not a
+terminal)` 오류로 실행이 중단됩니다. Enter 입력은 그대로입니다. 빈
+줄은 여전히 빈 답변이거나 제시된 기본값이거나 `n`입니다. 따라서
+파이프로 `init`을 구동하는 스크립트는 실행이 도달하는 프롬프트마다
+답변을 하나씩 공급하거나 해당 프롬프트를 억제하는 플래그를 지정해야
+합니다. 예외는 "Save unseal keys to file for automatic unseal?"
+프롬프트 하나로, 이 지점에서 입력이 떨어지면 실행이 실패하기 전에
+새로 생성된 unseal key를 평문으로 출력합니다. 부분 초기화가 키를
+어디에도 남기지 않는 상황을 막기 위해서입니다.
+
 이전 `init`이 중간에 실패하고 롤백되었다면 OpenBao는 볼륨에 초기화된
 상태로 남아 있는 반면 bootroot에는 사용 가능한 root token이 없을 수
 있습니다. `init`은 시작 시 이 상태를 감지하고 불투명한
