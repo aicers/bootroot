@@ -267,6 +267,7 @@ pub(crate) fn strip_responder_tls_config(secrets_dir: &Path, messages: &Messages
 mod tests {
     use std::collections::BTreeMap;
 
+    use super::super::test_support::write_self_contained_fake_docker;
     use super::*;
     /// The responder container name a default install renders.
     const DEFAULT_RESPONDER_CONTAINER: &str = "bootroot-http01";
@@ -301,9 +302,9 @@ mod tests {
     #[test]
     fn reissue_falls_back_to_instance_scoped_sans() {
         let dir = tempfile::tempdir().unwrap();
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).unwrap();
-        crate::commands::rotate::test_support::write_fake_docker_script(&bin_dir.join("docker"));
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
 
         let secrets_dir = dir.path().join("secrets");
         let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
@@ -324,26 +325,10 @@ mod tests {
             expires_at: None,
         };
 
-        let args_log = dir.path().join("docker_args.log");
         let messages = crate::i18n::test_messages();
-        let _lock = crate::commands::rotate::test_support::env_lock();
-        let _path = crate::commands::rotate::test_support::ScopedEnvVar::set(
-            "PATH",
-            crate::commands::rotate::test_support::path_with_prepend(&bin_dir),
-        );
-        let _log = crate::commands::rotate::test_support::ScopedEnvVar::set(
-            crate::commands::rotate::test_support::TEST_DOCKER_ARGS_ENV,
-            &args_log,
-        );
 
-        reissue_http01_admin_tls_cert(
-            &secrets_dir,
-            &entry,
-            "insight-http01",
-            Path::new("docker"),
-            &messages,
-        )
-        .expect("re-issuance must succeed against the fake docker");
+        reissue_http01_admin_tls_cert(&secrets_dir, &entry, "insight-http01", &fake, &messages)
+            .expect("re-issuance must succeed against the fake docker");
 
         let log = std::fs::read_to_string(&args_log).unwrap_or_default();
         assert!(

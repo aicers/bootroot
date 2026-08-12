@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,7 +35,13 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
 
     print_verify_plan(&entry.service_name, agent_config, messages);
 
-    let agent_binary = resolve_agent_binary(args.agent_binary.as_deref(), messages)?;
+    let search_path = std::env::var_os("PATH");
+    let agent_binary = resolve_agent_binary(
+        args.agent_binary.as_deref(),
+        search_path.as_deref(),
+        Path::new("."),
+        messages,
+    )?;
     let status = Command::new(&agent_binary)
         .args(oneshot_agent_args(entry, agent_config))
         .status()
@@ -155,7 +161,20 @@ fn oneshot_agent_args(entry: &ServiceEntry, agent_config: &Path) -> Vec<OsString
     args
 }
 
-fn resolve_agent_binary(override_path: Option<&Path>, messages: &Messages) -> Result<PathBuf> {
+/// Resolves the agent executable from the explicit override, then a
+/// sibling of the running binary, then `search_path`.
+///
+/// `search_path` is the `PATH` value to search — `None` for a variable
+/// that is unset, which the error message distinguishes — and
+/// `empty_entry_base` is the directory an empty entry stands for.  Both
+/// are supplied by the caller rather than read here, so the search is
+/// exercised without moving anything process-global.
+fn resolve_agent_binary(
+    override_path: Option<&Path>,
+    search_path: Option<&OsStr>,
+    empty_entry_base: &Path,
+    messages: &Messages,
+) -> Result<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Some(path) = override_path {
@@ -176,7 +195,7 @@ fn resolve_agent_binary(override_path: Option<&Path>, messages: &Messages) -> Re
         }
     }
 
-    let (found, path_candidates) = find_on_path(AGENT_BINARY_NAME);
+    let (found, path_candidates) = find_on_path(AGENT_BINARY_NAME, search_path, empty_entry_base);
     for candidate in &path_candidates {
         candidates.push(candidate.display().to_string());
     }
@@ -190,17 +209,27 @@ fn resolve_agent_binary(override_path: Option<&Path>, messages: &Messages) -> Re
     anyhow::bail!(messages.error_bootroot_agent_not_found(&candidates.join(", ")));
 }
 
-fn find_on_path(name: &str) -> (Option<PathBuf>, Vec<PathBuf>) {
+/// Searches `search_path` for `name`, returning the first match and
+/// every candidate it looked at.
+///
+/// `search_path` is the `PATH` value itself rather than a variable name,
+/// and `empty_entry_base` is the directory an empty entry stands for —
+/// `.` for the production caller, which is what POSIX prescribes.
+fn find_on_path(
+    name: &str,
+    search_path: Option<&OsStr>,
+    empty_entry_base: &Path,
+) -> (Option<PathBuf>, Vec<PathBuf>) {
     let mut checked = Vec::new();
-    let Some(path_var) = std::env::var_os("PATH") else {
+    let Some(path_var) = search_path else {
         return (None, checked);
     };
     let mut found = None;
-    for dir in std::env::split_paths(&path_var) {
+    for dir in std::env::split_paths(path_var) {
         // POSIX treats an empty PATH entry (leading/trailing/doubled `:`) as
         // the current working directory, so normalise before searching.
         let search_dir = if dir.as_os_str().is_empty() {
-            PathBuf::from(".")
+            empty_entry_base.to_path_buf()
         } else {
             dir
         };
@@ -386,13 +415,9 @@ fn expected_dns_name(entry: &ServiceEntry, messages: &Messages) -> Result<String
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use tempfile::tempdir;
 
     use super::*;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_service_entry(delivery_mode: DeliveryMode) -> ServiceEntry {
         ServiceEntry {
@@ -635,46 +660,38 @@ mod tests {
 
     #[test]
     fn resolve_agent_binary_prefers_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let messages = crate::i18n::test_messages();
         let dir = tempdir().unwrap();
         let explicit = dir.path().join("bootroot-agent");
         write_executable(&explicit);
 
-        let resolved = resolve_agent_binary(Some(&explicit), &messages).unwrap();
+        // An empty search path is the honest input for a case whose
+        // whole point is that the override short-circuits the search.
+        let resolved =
+            resolve_agent_binary(Some(&explicit), None, Path::new("."), &messages).unwrap();
         assert_eq!(resolved, explicit);
     }
 
     #[test]
     fn resolve_agent_binary_falls_back_to_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let messages = crate::i18n::test_messages();
         let dir = tempdir().unwrap();
         let path_entry = dir.path().to_path_buf();
         let binary = path_entry.join(AGENT_BINARY_NAME);
         write_executable(&binary);
 
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: Serialized via ENV_LOCK so no other test mutates PATH concurrently.
-        unsafe {
-            std::env::set_var("PATH", path_entry.as_os_str());
-        }
-        let resolved = resolve_agent_binary(None, &messages);
-        // SAFETY: Same serialization guarantee as above.
-        unsafe {
-            match original_path {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-
-        let resolved = resolved.unwrap();
+        let resolved = resolve_agent_binary(
+            None,
+            Some(path_entry.as_os_str()),
+            Path::new("."),
+            &messages,
+        )
+        .unwrap();
         assert_eq!(resolved, binary);
     }
 
     #[test]
     fn resolve_agent_binary_error_names_candidates() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let messages = crate::i18n::test_messages();
         let dir = tempdir().unwrap();
         let missing = dir.path().join("no-such-agent");
@@ -684,19 +701,13 @@ mod tests {
         std::fs::create_dir_all(&path_dir_b).unwrap();
         let path_value = std::env::join_paths([&path_dir_a, &path_dir_b]).unwrap();
 
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: Serialized via ENV_LOCK so no other test mutates PATH concurrently.
-        unsafe {
-            std::env::set_var("PATH", &path_value);
-        }
-        let err = resolve_agent_binary(Some(&missing), &messages).unwrap_err();
-        // SAFETY: Same serialization guarantee as above.
-        unsafe {
-            match original_path {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
-        }
+        let err = resolve_agent_binary(
+            Some(&missing),
+            Some(path_value.as_os_str()),
+            Path::new("."),
+            &messages,
+        )
+        .unwrap_err();
 
         let rendered = err.to_string();
         assert!(
@@ -717,7 +728,6 @@ mod tests {
 
     #[test]
     fn resolve_agent_binary_error_lists_empty_path_segment_as_cwd() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let messages = crate::i18n::test_messages();
         let dir = tempdir().unwrap();
         let missing = dir.path().join("no-such-agent");
@@ -726,19 +736,15 @@ mod tests {
         // Leading separator yields an empty segment, which POSIX treats as `.`.
         let path_value = std::env::join_paths([PathBuf::new(), path_dir.clone()]).unwrap();
 
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: Serialized via ENV_LOCK so no other test mutates PATH concurrently.
-        unsafe {
-            std::env::set_var("PATH", &path_value);
-        }
-        let err = resolve_agent_binary(Some(&missing), &messages).unwrap_err();
-        // SAFETY: Same serialization guarantee as above.
-        unsafe {
-            match original_path {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
-        }
+        // The production `.` base, because what is pinned here is how an
+        // empty entry renders in the error.
+        let err = resolve_agent_binary(
+            Some(&missing),
+            Some(path_value.as_os_str()),
+            Path::new("."),
+            &messages,
+        )
+        .unwrap_err();
 
         let rendered = err.to_string();
         let cwd_candidate = PathBuf::from(".").join(AGENT_BINARY_NAME);
@@ -756,7 +762,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolve_agent_binary_uses_cwd_for_empty_path_segment() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let messages = crate::i18n::test_messages();
         let dir = tempdir().unwrap();
         let agent = dir.path().join(AGENT_BINARY_NAME);
@@ -766,48 +771,24 @@ mod tests {
         // Trailing separator yields an empty segment after the non-empty entry.
         let path_value = std::env::join_paths([path_dir, PathBuf::new()]).unwrap();
 
-        let original_path = std::env::var_os("PATH");
-        let original_cwd = std::env::current_dir().unwrap();
-        // SAFETY: Serialized via ENV_LOCK; cwd and PATH restored below.
-        unsafe {
-            std::env::set_var("PATH", &path_value);
-        }
-        std::env::set_current_dir(dir.path()).unwrap();
-        let resolved = resolve_agent_binary(None, &messages);
-        std::env::set_current_dir(&original_cwd).unwrap();
-        // SAFETY: Same serialization guarantee as above.
-        unsafe {
-            match original_path {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-
-        let resolved = resolved.expect("empty PATH segment should resolve via cwd");
-        // Relative candidate; resolution used the cwd we set above.
-        assert_eq!(resolved, PathBuf::from(".").join(AGENT_BINARY_NAME));
+        // The tempdir stands in for the working directory an empty entry
+        // means, so the resolution the process-wide `chdir` used to set
+        // up is exercised without moving this process anywhere.
+        let resolved =
+            resolve_agent_binary(None, Some(path_value.as_os_str()), dir.path(), &messages)
+                .expect("empty PATH segment should resolve via the empty-entry base");
+        assert_eq!(resolved, agent);
         assert!(agent.is_file());
     }
 
     #[test]
     fn resolve_agent_binary_error_handles_unset_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let messages = crate::i18n::test_messages();
         let dir = tempdir().unwrap();
         let missing = dir.path().join("no-such-agent");
 
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: Serialized via ENV_LOCK so no other test mutates PATH concurrently.
-        unsafe {
-            std::env::remove_var("PATH");
-        }
-        let err = resolve_agent_binary(Some(&missing), &messages).unwrap_err();
-        // SAFETY: Same serialization guarantee as above.
-        unsafe {
-            if let Some(value) = original_path {
-                std::env::set_var("PATH", value);
-            }
-        }
+        let err =
+            resolve_agent_binary(Some(&missing), None, Path::new("."), &messages).unwrap_err();
 
         let rendered = err.to_string();
         assert!(

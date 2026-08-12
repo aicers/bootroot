@@ -572,41 +572,13 @@ mod tests {
         assert!(!names.contains(&DEFAULT_CA_CONTAINER.to_string()));
     }
 
+    /// The executable seam: the caller names the program, and the child
+    /// that runs is the one it named.
+    ///
     /// The restart bypasses Compose, so nothing but the name it is
     /// handed decides which install's sidecar goes down.  It used to
     /// inline a default-instance literal, which on a non-default
     /// instance restarted a co-located default install's sidecar.
-    #[test]
-    fn restarting_the_stepca_sidecar_names_the_container_it_is_given() {
-        use crate::commands::rotate::test_support::{
-            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
-            write_fake_docker_script,
-        };
-
-        let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
-        let args_log = dir.path().join("docker_args.log");
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _args = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
-
-        assert!(restart_stepca_openbao_agent(
-            "insight-openbao-agent-stepca",
-            Path::new("docker")
-        ));
-
-        let logged = fs::read_to_string(&args_log).expect("read docker args");
-        assert_eq!(
-            logged.lines().collect::<Vec<&str>>(),
-            vec!["restart", "insight-openbao-agent-stepca"]
-        );
-    }
-
-    /// The executable seam: the caller names the program, and the child
-    /// that runs is the one it named.
     ///
     /// The fake carries its own argv-log path in its script text, so
     /// nothing here sets a variable on this process or edits `PATH` —

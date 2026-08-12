@@ -278,88 +278,17 @@ async fn run_rotate_with_exec(
     Ok(RotateOutcome::Completed)
 }
 
-/// Shared test harness for commands that shell out to `docker`.
+/// Test harness for the `rotate` commands that shell out to `docker`.
 ///
-/// The fake-`docker` script and the environment scoping around it are
-/// `pub(in crate::commands)` rather than `pub(super)` because the
-/// `OpenBao` TLS transition in `init` asserts on the docker argv it
-/// emits with the same harness.
+/// It is private to this module and its descendants: a test names the
+/// fake executable through the `docker` seam production already
+/// carries, so nothing outside `rotate` reaches in here any more.
 #[cfg(test)]
-pub(super) mod test_support {
-    use std::env;
-    use std::ffi::{OsStr, OsString};
+mod test_support {
     use std::fs;
     use std::path::Path;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     pub(super) use crate::i18n::test_messages;
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-    pub(in crate::commands) const TEST_DOCKER_ARGS_ENV: &str = "BOOTROOT_TEST_DOCKER_ARGS";
-
-    pub(in crate::commands) struct ScopedEnvVar {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl ScopedEnvVar {
-        pub(in crate::commands) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let previous = env::var_os(key);
-            // SAFETY: Tests hold ENV_LOCK while mutating process environment.
-            unsafe {
-                env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for ScopedEnvVar {
-        fn drop(&mut self) {
-            // SAFETY: Tests hold ENV_LOCK while mutating process environment.
-            unsafe {
-                if let Some(previous) = &self.previous {
-                    env::set_var(self.key, previous);
-                } else {
-                    env::remove_var(self.key);
-                }
-            }
-        }
-    }
-
-    pub(in crate::commands) fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .expect("environment lock must not be poisoned")
-    }
-
-    pub(in crate::commands) fn write_fake_docker_script(path: &Path) {
-        let script = r#"#!/bin/sh
-set -eu
-printf '%s\n' "$@" > "${BOOTROOT_TEST_DOCKER_ARGS:?missing log path}"
-if [ -n "${BOOTROOT_TEST_DOCKER_STDERR:-}" ]; then
-  printf '%s' "${BOOTROOT_TEST_DOCKER_STDERR}" 1>&2
-fi
-if [ -n "${BOOTROOT_TEST_DOCKER_EXIT:-}" ]; then
-  exit "${BOOTROOT_TEST_DOCKER_EXIT}"
-fi
-exit 0
-"#;
-        fs::write(path, script).expect("fake docker script should be written");
-        #[cfg(unix)]
-        fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .expect("fake docker script should be executable");
-    }
-
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
-    pub(in crate::commands) fn path_with_prepend(bin_dir: &Path) -> OsString {
-        let mut paths = vec![bin_dir.to_path_buf()];
-        if let Some(existing) = env::var_os("PATH") {
-            paths.extend(env::split_paths(&existing));
-        }
-        env::join_paths(paths).expect("PATH components should be valid")
-    }
 
     /// Writes a fake `docker` at `path` that appends one record per
     /// invocation to `args_log` and reads nothing from its environment.
