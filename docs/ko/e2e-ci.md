@@ -158,7 +158,7 @@ bootroot infra install --compose-file "$COMPOSE_FILE"
 # host-mapped 포트를 통해 연결합니다.
 # 파이프로 넘기는 답변은 해당 실행이 도달하는 모든 프롬프트를 채워야
 # 합니다. init은 EOF를 답으로 읽지 않고 실행을 실패시킵니다.
-BOOTROOT_LANG=en printf "y\ny\ny\n" | bootroot init \
+printf "y\ny\ny\n" | BOOTROOT_LANG=en bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
@@ -295,7 +295,7 @@ sudo -n cp "$tmp_file" /etc/hosts
 ```bash
 # control node: infra-install / init / service-add
 bootroot infra install --compose-file "$COMPOSE_FILE"
-BOOTROOT_LANG=en printf "y\ny\nn\n" | bootroot init \
+printf "y\ny\nn\n" | BOOTROOT_LANG=en bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \
   --eab-hmac "$INIT_EAB_HMAC"

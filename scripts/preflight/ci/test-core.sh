@@ -31,7 +31,7 @@ cargo run --bin bootroot -- infra install
 # assertion below exercise the declined path deliberately — `init` fails
 # on EOF rather than reading an unanswered prompt as "no".
 echo "[test-core] zero-config init (answer n, no show-secrets)"
-BOOTROOT_LANG=en printf "n\nn\n" | cargo run --bin bootroot -- init \
+printf "n\nn\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
   --enable auto-generate \
   --http-hmac "dev-hmac" \
   --secrets-dir "$BOOTROOT_SECRETS_DIR" \
@@ -54,7 +54,7 @@ cargo run --bin bootroot -- infra install
 # overwrite confirmation fires here: the two prompts this run reaches
 # are EAB registration and saving the unseal keys, both declined.
 echo "[test-core] CLI init (smoke)"
-BOOTROOT_LANG=en printf "n\nn\n" | cargo run --bin bootroot -- init \
+printf "n\nn\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
   --enable auto-generate,show-secrets \
   --http-hmac "dev-hmac" \
   --secrets-dir "$BOOTROOT_SECRETS_DIR" \

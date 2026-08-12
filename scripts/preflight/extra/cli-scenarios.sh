@@ -90,7 +90,7 @@ run_init_scenario() {
   # the `db-provision` feature, then EAB registration and saving the
   # unseal keys are both declined.  An answer short of the last prompt
   # aborts the run — init fails on EOF rather than answering itself.
-  BOOTROOT_LANG=en printf "y\nn\nn\n" | cargo run --bin bootroot -- init \
+  printf "y\nn\nn\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
     --enable auto-generate,show-secrets,db-provision \
     --summary-json "$INIT_SUMMARY_JSON" \
     --http-hmac "$responder_hmac" \
