@@ -16,6 +16,11 @@ use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub(crate) const ROOT_TOKEN: &str = "root-token";
+/// The unseal keys [`stub_openbao_uninitialized`] hands back from
+/// `POST /v1/sys/init`.  Distinctive enough that a test can assert they
+/// reached the operator's terminal.
+pub(crate) const GENERATED_UNSEAL_KEYS: &[&str] =
+    &["generated-unseal-key-one", "generated-unseal-key-two"];
 const POLICY_NAMES: &[&str] = &[
     "bootroot-agent",
     "bootroot-responder",
@@ -238,6 +243,25 @@ pub(crate) async fn stub_openbao(server: &MockServer) {
     stub_kv_secrets(server).await;
 }
 
+/// Stubs an `OpenBao` that `init` has to initialize itself, handing back
+/// [`GENERATED_UNSEAL_KEYS`] and leaving the vault unsealed.
+///
+/// This is the only path that reaches the save-unseal-keys prompt: the
+/// prompt fires only when `init` generated the keys during this run, so
+/// a stub reporting an already-initialized vault never gets there.
+pub(crate) async fn stub_openbao_uninitialized(server: &MockServer) {
+    stub_health(server).await;
+    stub_init_status_uninitialized(server).await;
+    stub_seal_status(server).await;
+    stub_sys_init(server).await;
+    stub_kv_mount(server).await;
+    stub_auth_backends(server).await;
+    stub_audit_backend(server).await;
+    stub_policies(server).await;
+    stub_approles(server).await;
+    stub_kv_secrets(server).await;
+}
+
 pub(crate) async fn stub_openbao_expect_audit(server: &MockServer) {
     stub_health(server).await;
     stub_init_status(server).await;
@@ -363,6 +387,17 @@ async fn stub_init_status(server: &MockServer) {
         .and(path("/v1/sys/init"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "initialized": true
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn stub_sys_init(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/sys/init"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "keys": GENERATED_UNSEAL_KEYS,
+            "root_token": ROOT_TOKEN
         })))
         .mount(server)
         .await;

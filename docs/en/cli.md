@@ -610,6 +610,17 @@ prompts on the run still need their own flags (`--no-eab` or
 `--no-save-unseal-keys`, and `--root-token`/`--unseal-key` where the
 OpenBao state requires them).
 
+A prompt that is reached with nothing left to read — stdin closed, or a
+piped answer sequence that ran out — aborts the run with `no input
+available (stdin reached EOF / not a terminal)` instead of being
+answered. Pressing Enter is unaffected: a blank line is still the empty
+answer, the offered default, or `n`. So a script driving `init` over a
+pipe must supply one answer per prompt the run reaches, or set the flag
+that suppresses it. The one exception is the "Save unseal keys to file
+for automatic unseal?" prompt: running out of input there still echoes
+the freshly generated keys in cleartext before the run fails, so a
+partial init cannot leave them recorded nowhere.
+
 If a previous `init` failed mid-flight and rolled back, OpenBao may
 remain initialised in its volume while bootroot has no usable root
 token. `init` detects this state on startup and emits an actionable

@@ -418,6 +418,20 @@ mod tests {
         assert_eq!(err.to_string(), messages.error_prompt_eof());
     }
 
+    /// The shape a piped answer sequence actually runs out in: the
+    /// `kid` is answered and the `hmac` is not.  A partially answered
+    /// attempt must fail on the missing read rather than complete the
+    /// pair with `""` and retry, which is how the loop used to spin.
+    #[test]
+    fn prompt_eab_with_validation_errors_on_eof_midway_through_a_pair() {
+        use std::io::Cursor;
+
+        let messages = test_messages();
+        let err = prompt_eab_with_validation(&mut Cursor::new("kid-1\n"), &messages)
+            .expect_err("a half-answered pair must error, not retry");
+        assert_eq!(err.to_string(), messages.error_prompt_eof());
+    }
+
     /// The EOF fix must not turn a recoverable typo into a hard failure:
     /// a rejected attempt followed by a valid pair still loops once and
     /// returns the valid credentials.

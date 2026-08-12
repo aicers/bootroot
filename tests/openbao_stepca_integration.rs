@@ -14,10 +14,10 @@ mod unix_integration {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::support::{
-        ROOT_TOKEN, create_secrets_dir, expect_rollback_deletes, stub_openbao,
-        stub_openbao_audit_failure, stub_openbao_expect_audit, stub_openbao_sealed,
-        stub_openbao_unseal_failure, stub_openbao_with_write_failure, write_dotenv_file,
-        write_fake_docker, write_fake_docker_with_status, write_password_file,
+        GENERATED_UNSEAL_KEYS, ROOT_TOKEN, create_secrets_dir, expect_rollback_deletes,
+        stub_openbao, stub_openbao_audit_failure, stub_openbao_expect_audit, stub_openbao_sealed,
+        stub_openbao_uninitialized, stub_openbao_unseal_failure, stub_openbao_with_write_failure,
+        write_dotenv_file, write_fake_docker, write_fake_docker_with_status, write_password_file,
     };
 
     /// Drives `command` with a fixed answer sequence.
@@ -91,6 +91,77 @@ mod unix_integration {
         assert!(
             stdout.contains("bootroot init: summary"),
             "stdout was: {stdout}"
+        );
+        Ok(())
+    }
+
+    /// The save-unseal-keys prompt runs after `run_init_inner` has
+    /// returned, outside the rollback envelope, on keys that exist
+    /// nowhere else yet.  Running out of input there must still hand
+    /// them to the operator in cleartext and only then fail, so a run
+    /// that outlives its answers cannot leave the vault initialized with
+    /// its keys recorded nowhere.
+    #[tokio::test]
+    async fn init_echoes_unseal_keys_when_the_save_prompt_runs_out_of_input() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao_uninitialized(&server).await;
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        // `--no-eab` and `--overwrite-ca-json` answer the two prompts
+        // that would otherwise fire first, so the save-unseal-keys
+        // prompt is the one the empty stdin lands on.
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--enable",
+                "auto-generate",
+                "--no-eab",
+                "--overwrite-ca-json",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path)
+            .env("BOOTROOT_LANG", "en");
+        let output =
+            run_command_with_input(&mut command, "").context("Failed to run bootroot init")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "an unanswerable prompt must fail the run: {stdout}"
+        );
+        for key in GENERATED_UNSEAL_KEYS {
+            assert!(
+                stdout.contains(key),
+                "unseal key {key} must still reach the operator: {stdout}"
+            );
+        }
+        assert!(
+            stderr.contains("Unseal keys were NOT saved to a file"),
+            "the echo must be the declined branch's, warning included: {stderr}"
+        );
+        assert!(
+            stderr.contains("no input available"),
+            "the run must name EOF as the reason: {stderr}"
         );
         Ok(())
     }

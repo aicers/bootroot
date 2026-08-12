@@ -156,11 +156,14 @@ bootroot infra install --compose-file "$COMPOSE_FILE"
 # DB 자격 증명은 infra install이 생성한 .env에서 자동으로 읽힙니다.
 # POSTGRES_HOST와 POSTGRES_PORT는 스크립트에서 설정하여
 # host-mapped 포트를 통해 연결합니다.
-BOOTROOT_LANG=en printf "y\n" | bootroot init \
+# 파이프로 넘기는 답변은 해당 실행이 도달하는 모든 프롬프트를 채워야
+# 합니다. init은 EOF를 답으로 읽지 않고 실행을 실패시킵니다.
+BOOTROOT_LANG=en printf "y\ny\ny\n" | bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets,db-provision \
+  --no-eab \
   --db-user "step" \
   --db-name "stepca" \
   --responder-url "$RESPONDER_URL"
