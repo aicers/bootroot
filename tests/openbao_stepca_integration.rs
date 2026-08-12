@@ -20,6 +20,12 @@ mod unix_integration {
         write_fake_docker, write_fake_docker_with_status, write_password_file,
     };
 
+    /// Drives `command` with a fixed answer sequence.
+    ///
+    /// The sequence must cover every prompt the run reaches: `init`
+    /// fails on EOF rather than answering the remainder itself, so a
+    /// short sequence aborts the run with "no input available" instead
+    /// of proceeding on an answer nobody gave.
     fn run_command_with_input(command: &mut Command, input: &str) -> Result<Output> {
         let mut child = command
             .stdin(Stdio::piped())
@@ -74,8 +80,8 @@ mod unix_integration {
                 compose_file.to_string_lossy().as_ref(),
             ])
             .env("PATH", combined_path);
-        let output =
-            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+        let output = run_command_with_input(&mut command, "y\nn\n")
+            .context("Failed to run bootroot init")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -124,8 +130,8 @@ mod unix_integration {
                 compose_file.to_string_lossy().as_ref(),
             ])
             .env("PATH", combined_path);
-        let output =
-            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+        let output = run_command_with_input(&mut command, "y\nn\n")
+            .context("Failed to run bootroot init")?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
@@ -170,8 +176,8 @@ mod unix_integration {
                 compose_file.to_string_lossy().as_ref(),
             ])
             .env("PATH", combined_path);
-        let output =
-            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+        let output = run_command_with_input(&mut command, "y\nn\n")
+            .context("Failed to run bootroot init")?;
 
         assert!(
             !output.status.success(),
@@ -229,8 +235,8 @@ mod unix_integration {
                 &responder.uri(),
             ])
             .env("PATH", combined_path);
-        let output =
-            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+        let output = run_command_with_input(&mut command, "y\nn\n")
+            .context("Failed to run bootroot init")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -283,8 +289,8 @@ mod unix_integration {
                 &responder.uri(),
             ])
             .env("PATH", combined_path);
-        let output =
-            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+        let output = run_command_with_input(&mut command, "y\nn\n")
+            .context("Failed to run bootroot init")?;
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -338,8 +344,8 @@ mod unix_integration {
                 "responder-check",
             ])
             .env("PATH", combined_path);
-        let output =
-            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+        let output = run_command_with_input(&mut command, "y\nn\n")
+            .context("Failed to run bootroot init")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -378,8 +384,8 @@ mod unix_integration {
                 compose_file.to_string_lossy().as_ref(),
             ])
             .env("PATH", combined_path);
-        let output =
-            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+        let output = run_command_with_input(&mut command, "y\nn\n")
+            .context("Failed to run bootroot init")?;
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -422,8 +428,8 @@ mod unix_integration {
                 compose_file.to_string_lossy().as_ref(),
             ])
             .env("PATH", combined_path);
-        let output =
-            run_command_with_input(&mut command, "y\n").context("Failed to run bootroot init")?;
+        let output = run_command_with_input(&mut command, "y\nn\n")
+            .context("Failed to run bootroot init")?;
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -472,7 +478,7 @@ mod unix_integration {
                 "responder-check",
             ])
             .env("PATH", combined_path);
-        let output = run_command_with_input(&mut command, "y\ny\n")
+        let output = run_command_with_input(&mut command, "y\ny\nn\n")
             .context("Failed to run bootroot init")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -525,7 +531,7 @@ mod unix_integration {
                 compose_file.to_string_lossy().as_ref(),
             ])
             .env("PATH", combined_path);
-        let output = run_command_with_input(&mut command, "y\ny\n")
+        let output = run_command_with_input(&mut command, "y\ny\nn\n")
             .context("Failed to run bootroot init")?;
 
         assert!(!output.status.success());

@@ -117,6 +117,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed `bootroot init` treating a closed stdin as an answer. Every
+  `init` prompt read the terminating EOF as an empty line, so a run
+  whose piped answer sequence ran out answered the rest of its prompts
+  itself: the EAB credential prompt re-prompted forever (over five
+  gigabytes of output in one observed run, ending only when the process
+  was killed), and the remaining prompts took an empty string —
+  silently skipping EAB registration, declining to save freshly
+  generated unseal keys, or accepting a default nobody chose. A prompt
+  with no input left now fails the run with "no input available (stdin
+  reached EOF / not a terminal)". Pressing Enter is unchanged: a blank
+  line still means the empty answer, the offered default, or "no".
+  Where the unseal-key save prompt is the one that runs out, the keys
+  are still echoed in cleartext before the run fails, so a partial init
+  cannot leave them recorded nowhere. The confirmations in
+  `bootroot clean` and `bootroot reinit` now report the same error
+  instead of quietly declining; both still decline to act.
 - Fixed the published manual having no styling at all. The theme was
   installed into a dot-prefixed directory under `docs/`, and MkDocs
   excludes every dot-prefixed path inside `docs_dir` from the build, so

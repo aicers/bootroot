@@ -1074,7 +1074,21 @@ async fn maybe_save_unseal_keys(
         SaveUnsealKeysDecision::Save => true,
         SaveUnsealKeysDecision::DoNotSave => false,
         SaveUnsealKeysDecision::Prompt => {
-            prompt_yes_no(messages.prompt_save_unseal_keys(), messages)?
+            match prompt_yes_no(messages.prompt_save_unseal_keys(), messages) {
+                Ok(answer) => answer,
+                Err(err) => {
+                    // The prompt could not be answered — stdin is at EOF, or
+                    // the read failed.  This runs outside the rollback
+                    // envelope with OpenBao already initialised and unsealed,
+                    // and the keys exist nowhere else yet, so echo them
+                    // before failing: the run still exits nonzero, but the
+                    // operator's last capture channel stays open instead of
+                    // recreating the partial-init trap the comment in
+                    // `run_init` describes.
+                    echo_unseal_keys_cleartext(keys, messages);
+                    return Err(err);
+                }
+            }
         }
     };
     if save {
@@ -1090,12 +1104,29 @@ async fn maybe_save_unseal_keys(
         // `--no-save-unseal-keys` the keys are already captured in the
         // 0600 summary JSON (clap enforces `requires = "summary_json"`),
         // so echoing them here would leak into CI logs — skip it.
-        eprintln!("{}", messages.openbao_unseal_keys_not_saved_warning());
-        for (idx, key) in keys.iter().enumerate() {
-            println!("{}", messages.summary_unseal_key(idx + 1, key));
-        }
+        echo_unseal_keys_cleartext(keys, messages);
     }
     Ok(())
+}
+
+/// Displays the unseal keys in cleartext, one line per key, so the
+/// operator can copy them for manual safekeeping.
+///
+/// Shared by the declined branch and the unanswerable-prompt branch of
+/// `maybe_save_unseal_keys` so both emit exactly the same thing.
+fn echo_unseal_keys_cleartext(keys: &[String], messages: &Messages) {
+    eprintln!("{}", messages.openbao_unseal_keys_not_saved_warning());
+    for line in unseal_key_echo_lines(keys, messages) {
+        println!("{line}");
+    }
+}
+
+/// Formats one cleartext line per unseal key, in key order.
+fn unseal_key_echo_lines(keys: &[String], messages: &Messages) -> Vec<String> {
+    keys.iter()
+        .enumerate()
+        .map(|(idx, key)| messages.summary_unseal_key(idx + 1, key))
+        .collect()
 }
 
 /// Rotates the temporary `POSTGRES_PASSWORD` from `.env` and returns
@@ -1866,6 +1897,26 @@ mod tests {
             "--no-save-unseal-keys must not write {}",
             path.display()
         );
+    }
+
+    /// The cleartext echo is one shared path, so the declined branch and
+    /// the branch that fails on an unanswerable prompt hand the operator
+    /// the same thing: one line per key, in key order.
+    #[test]
+    fn unseal_key_echo_lines_emits_one_line_per_key() {
+        let messages = test_messages();
+        let keys = vec!["key-1".to_string(), "key-2".to_string()];
+        let lines = unseal_key_echo_lines(&keys, &messages);
+        assert_eq!(lines.len(), keys.len());
+        for (idx, key) in keys.iter().enumerate() {
+            let line = lines.get(idx).expect("one line per key");
+            assert!(line.contains(key), "line {idx} must carry its key: {line}");
+            assert!(
+                line.contains(&(idx + 1).to_string()),
+                "line {idx} must be numbered from 1: {line}"
+            );
+        }
+        assert!(unseal_key_echo_lines(&[], &messages).is_empty());
     }
 
     /// `write_root_token_file` persists the token with mode `0600`.
