@@ -426,13 +426,17 @@ ensure_bind_host_available() {
   #
   # Not being able to enumerate at all is a different condition from the
   # address being absent, and it has a different fix: no value of the bind
-  # host variable helps a host that has neither `ip` nor `ifconfig`, so
-  # that case must not tell the operator to change the variable.
+  # host variable helps a host that cannot list its own addresses, so that
+  # case must not tell the operator to change the variable.  `pipefail`
+  # also routes a present-but-failing `ip` here, whose own stderr now
+  # reaches the operator, so the message covers both.
   local bind_host="$1" bind_var="$2" local_addrs
   if ! local_addrs="$(list_local_ipv4)"; then
-    fail "cannot enumerate local IPv4 addresses: neither ip (iproute2) nor ifconfig is installed"
+    fail "cannot enumerate local IPv4 addresses: neither ip (iproute2) nor ifconfig is installed and working"
   fi
-  if ! printf '%s\n' "$local_addrs" | grep -qx "$bind_host"; then
+  # -F: the bind host is data, not a pattern, so a value carrying regex
+  # metacharacters cannot match an address it is not.
+  if ! printf '%s\n' "$local_addrs" | grep -qFx "$bind_host"; then
     fail "non-loopback bind host $bind_host is not assigned to any local interface (set $bind_var to an address that is)"
   fi
 }
