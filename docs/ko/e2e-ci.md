@@ -156,17 +156,24 @@ bootroot infra install --compose-file "$COMPOSE_FILE"
 # DB 자격 증명은 infra install이 생성한 .env에서 자동으로 읽힙니다.
 # POSTGRES_HOST와 POSTGRES_PORT는 스크립트에서 설정하여
 # host-mapped 포트를 통해 연결합니다.
-# 파이프로 넘기는 답변은 해당 실행이 도달하는 모든 프롬프트를 채워야
-# 합니다. init은 EOF를 답으로 읽지 않고 실행을 실패시킵니다.
-printf "y\ny\ny\n" | BOOTROOT_LANG=en bootroot init \
+# 모든 프롬프트를 각자의 전용 플래그로 답하고 stdin을 닫아서 실행하므로,
+# 파이프로 넘기는 답변 순서에도 남아 있는 파일에도 의존하지 않습니다.
+# 대상 파일이 없는 overwrite 플래그는 아무 일도 하지 않습니다. init은
+# EOF를 답으로 읽지 않고 실행을 실패시킵니다.
+BOOTROOT_LANG=en bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets,db-provision \
   --no-eab \
+  --save-unseal-keys \
+  --overwrite-password \
+  --overwrite-ca-json \
+  --overwrite-state \
+  --confirm-db-provision \
   --db-user "step" \
   --db-name "stepca" \
-  --responder-url "$RESPONDER_URL"
+  --responder-url "$RESPONDER_URL" </dev/null
 
 # 3) service-add
 # 서로 다른 로컬 서비스는 각자 자신의 에이전트 설정을 사용합니다
@@ -295,10 +302,14 @@ sudo -n cp "$tmp_file" /etc/hosts
 ```bash
 # control node: infra-install / init / service-add
 bootroot infra install --compose-file "$COMPOSE_FILE"
-printf "y\ny\nn\n" | BOOTROOT_LANG=en bootroot init \
+BOOTROOT_LANG=en bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
-  --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \
-  --eab-hmac "$INIT_EAB_HMAC"
+  --enable auto-generate,show-secrets,db-provision \
+  --no-eab --save-unseal-keys \
+  --overwrite-password --overwrite-ca-json --overwrite-state \
+  --confirm-db-provision \
+  --db-user "step" --db-name "stepca" \
+  --responder-url "$RESPONDER_URL" </dev/null
 bootroot service add --service-name edge-proxy \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
 bootroot service add --service-name web-app \

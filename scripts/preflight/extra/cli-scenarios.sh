@@ -85,19 +85,27 @@ run_init_scenario() {
 
   wait_for_postgres_admin
   log "Running bootroot init"
-  # One answer per prompt this run reaches.  `secrets/` and `state.json`
-  # were removed above, so no overwrite confirmation fires: `y` confirms
-  # the `db-provision` feature, then EAB registration and saving the
-  # unseal keys are both declined.  An answer short of the last prompt
-  # aborts the run — init fails on EOF rather than answering itself.
-  printf "y\nn\nn\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
+  # Answer every prompt with its own flag and run with stdin closed,
+  # rather than relying on the cleanup above having removed `secrets/`
+  # and `state.json` so that a piped answer sequence lines up: an
+  # overwrite flag whose file is absent is a silent no-op.
+  # `--no-save-unseal-keys` declines persistence and suppresses the
+  # cleartext echo, which nothing here asserts on; the keys stay
+  # available in the 0600 summary JSON this run already writes.
+  BOOTROOT_LANG=en cargo run --bin bootroot -- init \
     --enable auto-generate,show-secrets,db-provision \
     --summary-json "$INIT_SUMMARY_JSON" \
     --http-hmac "$responder_hmac" \
+    --no-eab \
+    --no-save-unseal-keys \
+    --overwrite-password \
+    --overwrite-ca-json \
+    --overwrite-state \
+    --confirm-db-provision \
     --db-user "step" \
     --db-name "stepca" \
     --responder-url "http://localhost:8080" \
-    --skip responder-check | tee "$ROOT_DIR/tmp/cli-init.log"
+    --skip responder-check </dev/null | tee "$ROOT_DIR/tmp/cli-init.log"
 
   if [ ! -f "$INIT_SUMMARY_JSON" ]; then
     fail "Init summary JSON not found: $INIT_SUMMARY_JSON"

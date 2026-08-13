@@ -25,16 +25,24 @@ cargo test --test monitoring_integration
 echo "[test-core] installing infrastructure"
 cargo run --bin bootroot -- infra install
 
-# --- Zero-config Init (answer n, no show-secrets) ---
-# Two answers, one per prompt this run reaches: decline EAB registration,
-# then decline saving the unseal keys.  The second `n` is what makes the
-# assertion below exercise the declined path deliberately — `init` fails
-# on EOF rather than reading an unanswered prompt as "no".
-echo "[test-core] zero-config init (answer n, no show-secrets)"
-printf "n\nn\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
+# --- Zero-config Init (decline saving the unseal keys, no show-secrets) ---
+# Every prompt but one is answered by its own flag, so the run cannot
+# depend on which of password.txt, ca.json and state.json a previous run
+# left behind.  The single piped `n` answers the save-unseal-keys
+# prompt, and it stays an answer on purpose: only the declined branch of
+# that prompt echoes the keys in cleartext, which is what the assertion
+# below reads.  `--no-save-unseal-keys` suppresses that echo, so it must
+# not replace this answer.  `init` fails on EOF rather than reading an
+# unanswered prompt as "no".
+echo "[test-core] zero-config init (decline saving the unseal keys, no show-secrets)"
+printf "n\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
   --enable auto-generate \
   --http-hmac "dev-hmac" \
   --secrets-dir "$BOOTROOT_SECRETS_DIR" \
+  --no-eab \
+  --overwrite-password \
+  --overwrite-ca-json \
+  --overwrite-state \
   --responder-url "http://localhost:8080" \
   --skip responder-check 2>&1 | tee zero-config-init.log
 
@@ -50,14 +58,21 @@ cargo run --bin bootroot -- clean -y
 cargo run --bin bootroot -- infra install
 
 # --- CLI Init ---
-# `clean -y` above removed password.txt, ca.json and state.json, so no
-# overwrite confirmation fires here: the two prompts this run reaches
-# are EAB registration and saving the unseal keys, both declined.
+# The overwrite prompts are answered by their own flags rather than by
+# relying on `clean -y` above having removed password.txt, ca.json and
+# state.json, and `--no-eab` answers the EAB prompt.  The piped `n`
+# answers the save-unseal-keys prompt: declining it needs no flag here
+# because `--no-save-unseal-keys` requires `--summary-json`, which this
+# smoke run does not write.
 echo "[test-core] CLI init (smoke)"
-printf "n\nn\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
+printf "n\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
   --enable auto-generate,show-secrets \
   --http-hmac "dev-hmac" \
   --secrets-dir "$BOOTROOT_SECRETS_DIR" \
+  --no-eab \
+  --overwrite-password \
+  --overwrite-ca-json \
+  --overwrite-state \
   --responder-url "http://localhost:8080" \
   --skip responder-check | tee cli-init.log
 

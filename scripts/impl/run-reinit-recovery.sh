@@ -438,12 +438,12 @@ run_bootstrap_init() {
 
   log_phase "bootstrap-init"
   # `infra install` writes state.json (to capture the openbao_bind_addr
-  # intent) before init runs, so init's overwrite-state prompt fires
-  # under default-yes-no semantics.  Pipe `y` answers to clear that
-  # prompt (and any future ca.json / password.txt overwrite prompts
-  # that may appear on rerun) so the bootstrap pass stays
-  # non-interactive.
-  if ! printf 'y\ny\ny\n' | BOOTROOT_LANG=en run_bootroot init \
+  # intent) before init runs, so init's overwrite-state prompt fires;
+  # ca.json and password.txt prompt too on a rerun, and `db-provision`
+  # adds its own confirmation.  Answer all four with their per-prompt
+  # flags and run with stdin closed, so the bootstrap pass stays
+  # non-interactive whatever the workspace was left holding.
+  if ! BOOTROOT_LANG=en run_bootroot init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$INIT_SUMMARY_JSON" \
@@ -452,10 +452,14 @@ run_bootstrap_init() {
     --http-hmac "dev-hmac" \
     --no-eab \
     --save-unseal-keys \
+    --overwrite-password \
+    --overwrite-ca-json \
+    --overwrite-state \
+    --confirm-db-provision \
     --db-user "step" \
     --db-name "stepca" \
     --responder-url "http://localhost:8080" \
-    --skip responder-check >"$INIT_RAW_LOG" 2>&1; then
+    --skip responder-check </dev/null >"$INIT_RAW_LOG" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"
       tail -n 200 "$INIT_RAW_LOG" || true
