@@ -409,14 +409,31 @@ reset_workspace() {
   rm -f "$ROOT_DIR/.env"
 }
 
+list_local_ipv4() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show | awk '{print $4}' | sed 's|/.*||'
+  elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig -a | awk '/inet /{print $2}' | sed 's/^addr://'
+  else
+    return 1
+  fi
+}
+
 ensure_bind_host_available() {
-  # Verify the configured non-loopback bind host actually exists on
-  # this machine; otherwise compose will refuse to publish the port
-  # and reinit will look broken when the real cause is a missing
-  # docker0 interface.
-  if ! ip -4 -o addr show 2>/dev/null | awk '{print $4}' | sed 's|/.*||' \
-      | grep -qx "$OPENBAO_BIND_HOST"; then
-    fail "non-loopback bind host $OPENBAO_BIND_HOST is not assigned to any local interface (set OPENBAO_BIND_HOST to an address that is)"
+  # Verify the configured non-loopback bind host actually exists on this
+  # machine; otherwise compose refuses to publish the port and the run
+  # fails for a reason that has nothing to do with what it exercises.
+  #
+  # Not being able to enumerate at all is a different condition from the
+  # address being absent, and it has a different fix: no value of the bind
+  # host variable helps a host that has neither `ip` nor `ifconfig`, so
+  # that case must not tell the operator to change the variable.
+  local bind_host="$1" bind_var="$2" local_addrs
+  if ! local_addrs="$(list_local_ipv4)"; then
+    fail "cannot enumerate local IPv4 addresses: neither ip (iproute2) nor ifconfig is installed"
+  fi
+  if ! printf '%s\n' "$local_addrs" | grep -qx "$bind_host"; then
+    fail "non-loopback bind host $bind_host is not assigned to any local interface (set $bind_var to an address that is)"
   fi
 }
 
@@ -628,7 +645,7 @@ main() {
   trap 'on_error $LINENO' ERR
 
   ensure_prerequisites
-  ensure_bind_host_available
+  ensure_bind_host_available "$OPENBAO_BIND_HOST" OPENBAO_BIND_HOST
   compose_down
   snapshot_repo_openbao_config
 
