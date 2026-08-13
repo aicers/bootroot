@@ -350,10 +350,8 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use super::super::test_support::write_self_contained_fake_docker;
     use super::*;
-    use crate::commands::rotate::test_support::{
-        ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend, write_fake_docker_script,
-    };
     use crate::i18n::test_messages;
 
     const PROBE_ATTEMPTS: u32 = 1;
@@ -577,37 +575,32 @@ mod tests {
     /// The availability pre-check runs before Docker is touched, so a
     /// deployment is never knocked into a sealed state `init` cannot
     /// recover from.
-    #[test]
-    fn no_available_source_fails_before_any_docker_call() {
+    #[tokio::test]
+    async fn no_available_source_fails_before_any_docker_call() {
         let dir = tempdir().expect("temp dir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir_all(&bin_dir).expect("bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        // The transition is handed a fake that logs every invocation, so
+        // the absent log below proves no docker command was emitted.
+        let fake = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
         let compose = dir.path().join("docker-compose.yml");
         let override_path = dir.path().join("docker-compose.openbao-exposed.yml");
         let default_file = dir.path().join("unseal-keys.txt");
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
         let transition = OpenBaoTlsTransition {
+            docker: &fake,
             probe_attempts: PROBE_ATTEMPTS,
             probe_delay: PROBE_DELAY,
             ..OpenBaoTlsTransition::new(&compose, &override_path, UNREACHABLE_HTTPS_URL, dir.path())
         };
         let mut recreated = false;
-        // `block_on` rather than `#[tokio::test]`: the environment lock
-        // has to stay held across the whole run so a parallel test
-        // cannot swap PATH out from under the fake `docker`.
-        let err = runtime
-            .block_on(transition.run(
+        let err = transition
+            .run(
                 &inputs(&[], None, default_file, false),
                 &mut recreated,
                 &test_messages(),
-            ))
+            )
+            .await
             .expect_err("no unseal key source is available");
 
         assert!(
@@ -785,39 +778,33 @@ mod tests {
     /// same failure a listener still answering plaintext produces.
     /// `state.openbao_url` is advanced by the caller only after this
     /// returns `Ok`, so the pre-TLS plaintext URL survives.
-    #[test]
-    fn tls_probe_failure_stops_before_the_url_is_recorded() {
+    #[tokio::test]
+    async fn tls_probe_failure_stops_before_the_url_is_recorded() {
         let dir = tempdir().expect("temp dir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir_all(&bin_dir).expect("bin dir");
-        write_fake_docker_script(&bin_dir.join("docker"));
+        let fake = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
         let compose = dir.path().join("docker-compose.yml");
         let override_path = dir.path().join("docker-compose.openbao-exposed.yml");
         let state_path = dir.path().join("state.json");
         let plaintext_state = "{\"openbao_url\":\"http://127.0.0.1:8200\"}\n";
         fs::write(&state_path, plaintext_state).expect("write state");
         let in_memory = vec!["memory-key".to_string()];
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
         let transition = OpenBaoTlsTransition {
+            docker: &fake,
             probe_attempts: PROBE_ATTEMPTS,
             probe_delay: PROBE_DELAY,
             ..OpenBaoTlsTransition::new(&compose, &override_path, UNREACHABLE_HTTPS_URL, dir.path())
         };
         let mut recreated = false;
-        // See `no_available_source_fails_before_any_docker_call` for why
-        // this drives the future with `block_on`.
-        let err = runtime
-            .block_on(transition.run(
+        let err = transition
+            .run(
                 &inputs(&in_memory, None, dir.path().join("unseal-keys.txt"), false),
                 &mut recreated,
                 &test_messages(),
-            ))
+            )
+            .await
             .expect_err("nothing is listening on the probed URL");
 
         assert!(

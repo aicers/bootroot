@@ -475,33 +475,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
-    use super::super::test_support::write_self_contained_fake_docker;
-    use super::*;
-    use crate::commands::rotate::test_support::{
-        ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
+    use super::super::test_support::{
+        write_self_contained_fake_docker, write_self_contained_fake_docker_exiting,
     };
+    use super::*;
 
     /// The `OpenBao` container name a default install renders.
     const DEFAULT_OPENBAO_CONTAINER: &str = "bootroot-openbao";
-
-    /// Fake `docker` that *appends* one line per invocation, unlike the
-    /// shared helper which truncates: the ordering of the two containers
-    /// this file runs is exactly what the wiring test below pins.
-    ///
-    /// `exit_code` is returned by every invocation, so a non-zero value
-    /// makes the first container this file runs — the chown — fail.
-    fn write_appending_fake_docker(path: &Path, exit_code: u8) {
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-{{ printf '%s ' "$@"; printf '\n'; }} >> "${{BOOTROOT_TEST_DOCKER_ARGS:?missing log path}}"
-exit {exit_code}
-"#
-        );
-        fs::write(path, script).expect("fake docker script should be written");
-        fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .expect("fake docker script should be executable");
-    }
 
     #[test]
     fn build_sans_includes_specific_ip() {
@@ -532,9 +512,9 @@ exit {exit_code}
     #[test]
     fn reissue_falls_back_to_instance_scoped_sans() {
         let dir = tempfile::tempdir().unwrap();
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).unwrap();
-        write_appending_fake_docker(&bin_dir.join("docker"), 0);
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
 
         let compose_dir = dir.path().join("compose");
         let secrets_dir = dir.path().join("secrets");
@@ -557,18 +537,14 @@ exit {exit_code}
             expires_at: None,
         };
 
-        let args_log = dir.path().join("docker_args.log");
         let messages = crate::i18n::test_messages();
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
         reissue_openbao_tls_cert(
             &compose_dir,
             &secrets_dir,
             &entry,
             "insight-openbao",
-            Path::new("docker"),
+            &fake,
             &messages,
         )
         .expect("re-issuance must succeed against the fake docker");
@@ -860,9 +836,9 @@ exit {exit_code}
     #[test]
     fn issue_openbao_tls_cert_chowns_output_dir_before_creating_the_cert() {
         let dir = tempfile::tempdir().unwrap();
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).unwrap();
-        write_appending_fake_docker(&bin_dir.join("docker"), 0);
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
 
         let compose_dir = dir.path().join("compose");
         let secrets_dir = dir.path().join("secrets");
@@ -874,18 +850,13 @@ exit {exit_code}
         fs::write(tls_dir.join("server.crt"), "cert").unwrap();
         fs::write(tls_dir.join("server.key"), "key").unwrap();
 
-        let args_log = dir.path().join("docker_args.log");
         let messages = crate::i18n::test_messages();
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
         issue_openbao_tls_cert(
             &compose_dir,
             &secrets_dir,
             &["openbao.internal"],
-            Path::new("docker"),
+            &fake,
             &messages,
         )
         .expect("issuing the certificate must succeed against the fake docker");
@@ -936,26 +907,21 @@ exit {exit_code}
     #[test]
     fn issue_openbao_tls_cert_aborts_when_the_chown_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).unwrap();
-        write_appending_fake_docker(&bin_dir.join("docker"), 1);
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker_exiting(&fake, &args_log, 1);
 
         let compose_dir = dir.path().join("compose");
         let secrets_dir = dir.path().join("secrets");
         fs::create_dir_all(&secrets_dir).unwrap();
 
-        let args_log = dir.path().join("docker_args.log");
         let messages = crate::i18n::test_messages();
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
         let error = issue_openbao_tls_cert(
             &compose_dir,
             &secrets_dir,
             &["openbao.internal"],
-            Path::new("docker"),
+            &fake,
             &messages,
         )
         .expect_err("a failing chown must fail the issuance");
@@ -988,9 +954,12 @@ exit {exit_code}
     #[test]
     fn issue_openbao_tls_cert_refuses_a_symlinked_output_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir(&bin_dir).unwrap();
-        write_appending_fake_docker(&bin_dir.join("docker"), 0);
+        // The fake would log any invocation it received, so the empty
+        // log below is evidence that nothing ran rather than evidence
+        // that nothing could.
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
 
         let compose_dir = dir.path().join("compose");
         let secrets_dir = dir.path().join("secrets");
@@ -1003,18 +972,13 @@ exit {exit_code}
         fs::create_dir_all(tls_dir.parent().expect("openbao dir")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &tls_dir).unwrap();
 
-        let args_log = dir.path().join("docker_args.log");
         let messages = crate::i18n::test_messages();
-
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
 
         let error = issue_openbao_tls_cert(
             &compose_dir,
             &secrets_dir,
             &["openbao.internal"],
-            Path::new("docker"),
+            &fake,
             &messages,
         )
         .expect_err("a symlinked output directory must fail the issuance");

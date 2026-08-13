@@ -886,27 +886,23 @@ mod rollback_tests {
         use std::fs;
         use std::path::PathBuf;
 
-        use crate::commands::rotate::test_support::{
-            ScopedEnvVar, TEST_DOCKER_ARGS_ENV, env_lock, path_with_prepend,
-            write_fake_docker_script,
-        };
+        use super::test_support::write_self_contained_fake_docker;
 
         let dir = tempfile::tempdir().unwrap();
         let messages = crate::i18n::test_messages();
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir_all(&bin_dir).unwrap();
-        write_fake_docker_script(&bin_dir.join("docker"));
+        // A fake that *would* log is what makes the absent log evidence:
+        // it is named through the seam, so anything the rollback ran
+        // would have left a record.
+        let fake = dir.path().join("fake-docker");
         let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
 
         let hcl_path = dir.path().join("openbao.hcl");
         fs::write(&hcl_path, "tls_cert_file = ...\n").unwrap();
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
-        let _lock = env_lock();
-        let _path = ScopedEnvVar::set("PATH", path_with_prepend(&bin_dir));
-        let _log = ScopedEnvVar::set(TEST_DOCKER_ARGS_ENV, &args_log);
-
         let rollback = InitRollback {
+            docker: Some(fake),
             hcl_backup: Some(RollbackFile {
                 path: hcl_path.clone(),
                 original: Some("tls_disable = 1\n".to_string()),
@@ -988,13 +984,28 @@ pub(super) mod test_support {
         path: &Path,
         args_log: &Path,
     ) {
+        write_self_contained_fake_docker_exiting(path, args_log, 0);
+    }
+
+    /// [`write_self_contained_fake_docker`] whose every invocation exits
+    /// `exit_code` after logging, so a test can steer the failure path
+    /// of a docker call production spawns on its behalf.
+    ///
+    /// The log it writes is the same one the zero-exit writer produces —
+    /// one appended, space-joined line per invocation — so a test that
+    /// swaps one writer for the other keeps its assertions.
+    pub(in crate::commands::init::steps) fn write_self_contained_fake_docker_exiting(
+        path: &Path,
+        args_log: &Path,
+        exit_code: u8,
+    ) {
         let log = args_log.display().to_string();
         assert!(
             !log.contains('\''),
             "the log path is interpolated into a single-quoted shell word"
         );
         let script = format!(
-            "#!/bin/sh\nset -eu\n{{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\nexit 0\n"
+            "#!/bin/sh\nset -eu\n{{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\nexit {exit_code}\n"
         );
         fs::write(path, script).expect("fake docker script should be written");
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
