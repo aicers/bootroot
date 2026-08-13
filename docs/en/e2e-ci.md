@@ -159,17 +159,24 @@ bootroot infra install --compose-file "$COMPOSE_FILE"
 # DB credentials are read from .env created by infra install.
 # POSTGRES_HOST and POSTGRES_PORT are set by the script so that
 # build_admin_dsn_from_env() connects via the host-mapped port.
-# The piped sequence must answer every prompt the run reaches: init
-# fails on EOF rather than answering an unanswered prompt itself.
-printf "y\ny\ny\n" | BOOTROOT_LANG=en bootroot init \
+# Every prompt is answered by its own flag and stdin is closed, so the
+# run depends on no piped answer sequence and on no leftover file:
+# an overwrite flag whose file is absent is a silent no-op. init fails
+# on EOF rather than answering an unanswered prompt itself.
+BOOTROOT_LANG=en bootroot init \
   --compose-file "$COMPOSE_FILE" \
   --secrets-dir "$SECRETS_DIR" \
   --summary-json "$INIT_SUMMARY_JSON" \
   --enable auto-generate,show-secrets,db-provision \
   --no-eab \
+  --save-unseal-keys \
+  --overwrite-password \
+  --overwrite-ca-json \
+  --overwrite-state \
+  --confirm-db-provision \
   --db-user "step" \
   --db-name "stepca" \
-  --responder-url "$RESPONDER_URL"
+  --responder-url "$RESPONDER_URL" </dev/null
 
 # 3) service-add
 # Each distinct local service gets its own agent config (one daemon
@@ -304,10 +311,14 @@ Actual commands (script excerpt):
 ```bash
 # control node: infra-install / init / service-add
 bootroot infra install --compose-file "$COMPOSE_FILE"
-printf "y\ny\nn\n" | BOOTROOT_LANG=en bootroot init \
+BOOTROOT_LANG=en bootroot init \
   --compose-file "$COMPOSE_FILE" --summary-json "$INIT_SUMMARY_JSON" \
-  --enable auto-generate,show-secrets --eab-kid "$INIT_EAB_KID" \
-  --eab-hmac "$INIT_EAB_HMAC"
+  --enable auto-generate,show-secrets,db-provision \
+  --no-eab --save-unseal-keys \
+  --overwrite-password --overwrite-ca-json --overwrite-state \
+  --confirm-db-provision \
+  --db-user "step" --db-name "stepca" \
+  --responder-url "$RESPONDER_URL" </dev/null
 bootroot service add --service-name edge-proxy \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
 bootroot service add --service-name web-app \

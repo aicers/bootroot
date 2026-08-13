@@ -281,7 +281,11 @@ run_bootstrap_chain() {
 
   log_phase "init"
   rm -f "$CONTROL_DIR/state.json"
-  if ! BOOTROOT_LANG=en printf "y\ny\ny\n" | run_bootroot_control init \
+  # Answer every prompt with its own flag and run with stdin closed, so
+  # the run neither depends on which of password.txt, ca.json and
+  # state.json the cleanup above happened to leave behind nor needs a
+  # TTY.  An overwrite flag whose file is absent is a silent no-op.
+  if ! BOOTROOT_LANG=en run_bootroot_control init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --summary-json "$INIT_SUMMARY_JSON" \
@@ -289,10 +293,15 @@ run_bootstrap_chain() {
     --stepca-provisioner "acme" \
     --stepca-password "password" \
     --no-eab \
+    --save-unseal-keys \
+    --overwrite-password \
+    --overwrite-ca-json \
+    --overwrite-state \
+    --confirm-db-provision \
     --http-hmac "dev-hmac" \
     --db-user "step" \
     --db-name "stepca" \
-    --responder-url "$RESPONDER_URL" >"$INIT_RAW_LOG" 2>&1; then
+    --responder-url "$RESPONDER_URL" </dev/null >"$INIT_RAW_LOG" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"
       tail -n 160 "$INIT_RAW_LOG" || true
