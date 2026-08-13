@@ -138,15 +138,6 @@ cargo run --bin bootroot -- service add \
   --instance-id 001 \
   --root-token "$ROOT_TOKEN"
 
-RESPONDER_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bootroot-http01)"
-if [ -z "${RESPONDER_IP:-}" ]; then
-  echo "Failed to read responder container IP"
-  exit 1
-fi
-docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.edge-proxy.edge-node-01.trusted.domain' >> /etc/hosts"
-docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.web-app.web-01.trusted.domain' >> /etc/hosts"
-docker exec bootroot-ca sh -c "printf '%s %s\n' '$RESPONDER_IP' '001.bootroot-agent.bootroot-agent.trusted.domain' >> /etc/hosts"
-
 host="001.edge-proxy.edge-node-01.trusted.domain"
 for attempt in {1..15}; do
   if docker exec bootroot-ca bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${host}/80'" >/dev/null 2>&1; then
