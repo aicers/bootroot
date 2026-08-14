@@ -342,6 +342,11 @@ jobs:
             sleep 1
           done
 
+          # TEMPORARY PROBE (issue #829 test plan item 2) — remove before merge.
+          echo "::group::responder network aliases"
+          docker inspect -f '{{json .NetworkSettings.Networks}}' bootroot-http01
+          echo "::endgroup::"
+
           export PATH="$(pwd)/target/debug:$PATH"
 
           cargo run --bin bootroot -- verify \
