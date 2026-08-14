@@ -709,6 +709,36 @@ mod tests {
         assert_eq!(mode, KEY_FILE_MODE_DEFAULT);
     }
 
+    /// The counterpart to `fs_util`'s flush pins: the rename here
+    /// deliberately declines `sync_parent_dir`, so a directory that
+    /// cannot be opened must not fail the write. This is what catches
+    /// the flush being added by reflex, putting a disk round trip on
+    /// every key write that the comment at the rename decided against.
+    ///
+    /// Write-and-search-only is the one mode that lets the staging
+    /// create, the chmod and the rename all land while the directory
+    /// open a flush would perform fails. Where it does not bite — an
+    /// effective root, or a filesystem that ignores modes — there is no
+    /// failure to observe, so the case is skipped.
+    #[tokio::test]
+    async fn write_key_file_does_not_flush_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let published = dir.path().join("published");
+        std::fs::create_dir(&published).unwrap();
+        let key = published.join("k");
+        std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::File::open(&published).is_ok() {
+            std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let result = write_key_file(&key, "K", CertGroupPolicy::none()).await;
+        std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        result.expect("the key writer must not open the directory");
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "K");
+    }
+
     #[tokio::test]
     async fn write_key_file_with_policy_uses_0640() {
         let Some(gid) = one_supplementary_test_gid() else {
