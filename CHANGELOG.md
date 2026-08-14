@@ -117,7 +117,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
-- Fixed every file bootroot writes being published by truncating the
+- Fixed the files bootroot writes being published by truncating the
   destination and writing over it, so a crash or a concurrent reader
   could see a half-written file at a name that is supposed to hold a
   complete one. Each is now written to a temporary file in the same
@@ -127,8 +127,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   destinations, `agent.toml`, `.env`, `ca.json` and its OpenBao Agent
   template, `openbao.hcl`, the HTTP-01 responder config and template,
   the OpenBao Agent configs and their `AppRole` credentials, the
-  generated compose overrides, and the remote bootstrap artifact. The
-  files a run reads back to resume flush the containing directory too,
+  generated compose overrides, and the remote bootstrap artifact. Two
+  files are not among them and are still written in place, to be fixed
+  separately: the OpenBao unseal-keys file and the ACME EAB credentials
+  file. The files a run reads back to resume flush the directory too,
   so the published name survives a power loss and not merely a clean
   replacement — `state.json`, `.env`, `agent.toml`, the two `init`
   outputs, and every credential OpenBao has already issued and cannot
@@ -140,10 +142,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   relocated — `.env`, `ca.json` and its template, `openbao.hcl`, the
   responder and OpenBao Agent configs, the compose overrides,
   `state.json`, and the two `init` outputs — so the link survives the
-  write and goes on naming the same file. A link at an issued
+  write and goes on naming the same file. The `agent.toml` that
+  `bootroot-remote bootstrap` writes on a target host is written
+  through a link there for the same reason. A link at an issued
   certificate, key or CA bundle path is replaced by the published file
-  instead, which is what the key file and `agent.toml` have always done
-  and what the certificate beside them now matches.
+  instead, which is what the key file and the control node's own
+  `agent.toml` have always done and what the certificate beside them
+  now matches.
 - Fixed the mode of every such file being applied after its bytes had
   already landed, which left a moment in which a freshly created file
   was readable more widely than intended — including the step-ca CA
