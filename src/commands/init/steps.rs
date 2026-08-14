@@ -423,7 +423,7 @@ const ROLLBACK_FILE_MODE: u32 = 0o644;
 /// either way.
 fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
     if let Some(contents) = &file.original {
-        fs_util::atomic_replace_blocking(
+        fs_util::atomic_replace_through_symlink_blocking(
             &file.path,
             contents.as_bytes(),
             fs_util::preserved_mode(&file.path, ROLLBACK_FILE_MODE),

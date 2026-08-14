@@ -413,6 +413,16 @@ pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy)
 /// next renewal reissues. That costs a reissue, not an outage, which
 /// does not buy a disk round trip on every write.
 ///
+/// A symlink at `dest` is replaced rather than followed, which is what
+/// the key writer has done since #593 and what the certificate and the
+/// bundle now do beside it — the point of the conversion was to remove
+/// the asymmetry between them, not to relocate it into how a link is
+/// treated. The configuration writers take
+/// [`fs_util::atomic_write_through_symlink`] instead, for destinations
+/// no rename writer has ever owned.
+///
+/// [`fs_util::atomic_write_through_symlink`]: crate::fs_util::atomic_write_through_symlink
+///
 /// [`fs_util::publish_staged_blocking`]: crate::fs_util::publish_staged_blocking
 /// [`fs_util::atomic_write_blocking`]: crate::fs_util::atomic_write_blocking
 fn publish_staged(dest: &Path, contents: &str, mode: u32, policy: CertGroupPolicy) -> Result<()> {

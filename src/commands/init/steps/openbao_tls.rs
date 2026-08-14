@@ -261,7 +261,7 @@ const OPENBAO_HCL_MODE: u32 = 0o644;
 /// the entry leaves the previous configuration in place and costs a
 /// re-run of the `init` step that produced it.
 fn publish_openbao_hcl(path: &Path, content: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_replace_blocking(
+    fs_util::atomic_replace_through_symlink_blocking(
         path,
         content.as_bytes(),
         fs_util::preserved_mode(path, OPENBAO_HCL_MODE),

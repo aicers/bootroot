@@ -361,7 +361,7 @@ pub(crate) const COMPOSE_OVERRIDE_MODE: u32 = 0o644;
 /// reconstruct — and `init` publishes enough of these that a disk round
 /// trip each is worth declining.
 fn publish_compose_override(path: &Path, content: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_replace_blocking(
+    fs_util::atomic_replace_through_symlink_blocking(
         path,
         content.as_bytes(),
         fs_util::preserved_mode(path, COMPOSE_OVERRIDE_MODE),

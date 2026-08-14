@@ -157,6 +157,24 @@ the two `init` outputs, `0644` for `state.json`, `.env`, `ca.json`,
 `openbao.hcl`, the issued certificates, the CA bundle and the compose
 overrides.
 
+If you point one of these paths at a file elsewhere with a symlink, what happens
+depends on which file it is, because a rename replaces the name it is given
+rather than following a link at it:
+
+- **Configuration you may have relocated is written through the link.** For
+  `.env`, `ca.json` and its template, `openbao.hcl`, the HTTP-01 responder
+  config and template, the OpenBao Agent configs, the generated compose
+  overrides, `state.json` and the two `init` output files, bootroot resolves the
+  link first and publishes to its target, so the link keeps naming the file it
+  named before. A chain of links that loops back on itself names no target and
+  is refused.
+- **`agent.toml`, the issued certificate and key, the CA bundle, and every
+  credential are published at the path itself**, replacing a link found there
+  with a regular file. Those files have been published by rename for several
+  releases, so a link at one of those paths has never survived the command that
+  creates the file; for a credential, following a link would also mean a write
+  redirected by whoever could plant one.
+
 ## bootroot infra up
 
 Starts OpenBao/PostgreSQL/step-ca/HTTP-01 responder via Docker Compose and

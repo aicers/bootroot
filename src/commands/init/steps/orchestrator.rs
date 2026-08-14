@@ -1343,7 +1343,9 @@ async fn maybe_rotate_env_db_password(
         doc["db"]["dataSource"] = serde_json::Value::String(new_dsn.clone());
         if let Ok(updated) = serde_json::to_string_pretty(&doc) {
             let mode = fs_util::preserved_mode(&ca_json_path, CA_JSON_FILE_MODE);
-            let _ = fs_util::atomic_replace(&ca_json_path, updated.as_bytes(), mode).await;
+            let _ =
+                fs_util::atomic_replace_through_symlink(&ca_json_path, updated.as_bytes(), mode)
+                    .await;
         }
     }
 

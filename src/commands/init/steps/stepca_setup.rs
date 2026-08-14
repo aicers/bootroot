@@ -63,7 +63,7 @@ pub(super) async fn write_stepca_templates(
     // container — but the templates are themselves regenerated in full
     // by this function on the next `init`, so losing a directory entry
     // to a crash costs that re-run and nothing more.
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_through_symlink(
         &password_template_path,
         password_template.as_bytes(),
         fs_util::KEY_FILE_MODE,
@@ -86,7 +86,7 @@ pub(super) async fn write_stepca_templates(
         messages,
     )?;
     let ca_json_template_path = templates_dir.join(STEPCA_CA_JSON_TEMPLATE_NAME);
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_through_symlink(
         &ca_json_template_path,
         ca_json_template.as_bytes(),
         fs_util::KEY_FILE_MODE,
@@ -129,7 +129,7 @@ pub(crate) const CA_JSON_FILE_MODE: u32 = 0o644;
 /// rather than anything unrecoverable. This mirrors the decision
 /// `crate::commands::ca`'s patcher records for the same file.
 async fn publish_ca_json(path: &Path, contents: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_through_symlink(
         path,
         contents.as_bytes(),
         fs_util::preserved_mode(path, CA_JSON_FILE_MODE),

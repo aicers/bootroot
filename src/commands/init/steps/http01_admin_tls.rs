@@ -264,7 +264,7 @@ pub(crate) fn strip_responder_tls_config(secrets_dir: &Path, messages: &Messages
             } else {
                 filtered
             };
-            fs_util::atomic_replace_blocking(
+            fs_util::atomic_replace_through_symlink_blocking(
                 path,
                 to_write.as_bytes(),
                 fs_util::preserved_mode(path, fs_util::KEY_FILE_MODE),

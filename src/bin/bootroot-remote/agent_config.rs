@@ -208,6 +208,11 @@ pub(super) async fn apply_agent_config_updates(
         // `agent.toml`; losing the entry leaves the agent renewing
         // against a stale responder HMAC or trust anchor with no signal
         // that a re-sync is needed.
+        //
+        // The rename lands on this path rather than through a symlink at
+        // it, matching every other writer of `agent.toml` — see
+        // `commands::service::rerender_local_managed_profile` for why
+        // the file's writers publish at the name.
         if let Err(err) = fs_util::atomic_write(
             &args.agent_config_path,
             with_profile.as_bytes(),

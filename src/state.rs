@@ -202,14 +202,16 @@ impl StateFile {
         serde_json::to_string_pretty(self).context("Failed to serialize state.json")
     }
 
-    /// The blocking core both entry points share: resolve a symlinked
-    /// destination, then publish the bytes by rename at the mode the
+    /// The blocking core both entry points share: publish the bytes by
+    /// rename, through a symlinked destination, at the mode the
     /// destination carries.
     fn publish(path: &Path, contents: &str) -> Result<()> {
-        let dest = fs_util::resolve_symlink_destination(path)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
-        fs_util::atomic_write_blocking(&dest, contents.as_bytes(), Self::publish_mode(&dest))
-            .with_context(|| format!("Failed to write {}", path.display()))
+        fs_util::atomic_write_through_symlink_blocking(
+            path,
+            contents.as_bytes(),
+            Self::publish_mode(path),
+        )
+        .with_context(|| format!("Failed to write {}", path.display()))
     }
 
     /// The mode [`StateFile::save`] publishes at: the mode the

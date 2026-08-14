@@ -795,7 +795,7 @@ async fn write_openbao_agent_files(
     // so a torn read is a container that will not come up, but the file
     // is regenerated in full from `state.json` and the template paths on
     // the next `init`.
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_through_symlink(
         &stepca_agent_config,
         stepca_config.as_bytes(),
         fs_util::KEY_FILE_MODE,
@@ -804,7 +804,7 @@ async fn write_openbao_agent_files(
     .with_context(|| {
         messages.error_write_file_failed(&stepca_agent_config.display().to_string())
     })?;
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_through_symlink(
         &responder_agent_config,
         responder_config.as_bytes(),
         fs_util::KEY_FILE_MODE,
@@ -910,7 +910,7 @@ services:
     // Published by rename, not flushed, at the destination's mode or the
     // umask's `0644` on a create — the compose-override decisions
     // `crate::commands::guardrails` records.
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_through_symlink(
         &override_path,
         contents.as_bytes(),
         fs_util::preserved_mode(&override_path, COMPOSE_OVERRIDE_MODE),

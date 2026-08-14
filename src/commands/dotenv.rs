@@ -47,16 +47,24 @@ fn strip_quotes(value: &str) -> String {
 
 /// Writes a `.env` file from key-value pairs.
 ///
-/// Published by rename through [`fs_util::atomic_write_blocking`]. Two
-/// readers make a torn `.env` costly: `docker compose` interpolates it
-/// on every invocation, and bootroot itself reads it back to recover the
-/// instance name and the assigned host ports.
+/// Published by rename through
+/// [`fs_util::atomic_write_through_symlink_blocking`]. Two readers make
+/// a torn `.env` costly: `docker compose` interpolates it on every
+/// invocation, and bootroot itself reads it back to recover the instance
+/// name and the assigned host ports.
 ///
 /// It takes the directory flush for that second reader. The ports and
 /// the instance id here are the only record of which containers this
 /// tree owns; a crash that loses the entry leaves a later run choosing
 /// fresh ones and unable to find the stack it already started, which no
 /// re-run of `init` repairs.
+///
+/// A symlinked `.env` is resolved before staging. Compose's own
+/// convention is to keep one `.env` beside the compose file, so pointing
+/// it at a shared file is a thing operators do, and the truncating write
+/// this replaced updated that shared file; a bare rename would replace
+/// the link and leave every other consumer of the target reading stale
+/// ports.
 pub(crate) fn write_dotenv(
     path: &Path,
     entries: &[(&str, &str)],
@@ -69,8 +77,12 @@ pub(crate) fn write_dotenv(
         content.push_str(value);
         content.push('\n');
     }
-    fs_util::atomic_write_blocking(path, content.as_bytes(), dotenv_publish_mode(path))
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write_through_symlink_blocking(
+        path,
+        content.as_bytes(),
+        dotenv_publish_mode(path),
+    )
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 
@@ -142,11 +154,11 @@ pub(crate) fn load_dotenv_into_env(path: &Path, messages: &Messages) -> Result<(
 
 /// Updates a single key in an existing `.env` file, preserving other entries.
 ///
-/// Publishes by rename and flushes, for the same two readers as
-/// [`write_dotenv`]. This is the hotter of the pair — a rotated
-/// `POSTGRES_PASSWORD` lands here while compose may be interpolating the
-/// file — so the torn read it closes is the one a running stack is most
-/// likely to hit.
+/// Publishes by rename, through a symlinked `.env`, and flushes — the
+/// same three decisions as [`write_dotenv`], for the same two readers.
+/// This is the hotter of the pair — a rotated `POSTGRES_PASSWORD` lands
+/// here while compose may be interpolating the file — so the torn read
+/// it closes is the one a running stack is most likely to hit.
 pub(crate) fn update_dotenv_key(
     path: &Path,
     key: &str,
@@ -181,8 +193,12 @@ pub(crate) fn update_dotenv_key(
         output.push_str(new_value);
         output.push('\n');
     }
-    fs_util::atomic_write_blocking(path, output.as_bytes(), dotenv_publish_mode(path))
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write_through_symlink_blocking(
+        path,
+        output.as_bytes(),
+        dotenv_publish_mode(path),
+    )
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 
@@ -437,5 +453,40 @@ mod tests {
             0o600,
             "a rewrite must not re-widen an operator-narrowed .env"
         );
+    }
+
+    /// A `.env` an operator pointed at a shared file keeps pointing at
+    /// it, and that file is what both writers update — the `O_TRUNC`
+    /// behaviour they replaced. Renaming over the link instead would
+    /// leave every other consumer of the target reading the ports and
+    /// the instance id of a stack that no longer exists.
+    #[test]
+    fn dotenv_writers_publish_through_a_symlinked_env() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("shared.env");
+        let link = dir.path().join(".env");
+        std::fs::write(&target, "A=seed\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let messages = test_messages();
+
+        write_dotenv(&link, &[("A", "1")], &messages).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "write_dotenv must not replace the operator's link"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "A=1\n");
+
+        update_dotenv_key(&link, "A", "2", &messages).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "update_dotenv_key must not replace the operator's link"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "A=2\n");
     }
 }

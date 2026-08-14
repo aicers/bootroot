@@ -135,6 +135,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   re-read. Files that are regenerated on their own — a certificate, a
   rendered `ca.json`, a compose override — do not pay for that flush,
   because a crash that loses one costs a rewrite rather than an outage.
+  A destination pointed elsewhere by a symlink keeps being written
+  through that link wherever it names configuration an operator may have
+  relocated — `.env`, `ca.json` and its template, `openbao.hcl`, the
+  responder and OpenBao Agent configs, the compose overrides,
+  `state.json`, and the two `init` outputs — so the link survives the
+  write and goes on naming the same file. A link at an issued
+  certificate, key or CA bundle path is replaced by the published file
+  instead, which is what the key file and `agent.toml` have always done
+  and what the certificate beside them now matches.
 - Fixed the mode of every such file being applied after its bytes had
   already landed, which left a moment in which a freshly created file
   was readable more widely than intended — including the step-ca CA
