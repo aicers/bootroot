@@ -745,6 +745,35 @@ mod rollback_tests {
         );
     }
 
+    /// The writer execs the fake once, to wait out the `ETXTBSY` a
+    /// sibling thread's `fork` can hold it under. That probe must
+    /// record nothing and exit 0 whatever the baked-in exit code is, or
+    /// every test that counts invocations would see one it never made
+    /// and the failure-path fakes would fail their own writer.
+    #[test]
+    fn the_fake_docker_records_nothing_for_the_exec_probe() {
+        use std::process::Command;
+
+        use super::test_support::write_self_contained_fake_docker_exiting;
+        use crate::test_support::EXEC_PROBE_ARG;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker_exiting(&fake, &args_log, 1);
+
+        let status = Command::new(&fake)
+            .arg(EXEC_PROBE_ARG)
+            .status()
+            .expect("the fake docker must be spawnable");
+
+        assert!(status.success(), "the probe must exit 0, got {status}");
+        assert!(
+            !args_log.exists(),
+            "the probe must leave the log untouched, so the first line is the first real call"
+        );
+    }
+
     /// Regression: rollback must recreate the `OpenBao` container with
     /// `up -d` (not `restart`) so that Docker Compose applies the base
     /// compose config without the non-loopback override.  `restart`
@@ -998,6 +1027,7 @@ pub(super) mod test_support {
     use super::super::constants::{DEFAULT_CERT_DURATION, DEFAULT_STEPCA_PROVISIONER};
     use crate::cli::args::InitArgs;
     pub(in crate::commands::init::steps) use crate::i18n::test_messages;
+    use crate::test_support::{EXEC_PROBE_ARG, wait_until_spawnable};
 
     /// Writes a fake `docker` that appends one line per invocation to
     /// `args_log` and reads nothing from its environment.
@@ -1030,12 +1060,20 @@ pub(super) mod test_support {
             !log.contains('\''),
             "the log path is interpolated into a single-quoted shell word"
         );
+        // The probe exits before the invocation is recorded, so waiting
+        // for the file to become executable leaves nothing in the log a
+        // test then reads.
         let script = format!(
-            "#!/bin/sh\nset -eu\n{{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\nexit {exit_code}\n"
+            "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = '{EXEC_PROBE_ARG}' ]; then exit 0; fi\n\
+             {{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\nexit {exit_code}\n"
         );
         fs::write(path, script).expect("fake docker script should be written");
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .expect("fake docker script should be executable");
+        // Production spawns this fake on the test's behalf and cannot
+        // retry a busy exec, so the wait happens here, once, while the
+        // path is still the writer's own concern.
+        wait_until_spawnable(path);
     }
 
     pub(in crate::commands::init::steps) fn default_init_args() -> InitArgs {
