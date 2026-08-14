@@ -331,18 +331,6 @@ jobs:
             --instance-id 001 \
             --root-token "$OPENBAO_ROOT_TOKEN"
 
-          # Re-create the responder with Docker DNS aliases so step-ca
-          # can resolve challenge hostnames via Docker's internal DNS.
-          # Include the responder compose override written by init so the
-          # rendered config (with the correct HMAC) is preserved.
-          RESPONDER_OVERRIDE="$BOOTROOT_SECRETS_DIR/responder/docker-compose.responder.override.yml"
-          docker compose \
-            -p "${COMPOSE_PROJECT_NAME:-bootroot}" \
-            -f docker-compose.yml \
-            -f "$RESPONDER_OVERRIDE" \
-            -f docker-compose.test.yml \
-            up -d bootroot-http01
-
           # Wait for step-ca to be healthy after the restart triggered
           # by init's DB password rotation.
           for i in {1..30}; do
