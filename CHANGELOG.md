@@ -128,11 +128,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   outputs additionally flush the containing directory, so the published
   file survives a power loss and not merely a clean replacement; a
   certificate or CA bundle lost that way is rewritten by the next
-  rotation and does not pay for that flush. File modes are unchanged —
-  `state.json`, certificates and CA bundles stay `0644`, the two `init`
-  outputs stay `0600` — and each is now applied before the file is
-  published, rather than left to the umask that happened to be in
-  effect or set after the bytes had already landed.
+  rotation and does not pay for that flush. Each file's mode is now
+  stated and applied before the file is published, rather than left to
+  the umask that happened to be in effect or set after the bytes had
+  already landed: `0644` for `state.json`, the certificates and the CA
+  bundle, `0600` for the two `init` outputs. Certificates, CA bundles
+  and the `init` outputs already carried those modes; `state.json` did
+  not have one of its own, so a host whose umask made it narrower than
+  `0644` — it holds a service inventory and `AppRole` role ids, no
+  secret — now sees `0644` after the next write.
 - Fixed `bootroot init` treating a closed stdin as an answer. Every
   `init` prompt read the terminating EOF as an empty line, so a run
   whose piped answer sequence ran out answered the rest of its prompts
