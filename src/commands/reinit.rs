@@ -1905,6 +1905,83 @@ mod tests {
         );
     }
 
+    /// The probe follows the destination the staged write will use.  A
+    /// link into a read-only directory has a perfectly writable
+    /// directory of its own, so probing that one would pass preflight
+    /// and leave the write to fail after `OpenBao` has been wiped —
+    /// the trap this check exists to prevent.
+    #[test]
+    fn validate_root_token_output_probes_the_link_targets_directory() {
+        let dir = tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        fs::create_dir_all(&ro).unwrap();
+        let target = ro.join("token");
+        let link = dir.path().join("root-token.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        let original = perms.mode();
+        perms.set_mode(0o500);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let messages = test_messages();
+        let result = validate_root_token_output_path(&link, &messages);
+
+        // Restore so tempdir cleanup succeeds.
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        perms.set_mode(original);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let err = result.expect_err("the target's directory cannot accept the staged file");
+        assert!(err.to_string().contains("root-token-output"), "got: {err}");
+    }
+
+    /// The same for `--summary-json`, which resolves its destination the
+    /// same way before staging.
+    #[test]
+    fn validate_summary_json_probes_the_link_targets_directory() {
+        let dir = tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        fs::create_dir_all(&ro).unwrap();
+        let target = ro.join("summary.json");
+        let link = dir.path().join("summary.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        let original = perms.mode();
+        perms.set_mode(0o500);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let messages = test_messages();
+        let result = validate_summary_json_output_path(&link, &messages);
+
+        // Restore so tempdir cleanup succeeds.
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        perms.set_mode(original);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let err = result.expect_err("the target's directory cannot accept the staged file");
+        assert!(err.to_string().contains("summary-json"), "got: {err}");
+    }
+
+    /// A link into a directory that does not exist yet is created here,
+    /// so the post-wipe write does not meet a missing directory.  The
+    /// link's own directory already exists, so only a probe that
+    /// follows the link can create the right one.
+    #[test]
+    fn validate_root_token_output_creates_the_link_targets_missing_directory() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("not-yet").join("token");
+        let link = dir.path().join("root-token.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        validate_root_token_output_path(&link, &test_messages())
+            .expect("a link into a creatable directory passes preflight");
+
+        assert!(
+            dir.path().join("not-yet").is_dir(),
+            "the directory the staged write will use must exist after preflight"
+        );
+    }
+
     /// Regression for Round 6 reviewer item: when `--summary-json`
     /// points at an unwritable destination (existing file with mode
     /// `0400`), the preflight must catch it before the destructive

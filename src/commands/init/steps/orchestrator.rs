@@ -2692,4 +2692,143 @@ mod tests {
         tighten_existing_secret_file(&dir.path().join("absent.json"))
             .expect("a missing destination is not an error");
     }
+
+    /// The other secret-bearing `init` output. It shares
+    /// `write_root_token_file`'s staging, tightening and symlink
+    /// resolution, and carries the same credentials plus the unseal
+    /// keys, so it is pinned in its own right rather than by
+    /// resemblance to the token writer.
+    fn summary_with_token(root_token: &str) -> InitSummary {
+        use super::super::super::types::{ResponderCheck, StepCaInitResult};
+
+        InitSummary {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: std::path::PathBuf::from("secrets"),
+            show_secrets: false,
+            init_response: true,
+            root_token: root_token.to_string(),
+            unseal_keys: vec!["unseal-one".to_string()],
+            approles: Vec::new(),
+            stepca_password: "pw".to_string(),
+            db_dsn: String::new(),
+            db_dsn_host_original: String::new(),
+            db_dsn_host_effective: String::new(),
+            http_hmac: "hmac".to_string(),
+            eab: None,
+            step_ca_result: StepCaInitResult::Skipped,
+            responder_check: ResponderCheck::Skipped,
+            responder_url: None,
+            responder_template_path: std::path::PathBuf::from("responder.tmpl"),
+            responder_config_path: std::path::PathBuf::from("responder.toml"),
+            openbao_agent_stepca_config_path: std::path::PathBuf::from("agent-stepca.hcl"),
+            openbao_agent_responder_config_path: std::path::PathBuf::from("agent-responder.hcl"),
+            openbao_agent_override_path: None,
+            db_check: DbCheckStatus::Skipped,
+        }
+    }
+
+    /// The summary is published by rename at `0600` over a destination
+    /// an earlier run left world-readable: the tightening narrows the
+    /// old credentials sitting there, and the fresh inode the rename
+    /// installs was never wider than `0600`.
+    #[tokio::test]
+    async fn write_init_summary_json_replaces_a_world_readable_destination_at_0600() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("summary.json");
+        std::fs::write(&path, "{\"stale\":true}").expect("seed the destination");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let stale_inode = std::fs::metadata(&path).expect("stat").ino();
+
+        write_init_summary_json(&path, &summary_with_token("hvs.fresh"))
+            .await
+            .expect("summary write over a world-readable destination");
+
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert!(written.contains("hvs.fresh"), "got: {written}");
+        let meta = std::fs::metadata(&path).expect("stat");
+        assert_eq!(meta.permissions().mode() & 0o777, SECRET_OUTPUT_FILE_MODE);
+        assert_ne!(meta.ino(), stale_inode, "the publish must be a rename");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("summary.json")],
+            "the staged temporary must not survive the publish"
+        );
+    }
+
+    /// As for the token: the summary reaches the link's target and the
+    /// operator's link survives. Renaming over the link would leave the
+    /// target holding the previous run's credentials while the write
+    /// reported success.
+    #[tokio::test]
+    async fn write_init_summary_json_writes_through_a_symlinked_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir");
+        let target = real_dir.join("summary.json");
+        std::fs::write(&target, "{\"stale\":true}").expect("seed the target");
+        let link = dir.path().join("summary.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_init_summary_json(&link, &summary_with_token("hvs.through-link"))
+            .await
+            .expect("summary write through a symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the write"
+        );
+        let written = std::fs::read_to_string(&target).expect("read");
+        assert!(written.contains("hvs.through-link"), "got: {written}");
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
+
+    /// A link whose target does not exist yet is still where the
+    /// operator wants the summary, exactly as for the token file.
+    #[tokio::test]
+    async fn write_init_summary_json_creates_a_dangling_symlink_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("secure")).expect("mkdir");
+        let target = dir.path().join("secure").join("summary.json");
+        let link = dir.path().join("summary.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_init_summary_json(&link, &summary_with_token("hvs.dangling"))
+            .await
+            .expect("summary write over a dangling link");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the write"
+        );
+        let written = std::fs::read_to_string(&target).expect("read");
+        assert!(written.contains("hvs.dangling"), "got: {written}");
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
 }
