@@ -64,6 +64,11 @@ use crate::commands::openbao_url::{OPENBAO_HOST_PORT_ENV, effective_openbao_url_
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
+/// Mode for the two operator-facing secret files `init` can be asked to
+/// write, `--summary-json` and `--root-token-output`. Both carry root
+/// credentials, so both are operator-only.
+const SECRET_OUTPUT_FILE_MODE: u32 = 0o600;
+
 /// Returns `args` with `openbao_url` rewritten to the endpoint the
 /// configured `OpenBao` host port publishes, borrowing them unchanged
 /// when the CLI value already names it.
@@ -273,15 +278,26 @@ async fn diagnose_partial_init(
 ///    write — overwriting a `0644` file leaves it world-readable while
 ///    the secret-bearing JSON is on disk, until the subsequent chmod.
 ///
-/// The same atomic-create discipline used by `write_root_token_file` is
-/// applied here: `OpenOptionsExt::mode(0o600)` ensures new files are
-/// born `0600`, and an explicit `set_permissions(0o600)` immediately
-/// after the write also restricts any pre-existing destination before
-/// `write_all` so the secrets never touch a wider-mode file.  Reinit's
-/// preflight (`validate_summary_json_output_path`) additionally
-/// rejects world-/group-readable existing destinations, but this write
-/// path is deliberately defensive — `--summary-json` may be invoked
-/// from the `init` flow (not just `reinit`) where no preflight runs.
+/// The write goes through [`fs_util::atomic_write_blocking`], which
+/// stages the JSON in a temporary file in the same directory born
+/// `0600`, flushes it, sets the mode there, and only then `rename`s it
+/// over the destination.  The secrets therefore never touch the
+/// destination inode at all, so neither hazard above has a window: the
+/// published file is `0600` from the instant the name points at it.
+///
+/// The pre-write tightening of an existing destination is kept.  It
+/// guards what the rename cannot — an older summary, with older
+/// credentials in it, sitting world-readable at the path right now.
+/// Renaming a fresh inode over it does not narrow that file during the
+/// write, and the operator's own preflight
+/// (`validate_summary_json_output_path`) only runs on the `reinit`
+/// path, while `--summary-json` is reachable from `init` too.
+///
+/// The containing directory is flushed after the rename, inside
+/// `atomic_write_blocking`.  This file is written once during `init`
+/// and read by an operator afterwards, possibly as the only record of
+/// credentials that cannot be re-derived, so it is worth the disk round
+/// trip that makes the published name survive a power loss.
 async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -290,33 +306,39 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
     }
     let payload = serde_json::to_string_pretty(summary)?;
     let path_buf = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        // Tighten an existing destination's permissions before any
-        // secret content is written.  No-op for missing files.  The
-        // `OpenOptions::mode` below covers the missing-file case so
-        // the file is born `0600`.
-        if path_buf.exists() {
-            std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&path_buf)?;
-        file.write_all(payload.as_bytes())?;
-        file.sync_all()?;
-        // Re-assert permissions in case an existing file's mode
-        // changed between the pre-write set and the open call (e.g.
-        // unusual filesystem semantics).
-        std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        tighten_existing_secret_file(&path_buf)?;
+        fs_util::atomic_write_blocking(&path_buf, payload.as_bytes(), SECRET_OUTPUT_FILE_MODE)
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for summary json write failed: {e}"))??;
     Ok(())
+}
+
+/// Narrows an existing destination to `0600` before a secret is written
+/// over it.  A no-op when nothing is there, which is the usual case.
+///
+/// The staged write that follows replaces the path with a fresh inode,
+/// so this is not about the bytes being written — it is about the ones
+/// already at the path.  A summary or token file left behind by an
+/// earlier run at a wider mode stays readable for as long as it takes
+/// the new one to be produced, and that file holds credentials too.
+fn tighten_existing_secret_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::set_permissions(
+        path,
+        std::fs::Permissions::from_mode(SECRET_OUTPUT_FILE_MODE),
+    )
+    .with_context(|| {
+        format!(
+            "Failed to set mode {SECRET_OUTPUT_FILE_MODE:o} on the existing {}",
+            path.display()
+        )
+    })
 }
 
 /// Persists the freshly generated `OpenBao` root token to `path` with
@@ -325,12 +347,21 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
 /// files are not recommended for production and the surrounding code
 /// validates the destination path before any destructive work begins.
 ///
-/// The file is created via `OpenOptionsExt::mode(0o600)` so a freshly
-/// minted root token never exists on disk with the process umask's
-/// default permissions (commonly `0644`) between creation and a
-/// subsequent `chmod` call.  Per-process umask still applies, so an
-/// explicit `set_permissions` follows for the existing-file case where
-/// `OpenOptionsExt::mode` is a no-op on POSIX.
+/// Written exactly as the init summary is, through
+/// [`fs_util::atomic_write_blocking`]: the token is staged in a
+/// temporary file in the same directory born `0600`, flushed, moded,
+/// and `rename`d over the destination.  So a freshly minted root token
+/// never exists on disk at the process umask's default permissions
+/// (commonly `0644`), and never at the destination name in a partial
+/// state.  An existing destination is tightened first, for the older
+/// token that may still be sitting in it — see
+/// [`tighten_existing_secret_file`].
+///
+/// The containing directory is flushed after the rename, inside
+/// `atomic_write_blocking`.  The token is written once and read by an
+/// operator afterwards; losing the published name to a power loss
+/// means losing the only copy of a credential `reinit` will not mint
+/// again, which is worth a disk round trip on a once-per-init write.
 async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -339,19 +370,9 @@ async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     }
     let path_buf = path.to_path_buf();
     let token = token.to_string();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&path_buf)?;
-        file.write_all(token.as_bytes())?;
-        file.sync_all()?;
-        std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        tighten_existing_secret_file(&path_buf)?;
+        fs_util::atomic_write_blocking(&path_buf, token.as_bytes(), SECRET_OUTPUT_FILE_MODE)
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for root token write failed: {e}"))??;
@@ -2479,5 +2500,78 @@ mod tests {
             .await
             .expect("rebuilt_admin_dsn_for_kv must succeed when KV path is absent");
         assert!(rebuilt.is_none(), "absent KV path must yield None");
+    }
+
+    /// The token arrives by rename from a staged temporary, so the
+    /// destination name never points at a partially written credential.
+    /// A changed inode is what separates that from the truncate-in-place
+    /// open this replaced.
+    #[tokio::test]
+    async fn write_root_token_file_publishes_a_new_inode_at_0600() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("root-token.txt");
+        write_root_token_file(&path, "hvs.first")
+            .await
+            .expect("first token write");
+        let first_inode = std::fs::metadata(&path).expect("stat").ino();
+
+        write_root_token_file(&path, "hvs.second")
+            .await
+            .expect("second token write");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "hvs.second");
+        assert_ne!(std::fs::metadata(&path).expect("stat").ino(), first_inode);
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("root-token.txt")],
+            "the staged temporary must not survive the publish"
+        );
+    }
+
+    /// The destination is created when the parent exists but the file
+    /// does not — the pre-write tightening must not trip over a missing
+    /// path.
+    #[tokio::test]
+    async fn write_root_token_file_creates_a_missing_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("root-token.txt");
+        write_root_token_file(&path, "hvs.only")
+            .await
+            .expect("token write into a fresh directory");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "hvs.only");
+    }
+
+    /// An older summary or token file left world-readable is narrowed
+    /// before the replacement is produced. The rename cannot do this:
+    /// it publishes a fresh inode and leaves the old one readable for
+    /// as long as it takes to write the new one.
+    #[test]
+    fn tighten_existing_secret_file_narrows_a_world_readable_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("summary.json");
+        std::fs::write(&path, "{}").expect("seed the destination");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        tighten_existing_secret_file(&path).expect("tighten");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
+
+    #[test]
+    fn tighten_existing_secret_file_ignores_a_missing_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tighten_existing_secret_file(&dir.path().join("absent.json"))
+            .expect("a missing destination is not an error");
     }
 }

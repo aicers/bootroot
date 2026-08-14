@@ -654,11 +654,13 @@ pub(crate) fn validate_root_token_output_path(path: &Path, messages: &Messages) 
 /// the freshly issued root token and unseal keys (see `InitSummary`), so
 /// it must be written with the same atomic restricted-permission write
 /// discipline as `--root-token-output`.  In particular, existing
-/// world-/group-readable destinations are rejected here: even though
-/// `write_init_summary_json` re-applies `0600` after the write, the
-/// content lands in the pre-existing file's permission bits first, and
-/// a `0644` destination would briefly expose root token + unseal keys
-/// to other users on the host between the write and the chmod.
+/// world-/group-readable destinations are rejected here.
+/// `write_init_summary_json` stages the secrets in a `0600` temporary
+/// and renames it over the path, so they never land in the pre-existing
+/// file's permission bits — but a `0644` destination is still an older
+/// summary, with older credentials in it, sitting readable to every
+/// user on the host.  The operator is told to deal with it rather than
+/// having it silently replaced.
 pub(crate) fn validate_summary_json_output_path(path: &Path, messages: &Messages) -> Result<()> {
     let display = path.display().to_string();
 
@@ -1922,9 +1924,10 @@ mod tests {
     /// Regression for Round 7 reviewer item: the summary JSON carries
     /// the freshly issued root token and unseal keys, so an existing
     /// world-/group-readable destination must be rejected at preflight.
-    /// Letting `write_init_summary_json` proceed against a `0644` file
-    /// would briefly leave the secret payload world-readable on disk
-    /// between the write and the post-write chmod.
+    /// The staged write that replaces such a file does not make it
+    /// acceptable: a `0644` summary already holds credentials from an
+    /// earlier run, readable to every user on the host until it is
+    /// replaced.
     #[test]
     fn validate_summary_json_rejects_world_readable_existing_file() {
         let dir = tempdir().unwrap();

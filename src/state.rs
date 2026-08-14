@@ -3,11 +3,20 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SECRETS_DIR: &str = "secrets";
 const DEFAULT_STATE_FILE: &str = "state.json";
+/// Mode for `state.json`. The plain `fs::write` this file used to be
+/// published with left the mode to the process umask on a fresh create
+/// (`0644` in practice) and to the destination on a rewrite. A staged
+/// temporary inherits neither, so the mode is stated here, and `0644`
+/// is what it has always been: the file is an inventory of services,
+/// paths and role ids, carrying no secret — the `secret_id` behind
+/// `secret_id_path` lives in its own `0600` file.
+const STATE_FILE_MODE: u32 = 0o644;
 pub(crate) const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
 /// Describes how to reload a service after its infrastructure certificate
@@ -122,10 +131,36 @@ impl StateFile {
         Ok(state)
     }
 
+    /// Publishes `state.json` by renaming a temporary staged in the same
+    /// directory.
+    ///
+    /// `state.json` is what `bootroot` reads back to know what it
+    /// already did, so a torn write is not a stale record but no record
+    /// at all: the next run fails to parse it and falls back to nothing.
+    /// Renaming over the destination means a reader — another `bootroot`
+    /// invocation, or the next run after a crash — sees either the whole
+    /// previous version or the whole new one, and two concurrent writers
+    /// see one version or the other rather than each other's bytes.
+    /// `bootler` staggers its two rotation units ten minutes apart
+    /// because this write used to race; that stagger is no longer
+    /// load-bearing for this file (removing it is `bootler`'s own
+    /// follow-up).
+    ///
+    /// The containing directory is flushed after the rename, inside
+    /// [`fs_util::atomic_write_blocking`]. This file is read back to
+    /// resume, so the published name has to survive a power loss and not
+    /// merely a clean replacement — the same decision `rotation-state.json`
+    /// takes, and for the same reason.
+    ///
+    /// Blocking, deliberately: the staged write, its flush and the
+    /// directory flush are disk round trips, and the callers are
+    /// command paths rather than a poll loop. An async caller on a hot
+    /// path wraps this in `spawn_blocking` at the call site, as the
+    /// rotation-state writers do.
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
         let contents =
             serde_json::to_string_pretty(self).context("Failed to serialize state.json")?;
-        std::fs::write(path, contents)
+        fs_util::atomic_write_blocking(path, contents.as_bytes(), STATE_FILE_MODE)
             .with_context(|| format!("Failed to write {}", path.display()))
     }
 
@@ -252,7 +287,63 @@ fn write_serde_string_value<T: Serialize>(
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     use super::*;
+
+    fn state_with_url(url: &str) -> StateFile {
+        StateFile {
+            openbao_url: url.to_string(),
+            ..StateFile::default()
+        }
+    }
+
+    /// The save replaces the destination name rather than truncating
+    /// the file behind it, so a reader holding the old path sees the
+    /// whole previous version. A changed inode is what distinguishes
+    /// the two: `fs::write` would have kept it.
+    #[test]
+    fn save_publishes_a_new_inode_over_an_existing_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        state_with_url("http://first:8200").save(&path).unwrap();
+        let first_inode = std::fs::metadata(&path).unwrap().ino();
+
+        state_with_url("http://second:8200").save(&path).unwrap();
+
+        let reloaded = StateFile::load(&path).unwrap();
+        assert_eq!(reloaded.openbao_url, "http://second:8200");
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), first_inode);
+    }
+
+    /// The staged temporary lives in the destination's own directory,
+    /// so a failure to clean it up would leave a stray file next to
+    /// `state.json` for the operator to find.
+    #[test]
+    fn save_leaves_no_temporary_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        state_with_url("http://localhost:8200").save(&path).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("state.json")]);
+    }
+
+    /// The mode is the writer's now that the file arrives by rename,
+    /// and it is the `0644` the umask used to produce. The file is an
+    /// inventory, not a secret.
+    #[test]
+    fn save_publishes_at_0644() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        state_with_url("http://localhost:8200").save(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, STATE_FILE_MODE);
+    }
 
     #[test]
     fn delivery_mode_defaults_to_local_file() {

@@ -117,7 +117,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
-- Fixed `bootroot init` treating a closed stdin as an answer. Every
+- Fixed the four remaining files that were written by truncating the
+  destination and writing over it, so a crash or a concurrent reader
+  could see a half-written file at a name that is supposed to hold a
+  complete one. `state.json`, the issued certificate files, and the
+  `--summary-json` and `--root-token-output` destinations are now each
+  written to a temporary file in the same directory and renamed into
+  place, so a reader sees either the previous file or the whole new
+  one. `state.json` and the two `init` outputs additionally flush the
+  containing directory, so the published file survives a power loss and
+  not merely a clean replacement; a lost certificate is reissued at the
+  next renewal and does not pay for that flush. File modes are
+  unchanged: `state.json` and certificates stay `0644`, the two `init`
+  outputs stay `0600`, and an existing destination's owner is
+  preserved. Every
   `init` prompt read the terminating EOF as an empty line, so a run
   whose piped answer sequence ran out answered the rest of its prompts
   itself: the EAB credential prompt re-prompted forever (over five

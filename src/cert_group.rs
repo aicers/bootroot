@@ -365,58 +365,114 @@ fn resolve_group_name(name: &str) -> Option<u32> {
 pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy) -> Result<()> {
     let dest = path.to_path_buf();
     let key_owned = key_pem.to_string();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let parent = dest
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Key path {} has no parent", dest.display()))?;
-        let file_name = dest
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Key path {} has no file name", dest.display()))?;
-
-        let staged = stage_key_file(parent, file_name, &key_owned, policy)?;
-        // The staged file is flushed before this rename, but the
-        // directory holding the new entry deliberately is not flushed
-        // after it: a crash that loses the rename leaves the previous
-        // key in place, and the next renewal reissues. That costs a
-        // reissue, not an outage, which does not buy a disk round trip
-        // on every key write. Contrast `fs_util::atomic_write_blocking`,
-        // whose callers read their file back to resume.
-        std::fs::rename(&staged, &dest).map_err(|err| {
-            let _ = std::fs::remove_file(&staged);
-            anyhow::Error::new(err).context(format!(
-                "Failed to rename {} to {}",
-                staged.display(),
-                dest.display()
-            ))
-        })?;
-        Ok(())
+    let final_mode = if policy.is_active() {
+        KEY_FILE_MODE_GROUP
+    } else {
+        KEY_FILE_MODE_DEFAULT
+    };
+    tokio::task::spawn_blocking(move || {
+        publish_staged(
+            &dest,
+            &key_owned,
+            KEY_FILE_MODE_DEFAULT,
+            final_mode,
+            policy,
+            StagedFile::Key,
+        )
     })
     .await
     .context("write_key_file task panicked")??;
     Ok(())
 }
 
-/// Creates the key staging file at `0600` with `O_CREAT|O_EXCL`, writes
-/// the key bytes, applies the policy's chown / chmod while the file is
-/// still at its temporary path, and returns the staged path so the caller
-/// can `rename` it over the destination.
-fn stage_key_file(
+/// Stages `contents` beside `dest`, applies the policy's ownership and
+/// the final mode while the file is still at its temporary path, and
+/// `rename`s it over `dest`.
+///
+/// Shared by the key and the certificate so both publish the same way:
+/// the destination name is only ever observed as the previous file or
+/// the complete new one, and never at a mode or owner other than the
+/// one the policy asks for.
+fn publish_staged(
+    dest: &Path,
+    contents: &str,
+    create_mode: u32,
+    final_mode: u32,
+    policy: CertGroupPolicy,
+    kind: StagedFile,
+) -> Result<()> {
+    let label = kind.label();
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{label} path {} has no parent", dest.display()))?;
+    let file_name = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("{label} path {} has no file name", dest.display()))?;
+
+    let staged = stage_file(parent, file_name, contents, create_mode, final_mode, policy)?;
+    // The staged file is flushed before this rename, but the directory
+    // holding the new entry deliberately is not flushed after it: a
+    // crash that loses the rename leaves the previous key or
+    // certificate in place, and the next renewal reissues. That costs a
+    // reissue, not an outage, which does not buy a disk round trip on
+    // every write. Contrast `fs_util::atomic_write_blocking`, whose
+    // callers read their file back to resume.
+    std::fs::rename(&staged, dest).map_err(|err| {
+        let _ = std::fs::remove_file(&staged);
+        anyhow::Error::new(err).context(format!(
+            "Failed to rename {} to {}",
+            staged.display(),
+            dest.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Which of the two files a staged write is publishing. Names the path
+/// in the errors [`publish_staged`] raises before it reaches the
+/// filesystem, and nothing else — the mode and ownership decisions are
+/// the caller's arguments.
+#[derive(Clone, Copy)]
+enum StagedFile {
+    Key,
+    Cert,
+}
+
+impl StagedFile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Key => "Key",
+            Self::Cert => "Cert",
+        }
+    }
+}
+
+/// Creates the staging file at `create_mode` with `O_CREAT|O_EXCL`,
+/// writes the bytes, applies the policy's chown and then `final_mode`
+/// while the file is still at its temporary path, and returns the
+/// staged path so the caller can `rename` it over the destination.
+///
+/// `create_mode` is what the file is born with, so the key never exists
+/// group-readable for an instant; `final_mode` is asserted before the
+/// rename, so the published mode is the policy's and not whatever the
+/// process umask narrowed the create to.
+fn stage_file(
     parent: &Path,
     final_name: &str,
-    key_pem: &str,
+    contents: &str,
+    create_mode: u32,
+    final_mode: u32,
     policy: CertGroupPolicy,
 ) -> Result<PathBuf> {
     let pid = std::process::id();
     for attempt in 0u32..32 {
         let candidate = parent.join(format!(".{final_name}.tmp.{pid}.{attempt}"));
         let mut opts = std::fs::OpenOptions::new();
-        opts.create_new(true)
-            .write(true)
-            .mode(KEY_FILE_MODE_DEFAULT);
+        opts.create_new(true).write(true).mode(create_mode);
         match opts.open(&candidate) {
             Ok(mut f) => {
-                if let Err(err) = f.write_all(key_pem.as_bytes()) {
+                if let Err(err) = f.write_all(contents.as_bytes()) {
                     let _ = std::fs::remove_file(&candidate);
                     return Err(anyhow::Error::new(err)
                         .context(format!("Failed to write {}", candidate.display())));
@@ -427,22 +483,24 @@ fn stage_key_file(
                         .context(format!("Failed to fsync {}", candidate.display())));
                 }
                 drop(f);
-                if let Some(gid) = policy.gid {
-                    if let Err(err) = std::os::unix::fs::chown(&candidate, None, Some(gid)) {
-                        let _ = std::fs::remove_file(&candidate);
-                        return Err(anyhow::Error::new(err).context(format!(
-                            "Failed to chown {} to gid {gid}",
-                            candidate.display()
-                        )));
-                    }
-                    if let Err(err) = std::fs::set_permissions(
-                        &candidate,
-                        std::fs::Permissions::from_mode(KEY_FILE_MODE_GROUP),
-                    ) {
-                        let _ = std::fs::remove_file(&candidate);
-                        return Err(anyhow::Error::new(err)
-                            .context(format!("Failed to chmod 0640 on {}", candidate.display())));
-                    }
+                if let Some(gid) = policy.gid
+                    && let Err(err) = std::os::unix::fs::chown(&candidate, None, Some(gid))
+                {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(anyhow::Error::new(err).context(format!(
+                        "Failed to chown {} to gid {gid}",
+                        candidate.display()
+                    )));
+                }
+                if let Err(err) = std::fs::set_permissions(
+                    &candidate,
+                    std::fs::Permissions::from_mode(final_mode),
+                ) {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(anyhow::Error::new(err).context(format!(
+                        "Failed to chmod {final_mode:o} on {}",
+                        candidate.display()
+                    )));
                 }
                 return Ok(candidate);
             }
@@ -467,20 +525,34 @@ fn stage_key_file(
 /// The cert mode (`0644`) is unchanged regardless of policy; only the
 /// group ownership is adjusted when `policy` is active.
 ///
+/// Published the same way as the key beside it, through
+/// `publish_staged`: the bytes go to a temporary file in the same
+/// directory, the mode and the policy's ownership are applied there,
+/// and only then is it `rename`d over the destination. A reader —
+/// `bootroot-agent`, or the server being reloaded — therefore observes
+/// the previous certificate or the complete new one, never a truncated
+/// PEM. The containing directory is deliberately not flushed after the
+/// rename; see the comment at that rename for why.
+///
 /// # Errors
 ///
-/// Returns an error if the write, chown, or chmod fails.
+/// Returns an error if the staging write, chown, chmod, or rename fails.
 pub async fn write_cert_file(path: &Path, cert_pem: &str, policy: CertGroupPolicy) -> Result<()> {
-    fs::write(path, cert_pem)
-        .await
-        .with_context(|| format!("Failed to write cert file {}", path.display()))?;
-    fs::set_permissions(path, std::fs::Permissions::from_mode(CERT_FILE_MODE))
-        .await
-        .with_context(|| format!("Failed to set 0644 on {}", path.display()))?;
-    if let Some(gid) = policy.gid {
-        chown_path(path, gid).await?;
-    }
-    Ok(())
+    let dest = path.to_path_buf();
+    let cert_owned = cert_pem.to_string();
+    tokio::task::spawn_blocking(move || {
+        publish_staged(
+            &dest,
+            &cert_owned,
+            CERT_FILE_MODE,
+            CERT_FILE_MODE,
+            policy,
+            StagedFile::Cert,
+        )
+    })
+    .await
+    .context("write_cert_file task panicked")?
+    .with_context(|| format!("Failed to write cert file {}", path.display()))
 }
 
 /// Ensures the directory containing the private key exists and has the
@@ -737,6 +809,88 @@ mod tests {
 
         result.expect("the key writer must not open the directory");
         assert_eq!(std::fs::read_to_string(&key).unwrap(), "K");
+    }
+
+    /// The certificate is published by rename like the key beside it,
+    /// so a reader of the destination never sees a half-written PEM. A
+    /// changed inode is the observable difference from the `fs::write`
+    /// this replaced, which truncated the destination in place.
+    #[tokio::test]
+    async fn write_cert_file_publishes_a_new_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("c.pem");
+        write_cert_file(&cert, "FIRST", CertGroupPolicy::none())
+            .await
+            .unwrap();
+        let first_inode = std::fs::metadata(&cert).unwrap().ino();
+
+        write_cert_file(&cert, "SECOND", CertGroupPolicy::none())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&cert).unwrap(), "SECOND");
+        assert_ne!(std::fs::metadata(&cert).unwrap().ino(), first_inode);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("c.pem")]);
+    }
+
+    /// `0644` regardless of policy, and asserted on the staged file
+    /// rather than left to the umask — the mode the published name
+    /// carries must not depend on the umask of whoever ran the rotation.
+    #[tokio::test]
+    async fn write_cert_file_uses_0644() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("c.pem");
+        write_cert_file(&cert, "C", CertGroupPolicy::none())
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&cert).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, CERT_FILE_MODE);
+    }
+
+    /// A destination an earlier writer left at a stricter mode is
+    /// republished at `0644`. Staging must not turn "the mode is
+    /// re-asserted on every write" into "the mode is whatever the
+    /// previous file had".
+    #[tokio::test]
+    async fn write_cert_file_widens_a_stricter_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("c.pem");
+        std::fs::write(&cert, "OLD").unwrap();
+        std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_cert_file(&cert, "NEW", CertGroupPolicy::none())
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&cert).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, CERT_FILE_MODE);
+    }
+
+    /// The certificate declines the directory flush for the same reason
+    /// the key does: a lost rename costs a reissue, not an outage. Same
+    /// construction as `write_key_file_does_not_flush_the_directory`,
+    /// including the skip where the mode does not bite.
+    #[tokio::test]
+    async fn write_cert_file_does_not_flush_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let published = dir.path().join("published");
+        std::fs::create_dir(&published).unwrap();
+        let cert = published.join("c.pem");
+        std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::File::open(&published).is_ok() {
+            std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let result = write_cert_file(&cert, "C", CertGroupPolicy::none()).await;
+        std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        result.expect("the cert writer must not open the directory");
+        assert_eq!(std::fs::read_to_string(&cert).unwrap(), "C");
     }
 
     #[tokio::test]
