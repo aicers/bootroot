@@ -61,41 +61,118 @@ pub(crate) fn rotation_state_path(state_dir: &Path) -> PathBuf {
 /// [`update_rotation_state`] carries every later one through
 /// `atomic_write_blocking`'s own flush.
 ///
+/// Callers in an async context use [`create_rotation_state_async`]
+/// instead, which runs the same blocking core on a blocking thread —
+/// the create, the file flush and the directory flush are each a disk
+/// round trip and must not run on a runtime thread.
+///
 /// Returns `Ok(())` if the file was created, or an error if it already exists.
+// The only production caller of a rotation-state writer is
+// `rotate_ca_key`, which is async and so goes through the wrapper
+// below. This is the entry point for a synchronous one, and is what the
+// unit tests below call; keeping it means a future non-async caller does
+// not have to unpick the wrapper to find the blocking core.
+#[allow(dead_code)]
 pub(crate) fn create_rotation_state(
     state_dir: &Path,
     state: &RotationState,
     messages: &Messages,
 ) -> Result<()> {
     let path = rotation_state_path(state_dir);
-    let json = serde_json::to_string_pretty(state)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    let write_failed = messages.error_write_file_failed(&path.display().to_string());
+    let json = serialize_rotation_state(state, &write_failed)?;
+    create_rotation_state_file(&path, &json, &write_failed)
+}
+
+/// Async entry point for [`create_rotation_state`].
+///
+/// The JSON and the failure message are built here, on the async side,
+/// so neither `&Messages` nor `&RotationState` has to cross into the
+/// `'static` closure: only the owned path, payload and message do.
+///
+/// # Errors
+/// Returns an error under the same conditions as
+/// [`create_rotation_state`], or if the blocking task cannot be joined.
+pub(crate) async fn create_rotation_state_async(
+    state_dir: &Path,
+    state: &RotationState,
+    messages: &Messages,
+) -> Result<()> {
+    let path = rotation_state_path(state_dir);
+    let write_failed = messages.error_write_file_failed(&path.display().to_string());
+    let json = serialize_rotation_state(state, &write_failed)?;
+    tokio::task::spawn_blocking(move || create_rotation_state_file(&path, &json, &write_failed))
+        .await
+        .context("Rotation state create task panicked")?
+}
+
+/// The blocking core shared by both entry points: create, write, flush
+/// the file, then flush the directory that now names it.
+fn create_rotation_state_file(path: &Path, json: &str, write_failed: &str) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(ROTATION_STATE_MODE)
-        .open(&path)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+        .open(path)
+        .with_context(|| write_failed.to_string())?;
     file.write_all(json.as_bytes())
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    file.sync_all()
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    fs_util::sync_parent_dir(&path)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+        .with_context(|| write_failed.to_string())?;
+    file.sync_all().with_context(|| write_failed.to_string())?;
+    fs_util::sync_parent_dir(path).with_context(|| write_failed.to_string())?;
     Ok(())
 }
 
 /// Updates `rotation-state.json` via temp-file + rename for crash safety.
+///
+/// Callers in an async context use [`update_rotation_state_async`]
+/// instead, which runs the same blocking core on a blocking thread.
+// Test-only today, for the same reason as `create_rotation_state`.
+#[allow(dead_code)]
 pub(crate) fn update_rotation_state(
     state_dir: &Path,
     state: &RotationState,
     messages: &Messages,
 ) -> Result<()> {
     let path = rotation_state_path(state_dir);
-    let json = serde_json::to_string_pretty(state)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    fs_util::atomic_write_blocking(&path, json.as_bytes(), ROTATION_STATE_MODE)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
+    let write_failed = messages.error_write_file_failed(&path.display().to_string());
+    let json = serialize_rotation_state(state, &write_failed)?;
+    update_rotation_state_file(&path, &json, &write_failed)
+}
+
+/// Async entry point for [`update_rotation_state`].
+///
+/// Moves only owned data into the blocking closure, exactly as
+/// [`create_rotation_state_async`] does.
+///
+/// # Errors
+/// Returns an error under the same conditions as
+/// [`update_rotation_state`], or if the blocking task cannot be joined.
+pub(crate) async fn update_rotation_state_async(
+    state_dir: &Path,
+    state: &RotationState,
+    messages: &Messages,
+) -> Result<()> {
+    let path = rotation_state_path(state_dir);
+    let write_failed = messages.error_write_file_failed(&path.display().to_string());
+    let json = serialize_rotation_state(state, &write_failed)?;
+    tokio::task::spawn_blocking(move || update_rotation_state_file(&path, &json, &write_failed))
+        .await
+        .context("Rotation state update task panicked")?
+}
+
+/// The blocking core shared by both entry points; the file flush, the
+/// rename and the directory flush all live in `atomic_write_blocking`.
+fn update_rotation_state_file(path: &Path, json: &str, write_failed: &str) -> Result<()> {
+    fs_util::atomic_write_blocking(path, json.as_bytes(), ROTATION_STATE_MODE)
+        .with_context(|| write_failed.to_string())
+}
+
+/// Renders the state as the pretty-printed JSON both writers publish,
+/// on the caller's thread: it touches no disk and the async wrappers
+/// need the result before the blocking boundary anyway, since
+/// `RotationState` is not `Clone` and cannot be moved into the closure.
+fn serialize_rotation_state(state: &RotationState, write_failed: &str) -> Result<String> {
+    serde_json::to_string_pretty(state).with_context(|| write_failed.to_string())
 }
 
 /// Loads `rotation-state.json` if it exists. Returns `None` if absent.
@@ -271,6 +348,129 @@ mod tests {
         assert!(
             rotation_state_path(dir.path()).exists(),
             "the create landed; only its durability was not established"
+        );
+    }
+
+    /// The async wrapper must carry the same failure the synchronous
+    /// writer does: the closure runs on a blocking thread, and both the
+    /// create and the directory flush it reports have to survive the
+    /// join rather than being swallowed there.
+    #[tokio::test]
+    async fn create_rotation_state_async_reports_a_directory_it_cannot_flush() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let state = sample_state();
+        let restrict = |mode| {
+            fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+
+        restrict(0o300);
+        if std::fs::File::open(dir.path()).is_ok() {
+            // Effective root, or a filesystem that ignores the mode:
+            // the flush cannot be made to fail here.
+            restrict(0o700);
+            return;
+        }
+        let result = create_rotation_state_async(dir.path(), &state, &messages).await;
+        restrict(0o700);
+
+        let err = result.expect_err("an unflushable directory must be reported");
+        assert!(
+            format!("{err:#}").contains("to fsync it"),
+            "the directory flush must be the reported failure, got: {err:#}"
+        );
+        assert!(
+            rotation_state_path(dir.path()).exists(),
+            "the create landed; only its durability was not established"
+        );
+    }
+
+    /// Same for the update wrapper, whose flush comes from
+    /// `atomic_write_blocking` rather than from a call of its own.
+    #[tokio::test]
+    async fn update_rotation_state_async_reports_a_directory_it_cannot_flush() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let mut state = sample_state();
+        let restrict = |mode| {
+            fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+
+        create_rotation_state(dir.path(), &state, &messages).expect("create");
+
+        restrict(0o300);
+        if std::fs::File::open(dir.path()).is_ok() {
+            restrict(0o700);
+            return;
+        }
+        state.phase = 2;
+        let result = update_rotation_state_async(dir.path(), &state, &messages).await;
+        restrict(0o700);
+
+        let err = result.expect_err("an unflushable directory must be reported");
+        assert!(
+            format!("{err:#}").contains("to fsync it"),
+            "the directory flush must be the reported failure, got: {err:#}"
+        );
+        let loaded = load_rotation_state(dir.path(), &messages)
+            .expect("load")
+            .expect("should be Some");
+        assert_eq!(
+            loaded.phase, 2,
+            "the rename landed; only its durability was not established"
+        );
+    }
+
+    /// The happy path through both wrappers, which the failure tests
+    /// above cannot reach: what the blocking thread publishes has to be
+    /// what the synchronous writers publish — the same payload, the same
+    /// `O_EXCL` create, and owner-only on both the create and the
+    /// republish that follows it.
+    #[tokio::test]
+    async fn rotation_state_async_wrappers_round_trip_at_the_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let mut state = sample_state();
+        let published_mode = || {
+            fs::metadata(rotation_state_path(dir.path()))
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        create_rotation_state_async(dir.path(), &state, &messages)
+            .await
+            .expect("create");
+        assert_eq!(published_mode(), ROTATION_STATE_MODE);
+
+        state.phase = 3;
+        update_rotation_state_async(dir.path(), &state, &messages)
+            .await
+            .expect("update");
+        assert_eq!(
+            published_mode(),
+            ROTATION_STATE_MODE,
+            "the rename must not leave the state file at the umask's mode"
+        );
+
+        let loaded = load_rotation_state(dir.path(), &messages)
+            .expect("load")
+            .expect("should be Some");
+        assert_eq!(loaded.phase, 3);
+        assert_eq!(loaded.mode, RotationMode::IntermediateOnly);
+        assert_eq!(loaded.old_intermediate_fp, "bbb");
+
+        let conflict = create_rotation_state_async(dir.path(), &state, &messages).await;
+        assert!(
+            conflict.is_err(),
+            "the wrapper keeps the create's O_EXCL: a second one must fail"
         );
     }
 
