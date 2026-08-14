@@ -48,6 +48,63 @@ pub fn path_is_within(candidate: &Path, prefix: &Path) -> std::io::Result<bool> 
     Ok(absolute_lexical(candidate)?.starts_with(absolute_lexical(prefix)?))
 }
 
+/// The directory holding `path`: its parent, or the process cwd when
+/// `path` is a bare file name.
+fn parent_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// Flushes the directory holding `path` — its entry list, not the files
+/// behind it — so the name just published there survives a crash.
+///
+/// A `rename(2)`, or an `O_EXCL` create, is a directory operation.
+/// `sync_all` on the file puts its *bytes* on disk; until the directory
+/// is flushed the entry pointing at those bytes may not be, and a crash
+/// in that window can leave the destination name still pointing at the
+/// old inode — or at nothing — with the fully written new data sitting
+/// on disk unreferenced. The file survived; the fact that it is the
+/// current one did not.
+///
+/// Call this *after* the rename or the create, never before, and only
+/// where the file has to survive a power loss rather than merely
+/// replace cleanly — the flush is a disk round trip per write. One call
+/// is enough per publish: a staged temporary is created in the
+/// destination's own directory, so both names live in the entry list
+/// being flushed here. It takes the published file rather than the
+/// directory so every caller resolves the same directory the write did,
+/// including the bare-file-name case that names the cwd.
+///
+/// What that buys is a Linux guarantee. macOS `fsync` does not flush
+/// the drive's own write cache — `F_FULLFSYNC` is the call that does —
+/// so on a developer machine this closes the ordering gap without
+/// promising power-loss durability. Linux is the deployment target and
+/// is where the guarantee has to hold.
+///
+/// Blocking, like the `std::fs` calls it wraps: async callers invoke it
+/// inside the `spawn_blocking` that already carries their write.
+///
+/// # Errors
+/// Returns an error if the directory cannot be opened or the flush
+/// fails. A failed flush means the publish is not durable, so it is
+/// reported rather than swallowed — including the `EINVAL` that a
+/// filesystem outside Linux and macOS may answer a directory `fsync`
+/// with.
+pub fn sync_parent_dir(path: &Path) -> Result<()> {
+    let dir = parent_dir(path);
+    std::fs::File::open(&dir)
+        .with_context(|| {
+            format!(
+                "Failed to open directory {} to fsync it after publishing {}",
+                dir.display(),
+                path.display()
+            )
+        })?
+        .sync_all()
+        .with_context(|| format!("Failed to fsync directory {}", dir.display()))
+}
+
 /// Stages `contents` into a fresh file inside the parent directory of
 /// `path`, chowns it to the parent directory's owner, applies mode
 /// `0600`, and links it into place **without** following or replacing
@@ -66,12 +123,18 @@ pub fn path_is_within(candidate: &Path, prefix: &Path) -> std::io::Result<bool> 
 /// lower-privileged user cannot redirect the root write or have a stale
 /// credential silently clobbered.
 ///
+/// The containing directory is flushed after the link
+/// ([`sync_parent_dir`]). Losing this write after `OpenBao` has already
+/// accepted the new credential does not cost a rewrite: it locks the
+/// agent out until an operator intervenes.
+///
 /// # Errors
 /// Returns an error if `path` is not absolute, has no parent, the
 /// parent is missing or not a directory, the temp file cannot be
-/// created/written/permissioned/chowned, or the target already exists.
+/// created/written/permissioned/chowned, the target already exists, or
+/// the containing directory cannot be flushed.
 pub async fn create_owned_credential_noclobber(path: &Path, contents: &[u8]) -> Result<()> {
-    write_owned_impl(path, contents, KEY_FILE_MODE, false).await
+    write_owned_impl(path, contents, KEY_FILE_MODE, Publish::NoClobber).await
 }
 
 /// Like [`create_owned_credential_noclobber`] but atomically *replaces*
@@ -80,12 +143,18 @@ pub async fn create_owned_credential_noclobber(path: &Path, contents: &[u8]) -> 
 /// parent owner, and the rename replaces the target name rather than
 /// following a symlink planted at it.
 ///
+/// The containing directory is deliberately *not* flushed after the
+/// rename. `eab.json` is rewritten on every sync, so a crash that loses
+/// the new directory entry costs the next sync's rewrite and nothing
+/// else — not worth a disk round trip on every write.
+///
 /// # Errors
 /// Returns an error under the same conditions as
 /// [`create_owned_credential_noclobber`], except that an existing
-/// regular file at the target is replaced instead of rejected.
+/// regular file at the target is replaced instead of rejected, and no
+/// directory flush is attempted.
 pub async fn write_owned_file_replace(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
-    write_owned_impl(path, contents, mode, true).await
+    write_owned_impl(path, contents, mode, Publish::Replace).await
 }
 
 /// Atomically rewrites an existing override credential file in place,
@@ -103,20 +172,24 @@ pub async fn write_owned_file_replace(path: &Path, contents: &[u8], mode: u32) -
 /// the target name (it never follows the link) and the ownership read is
 /// taken from the real file, so a swap after the check cannot escalate.
 ///
+/// The containing directory is flushed after the rename
+/// ([`sync_parent_dir`]), for the same reason as
+/// [`create_owned_credential_noclobber`]: losing the rotated
+/// `secret_id` once `OpenBao` has accepted it locks the agent out until
+/// an operator intervenes.
+///
 /// # Errors
 /// Returns an error if the destination is a symlink, is missing, its
-/// metadata cannot be read, or the staged file cannot be
-/// created/written/permissioned/chowned/renamed.
+/// metadata cannot be read, the staged file cannot be
+/// created/written/permissioned/chowned/renamed, or the containing
+/// directory cannot be flushed.
 pub async fn atomic_rewrite_owned_no_symlink(
     path: &Path,
     contents: &[u8],
     mode: u32,
 ) -> Result<()> {
     let dest = path.to_path_buf();
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let parent = parent_dir(path);
     let payload = contents.to_vec();
     tokio::task::spawn_blocking(move || -> Result<()> {
         // `symlink_metadata` does not follow the final component, so it
@@ -164,13 +237,25 @@ pub async fn atomic_rewrite_owned_no_symlink(
                 e.error
             )
         })?;
+        sync_parent_dir(&dest)?;
         Ok(())
     })
     .await
     .context("Owned credential rewrite task panicked")?
 }
 
-async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, replace: bool) -> Result<()> {
+/// How [`write_owned_impl`] links the staged file into place, and
+/// whether the directory entry that publishes it is flushed.
+enum Publish {
+    /// Refuse an existing target, then flush the directory: this is a
+    /// credential the agent cannot re-derive.
+    NoClobber,
+    /// Replace an existing target and leave the directory unflushed:
+    /// the payload is rewritten on the next sync anyway.
+    Replace,
+}
+
+async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publish) -> Result<()> {
     if !path.is_absolute() {
         anyhow::bail!(
             "Override credential path must be absolute: {}",
@@ -226,25 +311,32 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, replace: bool
                 dest.display()
             )
         })?;
-        if replace {
-            tmp.persist(&dest).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to rename temp file to {}: {}",
-                    dest.display(),
-                    e.error
-                )
-            })?;
-        } else {
-            // `persist_noclobber` fails if the target name already exists
-            // — a regular file *or* a planted symlink — so a root write is
-            // never redirected or a stale credential silently overwritten.
-            tmp.persist_noclobber(&dest).map_err(|e| {
-                anyhow::anyhow!(
-                    "Refusing to overwrite an existing file at {}: {}",
-                    dest.display(),
-                    e.error
-                )
-            })?;
+        match publish {
+            Publish::Replace => {
+                tmp.persist(&dest).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to rename temp file to {}: {}",
+                        dest.display(),
+                        e.error
+                    )
+                })?;
+                // No `sync_parent_dir` here: see
+                // `write_owned_file_replace`.
+            }
+            Publish::NoClobber => {
+                // `persist_noclobber` fails if the target name already
+                // exists — a regular file *or* a planted symlink — so a
+                // root write is never redirected or a stale credential
+                // silently overwritten.
+                tmp.persist_noclobber(&dest).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Refusing to overwrite an existing file at {}: {}",
+                        dest.display(),
+                        e.error
+                    )
+                })?;
+                sync_parent_dir(&dest)?;
+            }
         }
         Ok(())
     })
@@ -274,10 +366,16 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, replace: bool
 /// agent-readable file with a root-owned `0600` file the long-running
 /// agent process can no longer read).
 ///
+/// The containing directory is flushed after the rename
+/// ([`sync_parent_dir`]). This is the shared path for
+/// `bootroot-agent`'s fast-poll state and for `rotation-state.json`,
+/// both of which the program reads back to resume, so the published
+/// name has to survive a power loss and not merely a clean replacement.
+///
 /// # Errors
 /// Returns an error if the temp file cannot be created, written,
-/// permissioned, chowned (when ownership preservation is needed), or
-/// renamed.
+/// permissioned, chowned (when ownership preservation is needed),
+/// renamed, or if the containing directory cannot be flushed.
 pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     // Owned once, to move into the blocking task. The blocking half
     // borrows, so this is the only copy either path makes.
@@ -291,17 +389,14 @@ pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()>
 /// The blocking half of [`atomic_write`], for callers that are not async.
 ///
 /// Same guarantees, same order: staged in the destination's directory,
-/// written, `sync_all`ed, permissioned, ownership-preserved, renamed.
-/// Callers in an async context use [`atomic_write`] instead, which runs
-/// this on a blocking thread.
+/// written, `sync_all`ed, permissioned, ownership-preserved, renamed,
+/// and the directory flushed. Callers in an async context use
+/// [`atomic_write`] instead, which runs this on a blocking thread.
 ///
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_write`].
 pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let parent = parent_dir(path);
     // Capture the existing destination's uid/gid (if any) so the
     // rename does not strip operator-meaningful ownership. Missing
     // file -> None; do not chown the staged file in that case so a
@@ -345,6 +440,7 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<
             e.error
         )
     })?;
+    sync_parent_dir(path)?;
     Ok(())
 }
 
@@ -788,6 +884,22 @@ mod tests {
             "expected only the final file, got {entries:?}"
         );
         assert_eq!(entries[0], "agent.toml");
+    }
+
+    /// The flush itself is not observable from a test — a crash is what
+    /// would distinguish it — so this pins the two things that are: it
+    /// succeeds on a real directory, and a directory that cannot be
+    /// opened is reported instead of passing silently.
+    #[test]
+    fn sync_parent_dir_flushes_an_existing_directory_and_reports_a_missing_one() {
+        let dir = tempdir().unwrap();
+        sync_parent_dir(&dir.path().join("published")).unwrap();
+
+        let err = sync_parent_dir(&dir.path().join("nope").join("published")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("to fsync it"),
+            "a missing directory must be reported, got: {err:#}"
+        );
     }
 
     #[test]

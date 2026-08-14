@@ -375,6 +375,13 @@ pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy)
             .ok_or_else(|| anyhow::anyhow!("Key path {} has no file name", dest.display()))?;
 
         let staged = stage_key_file(parent, file_name, &key_owned, policy)?;
+        // The staged file is flushed before this rename, but the
+        // directory holding the new entry deliberately is not flushed
+        // after it: a crash that loses the rename leaves the previous
+        // key in place, and the next renewal reissues. That costs a
+        // reissue, not an outage, which does not buy a disk round trip
+        // on every key write. Contrast `fs_util::atomic_write_blocking`,
+        // whose callers read their file back to resume.
         std::fs::rename(&staged, &dest).map_err(|err| {
             let _ = std::fs::remove_file(&staged);
             anyhow::Error::new(err).context(format!(

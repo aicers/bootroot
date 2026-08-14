@@ -54,6 +54,13 @@ pub(crate) fn rotation_state_path(state_dir: &Path) -> PathBuf {
 
 /// Creates `rotation-state.json` atomically using `O_EXCL`.
 ///
+/// Publishing by creation leaves the new directory entry unflushed
+/// exactly as a rename does, so the containing directory is flushed
+/// after the create — otherwise phase 0 of a rotation would be the one
+/// record in the file's life that a power loss can erase, while
+/// [`update_rotation_state`] carries every later one through
+/// `atomic_write_blocking`'s own flush.
+///
 /// Returns `Ok(())` if the file was created, or an error if it already exists.
 pub(crate) fn create_rotation_state(
     state_dir: &Path,
@@ -72,6 +79,8 @@ pub(crate) fn create_rotation_state(
     file.write_all(json.as_bytes())
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     file.sync_all()
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::sync_parent_dir(&path)
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
