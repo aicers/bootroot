@@ -180,8 +180,12 @@ ensure_bind_host_available() {
     fail "cannot enumerate local IPv4 addresses: neither ip (iproute2) nor ifconfig is installed and working"
   fi
   # -F: the bind host is data, not a pattern, so a value carrying regex
-  # metacharacters cannot match an address it is not.
-  if ! printf '%s\n' "$local_addrs" | grep -qFx "$bind_host"; then
+  # metacharacters cannot match an address it is not.  `--` for the same
+  # reason one argument earlier: the value arrives from the environment, and
+  # one beginning with a dash is an option to grep rather than the pattern.
+  # `-e127.0.0.1` would otherwise be read as a second pattern and match a
+  # host holding 127.0.0.1, which is not the address that was configured.
+  if ! printf '%s\n' "$local_addrs" | grep -qFx -- "$bind_host"; then
     fail "non-loopback bind host $bind_host is not assigned to any local interface (set $bind_var to an address that is)"
   fi
 }
