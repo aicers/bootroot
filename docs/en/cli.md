@@ -107,9 +107,9 @@ For detailed rules and condition-specific behavior, see the Overview section
 ## How bootroot writes files
 
 Every file bootroot produces is published by stage-then-rename: the bytes go to
-a temporary file in the destination's own directory, that file is flushed and
-given its final mode and ownership while it is still at its temporary name, and
-only then is it renamed over the destination. Three consequences are worth
+a temporary file in the destination's own directory, that file is given its
+final mode and ownership and then flushed while it is still at its temporary
+name, and only then is it renamed over the destination. Three consequences are worth
 knowing when you operate around a running stack.
 
 - **A reader never sees a partial file.** A container mounting the file, a

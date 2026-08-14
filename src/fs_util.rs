@@ -484,7 +484,7 @@ pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()>
 /// The blocking half of [`atomic_write`], for callers that are not async.
 ///
 /// Same guarantees, same order: staged in the destination's directory,
-/// written, `sync_all`ed, ownership-preserved, permissioned, renamed,
+/// written, ownership-preserved, permissioned, `sync_all`ed, renamed,
 /// and the directory flushed. Callers in an async context use
 /// [`atomic_write`] instead, which runs this on a blocking thread.
 ///

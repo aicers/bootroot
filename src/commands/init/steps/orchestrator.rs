@@ -280,7 +280,7 @@ async fn diagnose_partial_init(
 ///
 /// The write goes through [`fs_util::atomic_write_blocking`], which
 /// stages the JSON in a temporary file in the same directory born
-/// `0600`, flushes it, sets the mode there, and only then `rename`s it
+/// `0600`, sets the mode there, flushes it, and only then `rename`s it
 /// over the destination.  The secrets therefore never touch the
 /// destination inode at all, so neither hazard above has a window: the
 /// published file is `0600` from the instant the name points at it.
@@ -358,7 +358,7 @@ fn tighten_existing_secret_file(path: &Path) -> Result<()> {
 ///
 /// Written exactly as the init summary is, through
 /// [`fs_util::atomic_write_blocking`]: the token is staged in a
-/// temporary file in the same directory born `0600`, flushed, moded,
+/// temporary file in the same directory born `0600`, moded, flushed,
 /// and `rename`d over the destination.  So a freshly minted root token
 /// never exists on disk at the process umask's default permissions
 /// (commonly `0644`), and never at the destination name in a partial
