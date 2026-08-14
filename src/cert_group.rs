@@ -15,7 +15,7 @@
 //!
 //! See `docs/services/cert-group.md` for the operator-facing overview.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -423,7 +423,6 @@ fn publish_staged(
         .ok_or_else(|| anyhow::anyhow!("{label} path {} has no parent", dest.display()))?;
     let file_name = dest
         .file_name()
-        .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow::anyhow!("{label} path {} has no file name", dest.display()))?;
 
     let staged = stage_file(parent, file_name, contents, create_mode, final_mode, policy)?;
@@ -475,9 +474,14 @@ impl StagedFile {
 /// group-readable for an instant; `final_mode` is asserted before the
 /// rename, so the published mode is the policy's and not whatever the
 /// process umask narrowed the create to.
+///
+/// `final_name` is an `OsStr` and the staging name is built from it as
+/// one, so a destination whose file name is not valid UTF-8 — which a
+/// Unix path may be, and which the writes this replaced accepted
+/// without looking — is published rather than refused.
 fn stage_file(
     parent: &Path,
-    final_name: &str,
+    final_name: &OsStr,
     contents: &str,
     create_mode: u32,
     final_mode: u32,
@@ -485,7 +489,10 @@ fn stage_file(
 ) -> Result<PathBuf> {
     let pid = std::process::id();
     for attempt in 0u32..32 {
-        let candidate = parent.join(format!(".{final_name}.tmp.{pid}.{attempt}"));
+        let mut staging_name = OsString::from(".");
+        staging_name.push(final_name);
+        staging_name.push(format!(".tmp.{pid}.{attempt}"));
+        let candidate = parent.join(staging_name);
         let mut opts = std::fs::OpenOptions::new();
         opts.create_new(true).write(true).mode(create_mode);
         match opts.open(&candidate) {
@@ -533,7 +540,7 @@ fn stage_file(
     }
     anyhow::bail!(
         "Failed to allocate a staging file for {} in {} after 32 attempts",
-        final_name,
+        Path::new(final_name).display(),
         parent.display()
     )
 }
@@ -931,6 +938,46 @@ mod tests {
 
         let mode = std::fs::metadata(&cert).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, CERT_FILE_MODE);
+    }
+
+    /// A Unix file name is bytes, not text, and a configured cert path
+    /// may hold any of them. The writes this replaced never looked, so
+    /// the staging name is built from the destination's `OsStr` rather
+    /// than from a `&str` it would first have to be valid UTF-8 to
+    /// become.
+    ///
+    /// Linux only: APFS validates file names as UTF-8 and answers
+    /// `EILSEQ`, so on macOS there is no such destination to write to.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_cert_file_accepts_a_non_utf8_file_name() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"c\xffert.pem");
+        assert!(name.to_str().is_none(), "the name must not be valid UTF-8");
+        let cert = dir.path().join(name);
+
+        write_cert_file(&cert, "PEM", CertGroupPolicy::none())
+            .await
+            .expect("a non-UTF-8 destination is a path, not an error");
+        let key = dir.path().join(std::ffi::OsStr::from_bytes(b"k\xffey.pem"));
+        write_key_file(&key, "KEY", CertGroupPolicy::none())
+            .await
+            .expect("the key publishes through the same staging");
+
+        assert_eq!(std::fs::read_to_string(&cert).unwrap(), "PEM");
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "KEY");
+        let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries.sort_unstable();
+        assert_eq!(
+            entries,
+            vec![name.to_os_string(), key.file_name().unwrap().to_os_string()],
+            "no staged file may be left behind"
+        );
     }
 
     /// The certificate declines the directory flush for the same reason
