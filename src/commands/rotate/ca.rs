@@ -21,8 +21,8 @@ use crate::commands::init::{
     compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
 };
 use crate::commands::trust::{
-    self, RotationMode, RotationState, create_rotation_state, delete_rotation_state,
-    load_rotation_state, update_rotation_state,
+    self, RotationMode, RotationState, create_rotation_state_async, delete_rotation_state,
+    load_rotation_state, update_rotation_state_async,
 };
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry};
@@ -149,9 +149,9 @@ pub(super) async fn rotate_ca_key(
         )?;
         rot_state.phase = 1;
         if start_phase == 0 && rot_state.new_intermediate_fp.is_empty() {
-            create_rotation_state(&ctx.state_dir, &rot_state, messages)?;
+            create_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
         } else {
-            update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
+            update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
         }
     } else {
         println!("{}", messages.rotate_ca_key_phase_skipped("1"));
@@ -184,7 +184,7 @@ pub(super) async fn rotate_ca_key(
         }
 
         rot_state.phase = 2;
-        update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
+        update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
     } else {
         println!("{}", messages.rotate_ca_key_phase_skipped("2"));
     }
@@ -233,7 +233,7 @@ pub(super) async fn rotate_ca_key(
         restart_infra_openbao_agents(ctx, messages);
 
         rot_state.phase = 3;
-        update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
+        update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
     } else {
         println!("{}", messages.rotate_ca_key_phase_skipped("3"));
     }
@@ -244,7 +244,7 @@ pub(super) async fn rotate_ca_key(
         restart_compose_service(&ctx.compose_file, "step-ca", messages)?;
 
         rot_state.phase = 4;
-        update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
+        update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
     } else {
         println!("{}", messages.rotate_ca_key_phase_skipped("4"));
     }
@@ -284,7 +284,7 @@ pub(super) async fn rotate_ca_key(
         );
 
         rot_state.phase = 5;
-        update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
+        update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
     } else if start_phase < 5 {
         println!("{}", messages.rotate_ca_key_phase_skipped("5"));
     }
@@ -347,7 +347,7 @@ pub(super) async fn rotate_ca_key(
         restart_infra_openbao_agents(ctx, messages);
 
         rot_state.phase = 6;
-        update_rotation_state(&ctx.state_dir, &rot_state, messages)?;
+        update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
     } else if start_phase < 6 {
         println!("{}", messages.rotate_ca_key_phase_skipped("6"));
     }
