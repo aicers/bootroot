@@ -189,7 +189,8 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         &openbao,
         &effective_secrets_dir,
         messages,
-    )?;
+    )
+    .await?;
 
     // 11. Bring OpenBao back up via the existing infra up path.
     let infra_args = InfraUpArgs {
@@ -452,7 +453,11 @@ pub(crate) fn snapshot_deployment_intent(state_path: &Path) -> Result<Deployment
 /// follow-up `init` run rebuilds them from the freshly-bootstrapped
 /// `OpenBao`.  Non-loopback bind intent is preserved so the `infra up`
 /// path layers the correct compose overrides for the restart.
-pub(crate) fn write_minimal_state(
+///
+/// Async because the state write is: publishing `state.json` costs
+/// three disk round trips, which `StateFile::save_async` keeps off the
+/// runtime thread `run_reinit` runs on.
+pub(crate) async fn write_minimal_state(
     state_path: &Path,
     snapshot: &DeploymentIntent,
     openbao: &OpenBaoArgs,
@@ -476,7 +481,8 @@ pub(crate) fn write_minimal_state(
         ..Default::default()
     };
     state
-        .save(state_path)
+        .save_async(state_path)
+        .await
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
 }
@@ -1201,8 +1207,8 @@ mod tests {
         // at all — the type itself is the test for the "drop" list.
     }
 
-    #[test]
-    fn write_minimal_state_rewrites_with_empty_registry_and_preserved_intent() {
+    #[tokio::test]
+    async fn write_minimal_state_rewrites_with_empty_registry_and_preserved_intent() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("state.json");
         state_with_intent().save(&state_path).unwrap();
@@ -1215,7 +1221,9 @@ mod tests {
         let effective = PathBuf::from("secrets");
         let messages = test_messages();
 
-        write_minimal_state(&state_path, &snapshot, &openbao, &effective, &messages).unwrap();
+        write_minimal_state(&state_path, &snapshot, &openbao, &effective, &messages)
+            .await
+            .unwrap();
 
         let rewritten = StateFile::load(&state_path).unwrap();
         assert!(
@@ -3092,8 +3100,8 @@ mod tests {
     /// The rewritten `state.json` must record the snapshotted (or
     /// CLI-default fallback) `secrets_dir` so a subsequent reinit on the
     /// same tree does not silently regress to the CLI default.
-    #[test]
-    fn write_minimal_state_preserves_snapshotted_secrets_dir() {
+    #[tokio::test]
+    async fn write_minimal_state_preserves_snapshotted_secrets_dir() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("state.json");
         state_with_intent().save(&state_path).unwrap();
@@ -3113,6 +3121,7 @@ mod tests {
             Path::new("secrets-custom"),
             &messages,
         )
+        .await
         .unwrap();
         let rewritten = StateFile::load(&state_path).unwrap();
         assert_eq!(

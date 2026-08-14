@@ -125,7 +125,7 @@ pub(super) async fn rotate_approle_secret_id(
     // invocation — batch, single-service, and infra alike — and only
     // after the self-mint above, so a failed self-mint cannot suppress
     // the stale-rotation warning in `bootroot status`.
-    record_rotation_success(ctx, messages)?;
+    record_rotation_success(ctx, messages).await?;
     Ok(())
 }
 
@@ -133,13 +133,18 @@ pub(super) async fn rotate_approle_secret_id(
 /// `approle-secret-id` invocation in `state.json`. A scheduler that
 /// silently stops firing produces no failure log of its own, so this
 /// timestamp is the only signal `bootroot status` can watch.
-fn record_rotation_success(ctx: &mut RotateContext, messages: &Messages) -> Result<()> {
+///
+/// Async because the state write is: publishing `state.json` costs
+/// three disk round trips, which `StateFile::save_async` keeps off the
+/// runtime thread this rotation runs on.
+async fn record_rotation_success(ctx: &mut RotateContext, messages: &Messages) -> Result<()> {
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .context("Failed to format the rotation-success timestamp")?;
     ctx.state.last_secret_id_rotation = Some(now);
     ctx.state
-        .save(&ctx.state_file)
+        .save_async(&ctx.state_file)
+        .await
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
 }
@@ -599,7 +604,8 @@ async fn provision_infra_rotate_role(
     }
     if state_changed {
         ctx.state
-            .save(&ctx.state_file)
+            .save_async(&ctx.state_file)
+            .await
             .with_context(|| messages.error_serialize_state_failed())?;
     }
 

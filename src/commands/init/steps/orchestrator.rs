@@ -859,7 +859,8 @@ async fn run_init_inner(
         &args.rotate_bound_cidrs,
         &args.secret_id_ttl,
         messages,
-    )?;
+    )
+    .await?;
 
     // Rotate the temporary POSTGRES_PASSWORD from .env (written by
     // `infra install`) before building the summary so that the emitted
@@ -1010,7 +1011,8 @@ async fn run_init_inner(
         });
         state.openbao_url = https_url;
         state
-            .save(&state_path)
+            .save_async(&state_path)
+            .await
             .with_context(|| messages.error_serialize_state_failed())?;
 
         // Phase 2 of the infra-agent bring-up: OpenBao now serves TLS,
@@ -1055,7 +1057,8 @@ async fn run_init_inner(
         );
         record_http01_admin_infra_cert(&mut state, &secrets_dir, sans, &responder_container);
         state
-            .save(&state_path)
+            .save_async(&state_path)
+            .await
             .with_context(|| messages.error_serialize_state_failed())?;
     }
 
@@ -1417,7 +1420,10 @@ async fn fix_permissions_recursive(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn write_state_file(
+/// Async because the state write is: publishing `state.json` costs
+/// three disk round trips, which `StateFile::save_async` keeps off the
+/// runtime thread `run_init_inner` runs on.
+pub(super) async fn write_state_file(
     openbao_url: &str,
     kv_mount: &str,
     approles: BTreeMap<String, String>,
@@ -1436,12 +1442,13 @@ pub(super) fn write_state_file(
         rotate_secret_id_ttl,
         messages,
     )
+    .await
 }
 
 /// Inner implementation that accepts an explicit state-file path for
 /// testability.
 #[allow(clippy::too_many_arguments)] // init-time state snapshot: every value is a distinct flag
-fn write_state_file_to(
+async fn write_state_file_to(
     state_path: &Path,
     openbao_url: &str,
     kv_mount: &str,
@@ -1518,7 +1525,8 @@ fn write_state_file_to(
         last_secret_id_rotation: existing_last_secret_id_rotation,
     };
     state
-        .save(state_path)
+        .save_async(state_path)
+        .await
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
 }
@@ -2064,8 +2072,8 @@ mod tests {
     /// Regression: `write_state_file_to` must propagate an error when an
     /// existing state file is corrupted, not silently replace it with a
     /// fresh state (which would erase stored `openbao_bind_addr`).
-    #[test]
-    fn write_state_file_errors_on_corrupted_state() {
+    #[tokio::test]
+    async fn write_state_file_errors_on_corrupted_state() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -2079,7 +2087,8 @@ mod tests {
             &[],
             "24h",
             &messages,
-        );
+        )
+        .await;
         assert!(
             result.is_err(),
             "corrupted state file must be a hard error, not silently replaced"
@@ -2088,8 +2097,8 @@ mod tests {
 
     /// `write_state_file_to` preserves `openbao_bind_addr` from an
     /// existing, valid state file.
-    #[test]
-    fn write_state_file_preserves_bind_addr() {
+    #[tokio::test]
+    async fn write_state_file_preserves_bind_addr() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -2120,6 +2129,7 @@ mod tests {
             "24h",
             &messages,
         )
+        .await
         .unwrap();
         let reloaded = crate::state::StateFile::load(&state_path).unwrap();
         assert_eq!(
@@ -2134,8 +2144,8 @@ mod tests {
     /// labels, the rotate roles' `secret_id` TTL (the dead-man
     /// threshold source), and preserves a previously recorded
     /// rotation-success timestamp across an init re-run.
-    #[test]
-    fn write_state_file_records_rotate_fields_and_preserves_timestamp() {
+    #[tokio::test]
+    async fn write_state_file_records_rotate_fields_and_preserves_timestamp() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -2156,6 +2166,7 @@ mod tests {
             "48h",
             &messages,
         )
+        .await
         .unwrap();
         let reloaded = crate::state::StateFile::load(&state_path).unwrap();
         for label in ["runtime_rotate", "infra_rotate"] {
@@ -2184,6 +2195,7 @@ mod tests {
             "24h",
             &messages,
         )
+        .await
         .unwrap();
         let reloaded = crate::state::StateFile::load(&state_path).unwrap();
         assert!(
@@ -2195,8 +2207,8 @@ mod tests {
     /// `write_state_file_to` preserves `stepca_bind_addr` /
     /// `stepca_advertise_addr` from an existing, valid state file so
     /// that an `init` re-run does not erase the step-ca exposure intent.
-    #[test]
-    fn write_state_file_preserves_stepca_bind_intent() {
+    #[tokio::test]
+    async fn write_state_file_preserves_stepca_bind_intent() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -2227,6 +2239,7 @@ mod tests {
             "24h",
             &messages,
         )
+        .await
         .unwrap();
         let reloaded = crate::state::StateFile::load(&state_path).unwrap();
         assert_eq!(

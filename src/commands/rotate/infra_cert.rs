@@ -126,7 +126,8 @@ pub(super) async fn rotate_infra_certs(
     }
 
     ctx.state
-        .save(&state_file)
+        .save_async(&state_file)
+        .await
         .with_context(|| messages.error_serialize_state_failed())?;
 
     Ok(())

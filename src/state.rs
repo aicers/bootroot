@@ -155,10 +155,13 @@ impl StateFile {
     /// takes, and for the same reason.
     ///
     /// Blocking, deliberately: the staged write, its flush and the
-    /// directory flush are disk round trips, and the callers are
-    /// command paths rather than a poll loop. An async caller on a hot
-    /// path wraps this in `spawn_blocking` at the call site, as the
-    /// rotation-state writers do.
+    /// directory flush are three disk round trips. Callers in an async
+    /// context use [`StateFile::save_async`] instead, which runs this
+    /// same core on a blocking thread — the pattern the rotation-state
+    /// writers in `commands::trust` establish. This entry point stays
+    /// for the synchronous callers (`infra install`, `service update`,
+    /// which run outside any runtime) and for the tests, which must not
+    /// need a runtime to write a state file.
     ///
     /// The mode the file is published at is the destination's own where
     /// there is one — see [`StateFile::publish_mode`].
@@ -171,8 +174,38 @@ impl StateFile {
     /// takes itself; it is here so an operator who put one there keeps
     /// it.
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
-        let contents =
-            serde_json::to_string_pretty(self).context("Failed to serialize state.json")?;
+        Self::publish(path, &self.serialize()?)
+    }
+
+    /// Async entry point for [`StateFile::save`].
+    ///
+    /// The JSON is serialized here, on the async side, so only the
+    /// owned payload and path cross into the `'static` closure; the
+    /// staged write, the file flush and the directory flush then run on
+    /// a blocking thread rather than a runtime worker. Every async
+    /// caller uses this — a Tokio worker parked on three disk round
+    /// trips is a worker polling nothing else, and on a current-thread
+    /// runtime it is the only worker there is.
+    ///
+    /// # Errors
+    /// Returns an error under the same conditions as
+    /// [`StateFile::save`], or if the blocking task panics.
+    pub(crate) async fn save_async(&self, path: &Path) -> Result<()> {
+        let contents = self.serialize()?;
+        let dest = path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::publish(&dest, &contents))
+            .await
+            .context("State file write task panicked")?
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string_pretty(self).context("Failed to serialize state.json")
+    }
+
+    /// The blocking core both entry points share: resolve a symlinked
+    /// destination, then publish the bytes by rename at the mode the
+    /// destination carries.
+    fn publish(path: &Path, contents: &str) -> Result<()> {
         let dest = fs_util::resolve_symlink_destination(path)
             .with_context(|| format!("Failed to write {}", path.display()))?;
         fs_util::atomic_write_blocking(&dest, contents.as_bytes(), Self::publish_mode(&dest))
@@ -428,6 +461,74 @@ mod tests {
         assert_eq!(mode, 0o600, "the save widened a narrowed state.json");
         assert_eq!(
             StateFile::load(&path).unwrap().openbao_url,
+            "http://second:8200"
+        );
+    }
+
+    /// The async entry point publishes what the blocking one does, and
+    /// does it from a runtime whose only worker is the caller's. A
+    /// current-thread runtime is the check that matters: `save_async`
+    /// hands the three disk round trips to `spawn_blocking`, so the
+    /// write completes while that single worker stays free — a direct
+    /// `save` here would park it for the duration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn save_async_publishes_the_same_file_as_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        state_with_url("http://first:8200").save(&path).unwrap();
+        let first_inode = std::fs::metadata(&path).unwrap().ino();
+
+        state_with_url("http://second:8200")
+            .save_async(&path)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            StateFile::load(&path).unwrap().openbao_url,
+            "http://second:8200"
+        );
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), first_inode);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("state.json")]);
+    }
+
+    /// Both entry points share one blocking core, so the async one
+    /// inherits every decision made there — including keeping the mode
+    /// an existing `state.json` carries and resolving a symlinked
+    /// destination to its target.
+    #[tokio::test]
+    async fn save_async_keeps_an_existing_mode_and_follows_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("shared");
+        std::fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("state.json");
+        let link = dir.path().join("state.json");
+        state_with_url("http://first:8200").save(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        state_with_url("http://second:8200")
+            .save_async(&link)
+            .await
+            .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the save"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the async save widened a narrowed state.json"
+        );
+        assert_eq!(
+            StateFile::load(&target).unwrap().openbao_url,
             "http://second:8200"
         );
     }

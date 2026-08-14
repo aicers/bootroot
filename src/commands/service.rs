@@ -425,6 +425,10 @@ async fn run_service_add_preview(
     );
 }
 
+// One line over the limit since the state persist gained its `.await`:
+// the body is a linear apply sequence whose steps depend on each other,
+// so splitting it would only move the ordering somewhere less visible.
+#[allow(clippy::too_many_lines)]
 async fn run_service_add_apply(
     state: &mut StateFile,
     state_path: &Path,
@@ -529,7 +533,8 @@ async fn run_service_add_apply(
         .services
         .insert(resolved.service_name.clone(), entry.clone());
     state
-        .save(state_path)
+        .save_async(state_path)
+        .await
         .with_context(|| messages.error_serialize_state_failed())?;
     // The entry is persisted, so `service remove --delete-artifacts` can
     // now reach the relocated files; keep them.

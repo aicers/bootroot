@@ -182,7 +182,8 @@ pub(crate) async fn run_service_remove(
         &args.service_name,
         |post_removal| reconcile_dns_aliases(post_removal, &identity, messages),
         messages,
-    )?;
+    )
+    .await?;
 
     println!("{}", messages.service_remove_success(&args.service_name));
     Ok(())
@@ -220,7 +221,11 @@ fn require_service_entry(
 /// stored role/policy names — is left untouched, so a re-run of
 /// `service remove` still finds the service and can retry rather than
 /// failing with `error_service_not_found`.
-fn finalize_removal(
+///
+/// Async because the persist is: publishing `state.json` costs three
+/// disk round trips, which `StateFile::save_async` keeps off the
+/// runtime thread `run_service_remove` runs on.
+async fn finalize_removal(
     state: &mut StateFile,
     state_path: &Path,
     service_name: &str,
@@ -230,7 +235,8 @@ fn finalize_removal(
     state.services.remove(service_name);
     reconcile(state)?;
     state
-        .save(state_path)
+        .save_async(state_path)
+        .await
         .with_context(|| messages.error_serialize_state_failed())
 }
 
@@ -517,8 +523,8 @@ mod tests {
         assert_eq!(entry.service_name, "svc");
     }
 
-    #[test]
-    fn finalize_removal_persists_entry_removal_after_reconcile_succeeds() {
+    #[tokio::test]
+    async fn finalize_removal_persists_entry_removal_after_reconcile_succeeds() {
         let dir = tempdir().expect("tempdir");
         let messages = test_messages();
         let state_path = dir.path().join("state.json");
@@ -546,6 +552,7 @@ mod tests {
             },
             &messages,
         )
+        .await
         .expect("remove");
         assert!(!state.services.contains_key("svc"));
 
@@ -560,8 +567,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_removal_keeps_on_disk_entry_when_reconcile_fails() {
+    #[tokio::test]
+    async fn finalize_removal_keeps_on_disk_entry_when_reconcile_fails() {
         let dir = tempdir().expect("tempdir");
         let messages = test_messages();
         let state_path = dir.path().join("state.json");
@@ -579,6 +586,7 @@ mod tests {
             |_| anyhow::bail!("responder detached"),
             &messages,
         )
+        .await
         .expect_err("reconcile failure must propagate");
         assert_eq!(err.to_string(), "responder detached");
 
