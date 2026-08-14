@@ -912,6 +912,126 @@ mod tests {
         sync_parent_dir(Path::new("published")).unwrap();
     }
 
+    /// Drops `dir` to write-and-search-only, the one mode that lets a
+    /// publish stage, chown, and rename inside it while the directory
+    /// open that [`sync_parent_dir`] performs fails. That makes the
+    /// otherwise unobservable flush observable: a writer that skips it
+    /// returns `Ok`, and one that performs it returns the `EACCES`.
+    ///
+    /// Returns `false` where the mode does not bite — an effective root
+    /// bypasses the check, and so does a filesystem that ignores modes
+    /// — leaving the caller to skip rather than assert a failure that
+    /// cannot happen there.
+    fn deny_directory_reads(dir: &Path) -> bool {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::File::open(dir).is_ok() {
+            restore_directory_reads(dir);
+            return false;
+        }
+        true
+    }
+
+    /// Undoes [`deny_directory_reads`] so the enclosing `TempDir` can
+    /// still list the directory when it removes the tree.
+    fn restore_directory_reads(dir: &Path) {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// The shared publish path must *call* the flush, not merely have
+    /// one available: this is what fails if the `sync_parent_dir` line
+    /// is dropped from `atomic_write_blocking`. The rename still lands
+    /// — the write is published and then reported undurable, which is
+    /// the honest order — so the file is asserted present too.
+    #[test]
+    fn atomic_write_blocking_reports_a_directory_it_cannot_flush() {
+        let dir = tempdir().unwrap();
+        let published = dir.path().join("published");
+        std::fs::create_dir(&published).unwrap();
+        let path = published.join("agent.toml");
+        if !deny_directory_reads(&published) {
+            return;
+        }
+
+        let result = atomic_write_blocking(&path, b"payload", KEY_FILE_MODE);
+        restore_directory_reads(&published);
+
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("to fsync it"),
+            "an unflushable directory must be reported, got: {err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "payload");
+    }
+
+    /// Same pin for the `O_EXCL` credential writer. Its flush lives in
+    /// the `NoClobber` arm of `write_owned_impl` rather than in
+    /// `atomic_write_blocking`, so it regresses independently.
+    #[tokio::test]
+    async fn create_owned_credential_noclobber_reports_a_directory_it_cannot_flush() {
+        let dir = tempdir().unwrap();
+        let published = dir.path().join("published");
+        std::fs::create_dir(&published).unwrap();
+        let path = published.join("secret_id");
+        if !deny_directory_reads(&published) {
+            return;
+        }
+
+        let result = create_owned_credential_noclobber(&path, b"sid").await;
+        restore_directory_reads(&published);
+
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("to fsync it"),
+            "an unflushable directory must be reported, got: {err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sid");
+    }
+
+    /// And for the rotation rewrite, whose flush is a third call site.
+    #[tokio::test]
+    async fn atomic_rewrite_owned_no_symlink_reports_a_directory_it_cannot_flush() {
+        let dir = tempdir().unwrap();
+        let published = dir.path().join("published");
+        std::fs::create_dir(&published).unwrap();
+        let path = published.join("secret_id");
+        std::fs::write(&path, b"old").unwrap();
+        if !deny_directory_reads(&published) {
+            return;
+        }
+
+        let result = atomic_rewrite_owned_no_symlink(&path, b"new", KEY_FILE_MODE).await;
+        restore_directory_reads(&published);
+
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("to fsync it"),
+            "an unflushable directory must be reported, got: {err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    /// The counterpart: `write_owned_file_replace` declines the flush,
+    /// so the same unreadable directory must *not* fail it. This is
+    /// what catches the flush being added there by reflex, restoring a
+    /// per-sync disk round trip the site decided against.
+    #[tokio::test]
+    async fn write_owned_file_replace_does_not_flush_the_directory() {
+        let dir = tempdir().unwrap();
+        let published = dir.path().join("published");
+        std::fs::create_dir(&published).unwrap();
+        let path = published.join("eab.json");
+        std::fs::write(&path, b"old").unwrap();
+        if !deny_directory_reads(&published) {
+            return;
+        }
+
+        let result = write_owned_file_replace(&path, b"new", KEY_FILE_MODE).await;
+        restore_directory_reads(&published);
+
+        result.expect("the replace writer must not open the directory");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
     #[test]
     fn path_is_within_matches_component_boundaries() {
         assert!(path_is_within(Path::new("/a/b/c"), Path::new("/a/b")).unwrap());

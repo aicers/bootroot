@@ -235,6 +235,45 @@ mod tests {
         assert!(result.is_err(), "second create should fail with O_EXCL");
     }
 
+    /// Phase 0 is published by `O_EXCL` creation rather than by rename,
+    /// so its directory flush is its own call and not the one inside
+    /// `atomic_write_blocking` that carries every later phase. Dropping
+    /// it would leave the first record the only undurable one, which is
+    /// exactly the shape this pins: with the state directory
+    /// write-and-search-only the create still lands and only the flush's
+    /// directory open fails.
+    #[test]
+    fn create_rotation_state_reports_a_directory_it_cannot_flush() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let state = sample_state();
+        let restrict = |mode| {
+            fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+
+        restrict(0o300);
+        if std::fs::File::open(dir.path()).is_ok() {
+            // Effective root, or a filesystem that ignores the mode:
+            // the flush cannot be made to fail here.
+            restrict(0o700);
+            return;
+        }
+        let result = create_rotation_state(dir.path(), &state, &messages);
+        restrict(0o700);
+
+        let err = result.expect_err("an unflushable directory must be reported");
+        assert!(
+            format!("{err:#}").contains("to fsync it"),
+            "the directory flush must be the reported failure, got: {err:#}"
+        );
+        assert!(
+            rotation_state_path(dir.path()).exists(),
+            "the create landed; only its durability was not established"
+        );
+    }
+
     #[test]
     fn load_rotation_state_missing_returns_none() {
         let dir = tempdir().expect("tempdir");
