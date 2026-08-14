@@ -1132,14 +1132,26 @@ into the managed `agent.toml` profile block, threaded through the
 remote-bootstrap artifact, and surfaced on `DaemonProfileSettings`,
 so rotation always reapplies the same policy.
 
-Atomicity: the key file is written via stage-then-rename — the bytes
-are first written to a sibling temp file created with `O_CREAT|O_EXCL`
-and `mode=0600`, the staged file is `chown`d and promoted to `0640`
-(when the policy is active), and only then renamed over the
-destination. The destination path is therefore never observable at a
-mode wider than the final policy: there is no umask-derived `0644`
-window before the clamp, and no group-readable window under the
-operator's primary gid before the chown lands.
+Atomicity: the key file, the certificate and the CA bundle are all
+written via stage-then-rename — the bytes are first written to a
+sibling temp file created with `O_CREAT|O_EXCL` (`mode=0600` for the
+key, `0644` for the certificate and the bundle), the staged file is
+`chown`d (when the policy is active) and set to its final mode —
+`0640` for the key under an active policy, `0600` otherwise, `0644`
+for the certificate and the bundle — and only then renamed over the
+destination. Two properties follow. The destination path is never
+observable at a mode wider than the final policy: there is no
+umask-derived `0644` window before the clamp, and no group-readable
+window under the operator's primary gid before the chown lands. And a
+consumer reading the destination during a rotation — a server being
+reloaded, or the agent rebuilding its trust store — sees either the
+previous file or the complete new one, never a truncated PEM.
+
+The containing directory is deliberately not flushed after these
+renames. A crash that loses one leaves the previous cert, key or
+bundle in place and the next renewal reissues, which costs a reissue
+rather than an outage; `state.json` and the `init` output files, which
+bootroot reads back to resume, do take that flush.
 
 ### Interactive behavior
 
@@ -2243,10 +2255,17 @@ operator-managed runbook for those.
   current process (e.g. mode `0400`), or if the parent directory
   cannot accept a new file, so a bad path cannot leave the operator
   with a wiped-and-reinitialised OpenBao plus a failed token write.
-  New token files are created atomically with mode `0600` via
-  `OpenOptionsExt::mode` so the freshly minted root token is never
-  observable on disk with the process umask's default permissions
-  between create and chmod. Should the post-init write still fail
+  The token file is written via stage-then-rename: the token goes to
+  a temporary file in the destination's own directory, born `0600`,
+  which is flushed and then renamed over the destination, and the
+  containing directory is flushed after the rename. So the freshly
+  minted root token is never observable on disk with the process
+  umask's default permissions, the destination name never holds a
+  partially written token, and a published token survives a power
+  loss — it is the only copy of a credential reinit will not mint
+  again. An existing destination is narrowed to `0600` first, for the
+  older token that may still be sitting in it. Should the post-init
+  write still fail
   (e.g. disk full), the freshly issued token is surfaced on stderr in
   cleartext (prefixed with `ROOT_TOKEN=`) so it is not lost.
 - `--enable <features>`: passed through to `init` (e.g.
@@ -2271,13 +2290,17 @@ operator-managed runbook for those.
   unwritable / uncreatable parent. The summary JSON carries the
   freshly issued root token and unseal keys, so an unwritable
   destination would recreate the partial-init trap through a
-  different output channel, and a wider-than-`0600` destination
-  would briefly leak those secrets on disk between the write and
-  the post-write chmod. The summary file itself is written
-  atomically: new files are born `0600` via the create-mode flag,
-  and any existing destination is tightened to `0600` before the
-  secret payload is written, so the JSON never lands on disk with
-  wider permissions.
+  different output channel, and a wider-than-`0600` destination is
+  an earlier run's summary — with its own credentials in it — left
+  readable to every user on the host. The summary file itself is
+  written the same way as the root token file: staged in a `0600`
+  temporary in the destination's directory, flushed, renamed into
+  place, and the containing directory flushed after the rename. The
+  JSON therefore never lands on disk with wider permissions and the
+  destination name never holds a partial summary. Any existing
+  destination is still tightened to `0600` before the replacement is
+  produced, since the rename publishes a fresh file and leaves the
+  old one readable until it does.
 - `--no-eab`: passed through to `init`
 
 ### Behavior

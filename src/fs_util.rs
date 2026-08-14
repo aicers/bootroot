@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio::fs;
 
-use crate::cert_group::{self, CA_BUNDLE_FILE_MODE, CertGroupPolicy};
+use crate::cert_group::{self, CertGroupPolicy};
 
 pub const KEY_FILE_MODE: u32 = 0o600;
 const SECRETS_DIR_MODE: u32 = 0o700;
@@ -525,7 +525,7 @@ pub async fn write_cert_and_key(
 
 /// Writes a CA bundle to disk, creating parent directories as needed.
 ///
-/// Always sets the mode to [`CA_BUNDLE_FILE_MODE`] (`0o644`),
+/// Always sets the mode to [`cert_group::CA_BUNDLE_FILE_MODE`] (`0o644`),
 /// regardless of `policy`. CA bundles are public trust material, and
 /// re-asserting the mode on every write means a rotation overrides
 /// any stricter mode left behind by an earlier writer (notably
@@ -533,6 +533,13 @@ pub async fn write_cert_and_key(
 /// `write_secret_file` at `0o600`). When `policy` is active, also
 /// `chown`s the file to the policy's gid so cert-group members can
 /// read the bundle alongside the cert and key.
+///
+/// The bundle itself is published by
+/// [`cert_group::write_bundle_file`], which stages it beside the
+/// destination and renames it into place with the mode and owner
+/// already applied. The agent re-reads this file to rebuild its trust
+/// store while a rotation may be rewriting it, so the destination name
+/// must never hold a truncated chain.
 ///
 /// # Errors
 /// Returns an error if the directory cannot be created, the bundle
@@ -548,31 +555,7 @@ pub async fn write_ca_bundle(
     fs::create_dir_all(bundle_dir)
         .await
         .with_context(|| format!("Failed to create CA bundle dir {}", bundle_dir.display()))?;
-    fs::write(bundle_path, bundle_pem)
-        .await
-        .context("Failed to write CA bundle file")?;
-    fs::set_permissions(
-        bundle_path,
-        std::fs::Permissions::from_mode(CA_BUNDLE_FILE_MODE),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "Failed to set mode {CA_BUNDLE_FILE_MODE:o} on CA bundle {}",
-            bundle_path.display()
-        )
-    })?;
-    if let Some(gid) = policy.gid {
-        let owned = bundle_path.to_path_buf();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            std::os::unix::fs::chown(&owned, None, Some(gid)).with_context(|| {
-                format!("Failed to chown CA bundle {} to gid {gid}", owned.display())
-            })
-        })
-        .await
-        .context("CA bundle chown task panicked")??;
-    }
-    Ok(())
+    cert_group::write_bundle_file(bundle_path, bundle_pem, policy).await
 }
 
 #[cfg(test)]
@@ -582,6 +565,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::cert_group::CA_BUNDLE_FILE_MODE;
 
     #[tokio::test]
     async fn test_ensure_secrets_dir_permissions() {
@@ -783,6 +767,55 @@ mod tests {
         assert_eq!(mode, CA_BUNDLE_FILE_MODE);
         let contents = fs::read_to_string(&bundle_path).await.unwrap();
         assert_eq!(contents, "FRESH");
+    }
+
+    /// The bundle arrives by rename from a staged temporary, so an
+    /// agent rebuilding its trust store mid-rotation reads either the
+    /// previous chain or the complete new one. A changed inode is what
+    /// distinguishes that from the `fs::write` this replaced, and an
+    /// otherwise empty directory is what proves the temporary did not
+    /// survive the publish.
+    #[tokio::test]
+    async fn write_ca_bundle_publishes_a_new_inode_and_leaves_no_temporary() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        write_ca_bundle(&bundle_path, "FIRST", CertGroupPolicy::none())
+            .await
+            .unwrap();
+        let first_inode = std::fs::metadata(&bundle_path).unwrap().ino();
+
+        write_ca_bundle(&bundle_path, "SECOND", CertGroupPolicy::none())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&bundle_path).await.unwrap(),
+            "SECOND",
+            "the rename must publish the new chain"
+        );
+        assert_ne!(std::fs::metadata(&bundle_path).unwrap().ino(), first_inode);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("ca-bundle.pem")]);
+    }
+
+    /// `write_ca_bundle` creates the parent directory before staging,
+    /// so the very first bundle of a deployment lands even though the
+    /// staged temporary needs a directory to be created in.
+    #[tokio::test]
+    async fn write_ca_bundle_creates_a_missing_parent_directory() {
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("nested").join("ca-bundle.pem");
+
+        write_ca_bundle(&bundle_path, "BUNDLE", CertGroupPolicy::none())
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&bundle_path).await.unwrap(), "BUNDLE");
     }
 
     /// `atomic_write` must leave the destination at the supplied mode

@@ -2549,6 +2549,32 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "hvs.only");
     }
 
+    /// A destination an earlier run left world-readable is replaced at
+    /// `0600`, both halves of the write pulling their weight: the
+    /// tightening narrows the old token sitting there, and the staged
+    /// publish gives the new one a fresh inode that was never wider
+    /// than `0600`. `init` reaches this writer with no preflight, so
+    /// the wide destination is not a case only `reinit` can rule out.
+    #[tokio::test]
+    async fn write_root_token_file_replaces_a_world_readable_destination() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("root-token.txt");
+        std::fs::write(&path, "hvs.stale").expect("seed the destination");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let stale_inode = std::fs::metadata(&path).expect("stat").ino();
+
+        write_root_token_file(&path, "hvs.fresh")
+            .await
+            .expect("token write over a world-readable destination");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "hvs.fresh");
+        let meta = std::fs::metadata(&path).expect("stat");
+        assert_eq!(meta.permissions().mode() & 0o777, SECRET_OUTPUT_FILE_MODE);
+        assert_ne!(meta.ino(), stale_inode, "the publish must be a rename");
+    }
+
     /// An older summary or token file left world-readable is narrowed
     /// before the replacement is produced. The rename cannot do this:
     /// it publishes a fresh inode and leaves the old one readable for

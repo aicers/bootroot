@@ -429,14 +429,15 @@ fn publish_staged(
     Ok(())
 }
 
-/// Which of the two files a staged write is publishing. Names the path
-/// in the errors [`publish_staged`] raises before it reaches the
+/// Which of the three files a staged write is publishing. Names the
+/// path in the errors [`publish_staged`] raises before it reaches the
 /// filesystem, and nothing else — the mode and ownership decisions are
 /// the caller's arguments.
 #[derive(Clone, Copy)]
 enum StagedFile {
     Key,
     Cert,
+    Bundle,
 }
 
 impl StagedFile {
@@ -444,6 +445,7 @@ impl StagedFile {
         match self {
             Self::Key => "Key",
             Self::Cert => "Cert",
+            Self::Bundle => "CA bundle",
         }
     }
 }
@@ -553,6 +555,51 @@ pub async fn write_cert_file(path: &Path, cert_pem: &str, policy: CertGroupPolic
     .await
     .context("write_cert_file task panicked")?
     .with_context(|| format!("Failed to write cert file {}", path.display()))
+}
+
+/// Writes a CA bundle file under the given policy.
+///
+/// The bundle mode ([`CA_BUNDLE_FILE_MODE`], `0644`) is unchanged
+/// regardless of policy; only the group ownership is adjusted when
+/// `policy` is active. Because the mode is applied to the staged file
+/// on every write, a bundle an earlier writer left stricter (the
+/// `bootroot-remote` bootstrap path creates it at `0600`) is still
+/// republished world-readable.
+///
+/// Published exactly as the certificate beside it, through
+/// `publish_staged`: a reader — `bootroot-agent` reloading its trust
+/// store mid-rotation — observes the previous bundle or the complete
+/// new one, never a truncated chain. The containing directory is
+/// deliberately not flushed after the rename; a bundle lost to a crash
+/// is rewritten by the next rotation, which is the same reasoning the
+/// key and the certificate record.
+///
+/// Callers that also need the parent directory created go through
+/// [`crate::fs_util::write_ca_bundle`].
+///
+/// # Errors
+///
+/// Returns an error if the staging write, chown, chmod, or rename fails.
+pub async fn write_bundle_file(
+    path: &Path,
+    bundle_pem: &str,
+    policy: CertGroupPolicy,
+) -> Result<()> {
+    let dest = path.to_path_buf();
+    let bundle_owned = bundle_pem.to_string();
+    tokio::task::spawn_blocking(move || {
+        publish_staged(
+            &dest,
+            &bundle_owned,
+            CA_BUNDLE_FILE_MODE,
+            CA_BUNDLE_FILE_MODE,
+            policy,
+            StagedFile::Bundle,
+        )
+    })
+    .await
+    .context("write_bundle_file task panicked")?
+    .with_context(|| format!("Failed to write CA bundle file {}", path.display()))
 }
 
 /// Ensures the directory containing the private key exists and has the
