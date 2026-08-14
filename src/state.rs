@@ -9,13 +9,15 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_SECRETS_DIR: &str = "secrets";
 const DEFAULT_STATE_FILE: &str = "state.json";
-/// Mode for `state.json`. The plain `fs::write` this file used to be
-/// published with left the mode to the process umask on a fresh create
-/// (`0644` in practice) and to the destination on a rewrite. A staged
-/// temporary inherits neither, so the mode is stated here, and `0644`
-/// is what it has always been: the file is an inventory of services,
-/// paths and role ids, carrying no secret — the `secret_id` behind
-/// `secret_id_path` lives in its own `0600` file.
+/// Mode for a `state.json` this process creates. The plain `fs::write`
+/// this file used to be published with left the mode to the process
+/// umask on a fresh create (`0644` in practice) and to the destination
+/// on a rewrite. A staged temporary inherits neither, so a create needs
+/// a stated mode, and `0644` is the one the umask produced: the file is
+/// an inventory of services, paths and role ids, carrying no secret —
+/// the `secret_id` behind `secret_id_path` lives in its own `0600`
+/// file. A destination that already exists keeps its own mode instead;
+/// see [`StateFile::publish_mode`].
 const STATE_FILE_MODE: u32 = 0o644;
 pub(crate) const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
@@ -157,11 +159,47 @@ impl StateFile {
     /// command paths rather than a poll loop. An async caller on a hot
     /// path wraps this in `spawn_blocking` at the call site, as the
     /// rotation-state writers do.
+    ///
+    /// The mode the file is published at is the destination's own where
+    /// there is one — see [`StateFile::publish_mode`].
+    ///
+    /// A symlinked destination is resolved first, for the same reason
+    /// the two `init` outputs resolve theirs: the `fs::write` this
+    /// replaced followed the link and rewrote its target, while a
+    /// rename replaces the link itself. Nothing bootroot does creates
+    /// `state.json` as a link, so this is a no-op on every path it
+    /// takes itself; it is here so an operator who put one there keeps
+    /// it.
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
         let contents =
             serde_json::to_string_pretty(self).context("Failed to serialize state.json")?;
-        fs_util::atomic_write_blocking(path, contents.as_bytes(), STATE_FILE_MODE)
+        let dest = fs_util::resolve_symlink_destination(path)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        fs_util::atomic_write_blocking(&dest, contents.as_bytes(), Self::publish_mode(&dest))
             .with_context(|| format!("Failed to write {}", path.display()))
+    }
+
+    /// The mode [`StateFile::save`] publishes at: the mode the
+    /// destination already carries, or [`STATE_FILE_MODE`] when there
+    /// is nothing there yet.
+    ///
+    /// The write this replaced opened the destination in place, so a
+    /// `state.json` an operator had narrowed — or that a restrictive
+    /// umask created narrow — stayed that way across every later save.
+    /// A staged temporary inherits nothing from the file it replaces,
+    /// so stating one mode unconditionally would widen theirs on the
+    /// next write bootroot makes. Reading it off the destination keeps
+    /// the rename from changing a property the operator set, the same
+    /// reason `fs_util::atomic_write_blocking` carries the
+    /// destination's uid and gid across it.
+    ///
+    /// A destination that cannot be stat'd is treated as absent: the
+    /// staged write that follows reports the real error, and guessing a
+    /// mode here would only replace it with a worse one.
+    fn publish_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path).map_or(STATE_FILE_MODE, |meta| meta.permissions().mode() & 0o7777)
     }
 
     pub(crate) fn secrets_dir(&self) -> &Path {
@@ -332,17 +370,66 @@ mod tests {
         assert_eq!(entries, vec![std::ffi::OsString::from("state.json")]);
     }
 
-    /// The mode is the writer's now that the file arrives by rename,
-    /// and it is the `0644` the umask used to produce. The file is an
-    /// inventory, not a secret.
+    /// A file that did not exist gets the stated create mode, which is
+    /// the `0644` the umask used to produce. The file is an inventory,
+    /// not a secret.
     #[test]
-    fn save_publishes_at_0644() {
+    fn save_creates_a_new_state_file_at_0644() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         state_with_url("http://localhost:8200").save(&path).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, STATE_FILE_MODE);
+    }
+
+    /// A `state.json` an operator pointed elsewhere with a symlink is
+    /// still written through the link, as the `fs::write` this replaced
+    /// did. Renaming over the link would leave them without it and the
+    /// target holding the previous state.
+    #[test]
+    fn save_writes_through_a_symlinked_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("shared");
+        std::fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("state.json");
+        let link = dir.path().join("state.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        state_with_url("http://linked:8200").save(&link).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the save"
+        );
+        assert_eq!(
+            StateFile::load(&target).unwrap().openbao_url,
+            "http://linked:8200"
+        );
+    }
+
+    /// The rename must not change a mode the operator set. A
+    /// `state.json` narrowed to `0600` — by hand, or by a restrictive
+    /// umask when it was created — stayed `0600` across the truncating
+    /// write this replaced, and still does.
+    #[test]
+    fn save_keeps_an_existing_state_files_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        state_with_url("http://first:8200").save(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        state_with_url("http://second:8200").save(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the save widened a narrowed state.json");
+        assert_eq!(
+            StateFile::load(&path).unwrap().openbao_url,
+            "http://second:8200"
+        );
     }
 
     #[test]
