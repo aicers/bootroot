@@ -106,8 +106,8 @@ For detailed rules and condition-specific behavior, see the Overview section
 
 ## How bootroot writes files
 
-Every file bootroot produces is published by stage-then-rename: the bytes go to
-a temporary file in the destination's own directory, that file is given its
+Nearly every file bootroot produces is published by stage-then-rename: the bytes
+go to a temporary file in the destination's own directory, that file is given its
 final mode and ownership and then flushed while it is still at its temporary
 name, and only then is it renamed over the destination. Three consequences are worth
 knowing when you operate around a running stack.
@@ -126,6 +126,15 @@ knowing when you operate around a running stack.
   reading the old contents until it reopens the path. Bind mounts of a
   *directory* follow the rename; a bind mount of a single *file* does not, and
   needs the container restarted to pick up a new version.
+
+Two files are not published this way yet, and none of the three points above
+applies to them: `secrets/openbao/unseal-keys.txt`, written by `init
+--save-unseal-keys` and `bootroot openbao save-unseal-keys`, and the `eab.json`
+written next to each service's `secret_id`. Both are still written over the
+destination in place and have their `0600` set afterwards, so a reader can catch
+one half-written, and a freshly created one is briefly readable more widely than
+that. Converting them is a separate change; the rest of this section describes
+the staged writers only.
 
 Whether the containing directory is flushed after the rename is decided per
 file, because that flush costs a disk round trip on every write:
