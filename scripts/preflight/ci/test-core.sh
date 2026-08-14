@@ -9,7 +9,12 @@ BOOTROOT_SECRETS_DIR="$ROOT_DIR/secrets"
 
 cleanup() {
   echo "[test-core] cleanup"
-  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" "${COMPOSE_FILES[@]}" down 2>/dev/null || true
+  # `--remove-orphans` because the OpenBao Agent sidecars are defined in
+  # the overlay `init` writes under `secrets/`, not in the two compose
+  # files above, so a plain `down` treats them as orphans and leaves them
+  # running.  `-v` is deliberately not passed: the named volumes are not
+  # what this teardown is failing to reach.
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" "${COMPOSE_FILES[@]}" down --remove-orphans 2>/dev/null || true
 }
 trap cleanup EXIT
 
