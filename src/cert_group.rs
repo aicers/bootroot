@@ -15,14 +15,15 @@
 //!
 //! See `docs/services/cert-group.md` for the operator-facing overview.
 
-use std::ffi::{CString, OsStr, OsString};
-use std::io::Write as _;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::ffi::CString;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use thiserror::Error;
 use tokio::fs;
+
+use crate::fs_util::{self, StagedDurability, StagedOwner};
 
 /// Default mode for the cert/key parent directory when no `--cert-group`
 /// is set. Operator-only access.
@@ -348,20 +349,24 @@ fn resolve_group_name(name: &str) -> Option<u32> {
 
 /// Writes a private key file under the given policy.
 ///
-/// The implementation is staging-then-rename: the bytes are first written
-/// to a temporary file in the same directory created with `O_CREAT |
-/// O_EXCL` and `mode=0600`, the staged file is `chown`d (when policy is
-/// active) and promoted to `0640`, and only then is it `rename`d over
-/// the destination. The destination path is therefore never observable
-/// at a mode wider than the final policy: there is no window where the
-/// destination exists at the umask-derived mode (typically `0644`) before
-/// the clamp lands, and no window where the file is group-readable under
-/// the operator's primary gid before the chown lands. This addresses the
-/// atomic-write requirement called out in issue #593.
+/// The implementation is staging-then-rename, through the crate's
+/// shared [`fs_util::publish_staged_blocking`]: the bytes are first
+/// written to a temporary file in the same directory created with
+/// `O_CREAT | O_EXCL` and `mode=0600`, the staged file is `chown`d
+/// (when policy is active) and promoted to `0640`, and only then is it
+/// `rename`d over the destination. The destination path is therefore
+/// never observable at a mode wider than the final policy: there is no
+/// window where the destination exists at the umask-derived mode
+/// (typically `0644`) before the clamp lands, and no window where the
+/// file is group-readable under the operator's primary gid before the
+/// chown lands. This addresses the atomic-write requirement called out
+/// in issue #593.
 ///
 /// # Errors
 ///
 /// Returns an error if the staging write, chown, chmod, or rename fails.
+///
+/// [`fs_util::publish_staged_blocking`]: crate::fs_util::publish_staged_blocking
 pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy) -> Result<()> {
     let dest = path.to_path_buf();
     let key_owned = key_pem.to_string();
@@ -370,178 +375,53 @@ pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy)
     } else {
         KEY_FILE_MODE_DEFAULT
     };
-    tokio::task::spawn_blocking(move || {
-        publish_staged(
-            &dest,
-            &key_owned,
-            KEY_FILE_MODE_DEFAULT,
-            final_mode,
-            policy,
-            StagedFile::Key,
-        )
-    })
-    .await
-    .context("write_key_file task panicked")??;
-    Ok(())
+    tokio::task::spawn_blocking(move || publish_staged(&dest, &key_owned, final_mode, policy))
+        .await
+        .context("write_key_file task panicked")?
+        .with_context(|| format!("Failed to write key file {}", path.display()))
 }
 
 /// Stages `contents` beside `dest`, applies the policy's ownership and
-/// the final mode while the file is still at its temporary path, and
-/// `rename`s it over `dest`.
+/// `mode` while the file is still at its temporary path, and `rename`s
+/// it over `dest`.
 ///
-/// Shared by the key, the certificate and the CA bundle so all three
-/// publish the same way: the destination name is only ever observed as
-/// the previous file or the complete new one, and never at a mode or
-/// owner other than the one the policy asks for.
+/// The staging itself is [`fs_util::publish_staged_blocking`], the one
+/// staging implementation in the crate; this is where the key, the
+/// certificate and the CA bundle state the two decisions that
+/// distinguish their publish from `state.json`'s.
 ///
-/// Ownership comes from the policy alone, not from whatever is at
-/// `dest`. The rename installs a fresh inode, so a file an earlier
-/// writer left owned by another user is republished owned by this one —
-/// where the truncating write the certificate and the bundle used to
-/// perform kept that owner. Deliberate: the gid these files need is the
-/// one `--cert-group` names, and re-reading it off the destination
-/// would let a stale owner outlive the policy that replaced it. All
-/// three land world-readable or group-readable by that policy, so no
-/// consumer loses access to a file it could read before. This is the
-/// opposite choice from [`fs_util::atomic_write_blocking`], which
-/// carries the destination's uid/gid across the rename because its
-/// files (`0600` agent config, fast-poll state) have no policy to
-/// restate and a re-owned one the daemon cannot read is an outage.
+/// Ownership comes from the policy, not from whatever is at `dest`
+/// ([`StagedOwner::PolicyGroup`]). The rename installs a fresh inode,
+/// so a file an earlier writer left owned by another user is
+/// republished owned by this one — where the truncating write the
+/// certificate and the bundle used to perform kept that owner.
+/// Deliberate: the gid these files need is the one `--cert-group`
+/// names, and re-reading it off the destination would let a stale owner
+/// outlive the policy that replaced it. All three land world-readable
+/// or group-readable by that policy, so no consumer loses access to a
+/// file it could read before, and the rename needs only the directory's
+/// permission — a writer that could not replace the destination before
+/// is not made to fail on a chown it has no privilege for. This is the
+/// opposite choice from [`fs_util::atomic_write_blocking`], whose files
+/// (`0600` agent config, `state.json`, the fast-poll state) have no
+/// policy to restate and where a re-owned one the daemon cannot read is
+/// an outage.
 ///
+/// The directory holding the new entry is deliberately not flushed
+/// after the rename ([`StagedDurability::RenameOnly`]): a crash that
+/// loses it leaves the previous key or certificate in place and the
+/// next renewal reissues. That costs a reissue, not an outage, which
+/// does not buy a disk round trip on every write.
+///
+/// [`fs_util::publish_staged_blocking`]: crate::fs_util::publish_staged_blocking
 /// [`fs_util::atomic_write_blocking`]: crate::fs_util::atomic_write_blocking
-fn publish_staged(
-    dest: &Path,
-    contents: &str,
-    create_mode: u32,
-    final_mode: u32,
-    policy: CertGroupPolicy,
-    kind: StagedFile,
-) -> Result<()> {
-    let label = kind.label();
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{label} path {} has no parent", dest.display()))?;
-    let file_name = dest
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("{label} path {} has no file name", dest.display()))?;
-
-    let staged = stage_file(parent, file_name, contents, create_mode, final_mode, policy)?;
-    // The staged file is flushed before this rename, but the directory
-    // holding the new entry deliberately is not flushed after it: a
-    // crash that loses the rename leaves the previous key or
-    // certificate in place, and the next renewal reissues. That costs a
-    // reissue, not an outage, which does not buy a disk round trip on
-    // every write. Contrast `fs_util::atomic_write_blocking`, whose
-    // callers read their file back to resume.
-    std::fs::rename(&staged, dest).map_err(|err| {
-        let _ = std::fs::remove_file(&staged);
-        anyhow::Error::new(err).context(format!(
-            "Failed to rename {} to {}",
-            staged.display(),
-            dest.display()
-        ))
-    })?;
-    Ok(())
-}
-
-/// Which of the three files a staged write is publishing. Names the
-/// path in the errors [`publish_staged`] raises before it reaches the
-/// filesystem, and nothing else — the mode and ownership decisions are
-/// the caller's arguments.
-#[derive(Clone, Copy)]
-enum StagedFile {
-    Key,
-    Cert,
-    Bundle,
-}
-
-impl StagedFile {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Key => "Key",
-            Self::Cert => "Cert",
-            Self::Bundle => "CA bundle",
-        }
-    }
-}
-
-/// Creates the staging file at `create_mode` with `O_CREAT|O_EXCL`,
-/// writes the bytes, applies the policy's chown and then `final_mode`
-/// while the file is still at its temporary path, and returns the
-/// staged path so the caller can `rename` it over the destination.
-///
-/// `create_mode` is what the file is born with, so the key never exists
-/// group-readable for an instant; `final_mode` is asserted before the
-/// rename, so the published mode is the policy's and not whatever the
-/// process umask narrowed the create to.
-///
-/// `final_name` is an `OsStr` and the staging name is built from it as
-/// one, so a destination whose file name is not valid UTF-8 — which a
-/// Unix path may be, and which the writes this replaced accepted
-/// without looking — is published rather than refused.
-fn stage_file(
-    parent: &Path,
-    final_name: &OsStr,
-    contents: &str,
-    create_mode: u32,
-    final_mode: u32,
-    policy: CertGroupPolicy,
-) -> Result<PathBuf> {
-    let pid = std::process::id();
-    for attempt in 0u32..32 {
-        let mut staging_name = OsString::from(".");
-        staging_name.push(final_name);
-        staging_name.push(format!(".tmp.{pid}.{attempt}"));
-        let candidate = parent.join(staging_name);
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create_new(true).write(true).mode(create_mode);
-        match opts.open(&candidate) {
-            Ok(mut f) => {
-                if let Err(err) = f.write_all(contents.as_bytes()) {
-                    let _ = std::fs::remove_file(&candidate);
-                    return Err(anyhow::Error::new(err)
-                        .context(format!("Failed to write {}", candidate.display())));
-                }
-                if let Err(err) = f.sync_all() {
-                    let _ = std::fs::remove_file(&candidate);
-                    return Err(anyhow::Error::new(err)
-                        .context(format!("Failed to fsync {}", candidate.display())));
-                }
-                drop(f);
-                if let Some(gid) = policy.gid
-                    && let Err(err) = std::os::unix::fs::chown(&candidate, None, Some(gid))
-                {
-                    let _ = std::fs::remove_file(&candidate);
-                    return Err(anyhow::Error::new(err).context(format!(
-                        "Failed to chown {} to gid {gid}",
-                        candidate.display()
-                    )));
-                }
-                if let Err(err) = std::fs::set_permissions(
-                    &candidate,
-                    std::fs::Permissions::from_mode(final_mode),
-                ) {
-                    let _ = std::fs::remove_file(&candidate);
-                    return Err(anyhow::Error::new(err).context(format!(
-                        "Failed to chmod {final_mode:o} on {}",
-                        candidate.display()
-                    )));
-                }
-                return Ok(candidate);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => {
-                return Err(anyhow::Error::new(err).context(format!(
-                    "Failed to create staging file in {}",
-                    parent.display()
-                )));
-            }
-        }
-    }
-    anyhow::bail!(
-        "Failed to allocate a staging file for {} in {} after 32 attempts",
-        Path::new(final_name).display(),
-        parent.display()
+fn publish_staged(dest: &Path, contents: &str, mode: u32, policy: CertGroupPolicy) -> Result<()> {
+    fs_util::publish_staged_blocking(
+        dest,
+        contents.as_bytes(),
+        mode,
+        StagedOwner::PolicyGroup(policy.gid),
+        StagedDurability::RenameOnly,
     )
 }
 
@@ -565,19 +445,10 @@ fn stage_file(
 pub async fn write_cert_file(path: &Path, cert_pem: &str, policy: CertGroupPolicy) -> Result<()> {
     let dest = path.to_path_buf();
     let cert_owned = cert_pem.to_string();
-    tokio::task::spawn_blocking(move || {
-        publish_staged(
-            &dest,
-            &cert_owned,
-            CERT_FILE_MODE,
-            CERT_FILE_MODE,
-            policy,
-            StagedFile::Cert,
-        )
-    })
-    .await
-    .context("write_cert_file task panicked")?
-    .with_context(|| format!("Failed to write cert file {}", path.display()))
+    tokio::task::spawn_blocking(move || publish_staged(&dest, &cert_owned, CERT_FILE_MODE, policy))
+        .await
+        .context("write_cert_file task panicked")?
+        .with_context(|| format!("Failed to write cert file {}", path.display()))
 }
 
 /// Writes a CA bundle file under the given policy.
@@ -611,14 +482,7 @@ pub async fn write_bundle_file(
     let dest = path.to_path_buf();
     let bundle_owned = bundle_pem.to_string();
     tokio::task::spawn_blocking(move || {
-        publish_staged(
-            &dest,
-            &bundle_owned,
-            CA_BUNDLE_FILE_MODE,
-            CA_BUNDLE_FILE_MODE,
-            policy,
-            StagedFile::Bundle,
-        )
+        publish_staged(&dest, &bundle_owned, CA_BUNDLE_FILE_MODE, policy)
     })
     .await
     .context("write_bundle_file task panicked")?
@@ -942,9 +806,10 @@ mod tests {
 
     /// A Unix file name is bytes, not text, and a configured cert path
     /// may hold any of them. The writes this replaced never looked, so
-    /// the staging name is built from the destination's `OsStr` rather
-    /// than from a `&str` it would first have to be valid UTF-8 to
-    /// become.
+    /// neither may the publish: the staged file carries a name of the
+    /// primitive's own choosing and the destination is only ever a
+    /// `rename` target, so nothing on this path needs it to be valid
+    /// UTF-8.
     ///
     /// Linux only: APFS validates file names as UTF-8 and answers
     /// `EILSEQ`, so on macOS there is no such destination to write to.

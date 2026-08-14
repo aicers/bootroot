@@ -470,20 +470,110 @@ pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()>
 /// The blocking half of [`atomic_write`], for callers that are not async.
 ///
 /// Same guarantees, same order: staged in the destination's directory,
-/// written, `sync_all`ed, permissioned, ownership-preserved, renamed,
+/// written, `sync_all`ed, ownership-preserved, permissioned, renamed,
 /// and the directory flushed. Callers in an async context use
 /// [`atomic_write`] instead, which runs this on a blocking thread.
+///
+/// One spelling of [`publish_staged_blocking`], which every staged
+/// publish in the crate goes through — see there for the two decisions
+/// this one makes ([`StagedOwner::Destination`] and
+/// [`StagedDurability::FlushDirectory`]) and why.
 ///
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_write`].
 pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
-    let parent = parent_dir(path);
-    // Capture the existing destination's uid/gid (if any) so the
-    // rename does not strip operator-meaningful ownership. Missing
-    // file -> None; do not chown the staged file in that case so a
-    // fresh create keeps process default ownership.
-    let existing_owner = std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()));
+    publish_staged_blocking(
+        path,
+        contents,
+        mode,
+        StagedOwner::Destination,
+        StagedDurability::FlushDirectory,
+    )
+}
 
+/// Who owns the inode a staged publish renames into place.
+///
+/// A rename installs a *fresh* inode, so ownership is never inherited
+/// from the file being replaced the way a truncating write left it
+/// untouched. Every staged publish therefore has to say where the
+/// uid/gid comes from, and the two answers below differ because their
+/// files do.
+#[derive(Clone, Copy)]
+pub enum StagedOwner {
+    /// Carry the destination's uid and gid onto the new inode, and
+    /// leave a fresh create to the writing process.
+    ///
+    /// For files with no ownership policy of their own — a `0600`
+    /// `agent.toml`, `rotation-state.json`, the fast-poll state,
+    /// `state.json` — where the operator's or an earlier writer's
+    /// ownership is the only record of who may read them. Re-owning one
+    /// to the writer (a `service add` run by root replacing a file the
+    /// long-running agent reads) is an outage.
+    Destination,
+    /// Leave the uid to the writing process and set the group to the
+    /// `--cert-group` policy's gid, where it names one.
+    ///
+    /// For the issued certificate, key and CA bundle, whose group is
+    /// dictated by that policy and re-asserted on every write: reading
+    /// the gid off the destination instead would let a stale group
+    /// outlive the policy that replaced it. All three land world- or
+    /// group-readable by the policy, so no consumer loses access to a
+    /// file it could read before.
+    PolicyGroup(Option<u32>),
+}
+
+/// Whether the directory entry a staged publish creates is flushed
+/// before the write is reported as done.
+///
+/// The flush is a disk round trip on every write, so it is a decision
+/// per file rather than a default — see [`sync_parent_dir`].
+#[derive(Clone, Copy)]
+pub enum StagedDurability {
+    /// `sync_parent_dir` after the rename: the file is read back to
+    /// resume, so the published name has to survive a power loss and
+    /// not merely a clean replacement.
+    FlushDirectory,
+    /// Rename and stop: a crash that loses the new directory entry
+    /// leaves the previous file in place and costs a rewrite — a
+    /// reissued certificate, the next sync's `eab.json` — rather than
+    /// an outage.
+    RenameOnly,
+}
+
+/// Publishes `contents` at `path` by staging a temporary in the same
+/// directory, applying `mode` and `owner` to it there, and `rename`ing
+/// it over the destination.
+///
+/// This is the one staging implementation in the crate: `state.json`,
+/// `rotation-state.json`, `agent.toml`, the fast-poll state, the two
+/// `init` outputs, and the issued certificate, key and CA bundle all
+/// publish through it. The destination name is only ever observed as
+/// the previous file or the complete new one.
+///
+/// The staged file is created by `tempfile` at `0600` and reaches
+/// `mode` only while it is still at its temporary name, so a wider
+/// `mode` is never observable at the destination — the property issue
+/// #593 asked of the key file, and which now holds for every caller.
+/// The chown runs before the chmod for the same reason: nothing may
+/// sit group-readable under the writer's primary gid, even at the
+/// temporary name, before the policy's gid lands.
+///
+/// The temporary is removed if any step before the rename fails
+/// (`NamedTempFile` deletes on drop), so a failed publish leaves
+/// neither a torn destination nor a stray sibling.
+///
+/// # Errors
+/// Returns an error if the temp file cannot be created, written,
+/// chowned, permissioned or renamed, or if the containing directory
+/// cannot be flushed under [`StagedDurability::FlushDirectory`].
+pub fn publish_staged_blocking(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    owner: StagedOwner,
+    durability: StagedDurability,
+) -> Result<()> {
+    let parent = parent_dir(path);
     let mut tmp = tempfile::NamedTempFile::new_in(&parent)
         .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
     tmp.as_file_mut()
@@ -492,6 +582,37 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<
     tmp.as_file_mut()
         .sync_all()
         .with_context(|| format!("Failed to fsync temp file for {}", path.display()))?;
+    match owner {
+        StagedOwner::Destination => {
+            // A destination that is missing, or cannot be stat'd,
+            // leaves the staged file with the writing process's own
+            // ownership rather than being chowned to a guess.
+            if let Some((dest_uid, dest_gid)) =
+                std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+            {
+                let tmp_meta = std::fs::metadata(tmp.path())
+                    .with_context(|| format!("Failed to stat temp file for {}", path.display()))?;
+                // Skipping a chown that would change nothing keeps an
+                // unprivileged writer whose ownership already matches
+                // from failing on a call it did not need to make.
+                if tmp_meta.uid() != dest_uid || tmp_meta.gid() != dest_gid {
+                    std::os::unix::fs::chown(tmp.path(), Some(dest_uid), Some(dest_gid))
+                        .with_context(|| {
+                            format!(
+                                "Failed to preserve existing uid={dest_uid} gid={dest_gid} on {}",
+                                path.display()
+                            )
+                        })?;
+                }
+            }
+        }
+        StagedOwner::PolicyGroup(Some(gid)) => {
+            std::os::unix::fs::chown(tmp.path(), None, Some(gid)).with_context(|| {
+                format!("Failed to chown {} to gid {gid}", tmp.path().display())
+            })?;
+        }
+        StagedOwner::PolicyGroup(None) => {}
+    }
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
         || {
             format!(
@@ -500,20 +621,6 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<
             )
         },
     )?;
-    if let Some((dest_uid, dest_gid)) = existing_owner {
-        let tmp_meta = std::fs::metadata(tmp.path())
-            .with_context(|| format!("Failed to stat temp file for {}", path.display()))?;
-        if tmp_meta.uid() != dest_uid || tmp_meta.gid() != dest_gid {
-            std::os::unix::fs::chown(tmp.path(), Some(dest_uid), Some(dest_gid)).with_context(
-                || {
-                    format!(
-                        "Failed to preserve existing uid={dest_uid} gid={dest_gid} on {}",
-                        path.display()
-                    )
-                },
-            )?;
-        }
-    }
     tmp.persist(path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to rename temp file to {}: {}",
@@ -521,7 +628,10 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<
             e.error
         )
     })?;
-    sync_parent_dir(path)?;
+    match durability {
+        StagedDurability::FlushDirectory => sync_parent_dir(path)?,
+        StagedDurability::RenameOnly => {}
+    }
     Ok(())
 }
 
@@ -1178,6 +1288,61 @@ mod tests {
             "an unflushable directory must be reported, got: {err:#}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "payload");
+    }
+
+    /// The two ownership answers must stay two answers. A destination
+    /// seeded with a supplementary gid keeps it under
+    /// [`StagedOwner::Destination`] — the case
+    /// `atomic_write_preserves_existing_gid_on_overwrite` covers — and
+    /// is re-owned to the writer's own gid under
+    /// [`StagedOwner::PolicyGroup`], where the `--cert-group` policy is
+    /// the authority on the group and a stale one must not outlive it.
+    /// Requires a supplementary gid (see `one_supplementary_test_gid`).
+    #[test]
+    fn publish_staged_re_owns_under_the_policy_and_preserves_under_destination() {
+        let Some(gid) = crate::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let seed = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "first").unwrap();
+            std::os::unix::fs::chown(&path, None, Some(gid))
+                .expect("test process must be able to chgrp to a supplementary gid");
+            path
+        };
+        let preserved = seed("preserved");
+        let re_owned = seed("re-owned");
+        let own_gid = std::fs::metadata(&preserved).unwrap().gid();
+        assert_eq!(own_gid, gid, "seed gid must take effect");
+
+        publish_staged_blocking(
+            &preserved,
+            b"second",
+            KEY_FILE_MODE,
+            StagedOwner::Destination,
+            StagedDurability::RenameOnly,
+        )
+        .unwrap();
+        publish_staged_blocking(
+            &re_owned,
+            b"second",
+            KEY_FILE_MODE,
+            StagedOwner::PolicyGroup(None),
+            StagedDurability::RenameOnly,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&preserved).unwrap().gid(),
+            gid,
+            "StagedOwner::Destination must carry the destination's gid across the rename"
+        );
+        assert_ne!(
+            std::fs::metadata(&re_owned).unwrap().gid(),
+            gid,
+            "StagedOwner::PolicyGroup must not inherit the destination's gid"
+        );
     }
 
     /// Same pin for the `O_EXCL` credential writer. Its flush lives in

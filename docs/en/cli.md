@@ -1133,13 +1133,14 @@ remote-bootstrap artifact, and surfaced on `DaemonProfileSettings`,
 so rotation always reapplies the same policy.
 
 Atomicity: the key file, the certificate and the CA bundle are all
-written via stage-then-rename — the bytes are first written to a
-sibling temp file created with `O_CREAT|O_EXCL` (`mode=0600` for the
-key, `0644` for the certificate and the bundle), the staged file is
-`chown`d (when the policy is active) and set to its final mode —
-`0640` for the key under an active policy, `0600` otherwise, `0644`
-for the certificate and the bundle — and only then renamed over the
-destination. Two properties follow. The destination path is never
+written via stage-then-rename, through the same publish routine that
+writes `state.json` and the `init` outputs — the bytes are first
+written to a sibling temp file created with `O_CREAT|O_EXCL` at
+`mode=0600`, the staged file is `chown`d (when the policy is active)
+and set to its final mode — `0640` for the key under an active policy,
+`0600` otherwise, `0644` for the certificate and the bundle — and only
+then renamed over the destination. Two properties follow. The
+destination path is never
 observable at a mode wider than the final policy: there is no
 umask-derived `0644` window before the clamp, and no group-readable
 window under the operator's primary gid before the chown lands. And a
