@@ -180,8 +180,9 @@ Run all preflight checks before pushing:
 ./scripts/preflight/run-all.sh
 ```
 
-Or run individual scripts. Scripts under `preflight/ci/` mirror CI workflow
-jobs; scripts under `preflight/extra/` are local-only checks not in CI.
+Or run individual scripts. Scripts under `preflight/ci/` cover CI workflow
+jobs — `deploy-no-build-smoke.sh` is the file CI itself runs, the rest mirror
+what CI runs; scripts under `preflight/extra/` are local-only checks not in CI.
 
 ### CI-equivalent (`preflight/ci/`)
 

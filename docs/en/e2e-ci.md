@@ -575,6 +575,10 @@ Or run individual scripts:
 | `./scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` Docker E2E Matrix |
 | `./scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` Run Extended |
 
+`deploy-no-build-smoke.sh` is the one entry that is not a mirror: the
+`Deploy Compose No-Build Smoke` step runs this same file, so it cannot
+drift from what CI does.
+
 Local-only extras (not in any CI workflow):
 
 | Script | Description |
