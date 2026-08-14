@@ -555,9 +555,14 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 | `scripts/preflight/ci/check.sh` | `ci.yml` → Quality Check |
 | `scripts/validate-deploy-compose.sh` | `ci.yml` → Validate Deploy Compose |
 | `scripts/validate-compose-instance-names.sh` | `ci.yml` → Validate Compose Instance Names |
+| `scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` → Deploy Compose No-Build Smoke |
 | `scripts/preflight/ci/test-core.sh` | `ci.yml` → test-core |
 | `scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` → test-docker-e2e-matrix |
 | `scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` → run-extended |
+
+`deploy-no-build-smoke.sh`만은 CI를 흉내 낸 스크립트가 아닙니다.
+`Deploy Compose No-Build Smoke` 단계가 이 파일을 그대로 실행하므로 CI와
+어긋날 수 없습니다.
 
 로컬 전용 스크립트(`scripts/preflight/extra/`):
 

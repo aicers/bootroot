@@ -14,8 +14,8 @@ echo "--- validate-deploy-compose.sh ---"
 echo "--- validate-compose-instance-names.sh ---"
 "$SCRIPT_DIR/../validate-compose-instance-names.sh"
 
-echo "--- extra/deploy-no-build-smoke.sh ---"
-"$SCRIPT_DIR/extra/deploy-no-build-smoke.sh"
+echo "--- ci/deploy-no-build-smoke.sh ---"
+"$SCRIPT_DIR/ci/deploy-no-build-smoke.sh"
 
 echo "--- ci/test-core.sh ---"
 "$SCRIPT_DIR/ci/test-core.sh"
