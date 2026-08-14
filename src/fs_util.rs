@@ -564,20 +564,22 @@ pub fn atomic_replace_blocking(path: &Path, contents: &[u8], mode: u32) -> Resul
 /// first keeps the file the operator arranged to be written the file
 /// that is written.
 ///
-/// This is the spelling for a *configuration* file bootroot renders and
-/// an operator may have pointed elsewhere — `.env`, `ca.json` and its
-/// template, `openbao.hcl`, the compose overrides, the responder and
-/// `OpenBao` Agent configs, the two `init` outputs, `state.json`.
+/// This is the spelling for a destination an operator arranges: the
+/// configuration bootroot renders into its own tree and an operator may
+/// have pointed elsewhere (`.env`, `ca.json` and its template,
+/// `openbao.hcl`, the compose overrides, the responder and `OpenBao`
+/// Agent configs, `state.json`), and the output paths they name on the
+/// command line (`init`'s two, `rotate openbao-recovery --output`).
 ///
 /// Two classes deliberately keep [`atomic_write`]'s bare rename:
 ///
-/// - **Credentials.** A link at a credential path is a redirection
-///   vector rather than an operator convenience, and the reader reads
-///   the configured path — which the rename leaves holding the current
-///   secret — so following one buys nothing and costs the guarantee.
-///   The override credential paths, whose directory an unprivileged
-///   user owns, go further and refuse a link outright
-///   ([`atomic_rewrite_owned_no_symlink`]).
+/// - **Credentials at a path bootroot chose**, inside the secrets tree.
+///   A link there is a redirection vector rather than an operator
+///   convenience, and the reader reads the path bootroot handed it —
+///   which the rename leaves holding the current secret — so following
+///   one buys nothing and costs the guarantee. The override credential
+///   paths, whose directory an unprivileged user owns, go further and
+///   refuse a link outright ([`atomic_rewrite_owned_no_symlink`]).
 /// - **Files another writer already publishes by rename**, namely
 ///   `agent.toml` (since #613) and the issued cert and key (since
 ///   #593). A link at those paths does not survive the writer that
