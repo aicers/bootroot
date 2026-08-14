@@ -591,6 +591,21 @@ When local `sudo -n` is unavailable:
 Use this only as a local constraint workaround. CI still executes
 `hosts` variants.
 
+The harnesses also assume two host tools, and each check fails in its
+prerequisite block rather than mid-run:
+
+- The bind-host guard in `run-reinit-recovery.sh`, `run-stepca-san.sh`,
+  `run-openbao-tls-no-delta.sh` and `run-openbao-tls-reown.sh` lists the
+  machine's IPv4 addresses with `ip` (iproute2), falling back to
+  `ifconfig`. A host with neither is told exactly that, because no value
+  of `OPENBAO_BIND_HOST` / `STEPCA_BIND_HOST` fixes a check that cannot
+  enumerate. Both default to `172.17.0.1`, the Docker bridge gateway on
+  Linux; elsewhere (Docker Desktop has no such interface) set them to an
+  address the host actually holds.
+- `run-remote-lifecycle.sh` reads the remote agent's TOML config with
+  `tomllib`, so its `python3` must be 3.11 or newer. The prerequisite
+  block imports it before any container starts.
+
 ## Init automation input/output rules
 
 Lifecycle scripts consume `bootroot init --summary-json` output for automation.

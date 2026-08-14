@@ -159,13 +159,39 @@ ensure_prerequisites() {
   [ -x "$BOOTROOT_BIN" ] || fail "bootroot binary not executable: $BOOTROOT_BIN"
 }
 
+list_local_ipv4() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show | awk '{print $4}' | sed 's|/.*||'
+  elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig -a | awk '/inet /{print $2}' | sed 's/^addr://'
+  else
+    return 1
+  fi
+}
+
 ensure_bind_host_available() {
   # Verify the configured non-loopback bind host actually exists on this
-  # machine; otherwise compose refuses to publish the port and the SAN
-  # assertions fail for a reason that has nothing to do with #733.
-  if ! ip -4 -o addr show 2>/dev/null | awk '{print $4}' | sed 's|/.*||' \
-      | grep -qx "$STEPCA_BIND_HOST"; then
-    fail "non-loopback bind host $STEPCA_BIND_HOST is not assigned to any local interface (set STEPCA_BIND_HOST to an address that is)"
+  # machine; otherwise compose refuses to publish the port and the run
+  # fails for a reason that has nothing to do with what it exercises.
+  #
+  # Not being able to enumerate at all is a different condition from the
+  # address being absent, and it has a different fix: no value of the bind
+  # host variable helps a host that cannot list its own addresses, so that
+  # case must not tell the operator to change the variable.  `pipefail`
+  # also routes a present-but-failing `ip` here, whose own stderr now
+  # reaches the operator, so the message covers both.
+  local bind_host="$1" bind_var="$2" local_addrs
+  if ! local_addrs="$(list_local_ipv4)"; then
+    fail "cannot enumerate local IPv4 addresses: neither ip (iproute2) nor ifconfig is installed and working"
+  fi
+  # -F: the bind host is data, not a pattern, so a value carrying regex
+  # metacharacters cannot match an address it is not.  `--` for the same
+  # reason one argument earlier: the value arrives from the environment, and
+  # one beginning with a dash is an option to grep rather than the pattern.
+  # `-e127.0.0.1` would otherwise be read as a second pattern and match a
+  # host holding 127.0.0.1, which is not the address that was configured.
+  if ! printf '%s\n' "$local_addrs" | grep -qFx -- "$bind_host"; then
+    fail "non-loopback bind host $bind_host is not assigned to any local interface (set $bind_var to an address that is)"
   fi
 }
 
@@ -567,7 +593,7 @@ main() {
   trap 'on_error $LINENO' ERR
 
   ensure_prerequisites
-  ensure_bind_host_available
+  ensure_bind_host_available "$STEPCA_BIND_HOST" STEPCA_BIND_HOST
 
   scenario_a_fresh_install_with_bind
   scenario_b_repair_initialized_ca

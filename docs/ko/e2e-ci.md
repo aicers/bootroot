@@ -581,6 +581,22 @@ scripts/preflight/run-all.sh
 
 이는 로컬 제약 우회용입니다. CI에서는 `hosts` 케이스도 실행됩니다.
 
+하네스는 호스트 도구 두 가지를 전제하며, 각 검사는 실행 도중이 아니라
+사전 조건 블록에서 실패합니다.
+
+- `run-reinit-recovery.sh`, `run-stepca-san.sh`,
+  `run-openbao-tls-no-delta.sh`, `run-openbao-tls-reown.sh`의 bind host
+  가드는 `ip`(iproute2)로, 없으면 `ifconfig`로 로컬 IPv4 주소를
+  열거합니다. 둘 다 없는 호스트에는 그 사실을 그대로 알립니다.
+  열거 자체가 불가능한 검사는 `OPENBAO_BIND_HOST` /
+  `STEPCA_BIND_HOST`를 어떤 값으로 바꿔도 통과하지 않기 때문입니다.
+  두 변수의 기본값 `172.17.0.1`은 Linux의 Docker 브리지 게이트웨이이며,
+  그 인터페이스가 없는 환경(예: Docker Desktop)에서는 호스트가 실제로
+  가진 주소로 지정합니다.
+- `run-remote-lifecycle.sh`는 원격 에이전트의 TOML 설정을 `tomllib`으로
+  읽으므로 `python3`이 3.11 이상이어야 합니다. 사전 조건 블록에서
+  컨테이너를 띄우기 전에 import를 확인합니다.
+
 ## init 자동화 입출력 규칙
 
 라이프사이클 스크립트는 `bootroot init --summary-json` 출력으로 자동화를

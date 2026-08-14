@@ -123,6 +123,12 @@ ensure_prerequisites() {
   docker compose version >/dev/null 2>&1 || fail "docker compose is required"
   command -v jq >/dev/null 2>&1 || fail "jq is required"
   command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+  # This harness parses the remote agent's TOML config with `tomllib`,
+  # which is standard library only from 3.11.  Check it here so an older
+  # interpreter stops the run before any container is started, rather
+  # than at the first import several phases in.
+  python3 -c 'import tomllib' >/dev/null 2>&1 \
+    || fail "python3 with tomllib (3.11+) is required"
   command -v openssl >/dev/null 2>&1 || fail "openssl is required"
   [ -x "$BOOTROOT_BIN" ] || fail "bootroot binary not executable: $BOOTROOT_BIN"
   [ -x "$BOOTROOT_REMOTE_BIN" ] || fail "bootroot-remote binary not executable: $BOOTROOT_REMOTE_BIN"
