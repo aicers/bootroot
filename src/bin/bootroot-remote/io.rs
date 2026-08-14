@@ -101,8 +101,19 @@ pub(super) async fn write_secret_file(path: &Path, contents: &str) -> Result<App
         fs_util::set_key_permissions(path).await?;
         return Ok(ApplyStatus::Unchanged);
     }
-    fs::write(path, next).await?;
-    fs_util::set_key_permissions(path).await?;
+    // Published by rename at the policy's `0600`, applied to the staged
+    // temporary. The remote `bootroot-agent` re-reads its `secret_id`
+    // and `role_id` on every `AppRole` re-login, so a bootstrap
+    // rewriting one in place could hand a running daemon a truncated
+    // credential; and the mode now holds from the moment the file
+    // appears, closing the window the `write` + `set_key_permissions`
+    // pair left open on a fresh create.
+    //
+    // It takes the directory flush: the control plane has already issued
+    // this credential and cannot re-read it, so losing the directory
+    // entry means re-running `service add` on the control plane, not
+    // repeating the write here.
+    fs_util::atomic_write(path, next.as_bytes(), fs_util::KEY_FILE_MODE).await?;
     Ok(ApplyStatus::Applied)
 }
 

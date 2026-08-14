@@ -33,6 +33,7 @@ use crate::cli::args::InitArgs;
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::CA_TRUST_KEY;
 use crate::commands::container_name::BootrootContainer;
+use crate::commands::guardrails::COMPOSE_OVERRIDE_MODE;
 use crate::commands::infra::run_compose;
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
@@ -726,35 +727,32 @@ async fn write_openbao_agent_files(
     let stepca_role = find_role_output(role_outputs, AppRoleLabel::Stepca, messages)?;
     let responder_role = find_role_output(role_outputs, AppRoleLabel::Responder, messages)?;
 
+    // The four `AppRole` credentials below publish by rename at the
+    // policy's `0600`, applied to the staged temporary. The `write` +
+    // `set_key_permissions` pair this replaced left each `secret_id`
+    // world-readable at its final path for the length of a chmod, in a
+    // directory the `OpenBao` Agent sidecars are already watching.
+    //
+    // All four take the directory flush: `OpenBao` has issued these by
+    // the time they are written and a `secret_id` is not re-readable, so
+    // a crash that loses one is not a rewrite but an agent locked out
+    // until an operator re-runs `init`. This is the reason
+    // `fs_util::create_owned_credential_noclobber` gives for flushing
+    // the service-side credential.
     let stepca_role_id_path = stepca_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
     let stepca_secret_id_path = stepca_dir.join(OPENBAO_AGENT_SECRET_ID_NAME);
-    tokio::fs::write(&stepca_role_id_path, &stepca_role.role_id)
-        .await
-        .with_context(|| {
-            messages.error_write_file_failed(&stepca_role_id_path.display().to_string())
-        })?;
-    tokio::fs::write(&stepca_secret_id_path, &stepca_role.secret_id)
-        .await
-        .with_context(|| {
-            messages.error_write_file_failed(&stepca_secret_id_path.display().to_string())
-        })?;
-    fs_util::set_key_permissions(&stepca_role_id_path).await?;
-    fs_util::set_key_permissions(&stepca_secret_id_path).await?;
+    write_agent_credential(&stepca_role_id_path, &stepca_role.role_id, messages).await?;
+    write_agent_credential(&stepca_secret_id_path, &stepca_role.secret_id, messages).await?;
 
     let responder_role_id_path = responder_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
     let responder_secret_id_path = responder_dir.join(OPENBAO_AGENT_SECRET_ID_NAME);
-    tokio::fs::write(&responder_role_id_path, &responder_role.role_id)
-        .await
-        .with_context(|| {
-            messages.error_write_file_failed(&responder_role_id_path.display().to_string())
-        })?;
-    tokio::fs::write(&responder_secret_id_path, &responder_role.secret_id)
-        .await
-        .with_context(|| {
-            messages.error_write_file_failed(&responder_secret_id_path.display().to_string())
-        })?;
-    fs_util::set_key_permissions(&responder_role_id_path).await?;
-    fs_util::set_key_permissions(&responder_secret_id_path).await?;
+    write_agent_credential(&responder_role_id_path, &responder_role.role_id, messages).await?;
+    write_agent_credential(
+        &responder_secret_id_path,
+        &responder_role.secret_id,
+        messages,
+    )
+    .await?;
 
     let stepca_agent_config = stepca_dir.join(OPENBAO_AGENT_CONFIG_NAME);
     let responder_agent_config = responder_dir.join(OPENBAO_AGENT_CONFIG_NAME);
@@ -792,18 +790,29 @@ async fn write_openbao_agent_files(
         &[(responder_template, responder_output)],
         ca_cert,
     );
-    tokio::fs::write(&stepca_agent_config, stepca_config)
-        .await
-        .with_context(|| {
-            messages.error_write_file_failed(&stepca_agent_config.display().to_string())
-        })?;
-    tokio::fs::write(&responder_agent_config, responder_config)
-        .await
-        .with_context(|| {
-            messages.error_write_file_failed(&responder_agent_config.display().to_string())
-        })?;
-    fs_util::set_key_permissions(&stepca_agent_config).await?;
-    fs_util::set_key_permissions(&responder_agent_config).await?;
+    // The two `agent.hcl` files publish by rename at `0600` and decline
+    // the flush: each sidecar reads its config at start and on restart,
+    // so a torn read is a container that will not come up, but the file
+    // is regenerated in full from `state.json` and the template paths on
+    // the next `init`.
+    fs_util::atomic_replace(
+        &stepca_agent_config,
+        stepca_config.as_bytes(),
+        fs_util::KEY_FILE_MODE,
+    )
+    .await
+    .with_context(|| {
+        messages.error_write_file_failed(&stepca_agent_config.display().to_string())
+    })?;
+    fs_util::atomic_replace(
+        &responder_agent_config,
+        responder_config.as_bytes(),
+        fs_util::KEY_FILE_MODE,
+    )
+    .await
+    .with_context(|| {
+        messages.error_write_file_failed(&responder_agent_config.display().to_string())
+    })?;
 
     Ok(OpenBaoAgentPaths {
         stepca_agent_config,
@@ -898,10 +907,27 @@ services:
         secrets_path = mount_root.display(),
         user = user
     );
-    tokio::fs::write(&override_path, contents)
-        .await
-        .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+    // Published by rename, not flushed, at the destination's mode or the
+    // umask's `0644` on a create — the compose-override decisions
+    // `crate::commands::guardrails` records.
+    fs_util::atomic_replace(
+        &override_path,
+        contents.as_bytes(),
+        fs_util::preserved_mode(&override_path, COMPOSE_OVERRIDE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
     Ok(Some(override_path))
+}
+
+/// Publishes one `OpenBao` Agent `AppRole` credential by rename at
+/// `0600`, flushing the containing directory.
+///
+/// See the call site for why both decisions go this way.
+async fn write_agent_credential(path: &Path, value: &str, messages: &Messages) -> Result<()> {
+    fs_util::atomic_write(path, value.as_bytes(), fs_util::KEY_FILE_MODE)
+        .await
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
 }
 
 pub(super) fn apply_openbao_agent_compose_override(

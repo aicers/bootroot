@@ -230,9 +230,7 @@ impl StateFile {
     /// staged write that follows reports the real error, and guessing a
     /// mode here would only replace it with a worse one.
     fn publish_mode(path: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::metadata(path).map_or(STATE_FILE_MODE, |meta| meta.permissions().mode() & 0o7777)
+        fs_util::preserved_mode(path, STATE_FILE_MODE)
     }
 
     pub(crate) fn secrets_dir(&self) -> &Path {

@@ -4,12 +4,13 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 
 use crate::cli::args::{CaRestartArgs, CaUpdateArgs};
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::infra::{collect_container_failures, collect_readiness, run_compose};
 use crate::commands::init::{
-    RESPONDER_TEMPLATE_DIR, STEPCA_CA_JSON_TEMPLATE_NAME, set_acme_cert_duration,
+    CA_JSON_FILE_MODE, RESPONDER_TEMPLATE_DIR, STEPCA_CA_JSON_TEMPLATE_NAME, set_acme_cert_duration,
 };
 use crate::i18n::Messages;
 
@@ -110,9 +111,7 @@ fn patch_ca_json(
     }
     let updated =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
-    std::fs::write(path, updated)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    Ok(())
+    publish_ca_json(path, &updated, messages)
 }
 
 fn patch_ca_json_ctmpl(
@@ -135,9 +134,34 @@ fn patch_ca_json_ctmpl(
     let serialized =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
     let restored = unmask_go_template_directives(&serialized, &directives);
-    std::fs::write(path, restored)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    Ok(())
+    publish_ca_json(path, &restored, messages)
+}
+
+/// Publishes a patched `ca.json` — or its `.ctmpl` template — by rename.
+///
+/// step-ca reads `ca.json` at boot and the `OpenBao` Agent sidecar
+/// re-renders it from the template on a fixed interval, so both files
+/// have a reader that can arrive mid-write. Truncating in place let
+/// either observe half a JSON document, which step-ca answers by
+/// refusing to start; the rename leaves the previous document or the
+/// complete new one.
+///
+/// The mode comes off the destination. Both files are read here before
+/// they are written, so one always exists, and `init` — not this patch —
+/// is what decides their mode.
+///
+/// The directory is not flushed. Both are derived files: `ca.json` is
+/// re-rendered from `ca.json.ctmpl` by the sidecar, and the template is
+/// rebuilt from `ca.json` by `init`. A crash that loses the entry leaves
+/// the previous document in place and costs the next render or a re-run
+/// of `bootroot ca update`, not an unrecoverable state.
+fn publish_ca_json(path: &Path, contents: &str, messages: &Messages) -> Result<()> {
+    fs_util::atomic_replace_blocking(
+        path,
+        contents.as_bytes(),
+        fs_util::preserved_mode(path, CA_JSON_FILE_MODE),
+    )
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
 }
 
 /// Replaces each `"{{ ... }}"` JSON-quoted Go template directive in

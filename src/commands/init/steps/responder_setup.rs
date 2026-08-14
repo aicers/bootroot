@@ -17,6 +17,7 @@ use super::InitSecrets;
 use crate::cli::args::{InitArgs, InitSkipPhase};
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
+use crate::commands::guardrails::COMPOSE_OVERRIDE_MODE;
 use crate::commands::infra::run_compose;
 use crate::i18n::Messages;
 
@@ -37,19 +38,27 @@ pub(super) async fn write_responder_files(
     let responder_dir = secrets_dir.join(RESPONDER_CONFIG_DIR);
     fs_util::ensure_secrets_dir(&responder_dir).await?;
 
+    // Both files publish by rename at the policy's `0600`, applied to
+    // the staged temporary — the config carries the responder HMAC, so
+    // the `write` + `set_key_permissions` pair this replaced left it
+    // briefly world-readable at its final path.
+    //
+    // Neither takes the directory flush. The responder container reads
+    // the config at start and the `OpenBao` Agent sidecar re-renders it
+    // from the template, so a torn read matters; but both are rebuilt in
+    // full by this function on the next `init`, so a crash that loses a
+    // directory entry costs that re-run.
     let template_path = templates_dir.join(RESPONDER_TEMPLATE_NAME);
     let template = build_responder_template(kv_mount, tls_enabled);
-    tokio::fs::write(&template_path, template)
+    fs_util::atomic_replace(&template_path, template.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&template_path.display().to_string()))?;
-    fs_util::set_key_permissions(&template_path).await?;
 
     let config_path = responder_dir.join(RESPONDER_CONFIG_NAME);
     let config = build_responder_config(hmac, tls_enabled);
-    tokio::fs::write(&config_path, config)
+    fs_util::atomic_replace(&config_path, config.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&config_path.display().to_string()))?;
-    fs_util::set_key_permissions(&config_path).await?;
 
     Ok(ResponderPaths {
         template_path,
@@ -159,9 +168,19 @@ services:
         dir = config_dir.display(),
         file_name = file_name,
     );
-    tokio::fs::write(&override_path, contents)
-        .await
-        .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+    // Published by rename, not flushed, at the destination's mode or the
+    // umask's `0644` on a create — the same three decisions the
+    // exposure overrides in `crate::commands::guardrails` record, for
+    // the same reader: `docker compose` parses this file on every
+    // invocation, and it is regenerated from `state.json` by the `init`
+    // step that writes it.
+    fs_util::atomic_replace(
+        &override_path,
+        contents.as_bytes(),
+        fs_util::preserved_mode(&override_path, COMPOSE_OVERRIDE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
     Ok(Some(override_path))
 }
 

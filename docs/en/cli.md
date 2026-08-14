@@ -104,6 +104,59 @@ Key points:
 For detailed rules and condition-specific behavior, see the Overview section
 [/etc/hosts Mapping](index.md#etchosts-mapping).
 
+## How bootroot writes files
+
+Every file bootroot produces is published by stage-then-rename: the bytes go to
+a temporary file in the destination's own directory, that file is flushed and
+given its final mode and ownership while it is still at its temporary name, and
+only then is it renamed over the destination. Three consequences are worth
+knowing when you operate around a running stack.
+
+- **A reader never sees a partial file.** A container mounting the file, a
+  sidecar re-rendering it, `docker compose` interpolating `.env`, or a
+  `bootroot-agent` reloading `agent.toml` sees either the previous file or the
+  complete new one. A write that fails partway leaves the previous file
+  untouched and removes the temporary.
+- **The final mode holds from the moment the file appears.** There is no window
+  in which a freshly written CA password, recovery key, `secret_id` or
+  responder HMAC is readable more widely than intended.
+- **A rename installs a new inode.** The file at the destination path is a
+  different inode after every write, so anything holding an open file
+  descriptor — a `tail -f`, a container that opened the file at start — keeps
+  reading the old contents until it reopens the path. Bind mounts of a
+  *directory* follow the rename; a bind mount of a single *file* does not, and
+  needs the container restarted to pick up a new version.
+
+Whether the containing directory is flushed after the rename is decided per
+file, because that flush costs a disk round trip on every write:
+
+Flushed, so the published file survives a power loss:
+
+- `state.json`, `.env`, `agent.toml`
+- the `init` `--summary-json` and `--root-token-output` files
+- the step-ca CA password and the OpenBao recovery keys
+- every `AppRole` `role_id`/`secret_id`, and the remote bootstrap artifact
+
+Not flushed, because a crash that loses one costs a rewrite rather than an
+outage:
+
+- issued certificates, keys, and the CA bundle
+- `ca.json` and its OpenBao Agent template
+- `openbao.hcl`, and the HTTP-01 responder config and template
+- the OpenBao Agent configs, and the generated compose overrides
+
+The second list is regenerated on its own: by the next renewal, by the OpenBao
+Agent sidecar's next render, or by re-running the command that produced it. The
+first is not — bootroot reads it back to resume, or it holds a credential
+OpenBao has already issued and will not hand out again.
+
+Modes are taken from the file already at the destination where it has one, so a
+file you narrow by hand stays narrowed across every later write. Only a fresh
+create takes bootroot's stated default: `0600` inside the secrets tree and for
+the two `init` outputs, `0644` for `state.json`, `.env`, `ca.json`,
+`openbao.hcl`, the issued certificates, the CA bundle and the compose
+overrides.
+
 ## bootroot infra up
 
 Starts OpenBao/PostgreSQL/step-ca/HTTP-01 responder via Docker Compose and

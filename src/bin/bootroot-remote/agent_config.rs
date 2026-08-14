@@ -195,7 +195,26 @@ pub(super) async fn apply_agent_config_updates(
                 ApplyItemSummary::failed(message),
             );
         }
-        if let Err(err) = fs::write(&args.agent_config_path, &with_profile).await {
+        // Published by rename at `0600`, matching the control plane's
+        // own `agent.toml` writer (`service::local_config`). This is the
+        // file `bootroot-agent` re-reads on every ACME retry, and the
+        // truncating write here reopened the #613 window that writer was
+        // moved off — a reload landing in the gap sees no profile and
+        // burns a retry. The mode reaching the staged temporary also
+        // folds the separate chmod, and its own failure arm, into the
+        // publish.
+        //
+        // It takes the directory flush. Nothing on this host regenerates
+        // `agent.toml`; losing the entry leaves the agent renewing
+        // against a stale responder HMAC or trust anchor with no signal
+        // that a re-sync is needed.
+        if let Err(err) = fs_util::atomic_write(
+            &args.agent_config_path,
+            with_profile.as_bytes(),
+            fs_util::KEY_FILE_MODE,
+        )
+        .await
+        {
             let message = localized(
                 lang,
                 &format!(
@@ -204,26 +223,6 @@ pub(super) async fn apply_agent_config_updates(
                 ),
                 &format!(
                     "agent.toml 쓰기 실패 ({}): {err}",
-                    args.agent_config_path.display()
-                ),
-            );
-            if responder_changed {
-                responder_hmac_status = ApplyItemSummary::failed(message.clone());
-            }
-            if trust_changed {
-                trust_sync_status = ApplyItemSummary::failed(message);
-            }
-            return (responder_hmac_status, trust_sync_status);
-        }
-        if let Err(err) = fs_util::set_key_permissions(&args.agent_config_path).await {
-            let message = localized(
-                lang,
-                &format!(
-                    "agent config chmod failed ({}): {err}",
-                    args.agent_config_path.display()
-                ),
-                &format!(
-                    "agent.toml 권한 설정 실패 ({}): {err}",
                     args.agent_config_path.display()
                 ),
             );

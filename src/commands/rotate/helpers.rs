@@ -43,6 +43,26 @@ pub(super) fn ensure_file_exists(path: &Path, messages: &Messages) -> Result<()>
     }
 }
 
+/// Writes an operator-only file inside the secrets tree, publishing it
+/// by rename at `0600`.
+///
+/// Its one caller stages the *new* step-ca CA password here before
+/// asking step-ca to re-encrypt its keys with it. The mode is the
+/// policy's `0600` rather than the destination's: this is a credential,
+/// and a stale wider mode left by an earlier run must not survive the
+/// file it was attached to.
+///
+/// Applying that mode to the staged temporary also closes the window the
+/// `write` + `set_key_permissions` pair this replaced left open, in
+/// which the password sat world-readable at its final path. That is the
+/// same defect #841's sibling issue tracks for `save_unseal_keys` and
+/// `eab::write_key_file`; those two are left to it, but a site being
+/// re-plumbed for the torn-read fix anyway does not get to keep the
+/// window.
+///
+/// It takes the directory flush. Losing the new password after step-ca
+/// has re-encrypted its keys with it leaves an intermediate CA key
+/// nobody can decrypt — not a rewrite, an unrecoverable CA.
 pub(super) async fn write_secret_file(
     path: &Path,
     contents: &str,
@@ -51,10 +71,9 @@ pub(super) async fn write_secret_file(
     if let Some(parent) = path.parent() {
         fs_util::ensure_secrets_dir(parent).await?;
     }
-    tokio::fs::write(path, contents)
+    fs_util::atomic_write(path, contents.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    fs_util::set_key_permissions(path).await?;
     Ok(())
 }
 

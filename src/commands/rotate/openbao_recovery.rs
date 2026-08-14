@@ -220,9 +220,16 @@ async fn write_openbao_recovery_output(
 
     let payload = serde_json::to_string_pretty(output)
         .with_context(|| messages.error_serialize_state_failed())?;
-    tokio::fs::write(path, payload)
+    // Published by rename at the policy's `0600`, applied to the staged
+    // temporary so the recovery keys are never observable at the final
+    // path under a wider mode.
+    //
+    // It takes the directory flush. These keys are the only way back
+    // into a sealed OpenBao and `OpenBao` has already rotated to them by
+    // the time this runs; a crash that loses the directory entry is not
+    // a rewrite, it is an unrecoverable barrier.
+    fs_util::atomic_write(path, payload.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    fs_util::set_key_permissions(path).await?;
     Ok(())
 }

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 
 use crate::commands::compose_project::COMPOSE_PROJECT_NAME_ENV;
 use crate::i18n::Messages;
@@ -45,6 +46,17 @@ fn strip_quotes(value: &str) -> String {
 }
 
 /// Writes a `.env` file from key-value pairs.
+///
+/// Published by rename through [`fs_util::atomic_write_blocking`]. Two
+/// readers make a torn `.env` costly: `docker compose` interpolates it
+/// on every invocation, and bootroot itself reads it back to recover the
+/// instance name and the assigned host ports.
+///
+/// It takes the directory flush for that second reader. The ports and
+/// the instance id here are the only record of which containers this
+/// tree owns; a crash that loses the entry leaves a later run choosing
+/// fresh ones and unable to find the stack it already started, which no
+/// re-run of `init` repairs.
 pub(crate) fn write_dotenv(
     path: &Path,
     entries: &[(&str, &str)],
@@ -57,9 +69,23 @@ pub(crate) fn write_dotenv(
         content.push_str(value);
         content.push('\n');
     }
-    std::fs::write(path, content)
+    fs_util::atomic_write_blocking(path, content.as_bytes(), dotenv_publish_mode(path))
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
+}
+
+/// Mode for a `.env` this process creates, when there is no destination
+/// to read one from.
+///
+/// The truncating write this replaced left the mode to the umask on a
+/// create — `0644` in practice — and to the destination on a rewrite.
+/// `.env` is mounted into `docker compose`'s own environment and read by
+/// every later bootroot invocation, so it is not narrowed here on the
+/// way past; see [`fs_util::preserved_mode`].
+const DOTENV_FILE_MODE: u32 = 0o644;
+
+fn dotenv_publish_mode(path: &Path) -> u32 {
+    fs_util::preserved_mode(path, DOTENV_FILE_MODE)
 }
 
 /// Decides which of `entries` [`load_dotenv_into_env`] would apply,
@@ -115,6 +141,12 @@ pub(crate) fn load_dotenv_into_env(path: &Path, messages: &Messages) -> Result<(
 }
 
 /// Updates a single key in an existing `.env` file, preserving other entries.
+///
+/// Publishes by rename and flushes, for the same two readers as
+/// [`write_dotenv`]. This is the hotter of the pair — a rotated
+/// `POSTGRES_PASSWORD` lands here while compose may be interpolating the
+/// file — so the torn read it closes is the one a running stack is most
+/// likely to hit.
 pub(crate) fn update_dotenv_key(
     path: &Path,
     key: &str,
@@ -149,7 +181,7 @@ pub(crate) fn update_dotenv_key(
         output.push_str(new_value);
         output.push('\n');
     }
-    std::fs::write(path, output)
+    fs_util::atomic_write_blocking(path, output.as_bytes(), dotenv_publish_mode(path))
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
@@ -307,5 +339,72 @@ mod tests {
         let map = read_dotenv(&path, &messages).unwrap();
         assert_eq!(map.get("A").unwrap(), "1");
         assert_eq!(map.get("B").unwrap(), "2");
+    }
+
+    /// Both writers publish a fresh inode and leave no staged sibling,
+    /// so `docker compose` reading concurrently sees one whole `.env`
+    /// or the other.
+    #[test]
+    fn dotenv_writers_publish_by_rename() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let messages = test_messages();
+
+        write_dotenv(&path, &[("A", "1")], &messages).unwrap();
+        let first_ino = std::fs::metadata(&path).unwrap().ino();
+
+        write_dotenv(&path, &[("A", "2")], &messages).unwrap();
+        let rewritten_ino = std::fs::metadata(&path).unwrap().ino();
+        assert_ne!(first_ino, rewritten_ino, "write_dotenv must rename");
+
+        update_dotenv_key(&path, "A", "3", &messages).unwrap();
+        assert_ne!(
+            rewritten_ino,
+            std::fs::metadata(&path).unwrap().ino(),
+            "update_dotenv_key must rename"
+        );
+        assert_eq!(
+            read_dotenv(&path, &messages).unwrap().get("A").unwrap(),
+            "3"
+        );
+
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|name| name != ".env")
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "staged temporary left behind: {strays:?}"
+        );
+    }
+
+    /// A `.env` an operator narrowed keeps its mode across a rewrite,
+    /// the way the truncating write left it; only a create takes the
+    /// umask-equivalent `0644`.
+    #[test]
+    fn dotenv_writers_keep_an_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let messages = test_messages();
+
+        write_dotenv(&path, &[("A", "1")], &messages).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            DOTENV_FILE_MODE,
+            "a create takes the stated default"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        update_dotenv_key(&path, "A", "2", &messages).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a rewrite must not re-widen an operator-narrowed .env"
+        );
     }
 }

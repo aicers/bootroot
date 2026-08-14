@@ -509,10 +509,18 @@ async fn ensure_infra_role_id_file(
         .await
         .with_context(|| messages.error_openbao_role_id_failed())?;
     fs_util::ensure_secrets_dir(agent_dir).await?;
-    tokio::fs::write(&role_id_path, &role_id)
+    // Published by rename at the policy's `0600`. The `OpenBao` Agent
+    // sidecar re-reads this file on every `AppRole` re-login, so a
+    // backfill racing one handed it a truncated `role_id` and a failed
+    // login; the rename leaves the previous file or the whole new one.
+    //
+    // No directory flush: `role_id` is not a secret and is re-readable
+    // from `OpenBao` at any time — this function exists precisely to
+    // fetch it again when the file is missing or empty — so a crash that
+    // loses the entry costs one more round trip on the next rotation.
+    fs_util::atomic_replace(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
-    fs_util::set_key_permissions(&role_id_path).await?;
     Ok(role_id)
 }
 
@@ -704,13 +712,16 @@ async fn ensure_role_id_file(
                 messages.error_write_file_failed(&role_id_path.display().to_string())
             })?;
     } else {
+        // Inside the secrets tree, published by rename at the policy's
+        // `0600` and not flushed — the same two decisions, for the same
+        // reasons, as `ensure_infra_role_id_file` above. The early
+        // return on `role_id_path.exists()` means this only ever creates.
         fs_util::ensure_secrets_dir(service_dir).await?;
-        tokio::fs::write(&role_id_path, role_id)
+        fs_util::atomic_replace(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
             .await
             .with_context(|| {
                 messages.error_write_file_failed(&role_id_path.display().to_string())
             })?;
-        fs_util::set_key_permissions(&role_id_path).await?;
     }
     Ok(())
 }

@@ -491,6 +491,75 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<
     )
 }
 
+/// Publishes `contents` at `path` by rename, **without** flushing the
+/// containing directory.
+///
+/// [`atomic_write`]'s guarantee against a torn read, without its
+/// durability guarantee. This is the right writer for regenerable
+/// configuration — a compose override, an `OpenBao` Agent template, a
+/// patched `ca.json` — where a reader (a container mounting the file, a
+/// sidecar re-rendering it) must never see half a document, but a crash
+/// that loses the new directory entry leaves the previous file in place
+/// and costs a re-run of the command that produced it rather than an
+/// outage. The flush is a disk round trip per write and `init` performs
+/// dozens of these, so it is not spent where the file can be rebuilt.
+///
+/// Callers whose file is read back to resume, or that hold something
+/// that cannot be re-derived, use [`atomic_write`] instead.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_write`],
+/// except that no directory flush is attempted.
+pub async fn atomic_replace(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    // Owned once, to move into the blocking task, exactly as
+    // `atomic_write` does.
+    let dest = path.to_path_buf();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || atomic_replace_blocking(&dest, &payload, mode))
+        .await
+        .context("Atomic replace task panicked")?
+}
+
+/// The blocking half of [`atomic_replace`], for callers that are not
+/// async.
+///
+/// One spelling of [`publish_staged_blocking`] — see there for the two
+/// decisions this one makes ([`StagedOwner::Destination`] and
+/// [`StagedDurability::RenameOnly`]) and why.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_replace`].
+pub fn atomic_replace_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    publish_staged_blocking(
+        path,
+        contents,
+        mode,
+        StagedOwner::Destination,
+        StagedDurability::RenameOnly,
+    )
+}
+
+/// The mode a staged publish should apply at `path`: the mode the file
+/// already carries, or `default_mode` when there is no file to read one
+/// from.
+///
+/// A truncating write left an existing destination's mode alone and let
+/// the umask decide a fresh create's. A rename installs a *fresh* inode
+/// that inherits neither, so every publish replacing such a write has to
+/// state a mode — and stating a constant would silently re-widen a file
+/// an operator narrowed by hand, or that a restrictive umask created
+/// narrow. Reading the destination's own mode back keeps the rewrite
+/// case byte-for-byte as it was; `default_mode` covers only the create,
+/// which is the one case a host with a non-default umask can observe.
+///
+/// Not for a file with a mode policy of its own — a key, a certificate,
+/// the two `init` outputs — where the policy's constant is the answer
+/// and a stale mode on disk must not outlive it.
+#[must_use]
+pub fn preserved_mode(path: &Path, default_mode: u32) -> u32 {
+    std::fs::metadata(path).map_or(default_mode, |meta| meta.permissions().mode() & 0o7777)
+}
+
 /// Who owns the inode a staged publish renames into place.
 ///
 /// A rename installs a *fresh* inode, so ownership is never inherited
@@ -544,11 +613,22 @@ pub enum StagedDurability {
 /// directory, applying `mode` and `owner` to it there, and `rename`ing
 /// it over the destination.
 ///
-/// This is the one staging implementation in the crate: `state.json`,
-/// `rotation-state.json`, `agent.toml`, the fast-poll state, the two
-/// `init` outputs, and the issued certificate, key and CA bundle all
-/// publish through it. The destination name is only ever observed as
+/// This is the one staging implementation in the crate. Every
+/// production file bootroot publishes reaches disk through it —
+/// `state.json`, `rotation-state.json`, `agent.toml`, the fast-poll
+/// state, the two `init` outputs, the issued certificate, key and CA
+/// bundle, and the configuration `init` and the rotation commands
+/// generate (`.env`, `ca.json` and its template, `openbao.hcl`, the
+/// responder config, the `OpenBao` Agent configs and credentials, the
+/// compose overrides). The destination name is only ever observed as
 /// the previous file or the complete new one.
+///
+/// Callers reach it through one of the four wrappers rather than
+/// directly: [`atomic_write`]/[`atomic_write_blocking`] for a file read
+/// back to resume, [`atomic_replace`]/[`atomic_replace_blocking`] for
+/// one that can be regenerated. `crate::cert_group` is the exception,
+/// calling in with [`StagedOwner::PolicyGroup`] for the three files the
+/// `--cert-group` policy owns.
 ///
 /// The staged file is created by `tempfile` at `0600` and reaches
 /// `mode` only while it is still at its temporary name, so a wider
@@ -1135,6 +1215,73 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(contents, "second");
         assert_eq!(mode, KEY_FILE_MODE);
+    }
+
+    /// `atomic_replace` publishes the same way `atomic_write` does —
+    /// fresh inode, requested mode, no torn destination — and differs
+    /// only in declining the directory flush, which leaves no
+    /// observable trace to assert on. Pinning the rest here keeps the
+    /// no-flush spelling from drifting into a plain `fs::write` on the
+    /// assumption that "not durable" means "not staged".
+    #[tokio::test]
+    async fn atomic_replace_creates_and_overwrites_with_mode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("compose.override.yml");
+
+        super::atomic_replace(&path, b"first", 0o644).await.unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "first");
+        let first_ino = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        super::atomic_replace(&path, b"second", 0o644)
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "second");
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            first_ino,
+            "a staged publish installs a new inode; an in-place write would not"
+        );
+
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|name| name != "compose.override.yml")
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "staged temporary left behind: {strays:?}"
+        );
+    }
+
+    /// `preserved_mode` answers with the destination's own mode where
+    /// there is one, and the caller's default only on a create. A
+    /// regression here is a rename silently re-widening a file an
+    /// operator narrowed — the one property the truncating writes these
+    /// publishes replaced got for free.
+    #[test]
+    fn preserved_mode_reads_the_destination_then_falls_back() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        assert_eq!(
+            super::preserved_mode(&path, 0o644),
+            0o644,
+            "a missing destination takes the caller's default"
+        );
+
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            super::preserved_mode(&path, 0o644),
+            0o600,
+            "an existing destination keeps the mode it carries"
+        );
     }
 
     /// Overwriting an existing file via `atomic_write` must preserve

@@ -2,6 +2,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 
 use super::super::constants::{
     RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME,
@@ -222,6 +223,17 @@ pub(crate) fn reissue_http01_admin_tls_cert(
 /// TLS enabled until the next `bootroot init` issues a fresh certificate.
 ///
 /// No-ops when neither file exists (fresh install before first `init`).
+///
+/// Each stripped file is published by rename at the mode it already
+/// carries — `0600`, set by `responder_setup` when it wrote them — which
+/// the `path.exists()` guard below has established is readable. The
+/// responder container reads its config at start and the `OpenBao` Agent
+/// sidecar re-renders it from the template on a fixed interval, so a
+/// truncating rewrite could hand either one a half-stripped file.
+///
+/// The directory is not flushed: the next `bootroot init` regenerates
+/// both files in full, so a crash that loses the entry costs that re-run
+/// and leaves the previous config, with TLS still configured, in place.
 pub(crate) fn strip_responder_tls_config(secrets_dir: &Path, messages: &Messages) -> Result<()> {
     let configs = [
         secrets_dir
@@ -252,8 +264,12 @@ pub(crate) fn strip_responder_tls_config(secrets_dir: &Path, messages: &Messages
             } else {
                 filtered
             };
-            std::fs::write(path, to_write)
-                .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+            fs_util::atomic_replace_blocking(
+                path,
+                to_write.as_bytes(),
+                fs_util::preserved_mode(path, fs_util::KEY_FILE_MODE),
+            )
+            .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
             stripped = true;
         }
     }

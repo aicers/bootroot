@@ -117,30 +117,43 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
-- Fixed the remaining files that were written by truncating the
+- Fixed every file bootroot writes being published by truncating the
   destination and writing over it, so a crash or a concurrent reader
   could see a half-written file at a name that is supposed to hold a
-  complete one. `state.json`, the issued certificate files, the CA
-  bundle, and the `--summary-json` and `--root-token-output`
-  destinations are now each written to a temporary file in the same
-  directory and renamed into place, so a reader sees either the
-  previous file or the whole new one. `state.json` and the two `init`
-  outputs additionally flush the containing directory, so the published
-  file survives a power loss and not merely a clean replacement; a
-  certificate or CA bundle lost that way is rewritten by the next
-  rotation and does not pay for that flush. Each file's mode is now
-  applied before the file is published rather than after the bytes have
-  already landed, and the modes themselves are unchanged: `0644` for
-  the certificates and the CA bundle, `0600` for the two `init`
-  outputs, and for `state.json` whatever mode it already carries — a
-  file narrowed by hand, or by a restrictive umask when it was created,
-  stays narrowed. A `state.json` this release creates where there was
-  none is `0644` whatever the umask in effect, where before the umask
-  decided; it holds a service inventory and `AppRole` role ids, no
-  secret. A `--summary-json` or `--root-token-output` destination whose
-  symlink chain loops back on itself is also refused by the preflight
-  now, before `reinit` wipes anything, rather than failing at the write
-  once the wipe has happened.
+  complete one. Each is now written to a temporary file in the same
+  directory and renamed into place, so a reader sees either the previous
+  file or the whole new one: `state.json`, the issued certificate files
+  and the CA bundle, the `--summary-json` and `--root-token-output`
+  destinations, `agent.toml`, `.env`, `ca.json` and its OpenBao Agent
+  template, `openbao.hcl`, the HTTP-01 responder config and template,
+  the OpenBao Agent configs and their `AppRole` credentials, the
+  generated compose overrides, and the remote bootstrap artifact. The
+  files a run reads back to resume flush the containing directory too,
+  so the published name survives a power loss and not merely a clean
+  replacement — `state.json`, `.env`, `agent.toml`, the two `init`
+  outputs, and every credential OpenBao has already issued and cannot
+  re-read. Files that are regenerated on their own — a certificate, a
+  rendered `ca.json`, a compose override — do not pay for that flush,
+  because a crash that loses one costs a rewrite rather than an outage.
+- Fixed the mode of every such file being applied after its bytes had
+  already landed, which left a moment in which a freshly created file
+  was readable more widely than intended — including the step-ca CA
+  password, the OpenBao recovery keys, the responder HMAC config and
+  each `AppRole` `secret_id`. The mode is now applied while the file is
+  still at its temporary name, so it holds from the moment the file
+  appears. The modes themselves are unchanged: `0644` for the
+  certificates and CA bundle, `0600` for the two `init` outputs and for
+  everything inside the secrets tree, and for a file that already exists
+  whatever mode it already carries — one narrowed by hand, or by a
+  restrictive umask when it was created, stays narrowed. Where such a
+  file is created fresh it now takes a stated mode rather than whatever
+  the umask decides, which is `0644` for `state.json`, `.env`,
+  `ca.json`, `openbao.hcl` and the compose overrides; a host running a
+  non-default umask is the only one that can observe the difference.
+- Fixed a `--summary-json` or `--root-token-output` destination whose
+  symlink chain loops back on itself being accepted by the preflight and
+  failing at the write, once `reinit` had already wiped OpenBao. It is
+  refused before the wipe now.
 - Fixed `bootroot init` treating a closed stdin as an answer. Every
   `init` prompt read the terminating EOF as an empty line, so a run
   whose piped answer sequence ran out answered the rest of its prompts

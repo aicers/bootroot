@@ -8,6 +8,7 @@ mod secrets;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 
 use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs, ServiceUpdateArgs};
@@ -1118,8 +1119,30 @@ fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
     } else {
         next
     };
-    std::fs::write(agent_config_path, next)
-        .with_context(|| format!("Failed to write {}", agent_config_path.display()))?;
+    // Published by rename, like the `service add` writer this edits
+    // behind (`service::local_config`). `agent.toml` is the file
+    // `bootroot-agent`'s daemon loop re-reads on every ACME retry, and a
+    // truncating rewrite here reopened exactly the #613 window that
+    // writer was moved off: a reload landing in the gap sees no profile
+    // and burns a retry.
+    //
+    // The mode comes off the destination, which this function has
+    // already established exists. A rename installs a fresh inode, so
+    // stating a constant would re-widen or re-narrow a file the operator
+    // may have adjusted; `service add` remains the one place that sets
+    // the `0600` policy mode, and this edit carries whatever is there.
+    //
+    // It takes the directory flush. `agent.toml` is not regenerated on a
+    // timer by anything — losing the entry costs a `service add` re-run
+    // by an operator who has no signal that it is needed, because the
+    // agent goes on reading the previous file and renewing against the
+    // old `cert_group_gid`.
+    fs_util::atomic_write_blocking(
+        agent_config_path,
+        next.as_bytes(),
+        fs_util::preserved_mode(agent_config_path, fs_util::KEY_FILE_MODE),
+    )
+    .with_context(|| format!("Failed to write {}", agent_config_path.display()))?;
     Ok(())
 }
 

@@ -35,9 +35,9 @@ use super::responder_setup::{
 };
 use super::secrets::{maybe_register_eab, resolve_init_secrets};
 use super::stepca_setup::{
-    ensure_step_ca_initialized, reconcile_ca_json_dns_names, resolve_stepca_ca_dns_names,
-    restart_stepca_openbao_agent, snapshot_stepca_ca_json_template, update_ca_json_with_backup,
-    write_password_file_with_backup, write_stepca_templates,
+    CA_JSON_FILE_MODE, ensure_step_ca_initialized, reconcile_ca_json_dns_names,
+    resolve_stepca_ca_dns_names, restart_stepca_openbao_agent, snapshot_stepca_ca_json_template,
+    update_ca_json_with_backup, write_password_file_with_backup, write_stepca_templates,
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
@@ -1328,10 +1328,22 @@ async fn maybe_rotate_env_db_password(
     // restart.  The OpenBao Agent template will eventually overwrite
     // this, but patching now avoids a window where step-ca would boot
     // with the old (now-invalid) password.
+    //
+    // Published by rename at the mode the file already carries, so a
+    // step-ca boot or an agent render landing here reads the previous
+    // document or the whole new one rather than half of either. The
+    // directory is not flushed: this patch exists only to bridge until
+    // the sidecar re-renders `ca.json` from its template, which is what
+    // recovers it if a crash loses the entry.
+    //
+    // The result stays discarded, as it was: the KV write above is what
+    // makes the new DSN authoritative, so a failure to pre-patch the
+    // rendered file is a missed optimisation, not a failed rotation.
     if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&ca_json_contents) {
         doc["db"]["dataSource"] = serde_json::Value::String(new_dsn.clone());
         if let Ok(updated) = serde_json::to_string_pretty(&doc) {
-            let _ = tokio::fs::write(&ca_json_path, updated).await;
+            let mode = fs_util::preserved_mode(&ca_json_path, CA_JSON_FILE_MODE);
+            let _ = fs_util::atomic_replace(&ca_json_path, updated.as_bytes(), mode).await;
         }
     }
 

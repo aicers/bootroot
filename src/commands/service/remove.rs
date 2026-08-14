@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::trust_bootstrap::remove_managed_service_profile;
 
@@ -431,7 +432,19 @@ fn strip_managed_profile(path: &Path, service_name: &str) -> Result<bool> {
     if next == current {
         return Ok(false);
     }
-    std::fs::write(path, next).with_context(|| format!("Failed to write {}", path.display()))?;
+    // Published by rename at the destination's own mode, for the same
+    // reason as `service::rerender_local_managed_profile`: the file is
+    // `agent.toml`, the early return above has established it exists,
+    // and the agent may be re-reading it as this runs. It takes the
+    // directory flush — losing the strip leaves the agent renewing a
+    // profile the operator removed, and nothing rewrites the file again
+    // on its own.
+    fs_util::atomic_write_blocking(
+        path,
+        next.as_bytes(),
+        fs_util::preserved_mode(path, fs_util::KEY_FILE_MODE),
+    )
+    .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(true)
 }
 

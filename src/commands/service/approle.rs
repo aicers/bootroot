@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 use bootroot::trust_bootstrap::SERVICE_REISSUE_KV_SUFFIX;
-use tokio::fs;
 
 use super::{SERVICE_ROLE_PREFIX, ServiceAppRoleMaterialized};
 use crate::commands::constants::SERVICE_KV_BASE;
@@ -130,7 +129,7 @@ pub(super) async fn write_role_id_file(
 /// sibling `role_id`) to `path`.
 ///
 /// For the default secrets-tree location bootroot owns the directory:
-/// it is created `0700`, and the file is plainly (over)written `0600`,
+/// it is created `0700`, and the file is published by rename at `0600`,
 /// replacing any stale file left by a previously removed service. For an
 /// operator `--secret-id-path` override the directory is agent-owned and
 /// sits outside the secrets tree, so the write goes through the hardened
@@ -149,12 +148,23 @@ async fn write_service_credential_file(
             .await
             .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     } else {
+        // Inside the root-owned secrets tree, published by rename at the
+        // policy's `0600` — the same mode the `write` +
+        // `set_key_permissions` pair this replaced ended at, now applied
+        // to the staged temporary so it holds from the moment the
+        // credential appears at its path.
+        //
+        // It takes the directory flush, for the reason
+        // `fs_util::create_owned_credential_noclobber` states for the
+        // override path beside it: `OpenBao` has already issued this
+        // `secret_id` by the time it is written, and losing the
+        // directory entry locks the agent out until an operator
+        // intervenes rather than costing a rewrite.
         let parent = path.parent().unwrap_or(Path::new("."));
         fs_util::ensure_secrets_dir(parent).await?;
-        fs::write(path, contents)
+        fs_util::atomic_write(path, contents.as_bytes(), fs_util::KEY_FILE_MODE)
             .await
             .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-        fs_util::set_key_permissions(path).await?;
     }
     Ok(())
 }
