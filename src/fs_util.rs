@@ -569,7 +569,10 @@ pub fn atomic_replace_blocking(path: &Path, contents: &[u8], mode: u32) -> Resul
 /// have pointed elsewhere (`.env`, `ca.json` and its template,
 /// `openbao.hcl`, the compose overrides, the responder and `OpenBao`
 /// Agent configs, `state.json`), and the output paths they name on the
-/// command line (`init`'s two, `rotate openbao-recovery --output`).
+/// command line (`init`'s two, `rotate openbao-recovery --output`,
+/// `bootroot-remote bootstrap`'s `agent.toml` destination — that
+/// command is what creates the file on a target host, so a link there
+/// is one the operator put in place and the truncating write followed).
 ///
 /// Two classes deliberately keep [`atomic_write`]'s bare rename:
 ///
@@ -580,11 +583,12 @@ pub fn atomic_replace_blocking(path: &Path, contents: &[u8], mode: u32) -> Resul
 ///   one buys nothing and costs the guarantee. The override credential
 ///   paths, whose directory an unprivileged user owns, go further and
 ///   refuse a link outright ([`atomic_rewrite_owned_no_symlink`]).
-/// - **Files another writer already publishes by rename**, namely
-///   `agent.toml` (since #613) and the issued cert and key (since
-///   #593). A link at those paths does not survive the writer that
-///   creates the file, so resolving it in the writers that *edit* the
-///   file would make the two disagree rather than preserve anything.
+/// - **Files another writer already publishes by rename**, namely the
+///   control node's `agent.toml` (since #613) and the issued cert and
+///   key (since #593). A link at those paths does not survive the
+///   writer that creates the file, so resolving it in the writers that
+///   *edit* the file would make the two disagree rather than preserve
+///   anything.
 ///
 /// Not a security check: see [`resolve_symlink_destination`].
 ///

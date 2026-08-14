@@ -167,13 +167,15 @@ rather than following a link at it:
   overrides, `state.json` and the two `init` output files, bootroot resolves the
   link first and publishes to its target, so the link keeps naming the file it
   named before. A chain of links that loops back on itself names no target and
-  is refused.
-- **`agent.toml`, the issued certificate and key, the CA bundle, and every
-  credential are published at the path itself**, replacing a link found there
-  with a regular file. Those files have been published by rename for several
-  releases, so a link at one of those paths has never survived the command that
-  creates the file; for a credential, following a link would also mean a write
-  redirected by whoever could plant one.
+  is refused. The `agent.toml` that `bootroot-remote bootstrap` writes on a
+  target host is in this group: that command is what creates the file there, so
+  a link you put at its `--agent-config-path` is one you arranged yourself.
+- **The control node's own `agent.toml`, the issued certificate and key, the CA
+  bundle, and every credential are published at the path itself**, replacing a
+  link found there with a regular file. Those files have been published by
+  rename for several releases, so a link at one of those paths has never
+  survived the command that creates the file; for a credential, following a link
+  would also mean a write redirected by whoever could plant one.
 
 ## bootroot infra up
 
