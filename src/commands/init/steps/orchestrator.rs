@@ -298,6 +298,12 @@ async fn diagnose_partial_init(
 /// and read by an operator afterwards, possibly as the only record of
 /// credentials that cannot be re-derived, so it is worth the disk round
 /// trip that makes the published name survive a power loss.
+///
+/// A symlinked destination is resolved first
+/// ([`fs_util::resolve_symlink_destination`]), so the rename lands on
+/// the link's target the way the truncating write's `O_TRUNC` did.
+/// Renaming over the link instead would leave the operator without
+/// their link and the target holding the previous run's credentials.
 async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -307,8 +313,9 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
     let payload = serde_json::to_string_pretty(summary)?;
     let path_buf = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        tighten_existing_secret_file(&path_buf)?;
-        fs_util::atomic_write_blocking(&path_buf, payload.as_bytes(), SECRET_OUTPUT_FILE_MODE)
+        let dest = fs_util::resolve_symlink_destination(&path_buf);
+        tighten_existing_secret_file(&dest)?;
+        fs_util::atomic_write_blocking(&dest, payload.as_bytes(), SECRET_OUTPUT_FILE_MODE)
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for summary json write failed: {e}"))??;
@@ -362,6 +369,11 @@ fn tighten_existing_secret_file(path: &Path) -> Result<()> {
 /// operator afterwards; losing the published name to a power loss
 /// means losing the only copy of a credential `reinit` will not mint
 /// again, which is worth a disk round trip on a once-per-init write.
+///
+/// A symlinked destination is resolved first, as it is for the summary
+/// JSON — `validate_root_token_output_path` accepts a link to a regular
+/// file on purpose, so the token has to reach the file that preflight
+/// judged and not replace the link that named it.
 async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -371,8 +383,9 @@ async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     let path_buf = path.to_path_buf();
     let token = token.to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        tighten_existing_secret_file(&path_buf)?;
-        fs_util::atomic_write_blocking(&path_buf, token.as_bytes(), SECRET_OUTPUT_FILE_MODE)
+        let dest = fs_util::resolve_symlink_destination(&path_buf);
+        tighten_existing_secret_file(&dest)?;
+        fs_util::atomic_write_blocking(&dest, token.as_bytes(), SECRET_OUTPUT_FILE_MODE)
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for root token write failed: {e}"))??;
@@ -2573,6 +2586,72 @@ mod tests {
         let meta = std::fs::metadata(&path).expect("stat");
         assert_eq!(meta.permissions().mode() & 0o777, SECRET_OUTPUT_FILE_MODE);
         assert_ne!(meta.ino(), stale_inode, "the publish must be a rename");
+    }
+
+    /// A symlinked destination delivers the token to the link's target,
+    /// which is what `validate_root_token_output_path` accepts a link to
+    /// a regular file *for*. Renaming over the link would leave the
+    /// operator without their link and the target holding the previous
+    /// run's token — a silent loss, since the write reports success.
+    #[tokio::test]
+    async fn write_root_token_file_writes_through_a_symlinked_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir");
+        let target = real_dir.join("token.txt");
+        std::fs::write(&target, "hvs.stale").expect("seed the target");
+        let link = dir.path().join("root-token.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_root_token_file(&link, "hvs.fresh")
+            .await
+            .expect("token write through a symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "hvs.fresh",
+            "the token must reach the link's target"
+        );
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
+
+    /// A dangling link has no target to resolve, so the write publishes
+    /// at the link's own name rather than failing. The truncating write
+    /// this replaced created the target through the link; landing the
+    /// token somewhere the operator named is the closer behaviour of the
+    /// two available, and it is `0600` either way.
+    #[tokio::test]
+    async fn write_root_token_file_handles_a_dangling_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("root-token.txt");
+        std::os::unix::fs::symlink(dir.path().join("absent.txt"), &link).expect("symlink");
+
+        write_root_token_file(&link, "hvs.dangling")
+            .await
+            .expect("token write over a dangling link");
+
+        assert_eq!(
+            std::fs::read_to_string(&link).expect("read"),
+            "hvs.dangling"
+        );
+        let mode = std::fs::metadata(&link).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
     }
 
     /// An older summary or token file left world-readable is narrowed

@@ -56,6 +56,38 @@ fn parent_dir(path: &Path) -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
+/// Resolves the file a staged write should land on when `path` is a
+/// symlink, returning `path` unchanged when it is not.
+///
+/// A truncating write opens the path with `O_TRUNC`, which follows the
+/// final symlink, so a destination pointed at a link has always
+/// delivered its bytes to the link's target. [`atomic_write`] and
+/// [`atomic_write_blocking`] `rename` over the name they are given
+/// instead, which replaces the link itself: the operator's link is
+/// gone and the target is left holding whatever was written last. Call
+/// this first where a symlinked destination is a configuration the
+/// caller supports — `bootroot reinit`'s two output files are checked
+/// for exactly that by their preflights, which resolve the link and
+/// judge the target's mode — so the rename lands on the target the way
+/// the truncating write did.
+///
+/// Not a security check. It follows whatever the link points at, so a
+/// caller whose destination an untrusted user can plant must reject
+/// the symlink rather than resolve it (see
+/// [`atomic_rewrite_owned_no_symlink`], which does).
+///
+/// A dangling link resolves to nothing, so `path` is returned and the
+/// rename publishes at the link's own name.
+#[must_use]
+pub fn resolve_symlink_destination(path: &Path) -> PathBuf {
+    let is_symlink =
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    if !is_symlink {
+        return path.to_path_buf();
+    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Flushes the directory holding `path` — its entry list, not the files
 /// behind it — so the name just published there survives a crash.
 ///
@@ -816,6 +848,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(fs::read_to_string(&bundle_path).await.unwrap(), "BUNDLE");
+    }
+
+    /// The common case: nothing to resolve, so the caller stages and
+    /// renames at exactly the path it was given.
+    #[test]
+    fn resolve_symlink_destination_passes_a_regular_file_through() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        assert_eq!(resolve_symlink_destination(&path), path);
+        assert_eq!(
+            resolve_symlink_destination(&dir.path().join("absent.txt")),
+            dir.path().join("absent.txt"),
+            "a destination that does not exist yet resolves to itself"
+        );
+    }
+
+    /// A link resolves to the file behind it, so the rename that follows
+    /// replaces the target and leaves the link pointing at it.
+    #[test]
+    fn resolve_symlink_destination_follows_a_link_to_its_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "x").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            resolve_symlink_destination(&link),
+            std::fs::canonicalize(&target).unwrap()
+        );
+    }
+
+    /// A dangling link has no target, so the caller publishes at the
+    /// link's own name rather than being handed a path that cannot be
+    /// staged beside.
+    #[test]
+    fn resolve_symlink_destination_returns_a_dangling_link_unchanged() {
+        let dir = tempdir().unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(dir.path().join("absent.txt"), &link).unwrap();
+
+        assert_eq!(resolve_symlink_destination(&link), link);
     }
 
     /// `atomic_write` must leave the destination at the supplied mode

@@ -2264,8 +2264,11 @@ operator-managed runbook for those.
   partially written token, and a published token survives a power
   loss — it is the only copy of a credential reinit will not mint
   again. An existing destination is narrowed to `0600` first, for the
-  older token that may still be sitting in it. Should the post-init
-  write still fail
+  older token that may still be sitting in it. A destination that is a
+  symlink to a regular file stays supported: the link is resolved and
+  the token is written to its target, so the rename replaces the file
+  the preflight judged rather than the link naming it. Should the
+  post-init write still fail
   (e.g. disk full), the freshly issued token is surfaced on stderr in
   cleartext (prefixed with `ROOT_TOKEN=`) so it is not lost.
 - `--enable <features>`: passed through to `init` (e.g.

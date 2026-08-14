@@ -607,7 +607,15 @@ pub(crate) fn validate_root_token_output_path(path: &Path, messages: &Messages) 
             })?;
     }
 
-    let parent = path
+    // Probe the directory the write will actually stage in.  A symlinked
+    // destination is resolved by `write_root_token_file` before it
+    // stages, so for a link into another directory it is that
+    // directory — not the one holding the link — that has to accept a
+    // new file.  Probing the wrong one would let the preflight pass and
+    // the post-wipe write fail, which is the trap this check exists to
+    // prevent.
+    let staged_in = bootroot::fs_util::resolve_symlink_destination(path);
+    let parent = staged_in
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -700,7 +708,11 @@ pub(crate) fn validate_summary_json_output_path(path: &Path, messages: &Messages
             })?;
     }
 
-    let parent = path
+    // As in `validate_root_token_output_path`: probe the directory the
+    // staged write will use, which for a symlinked destination is the
+    // target's, not the link's.
+    let staged_in = bootroot::fs_util::resolve_symlink_destination(path);
+    let parent = staged_in
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
