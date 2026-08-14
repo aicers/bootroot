@@ -289,7 +289,7 @@ mod test_support {
     use std::path::Path;
 
     pub(super) use crate::i18n::test_messages;
-    use crate::test_support::{EXEC_PROBE_ARG, wait_until_spawnable};
+    use crate::test_support::write_executable;
 
     /// Writes a fake `docker` at `path` that appends one record per
     /// invocation to `args_log` and reads nothing from its environment.
@@ -320,27 +320,16 @@ mod test_support {
         exit_code: u8,
     ) {
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::PermissionsExt;
 
         // The script is assembled as bytes, not as a `String`: a Unix
         // path is an arbitrary NUL-free byte sequence, and rendering
         // `args_log` through `Display` would replace any byte that is
         // not valid UTF-8, pointing the fake at a different path that
         // nothing would ever create.
-        let mut script = b"#!/bin/sh\nset -eu\n".to_vec();
-        // The probe runs before anything is recorded, so waiting for
-        // the file to become executable leaves no invocation behind
-        // for `decode_fake_docker_log` to find.
-        script.extend_from_slice(
-            format!("if [ \"${{1-}}\" = '{EXEC_PROBE_ARG}' ]; then exit 0; fi\n").as_bytes(),
-        );
-        script.extend_from_slice(b"printf '%s\\0' \"$#\" \"$@\" >> ");
+        let mut script = b"#!/bin/sh\nset -eu\nprintf '%s\\0' \"$#\" \"$@\" >> ".to_vec();
         script.extend_from_slice(&shell_single_quote(args_log.as_os_str().as_bytes()));
         script.extend_from_slice(format!("\nexit {exit_code}\n").as_bytes());
-        fs::write(path, script).expect("fake docker script should be written");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .expect("fake docker script should be executable");
-        wait_until_spawnable(path);
+        write_executable(path, &script);
     }
 
     /// Quotes `value` as a single POSIX shell word, byte for byte.
@@ -603,27 +592,5 @@ mod tests {
 
         assert_eq!(status.code(), Some(7));
         assert_eq!(decode_fake_docker_log(&args_log), [["run"]]);
-    }
-
-    /// The writer execs the fake once, to wait out the `ETXTBSY` a
-    /// sibling thread's `fork` can hold it under. That probe must
-    /// record nothing and exit 0 whatever the baked-in exit code is, or
-    /// every log would open with an invocation no test made and the
-    /// failure-path fakes would fail their own writer.
-    #[test]
-    fn the_fake_docker_records_nothing_for_the_exec_probe() {
-        use crate::test_support::EXEC_PROBE_ARG;
-
-        let dir = tempdir().expect("tempdir");
-        let args_log = dir.path().join("docker_args.log");
-        let fake = dir.path().join("fake-docker");
-        write_self_contained_fake_docker_exiting(&fake, &args_log, 7);
-
-        run_fake(&fake, &[EXEC_PROBE_ARG]);
-
-        assert!(
-            !args_log.exists(),
-            "the probe must leave the log untouched, so the first record is the first real call"
-        );
     }
 }
