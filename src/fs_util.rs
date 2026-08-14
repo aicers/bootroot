@@ -291,9 +291,6 @@ pub async fn atomic_rewrite_owned_no_symlink(
         tmp.as_file_mut()
             .write_all(&payload)
             .with_context(|| format!("Failed to write temp file for {}", dest.display()))?;
-        tmp.as_file_mut()
-            .sync_all()
-            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
             || {
                 format!(
@@ -308,6 +305,15 @@ pub async fn atomic_rewrite_owned_no_symlink(
                 dest.display()
             )
         })?;
+        // Flushed after the mode and the ownership, not before them: an
+        // `fsync` persists the inode as it stands, so a flush taken at
+        // the bytes leaves a crash able to recover this credential
+        // world-readable or owned by the wrong uid. See
+        // `publish_staged_blocking`, which orders the same three steps
+        // for the same reason.
+        tmp.as_file_mut()
+            .sync_all()
+            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
         // `persist` replaces the target *name* via rename(2), which does
         // not traverse a symlink at the final component, so even a
         // post-check swap cannot redirect the write.
@@ -375,9 +381,6 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publ
         tmp.as_file_mut()
             .write_all(&payload)
             .with_context(|| format!("Failed to write temp file for {}", dest.display()))?;
-        tmp.as_file_mut()
-            .sync_all()
-            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
             || {
                 format!(
@@ -392,6 +395,12 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publ
                 dest.display()
             )
         })?;
+        // Flushed last, after the mode and the ownership, so the inode a
+        // crash recovers is the one that was published — see
+        // `publish_staged_blocking`.
+        tmp.as_file_mut()
+            .sync_all()
+            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
         match publish {
             Publish::Replace => {
                 tmp.persist(&dest).map_err(|e| {
@@ -636,7 +645,10 @@ pub enum StagedDurability {
 /// #593 asked of the key file, and which now holds for every caller.
 /// The chown runs before the chmod for the same reason: nothing may
 /// sit group-readable under the writer's primary gid, even at the
-/// temporary name, before the policy's gid lands.
+/// temporary name, before the policy's gid lands. The staged file is
+/// `fsync`ed last of all, once both have been applied, so a publish
+/// that survives a crash carries the ownership and mode it was
+/// published with rather than the temporary's defaults.
 ///
 /// The temporary is removed if any step before the rename fails
 /// (`NamedTempFile` deletes on drop), so a failed publish leaves
@@ -659,9 +671,6 @@ pub fn publish_staged_blocking(
     tmp.as_file_mut()
         .write_all(contents)
         .with_context(|| format!("Failed to write temp file for {}", path.display()))?;
-    tmp.as_file_mut()
-        .sync_all()
-        .with_context(|| format!("Failed to fsync temp file for {}", path.display()))?;
     match owner {
         StagedOwner::Destination => {
             // A destination that is missing, or cannot be stat'd,
@@ -701,6 +710,17 @@ pub fn publish_staged_blocking(
             )
         },
     )?;
+    // Last of the three, after the bytes *and* the uid/gid/mode: `fsync`
+    // persists the whole inode, so a flush taken before the chown and
+    // the chmod leaves those two changes in memory only. A crash could
+    // then recover a durably named, fully written file wearing the
+    // temporary's own `0600` and the writer's primary group instead of
+    // the mode and the policy gid it was published with — the directory
+    // flush below makes the *name* durable and says nothing about the
+    // inode it points at.
+    tmp.as_file_mut()
+        .sync_all()
+        .with_context(|| format!("Failed to fsync temp file for {}", path.display()))?;
     tmp.persist(path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to rename temp file to {}: {}",
