@@ -1178,7 +1178,7 @@ async fn maybe_rotate_env_db_password(
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<Option<String>> {
-    use crate::commands::dotenv::{read_dotenv, update_dotenv_key};
+    use crate::commands::dotenv::{read_dotenv, update_dotenv_key_async};
     use crate::commands::init::{PATH_STEPCA_DB, PATH_STEPCA_DB_ADMIN};
 
     // Docker Compose reads .env from the compose file's directory.
@@ -1348,12 +1348,15 @@ async fn maybe_rotate_env_db_password(
     }
 
     // Overwrite .env with a dummy password so docker compose doesn't error.
-    update_dotenv_key(
+    // Through the async entry point: this is the one async caller of the
+    // `.env` writer, and that writer now flushes.
+    update_dotenv_key_async(
         &env_path,
         "POSTGRES_PASSWORD",
         "rotated-use-openbao",
         messages,
-    )?;
+    )
+    .await?;
 
     // Restart step-ca to pick up the new DSN from the patched ca.json.
     let identity = ComposeIdentity::resolve(compose_file, None, messages)?;

@@ -186,6 +186,37 @@ pub(crate) fn update_dotenv_key(
     Ok(())
 }
 
+/// Async entry point for [`update_dotenv_key`].
+///
+/// The read, the rewrite and the two flushes all run on a blocking
+/// thread rather than a runtime worker. `init`'s database password
+/// rotation is the one async caller, and a Tokio worker parked on three
+/// disk round trips is a worker polling nothing else — on a
+/// current-thread runtime it is the only worker there is. Same pattern
+/// as `StateFile::save_async`, for the same reason.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`update_dotenv_key`],
+/// or if the blocking task panics.
+pub(crate) async fn update_dotenv_key_async(
+    path: &Path,
+    key: &str,
+    new_value: &str,
+    messages: &Messages,
+) -> Result<()> {
+    // Owned once, to move into the `'static` closure. The `Messages`
+    // clone is a byte copy of one locale discriminant.
+    let (path, key, new_value, messages) = (
+        path.to_path_buf(),
+        key.to_string(),
+        new_value.to_string(),
+        messages.clone(),
+    );
+    tokio::task::spawn_blocking(move || update_dotenv_key(&path, &key, &new_value, &messages))
+        .await
+        .context("dotenv update task panicked")?
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
