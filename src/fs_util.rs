@@ -902,6 +902,16 @@ mod tests {
         );
     }
 
+    /// A bare file name has an *empty* parent rather than none, and
+    /// `File::open("")` is `ENOENT`. `rotate`'s `state_dir` is that
+    /// empty string whenever the state file is given as a bare relative
+    /// name, so the cwd fallback is a live path and not a nicety.
+    #[test]
+    fn sync_parent_dir_resolves_a_bare_file_name_to_the_cwd() {
+        assert_eq!(Path::new("published").parent(), Some(Path::new("")));
+        sync_parent_dir(Path::new("published")).unwrap();
+    }
+
     #[test]
     fn path_is_within_matches_component_boundaries() {
         assert!(path_is_within(Path::new("/a/b/c"), Path::new("/a/b")).unwrap());
