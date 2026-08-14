@@ -14,6 +14,24 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Unit Tests ---
+# CI runs this same `cargo test` under a fixture this script deliberately
+# does not reproduce: a dedicated group created with `groupadd`, the
+# runner added to it with `usermod`, and `cargo test` re-executed under
+# `sudo setpriv --init-groups` so the fixture gid arrives as a
+# non-primary supplementary group.  Doing that here would mean a
+# preflight script running `sudo groupadd` on a developer's machine.
+# The consequence is stated rather than hidden: without the fixture,
+# `tests/e2e_cert_group_chown.rs` runs in dev mode, where it either
+# falls back to whatever supplementary gid this account happens to have
+# or skips outright -- and both report as a pass.
+echo "[test-core] NOTICE: the cert-group regression in"
+echo "[test-core]   tests/e2e_cert_group_chown.rs is NOT exercised here the"
+echo "[test-core]   way CI exercises it.  CI exports"
+echo "[test-core]   BOOTROOT_E2E_REQUIRE_CERT_GROUP=1 and"
+echo "[test-core]   BOOTROOT_E2E_CERT_GROUP_GID=<gid of a group this user is"
+echo "[test-core]   in as a non-primary supplementary group>, then runs cargo"
+echo "[test-core]   test under 'setpriv --init-groups'.  A green run below"
+echo "[test-core]   does not mean that regression was verified."
 echo "[test-core] running unit tests"
 cargo test
 

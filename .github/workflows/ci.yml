@@ -231,7 +231,7 @@ jobs:
         run: cargo build --bins
 
       - name: Deploy Compose No-Build Smoke
-        run: ./scripts/preflight/extra/deploy-no-build-smoke.sh
+        run: ./scripts/preflight/ci/deploy-no-build-smoke.sh
 
       - name: Install Infrastructure
         run: cargo run --bin bootroot -- infra install

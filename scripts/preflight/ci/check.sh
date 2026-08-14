@@ -10,6 +10,9 @@ cargo fmt -- --check --config group_imports=StdExternalCrate
 echo "[check] Rust lints (Clippy)"
 cargo clippy --all-targets -- -D warnings
 
+echo "[check] Rustdoc"
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+
 echo "[check] Python formatting"
 ruff format --check .
 
