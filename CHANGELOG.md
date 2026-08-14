@@ -129,14 +129,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   file survives a power loss and not merely a clean replacement; a
   certificate or CA bundle lost that way is rewritten by the next
   rotation and does not pay for that flush. Each file's mode is now
-  stated and applied before the file is published, rather than left to
-  the umask that happened to be in effect or set after the bytes had
-  already landed: `0644` for `state.json`, the certificates and the CA
-  bundle, `0600` for the two `init` outputs. Certificates, CA bundles
-  and the `init` outputs already carried those modes; `state.json` did
-  not have one of its own, so a host whose umask made it narrower than
-  `0644` — it holds a service inventory and `AppRole` role ids, no
-  secret — now sees `0644` after the next write.
+  applied before the file is published rather than after the bytes have
+  already landed, and the modes themselves are unchanged: `0644` for
+  the certificates and the CA bundle, `0600` for the two `init`
+  outputs, and for `state.json` whatever mode it already carries — a
+  file narrowed by hand, or by a restrictive umask when it was created,
+  stays narrowed. A `state.json` this release creates where there was
+  none is `0644` whatever the umask in effect, where before the umask
+  decided; it holds a service inventory and `AppRole` role ids, no
+  secret. A `--summary-json` or `--root-token-output` destination whose
+  symlink chain loops back on itself is also refused by the preflight
+  now, before `reinit` wipes anything, rather than failing at the write
+  once the wipe has happened.
 - Fixed `bootroot init` treating a closed stdin as an answer. Every
   `init` prompt read the terminating EOF as an empty line, so a run
   whose piped answer sequence ran out answered the rest of its prompts

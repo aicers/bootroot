@@ -65,11 +65,10 @@ fn parent_dir(path: &Path) -> PathBuf {
 /// [`atomic_write_blocking`] `rename` over the name they are given
 /// instead, which replaces the link itself: the operator's link is
 /// gone and the target is left holding whatever was written last. Call
-/// this first where a symlinked destination is a configuration the
-/// caller supports — `bootroot reinit`'s two output files are checked
-/// for exactly that by their preflights, which resolve the link and
-/// judge the target's mode — so the rename lands on the target the way
-/// the truncating write did.
+/// this first wherever the destination is a path an operator names —
+/// `bootroot reinit`'s two output files, whose preflights resolve the
+/// link and judge the target's mode, and `state.json` — so the rename
+/// lands on the target the way the truncating write did.
 ///
 /// Not a security check. It follows whatever the link points at, so a
 /// caller whose destination an untrusted user can plant must reject
@@ -83,8 +82,15 @@ fn parent_dir(path: &Path) -> PathBuf {
 /// link and put the file in a directory nobody chose, which for the
 /// root token means a credential landing outside the place the
 /// operator set aside for it.
-#[must_use]
-pub fn resolve_symlink_destination(path: &Path) -> PathBuf {
+///
+/// # Errors
+/// Returns an error if the chain does not end within `SYMLOOP_MAX`
+/// hops — a cycle, which the truncating write reported as `ELOOP` and
+/// which is reported here rather than resolved, since every path in a
+/// loop is a link the caller would destroy by renaming over it — or if
+/// a link in the chain cannot be read, which leaves the destination
+/// unknown for the same reason.
+pub fn resolve_symlink_destination(path: &Path) -> Result<PathBuf> {
     /// Hops allowed before a chain of dangling links is treated as a
     /// cycle, matching the kernel's own `SYMLOOP_MAX`.
     const MAX_HOPS: u32 = 40;
@@ -94,31 +100,41 @@ pub fn resolve_symlink_destination(path: &Path) -> PathBuf {
     }
 
     if !is_symlink(path) {
-        return path.to_path_buf();
+        return Ok(path.to_path_buf());
     }
     // Resolves the whole chain, and normalises the parent components
     // with it, whenever the target exists.
     if let Ok(resolved) = std::fs::canonicalize(path) {
-        return resolved;
+        return Ok(resolved);
     }
     let mut current = path.to_path_buf();
     for _ in 0..MAX_HOPS {
-        let Ok(target) = std::fs::read_link(&current) else {
-            return current;
-        };
+        let target = std::fs::read_link(&current).with_context(|| {
+            format!(
+                "Failed to read the symlink {} while resolving the destination {}",
+                current.display(),
+                path.display()
+            )
+        })?;
         current = if target.is_absolute() {
             target
         } else {
             parent_dir(&current).join(target)
         };
         if !is_symlink(&current) {
-            return current;
+            return Ok(current);
         }
     }
-    // A cycle. Nothing here can be published without losing a link, so
-    // hand back the path the caller named and let the write fail or
-    // land there rather than following the loop further.
-    path.to_path_buf()
+    // A cycle: every name in it is a link, so there is nothing to
+    // publish that does not destroy one. The truncating write this
+    // replaces answered ELOOP here, and the caller keeps that answer —
+    // returning the path the caller named would have the rename
+    // silently replace the operator's link with a regular file.
+    anyhow::bail!(
+        "Too many levels of symbolic links resolving the destination {}: \
+         followed {MAX_HOPS} links without reaching a file",
+        path.display()
+    )
 }
 
 /// Flushes the directory holding `path` — its entry list, not the files
@@ -891,9 +907,9 @@ mod tests {
         let path = dir.path().join("plain.txt");
         std::fs::write(&path, "x").unwrap();
 
-        assert_eq!(resolve_symlink_destination(&path), path);
+        assert_eq!(resolve_symlink_destination(&path).unwrap(), path);
         assert_eq!(
-            resolve_symlink_destination(&dir.path().join("absent.txt")),
+            resolve_symlink_destination(&dir.path().join("absent.txt")).unwrap(),
             dir.path().join("absent.txt"),
             "a destination that does not exist yet resolves to itself"
         );
@@ -910,7 +926,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         assert_eq!(
-            resolve_symlink_destination(&link),
+            resolve_symlink_destination(&link).unwrap(),
             std::fs::canonicalize(&target).unwrap()
         );
     }
@@ -926,14 +942,14 @@ mod tests {
         let absolute = dir.path().join("absolute.txt");
         std::os::unix::fs::symlink(dir.path().join("absent.txt"), &absolute).unwrap();
         assert_eq!(
-            resolve_symlink_destination(&absolute),
+            resolve_symlink_destination(&absolute).unwrap(),
             dir.path().join("absent.txt")
         );
 
         let relative = dir.path().join("relative.txt");
         std::os::unix::fs::symlink("sub/absent.txt", &relative).unwrap();
         assert_eq!(
-            resolve_symlink_destination(&relative),
+            resolve_symlink_destination(&relative).unwrap(),
             dir.path().join("sub").join("absent.txt"),
             "a relative link is resolved against its own directory"
         );
@@ -950,20 +966,40 @@ mod tests {
         std::os::unix::fs::symlink(&end, &middle).unwrap();
         std::os::unix::fs::symlink(&middle, &head).unwrap();
 
-        assert_eq!(resolve_symlink_destination(&head), end);
+        assert_eq!(resolve_symlink_destination(&head).unwrap(), end);
     }
 
-    /// A cycle has no end to follow to, so the caller is handed back
-    /// the path it named rather than an arbitrary link from the loop.
+    /// A cycle has no end to follow to, and every name in it is a link
+    /// a rename would destroy. The truncating write answered `ELOOP`
+    /// here; resolution fails rather than handing back a path the
+    /// caller would publish over.
     #[test]
-    fn resolve_symlink_destination_returns_a_symlink_cycle_unchanged() {
+    fn resolve_symlink_destination_rejects_a_symlink_cycle() {
         let dir = tempdir().unwrap();
         let a = dir.path().join("a.txt");
         let b = dir.path().join("b.txt");
         std::os::unix::fs::symlink(&b, &a).unwrap();
         std::os::unix::fs::symlink(&a, &b).unwrap();
 
-        assert_eq!(resolve_symlink_destination(&a), a);
+        let err = resolve_symlink_destination(&a).unwrap_err().to_string();
+        assert!(
+            err.contains("Too many levels of symbolic links"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&a)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "resolution must not touch the links it refuses to follow"
+        );
+
+        let self_link = dir.path().join("self.txt");
+        std::os::unix::fs::symlink(&self_link, &self_link).unwrap();
+        assert!(
+            resolve_symlink_destination(&self_link).is_err(),
+            "a link pointing at itself is a cycle too"
+        );
     }
 
     /// `atomic_write` must leave the destination at the supplied mode

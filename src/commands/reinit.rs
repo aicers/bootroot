@@ -613,8 +613,14 @@ pub(crate) fn validate_root_token_output_path(path: &Path, messages: &Messages) 
     // directory — not the one holding the link — that has to accept a
     // new file.  Probing the wrong one would let the preflight pass and
     // the post-wipe write fail, which is the trap this check exists to
-    // prevent.
-    let staged_in = bootroot::fs_util::resolve_symlink_destination(path);
+    // prevent.  A destination whose links form a cycle has no such
+    // directory: it is refused here, before the wipe, rather than by
+    // the write afterwards.
+    let staged_in = bootroot::fs_util::resolve_symlink_destination(path).map_err(|err| {
+        anyhow::anyhow!(
+            messages.error_reinit_root_token_output_unwritable(&display, &err.to_string())
+        )
+    })?;
     let parent = staged_in
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -710,8 +716,11 @@ pub(crate) fn validate_summary_json_output_path(path: &Path, messages: &Messages
 
     // As in `validate_root_token_output_path`: probe the directory the
     // staged write will use, which for a symlinked destination is the
-    // target's, not the link's.
-    let staged_in = bootroot::fs_util::resolve_symlink_destination(path);
+    // target's, not the link's, and refuse a cycle here rather than
+    // leaving it to the post-wipe write.
+    let staged_in = bootroot::fs_util::resolve_symlink_destination(path).map_err(|err| {
+        anyhow::anyhow!(messages.error_reinit_summary_json_unwritable(&display, &err.to_string()))
+    })?;
     let parent = staged_in
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1959,6 +1968,42 @@ mod tests {
         fs::set_permissions(&ro, perms).unwrap();
 
         let err = result.expect_err("the target's directory cannot accept the staged file");
+        assert!(err.to_string().contains("summary-json"), "got: {err}");
+    }
+
+    /// A destination whose links form a cycle resolves to nothing the
+    /// write can publish without destroying a link.  The preflight is
+    /// where that has to be said: `path.exists()` is false for a cycle
+    /// (the kernel answers `ELOOP`), so the checks above skip it, and
+    /// without this the run would reach the post-wipe write before
+    /// anything noticed.
+    #[test]
+    fn validate_root_token_output_rejects_a_symlink_cycle() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("root-token.txt");
+        let b = dir.path().join("other.txt");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let messages = test_messages();
+        let err = validate_root_token_output_path(&a, &messages)
+            .expect_err("a cyclic destination must be refused before the wipe");
+        assert!(err.to_string().contains("root-token-output"), "got: {err}");
+    }
+
+    /// The same for `--summary-json`, which resolves its destination the
+    /// same way.
+    #[test]
+    fn validate_summary_json_rejects_a_symlink_cycle() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("summary.json");
+        let b = dir.path().join("other.json");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let messages = test_messages();
+        let err = validate_summary_json_output_path(&a, &messages)
+            .expect_err("a cyclic destination must be refused before the wipe");
         assert!(err.to_string().contains("summary-json"), "got: {err}");
     }
 

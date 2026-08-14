@@ -2267,7 +2267,10 @@ operator-managed runbook for those.
   older token that may still be sitting in it. A destination that is a
   symlink to a regular file stays supported: the link is resolved and
   the token is written to its target, so the rename replaces the file
-  the preflight judged rather than the link naming it. Should the
+  the preflight judged rather than the link naming it. A chain of links
+  that loops back on itself names no such file, and the preflight
+  refuses the path — before the wipe, where the truncating write this
+  replaced reported `ELOOP` after it. Should the
   post-init write still fail
   (e.g. disk full), the freshly issued token is surfaced on stderr in
   cleartext (prefixed with `ROOT_TOKEN=`) so it is not lost.

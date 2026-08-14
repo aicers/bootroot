@@ -289,9 +289,11 @@ async fn diagnose_partial_init(
 /// guards what the rename cannot — an older summary, with older
 /// credentials in it, sitting world-readable at the path right now.
 /// Renaming a fresh inode over it does not narrow that file during the
-/// write, and the operator's own preflight
-/// (`validate_summary_json_output_path`) only runs on the `reinit`
-/// path, while `--summary-json` is reachable from `init` too.
+/// write.  `validate_summary_json_output_path` rejects such a
+/// destination on both the `init` and the `reinit` path, but it runs
+/// before `OpenBao` is touched: the whole of init happens between that
+/// judgement and this write, and a file appearing or being widened in
+/// that window is exactly what this narrows.
 ///
 /// The containing directory is flushed after the rename, inside
 /// `atomic_write_blocking`.  This file is written once during `init`
@@ -313,7 +315,7 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
     let payload = serde_json::to_string_pretty(summary)?;
     let path_buf = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let dest = fs_util::resolve_symlink_destination(&path_buf);
+        let dest = fs_util::resolve_symlink_destination(&path_buf)?;
         tighten_existing_secret_file(&dest)?;
         fs_util::atomic_write_blocking(&dest, payload.as_bytes(), SECRET_OUTPUT_FILE_MODE)
     })
@@ -383,7 +385,7 @@ async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     let path_buf = path.to_path_buf();
     let token = token.to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let dest = fs_util::resolve_symlink_destination(&path_buf);
+        let dest = fs_util::resolve_symlink_destination(&path_buf)?;
         tighten_existing_secret_file(&dest)?;
         fs_util::atomic_write_blocking(&dest, token.as_bytes(), SECRET_OUTPUT_FILE_MODE)
     })
@@ -2665,6 +2667,64 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
+
+    /// A destination whose links form a cycle has no target to deliver
+    /// to, and every name in the loop is a link. The truncating write
+    /// this replaced failed with `ELOOP`; the staged write fails too,
+    /// rather than renaming the token over the operator's link and
+    /// reporting success.
+    #[tokio::test]
+    async fn write_root_token_file_refuses_a_symlink_cycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("root-token.txt");
+        let b = dir.path().join("other.txt");
+        std::os::unix::fs::symlink(&b, &a).expect("symlink");
+        std::os::unix::fs::symlink(&a, &b).expect("symlink");
+
+        let err = write_root_token_file(&a, "hvs.looped")
+            .await
+            .expect_err("a cyclic destination must not be published");
+        assert!(
+            format!("{err:#}").contains("Too many levels of symbolic links"),
+            "unexpected error: {err:#}"
+        );
+        for link in [&a, &b] {
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .expect("stat")
+                    .file_type()
+                    .is_symlink(),
+                "{} was replaced by the write",
+                link.display()
+            );
+        }
+    }
+
+    /// The summary JSON carries the same credentials, and refuses the
+    /// same destination for the same reason.
+    #[tokio::test]
+    async fn write_init_summary_json_refuses_a_symlink_cycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("summary.json");
+        let b = dir.path().join("other.json");
+        std::os::unix::fs::symlink(&b, &a).expect("symlink");
+        std::os::unix::fs::symlink(&a, &b).expect("symlink");
+
+        let err = write_init_summary_json(&a, &summary_with_token("hvs.looped"))
+            .await
+            .expect_err("a cyclic destination must not be published");
+        assert!(
+            format!("{err:#}").contains("Too many levels of symbolic links"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&a)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link was replaced by the write"
+        );
     }
 
     /// An older summary or token file left world-readable is narrowed
