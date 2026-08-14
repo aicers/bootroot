@@ -2629,28 +2629,41 @@ mod tests {
         assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
     }
 
-    /// A dangling link has no target to resolve, so the write publishes
-    /// at the link's own name rather than failing. The truncating write
-    /// this replaced created the target through the link; landing the
-    /// token somewhere the operator named is the closer behaviour of the
-    /// two available, and it is `0600` either way.
+    /// A link whose target does not exist yet is still where the
+    /// operator wants the token: the truncating write this replaced
+    /// created the target through the link, so the staged write creates
+    /// it too. Publishing at the link's own name instead would destroy
+    /// the link and leave a root token in a directory nobody chose.
     #[tokio::test]
-    async fn write_root_token_file_handles_a_dangling_symlink() {
+    async fn write_root_token_file_creates_a_dangling_symlink_target() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("secure").join("token.txt");
+        std::fs::create_dir(dir.path().join("secure")).expect("mkdir");
         let link = dir.path().join("root-token.txt");
-        std::os::unix::fs::symlink(dir.path().join("absent.txt"), &link).expect("symlink");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
         write_root_token_file(&link, "hvs.dangling")
             .await
             .expect("token write over a dangling link");
 
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the write"
+        );
         assert_eq!(
-            std::fs::read_to_string(&link).expect("read"),
+            std::fs::read_to_string(&target).expect("read"),
             "hvs.dangling"
         );
-        let mode = std::fs::metadata(&link).expect("stat").permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
     }
 

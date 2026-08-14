@@ -76,16 +76,49 @@ fn parent_dir(path: &Path) -> PathBuf {
 /// the symlink rather than resolve it (see
 /// [`atomic_rewrite_owned_no_symlink`], which does).
 ///
-/// A dangling link resolves to nothing, so `path` is returned and the
-/// rename publishes at the link's own name.
+/// A dangling link is resolved from its own text rather than from the
+/// filesystem, so the write still lands where the operator pointed it.
+/// The truncating write's `O_CREAT` created the target through the
+/// link; publishing at the link's own name instead would destroy the
+/// link and put the file in a directory nobody chose, which for the
+/// root token means a credential landing outside the place the
+/// operator set aside for it.
 #[must_use]
 pub fn resolve_symlink_destination(path: &Path) -> PathBuf {
-    let is_symlink =
-        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
-    if !is_symlink {
+    /// Hops allowed before a chain of dangling links is treated as a
+    /// cycle, matching the kernel's own `SYMLOOP_MAX`.
+    const MAX_HOPS: u32 = 40;
+
+    fn is_symlink(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+    }
+
+    if !is_symlink(path) {
         return path.to_path_buf();
     }
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    // Resolves the whole chain, and normalises the parent components
+    // with it, whenever the target exists.
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        let Ok(target) = std::fs::read_link(&current) else {
+            return current;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            parent_dir(&current).join(target)
+        };
+        if !is_symlink(&current) {
+            return current;
+        }
+    }
+    // A cycle. Nothing here can be published without losing a link, so
+    // hand back the path the caller named and let the write fail or
+    // land there rather than following the loop further.
+    path.to_path_buf()
 }
 
 /// Flushes the directory holding `path` — its entry list, not the files
@@ -882,16 +915,55 @@ mod tests {
         );
     }
 
-    /// A dangling link has no target, so the caller publishes at the
-    /// link's own name rather than being handed a path that cannot be
-    /// staged beside.
+    /// A dangling link still names where the operator wants the file.
+    /// `canonicalize` cannot say so — there is nothing to resolve
+    /// against — so the link text is read instead, absolute and
+    /// relative alike, and the caller publishes at the target the way
+    /// the truncating write's `O_CREAT` created it.
     #[test]
-    fn resolve_symlink_destination_returns_a_dangling_link_unchanged() {
+    fn resolve_symlink_destination_follows_a_dangling_link_to_its_target() {
         let dir = tempdir().unwrap();
-        let link = dir.path().join("link.txt");
-        std::os::unix::fs::symlink(dir.path().join("absent.txt"), &link).unwrap();
+        let absolute = dir.path().join("absolute.txt");
+        std::os::unix::fs::symlink(dir.path().join("absent.txt"), &absolute).unwrap();
+        assert_eq!(
+            resolve_symlink_destination(&absolute),
+            dir.path().join("absent.txt")
+        );
 
-        assert_eq!(resolve_symlink_destination(&link), link);
+        let relative = dir.path().join("relative.txt");
+        std::os::unix::fs::symlink("sub/absent.txt", &relative).unwrap();
+        assert_eq!(
+            resolve_symlink_destination(&relative),
+            dir.path().join("sub").join("absent.txt"),
+            "a relative link is resolved against its own directory"
+        );
+    }
+
+    /// A chain of dangling links is followed to its end, so the write
+    /// replaces neither link on the way.
+    #[test]
+    fn resolve_symlink_destination_follows_a_dangling_link_chain() {
+        let dir = tempdir().unwrap();
+        let end = dir.path().join("absent.txt");
+        let middle = dir.path().join("middle.txt");
+        let head = dir.path().join("head.txt");
+        std::os::unix::fs::symlink(&end, &middle).unwrap();
+        std::os::unix::fs::symlink(&middle, &head).unwrap();
+
+        assert_eq!(resolve_symlink_destination(&head), end);
+    }
+
+    /// A cycle has no end to follow to, so the caller is handed back
+    /// the path it named rather than an arbitrary link from the loop.
+    #[test]
+    fn resolve_symlink_destination_returns_a_symlink_cycle_unchanged() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        assert_eq!(resolve_symlink_destination(&a), a);
     }
 
     /// `atomic_write` must leave the destination at the supplied mode
