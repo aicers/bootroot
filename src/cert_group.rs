@@ -389,10 +389,26 @@ pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy)
 /// the final mode while the file is still at its temporary path, and
 /// `rename`s it over `dest`.
 ///
-/// Shared by the key and the certificate so both publish the same way:
-/// the destination name is only ever observed as the previous file or
-/// the complete new one, and never at a mode or owner other than the
-/// one the policy asks for.
+/// Shared by the key, the certificate and the CA bundle so all three
+/// publish the same way: the destination name is only ever observed as
+/// the previous file or the complete new one, and never at a mode or
+/// owner other than the one the policy asks for.
+///
+/// Ownership comes from the policy alone, not from whatever is at
+/// `dest`. The rename installs a fresh inode, so a file an earlier
+/// writer left owned by another user is republished owned by this one —
+/// where the truncating write the certificate and the bundle used to
+/// perform kept that owner. Deliberate: the gid these files need is the
+/// one `--cert-group` names, and re-reading it off the destination
+/// would let a stale owner outlive the policy that replaced it. All
+/// three land world-readable or group-readable by that policy, so no
+/// consumer loses access to a file it could read before. This is the
+/// opposite choice from [`fs_util::atomic_write_blocking`], which
+/// carries the destination's uid/gid across the rename because its
+/// files (`0600` agent config, fast-poll state) have no policy to
+/// restate and a re-owned one the daemon cannot read is an outage.
+///
+/// [`fs_util::atomic_write_blocking`]: crate::fs_util::atomic_write_blocking
 fn publish_staged(
     dest: &Path,
     contents: &str,
