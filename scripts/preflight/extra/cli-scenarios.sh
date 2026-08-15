@@ -139,6 +139,26 @@ verify_dns_aliases() {
   log "All expected DNS aliases present"
 }
 
+# The registration is best-effort and signals failure only by an absent
+# stdout line, which no script can assert on.  `service add`'s summary
+# states the count instead, so assert that count here — together with
+# verify_dns_aliases, which checks `docker inspect` lists every alias the
+# summary claims.
+verify_service_add_alias_summary() {
+  local log_file="$1"
+  local expected_count="$2"
+  log "Verifying service add reported the DNS alias count"
+  local line
+  line="$(grep -F -- '- HTTP-01 DNS aliases registered:' "$log_file" || true)"
+  if [[ -z "$line" ]]; then
+    fail "service add summary did not report the DNS alias outcome: $log_file"
+  fi
+  log "Summary alias line: $line"
+  if [[ "$line" != "- HTTP-01 DNS aliases registered: ${expected_count}" ]]; then
+    fail "Expected ${expected_count} registered DNS alias(es), got: $line"
+  fi
+}
+
 wait_for_responder_http01() {
   local host="001.edge-proxy.edge-node-01.trusted.domain"
   local attempt
@@ -230,7 +250,10 @@ run_service_scenarios() {
     --approle-role-id "$runtime_service_add_role_id" \
     --approle-secret-id "$runtime_service_add_secret_id"
 
-  cargo run --bin bootroot -- service add \
+  # Capture the second add: by then both services are registered, so the
+  # summary must count two aliases — the same two verify_dns_aliases
+  # looks for on the responder.
+  BOOTROOT_LANG=en cargo run --bin bootroot -- service add \
     --service-name web-app \
     --hostname web-01 \
     --domain trusted.domain \
@@ -240,8 +263,10 @@ run_service_scenarios() {
     --instance-id 001 \
     --auth-mode approle \
     --approle-role-id "$runtime_service_add_role_id" \
-    --approle-secret-id "$runtime_service_add_secret_id"
+    --approle-secret-id "$runtime_service_add_secret_id" |
+    tee "$ROOT_DIR/tmp/cli-service-add-web-app.log"
 
+  verify_service_add_alias_summary "$ROOT_DIR/tmp/cli-service-add-web-app.log" 2
   verify_dns_aliases
   wait_for_responder_http01
   wait_for_stepca_directory

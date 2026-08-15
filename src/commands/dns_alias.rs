@@ -8,6 +8,23 @@ use crate::commands::infra::{docker_output, run_docker};
 use crate::i18n::Messages;
 use crate::state::{ServiceEntry, StateFile};
 
+/// What an alias registration attempt did, so a caller can report it
+/// alongside its own result.
+///
+/// Deliberately not `#[must_use]`: `infra up` and `service remove`
+/// discard it on purpose, and under `-D warnings` an ignored
+/// `#[must_use]` value on a `expr?;` statement is a build failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DnsAliasOutcome {
+    /// Aliases were attached to the responder.
+    Registered { count: usize },
+    /// The alias set was empty, so nothing was attempted.
+    NothingToRegister,
+    /// Registration was attempted and attached nothing; a warning was
+    /// already printed on stderr.
+    Skipped,
+}
+
 /// Builds the HTTP-01 DNS alias FQDN from a service entry.
 ///
 /// Returns `None` when `instance_id` is absent.
@@ -37,10 +54,10 @@ pub(crate) fn register_dns_alias(
     state: &StateFile,
     identity: &ComposeIdentity,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<DnsAliasOutcome> {
     let aliases = collect_dns_aliases(state);
     if aliases.is_empty() {
-        return Ok(());
+        return Ok(DnsAliasOutcome::NothingToRegister);
     }
     apply_dns_aliases(&aliases, identity, messages)
 }
@@ -60,7 +77,7 @@ pub(crate) fn reconcile_dns_aliases(
     state: &StateFile,
     identity: &ComposeIdentity,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<DnsAliasOutcome> {
     let aliases = collect_dns_aliases(state);
     apply_dns_aliases(&aliases, identity, messages)
 }
@@ -74,10 +91,10 @@ pub(crate) fn replay_dns_aliases(
     state: &StateFile,
     identity: &ComposeIdentity,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<DnsAliasOutcome> {
     let aliases = collect_dns_aliases(state);
     if aliases.is_empty() {
-        return Ok(());
+        return Ok(DnsAliasOutcome::NothingToRegister);
     }
     let container = identity.container(BootrootContainer::Http01);
     println!(
@@ -94,22 +111,26 @@ pub(crate) fn replay_dns_aliases(
 /// reconnect fails, a rollback reconnect (without aliases) is attempted
 /// so the responder is never left detached from the network.
 ///
-/// Returns `Ok(())` for all cases where the container remains connected
-/// to the network (including when aliases could not be applied).
+/// Returns `Ok` for all cases where the container remains connected to
+/// the network: [`DnsAliasOutcome::Registered`] when the aliases were
+/// attached, and [`DnsAliasOutcome::Skipped`] when they could not be,
+/// which is the outcome every warning path below reports.  The warning
+/// on stderr is the detail; the returned outcome is what lets a caller
+/// state the result in its own summary.
 /// Returns `Err` only when the container is left detached from the
 /// network (disconnect succeeded but both reconnect and rollback failed).
 fn apply_dns_aliases(
     aliases: &[String],
     identity: &ComposeIdentity,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<DnsAliasOutcome> {
     // The operator-facing half of this function names the container the
     // recovery command has to target, which is this install's responder
     // and not the default instance's.
     let container = identity.container(BootrootContainer::Http01);
     let Some(container_id) = find_responder_container(identity.project(), messages)? else {
         eprintln!("{}", messages.dns_alias_responder_not_running(&container));
-        return Ok(());
+        return Ok(DnsAliasOutcome::Skipped);
     };
     let Ok(network) = find_container_network(&container_id, messages) else {
         eprintln!(
@@ -117,7 +138,7 @@ fn apply_dns_aliases(
             messages
                 .dns_alias_connect_recovered(&messages.dns_alias_network_not_found(&container_id))
         );
-        return Ok(());
+        return Ok(DnsAliasOutcome::Skipped);
     };
 
     if let Err(err) = run_docker(
@@ -128,7 +149,7 @@ fn apply_dns_aliases(
         // Disconnect failed — the container is still connected
         // (possibly was never on this network).  Not critical.
         eprintln!("{}", messages.dns_alias_connect_recovered(&err.to_string()));
-        return Ok(());
+        return Ok(DnsAliasOutcome::Skipped);
     }
 
     let mut args: Vec<&str> = vec!["network", "connect"];
@@ -170,13 +191,15 @@ fn apply_dns_aliases(
         // were not applied.  Warn and return Ok so the caller can
         // continue; aliases can be retried with `bootroot infra up`.
         eprintln!("{}", messages.dns_alias_connect_recovered(&err.to_string()));
-        return Ok(());
+        return Ok(DnsAliasOutcome::Skipped);
     }
 
     for alias in aliases {
         println!("{}", messages.dns_alias_registered(alias));
     }
-    Ok(())
+    Ok(DnsAliasOutcome::Registered {
+        count: aliases.len(),
+    })
 }
 
 /// Finds the container ID of `project`'s HTTP-01 responder.
@@ -342,6 +365,24 @@ mod tests {
             assert!(err.contains('2'), "{locale}: {err}");
             assert!(!err.contains('{'), "{locale} left a placeholder: {err}");
         }
+    }
+
+    /// The short-circuit runs before Docker is touched, so it must
+    /// report `NothingToRegister` rather than borrowing `Skipped`, which
+    /// tells the operator to look for a warning that was never printed.
+    #[test]
+    fn register_dns_alias_reports_an_empty_alias_set_as_nothing_to_register() {
+        let messages = crate::i18n::test_messages();
+        let identity = ComposeIdentity::for_instance("insight");
+        let state = StateFile::default();
+        assert_eq!(
+            register_dns_alias(&state, &identity, &messages).unwrap(),
+            DnsAliasOutcome::NothingToRegister
+        );
+        assert_eq!(
+            replay_dns_aliases(&state, &identity, &messages).unwrap(),
+            DnsAliasOutcome::NothingToRegister
+        );
     }
 
     #[test]

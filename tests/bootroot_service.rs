@@ -77,6 +77,24 @@ async fn test_app_add_writes_state_and_secret() {
     assert!(stdout.contains("Operator-managed (required):"));
     assert!(stdout.contains("next steps:"));
     assert!(stdout.contains("daemon profile snippet:"));
+    // The alias registration is best-effort and used to signal failure
+    // only by an absence — no per-alias line, a zero exit status, and a
+    // summary that never mentioned aliases. The summary states the
+    // outcome now, so assert it is there on whichever path this host
+    // takes. No responder runs for this fixture, so the skipped variant
+    // is what CI sees; a dev box with a live stack registers instead,
+    // hence the conditional rather than a hard-coded expectation.
+    let alias_line = stdout
+        .lines()
+        .find(|line| line.starts_with("- HTTP-01 DNS aliases registered: "))
+        .unwrap_or_else(|| panic!("summary must report the DNS alias outcome: {stdout}"));
+    if stderr.contains("skipping DNS alias registration") {
+        assert_eq!(
+            alias_line,
+            "- HTTP-01 DNS aliases registered: 0 (registration skipped; see the warning above)",
+            "a skipped registration must be reported as zero: {stdout}"
+        );
+    }
     // The Bootroot-managed section lists exactly the two host-daemon
     // artifacts: the rendered agent config and the provisioned EAB file.
     // The retired per-service OpenBao Agent artifacts must be gone.

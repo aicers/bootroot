@@ -570,6 +570,17 @@ impl Messages {
         )
     }
 
+    pub(crate) fn service_summary_dns_alias_registered(&self, count: usize) -> String {
+        format_template(
+            self.strings().service_summary_dns_alias_registered,
+            &[("count", &count.to_string())],
+        )
+    }
+
+    pub(crate) fn service_summary_dns_alias_skipped(&self) -> &'static str {
+        self.strings().service_summary_dns_alias_skipped
+    }
+
     pub(crate) fn service_summary_auto_applied_agent_config(&self, value: &str) -> String {
         format_template(
             self.strings().service_summary_auto_applied_agent_config,

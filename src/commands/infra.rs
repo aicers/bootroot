@@ -307,6 +307,8 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     if state_path.exists()
         && let Ok(state) = StateFile::load(&state_path)
     {
+        // The replay already prints its own per-alias lines; `infra up`
+        // adds nothing to them, so the outcome is dropped.
         replay_dns_aliases(&state, &identity, messages)?;
     }
 

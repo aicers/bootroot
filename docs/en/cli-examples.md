@@ -168,6 +168,7 @@ bootroot service add: summary
 - role_id: ********
 - secret_id path: secrets/services/edge-proxy/secret_id
 - OpenBao path: bootroot/services/edge-proxy
+- HTTP-01 DNS aliases registered: 1
 Bootroot-managed:
 - auto-applied bootroot-agent config: /etc/bootroot/agent.toml
 - auto-provisioned EAB file (present only when EAB is configured; pass

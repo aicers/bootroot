@@ -223,6 +223,8 @@ pub(crate) struct Strings {
     pub(crate) service_summary_approle: &'static str,
     pub(crate) service_summary_secret_path: &'static str,
     pub(crate) service_summary_openbao_path: &'static str,
+    pub(crate) service_summary_dns_alias_registered: &'static str,
+    pub(crate) service_summary_dns_alias_skipped: &'static str,
     pub(crate) service_summary_auto_applied_agent_config: &'static str,
     pub(crate) service_summary_auto_applied_eab_file: &'static str,
     pub(crate) service_scope_bootroot_managed: &'static str,
@@ -652,6 +654,29 @@ mod tests {
                     !text.contains("bootroot-openbao") && !text.contains("bootroot-http01"),
                     "{locale}: message still hard-codes a default container name: {text}"
                 );
+                assert!(!text.contains('{'), "{locale} left a placeholder: {text}");
+            }
+        }
+    }
+
+    /// `service add`'s alias line is the only place the outcome is
+    /// stated, so both locales have to render the count and both have
+    /// to say zero on the skipped path — an operator reading Korean
+    /// gets the same assertion as one reading English.
+    #[test]
+    fn dns_alias_summary_messages_state_a_count_in_both_locales() {
+        for locale in ["en", "ko"] {
+            let m = Messages::new(locale).unwrap();
+            let registered = m.service_summary_dns_alias_registered(3);
+            let zero = m.service_summary_dns_alias_registered(0);
+            let skipped = m.service_summary_dns_alias_skipped();
+            assert!(registered.contains('3'), "{locale}: {registered}");
+            assert!(zero.contains('0'), "{locale}: {zero}");
+            assert!(skipped.contains('0'), "{locale}: {skipped}");
+            // The skipped line is the zero line plus the pointer at the
+            // warning already on stderr, so one grep finds both.
+            assert!(skipped.starts_with(&zero), "{locale}: {skipped}");
+            for text in [registered.as_str(), zero.as_str(), skipped] {
                 assert!(!text.contains('{'), "{locale} left a placeholder: {text}");
             }
         }

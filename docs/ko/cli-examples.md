@@ -165,6 +165,7 @@ bootroot 서비스 추가: 요약
 - role_id: ********
 - secret_id 경로: secrets/services/edge-proxy/secret_id
 - OpenBao 경로: bootroot/services/edge-proxy
+- 등록된 HTTP-01 DNS 별칭: 1개
 Bootroot 자동 반영 항목:
 - 자동 반영 bootroot-agent 설정: /etc/bootroot/agent.toml
 - 자동 프로비저닝 EAB 파일 (EAB가 설정된 경우에만 존재; --eab-file로
