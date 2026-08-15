@@ -7,12 +7,26 @@ cd "$ROOT_DIR"
 
 # shellcheck source=lib/leftovers.sh
 . "$SCRIPT_DIR/lib/leftovers.sh"
+# shellcheck source=lib/ports.sh
+. "$SCRIPT_DIR/lib/ports.sh"
 
 # docker-compose.yml interpolates the entire file regardless of which
 # services are targeted or which profiles are active, so required vars
 # referenced by gated services (e.g. grafana) must still be defined.
 export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-step-pass}"
 export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-admin}"
+
+# This harness installs at the default identity, and declares it rather
+# than reading it out of `$ROOT_DIR/.env`.  Nothing here runs `infra
+# install`, so that file is whatever the last harness that did left
+# behind — since the lifecycle harnesses became run-scoped, a previous
+# run's derived instance.  Inheriting it would name this run's
+# containers after a run that is over, and point the leftover checks at
+# names this run never creates.  Exporting is what makes the recorded
+# value unreachable: Compose prefers a process-environment variable over
+# `.env`, where unsetting one would let `.env` supply it.
+RUN_INSTANCE="$BOOTROOT_DEFAULT_INSTANCE_NAME"
+export BOOTROOT_INSTANCE="$RUN_INSTANCE"
 
 DEFAULT_SCENARIO_FILE="$ROOT_DIR/tests/e2e/docker_harness/scenarios/scenario-a-single-node-mixed.json"
 SCENARIO_FILE="${SCENARIO_FILE:-$DEFAULT_SCENARIO_FILE}"
@@ -75,6 +89,23 @@ ensure_prerequisites() {
   command -v curl >/dev/null 2>&1 || fail_with_context "curl is required"
   [ -x "$BOOTROOT_BIN" ] || fail_with_context "bootroot binary not executable: $BOOTROOT_BIN"
   [ -x "$BOOTROOT_REMOTE_BIN" ] || fail_with_context "bootroot-remote binary not executable: $BOOTROOT_REMOTE_BIN"
+}
+
+# Picks this run's four published ports, for the same reason the
+# instance name is declared above and with one addition: `.env` records
+# the four ephemeral ports a previous lifecycle run chose, and one of
+# them may well have been taken since — a bind failure on a port this
+# harness never asked for.  Picking also leaves the compose file's
+# defaults as the one place they are written down.
+allocate_run_ports() {
+  pick_free_port
+  export POSTGRES_HOST_PORT="$PICKED_PORT"
+  pick_free_port
+  export OPENBAO_HOST_PORT="$PICKED_PORT"
+  pick_free_port
+  export STEPCA_HOST_PORT="$PICKED_PORT"
+  pick_free_port
+  export HTTP01_ADMIN_HOST_PORT="$PICKED_PORT"
 }
 
 compose_up() {
@@ -378,7 +409,7 @@ cleanup() {
       echo "run-baseline: teardown failed; see ${RUNNER_LOG}" >&2
       cleanup_status=1
     fi
-    report_leftover_containers "$COMPOSE_FILE" "run-baseline cleanup" || cleanup_status=1
+    report_leftover_containers "$COMPOSE_FILE" "run-baseline cleanup" "$RUN_INSTANCE" || cleanup_status=1
   fi
   exit_with_cleanup_status "$status" "$cleanup_status"
 }
@@ -391,13 +422,14 @@ main() {
   trap cleanup EXIT
 
   ensure_prerequisites
+  allocate_run_ports
   # The assertion comes first, before the teardown and before anything
   # else that could remove a container.  A `down -v` at this project
   # would take a real install on this host with it, volumes and all, and
   # leave the check reading a daemon it had just cleaned — and a killed
   # run's leftovers, which the check exists to report, are
   # indistinguishable from that install to everything but an operator.
-  assert_no_leftover_containers "$COMPOSE_FILE" "run-baseline startup"
+  assert_no_leftover_containers "$COMPOSE_FILE" "run-baseline startup" "$RUN_INSTANCE"
   # Past the assertion nothing here is anyone else's, so the stack
   # becomes this run's to remove.  Nothing used to tear it down at the
   # start of a run at all, so a previous run killed before its own
