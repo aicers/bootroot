@@ -85,6 +85,42 @@ RUN_SCOPE_INSTANCE_ALPHABET="abcdefghijklmnopqrstuvwxyz0123456789"
 # filter.  Spelled out for the same collation reason as above.
 RUN_SCOPE_PROJECT_ALPHABET="abcdefghijklmnopqrstuvwxyz0123456789-_"
 
+# The namespaces a derived run identity may sit in, one per lifecycle
+# harness, each written `<instance prefix>:<project prefix>`.
+#
+# Here, and not only in the harnesses that derive from them, because the
+# sweep is the half that needs them.  A marker's filename is an instance
+# the sweep hands to `docker rm -f`, and its `project` field is the label
+# it removes volumes and networks by, so the sweep reaches exactly as far
+# as what it will accept out of that directory.  Owner-only permissions
+# establish that no other user put a marker there; they establish nothing
+# about what this user's own host put there — an older harness's marker
+# under a naming rule since changed, a file made by hand while debugging,
+# a write from some other tool that happened to pick the same directory.
+# A file named `bootroot` recording `project=bootroot` and a pid that is
+# no longer alive would otherwise be collected exactly as a dead run is,
+# tearing down the nine default-identity containers and then every volume
+# and network labelled with the default project: the one install on the
+# host the sweep exists never to reach.
+#
+# So a marker is honoured only when both of its halves sit inside a
+# namespace below, and refused and kept otherwise.  The default identity
+# cannot be spelled as one: no instance prefix here begins `bootroot`,
+# and every project prefix begins `bootroot-e2e-`, so neither `bootroot`
+# nor any name a real install derives from it is expressible.
+#
+# The harnesses declare their own prefixes as literals of their own, and
+# `validate-e2e-run-scope.sh` holds each declared pair against this
+# table.  A prefix changed in one place and not the other therefore fails
+# there, rather than shipping a harness whose markers no sweep will
+# honour — which would strand its leftovers for as long as the machine
+# runs, silently, since a refused marker is kept and a kept marker looks
+# from the outside exactly like one waiting to be retried.
+BOOTROOT_E2E_RUN_NAMESPACES=(
+  "e2e-local-:bootroot-e2e-local-"
+  "e2e-remote-:bootroot-e2e-remote-"
+)
+
 # Reduces a free-form run identifier to the alphabet an instance name may
 # use, dropping every other character rather than mapping it to `-`: the
 # result is a token to be appended to a prefix, and a mapped separator
@@ -139,25 +175,46 @@ run_scope_instance() {
   printf '%s%s\n' "$prefix" "$token"
 }
 
+# True when `name` is one `infra install` will accept:
+# `validate_instance_name`'s rule, restated for a shell.
+#
+# A predicate rather than only the abort below, because the sweep asks
+# the same question of a name it did not derive and must answer it
+# without taking the run down.
+run_scope_instance_is_valid() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  [ "${#name}" -le "$BOOTROOT_MAX_INSTANCE_NAME_LEN" ] || return 1
+  case "$name" in
+    ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
+    *) return 1 ;;
+  esac
+  case "$name" in
+    *[!"$RUN_SCOPE_INSTANCE_ALPHABET"-]*) return 1 ;;
+  esac
+}
+
 # Aborts unless `name` is one `infra install` will accept.
 #
 # The derivation above is meant to produce nothing else, which is exactly
 # why this is checked rather than trusted: a prefix edited later, or a
 # limit that moves in `compose_project.rs`, would otherwise surface as a
 # rejected install several minutes into a run.
+#
+# The verdict is the predicate's; what is below it runs only once that
+# has said no, and only to name which half of the rule was broken.  So
+# there is one statement of what is acceptable and not two that can drift
+# apart.
 run_scope_assert_valid_instance() {
   local name="$1"
+  run_scope_instance_is_valid "$name" && return 0
   [ "${#name}" -le "$BOOTROOT_MAX_INSTANCE_NAME_LEN" ] \
     || fail "derived instance name '${name}' is ${#name} characters, over the ${BOOTROOT_MAX_INSTANCE_NAME_LEN}-character limit"
   case "$name" in
     ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
     *) fail "derived instance name '${name}' does not start with a lowercase letter or a digit" ;;
   esac
-  case "$name" in
-    *[!"$RUN_SCOPE_INSTANCE_ALPHABET"-]*)
-      fail "derived instance name '${name}' holds a character outside [a-z0-9-]"
-      ;;
-  esac
+  fail "derived instance name '${name}' holds a character outside [a-z0-9-]"
 }
 
 # Prints the Compose project a run scopes every `docker compose` call to
@@ -179,24 +236,84 @@ run_scope_project() {
   printf '%s%s\n' "$prefix" "$token"
 }
 
+# True when `name` is one Compose will accept as a project: a lowercase
+# letter or a digit first, then lowercase letters, digits, `-` and `_`,
+# and no length limit — that last is the whole difference from an
+# instance name.
+#
+# A predicate for the same reason the instance one is: the sweep asks
+# this of a project it read out of a file rather than derived.
+run_scope_project_is_valid() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  case "$name" in
+    ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
+    *) return 1 ;;
+  esac
+  case "$name" in
+    *[!"$RUN_SCOPE_PROJECT_ALPHABET"]*) return 1 ;;
+  esac
+}
+
 # Aborts unless `name` is one Compose will accept as a project.
 #
 # Checked for the same reason the instance name is: a prefix edited later
 # would otherwise surface as a rejected `docker compose` call several
-# minutes into a run.  Compose requires a lowercase letter or a digit
-# first, then lowercase letters, digits, `-` and `_`.
+# minutes into a run.  As above, the predicate holds the rule and what
+# follows only names the broken half.
 run_scope_assert_valid_project() {
   local name="$1"
+  run_scope_project_is_valid "$name" && return 0
   [ -n "$name" ] || fail "the derived Compose project name is empty"
   case "$name" in
     ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
     *) fail "derived Compose project '${name}' does not start with a lowercase letter or a digit" ;;
   esac
-  case "$name" in
-    *[!"$RUN_SCOPE_PROJECT_ALPHABET"]*)
-      fail "derived Compose project '${name}' holds a character outside [a-z0-9_-]"
-      ;;
+  fail "derived Compose project '${name}' holds a character outside [a-z0-9_-]"
+}
+
+# Prints the project prefix belonging to the namespace `instance` sits
+# in, and returns non-zero when it sits in none of them.
+#
+# The pairing is what makes this worth consulting: an instance in the
+# local namespace can only ever have been derived alongside a project in
+# the local project namespace, so a marker pairing one harness's instance
+# with the other's project is as much a marker this harness did not write
+# as one naming `bootroot`.
+run_scope_project_prefix_for_instance() {
+  local instance="$1" pair instance_prefix
+  for pair in "${BOOTROOT_E2E_RUN_NAMESPACES[@]}"; do
+    instance_prefix="${pair%%:*}"
+    case "$instance" in
+      "$instance_prefix"?*)
+        printf '%s' "${pair#*:}"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# True when `instance` and `project` are a pair this harness could have
+# derived: both valid, both inside one namespace, and inside the same
+# one.
+#
+# This is the whole of what confines the sweep.  Everything it does is
+# driven off a marker — the nine container names come from the filename,
+# the volume and network label from the `project` field — so the question
+# of what the sweep can reach is exactly the question of which markers it
+# will act on.  A file failing this is refused and kept rather than
+# collected: it is not this harness's to tear down, and it is not this
+# harness's to delete either.
+run_scope_marker_is_derived() {
+  local instance="$1" project="$2" project_prefix
+  project_prefix="$(run_scope_project_prefix_for_instance "$instance")" || return 1
+  run_scope_instance_is_valid "$instance" || return 1
+  case "$project" in
+    "$project_prefix"?*) ;;
+    *) return 1 ;;
   esac
+  run_scope_project_is_valid "$project" || return 1
 }
 
 # Prints the responder image a run builds and runs its own stack from.
@@ -366,8 +483,17 @@ ensure_run_marker_dir() {
 # Published by rename, as every file another process may read is: a
 # sweep reading a half-written marker would see no pid and collect a run
 # that had only just started.
+#
+# The pair is checked here as well as where it is read, so that "every
+# marker this harness wrote names a derived namespace" is an invariant
+# the code enforces at both ends rather than one the sweep merely hopes
+# for.  A run whose identity somehow fell outside the table is one whose
+# containers no sweep would collect, so it is better stopped at the
+# marker than left to install and accumulate.
 write_run_marker() {
   local instance="$1" project="$2" path tmp
+  run_scope_marker_is_derived "$instance" "$project" \
+    || fail "refusing to record an E2E run marker for instance '${instance}' and project '${project}': the sweep only collects a marker whose two halves sit in one of the derived namespaces (${BOOTROOT_E2E_RUN_NAMESPACES[*]}), so a marker outside them would name leftovers nothing later collects"
   path="$(run_marker_path "$instance")"
   ensure_run_marker_dir
   tmp="${path}.$$.tmp"
@@ -499,6 +625,26 @@ sweep_dead_run_instances() {
     instance="$(basename "$marker")"
     pid="$(run_marker_field "$marker" pid)"
     project="$(run_marker_field "$marker" project)"
+    # Everything below this point acts on those two values: the filename
+    # becomes nine exact container names handed to `docker rm -f`, and
+    # the `project` field becomes the label whose volumes and networks
+    # are removed.  So they are held to the derived namespaces before
+    # anything is done with them, and a file that fails is left exactly
+    # as it was found.  Owner-only permissions say this user's host wrote
+    # it; they do not say this harness did, and a stale or malformed
+    # marker naming `bootroot` with a dead pid would otherwise take out
+    # the default-identity install the sweep exists never to reach.
+    #
+    # Reported rather than counted as a failed collection, because there
+    # is nothing here to retry: a foreign marker is not leftovers this
+    # sweep could ever collect, so a non-zero status would ask every
+    # later run to try again at something none of them will ever do.
+    if ! run_scope_marker_is_derived "$instance" "$project"; then
+      printf '[%s] not collecting %s: instance %s and project %s are not a pair this harness derives (%s), so it is neither swept nor removed\n' \
+        "$label" "$marker" "$instance" "${project:-<none>}" \
+        "${BOOTROOT_E2E_RUN_NAMESPACES[*]}" | tee -a "$log" >&2
+      continue
+    fi
     if run_pid_is_alive "$pid"; then
       continue
     fi

@@ -241,10 +241,28 @@ sweep never matches a prefix or a wildcard — `bootroot-*` would reach into a
 real default-identity install on the same host — so it can only touch
 instances a run recorded.
 
+Every one of those removals is read out of a marker, so what confines the sweep
+is which markers it will act on. A marker is honoured only when both of its
+halves sit inside one derived namespace: its filename must be an instance under
+`e2e-local-` or `e2e-remote-`, and its `project` field a Compose project under
+the matching `bootroot-e2e-local-` or `bootroot-e2e-remote-`. Anything else —
+a stale marker from an older naming rule, a file made by hand, a half-written
+record from something that picked the same path — is reported and left exactly
+as it was found, neither swept nor deleted. That is what makes the default
+identity unreachable by construction rather than by the absence of a marker
+naming it: `bootroot` cannot be spelled with any of those prefixes, so a file
+called `bootroot` recording `project=bootroot` and a dead pid cannot aim the
+sweep at a real install's containers, volumes, networks or `:latest` responder
+image. The same pairing is enforced where markers are written, so a run whose
+identity fell outside the table is stopped before it installs anything no later
+sweep would collect.
+
 The directory is per-user and created `0700`, and a run refuses one it does not
 own: a marker's filename is an instance the sweep tears down by exact container
 name, so anyone who could write there would be choosing what a later run
-destroys. A symbolic link at that path is refused outright rather than
+destroys. The namespace check stands behind that rather than beside it —
+ownership establishes that no other user wrote a marker, not that this harness
+did. A symbolic link at that path is refused outright rather than
 followed, because ownership cannot see one — every shell test but `-L` reports
 on the link's target, so a link aimed at a directory this user happens to own
 would pass the ownership check and hand the sweep files that were never

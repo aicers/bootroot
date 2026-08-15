@@ -215,6 +215,66 @@ check_instance_and_project_are_derived_separately() {
   ok "the instance and the project are separate derivations, and the project outgrows the instance limit under a CI-length run id"
 }
 
+# The sweep honours a marker only when both halves sit in one of the
+# library's declared namespaces, and each harness declares its own two
+# prefixes as literals of its own. Those are two statements of one fact,
+# and this is what keeps them the same fact.
+#
+# Drift here is silent in the direction that matters. A harness given a
+# prefix the table does not carry still runs, still installs and still
+# writes a marker — and then no sweep will ever honour that marker, so
+# every run of that harness that is killed strands its stack on the host
+# for good. Nothing in a green matrix can see it, because a refused
+# marker is kept, and a kept marker is indistinguishable from one waiting
+# to be retried.
+check_harness_namespaces_are_declared() {
+  local script instance_prefix project_prefix pair found
+  for script in "${LIFECYCLE_SCRIPTS[@]}"; do
+    instance_prefix="$(harness_prefix "$script" RUN_INSTANCE_PREFIX)"
+    project_prefix="$(harness_prefix "$script" RUN_PROJECT_PREFIX)"
+    found=0
+    for pair in "${BOOTROOT_E2E_RUN_NAMESPACES[@]}"; do
+      [ "$pair" = "${instance_prefix}:${project_prefix}" ] || continue
+      found=1
+      break
+    done
+    [ "$found" -eq 1 ] \
+      || die "${script} derives its identity under '${instance_prefix}' and '${project_prefix}', a pair BOOTROOT_E2E_RUN_NAMESPACES does not carry (${BOOTROOT_E2E_RUN_NAMESPACES[*]}); the sweep refuses every marker outside that table, so this harness's killed runs would never be collected"
+    # Round trip: what the harness actually derives has to be honoured,
+    # not merely the prefixes it declares.
+    run_scope_marker_is_derived \
+      "$(run_scope_instance "$instance_prefix" "$(run_scope_token /tmp/e2e/ci-run-12345678901)")" \
+      "$(run_scope_project "$project_prefix" "$(run_scope_token /tmp/e2e/ci-run-12345678901)")" \
+      || die "${script}'s own derived instance and project are not a pair the sweep would honour"
+  done
+  ok "each harness's declared prefixes are a namespace the sweep honours, and what it derives from them round-trips"
+}
+
+# The default identity has to be unreachable by construction, not by the
+# absence of a marker naming it. A sweep confined to a table of prefixes
+# is only confined if `bootroot` cannot be spelled with them.
+check_no_namespace_can_name_the_default_identity() {
+  local default="bootroot" pair instance_prefix project_prefix
+  for pair in "${BOOTROOT_E2E_RUN_NAMESPACES[@]}"; do
+    instance_prefix="${pair%%:*}"
+    project_prefix="${pair#*:}"
+    case "$default" in
+      "$instance_prefix"*)
+        die "the instance prefix '${instance_prefix}' admits the default identity '${default}'"
+        ;;
+    esac
+    case "$default" in
+      "$project_prefix"*)
+        die "the project prefix '${project_prefix}' admits the default project '${default}'"
+        ;;
+    esac
+  done
+  if run_scope_marker_is_derived "$default" "$default"; then
+    die "a marker naming the default identity is one the sweep would collect"
+  fi
+  ok "no declared namespace can spell the default identity, so the sweep cannot reach a real install"
+}
+
 check_project_derivation_rejects_what_compose_would() {
   local status=0
   ( run_scope_project "bootroot-e2e-local-" "..." ) >/dev/null 2>&1 || status=$?
@@ -295,13 +355,16 @@ check_derivation_rejects_what_it_cannot_derive() {
 # ---------------------------------------------------------------------------
 
 check_markers() {
-  local instance="e2e-local-marker" path
+  # A pair from one derived namespace, because that is all a marker may
+  # hold: the instance and the project are two different strings, as a
+  # real run's are, and both sit inside the local harness's namespace.
+  local instance="e2e-local-marker" project="bootroot-e2e-local-marker" path
   path="$(run_marker_path "$instance")"
-  write_run_marker "$instance" "$instance"
+  write_run_marker "$instance" "$project"
   [ -f "$path" ] || die "write_run_marker wrote no marker at ${path}"
   [ "$(run_marker_field "$path" pid)" = "$$" ] \
     || die "the marker does not record this process's pid"
-  [ "$(run_marker_field "$path" project)" = "$instance" ] \
+  [ "$(run_marker_field "$path" project)" = "$project" ] \
     || die "the marker does not record the compose project"
   # A `.tmp` left behind by an interrupted write must not read as a run.
   [ -z "$(find "$BOOTROOT_E2E_RUN_MARKER_DIR" -name '*.tmp' -print -quit)" ] \
@@ -314,7 +377,7 @@ check_markers() {
   # rather than trusted, and the sweep applies the same rule because it
   # runs before any marker is written.
   chmod 777 "$BOOTROOT_E2E_RUN_MARKER_DIR"
-  write_run_marker "$instance" "$instance"
+  write_run_marker "$instance" "$project"
   [ "$(path_mode)" = "700" ] \
     || die "write_run_marker left the marker directory at mode $(path_mode)"
   chmod 777 "$BOOTROOT_E2E_RUN_MARKER_DIR"
@@ -326,12 +389,12 @@ check_markers() {
 
   # Another run's marker is not this run's to remove: dropping it would
   # hide that run's containers from every later sweep.
-  printf 'pid=%s\nproject=%s\n' "999999" "$instance" >"$path"
+  printf 'pid=%s\nproject=%s\n' "999999" "$project" >"$path"
   remove_run_marker "$instance"
   [ -f "$path" ] || die "remove_run_marker removed a marker recording another pid"
   ok "a marker recording another pid survives this run's cleanup"
 
-  write_run_marker "$instance" "$instance"
+  write_run_marker "$instance" "$project"
   remove_run_marker "$instance"
   [ ! -f "$path" ] || die "remove_run_marker left this run's own marker behind"
   remove_run_marker ""
@@ -343,7 +406,7 @@ check_markers() {
   # resources once the run is gone.  Dropping the marker there strands
   # them under a name no later sweep knows to ask about — precisely the
   # accumulation the marker exists to stop.
-  write_run_marker "$instance" "$instance"
+  write_run_marker "$instance" "$project"
   remove_run_marker "$instance" 1 2>/dev/null
   [ -f "$path" ] \
     || die "remove_run_marker dropped the marker of a run whose teardown left containers behind"
@@ -372,8 +435,12 @@ check_marker_dir_refuses_a_symlink() {
     >/dev/null 2>&1 || status=$?
   [ "$status" -eq 9 ] \
     || die "the sweep read a marker directory reached through a symbolic link"
+  # A pair the namespace check accepts, so what refuses this write can
+  # only be the link. Handing it an out-of-namespace pair would abort
+  # with the same status for the other reason and leave the link
+  # untested.
   status=0
-  (BOOTROOT_E2E_RUN_MARKER_DIR="$link" write_run_marker "e2e-local-link" "e2e-local-link") \
+  (BOOTROOT_E2E_RUN_MARKER_DIR="$link" write_run_marker "e2e-local-link" "bootroot-e2e-local-link") \
     >/dev/null 2>&1 || status=$?
   [ "$status" -eq 9 ] \
     || die "a marker was written into a directory reached through a symbolic link"
@@ -991,6 +1058,104 @@ check_sweep_collects_only_dead_runs() {
   ok "the sweep removes exact names and queries one exact project label, never a wildcard"
 }
 
+# Everything the sweep does is read out of a marker, so what confines it
+# is which markers it acts on. The directory being mode 0700 says no
+# other user wrote one; it says nothing about what this user's own host
+# left there — an older harness's marker under a naming rule since
+# changed, a file made by hand while debugging, a half-written record
+# from some other tool that picked the same path.
+#
+# A file named `bootroot` recording `project=bootroot` and a dead pid is
+# the worst of those, and the one that has to be proved harmless: acted
+# on as a run, it would remove the nine default-identity containers, then
+# every volume and network labelled with the default project, then the
+# `:latest` responder image a real install builds. That is the whole of a
+# developer's install on the same machine.
+check_sweep_refuses_a_marker_outside_the_derived_namespaces() {
+  local status=0 defaults foreign
+  defaults="$(instance_containers bootroot)"
+  seed_daemon \
+    "$defaults $(instance_containers "$DEAD")" \
+    "$(printf 'bootroot vol-real\n%s vol-dead\n' "$DEAD_PROJECT")" \
+    "$(printf 'bootroot net-real\n%s net-dead\n' "$DEAD_PROJECT")" \
+    "$(run_scope_http01_image bootroot) $(run_scope_http01_image "$DEAD") ${BOOTROOT_HTTP01_IMAGE_REPO}:latest"
+
+  # The default identity, spelled the way a stale or malformed marker
+  # would spell it, with a pid no longer alive.
+  seed_marker "bootroot" 4194305 "bootroot"
+  # An instance in a derived namespace paired with the default project:
+  # half-valid is still not a pair this harness ever wrote, and honouring
+  # the project field alone would take the real install's volumes and
+  # networks.
+  seed_marker "e2e-local-halfway" 4194305 "bootroot"
+  # And the mirror of it — a project in a derived namespace under an
+  # instance name that is not.
+  seed_marker "postgres" 4194305 "$DEAD_PROJECT"
+  # A real dead run alongside them, so this proves the sweep still works
+  # rather than merely that it did nothing.
+  seed_marker "$DEAD" 4194305 "$DEAD_PROJECT"
+
+  sweep_dead_run_instances "a-label" "$WORK_DIR/sweep.log" 2>/dev/null || status=$?
+  # Not a failed collection: a marker this harness did not write names
+  # nothing a later run could ever collect, so asking every one of them
+  # to retry it forever would be reporting a fault that has no fix.
+  [ "$status" -eq 0 ] \
+    || die "the sweep reported ${status} over markers it correctly refused, which asks every later run to retry something none of them will ever do"
+
+  for foreign in bootroot e2e-local-halfway postgres; do
+    [ -f "$BOOTROOT_E2E_RUN_MARKER_DIR/$foreign" ] \
+      || die "the sweep removed the marker '${foreign}', which it refused to act on; a marker it does not understand is not its to delete either"
+  done
+  [ ! -f "$BOOTROOT_E2E_RUN_MARKER_DIR/$DEAD" ] \
+    || die "the sweep stopped collecting a genuine dead run"
+  ok "a marker outside the derived namespaces is refused and kept, and a real dead run beside it is still collected"
+
+  local expected
+  expected="$(printf '%s\n' $defaults | LC_ALL=C sort | tr '\n' ' ' | sed 's/ *$//')"
+  [ "$(daemon_containers)" = "$expected" ] \
+    || die "the sweep left '$(daemon_containers)', expected the nine default-identity containers '${expected}'"
+  [ "$(awk '$1 == "bootroot" { print $2 }' "$STUB_STATE/volumes")" = "vol-real" ] \
+    || die "the sweep removed the default-identity install's volume"
+  [ "$(awk '$1 == "bootroot" { print $2 }' "$STUB_STATE/networks")" = "net-real" ] \
+    || die "the sweep removed the default-identity install's network"
+  grep -qxF "$(run_scope_http01_image bootroot)" "$STUB_STATE/images" \
+    || die "the sweep removed the default-identity responder image"
+  grep -qxF "${BOOTROOT_HTTP01_IMAGE_REPO}:latest" "$STUB_STATE/images" \
+    || die "the sweep removed the shipped :latest responder image"
+  ok "a co-located default-identity install keeps its containers, volumes, networks and images"
+
+  # Nothing was even asked about outside the one real dead run: a refused
+  # marker must not reach the daemon at all, since a query is one
+  # `docker rm -f` away from being an removal.
+  local removed asked
+  removed="$(awk '$1 == "rm" { print $2 }' "$WORK_DIR/query.log" | LC_ALL=C sort -u)"
+  [ "$removed" = "$(printf '%s\n' $(instance_containers "$DEAD") | LC_ALL=C sort)" ] \
+    || die "the sweep removed ${removed//$'\n'/ }"
+  asked="$(awk '$1 ~ /-ls$/ { print $2 }' "$WORK_DIR/query.log" | LC_ALL=C sort -u)"
+  [ "$asked" = "label=com.docker.compose.project=${DEAD_PROJECT}" ] \
+    || die "the sweep's label queries were: ${asked//$'\n'/; }"
+  ok "a refused marker reaches the daemon with no query at all"
+}
+
+# The invariant is enforced where markers are written as well as where
+# they are read, so a run whose identity fell outside the table is
+# stopped before it installs anything a sweep would then never collect.
+check_marker_write_refuses_an_undeclared_pair() {
+  local status=0
+  seed_daemon "" "" ""
+  ( write_run_marker "bootroot" "bootroot" ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] || die "a marker naming the default identity was written"
+  status=0
+  ( write_run_marker "e2e-local-x" "bootroot" ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] || die "a marker pairing a derived instance with the default project was written"
+  status=0
+  ( write_run_marker "e2e-local-x" "bootroot-e2e-remote-x" ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] || die "a marker pairing one harness's instance with the other's project was written"
+  [ -z "$(find "$BOOTROOT_E2E_RUN_MARKER_DIR" -type f -print -quit)" ] \
+    || die "a refused marker write left a file behind"
+  ok "a marker outside the derived namespaces is refused at write time too"
+}
+
 check_sweep_keeps_a_marker_it_could_not_clear() {
   local status=0
   seed_daemon "$(instance_containers "$DEAD")" "" ""
@@ -1244,6 +1409,8 @@ check_no_hardcoded_identity() {
 check_limit_matches_the_rust_derivation
 check_derived_instances_are_installable
 check_instance_and_project_are_derived_separately
+check_harness_namespaces_are_declared
+check_no_namespace_can_name_the_default_identity
 check_project_derivation_rejects_what_compose_would
 check_truncation_keeps_the_discriminating_tail
 check_derivation_rejects_what_it_cannot_derive
@@ -1262,6 +1429,8 @@ check_default_hosts_lock_is_the_file_it_protects
 check_liveness
 install_docker_stub
 check_sweep_collects_only_dead_runs
+check_sweep_refuses_a_marker_outside_the_derived_namespaces
+check_marker_write_refuses_an_undeclared_pair
 check_sweep_keeps_a_marker_it_could_not_clear
 check_harness_wiring
 check_responder_image_is_run_scoped
