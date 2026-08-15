@@ -123,11 +123,34 @@ run_sudo() {
   sudo -n "$@"
 }
 
+# Finding *an* `openssl` on PATH is not enough. macOS ships LibreSSL as
+# /usr/bin/openssl, and LibreSSL 3.3.6 has no `x509 -ext` — an OpenSSL
+# 1.1.1 addition, and how the harness reads a certificate's
+# subjectAltName. Probe for that option rather than for the string
+# `OpenSSL` in `openssl version`: the harness needs the capability, not
+# a particular implementation, and a build that grows the option should
+# pass. Every matrix script checks this even where it makes no `-ext`
+# call, because the ten steps run against one host: a host that cannot
+# serve the SAN step cannot serve the matrix, and learning that at that
+# step costs every step before it.
+ensure_openssl() {
+  local openssl_bin x509_help
+  openssl_bin="$(command -v openssl 2>/dev/null || true)"
+  [ -n "$openssl_bin" ] || fail "openssl is required"
+  # `x509 -help` exits non-zero on some builds (LibreSSL 3.3.6 does), so
+  # capture the text and let the match alone decide.  A here-string, not
+  # a pipe: `grep -q` exits on the first match, and under `pipefail` the
+  # writer's SIGPIPE would then fail the very check that just passed.
+  x509_help="$(openssl x509 -help 2>&1 || true)"
+  grep -qE '^[[:space:]]*-ext([[:space:]]|$)' <<<"$x509_help" || fail \
+    "openssl at ${openssl_bin} does not support 'x509 -ext', which this harness needs to read a certificate's subjectAltName; put a directory holding an openssl that supports it first on PATH"
+}
+
 ensure_prerequisites() {
   command -v docker >/dev/null 2>&1 || fail "docker is required"
   docker compose version >/dev/null 2>&1 || fail "docker compose is required"
   command -v jq >/dev/null 2>&1 || fail "jq is required"
-  command -v openssl >/dev/null 2>&1 || fail "openssl is required"
+  ensure_openssl
   [ -x "$BOOTROOT_BIN" ] || fail "bootroot binary not executable: $BOOTROOT_BIN"
   [ -x "$BOOTROOT_REMOTE_BIN" ] || fail "bootroot-remote binary not executable: $BOOTROOT_REMOTE_BIN"
 }
@@ -558,11 +581,25 @@ snapshot_cert_meta() {
   openssl x509 -in "$cert_path" -noout -serial -startdate -enddate -fingerprint -sha256 >"$meta_file"
 }
 
+cert_meta_file() {
+  local service="$1"
+  local label="$2"
+  printf '%s\n' "$CERT_META_DIR/${service}-${label}.txt"
+}
+
+# `x509 -fingerprint` does not agree with itself on the digest's case —
+# OpenSSL 3.6.3 prints `sha256 Fingerprint=` here and `SHA2-256(stdin)= `
+# from `dgst -sha256`, and LibreSSL prints `SHA256 Fingerprint=`. Compare
+# the field case-insensitively instead of anchoring on one spelling.
+# Matching the whole field still pins the digest, so a second fingerprint
+# line added to `snapshot_cert_meta` later cannot satisfy this read. The
+# hex holds no `=`, so `$2` is the entire value.
 fingerprint_of() {
   local service="$1"
   local label="$2"
-  local meta_file="$CERT_META_DIR/${service}-${label}.txt"
-  awk -F= '/^sha256 Fingerprint=/{print $2}' "$meta_file"
+  local meta_file
+  meta_file="$(cert_meta_file "$service" "$label")"
+  awk -F= 'tolower($1) == "sha256 fingerprint" { print $2 }' "$meta_file"
 }
 
 run_verify_pair() {
@@ -725,15 +762,32 @@ wait_for_responder_hmac_propagation() {
   fail "bootroot-agent fast-poll did not propagate the rotated responder HMAC into $config within $((RESPONDER_HMAC_PROPAGATION_ATTEMPTS * RESPONDER_HMAC_PROPAGATION_DELAY_SECS))s"
 }
 
+# An unwritten snapshot and a snapshot this read cannot parse are
+# different problems: the first points at the phase that should have
+# written it, the second at the format the read expects. Reporting both
+# as "Missing fingerprint" sent the reader hunting for a file that was
+# there all along.
+assert_cert_meta_readable() {
+  local service="$1"
+  local label="$2"
+  local meta_file
+  meta_file="$(cert_meta_file "$service" "$label")"
+  [ -f "$meta_file" ] \
+    || fail "Missing cert-meta file for $service/$label: $meta_file"
+  if [ -z "$(fingerprint_of "$service" "$label")" ]; then
+    fail "No SHA-256 fingerprint parsed from $meta_file for $service/$label; it holds: $(tr '\n' ' ' <"$meta_file")"
+  fi
+}
+
 assert_fingerprint_changed() {
   local service="$1"
   local before_label="$2"
   local after_label="$3"
   local before_fp after_fp
+  assert_cert_meta_readable "$service" "$before_label"
+  assert_cert_meta_readable "$service" "$after_label"
   before_fp="$(fingerprint_of "$service" "$before_label")"
   after_fp="$(fingerprint_of "$service" "$after_label")"
-  [ -n "$before_fp" ] || fail "Missing fingerprint for $service/$before_label"
-  [ -n "$after_fp" ] || fail "Missing fingerprint for $service/$after_label"
   if [ "$before_fp" = "$after_fp" ]; then
     fail "Fingerprint did not change for $service ($before_label -> $after_label)"
   fi

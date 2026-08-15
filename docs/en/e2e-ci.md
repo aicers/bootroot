@@ -596,7 +596,7 @@ When local `sudo -n` is unavailable:
 Use this only as a local constraint workaround. CI still executes
 `hosts` variants.
 
-The harnesses also assume two host tools, and each check fails in its
+The harnesses also assume three host tools, and each check fails in its
 prerequisite block rather than mid-run:
 
 - The bind-host guard in `run-reinit-recovery.sh`, `run-stepca-san.sh`,
@@ -610,6 +610,15 @@ prerequisite block rather than mid-run:
 - `run-remote-lifecycle.sh` reads the remote agent's TOML config with
   `tomllib`, so its `python3` must be 3.11 or newer. The prerequisite
   block imports it before any container starts.
+- The `openssl` the harness finds on `PATH` must support `x509 -ext`,
+  which `run-stepca-san.sh` reads step-ca's `subjectAltName` with. The
+  option arrived in OpenSSL 1.1.1, and LibreSSL 3.3.6 — what macOS
+  ships as `/usr/bin/openssl` — does not have it. The check probes for
+  the option rather than for the implementation's name and names the
+  binary it found; the fix is to put a directory holding a capable
+  `openssl` first on `PATH`. All six scripts that check for `openssl`
+  check this, not only the one that calls `-ext`, because the matrix
+  runs every step against one host.
 
 ## Init automation input/output rules
 
