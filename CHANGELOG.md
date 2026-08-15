@@ -14,10 +14,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   with a default umask the database password was world-readable. Only
   the create is narrowed: a `.env` that already exists keeps whatever
   mode it carries, so an operator who has widened one deliberately keeps
-  that choice across every later write. Everything that reads the file —
-  `docker compose` and bootroot itself — is invoked as root; a reader
-  that does lose access fails loudly at the next compose invocation
-  rather than silently, and can be given access back with a `chmod`.
+  that choice across every later write. An install that predates this
+  release therefore keeps the mode it was created with, so `chmod 0600`
+  its `.env` by hand to narrow a password already on disk. Everything
+  that reads the file — `docker compose` and bootroot itself — is
+  invoked as root; a reader that does lose access fails loudly at the
+  next compose invocation rather than silently, and can be given access
+  back with a `chmod`.
 - Hardened the `bootroot-agent` fast-poll OpenBao channel (#695):
   - Config validation now rejects a non-loopback plaintext `http://`
     `[openbao].url` unless the operator sets the new
