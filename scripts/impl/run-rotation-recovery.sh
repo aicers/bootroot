@@ -106,8 +106,19 @@ ENV
 # teardown that removed nothing has to be distinguishable from one that
 # removed everything.  The status is the caller's to decide — the
 # start-of-run call tolerates a failure, `cleanup` does not.
+#
+# The two required variables are supplied here rather than exported,
+# unlike in `run-baseline.sh` and `run-harness-smoke.sh`.  Compose
+# interpolates the whole file on any subcommand, so without them `down`
+# aborts before removing anything — and the start-of-run call runs
+# before `compose_up` writes the `.env` that would otherwise carry them.
+# Their values cannot matter to a `down`, which selects what it removes
+# by project and label, and confining them to this function keeps them
+# from overriding the `POSTGRES_PASSWORD` that `init` rewrites mid-run.
 compose_down() {
-  docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >>"$RUNNER_LOG" 2>&1
+  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-step-pass}" \
+    GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-admin}" \
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >>"$RUNNER_LOG" 2>&1
 }
 
 capture_artifacts() {
