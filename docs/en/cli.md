@@ -174,6 +174,15 @@ later write, and a fresh create takes what the process umask allows — the same
 `init` restores when it rolls back: on a host running `umask 077` they are
 created at `0600`, on the default `umask 022` at `0644`.
 
+`.env` is the exception in that second group. It preserves an existing mode like
+the rest, but a fresh one is created `0600` rather than left to your umask,
+because `infra install` writes `POSTGRES_PASSWORD` into it and it sits in the
+compose directory rather than in the `0700` secrets tree. Everything that reads
+it — `docker compose` and bootroot itself — is invoked as root. If you need it
+readable more widely, `chmod` it once: every later write keeps what you set, and
+a reader that has lost access fails at the next compose invocation rather than
+silently.
+
 If you point one of these paths at a file elsewhere with a symlink, what happens
 depends on which file it is, because a rename replaces the name it is given
 rather than following a link at it:

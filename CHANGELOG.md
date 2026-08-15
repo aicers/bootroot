@@ -8,6 +8,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- A `.env` bootroot creates is now `0600`. `bootroot infra install`
+  generates `POSTGRES_PASSWORD` into this file, and it sits in the
+  compose directory rather than in the `0700` secrets tree, so on a host
+  with a default umask the database password was world-readable. Only
+  the create is narrowed: a `.env` that already exists keeps whatever
+  mode it carries, so an operator who has widened one deliberately keeps
+  that choice across every later write. Everything that reads the file —
+  `docker compose` and bootroot itself — is invoked as root; a reader
+  that does lose access fails loudly at the next compose invocation
+  rather than silently, and can be given access back with a `chmod`.
 - Hardened the `bootroot-agent` fast-poll OpenBao channel (#695):
   - Config validation now rejects a non-loopback plaintext `http://`
     `[openbao].url` unless the operator sets the new
