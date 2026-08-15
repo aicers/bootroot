@@ -97,18 +97,28 @@ check_suffixes_match_the_rust_enum() {
 # `BOOTROOT_INSTANCE` and `COMPOSE_PROJECT_NAME` set in the environment
 # to values that must not reach the answer.
 resolve_case() {
-  local env_contents="$1" case_dir
+  local env_contents="$1" explicit="${2:-}" case_dir
   case_dir="$(mktemp -d "$WORK_DIR/compose.XXXXXX")"
   if [ "$env_contents" != "<none>" ]; then
     printf '%s' "$env_contents" >"$case_dir/.env"
   fi
   BOOTROOT_INSTANCE="ambient-instance" COMPOSE_PROJECT_NAME="ambient-project" \
-    resolve_recorded_instance_name "$case_dir"
+    resolve_recorded_instance_name "$case_dir" "$explicit"
 }
 
 expect_resolved() {
   local description="$1" env_contents="$2" expected="$3" actual
   actual="$(resolve_case "$env_contents")" \
+    || die "resolving ${description} failed"
+  [ "$actual" = "$expected" ] \
+    || die "${description}: resolved '${actual}', expected '${expected}'"
+  ok "${description} resolves to '${expected}'"
+}
+
+# The same, for the `--instance-name` the install may have been given.
+expect_resolved_explicit() {
+  local description="$1" env_contents="$2" explicit="$3" expected="$4" actual
+  actual="$(resolve_case "$env_contents" "$explicit")" \
     || die "resolving ${description} failed"
   [ "$actual" = "$expected" ] \
     || die "${description}: resolved '${actual}', expected '${expected}'"
@@ -142,6 +152,18 @@ check_instance_name_resolution() {
   # selects a project rather than an identity. Neither may reach the
   # answer — both are set in every case above.
   ok "neither BOOTROOT_INSTANCE nor COMPOSE_PROJECT_NAME from the environment is consulted"
+
+  # `--instance-name` outranks both, exactly as it does in
+  # `resolve_recorded_instance_name`.  No harness passes one today, so
+  # nothing but this exercises the branch — and the harness that first
+  # does would otherwise have the check read the identity of an install
+  # it did not make.
+  expect_resolved_explicit "an explicit instance over a recorded one" \
+    $'BOOTROOT_INSTANCE=recorded\n' "explicit" "explicit"
+  expect_resolved_explicit "an explicit instance with no .env" \
+    "<none>" "explicit" "explicit"
+  expect_resolved_explicit "an empty explicit instance falling through to the recorded one" \
+    $'BOOTROOT_INSTANCE=recorded\n' "" "recorded"
 
   # A `.env` bootroot itself would refuse to parse must not read as
   # "records nothing" and send the check at the wrong container names.
@@ -280,6 +302,25 @@ check_container_check() {
   [ "$(head -n 1 <<<"$result")" -eq 0 ] \
     || die "the end-of-run report failed on a clean teardown"
   ok "the end-of-run report returns non-zero on a leftover and zero on a clean teardown"
+
+  # An install given `--instance-name` creates its containers at that
+  # name and not at the recorded one, so both checks have to ask about
+  # it when the harness hands it over.
+  local check
+  for check in assert_no_leftover_containers report_leftover_containers; do
+    status=0
+    : >"$WORK_DIR/inspected.log"
+    output="$(PRESENT_CONTAINERS="explicit-ca" INSPECTED_LOG="$WORK_DIR/inspected.log" \
+      "$check" "$compose_file" "a-label" "explicit" 2>&1)" || status=$?
+    [ "$status" -ne 0 ] \
+      || die "${check} ignored the explicit instance name it was given"
+    grep -q 'explicit-ca' <<<"$output" \
+      || die "${check} did not report the explicit instance's container"
+    if grep -q '^insight-' "$WORK_DIR/inspected.log"; then
+      die "${check} asked about the recorded identity despite an explicit instance name"
+    fi
+  done
+  ok "an explicit instance name outranks the recorded one in both checks"
 }
 
 # ---------------------------------------------------------------------------
@@ -644,6 +685,163 @@ check_startup_ordering() {
   ok "the startup check runs before the teardown, and before anything main reaches can remove a container"
 }
 
+# ---------------------------------------------------------------------------
+# An explicit instance name reaches the checks
+# ---------------------------------------------------------------------------
+#
+# No default-identity harness passes `--instance-name` today, so every
+# one of them leaves the checks' explicit argument empty and the
+# recorded `.env` decides.  The first one to take an instance name would
+# create its containers at that name while the checks kept asking about
+# the recorded identity — a run passing its own startup check on a host
+# carrying exactly the leftovers it exists to report.  That is what this
+# makes impossible to land quietly.
+
+check_explicit_instance_wiring() {
+  local script path call normalized checked=0
+  for script in "${DEFAULT_IDENTITY_SCRIPTS[@]}"; do
+    path="$IMPL_DIR/$script"
+    # Comments stripped first: one of these scripts discusses
+    # `--instance-name` without passing one.
+    grep -vE '^[[:space:]]*#' "$path" | grep -q -- '--instance-name' || continue
+    checked=1
+    while IFS= read -r call; do
+      # `<check> <compose-file> <label> [<instance-name>]`, with quoted
+      # arguments collapsed so a label carrying a space counts as one.
+      normalized="$(sed 's/"[^"]*"/ARG/g' <<<"$call")"
+      [ "$(wc -w <<<"$normalized")" -ge 4 ] \
+        || die "${script} installs at an explicit instance name but does not hand it to the leftover check: ${call}"
+    done < <(grep -hE '^[[:space:]]*(assert_no_leftover_containers|report_leftover_containers) ' "$path")
+  done
+  if [ "$checked" -eq 1 ]; then
+    ok "every harness installing at an explicit instance name hands it to the checks"
+  else
+    ok "no default-identity harness passes --instance-name, so the checks resolve from .env"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# The run-scoped teardown reports its own failures
+# ---------------------------------------------------------------------------
+#
+# `teardown_instance` sweeps four resource kinds, and no one failure may
+# stop the ones after it — a Compose `down` that errored is precisely
+# when the per-resource removals are worth running.  What it must not do
+# is return success anyway.  The leftover assertion that follows each
+# call site cannot cover for that: it reports what the label query
+# returns, and a query that could not reach the daemon returns nothing,
+# which reads there as a clean teardown.
+#
+# The function is `eval`'d out of the shipped script rather than
+# reimplemented here, so what is exercised is the code that runs.
+
+# Runs the shipped `teardown_instance` with the docker operations named
+# in `failing` returning non-zero.  Prints its status on the first line
+# and the operations it attempted on the second.
+run_teardown_instance() {
+  local failing="$1" status=0 dir
+  dir="$(mktemp -d "$WORK_DIR/teardown.XXXXXX")"
+  : >"$dir/docker-compose.yml"
+  : >"$WORK_DIR/teardown-ops.log"
+  (
+    RUN_LOG="$WORK_DIR/teardown-run.log"
+    COMPOSE_FILE_NAME="docker-compose.yml"
+    OPS_LOG="$WORK_DIR/teardown-ops.log"
+    FAILING_OPS=" $failing "
+
+    record_op() {
+      printf '%s\n' "$1" >>"$OPS_LOG"
+      case "$FAILING_OPS" in *" $1 "*) return 1 ;; esac
+      return 0
+    }
+
+    instance_compose() {
+      record_op compose
+    }
+
+    # A shell function outranks the `docker` stub on PATH, which answers
+    # only the queries the library itself makes.
+    docker() {
+      local op
+      case "${1:-}:${2:-}" in
+        ps:-aq) op=ps ;;
+        rm:*) op=rm ;;
+        volume:ls) op=volume-ls ;;
+        volume:rm) op=volume-rm ;;
+        network:ls) op=network-ls ;;
+        network:rm) op=network-rm ;;
+        *)
+          echo "unexpected docker call: $*" >&2
+          return 125
+          ;;
+      esac
+      record_op "$op" || return 1
+      case "$op" in
+        ps) printf 'c0ffee\n' ;;
+        volume-ls) printf 'v01\n' ;;
+        network-ls) printf 'n01\n' ;;
+      esac
+    }
+
+    eval "teardown_instance() {
+$(function_body teardown_instance "$IMPL_DIR/$RUN_SCOPED_SCRIPT")
+}"
+    teardown_instance "twoinst-a-t0k3n" "$dir"
+  ) || status=$?
+  printf '%s\n%s\n' "$status" "$(tr '\n' ' ' <"$WORK_DIR/teardown-ops.log" | sed 's/ *$//')"
+}
+
+ALL_TEARDOWN_OPS="compose ps rm volume-ls volume-rm network-ls network-rm"
+
+check_run_scoped_teardown() {
+  local result status ops failing
+  result="$(run_teardown_instance "")"
+  status="$(head -n 1 <<<"$result")"
+  ops="$(tail -n +2 <<<"$result")"
+  [ "$status" -eq 0 ] || die "a teardown whose every step succeeded returned ${status}"
+  [ "$ops" = "$ALL_TEARDOWN_OPS" ] \
+    || die "the teardown attempted '${ops}', expected '${ALL_TEARDOWN_OPS}'"
+  ok "a teardown whose every step succeeded returns 0, having swept all four resource kinds"
+
+  # Each removal failing on its own: the status has to come back
+  # non-zero, and the kinds after it have to have been attempted anyway.
+  for failing in compose rm volume-rm network-rm; do
+    result="$(run_teardown_instance "$failing")"
+    status="$(head -n 1 <<<"$result")"
+    ops="$(tail -n +2 <<<"$result")"
+    [ "$status" -ne 0 ] \
+      || die "a teardown whose ${failing} failed returned 0"
+    [ "$ops" = "$ALL_TEARDOWN_OPS" ] \
+      || die "a failed ${failing} stopped the sweep: attempted '${ops}'"
+  done
+  ok "a failed removal returns non-zero and does not stop the kinds after it"
+
+  # A query that cannot reach the daemon reports no resources, which is
+  # indistinguishable from a clean sweep to everything except this.
+  result="$(run_teardown_instance "ps")"
+  [ "$(head -n 1 <<<"$result")" -ne 0 ] \
+    || die "a teardown whose container query failed returned 0"
+  [ "$(tail -n +2 <<<"$result")" = "compose ps volume-ls volume-rm network-ls network-rm" ] \
+    || die "a failed container query did not leave the later kinds attempted"
+  ok "a failed label query fails the teardown rather than reading as nothing to remove"
+}
+
+# Every call site has to act on that status, which is not visible in the
+# function merely returning it.
+check_run_scoped_teardown_wiring() {
+  local path="$IMPL_DIR/$RUN_SCOPED_SCRIPT" call handled
+  while IFS= read -r call; do
+    case "$call" in
+      *'|| {' | *'\') ;;
+      *) die "${RUN_SCOPED_SCRIPT}: a teardown_instance call ignores its status: ${call}" ;;
+    esac
+    handled="$(grep -A3 -F "$call" "$path" | tail -n +2)"
+    grep -qE 'cleanup_status=1|fail ' <<<"$handled" \
+      || die "${RUN_SCOPED_SCRIPT}: a failed teardown_instance neither fails the run nor folds into the cleanup status: ${call}"
+  done < <(grep -E '^[[:space:]]+teardown_instance ' "$path")
+  ok "every teardown_instance call fails the run or folds into the cleanup status"
+}
+
 check_cleanup_guard() {
   local script path cleanup_body guard_line line
   for script in "${DEFAULT_IDENTITY_SCRIPTS[@]}"; do
@@ -681,6 +879,9 @@ check_ownership_flag
 check_cleanup_ownership
 check_cleanup_status
 check_harness_wiring
+check_explicit_instance_wiring
+check_run_scoped_teardown
+check_run_scoped_teardown_wiring
 check_startup_ordering
 check_cleanup_guard
 

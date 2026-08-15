@@ -141,21 +141,38 @@ dotenv_lookup() {
 # after, for the install the given compose file belongs to.
 #
 # Resolved as `resolve_recorded_instance_name`
-# (`src/commands/compose_project.rs`) resolves it: `--instance-name`,
-# which no harness passes, then `BOOTROOT_INSTANCE` as recorded in the
-# compose directory's `.env`, then the default identity.
+# (`src/commands/compose_project.rs`) resolves it, in the same order:
+# the `--instance-name` the install was given, passed here as the
+# optional second argument and empty where there was none, then
+# `BOOTROOT_INSTANCE` as recorded in the compose directory's `.env`,
+# then the default identity.
+#
+# No harness passes `--instance-name` today, so every one of them leaves
+# that argument empty.  The precedence is implemented rather than
+# assumed away because the first harness to take an instance name would
+# otherwise have the check read the identity of an install it did not
+# make, and pass on a host carrying exactly the leftovers it exists to
+# report.  The wiring is enforced from the other side too:
+# `validate-e2e-leftover-check.sh` fails a harness that passes
+# `--instance-name` without handing the same value to the checks.
 #
 # Deliberately not `${BOOTROOT_INSTANCE:-bootroot}` out of the invoking
 # environment.  That expansion happens to give the right answer today
 # only because every harness using this runs at the default identity,
-# and it stops the moment one of them takes an instance name.
+# and it stops the moment one of them takes an instance name — and an
+# explicit name belongs to the install invocation carrying it, not to
+# whatever the invoking shell happened to export.
 # `COMPOSE_PROJECT_NAME` is not consulted at all: it selects a project
 # for one invocation and is not an identity, and the harness sets it to
 # values that are not valid instance names.
 #
 # Returns non-zero, printing nothing, when the `.env` cannot be parsed.
 resolve_recorded_instance_name() {
-  local compose_dir="$1" env_file recorded
+  local compose_dir="$1" explicit="${2:-}" env_file recorded
+  if [ -n "$explicit" ]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
   env_file="$compose_dir/.env"
   if [ -f "$env_file" ]; then
     recorded="$(dotenv_lookup "$env_file" BOOTROOT_INSTANCE)" || return 1
@@ -224,10 +241,13 @@ stack_owned() {
 # cannot proceed — container names are global to the daemon, so `up`
 # would collide — and failing here costs a message instead of a
 # confusing failure twenty minutes in, or a deleted install.
+#
+# The optional third argument is the `--instance-name` the harness
+# installs at, empty where it declares none.
 assert_no_leftover_containers() {
-  local compose_file="$1" label="$2" compose_dir instance leftovers
+  local compose_file="$1" label="$2" explicit="${3:-}" compose_dir instance leftovers
   compose_dir="$(compose_file_dir "$compose_file")"
-  if ! instance="$(resolve_recorded_instance_name "$compose_dir")"; then
+  if ! instance="$(resolve_recorded_instance_name "$compose_dir" "$explicit")"; then
     fail "cannot read the instance name from ${compose_dir}/.env; it records the identity every bootroot container is named after"
   fi
   leftovers="$(_bootroot_leftovers_line "$instance")"
@@ -246,10 +266,15 @@ assert_no_leftover_containers() {
 # Returns non-zero when there are any, so an EXIT trap can fold that
 # into its status rather than exiting from inside itself and dropping
 # the reason the run failed.
+#
+# Takes the same optional explicit instance name its start-of-run
+# counterpart does, and has to be given the same value: a run that
+# checked one identity on the way in and another on the way out would
+# report neither.
 report_leftover_containers() {
-  local compose_file="$1" label="$2" compose_dir instance leftovers
+  local compose_file="$1" label="$2" explicit="${3:-}" compose_dir instance leftovers
   compose_dir="$(compose_file_dir "$compose_file")"
-  if ! instance="$(resolve_recorded_instance_name "$compose_dir")"; then
+  if ! instance="$(resolve_recorded_instance_name "$compose_dir" "$explicit")"; then
     echo "[${label}] cannot read the instance name from ${compose_dir}/.env; leftover containers were not checked for" >&2
     return 1
   fi
