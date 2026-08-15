@@ -98,13 +98,70 @@ and picks free host ports itself, and every teardown and leftover check is
 scoped to those exact names — it is safe to run on a host that already has a
 default `bootroot` install.
 
+### Two lifecycle runs can share a host
+
+`run-local-lifecycle.sh` and `run-remote-lifecycle.sh` derive their whole
+identity per run, so a second run — another worktree, another agent session,
+a developer checking something by hand — no longer has to wait for the first
+to finish. Each run:
+
+- derives an instance name from its artifact directory's basename and its own
+  pid, prefixed `e2e-local-` or `e2e-remote-` and cut to the 39 characters
+  `infra install` accepts. The pid sits at the tail, which is the part the cut
+  keeps, so two runs whose artifact basenames agree still get different names.
+- hands that name to `infra install --instance-name` and exports it as
+  `BOOTROOT_INSTANCE`, so Compose and the binary name every container
+  identically. `--instance-name` also fixes the Compose project: an explicitly
+  named install resolves its project *to* the instance name, so the two are one
+  string. The run reads that back off a real container's
+  `com.docker.compose.project` label rather than assuming it.
+- picks four free `127.0.0.1` ports and passes them to `infra install` as
+  `--postgres-host-port`, `--openbao-host-port`, `--stepca-host-port` and
+  `--http01-admin-host-port`, so the `.env` the install writes records them for
+  every later `bootroot` invocation in the same run.
+- records the instance, the project and the four ports in
+  `<artifact dir>/run-identity.json`, so a failed run can be read afterwards.
+
+`hosts` mode still has to be serialised. The marker each script writes into
+`/etc/hosts` is a fixed literal, and rewriting that file is an unlocked
+read-modify-write on state the whole machine shares — which no spelling of the
+marker fixes.
+
+### Collecting the runs that were killed
+
+Unique naming costs the accident that used to clean up after a killed run:
+nothing is ever named the same as its leftovers again, so no later run tears
+them down on the way in, and they would otherwise accumulate for as long as
+the machine runs.
+
+Each run records its liveness explicitly instead. On start it writes
+`${TMPDIR:-/tmp}/bootroot-e2e-runs/<instance>` holding its own pid and its
+Compose project, and on the way out it removes that file — only ever the one
+recording its own pid. Before doing any work it reads every marker in that
+directory, skips the ones whose pid is still alive, and for each dead one
+removes that instance's nine container names along with the volumes and
+networks carrying its project label, then drops the marker. A marker it could
+not fully collect survives, so the next run retries rather than stranding what
+was left.
+
+A recycled pid can spare a dead run's containers for one further run, which is
+acceptable: the next run collects them and nothing is removed wrongly. The
+sweep never matches a prefix or a wildcard — `bootroot-*` would reach into a
+real default-identity install on the same host — so it can only touch
+instances a run recorded.
+
+`scripts/validate-e2e-run-scope.sh` covers the derivation, the markers and the
+sweep without Docker, and runs in the `check` CI job.
+
 ### Leftover containers fail a run before it starts
 
-Every other harness installs at the default identity, so its containers are
-named after whatever the compose directory's `.env` records — `bootroot-*`
-unless an install recorded something else. Those names are global to the
-Docker daemon, so two such runs, or one such run and a real install, cannot
-share a host: they collide on `container_name` at `up`.
+The remaining harnesses install at the default identity, so their containers
+are named after whatever the compose directory's `.env` records — `bootroot-*`
+unless an install recorded something else. The two lifecycle scripts install
+at the derived instance above and hand that name to the same check. Either
+way the names are global to the Docker daemon, so two runs sharing a name, or
+one such run and a real install, cannot share a host: they collide on
+`container_name` at `up`.
 
 Each of them therefore asserts, before doing any work, that none of the nine
 container names bootroot creates (`-openbao`, `-postgres`, `-ca`, `-http01`,

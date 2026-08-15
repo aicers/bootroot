@@ -55,6 +55,12 @@ cd "$ROOT_DIR"
 # installing at the default identity run.
 # shellcheck source=lib/leftovers.sh
 . "$SCRIPT_DIR/lib/leftovers.sh"
+# The free-host-port allocator this script used to carry its own copy
+# of.  The lifecycle harnesses pick their four published ports the same
+# way, for the same reason: two stacks on one host cannot both publish
+# `127.0.0.1:8200`.
+# shellcheck source=lib/ports.sh
+. "$SCRIPT_DIR/lib/ports.sh"
 
 # ---------------------------------------------------------------------------
 # Ambient environment sanitisation
@@ -139,12 +145,10 @@ CURRENT_PHASE="startup"
 RUN_ROOT=""
 DIR_A=""
 DIR_B=""
-PORTS_TAKEN=""
 # Image used by the throwaway sentinel containers and by the cleanup
 # chown fallback.  Resolved from a running container of the run's own
 # stack so no extra image has to be present under `--no-build`.
 HELPER_IMAGE=""
-PYTHON_BIN=""
 
 PORT_A_POSTGRES=0
 PORT_A_OPENBAO=0
@@ -212,9 +216,6 @@ ensure_prerequisites() {
   command -v jq >/dev/null 2>&1 || fail "jq is required"
   command -v curl >/dev/null 2>&1 || fail "curl is required"
   [ -x "$BOOTROOT_BIN" ] || fail "bootroot binary not executable: $BOOTROOT_BIN"
-  if command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN="$(command -v python3)"
-  fi
   [ -n "$RUN_TOKEN" ] || fail "RUN_TOKEN reduced to the empty string; supply a token of [a-z0-9]"
   local name
   for name in "$INSTANCE_A" "$INSTANCE_B"; do
@@ -222,53 +223,6 @@ ensure_prerequisites() {
       fail "derived instance name '${name}' exceeds the ${MAX_INSTANCE_NAME_LEN}-character limit; shorten RUN_TOKEN"
     fi
   done
-}
-
-port_is_taken() {
-  local port="$1" taken
-  for taken in $PORTS_TAKEN; do
-    [ "$taken" = "$port" ] && return 0
-  done
-  return 1
-}
-
-# Picks a free host port on 127.0.0.1 into `PICKED_PORT`.
-#
-# Prefers the bind-to-port-0 allocation `free_port` in
-# tests/bootroot_cli.rs uses: the kernel hands back a port that was free
-# at that instant.  Without python3 the fallback probes a randomised
-# high range instead.  Either way the allocation is advisory — `infra
-# install` binds every published port up front and aborts with `host
-# port <addr> is already in use`, and surfacing that failure is the
-# contract here rather than adding a second timeout layer.  Neither
-# branch ever waits on an occupied port.
-#
-# The result travels through a global rather than stdout because the
-# already-handed-out list has to survive the call, and a command
-# substitution would keep it inside a subshell.
-PICKED_PORT=0
-pick_free_port() {
-  local attempt port
-  for attempt in $(seq 1 200); do
-    if [ -n "$PYTHON_BIN" ]; then
-      port="$("$PYTHON_BIN" -c 'import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()')"
-    else
-      port=$((20000 + RANDOM % 30000))
-      if bash -c ": >/dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
-        continue
-      fi
-    fi
-    if [ -n "$port" ] && ! port_is_taken "$port"; then
-      PORTS_TAKEN="$PORTS_TAKEN $port"
-      PICKED_PORT="$port"
-      return 0
-    fi
-  done
-  fail "could not allocate a free host port after 200 attempts"
 }
 
 # Allocated per instance immediately before that instance's install.  The
