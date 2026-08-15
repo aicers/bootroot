@@ -30,6 +30,25 @@
 # `assert_no_project_leftovers` additionally needs `pass`, which reports
 # a satisfied assertion.
 #
+# The start-of-run assertion runs *before* the start-of-run teardown,
+# and before anything else that could remove a container.  A harness
+# tears down with `down -v --remove-orphans` at the Compose project it
+# was given, which for a default-identity harness is the same project a
+# real install on this host holds; running it first would delete that
+# install, volumes and all, and leave the assertion looking at a daemon
+# it had just cleaned.  The one case the reversed order would have
+# handled silently — a killed run's leftovers under the project this run
+# happens to use — is precisely the one the assertion exists to report,
+# because nothing can tell those apart from an install.  The teardown
+# still follows, for the volumes, networks and orphans the assertion
+# does not look at.
+#
+# Which side of that assertion a harness is on is what `mark_stack_owned`
+# records.  Until it is called, the harness has taken nothing over, and
+# its EXIT trap must not tear anything down: a startup assertion that
+# aborted because a real install is here would otherwise have `cleanup`
+# remove on the way out exactly what it refused to touch on the way in.
+#
 # The end-of-run half is deliberately split into `report_*` functions
 # that print and return non-zero rather than aborting, so an EXIT trap
 # can fold the result into the status the run already carried:
@@ -38,8 +57,10 @@
 #     local status=$?
 #     local teardown_status=0
 #     capture_artifacts
-#     compose_down || teardown_status=1
-#     report_leftover_containers "$COMPOSE_FILE" cleanup || teardown_status=1
+#     if stack_owned; then
+#       compose_down || teardown_status=1
+#       report_leftover_containers "$COMPOSE_FILE" cleanup || teardown_status=1
+#     fi
 #     exit_with_cleanup_status "$status" "$teardown_status"
 #   }
 #
@@ -171,15 +192,38 @@ _bootroot_leftovers_line() {
   bootroot_leftover_containers "$1" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 
+# Whether the harness has taken the stack over.
+#
+# A default-identity harness shares its Compose project, and every
+# container name it uses, with any real install on the host.  Nothing it
+# runs may remove a container until the startup assertion has said there
+# was none to begin with — which is exactly what this records.
+BOOTROOT_STACK_OWNED=0
+
+# Declares the stack the harness's to remove, from here to the end of
+# the run.  Called once, immediately after the startup assertion passes.
+mark_stack_owned() {
+  BOOTROOT_STACK_OWNED=1
+}
+
+# True once `mark_stack_owned` has run.  An EXIT trap firing before that
+# must leave every container on the host alone: the run created none, and
+# what is here is someone else's.
+stack_owned() {
+  [ "${BOOTROOT_STACK_OWNED:-0}" -eq 1 ]
+}
+
 # Aborts the run when any container bootroot creates at the resolved
 # identity already exists.
 #
-# Called at the start of a run, after the start-of-run teardown has had
-# its chance: what survives that is either a killed run's leftovers,
-# whose Compose project no later run knows to ask about, or a real
-# install on this host.  Either way the run cannot proceed — container
-# names are global to the daemon, so `up` would collide — and failing
-# here costs a message instead of a confusing failure twenty minutes in.
+# Called at the start of a run, before the start-of-run teardown and
+# before anything else that could remove a container: what is here is
+# either a killed run's leftovers, whose Compose project no later run
+# knows to ask about, or a real install on this host, and the two are
+# indistinguishable to anything but the operator.  Either way the run
+# cannot proceed — container names are global to the daemon, so `up`
+# would collide — and failing here costs a message instead of a
+# confusing failure twenty minutes in, or a deleted install.
 assert_no_leftover_containers() {
   local compose_file="$1" label="$2" compose_dir instance leftovers
   compose_dir="$(compose_file_dir "$compose_file")"

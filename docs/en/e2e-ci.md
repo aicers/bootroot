@@ -106,16 +106,28 @@ unless an install recorded something else. Those names are global to the
 Docker daemon, so two such runs, or one such run and a real install, cannot
 share a host: they collide on `container_name` at `up`.
 
-Each of them therefore tears the stack down before doing any work and then
-asserts that none of the nine container names bootroot creates
-(`-openbao`, `-postgres`, `-ca`, `-http01`, `-prometheus`, `-grafana`,
-`-grafana-public`, `-openbao-agent-stepca`, `-openbao-agent-responder`)
-exists at the resolved instance name. A run killed with `SIGKILL` never
-reaches its own cleanup, and the containers it leaves behind carry a Compose
-project label no later run knows to ask about, which is why the check is by
-name rather than by label. The failure names what it found and the
-`docker rm -f` line that removes it; establish whether it is a killed run's
-leftovers or an install you need before running that line.
+Each of them therefore asserts, before doing any work, that none of the nine
+container names bootroot creates (`-openbao`, `-postgres`, `-ca`, `-http01`,
+`-prometheus`, `-grafana`, `-grafana-public`, `-openbao-agent-stepca`,
+`-openbao-agent-responder`) exists at the resolved instance name. A run
+killed with `SIGKILL` never reaches its own cleanup, and the containers it
+leaves behind carry a Compose project label no later run knows to ask about,
+which is why the check is by name rather than by label. The failure names
+what it found and the `docker rm -f` line that removes it; establish whether
+it is a killed run's leftovers or an install you need before running that
+line.
+
+The assertion comes first, ahead of the start-of-run teardown rather than
+after it. That teardown is a `down -v --remove-orphans` at a Compose project
+a real install on the same host holds too, so running it first would delete
+that install, volumes and all, and leave the assertion reading a daemon it
+had just cleaned. Nothing can tell such an install apart from a killed run's
+leftovers — that is what the message asks you to establish — so the harness
+removes neither. Only once the assertion has passed does the harness take
+the stack over: the teardown that follows it is there for the volumes,
+networks and orphans the assertion does not look at, and the EXIT trap
+removes nothing before that point, so a run that stopped at the assertion
+leaves the host exactly as it found it.
 
 The same check runs again in `cleanup`, where a leftover fails the run — a
 harness that leaves its own garbage behind is broken — without replacing the

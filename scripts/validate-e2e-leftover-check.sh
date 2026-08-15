@@ -355,6 +355,86 @@ check_project_check() {
 }
 
 # ---------------------------------------------------------------------------
+# The ownership boundary
+# ---------------------------------------------------------------------------
+#
+# A default-identity harness shares its Compose project, and every
+# container name it uses, with a real install on the same host.  Until
+# the startup assertion has said there was nothing here, nothing the
+# harness runs may remove a container — an EXIT trap firing on that very
+# assertion least of all.
+
+check_ownership_flag() {
+  ( stack_owned ) \
+    && die "the stack reads as owned before the startup assertion has run"
+  ( mark_stack_owned && stack_owned ) \
+    || die "the stack does not read as owned after mark_stack_owned"
+  # A subshell cannot mark it for its parent, which is why the harnesses
+  # call it from `main` rather than from anything `main` calls.
+  ( mark_stack_owned ) >/dev/null 2>&1
+  ( stack_owned ) && die "mark_stack_owned leaked out of a subshell"
+  ok "the stack reads as unowned until mark_stack_owned runs"
+}
+
+# Runs the cleanup shape every harness now carries, with `owned`
+# deciding whether the run had got past its startup assertion.  Records
+# what the teardown did, and prints the status the trap exited with.
+simulate_cleanup() {
+  local owned="$1" entry_status="$2" teardown_status="$3" leftover="$4"
+  : >"$WORK_DIR/teardown.log"
+  (
+    compose_down() {
+      echo "compose_down" >>"$WORK_DIR/teardown.log"
+      return "$teardown_status"
+    }
+    report_leftover_containers() {
+      echo "report" >>"$WORK_DIR/teardown.log"
+      return "$leftover"
+    }
+    if [ "$owned" = "owned" ]; then
+      mark_stack_owned
+    fi
+    local cleanup_status=0
+    if stack_owned; then
+      compose_down || cleanup_status=1
+      report_leftover_containers "a-compose-file" "a-label" || cleanup_status=1
+    fi
+    exit_with_cleanup_status "$entry_status" "$cleanup_status"
+  )
+}
+
+expect_simulated_cleanup() {
+  local description="$1" owned="$2" entry="$3" teardown="$4" leftover="$5"
+  local expected_status="$6" expected_log="$7" actual=0 actual_log
+  simulate_cleanup "$owned" "$entry" "$teardown" "$leftover" || actual=$?
+  actual_log="$(tr '\n' ' ' <"$WORK_DIR/teardown.log" | sed 's/ *$//')"
+  [ "$actual" -eq "$expected_status" ] \
+    || die "${description}: exited ${actual}, expected ${expected_status}"
+  [ "$actual_log" = "$expected_log" ] \
+    || die "${description}: teardown did '${actual_log}', expected '${expected_log}'"
+  ok "${description}"
+}
+
+check_cleanup_ownership() {
+  # The case the boundary exists for: the startup assertion aborted
+  # because a real install is on this host, and the trap it fires must
+  # not remove on the way out what the assertion refused to touch on the
+  # way in.
+  expect_simulated_cleanup \
+    "a cleanup before the startup assertion passed tears nothing down" \
+    unowned 1 0 0 1 ""
+  expect_simulated_cleanup \
+    "a cleanup after it tears down and checks what the teardown left" \
+    owned 0 0 0 0 "compose_down report"
+  expect_simulated_cleanup \
+    "a failed teardown fails a run that had passed" \
+    owned 0 1 0 1 "compose_down report"
+  expect_simulated_cleanup \
+    "a leftover fails a run that had passed" \
+    owned 0 0 1 1 "compose_down report"
+}
+
+# ---------------------------------------------------------------------------
 # The status-preserving cleanup shape
 # ---------------------------------------------------------------------------
 
@@ -416,7 +496,7 @@ check_harness_wiring() {
       || die "${script} has no start-of-run teardown"
     grep -q 'down -v --remove-orphans >>"\$RUN\(NER\)\?_LOG" 2>&1' "$IMPL_DIR/$script" \
       || die "${script}'s teardown does not send its output to the run log"
-    grep -q '^  if ! compose_down; then$' "$IMPL_DIR/$script" \
+    grep -q '^    if ! compose_down; then$' "$IMPL_DIR/$script" \
       || die "${script}'s cleanup does not fail the run on a failed teardown"
   done
   ok "every default-identity harness tears down and checks at the start, and reports at the end"
@@ -449,12 +529,159 @@ check_harness_wiring() {
   ok "no teardown sends its output to /dev/null"
 }
 
+# ---------------------------------------------------------------------------
+# The assertion runs before anything can remove a container
+# ---------------------------------------------------------------------------
+#
+# That the two calls exist says nothing about their order, and the order
+# is the whole safety property.  A default-identity harness tears down
+# with `down -v --remove-orphans` at a Compose project a real install on
+# the host holds too; run before the assertion, it deletes that install,
+# volumes and all, and the assertion then reads a daemon it had just
+# cleaned and lets the run proceed.  The containers the check exists to
+# report — a killed run's — carry that same project label, so nothing
+# can spare one while removing the other.
+#
+# What is checked is therefore reachability, not just line order: no
+# function `main` calls ahead of the assertion may remove a container,
+# however deep.  `trap` lines are exempt and checked separately, because
+# an EXIT trap firing before the assertion is what the ownership flag
+# governs.
+
+# Anything that can remove a container or a volume.
+DESTRUCTIVE_RE='compose_down|down -v|docker[[:space:]]+(rm|kill)|docker[[:space:]]+(volume|network)[[:space:]]+rm'
+
+# Prints the body of the shell function `name` defines in `file`.
+function_body() {
+  awk -v want="$1() {" '
+    $0 == want { inside = 1; next }
+    inside && $0 == "}" { inside = 0 }
+    inside { print }
+  ' "$2"
+}
+
+# Prints every function name `file` defines.
+defined_functions() {
+  sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)() {$/\1/p' "$1"
+}
+
+# Prints `chunk` with comment and `trap` lines removed.
+executable_lines() {
+  grep -vE '^[[:space:]]*(#|trap )' <<<"$1" || true
+}
+
+# True when `chunk` invokes the function `name`.
+calls_function() {
+  executable_lines "$1" \
+    | grep -qE "(^|[^[:alnum:]_./\"-])${2}([[:space:]]|\)|;|\"|$)"
+}
+
+# Prints every function of `file` that `chunk` can reach, transitively.
+reachable_functions() {
+  local file="$1" chunk="$2" all name candidate body pending="" seen=" "
+  all="$(defined_functions "$file")"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if calls_function "$chunk" "$name"; then
+      pending="$pending $name"
+    fi
+  done <<<"$all"
+  while [ -n "${pending// /}" ]; do
+    # shellcheck disable=SC2086 # a worklist of shell identifiers
+    set -- $pending
+    name="$1"
+    shift
+    pending="$*"
+    case "$seen" in *" $name "*) continue ;; esac
+    seen="$seen$name "
+    body="$(function_body "$name" "$file")"
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      case "$seen" in *" $candidate "*) continue ;; esac
+      if calls_function "$body" "$candidate"; then
+        pending="$pending $candidate"
+      fi
+    done <<<"$all"
+  done
+  printf '%s\n' "$seen"
+}
+
+check_startup_ordering() {
+  local script path main_body assert_line mark_line down_line prefix name
+  for script in "${DEFAULT_IDENTITY_SCRIPTS[@]}"; do
+    path="$IMPL_DIR/$script"
+    main_body="$(function_body main "$path")"
+    [ -n "$main_body" ] || die "${script} defines no main"
+
+    # Each `|| true` keeps a missing call reportable: without it the
+    # failing `grep` would take the whole script down under `set -e`,
+    # before the `die` below could say which call is gone.
+    assert_line="$(grep -n '^  assert_no_leftover_containers ' <<<"$main_body" \
+      | head -n 1 | cut -d: -f1)" || true
+    mark_line="$(grep -n '^  mark_stack_owned$' <<<"$main_body" \
+      | head -n 1 | cut -d: -f1)" || true
+    down_line="$(grep -n '^  compose_down || true$' <<<"$main_body" \
+      | head -n 1 | cut -d: -f1)" || true
+    [ -n "$assert_line" ] || die "${script}: main does not run the startup check"
+    [ -n "$mark_line" ] || die "${script}: main never takes the stack over"
+    [ -n "$down_line" ] || die "${script}: main has no start-of-run teardown"
+    [ "$assert_line" -lt "$mark_line" ] \
+      || die "${script}: the stack is taken over before the startup check"
+    [ "$mark_line" -lt "$down_line" ] \
+      || die "${script}: the start-of-run teardown runs unowned"
+
+    prefix="$(head -n "$((assert_line - 1))" <<<"$main_body")"
+    if executable_lines "$prefix" | grep -qE "$DESTRUCTIVE_RE"; then
+      die "${script}: main removes a container before the startup check"
+    fi
+    for name in $(reachable_functions "$path" "$prefix"); do
+      if executable_lines "$(function_body "$name" "$path")" \
+        | grep -qE "$DESTRUCTIVE_RE"; then
+        die "${script}: ${name}, reached before the startup check, removes a container"
+      fi
+    done
+  done
+  ok "the startup check runs before the teardown, and before anything main reaches can remove a container"
+}
+
+check_cleanup_guard() {
+  local script path cleanup_body guard_line line
+  for script in "${DEFAULT_IDENTITY_SCRIPTS[@]}"; do
+    path="$IMPL_DIR/$script"
+    cleanup_body="$(function_body cleanup "$path")"
+    [ -n "$cleanup_body" ] || die "${script} defines no cleanup"
+    guard_line="$(grep -n '^  if stack_owned; then$' <<<"$cleanup_body" \
+      | head -n 1 | cut -d: -f1)" || true
+    [ -n "$guard_line" ] \
+      || die "${script}: cleanup tears down whether or not the run owns the stack"
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      [ "$line" -gt "$guard_line" ] \
+        || die "${script}: cleanup removes a container outside the ownership guard"
+    done < <(grep -nE "$DESTRUCTIVE_RE" <<<"$cleanup_body" | cut -d: -f1)
+    grep -q '^    report_leftover_containers ' <<<"$cleanup_body" \
+      || die "${script}: cleanup checks for leftovers outside the ownership guard"
+  done
+  ok "no cleanup tears anything down before the startup check has passed"
+
+  # The run-scoped harness needs no such guard: its instances, its
+  # containers and its Compose projects all carry a per-run token, so
+  # there is nothing of anyone else's for its teardown to reach.
+  ! grep -q 'stack_owned' "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
+    || die "${RUN_SCOPED_SCRIPT} took on an ownership guard it does not need"
+  ok "the run-scoped harness needs no ownership guard, and has none"
+}
+
 check_suffixes_match_the_rust_enum
 check_instance_name_resolution
 install_docker_stub
 check_container_check
 check_project_check
+check_ownership_flag
+check_cleanup_ownership
 check_cleanup_status
 check_harness_wiring
+check_startup_ordering
+check_cleanup_guard
 
 echo "[$LABEL] OK: the E2E teardown assertions hold"

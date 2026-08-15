@@ -215,12 +215,17 @@ cleanup() {
   local cleanup_status=0
   log_phase "cleanup"
   capture_artifacts
-  if ! compose_down; then
-    echo "run-openbao-tls-no-delta: teardown failed; see ${RUN_LOG}" >&2
-    cleanup_status=1
+  # Nothing is torn down before the startup assertion passed: what is on
+  # this host then belongs to whoever put it there, and removing it is
+  # exactly what the assertion refused to do.
+  if stack_owned; then
+    if ! compose_down; then
+      echo "run-openbao-tls-no-delta: teardown failed; see ${RUN_LOG}" >&2
+      cleanup_status=1
+    fi
+    report_leftover_containers "$COMPOSE_FILE" "run-openbao-tls-no-delta cleanup" || cleanup_status=1
   fi
   restore_repo_openbao_config
-  report_leftover_containers "$COMPOSE_FILE" "run-openbao-tls-no-delta cleanup" || cleanup_status=1
   exit_with_cleanup_status "$status" "$cleanup_status"
 }
 
@@ -519,11 +524,19 @@ main() {
 
   ensure_prerequisites
   ensure_bind_host_available "$OPENBAO_BIND_HOST" OPENBAO_BIND_HOST
-  # A start-of-run teardown may legitimately find nothing to do, so its
-  # status is not fatal — what matters is what it leaves behind, which
-  # the assertion below reads.
-  compose_down || true
+  # The assertion comes first, before the teardown and before anything
+  # else that could remove a container.  A `down -v` at this project
+  # would take a real install on this host with it, volumes and all, and
+  # leave the check reading a daemon it had just cleaned — and a killed
+  # run's leftovers, which the check exists to report, are
+  # indistinguishable from that install to everything but an operator.
   assert_no_leftover_containers "$COMPOSE_FILE" "run-openbao-tls-no-delta startup"
+  # Past the assertion nothing here is anyone else's, so the stack
+  # becomes this run's to remove.  The teardown takes the volumes,
+  # networks and orphans the assertion does not look at, and may
+  # legitimately find nothing to do, so its status is not fatal.
+  mark_stack_owned
+  compose_down || true
   snapshot_repo_openbao_config
 
   log_phase "install"
