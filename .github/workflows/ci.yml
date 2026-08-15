@@ -139,6 +139,9 @@ jobs:
       - name: Validate Compose Instance Names
         run: ./scripts/validate-compose-instance-names.sh
 
+      - name: Validate E2E OpenSSL Compatibility
+        run: ./scripts/validate-e2e-openssl-compat.sh
+
       - name: Install cargo-audit
         run: cargo install cargo-audit || true
 

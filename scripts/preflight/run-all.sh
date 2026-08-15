@@ -14,6 +14,9 @@ echo "--- validate-deploy-compose.sh ---"
 echo "--- validate-compose-instance-names.sh ---"
 "$SCRIPT_DIR/../validate-compose-instance-names.sh"
 
+echo "--- validate-e2e-openssl-compat.sh ---"
+"$SCRIPT_DIR/../validate-e2e-openssl-compat.sh"
+
 echo "--- ci/deploy-no-build-smoke.sh ---"
 "$SCRIPT_DIR/ci/deploy-no-build-smoke.sh"
 

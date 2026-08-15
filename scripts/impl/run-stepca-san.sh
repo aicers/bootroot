@@ -150,11 +150,31 @@ run_bootroot() {
   ( cd "$WORKSPACE_DIR" && "$BOOTROOT_BIN" "$@" )
 }
 
+# Finding *an* `openssl` on PATH is not enough. macOS ships LibreSSL as
+# /usr/bin/openssl, and LibreSSL 3.3.6 has no `x509 -ext` — an OpenSSL
+# 1.1.1 addition, and how `assert_stepca_ip_san` below reads step-ca's
+# subjectAltName. Probe for that option rather than for the string
+# `OpenSSL` in `openssl version`: the harness needs the capability, not
+# a particular implementation, and a build that grows the option should
+# pass.
+ensure_openssl() {
+  local openssl_bin x509_help
+  openssl_bin="$(command -v openssl 2>/dev/null || true)"
+  [ -n "$openssl_bin" ] || fail "openssl is required"
+  # `x509 -help` exits non-zero on some builds (LibreSSL 3.3.6 does), so
+  # capture the text and let the match alone decide.  A here-string, not
+  # a pipe: `grep -q` exits on the first match, and under `pipefail` the
+  # writer's SIGPIPE would then fail the very check that just passed.
+  x509_help="$(openssl x509 -help 2>&1 || true)"
+  grep -qE '^[[:space:]]*-ext([[:space:]]|$)' <<<"$x509_help" || fail \
+    "openssl at ${openssl_bin} does not support 'x509 -ext', which this harness needs to read a certificate's subjectAltName; put a directory holding an openssl that supports it first on PATH"
+}
+
 ensure_prerequisites() {
   command -v docker >/dev/null 2>&1 || fail "docker is required"
   docker compose version >/dev/null 2>&1 || fail "docker compose is required"
   command -v jq >/dev/null 2>&1 || fail "jq is required"
-  command -v openssl >/dev/null 2>&1 || fail "openssl is required"
+  ensure_openssl
   command -v curl >/dev/null 2>&1 || fail "curl is required"
   [ -x "$BOOTROOT_BIN" ] || fail "bootroot binary not executable: $BOOTROOT_BIN"
 }

@@ -555,6 +555,7 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 | `scripts/preflight/ci/check.sh` | `ci.yml` → Quality Check |
 | `scripts/validate-deploy-compose.sh` | `ci.yml` → Validate Deploy Compose |
 | `scripts/validate-compose-instance-names.sh` | `ci.yml` → Validate Compose Instance Names |
+| `scripts/validate-e2e-openssl-compat.sh` | `ci.yml` → Validate E2E OpenSSL Compatibility |
 | `scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` → Deploy Compose No-Build Smoke |
 | `scripts/preflight/ci/test-core.sh` | `ci.yml` → test-core |
 | `scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` → test-docker-e2e-matrix |
@@ -586,7 +587,7 @@ scripts/preflight/run-all.sh
 
 이는 로컬 제약 우회용입니다. CI에서는 `hosts` 케이스도 실행됩니다.
 
-하네스는 호스트 도구 두 가지를 전제하며, 각 검사는 실행 도중이 아니라
+하네스는 호스트 도구 세 가지를 전제하며, 각 검사는 실행 도중이 아니라
 사전 조건 블록에서 실패합니다.
 
 - `run-reinit-recovery.sh`, `run-stepca-san.sh`,
@@ -601,6 +602,16 @@ scripts/preflight/run-all.sh
 - `run-remote-lifecycle.sh`는 원격 에이전트의 TOML 설정을 `tomllib`으로
   읽으므로 `python3`이 3.11 이상이어야 합니다. 사전 조건 블록에서
   컨테이너를 띄우기 전에 import를 확인합니다.
+- `PATH`에서 찾은 `openssl`은 `x509 -ext`를 지원해야 합니다.
+  `run-stepca-san.sh`가 step-ca의 `subjectAltName`을 이 옵션으로 읽기
+  때문입니다. 이 옵션은 OpenSSL 1.1.1에서 추가되었고, macOS가
+  `/usr/bin/openssl`로 제공하는 LibreSSL 3.3.6에는 없습니다. 검사는
+  구현체 이름이 아니라 옵션 지원 여부를 확인하며 찾은 실행 파일 경로를
+  함께 알립니다. 해결 방법은 해당 옵션을 지원하는 `openssl`이 있는
+  디렉터리를 `PATH` 앞에 두는 것입니다. `-ext`를 실제로 호출하는
+  스크립트는 하나뿐이지만 `openssl`을 검사하는 여섯 스크립트가 모두 이
+  검사를 수행합니다. 매트릭스의 모든 단계가 같은 호스트에서 실행되기
+  때문입니다.
 
 ## init 자동화 입출력 규칙
 
