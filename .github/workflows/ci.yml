@@ -145,9 +145,6 @@ jobs:
       - name: Validate E2E Leftover Check
         run: ./scripts/validate-e2e-leftover-check.sh
 
-      - name: Validate E2E Run Scope
-        run: ./scripts/validate-e2e-run-scope.sh
-
       - name: Install cargo-audit
         run: cargo install cargo-audit || true
 

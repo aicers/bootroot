@@ -759,10 +759,13 @@ fn build_ownership_sweep_args<'a>(
 /// already exists.
 ///
 /// `identity` is the one the caller just brought the stack up under, not
-/// a freshly resolved one: `infra install --instance-name` outranks the
-/// `COMPOSE_PROJECT_NAME` the resolver would otherwise return, so
-/// re-resolving here would probe a different project than `up` created
-/// and report step-ca as having no container.
+/// a freshly resolved one.  An install resolves its project and its
+/// instance once and then rewrites `<compose dir>/.env` with the
+/// instance it recorded, so a second resolution here would read inputs
+/// the run has since changed and could probe a project `up` never
+/// created — reporting step-ca as having no container.  Threading the
+/// resolved identity through is what keeps every call in one invocation
+/// addressing the same project and the same instance.
 fn resolve_stepca_image(
     compose_file: &Path,
     identity: &ComposeIdentity,
@@ -2179,9 +2182,10 @@ fn run_to_completion(
 /// rather than the one they were pointed at.
 ///
 /// `identity` is passed in rather than resolved here so a caller that
-/// already knows it — `infra install`, whose `--instance-name` outranks
-/// everything the resolver would consult — probes the same project it
-/// just brought the stack up under.
+/// already resolved one — `infra install`, which resolves its project
+/// and instance once and then records that instance in `.env` — probes
+/// the same project it just brought the stack up under, under the same
+/// instance, rather than whatever a second resolution would now return.
 pub(crate) fn docker_compose_output(
     compose_file: &Path,
     identity: &ComposeIdentity,

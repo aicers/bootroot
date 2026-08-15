@@ -256,7 +256,8 @@ pid가 살아 있는 것은 건너뛰고, 죽은 것은 그 인스턴스의 컨�
 그것을 잘라 버리게 되는 경로이기 때문입니다.
 
 `scripts/validate-e2e-run-scope.sh`가 Docker 없이 이름 생성, 마커, 수거,
-`hosts` 잠금을 모두 확인하며 `check` CI 잡에서 실행됩니다.
+`hosts` 잠금을 모두 확인합니다. 이 스크립트는 로컬 검사이며,
+`scripts/preflight/run-all.sh`가 실행하고 CI 워크플로에서는 실행되지 않습니다.
 
 ### 남은 컨테이너는 실행이 시작되기 전에 실패시킵니다
 
@@ -776,7 +777,6 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 | `scripts/validate-compose-instance-names.sh` | `ci.yml` → Validate Compose Instance Names |
 | `scripts/validate-e2e-openssl-compat.sh` | `ci.yml` → Validate E2E OpenSSL Compatibility |
 | `scripts/validate-e2e-leftover-check.sh` | `ci.yml` → Validate E2E Leftover Check |
-| `scripts/validate-e2e-run-scope.sh` | `ci.yml` → Validate E2E Run Scope |
 | `scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` → Deploy Compose No-Build Smoke |
 | `scripts/preflight/ci/test-core.sh` | `ci.yml` → test-core |
 | `scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` → test-docker-e2e-matrix |
@@ -786,10 +786,11 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 `Deploy Compose No-Build Smoke` 단계가 이 파일을 그대로 실행하므로 CI와
 어긋날 수 없습니다.
 
-로컬 전용 스크립트(`scripts/preflight/extra/`):
+로컬 전용 스크립트(어느 CI 워크플로에서도 실행되지 않습니다):
 
 | 스크립트 | 설명 |
 | --- | --- |
+| `scripts/validate-e2e-run-scope.sh` | 실행 범위 이름 생성, 마커, 수거, `hosts` 잠금 |
 | `scripts/preflight/extra/agent-scenarios.sh` | 에이전트 시나리오 |
 | `scripts/preflight/extra/cli-scenarios.sh` | CLI 시나리오 |
 

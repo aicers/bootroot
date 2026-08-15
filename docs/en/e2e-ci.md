@@ -260,7 +260,8 @@ world-writable directory is one a run's write would truncate wherever
 somebody else's link pointed.
 
 `scripts/validate-e2e-run-scope.sh` covers the derivation, the markers, the
-sweep and the `hosts` lock without Docker, and runs in the `check` CI job.
+sweep and the `hosts` lock without Docker. It is a local check, run by
+`scripts/preflight/run-all.sh` and not by any CI workflow.
 
 ### Leftover containers fail a run before it starts
 
@@ -793,7 +794,6 @@ Or run individual scripts:
 | `./scripts/validate-compose-instance-names.sh` | `ci.yml` Validate Compose Instance Names |
 | `./scripts/validate-e2e-openssl-compat.sh` | `ci.yml` Validate E2E OpenSSL Compatibility |
 | `./scripts/validate-e2e-leftover-check.sh` | `ci.yml` Validate E2E Leftover Check |
-| `./scripts/validate-e2e-run-scope.sh` | `ci.yml` Validate E2E Run Scope |
 | `./scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` Deploy Compose No-Build Smoke |
 | `./scripts/preflight/ci/test-core.sh` | `ci.yml` Unit & CLI Smoke |
 | `./scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` Docker E2E Matrix |
@@ -807,6 +807,7 @@ Local-only extras (not in any CI workflow):
 
 | Script | Description |
 | --- | --- |
+| `./scripts/validate-e2e-run-scope.sh` | Run-scope derivation, markers, sweep, `hosts` lock |
 | `./scripts/preflight/extra/agent-scenarios.sh` | Agent scenario tests |
 | `./scripts/preflight/extra/cli-scenarios.sh` | CLI scenario tests |
 
