@@ -96,13 +96,68 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 직접 고르며, 모든 정리와 잔여물 확인이 그 이름들로만 한정되므로 기본
 `bootroot` 설치본이 이미 있는 호스트에서도 안전하게 실행할 수 있습니다.
 
+### 라이프사이클 실행 두 개는 한 호스트를 공유할 수 있습니다
+
+`run-local-lifecycle.sh`와 `run-remote-lifecycle.sh`는 실행마다 아이덴티티
+전체를 스스로 만들어 냅니다. 그래서 두 번째 실행(다른 워크트리, 다른 에이전트
+세션, 손으로 무언가를 확인하는 개발자)이 첫 번째 실행이 끝나기를 기다릴 필요가
+없습니다. 각 실행은 다음을 수행합니다.
+
+- 아티팩트 디렉터리의 basename과 자신의 pid로 인스턴스 이름을 만듭니다.
+  앞에는 `e2e-local-` 또는 `e2e-remote-`가 붙고, `infra install`이 받아들이는
+  39자에 맞춰 잘립니다. pid는 꼬리에 있고 자르기가 남기는 쪽이 꼬리이므로,
+  아티팩트 basename이 같은 두 실행도 서로 다른 이름을 얻습니다.
+- 그 이름을 `infra install --instance-name`에 넘기고 `BOOTROOT_INSTANCE`로
+  내보내므로, Compose와 바이너리가 모든 컨테이너를 같은 이름으로 부릅니다.
+  `--instance-name`은 Compose 프로젝트도 함께 결정합니다. 이름이 명시된
+  설치는 프로젝트를 인스턴스 이름 *그 자체*로 해석하므로 둘은 하나의
+  문자열입니다. 실행은 그것을 가정하지 않고 실제 컨테이너의
+  `com.docker.compose.project` 레이블에서 다시 읽어 확인합니다.
+- 비어 있는 `127.0.0.1` 포트 네 개를 고르고 `--postgres-host-port`,
+  `--openbao-host-port`, `--stepca-host-port`, `--http01-admin-host-port`로
+  `infra install`에 넘깁니다. 그래야 설치가 쓰는 `.env`에 기록되어, 같은
+  실행의 이후 `bootroot` 호출이 모두 같은 포트를 해석합니다.
+- 인스턴스, 프로젝트, 포트 네 개를 `<아티팩트 디렉터리>/run-identity.json`에
+  기록하므로 실패한 실행도 나중에 읽을 수 있습니다.
+
+`hosts` 모드는 여전히 직렬로 실행해야 합니다. 각 스크립트가 `/etc/hosts`에
+쓰는 마커는 고정된 리터럴이고, 그 파일을 고쳐 쓰는 일은 머신 전체가 공유하는
+상태에 대한 잠금 없는 읽기-수정-쓰기입니다. 마커 철자를 바꾼다고 해결되지
+않습니다.
+
+### 종료된 실행을 수거합니다
+
+고유한 이름은 종료된 실행을 우연히 정리해 주던 효과를 잃게 합니다. 어떤
+것도 그 잔여물과 같은 이름을 다시 갖지 않으므로, 이후 어떤 실행도 시작할 때
+그것을 정리하지 않고, 그대로 두면 머신이 켜져 있는 내내 쌓입니다.
+
+그래서 각 실행은 자신의 생존을 명시적으로 기록합니다. 시작할 때
+`${TMPDIR:-/tmp}/bootroot-e2e-runs/<인스턴스>`에 자신의 pid와 Compose
+프로젝트를 쓰고, 끝날 때 그 파일을 지웁니다. 지우는 것은 오직 자신의 pid를
+기록한 파일뿐입니다. 어떤 작업을 하기 전에 그 디렉터리의 모든 마커를 읽어
+pid가 살아 있는 것은 건너뛰고, 죽은 것은 그 인스턴스의 컨테이너 아홉 개와
+그 프로젝트 레이블이 붙은 볼륨과 네트워크를 제거한 뒤 마커를 지웁니다.
+완전히 수거하지 못한 마커는 남으므로, 남은 것을 방치하지 않고 다음 실행이
+다시 시도합니다.
+
+재사용된 pid는 죽은 실행의 컨테이너를 한 번 더 살려 둘 수 있지만 이는
+받아들일 수 있습니다. 다음 실행이 수거하고, 잘못 제거되는 것은 없습니다.
+이 수거는 접두사나 와일드카드로 일치시키지 않습니다. `bootroot-*`는 같은
+호스트의 실제 기본 아이덴티티 설치본까지 닿기 때문이며, 따라서 실행이
+기록한 인스턴스에만 손댈 수 있습니다.
+
+`scripts/validate-e2e-run-scope.sh`가 Docker 없이 이름 생성, 마커, 수거를
+모두 확인하며 `check` CI 잡에서 실행됩니다.
+
 ### 남은 컨테이너는 실행이 시작되기 전에 실패시킵니다
 
-나머지 하네스는 모두 기본 아이덴티티로 설치하므로, 컨테이너 이름은
-compose 디렉터리의 `.env`에 기록된 값을 따릅니다. 설치가 다른 값을
-기록하지 않았다면 `bootroot-*`입니다. 이 이름들은 Docker 데몬 전체에서
-고유하므로 그런 실행 두 개, 또는 그런 실행 하나와 실제 설치본은 한
-호스트를 공유할 수 없습니다. `up` 시점에 `container_name`이 충돌합니다.
+나머지 하네스는 기본 아이덴티티로 설치하므로, 컨테이너 이름은 compose
+디렉터리의 `.env`에 기록된 값을 따릅니다. 설치가 다른 값을 기록하지 않았다면
+`bootroot-*`입니다. 라이프사이클 스크립트 두 개는 위에서 만든 인스턴스로
+설치하고 같은 확인에 그 이름을 넘깁니다. 어느 쪽이든 이름은 Docker 데몬
+전체에서 고유하므로 같은 이름을 쓰는 실행 두 개, 또는 그런 실행 하나와 실제
+설치본은 한 호스트를 공유할 수 없습니다. `up` 시점에 `container_name`이
+충돌합니다.
 
 그래서 각 하네스는 어떤 작업도 하기 전에, 해석된 인스턴스 이름으로
 bootroot가 만드는 아홉 개 컨테이너 이름
@@ -604,6 +659,8 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 | `scripts/validate-deploy-compose.sh` | `ci.yml` → Validate Deploy Compose |
 | `scripts/validate-compose-instance-names.sh` | `ci.yml` → Validate Compose Instance Names |
 | `scripts/validate-e2e-openssl-compat.sh` | `ci.yml` → Validate E2E OpenSSL Compatibility |
+| `scripts/validate-e2e-leftover-check.sh` | `ci.yml` → Validate E2E Leftover Check |
+| `scripts/validate-e2e-run-scope.sh` | `ci.yml` → Validate E2E Run Scope |
 | `scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` → Deploy Compose No-Build Smoke |
 | `scripts/preflight/ci/test-core.sh` | `ci.yml` → test-core |
 | `scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` → test-docker-e2e-matrix |
