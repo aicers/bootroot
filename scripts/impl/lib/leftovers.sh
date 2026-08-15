@@ -30,6 +30,16 @@
 # `assert_no_project_leftovers` additionally needs `pass`, which reports
 # a satisfied assertion.
 #
+# A query that could not run is never read as a clean host.  Every check
+# below distinguishes "the daemon holds none of these" from "the daemon
+# could not be asked", and treats the second as a failure of the check
+# itself: a stopped daemon, a socket the run cannot reach, or a refused
+# authorization would otherwise pass the startup assertion, hide behind
+# the start-of-run teardown's deliberate `|| true`, and surface as the
+# confusing mid-run failure all of this exists to replace.  Docker's own
+# diagnostics are left on stderr, where the harness's log picks them up
+# alongside the message saying which check could not run.
+#
 # The start-of-run assertion runs *before* the start-of-run teardown,
 # and before anything else that could remove a container.  A harness
 # tears down with `down -v --remove-orphans` at the Compose project it
@@ -184,29 +194,50 @@ resolve_recorded_instance_name() {
   printf '%s\n' "$BOOTROOT_DEFAULT_INSTANCE_NAME"
 }
 
+# Prints the name of every container this daemon holds, one per line.
+#
+# One listing rather than a `docker container inspect` per name, because
+# an inspect cannot say which of the two answers it gave: a container
+# that is absent and a daemon that could not be reached both come back
+# non-zero, so a per-name check reads an unreachable daemon as a clean
+# host.  A listing separates them — the names on stdout are the answer,
+# and a non-zero status means there was none.
+#
+# Not `docker ps --filter name=` either: that filter matches substrings,
+# and the whole point of the check is that it is exact.  The names are
+# matched here instead, in full.  `{{.Names}}` joins the names of a
+# container that carries more than one with commas, so they are split
+# back apart.
+docker_container_names() {
+  local listed
+  listed="$(docker ps -a --format '{{.Names}}')" || return 1
+  printf '%s\n' "$listed" | tr ',' '\n'
+}
+
 # Prints every container bootroot creates at `instance`, one per line,
 # that exists on this daemon right now.
 #
-# `docker container inspect` per name rather than a `docker ps --filter
-# name=` regex: the filter matches substrings, and the whole point of
-# the check is that it is exact.
+# Returns non-zero, printing nothing, when the daemon could not be
+# asked.
 bootroot_leftover_containers() {
-  local instance="$1" suffix name
+  local instance="$1" listed suffix name
+  listed="$(docker_container_names)" || return 1
+  listed=$'\n'"${listed}"$'\n'
   for suffix in "${BOOTROOT_CONTAINER_SUFFIXES[@]}"; do
     name="${instance}${suffix}"
-    if docker container inspect "$name" >/dev/null 2>&1; then
-      printf '%s\n' "$name"
-    fi
+    case "$listed" in
+      *$'\n'"$name"$'\n'*) printf '%s\n' "$name" ;;
+    esac
   done
-  # An absent container is the expected case, and it is what the last
-  # `inspect` in the loop reports through the function's own status.
-  # Under `set -o pipefail` that would fail the caller's assignment.
   return 0
 }
 
-# Prints the leftover containers as one space-separated line.
+# Prints the leftover containers as one space-separated line, and
+# returns non-zero when the daemon could not be asked.
 _bootroot_leftovers_line() {
-  bootroot_leftover_containers "$1" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+  local names
+  names="$(bootroot_leftover_containers "$1")" || return 1
+  printf '%s\n' "$names" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 
 # Whether the harness has taken the stack over.
@@ -250,7 +281,9 @@ assert_no_leftover_containers() {
   if ! instance="$(resolve_recorded_instance_name "$compose_dir" "$explicit")"; then
     fail "cannot read the instance name from ${compose_dir}/.env; it records the identity every bootroot container is named after"
   fi
-  leftovers="$(_bootroot_leftovers_line "$instance")"
+  if ! leftovers="$(_bootroot_leftovers_line "$instance")"; then
+    fail "[${label}] cannot list this daemon's containers, so whether a bootroot install at instance name '${instance}' is already here is unknown; see the docker error above"
+  fi
   [ -n "$leftovers" ] || return 0
   fail "$(printf '%s\n%s\n%s\n%s\n  docker rm -f %s' \
     "[${label}] containers of a bootroot install at instance name '${instance}' are already present:" \
@@ -278,25 +311,35 @@ report_leftover_containers() {
     echo "[${label}] cannot read the instance name from ${compose_dir}/.env; leftover containers were not checked for" >&2
     return 1
   fi
-  leftovers="$(_bootroot_leftovers_line "$instance")"
+  if ! leftovers="$(_bootroot_leftovers_line "$instance")"; then
+    echo "[${label}] cannot list this daemon's containers, so what the teardown left behind at instance name '${instance}' was not checked; see the docker error above" >&2
+    return 1
+  fi
   [ -n "$leftovers" ] || return 0
   echo "[${label}] the teardown left containers behind at instance name '${instance}': ${leftovers}" >&2
   echo "[${label}] remove them with: docker rm -f ${leftovers}" >&2
   return 1
 }
 
-# Prints the id of every container labelled with `project`.
+# Prints the id of every container labelled with `project`, and returns
+# non-zero, printing nothing, when the daemon could not be asked.
+#
+# Neither this nor `project_volume_ids` swallows that status.  An empty
+# list is the answer the caller acts on, and a query that failed
+# produces one too — which is how an unreachable daemon used to read
+# here as a teardown that had removed everything it owned.
 project_container_ids() {
-  docker ps -aq --filter "label=com.docker.compose.project=$1" 2>/dev/null || true
+  docker ps -aq --filter "label=com.docker.compose.project=$1"
 }
 
-# Prints the name of every volume labelled with `project`.
+# Prints the name of every volume labelled with `project`, and returns
+# non-zero, printing nothing, when the daemon could not be asked.
 project_volume_ids() {
-  docker volume ls -q --filter "label=com.docker.compose.project=$1" 2>/dev/null || true
+  docker volume ls -q --filter "label=com.docker.compose.project=$1"
 }
 
 # Aborts the run when a container or volume of `project` survived the
-# teardown named by `label`.
+# teardown named by `label`, or when the daemon could not be asked.
 #
 # The label-scoped counterpart of `assert_no_leftover_containers`, for
 # the harness whose instance names are its own rather than the default
@@ -304,21 +347,40 @@ project_volume_ids() {
 # names which survived.
 assert_no_project_leftovers() {
   local project="$1" label="$2" leftovers
-  leftovers="$(project_container_ids "$project")"
+  if ! leftovers="$(project_container_ids "$project")"; then
+    fail "cannot list containers of project ${project}, so what ${label} left behind is unknown; see the docker error above"
+  fi
   [ -z "$leftovers" ] || fail "containers of project ${project} survived ${label}"
-  leftovers="$(project_volume_ids "$project")"
+  if ! leftovers="$(project_volume_ids "$project")"; then
+    fail "cannot list volumes of project ${project}, so what ${label} left behind is unknown; see the docker error above"
+  fi
   [ -z "$leftovers" ] || fail "volumes of project ${project} survived ${label}"
   pass "no container or volume of project ${project} survived ${label}"
 }
 
 # Reports containers or volumes of `project` surviving the end-of-run
-# teardown, without aborting.  Returns non-zero when there are any.
+# teardown, without aborting.  Returns non-zero when there are any, and
+# when either query could not be run.
+#
+# Both queries are attempted whichever fails: a run whose daemon went
+# away wants to be told about the volumes as well as the containers.
 report_project_leftovers() {
-  local project="$1" label="$2" leftovers
-  leftovers="$(project_container_ids "$project")$(project_volume_ids "$project")"
-  [ -n "$leftovers" ] || return 0
-  echo "[${label}] leftovers survived for project ${project}" >&2
-  return 1
+  local project="$1" label="$2" containers="" volumes="" status=0
+  if ! containers="$(project_container_ids "$project")"; then
+    echo "[${label}] cannot list containers of project ${project}; leftovers were not checked for, see the docker error above" >&2
+    containers=""
+    status=1
+  fi
+  if ! volumes="$(project_volume_ids "$project")"; then
+    echo "[${label}] cannot list volumes of project ${project}; leftovers were not checked for, see the docker error above" >&2
+    volumes=""
+    status=1
+  fi
+  if [ -n "${containers}${volumes}" ]; then
+    echo "[${label}] leftovers survived for project ${project}" >&2
+    status=1
+  fi
+  return "$status"
 }
 
 # Ends an EXIT trap with the status the run must carry.

@@ -136,6 +136,14 @@ goes to the run log (`<artifact dir>/run.log`, or `runner.log` where the
 harness has no `run.log`), so a teardown that removed nothing can be told
 from one that removed everything.
 
+A daemon that cannot be asked is not a clean host. Both checks list what the
+daemon holds — the container names for the default-identity harnesses, the
+`com.docker.compose.project` labels for the run-scoped one — and a listing
+that fails fails the check, with Docker's own error alongside it. Reading a
+failed query as "nothing found" would pass the start-of-run assertion, slip
+past the start-of-run teardown's deliberately non-fatal `|| true`, and
+resurface as the confusing mid-run failure the assertion exists to replace.
+
 `scripts/validate-e2e-leftover-check.sh` covers all of it without Docker, and
 runs in the `check` CI job.
 

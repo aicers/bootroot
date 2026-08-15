@@ -182,40 +182,56 @@ check_instance_name_resolution() {
 # Puts a `docker` on PATH that answers the three queries the library
 # makes and nothing else.
 #
-#   * `container inspect <name>` reports the names in
-#     `PRESENT_CONTAINERS` as existing, and records every name it was
-#     asked about in `INSPECTED_LOG`.
+#   * `ps -a --format '{{.Names}}'` lists `PRESENT_CONTAINERS` as the
+#     containers this daemon holds, and records the query in
+#     `QUERY_LOG`.  A `--format` it is not given is an error, so a check
+#     that went back to a `--filter name=` — which matches substrings —
+#     fails here rather than quietly matching too much.
 #   * `ps -aq --filter <f>` and `volume ls -q --filter <f>` print
 #     `PROJECT_CONTAINERS` and `PROJECT_VOLUMES`, and record the filter
 #     they were given in `FILTERED_LOG`.  The filter is recorded because
 #     the safety contract the run-scoped harness states in its header is
 #     about which resources the query can reach, and that is decided by
 #     the filter rather than by what the daemon happens to hold.
+#
+# Any query named in `FAILING_QUERIES` — `list`, `ps-filter` or
+# `volume-ls` — fails the way an unreachable daemon fails it: a
+# diagnostic on stderr, a non-zero status, and nothing on stdout.
 install_docker_stub() {
   local stub_dir="$WORK_DIR/bin"
   mkdir -p "$stub_dir"
   cat >"$stub_dir/docker" <<'STUB'
 #!/usr/bin/env bash
+# Fails `query` the way a daemon that cannot be reached fails it.
+refuse_if_failing() {
+  case " ${FAILING_QUERIES:-} " in
+    *" $1 "*)
+      echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock." >&2
+      exit 1
+      ;;
+  esac
+}
+
 # Anything not answered here is a bug in the check under test.
 case "${1:-}:${2:-}" in
-  container:inspect)
-    printf '%s\n' "$3" >>"$INSPECTED_LOG"
-    for present in ${PRESENT_CONTAINERS:-}; do
-      if [ "$present" = "$3" ]; then
-        exit 0
-      fi
-    done
-    exit 1
+  ps:-a)
+    [ "${3:-}" = "--format" ] || { echo "docker stub: unformatted ps: $*" >&2; exit 125; }
+    printf 'list %s\n' "$4" >>"${QUERY_LOG:-/dev/null}"
+    refuse_if_failing list
+    [ -z "${PRESENT_CONTAINERS:-}" ] || printf '%s\n' ${PRESENT_CONTAINERS}
+    exit 0
     ;;
   ps:-aq)
     [ "${3:-}" = "--filter" ] || { echo "docker stub: unfiltered ps: $*" >&2; exit 125; }
-    printf 'ps %s\n' "$4" >>"$FILTERED_LOG"
+    printf 'ps %s\n' "$4" >>"${FILTERED_LOG:-/dev/null}"
+    refuse_if_failing ps-filter
     [ -z "${PROJECT_CONTAINERS:-}" ] || printf '%s\n' ${PROJECT_CONTAINERS}
     exit 0
     ;;
   volume:ls)
     [ "${4:-}" = "--filter" ] || { echo "docker stub: unfiltered volume ls: $*" >&2; exit 125; }
-    printf 'volume %s\n' "$5" >>"$FILTERED_LOG"
+    printf 'volume %s\n' "$5" >>"${FILTERED_LOG:-/dev/null}"
+    refuse_if_failing volume-ls
     [ -z "${PROJECT_VOLUMES:-}" ] || printf '%s\n' ${PROJECT_VOLUMES}
     exit 0
     ;;
@@ -234,9 +250,18 @@ run_check() {
   local present="$1" compose_file="$2"
   shift 2
   local status=0 output
-  : >"$WORK_DIR/inspected.log"
-  output="$(PRESENT_CONTAINERS="$present" INSPECTED_LOG="$WORK_DIR/inspected.log" \
+  : >"$WORK_DIR/query.log"
+  output="$(PRESENT_CONTAINERS="$present" QUERY_LOG="$WORK_DIR/query.log" \
     "$@" "$compose_file" "a-label" 2>&1)" || status=$?
+  printf '%s\n%s\n' "$status" "$output"
+}
+
+# The same, with the daemon refusing to list its containers.
+run_check_with_failing_query() {
+  local compose_file="$1"
+  shift
+  local status=0 output
+  output="$(FAILING_QUERIES="list" "$@" "$compose_file" "a-label" 2>&1)" || status=$?
   printf '%s\n%s\n' "$status" "$output"
 }
 
@@ -247,17 +272,27 @@ check_container_check() {
   : >"$compose_file"
   printf 'BOOTROOT_INSTANCE=insight\n' >"$compose_dir/.env"
 
-  # A clean host: every one of the nine names is asked about, and
-  # nothing is reported.
+  # A clean host: the daemon is asked what it holds, and nothing is
+  # reported.
   result="$(run_check "" "$compose_file" assert_no_leftover_containers)"
   status="$(head -n 1 <<<"$result")"
   [ "$status" -eq 0 ] || die "the check failed on a host carrying no containers"
+  [ "$(cat "$WORK_DIR/query.log")" = 'list {{.Names}}' ] \
+    || die "the check asked '$(cat "$WORK_DIR/query.log")', expected one unfiltered name listing"
+  ok "a clean host passes, off one listing of what the daemon holds"
+
+  # The names the check reports are derived from the recorded instance
+  # and from nothing else: a daemon holding every container of two
+  # installs yields exactly the nine of this one.
   local asked expected_asked
-  asked="$(sort "$WORK_DIR/inspected.log")"
+  result="$(run_check "$(printf 'insight%s ' "${EXPECTED_SUFFIXES[@]}")$(printf 'bootroot%s ' "${EXPECTED_SUFFIXES[@]}")" \
+    "$compose_file" assert_no_leftover_containers)"
+  [ "$(head -n 1 <<<"$result")" -ne 0 ] || die "the check passed on a host carrying every leftover"
+  asked="$(tr ' ' '\n' <<<"$(tail -n +2 <<<"$result")" | grep -E '^(insight|bootroot)-' | sort -u)"
   expected_asked="$(printf 'insight%s\n' "${EXPECTED_SUFFIXES[@]}" | sort)"
   [ "$asked" = "$expected_asked" ] \
-    || die "the check asked about ${asked//$'\n'/ }, expected the nine insight-* names"
-  ok "a clean host passes, and every name asked about is derived from the recorded instance"
+    || die "the check reported ${asked//$'\n'/ }, expected the nine insight-* names"
+  ok "every name reported is derived from the recorded instance, and the nine are all reported"
 
   # The names come from the recorded identity, so they are not
   # `bootroot-*` here — a leftover from an install under a different
@@ -309,18 +344,42 @@ check_container_check() {
   local check
   for check in assert_no_leftover_containers report_leftover_containers; do
     status=0
-    : >"$WORK_DIR/inspected.log"
-    output="$(PRESENT_CONTAINERS="explicit-ca" INSPECTED_LOG="$WORK_DIR/inspected.log" \
+    output="$(PRESENT_CONTAINERS="explicit-ca insight-postgres" \
       "$check" "$compose_file" "a-label" "explicit" 2>&1)" || status=$?
     [ "$status" -ne 0 ] \
       || die "${check} ignored the explicit instance name it was given"
     grep -q 'explicit-ca' <<<"$output" \
       || die "${check} did not report the explicit instance's container"
-    if grep -q '^insight-' "$WORK_DIR/inspected.log"; then
-      die "${check} asked about the recorded identity despite an explicit instance name"
+    if grep -q 'insight-postgres' <<<"$output"; then
+      die "${check} reported the recorded identity despite an explicit instance name"
     fi
   done
   ok "an explicit instance name outranks the recorded one in both checks"
+
+  # A daemon that cannot be asked is not a clean host.  Both halves have
+  # to say so: the startup check by aborting the run before it installs
+  # over whatever is here, the end-of-run one by returning non-zero so
+  # the trap folds it into the run's status.  Reading the failed query
+  # as "no containers" is what would let the run proceed and fail later
+  # somewhere unrelated — the very failure this check replaces.
+  result="$(run_check_with_failing_query "$compose_file" assert_no_leftover_containers)"
+  status="$(head -n 1 <<<"$result")"
+  output="$(tail -n +2 <<<"$result")"
+  [ "$status" -ne 0 ] || die "the startup check passed while the container query was failing"
+  grep -q 'cannot list' <<<"$output" \
+    || die "the startup check does not say the query could not be run"
+  grep -q 'Cannot connect to the Docker daemon' <<<"$output" \
+    || die "the startup check discards the docker diagnostics"
+
+  result="$(run_check_with_failing_query "$compose_file" report_leftover_containers)"
+  status="$(head -n 1 <<<"$result")"
+  output="$(tail -n +2 <<<"$result")"
+  [ "$status" -eq 1 ] || die "the end-of-run report returned ${status} on a failing query, expected 1"
+  grep -q 'cannot list' <<<"$output" \
+    || die "the end-of-run report does not say the query could not be run"
+  grep -q 'Cannot connect to the Docker daemon' <<<"$output" \
+    || die "the end-of-run report discards the docker diagnostics"
+  ok "a query that could not be run fails both halves rather than reading as a clean host"
 }
 
 # ---------------------------------------------------------------------------
@@ -393,6 +452,44 @@ check_project_check() {
   [ "$(head -n 1 <<<"$result")" -eq 0 ] \
     || die "the end-of-run project report failed after a clean teardown"
   ok "the end-of-run project report returns non-zero for either kind and zero for neither"
+
+  # A label query returns nothing when it could not reach the daemon,
+  # which is byte for byte what a teardown that removed everything it
+  # owns returns.  Neither half may read the first as the second.  Each
+  # kind is refused on its own, because a check that gave up after the
+  # containers would never notice the volumes.
+  local failing
+  for failing in ps-filter volume-ls; do
+    status=0
+    output="$(FAILING_QUERIES="$failing" \
+      assert_no_project_leftovers "twoinst-a-t0k3n" "a-teardown" 2>&1)" || status=$?
+    [ "$status" -ne 0 ] \
+      || die "the label-scoped check passed while the ${failing} query was failing"
+    grep -q 'cannot list' <<<"$output" \
+      || die "the label-scoped check does not say the ${failing} query could not be run"
+    grep -q 'Cannot connect to the Docker daemon' <<<"$output" \
+      || die "the label-scoped check discards the docker diagnostics for ${failing}"
+
+    status=0
+    output="$(FAILING_QUERIES="$failing" \
+      report_project_leftovers "twoinst-a-t0k3n" "a-teardown" 2>&1)" || status=$?
+    [ "$status" -eq 1 ] \
+      || die "the end-of-run project report returned ${status} on a failing ${failing} query, expected 1"
+    grep -q 'cannot list' <<<"$output" \
+      || die "the end-of-run project report does not say the ${failing} query could not be run"
+  done
+
+  # Both kinds are still attempted when the first one fails: a run whose
+  # daemon went away wants to be told about the volumes as well.
+  status=0
+  output="$(FAILING_QUERIES="ps-filter volume-ls" \
+    report_project_leftovers "twoinst-a-t0k3n" "a-teardown" 2>&1)" || status=$?
+  [ "$status" -eq 1 ] || die "the end-of-run project report returned ${status} with both queries failing"
+  grep -q 'cannot list containers' <<<"$output" \
+    || die "the end-of-run project report does not name the failed container query"
+  grep -q 'cannot list volumes' <<<"$output" \
+    || die "the end-of-run project report gave up before the volume query"
+  ok "a label query that could not be run fails both halves rather than reading as a clean teardown"
 }
 
 # ---------------------------------------------------------------------------
