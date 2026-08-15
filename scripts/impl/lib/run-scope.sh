@@ -204,6 +204,36 @@ run_pid_is_alive() {
   [ -d "/proc/$pid" ]
 }
 
+# Creates the marker directory owner-only, and aborts unless it is this
+# user's.
+#
+# A marker's filename is the instance the sweep tears down by exact
+# container name, and its `project` field is the label the sweep removes
+# volumes and networks by.  The directory therefore holds instructions,
+# not just bookkeeping: anyone who can write to it can aim a
+# `docker rm -f` at a name of their choosing — including `bootroot`, the
+# one identity the sweep is meant never to reach.  Owner-only is what
+# makes it per-user on Linux the way `$TMPDIR` already does on macOS.
+#
+# Ownership is asserted rather than inferred from the `chmod`.  `mkdir
+# -p` succeeds on a directory that is already there whoever owns it, and
+# re-moding one owned by someone else fails — so a `chmod` allowed to
+# fail quietly would leave intact exactly the case it was added for: a
+# directory another user pre-created world-writable at this predictable
+# `/tmp` path.  Refusing it is the only answer available, since it is
+# not this run's to re-mode.
+#
+# Both the sweep and the marker write go through here, because the sweep
+# runs first and is the half that acts on what the directory says.
+ensure_run_marker_dir() {
+  mkdir -p "$BOOTROOT_E2E_RUN_MARKER_DIR" \
+    || fail "cannot create the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR}"
+  [ -O "$BOOTROOT_E2E_RUN_MARKER_DIR" ] \
+    || fail "the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR} is not owned by this user; the sweep tears containers down by the names it holds, so a directory someone else can write is not one to read them from"
+  chmod 700 "$BOOTROOT_E2E_RUN_MARKER_DIR" \
+    || fail "cannot restrict the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR} to its owner"
+}
+
 # Records this run as the live owner of `instance`.
 #
 # Published by rename, as every file another process may read is: a
@@ -212,17 +242,7 @@ run_pid_is_alive() {
 write_run_marker() {
   local instance="$1" project="$2" path tmp
   path="$(run_marker_path "$instance")"
-  mkdir -p "$BOOTROOT_E2E_RUN_MARKER_DIR" \
-    || fail "cannot create the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR}"
-  # Owner-only, so the directory is per-user on Linux the way `$TMPDIR`
-  # already makes it per-user on macOS.  A marker's filename is the
-  # instance the sweep tears down by exact container name, so a
-  # world-writable directory at a predictable `/tmp` path would let
-  # anyone who can write there aim a `docker rm -f` at a name of their
-  # choosing — including `bootroot`, the one identity the sweep is meant
-  # never to reach.  Best-effort: a directory another user already owns
-  # is not this run's to re-mode, and the write below fails naming it.
-  chmod 700 "$BOOTROOT_E2E_RUN_MARKER_DIR" 2>/dev/null || true
+  ensure_run_marker_dir
   tmp="${path}.$$.tmp"
   {
     printf 'pid=%s\n' "$$"
@@ -324,6 +344,10 @@ collect_dead_run_instance() {
 sweep_dead_run_instances() {
   local label="$1" log="$2" marker instance pid project status=0
   [ -d "$BOOTROOT_E2E_RUN_MARKER_DIR" ] || return 0
+  # Aborts on a directory this user does not own, rather than reporting:
+  # every name below is read out of it and handed to `docker rm -f`, so
+  # one someone else can write is not a degraded input but a hostile one.
+  ensure_run_marker_dir
   for marker in "$BOOTROOT_E2E_RUN_MARKER_DIR"/*; do
     [ -f "$marker" ] || continue
     case "$marker" in

@@ -54,6 +54,13 @@ ok() {
   echo "[$LABEL] ok: $1"
 }
 
+# The marker directory's permission bits, in octal. BSD `stat` first,
+# GNU second: the harness runs on both.
+marker_dir_mode() {
+  stat -f '%OLp' "$BOOTROOT_E2E_RUN_MARKER_DIR" 2>/dev/null \
+    || stat -c '%a' "$BOOTROOT_E2E_RUN_MARKER_DIR"
+}
+
 # The lifecycle harnesses, and the instance-name prefix each derives
 # under. Both are asserted against the shipped scripts below, so a
 # renamed prefix cannot leave this file validating a value nothing uses.
@@ -195,6 +202,22 @@ check_markers() {
   [ -z "$(find "$BOOTROOT_E2E_RUN_MARKER_DIR" -name '*.tmp' -print -quit)" ] \
     || die "write_run_marker left its temporary file behind"
   ok "a marker records this run's pid and project, published under the instance name"
+
+  # The directory holds the names the sweep hands to `docker rm -f`, so a
+  # world-writable one at a predictable `/tmp` path would let anyone who
+  # can write there choose them.  A pre-existing directory is re-moded
+  # rather than trusted, and the sweep applies the same rule because it
+  # runs before any marker is written.
+  chmod 777 "$BOOTROOT_E2E_RUN_MARKER_DIR"
+  write_run_marker "$instance" "$instance"
+  [ "$(marker_dir_mode)" = "700" ] \
+    || die "write_run_marker left the marker directory at mode $(marker_dir_mode)"
+  chmod 777 "$BOOTROOT_E2E_RUN_MARKER_DIR"
+  sweep_dead_run_instances "$LABEL" /dev/null >/dev/null 2>&1 || true
+  [ "$(marker_dir_mode)" = "700" ] \
+    || die "the sweep read a marker directory at mode $(marker_dir_mode)"
+  rm -f "$path"
+  ok "a pre-existing marker directory is restricted to its owner before it is read or written"
 
   # Another run's marker is not this run's to remove: dropping it would
   # hide that run's containers from every later sweep.
