@@ -156,7 +156,11 @@ instances a run recorded.
 The directory is per-user and created `0700`, and a run refuses one it does not
 own: a marker's filename is an instance the sweep tears down by exact container
 name, so anyone who could write there would be choosing what a later run
-destroys. The uid in the path is what gives Linux the separation `$TMPDIR`
+destroys. A symbolic link at that path is refused outright rather than
+followed, because ownership cannot see one — every shell test but `-L` reports
+on the link's target, so a link aimed at a directory this user happens to own
+would pass the ownership check and hand the sweep files that were never
+markers. The uid in the path is what gives Linux the separation `$TMPDIR`
 already gives macOS, so two users can run the harness on one host instead of
 the second being refused.
 

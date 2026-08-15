@@ -66,8 +66,9 @@ ok() {
 # filesystem dump that is never going to equal `700`. GNU-first has no
 # such trap: BSD `stat` rejects `-c` outright, so the fallback runs.
 marker_dir_mode() {
-  stat -c '%a' "$BOOTROOT_E2E_RUN_MARKER_DIR" 2>/dev/null \
-    || stat -f '%OLp' "$BOOTROOT_E2E_RUN_MARKER_DIR"
+  local dir="${1:-$BOOTROOT_E2E_RUN_MARKER_DIR}"
+  stat -c '%a' "$dir" 2>/dev/null \
+    || stat -f '%OLp' "$dir"
 }
 
 # The lifecycle harnesses, and the instance-name prefix each derives
@@ -254,6 +255,40 @@ check_markers() {
   remove_run_marker "$instance" 0
   [ ! -f "$path" ] || die "remove_run_marker kept the marker of a clean teardown"
   ok "a marker survives a teardown that did not finish, and goes with one that did"
+}
+
+# Ownership cannot see a symbolic link: every test operator but `-L`
+# follows one, so `-O` reports on the target. A link planted at this
+# predictable `/tmp` path and pointed at a directory this user owns
+# therefore passes the ownership check while handing the sweep a
+# directory that was never the harness's — whose filenames it reads as
+# instance names and whose files it then removes.
+check_marker_dir_refuses_a_symlink() {
+  local victim="$WORK_DIR/symlink-victim" link="$WORK_DIR/symlink-markers"
+  local bystander status=0
+  rm -rf "$victim" "$link"
+  mkdir -p "$victim"
+  chmod 755 "$victim"
+  bystander="$victim/e2e-local-not-a-marker"
+  : >"$bystander"
+  ln -s "$victim" "$link"
+
+  (BOOTROOT_E2E_RUN_MARKER_DIR="$link" sweep_dead_run_instances "$LABEL" /dev/null) \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] \
+    || die "the sweep read a marker directory reached through a symbolic link"
+  status=0
+  (BOOTROOT_E2E_RUN_MARKER_DIR="$link" write_run_marker "e2e-local-link" "e2e-local-link") \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] \
+    || die "a marker was written into a directory reached through a symbolic link"
+
+  [ -f "$bystander" ] \
+    || die "the refused symbolic link's target had a file removed from it"
+  [ "$(marker_dir_mode "$victim")" = "755" ] \
+    || die "the refused symbolic link's target was re-moded to $(marker_dir_mode "$victim")"
+  rm -rf "$victim" "$link"
+  ok "a marker directory reached through a symbolic link is refused, not followed"
 }
 
 # The default marker directory has to be per-user, and this is the only
@@ -601,6 +636,7 @@ check_derived_instances_are_installable
 check_truncation_keeps_the_discriminating_tail
 check_derivation_rejects_what_it_cannot_derive
 check_markers
+check_marker_dir_refuses_a_symlink
 check_default_marker_dir_is_per_user
 check_liveness
 install_docker_stub

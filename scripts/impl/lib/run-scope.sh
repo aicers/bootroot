@@ -232,11 +232,24 @@ run_pid_is_alive() {
 # `/tmp` path.  Refusing it is the only answer available, since it is
 # not this run's to re-mode.
 #
+# A symbolic link is refused before that, because ownership cannot see
+# one: every test operator but `-L` follows the link, so `-O` reports on
+# the target.  Someone who plants a link at this path pointing at a
+# directory *this* user owns therefore passes the ownership check, and
+# aims the whole of the rest at a directory that was never the harness's
+# — the `chmod` re-modes it to 0700, the sweep reads its filenames as
+# instance names, and `rm -f "$marker"` deletes each file it finds once
+# the containers those names would produce are gone.  `mkdir -p`
+# succeeds on a link to a directory, so this has to be checked after it
+# and before anything acts on the path.
+#
 # Both the sweep and the marker write go through here, because the sweep
 # runs first and is the half that acts on what the directory says.
 ensure_run_marker_dir() {
   mkdir -p "$BOOTROOT_E2E_RUN_MARKER_DIR" \
     || fail "cannot create the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR}"
+  [ ! -L "$BOOTROOT_E2E_RUN_MARKER_DIR" ] \
+    || fail "the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR} is a symbolic link; the sweep re-modes it, reads container names out of it and removes what it reads, so it must be the directory itself and not a pointer at somebody else's choosing"
   [ -O "$BOOTROOT_E2E_RUN_MARKER_DIR" ] \
     || fail "the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR} is not owned by this user; the sweep tears containers down by the names it holds, so a directory someone else can write is not one to read them from"
   chmod 700 "$BOOTROOT_E2E_RUN_MARKER_DIR" \
