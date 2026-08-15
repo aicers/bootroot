@@ -157,27 +157,49 @@ check_instance_name_resolution() {
 # The container check itself
 # ---------------------------------------------------------------------------
 
-# Puts a `docker` on PATH that reports exactly the container names in
-# `PRESENT_CONTAINERS` as existing, and records every name it was asked
-# about in `INSPECTED_LOG`.
+# Puts a `docker` on PATH that answers the three queries the library
+# makes and nothing else.
+#
+#   * `container inspect <name>` reports the names in
+#     `PRESENT_CONTAINERS` as existing, and records every name it was
+#     asked about in `INSPECTED_LOG`.
+#   * `ps -aq --filter <f>` and `volume ls -q --filter <f>` print
+#     `PROJECT_CONTAINERS` and `PROJECT_VOLUMES`, and record the filter
+#     they were given in `FILTERED_LOG`.  The filter is recorded because
+#     the safety contract the run-scoped harness states in its header is
+#     about which resources the query can reach, and that is decided by
+#     the filter rather than by what the daemon happens to hold.
 install_docker_stub() {
   local stub_dir="$WORK_DIR/bin"
   mkdir -p "$stub_dir"
   cat >"$stub_dir/docker" <<'STUB'
 #!/usr/bin/env bash
-# Only `container inspect <name>` is stubbed; anything else is a bug in
-# the check under test.
-if [ "${1:-}" != "container" ] || [ "${2:-}" != "inspect" ]; then
-  echo "docker stub: unexpected invocation: $*" >&2
-  exit 125
-fi
-printf '%s\n' "$3" >>"$INSPECTED_LOG"
-for present in $PRESENT_CONTAINERS; do
-  if [ "$present" = "$3" ]; then
+# Anything not answered here is a bug in the check under test.
+case "${1:-}:${2:-}" in
+  container:inspect)
+    printf '%s\n' "$3" >>"$INSPECTED_LOG"
+    for present in ${PRESENT_CONTAINERS:-}; do
+      if [ "$present" = "$3" ]; then
+        exit 0
+      fi
+    done
+    exit 1
+    ;;
+  ps:-aq)
+    [ "${3:-}" = "--filter" ] || { echo "docker stub: unfiltered ps: $*" >&2; exit 125; }
+    printf 'ps %s\n' "$4" >>"$FILTERED_LOG"
+    [ -z "${PROJECT_CONTAINERS:-}" ] || printf '%s\n' ${PROJECT_CONTAINERS}
     exit 0
-  fi
-done
-exit 1
+    ;;
+  volume:ls)
+    [ "${4:-}" = "--filter" ] || { echo "docker stub: unfiltered volume ls: $*" >&2; exit 125; }
+    printf 'volume %s\n' "$5" >>"$FILTERED_LOG"
+    [ -z "${PROJECT_VOLUMES:-}" ] || printf '%s\n' ${PROJECT_VOLUMES}
+    exit 0
+    ;;
+esac
+echo "docker stub: unexpected invocation: $*" >&2
+exit 125
 STUB
   chmod +x "$stub_dir/docker"
   PATH="$stub_dir:$PATH"
@@ -258,6 +280,78 @@ check_container_check() {
   [ "$(head -n 1 <<<"$result")" -eq 0 ] \
     || die "the end-of-run report failed on a clean teardown"
   ok "the end-of-run report returns non-zero on a leftover and zero on a clean teardown"
+}
+
+# ---------------------------------------------------------------------------
+# The label-scoped check
+# ---------------------------------------------------------------------------
+#
+# The half `run-two-instance-isolation.sh` uses.  It is no more
+# observable from a green run than the other one: it fires only after a
+# teardown that failed to remove what it owns.
+
+# Runs one of the library's label-scoped checks under the stub, with the
+# daemon holding `containers` and `volumes` for the queried project.
+# Prints its status on the first line, followed by everything it wrote.
+run_project_check() {
+  local containers="$1" volumes="$2"
+  shift 2
+  local status=0 output
+  : >"$WORK_DIR/filtered.log"
+  output="$(PROJECT_CONTAINERS="$containers" PROJECT_VOLUMES="$volumes" \
+    FILTERED_LOG="$WORK_DIR/filtered.log" \
+    "$@" "twoinst-a-t0k3n" "a-teardown" 2>&1)" || status=$?
+  printf '%s\n%s\n' "$status" "$output"
+}
+
+check_project_check() {
+  local result status output filtered
+
+  # A teardown that removed what it owns.  `assert_no_project_leftovers`
+  # reports the satisfied assertion through `pass`, which is how the
+  # run-scoped harness logs it mid-run.
+  result="$(run_project_check "" "" assert_no_project_leftovers)"
+  status="$(head -n 1 <<<"$result")"
+  output="$(tail -n +2 <<<"$result")"
+  [ "$status" -eq 0 ] || die "the label-scoped check failed after a clean teardown"
+  grep -q '^PASS ' <<<"$output" || die "a clean teardown is not reported as a pass"
+
+  # Both resource kinds are asked about by `com.docker.compose.project`
+  # at the exact project, never by a `bootroot-*` name: the run-scoped
+  # harness's safety contract is that a co-located default install is
+  # out of reach, and the filter is what puts it there.
+  filtered="$(sort -u "$WORK_DIR/filtered.log")"
+  [ "$filtered" = "$(printf 'ps label=com.docker.compose.project=twoinst-a-t0k3n\nvolume label=com.docker.compose.project=twoinst-a-t0k3n\n' | sort -u)" ] \
+    || die "the label-scoped check queried ${filtered//$'\n'/; }"
+  ok "the label-scoped check asks only by com.docker.compose.project, for containers and volumes"
+
+  # A surviving container and a surviving volume are separate failures,
+  # so the message names which kind survived.
+  result="$(run_project_check "c0ffee" "" assert_no_project_leftovers)"
+  [ "$(head -n 1 <<<"$result")" -ne 0 ] || die "a surviving container passed the label-scoped check"
+  grep -q 'containers of project twoinst-a-t0k3n survived a-teardown' <<<"$result" \
+    || die "a surviving container is not reported as a container"
+
+  result="$(run_project_check "" "v01" assert_no_project_leftovers)"
+  [ "$(head -n 1 <<<"$result")" -ne 0 ] || die "a surviving volume passed the label-scoped check"
+  grep -q 'volumes of project twoinst-a-t0k3n survived a-teardown' <<<"$result" \
+    || die "a surviving volume is not reported as a volume"
+  ok "a surviving container and a surviving volume each fail, naming which kind survived"
+
+  # The end-of-run half returns rather than aborting, for the same
+  # reason its container-name counterpart does.
+  local kind
+  for kind in "c0ffee:" ":v01" "c0ffee:v01"; do
+    result="$(run_project_check "${kind%%:*}" "${kind##*:}" report_project_leftovers)"
+    [ "$(head -n 1 <<<"$result")" -eq 1 ] \
+      || die "the end-of-run project report did not return 1 for ${kind}"
+    grep -q 'leftovers survived for project twoinst-a-t0k3n' <<<"$result" \
+      || die "the end-of-run project report names nothing for ${kind}"
+  done
+  result="$(run_project_check "" "" report_project_leftovers)"
+  [ "$(head -n 1 <<<"$result")" -eq 0 ] \
+    || die "the end-of-run project report failed after a clean teardown"
+  ok "the end-of-run project report returns non-zero for either kind and zero for neither"
 }
 
 # ---------------------------------------------------------------------------
@@ -359,6 +453,7 @@ check_suffixes_match_the_rust_enum
 check_instance_name_resolution
 install_docker_stub
 check_container_check
+check_project_check
 check_cleanup_status
 check_harness_wiring
 
