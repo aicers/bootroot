@@ -593,10 +593,10 @@ alias on the `bootroot-http01` container.  No manual
 Registration is best-effort and never fails the add, so the summary
 reports what it did on its `- HTTP-01 DNS aliases registered:` line.
 A count is how many aliases were attached; a zero followed by
-`(registration skipped; see the warning above)` means the responder was
-not running. Read that line before moving on — a skipped registration
-leaves the challenge hostname unresolvable until the aliases are
-replayed.
+`(registration skipped; see the warning above)` means no aliases were
+registered — consult the warning printed above it for the specific
+cause.  Read that line before moving on: a skipped registration leaves
+the challenge hostname unresolvable until the aliases are replayed.
 
 If the responder container is restarted (e.g. `docker compose down` / `up`),
 run `bootroot infra up` to replay all aliases from `state.json`.

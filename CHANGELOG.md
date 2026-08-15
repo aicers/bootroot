@@ -1966,9 +1966,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `bootroot-http01` at runtime, removing the need for a hand-written
   `docker-compose.override.yml`. Aliases are replayed automatically by
   `infra up` after container restarts. `service add`'s summary reports
-  the outcome: the number of aliases registered, or zero when the
-  responder could not be reached and registration was skipped —
-  registration stays best-effort, so a skipped run still succeeds.
+  the outcome: the number of aliases registered, or zero when
+  registration was skipped, pointing at the warning that names the
+  cause — registration stays best-effort, so a skipped run still
+  succeeds.
 - Added `bootroot infra install` for zero-config first-time setup:
   generates `.env` with a random PostgreSQL password, creates `secrets/`
   and `certs/` directories, and brings up Docker Compose services.

@@ -219,8 +219,9 @@ fields independently.
 - Start from that add's summary: its
   `- HTTP-01 DNS aliases registered:` line states how many aliases were
   attached, and a zero with `(registration skipped; see the warning
-  above)` means the responder was down at the time. The add still
-  succeeded, so `bootroot infra up` is what registers them.
+  above)` means none were registered — consult the warning above it for
+  the specific cause. The add still succeeded, so `bootroot infra up` is
+  what registers them once that cause is addressed.
 - step-ca must map service FQDN to responder IP
 - service hosts (remote mode) must also map step-ca/responder names correctly
 
