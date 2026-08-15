@@ -156,8 +156,12 @@ outage:
 
 The second list is regenerated on its own: by the next renewal, by the OpenBao
 Agent sidecar's next render, or by re-running the command that produced it. The
-first is not — bootroot reads it back to resume, or it holds a credential
-OpenBao has already issued and will not hand out again.
+first is not — bootroot reads it back to resume, or it holds a credential the
+stack logs in with, and losing one of those takes an operator or another
+rotation to put back rather than the next write. A `role_id` is on the flushed
+list with the `secret_id` beside it for that reason: bootroot can read it from
+OpenBao again, but only on the next `rotate` run, and until then the agent or
+sidecar it belongs to cannot log in.
 
 Modes are taken from the file already at the destination where it has one, so a
 file you narrow by hand stays narrowed across every later write. Only a fresh

@@ -514,11 +514,13 @@ async fn ensure_infra_role_id_file(
     // backfill racing one handed it a truncated `role_id` and a failed
     // login; the rename leaves the previous file or the whole new one.
     //
-    // No directory flush: `role_id` is not a secret and is re-readable
-    // from `OpenBao` at any time — this function exists precisely to
-    // fetch it again when the file is missing or empty — so a crash that
-    // loses the entry costs one more round trip on the next rotation.
-    fs_util::atomic_replace(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
+    // It takes the directory flush, like the `secret_id` written beside
+    // it. `role_id` is not a secret and is re-readable from `OpenBao` —
+    // this function is what re-reads it — but only on the next `rotate`
+    // run, and until then a lost directory entry is a sidecar that
+    // cannot log in. The early return above means this writes only on a
+    // backfill, so the round trip is not on any repeated path.
+    fs_util::atomic_write(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
     Ok(role_id)
@@ -713,11 +715,12 @@ async fn ensure_role_id_file(
             })?;
     } else {
         // Inside the secrets tree, published by rename at the policy's
-        // `0600` and not flushed — the same two decisions, for the same
-        // reasons, as `ensure_infra_role_id_file` above. The early
-        // return on `role_id_path.exists()` means this only ever creates.
+        // `0600` and flushed — the same two decisions, for the same
+        // reasons, as `ensure_infra_role_id_file` above, and the same
+        // pair the override branch beside it makes. The early return on
+        // `role_id_path.exists()` means this only ever creates.
         fs_util::ensure_secrets_dir(service_dir).await?;
-        fs_util::atomic_replace(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
+        fs_util::atomic_write(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
             .await
             .with_context(|| {
                 messages.error_write_file_failed(&role_id_path.display().to_string())

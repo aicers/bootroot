@@ -133,8 +133,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   file. The files a run reads back to resume flush the directory too,
   so the published name survives a power loss and not merely a clean
   replacement — `state.json`, `.env`, `agent.toml`, the two `init`
-  outputs, and every credential OpenBao has already issued and cannot
-  re-read. Files that are regenerated on their own — a certificate, a
+  outputs, and every credential file the stack logs in with, which takes
+  an operator or another rotation to put back rather than the next
+  write. Files that are regenerated on their own — a certificate, a
   rendered `ca.json`, a compose override — do not pay for that flush,
   because a crash that loses one costs a rewrite rather than an outage.
   A destination pointed elsewhere by a symlink keeps being written
