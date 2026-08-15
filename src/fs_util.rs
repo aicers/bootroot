@@ -829,14 +829,6 @@ pub enum StagedDurability {
 /// it. Neither policy generalises to the files above, and folding them
 /// together would make one of the two callers wrong.
 ///
-/// Two production writers stage nothing at all and have neither
-/// property: `save_unseal_keys`, for `secrets/openbao/unseal-keys.txt`,
-/// and [`crate::eab`]'s `write_key_file`, for the secrets-tree
-/// `eab.json` beside each service's `secret_id`. Both still write over
-/// the destination in place and set `0600` once the bytes are down.
-/// Converting them is a separate change; do not read the guarantees
-/// above as covering the crate's writes exhaustively until it lands.
-///
 /// Callers reach it through one of the four wrappers rather than
 /// directly: [`atomic_write`]/[`atomic_write_blocking`] for a file read
 /// back to resume, [`atomic_replace`]/[`atomic_replace_blocking`] for

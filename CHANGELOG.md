@@ -140,10 +140,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   destinations, `agent.toml`, `.env`, `ca.json` and its OpenBao Agent
   template, `openbao.hcl`, the HTTP-01 responder config and template,
   the OpenBao Agent configs and their `AppRole` credentials, the
-  generated compose overrides, and the remote bootstrap artifact. Two
-  files are not among them and are still written in place, to be fixed
-  separately: the OpenBao unseal-keys file and the ACME EAB credentials
-  file. The files a run reads back to resume flush the directory too,
+  generated compose overrides, the OpenBao unseal-keys file, the ACME
+  EAB credentials file, and the remote bootstrap artifact. The files a
+  run reads back to resume flush the directory too,
   so the published name survives a power loss and not merely a clean
   replacement — `state.json`, `.env`, `agent.toml`, the two `init`
   outputs, and every credential file the stack logs in with, which takes

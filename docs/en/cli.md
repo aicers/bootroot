@@ -106,7 +106,7 @@ For detailed rules and condition-specific behavior, see the Overview section
 
 ## How bootroot writes files
 
-Nearly every file bootroot produces is published by stage-then-rename: the bytes
+Every file bootroot produces is published by stage-then-rename: the bytes
 go to a temporary file in the destination's own directory, that file is given its
 final mode and ownership and then flushed while it is still at its temporary
 name, and only then is it renamed over the destination. Three consequences are worth
@@ -127,15 +127,6 @@ knowing when you operate around a running stack.
   *directory* follow the rename; a bind mount of a single *file* does not, and
   needs the container restarted to pick up a new version.
 
-Two files are not published this way yet, and none of the three points above
-applies to them: `secrets/openbao/unseal-keys.txt`, written by `init
---save-unseal-keys` and `bootroot openbao save-unseal-keys`, and the `eab.json`
-written next to each service's `secret_id`. Both are still written over the
-destination in place and have their `0600` set afterwards, so a reader can catch
-one half-written, and a freshly created one is briefly readable more widely than
-that. Converting them is a separate change; the rest of this section describes
-the staged writers only.
-
 Whether the containing directory is flushed after the rename is decided per
 file, because that flush costs a disk round trip on every write:
 
@@ -144,7 +135,8 @@ Flushed, so the published file survives a power loss:
 - `state.json`, `.env`, `agent.toml`
 - the `init` `--summary-json` and `--root-token-output` files
 - the step-ca CA password and the OpenBao recovery keys
-- every `AppRole` `role_id`/`secret_id`, and the remote bootstrap artifact
+- every `AppRole` `role_id`/`secret_id` and `eab.json`, the OpenBao unseal
+  keys, and the remote bootstrap artifact
 
 Not flushed, because a crash that loses one costs a rewrite rather than an
 outage:

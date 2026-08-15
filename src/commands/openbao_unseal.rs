@@ -25,10 +25,15 @@ pub(crate) async fn save_unseal_keys(
     fs_util::ensure_secrets_dir(&dir).await?;
     let path = dir.join(UNSEAL_KEYS_FILENAME);
     let contents = keys.join("\n") + "\n";
-    tokio::fs::write(&path, contents)
-        .await
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    fs_util::set_key_permissions(&path).await?;
+    // This bootroot-owned secrets-tree path must replace a final symlink,
+    // rather than follow a redirection an attacker could plant there.
+    fs_util::atomic_write(
+        &path,
+        contents.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(path)
 }
 
@@ -140,6 +145,8 @@ pub(crate) fn read_unseal_keys_from_file(path: &Path, messages: &Messages) -> Re
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use tempfile::tempdir;
 
@@ -245,5 +252,75 @@ mod tests {
         let err = read_unseal_keys(&mut input, None, &messages)
             .expect_err("a blank threshold must error");
         assert_eq!(err.to_string(), messages.error_invalid_unseal_threshold());
+    }
+
+    /// The unseal-key writer states `0600` independently of the process umask.
+    ///
+    /// Runs in a child process because umask is process-wide; see
+    /// [`fs_util::umask_test_ran_in_child`].
+    #[cfg(unix)]
+    #[test]
+    fn save_unseal_keys_creates_with_restricted_mode_under_umask_022() {
+        if fs_util::umask_test_ran_in_child(
+            "commands::openbao_unseal::tests::save_unseal_keys_creates_with_restricted_mode_under_umask_022",
+        ) {
+            return;
+        }
+
+        let dir = tempdir().expect("tempdir");
+        // SAFETY: this test runs in the child spawned above, with no other
+        // tests sharing the process, and restores the prior umask immediately.
+        let previous = unsafe { libc::umask(0o022) };
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(save_unseal_keys(
+                dir.path(),
+                &["key-a".to_string(), "key-b".to_string()],
+                &test_messages(),
+            ));
+        unsafe { libc::umask(previous) };
+        let path = result.expect("save unseal keys");
+
+        let mode = std::fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, fs_util::KEY_FILE_MODE);
+    }
+
+    /// A secrets-tree link is replaced so the new key shares cannot be
+    /// redirected to an attacker-selected target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_unseal_keys_replaces_a_symlinked_destination() {
+        let dir = tempdir().expect("tempdir");
+        let openbao_dir = dir.path().join(UNSEAL_KEYS_DIR);
+        std::fs::create_dir(&openbao_dir).expect("mkdir");
+        let target = dir.path().join("former-target.txt");
+        std::fs::write(&target, "old keys\n").expect("seed target");
+        let path = openbao_dir.join(UNSEAL_KEYS_FILENAME);
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+        let saved = save_unseal_keys(
+            dir.path(),
+            &["key-a".to_string(), "key-b".to_string()],
+            &test_messages(),
+        )
+        .await
+        .expect("save unseal keys");
+
+        assert_eq!(saved, path);
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the secrets-tree symlink must be replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "key-a\nkey-b\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read former target"),
+            "old keys\n"
+        );
     }
 }
