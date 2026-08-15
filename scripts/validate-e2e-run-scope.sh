@@ -34,8 +34,10 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 # must not be a fixture here.
 export BOOTROOT_E2E_RUN_MARKER_DIR="$WORK_DIR/markers"
 # And the hosts lock for the same reason, one step further: the real one
-# is machine-wide, so taking or clearing it here would let a `hosts`-mode
-# run in beside a live one, or refuse the next one outright.
+# is `/etc/hosts` itself, machine-wide, so locking it here would refuse
+# a live `hosts`-mode run's turn at the file it is editing. Every path
+# below stands in for that file, and is created like it — the lock opens
+# what is there and never creates it.
 export BOOTROOT_E2E_HOSTS_LOCK="$WORK_DIR/hosts.lock"
 
 # shellcheck source=impl/lib/run-scope.sh
@@ -424,12 +426,19 @@ check_default_marker_dir_is_per_user() {
 # still resolving through them. So the serialisation is stated instead,
 # and this is what says it still holds.
 #
-# What holds the lock is `flock(2)` on an open file descriptor, so almost
-# everything below is about one property: ownership is the kernel's, and
-# the file at the path is a label. That is what makes the contention here
-# real rather than simulated — a lock the library judged by reading a pid
-# out of a file could be driven with `printf`, and this one cannot be. It
-# takes a live process holding a descriptor, and a `kill -9` to end it.
+# What holds the lock is `flock(2)` on an open descriptor for
+# `/etc/hosts` itself, so almost everything below is about two
+# properties. Ownership is the kernel's, which is what makes the
+# contention here real rather than simulated — a lock the library judged
+# by reading a pid out of a file could be driven with `printf`, and this
+# one cannot be; it takes a live process holding a descriptor, and a
+# `kill -9` to end it. And the inode is the file the run edits, which no
+# unprivileged user can put a different one in the place of: a lock file
+# of the harness's own, at a predictable name in a world-writable `/tmp`,
+# can be swapped between the check that refuses a link and the open that
+# follows it, leaving two runs holding locks on two inodes and both
+# editing the file. So the checks below drive a lock that creates
+# nothing, writes nothing and re-modes nothing.
 
 # A process that takes the lock and holds it until it is killed, or until
 # something is written to its fifo.
@@ -501,68 +510,89 @@ kill_hosts_lock_holder() {
   rm -f "$HOSTS_LOCK_HOLDER_FIFO"
 }
 
-# Runs one contender in a process of its own and prints its status.
+# Runs one contender in a process of its own and prints its status. What
+# it said on the way out is left in `$CONTENDER_ERR`, because a refusal
+# that names the wrong run is a refusal an operator acts on. The path is
+# fixed rather than set here: the status is read through a command
+# substitution, so nothing this assigns would outlive the subshell.
+CONTENDER_ERR="$WORK_DIR/contender.err"
+
 hosts_lock_contender() {
   local lock="$1" label="${2:-a contender}" impl="${3:-auto}" status=0
   BOOTROOT_E2E_HOSTS_LOCK="$lock" BOOTROOT_E2E_HOSTS_LOCK_IMPL="$impl" \
-    "$WORK_DIR/take-hosts-lock.sh" "$IMPL_DIR" "$label" >/dev/null 2>&1 9>&- \
+    "$WORK_DIR/take-hosts-lock.sh" "$IMPL_DIR" "$label" >/dev/null 2>"$CONTENDER_ERR" 9>&- \
     || status=$?
   printf '%s' "$status"
 }
 
+# A stand-in for `/etc/hosts`. The lock opens what is already there and
+# never creates it, so every path locked below has to exist first — and
+# carries contents the lock must be seen not to disturb.
+make_hosts_file() {
+  local path="$1"
+  rm -f "$path"
+  printf '127.0.0.1\tlocalhost\n::1\tlocalhost\n' >"$path"
+}
+
 check_hosts_lock() {
-  local lock="$BOOTROOT_E2E_HOSTS_LOCK" status=0
-  rm -f "$lock"
+  local lock="$BOOTROOT_E2E_HOSTS_LOCK" label status=0 contents mode
+  make_hosts_file "$lock"
+  contents="$(cat "$lock")"
+  mode="$(path_mode "$lock")"
+  label="$(hosts_lock_label_path)"
+  rm -f "$label"
   BOOTROOT_HOSTS_LOCK_HELD=0
 
-  # The file the first run creates is the file every later run locks —
-  # it is never removed — and the run that arrives next is regularly
-  # another user's, which has to open it to lock it. So the mode is the
-  # taking run's to set, whatever umask it was started under: one that
-  # left this at 0600 would deny hosts mode to everybody else on the
-  # host for good, and not merely for as long as it ran.
-  (
-    umask 077
-    export BOOTROOT_E2E_HOSTS_LOCK="$lock"
-    "$WORK_DIR/take-hosts-lock.sh" "$IMPL_DIR" "a run under a restrictive umask" 9>&-
-  ) >/dev/null 2>&1 || status=$?
-  [ "$status" -eq 0 ] \
-    || die "a run under umask 077 could not take the hosts lock (status ${status})"
-  case "$(path_mode "$lock")" in
-    *[4567]) ;;
-    *) die "a run under umask 077 left the hosts lock at mode $(path_mode "$lock"), which another user's run cannot open to lock" ;;
-  esac
-  ok "the lock a run takes is readable by the other users' runs that have to open it, whatever umask made it"
-
-  rm -f "$lock"
   acquire_hosts_lock "validator"
   hosts_lock_held || die "acquire_hosts_lock returned without recording that it holds the lock"
-  [ "$(run_marker_field "$lock" pid)" = "$$" ] \
-    || die "the hosts lock does not record this process's pid"
-  ok "a hosts-mode run takes the lock and records its own pid in it"
+  # The lock is the file the run is about to edit, so what it must not do
+  # to it is anything: a lock that truncated, appended to or re-moded
+  # `/etc/hosts` would be doing the damage it exists to serialise.
+  [ "$(cat "$lock")" = "$contents" ] \
+    || die "taking the hosts lock changed the contents of the file it locks"
+  [ "$(path_mode "$lock")" = "$mode" ] \
+    || die "taking the hosts lock re-moded the file it locks"
+  [ "$(run_marker_field "$label" pid)" = "$$" ] \
+    || die "the holder recorded no pid of its own for the next run to name"
+  ok "a hosts-mode run locks the file it is about to edit, writes nothing to it, and records itself elsewhere"
 
   # A second run is refused, and leaves the holder's label untouched: the
   # whole point is that it stops before it can edit the file.
   status="$(hosts_lock_contender "$lock" "the second run")"
   [ "$status" -eq 9 ] \
     || die "a second hosts-mode run was not refused while a live run held the lock (status ${status})"
-  [ "$(run_marker_field "$lock" pid)" = "$$" ] \
+  [ "$(run_marker_field "$label" pid)" = "$$" ] \
     || die "the refused run overwrote the live holder's label"
-  ok "a second hosts-mode run is refused while a live one holds the lock"
+  grep -q "pid $$" "$CONTENDER_ERR" \
+    || die "the refusal does not name the run holding the lock: $(cat "$CONTENDER_ERR")"
+  ok "a second hosts-mode run is refused while a live one holds the lock, and told which run holds it"
+
+  # A label is a record of a live holder or it is nothing. One left
+  # behind by a run that was killed names a process that released the
+  # lock the moment it died, so a run refused afterwards is being refused
+  # by somebody else — and naming the dead run would send its operator
+  # after a process that is not there.
+  printf 'pid=%s\nholder=%s\n' 4194305 "a run that was killed" >"${label}.stale.tmp"
+  mv "${label}.stale.tmp" "$label"
+  status="$(hosts_lock_contender "$lock" "the run refused by somebody else")"
+  [ "$status" -eq 9 ] \
+    || die "a run was admitted while this process held the lock (status ${status})"
+  ! grep -q "pid 4194305" "$CONTENDER_ERR" \
+    || die "the refusal named a dead run's label as the holder: $(cat "$CONTENDER_ERR")"
+  ok "a label left by a killed run is not named as the holder of a lock it no longer has"
+  printf 'pid=%s\nholder=%s\n' "$$" "validator" >"${label}.ours.tmp"
+  mv "${label}.ours.tmp" "$label"
 
   release_hosts_lock
   ! hosts_lock_held || die "release_hosts_lock still reads as holding the lock"
-  # The file stays. Unlinking it is what would break this: two runs
-  # opening the path either side of an unlink lock two different inodes,
-  # and neither conflicts with the other.
-  [ -f "$lock" ] \
-    || die "release_hosts_lock removed the lock file; two runs either side of that hold locks on different inodes"
-  [ -z "$(run_marker_field "$lock" pid)" ] \
+  [ "$(cat "$lock")" = "$contents" ] \
+    || die "releasing the hosts lock changed the contents of the file it locked"
+  [ ! -f "$label" ] \
     || die "release_hosts_lock left this run's label behind for the next run to name"
   status="$(hosts_lock_contender "$lock" "the next run")"
   [ "$status" -eq 0 ] \
     || die "the lock could not be taken after it was released (status ${status})"
-  ok "a run releases the lock on the way out, and leaves the file for the next one to lock"
+  ok "a run releases the lock on the way out, and leaves the file exactly as it found it"
 }
 
 # The one property everything else rests on: a run that is killed leaves
@@ -572,7 +602,7 @@ check_hosts_lock() {
 # whatever the recovery does with what it read.
 check_hosts_lock_dies_with_the_run() {
   local lock="$WORK_DIR/killed-hosts.lock" status
-  rm -f "$lock"
+  make_hosts_file "$lock"
   start_hosts_lock_holder "$lock"
   status="$(hosts_lock_contender "$lock" "the run that arrived second")"
   [ "$status" -eq 9 ] \
@@ -586,66 +616,62 @@ check_hosts_lock_dies_with_the_run() {
   ok "a killed run's lock is released by the kernel, so there is no stale lock and nothing to recover"
 }
 
-# And the file is not what decides, in either direction. A label naming a
-# live process does not make the lock held, and a lock with no label at
-# all is still held. Anything else is a lock that can be taken twice by
-# writing a file, or refused for ever by planting one.
+# And the label is not what decides, in either direction. One naming a
+# live process does not make the lock held, and none at all does not make
+# it free. Anything else is a lock that can be taken twice by writing a
+# file, or refused for ever by planting one.
 check_hosts_lock_is_the_kernels() {
-  local lock="$WORK_DIR/label-hosts.lock" status
-  printf 'pid=%s\nholder=%s\n' "$$" "a process that is alive and holds nothing" >"$lock"
+  local lock="$WORK_DIR/label-hosts.lock" label status
+  label="$(hosts_lock_label_path)"
+  make_hosts_file "$lock"
+  ensure_run_marker_dir
+  printf 'pid=%s\nholder=%s\n' "$$" "a process that is alive and holds nothing" >"$label"
   status="$(hosts_lock_contender "$lock" "the run that read the label")"
   [ "$status" -eq 0 ] \
-    || die "a lock file whose label names a live process was treated as held (status ${status}); the label is a message, not the lock"
+    || die "a label naming a live process was treated as the lock being held (status ${status}); the label is a message, not the lock"
 
-  : >"$lock"
+  rm -f "$label"
   start_hosts_lock_holder "$lock"
-  : >"$lock"
+  rm -f "$label"
   status="$(hosts_lock_contender "$lock" "the run that found no label")"
   [ "$status" -eq 9 ] \
-    || die "a lock with no label was taken while a live holder had it (status ${status})"
+    || die "the lock was taken from a live holder because no label named it (status ${status})"
   kill_hosts_lock_holder
-  rm -f "$lock"
+  rm -f "$lock" "$label"
   ok "the lock is the kernel's: a label naming a live pid does not hold it, and no label does not free it"
 }
 
-# Across users the lock file belongs to whoever created it, and the run
-# taking it next can neither write to it nor re-mode it. `flock(2)` locks
-# a descriptor however it was opened, so a read-only open is enough — and
-# it has to be, or a lock file owned by another user would deny hosts
-# mode to everybody else. That is also the whole of what the cross-user
-# case now needs: no unlink, no rename, no `sudo`.
+# The file this locks is root's, and every run that takes the lock is not
+# — `/etc/hosts` is `0644 root:wheel`, which is exactly why the mode a
+# run may edit it in is `sudo`. `flock(2)` locks a descriptor however it
+# was opened, so a read-only open is enough, and it has to be: a lock
+# needing write access would be one no ordinary run could take, on the
+# one file `hosts` mode exists to serialise.
 #
-# One uid owns everything it creates here, so what is reproduced is the
-# two refusals that case is made of: a mode this user's own `open` for
-# writing cannot pass, and a `chmod` that refuses to lift it, standing in
-# for a file this run does not own.
+# One uid owns everything this script creates, so what stands in for that
+# file is a mode this user's own `open` for writing cannot pass.
 check_hosts_lock_needs_no_write_access() {
-  local lock="$WORK_DIR/readonly-hosts.lock" stub_dir="$WORK_DIR/readonly-bin"
-  local status=0
+  local lock="$WORK_DIR/readonly-hosts.lock" status=0 contents
   if [ "$(id -u)" -eq 0 ]; then
-    ok "skipped as root, which opens and re-modes a file whoever owns it"
+    ok "skipped as root, which opens a file for writing whoever owns it"
     return 0
   fi
-  mkdir -p "$stub_dir"
-  cat >"$stub_dir/chmod" <<'STUB'
-#!/bin/sh
-exit 1
-STUB
-  chmod 755 "$stub_dir/chmod"
-  printf 'pid=%s\nholder=%s\n' 4194305 "a run of another user's that has finished" >"$lock"
+  make_hosts_file "$lock"
+  contents="$(cat "$lock")"
   chmod 444 "$lock"
   (
-    PATH="$stub_dir:$PATH"
     export BOOTROOT_E2E_HOSTS_LOCK="$lock"
-    "$WORK_DIR/take-hosts-lock.sh" "$IMPL_DIR" "another user's run" 9>&-
+    "$WORK_DIR/take-hosts-lock.sh" "$IMPL_DIR" "a run locking a file it may not write" 9>&-
   ) >/dev/null 2>&1 || status=$?
   [ "$status" -eq 0 ] \
-    || die "a lock file this user can neither write nor re-mode could not be taken (status ${status}); across users that is the ordinary case"
-  [ "$(run_marker_field "$lock" pid)" = 4194305 ] \
-    || die "a run holding a lock file it cannot write rewrote the label anyway"
+    || die "a file this user cannot write could not be locked (status ${status}); that is what /etc/hosts is to every run that takes this lock"
+  [ "$(path_mode "$lock")" = "444" ] \
+    || die "the lock re-moded the file it locked; /etc/hosts is not a harness's to re-mode"
+  [ "$(cat "$lock")" = "$contents" ] \
+    || die "the lock wrote to a file it was only supposed to lock"
   chmod 644 "$lock"
-  rm -f "$lock" "$stub_dir/chmod"
-  ok "a lock file this user can neither write nor re-mode is still takeable, and its label is left alone"
+  rm -f "$lock"
+  ok "a file this run may read and not write is still lockable, and is left exactly as it was"
 }
 
 # Every way of calling `flock(2)` this host has, driven both ways. They
@@ -657,7 +683,7 @@ check_hosts_lock_backends() {
   for impl in flock perl python3; do
     command -v "$impl" >/dev/null 2>&1 || continue
     tried="$tried $impl"
-    rm -f "$lock"
+    make_hosts_file "$lock"
     status="$(hosts_lock_contender "$lock" "a run using ${impl}" "$impl")"
     [ "$status" -eq 0 ] \
       || die "the hosts lock could not be taken through ${impl} (status ${status})"
@@ -673,45 +699,64 @@ check_hosts_lock_backends() {
   ok "every flock(2) caller this host has takes the lock when it is free and refuses it when it is held:${tried}"
 }
 
-# `>>` creates the target of a dangling link, and the label write
-# truncates what it opens, so a link planted at this predictable
-# machine-wide path would have both land wherever it points.
-check_hosts_lock_refuses_a_symlink() {
+# A lock that creates what it locks is a lock on an inode of its own
+# making, which is the whole of what a lock file in a shared directory
+# gets wrong: whoever gets to that path first decides what every run
+# afterwards locks, and can put a different inode there between one run's
+# open and the next's. So a path that resolves to nothing is refused —
+# and the run is refused with it, rather than going on to edit the file
+# it never locked.
+check_hosts_lock_creates_nothing() {
+  local missing="$WORK_DIR/hosts-that-is-not-there"
   local target="$WORK_DIR/hosts-lock-target" link="$WORK_DIR/hosts-lock-link"
   local status
-  rm -f "$target" "$link"
+  rm -f "$missing" "$target" "$link"
+  status="$(hosts_lock_contender "$missing" "the run with nothing to lock")"
+  [ "$status" -eq 9 ] \
+    || die "a run was admitted after locking a file that was not there (status ${status})"
+  [ ! -e "$missing" ] \
+    || die "the hosts lock created the file it was supposed to be locking"
   ln -s "$target" "$link"
   status="$(hosts_lock_contender "$link" "the linked run")"
-  [ "$status" -eq 9 ] || die "the hosts lock was taken through a symbolic link"
+  [ "$status" -eq 9 ] \
+    || die "a run was admitted through a symbolic link that pointed at nothing"
   [ ! -e "$target" ] \
-    || die "the refused symbolic link's target was created by the hosts lock"
+    || die "the hosts lock created a dangling link's target"
   rm -f "$target" "$link"
-  ok "a hosts lock reached through a symbolic link is refused, not followed"
+  ok "the hosts lock opens what is there and creates nothing, so no path it is pointed at becomes a lock of its own"
 }
 
-# Unlike the marker directory, this one must not be per-user.
-# `/etc/hosts` is one file for the whole machine, so a lock only one
-# user's runs can see would leave two users' runs editing it at once —
-# which is the case the accident used to cover, since a second user's
-# containers collided on the Compose project too.
-check_default_hosts_lock_is_machine_wide() {
-  local resolved
+# The lock is the file, and the file is `/etc/hosts`: it must not become
+# a file of the harness's own at a shared path again, where an inode can
+# be swapped in between the check that vets it and the open that locks
+# it. The default is asserted against what both harnesses edit, and the
+# library is held to opening it and nothing more.
+check_default_hosts_lock_is_the_file_it_protects() {
+  local resolved script path offenders
   resolved="$(
     unset BOOTROOT_E2E_HOSTS_LOCK
     # shellcheck source=impl/lib/run-scope.sh
     . "$IMPL_DIR/lib/run-scope.sh"
     printf '%s' "$BOOTROOT_E2E_HOSTS_LOCK"
   )"
-  case "$resolved" in
-    /tmp/*) ;;
-    *) die "the default hosts lock '${resolved}' is not at a machine-wide path; \$TMPDIR is per-user on macOS, and /etc/hosts is not" ;;
-  esac
-  case "$resolved" in
-    *"$(id -u)"*)
-      die "the default hosts lock '${resolved}' is per-user, but the file it serialises access to is the whole machine's"
-      ;;
-  esac
-  ok "the default hosts lock is machine-wide, like the file it serialises"
+  [ "$resolved" = "/etc/hosts" ] \
+    || die "the default hosts lock is '${resolved}' rather than /etc/hosts; a lock at a path of the harness's own can be swapped for another inode between the check and the open, and one under \$TMPDIR is not even machine-wide"
+  for script in "${LIFECYCLE_SCRIPTS[@]}"; do
+    path="$IMPL_DIR/$script"
+    grep -q 'run_sudo cp "\$tmp_file" /etc/hosts' "$path" \
+      || die "${script} no longer rewrites /etc/hosts the way the lock assumes; the lock is that file's inode, so an edit that renames over it locks one inode and edits another"
+  done
+  # The open is read-only, and there is no second one. `>` or `>>` on fd 9
+  # would create the file at a path that resolved to nothing and truncate
+  # one that did not — on `/etc/hosts`.
+  offenders="$(grep -nE 'exec 9>' "$IMPL_DIR/lib/run-scope.sh" | grep -v 'exec 9>&-' || true)"
+  [ -z "$offenders" ] \
+    || die "run-scope.sh opens the hosts lock for writing: ${offenders//$'\n'/; }"
+  offenders="$(grep -n '"\$BOOTROOT_E2E_HOSTS_LOCK"' "$IMPL_DIR/lib/run-scope.sh" \
+    | grep -v 'exec 9<"\$BOOTROOT_E2E_HOSTS_LOCK"' || true)"
+  [ -z "$offenders" ] \
+    || die "run-scope.sh hands the file it locks to something other than that one read-only open: ${offenders//$'\n'/; }"
+  ok "the hosts lock is /etc/hosts itself, opened read-only, and the file both harnesses edit in place"
 }
 
 check_liveness() {
@@ -885,6 +930,14 @@ check_sweep_collects_only_dead_runs() {
     "$(run_scope_http01_image "$DEAD") $(run_scope_http01_image "$LIVE") ${BOOTROOT_HTTP01_IMAGE_REPO}:latest"
   seed_marker "$DEAD" 4194305 "$DEAD_PROJECT"
   seed_marker "$LIVE" "$$" "$LIVE_PROJECT"
+  # The `hosts` lock's holder label shares this directory, which is the
+  # one directory whose ownership is already established. Its name is one
+  # no instance can carry, and the sweep has to read it as such — the pid
+  # here is a dead one, as a killed holder's label carries, which is
+  # exactly when a sweep that read the filename as an instance would
+  # collect it.
+  printf 'pid=%s\nholder=%s\n' 4194305 "a hosts-mode run that was killed" \
+    >"$(hosts_lock_label_path)"
 
   sweep_dead_run_instances "a-label" "$WORK_DIR/sweep.log" || status=$?
   [ "$status" -eq 0 ] || die "the sweep returned ${status} on a daemon it could fully collect"
@@ -893,6 +946,8 @@ check_sweep_collects_only_dead_runs() {
     || die "the sweep left the dead run's marker behind"
   [ -f "$BOOTROOT_E2E_RUN_MARKER_DIR/$LIVE" ] \
     || die "the sweep removed a live run's marker"
+  [ -f "$(hosts_lock_label_path)" ] \
+    || die "the sweep read the hosts lock's holder label as a run and collected it"
 
   local expected
   expected="$(printf '%s\n' bootroot-ca bootroot-openbao $(instance_containers "$LIVE") \
@@ -1202,8 +1257,8 @@ check_hosts_lock_dies_with_the_run
 check_hosts_lock_is_the_kernels
 check_hosts_lock_needs_no_write_access
 check_hosts_lock_backends
-check_hosts_lock_refuses_a_symlink
-check_default_hosts_lock_is_machine_wide
+check_hosts_lock_creates_nothing
+check_default_hosts_lock_is_the_file_it_protects
 check_liveness
 install_docker_stub
 check_sweep_collects_only_dead_runs

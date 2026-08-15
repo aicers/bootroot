@@ -153,33 +153,57 @@ names already present and adds nothing, then the first run's cleanup strips
 both marker lines while the second is still resolving through them.
 
 So the serialisation is stated instead of inherited. A run in `hosts` mode
-takes a lock at `/tmp/bootroot-e2e-hosts.lock` after its `sudo` checks and
-before its first edit, and releases it once its own entries are gone. A second
-such run is refused there, before it touches the file, with a message naming
-the run last recorded in it. A run that was refused, or that failed before
+takes an exclusive `flock(2)` on `/etc/hosts` itself after its `sudo` checks
+and before its first edit, and releases it once its own entries are gone. A
+second such run is refused there, before it touches the file, and told which
+run holds it where it can tell. A run that was refused, or that failed before
 taking the lock, leaves `/etc/hosts` alone on the way out: the cleanup rewrite
 drops every line carrying the script's marker, so it cannot tell one run's
 entries from another's.
 
-What holds that lock is an advisory lock on an open file descriptor —
-`flock(2)` — and never the presence of the file. Ownership is the kernel's, and
-it lasts exactly as long as the run does, so there is no such thing as a stale
-lock here: a run killed with `SIGKILL` releases it at the instant it stops
-being able to write `/etc/hosts`, and the next run takes it with nothing to
-reclaim and nothing to judge. That is what a pid file cannot do. Recovering one
-means removing a file on the strength of a pid read from it a moment earlier,
-and a second run arriving at the same stale lock can take it in between —
-whereupon the recovery destroys a live run's lock, and both runs edit
-`/etc/hosts` believing they hold the mutex.
+The lock is the resource, and that is the whole of the design. Two properties
+carry it, and each covers a failure the other does not.
 
-Two things follow from the lock being a descriptor rather than a file. The file
-at that path is created once and never removed, because two runs opening the
-path either side of an unlink would lock two different inodes and neither would
-conflict with the other; what it holds is a label — a pid and the harness and
-artifact directory of the run that wrote it — which the refusal message names
-and nothing acts on. And every child a run starts inherits the descriptor, so
-the harnesses close it (`9>&-`) on the `bootroot-agent` daemons they start: one
-that outlived a killed run would otherwise go on holding the lock.
+Ownership is the kernel's and lasts exactly as long as the run does, so there
+is no such thing as a stale lock: a run killed with `SIGKILL` releases it at
+the instant it stops being able to write `/etc/hosts`, and the next run takes
+it with nothing to reclaim and nothing to judge. That is what a lock file whose
+ownership is "this path exists" cannot do — recovering one means removing a
+file on the strength of a pid read from it a moment earlier, and a second run
+arriving at the same stale lock can take it in between, whereupon the recovery
+destroys a live run's lock and both runs edit `/etc/hosts` believing they hold
+the mutex.
+
+And the inode is one nobody can swap. `flock(2)` locks an inode, and a path
+names one only for as long as nobody changes what it names, so a lock file of
+the harness's own at a predictable name in a world-writable `/tmp` is a mutex
+that can be split: the test that refuses a symbolic link and the `open` that
+follows it are two calls, and anyone on the machine can put a link there in
+between. One run locks whatever it points at; the next, arriving after the link
+has been swapped back for an ordinary file, locks a different inode and takes a
+mutex the first believes it holds. `O_NOFOLLOW` narrows that without closing
+it, because a file another user owns in a sticky `/tmp` is still theirs to
+unlink and create again between two opens. `/etc/hosts` sits in a directory
+that is root's, so no unprivileged user can put another inode at that path —
+and the run that locks it is the run about to edit it.
+
+Nothing is created, written or re-moded by the lock. The open is read-only,
+which is all `flock(2)` needs and all any run has to `/etc/hosts` without
+`sudo`, and it is also what makes a missing file a refusal rather than a lock
+on something the run has just brought into being. The harnesses' own edits keep
+the inode — `cp` over the file and `tee -a` onto it, never a rename — so what a
+run locked at the start is what it is still editing at the end. Beyond the
+`sudo -n` the mode already requires, the lock asks for nothing.
+
+Who holds it is recorded separately, in the run-marker directory below, and is
+advisory: a label naming a live process names the holder, one left by a killed
+run reads as nothing, and another user's sits in a directory of their own that
+this run cannot read. Then the refusal says so rather than naming the wrong
+run. Nothing is read out of that label and acted on.
+
+Every child a run starts inherits the descriptor, so the harnesses close it
+(`9>&-`) on the `bootroot-agent` daemons they start: one that outlived a killed
+run would otherwise go on holding the lock.
 
 Taking the lock needs `flock(1)`, `perl` or `python3` — whichever the host has,
 in that order. Linux runners have all three and macOS has the last two; a host
@@ -187,23 +211,8 @@ with none of them is refused in `hosts` mode, naming what to install.
 
 One lock covers both harnesses, because both add the same two host names — a
 local run and a remote run overwrite each other exactly as two local runs
-would. Its path is machine-wide rather than per-user like the run-marker
-directory, because `/etc/hosts` is: a lock only one user's runs could see would
-leave two users' runs editing the one file at once. Nothing is read out of that
-lock and acted on, so a file planted at that path denies `hosts` runs loudly
-rather than aiming a teardown, which is why it needs none of the ownership
-machinery the marker directory has.
-
-Across users it needs nothing further. The file belongs to whoever created it
-and outlives them, and the next run can neither write to it nor re-mode it —
-but `flock(2)` locks a descriptor however it was opened, so a read-only open is
-enough, and a run holding a lock file it does not own simply leaves the label
-alone. The lock is written world-readable whatever the umask that created it,
-because opening it is what taking it means: one left at 0600 would deny `hosts`
-mode to every other user on the host for good. Nothing here unlinks or renames
-a file in a sticky `/tmp` that somebody else owns, so the lock asks for no
-`sudo` of its own beyond the `sudo -n` the mode already requires to edit
-`/etc/hosts` at all.
+would. It is machine-wide rather than per-user like the run-marker directory,
+because `/etc/hosts` is.
 
 `no-hosts` runs take no lock and are unaffected. Use that mode when you need
 two lifecycle runs at once.
@@ -242,6 +251,13 @@ would pass the ownership check and hand the sweep files that were never
 markers. The uid in the path is what gives Linux the separation `$TMPDIR`
 already gives macOS, so two users can run the harness on one host instead of
 the second being refused.
+
+It is also where a `hosts`-mode run records that it holds the lock, under a
+name no instance can carry (`hosts-lock-holder.label`), so the sweep never
+reads it as a run. That record lives here rather than at a machine-wide path
+of its own for the reason the lock no longer does: a predictable name in a
+world-writable directory is one a run's write would truncate wherever
+somebody else's link pointed.
 
 `scripts/validate-e2e-run-scope.sh` covers the derivation, the markers, the
 sweep and the `hosts` lock without Docker, and runs in the `check` CI job.
@@ -432,7 +448,7 @@ Configuration:
 - Script writes temporary `stepca.internal` / `responder.internal` host entries
   (requires `sudo -n`)
 - One `hosts`-mode run at a time, across both lifecycle scripts: a second one
-  is refused at `/tmp/bootroot-e2e-hosts.lock`
+  is refused at the `flock(2)` the first holds on `/etc/hosts`
 
 Purpose:
 
