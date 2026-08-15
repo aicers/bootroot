@@ -475,8 +475,9 @@ jobs:
             VERIFY_DELAY_SECS=5
             TIMEOUT_SECS=120
           fi
+          # No PROJECT_NAME: the lifecycle scripts derive their own
+          # per-run instance, Compose project and published ports.
           ARTIFACT_DIR="$ARTIFACT_DIR" \
-          PROJECT_NAME="bootroot-e2e-ci-${{ matrix.scenario.label }}-${GITHUB_RUN_ID}" \
           RESOLUTION_MODE="${{ matrix.scenario.resolution }}" \
           SECRETS_DIR="$(pwd)/secrets" \
           TIMEOUT_SECS="$TIMEOUT_SECS" \

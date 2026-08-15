@@ -80,9 +80,14 @@ cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 # is a host bootroot-agent process whose fast-poll loop (default
 # fast_poll_interval = 30s) propagates rotated secrets.  Verify
 # retries are sized to cover a full poll interval on slow runners.
+# The lifecycle scripts take no project name.  They derive their own
+# per-run instance, Compose project and published ports so two runs can
+# share a host, which a caller-supplied project would only half-override:
+# `infra install --instance-name` fixes the project to the instance name,
+# and a `-p` disagreeing with it would name a project the install never
+# created.  See `scripts/impl/lib/run-scope.sh`.
 echo "[ci-local-e2e] run local lifecycle (no-hosts)"
 ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}" \
-PROJECT_NAME="bootroot-e2e-ci-local-no-hosts-${RUN_ID}" \
 RESOLUTION_MODE="no-hosts" \
 SECRETS_DIR="$ROOT_DIR/secrets" \
 TIMEOUT_SECS=180 \
@@ -98,7 +103,6 @@ BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
 if [ "$SKIP_HOSTS" -eq 0 ]; then
   echo "[ci-local-e2e] run local lifecycle (hosts)"
   ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-hosts-${RUN_ID}" \
-  PROJECT_NAME="bootroot-e2e-ci-local-hosts-${RUN_ID}" \
   RESOLUTION_MODE="hosts" \
   SECRETS_DIR="$ROOT_DIR/secrets" \
   TIMEOUT_SECS=180 \
@@ -116,7 +120,6 @@ fi
 
 echo "[ci-local-e2e] run remote lifecycle (no-hosts)"
 ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-remote-no-hosts-${RUN_ID}" \
-PROJECT_NAME="bootroot-e2e-ci-remote-no-hosts-${RUN_ID}" \
 RESOLUTION_MODE="no-hosts" \
 SECRETS_DIR="$ROOT_DIR/secrets" \
 TIMEOUT_SECS=120 \
@@ -132,7 +135,6 @@ BOOTROOT_AGENT_BIN="$ROOT_DIR/target/debug/bootroot-agent" \
 if [ "$SKIP_HOSTS" -eq 0 ]; then
   echo "[ci-local-e2e] run remote lifecycle (hosts)"
   ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-remote-hosts-${RUN_ID}" \
-  PROJECT_NAME="bootroot-e2e-ci-remote-hosts-${RUN_ID}" \
   RESOLUTION_MODE="hosts" \
   SECRETS_DIR="$ROOT_DIR/secrets" \
   TIMEOUT_SECS=120 \
