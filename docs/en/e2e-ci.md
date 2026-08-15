@@ -156,45 +156,54 @@ So the serialisation is stated instead of inherited. A run in `hosts` mode
 takes a lock at `/tmp/bootroot-e2e-hosts.lock` after its `sudo` checks and
 before its first edit, and releases it once its own entries are gone. A second
 such run is refused there, before it touches the file, with a message naming
-the pid that holds it; a lock left behind by a run that was killed names a dead
-pid, and the next run clears it and takes it. A run that was refused, or that
-failed before taking the lock, leaves `/etc/hosts` alone on the way out: the
-cleanup rewrite drops every line carrying the script's marker, so it cannot
-tell one run's entries from another's.
+the run last recorded in it. A run that was refused, or that failed before
+taking the lock, leaves `/etc/hosts` alone on the way out: the cleanup rewrite
+drops every line carrying the script's marker, so it cannot tell one run's
+entries from another's.
 
-Clearing a stale lock moves it aside under a name private to the run doing the
-clearing, and judges the file that move got hold of — it never removes the
-lock path on the strength of a pid read from it a moment earlier. The two are
-not the same thing when two runs arrive at the same stale lock: the second can
-clear it and take it in between, and a removal aimed at the path would then
-destroy a live run's lock and create its own over it, leaving both runs editing
-`/etc/hosts` believing they hold the mutex. A rename is atomic, so the file
-that is judged and the file that is removed are one file; a run that finds it
-has moved aside a live run's lock puts it straight back and is refused.
+What holds that lock is an advisory lock on an open file descriptor —
+`flock(2)` — and never the presence of the file. Ownership is the kernel's, and
+it lasts exactly as long as the run does, so there is no such thing as a stale
+lock here: a run killed with `SIGKILL` releases it at the instant it stops
+being able to write `/etc/hosts`, and the next run takes it with nothing to
+reclaim and nothing to judge. That is what a pid file cannot do. Recovering one
+means removing a file on the strength of a pid read from it a moment earlier,
+and a second run arriving at the same stale lock can take it in between —
+whereupon the recovery destroys a live run's lock, and both runs edit
+`/etc/hosts` believing they hold the mutex.
+
+Two things follow from the lock being a descriptor rather than a file. The file
+at that path is created once and never removed, because two runs opening the
+path either side of an unlink would lock two different inodes and neither would
+conflict with the other; what it holds is a label — a pid and the harness and
+artifact directory of the run that wrote it — which the refusal message names
+and nothing acts on. And every child a run starts inherits the descriptor, so
+the harnesses close it (`9>&-`) on the `bootroot-agent` daemons they start: one
+that outlived a killed run would otherwise go on holding the lock.
+
+Taking the lock needs `flock(1)`, `perl` or `python3` — whichever the host has,
+in that order. Linux runners have all three and macOS has the last two; a host
+with none of them is refused in `hosts` mode, naming what to install.
 
 One lock covers both harnesses, because both add the same two host names — a
 local run and a remote run overwrite each other exactly as two local runs
 would. Its path is machine-wide rather than per-user like the run-marker
 directory, because `/etc/hosts` is: a lock only one user's runs could see would
 leave two users' runs editing the one file at once. Nothing is read out of that
-lock and acted on — it holds a pid to test for liveness and a name to put in a
-message — so a file planted at that path denies `hosts` runs loudly rather than
-aiming a teardown, which is why it needs none of the ownership machinery the
-marker directory has.
+lock and acted on, so a file planted at that path denies `hosts` runs loudly
+rather than aiming a teardown, which is why it needs none of the ownership
+machinery the marker directory has.
 
-Reclaiming a lock left behind by *another user's* killed run does need one
-thing that path costs, and takes it: `/tmp` is sticky, so only a file's owner
-may unlink it there, and a plain `rm` would recover a killed run's lock for
-that user alone — leaving `hosts` mode refused on the host for everybody else
-until they or root removed a file by hand, which is the per-user serialisation
-a machine-wide lock exists to avoid. The stale-lock recovery therefore falls
-back to `sudo -n`, for the rename that moves the lock aside as for the unlink
-that follows, and asks for nothing the mode has not already required of the run
-before it reaches the lock. What licenses that recovery is the pid
-read out of the file, so a lock whose pid cannot be read is treated as held
-rather than stale — an unreadable pid is not a dead one — and the lock is
-written world-readable whatever the umask that created it, since the run that
-has to judge it next is regularly not the one that wrote it.
+Across users it needs nothing further. The file belongs to whoever created it
+and outlives them, and the next run can neither write to it nor re-mode it —
+but `flock(2)` locks a descriptor however it was opened, so a read-only open is
+enough, and a run holding a lock file it does not own simply leaves the label
+alone. The lock is written world-readable whatever the umask that created it,
+because opening it is what taking it means: one left at 0600 would deny `hosts`
+mode to every other user on the host for good. Nothing here unlinks or renames
+a file in a sticky `/tmp` that somebody else owns, so the lock asks for no
+`sudo` of its own beyond the `sudo -n` the mode already requires to edit
+`/etc/hosts` at all.
 
 `no-hosts` runs take no lock and are unaffected. Use that mode when you need
 two lifecycle runs at once.

@@ -302,13 +302,12 @@ run_marker_field() {
 # `kill -0` reports a process owned by another user as an error, which is
 # indistinguishable here from "no such process", so two more probes stand
 # behind it: the process directory on Linux, and `ps -p` where there is
-# none.  Both see another user's process, which the `/etc/hosts` lock
-# below needs — that lock is machine-wide, so the pid it records is
-# regularly not this user's, and reading it as dead would hand two runs
-# the file at once.  The marker sweep only gains by the same
-# conservatism: a pid recycled by anyone's process spares a dead run's
-# containers for one more round, which is the trade already recorded
-# below, and never removes a live run's.
+# none.  The marker directory this decides for is one user's, so the
+# extra probes are conservatism rather than necessity — and the
+# conservatism is the direction to err in.  A pid this reads as alive
+# spares a dead run's containers for one more round, which is the trade
+# recorded below; one it read as dead while another user's process held
+# it would take a live run's containers out from under it.
 run_pid_is_alive() {
   local pid="$1"
   case "$pid" in
@@ -543,21 +542,58 @@ sweep_dead_run_instances() {
 # user on macOS, which is exactly what is not wanted here, so this is
 # `/tmp` outright.
 #
-# A shared path at a predictable location is worth less caution here than
-# it is for the marker directory, and the difference is what the file is
-# used for.  Nothing is read out of this one and handed to `docker rm`:
-# it holds a pid to test for liveness and a name to put in a message.  So
-# a lock somebody else planted denies `hosts` runs — loudly, naming the
-# path — where a marker directory somebody else planted would have aimed
-# a teardown.
 #
-# What a machine-wide path in `/tmp` does cost is the recovery of a
-# killed run's lock, and that has to be paid rather than accepted:
-# `/tmp` is sticky, so the next user's run cannot unlink or rename the
-# file the killed user's run left behind, and `hosts` mode would stay
-# refused for everyone but its owner.  The stale-lock recovery below
-# therefore falls back to the `sudo -n` the mode already requires.
+# What holds this lock is an advisory lock on an open file descriptor —
+# `flock(2)` — and never the presence of the file.  That is the whole of
+# the design, and it is the one thing a pid file cannot do.
+#
+# A lock whose ownership is "this path exists" has to be recovered when
+# the run holding it is killed, and the recovery is where it comes apart.
+# The pid read at the path says nothing about the file that is there an
+# instant later: a second run arriving at the same stale lock can clear it
+# and take it in between.  Judging the object rather than the path fixes
+# that much and no more — a recovery that has to take a lock out of the
+# path, even for an instant, has hidden a live owner's lock from a third
+# run arriving in that instant, which then creates its own.  Two runs go
+# on to edit `/etc/hosts` believing they hold the mutex, which is the one
+# outcome this exists to prevent, and it arrives silently.
+#
+# `flock(2)` has no such gap, because ownership is a kernel object that
+# lives as long as an open file description does:
+#
+#   - There is no stale lock, so nothing is recovered and nothing is
+#     judged.  A run killed with `SIGKILL` releases it the moment the
+#     kernel closes its descriptors, which is the same instant it stops
+#     being able to write `/etc/hosts`.
+#   - The file is created once and never removed.  Removing it is what
+#     would break this: two runs that open the path either side of an
+#     unlink hold locks on two different inodes, and neither conflicts
+#     with the other.  So `release_hosts_lock` closes a descriptor and
+#     leaves the file where it is.
+#   - Nothing is read out of the file and acted on.  It holds a label —
+#     this run's pid and a line saying which harness and which artifact
+#     directory — for the refusal message to name, and the lock is the
+#     kernel's whatever the label says.  A run whose lock file belongs to
+#     another user cannot rewrite that label and does not try, which is
+#     why the message says `last recorded` rather than naming a holder.
+#
+# It also spares this lock a privileged call.  Nothing here unlinks or
+# renames a file in a sticky `/tmp` that another user owns, so the
+# `sudo -n` a path-based lock needed in order to stay machine-wide goes
+# with the recovery that needed it.
+#
+# The descriptor is fd 9, spelled as a literal because `exec {var}>` wants
+# bash 4.1 and macOS ships 3.2.  Being a descriptor has one consequence
+# worth stating: every child inherits it, so a background daemon that
+# outlives the run would hold the lock after the run is gone.  The
+# lifecycle harnesses close it (`9>&-`) on the `bootroot-agent` processes
+# they start, and `validate-e2e-run-scope.sh` holds them to it.
 BOOTROOT_E2E_HOSTS_LOCK="${BOOTROOT_E2E_HOSTS_LOCK:-/tmp/bootroot-e2e-hosts.lock}"
+
+# Which of the three ways of calling `flock(2)` on fd 9 to use.  `auto`
+# takes the first this host has; naming one is for the validator, which
+# drives every one of them that is installed.
+BOOTROOT_E2E_HOSTS_LOCK_IMPL="${BOOTROOT_E2E_HOSTS_LOCK_IMPL:-auto}"
 
 # Whether this process is the run holding the lock.  Consulted by
 # `cleanup_hosts` in both harnesses, which must rewrite `/etc/hosts` only
@@ -571,159 +607,105 @@ hosts_lock_held() {
   [ "$BOOTROOT_HOSTS_LOCK_HELD" -eq 1 ]
 }
 
-# Creates the lock file, and only when it is not already there.
+# Prints the name of the tool this host takes the lock with, and nothing
+# when it has none.
 #
-# `noclobber` turns `>` into an exclusive create, which is the whole
-# mechanism: two runs racing here — at the first attempt, or at the retry
-# after one of them cleared a stale lock — cannot both succeed, where a
-# test-then-write would let both through.
-#
-# World-readable on purpose, whatever the umask that created it.  The
-# next run to arrive here is regularly another user's, and the pid this
-# file holds is what tells it whether the run holding the lock is still
-# alive.  A lock it cannot read is one it must refuse rather than clear —
-# an unreadable pid is not a dead one — so a run started under `umask
-# 077` would otherwise deny `hosts` mode to every other user on the
-# machine for as long as it lasted, and past its death.  Nothing in here
-# is a secret: a pid and a one-line description of the run.
-hosts_lock_create() {
-  local holder="$1"
-  (
-    set -o noclobber
-    printf 'pid=%s\nholder=%s\n' "$$" "$holder" >"$BOOTROOT_E2E_HOSTS_LOCK"
-  ) 2>/dev/null || return 1
-  chmod 644 "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null || true
-}
-
-# Unlinks a path, through the privileged path when this user's own
-# unlink is refused.
-#
-# The refusal is the normal case across users rather than an unusual one.
-# `/tmp` is sticky on every system this harness runs on, so only a file's
-# owner may unlink it there, and the lock is deliberately machine-wide:
-# the run that finds it stale is exactly the run that did not write it.
-# A plain `rm` therefore recovers a killed run's lock only for the user
-# who was killed, which leaves `hosts` mode refused on that host for
-# everybody else until that user or root removes a file by hand — the
-# per-user serialisation this issue exists to remove, arriving as a hard
-# failure.
-#
-# `sudo -n` is already a precondition of the mode, checked by the caller
-# before it gets here: a run that cannot edit `/etc/hosts` unprompted
-# never reaches the lock at all.  So the privileged unlink asks for
-# nothing the run does not already have.
-#
-# It is also a safe thing to hand root.  `rm` unlinks a symbolic link
-# rather than following it, so the link the path is checked for above
-# cannot aim this at a file of somebody else's choosing even if one is
-# planted between the check and here, and a hard link planted at this
-# path costs the file it points at one of its names and none of its
-# contents.
-hosts_lock_priv_rm() {
-  local path="$1"
-  rm -f -- "$path" 2>/dev/null && return 0
-  # Somebody else got there first: gone is gone, whoever won.
-  [ -e "$path" ] || return 0
-  # root's unlink has already been tried, and there is nothing above it.
-  if [ "$(id -u)" -eq 0 ]; then
-    return 1
+# Three of them because no one is everywhere.  `flock(1)` is util-linux,
+# so Linux and CI have it and macOS has not; `perl` ships with macOS;
+# `python3` is already a prerequisite of the other E2E harnesses.
+hosts_lock_impl() {
+  local impl
+  if [ "$BOOTROOT_E2E_HOSTS_LOCK_IMPL" != "auto" ]; then
+    command -v "$BOOTROOT_E2E_HOSTS_LOCK_IMPL" >/dev/null 2>&1 || return 1
+    printf '%s' "$BOOTROOT_E2E_HOSTS_LOCK_IMPL"
+    return 0
   fi
-  command -v sudo >/dev/null 2>&1 || return 1
-  sudo -n rm -f -- "$path" 2>/dev/null
-}
-
-# Renames a path, through the privileged path for the same reason
-# `hosts_lock_priv_rm` unlinks through it: a sticky `/tmp` refuses a
-# rename of another user's file exactly as it refuses the unlink, and the
-# lock this moves aside is regularly another user's.
-#
-# `rename` never follows a symbolic link at either end, so neither a link
-# planted at the source — already refused above — nor one planted at the
-# destination in between can aim this, privileged or not: the link itself
-# is what gets replaced.
-hosts_lock_priv_mv() {
-  local from="$1" to="$2"
-  mv -f -- "$from" "$to" 2>/dev/null && return 0
-  # Nothing there to move: the caller decides what that means.
-  [ -e "$from" ] || return 1
-  if [ "$(id -u)" -eq 0 ]; then
-    return 1
-  fi
-  command -v sudo >/dev/null 2>&1 || return 1
-  sudo -n mv -f -- "$from" "$to" 2>/dev/null
-}
-
-# The pid and holder read out of the object `hosts_lock_steal_stale`
-# moved aside, for the caller's refusal message.
-HOSTS_LOCK_STOLEN_PID=""
-HOSTS_LOCK_STOLEN_HOLDER=""
-
-# Moves the lock aside under a name only this process knows, then decides
-# what to do with the object it actually got.  Returns 0 when the path is
-# clear for another attempt at the create, 2 when what it moved aside
-# turned out to be a live run's lock and has been put back, and 1 when
-# the move was refused outright.
-#
-# The ordering is the whole point, and it is the opposite of the obvious
-# one.  Reading a pid at the path and then removing the path acts on
-# whatever is there at the moment of the removal, which need not be what
-# was read: a second run arriving at the same stale lock can clear it and
-# take it in between, and the removal then destroys a live run's lock and
-# hands `/etc/hosts` to two runs at once — the very thing this lock
-# exists to prevent.  No amount of re-reading closes that, because every
-# check is of a name and every name can be re-pointed before the next
-# call opens it.
-#
-# `rename` is the one operation here that is atomic and that yields an
-# object rather than a name.  After it, the file this judges and the file
-# it removes are the same file, whatever else happens at the path: a
-# second run that gets there first finds nothing to move and takes the
-# lock cleanly, and this one loses its retry and is refused, which is the
-# correct answer.
-#
-# A lock that turns out to be live goes straight back.  That is the
-# losing side of the same race — the pid was dead when the caller read it
-# and the file was replaced before this ran — and the run that owns it is
-# editing `/etc/hosts` right now.  `ln` puts it back only while the path
-# is free, so a third run's lock is not overwritten by the restore; if
-# one did get in through the gap this opened, the live holder's own
-# record is what belongs at the path and replaces it.
-#
-# An object whose pid cannot be read is treated as live for the reason
-# the caller treats an unreadable lock as held: an unreadable pid is not
-# a dead one.
-hosts_lock_steal_stale() {
-  local stash="${BOOTROOT_E2E_HOSTS_LOCK}.stale.$$"
-  HOSTS_LOCK_STOLEN_PID=""
-  HOSTS_LOCK_STOLEN_HOLDER=""
-  # A stash of this pid's own, left by an attempt that did not finish,
-  # would otherwise be read as what this one moved aside.
-  hosts_lock_priv_rm "$stash" || return 1
-  if ! hosts_lock_priv_mv "$BOOTROOT_E2E_HOSTS_LOCK" "$stash"; then
-    # Either the holder released it in between, in which case the retry
-    # takes it, or the move was refused.
-    [ -e "$BOOTROOT_E2E_HOSTS_LOCK" ] || return 0
-    return 1
-  fi
-  if [ -r "$stash" ]; then
-    HOSTS_LOCK_STOLEN_PID="$(run_marker_field "$stash" pid 2>/dev/null || true)"
-    HOSTS_LOCK_STOLEN_HOLDER="$(run_marker_field "$stash" holder 2>/dev/null || true)"
-    if ! run_pid_is_alive "$HOSTS_LOCK_STOLEN_PID"; then
-      hosts_lock_priv_rm "$stash" || return 1
+  for impl in flock perl python3; do
+    if command -v "$impl" >/dev/null 2>&1; then
+      printf '%s' "$impl"
       return 0
     fi
-  fi
-  if ln -- "$stash" "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null; then
-    hosts_lock_priv_rm "$stash" >/dev/null 2>&1 || true
-  elif ! hosts_lock_priv_mv "$stash" "$BOOTROOT_E2E_HOSTS_LOCK"; then
-    fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} was moved aside to ${stash} while a live run held it, and could not be put back; move that file back once you are certain of it"
-  fi
-  return 2
+  done
+  return 1
 }
 
-# Aborts, naming the run that holds the lock.
+# Takes an exclusive, non-blocking `flock(2)` on fd 9.  0 when it was
+# taken, 1 when another run holds it, 2 when this host has nothing to
+# call the syscall with.
+#
+# Each spelling locks the descriptor it is handed rather than a path of
+# its own, so the lock outlives the process that took it: it lives on the
+# open file description fd 9 names, and this shell keeps that open.  That
+# is how `flock -n 9` has always worked, and `perl` and `python3` reach
+# the same syscall by the same route.
+#
+# Failure closes.  Anything but a clean acquisition is read as "somebody
+# else holds it", because refusing a run that could have had the lock
+# costs a rerun, and admitting one that could not costs two runs editing
+# `/etc/hosts` at once.
+hosts_lock_try_fd9() {
+  local impl
+  impl="$(hosts_lock_impl)" || return 2
+  case "$impl" in
+    flock) flock -n 9 ;;
+    perl) perl -e 'open(my $fh, "<&=9") or exit 3; exit(flock($fh, 2 | 4) ? 0 : 1)' ;;
+    python3) python3 -c 'import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)' ;;
+    *) return 2 ;;
+  esac || return 1
+}
+
+# Closes the descriptor the lock lives on, which is what releases it.
+hosts_lock_close_fd9() {
+  { exec 9>&-; } 2>/dev/null || true
+}
+
+# True when the label in the lock file is this run's to rewrite.
+#
+# The write below truncates what it opens, and this is a predictable path
+# in a directory the whole machine can create in — so it happens only on
+# a file this user owns and that is not a symbolic link.  A file this
+# user owns in a sticky `/tmp` is one nobody else can swap for something
+# of their choosing, which is what makes the check hold until the write.
+hosts_lock_label_is_ours() {
+  [ ! -L "$BOOTROOT_E2E_HOSTS_LOCK" ] && [ -O "$BOOTROOT_E2E_HOSTS_LOCK" ]
+}
+
+# Records who is holding the lock, for the next run's refusal message.
+#
+# Advisory, and best-effort with it.  A run holding a lock file another
+# user created leaves the label alone rather than failing: the lock is
+# the kernel's, and a message that names the last run to write here is
+# the whole of what is lost.
+hosts_lock_record() {
+  hosts_lock_label_is_ours || return 0
+  printf 'pid=%s\nholder=%s\n' "$$" "$1" >"$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null || true
+}
+
+# Prints the recorded label, for a message and nothing else.
+#
+# Sanitised because the file is machine-wide: the line was written by
+# another user's run as often as not, and it is on its way to a terminal.
+hosts_lock_label() {
+  local pid="" holder=""
+  if [ -r "$BOOTROOT_E2E_HOSTS_LOCK" ]; then
+    pid="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" pid 2>/dev/null || true)"
+    holder="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" holder 2>/dev/null || true)"
+    pid="$(printf '%s' "$pid" | LC_ALL=C tr -cd '0-9' | cut -c1-16)"
+    holder="$(printf '%s' "$holder" | LC_ALL=C tr -d '[:cntrl:]' | cut -c1-160)"
+  fi
+  printf 'pid %s, %s' "${pid:-unknown}" "${holder:-unknown}"
+}
+
+# Aborts, naming the label the lock carries.
+#
+# `last recorded` rather than `held by`: the holder writes that line when
+# it can, and a run holding a lock file another user owns cannot.
 hosts_lock_refuse() {
-  fail "another E2E run is already resolving through /etc/hosts (pid ${1:-unknown}, ${2:-unknown}); hosts mode edits one file the whole machine shares under a fixed marker, so it runs one at a time — wait for that run to finish, or use RESOLUTION_MODE=no-hosts, which has no such limit"
+  fail "another E2E run is already resolving through /etc/hosts (last recorded: ${1:-unknown}); hosts mode edits one file the whole machine shares under a fixed marker, so it runs one at a time — wait for that run to finish, or use RESOLUTION_MODE=no-hosts, which has no such limit"
 }
 
 # Takes the `/etc/hosts` lock for this run, or aborts.
@@ -735,74 +717,64 @@ hosts_lock_refuse() {
 # again.  What matters is that the second run stops before it edits the
 # file, not that it eventually gets a turn.
 #
-# A lock naming a dead pid is cleared and retried once: a run killed with
-# `SIGKILL` never reaches its own release, and leaving that lock in place
-# would refuse `hosts` mode on this machine until somebody deleted a file
-# by hand.  Its `/etc/hosts` entries survive that too, and are collected
-# by the next run's own `add_hosts_entry`/`cleanup_hosts` pair, which
-# match on the host name and the marker rather than on who wrote them.
-# The clearing goes through `hosts_lock_steal_stale`, which moves the
-# lock aside before judging it — the pid read here licenses nothing on
-# its own, since the file it was read from can be replaced by a second
-# run doing exactly this before the removal lands.
-#
-# A lock that exists and cannot be read is refused instead of cleared.
-# Liveness is the only thing that licenses a removal here, and it is read
-# out of the file: a pid that cannot be read is not a pid that is dead,
-# and clearing on it would hand `/etc/hosts` to two runs at once.
+# There is no second attempt, because there is nothing to retry.  A lock
+# that is taken is taken by a process that is running right now; the only
+# way it comes free is that process ending, which releases it whether it
+# ended well or was killed.
 acquire_hosts_lock() {
-  local holder="$1" owner_pid owner_holder steal_status
-  # Checked before anything acts on the path, and for the reason
-  # `ensure_run_marker_dir` checks it: `-e` and the rest follow a link,
-  # so a link planted here aims the create and the `rm` below at a file
-  # of somebody else's choosing.
+  local holder="$1" status=0 label
+  # Checked before the descriptor is opened, and for the reason
+  # `ensure_run_marker_dir` checks it: every test operator but `-L`
+  # follows a link, the open below creates what it points at, and the
+  # label write truncates it.
   [ ! -L "$BOOTROOT_E2E_HOSTS_LOCK" ] \
     || fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} is a symbolic link; it must be the file itself and not a pointer at somebody else's choosing"
-  # Twice: the first attempt, and one more after a lock naming a dead
-  # pid has been cleared.  No further, because a second failure means
-  # another run took it in between, which is the answer rather than a
-  # reason to keep trying.
-  for _ in 1 2; do
-    if hosts_lock_create "$holder"; then
-      BOOTROOT_HOSTS_LOCK_HELD=1
-      return 0
-    fi
-    if [ -e "$BOOTROOT_E2E_HOSTS_LOCK" ] && [ ! -r "$BOOTROOT_E2E_HOSTS_LOCK" ]; then
-      fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} cannot be read, so whether the run holding it is still alive cannot be told; it is treated as held — wait for that run to finish, or use RESOLUTION_MODE=no-hosts, which has no such limit"
-    fi
-    owner_pid="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" pid 2>/dev/null || true)"
-    owner_holder="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" holder 2>/dev/null || true)"
-    if run_pid_is_alive "$owner_pid"; then
-      hosts_lock_refuse "$owner_pid" "$owner_holder"
-    fi
-    # This pid is what says the lock may be stale, and nothing more: what
-    # decides is what the move aside actually gets hold of.
-    steal_status=0
-    hosts_lock_steal_stale || steal_status=$?
-    case "$steal_status" in
-      # The path is clear, or was cleared by whoever else was here; the
-      # retry's exclusive create is what settles it.
-      0) ;;
-      # A live run's lock, put back where it was.
-      2) hosts_lock_refuse "$HOSTS_LOCK_STOLEN_PID" "$HOSTS_LOCK_STOLEN_HOLDER" ;;
-      *)
-        fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} names the dead pid ${owner_pid:-unknown} and could not be moved aside, by this user or through sudo -n; remove it once you are certain no run is resolving through /etc/hosts"
-        ;;
-    esac
-  done
-  fail "could not take the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK}; another run took it while this one was clearing a dead run's"
+  # Created when it is not there, and opened read-only when it is there
+  # at a mode this user cannot write — which is the ordinary case across
+  # users, since the file outlives the run that created it.  `flock(2)`
+  # locks a descriptor however it was opened.
+  if ! { exec 9>>"$BOOTROOT_E2E_HOSTS_LOCK"; } 2>/dev/null; then
+    { exec 9<"$BOOTROOT_E2E_HOSTS_LOCK"; } 2>/dev/null \
+      || fail "cannot open the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK}; hosts mode serialises on it, so a run that cannot open it must not edit /etc/hosts — use RESOLUTION_MODE=no-hosts, which has no such limit"
+  fi
+  # Readable by everyone, whatever the umask that created it, and for a
+  # load-bearing reason rather than a tidy one: the next run to arrive is
+  # regularly another user's, taking the lock means opening this file,
+  # and the file is never removed.  A run started under `umask 077` would
+  # otherwise deny `hosts` mode to every other user on the machine for
+  # good, and not merely for as long as it ran.
+  chmod 644 "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null || true
+  hosts_lock_try_fd9 || status=$?
+  if [ "$status" -ne 0 ]; then
+    label="$(hosts_lock_label)"
+    hosts_lock_close_fd9
+  fi
+  case "$status" in
+    0) ;;
+    2)
+      fail "hosts mode takes the lock at ${BOOTROOT_E2E_HOSTS_LOCK} with flock(2), and this host has none of flock, perl or python3 to call it with; that lock is what keeps two runs from editing /etc/hosts at once — install one of them, or use RESOLUTION_MODE=no-hosts, which has no such limit"
+      ;;
+    *) hosts_lock_refuse "$label" ;;
+  esac
+  BOOTROOT_HOSTS_LOCK_HELD=1
+  hosts_lock_record "$holder"
 }
 
-# Releases the lock, and only when this process is what it records.
+# Releases the lock by closing the descriptor that holds it.
 #
-# The recorded pid is compared for the reason `remove_run_marker`
-# compares it: a lock naming another pid belongs to a run still editing
-# the file, and removing it would let a third run in alongside that one.
+# The file stays.  Unlinking it would let the next two runs lock two
+# different inodes and both proceed, which is exactly what the lock is
+# for; what is cleared instead is the label, so the run after this one
+# does not name a run that has finished.
+#
+# The label goes while the lock is still held, so a run taking the lock
+# the instant this one lets it go cannot have its own label wiped by
+# this.
 release_hosts_lock() {
-  local owner
   hosts_lock_held || return 0
   BOOTROOT_HOSTS_LOCK_HELD=0
-  owner="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" pid 2>/dev/null || true)"
-  [ "$owner" = "$$" ] || return 0
-  rm -f "$BOOTROOT_E2E_HOSTS_LOCK"
+  if hosts_lock_label_is_ours; then
+    : >"$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null || true
+  fi
+  hosts_lock_close_fd9
 }

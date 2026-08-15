@@ -883,7 +883,10 @@ run_force_reissue_wait_roundtrip() {
   # KV force-reissue request. It authenticates via the service AppRole from
   # the [openbao] section that bootstrap wrote into the agent config.
   local agent_log="$ARTIFACT_DIR/remote-agent-${service}.log"
-  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 &
+  # `9>&-` closes the `/etc/hosts` lock this run may be holding: it
+  # lives on an open file descriptor, and a daemon that inherited it and
+  # outlived a killed run would keep hosts mode refused on this host.
+  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 9>&- &
   REMOTE_AGENT_PID=$!
   # Give the daemon a moment to load config and complete its initial login
   # before the request lands, so the next fast-poll tick observes it.
@@ -920,7 +923,10 @@ run_selfheal_roundtrip() {
   snapshot_cert_meta "$service" "before-selfheal"
 
   local agent_log="$ARTIFACT_DIR/selfheal-agent-${service}.log"
-  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 &
+  # `9>&-` closes the `/etc/hosts` lock this run may be holding: it
+  # lives on an open file descriptor, and a daemon that inherited it and
+  # outlived a killed run would keep hosts mode refused on this host.
+  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 9>&- &
   REMOTE_AGENT_PID=$!
 
   # Wait for the secret_id + trust polls to apply on disk. The secret_id
@@ -946,7 +952,10 @@ run_selfheal_roundtrip() {
   # secret_id, so the round-trip below can only succeed if that credential
   # actually authenticates.
   stop_remote_agent
-  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 &
+  # `9>&-` closes the `/etc/hosts` lock this run may be holding: it
+  # lives on an open file descriptor, and a daemon that inherited it and
+  # outlived a killed run would keep hosts mode refused on this host.
+  "$BOOTROOT_AGENT_BIN" --config "$agent_config" >>"$agent_log" 2>&1 9>&- &
   REMOTE_AGENT_PID=$!
 
   # The restarted loop is operating on the refreshed credential: drive a

@@ -888,10 +888,15 @@ start_local_agent_daemon() {
   # bootroot-agent uses tracing_subscriber::fmt::init(), whose default
   # filter is ERROR.  The readiness probe below greps for an info-level
   # message, so we have to opt into info output explicitly.
+  # `9>&-` closes the `/etc/hosts` lock this run may be holding.  That
+  # lock lives on an open file descriptor, so a daemon that inherited it
+  # and outlived a killed run would keep hosts mode refused on this host
+  # for as long as it ran.  It is the harness that holds the lock, never
+  # the daemons it starts.
   RUST_LOG="${RUST_LOG:-info}" \
     "$BOOTROOT_AGENT_BIN" --config "$config" \
     --eab-file "$eab_file" \
-    >>"$log" 2>&1 &
+    >>"$log" 2>&1 9>&- &
   local pid=$!
   LOCAL_AGENT_DAEMON_PIDS="$LOCAL_AGENT_DAEMON_PIDS $pid"
   # Give the daemon time to load config and install its SIGHUP handler;
