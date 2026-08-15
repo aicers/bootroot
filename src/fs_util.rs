@@ -680,9 +680,14 @@ pub fn preserved_mode(path: &Path, default_mode: u32) -> u32 {
 ///
 /// A rename installs a *fresh* inode, so ownership is never inherited
 /// from the file being replaced the way a truncating write left it
-/// untouched. Every staged publish therefore has to say where the
-/// uid/gid comes from, and the two answers below differ because their
-/// files do.
+/// untouched. A staged publish therefore has to say where the uid/gid
+/// comes from, and the two answers below differ because their files
+/// do.
+///
+/// These two are [`publish_staged_blocking`]'s answers, not the
+/// crate's. The override credential writers stage independently and
+/// take a third — ownership from the parent directory, or read back
+/// through `symlink_metadata` — for the reason recorded there.
 #[derive(Clone, Copy)]
 pub enum StagedOwner {
     /// Carry the destination's uid and gid onto the new inode, and
