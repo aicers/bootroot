@@ -385,9 +385,9 @@ pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy)
 /// `mode` while the file is still at its temporary path, and `rename`s
 /// it over `dest`.
 ///
-/// The staging itself is [`fs_util::publish_staged_blocking`], the one
-/// staging implementation in the crate; this is where the key, the
-/// certificate and the CA bundle state the two decisions that
+/// The staging itself is [`fs_util::publish_staged_blocking`], the
+/// crate's general-purpose staging publisher; this is where the key,
+/// the certificate and the CA bundle state the two decisions that
 /// distinguish their publish from `state.json`'s.
 ///
 /// Ownership comes from the policy, not from whatever is at `dest`
