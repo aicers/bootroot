@@ -77,6 +77,19 @@ async fn test_app_add_writes_state_and_secret() {
     assert!(stdout.contains("Operator-managed (required):"));
     assert!(stdout.contains("next steps:"));
     assert!(stdout.contains("daemon profile snippet:"));
+    // The alias registration is best-effort and used to signal failure
+    // only by an absence — no per-alias line, a zero exit status, and a
+    // summary that never mentioned aliases. The summary states the
+    // outcome now, and this fixture runs against whatever Docker this
+    // host has, so assert only that the line is there; which outcome it
+    // reports is pinned by the two tests below that decide Docker's
+    // answers rather than inheriting them.
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("- HTTP-01 DNS aliases registered: ")),
+        "summary must report the DNS alias outcome: {stdout}"
+    );
     // The Bootroot-managed section lists exactly the two host-daemon
     // artifacts: the rendered agent config and the provisioned EAB file.
     // The retired per-service OpenBao Agent artifacts must be gone.
@@ -162,6 +175,133 @@ async fn test_app_add_writes_state_and_secret() {
     assert_eq!(mode, 0o600);
 
     assert_local_fast_poll_artifacts(temp_dir.path(), &agent_config, "edge-proxy");
+}
+
+/// Issue #830 — with a responder to attach to, the summary states how
+/// many aliases were registered, the per-alias detail lines are still
+/// printed alongside it, and every alias the count claims is in the
+/// `docker network connect` the command actually issued.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_summary_reports_registered_dns_aliases() {
+    let run = service_add_with_fake_docker(FakeDocker::ResponderUp).await;
+
+    assert!(
+        run.output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        run.stdout(),
+        run.stderr()
+    );
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("- HTTP-01 DNS aliases registered: 1"),
+        "summary must state the registered count: {stdout}"
+    );
+    // The aggregate does not replace the detail: `apply_dns_aliases` is
+    // shared with `infra up` and `service remove`, whose output must not
+    // change, so its per-alias lines stay exactly where they were.
+    assert!(
+        stdout.contains(&format!(
+            "bootroot service add: registered HTTP-01 DNS alias {SERVICE_DNS_ALIAS}"
+        )),
+        "the per-alias line must survive the aggregate: {stdout}"
+    );
+    assert_alias_line_position(&stdout);
+    // The count is only worth grepping if it names aliases that were
+    // really attached; the E2E asserts this against `docker inspect`,
+    // and here against the command the responder was reconnected with.
+    assert!(
+        run.docker_log.lines().any(|line| line
+            .starts_with("network connect --alias bootroot-http01 --alias ")
+            && line.contains(SERVICE_DNS_ALIAS)),
+        "every counted alias must reach `docker network connect`: {}",
+        run.docker_log
+    );
+}
+
+/// Issue #830 — with the responder down the registration is skipped,
+/// which stays a success: exit 0, the existing warning on stderr, and a
+/// summary that now says none were registered instead of leaving the
+/// operator to notice an absent line.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_summary_reports_skipped_dns_aliases() {
+    let run = service_add_with_fake_docker(FakeDocker::ResponderDown).await;
+
+    assert!(
+        run.output.status.success(),
+        "a responder that is down must not fail the add: stdout:\n{}\nstderr:\n{}",
+        run.stdout(),
+        run.stderr()
+    );
+    let stdout = run.stdout();
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("container not running — skipping DNS alias registration"),
+        "the existing warning must still be printed: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "- HTTP-01 DNS aliases registered: 0 (registration skipped; see the warning above)"
+        ),
+        "the summary must state that nothing was registered: {stdout}"
+    );
+    assert!(
+        !stdout.contains("registered HTTP-01 DNS alias"),
+        "nothing was attached, so no per-alias line may be printed: {stdout}"
+    );
+    assert_alias_line_position(&stdout);
+    assert!(
+        !run.docker_log.contains("network connect"),
+        "a missing responder must not be reconnected: {}",
+        run.docker_log
+    );
+}
+
+/// Issue #830 — the second way nothing gets attached: the responder is
+/// running, but the reconnect carrying the aliases fails and only the
+/// rollback that restores plain connectivity succeeds.  The summary must
+/// report it exactly as it reports a responder that was never there —
+/// what an operator has to act on is that no alias was attached, and the
+/// stderr warning is where the reason lives.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_summary_reports_a_recovered_connect_as_skipped() {
+    let run = service_add_with_fake_docker(FakeDocker::AliasedConnectFails).await;
+
+    assert!(
+        run.output.status.success(),
+        "a recovered reconnect must not fail the add: stdout:\n{}\nstderr:\n{}",
+        run.stdout(),
+        run.stderr()
+    );
+    let stdout = run.stdout();
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("DNS alias registration failed but network connectivity was restored"),
+        "the existing recovery warning must still be printed: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "- HTTP-01 DNS aliases registered: 0 (registration skipped; see the warning above)"
+        ),
+        "the summary must state that nothing was registered: {stdout}"
+    );
+    assert!(
+        !stdout.contains("registered HTTP-01 DNS alias"),
+        "nothing was attached, so no per-alias line may be printed: {stdout}"
+    );
+    assert_alias_line_position(&stdout);
+    // The rollback is what makes this outcome `Skipped` rather than an
+    // error: the responder is back on its network, just without aliases.
+    assert!(
+        run.docker_log.lines().any(|line| line
+            == format!(
+                "network connect --alias bootroot-http01 {FAKE_RESPONDER_NETWORK} {FAKE_RESPONDER_ID}"
+            )),
+        "the responder must be reconnected without aliases: {}",
+        run.docker_log
+    );
 }
 
 /// Issue #722 — a local-file `service add --secret-id-path <abs>`
@@ -1036,6 +1176,13 @@ async fn test_app_add_print_only_shows_snippets_without_writes() {
     assert!(stdout.contains("preview mode: no files or state were changed"));
     assert!(stdout.contains("trust preview unavailable"));
     assert!(!stdout.contains("auto-applied"));
+    // The preview registers no aliases, so it reports none: reporting
+    // zero here would read as a registration that attached nothing, and
+    // any count at all would claim work the preview did not do.
+    assert!(
+        !stdout.contains("HTTP-01 DNS aliases registered"),
+        "the preview must not report an alias outcome: {stdout}"
+    );
 
     let state_contents =
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state.json");
@@ -2526,6 +2673,227 @@ fn test_app_info_missing_state_file() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(stderr.contains("bootroot service info failed"));
+}
+
+/// The container ID the fake `docker` reports for a running responder.
+const FAKE_RESPONDER_ID: &str = "fakeresponder01";
+/// The network that fake responder is attached to.
+const FAKE_RESPONDER_NETWORK: &str = "bootroot_fake_default";
+/// The alias `service add` derives for the fixture service below.
+const SERVICE_DNS_ALIAS: &str = "001.edge-proxy.edge-node-01.trusted.domain";
+
+/// One `service add` run against a decided Docker.
+struct FakeDockerAddRun {
+    output: std::process::Output,
+    /// Every argument vector the fake `docker` was invoked with, one per
+    /// line, so a test can assert what the command actually issued.
+    docker_log: String,
+}
+
+impl FakeDockerAddRun {
+    fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.output.stdout).into_owned()
+    }
+
+    fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.output.stderr).into_owned()
+    }
+}
+
+/// What the fake `docker` decides for one run, so each test names the
+/// branch of the registration it is about rather than a container ID.
+#[derive(Clone, Copy)]
+enum FakeDocker {
+    /// No responder container is running.
+    ResponderDown,
+    /// A responder is running and every reconnect succeeds.
+    ResponderUp,
+    /// A responder is running, but the reconnect carrying the aliases
+    /// fails; the rollback that restores plain connectivity succeeds.
+    AliasedConnectFails,
+}
+
+impl FakeDocker {
+    /// The container ID the fake reports for the responder — empty when
+    /// none is running, which is what the `ps` lookup finds nothing on.
+    fn responder_id(self) -> &'static str {
+        match self {
+            Self::ResponderDown => "",
+            Self::ResponderUp | Self::AliasedConnectFails => FAKE_RESPONDER_ID,
+        }
+    }
+
+    /// Non-empty when the fake must refuse the aliased reconnect.
+    fn aliased_connect_fails(self) -> &'static str {
+        match self {
+            Self::ResponderDown | Self::ResponderUp => "",
+            Self::AliasedConnectFails => "1",
+        }
+    }
+}
+
+/// Runs `service add` with a `docker` stand-in first on the child's
+/// `PATH`, so the alias registration takes a decided branch rather than
+/// whatever this host happens to have running.
+async fn service_add_with_fake_docker(docker: FakeDocker) -> FakeDockerAddRun {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert path has a parent"))
+        .expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    let docker_log = temp_dir.path().join("docker-args.log");
+    write_fake_docker_for_aliases(&bin_dir).expect("write fake docker");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{path}", bin_dir.display());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .env("PATH", combined_path)
+        // The summary is asserted verbatim, so pin the locale rather
+        // than inheriting whatever this host sets.
+        .env("BOOTROOT_LANG", "en")
+        .env("FAKE_DOCKER_LOG", &docker_log)
+        .env("FAKE_RESPONDER_ID", docker.responder_id())
+        .env("FAKE_RESPONDER_NETWORK", FAKE_RESPONDER_NETWORK)
+        .env("FAKE_ALIASED_CONNECT_FAILS", docker.aliased_connect_fails())
+        .args([
+            "service",
+            "add",
+            "--service-name",
+            "edge-proxy",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+
+    FakeDockerAddRun {
+        docker_log: fs::read_to_string(&docker_log).unwrap_or_default(),
+        output,
+    }
+}
+
+/// Writes the `docker` stand-in [`service_add_with_fake_docker`] puts on
+/// the child's `PATH`.
+///
+/// It answers only the two lookups the alias registration makes — the
+/// responder `docker ps` and the network `docker inspect` — from the
+/// environment, and succeeds silently at everything else, which is what
+/// a real `docker` with nothing to do would look like here.
+fn write_fake_docker_for_aliases(bin_dir: &std::path::Path) -> anyhow::Result<()> {
+    let script = r#"#!/bin/sh
+set -eu
+
+if [ -n "${FAKE_DOCKER_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+fi
+
+case "${1:-}" in
+  ps)
+    if [ -n "${FAKE_RESPONDER_ID:-}" ]; then
+      printf '%s\n' "$FAKE_RESPONDER_ID"
+    fi
+    ;;
+  inspect)
+    # Answer the network lookup for the responder only, so an inspect of
+    # anything else is not handed this network by accident.
+    for arg in "$@"; do
+      if [ -n "${FAKE_RESPONDER_ID:-}" ] && [ "$arg" = "$FAKE_RESPONDER_ID" ]; then
+        printf '%s\n' "${FAKE_RESPONDER_NETWORK:-}"
+      fi
+    done
+    ;;
+  network)
+    if [ -n "${FAKE_ALIASED_CONNECT_FAILS:-}" ] && [ "${2:-}" = "connect" ]; then
+      aliases=0
+      for arg in "$@"; do
+        if [ "$arg" = "--alias" ]; then
+          aliases=$((aliases + 1))
+        fi
+      done
+      # The rollback reconnect carries the responder's own service alias
+      # and nothing else, so it must still succeed; anything beyond that
+      # one is the aliased reconnect this run refuses.
+      if [ "$aliases" -gt 1 ]; then
+        printf 'fake docker: refusing the aliased connect\n' >&2
+        exit 1
+      fi
+    fi
+    ;;
+esac
+
+exit 0
+"#;
+    let path = bin_dir.join("docker");
+    // Hand the write to a child rather than doing it here: a `fork` on
+    // another thread of this test binary duplicates every descriptor
+    // this process holds at that instant, and the kernel refuses to
+    // execute a file any process still holds open for writing
+    // (rust-lang/rust#74214).  A child's descriptor cannot be inherited
+    // that way, so the fake is runnable the moment it exists.
+    let mut writer = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"cat > "$1""#)
+        .arg("sh")
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("spawn the fake docker writer")?;
+    writer
+        .stdin
+        .take()
+        .context("the fake docker writer's stdin was piped")?
+        .write_all(script.as_bytes())
+        .context("write fake docker")?;
+    let status = writer.wait().context("wait for the fake docker writer")?;
+    anyhow::ensure!(status.success(), "fake docker writer failed: {status}");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .context("set fake docker permissions")?;
+    Ok(())
+}
+
+/// Asserts the alias line sits at the fixed position the summary
+/// promises: after the `OpenBao path` line and ahead of the optional
+/// blocks, so neither an operator nor a script has to find it somewhere
+/// that moves with whichever of those blocks a run happens to print.
+fn assert_alias_line_position(stdout: &str) {
+    let position = |needle: &str| {
+        stdout
+            .lines()
+            .position(|line| line.starts_with(needle))
+            .unwrap_or_else(|| panic!("summary must contain a line starting {needle}: {stdout}"))
+    };
+    let openbao_path = position("- OpenBao path:");
+    let alias = position("- HTTP-01 DNS aliases registered:");
+    let managed = position("Bootroot-managed:");
+    assert!(
+        openbao_path < alias && alias < managed,
+        "alias line is out of position: {stdout}"
+    );
 }
 
 fn write_state_file(root: &std::path::Path, openbao_url: &str) -> anyhow::Result<()> {

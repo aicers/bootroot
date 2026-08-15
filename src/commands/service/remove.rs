@@ -181,7 +181,10 @@ pub(crate) async fn run_service_remove(
         &mut state,
         &state_path,
         &args.service_name,
-        |post_removal| reconcile_dns_aliases(post_removal, &identity, messages),
+        // `service remove` reports the alias refresh nowhere, so the
+        // outcome is dropped here rather than widening this command's
+        // output.
+        |post_removal| reconcile_dns_aliases(post_removal, &identity, messages).map(|_| ()),
         messages,
     )
     .await?;

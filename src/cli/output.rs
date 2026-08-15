@@ -1,3 +1,4 @@
+use crate::commands::dns_alias::DnsAliasOutcome;
 use crate::commands::init::{InitPlan, InitSummary};
 use crate::commands::service::{display_policy_value, display_wrap_ttl, service_eab_file_path};
 use crate::i18n::{Messages, ServiceNextStepsDaemon};
@@ -33,6 +34,10 @@ pub(crate) struct ServiceAddSummaryOptions<'a> {
     pub(crate) trusted_ca_sha256: Option<&'a [String]>,
     pub(crate) show_snippets: bool,
     pub(crate) note: Option<String>,
+    /// Outcome of the HTTP-01 DNS alias registration, for the paths that
+    /// attempt one.  `None` on every path that does not (the preview and
+    /// the remote-idempotent re-run), which prints no alias line at all.
+    pub(crate) dns_alias: Option<DnsAliasOutcome>,
 }
 
 pub(crate) fn print_init_summary(summary: &InitSummary, messages: &Messages) {
@@ -92,6 +97,11 @@ pub(crate) fn print_service_add_summary(
         "{}",
         messages.service_summary_openbao_path(&entry.service_name)
     );
+    // Fixed position, ahead of the optional blocks, so the line an
+    // operator or a script looks for does not move with them.
+    if let Some(outcome) = options.dns_alias {
+        println!("{}", dns_alias_summary_line(outcome, messages));
+    }
     if let Some(paths) = options.applied {
         print_local_apply_summary(&paths, messages);
     }
@@ -105,6 +115,23 @@ pub(crate) fn print_service_add_summary(
         return;
     }
     print_service_add_snippets(entry, secret_id_path, options.trusted_ca_sha256, messages);
+}
+
+/// Renders the DNS alias registration as one summary line.
+///
+/// `NothingToRegister` reports zero through the same count message as
+/// `Registered`: nothing was attempted, so there is no warning on stderr
+/// for a "see above" to point at.
+///
+/// Split out from the `println!` so the mapping is unit-testable.
+fn dns_alias_summary_line(outcome: DnsAliasOutcome, messages: &Messages) -> String {
+    match outcome {
+        DnsAliasOutcome::Registered { count } => {
+            messages.service_summary_dns_alias_registered(count)
+        }
+        DnsAliasOutcome::NothingToRegister => messages.service_summary_dns_alias_registered(0),
+        DnsAliasOutcome::Skipped => messages.service_summary_dns_alias_skipped().to_string(),
+    }
 }
 
 fn print_local_apply_summary(paths: &ServiceAddAppliedPaths<'_>, messages: &Messages) {
@@ -617,5 +644,38 @@ mod tests {
     #[test]
     fn test_mask_value_long() {
         assert_eq!(mask_value("secretvalue"), "****alue");
+    }
+
+    /// The summary has to state the count it registered, so a run that
+    /// attached aliases is distinguishable from one that did not by
+    /// something a script can assert on rather than by an absence.
+    #[test]
+    fn dns_alias_summary_line_states_the_registered_count() {
+        let messages = crate::i18n::test_messages();
+        let line = dns_alias_summary_line(DnsAliasOutcome::Registered { count: 3 }, &messages);
+        assert!(line.contains('3'), "{line}");
+        assert!(!line.contains('{'), "left a placeholder: {line}");
+    }
+
+    /// Nothing was attempted, so there is no warning above to point at:
+    /// this reports zero through the plain count message.
+    #[test]
+    fn dns_alias_summary_line_reports_nothing_to_register_as_zero() {
+        let messages = crate::i18n::test_messages();
+        assert_eq!(
+            dns_alias_summary_line(DnsAliasOutcome::NothingToRegister, &messages),
+            dns_alias_summary_line(DnsAliasOutcome::Registered { count: 0 }, &messages)
+        );
+    }
+
+    /// The skipped line extends the zero-count line rather than
+    /// replacing it, so one grep finds both reachable outcomes.
+    #[test]
+    fn dns_alias_summary_line_for_skipped_extends_the_zero_line() {
+        let messages = crate::i18n::test_messages();
+        let zero = dns_alias_summary_line(DnsAliasOutcome::Registered { count: 0 }, &messages);
+        let skipped = dns_alias_summary_line(DnsAliasOutcome::Skipped, &messages);
+        assert!(skipped.starts_with(&zero), "{skipped} vs {zero}");
+        assert_ne!(skipped, zero);
     }
 }

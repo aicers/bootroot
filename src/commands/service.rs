@@ -18,7 +18,7 @@ use crate::cli::output::{
 };
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::DEFAULT_SECRET_ID_WRAP_TTL;
-use crate::commands::dns_alias::register_dns_alias;
+use crate::commands::dns_alias::{DnsAliasOutcome, register_dns_alias};
 use crate::commands::init::validate_secret_id_ttl;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
@@ -354,6 +354,7 @@ async fn run_service_add_preview(
                 trusted_ca_sha256: None,
                 show_snippets: true,
                 note: Some(note),
+                dns_alias: None,
             },
             messages,
         );
@@ -380,6 +381,7 @@ async fn run_service_add_preview(
                             trusted_ca_sha256: None,
                             show_snippets: true,
                             note: Some(note),
+                            dns_alias: None,
                         },
                         messages,
                     );
@@ -421,6 +423,7 @@ async fn run_service_add_preview(
             trusted_ca_sha256: trusted_ca_sha256.as_deref(),
             show_snippets: true,
             note: Some(note),
+            dns_alias: None,
         },
         messages,
     );
@@ -547,7 +550,7 @@ async fn run_service_add_apply(
     // `.env` in the process working directory — the same place these
     // commands already resolve `state.json` from.
     let identity = ComposeIdentity::resolve_for_dir(Path::new("."), None, messages)?;
-    register_dns_alias(state, &identity, messages)?;
+    let dns_alias = register_dns_alias(state, &identity, messages)?;
 
     print_service_add_apply_summary(
         &entry,
@@ -555,6 +558,7 @@ async fn run_service_add_apply(
         applied.as_ref(),
         remote_bootstrap_result.as_ref(),
         trusted_ca_sha256,
+        dns_alias,
         messages,
     );
     print_consumer_reload_hint(std::iter::once(&entry), messages);
@@ -640,6 +644,7 @@ fn print_service_add_apply_summary(
     applied: Option<&LocalApplyResult>,
     remote_bootstrap: Option<&RemoteBootstrapResult>,
     trusted_ca_sha256: Option<&[String]>,
+    dns_alias: DnsAliasOutcome,
     messages: &Messages,
 ) {
     print_service_add_summary(
@@ -658,6 +663,7 @@ fn print_service_add_apply_summary(
             trusted_ca_sha256,
             show_snippets: true,
             note: None,
+            dns_alias: Some(dns_alias),
         },
         messages,
     );
@@ -720,6 +726,7 @@ async fn run_service_add_remote_idempotent(
                     .service_summary_remote_idempotent_hint()
                     .to_string(),
             ),
+            dns_alias: None,
         },
         messages,
     );

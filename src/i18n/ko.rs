@@ -203,6 +203,8 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_approle: "- AppRole: {value}",
     service_summary_secret_path: "- secret_id 경로: {value}",
     service_summary_openbao_path: "- OpenBao 경로: bootroot/services/{value}",
+    service_summary_dns_alias_registered: "- 등록된 HTTP-01 DNS 별칭: {count}개",
+    service_summary_dns_alias_skipped: "- 등록된 HTTP-01 DNS 별칭: 0개 (등록을 건너뛰었습니다; 위 경고를 확인하세요)",
     service_summary_auto_applied_agent_config: "- 자동 반영 bootroot-agent 설정: {value}",
     service_summary_auto_applied_eab_file: "- 자동 프로비저닝 EAB 파일 (EAB가 설정된 경우에만 존재; --eab-file로 경로 전달): {value}",
     service_scope_bootroot_managed: "Bootroot 자동 반영 항목:",

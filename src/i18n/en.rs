@@ -203,6 +203,8 @@ pub(super) static STRINGS: Strings = Strings {
     service_summary_approle: "- AppRole: {value}",
     service_summary_secret_path: "- secret_id path: {value}",
     service_summary_openbao_path: "- OpenBao path: bootroot/services/{value}",
+    service_summary_dns_alias_registered: "- HTTP-01 DNS aliases registered: {count}",
+    service_summary_dns_alias_skipped: "- HTTP-01 DNS aliases registered: 0 (registration skipped; see the warning above)",
     service_summary_auto_applied_agent_config: "- auto-applied bootroot-agent config: {value}",
     service_summary_auto_applied_eab_file: "- auto-provisioned EAB file (present only when EAB is configured; pass its path via --eab-file): {value}",
     service_scope_bootroot_managed: "Bootroot-managed:",

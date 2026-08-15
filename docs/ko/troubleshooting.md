@@ -214,6 +214,11 @@ bootroot service add --service-name <name> --delivery-mode remote-bootstrap ...
   Docker 네트워크 별칭으로 자동 등록합니다. 컨테이너 재시작 후 별칭이
   사라진 경우 `bootroot infra up`을 실행하면 `state.json`에서 별칭을
   자동 재적용합니다.
+- 먼저 해당 추가 명령의 요약을 확인하세요. `- 등록된 HTTP-01 DNS 별칭:`
+  줄이 등록된 별칭 개수를 알려주며, `0개 (등록을 건너뛰었습니다; 위 경고를
+  확인하세요)`는 등록된 별칭이 없다는 뜻이며, 구체적인 원인은 그 위에 출력된
+  경고에 나옵니다. 추가 자체는 성공했으므로 원인을 해결한 뒤
+  `bootroot infra up`으로 별칭을 등록하면 됩니다.
 - step-ca가 서비스 FQDN을 responder IP로 찾을 수 있어야 합니다.
 - 서비스 머신(원격 추가 시)도 step-ca/responder 이름을 올바른 IP로 찾을 수 있어야 합니다.
 

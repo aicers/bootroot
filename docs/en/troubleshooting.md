@@ -216,6 +216,12 @@ fields independently.
   alias on `bootroot-http01` automatically. If the alias was lost (e.g.
   after a container restart without running `bootroot infra up`), re-run
   `bootroot infra up` to replay aliases from `state.json`.
+- Start from that add's summary: its
+  `- HTTP-01 DNS aliases registered:` line states how many aliases were
+  attached, and a zero with `(registration skipped; see the warning
+  above)` means none were registered — consult the warning above it for
+  the specific cause. The add still succeeded, so `bootroot infra up` is
+  what registers them once that cause is addressed.
 - step-ca must map service FQDN to responder IP
 - service hosts (remote mode) must also map step-ca/responder names correctly
 
