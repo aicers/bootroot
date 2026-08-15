@@ -543,7 +543,10 @@ PostgreSQL 비밀번호 포함) 생성과 `secrets/`, `certs/` 디렉터리 생�
 있습니다 — 예를 들어 `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
 `BOOTROOT_STEP_CA_IMAGE`, `BOOTROOT_HTTP01_IMAGE`. `.env`나 프로세스
 환경에 설정하며, 설정하지 않은 변수는 릴리스 빌드 기본값으로
-대체됩니다. 운영 및 에어갭 설치에서는 `BOOTROOT_STEP_CA_IMAGE`를
+대체됩니다. `BOOTROOT_HTTP01_IMAGE`는 기본 `docker-compose.yml`도 읽습니다.
+그곳에서는 응답기 빌드가 기록되는 태그 이름이 되며, 한 호스트의 두 설치가
+서로의 이미지를 덮어쓰지 않는 방법입니다. 설정하지 않으면 이전과 같이
+`bootroot-http01-responder:latest`입니다. 운영 및 에어갭 설치에서는 `BOOTROOT_STEP_CA_IMAGE`를
 `0.30.2` 태그가 아니라 `@sha256:` 다이제스트로 고정하세요. step-ca는
 CA이며, 이제 기본값이 변경 가능한 태그의 서드파티 이미지이고, smallstep은
 이미지에 대한 cosign 서명을 게시하므로, 다이제스트로 고정하면 변하지 않는

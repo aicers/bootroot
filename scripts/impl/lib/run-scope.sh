@@ -62,6 +62,12 @@ BOOTROOT_MAX_INSTANCE_NAME_LEN=39
 # still one somebody else can get to first.
 BOOTROOT_E2E_RUN_MARKER_DIR="${BOOTROOT_E2E_RUN_MARKER_DIR:-${TMPDIR:-/tmp}/bootroot-e2e-runs-$(id -u)}"
 
+# The repository half of the responder image tag, as
+# `docker-compose.yml` and `docker-compose.deploy.yml` both spell it.
+# The tag half is this run's instance name, which is what keeps two
+# concurrent runs off one image.
+BOOTROOT_HTTP01_IMAGE_REPO="bootroot-http01-responder"
+
 # The characters `validate_instance_name` accepts after the prefix,
 # spelled out rather than written as `a-z0-9`.  A bracket range is
 # collated by the caller's locale, and under most of them `[a-z]` matches
@@ -188,6 +194,45 @@ run_scope_assert_valid_project() {
       fail "derived Compose project '${name}' holds a character outside [a-z0-9_-]"
       ;;
   esac
+}
+
+# Prints the responder image a run builds and runs its own stack from.
+#
+# The compose file declares one `build:` context, and its `image:` is the
+# tag that build is written to.  Left at the shipped default, two
+# concurrent runs write to the same tag in turn: the second run's
+# `up --build` retags it while the first is up, and the first's later
+# `up -d bootroot-http01` — the recreate that applies the DNS aliases —
+# resolves the tag again and starts the other run's build.  A running
+# container holds its image by id, so nothing is disturbed until that
+# recreate, which is exactly the point at which it is.
+#
+# So the tag is the run's instance name.  Derived rather than recorded,
+# for the same reason the nine container names are: it is a function of
+# the instance, so a sweep reading a marker's filename can name it
+# exactly.
+run_scope_http01_image() {
+  printf '%s:%s\n' "$BOOTROOT_HTTP01_IMAGE_REPO" "$1"
+}
+
+# Removes one run's responder image, and returns non-zero only when the
+# tag is still there afterwards.
+#
+# An absent tag is not a failure: a run killed before its install built
+# anything has none, and neither has one whose image a concurrent sweep
+# already removed.  What must not pass is a tag that survived the
+# removal — that is a run's leftovers under a name only this derivation
+# knows, which is what the marker exists to keep collectable.
+#
+# What is removed is always a tag and never an image id, which is what
+# makes this safe when a run's build came out byte-identical to another
+# tag's: Docker untags a multiply-tagged image rather than deleting it,
+# so the `:latest` a real install left on the same layers stays.
+remove_run_image() {
+  local image="$1" log="$2"
+  docker image inspect "$image" >/dev/null 2>&1 || return 0
+  docker image rm -f "$image" >>"$log" 2>&1 || true
+  ! docker image inspect "$image" >/dev/null 2>&1
 }
 
 # Records the instance in a `.env` beside the directory a harness runs
@@ -381,6 +426,14 @@ collect_dead_run_instance() {
   existing="$(printf '%s\n' "$existing" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
   if [ -n "$existing" ]; then
     echo "[${label}] could not remove the containers of dead run ${instance}: ${existing}" >&2
+    status=1
+  fi
+  # The responder image that run built for itself, named by the same
+  # derivation the containers were: a tag carrying an instance name no
+  # other run derives, so the shipped `:latest` a real install produced
+  # is as far out of reach here as its containers are.
+  if ! remove_run_image "$(run_scope_http01_image "$instance")" "$log"; then
+    echo "[${label}] could not remove the responder image of dead run ${instance}" >&2
     status=1
   fi
   # Volumes and networks are reached by the project label the marker

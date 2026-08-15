@@ -558,7 +558,12 @@ environment variable so an installer can pin an exact release tag or a
 `@sha256:` digest — for example `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
 `BOOTROOT_STEP_CA_IMAGE`, and `BOOTROOT_HTTP01_IMAGE`. Set them in `.env`
 or the process environment; unset variables fall back to the release-built
-defaults. For production and air-gapped installs, pin
+defaults. `BOOTROOT_HTTP01_IMAGE` is read by the default
+`docker-compose.yml` too, where it names the tag the responder build is
+written to — that is how two installs on one host avoid building over each
+other's image; unset, it is `bootroot-http01-responder:latest` as before.
+
+For production and air-gapped installs, pin
 `BOOTROOT_STEP_CA_IMAGE` to a `@sha256:` digest rather than the `0.30.2`
 tag: step-ca is the CA, its default is now a third-party image under a
 mutable tag, and smallstep publishes cosign signatures for its images, so a

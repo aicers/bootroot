@@ -28,6 +28,9 @@ cd "$ROOT_DIR"
 # writes, and an inherited value would republish this run's stack on a
 # port another run already holds.  `POSTGRES_HOST`/`POSTGRES_PORT` are
 # this script's own host-side wiring and are re-exported below.
+# `BOOTROOT_HTTP01_IMAGE` is cleared for the third: it names the tag the
+# responder build is written to and read back from, and an inherited one
+# would put this run's build on another run's tag.
 #
 # Clearing them makes an inherited value harmless rather than fatal, and
 # it is only the first of two layers: `assert_resolved_compose_project`
@@ -35,6 +38,7 @@ cd "$ROOT_DIR"
 # rather than assuming this worked.
 unset COMPOSE_PROJECT_NAME
 unset POSTGRES_HOST_PORT OPENBAO_HOST_PORT STEPCA_HOST_PORT HTTP01_ADMIN_HOST_PORT
+unset BOOTROOT_HTTP01_IMAGE
 
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-local-lifecycle-$(date +%s)}"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
@@ -127,11 +131,12 @@ RUN_INSTANCE_PREFIX="e2e-local-"
 # to spend, so it says in full what the truncated instance name cannot.
 RUN_PROJECT_PREFIX="bootroot-e2e-local-"
 # This run's install identity, the Compose project every `docker compose`
-# call is scoped to, and the four ports it publishes on `127.0.0.1`.  All
-# derived in `derive_run_scope`, which `main` runs before anything reads
-# them.
+# call is scoped to, the tag its responder image is built under, and the
+# four ports it publishes on `127.0.0.1`.  All derived in
+# `derive_run_scope`, which `main` runs before anything reads them.
 RUN_INSTANCE=""
 COMPOSE_PROJECT=""
+RUN_HTTP01_IMAGE=""
 POSTGRES_HOST_PORT=0
 OPENBAO_HOST_PORT=0
 STEPCA_HOST_PORT=0
@@ -194,6 +199,7 @@ write_run_identity_artifact() {
 {
   "instance": "${RUN_INSTANCE}",
   "compose_project": "${COMPOSE_PROJECT}",
+  "http01_image": "${RUN_HTTP01_IMAGE}",
   "ports": {
     "postgres": ${POSTGRES_HOST_PORT},
     "openbao": ${OPENBAO_HOST_PORT},
@@ -226,6 +232,15 @@ derive_run_scope() {
   # what the variable is: a per-invocation Compose override, deliberately
   # never written to `.env`.
   export COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT"
+  # The one image the compose file builds, and the last thing two runs
+  # would still share: its `image:` is the tag `up --build` writes to and
+  # every later recreate reads back, so a run left on the shipped default
+  # can be handed the other run's build the moment it recreates the
+  # responder to apply its DNS aliases.  Compose interpolates this for
+  # the raw calls here, and `infra install` inherits it for the build
+  # itself.
+  RUN_HTTP01_IMAGE="$(run_scope_http01_image "$RUN_INSTANCE")"
+  export BOOTROOT_HTTP01_IMAGE="$RUN_HTTP01_IMAGE"
   # `service add` resolves its identity from the directory this script
   # runs `bootroot` from rather than from the compose file's, so that
   # directory has to record the instance too.
@@ -233,9 +248,9 @@ derive_run_scope() {
   allocate_run_ports
   OPENBAO_URL="http://${STEPCA_HOST_IP}:${OPENBAO_HOST_PORT}"
   write_run_identity_artifact
-  printf '[lifecycle] instance=%s project=%s postgres=%s openbao=%s stepca=%s http01=%s\n' \
-    "$RUN_INSTANCE" "$COMPOSE_PROJECT" "$POSTGRES_HOST_PORT" "$OPENBAO_HOST_PORT" \
-    "$STEPCA_HOST_PORT" "$HTTP01_ADMIN_HOST_PORT" >>"$RUN_LOG"
+  printf '[lifecycle] instance=%s project=%s image=%s postgres=%s openbao=%s stepca=%s http01=%s\n' \
+    "$RUN_INSTANCE" "$COMPOSE_PROJECT" "$RUN_HTTP01_IMAGE" "$POSTGRES_HOST_PORT" \
+    "$OPENBAO_HOST_PORT" "$STEPCA_HOST_PORT" "$HTTP01_ADMIN_HOST_PORT" >>"$RUN_LOG"
 }
 
 # Collects the containers, volumes and networks of runs that were killed
@@ -408,6 +423,16 @@ cleanup() {
       cleanup_status=1
     fi
     report_leftover_containers "$COMPOSE_FILE" "run-local-lifecycle cleanup" "$RUN_INSTANCE" || cleanup_status=1
+    # `down` removes containers, never images, so the tag this run built
+    # under is its to remove — and it is leftovers of exactly the kind
+    # the marker exists for: named after this run's instance, so nothing
+    # later is named the same and no sweep would ask about it once the
+    # marker is gone.  A tag that survives therefore keeps the marker,
+    # which is what `cleanup_status` decides below.
+    if ! remove_run_image "$RUN_HTTP01_IMAGE" "$RUN_LOG"; then
+      echo "run-local-lifecycle: the responder image ${RUN_HTTP01_IMAGE} could not be removed; see ${RUN_LOG}" >&2
+      cleanup_status=1
+    fi
   fi
   # Last, and outside the ownership guard: the marker says this run is
   # still using its instance, and it has to outlive everything that could
@@ -1303,6 +1328,7 @@ write_manifest() {
   "compose_file": "${COMPOSE_FILE}",
   "instance": "${RUN_INSTANCE}",
   "compose_project": "${COMPOSE_PROJECT}",
+  "http01_image": "${RUN_HTTP01_IMAGE}",
   "ports": {
     "postgres": ${POSTGRES_HOST_PORT},
     "openbao": ${OPENBAO_HOST_PORT},

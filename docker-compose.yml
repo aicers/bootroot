@@ -71,7 +71,15 @@ services:
     build:
       context: .
       dockerfile: docker/http01-responder/Dockerfile
-    image: bootroot-http01-responder:latest
+    # The only image this file builds, so it is the only one whose tag two
+    # installs on one host would otherwise write to in turn: `up --build`
+    # retags it, and a container recreated afterwards resolves the tag
+    # again and can pick up the other install's build. Interpolated so an
+    # install that has to be isolated — the E2E lifecycle harnesses, which
+    # derive one tag per run — can give the build a name of its own. The
+    # default is what it always was, so an install that sets nothing is
+    # unchanged; `docker-compose.deploy.yml` reads the same variable.
+    image: ${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:latest}
     container_name: ${BOOTROOT_INSTANCE:-bootroot}-http01
     restart: always
     ports:

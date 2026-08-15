@@ -128,7 +128,14 @@ to finish. Each run:
   `--postgres-host-port`, `--openbao-host-port`, `--stepca-host-port` and
   `--http01-admin-host-port`, so the `.env` the install writes records them for
   every later `bootroot` invocation in the same run.
-- records the instance, the project and the four ports in
+- exports `BOOTROOT_HTTP01_IMAGE` as `bootroot-http01-responder:<instance>`,
+  because the responder is the one image `docker-compose.yml` builds and its
+  `image:` is the tag that build is written to. Left at the shipped default,
+  two runs write to one tag in turn, and the recreate that applies a run's
+  HTTP-01 DNS aliases resolves it again — and starts the other run's build.
+  The run removes the tag on the way out; `down` removes containers, never
+  images.
+- records the instance, the project, the image and the four ports in
   `<artifact dir>/run-identity.json`, so a failed run can be read afterwards.
 
 `hosts` mode still has to be serialised. The marker each script writes into
@@ -149,10 +156,10 @@ Compose project, and on the way out it removes that file — only ever the one
 recording its own pid, and only once its own teardown has left nothing
 behind. Before doing any work it reads every marker in that
 directory, skips the ones whose pid is still alive, and for each dead one
-removes that instance's nine container names along with the volumes and
-networks carrying its project label, then drops the marker. A marker it could
-not fully collect survives, so the next run retries rather than stranding what
-was left.
+removes that instance's nine container names and its responder image tag,
+along with the volumes and networks carrying its project label, then drops the
+marker. A marker it could not fully collect survives, so the next run retries
+rather than stranding what was left.
 
 A recycled pid can spare a dead run's containers for one further run, which is
 acceptable: the next run collects them and nothing is removed wrongly. The

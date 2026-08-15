@@ -435,6 +435,7 @@ install_docker_stub() {
 CONTAINERS="${STUB_STATE}/containers"
 VOLUMES="${STUB_STATE}/volumes"
 NETWORKS="${STUB_STATE}/networks"
+IMAGES="${STUB_STATE}/images"
 
 refuse_if_failing() {
   case " ${FAILING_QUERIES:-} " in
@@ -499,6 +500,20 @@ case "${1:-}:${2:-}" in
     drop_line "$NETWORKS" "$(awk -v id="$3" '$2 == id { print; exit }' "$NETWORKS")"
     exit 0
     ;;
+  image:inspect)
+    printf 'image-inspect %s\n' "$3" >>"${QUERY_LOG:-/dev/null}"
+    refuse_if_failing image-inspect
+    grep -qxF "$3" "$IMAGES" || { echo "Error: No such image: $3" >&2; exit 1; }
+    exit 0
+    ;;
+  image:rm)
+    [ "${3:-}" = "-f" ] || { echo "docker stub: unforced image rm: $*" >&2; exit 125; }
+    printf 'image-rm %s\n' "$4" >>"${QUERY_LOG:-/dev/null}"
+    refuse_if_failing image-rm
+    grep -qxF "$4" "$IMAGES" || { echo "Error: No such image: $4" >&2; exit 1; }
+    drop_line "$IMAGES" "$4"
+    exit 0
+    ;;
 esac
 echo "docker stub: unexpected invocation: $*" >&2
 exit 125
@@ -515,10 +530,11 @@ STUB
 # Loads the stub daemon's inventory, and clears the marker directory and
 # the query log.
 seed_daemon() {
-  local containers="$1" volumes="$2" networks="$3"
+  local containers="$1" volumes="$2" networks="$3" images="${4:-}"
   printf '%s\n' $containers | grep -v '^$' >"$STUB_STATE/containers" || : >"$STUB_STATE/containers"
   printf '%s\n' "$volumes" | grep -v '^$' >"$STUB_STATE/volumes" || : >"$STUB_STATE/volumes"
   printf '%s\n' "$networks" | grep -v '^$' >"$STUB_STATE/networks" || : >"$STUB_STATE/networks"
+  printf '%s\n' $images | grep -v '^$' >"$STUB_STATE/images" || : >"$STUB_STATE/images"
   rm -rf "$BOOTROOT_E2E_RUN_MARKER_DIR"
   mkdir -p "$BOOTROOT_E2E_RUN_MARKER_DIR"
   : >"$WORK_DIR/query.log"
@@ -558,7 +574,8 @@ check_sweep_collects_only_dead_runs() {
   seed_daemon \
     "$(instance_containers "$DEAD") $(instance_containers "$LIVE") bootroot-openbao bootroot-ca" \
     "$(printf '%s vol-dead\n%s vol-live\n' "$DEAD_PROJECT" "$LIVE_PROJECT")" \
-    "$(printf '%s net-dead\n%s net-live\n' "$DEAD_PROJECT" "$LIVE_PROJECT")"
+    "$(printf '%s net-dead\n%s net-live\n' "$DEAD_PROJECT" "$LIVE_PROJECT")" \
+    "$(run_scope_http01_image "$DEAD") $(run_scope_http01_image "$LIVE") ${BOOTROOT_HTTP01_IMAGE_REPO}:latest"
   seed_marker "$DEAD" 4194305 "$DEAD_PROJECT"
   seed_marker "$LIVE" "$$" "$LIVE_PROJECT"
 
@@ -585,6 +602,18 @@ check_sweep_collects_only_dead_runs() {
   [ "$(awk -v p="$LIVE_PROJECT" '$1 == p { print $2 }' "$STUB_STATE/networks")" = "net-live" ] \
     || die "the live run's network did not survive"
   ok "the dead run's volumes and networks go with it, and the live run's stay"
+
+  # The responder image is the one thing `down` never removes, so a
+  # killed run's tag outlives its containers.  It carries the dead run's
+  # instance name and nothing else does, which is what keeps the shipped
+  # `:latest` a real install built out of reach.
+  ! grep -qxF "$(run_scope_http01_image "$DEAD")" "$STUB_STATE/images" \
+    || die "the dead run's responder image survived the sweep"
+  grep -qxF "$(run_scope_http01_image "$LIVE")" "$STUB_STATE/images" \
+    || die "the sweep removed a live run's responder image"
+  grep -qxF "${BOOTROOT_HTTP01_IMAGE_REPO}:latest" "$STUB_STATE/images" \
+    || die "the sweep removed the default-identity responder image a real install builds"
+  ok "the dead run's responder image goes with it, and neither a live run's nor the shipped :latest does"
 
   # Every removal is by an exact name the marker's instance produces, and
   # every label query names one project in full. A prefix or a wildcard
@@ -618,6 +647,19 @@ check_sweep_keeps_a_marker_it_could_not_clear() {
   [ -f "$BOOTROOT_E2E_RUN_MARKER_DIR/$DEAD" ] \
     || die "a sweep whose listing failed dropped the marker anyway"
   ok "a listing that could not be run fails the sweep rather than reading as nothing to collect"
+
+  # An image that could not be removed is a collection that did not
+  # finish, for the same reason a container is: it carries a name only
+  # this derivation produces, so once the marker is gone nothing later
+  # asks about it.
+  status=0
+  seed_daemon "" "" "" "$(run_scope_http01_image "$DEAD")"
+  seed_marker "$DEAD" 4194305 "$DEAD_PROJECT"
+  FAILING_QUERIES="image-rm" sweep_dead_run_instances "a-label" "$WORK_DIR/sweep.log" 2>/dev/null || status=$?
+  [ "$status" -ne 0 ] || die "a sweep that could not remove a dead run's image returned 0"
+  [ -f "$BOOTROOT_E2E_RUN_MARKER_DIR/$DEAD" ] \
+    || die "a sweep that left a dead run's image behind dropped its marker anyway"
+  ok "an image the sweep could not remove keeps the marker, like a container it could not remove"
 
   # Two runs starting at once sweep the same marker. The one that loses
   # the race sees its `rm` fail on a container that is already gone, and
@@ -681,6 +723,52 @@ check_harness_wiring() {
     done
   done
   ok "both lifecycle harnesses derive, record, sweep and install at a per-run scope"
+}
+
+# The compose file builds exactly one image, and its `image:` is the tag
+# that build is written to and every later recreate reads back. Two runs
+# left on one tag do not collide until one of them recreates the
+# responder — which both lifecycle harnesses do, to apply their DNS
+# aliases — and what they get then is the other run's build. Nothing
+# fails; the run just verifies against an image it did not build.
+#
+# So the tag is per run, and that has three halves: the compose file has
+# to interpolate it, each harness has to export one derived from its own
+# instance, and each has to remove it afterwards, because `down` never
+# does.
+check_responder_image_is_run_scoped() {
+  local script path first second
+  grep -qF 'image: ${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:latest}' \
+    docker-compose.yml \
+    || die "docker-compose.yml no longer interpolates the responder image from BOOTROOT_HTTP01_IMAGE at its shipped default; two concurrent runs would build and recreate against one tag"
+  for script in "${LIFECYCLE_SCRIPTS[@]}"; do
+    path="$IMPL_DIR/$script"
+    # Cleared before anything reads it, like the project and the ports:
+    # an inherited tag would put this run's build on another run's name.
+    grep -q '^unset BOOTROOT_HTTP01_IMAGE$' "$path" \
+      || die "${script} does not clear an inherited BOOTROOT_HTTP01_IMAGE"
+    grep -qF -- 'RUN_HTTP01_IMAGE="$(run_scope_http01_image "$RUN_INSTANCE")"' "$path" \
+      || die "${script} does not derive its responder image from its own instance"
+    grep -q '^  export BOOTROOT_HTTP01_IMAGE="\$RUN_HTTP01_IMAGE"$' "$path" \
+      || die "${script} does not hand Compose and infra install the image tag it derived"
+    grep -qF -- 'remove_run_image "$RUN_HTTP01_IMAGE" "$RUN_LOG"' "$path" \
+      || die "${script} never removes the image it built; \`down\` removes containers, never images"
+  done
+  # One tag per instance, and a tag Docker will accept: the instance
+  # alphabet is a subset of what a tag may hold, so this holds as long as
+  # the two derivations stay in step.
+  first="$(run_scope_http01_image "e2e-local-a4242")"
+  second="$(run_scope_http01_image "e2e-local-a4243")"
+  [ "$first" != "$second" ] \
+    || die "two instances derived the same responder image tag '${first}'"
+  case "${first#*:}" in
+    [a-zA-Z0-9_]*) ;;
+    *) die "the derived image tag '${first}' does not start with a character a Docker tag may open with" ;;
+  esac
+  case "${first#*:}" in
+    *[!a-zA-Z0-9._-]*) die "the derived image tag '${first}' holds a character outside [a-zA-Z0-9._-]" ;;
+  esac
+  ok "the responder image is one tag per run, derived from the instance and removed with it"
 }
 
 # The marker has to outlive everything that could leave a container
@@ -749,6 +837,7 @@ install_docker_stub
 check_sweep_collects_only_dead_runs
 check_sweep_keeps_a_marker_it_could_not_clear
 check_harness_wiring
+check_responder_image_is_run_scoped
 check_marker_removal_is_last
 check_no_hardcoded_identity
 

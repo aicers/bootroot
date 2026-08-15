@@ -265,6 +265,13 @@ checkout that build has nothing to read, so install the second instance with
 `--no-build` implies `--pull never`, and the first install both built
 `bootroot-http01-responder:latest` and pulled the third-party images.
 
+That tag is `docker-compose.yml`'s default rather than a fixed name: the
+responder's `image:` reads `BOOTROOT_HTTP01_IMAGE`, so an install that sets
+the variable builds under whatever it names — which is how two installs that
+must not share a build (the E2E lifecycle harnesses, one tag per run) keep
+apart. The second install has to resolve the same value as the first, or
+`--no-build` finds no image.
+
 A minimal second instance therefore looks like:
 
 ```bash
