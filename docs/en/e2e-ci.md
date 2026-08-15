@@ -98,6 +98,35 @@ and picks free host ports itself, and every teardown and leftover check is
 scoped to those exact names — it is safe to run on a host that already has a
 default `bootroot` install.
 
+### Leftover containers fail a run before it starts
+
+Every other harness installs at the default identity, so its containers are
+named after whatever the compose directory's `.env` records — `bootroot-*`
+unless an install recorded something else. Those names are global to the
+Docker daemon, so two such runs, or one such run and a real install, cannot
+share a host: they collide on `container_name` at `up`.
+
+Each of them therefore tears the stack down before doing any work and then
+asserts that none of the nine container names bootroot creates
+(`-openbao`, `-postgres`, `-ca`, `-http01`, `-prometheus`, `-grafana`,
+`-grafana-public`, `-openbao-agent-stepca`, `-openbao-agent-responder`)
+exists at the resolved instance name. A run killed with `SIGKILL` never
+reaches its own cleanup, and the containers it leaves behind carry a Compose
+project label no later run knows to ask about, which is why the check is by
+name rather than by label. The failure names what it found and the
+`docker rm -f` line that removes it; establish whether it is a killed run's
+leftovers or an install you need before running that line.
+
+The same check runs again in `cleanup`, where a leftover fails the run — a
+harness that leaves its own garbage behind is broken — without replacing the
+status of a run that had already failed for its own reason. Teardown output
+goes to the run log (`<artifact dir>/run.log`, or `runner.log` where the
+harness has no `run.log`), so a teardown that removed nothing can be told
+from one that removed everything.
+
+`scripts/validate-e2e-leftover-check.sh` covers all of it without Docker, and
+runs in the `check` CI job.
+
 Extended workflow validates:
 
 - baseline scale/contention behavior

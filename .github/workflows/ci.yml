@@ -142,6 +142,9 @@ jobs:
       - name: Validate E2E OpenSSL Compatibility
         run: ./scripts/validate-e2e-openssl-compat.sh
 
+      - name: Validate E2E Leftover Check
+        run: ./scripts/validate-e2e-leftover-check.sh
+
       - name: Install cargo-audit
         run: cargo install cargo-audit || true
 

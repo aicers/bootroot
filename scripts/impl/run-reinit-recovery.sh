@@ -27,7 +27,11 @@ set -euo pipefail
 # above must hold against the snapshot taken at bootstrap time.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+
+# shellcheck source=lib/leftovers.sh
+. "$SCRIPT_DIR/lib/leftovers.sh"
 
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-reinit-recovery-$(date +%s)}"
 mkdir -p "$ARTIFACT_DIR"
@@ -133,8 +137,12 @@ compose() {
   docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
 }
 
+# Teardown output goes to the run log rather than to `/dev/null`: a
+# teardown that removed nothing has to be distinguishable from one that
+# removed everything.  The status is the caller's to decide — the
+# start-of-run call tolerates a failure, `cleanup` does not.
 compose_down() {
-  compose down -v --remove-orphans >/dev/null 2>&1 || true
+  compose down -v --remove-orphans >>"$RUN_LOG" 2>&1
 }
 
 run_bootroot() {
@@ -186,10 +194,17 @@ capture_artifacts() {
 }
 
 cleanup() {
+  local status=$?
+  local cleanup_status=0
   log_phase "cleanup"
   capture_artifacts
-  compose_down
+  if ! compose_down; then
+    echo "run-reinit-recovery: teardown failed; see ${RUN_LOG}" >&2
+    cleanup_status=1
+  fi
   restore_repo_openbao_config
+  report_leftover_containers "$COMPOSE_FILE" "run-reinit-recovery cleanup" || cleanup_status=1
+  exit_with_cleanup_status "$status" "$cleanup_status"
 }
 
 # `bootroot init --openbao-bind --openbao-tls-required` rewrites the
@@ -677,7 +692,11 @@ main() {
 
   ensure_prerequisites
   ensure_bind_host_available "$OPENBAO_BIND_HOST" OPENBAO_BIND_HOST
-  compose_down
+  # A start-of-run teardown may legitimately find nothing to do, so its
+  # status is not fatal — what matters is what it leaves behind, which
+  # the assertion below reads.
+  compose_down || true
+  assert_no_leftover_containers "$COMPOSE_FILE" "run-reinit-recovery startup"
   snapshot_repo_openbao_config
 
   log_phase "bootstrap-install"

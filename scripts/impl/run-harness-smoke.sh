@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+
+# shellcheck source=lib/leftovers.sh
+. "$SCRIPT_DIR/lib/leftovers.sh"
 
 # docker-compose.yml interpolates the entire file regardless of which
 # services are targeted or which profiles are active, so required vars
@@ -40,6 +44,13 @@ log_phase() {
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '{"ts":"%s","phase":"%s","scenario":"%s","node":"%s","service":"%s","cycle":%s}\n' \
     "$now" "$phase" "$SCENARIO_ID" "$node" "$service" "$cycle" >>"$PHASE_LOG"
+}
+
+# `lib/leftovers.sh` aborts through `fail`, which this script otherwise
+# spells out at each site.
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
 }
 
 ensure_compose() {
@@ -80,12 +91,16 @@ compose_up() {
     up -d $COMPOSE_SERVICES
 }
 
+# Teardown output goes to the run log rather than to `/dev/null`: a
+# teardown that removed nothing has to be distinguishable from one that
+# removed everything.  The status is the caller's to decide — the
+# start-of-run call tolerates a failure, `cleanup` does not.
 compose_down() {
   docker compose \
     -p "$PROJECT_NAME" \
     -f "$COMPOSE_FILE" \
     -f "$COMPOSE_TEST_FILE" \
-    down -v --remove-orphans >/dev/null 2>&1 || true
+    down -v --remove-orphans >>"$RUNNER_LOG" 2>&1
 }
 
 capture_artifacts() {
@@ -122,6 +137,8 @@ wait_for_mock_openbao() {
 }
 
 cleanup() {
+  local status=$?
+  local cleanup_status=0
   log_phase "cleanup" "control-plane" "all"
   if [ -f "$MOCK_OPENBAO_PID_FILE" ]; then
     local mock_pid
@@ -130,7 +147,12 @@ cleanup() {
     wait "$mock_pid" 2>/dev/null || true
   fi
   capture_artifacts
-  compose_down
+  if ! compose_down; then
+    echo "run-harness-smoke: teardown failed; see ${RUNNER_LOG}" >&2
+    cleanup_status=1
+  fi
+  report_leftover_containers "$COMPOSE_FILE" "run-harness-smoke cleanup" || cleanup_status=1
+  exit_with_cleanup_status "$status" "$cleanup_status"
 }
 
 run_bootstrap() {
@@ -288,6 +310,14 @@ main() {
   : >"$PHASE_LOG"
 
   trap cleanup EXIT
+
+  # Nothing here used to tear the stack down before the run started, so
+  # a previous run killed before its own teardown was found only when
+  # `up` collided with the containers it had left.  A teardown may
+  # legitimately find nothing to do, so its status is not fatal — what
+  # matters is what it leaves behind, which the assertion below reads.
+  compose_down || true
+  assert_no_leftover_containers "$COMPOSE_FILE" "run-harness-smoke startup"
 
   log_phase "bootstrap" "control-plane" "all"
   compose_up

@@ -7,6 +7,8 @@ cd "$ROOT_DIR"
 
 # shellcheck source=lib/audit-log.sh
 . "$SCRIPT_DIR/lib/audit-log.sh"
+# shellcheck source=lib/leftovers.sh
+. "$SCRIPT_DIR/lib/leftovers.sh"
 
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-local-lifecycle-$(date +%s)}"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
@@ -217,8 +219,12 @@ wait_for_infra_ready() {
   return 1
 }
 
+# Teardown output goes to the run log rather than to `/dev/null`: a
+# teardown that removed nothing has to be distinguishable from one that
+# removed everything.  The status is the caller's to decide — the
+# start-of-run call tolerates a failure, `cleanup` does not.
 compose_down() {
-  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >>"$RUN_LOG" 2>&1
 }
 
 capture_artifacts() {
@@ -243,11 +249,18 @@ cleanup_hosts() {
 }
 
 cleanup() {
+  local status=$?
+  local cleanup_status=0
   log_phase "cleanup"
   cleanup_hosts
   stop_local_bootroot_agent_daemons
   capture_artifacts
-  compose_down
+  if ! compose_down; then
+    echo "run-local-lifecycle: teardown failed; see ${RUN_LOG}" >&2
+    cleanup_status=1
+  fi
+  report_leftover_containers "$COMPOSE_FILE" "run-local-lifecycle cleanup" || cleanup_status=1
+  exit_with_cleanup_status "$status" "$cleanup_status"
 }
 
 on_error() {
@@ -1125,7 +1138,11 @@ main() {
 
   ensure_prerequisites
   configure_resolution_mode
-  compose_down
+  # A start-of-run teardown may legitimately find nothing to do, so its
+  # status is not fatal — what matters is what it leaves behind, which
+  # the assertion below reads.
+  compose_down || true
+  assert_no_leftover_containers "$COMPOSE_FILE" "run-local-lifecycle startup"
   reset_stepca_materials_for_e2e
   install_infra
   write_agent_config "$EDGE_AGENT_CONFIG"

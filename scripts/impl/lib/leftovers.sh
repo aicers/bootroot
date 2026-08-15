@@ -1,0 +1,269 @@
+# shellcheck shell=bash
+# Shared teardown assertions for the Docker E2E harness.
+#
+# A `docker compose down` that removed nothing is indistinguishable from
+# one that removed everything: it is best-effort by design, and it used
+# to send every byte to `/dev/null`.  A run killed with `SIGKILL` never
+# reaches its teardown at all, and the containers bootroot creates are
+# named after the install identity rather than after the Compose
+# project, so they collide with the next run's on `up` whichever project
+# either run used.
+#
+# The checks here are what turn both into a message at the point the
+# harness can still say something useful.  There are two, and which one
+# a script wants follows from the identity it installs at:
+#
+#   * `assert_no_leftover_containers` / `report_leftover_containers`
+#     check for the exact container names bootroot creates at the
+#     identity recorded beside a compose file.  Every harness that
+#     installs at the default identity uses these.  Exact names, never a
+#     `bootroot-*` wildcard: a wildcard would reach past the run's own
+#     containers and into a co-located install's.
+#
+#   * `assert_no_project_leftovers` / `report_project_leftovers` check
+#     containers and volumes by `com.docker.compose.project` label.
+#     `run-two-instance-isolation.sh` uses these, being the one harness
+#     that installs under run-scoped instance names of its own, whose
+#     containers are therefore not named `bootroot-*` at all.
+#
+# Callers must define `fail`, which aborts the harness with a message;
+# `assert_no_project_leftovers` additionally needs `pass`, which reports
+# a satisfied assertion.
+#
+# The end-of-run half is deliberately split into `report_*` functions
+# that print and return non-zero rather than aborting, so an EXIT trap
+# can fold the result into the status the run already carried:
+#
+#   cleanup() {
+#     local status=$?
+#     local teardown_status=0
+#     capture_artifacts
+#     compose_down || teardown_status=1
+#     report_leftover_containers "$COMPOSE_FILE" cleanup || teardown_status=1
+#     exit_with_cleanup_status "$status" "$teardown_status"
+#   }
+#
+# A harness that leaves its own garbage behind is broken and has to
+# fail, but it must not overwrite the failure that ended the run — that
+# one is the more useful reason to report.
+
+# Identity an install takes when it declares none —
+# `DEFAULT_INSTANCE_NAME` in `src/commands/compose_project.rs`.
+BOOTROOT_DEFAULT_INSTANCE_NAME="bootroot"
+
+# The suffix bootroot appends to the install identity, one per container
+# it creates.  The set mirrors `BootrootContainer::ALL` in
+# `src/commands/container_name.rs`; a container added there and not here
+# would escape every check below.
+BOOTROOT_CONTAINER_SUFFIXES=(
+  -openbao
+  -postgres
+  -ca
+  -http01
+  -prometheus
+  -grafana
+  -grafana-public
+  -openbao-agent-stepca
+  -openbao-agent-responder
+)
+
+# Returns the directory a compose file's `.env` sits in.
+#
+# Mirrors `compose_file_dir` in `src/commands/compose_file.rs`, down to
+# a bare filename resolving to `.` rather than to an empty path.
+compose_file_dir() {
+  local compose_file="$1" dir
+  dir="$(dirname "$compose_file")"
+  [ -n "$dir" ] || dir="."
+  printf '%s\n' "$dir"
+}
+
+# Prints the value one `.env` key holds, the way `read_dotenv`
+# (`src/commands/dotenv.rs`) reads it: blank and `#` lines skipped, the
+# split on the *first* `=`, key and value trimmed, one layer of matching
+# surrounding quotes stripped, and the last assignment winning.
+#
+# Exits 2 on a line carrying no `=`, where `read_dotenv` errors rather
+# than reading the file as recording nothing: a `.env` bootroot itself
+# will refuse to parse must not resolve here to the default identity and
+# have the check look at the wrong container names.
+dotenv_lookup() {
+  local file="$1" key="$2"
+  awk -v want="$key" -v squote="'" '
+    {
+      line = $0
+      sub(/^[ \t\r]+/, "", line)
+      sub(/[ \t\r]+$/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") next
+      eq = index(line, "=")
+      if (eq == 0) { malformed = 1; exit 2 }
+      name = substr(line, 1, eq - 1)
+      value = substr(line, eq + 1)
+      sub(/^[ \t\r]+/, "", name)
+      sub(/[ \t\r]+$/, "", name)
+      sub(/^[ \t\r]+/, "", value)
+      sub(/[ \t\r]+$/, "", value)
+      if (length(value) >= 2) {
+        first = substr(value, 1, 1)
+        last = substr(value, length(value), 1)
+        if ((first == "\"" && last == "\"") || (first == squote && last == squote)) {
+          value = substr(value, 2, length(value) - 2)
+        }
+      }
+      if (name == want) { found = 1; result = value }
+    }
+    END { if (!malformed && found) print result }
+  ' "$file"
+}
+
+# Prints the instance name every container bootroot creates is named
+# after, for the install the given compose file belongs to.
+#
+# Resolved as `resolve_recorded_instance_name`
+# (`src/commands/compose_project.rs`) resolves it: `--instance-name`,
+# which no harness passes, then `BOOTROOT_INSTANCE` as recorded in the
+# compose directory's `.env`, then the default identity.
+#
+# Deliberately not `${BOOTROOT_INSTANCE:-bootroot}` out of the invoking
+# environment.  That expansion happens to give the right answer today
+# only because every harness using this runs at the default identity,
+# and it stops the moment one of them takes an instance name.
+# `COMPOSE_PROJECT_NAME` is not consulted at all: it selects a project
+# for one invocation and is not an identity, and the harness sets it to
+# values that are not valid instance names.
+#
+# Returns non-zero, printing nothing, when the `.env` cannot be parsed.
+resolve_recorded_instance_name() {
+  local compose_dir="$1" env_file recorded
+  env_file="$compose_dir/.env"
+  if [ -f "$env_file" ]; then
+    recorded="$(dotenv_lookup "$env_file" BOOTROOT_INSTANCE)" || return 1
+    if [ -n "$recorded" ]; then
+      printf '%s\n' "$recorded"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$BOOTROOT_DEFAULT_INSTANCE_NAME"
+}
+
+# Prints every container bootroot creates at `instance`, one per line,
+# that exists on this daemon right now.
+#
+# `docker container inspect` per name rather than a `docker ps --filter
+# name=` regex: the filter matches substrings, and the whole point of
+# the check is that it is exact.
+bootroot_leftover_containers() {
+  local instance="$1" suffix name
+  for suffix in "${BOOTROOT_CONTAINER_SUFFIXES[@]}"; do
+    name="${instance}${suffix}"
+    if docker container inspect "$name" >/dev/null 2>&1; then
+      printf '%s\n' "$name"
+    fi
+  done
+  # An absent container is the expected case, and it is what the last
+  # `inspect` in the loop reports through the function's own status.
+  # Under `set -o pipefail` that would fail the caller's assignment.
+  return 0
+}
+
+# Prints the leftover containers as one space-separated line.
+_bootroot_leftovers_line() {
+  bootroot_leftover_containers "$1" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+# Aborts the run when any container bootroot creates at the resolved
+# identity already exists.
+#
+# Called at the start of a run, after the start-of-run teardown has had
+# its chance: what survives that is either a killed run's leftovers,
+# whose Compose project no later run knows to ask about, or a real
+# install on this host.  Either way the run cannot proceed — container
+# names are global to the daemon, so `up` would collide — and failing
+# here costs a message instead of a confusing failure twenty minutes in.
+assert_no_leftover_containers() {
+  local compose_file="$1" label="$2" compose_dir instance leftovers
+  compose_dir="$(compose_file_dir "$compose_file")"
+  if ! instance="$(resolve_recorded_instance_name "$compose_dir")"; then
+    fail "cannot read the instance name from ${compose_dir}/.env; it records the identity every bootroot container is named after"
+  fi
+  leftovers="$(_bootroot_leftovers_line "$instance")"
+  [ -n "$leftovers" ] || return 0
+  fail "$(printf '%s\n%s\n%s\n%s\n  docker rm -f %s' \
+    "[${label}] containers of a bootroot install at instance name '${instance}' are already present:" \
+    "  ${leftovers}" \
+    "They are either what an E2E run killed before its teardown left behind, or a real bootroot install on this host." \
+    "This harness installs at that same identity and cannot run beside either, so remove them once you have established which:" \
+    "${leftovers}")"
+}
+
+# Reports containers surviving the end-of-run teardown, without
+# aborting.
+#
+# Returns non-zero when there are any, so an EXIT trap can fold that
+# into its status rather than exiting from inside itself and dropping
+# the reason the run failed.
+report_leftover_containers() {
+  local compose_file="$1" label="$2" compose_dir instance leftovers
+  compose_dir="$(compose_file_dir "$compose_file")"
+  if ! instance="$(resolve_recorded_instance_name "$compose_dir")"; then
+    echo "[${label}] cannot read the instance name from ${compose_dir}/.env; leftover containers were not checked for" >&2
+    return 1
+  fi
+  leftovers="$(_bootroot_leftovers_line "$instance")"
+  [ -n "$leftovers" ] || return 0
+  echo "[${label}] the teardown left containers behind at instance name '${instance}': ${leftovers}" >&2
+  echo "[${label}] remove them with: docker rm -f ${leftovers}" >&2
+  return 1
+}
+
+# Prints the id of every container labelled with `project`.
+project_container_ids() {
+  docker ps -aq --filter "label=com.docker.compose.project=$1" 2>/dev/null || true
+}
+
+# Prints the name of every volume labelled with `project`.
+project_volume_ids() {
+  docker volume ls -q --filter "label=com.docker.compose.project=$1" 2>/dev/null || true
+}
+
+# Aborts the run when a container or volume of `project` survived the
+# teardown named by `label`.
+#
+# The label-scoped counterpart of `assert_no_leftover_containers`, for
+# the harness whose instance names are its own rather than the default
+# identity's.  Reports the two resource kinds separately, so a failure
+# names which survived.
+assert_no_project_leftovers() {
+  local project="$1" label="$2" leftovers
+  leftovers="$(project_container_ids "$project")"
+  [ -z "$leftovers" ] || fail "containers of project ${project} survived ${label}"
+  leftovers="$(project_volume_ids "$project")"
+  [ -z "$leftovers" ] || fail "volumes of project ${project} survived ${label}"
+  pass "no container or volume of project ${project} survived ${label}"
+}
+
+# Reports containers or volumes of `project` surviving the end-of-run
+# teardown, without aborting.  Returns non-zero when there are any.
+report_project_leftovers() {
+  local project="$1" label="$2" leftovers
+  leftovers="$(project_container_ids "$project")$(project_volume_ids "$project")"
+  [ -n "$leftovers" ] || return 0
+  echo "[${label}] leftovers survived for project ${project}" >&2
+  return 1
+}
+
+# Ends an EXIT trap with the status the run must carry.
+#
+# `entry_status` is `$?` as captured on the trap's first line, before
+# anything the trap itself runs can overwrite it.  A failed teardown or
+# leftover check turns a run that had passed into a failure; where the
+# run had already failed, that original status is what the harness exits
+# with, because what ended the run is a more useful reason than the
+# garbage it then failed to clear.
+exit_with_cleanup_status() {
+  local entry_status="$1" cleanup_status="$2"
+  if [ "$entry_status" -ne 0 ]; then
+    exit "$entry_status"
+  fi
+  exit "$cleanup_status"
+}
