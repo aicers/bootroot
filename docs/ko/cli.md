@@ -344,8 +344,8 @@ bootroot infra up
 
 명령이 대상으로 삼는 프로젝트는 다음 순서로 결정됩니다.
 
-1. `--instance-name` (`infra install`에만 존재);
-2. 호출 환경의 `COMPOSE_PROJECT_NAME`(비어 있지 않은 경우);
+1. 호출 환경의 `COMPOSE_PROJECT_NAME`(비어 있지 않은 경우);
+2. `--instance-name` (`infra install`에만 존재);
 3. 명령에 전달된 compose 파일 옆 `.env`의 `BOOTROOT_INSTANCE`;
 4. 리터럴 `bootroot`.
 
@@ -357,6 +357,16 @@ bootroot infra up
 값이므로, 이후 그 스택을 다루는 모든 명령에도 같은 변수를 내보내야
 합니다. 일회성 스택에는 이 변수를(이 저장소의 E2E 하니스가 그렇게
 합니다), 지속적인 설치에는 `--instance-name`을 사용하세요.
+
+이 변수가 `--instance-name`보다 우선하는 이유는 다른 모든 명령도 프로젝트를
+이 변수에서 해석하기 때문입니다. 설치만 이 변수를 무시하면 스택은 한
+프로젝트에 만들어지는데 그 설치를 실행한 셸은 다른 프로젝트를 가리키게 되어,
+`clean`은 아무것도 지우지 못하고 `status`는 아무것도 보고하지 못합니다.
+따라서 둘을 함께 쓰는 것은 충돌이 아니라 정상적인 조합입니다. 내보낸 변수는
+프로젝트를, 플래그는 모든 컨테이너 이름의 바탕이 되는 기록된 정체성을
+결정하며, 둘은 서로 다른 문자열이어도 됩니다. E2E 하니스가 실행마다 39자
+인스턴스 이름과 같은 식별자에서 따로 만든 더 긴 프로젝트를 함께 쓸 수 있는
+것이 바로 이 때문입니다.
 
 한 호스트에 두 bootroot 인스턴스를 함께 두려면 각각에 서로 다른
 `--instance-name`을 지정해야 합니다. 둘 다 기본 정체성을 취하면 하나의
@@ -533,7 +543,10 @@ PostgreSQL 비밀번호 포함) 생성과 `secrets/`, `certs/` 디렉터리 생�
 있습니다 — 예를 들어 `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
 `BOOTROOT_STEP_CA_IMAGE`, `BOOTROOT_HTTP01_IMAGE`. `.env`나 프로세스
 환경에 설정하며, 설정하지 않은 변수는 릴리스 빌드 기본값으로
-대체됩니다. 운영 및 에어갭 설치에서는 `BOOTROOT_STEP_CA_IMAGE`를
+대체됩니다. `BOOTROOT_HTTP01_IMAGE`는 기본 `docker-compose.yml`도 읽습니다.
+그곳에서는 응답기 빌드가 기록되는 태그 이름이 되며, 한 호스트의 두 설치가
+서로의 이미지를 덮어쓰지 않는 방법입니다. 설정하지 않으면 이전과 같이
+`bootroot-http01-responder:latest`입니다. 운영 및 에어갭 설치에서는 `BOOTROOT_STEP_CA_IMAGE`를
 `0.30.2` 태그가 아니라 `@sha256:` 다이제스트로 고정하세요. step-ca는
 CA이며, 이제 기본값이 변경 가능한 태그의 서드파티 이미지이고, smallstep은
 이미지에 대한 cosign 서명을 게시하므로, 다이제스트로 고정하면 변하지 않는

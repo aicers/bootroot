@@ -490,15 +490,54 @@ fn test_infra_install_honours_compose_project_name_without_recording_it() {
     );
 }
 
-/// Closes #745: `--instance-name` outranks an exported
-/// `COMPOSE_PROJECT_NAME`, and a re-run without the flag keeps the
-/// recorded identity rather than resetting it to the default — while the
-/// generated `PostgreSQL` password survives the upsert.
+/// Part of #846: an install may declare an identity and be scoped to a
+/// project of another name at the same time.  The exported
+/// `COMPOSE_PROJECT_NAME` decides the project — including for the
+/// install itself, so the stack lands where every later command in that
+/// same environment will look for it — while `--instance-name` decides
+/// the recorded identity every container is named after.
+///
+/// This is what lets the E2E lifecycle harness derive the two
+/// separately: a project longer than an instance name may legally be,
+/// and an instance cut to the 39 characters `infra install` accepts.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_separates_the_declared_identity_from_the_project() {
+    const RUN_PROJECT: &str = "bootroot-e2e-local-ci-local-no-hosts-19283746501-4242";
+    assert!(RUN_PROJECT.len() > 39, "must exceed the instance limit");
+
+    let harness = InstallHarness::new();
+    let argv = harness.install(Some("insight"), Some(RUN_PROJECT));
+    InstallHarness::assert_every_compose_scoped_to(&argv, RUN_PROJECT);
+    assert!(
+        harness.dotenv().contains("BOOTROOT_INSTANCE=insight"),
+        "the declared identity must be recorded whatever the project, got: {}",
+        harness.dotenv()
+    );
+    assert!(
+        !harness.dotenv().contains(RUN_PROJECT),
+        "the project override must not be recorded, got: {}",
+        harness.dotenv()
+    );
+    assert!(
+        harness
+            .compose_instance_env()
+            .iter()
+            .all(|value| value == "insight"),
+        "every compose subprocess must render container names from the \
+         declared identity, not from the project, got: {:?}",
+        harness.compose_instance_env()
+    );
+}
+
+/// Closes #745: a re-run without the flag keeps the recorded identity
+/// rather than resetting it to the default — while the generated
+/// `PostgreSQL` password survives the upsert.
 #[cfg(unix)]
 #[test]
 fn test_infra_install_rerun_preserves_the_recorded_instance() {
     let harness = InstallHarness::new();
-    let argv = harness.install(Some("insight"), Some("throwaway-project"));
+    let argv = harness.install(Some("insight"), None);
     InstallHarness::assert_every_compose_scoped_to(&argv, "insight");
 
     let first_dotenv = harness.dotenv();

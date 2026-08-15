@@ -1,0 +1,957 @@
+# shellcheck shell=bash
+# Per-run identity for the lifecycle E2E harnesses, and the collection of
+# what a killed run leaves behind.
+#
+# Two lifecycle runs could not share a machine.  Every run brought the
+# stack up under the default Compose project, the default install
+# identity and the default published ports, so a second run — another
+# worktree, another agent session, a developer checking something by hand
+# — collided with the first on the project, on container names and on
+# `127.0.0.1` ports, and the collision surfaced as a verify timeout or a
+# container-name error far from its cause.
+#
+# What this library gives a harness is one identity per run, derived from
+# the run identifier its artifact directory is already named after, plus
+# the liveness bookkeeping that unique naming makes necessary — and, at
+# the end, the one lock that keeps `hosts` mode serialised, since
+# `/etc/hosts` is the one thing left that no derivation can give a run
+# its own copy of.
+#
+# The instance and the Compose project are derived separately, from the
+# same run identifier, under different rules — and they have to be.  An
+# instance name is a prefix on container names, which are DNS labels and
+# certificate SANs, so it is validated and capped at 39 characters; a
+# CI-length `GITHUB_RUN_ID` carries the identifier past that on its own.
+# A Compose project carries no such limit, so it keeps the identifier
+# whole and stays legible in `docker ps` when the truncated instance no
+# longer is.
+#
+# Both then have to be made effective, by different routes.  The instance
+# reaches `infra install` as `--instance-name`, which is what records it
+# in `.env` and names every container the binary later creates — the
+# `-openbao-agent-stepca` and `-openbao-agent-responder` sidecars
+# included.  The project reaches it as an exported `COMPOSE_PROJECT_NAME`,
+# which outranks the declared identity for the project and nothing else
+# (`resolve_compose_project_for_dir`, `src/commands/compose_project.rs`),
+# and which every later `bootroot` invocation in the run resolves the
+# same way.  `assert_resolved_compose_project` in each harness then reads
+# the project the install actually resolved back off a real container,
+# because a run whose binary resolved some other project would tear down
+# a project holding none of its containers.
+#
+# Requires `lib/leftovers.sh` for `BOOTROOT_CONTAINER_SUFFIXES` and
+# `bootroot_leftover_containers`, and a caller-defined `fail`.
+
+# `MAX_INSTANCE_NAME_LEN` in src/commands/compose_project.rs: the
+# DNS-label budget left over after the longest container-name suffix.
+# `validate_instance_name` rejects anything longer rather than
+# normalising it, so an over-long derived name fails `infra install`
+# outright.
+BOOTROOT_MAX_INSTANCE_NAME_LEN=39
+
+# Directory holding one liveness marker per live E2E run.
+#
+# Under `${TMPDIR:-/tmp}` because that is where the harness already keeps
+# run state (`scripts/preflight/ci/e2e-matrix.sh`), and because on macOS
+# it is per-user, which keeps one user's markers out of another's sweep.
+#
+# The uid is in the name so Linux gets that separation too, where
+# `TMPDIR` is usually unset and `/tmp` is the whole machine's.  Without
+# it two users cannot both run the harness on one host: the first
+# creates the directory 0700, and `ensure_run_marker_dir` then refuses
+# it for the second — which is the same serialisation this issue exists
+# to remove, arriving as a hard failure instead of a collision.  The
+# ownership check below stays regardless, because a predictable path is
+# still one somebody else can get to first.
+BOOTROOT_E2E_RUN_MARKER_DIR="${BOOTROOT_E2E_RUN_MARKER_DIR:-${TMPDIR:-/tmp}/bootroot-e2e-runs-$(id -u)}"
+
+# The repository half of the responder image tag, as
+# `docker-compose.yml` and `docker-compose.deploy.yml` both spell it.
+# The tag half is this run's instance name, which is what keeps two
+# concurrent runs off one image.
+BOOTROOT_HTTP01_IMAGE_REPO="bootroot-http01-responder"
+
+# The characters `validate_instance_name` accepts after the prefix,
+# spelled out rather than written as `a-z0-9`.  A bracket range is
+# collated by the caller's locale, and under most of them `[a-z]` matches
+# `E` — which would let an uppercase name through the guard below and
+# have `infra install` reject it several minutes into a run.
+RUN_SCOPE_INSTANCE_ALPHABET="abcdefghijklmnopqrstuvwxyz0123456789"
+
+# What a Compose project name may hold after its first character, per
+# Compose's own rule.  Wider than the instance alphabet on purpose: the
+# project is not truncated, so it can afford to keep the `-` separators
+# that make the run identifier readable in `docker ps` and in a label
+# filter.  Spelled out for the same collation reason as above.
+RUN_SCOPE_PROJECT_ALPHABET="abcdefghijklmnopqrstuvwxyz0123456789-_"
+
+# The namespaces a derived run identity may sit in, one per lifecycle
+# harness, each written `<instance prefix>:<project prefix>`.
+#
+# Here, and not only in the harnesses that derive from them, because the
+# sweep is the half that needs them.  A marker's filename is an instance
+# the sweep hands to `docker rm -f`, and its `project` field is the label
+# it removes volumes and networks by, so the sweep reaches exactly as far
+# as what it will accept out of that directory.  Owner-only permissions
+# establish that no other user put a marker there; they establish nothing
+# about what this user's own host put there — an older harness's marker
+# under a naming rule since changed, a file made by hand while debugging,
+# a write from some other tool that happened to pick the same directory.
+# A file named `bootroot` recording `project=bootroot` and a pid that is
+# no longer alive would otherwise be collected exactly as a dead run is,
+# tearing down the nine default-identity containers and then every volume
+# and network labelled with the default project: the one install on the
+# host the sweep exists never to reach.
+#
+# So a marker is honoured only when both of its halves sit inside a
+# namespace below, and refused and kept otherwise.  The default identity
+# cannot be spelled as one: no instance prefix here begins `bootroot`,
+# and every project prefix begins `bootroot-e2e-`, so neither `bootroot`
+# nor any name a real install derives from it is expressible.
+#
+# The harnesses declare their own prefixes as literals of their own, and
+# `validate-e2e-run-scope.sh` holds each declared pair against this
+# table.  A prefix changed in one place and not the other therefore fails
+# there, rather than shipping a harness whose markers no sweep will
+# honour — which would strand its leftovers for as long as the machine
+# runs, silently, since a refused marker is kept and a kept marker looks
+# from the outside exactly like one waiting to be retried.
+BOOTROOT_E2E_RUN_NAMESPACES=(
+  "e2e-local-:bootroot-e2e-local-"
+  "e2e-remote-:bootroot-e2e-remote-"
+)
+
+# Reduces a free-form run identifier to the alphabet an instance name may
+# use, dropping every other character rather than mapping it to `-`: the
+# result is a token to be appended to a prefix, and a mapped separator
+# would spend the length budget on punctuation.
+run_scope_sanitize() {
+  printf '%s' "$1" \
+    | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' \
+    | LC_ALL=C tr -cd "$RUN_SCOPE_INSTANCE_ALPHABET"
+}
+
+# Reduces a free-form run identifier to what a Compose project name may
+# hold, keeping the separators `run_scope_sanitize` drops.  Nothing here
+# is truncated, so there is no length budget for a separator to spend.
+run_scope_project_sanitize() {
+  printf '%s' "$1" \
+    | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' \
+    | LC_ALL=C tr -cd "$RUN_SCOPE_PROJECT_ALPHABET"
+}
+
+# Prints the identifier this run's instance and project are both derived
+# from: the artifact directory's basename, which every caller already
+# makes unique per run, followed by this process's pid.
+#
+# The pid is not decoration.  Two runs started from two worktrees in the
+# same second can carry the same artifact basename — `run-extended-
+# suite.sh` gives its lifecycle case the fixed basename `infra-lifecycle`
+# — and the pid is what separates them.  It is also what the liveness
+# marker records, so the name and the marker agree on which run is which.
+run_scope_token() {
+  local artifact_dir="$1"
+  printf '%s-%s' "$(basename "$artifact_dir")" "$$"
+}
+
+# Prints the instance name a run installs at: `prefix` followed by as
+# much of the sanitised token as the length limit leaves room for.
+#
+# The *tail* of the token is what survives truncation, deliberately: the
+# pid sits at the end, so two runs whose identifiers agree on everything
+# else still derive different names.  Truncating the front instead would
+# keep the part they share and drop the part they do not.
+run_scope_instance() {
+  local prefix="$1" token budget
+  token="$(run_scope_sanitize "$2")"
+  [ -n "$token" ] \
+    || fail "the run identifier '$2' holds no [a-z0-9] character to derive an instance name from"
+  budget=$((BOOTROOT_MAX_INSTANCE_NAME_LEN - ${#prefix}))
+  [ "$budget" -ge 1 ] \
+    || fail "the instance-name prefix '${prefix}' leaves no room for a run token within ${BOOTROOT_MAX_INSTANCE_NAME_LEN} characters"
+  if [ "${#token}" -gt "$budget" ]; then
+    token="${token:$((${#token} - budget))}"
+  fi
+  printf '%s%s\n' "$prefix" "$token"
+}
+
+# True when `name` is one `infra install` will accept:
+# `validate_instance_name`'s rule, restated for a shell.
+#
+# A predicate rather than only the abort below, because the sweep asks
+# the same question of a name it did not derive and must answer it
+# without taking the run down.
+run_scope_instance_is_valid() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  [ "${#name}" -le "$BOOTROOT_MAX_INSTANCE_NAME_LEN" ] || return 1
+  case "$name" in
+    ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
+    *) return 1 ;;
+  esac
+  case "$name" in
+    *[!"$RUN_SCOPE_INSTANCE_ALPHABET"-]*) return 1 ;;
+  esac
+}
+
+# Aborts unless `name` is one `infra install` will accept.
+#
+# The derivation above is meant to produce nothing else, which is exactly
+# why this is checked rather than trusted: a prefix edited later, or a
+# limit that moves in `compose_project.rs`, would otherwise surface as a
+# rejected install several minutes into a run.
+#
+# The verdict is the predicate's; what is below it runs only once that
+# has said no, and only to name which half of the rule was broken.  So
+# there is one statement of what is acceptable and not two that can drift
+# apart.
+run_scope_assert_valid_instance() {
+  local name="$1"
+  run_scope_instance_is_valid "$name" && return 0
+  [ "${#name}" -le "$BOOTROOT_MAX_INSTANCE_NAME_LEN" ] \
+    || fail "derived instance name '${name}' is ${#name} characters, over the ${BOOTROOT_MAX_INSTANCE_NAME_LEN}-character limit"
+  case "$name" in
+    ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
+    *) fail "derived instance name '${name}' does not start with a lowercase letter or a digit" ;;
+  esac
+  fail "derived instance name '${name}' holds a character outside [a-z0-9-]"
+}
+
+# Prints the Compose project a run scopes every `docker compose` call to
+# — its own and the ones `bootroot` makes — derived from the same token
+# as the instance name and under its own rule.
+#
+# Nothing is truncated here.  A Compose project has no DNS label to fit
+# inside and no certificate SAN to appear in, so it keeps the whole run
+# identifier: that is what makes it unique without relying on the pid
+# alone, and what keeps a `com.docker.compose.project` filter legible
+# after the instance name has been cut to 39 characters.  For a
+# CI-length `GITHUB_RUN_ID` the two therefore differ in length as well as
+# in content, which is the point of deriving them separately.
+run_scope_project() {
+  local prefix="$1" token
+  token="$(run_scope_project_sanitize "$2")"
+  [ -n "$token" ] \
+    || fail "the run identifier '$2' holds no character a Compose project name may use"
+  printf '%s%s\n' "$prefix" "$token"
+}
+
+# True when `name` is one Compose will accept as a project: a lowercase
+# letter or a digit first, then lowercase letters, digits, `-` and `_`,
+# and no length limit — that last is the whole difference from an
+# instance name.
+#
+# A predicate for the same reason the instance one is: the sweep asks
+# this of a project it read out of a file rather than derived.
+run_scope_project_is_valid() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  case "$name" in
+    ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
+    *) return 1 ;;
+  esac
+  case "$name" in
+    *[!"$RUN_SCOPE_PROJECT_ALPHABET"]*) return 1 ;;
+  esac
+}
+
+# Aborts unless `name` is one Compose will accept as a project.
+#
+# Checked for the same reason the instance name is: a prefix edited later
+# would otherwise surface as a rejected `docker compose` call several
+# minutes into a run.  As above, the predicate holds the rule and what
+# follows only names the broken half.
+run_scope_assert_valid_project() {
+  local name="$1"
+  run_scope_project_is_valid "$name" && return 0
+  [ -n "$name" ] || fail "the derived Compose project name is empty"
+  case "$name" in
+    ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
+    *) fail "derived Compose project '${name}' does not start with a lowercase letter or a digit" ;;
+  esac
+  fail "derived Compose project '${name}' holds a character outside [a-z0-9_-]"
+}
+
+# Prints the project prefix belonging to the namespace `instance` sits
+# in, and returns non-zero when it sits in none of them.
+#
+# The pairing is what makes this worth consulting: an instance in the
+# local namespace can only ever have been derived alongside a project in
+# the local project namespace, so a marker pairing one harness's instance
+# with the other's project is as much a marker this harness did not write
+# as one naming `bootroot`.
+run_scope_project_prefix_for_instance() {
+  local instance="$1" pair instance_prefix
+  for pair in "${BOOTROOT_E2E_RUN_NAMESPACES[@]}"; do
+    instance_prefix="${pair%%:*}"
+    case "$instance" in
+      "$instance_prefix"?*)
+        printf '%s' "${pair#*:}"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# True when `instance` and `project` are a pair this harness could have
+# derived: both valid, both inside one namespace, and inside the same
+# one.
+#
+# This is the whole of what confines the sweep.  Everything it does is
+# driven off a marker — the nine container names come from the filename,
+# the volume and network label from the `project` field — so the question
+# of what the sweep can reach is exactly the question of which markers it
+# will act on.  A file failing this is refused and kept rather than
+# collected: it is not this harness's to tear down, and it is not this
+# harness's to delete either.
+run_scope_marker_is_derived() {
+  local instance="$1" project="$2" project_prefix
+  project_prefix="$(run_scope_project_prefix_for_instance "$instance")" || return 1
+  run_scope_instance_is_valid "$instance" || return 1
+  case "$project" in
+    "$project_prefix"?*) ;;
+    *) return 1 ;;
+  esac
+  run_scope_project_is_valid "$project" || return 1
+}
+
+# Prints the responder image a run builds and runs its own stack from.
+#
+# The compose file declares one `build:` context, and its `image:` is the
+# tag that build is written to.  Left at the shipped default, two
+# concurrent runs write to the same tag in turn: the second run's
+# `up --build` retags it while the first is up, and the first's later
+# `up -d bootroot-http01` — the recreate that applies the DNS aliases —
+# resolves the tag again and starts the other run's build.  A running
+# container holds its image by id, so nothing is disturbed until that
+# recreate, which is exactly the point at which it is.
+#
+# So the tag is the run's instance name.  Derived rather than recorded,
+# for the same reason the nine container names are: it is a function of
+# the instance, so a sweep reading a marker's filename can name it
+# exactly.
+run_scope_http01_image() {
+  printf '%s:%s\n' "$BOOTROOT_HTTP01_IMAGE_REPO" "$1"
+}
+
+# Removes one run's responder image, and returns non-zero only when the
+# tag is still there afterwards.
+#
+# An absent tag is not a failure: a run killed before its install built
+# anything has none, and neither has one whose image a concurrent sweep
+# already removed.  What must not pass is a tag that survived the
+# removal — that is a run's leftovers under a name only this derivation
+# knows, which is what the marker exists to keep collectable.
+#
+# What is removed is always a tag and never an image id, which is what
+# makes this safe when a run's build came out byte-identical to another
+# tag's: Docker untags a multiply-tagged image rather than deleting it,
+# so the `:latest` a real install left on the same layers stays.
+remove_run_image() {
+  local image="$1" log="$2"
+  docker image inspect "$image" >/dev/null 2>&1 || return 0
+  docker image rm -f "$image" >>"$log" 2>&1 || true
+  ! docker image inspect "$image" >/dev/null 2>&1
+}
+
+# Records the instance in a `.env` beside the directory a harness runs
+# `bootroot` *from*, as opposed to the one its compose file sits in.
+#
+# `service add` takes no compose file at all: it resolves its identity
+# with `ComposeIdentity::resolve_for_dir(Path::new("."), ...)`
+# (`src/commands/service.rs`), from the same working directory it loads
+# `state.json` from.  A harness that runs it from a workspace directory
+# — which both lifecycle harnesses do, to keep `state.json` out of the
+# source tree — would otherwise resolve the default identity there and
+# look for `bootroot-http01` on project `bootroot`, find no responder of
+# this run's, and skip the DNS-alias rewiring with a warning rather than
+# a failure.  Recording the instance here is what keeps that path
+# pointed at this run's own responder.
+write_instance_dotenv() {
+  local dir="$1" instance="$2" tmp
+  tmp="$dir/.env.$$.tmp"
+  printf 'BOOTROOT_INSTANCE=%s\n' "$instance" >"$tmp" \
+    || fail "cannot record the instance name in ${dir}/.env"
+  mv "$tmp" "$dir/.env" || fail "cannot publish ${dir}/.env"
+}
+
+# ---------------------------------------------------------------------------
+# Liveness markers
+# ---------------------------------------------------------------------------
+#
+# Giving every run its own project and instance stops a dead run's
+# leftovers from being collected by accident.  Today the next run
+# collects them, because it uses the same project and the same names and
+# tears them down before starting; once nothing is ever named the same as
+# a dead run's containers again, they accumulate for as long as the
+# machine runs.  The start-of-run check in `lib/leftovers.sh` does not
+# catch them and is not meant to: it matches the exact container names at
+# *this* run's identity.
+#
+# A sweep has to tell a dead run's containers from a live one's, and with
+# concurrent runs it cannot do that by name or by age — another run may
+# legitimately own containers in the derived namespace right now.  So
+# liveness is recorded rather than guessed: each run writes a marker
+# naming its own pid and project, the sweep skips the markers whose pid
+# is still alive, and tears the rest down by the exact names and the
+# exact project label those markers record.  Never a prefix and never a
+# wildcard: a `bootroot-*` sweep would reach into a real default-identity
+# install on the same host.
+#
+# A recycled pid can spare a dead run's containers for one further run.
+# That is acceptable — the next run collects them, and nothing is removed
+# wrongly.
+
+run_marker_path() {
+  printf '%s/%s\n' "$BOOTROOT_E2E_RUN_MARKER_DIR" "$1"
+}
+
+# Prints the value one marker key holds, and nothing when the key is
+# absent.
+run_marker_field() {
+  local file="$1" key="$2"
+  awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+# True when a process with this pid exists.
+#
+# `kill -0` reports a process owned by another user as an error, which is
+# indistinguishable here from "no such process", so two more probes stand
+# behind it: the process directory on Linux, and `ps -p` where there is
+# none.  The marker directory this decides for is one user's, so the
+# extra probes are conservatism rather than necessity — and the
+# conservatism is the direction to err in.  A pid this reads as alive
+# spares a dead run's containers for one more round, which is the trade
+# recorded below; one it read as dead while another user's process held
+# it would take a live run's containers out from under it.
+run_pid_is_alive() {
+  local pid="$1"
+  case "$pid" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null && return 0
+  [ -d "/proc/$pid" ] && return 0
+  ps -p "$pid" >/dev/null 2>&1
+}
+
+# Creates the marker directory owner-only, and aborts unless it is this
+# user's.
+#
+# A marker's filename is the instance the sweep tears down by exact
+# container name, and its `project` field is the label the sweep removes
+# volumes and networks by.  The directory therefore holds instructions,
+# not just bookkeeping: anyone who can write to it can aim a
+# `docker rm -f` at a name of their choosing — including `bootroot`, the
+# one identity the sweep is meant never to reach.  Owner-only is what
+# makes it per-user on Linux the way `$TMPDIR` already does on macOS.
+#
+# Ownership is asserted rather than inferred from the `chmod`.  `mkdir
+# -p` succeeds on a directory that is already there whoever owns it, and
+# re-moding one owned by someone else fails — so a `chmod` allowed to
+# fail quietly would leave intact exactly the case it was added for: a
+# directory another user pre-created world-writable at this predictable
+# `/tmp` path.  Refusing it is the only answer available, since it is
+# not this run's to re-mode.
+#
+# A symbolic link is refused before that, because ownership cannot see
+# one: every test operator but `-L` follows the link, so `-O` reports on
+# the target.  Someone who plants a link at this path pointing at a
+# directory *this* user owns therefore passes the ownership check, and
+# aims the whole of the rest at a directory that was never the harness's
+# — the `chmod` re-modes it to 0700, the sweep reads its filenames as
+# instance names, and `rm -f "$marker"` deletes each file it finds once
+# the containers those names would produce are gone.  `mkdir -p`
+# succeeds on a link to a directory, so this has to be checked after it
+# and before anything acts on the path.
+#
+# Both the sweep and the marker write go through here, because the sweep
+# runs first and is the half that acts on what the directory says.
+ensure_run_marker_dir() {
+  mkdir -p "$BOOTROOT_E2E_RUN_MARKER_DIR" \
+    || fail "cannot create the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR}"
+  [ ! -L "$BOOTROOT_E2E_RUN_MARKER_DIR" ] \
+    || fail "the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR} is a symbolic link; the sweep re-modes it, reads container names out of it and removes what it reads, so it must be the directory itself and not a pointer at somebody else's choosing"
+  [ -O "$BOOTROOT_E2E_RUN_MARKER_DIR" ] \
+    || fail "the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR} is not owned by this user; the sweep tears containers down by the names it holds, so a directory someone else can write is not one to read them from"
+  chmod 700 "$BOOTROOT_E2E_RUN_MARKER_DIR" \
+    || fail "cannot restrict the E2E run-marker directory ${BOOTROOT_E2E_RUN_MARKER_DIR} to its owner"
+}
+
+# Records this run as the live owner of `instance`.
+#
+# Published by rename, as every file another process may read is: a
+# sweep reading a half-written marker would see no pid and collect a run
+# that had only just started.
+#
+# The pair is checked here as well as where it is read, so that "every
+# marker this harness wrote names a derived namespace" is an invariant
+# the code enforces at both ends rather than one the sweep merely hopes
+# for.  A run whose identity somehow fell outside the table is one whose
+# containers no sweep would collect, so it is better stopped at the
+# marker than left to install and accumulate.
+write_run_marker() {
+  local instance="$1" project="$2" path tmp
+  run_scope_marker_is_derived "$instance" "$project" \
+    || fail "refusing to record an E2E run marker for instance '${instance}' and project '${project}': the sweep only collects a marker whose two halves sit in one of the derived namespaces (${BOOTROOT_E2E_RUN_NAMESPACES[*]}), so a marker outside them would name leftovers nothing later collects"
+  path="$(run_marker_path "$instance")"
+  ensure_run_marker_dir
+  tmp="${path}.$$.tmp"
+  {
+    printf 'pid=%s\n' "$$"
+    printf 'project=%s\n' "$project"
+  } >"$tmp" || fail "cannot write the E2E run marker ${tmp}"
+  mv "$tmp" "$path" || fail "cannot publish the E2E run marker ${path}"
+}
+
+# Removes this run's own marker, and only this run's, once its teardown
+# has left nothing behind.
+#
+# The recorded pid is compared rather than assumed: a marker naming
+# another pid belongs to a run still using that instance, and removing it
+# would hide that run's containers from every later sweep.
+#
+# The second argument is the teardown's status, and a non-zero one keeps
+# the marker — the same rule `sweep_dead_run_instances` applies to a
+# collection that did not finish, for the same reason.  A teardown that
+# failed, or that left a container the end-of-run check reported, is the
+# one case where this run's instance still holds resources after this
+# run is gone.  Dropping the marker there would strand them under a name
+# no later sweep knows to ask about, which is the accumulation the
+# marker exists to stop; keeping it costs one retry by the next run,
+# which finds this pid dead and collects what is left.
+remove_run_marker() {
+  local instance="${1:-}" teardown_status="${2:-0}" path recorded
+  [ -n "$instance" ] || return 0
+  path="$(run_marker_path "$instance")"
+  [ -f "$path" ] || return 0
+  recorded="$(run_marker_field "$path" pid)"
+  [ "$recorded" = "$$" ] || return 0
+  if [ "$teardown_status" -ne 0 ]; then
+    echo "the teardown of ${instance} did not finish, so its run marker is kept for the next run to collect: ${path}" >&2
+    return 0
+  fi
+  rm -f "$path"
+}
+
+# Tears one dead run's stack down, by the exact container names its
+# instance produces and the exact `com.docker.compose.project` label its
+# marker recorded.
+#
+# Containers are listed before they are removed, and listed again
+# afterwards: two runs starting at the same moment sweep the same marker,
+# so a `docker rm` that lost the race must not read as a failure, while a
+# container that is genuinely still there must not read as success.
+collect_dead_run_instance() {
+  local instance="$1" project="$2" label="$3" log="$4" status=0
+  local existing name ids id
+  if ! existing="$(bootroot_leftover_containers "$instance")"; then
+    echo "[${label}] cannot list this daemon's containers, so the leftovers of dead run ${instance} were not collected; see the docker error above" >&2
+    return 1
+  fi
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    docker rm -f "$name" >>"$log" 2>&1 || true
+  done <<<"$existing"
+  if ! existing="$(bootroot_leftover_containers "$instance")"; then
+    echo "[${label}] cannot list this daemon's containers, so what the collection of dead run ${instance} removed is unknown; see the docker error above" >&2
+    return 1
+  fi
+  existing="$(printf '%s\n' "$existing" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  if [ -n "$existing" ]; then
+    echo "[${label}] could not remove the containers of dead run ${instance}: ${existing}" >&2
+    status=1
+  fi
+  # The responder image that run built for itself, named by the same
+  # derivation the containers were: a tag carrying an instance name no
+  # other run derives, so the shipped `:latest` a real install produced
+  # is as far out of reach here as its containers are.
+  if ! remove_run_image "$(run_scope_http01_image "$instance")" "$log"; then
+    echo "[${label}] could not remove the responder image of dead run ${instance}" >&2
+    status=1
+  fi
+  # Volumes and networks are reached by the project label the marker
+  # recorded, which is as exact as the container names: the label filter
+  # matches that one project and no other, so a default-identity
+  # install's `bootroot` project is out of reach here for the same
+  # reason its containers are.  The project is read from the marker
+  # rather than derived from the instance, because the two are separate
+  # values and only the marker knows which project went with which
+  # instance.
+  [ -n "$project" ] || return "$status"
+  if ids="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" 2>>"$log")"; then
+    for id in $ids; do
+      docker volume rm -f "$id" >>"$log" 2>&1 || status=1
+    done
+  else
+    echo "[${label}] cannot list the volumes of dead run ${instance}; see ${log}" >&2
+    status=1
+  fi
+  if ids="$(docker network ls -q --filter "label=com.docker.compose.project=${project}" 2>>"$log")"; then
+    for id in $ids; do
+      docker network rm "$id" >>"$log" 2>&1 || status=1
+    done
+  else
+    echo "[${label}] cannot list the networks of dead run ${instance}; see ${log}" >&2
+    status=1
+  fi
+  return "$status"
+}
+
+# Collects every dead run's leftovers, and returns non-zero when any of
+# it could not be collected.
+#
+# Deliberately not fatal to the caller.  This run's instance, containers
+# and ports are its own, so another run's garbage cannot collide with
+# them and aborting here would fail a run over someone else's mess.  What
+# it must not do is stay quiet: every failure names the instance it could
+# not clear, and the caller reports the non-zero status.
+sweep_dead_run_instances() {
+  local label="$1" log="$2" marker instance pid project status=0
+  [ -d "$BOOTROOT_E2E_RUN_MARKER_DIR" ] || return 0
+  # Aborts on a directory this user does not own, rather than reporting:
+  # every name below is read out of it and handed to `docker rm -f`, so
+  # one someone else can write is not a degraded input but a hostile one.
+  ensure_run_marker_dir
+  for marker in "$BOOTROOT_E2E_RUN_MARKER_DIR"/*; do
+    [ -f "$marker" ] || continue
+    # A marker's filename is the instance it names, and an instance name
+    # holds no `.` — so a dotted suffix is this directory's other
+    # residents rather than a run: a marker being published, and the
+    # `hosts` lock's holder label.
+    case "$marker" in
+      *.tmp | *.label) continue ;;
+    esac
+    instance="$(basename "$marker")"
+    pid="$(run_marker_field "$marker" pid)"
+    project="$(run_marker_field "$marker" project)"
+    # Everything below this point acts on those two values: the filename
+    # becomes nine exact container names handed to `docker rm -f`, and
+    # the `project` field becomes the label whose volumes and networks
+    # are removed.  So they are held to the derived namespaces before
+    # anything is done with them, and a file that fails is left exactly
+    # as it was found.  Owner-only permissions say this user's host wrote
+    # it; they do not say this harness did, and a stale or malformed
+    # marker naming `bootroot` with a dead pid would otherwise take out
+    # the default-identity install the sweep exists never to reach.
+    #
+    # Reported rather than counted as a failed collection, because there
+    # is nothing here to retry: a foreign marker is not leftovers this
+    # sweep could ever collect, so a non-zero status would ask every
+    # later run to try again at something none of them will ever do.
+    if ! run_scope_marker_is_derived "$instance" "$project"; then
+      printf '[%s] not collecting %s: instance %s and project %s are not a pair this harness derives (%s), so it is neither swept nor removed\n' \
+        "$label" "$marker" "$instance" "${project:-<none>}" \
+        "${BOOTROOT_E2E_RUN_NAMESPACES[*]}" | tee -a "$log" >&2
+      continue
+    fi
+    if run_pid_is_alive "$pid"; then
+      continue
+    fi
+    printf '[%s] collecting the leftovers of dead run %s (pid %s, project %s)\n' \
+      "$label" "$instance" "${pid:-unknown}" "${project:-unknown}" >>"$log"
+    # The marker outlives a collection that did not finish, so the next
+    # run retries it.  Dropping it there would strand whatever was left
+    # behind under a name no later sweep knows to ask about — the very
+    # accumulation this exists to stop.
+    if collect_dead_run_instance "$instance" "$project" "$label" "$log"; then
+      rm -f "$marker"
+    else
+      status=1
+    fi
+  done
+  return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# The `/etc/hosts` mutex
+# ---------------------------------------------------------------------------
+#
+# Everything above makes two `no-hosts` runs independent.  `hosts` mode
+# is deliberately left out of that: the entries a run adds are keyed by a
+# fixed host name (`stepca.internal`, `responder.internal`) and removed
+# by a fixed marker literal, and rewriting `/etc/hosts` is an unlocked
+# read-modify-write on one file the whole machine shares.  No spelling of
+# the marker fixes either half.
+#
+# That mode used to be serialised by accident, and only by accident.  Two
+# runs collided on the Compose project, on container names and on ports
+# long before either reached `/etc/hosts`, so the second failed at `up`.
+# Once every run has its own project, names and ports, nothing stops them
+# from reaching that file together — and what happens then is silent
+# rather than loud: the second run finds the host names already there and
+# adds nothing, then the first run's cleanup strips both marker lines
+# while the second is still resolving through them.
+#
+# So the serialisation is stated instead of inherited.  One run at a time
+# holds this lock, and a second is refused before it touches the file.
+#
+# What holds this lock is an exclusive `flock(2)` on an open file
+# descriptor — never the presence of a file — and the descriptor is one
+# for `/etc/hosts` itself.  Both halves are load-bearing, and each covers
+# a failure the other does not.
+#
+# The kernel half is what a pid file cannot do.  A lock whose ownership
+# is "this path exists" has to be recovered when the run holding it is
+# killed, and the recovery is where it comes apart.  The pid read at the
+# path says nothing about the file that is there an instant later: a
+# second run arriving at the same stale lock can clear it and take it in
+# between.  Judging the object rather than the path fixes that much and
+# no more — a recovery that has to take a lock out of the path, even for
+# an instant, has hidden a live owner's lock from a third run arriving in
+# that instant, which then creates its own.  Two runs go on to edit
+# `/etc/hosts` believing they hold the mutex, which is the one outcome
+# this exists to prevent, and it arrives silently.
+#
+# `flock(2)` has no such gap, because ownership is a kernel object that
+# lives as long as an open file description does.  There is no stale
+# lock, so nothing is recovered and nothing is judged: a run killed with
+# `SIGKILL` releases it the moment the kernel closes its descriptors,
+# which is the same instant it stops being able to write `/etc/hosts`.
+#
+# The inode half is why the descriptor is not one for a lock file of the
+# harness's own.  `flock(2)` locks an inode, and a path names one only
+# for as long as nobody changes what it names.  A lock file at a
+# predictable path in a world-writable `/tmp` is exactly that: the test
+# that refuses a symbolic link and the `open` that follows it are two
+# calls, and anyone on the machine can put a link there in between.  One
+# run then locks whatever it points at, and the next — arriving after
+# that link has been swapped back for an ordinary file — locks a
+# different inode and takes a mutex the first believes it holds.
+# Opening with `O_NOFOLLOW` narrows that without closing it, because a
+# regular file another user owns in a sticky `/tmp` is still theirs to
+# unlink and create again between two runs' opens.  Two inodes at one
+# path is the whole of the failure, and no ordering of check and open
+# fixes it while the path is not the run's to keep.
+#
+# So the mutex is the resource.  `/etc/hosts` sits in a directory that is
+# root's, so nobody unprivileged can put another inode at that path, and
+# the run that locks it is the run about to edit it — which closes the
+# distance between what is locked and what is protected rather than
+# narrowing it.  The harnesses' own edits keep that inode (`run_sudo cp`
+# over the file, `tee -a` onto it, never a rename), so what a run locked
+# at the start is what it is still editing at the end.
+#
+# Nothing is created, re-moded or written by the lock.  The open is
+# read-only, which is what every user's run may do to `/etc/hosts` and
+# all `flock(2)` needs — it locks a descriptor however it was opened —
+# and it is also what makes a missing file a refusal rather than a lock
+# on something this run has just brought into being.  The `sudo -n` a
+# path-based lock needed in order to stay machine-wide goes with the
+# recovery and the lock file that needed it: this one asks for nothing
+# beyond the `sudo -n` the mode already requires.
+#
+# The descriptor is fd 9, spelled as a literal because `exec {var}>` wants
+# bash 4.1 and macOS ships 3.2.  Being a descriptor has one consequence
+# worth stating: every child inherits it, so a background daemon that
+# outlives the run would hold the lock after the run is gone.  The
+# lifecycle harnesses close it (`9>&-`) on the `bootroot-agent` processes
+# they start, and `validate-e2e-run-scope.sh` holds them to it.
+#
+# The path is the one the harnesses edit, and overriding it is for
+# `validate-e2e-run-scope.sh`, which must not take the machine's real
+# turn at `/etc/hosts` while a run is using it.
+BOOTROOT_E2E_HOSTS_LOCK="${BOOTROOT_E2E_HOSTS_LOCK:-/etc/hosts}"
+
+# Which of the three ways of calling `flock(2)` on fd 9 to use.  `auto`
+# takes the first this host has; naming one is for the validator, which
+# drives every one of them that is installed.
+BOOTROOT_E2E_HOSTS_LOCK_IMPL="${BOOTROOT_E2E_HOSTS_LOCK_IMPL:-auto}"
+
+# Whether this process is the run holding the lock.  Consulted by
+# `cleanup_hosts` in both harnesses, which must rewrite `/etc/hosts` only
+# on behalf of a run that put entries there: a run refused at the lock,
+# or one that failed before taking it, would otherwise remove the live
+# holder's lines on its way out.
+BOOTROOT_HOSTS_LOCK_HELD=0
+
+# True when this process holds the `/etc/hosts` lock.
+hosts_lock_held() {
+  [ "$BOOTROOT_HOSTS_LOCK_HELD" -eq 1 ]
+}
+
+# Prints the name of the tool this host takes the lock with, and nothing
+# when it has none.
+#
+# Three of them because no one is everywhere.  `flock(1)` is util-linux,
+# so Linux and CI have it and macOS has not; `perl` ships with macOS;
+# `python3` is already a prerequisite of the other E2E harnesses.
+hosts_lock_impl() {
+  local impl
+  if [ "$BOOTROOT_E2E_HOSTS_LOCK_IMPL" != "auto" ]; then
+    command -v "$BOOTROOT_E2E_HOSTS_LOCK_IMPL" >/dev/null 2>&1 || return 1
+    printf '%s' "$BOOTROOT_E2E_HOSTS_LOCK_IMPL"
+    return 0
+  fi
+  for impl in flock perl python3; do
+    if command -v "$impl" >/dev/null 2>&1; then
+      printf '%s' "$impl"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Takes an exclusive, non-blocking `flock(2)` on fd 9.  0 when it was
+# taken, 1 when another run holds it, 2 when this host has nothing to
+# call the syscall with.
+#
+# Each spelling locks the descriptor it is handed rather than a path of
+# its own, so the lock outlives the process that took it: it lives on the
+# open file description fd 9 names, and this shell keeps that open.  That
+# is how `flock -n 9` has always worked, and `perl` and `python3` reach
+# the same syscall by the same route.
+#
+# Failure closes.  Anything but a clean acquisition is read as "somebody
+# else holds it", because refusing a run that could have had the lock
+# costs a rerun, and admitting one that could not costs two runs editing
+# `/etc/hosts` at once.
+hosts_lock_try_fd9() {
+  local impl
+  impl="$(hosts_lock_impl)" || return 2
+  case "$impl" in
+    flock) flock -n 9 ;;
+    perl) perl -e 'open(my $fh, "<&=9") or exit 3; exit(flock($fh, 2 | 4) ? 0 : 1)' ;;
+    python3) python3 -c 'import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)' ;;
+    *) return 2 ;;
+  esac || return 1
+}
+
+# Closes the descriptor the lock lives on, which is what releases it.
+hosts_lock_close_fd9() {
+  { exec 9>&-; } 2>/dev/null || true
+}
+
+# Where a holder records who it is, for the next run's refusal message.
+#
+# Inside the per-user marker directory, whose ownership
+# `ensure_run_marker_dir` has already established, and not at a
+# machine-wide path of its own: a predictable name in a world-writable
+# directory is one this run's write would truncate wherever somebody
+# else's link pointed, which is the hazard the lock itself has just
+# stopped resting on.  The `.label` suffix is one no instance name can
+# carry, so the sweep never reads this as a run to collect.
+hosts_lock_label_path() {
+  printf '%s/hosts-lock-holder.label\n' "$BOOTROOT_E2E_RUN_MARKER_DIR"
+}
+
+# Records this run as the holder.
+#
+# Advisory, and best-effort with it: the lock is the kernel's whatever
+# this file says, and a message naming the run that holds it is the whole
+# of what a failed write loses.  Published by rename like every other
+# file a second process reads.
+hosts_lock_record() {
+  local path tmp
+  path="$(hosts_lock_label_path)"
+  ensure_run_marker_dir
+  tmp="${path}.$$.tmp"
+  {
+    printf 'pid=%s\n' "$$"
+    printf 'holder=%s\n' "$1"
+  } >"$tmp" 2>/dev/null || return 0
+  mv "$tmp" "$path" 2>/dev/null || rm -f "$tmp"
+}
+
+# Drops this run's label, and only this run's.
+#
+# Called while the lock is still held, so a run taking it the instant
+# this one lets go cannot have its own label removed by this; the pid
+# comparison is what covers the rest.
+hosts_lock_clear_label() {
+  local path
+  path="$(hosts_lock_label_path)"
+  [ -f "$path" ] || return 0
+  [ "$(run_marker_field "$path" pid 2>/dev/null || true)" = "$$" ] || return 0
+  rm -f "$path"
+}
+
+# Prints who holds the lock, and nothing when this run cannot tell.
+#
+# Only a run that took the lock writes here, and only one that released
+# it clears the file, so a label naming a live process names the holder.
+# A dead pid is a killed run's label outliving it, and reads as nothing:
+# the lock the kernel released is not that run's any more, so the run
+# refused is being refused by somebody else.
+#
+# Somebody else is regularly another user, whose label sits in a
+# directory of their own that this run cannot read — the lock is
+# machine-wide and this record is not.  Then this prints nothing too, and
+# the refusal says as much rather than naming the wrong run.
+hosts_lock_label() {
+  local path pid holder
+  path="$(hosts_lock_label_path)"
+  [ -r "$path" ] || return 0
+  pid="$(run_marker_field "$path" pid 2>/dev/null || true)"
+  run_pid_is_alive "$pid" || return 0
+  holder="$(run_marker_field "$path" holder 2>/dev/null || true)"
+  holder="$(printf '%s' "$holder" | LC_ALL=C tr -d '[:cntrl:]' | cut -c1-160)"
+  printf 'pid %s, %s' "$pid" "${holder:-unknown}"
+}
+
+# Aborts, naming the holder where this run can name it.
+hosts_lock_refuse() {
+  local who="${1:-}"
+  [ -n "$who" ] || who="another user's run, or one that recorded nothing"
+  fail "another E2E run is already resolving through /etc/hosts (${who}); hosts mode edits one file the whole machine shares under a fixed marker, so it runs one at a time — wait for that run to finish, or use RESOLUTION_MODE=no-hosts, which has no such limit"
+}
+
+# Takes the `/etc/hosts` lock for this run, or aborts.
+#
+# Refusal rather than waiting.  A `hosts` run holds the file for its
+# whole length — the entries have to outlive every resolution the run
+# makes — so a queue here is a wait of minutes with no bound worth
+# writing down, and the caller is a harness whose operator can start it
+# again.  What matters is that the second run stops before it edits the
+# file, not that it eventually gets a turn.
+#
+# There is no second attempt, because there is nothing to retry.  A lock
+# that is taken is taken by a process that is running right now; the only
+# way it comes free is that process ending, which releases it whether it
+# ended well or was killed.
+acquire_hosts_lock() {
+  local holder="$1" status=0 label
+  # Read-only, and never creating: this is the file the run is about to
+  # edit, so it is already there, it is root's, and a path that resolves
+  # to nothing is a host where `hosts` mode has nothing to serialise on
+  # rather than one to create a lock at.  `flock(2)` locks a descriptor
+  # however it was opened, which is also what lets every user's run lock
+  # a file only root may write.
+  { exec 9<"$BOOTROOT_E2E_HOSTS_LOCK"; } 2>/dev/null \
+    || fail "cannot open ${BOOTROOT_E2E_HOSTS_LOCK} to serialise hosts mode on it; that file is both what a hosts run edits and the lock it takes, so a run that cannot open it must not edit it — use RESOLUTION_MODE=no-hosts, which has no such limit"
+  hosts_lock_try_fd9 || status=$?
+  if [ "$status" -ne 0 ]; then
+    label="$(hosts_lock_label)"
+    hosts_lock_close_fd9
+  fi
+  case "$status" in
+    0) ;;
+    2)
+      fail "hosts mode takes the lock at ${BOOTROOT_E2E_HOSTS_LOCK} with flock(2), and this host has none of flock, perl or python3 to call it with; that lock is what keeps two runs from editing /etc/hosts at once — install one of them, or use RESOLUTION_MODE=no-hosts, which has no such limit"
+      ;;
+    *) hosts_lock_refuse "$label" ;;
+  esac
+  BOOTROOT_HOSTS_LOCK_HELD=1
+  hosts_lock_record "$holder"
+}
+
+# Releases the lock by closing the descriptor that holds it.
+#
+# `/etc/hosts` is untouched by this, as it is by everything else here:
+# what the release drops is the label, so the run after this one does not
+# name a run that has finished, and the entries this run put in the file
+# are removed by the caller before it gets here.
+#
+# The label goes while the lock is still held, so a run taking the lock
+# the instant this one lets it go cannot have its own label wiped by
+# this.
+release_hosts_lock() {
+  hosts_lock_held || return 0
+  BOOTROOT_HOSTS_LOCK_HELD=0
+  hosts_lock_clear_label
+  hosts_lock_close_fd9
+}

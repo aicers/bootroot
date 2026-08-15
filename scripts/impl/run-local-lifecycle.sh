@@ -9,6 +9,36 @@ cd "$ROOT_DIR"
 . "$SCRIPT_DIR/lib/audit-log.sh"
 # shellcheck source=lib/leftovers.sh
 . "$SCRIPT_DIR/lib/leftovers.sh"
+# shellcheck source=lib/ports.sh
+. "$SCRIPT_DIR/lib/ports.sh"
+# shellcheck source=lib/run-scope.sh
+. "$SCRIPT_DIR/lib/run-scope.sh"
+
+# Ambient environment sanitisation.
+#
+# `COMPOSE_PROJECT_NAME` is what this run hands the binary its own
+# Compose project in, and it is exported with that value in
+# `derive_run_scope`.  It is cleared first because everything before that
+# point would otherwise run against an inherited one: a value from the
+# invoking shell would send those calls at a different project than the
+# one this run creates, and it must not survive as far as `infra
+# install`, which would then record containers named after this run's
+# instance in someone else's project.  The four host-port variables are
+# cleared for the same reason — they outrank the `.env` the install
+# writes, and an inherited value would republish this run's stack on a
+# port another run already holds.  `POSTGRES_HOST`/`POSTGRES_PORT` are
+# this script's own host-side wiring and are re-exported below.
+# `BOOTROOT_HTTP01_IMAGE` is cleared for the third: it names the tag the
+# responder build is written to and read back from, and an inherited one
+# would put this run's build on another run's tag.
+#
+# Clearing them makes an inherited value harmless rather than fatal, and
+# it is only the first of two layers: `assert_resolved_compose_project`
+# reads the project the install actually resolved back off a container
+# rather than assuming this worked.
+unset COMPOSE_PROJECT_NAME
+unset POSTGRES_HOST_PORT OPENBAO_HOST_PORT STEPCA_HOST_PORT HTTP01_ADMIN_HOST_PORT
+unset BOOTROOT_HTTP01_IMAGE
 
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-local-lifecycle-$(date +%s)}"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
@@ -90,14 +120,29 @@ CURRENT_PHASE="init"
 # to a real process — without it, pkill -HUP exits 1 ("no processes
 # matched") and the rotate fails before the wait path runs.
 LOCAL_AGENT_DAEMON_PIDS=""
-# Pin POSTGRES_HOST_PORT for the compose stack: docker-compose.yml's
-# default moved from 5432 to 5433 in #588 §4c; the e2e harness
-# expects 5432 (CI runners free that port before the matrix), so
-# pin it explicitly here to keep compose port mapping aligned with
-# wait_for_postgres_admin and the host-side admin DSN.
-export POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-5432}"
-export POSTGRES_HOST="127.0.0.1"
-export POSTGRES_PORT="$POSTGRES_HOST_PORT"
+
+# Prefix every derived instance name starts with.  Short on purpose: the
+# instance-name budget is 39 characters and what follows it is the run
+# token, whose tail is the only part distinguishing two runs started in
+# the same second.
+RUN_INSTANCE_PREFIX="e2e-local-"
+# Prefix every derived Compose project starts with.  Long on purpose,
+# and nothing like the instance prefix: the project has no length budget
+# to spend, so it says in full what the truncated instance name cannot.
+RUN_PROJECT_PREFIX="bootroot-e2e-local-"
+# This run's install identity, the Compose project every `docker compose`
+# call is scoped to, the tag its responder image is built under, and the
+# four ports it publishes on `127.0.0.1`.  All derived in
+# `derive_run_scope`, which `main` runs before anything reads them.
+RUN_INSTANCE=""
+COMPOSE_PROJECT=""
+RUN_HTTP01_IMAGE=""
+POSTGRES_HOST_PORT=0
+OPENBAO_HOST_PORT=0
+STEPCA_HOST_PORT=0
+HTTP01_ADMIN_HOST_PORT=0
+OPENBAO_URL=""
+RUN_IDENTITY_JSON="$ARTIFACT_DIR/run-identity.json"
 
 log_phase() {
   local phase="$1"
@@ -123,6 +168,120 @@ run_sudo() {
     return
   fi
   sudo -n "$@"
+}
+
+# Picks this run's four published ports and exports them.
+#
+# The exports are for this script's own raw `docker compose` calls, which
+# interpolate the compose file's `ports:` themselves; `infra install`
+# receives the same four values as flags, so the `.env` it writes records
+# them and every later `bootroot` invocation resolves the same ports
+# whether or not it inherited the exports.
+allocate_run_ports() {
+  pick_free_port
+  POSTGRES_HOST_PORT="$PICKED_PORT"
+  pick_free_port
+  OPENBAO_HOST_PORT="$PICKED_PORT"
+  pick_free_port
+  STEPCA_HOST_PORT="$PICKED_PORT"
+  pick_free_port
+  HTTP01_ADMIN_HOST_PORT="$PICKED_PORT"
+  export POSTGRES_HOST_PORT OPENBAO_HOST_PORT STEPCA_HOST_PORT HTTP01_ADMIN_HOST_PORT
+  export POSTGRES_HOST="127.0.0.1"
+  export POSTGRES_PORT="$POSTGRES_HOST_PORT"
+}
+
+# Records what this run chose, so a failed run can be read afterwards:
+# which containers were its own, which project to look for, and which
+# ports to probe.
+write_run_identity_artifact() {
+  cat >"$RUN_IDENTITY_JSON" <<EOF
+{
+  "instance": "${RUN_INSTANCE}",
+  "compose_project": "${COMPOSE_PROJECT}",
+  "http01_image": "${RUN_HTTP01_IMAGE}",
+  "ports": {
+    "postgres": ${POSTGRES_HOST_PORT},
+    "openbao": ${OPENBAO_HOST_PORT},
+    "stepca": ${STEPCA_HOST_PORT},
+    "http01_admin": ${HTTP01_ADMIN_HOST_PORT}
+  }
+}
+EOF
+}
+
+# Derives everything that makes this run's stack its own, before any of
+# it is read.
+derive_run_scope() {
+  local token
+  token="$(run_scope_token "$ARTIFACT_DIR")"
+  RUN_INSTANCE="$(run_scope_instance "$RUN_INSTANCE_PREFIX" "$token")"
+  run_scope_assert_valid_instance "$RUN_INSTANCE"
+  COMPOSE_PROJECT="$(run_scope_project "$RUN_PROJECT_PREFIX" "$token")"
+  run_scope_assert_valid_project "$COMPOSE_PROJECT"
+  # Compose reads the invoking process's environment ahead of the project
+  # directory's `.env`, so this is what names the containers of the raw
+  # `docker compose` calls below — including the ones made before `infra
+  # install` has written anything.
+  export BOOTROOT_INSTANCE="$RUN_INSTANCE"
+  # And this is how the derived project reaches the binary.  It outranks
+  # the `--instance-name` the install declares for the project and for
+  # nothing else, so `bootroot` scopes itself to the same project as the
+  # raw `docker compose` calls here while still naming every container
+  # after the instance.  Exported rather than recorded because that is
+  # what the variable is: a per-invocation Compose override, deliberately
+  # never written to `.env`.
+  export COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT"
+  # The one image the compose file builds, and the last thing two runs
+  # would still share: its `image:` is the tag `up --build` writes to and
+  # every later recreate reads back, so a run left on the shipped default
+  # can be handed the other run's build the moment it recreates the
+  # responder to apply its DNS aliases.  Compose interpolates this for
+  # the raw calls here, and `infra install` inherits it for the build
+  # itself.
+  RUN_HTTP01_IMAGE="$(run_scope_http01_image "$RUN_INSTANCE")"
+  export BOOTROOT_HTTP01_IMAGE="$RUN_HTTP01_IMAGE"
+  # `service add` resolves its identity from the directory this script
+  # runs `bootroot` from rather than from the compose file's, so that
+  # directory has to record the instance too.
+  write_instance_dotenv "$WORKSPACE_DIR" "$RUN_INSTANCE"
+  allocate_run_ports
+  OPENBAO_URL="http://${STEPCA_HOST_IP}:${OPENBAO_HOST_PORT}"
+  write_run_identity_artifact
+  printf '[lifecycle] instance=%s project=%s image=%s postgres=%s openbao=%s stepca=%s http01=%s\n' \
+    "$RUN_INSTANCE" "$COMPOSE_PROJECT" "$RUN_HTTP01_IMAGE" "$POSTGRES_HOST_PORT" \
+    "$OPENBAO_HOST_PORT" "$STEPCA_HOST_PORT" "$HTTP01_ADMIN_HOST_PORT" >>"$RUN_LOG"
+}
+
+# Collects the containers, volumes and networks of runs that were killed
+# before their own teardown.
+#
+# Unique naming is what makes this necessary: nothing will ever again be
+# named the same as a dead run's leftovers, so no later run tears them
+# down by accident, and they accumulate for as long as the machine runs.
+# It is reported rather than fatal — this run's identity is its own, so
+# another run's garbage cannot collide with it.
+collect_dead_runs() {
+  sweep_dead_run_instances "run-local-lifecycle startup" "$RUN_LOG" \
+    || echo "run-local-lifecycle: a dead run's leftovers could not be fully collected; see ${RUN_LOG}" >&2
+}
+
+# Asserts that the project `bootroot` resolved is the one this script
+# scopes its own `docker compose` calls to.
+#
+# Read off a container the install created rather than assumed.  The
+# instance and the project are separately derived and deliberately
+# different strings, so nothing about the container names proves the
+# binary agreed with this script about the project — and a run whose
+# binary resolved some other project would tear down a project holding
+# none of its containers and leave the whole stack behind.
+assert_resolved_compose_project() {
+  local container="${RUN_INSTANCE}-openbao" resolved
+  resolved="$(docker inspect \
+    --format '{{index .Config.Labels "com.docker.compose.project"}}' \
+    "$container" 2>>"$RUN_LOG" || true)"
+  [ "$resolved" = "$COMPOSE_PROJECT" ] || fail \
+    "the install resolved Compose project '${resolved}' for ${container}, but this run scopes its own compose calls to '${COMPOSE_PROJECT}'"
 }
 
 # Finding *an* `openssl` on PATH is not enough. macOS ships LibreSSL as
@@ -170,7 +329,7 @@ infra_services() {
 
 service_container_id() {
   local service="$1"
-  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -q "$service" | tr -d '\n'
+  docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -q "$service" | tr -d '\n'
 }
 
 is_service_ready() {
@@ -224,28 +383,36 @@ wait_for_infra_ready() {
 # removed everything.  The status is the caller's to decide — the
 # start-of-run call tolerates a failure, `cleanup` does not.
 compose_down() {
-  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >>"$RUN_LOG" 2>&1
+  docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >>"$RUN_LOG" 2>&1
 }
 
 capture_artifacts() {
-  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
-  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
-  docker logs bootroot-openbao-agent-stepca >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
-  docker logs bootroot-openbao-agent-responder >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+  docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
+  docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+  docker logs "${RUN_INSTANCE}-openbao-agent-stepca" >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+  docker logs "${RUN_INSTANCE}-openbao-agent-responder" >>"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
 }
 
 cleanup_hosts() {
   if [ "$RESOLUTION_MODE" != "hosts" ]; then
     return 0
   fi
-  if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
+  # Only the run holding the lock has entries of its own in that file.
+  # The rewrite below drops every line carrying this script's fixed
+  # marker, so it cannot tell one run's lines from another's — and a run
+  # refused at the lock, or one that failed before taking it, would
+  # strip the live holder's entries out from under it.
+  if ! hosts_lock_held; then
     return 0
   fi
-  local tmp_file
-  tmp_file="$(mktemp)"
-  run_sudo awk -v marker="$HOSTS_MARKER" 'index($0, marker) == 0 { print }' /etc/hosts >"$tmp_file"
-  run_sudo cp "$tmp_file" /etc/hosts
-  rm -f "$tmp_file"
+  if [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+    local tmp_file
+    tmp_file="$(mktemp)"
+    run_sudo awk -v marker="$HOSTS_MARKER" 'index($0, marker) == 0 { print }' /etc/hosts >"$tmp_file"
+    run_sudo cp "$tmp_file" /etc/hosts
+    rm -f "$tmp_file"
+  fi
+  release_hosts_lock
 }
 
 cleanup() {
@@ -263,8 +430,25 @@ cleanup() {
       echo "run-local-lifecycle: teardown failed; see ${RUN_LOG}" >&2
       cleanup_status=1
     fi
-    report_leftover_containers "$COMPOSE_FILE" "run-local-lifecycle cleanup" || cleanup_status=1
+    report_leftover_containers "$COMPOSE_FILE" "run-local-lifecycle cleanup" "$RUN_INSTANCE" || cleanup_status=1
+    # `down` removes containers, never images, so the tag this run built
+    # under is its to remove — and it is leftovers of exactly the kind
+    # the marker exists for: named after this run's instance, so nothing
+    # later is named the same and no sweep would ask about it once the
+    # marker is gone.  A tag that survives therefore keeps the marker,
+    # which is what `cleanup_status` decides below.
+    if ! remove_run_image "$RUN_HTTP01_IMAGE" "$RUN_LOG"; then
+      echo "run-local-lifecycle: the responder image ${RUN_HTTP01_IMAGE} could not be removed; see ${RUN_LOG}" >&2
+      cleanup_status=1
+    fi
   fi
+  # Last, and outside the ownership guard: the marker says this run is
+  # still using its instance, and it has to outlive everything that could
+  # leave a container behind.  It removes only a marker recording this
+  # process's own pid, so a run that never wrote one removes nothing, and
+  # only when the teardown above left nothing for the next run to
+  # collect.
+  remove_run_marker "$RUN_INSTANCE" "$cleanup_status"
   exit_with_cleanup_status "$status" "$cleanup_status"
 }
 
@@ -302,14 +486,19 @@ configure_resolution_mode() {
         command -v sudo >/dev/null 2>&1 || fail "hosts mode requires sudo"
         run_sudo true || fail "hosts mode requires non-interactive sudo (sudo -n)"
       fi
+      # Before the first edit, and after the sudo checks: a run that
+      # cannot write the file has no business holding the machine's turn
+      # at it.  Everything else about this run is its own, so this is
+      # the one thing a second run still has to wait for.
+      acquire_hosts_lock "run-local-lifecycle.sh, ${ARTIFACT_DIR}"
       add_hosts_entry "$STEPCA_HOST_IP" "$STEPCA_HOST_NAME"
       add_hosts_entry "$RESPONDER_HOST_IP" "$RESPONDER_HOST_NAME"
-      STEPCA_SERVER_URL="https://${STEPCA_HOST_NAME}:9000/acme/acme/directory"
-      RESPONDER_URL="http://${RESPONDER_HOST_NAME}:8080"
+      STEPCA_SERVER_URL="https://${STEPCA_HOST_NAME}:${STEPCA_HOST_PORT}/acme/acme/directory"
+      RESPONDER_URL="http://${RESPONDER_HOST_NAME}:${HTTP01_ADMIN_HOST_PORT}"
       ;;
     no-hosts)
-      STEPCA_SERVER_URL="https://localhost:9000/acme/acme/directory"
-      RESPONDER_URL="http://${RESPONDER_HOST_IP}:8080"
+      STEPCA_SERVER_URL="https://localhost:${STEPCA_HOST_PORT}/acme/acme/directory"
+      RESPONDER_URL="http://${RESPONDER_HOST_IP}:${HTTP01_ADMIN_HOST_PORT}"
       ;;
     *)
       fail "Unsupported RESOLUTION_MODE: $RESOLUTION_MODE"
@@ -343,7 +532,30 @@ install_infra() {
   chmod 700 "$CERTS_DIR"
   # Remove stale .env so infra install generates a fresh bootstrap password.
   rm -f "$ROOT_DIR/.env"
-  run_bootroot infra install --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
+  # The identity and the four ports travel as flags rather than as the
+  # exported variables.  `BOOTROOT_INSTANCE` out of the process
+  # environment is never consulted by bootroot, so exporting it alone
+  # would split the run in two: Compose would interpolate the derived
+  # name for this script's own calls while the binary installed at
+  # `bootroot`.  The ports are flags for the other half of the same
+  # reason — a flag is recorded in the `.env` the install writes, so
+  # every later `bootroot` invocation in this run resolves the same
+  # ports whether or not it inherited the exports.
+  #
+  # The Compose project is the one value that travels the other way, as
+  # the exported `COMPOSE_PROJECT_NAME` `derive_run_scope` set.  There is
+  # no flag for it and there is deliberately no `.env` key either: it is
+  # Compose's own per-invocation override, and what makes it reliable
+  # here is that this script exports it for every `bootroot` invocation
+  # it makes, not that anything recorded it.
+  run_bootroot infra install \
+    --compose-file "$COMPOSE_FILE" \
+    --instance-name "$RUN_INSTANCE" \
+    --postgres-host-port "$POSTGRES_HOST_PORT" \
+    --openbao-host-port "$OPENBAO_HOST_PORT" \
+    --stepca-host-port "$STEPCA_HOST_PORT" \
+    --http01-admin-host-port "$HTTP01_ADMIN_HOST_PORT" \
+    >>"$RUN_LOG" 2>&1
 }
 
 reset_stepca_materials_for_e2e() {
@@ -394,8 +606,8 @@ run_bootstrap_chain() {
       echo "bootroot init failed (raw tail):"
       tail -n 160 "$INIT_RAW_LOG" || true
     } >>"$RUN_LOG"
-    docker logs bootroot-openbao >>"$RUN_LOG" 2>&1 || true
-    docker logs bootroot-postgres >>"$RUN_LOG" 2>&1 || true
+    docker logs "${RUN_INSTANCE}-openbao" >>"$RUN_LOG" 2>&1 || true
+    docker logs "${RUN_INSTANCE}-postgres" >>"$RUN_LOG" 2>&1 || true
     fail "bootroot init failed"
   fi
 
@@ -482,31 +694,31 @@ wait_for_openbao_api() {
   local attempt
   for attempt in $(seq 1 30); do
     local code
-    code="$(curl -sS -o /dev/null -w '%{http_code}' "http://${STEPCA_HOST_IP}:8200/v1/sys/health" || true)"
+    code="$(curl -sS -o /dev/null -w '%{http_code}' "${OPENBAO_URL}/v1/sys/health" || true)"
     if [ -n "$code" ] && [ "$code" != "000" ]; then
       return 0
     fi
     sleep 1
   done
-  docker logs bootroot-openbao >>"$RUN_LOG" 2>&1 || true
+  docker logs "${RUN_INSTANCE}-openbao" >>"$RUN_LOG" 2>&1 || true
   fail "openbao API did not become reachable before init"
 }
 
 wait_for_postgres_admin() {
-  local host_port="${POSTGRES_HOST_PORT:-5432}"
+  local host_port="${POSTGRES_HOST_PORT}"
   local admin_user="${POSTGRES_USER:-step}"
   local attempt
   for attempt in $(seq 1 30); do
     # Probe over TCP: the initdb bootstrap server listens only on the Unix
     # socket, so a socket-based pg_isready reports ready before the final
     # server (the one init connects to over TCP) is up.
-    if docker exec bootroot-postgres pg_isready -h 127.0.0.1 -U "$admin_user" -d postgres >/dev/null 2>&1 &&
+    if docker exec "${RUN_INSTANCE}-postgres" pg_isready -h 127.0.0.1 -U "$admin_user" -d postgres >/dev/null 2>&1 &&
       bash -lc ": >/dev/tcp/127.0.0.1/${host_port}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
   done
-  docker logs bootroot-postgres >>"$RUN_LOG" 2>&1 || true
+  docker logs "${RUN_INSTANCE}-postgres" >>"$RUN_LOG" 2>&1 || true
   fail "postgres admin endpoint did not become reachable before init"
 }
 
@@ -521,7 +733,7 @@ wait_for_responder_admin() {
     fi
     sleep "$RESPONDER_READY_DELAY_SECS"
   done
-  docker logs bootroot-http01 >>"$RUN_LOG" 2>&1 || true
+  docker logs "${RUN_INSTANCE}-http01" >>"$RUN_LOG" 2>&1 || true
   fail "responder admin endpoint did not become reachable before init: $admin_url"
 }
 
@@ -541,7 +753,7 @@ YAML
   # that recreating bootroot-http01 preserves both the rendered config
   # mount and the DNS aliases.
   local responder_override="$SECRETS_DIR/responder/docker-compose.responder.override.yml"
-  local -a compose_args=(-p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$override")
+  local -a compose_args=(-p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$override")
   if [ -f "$responder_override" ]; then
     compose_args+=(-f "$responder_override")
   fi
@@ -560,12 +772,12 @@ wait_for_stepca_http01_targets() {
   for host in "${hosts[@]}"; do
     local attempt
     for attempt in $(seq 1 "$HTTP01_TARGET_ATTEMPTS"); do
-      if docker exec bootroot-ca bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${host}/80'" >/dev/null 2>&1; then
+      if docker exec "${RUN_INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${host}/80'" >/dev/null 2>&1; then
         break
       fi
       if [ "$attempt" -eq "$HTTP01_TARGET_ATTEMPTS" ]; then
-        docker exec bootroot-ca sh -c "cat /etc/hosts | tail -n 20" >>"$RUN_LOG" 2>&1 || true
-        docker logs bootroot-http01 >>"$RUN_LOG" 2>&1 || true
+        docker exec "${RUN_INSTANCE}-ca" sh -c "cat /etc/hosts | tail -n 20" >>"$RUN_LOG" 2>&1 || true
+        docker logs "${RUN_INSTANCE}-http01" >>"$RUN_LOG" 2>&1 || true
         fail "step-ca cannot reach HTTP-01 target: ${host}:80"
       fi
       sleep "$HTTP01_TARGET_DELAY_SECS"
@@ -576,7 +788,7 @@ wait_for_stepca_http01_targets() {
 wait_for_stepca_health() {
   local attempt
   for attempt in $(seq 1 30); do
-    if curl -kfsS https://127.0.0.1:9000/health >/dev/null 2>&1; then
+    if curl -kfsS "https://127.0.0.1:${STEPCA_HOST_PORT}/health" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -638,7 +850,7 @@ force_reissue_for_service() {
   local service="$1"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
-    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --openbao-url "$OPENBAO_URL" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
@@ -676,10 +888,15 @@ start_local_agent_daemon() {
   # bootroot-agent uses tracing_subscriber::fmt::init(), whose default
   # filter is ERROR.  The readiness probe below greps for an info-level
   # message, so we have to opt into info output explicitly.
+  # `9>&-` closes the `/etc/hosts` lock this run may be holding.  That
+  # lock lives on an open file descriptor, so a daemon that inherited it
+  # and outlived a killed run would keep hosts mode refused on this host
+  # for as long as it ran.  It is the harness that holds the lock, never
+  # the daemons it starts.
   RUST_LOG="${RUST_LOG:-info}" \
     "$BOOTROOT_AGENT_BIN" --config "$config" \
     --eab-file "$eab_file" \
-    >>"$log" 2>&1 &
+    >>"$log" 2>&1 9>&- &
   local pid=$!
   LOCAL_AGENT_DAEMON_PIDS="$LOCAL_AGENT_DAEMON_PIDS $pid"
   # Give the daemon time to load config and install its SIGHUP handler;
@@ -819,7 +1036,7 @@ assert_fingerprint_changed() {
 # rotation must converge this back to owner-owned.
 seed_root_owned_ca_keys() {
   local cid img
-  cid="$(docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -a -q step-ca | tr -d '\n')"
+  cid="$(docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps -a -q step-ca | tr -d '\n')"
   [ -n "$cid" ] || fail "step-ca container not found for root-owned seeding"
   img="$(docker inspect --format '{{.Config.Image}}' "$cid")"
   [ -n "$img" ] || fail "could not resolve step-ca image for root-owned seeding"
@@ -863,7 +1080,7 @@ run_remote_bootstrap() {
   (
     cd "$REMOTE_DIR"
     "$BOOTROOT_REMOTE_BIN" bootstrap \
-      --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+      --openbao-url "$OPENBAO_URL" \
       --kv-mount "secret" \
       --service-name "$REMOTE_SERVICE" \
       --role-id-path "$role_id_path" \
@@ -887,7 +1104,7 @@ rotate_infra_secret_id() {
   local target="$1"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
-    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --openbao-url "$OPENBAO_URL" \
     --auth-mode approle \
     --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
     --approle-secret-id "$INFRA_ROTATE_SECRET_ID" \
@@ -913,7 +1130,7 @@ run_rotation_infra_secret_id() {
   log_phase "rotate-infra-secret-id-denied-for-runtime-rotate"
   if run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
-    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --openbao-url "$OPENBAO_URL" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
@@ -946,7 +1163,7 @@ run_rotation_secret_id_self_mint() {
     before="$(cat "$cred_dir/runtime/secret_id")"
     run_bootroot rotate \
       --compose-file "$COMPOSE_FILE" \
-      --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+      --openbao-url "$OPENBAO_URL" \
       --auth-mode approle \
       --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
       --approle-secret-id-file "$cred_dir/runtime/secret_id" \
@@ -964,7 +1181,7 @@ run_rotation_secret_id_self_mint() {
     before="$(cat "$cred_dir/infra/secret_id")"
     run_bootroot rotate \
       --compose-file "$COMPOSE_FILE" \
-      --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+      --openbao-url "$OPENBAO_URL" \
       --auth-mode approle \
       --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
       --approle-secret-id-file "$cred_dir/infra/secret_id" \
@@ -989,7 +1206,7 @@ run_rotations_with_verification() {
   log_phase "rotate-openbao-recovery"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
-    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --openbao-url "$OPENBAO_URL" \
     --root-token "$INIT_ROOT_TOKEN" \
     --yes \
     openbao-recovery \
@@ -1006,7 +1223,7 @@ run_rotations_with_verification() {
   web_hmac_before="$(current_agent_responder_hmac "$WEB_AGENT_CONFIG")"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
-    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --openbao-url "$OPENBAO_URL" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
@@ -1032,7 +1249,7 @@ run_rotations_with_verification() {
   log_phase "rotate-stepca-password"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
-    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --openbao-url "$OPENBAO_URL" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
@@ -1055,15 +1272,15 @@ run_rotations_with_verification() {
   local db_admin_dsn
   db_admin_dsn="$(jq -r '.db.dataSource // empty' "$SECRETS_DIR/config/ca.json")"
   if [ -z "${db_admin_dsn:-}" ]; then
-    db_admin_dsn="postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/stepca?sslmode=disable"
+    db_admin_dsn="postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT}/stepca?sslmode=disable"
   else
     # Replace the Docker-internal host:port with the host-side mapping.
     db_admin_dsn="$(echo "$db_admin_dsn" \
-      | sed "s|@postgres:5432|@127.0.0.1:${POSTGRES_HOST_PORT:-5432}|")"
+      | sed "s|@postgres:5432|@127.0.0.1:${POSTGRES_HOST_PORT}|")"
   fi
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
-    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --openbao-url "$OPENBAO_URL" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
@@ -1088,7 +1305,7 @@ run_rotations_with_verification() {
   log_phase "rotate-ca-key"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
-    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --openbao-url "$OPENBAO_URL" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
@@ -1108,7 +1325,7 @@ run_rotations_with_verification() {
   log_phase "rotate-ca-key-full"
   run_bootroot rotate \
     --compose-file "$COMPOSE_FILE" \
-    --openbao-url "http://${STEPCA_HOST_IP}:8200" \
+    --openbao-url "$OPENBAO_URL" \
     --auth-mode approle \
     --approle-role-id "$RUNTIME_ROTATE_ROLE_ID" \
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
@@ -1127,6 +1344,15 @@ write_manifest() {
 {
   "mode": "${RESOLUTION_MODE}",
   "compose_file": "${COMPOSE_FILE}",
+  "instance": "${RUN_INSTANCE}",
+  "compose_project": "${COMPOSE_PROJECT}",
+  "http01_image": "${RUN_HTTP01_IMAGE}",
+  "ports": {
+    "postgres": ${POSTGRES_HOST_PORT},
+    "openbao": ${OPENBAO_HOST_PORT},
+    "stepca": ${STEPCA_HOST_PORT},
+    "http01_admin": ${HTTP01_ADMIN_HOST_PORT}
+  },
   "state_file": "${ROOT_DIR}/state.json",
   "agent_config_paths": ["${EDGE_AGENT_CONFIG}", "${WEB_AGENT_CONFIG}"],
   "services": ["${EDGE_SERVICE}", "${WEB_SERVICE}", "${REMOTE_SERVICE}"]
@@ -1138,6 +1364,10 @@ main() {
   mkdir -p "$ARTIFACT_DIR" "$WORKSPACE_DIR" "$CERT_META_DIR" "$REMOTE_DIR" "$REMOTE_CERTS_DIR"
   : >"$PHASE_LOG"
   : >"$RUN_LOG"
+  # Before the traps: the identity `cleanup` reports leftovers at, and
+  # the marker it removes, are both this run's own, and until they exist
+  # there is nothing for a trap to act on.
+  derive_run_scope
   trap cleanup EXIT
   trap 'on_error $LINENO' ERR
 
@@ -1149,15 +1379,23 @@ main() {
   # leave the check reading a daemon it had just cleaned — and a killed
   # run's leftovers, which the check exists to report, are
   # indistinguishable from that install to everything but an operator.
-  assert_no_leftover_containers "$COMPOSE_FILE" "run-local-lifecycle startup"
+  assert_no_leftover_containers "$COMPOSE_FILE" "run-local-lifecycle startup" "$RUN_INSTANCE"
   # Past the assertion nothing here is anyone else's, so the stack
   # becomes this run's to remove.  The teardown takes the volumes,
   # networks and orphans the assertion does not look at, and may
   # legitimately find nothing to do, so its status is not fatal.
   mark_stack_owned
+  # Only now, with removal permitted: the sweep is what collects the runs
+  # that were killed before their own teardown, whose leftovers nothing
+  # else will ever be named after again.  It is driven off recorded
+  # instance names, so a real default-identity install stays out of
+  # reach.
+  collect_dead_runs
+  write_run_marker "$RUN_INSTANCE" "$COMPOSE_PROJECT"
   compose_down || true
   reset_stepca_materials_for_e2e
   install_infra
+  assert_resolved_compose_project
   write_agent_config "$EDGE_AGENT_CONFIG"
   write_agent_config "$WEB_AGENT_CONFIG"
   run_bootstrap_chain
@@ -1178,7 +1416,7 @@ main() {
   stop_local_bootroot_agent_daemons
 
   log_phase "assert-openbao-audit-log"
-  assert_openbao_audit_log
+  assert_openbao_audit_log "${RUN_INSTANCE}-openbao"
 
   write_manifest
 }

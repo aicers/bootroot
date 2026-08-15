@@ -357,8 +357,8 @@ volumes.
 
 The project a command acts on is resolved in this order:
 
-1. `--instance-name`, on `infra install` only;
-2. `COMPOSE_PROJECT_NAME` from the invoking environment, when non-empty;
+1. `COMPOSE_PROJECT_NAME` from the invoking environment, when non-empty;
+2. `--instance-name`, on `infra install` only;
 3. `BOOTROOT_INSTANCE` from the `.env` beside the compose file the
    command was handed;
 4. the literal `bootroot`.
@@ -372,6 +372,17 @@ it would have had without it, so every later command against that stack
 needs the same variable exported. Use it for throwaway stacks (this
 repository's E2E harness does); use `--instance-name` for anything
 durable.
+
+It outranks `--instance-name` because every other command resolves the
+project from it too: an install that ignored it would create the stack in
+one project while the shell that ran it addressed another, leaving a
+`clean` that removes nothing and a `status` that reports on nothing. The
+two together are therefore a legitimate combination rather than a
+conflict — the exported variable decides the project, the flag decides
+the recorded identity every container is named after, and the two may be
+different strings. That is what lets the E2E harness give each run a
+39-character instance name and a longer project derived separately from
+the same run identifier.
 
 Co-locating two bootroot instances on one host requires giving each a
 distinct `--instance-name`. Two installs that both take the default
@@ -547,7 +558,12 @@ environment variable so an installer can pin an exact release tag or a
 `@sha256:` digest — for example `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
 `BOOTROOT_STEP_CA_IMAGE`, and `BOOTROOT_HTTP01_IMAGE`. Set them in `.env`
 or the process environment; unset variables fall back to the release-built
-defaults. For production and air-gapped installs, pin
+defaults. `BOOTROOT_HTTP01_IMAGE` is read by the default
+`docker-compose.yml` too, where it names the tag the responder build is
+written to — that is how two installs on one host avoid building over each
+other's image; unset, it is `bootroot-http01-responder:latest` as before.
+
+For production and air-gapped installs, pin
 `BOOTROOT_STEP_CA_IMAGE` to a `@sha256:` digest rather than the `0.30.2`
 tag: step-ca is the CA, its default is now a third-party image under a
 mutable tag, and smallstep publishes cosign signatures for its images, so a

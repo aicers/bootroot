@@ -584,11 +584,14 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         .map(|(key, value)| (*key, value.as_str()))
         .collect();
 
-    // The identity this install acts on.  For the project the declared
-    // identity wins, then an exported `COMPOSE_PROJECT_NAME`, then the
+    // The identity this install acts on.  For the project an exported
+    // `COMPOSE_PROJECT_NAME` wins, then the declared identity, then the
     // identity just recorded in `.env` — so a harness that exports the
-    // variable still gets its own throwaway project while `.env` keeps
-    // the durable identity every container is named after.
+    // variable gets its own throwaway project while `.env` keeps the
+    // durable identity every container is named after, and the two are
+    // free to be different strings.  That is what lets a run declare a
+    // length-bounded `--instance-name` and still scope itself to a
+    // project derived separately, past the instance-name limit.
     let identity = ComposeIdentity::resolve(
         &args.compose_file.compose_file,
         args.instance_name.as_deref(),
@@ -756,10 +759,13 @@ fn build_ownership_sweep_args<'a>(
 /// already exists.
 ///
 /// `identity` is the one the caller just brought the stack up under, not
-/// a freshly resolved one: `infra install --instance-name` outranks the
-/// `COMPOSE_PROJECT_NAME` the resolver would otherwise return, so
-/// re-resolving here would probe a different project than `up` created
-/// and report step-ca as having no container.
+/// a freshly resolved one.  An install resolves its project and its
+/// instance once and then rewrites `<compose dir>/.env` with the
+/// instance it recorded, so a second resolution here would read inputs
+/// the run has since changed and could probe a project `up` never
+/// created — reporting step-ca as having no container.  Threading the
+/// resolved identity through is what keeps every call in one invocation
+/// addressing the same project and the same instance.
 fn resolve_stepca_image(
     compose_file: &Path,
     identity: &ComposeIdentity,
@@ -2176,9 +2182,10 @@ fn run_to_completion(
 /// rather than the one they were pointed at.
 ///
 /// `identity` is passed in rather than resolved here so a caller that
-/// already knows it — `infra install`, whose `--instance-name` outranks
-/// everything the resolver would consult — probes the same project it
-/// just brought the stack up under.
+/// already resolved one — `infra install`, which resolves its project
+/// and instance once and then records that instance in `.env` — probes
+/// the same project it just brought the stack up under, under the same
+/// instance, rather than whatever a second resolution would now return.
 pub(crate) fn docker_compose_output(
     compose_file: &Path,
     identity: &ComposeIdentity,

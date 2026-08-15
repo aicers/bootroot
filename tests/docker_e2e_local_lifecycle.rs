@@ -19,10 +19,16 @@ mod unix_integration {
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .arg(super::support::docker_harness::local_lifecycle_script_path())
             .env("ARTIFACT_DIR", &artifact_dir)
-            .env(
-                "PROJECT_NAME",
-                format!("bootroot-e2e-local-lifecycle-{mode}-{scenario_id}"),
-            )
+            // Deliberately no `PROJECT_NAME`, unlike the harnesses that
+            // read one: the lifecycle script derives its own instance,
+            // Compose project and published ports from `ARTIFACT_DIR`
+            // and its pid, exporting the project as
+            // `COMPOSE_PROJECT_NAME` and declaring the instance as
+            // `--instance-name` — two separate names, the export
+            // deciding the project and the flag the recorded identity
+            // every container is called after.  A value passed here
+            // would be read by nothing while looking as though it
+            // scoped the run.
             .env("RESOLUTION_MODE", mode)
             .env("TIMEOUT_SECS", "120")
             .env("BOOTROOT_BIN", env!("CARGO_BIN_EXE_bootroot"))

@@ -20,6 +20,9 @@ echo "--- validate-e2e-openssl-compat.sh ---"
 echo "--- validate-e2e-leftover-check.sh ---"
 "$SCRIPT_DIR/../validate-e2e-leftover-check.sh"
 
+echo "--- validate-e2e-run-scope.sh ---"
+"$SCRIPT_DIR/../validate-e2e-run-scope.sh"
+
 echo "--- ci/deploy-no-build-smoke.sh ---"
 "$SCRIPT_DIR/ci/deploy-no-build-smoke.sh"
 

@@ -157,21 +157,20 @@ dotenv_lookup() {
 # `BOOTROOT_INSTANCE` as recorded in the compose directory's `.env`,
 # then the default identity.
 #
-# No harness passes `--instance-name` today, so every one of them leaves
-# that argument empty.  The precedence is implemented rather than
-# assumed away because the first harness to take an instance name would
-# otherwise have the check read the identity of an install it did not
+# The two lifecycle harnesses pass their derived `--instance-name` here;
+# every other one installs at the default identity and leaves the
+# argument empty.  Without the precedence a harness taking an instance
+# name would have the check read the identity of an install it did not
 # make, and pass on a host carrying exactly the leftovers it exists to
 # report.  The wiring is enforced from the other side too:
 # `validate-e2e-leftover-check.sh` fails a harness that passes
 # `--instance-name` without handing the same value to the checks.
 #
 # Deliberately not `${BOOTROOT_INSTANCE:-bootroot}` out of the invoking
-# environment.  That expansion happens to give the right answer today
-# only because every harness using this runs at the default identity,
-# and it stops the moment one of them takes an instance name — and an
-# explicit name belongs to the install invocation carrying it, not to
-# whatever the invoking shell happened to export.
+# environment.  That expansion gives the right answer only for a harness
+# running at the default identity, and an explicit name belongs to the
+# install invocation carrying it, not to whatever the invoking shell
+# happened to export.
 # `COMPOSE_PROJECT_NAME` is not consulted at all: it selects a project
 # for one invocation and is not an identity, and the harness sets it to
 # values that are not valid instance names.

@@ -94,8 +94,9 @@ case_infra_lifecycle() {
   # Verify retries sized to cover a full bootroot-agent fast-poll
   # interval (default 30s) — the only propagation route for rotated
   # per-service secrets in the daemon-only model.
+  # No PROJECT_NAME: run-local-lifecycle.sh derives its own per-run
+  # instance, Compose project and published ports.
   ARTIFACT_DIR="$case_dir" \
-  PROJECT_NAME="${PROJECT_PREFIX}-lifecycle-$$" \
   TIMEOUT_SECS="$TIMEOUT_SECS_LIFECYCLE" \
   VERIFY_ATTEMPTS=20 \
   VERIFY_DELAY_SECS=4 \

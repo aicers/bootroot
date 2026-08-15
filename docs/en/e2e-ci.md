@@ -89,22 +89,207 @@ Primary scripts:
 - `scripts/impl/run-openbao-tls-reown.sh`
 - `scripts/impl/run-two-instance-isolation.sh`
 
-`run-two-instance-isolation.sh` is the one matrix scenario that is **not**
-handed a `COMPOSE_PROJECT_NAME`: it installs two instances into two compose
-directories that share a basename and must resolve each instance's Compose
-project from that instance's own `.env`, so a caller-supplied project name
-would collapse both into one. It derives run-scoped `--instance-name` values
-and picks free host ports itself, and every teardown and leftover check is
-scoped to those exact names — it is safe to run on a host that already has a
-default `bootroot` install.
+Three of those scripts are handed no project name at all, and derive their
+own instead. `run-two-instance-isolation.sh` installs two instances into two
+compose directories that share a basename and must resolve each instance's
+Compose project from that instance's own `.env`, so a caller-supplied
+`COMPOSE_PROJECT_NAME` would collapse both into one. The two lifecycle
+scripts derive one identity per run for the reason the next section gives.
+All three pick run-scoped `--instance-name` values and free host ports
+themselves, and every teardown and leftover check is scoped to those exact
+names — they are safe to run on a host that already has a default `bootroot`
+install.
+
+### Two lifecycle runs can share a host
+
+`run-local-lifecycle.sh` and `run-remote-lifecycle.sh` derive their whole
+identity per run, so a second run — another worktree, another agent session,
+a developer checking something by hand — no longer has to wait for the first
+to finish. Each run:
+
+- derives an instance name from its artifact directory's basename and its own
+  pid, prefixed `e2e-local-` or `e2e-remote-` and cut to the 39 characters
+  `infra install` accepts. The pid sits at the tail, which is the part the cut
+  keeps, so two runs whose artifact basenames agree still get different names.
+- hands that name to `infra install --instance-name` and exports it as
+  `BOOTROOT_INSTANCE`, so Compose and the binary name every container
+  identically.
+- derives its Compose project from the same identifier, separately and under
+  its own rule: prefixed `bootroot-e2e-local-` or `bootroot-e2e-remote-`, and
+  never truncated, because a project has no DNS label to fit inside. Under a
+  CI-length `GITHUB_RUN_ID` it is therefore longer than an instance name is
+  allowed to be. The project reaches the binary as an exported
+  `COMPOSE_PROJECT_NAME`, which outranks `--instance-name` for the project and
+  for nothing else, so every `bootroot` invocation in the run is scoped to the
+  same project as the script's own raw `docker compose` calls. The run reads
+  that project back off a real container's `com.docker.compose.project` label
+  rather than assuming it.
+- picks four free `127.0.0.1` ports and passes them to `infra install` as
+  `--postgres-host-port`, `--openbao-host-port`, `--stepca-host-port` and
+  `--http01-admin-host-port`, so the `.env` the install writes records them for
+  every later `bootroot` invocation in the same run.
+- exports `BOOTROOT_HTTP01_IMAGE` as `bootroot-http01-responder:<instance>`,
+  because the responder is the one image `docker-compose.yml` builds and its
+  `image:` is the tag that build is written to. Left at the shipped default,
+  two runs write to one tag in turn, and the recreate that applies a run's
+  HTTP-01 DNS aliases resolves it again — and starts the other run's build.
+  The run removes the tag on the way out; `down` removes containers, never
+  images.
+- records the instance, the project, the image and the four ports in
+  `<artifact dir>/run-identity.json`, so a failed run can be read afterwards.
+
+### `hosts` mode still runs one at a time
+
+The entries a run adds are keyed by fixed host names (`stepca.internal`,
+`responder.internal`) and removed by a fixed marker literal, and rewriting
+`/etc/hosts` is an unlocked read-modify-write on one file the whole machine
+shares — which no spelling of the marker fixes.
+
+That mode used to be serialised by accident, and only by accident: two runs
+collided on the Compose project, the container names and the ports long before
+either reached that file. Nothing stops them now, and what they would do to
+each other there is silent rather than loud — the second run finds the host
+names already present and adds nothing, then the first run's cleanup strips
+both marker lines while the second is still resolving through them.
+
+So the serialisation is stated instead of inherited. A run in `hosts` mode
+takes an exclusive `flock(2)` on `/etc/hosts` itself after its `sudo` checks
+and before its first edit, and releases it once its own entries are gone. A
+second such run is refused there, before it touches the file, and told which
+run holds it where it can tell. A run that was refused, or that failed before
+taking the lock, leaves `/etc/hosts` alone on the way out: the cleanup rewrite
+drops every line carrying the script's marker, so it cannot tell one run's
+entries from another's.
+
+The lock is the resource, and that is the whole of the design. Two properties
+carry it, and each covers a failure the other does not.
+
+Ownership is the kernel's and lasts exactly as long as the run does, so there
+is no such thing as a stale lock: a run killed with `SIGKILL` releases it at
+the instant it stops being able to write `/etc/hosts`, and the next run takes
+it with nothing to reclaim and nothing to judge. That is what a lock file whose
+ownership is "this path exists" cannot do — recovering one means removing a
+file on the strength of a pid read from it a moment earlier, and a second run
+arriving at the same stale lock can take it in between, whereupon the recovery
+destroys a live run's lock and both runs edit `/etc/hosts` believing they hold
+the mutex.
+
+And the inode is one nobody can swap. `flock(2)` locks an inode, and a path
+names one only for as long as nobody changes what it names, so a lock file of
+the harness's own at a predictable name in a world-writable `/tmp` is a mutex
+that can be split: the test that refuses a symbolic link and the `open` that
+follows it are two calls, and anyone on the machine can put a link there in
+between. One run locks whatever it points at; the next, arriving after the link
+has been swapped back for an ordinary file, locks a different inode and takes a
+mutex the first believes it holds. `O_NOFOLLOW` narrows that without closing
+it, because a file another user owns in a sticky `/tmp` is still theirs to
+unlink and create again between two opens. `/etc/hosts` sits in a directory
+that is root's, so no unprivileged user can put another inode at that path —
+and the run that locks it is the run about to edit it.
+
+Nothing is created, written or re-moded by the lock. The open is read-only,
+which is all `flock(2)` needs and all any run has to `/etc/hosts` without
+`sudo`, and it is also what makes a missing file a refusal rather than a lock
+on something the run has just brought into being. The harnesses' own edits keep
+the inode — `cp` over the file and `tee -a` onto it, never a rename — so what a
+run locked at the start is what it is still editing at the end. Beyond the
+`sudo -n` the mode already requires, the lock asks for nothing.
+
+Who holds it is recorded separately, in the run-marker directory below, and is
+advisory: a label naming a live process names the holder, one left by a killed
+run reads as nothing, and another user's sits in a directory of their own that
+this run cannot read. Then the refusal says so rather than naming the wrong
+run. Nothing is read out of that label and acted on.
+
+Every child a run starts inherits the descriptor, so the harnesses close it
+(`9>&-`) on the `bootroot-agent` daemons they start: one that outlived a killed
+run would otherwise go on holding the lock.
+
+Taking the lock needs `flock(1)`, `perl` or `python3` — whichever the host has,
+in that order. Linux runners have all three and macOS has the last two; a host
+with none of them is refused in `hosts` mode, naming what to install.
+
+One lock covers both harnesses, because both add the same two host names — a
+local run and a remote run overwrite each other exactly as two local runs
+would. It is machine-wide rather than per-user like the run-marker directory,
+because `/etc/hosts` is.
+
+`no-hosts` runs take no lock and are unaffected. Use that mode when you need
+two lifecycle runs at once.
+
+### Collecting the runs that were killed
+
+Unique naming costs the accident that used to clean up after a killed run:
+nothing is ever named the same as its leftovers again, so no later run tears
+them down on the way in, and they would otherwise accumulate for as long as
+the machine runs.
+
+Each run records its liveness explicitly instead. On start it writes
+`${TMPDIR:-/tmp}/bootroot-e2e-runs-<uid>/<instance>` holding its own pid and its
+Compose project, and on the way out it removes that file — only ever the one
+recording its own pid, and only once its own teardown has left nothing
+behind. Before doing any work it reads every marker in that
+directory, skips the ones whose pid is still alive, and for each dead one
+removes that instance's nine container names and its responder image tag,
+along with the volumes and networks carrying its project label, then drops the
+marker. A marker it could not fully collect survives, so the next run retries
+rather than stranding what was left.
+
+A recycled pid can spare a dead run's containers for one further run, which is
+acceptable: the next run collects them and nothing is removed wrongly. The
+sweep never matches a prefix or a wildcard — `bootroot-*` would reach into a
+real default-identity install on the same host — so it can only touch
+instances a run recorded.
+
+Every one of those removals is read out of a marker, so what confines the sweep
+is which markers it will act on. A marker is honoured only when both of its
+halves sit inside one derived namespace: its filename must be an instance under
+`e2e-local-` or `e2e-remote-`, and its `project` field a Compose project under
+the matching `bootroot-e2e-local-` or `bootroot-e2e-remote-`. Anything else —
+a stale marker from an older naming rule, a file made by hand, a half-written
+record from something that picked the same path — is reported and left exactly
+as it was found, neither swept nor deleted. That is what makes the default
+identity unreachable by construction rather than by the absence of a marker
+naming it: `bootroot` cannot be spelled with any of those prefixes, so a file
+called `bootroot` recording `project=bootroot` and a dead pid cannot aim the
+sweep at a real install's containers, volumes, networks or `:latest` responder
+image. The same pairing is enforced where markers are written, so a run whose
+identity fell outside the table is stopped before it installs anything no later
+sweep would collect.
+
+The directory is per-user and created `0700`, and a run refuses one it does not
+own: a marker's filename is an instance the sweep tears down by exact container
+name, so anyone who could write there would be choosing what a later run
+destroys. The namespace check stands behind that rather than beside it —
+ownership establishes that no other user wrote a marker, not that this harness
+did. A symbolic link at that path is refused outright rather than
+followed, because ownership cannot see one — every shell test but `-L` reports
+on the link's target, so a link aimed at a directory this user happens to own
+would pass the ownership check and hand the sweep files that were never
+markers. The uid in the path is what gives Linux the separation `$TMPDIR`
+already gives macOS, so two users can run the harness on one host instead of
+the second being refused.
+
+It is also where a `hosts`-mode run records that it holds the lock, under a
+name no instance can carry (`hosts-lock-holder.label`), so the sweep never
+reads it as a run. That record lives here rather than at a machine-wide path
+of its own for the reason the lock no longer does: a predictable name in a
+world-writable directory is one a run's write would truncate wherever
+somebody else's link pointed.
+
+`scripts/validate-e2e-run-scope.sh` covers the derivation, the markers, the
+sweep and the `hosts` lock without Docker. It is a local check, run by
+`scripts/preflight/run-all.sh` and not by any CI workflow.
 
 ### Leftover containers fail a run before it starts
 
-Every other harness installs at the default identity, so its containers are
-named after whatever the compose directory's `.env` records — `bootroot-*`
-unless an install recorded something else. Those names are global to the
-Docker daemon, so two such runs, or one such run and a real install, cannot
-share a host: they collide on `container_name` at `up`.
+The remaining harnesses install at the default identity, so their containers
+are named after whatever the compose directory's `.env` records — `bootroot-*`
+unless an install recorded something else. The two lifecycle scripts install
+at the derived instance above and hand that name to the same check. Either
+way the names are global to the Docker daemon, so two runs sharing a name, or
+one such run and a real install, cannot share a host: they collide on
+`container_name` at `up`.
 
 Each of them therefore asserts, before doing any work, that none of the nine
 container names bootroot creates (`-openbao`, `-postgres`, `-ca`, `-http01`,
@@ -281,6 +466,8 @@ Configuration:
 - Resolution mode is `hosts`
 - Script writes temporary `stepca.internal` / `responder.internal` host entries
   (requires `sudo -n`)
+- One `hosts`-mode run at a time, across both lifecycle scripts: a second one
+  is refused at the `flock(2)` the first holds on `/etc/hosts`
 
 Purpose:
 
@@ -289,7 +476,8 @@ Purpose:
 
 Execution steps:
 
-1. Add host entries for `stepca.internal` and `responder.internal`
+1. Take the machine-wide `hosts` lock, then add host entries for
+   `stepca.internal` and `responder.internal`
 2. Run the same end-to-end flow phases as `no-hosts`
 3. Remove temporary host entries during cleanup
 
@@ -401,6 +589,8 @@ Configuration:
 - Same service set as remote `no-hosts`: `edge-proxy`, `web-app`
 - Resolution mode is `hosts`
 - Temporary `/etc/hosts` entries are added/removed by the script
+- One `hosts`-mode run at a time, across both lifecycle scripts: this script
+  and `run-local-lifecycle.sh` add the same two host names and share one lock
 
 Purpose:
 
@@ -409,7 +599,8 @@ Purpose:
 
 Execution steps:
 
-1. Add host entries for `stepca.internal` / `responder.internal`
+1. Take the machine-wide `hosts` lock, then add host entries for
+   `stepca.internal` / `responder.internal`
     - Add `stepca.internal` entry
     - Add `responder.internal` entry
 2. Run all remote-delivery E2E scenario phases
@@ -620,6 +811,7 @@ Or run individual scripts:
 | `./scripts/validate-deploy-compose.sh` | `ci.yml` Validate Deploy Compose |
 | `./scripts/validate-compose-instance-names.sh` | `ci.yml` Validate Compose Instance Names |
 | `./scripts/validate-e2e-openssl-compat.sh` | `ci.yml` Validate E2E OpenSSL Compatibility |
+| `./scripts/validate-e2e-leftover-check.sh` | `ci.yml` Validate E2E Leftover Check |
 | `./scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` Deploy Compose No-Build Smoke |
 | `./scripts/preflight/ci/test-core.sh` | `ci.yml` Unit & CLI Smoke |
 | `./scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` Docker E2E Matrix |
@@ -633,6 +825,7 @@ Local-only extras (not in any CI workflow):
 
 | Script | Description |
 | --- | --- |
+| `./scripts/validate-e2e-run-scope.sh` | Run-scope derivation, markers, sweep, `hosts` lock |
 | `./scripts/preflight/extra/agent-scenarios.sh` | Agent scenario tests |
 | `./scripts/preflight/extra/cli-scenarios.sh` | CLI scenario tests |
 
@@ -645,6 +838,12 @@ When local `sudo -n` is unavailable:
 
 Use this only as a local constraint workaround. CI still executes
 `hosts` variants.
+
+`--skip-hosts` is also what lets two matrix runs share one host. The matrix
+runs its own steps in sequence, so a single run never contends with itself,
+but a second run reaching a `hosts` step while the first is inside one is
+refused at the lock rather than made to wait. Every other step is run-scoped
+and unaffected.
 
 The harnesses also assume three host tools, and each check fails in its
 prerequisite block rather than mid-run:

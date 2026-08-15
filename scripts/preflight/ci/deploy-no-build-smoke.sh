@@ -89,8 +89,15 @@ prepare_images() {
   docker pull "$BOOTROOT_STEP_CA_IMAGE"
 
   log "building responder image"
+  # `docker-compose.yml` interpolates the responder's `image:` from
+  # `BOOTROOT_HTTP01_IMAGE`, and this script's own value for that
+  # variable may have been inherited from the caller — so the build's tag
+  # is pinned here rather than left to the environment.  Otherwise the
+  # build would land on the release tag and the retag below would look
+  # for a `:latest` nothing had produced.
   POSTGRES_PASSWORD=build-only \
     GRAFANA_ADMIN_PASSWORD=build-only \
+    BOOTROOT_HTTP01_IMAGE=bootroot-http01-responder:latest \
     docker compose -f docker-compose.yml build bootroot-http01
   docker tag bootroot-http01-responder:latest "$BOOTROOT_HTTP01_IMAGE"
 
