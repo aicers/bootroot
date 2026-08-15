@@ -125,7 +125,7 @@ pub(super) async fn rotate_approle_secret_id(
     // invocation — batch, single-service, and infra alike — and only
     // after the self-mint above, so a failed self-mint cannot suppress
     // the stale-rotation warning in `bootroot status`.
-    record_rotation_success(ctx, messages)?;
+    record_rotation_success(ctx, messages).await?;
     Ok(())
 }
 
@@ -133,13 +133,18 @@ pub(super) async fn rotate_approle_secret_id(
 /// `approle-secret-id` invocation in `state.json`. A scheduler that
 /// silently stops firing produces no failure log of its own, so this
 /// timestamp is the only signal `bootroot status` can watch.
-fn record_rotation_success(ctx: &mut RotateContext, messages: &Messages) -> Result<()> {
+///
+/// Async because the state write is: publishing `state.json` costs
+/// three disk round trips, which `StateFile::save_async` keeps off the
+/// runtime thread this rotation runs on.
+async fn record_rotation_success(ctx: &mut RotateContext, messages: &Messages) -> Result<()> {
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .context("Failed to format the rotation-success timestamp")?;
     ctx.state.last_secret_id_rotation = Some(now);
     ctx.state
-        .save(&ctx.state_file)
+        .save_async(&ctx.state_file)
+        .await
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
 }
@@ -504,10 +509,20 @@ async fn ensure_infra_role_id_file(
         .await
         .with_context(|| messages.error_openbao_role_id_failed())?;
     fs_util::ensure_secrets_dir(agent_dir).await?;
-    tokio::fs::write(&role_id_path, &role_id)
+    // Published by rename at the policy's `0600`. The `OpenBao` Agent
+    // sidecar re-reads this file on every `AppRole` re-login, so a
+    // backfill racing one handed it a truncated `role_id` and a failed
+    // login; the rename leaves the previous file or the whole new one.
+    //
+    // It takes the directory flush, like the `secret_id` written beside
+    // it. `role_id` is not a secret and is re-readable from `OpenBao` —
+    // this function is what re-reads it — but only on the next `rotate`
+    // run, and until then a lost directory entry is a sidecar that
+    // cannot log in. The early return above means this writes only on a
+    // backfill, so the round trip is not on any repeated path.
+    fs_util::atomic_write(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
-    fs_util::set_key_permissions(&role_id_path).await?;
     Ok(role_id)
 }
 
@@ -599,7 +614,8 @@ async fn provision_infra_rotate_role(
     }
     if state_changed {
         ctx.state
-            .save(&ctx.state_file)
+            .save_async(&ctx.state_file)
+            .await
             .with_context(|| messages.error_serialize_state_failed())?;
     }
 
@@ -698,13 +714,17 @@ async fn ensure_role_id_file(
                 messages.error_write_file_failed(&role_id_path.display().to_string())
             })?;
     } else {
+        // Inside the secrets tree, published by rename at the policy's
+        // `0600` and flushed — the same two decisions, for the same
+        // reasons, as `ensure_infra_role_id_file` above, and the same
+        // pair the override branch beside it makes. The early return on
+        // `role_id_path.exists()` means this only ever creates.
         fs_util::ensure_secrets_dir(service_dir).await?;
-        tokio::fs::write(&role_id_path, role_id)
+        fs_util::atomic_write(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
             .await
             .with_context(|| {
                 messages.error_write_file_failed(&role_id_path.display().to_string())
             })?;
-        fs_util::set_key_permissions(&role_id_path).await?;
     }
     Ok(())
 }

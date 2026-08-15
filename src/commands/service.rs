@@ -8,6 +8,7 @@ mod secrets;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 
 use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs, ServiceUpdateArgs};
@@ -425,6 +426,10 @@ async fn run_service_add_preview(
     );
 }
 
+// One line over the limit since the state persist gained its `.await`:
+// the body is a linear apply sequence whose steps depend on each other,
+// so splitting it would only move the ordering somewhere less visible.
+#[allow(clippy::too_many_lines)]
 async fn run_service_add_apply(
     state: &mut StateFile,
     state_path: &Path,
@@ -529,7 +534,8 @@ async fn run_service_add_apply(
         .services
         .insert(resolved.service_name.clone(), entry.clone());
     state
-        .save(state_path)
+        .save_async(state_path)
+        .await
         .with_context(|| messages.error_serialize_state_failed())?;
     // The entry is persisted, so `service remove --delete-artifacts` can
     // now reach the relocated files; keep them.
@@ -1113,8 +1119,39 @@ fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
     } else {
         next
     };
-    std::fs::write(agent_config_path, next)
-        .with_context(|| format!("Failed to write {}", agent_config_path.display()))?;
+    // Published by rename, like the `service add` writer this edits
+    // behind (`service::local_config`). `agent.toml` is the file
+    // `bootroot-agent`'s daemon loop re-reads on every ACME retry, and a
+    // truncating rewrite here reopened exactly the #613 window that
+    // writer was moved off: a reload landing in the gap sees no profile
+    // and burns a retry.
+    //
+    // The mode comes off the destination, which this function has
+    // already established exists. A rename installs a fresh inode, so
+    // stating a constant would re-widen or re-narrow a file the operator
+    // may have adjusted; `service add` remains the one place that sets
+    // the `0600` policy mode, and this edit carries whatever is there.
+    //
+    // It takes the directory flush. `agent.toml` is not regenerated on a
+    // timer by anything — losing the entry costs a `service add` re-run
+    // by an operator who has no signal that it is needed, because the
+    // agent goes on reading the previous file and renewing against the
+    // old `cert_group_gid`.
+    //
+    // The rename lands on this path, not through a symlink at it —
+    // `atomic_write_blocking`, not the `_through_symlink` spelling the
+    // configuration writers take. `service::local_config` has published
+    // `agent.toml` by rename since #613, so a link an operator puts here
+    // is already replaced by the `service add` that creates the file;
+    // resolving it in the writer that only *edits* the file would make
+    // the two disagree about the same path rather than preserve anything
+    // that survives a `service add`.
+    fs_util::atomic_write_blocking(
+        agent_config_path,
+        next.as_bytes(),
+        fs_util::preserved_mode(agent_config_path, fs_util::KEY_FILE_MODE),
+    )
+    .with_context(|| format!("Failed to write {}", agent_config_path.display()))?;
     Ok(())
 }
 
@@ -1231,7 +1268,7 @@ mod tests {
         OverrideCredentialRollback, ServiceAppRoleMaterialized, build_secret_id_options,
         build_service_entry, build_service_entry_from_role, display_policy_value, display_wrap_ttl,
         is_idempotent_remote_rerun, is_policy_only_mismatch, non_policy_fields_match,
-        policy_fields_match, write_origin_credential_files,
+        policy_fields_match, rerender_local_managed_profile, write_origin_credential_files,
     };
     use crate::i18n::{Messages, test_messages};
     use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry};
@@ -1370,6 +1407,39 @@ mod tests {
             cert_group_gid: None,
             secret_id_path_override: None,
         }
+    }
+
+    /// `agent.toml` is published at its own name by every writer that
+    /// touches it — `service add` has renamed over it since #613 — so
+    /// this edit does the same rather than resolving a link an operator
+    /// planted. Pinned because the opposite is a defensible-looking
+    /// change: it would leave two writers of one file disagreeing about
+    /// whether a link at that path survives.
+    #[test]
+    fn rerender_publishes_agent_toml_at_its_own_name() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real-agent.toml");
+        let link = dir.path().join("agent.toml");
+        std::fs::write(&target, "# seed\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut entry = sample_entry_from_resolved(&sample_resolved());
+        entry.agent_config_path = link.clone();
+        rerender_local_managed_profile(&entry).unwrap();
+
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the rename publishes at the name, as `service add` does"
+        );
+        assert!(std::fs::read_to_string(&link).unwrap().contains("test-svc"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "# seed\n",
+            "and leaves what the link pointed at untouched"
+        );
     }
 
     fn assert_common_fields(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) {

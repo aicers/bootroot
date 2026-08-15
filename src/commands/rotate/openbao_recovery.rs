@@ -220,9 +220,22 @@ async fn write_openbao_recovery_output(
 
     let payload = serde_json::to_string_pretty(output)
         .with_context(|| messages.error_serialize_state_failed())?;
-    tokio::fs::write(path, payload)
+    // Published by rename at the policy's `0600`, applied to the staged
+    // temporary so the recovery keys are never observable at the final
+    // path under a wider mode.
+    //
+    // It takes the directory flush. These keys are the only way back
+    // into a sealed OpenBao and `OpenBao` has already rotated to them by
+    // the time this runs; a crash that loses the directory entry is not
+    // a rewrite, it is an unrecoverable barrier.
+    //
+    // A symlinked destination is resolved first, as `init`'s two output
+    // files resolve theirs: `--output` names a path the operator chose,
+    // the truncating write this replaced delivered through a link there,
+    // and renaming over the link would leave the keys in a directory
+    // nobody picked while the target kept the superseded ones.
+    fs_util::atomic_write_through_symlink(path, payload.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
-    fs_util::set_key_permissions(path).await?;
     Ok(())
 }

@@ -2,7 +2,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
-use tokio::fs;
 
 use super::resolve::ResolvedServiceAdd;
 use super::{
@@ -270,10 +269,19 @@ async fn write_remote_bootstrap_artifact_file(
     let artifact_path = artifact_dir.join(REMOTE_BOOTSTRAP_FILENAME);
     let payload = serde_json::to_string_pretty(artifact)
         .with_context(|| "Failed to serialize remote bootstrap artifact".to_string())?;
-    fs::write(&artifact_path, payload)
+    // Published by rename at the policy's `0600`, applied while the file
+    // is still at its temporary name so the wrapped token it may carry
+    // is never readable at the final path under a wider mode.
+    //
+    // It takes the directory flush. The artifact holds a single-use
+    // response-wrapping token that `OpenBao` has already issued and that
+    // expires on its own clock; losing the directory entry means the
+    // operator cannot run the bootstrap and cannot get that token back
+    // either, so `service add --remote` has to be re-run against a
+    // freshly issued one.
+    fs_util::atomic_write(&artifact_path, payload.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
-    fs_util::set_key_permissions(&artifact_path).await?;
     let remote_run_command = render_remote_run_command(artifact);
     Ok(RemoteBootstrapResult {
         bootstrap_file: artifact_path.display().to_string(),

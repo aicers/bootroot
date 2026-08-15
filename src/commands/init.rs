@@ -30,7 +30,7 @@ pub(crate) use steps::http01_admin_tls::{
     reissue_http01_admin_tls_cert, strip_responder_tls_config,
 };
 pub(crate) use steps::openbao_tls::{reissue_openbao_tls_cert, write_openbao_hcl_plaintext};
-pub(crate) use steps::stepca_setup::set_acme_cert_duration;
+pub(crate) use steps::stepca_setup::{CA_JSON_FILE_MODE, set_acme_cert_duration};
 pub(crate) use steps::{
     compute_ca_bundle_pem, compute_ca_fingerprints, infra_rotate_policy, parse_ttl_to_secs,
     prompt_yes_no, read_ca_cert_fingerprint, run_init, validate_rotate_bound_cidrs,

@@ -13,6 +13,7 @@ pub(crate) mod stepca_setup;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 use bootroot::openbao::{InitResponse, OpenBaoClient};
 pub(crate) use ca_certs::{
     compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
@@ -398,11 +399,36 @@ fn rollback_openbao_agent_invocation(
     )
 }
 
+/// Fallback mode for a file being restored that is no longer present.
+///
+/// A `RollbackFile` records a destination that existed before `init`, so
+/// the restore normally reads the mode back off it. `0644` covers only
+/// the case where `init` deleted it outright, and is what the umask gave
+/// the truncating write this replaced.
+const ROLLBACK_FILE_MODE: u32 = 0o644;
+
+/// Restores one snapshotted file, or removes it when `init` created it.
+///
+/// The restore publishes by rename. This runs on the failure path, where
+/// the containers `init` started may still be up and reading the very
+/// files being put back — `ca.json`, `password.txt`, the templates — so
+/// a truncating restore could hand a half-written document to a service
+/// that is already unhappy. It also means an interrupted rollback leaves
+/// the pre-`init` file or the `init`-era one, never a shredded third
+/// thing that matches neither snapshot.
+///
+/// The directory is not flushed: the rollback is undoing work, so losing
+/// its last entry to a crash leaves the operator exactly where a crash
+/// one moment earlier would have, and a re-run of `init` is the recovery
+/// either way.
 fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
     if let Some(contents) = &file.original {
-        std::fs::write(&file.path, contents).with_context(|| {
-            messages.error_restore_file_failed(&file.path.display().to_string())
-        })?;
+        fs_util::atomic_replace_through_symlink_blocking(
+            &file.path,
+            contents.as_bytes(),
+            fs_util::preserved_mode(&file.path, ROLLBACK_FILE_MODE),
+        )
+        .with_context(|| messages.error_restore_file_failed(&file.path.display().to_string()))?;
     } else if file.path.exists() {
         std::fs::remove_file(&file.path)
             .with_context(|| messages.error_remove_file_failed(&file.path.display().to_string()))?;
@@ -964,14 +990,13 @@ mod rollback_tests {
 
 #[cfg(test)]
 pub(super) mod test_support {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     use super::super::constants::openbao_constants::SECRET_ID_TTL;
     use super::super::constants::{DEFAULT_CERT_DURATION, DEFAULT_STEPCA_PROVISIONER};
     use crate::cli::args::InitArgs;
     pub(in crate::commands::init::steps) use crate::i18n::test_messages;
+    use crate::test_support::write_executable;
 
     /// Writes a fake `docker` that appends one line per invocation to
     /// `args_log` and reads nothing from its environment.
@@ -1007,9 +1032,7 @@ pub(super) mod test_support {
         let script = format!(
             "#!/bin/sh\nset -eu\n{{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\nexit {exit_code}\n"
         );
-        fs::write(path, script).expect("fake docker script should be written");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .expect("fake docker script should be executable");
+        write_executable(path, script.as_bytes());
     }
 
     pub(in crate::commands::init::steps) fn default_init_args() -> InitArgs {

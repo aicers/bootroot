@@ -104,6 +104,92 @@ Key points:
 For detailed rules and condition-specific behavior, see the Overview section
 [/etc/hosts Mapping](index.md#etchosts-mapping).
 
+## How bootroot writes files
+
+Nearly every file bootroot produces is published by stage-then-rename: the bytes
+go to a temporary file in the destination's own directory, that file is given its
+final mode and ownership and then flushed while it is still at its temporary
+name, and only then is it renamed over the destination. Three consequences are worth
+knowing when you operate around a running stack.
+
+- **A reader never sees a partial file.** A container mounting the file, a
+  sidecar re-rendering it, `docker compose` interpolating `.env`, or a
+  `bootroot-agent` reloading `agent.toml` sees either the previous file or the
+  complete new one. A write that fails partway leaves the previous file
+  untouched and removes the temporary.
+- **The final mode holds from the moment the file appears.** There is no window
+  in which a freshly written CA password, recovery key, `secret_id` or
+  responder HMAC is readable more widely than intended.
+- **A rename installs a new inode.** The file at the destination path is a
+  different inode after every write, so anything holding an open file
+  descriptor — a `tail -f`, a container that opened the file at start — keeps
+  reading the old contents until it reopens the path. Bind mounts of a
+  *directory* follow the rename; a bind mount of a single *file* does not, and
+  needs the container restarted to pick up a new version.
+
+Two files are not published this way yet, and none of the three points above
+applies to them: `secrets/openbao/unseal-keys.txt`, written by `init
+--save-unseal-keys` and `bootroot openbao save-unseal-keys`, and the `eab.json`
+written next to each service's `secret_id`. Both are still written over the
+destination in place and have their `0600` set afterwards, so a reader can catch
+one half-written, and a freshly created one is briefly readable more widely than
+that. Converting them is a separate change; the rest of this section describes
+the staged writers only.
+
+Whether the containing directory is flushed after the rename is decided per
+file, because that flush costs a disk round trip on every write:
+
+Flushed, so the published file survives a power loss:
+
+- `state.json`, `.env`, `agent.toml`
+- the `init` `--summary-json` and `--root-token-output` files
+- the step-ca CA password and the OpenBao recovery keys
+- every `AppRole` `role_id`/`secret_id`, and the remote bootstrap artifact
+
+Not flushed, because a crash that loses one costs a rewrite rather than an
+outage:
+
+- issued certificates, keys, and the CA bundle
+- `ca.json` and its OpenBao Agent template
+- `openbao.hcl`, and the HTTP-01 responder config and template
+- the OpenBao Agent configs, and the generated compose overrides
+
+The second list is regenerated on its own: by the next renewal, by the OpenBao
+Agent sidecar's next render, or by re-running the command that produced it. The
+first is not — bootroot reads it back to resume, or it holds a credential the
+stack logs in with, and losing one of those takes an operator or another
+rotation to put back rather than the next write. A `role_id` is on the flushed
+list with the `secret_id` beside it for that reason: bootroot can read it from
+OpenBao again, but only on the next `rotate` run, and until then the agent or
+sidecar it belongs to cannot log in.
+
+Modes are taken from the file already at the destination where it has one, so a
+file you narrow by hand stays narrowed across every later write. Only a fresh
+create takes bootroot's stated default: `0600` inside the secrets tree and for
+the two `init` outputs, `0644` for `state.json`, `.env`, `ca.json`,
+`openbao.hcl`, the issued certificates, the CA bundle and the compose
+overrides.
+
+If you point one of these paths at a file elsewhere with a symlink, what happens
+depends on which file it is, because a rename replaces the name it is given
+rather than following a link at it:
+
+- **Configuration you may have relocated is written through the link.** For
+  `.env`, `ca.json` and its template, `openbao.hcl`, the HTTP-01 responder
+  config and template, the OpenBao Agent configs, the generated compose
+  overrides, `state.json` and the two `init` output files, bootroot resolves the
+  link first and publishes to its target, so the link keeps naming the file it
+  named before. A chain of links that loops back on itself names no target and
+  is refused. The `agent.toml` that `bootroot-remote bootstrap` writes on a
+  target host is in this group: that command is what creates the file there, so
+  a link you put at its `--agent-config-path` is one you arranged yourself.
+- **The control node's own `agent.toml`, the issued certificate and key, the CA
+  bundle, and every credential are published at the path itself**, replacing a
+  link found there with a regular file. Those files have been published by
+  rename for several releases, so a link at one of those paths has never
+  survived the command that creates the file; for a credential, following a link
+  would also mean a write redirected by whoever could plant one.
+
 ## bootroot infra up
 
 Starts OpenBao/PostgreSQL/step-ca/HTTP-01 responder via Docker Compose and
@@ -1132,14 +1218,27 @@ into the managed `agent.toml` profile block, threaded through the
 remote-bootstrap artifact, and surfaced on `DaemonProfileSettings`,
 so rotation always reapplies the same policy.
 
-Atomicity: the key file is written via stage-then-rename — the bytes
-are first written to a sibling temp file created with `O_CREAT|O_EXCL`
-and `mode=0600`, the staged file is `chown`d and promoted to `0640`
-(when the policy is active), and only then renamed over the
-destination. The destination path is therefore never observable at a
-mode wider than the final policy: there is no umask-derived `0644`
-window before the clamp, and no group-readable window under the
-operator's primary gid before the chown lands.
+Atomicity: the key file, the certificate and the CA bundle are all
+written via stage-then-rename, through the same publish routine that
+writes `state.json` and the `init` outputs — the bytes are first
+written to a sibling temp file created with `O_CREAT|O_EXCL` at
+`mode=0600`, the staged file is `chown`d (when the policy is active)
+and set to its final mode — `0640` for the key under an active policy,
+`0600` otherwise, `0644` for the certificate and the bundle — and only
+then renamed over the destination. Two properties follow. The
+destination path is never
+observable at a mode wider than the final policy: there is no
+umask-derived `0644` window before the clamp, and no group-readable
+window under the operator's primary gid before the chown lands. And a
+consumer reading the destination during a rotation — a server being
+reloaded, or the agent rebuilding its trust store — sees either the
+previous file or the complete new one, never a truncated PEM.
+
+The containing directory is deliberately not flushed after these
+renames. A crash that loses one leaves the previous cert, key or
+bundle in place and the next renewal reissues, which costs a reissue
+rather than an outage; `state.json` and the `init` output files, which
+bootroot reads back to resume, do take that flush.
 
 ### Interactive behavior
 
@@ -2243,10 +2342,23 @@ operator-managed runbook for those.
   current process (e.g. mode `0400`), or if the parent directory
   cannot accept a new file, so a bad path cannot leave the operator
   with a wiped-and-reinitialised OpenBao plus a failed token write.
-  New token files are created atomically with mode `0600` via
-  `OpenOptionsExt::mode` so the freshly minted root token is never
-  observable on disk with the process umask's default permissions
-  between create and chmod. Should the post-init write still fail
+  The token file is written via stage-then-rename: the token goes to
+  a temporary file in the destination's own directory, born `0600`,
+  which is flushed and then renamed over the destination, and the
+  containing directory is flushed after the rename. So the freshly
+  minted root token is never observable on disk with the process
+  umask's default permissions, the destination name never holds a
+  partially written token, and a published token survives a power
+  loss — it is the only copy of a credential reinit will not mint
+  again. An existing destination is narrowed to `0600` first, for the
+  older token that may still be sitting in it. A destination that is a
+  symlink to a regular file stays supported: the link is resolved and
+  the token is written to its target, so the rename replaces the file
+  the preflight judged rather than the link naming it. A chain of links
+  that loops back on itself names no such file, and the preflight
+  refuses the path — before the wipe, where the truncating write this
+  replaced reported `ELOOP` after it. Should the
+  post-init write still fail
   (e.g. disk full), the freshly issued token is surfaced on stderr in
   cleartext (prefixed with `ROOT_TOKEN=`) so it is not lost.
 - `--enable <features>`: passed through to `init` (e.g.
@@ -2271,13 +2383,17 @@ operator-managed runbook for those.
   unwritable / uncreatable parent. The summary JSON carries the
   freshly issued root token and unseal keys, so an unwritable
   destination would recreate the partial-init trap through a
-  different output channel, and a wider-than-`0600` destination
-  would briefly leak those secrets on disk between the write and
-  the post-write chmod. The summary file itself is written
-  atomically: new files are born `0600` via the create-mode flag,
-  and any existing destination is tightened to `0600` before the
-  secret payload is written, so the JSON never lands on disk with
-  wider permissions.
+  different output channel, and a wider-than-`0600` destination is
+  an earlier run's summary — with its own credentials in it — left
+  readable to every user on the host. The summary file itself is
+  written the same way as the root token file: staged in a `0600`
+  temporary in the destination's directory, flushed, renamed into
+  place, and the containing directory flushed after the rename. The
+  JSON therefore never lands on disk with wider permissions and the
+  destination name never holds a partial summary. Any existing
+  destination is still tightened to `0600` before the replacement is
+  produced, since the rename publishes a fresh file and leaves the
+  old one readable until it does.
 - `--no-eab`: passed through to `init`
 
 ### Behavior

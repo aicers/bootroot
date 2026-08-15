@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio::fs;
 
-use crate::cert_group::{self, CA_BUNDLE_FILE_MODE, CertGroupPolicy};
+use crate::cert_group::{self, CertGroupPolicy};
 
 pub const KEY_FILE_MODE: u32 = 0o600;
 const SECRETS_DIR_MODE: u32 = 0o700;
@@ -54,6 +54,92 @@ fn parent_dir(path: &Path) -> PathBuf {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// Resolves the file a staged write should land on when `path` is a
+/// symlink, returning `path` unchanged when it is not.
+///
+/// A truncating write opens the path with `O_TRUNC`, which follows the
+/// final symlink, so a destination pointed at a link has always
+/// delivered its bytes to the link's target. [`atomic_write`] and
+/// [`atomic_write_blocking`] `rename` over the name they are given
+/// instead, which replaces the link itself: the operator's link is
+/// gone and the target is left holding whatever was written last.
+///
+/// Writers reach this through
+/// [`atomic_write_through_symlink`]/[`atomic_replace_through_symlink`]
+/// and their blocking halves, which document what takes that spelling
+/// and what deliberately keeps the bare rename. It is called directly
+/// only where the resolved path itself is needed — `bootroot reinit`'s
+/// two output preflights, which judge the target's mode before the
+/// destructive step, and the two writers behind them, which narrow that
+/// same target before writing a credential over it.
+///
+/// Not a security check. It follows whatever the link points at, so a
+/// caller whose destination an untrusted user can plant must reject
+/// the symlink rather than resolve it (see
+/// [`atomic_rewrite_owned_no_symlink`], which does).
+///
+/// A dangling link is resolved from its own text rather than from the
+/// filesystem, so the write still lands where the operator pointed it.
+/// The truncating write's `O_CREAT` created the target through the
+/// link; publishing at the link's own name instead would destroy the
+/// link and put the file in a directory nobody chose, which for the
+/// root token means a credential landing outside the place the
+/// operator set aside for it.
+///
+/// # Errors
+/// Returns an error if the chain does not end within `SYMLOOP_MAX`
+/// hops — a cycle, which the truncating write reported as `ELOOP` and
+/// which is reported here rather than resolved, since every path in a
+/// loop is a link the caller would destroy by renaming over it — or if
+/// a link in the chain cannot be read, which leaves the destination
+/// unknown for the same reason.
+pub fn resolve_symlink_destination(path: &Path) -> Result<PathBuf> {
+    /// Hops allowed before a chain of dangling links is treated as a
+    /// cycle, matching the kernel's own `SYMLOOP_MAX`.
+    const MAX_HOPS: u32 = 40;
+
+    fn is_symlink(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+    }
+
+    if !is_symlink(path) {
+        return Ok(path.to_path_buf());
+    }
+    // Resolves the whole chain, and normalises the parent components
+    // with it, whenever the target exists.
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return Ok(resolved);
+    }
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        let target = std::fs::read_link(&current).with_context(|| {
+            format!(
+                "Failed to read the symlink {} while resolving the destination {}",
+                current.display(),
+                path.display()
+            )
+        })?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            parent_dir(&current).join(target)
+        };
+        if !is_symlink(&current) {
+            return Ok(current);
+        }
+    }
+    // A cycle: every name in it is a link, so there is nothing to
+    // publish that does not destroy one. The truncating write this
+    // replaces answered ELOOP here, and the caller keeps that answer —
+    // returning the path the caller named would have the rename
+    // silently replace the operator's link with a regular file.
+    anyhow::bail!(
+        "Too many levels of symbolic links resolving the destination {}: \
+         followed {MAX_HOPS} links without reaching a file",
+        path.display()
+    )
 }
 
 /// Flushes the directory holding `path` — its entry list, not the files
@@ -210,9 +296,6 @@ pub async fn atomic_rewrite_owned_no_symlink(
         tmp.as_file_mut()
             .write_all(&payload)
             .with_context(|| format!("Failed to write temp file for {}", dest.display()))?;
-        tmp.as_file_mut()
-            .sync_all()
-            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
             || {
                 format!(
@@ -227,6 +310,15 @@ pub async fn atomic_rewrite_owned_no_symlink(
                 dest.display()
             )
         })?;
+        // Flushed after the mode and the ownership, not before them: an
+        // `fsync` persists the inode as it stands, so a flush taken at
+        // the bytes leaves a crash able to recover this credential
+        // world-readable or owned by the wrong uid. See
+        // `publish_staged_blocking`, which orders the same three steps
+        // for the same reason.
+        tmp.as_file_mut()
+            .sync_all()
+            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
         // `persist` replaces the target *name* via rename(2), which does
         // not traverse a symlink at the final component, so even a
         // post-check swap cannot redirect the write.
@@ -294,9 +386,6 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publ
         tmp.as_file_mut()
             .write_all(&payload)
             .with_context(|| format!("Failed to write temp file for {}", dest.display()))?;
-        tmp.as_file_mut()
-            .sync_all()
-            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
             || {
                 format!(
@@ -311,6 +400,12 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publ
                 dest.display()
             )
         })?;
+        // Flushed last, after the mode and the ownership, so the inode a
+        // crash recovers is the one that was published — see
+        // `publish_staged_blocking`.
+        tmp.as_file_mut()
+            .sync_all()
+            .with_context(|| format!("Failed to fsync temp file for {}", dest.display()))?;
         match publish {
             Publish::Replace => {
                 tmp.persist(&dest).map_err(|e| {
@@ -389,28 +484,360 @@ pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()>
 /// The blocking half of [`atomic_write`], for callers that are not async.
 ///
 /// Same guarantees, same order: staged in the destination's directory,
-/// written, `sync_all`ed, permissioned, ownership-preserved, renamed,
+/// written, ownership-preserved, permissioned, `sync_all`ed, renamed,
 /// and the directory flushed. Callers in an async context use
 /// [`atomic_write`] instead, which runs this on a blocking thread.
+///
+/// One spelling of [`publish_staged_blocking`], the crate's
+/// general-purpose staging publisher — see there for the two decisions
+/// this one makes ([`StagedOwner::Destination`] and
+/// [`StagedDurability::FlushDirectory`]) and why, and for the staged
+/// writers that publish outside it.
 ///
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_write`].
 pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
-    let parent = parent_dir(path);
-    // Capture the existing destination's uid/gid (if any) so the
-    // rename does not strip operator-meaningful ownership. Missing
-    // file -> None; do not chown the staged file in that case so a
-    // fresh create keeps process default ownership.
-    let existing_owner = std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()));
+    publish_staged_blocking(
+        path,
+        contents,
+        mode,
+        StagedOwner::Destination,
+        StagedDurability::FlushDirectory,
+    )
+}
 
+/// Publishes `contents` at `path` by rename, **without** flushing the
+/// containing directory.
+///
+/// [`atomic_write`]'s guarantee against a torn read, without its
+/// durability guarantee. This is the right writer for regenerable
+/// configuration — a compose override, an `OpenBao` Agent template, a
+/// patched `ca.json` — where a reader (a container mounting the file, a
+/// sidecar re-rendering it) must never see half a document, but a crash
+/// that loses the new directory entry leaves the previous file in place
+/// and costs a re-run of the command that produced it rather than an
+/// outage. The flush is a disk round trip per write and `init` performs
+/// dozens of these, so it is not spent where the file can be rebuilt.
+///
+/// Callers whose file is read back to resume, or that hold something
+/// that cannot be re-derived, use [`atomic_write`] instead.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_write`],
+/// except that no directory flush is attempted.
+pub async fn atomic_replace(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    // Owned once, to move into the blocking task, exactly as
+    // `atomic_write` does.
+    let dest = path.to_path_buf();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || atomic_replace_blocking(&dest, &payload, mode))
+        .await
+        .context("Atomic replace task panicked")?
+}
+
+/// The blocking half of [`atomic_replace`], for callers that are not
+/// async.
+///
+/// One spelling of [`publish_staged_blocking`] — see there for the two
+/// decisions this one makes ([`StagedOwner::Destination`] and
+/// [`StagedDurability::RenameOnly`]) and why.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_replace`].
+pub fn atomic_replace_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    publish_staged_blocking(
+        path,
+        contents,
+        mode,
+        StagedOwner::Destination,
+        StagedDurability::RenameOnly,
+    )
+}
+
+/// [`atomic_write`], resolving a symlink at the final path component
+/// first.
+///
+/// The truncating write this pair of functions replaces opened the
+/// destination with `O_TRUNC`, which follows that link and delivers the
+/// bytes to its target. A bare rename replaces the link instead: the
+/// operator's link is gone, and whatever it pointed at is left holding
+/// the previous contents while the write reports success. Resolving
+/// first keeps the file the operator arranged to be written the file
+/// that is written.
+///
+/// This is the spelling for a destination an operator arranges: the
+/// configuration bootroot renders into its own tree and an operator may
+/// have pointed elsewhere (`.env`, `ca.json` and its template,
+/// `openbao.hcl`, the compose overrides, the responder and `OpenBao`
+/// Agent configs, `state.json`), and the output paths they name on the
+/// command line (`init`'s two, `rotate openbao-recovery --output`,
+/// `bootroot-remote bootstrap`'s `agent.toml` destination — that
+/// command is what creates the file on a target host, so a link there
+/// is one the operator put in place and the truncating write followed).
+///
+/// Two classes deliberately keep [`atomic_write`]'s bare rename:
+///
+/// - **Credentials at a path bootroot chose**, inside the secrets tree.
+///   A link there is a redirection vector rather than an operator
+///   convenience, and the reader reads the path bootroot handed it —
+///   which the rename leaves holding the current secret — so following
+///   one buys nothing and costs the guarantee. The override credential
+///   paths, whose directory an unprivileged user owns, go further and
+///   refuse a link outright ([`atomic_rewrite_owned_no_symlink`]).
+/// - **Files another writer already publishes by rename**, namely the
+///   control node's `agent.toml` (since #613) and the issued cert and
+///   key (since #593). A link at those paths does not survive the
+///   writer that creates the file, so resolving it in the writers that
+///   *edit* the file would make the two disagree rather than preserve
+///   anything.
+///
+/// Not a security check: see [`resolve_symlink_destination`].
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_write`], or
+/// if the destination's symlink chain cannot be resolved (a cycle, or
+/// an unreadable link).
+pub async fn atomic_write_through_symlink(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    let dest = path.to_path_buf();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || {
+        atomic_write_through_symlink_blocking(&dest, &payload, mode)
+    })
+    .await
+    .context("Atomic write task panicked")?
+}
+
+/// The blocking half of [`atomic_write_through_symlink`], for callers
+/// that are not async.
+///
+/// # Errors
+/// Returns an error under the same conditions as
+/// [`atomic_write_through_symlink`].
+pub fn atomic_write_through_symlink_blocking(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<()> {
+    atomic_write_blocking(&resolve_symlink_destination(path)?, contents, mode)
+}
+
+/// [`atomic_replace`], resolving a symlink at the final path component
+/// first.
+///
+/// The same compatibility decision [`atomic_write_through_symlink`]
+/// documents — see there for which destinations take it and which keep
+/// the bare rename — without the directory flush.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_replace`], or
+/// if the destination's symlink chain cannot be resolved.
+pub async fn atomic_replace_through_symlink(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    let dest = path.to_path_buf();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || {
+        atomic_replace_through_symlink_blocking(&dest, &payload, mode)
+    })
+    .await
+    .context("Atomic replace task panicked")?
+}
+
+/// The blocking half of [`atomic_replace_through_symlink`], for callers
+/// that are not async.
+///
+/// # Errors
+/// Returns an error under the same conditions as
+/// [`atomic_replace_through_symlink`].
+pub fn atomic_replace_through_symlink_blocking(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<()> {
+    atomic_replace_blocking(&resolve_symlink_destination(path)?, contents, mode)
+}
+
+/// The mode a staged publish should apply at `path`: the mode the file
+/// already carries, or `default_mode` when there is no file to read one
+/// from.
+///
+/// A truncating write left an existing destination's mode alone and let
+/// the umask decide a fresh create's. A rename installs a *fresh* inode
+/// that inherits neither, so every publish replacing such a write has to
+/// state a mode — and stating a constant would silently re-widen a file
+/// an operator narrowed by hand, or that a restrictive umask created
+/// narrow. Reading the destination's own mode back keeps the rewrite
+/// case byte-for-byte as it was; `default_mode` covers only the create,
+/// which is the one case a host with a non-default umask can observe.
+///
+/// Not for a file with a mode policy of its own — a key, a certificate,
+/// the two `init` outputs — where the policy's constant is the answer
+/// and a stale mode on disk must not outlive it.
+#[must_use]
+pub fn preserved_mode(path: &Path, default_mode: u32) -> u32 {
+    std::fs::metadata(path).map_or(default_mode, |meta| meta.permissions().mode() & 0o7777)
+}
+
+/// Who owns the inode a staged publish renames into place.
+///
+/// A rename installs a *fresh* inode, so ownership is never inherited
+/// from the file being replaced the way a truncating write left it
+/// untouched. A staged publish therefore has to say where the uid/gid
+/// comes from, and the two answers below differ because their files
+/// do.
+///
+/// These two are [`publish_staged_blocking`]'s answers, not the
+/// crate's. The override credential writers stage independently and
+/// take a third — ownership from the parent directory, or read back
+/// through `symlink_metadata` — for the reason recorded there.
+#[derive(Clone, Copy)]
+pub enum StagedOwner {
+    /// Carry the destination's uid and gid onto the new inode, and
+    /// leave a fresh create to the writing process.
+    ///
+    /// For files with no ownership policy of their own — a `0600`
+    /// `agent.toml`, `rotation-state.json`, the fast-poll state,
+    /// `state.json` — where the operator's or an earlier writer's
+    /// ownership is the only record of who may read them. Re-owning one
+    /// to the writer (a `service add` run by root replacing a file the
+    /// long-running agent reads) is an outage.
+    Destination,
+    /// Leave the uid to the writing process and set the group to the
+    /// `--cert-group` policy's gid, where it names one.
+    ///
+    /// For the issued certificate, key and CA bundle, whose group is
+    /// dictated by that policy and re-asserted on every write: reading
+    /// the gid off the destination instead would let a stale group
+    /// outlive the policy that replaced it. All three land world- or
+    /// group-readable by the policy, so no consumer loses access to a
+    /// file it could read before.
+    PolicyGroup(Option<u32>),
+}
+
+/// Whether the directory entry a staged publish creates is flushed
+/// before the write is reported as done.
+///
+/// The flush is a disk round trip on every write, so it is a decision
+/// per file rather than a default — see [`sync_parent_dir`].
+#[derive(Clone, Copy)]
+pub enum StagedDurability {
+    /// `sync_parent_dir` after the rename: the file is read back to
+    /// resume, so the published name has to survive a power loss and
+    /// not merely a clean replacement.
+    FlushDirectory,
+    /// Rename and stop: a crash that loses the new directory entry
+    /// leaves the previous file in place and costs a rewrite — a
+    /// reissued certificate, the next sync's `eab.json` — rather than
+    /// an outage.
+    RenameOnly,
+}
+
+/// Publishes `contents` at `path` by staging a temporary in the same
+/// directory, applying `mode` and `owner` to it there, and `rename`ing
+/// it over the destination.
+///
+/// This is the crate's general-purpose staging publisher, and every
+/// writer of a file at a path bootroot itself owns goes through it —
+/// `state.json`, `rotation-state.json`, `agent.toml`, the fast-poll
+/// state, the two `init` outputs, the issued certificate, key and CA
+/// bundle, and the configuration `init` and the rotation commands
+/// generate (`.env`, `ca.json` and its template, `openbao.hcl`, the
+/// responder config, the `OpenBao` Agent configs and credentials, the
+/// compose overrides). For those the destination name is only ever
+/// observed as the previous file or the complete new one, and the final
+/// mode holds from the moment the name appears.
+///
+/// It is not the crate's only staged publish. The override credential
+/// writers — [`create_owned_credential_noclobber`],
+/// [`write_owned_file_replace`] and
+/// [`atomic_rewrite_owned_no_symlink`], which write a service's
+/// `role_id`, `secret_id` and `eab.json` when those are relocated into
+/// an operator-provisioned, agent-owned directory — stage and rename a
+/// temporary of their own. They reach the same two guarantees by the
+/// same means, and differ in what this routine deliberately does not
+/// offer: ownership taken from the parent directory (a root process
+/// creating a file there would otherwise leave it unreadable to the
+/// non-root agent) or read back through `symlink_metadata`, and a
+/// publish that refuses a name already present rather than replacing
+/// it. Neither policy generalises to the files above, and folding them
+/// together would make one of the two callers wrong.
+///
+/// Two production writers stage nothing at all and have neither
+/// property: `save_unseal_keys`, for `secrets/openbao/unseal-keys.txt`,
+/// and [`crate::eab`]'s `write_key_file`, for the secrets-tree
+/// `eab.json` beside each service's `secret_id`. Both still write over
+/// the destination in place and set `0600` once the bytes are down.
+/// Converting them is a separate change; do not read the guarantees
+/// above as covering the crate's writes exhaustively until it lands.
+///
+/// Callers reach it through one of the four wrappers rather than
+/// directly: [`atomic_write`]/[`atomic_write_blocking`] for a file read
+/// back to resume, [`atomic_replace`]/[`atomic_replace_blocking`] for
+/// one that can be regenerated. `crate::cert_group` is the exception,
+/// calling in with [`StagedOwner::PolicyGroup`] for the three files the
+/// `--cert-group` policy owns.
+///
+/// The staged file is created by `tempfile` at `0600` and reaches
+/// `mode` only while it is still at its temporary name, so a wider
+/// `mode` is never observable at the destination — the property issue
+/// #593 asked of the key file, and which now holds for every caller.
+/// The chown runs before the chmod for the same reason: nothing may
+/// sit group-readable under the writer's primary gid, even at the
+/// temporary name, before the policy's gid lands. The staged file is
+/// `fsync`ed last of all, once both have been applied, so a publish
+/// that survives a crash carries the ownership and mode it was
+/// published with rather than the temporary's defaults.
+///
+/// The temporary is removed if any step before the rename fails
+/// (`NamedTempFile` deletes on drop), so a failed publish leaves
+/// neither a torn destination nor a stray sibling.
+///
+/// # Errors
+/// Returns an error if the temp file cannot be created, written,
+/// chowned, permissioned or renamed, or if the containing directory
+/// cannot be flushed under [`StagedDurability::FlushDirectory`].
+pub fn publish_staged_blocking(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    owner: StagedOwner,
+    durability: StagedDurability,
+) -> Result<()> {
+    let parent = parent_dir(path);
     let mut tmp = tempfile::NamedTempFile::new_in(&parent)
         .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
     tmp.as_file_mut()
         .write_all(contents)
         .with_context(|| format!("Failed to write temp file for {}", path.display()))?;
-    tmp.as_file_mut()
-        .sync_all()
-        .with_context(|| format!("Failed to fsync temp file for {}", path.display()))?;
+    match owner {
+        StagedOwner::Destination => {
+            // A destination that is missing, or cannot be stat'd,
+            // leaves the staged file with the writing process's own
+            // ownership rather than being chowned to a guess.
+            if let Some((dest_uid, dest_gid)) =
+                std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+            {
+                let tmp_meta = std::fs::metadata(tmp.path())
+                    .with_context(|| format!("Failed to stat temp file for {}", path.display()))?;
+                // Skipping a chown that would change nothing keeps an
+                // unprivileged writer whose ownership already matches
+                // from failing on a call it did not need to make.
+                if tmp_meta.uid() != dest_uid || tmp_meta.gid() != dest_gid {
+                    std::os::unix::fs::chown(tmp.path(), Some(dest_uid), Some(dest_gid))
+                        .with_context(|| {
+                            format!(
+                                "Failed to preserve existing uid={dest_uid} gid={dest_gid} on {}",
+                                path.display()
+                            )
+                        })?;
+                }
+            }
+        }
+        StagedOwner::PolicyGroup(Some(gid)) => {
+            std::os::unix::fs::chown(tmp.path(), None, Some(gid)).with_context(|| {
+                format!("Failed to chown {} to gid {gid}", tmp.path().display())
+            })?;
+        }
+        StagedOwner::PolicyGroup(None) => {}
+    }
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
         || {
             format!(
@@ -419,20 +846,17 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<
             )
         },
     )?;
-    if let Some((dest_uid, dest_gid)) = existing_owner {
-        let tmp_meta = std::fs::metadata(tmp.path())
-            .with_context(|| format!("Failed to stat temp file for {}", path.display()))?;
-        if tmp_meta.uid() != dest_uid || tmp_meta.gid() != dest_gid {
-            std::os::unix::fs::chown(tmp.path(), Some(dest_uid), Some(dest_gid)).with_context(
-                || {
-                    format!(
-                        "Failed to preserve existing uid={dest_uid} gid={dest_gid} on {}",
-                        path.display()
-                    )
-                },
-            )?;
-        }
-    }
+    // Last of the three, after the bytes *and* the uid/gid/mode: `fsync`
+    // persists the whole inode, so a flush taken before the chown and
+    // the chmod leaves those two changes in memory only. A crash could
+    // then recover a durably named, fully written file wearing the
+    // temporary's own `0600` and the writer's primary group instead of
+    // the mode and the policy gid it was published with — the directory
+    // flush below makes the *name* durable and says nothing about the
+    // inode it points at.
+    tmp.as_file_mut()
+        .sync_all()
+        .with_context(|| format!("Failed to fsync temp file for {}", path.display()))?;
     tmp.persist(path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to rename temp file to {}: {}",
@@ -440,7 +864,10 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<
             e.error
         )
     })?;
-    sync_parent_dir(path)?;
+    match durability {
+        StagedDurability::FlushDirectory => sync_parent_dir(path)?,
+        StagedDurability::RenameOnly => {}
+    }
     Ok(())
 }
 
@@ -525,7 +952,7 @@ pub async fn write_cert_and_key(
 
 /// Writes a CA bundle to disk, creating parent directories as needed.
 ///
-/// Always sets the mode to [`CA_BUNDLE_FILE_MODE`] (`0o644`),
+/// Always sets the mode to [`cert_group::CA_BUNDLE_FILE_MODE`] (`0o644`),
 /// regardless of `policy`. CA bundles are public trust material, and
 /// re-asserting the mode on every write means a rotation overrides
 /// any stricter mode left behind by an earlier writer (notably
@@ -533,6 +960,13 @@ pub async fn write_cert_and_key(
 /// `write_secret_file` at `0o600`). When `policy` is active, also
 /// `chown`s the file to the policy's gid so cert-group members can
 /// read the bundle alongside the cert and key.
+///
+/// The bundle itself is published by
+/// [`cert_group::write_bundle_file`], which stages it beside the
+/// destination and renames it into place with the mode and owner
+/// already applied. The agent re-reads this file to rebuild its trust
+/// store while a rotation may be rewriting it, so the destination name
+/// must never hold a truncated chain.
 ///
 /// # Errors
 /// Returns an error if the directory cannot be created, the bundle
@@ -548,31 +982,7 @@ pub async fn write_ca_bundle(
     fs::create_dir_all(bundle_dir)
         .await
         .with_context(|| format!("Failed to create CA bundle dir {}", bundle_dir.display()))?;
-    fs::write(bundle_path, bundle_pem)
-        .await
-        .context("Failed to write CA bundle file")?;
-    fs::set_permissions(
-        bundle_path,
-        std::fs::Permissions::from_mode(CA_BUNDLE_FILE_MODE),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "Failed to set mode {CA_BUNDLE_FILE_MODE:o} on CA bundle {}",
-            bundle_path.display()
-        )
-    })?;
-    if let Some(gid) = policy.gid {
-        let owned = bundle_path.to_path_buf();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            std::os::unix::fs::chown(&owned, None, Some(gid)).with_context(|| {
-                format!("Failed to chown CA bundle {} to gid {gid}", owned.display())
-            })
-        })
-        .await
-        .context("CA bundle chown task panicked")??;
-    }
-    Ok(())
+    cert_group::write_bundle_file(bundle_path, bundle_pem, policy).await
 }
 
 #[cfg(test)]
@@ -582,6 +992,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::cert_group::CA_BUNDLE_FILE_MODE;
 
     #[tokio::test]
     async fn test_ensure_secrets_dir_permissions() {
@@ -785,6 +1196,158 @@ mod tests {
         assert_eq!(contents, "FRESH");
     }
 
+    /// The bundle arrives by rename from a staged temporary, so an
+    /// agent rebuilding its trust store mid-rotation reads either the
+    /// previous chain or the complete new one. A changed inode is what
+    /// distinguishes that from the `fs::write` this replaced, and an
+    /// otherwise empty directory is what proves the temporary did not
+    /// survive the publish.
+    #[tokio::test]
+    async fn write_ca_bundle_publishes_a_new_inode_and_leaves_no_temporary() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        write_ca_bundle(&bundle_path, "FIRST", CertGroupPolicy::none())
+            .await
+            .unwrap();
+        let first_inode = std::fs::metadata(&bundle_path).unwrap().ino();
+
+        write_ca_bundle(&bundle_path, "SECOND", CertGroupPolicy::none())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&bundle_path).await.unwrap(),
+            "SECOND",
+            "the rename must publish the new chain"
+        );
+        assert_ne!(std::fs::metadata(&bundle_path).unwrap().ino(), first_inode);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("ca-bundle.pem")]);
+    }
+
+    /// `write_ca_bundle` creates the parent directory before staging,
+    /// so the very first bundle of a deployment lands even though the
+    /// staged temporary needs a directory to be created in.
+    #[tokio::test]
+    async fn write_ca_bundle_creates_a_missing_parent_directory() {
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("nested").join("ca-bundle.pem");
+
+        write_ca_bundle(&bundle_path, "BUNDLE", CertGroupPolicy::none())
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&bundle_path).await.unwrap(), "BUNDLE");
+    }
+
+    /// The common case: nothing to resolve, so the caller stages and
+    /// renames at exactly the path it was given.
+    #[test]
+    fn resolve_symlink_destination_passes_a_regular_file_through() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        assert_eq!(resolve_symlink_destination(&path).unwrap(), path);
+        assert_eq!(
+            resolve_symlink_destination(&dir.path().join("absent.txt")).unwrap(),
+            dir.path().join("absent.txt"),
+            "a destination that does not exist yet resolves to itself"
+        );
+    }
+
+    /// A link resolves to the file behind it, so the rename that follows
+    /// replaces the target and leaves the link pointing at it.
+    #[test]
+    fn resolve_symlink_destination_follows_a_link_to_its_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "x").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            resolve_symlink_destination(&link).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
+    }
+
+    /// A dangling link still names where the operator wants the file.
+    /// `canonicalize` cannot say so — there is nothing to resolve
+    /// against — so the link text is read instead, absolute and
+    /// relative alike, and the caller publishes at the target the way
+    /// the truncating write's `O_CREAT` created it.
+    #[test]
+    fn resolve_symlink_destination_follows_a_dangling_link_to_its_target() {
+        let dir = tempdir().unwrap();
+        let absolute = dir.path().join("absolute.txt");
+        std::os::unix::fs::symlink(dir.path().join("absent.txt"), &absolute).unwrap();
+        assert_eq!(
+            resolve_symlink_destination(&absolute).unwrap(),
+            dir.path().join("absent.txt")
+        );
+
+        let relative = dir.path().join("relative.txt");
+        std::os::unix::fs::symlink("sub/absent.txt", &relative).unwrap();
+        assert_eq!(
+            resolve_symlink_destination(&relative).unwrap(),
+            dir.path().join("sub").join("absent.txt"),
+            "a relative link is resolved against its own directory"
+        );
+    }
+
+    /// A chain of dangling links is followed to its end, so the write
+    /// replaces neither link on the way.
+    #[test]
+    fn resolve_symlink_destination_follows_a_dangling_link_chain() {
+        let dir = tempdir().unwrap();
+        let end = dir.path().join("absent.txt");
+        let middle = dir.path().join("middle.txt");
+        let head = dir.path().join("head.txt");
+        std::os::unix::fs::symlink(&end, &middle).unwrap();
+        std::os::unix::fs::symlink(&middle, &head).unwrap();
+
+        assert_eq!(resolve_symlink_destination(&head).unwrap(), end);
+    }
+
+    /// A cycle has no end to follow to, and every name in it is a link
+    /// a rename would destroy. The truncating write answered `ELOOP`
+    /// here; resolution fails rather than handing back a path the
+    /// caller would publish over.
+    #[test]
+    fn resolve_symlink_destination_rejects_a_symlink_cycle() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let err = resolve_symlink_destination(&a).unwrap_err().to_string();
+        assert!(
+            err.contains("Too many levels of symbolic links"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&a)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "resolution must not touch the links it refuses to follow"
+        );
+
+        let self_link = dir.path().join("self.txt");
+        std::os::unix::fs::symlink(&self_link, &self_link).unwrap();
+        assert!(
+            resolve_symlink_destination(&self_link).is_err(),
+            "a link pointing at itself is a cycle too"
+        );
+    }
+
     /// `atomic_write` must leave the destination at the supplied mode
     /// and the requested contents, both for the create case and for
     /// the overwrite case (rotation).
@@ -808,6 +1371,179 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(contents, "second");
         assert_eq!(mode, KEY_FILE_MODE);
+    }
+
+    /// `atomic_replace` publishes the same way `atomic_write` does —
+    /// fresh inode, requested mode, no torn destination — and differs
+    /// only in declining the directory flush, which leaves no
+    /// observable trace to assert on. Pinning the rest here keeps the
+    /// no-flush spelling from drifting into a plain `fs::write` on the
+    /// assumption that "not durable" means "not staged".
+    #[tokio::test]
+    async fn atomic_replace_creates_and_overwrites_with_mode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("compose.override.yml");
+
+        super::atomic_replace(&path, b"first", 0o644).await.unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "first");
+        let first_ino = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        super::atomic_replace(&path, b"second", 0o644)
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "second");
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            first_ino,
+            "a staged publish installs a new inode; an in-place write would not"
+        );
+
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|name| name != "compose.override.yml")
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "staged temporary left behind: {strays:?}"
+        );
+    }
+
+    /// The two spellings differ in exactly one observable way, and this
+    /// pins both halves of it: given a symlinked destination, the
+    /// `_through_symlink` wrappers deliver to the target and leave the
+    /// link standing — what `O_TRUNC` did — while the bare wrappers
+    /// replace the link with the published file, which is what the
+    /// `agent.toml` and cert/key writers want.
+    #[tokio::test]
+    async fn through_symlink_wrappers_deliver_to_the_target_the_bare_ones_replace() {
+        let dir = tempdir().unwrap();
+
+        for (name, published) in [("write.env", false), ("replace.env", true)] {
+            let target = dir.path().join(format!("target-{name}"));
+            let link = dir.path().join(name);
+            std::fs::write(&target, b"seed").unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+
+            if published {
+                super::atomic_replace_through_symlink(&link, b"fresh", 0o644)
+                    .await
+                    .unwrap();
+            } else {
+                super::atomic_write_through_symlink(&link, b"fresh", 0o644)
+                    .await
+                    .unwrap();
+            }
+
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name}: the operator's link must survive the publish"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "fresh");
+            assert_eq!(
+                std::fs::metadata(&link).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "{name}: the mode lands on the target"
+            );
+        }
+
+        let target = dir.path().join("target-bare");
+        let link = dir.path().join("bare");
+        std::fs::write(&target, b"seed").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        super::atomic_write(&link, b"fresh", 0o644).await.unwrap();
+
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the bare spelling publishes at the name, replacing the link"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "fresh");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "seed",
+            "and leaves the target alone"
+        );
+    }
+
+    /// A dangling link is followed to where it points, so a first write
+    /// through one creates the target rather than replacing the link —
+    /// the `O_CREAT` half of the behaviour being preserved.
+    #[test]
+    fn through_symlink_wrappers_create_a_dangling_links_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("absent.yml");
+        let link = dir.path().join("override.yml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        super::atomic_replace_through_symlink_blocking(&link, b"fresh", 0o644).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fresh");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// A cycle has no target to deliver to, so the publish fails the way
+    /// the truncating write's `ELOOP` did rather than replacing one of
+    /// the links with the file.
+    #[test]
+    fn through_symlink_wrappers_refuse_a_symlink_cycle() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.env");
+        let b = dir.path().join("b.env");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        assert!(super::atomic_write_through_symlink_blocking(&a, b"x", 0o644).is_err());
+        assert!(super::atomic_replace_through_symlink_blocking(&a, b"x", 0o644).is_err());
+        assert!(
+            std::fs::symlink_metadata(&a)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a refused publish must leave the links it would not follow"
+        );
+    }
+
+    /// `preserved_mode` answers with the destination's own mode where
+    /// there is one, and the caller's default only on a create. A
+    /// regression here is a rename silently re-widening a file an
+    /// operator narrowed — the one property the truncating writes these
+    /// publishes replaced got for free.
+    #[test]
+    fn preserved_mode_reads_the_destination_then_falls_back() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        assert_eq!(
+            super::preserved_mode(&path, 0o644),
+            0o644,
+            "a missing destination takes the caller's default"
+        );
+
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            super::preserved_mode(&path, 0o644),
+            0o600,
+            "an existing destination keeps the mode it carries"
+        );
     }
 
     /// Overwriting an existing file via `atomic_write` must preserve
@@ -961,6 +1697,61 @@ mod tests {
             "an unflushable directory must be reported, got: {err:#}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "payload");
+    }
+
+    /// The two ownership answers must stay two answers. A destination
+    /// seeded with a supplementary gid keeps it under
+    /// [`StagedOwner::Destination`] — the case
+    /// `atomic_write_preserves_existing_gid_on_overwrite` covers — and
+    /// is re-owned to the writer's own gid under
+    /// [`StagedOwner::PolicyGroup`], where the `--cert-group` policy is
+    /// the authority on the group and a stale one must not outlive it.
+    /// Requires a supplementary gid (see `one_supplementary_test_gid`).
+    #[test]
+    fn publish_staged_re_owns_under_the_policy_and_preserves_under_destination() {
+        let Some(gid) = crate::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let seed = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "first").unwrap();
+            std::os::unix::fs::chown(&path, None, Some(gid))
+                .expect("test process must be able to chgrp to a supplementary gid");
+            path
+        };
+        let preserved = seed("preserved");
+        let re_owned = seed("re-owned");
+        let own_gid = std::fs::metadata(&preserved).unwrap().gid();
+        assert_eq!(own_gid, gid, "seed gid must take effect");
+
+        publish_staged_blocking(
+            &preserved,
+            b"second",
+            KEY_FILE_MODE,
+            StagedOwner::Destination,
+            StagedDurability::RenameOnly,
+        )
+        .unwrap();
+        publish_staged_blocking(
+            &re_owned,
+            b"second",
+            KEY_FILE_MODE,
+            StagedOwner::PolicyGroup(None),
+            StagedDurability::RenameOnly,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&preserved).unwrap().gid(),
+            gid,
+            "StagedOwner::Destination must carry the destination's gid across the rename"
+        );
+        assert_ne!(
+            std::fs::metadata(&re_owned).unwrap().gid(),
+            gid,
+            "StagedOwner::PolicyGroup must not inherit the destination's gid"
+        );
     }
 
     /// Same pin for the `O_EXCL` credential writer. Its flush lives in

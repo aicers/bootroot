@@ -56,12 +56,22 @@ pub(super) async fn write_stepca_templates(
 
     let password_template_path = templates_dir.join(STEPCA_PASSWORD_TEMPLATE_NAME);
     let password_template = build_password_template(kv_mount);
-    tokio::fs::write(&password_template_path, password_template)
-        .await
-        .with_context(|| {
-            messages.error_write_file_failed(&password_template_path.display().to_string())
-        })?;
-    fs_util::set_key_permissions(&password_template_path).await?;
+    // Both templates below publish by rename at `0600` and decline the
+    // directory flush. The `OpenBao` Agent sidecar re-reads them on a
+    // fixed interval and re-renders `password.txt` and `ca.json` from
+    // them, so a torn template is a render failure in a running
+    // container — but the templates are themselves regenerated in full
+    // by this function on the next `init`, so losing a directory entry
+    // to a crash costs that re-run and nothing more.
+    fs_util::atomic_replace_through_symlink(
+        &password_template_path,
+        password_template.as_bytes(),
+        fs_util::KEY_FILE_MODE,
+    )
+    .await
+    .with_context(|| {
+        messages.error_write_file_failed(&password_template_path.display().to_string())
+    })?;
 
     let ca_json_path = secrets_dir.join("config").join("ca.json");
     let ca_json_contents = tokio::fs::read_to_string(&ca_json_path)
@@ -76,17 +86,56 @@ pub(super) async fn write_stepca_templates(
         messages,
     )?;
     let ca_json_template_path = templates_dir.join(STEPCA_CA_JSON_TEMPLATE_NAME);
-    tokio::fs::write(&ca_json_template_path, ca_json_template)
-        .await
-        .with_context(|| {
-            messages.error_write_file_failed(&ca_json_template_path.display().to_string())
-        })?;
-    fs_util::set_key_permissions(&ca_json_template_path).await?;
+    fs_util::atomic_replace_through_symlink(
+        &ca_json_template_path,
+        ca_json_template.as_bytes(),
+        fs_util::KEY_FILE_MODE,
+    )
+    .await
+    .with_context(|| {
+        messages.error_write_file_failed(&ca_json_template_path.display().to_string())
+    })?;
 
     Ok(StepCaTemplatePaths {
         password_template_path,
         ca_json_template_path,
     })
+}
+
+/// Fallback mode for a `ca.json` with no destination to read one from.
+///
+/// Every publisher of this file reads it first, so the fallback is
+/// unreachable in practice — but a staged publish has to state a mode.
+/// `0644` is what the umask gave the truncating writes these replaced,
+/// and is the mode `step ca init` leaves on the file it creates. Shared
+/// so the three places that patch `ca.json` — here, the `init`
+/// orchestrator's password rotation, and `bootroot ca update` — cannot
+/// drift on it.
+pub(crate) const CA_JSON_FILE_MODE: u32 = 0o644;
+
+/// Publishes a patched `ca.json` by rename, at the mode it already
+/// carries.
+///
+/// step-ca reads this file at boot and the `OpenBao` Agent sidecar
+/// re-renders it from `ca.json.ctmpl` on a fixed interval, so both
+/// callers below are writing a file with a live reader. Truncating in
+/// place let step-ca boot against half a JSON document and refuse to
+/// start; the rename leaves the previous document or the complete new
+/// one.
+///
+/// The directory is not flushed. `ca.json` is a rendered file — the
+/// sidecar rebuilds it from the template, and `init` rebuilds the
+/// template — so a crash that loses the entry costs the next render
+/// rather than anything unrecoverable. This mirrors the decision
+/// `crate::commands::ca`'s patcher records for the same file.
+async fn publish_ca_json(path: &Path, contents: &str, messages: &Messages) -> Result<()> {
+    fs_util::atomic_replace_through_symlink(
+        path,
+        contents.as_bytes(),
+        fs_util::preserved_mode(path, CA_JSON_FILE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
 }
 
 /// Snapshots `templates/ca.json.ctmpl` for the `init` rollback.
@@ -374,10 +423,18 @@ pub(super) async fn write_password_file_with_backup(
             });
         }
     };
-    tokio::fs::write(&password_path, password)
+    // Published by rename at the policy's `0600`, applied to the staged
+    // temporary so the CA password is never readable at its final path
+    // under a wider mode — the window the `write` +
+    // `set_key_permissions` pair this replaced left open.
+    //
+    // It takes the directory flush. This password decrypts the root and
+    // intermediate CA keys sitting beside it; a crash that loses the
+    // directory entry after step-ca has been handed it leaves keys
+    // nobody can open, which no re-run of `init` reconstructs.
+    fs_util::atomic_write(&password_path, password.as_bytes(), fs_util::KEY_FILE_MODE)
         .await
         .with_context(|| messages.error_write_file_failed(&password_path.display().to_string()))?;
-    fs_util::set_key_permissions(&password_path).await?;
     Ok(RollbackFile {
         path: password_path,
         original,
@@ -417,9 +474,7 @@ pub(super) async fn update_ca_json_with_backup(
     let dns_names_changed = set_ca_json_dns_names(&mut value, dns_names);
     let updated =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
-    tokio::fs::write(&path, updated)
-        .await
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    publish_ca_json(&path, &updated, messages).await?;
     Ok(CaJsonUpdate {
         rollback: RollbackFile {
             path,
@@ -456,9 +511,7 @@ pub(super) async fn reconcile_ca_json_dns_names(
     }
     let updated =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
-    tokio::fs::write(&path, updated)
-        .await
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    publish_ca_json(&path, &updated, messages).await?;
     Ok(true)
 }
 

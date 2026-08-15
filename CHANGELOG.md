@@ -117,6 +117,58 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Fixed the files bootroot writes being published by truncating the
+  destination and writing over it, so a crash or a concurrent reader
+  could see a half-written file at a name that is supposed to hold a
+  complete one. Each is now written to a temporary file in the same
+  directory and renamed into place, so a reader sees either the previous
+  file or the whole new one: `state.json`, the issued certificate files
+  and the CA bundle, the `--summary-json` and `--root-token-output`
+  destinations, `agent.toml`, `.env`, `ca.json` and its OpenBao Agent
+  template, `openbao.hcl`, the HTTP-01 responder config and template,
+  the OpenBao Agent configs and their `AppRole` credentials, the
+  generated compose overrides, and the remote bootstrap artifact. Two
+  files are not among them and are still written in place, to be fixed
+  separately: the OpenBao unseal-keys file and the ACME EAB credentials
+  file. The files a run reads back to resume flush the directory too,
+  so the published name survives a power loss and not merely a clean
+  replacement — `state.json`, `.env`, `agent.toml`, the two `init`
+  outputs, and every credential file the stack logs in with, which takes
+  an operator or another rotation to put back rather than the next
+  write. Files that are regenerated on their own — a certificate, a
+  rendered `ca.json`, a compose override — do not pay for that flush,
+  because a crash that loses one costs a rewrite rather than an outage.
+  A destination pointed elsewhere by a symlink keeps being written
+  through that link wherever it names configuration an operator may have
+  relocated — `.env`, `ca.json` and its template, `openbao.hcl`, the
+  responder and OpenBao Agent configs, the compose overrides,
+  `state.json`, and the two `init` outputs — so the link survives the
+  write and goes on naming the same file. The `agent.toml` that
+  `bootroot-remote bootstrap` writes on a target host is written
+  through a link there for the same reason. A link at an issued
+  certificate, key or CA bundle path is replaced by the published file
+  instead, which is what the key file and the control node's own
+  `agent.toml` have always done and what the certificate beside them
+  now matches.
+- Fixed the mode of every such file being applied after its bytes had
+  already landed, which left a moment in which a freshly created file
+  was readable more widely than intended — including the step-ca CA
+  password, the OpenBao recovery keys, the responder HMAC config and
+  each `AppRole` `secret_id`. The mode is now applied while the file is
+  still at its temporary name, so it holds from the moment the file
+  appears. The modes themselves are unchanged: `0644` for the
+  certificates and CA bundle, `0600` for the two `init` outputs and for
+  everything inside the secrets tree, and for a file that already exists
+  whatever mode it already carries — one narrowed by hand, or by a
+  restrictive umask when it was created, stays narrowed. Where such a
+  file is created fresh it now takes a stated mode rather than whatever
+  the umask decides, which is `0644` for `state.json`, `.env`,
+  `ca.json`, `openbao.hcl` and the compose overrides; a host running a
+  non-default umask is the only one that can observe the difference.
+- Fixed a `--summary-json` or `--root-token-output` destination whose
+  symlink chain loops back on itself being accepted by the preflight and
+  failing at the write, once `reinit` had already wiped OpenBao. It is
+  refused before the wipe now.
 - Fixed `bootroot init` treating a closed stdin as an answer. Every
   `init` prompt read the terminating EOF as an empty line, so a run
   whose piped answer sequence ran out answered the rest of its prompts

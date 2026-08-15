@@ -2,6 +2,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use bootroot::fs_util;
 
 use crate::commands::infra::run_docker_with_exec;
 use crate::commands::init::{
@@ -237,6 +238,37 @@ fn set_openbao_readable_permissions(cert_path: &Path, key_path: &Path) -> Result
     Ok(())
 }
 
+/// Fallback mode for an `openbao.hcl` with no destination to read one
+/// from.
+///
+/// `0644` is what the umask gave the truncating writes these replaced.
+/// The file is bind-mounted into the `OpenBao` container and read by a
+/// process that is not the writing operator, so it is not narrowed here;
+/// see [`fs_util::preserved_mode`].
+const OPENBAO_HCL_MODE: u32 = 0o644;
+
+/// Publishes `openbao.hcl` by rename.
+///
+/// `OpenBao` reads this file at start and on `SIGHUP`, from inside a
+/// container that may already be running when the enable/revert pair
+/// below rewrites it. A truncating write let that read land on a
+/// half-written HCL document, which `OpenBao` answers by refusing to
+/// come up — the failure the operator sees is a container restart loop
+/// with a parse error, not a write error from bootroot.
+///
+/// The directory is not flushed. Both callers regenerate the whole file
+/// from a constant template plus the mount paths, so a crash that loses
+/// the entry leaves the previous configuration in place and costs a
+/// re-run of the `init` step that produced it.
+fn publish_openbao_hcl(path: &Path, content: &str, messages: &Messages) -> Result<()> {
+    fs_util::atomic_replace_through_symlink_blocking(
+        path,
+        content.as_bytes(),
+        fs_util::preserved_mode(path, OPENBAO_HCL_MODE),
+    )
+    .with_context(|| messages.error_openbao_hcl_write_failed())
+}
+
 /// Rewrites `openbao.hcl` to enable TLS on the API listener.
 ///
 /// Replaces `tls_disable = 1` on the `:8200` listener with
@@ -293,8 +325,7 @@ ui = true
 "#,
     );
 
-    std::fs::write(&hcl_path, content)
-        .with_context(|| messages.error_openbao_hcl_write_failed())?;
+    publish_openbao_hcl(&hcl_path, &content, messages)?;
 
     println!("{}", messages.info_openbao_hcl_tls_written());
     Ok(())
@@ -443,8 +474,7 @@ disable_mlock = true
 ui = true
 "#;
 
-    std::fs::write(&hcl_path, content)
-        .with_context(|| messages.error_openbao_hcl_write_failed())?;
+    publish_openbao_hcl(&hcl_path, content, messages)?;
 
     println!("{}", messages.info_openbao_hcl_tls_reverted());
     Ok(())

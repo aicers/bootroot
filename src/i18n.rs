@@ -575,6 +575,14 @@ pub(crate) struct Strings {
     pub(crate) error_reinit_stepca_password_missing_with_ca_material: &'static str,
 }
 
+/// `Clone` so a message bundle can cross into a `spawn_blocking`
+/// closure without the caller giving up its own — it is one `Locale`
+/// discriminant, and every string it reaches is `&'static`, so the
+/// clone is a byte copy. Deliberately not `Copy`: the crate passes
+/// `&Messages` through several hundred signatures, and
+/// `clippy::trivially_copy_pass_by_ref` would demand every one of them
+/// change.
+#[derive(Clone)]
 pub(crate) struct Messages {
     locale: Locale,
 }

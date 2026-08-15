@@ -189,7 +189,8 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         &openbao,
         &effective_secrets_dir,
         messages,
-    )?;
+    )
+    .await?;
 
     // 11. Bring OpenBao back up via the existing infra up path.
     let infra_args = InfraUpArgs {
@@ -452,7 +453,11 @@ pub(crate) fn snapshot_deployment_intent(state_path: &Path) -> Result<Deployment
 /// follow-up `init` run rebuilds them from the freshly-bootstrapped
 /// `OpenBao`.  Non-loopback bind intent is preserved so the `infra up`
 /// path layers the correct compose overrides for the restart.
-pub(crate) fn write_minimal_state(
+///
+/// Async because the state write is: publishing `state.json` costs
+/// three disk round trips, which `StateFile::save_async` keeps off the
+/// runtime thread `run_reinit` runs on.
+pub(crate) async fn write_minimal_state(
     state_path: &Path,
     snapshot: &DeploymentIntent,
     openbao: &OpenBaoArgs,
@@ -476,7 +481,8 @@ pub(crate) fn write_minimal_state(
         ..Default::default()
     };
     state
-        .save(state_path)
+        .save_async(state_path)
+        .await
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
 }
@@ -607,7 +613,21 @@ pub(crate) fn validate_root_token_output_path(path: &Path, messages: &Messages) 
             })?;
     }
 
-    let parent = path
+    // Probe the directory the write will actually stage in.  A symlinked
+    // destination is resolved by `write_root_token_file` before it
+    // stages, so for a link into another directory it is that
+    // directory — not the one holding the link — that has to accept a
+    // new file.  Probing the wrong one would let the preflight pass and
+    // the post-wipe write fail, which is the trap this check exists to
+    // prevent.  A destination whose links form a cycle has no such
+    // directory: it is refused here, before the wipe, rather than by
+    // the write afterwards.
+    let staged_in = bootroot::fs_util::resolve_symlink_destination(path).map_err(|err| {
+        anyhow::anyhow!(
+            messages.error_reinit_root_token_output_unwritable(&display, &err.to_string())
+        )
+    })?;
+    let parent = staged_in
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -654,11 +674,13 @@ pub(crate) fn validate_root_token_output_path(path: &Path, messages: &Messages) 
 /// the freshly issued root token and unseal keys (see `InitSummary`), so
 /// it must be written with the same atomic restricted-permission write
 /// discipline as `--root-token-output`.  In particular, existing
-/// world-/group-readable destinations are rejected here: even though
-/// `write_init_summary_json` re-applies `0600` after the write, the
-/// content lands in the pre-existing file's permission bits first, and
-/// a `0644` destination would briefly expose root token + unseal keys
-/// to other users on the host between the write and the chmod.
+/// world-/group-readable destinations are rejected here.
+/// `write_init_summary_json` stages the secrets in a `0600` temporary
+/// and renames it over the path, so they never land in the pre-existing
+/// file's permission bits — but a `0644` destination is still an older
+/// summary, with older credentials in it, sitting readable to every
+/// user on the host.  The operator is told to deal with it rather than
+/// having it silently replaced.
 pub(crate) fn validate_summary_json_output_path(path: &Path, messages: &Messages) -> Result<()> {
     let display = path.display().to_string();
 
@@ -698,7 +720,14 @@ pub(crate) fn validate_summary_json_output_path(path: &Path, messages: &Messages
             })?;
     }
 
-    let parent = path
+    // As in `validate_root_token_output_path`: probe the directory the
+    // staged write will use, which for a symlinked destination is the
+    // target's, not the link's, and refuse a cycle here rather than
+    // leaving it to the post-wipe write.
+    let staged_in = bootroot::fs_util::resolve_symlink_destination(path).map_err(|err| {
+        anyhow::anyhow!(messages.error_reinit_summary_json_unwritable(&display, &err.to_string()))
+    })?;
+    let parent = staged_in
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -1178,8 +1207,8 @@ mod tests {
         // at all — the type itself is the test for the "drop" list.
     }
 
-    #[test]
-    fn write_minimal_state_rewrites_with_empty_registry_and_preserved_intent() {
+    #[tokio::test]
+    async fn write_minimal_state_rewrites_with_empty_registry_and_preserved_intent() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("state.json");
         state_with_intent().save(&state_path).unwrap();
@@ -1192,7 +1221,9 @@ mod tests {
         let effective = PathBuf::from("secrets");
         let messages = test_messages();
 
-        write_minimal_state(&state_path, &snapshot, &openbao, &effective, &messages).unwrap();
+        write_minimal_state(&state_path, &snapshot, &openbao, &effective, &messages)
+            .await
+            .unwrap();
 
         let rewritten = StateFile::load(&state_path).unwrap();
         assert!(
@@ -1891,6 +1922,119 @@ mod tests {
         );
     }
 
+    /// The probe follows the destination the staged write will use.  A
+    /// link into a read-only directory has a perfectly writable
+    /// directory of its own, so probing that one would pass preflight
+    /// and leave the write to fail after `OpenBao` has been wiped —
+    /// the trap this check exists to prevent.
+    #[test]
+    fn validate_root_token_output_probes_the_link_targets_directory() {
+        let dir = tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        fs::create_dir_all(&ro).unwrap();
+        let target = ro.join("token");
+        let link = dir.path().join("root-token.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        let original = perms.mode();
+        perms.set_mode(0o500);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let messages = test_messages();
+        let result = validate_root_token_output_path(&link, &messages);
+
+        // Restore so tempdir cleanup succeeds.
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        perms.set_mode(original);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let err = result.expect_err("the target's directory cannot accept the staged file");
+        assert!(err.to_string().contains("root-token-output"), "got: {err}");
+    }
+
+    /// The same for `--summary-json`, which resolves its destination the
+    /// same way before staging.
+    #[test]
+    fn validate_summary_json_probes_the_link_targets_directory() {
+        let dir = tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        fs::create_dir_all(&ro).unwrap();
+        let target = ro.join("summary.json");
+        let link = dir.path().join("summary.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        let original = perms.mode();
+        perms.set_mode(0o500);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let messages = test_messages();
+        let result = validate_summary_json_output_path(&link, &messages);
+
+        // Restore so tempdir cleanup succeeds.
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        perms.set_mode(original);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let err = result.expect_err("the target's directory cannot accept the staged file");
+        assert!(err.to_string().contains("summary-json"), "got: {err}");
+    }
+
+    /// A destination whose links form a cycle resolves to nothing the
+    /// write can publish without destroying a link.  The preflight is
+    /// where that has to be said: `path.exists()` is false for a cycle
+    /// (the kernel answers `ELOOP`), so the checks above skip it, and
+    /// without this the run would reach the post-wipe write before
+    /// anything noticed.
+    #[test]
+    fn validate_root_token_output_rejects_a_symlink_cycle() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("root-token.txt");
+        let b = dir.path().join("other.txt");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let messages = test_messages();
+        let err = validate_root_token_output_path(&a, &messages)
+            .expect_err("a cyclic destination must be refused before the wipe");
+        assert!(err.to_string().contains("root-token-output"), "got: {err}");
+    }
+
+    /// The same for `--summary-json`, which resolves its destination the
+    /// same way.
+    #[test]
+    fn validate_summary_json_rejects_a_symlink_cycle() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("summary.json");
+        let b = dir.path().join("other.json");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let messages = test_messages();
+        let err = validate_summary_json_output_path(&a, &messages)
+            .expect_err("a cyclic destination must be refused before the wipe");
+        assert!(err.to_string().contains("summary-json"), "got: {err}");
+    }
+
+    /// A link into a directory that does not exist yet is created here,
+    /// so the post-wipe write does not meet a missing directory.  The
+    /// link's own directory already exists, so only a probe that
+    /// follows the link can create the right one.
+    #[test]
+    fn validate_root_token_output_creates_the_link_targets_missing_directory() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("not-yet").join("token");
+        let link = dir.path().join("root-token.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        validate_root_token_output_path(&link, &test_messages())
+            .expect("a link into a creatable directory passes preflight");
+
+        assert!(
+            dir.path().join("not-yet").is_dir(),
+            "the directory the staged write will use must exist after preflight"
+        );
+    }
+
     /// Regression for Round 6 reviewer item: when `--summary-json`
     /// points at an unwritable destination (existing file with mode
     /// `0400`), the preflight must catch it before the destructive
@@ -1922,9 +2066,10 @@ mod tests {
     /// Regression for Round 7 reviewer item: the summary JSON carries
     /// the freshly issued root token and unseal keys, so an existing
     /// world-/group-readable destination must be rejected at preflight.
-    /// Letting `write_init_summary_json` proceed against a `0644` file
-    /// would briefly leave the secret payload world-readable on disk
-    /// between the write and the post-write chmod.
+    /// The staged write that replaces such a file does not make it
+    /// acceptable: a `0644` summary already holds credentials from an
+    /// earlier run, readable to every user on the host until it is
+    /// replaced.
     #[test]
     fn validate_summary_json_rejects_world_readable_existing_file() {
         let dir = tempdir().unwrap();
@@ -2955,8 +3100,8 @@ mod tests {
     /// The rewritten `state.json` must record the snapshotted (or
     /// CLI-default fallback) `secrets_dir` so a subsequent reinit on the
     /// same tree does not silently regress to the CLI default.
-    #[test]
-    fn write_minimal_state_preserves_snapshotted_secrets_dir() {
+    #[tokio::test]
+    async fn write_minimal_state_preserves_snapshotted_secrets_dir() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("state.json");
         state_with_intent().save(&state_path).unwrap();
@@ -2976,6 +3121,7 @@ mod tests {
             Path::new("secrets-custom"),
             &messages,
         )
+        .await
         .unwrap();
         let rewritten = StateFile::load(&state_path).unwrap();
         assert_eq!(

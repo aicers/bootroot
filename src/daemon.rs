@@ -381,18 +381,28 @@ async fn issue_with_retry(
 /// target profile. Falls back to the supplied in-memory pair when the
 /// reload fails or the profile is absent from the reloaded file.
 ///
-/// The fallback path exists because some `agent.toml` writers (the
-/// remote bootstrap/fast-poll appliers, operator edits) still rewrite
-/// the file non-atomically (truncate-then-write), so a concurrent
-/// reader can observe a partial file or one that does not yet contain
-/// the named profile. `apply_local_service_configs` writes through
-/// [`crate::fs_util::atomic_write`] and does not contribute to the
-/// race, but until every writer is hardened the consumer-side
-/// fallback is the load-bearing guarantee. Treating those races as
-/// transient and reusing the prior in-memory profile keeps the retry
-/// budget available for genuine ACME failures, while still honouring
-/// `#303`'s intent of picking up freshly-rendered KV values whenever
-/// the reload does land on a coherent file.
+/// The fallback no longer stands in for an unhardened `agent.toml`
+/// writer. Every writer this crate controls now publishes the file by
+/// rename from a temporary — `service::local_config` and the
+/// `service update` and `service remove --strip-config` editors beside
+/// it, `bootroot-remote bootstrap`'s apply, `apply_local_service_configs`
+/// through [`crate::fs_util::atomic_write`], and the three `fast_poll`
+/// appliers — so none of them can leave a partial file for this reload
+/// to read.
+///
+/// Two cases remain, and neither is a bootroot writer losing a race.
+/// An operator editing the file in place with a truncating editor is
+/// still observable half-written, and bootroot has no say in that. And
+/// the profile can be genuinely absent rather than momentarily
+/// unobservable, since `service remove --strip-config` deletes the
+/// managed block outright; there the fallback keeps the in-flight
+/// attempt running on the profile it started with rather than failing
+/// on a configuration change made mid-attempt.
+///
+/// Treating both as transient and reusing the prior in-memory profile
+/// keeps the retry budget available for genuine ACME failures, while
+/// still honouring `#303`'s intent of picking up freshly-rendered KV
+/// values whenever the reload does land on a coherent file.
 fn reload_profile_or_fallback(
     config_path: &Path,
     overrides: &config::CliOverrides,

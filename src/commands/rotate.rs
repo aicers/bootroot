@@ -289,6 +289,7 @@ mod test_support {
     use std::path::Path;
 
     pub(super) use crate::i18n::test_messages;
+    use crate::test_support::write_executable;
 
     /// Writes a fake `docker` at `path` that appends one record per
     /// invocation to `args_log` and reads nothing from its environment.
@@ -319,7 +320,6 @@ mod test_support {
         exit_code: u8,
     ) {
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::PermissionsExt;
 
         // The script is assembled as bytes, not as a `String`: a Unix
         // path is an arbitrary NUL-free byte sequence, and rendering
@@ -329,9 +329,7 @@ mod test_support {
         let mut script = b"#!/bin/sh\nset -eu\nprintf '%s\\0' \"$#\" \"$@\" >> ".to_vec();
         script.extend_from_slice(&shell_single_quote(args_log.as_os_str().as_bytes()));
         script.extend_from_slice(format!("\nexit {exit_code}\n").as_bytes());
-        fs::write(path, script).expect("fake docker script should be written");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .expect("fake docker script should be executable");
+        write_executable(path, &script);
     }
 
     /// Quotes `value` as a single POSIX shell word, byte for byte.

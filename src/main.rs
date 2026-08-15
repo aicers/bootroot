@@ -6,6 +6,8 @@ mod cli;
 mod commands;
 mod i18n;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use clap::Parser;
 

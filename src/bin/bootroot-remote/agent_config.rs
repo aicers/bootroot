@@ -195,7 +195,39 @@ pub(super) async fn apply_agent_config_updates(
                 ApplyItemSummary::failed(message),
             );
         }
-        if let Err(err) = fs::write(&args.agent_config_path, &with_profile).await {
+        // Published by rename at `0600`, matching the control plane's
+        // own `agent.toml` writer (`service::local_config`). This is the
+        // file `bootroot-agent` re-reads on every ACME retry, and the
+        // truncating write here reopened the #613 window that writer was
+        // moved off — a reload landing in the gap sees no profile and
+        // burns a retry. The mode reaching the staged temporary also
+        // folds the separate chmod, and its own failure arm, into the
+        // publish.
+        //
+        // It takes the directory flush. Nothing on this host regenerates
+        // `agent.toml`; losing the entry leaves the agent renewing
+        // against a stale responder HMAC or trust anchor with no signal
+        // that a re-sync is needed.
+        //
+        // A symlink at the destination is resolved first and the target
+        // is published, unlike the control plane's writers of the same
+        // file name. The rule there is that `service::local_config`
+        // creates `agent.toml` by rename, so a link at the path never
+        // survives the command that creates it and the later editors
+        // have nothing to preserve. On a bootstrap target this writer is
+        // the one that creates the file, and the write it replaces
+        // opened with `O_TRUNC`, which follows a final link — so an
+        // operator who pointed the destination at a config they keep
+        // elsewhere has a working installation today, and a bare rename
+        // would destroy the link, leave its target holding the previous
+        // profile, and report the item applied.
+        if let Err(err) = fs_util::atomic_write_through_symlink(
+            &args.agent_config_path,
+            with_profile.as_bytes(),
+            fs_util::KEY_FILE_MODE,
+        )
+        .await
+        {
             let message = localized(
                 lang,
                 &format!(
@@ -204,26 +236,6 @@ pub(super) async fn apply_agent_config_updates(
                 ),
                 &format!(
                     "agent.toml 쓰기 실패 ({}): {err}",
-                    args.agent_config_path.display()
-                ),
-            );
-            if responder_changed {
-                responder_hmac_status = ApplyItemSummary::failed(message.clone());
-            }
-            if trust_changed {
-                trust_sync_status = ApplyItemSummary::failed(message);
-            }
-            return (responder_hmac_status, trust_sync_status);
-        }
-        if let Err(err) = fs_util::set_key_permissions(&args.agent_config_path).await {
-            let message = localized(
-                lang,
-                &format!(
-                    "agent config chmod failed ({}): {err}",
-                    args.agent_config_path.display()
-                ),
-                &format!(
-                    "agent.toml 권한 설정 실패 ({}): {err}",
                     args.agent_config_path.display()
                 ),
             );
@@ -1342,6 +1354,57 @@ mod tests {
         assert!(
             !overridden.contains(&args.agent_server),
             "backfill must not introduce the localhost default server: {overridden}"
+        );
+    }
+
+    /// On a bootstrap target this is the writer that *creates*
+    /// `agent.toml`, and the truncating write it replaced opened with
+    /// `O_TRUNC`, which follows a final symlink. So a destination an
+    /// operator pointed at a config kept elsewhere is written through,
+    /// which is the opposite answer from the control plane's editors of
+    /// the same file name — and for the opposite reason: there
+    /// `service add` creates the file by rename, so a link at the path
+    /// never survived in the first place.
+    #[tokio::test]
+    async fn remote_bootstrap_writes_agent_toml_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("shared-agent.toml");
+        let link = dir.path().join("agent.toml");
+        std::fs::write(&target, "domain = \"existing.domain\"\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut args = test_bootstrap_args();
+        args.agent_config_path = link.clone();
+        let pulled = PulledSecrets {
+            secret_id: "secret".to_string(),
+            eab_kid: None,
+            eab_hmac: None,
+            responder_hmac: "responder-hmac".to_string(),
+            trusted_ca_sha256: vec!["aa:bb".to_string()],
+            ca_bundle_pem: String::new(),
+        };
+
+        let (responder, trust) = apply_agent_config_updates(&args, &pulled, Locale::En).await;
+        assert!(
+            responder.error.is_none() && trust.error.is_none(),
+            "the write must succeed: {responder:?} {trust:?}"
+        );
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the publish"
+        );
+        let published = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            published.contains("responder-hmac"),
+            "the link's target must hold the new profile: {published}"
+        );
+        assert!(
+            published.contains("domain = \"existing.domain\""),
+            "and the file it edited, not a fresh one: {published}"
         );
     }
 }

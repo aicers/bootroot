@@ -35,9 +35,9 @@ use super::responder_setup::{
 };
 use super::secrets::{maybe_register_eab, resolve_init_secrets};
 use super::stepca_setup::{
-    ensure_step_ca_initialized, reconcile_ca_json_dns_names, resolve_stepca_ca_dns_names,
-    restart_stepca_openbao_agent, snapshot_stepca_ca_json_template, update_ca_json_with_backup,
-    write_password_file_with_backup, write_stepca_templates,
+    CA_JSON_FILE_MODE, ensure_step_ca_initialized, reconcile_ca_json_dns_names,
+    resolve_stepca_ca_dns_names, restart_stepca_openbao_agent, snapshot_stepca_ca_json_template,
+    update_ca_json_with_backup, write_password_file_with_backup, write_stepca_templates,
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
@@ -63,6 +63,11 @@ use crate::commands::openbao_unseal::unseal_keys_path;
 use crate::commands::openbao_url::{OPENBAO_HOST_PORT_ENV, effective_openbao_url_with_env};
 use crate::i18n::Messages;
 use crate::state::StateFile;
+
+/// Mode for the two operator-facing secret files `init` can be asked to
+/// write, `--summary-json` and `--root-token-output`. Both carry root
+/// credentials, so both are operator-only.
+const SECRET_OUTPUT_FILE_MODE: u32 = 0o600;
 
 /// Returns `args` with `openbao_url` rewritten to the endpoint the
 /// configured `OpenBao` host port publishes, borrowing them unchanged
@@ -273,15 +278,34 @@ async fn diagnose_partial_init(
 ///    write — overwriting a `0644` file leaves it world-readable while
 ///    the secret-bearing JSON is on disk, until the subsequent chmod.
 ///
-/// The same atomic-create discipline used by `write_root_token_file` is
-/// applied here: `OpenOptionsExt::mode(0o600)` ensures new files are
-/// born `0600`, and an explicit `set_permissions(0o600)` immediately
-/// after the write also restricts any pre-existing destination before
-/// `write_all` so the secrets never touch a wider-mode file.  Reinit's
-/// preflight (`validate_summary_json_output_path`) additionally
-/// rejects world-/group-readable existing destinations, but this write
-/// path is deliberately defensive — `--summary-json` may be invoked
-/// from the `init` flow (not just `reinit`) where no preflight runs.
+/// The write goes through [`fs_util::atomic_write_blocking`], which
+/// stages the JSON in a temporary file in the same directory born
+/// `0600`, sets the mode there, flushes it, and only then `rename`s it
+/// over the destination.  The secrets therefore never touch the
+/// destination inode at all, so neither hazard above has a window: the
+/// published file is `0600` from the instant the name points at it.
+///
+/// The pre-write tightening of an existing destination is kept.  It
+/// guards what the rename cannot — an older summary, with older
+/// credentials in it, sitting world-readable at the path right now.
+/// Renaming a fresh inode over it does not narrow that file during the
+/// write.  `validate_summary_json_output_path` rejects such a
+/// destination on both the `init` and the `reinit` path, but it runs
+/// before `OpenBao` is touched: the whole of init happens between that
+/// judgement and this write, and a file appearing or being widened in
+/// that window is exactly what this narrows.
+///
+/// The containing directory is flushed after the rename, inside
+/// `atomic_write_blocking`.  This file is written once during `init`
+/// and read by an operator afterwards, possibly as the only record of
+/// credentials that cannot be re-derived, so it is worth the disk round
+/// trip that makes the published name survive a power loss.
+///
+/// A symlinked destination is resolved first
+/// ([`fs_util::resolve_symlink_destination`]), so the rename lands on
+/// the link's target the way the truncating write's `O_TRUNC` did.
+/// Renaming over the link instead would leave the operator without
+/// their link and the target holding the previous run's credentials.
 async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -290,33 +314,40 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
     }
     let payload = serde_json::to_string_pretty(summary)?;
     let path_buf = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        // Tighten an existing destination's permissions before any
-        // secret content is written.  No-op for missing files.  The
-        // `OpenOptions::mode` below covers the missing-file case so
-        // the file is born `0600`.
-        if path_buf.exists() {
-            std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&path_buf)?;
-        file.write_all(payload.as_bytes())?;
-        file.sync_all()?;
-        // Re-assert permissions in case an existing file's mode
-        // changed between the pre-write set and the open call (e.g.
-        // unusual filesystem semantics).
-        std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let dest = fs_util::resolve_symlink_destination(&path_buf)?;
+        tighten_existing_secret_file(&dest)?;
+        fs_util::atomic_write_blocking(&dest, payload.as_bytes(), SECRET_OUTPUT_FILE_MODE)
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for summary json write failed: {e}"))??;
     Ok(())
+}
+
+/// Narrows an existing destination to `0600` before a secret is written
+/// over it.  A no-op when nothing is there, which is the usual case.
+///
+/// The staged write that follows replaces the path with a fresh inode,
+/// so this is not about the bytes being written — it is about the ones
+/// already at the path.  A summary or token file left behind by an
+/// earlier run at a wider mode stays readable for as long as it takes
+/// the new one to be produced, and that file holds credentials too.
+fn tighten_existing_secret_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::set_permissions(
+        path,
+        std::fs::Permissions::from_mode(SECRET_OUTPUT_FILE_MODE),
+    )
+    .with_context(|| {
+        format!(
+            "Failed to set mode {SECRET_OUTPUT_FILE_MODE:o} on the existing {}",
+            path.display()
+        )
+    })
 }
 
 /// Persists the freshly generated `OpenBao` root token to `path` with
@@ -325,12 +356,26 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
 /// files are not recommended for production and the surrounding code
 /// validates the destination path before any destructive work begins.
 ///
-/// The file is created via `OpenOptionsExt::mode(0o600)` so a freshly
-/// minted root token never exists on disk with the process umask's
-/// default permissions (commonly `0644`) between creation and a
-/// subsequent `chmod` call.  Per-process umask still applies, so an
-/// explicit `set_permissions` follows for the existing-file case where
-/// `OpenOptionsExt::mode` is a no-op on POSIX.
+/// Written exactly as the init summary is, through
+/// [`fs_util::atomic_write_blocking`]: the token is staged in a
+/// temporary file in the same directory born `0600`, moded, flushed,
+/// and `rename`d over the destination.  So a freshly minted root token
+/// never exists on disk at the process umask's default permissions
+/// (commonly `0644`), and never at the destination name in a partial
+/// state.  An existing destination is tightened first, for the older
+/// token that may still be sitting in it — see
+/// [`tighten_existing_secret_file`].
+///
+/// The containing directory is flushed after the rename, inside
+/// `atomic_write_blocking`.  The token is written once and read by an
+/// operator afterwards; losing the published name to a power loss
+/// means losing the only copy of a credential `reinit` will not mint
+/// again, which is worth a disk round trip on a once-per-init write.
+///
+/// A symlinked destination is resolved first, as it is for the summary
+/// JSON — `validate_root_token_output_path` accepts a link to a regular
+/// file on purpose, so the token has to reach the file that preflight
+/// judged and not replace the link that named it.
 async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -339,19 +384,10 @@ async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     }
     let path_buf = path.to_path_buf();
     let token = token.to_string();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&path_buf)?;
-        file.write_all(token.as_bytes())?;
-        file.sync_all()?;
-        std::fs::set_permissions(&path_buf, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let dest = fs_util::resolve_symlink_destination(&path_buf)?;
+        tighten_existing_secret_file(&dest)?;
+        fs_util::atomic_write_blocking(&dest, token.as_bytes(), SECRET_OUTPUT_FILE_MODE)
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for root token write failed: {e}"))??;
@@ -823,7 +859,8 @@ async fn run_init_inner(
         &args.rotate_bound_cidrs,
         &args.secret_id_ttl,
         messages,
-    )?;
+    )
+    .await?;
 
     // Rotate the temporary POSTGRES_PASSWORD from .env (written by
     // `infra install`) before building the summary so that the emitted
@@ -974,7 +1011,8 @@ async fn run_init_inner(
         });
         state.openbao_url = https_url;
         state
-            .save(&state_path)
+            .save_async(&state_path)
+            .await
             .with_context(|| messages.error_serialize_state_failed())?;
 
         // Phase 2 of the infra-agent bring-up: OpenBao now serves TLS,
@@ -1019,7 +1057,8 @@ async fn run_init_inner(
         );
         record_http01_admin_infra_cert(&mut state, &secrets_dir, sans, &responder_container);
         state
-            .save(&state_path)
+            .save_async(&state_path)
+            .await
             .with_context(|| messages.error_serialize_state_failed())?;
     }
 
@@ -1139,7 +1178,7 @@ async fn maybe_rotate_env_db_password(
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<Option<String>> {
-    use crate::commands::dotenv::{read_dotenv, update_dotenv_key};
+    use crate::commands::dotenv::{read_dotenv, update_dotenv_key_async};
     use crate::commands::init::{PATH_STEPCA_DB, PATH_STEPCA_DB_ADMIN};
 
     // Docker Compose reads .env from the compose file's directory.
@@ -1289,20 +1328,37 @@ async fn maybe_rotate_env_db_password(
     // restart.  The OpenBao Agent template will eventually overwrite
     // this, but patching now avoids a window where step-ca would boot
     // with the old (now-invalid) password.
+    //
+    // Published by rename at the mode the file already carries, so a
+    // step-ca boot or an agent render landing here reads the previous
+    // document or the whole new one rather than half of either. The
+    // directory is not flushed: this patch exists only to bridge until
+    // the sidecar re-renders `ca.json` from its template, which is what
+    // recovers it if a crash loses the entry.
+    //
+    // The result stays discarded, as it was: the KV write above is what
+    // makes the new DSN authoritative, so a failure to pre-patch the
+    // rendered file is a missed optimisation, not a failed rotation.
     if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&ca_json_contents) {
         doc["db"]["dataSource"] = serde_json::Value::String(new_dsn.clone());
         if let Ok(updated) = serde_json::to_string_pretty(&doc) {
-            let _ = tokio::fs::write(&ca_json_path, updated).await;
+            let mode = fs_util::preserved_mode(&ca_json_path, CA_JSON_FILE_MODE);
+            let _ =
+                fs_util::atomic_replace_through_symlink(&ca_json_path, updated.as_bytes(), mode)
+                    .await;
         }
     }
 
     // Overwrite .env with a dummy password so docker compose doesn't error.
-    update_dotenv_key(
+    // Through the async entry point: this is the one async caller of the
+    // `.env` writer, and that writer now flushes.
+    update_dotenv_key_async(
         &env_path,
         "POSTGRES_PASSWORD",
         "rotated-use-openbao",
         messages,
-    )?;
+    )
+    .await?;
 
     // Restart step-ca to pick up the new DSN from the patched ca.json.
     let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
@@ -1381,7 +1437,10 @@ async fn fix_permissions_recursive(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn write_state_file(
+/// Async because the state write is: publishing `state.json` costs
+/// three disk round trips, which `StateFile::save_async` keeps off the
+/// runtime thread `run_init_inner` runs on.
+pub(super) async fn write_state_file(
     openbao_url: &str,
     kv_mount: &str,
     approles: BTreeMap<String, String>,
@@ -1400,12 +1459,13 @@ pub(super) fn write_state_file(
         rotate_secret_id_ttl,
         messages,
     )
+    .await
 }
 
 /// Inner implementation that accepts an explicit state-file path for
 /// testability.
 #[allow(clippy::too_many_arguments)] // init-time state snapshot: every value is a distinct flag
-fn write_state_file_to(
+async fn write_state_file_to(
     state_path: &Path,
     openbao_url: &str,
     kv_mount: &str,
@@ -1482,7 +1542,8 @@ fn write_state_file_to(
         last_secret_id_rotation: existing_last_secret_id_rotation,
     };
     state
-        .save(state_path)
+        .save_async(state_path)
+        .await
         .with_context(|| messages.error_serialize_state_failed())?;
     Ok(())
 }
@@ -2028,8 +2089,8 @@ mod tests {
     /// Regression: `write_state_file_to` must propagate an error when an
     /// existing state file is corrupted, not silently replace it with a
     /// fresh state (which would erase stored `openbao_bind_addr`).
-    #[test]
-    fn write_state_file_errors_on_corrupted_state() {
+    #[tokio::test]
+    async fn write_state_file_errors_on_corrupted_state() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -2043,7 +2104,8 @@ mod tests {
             &[],
             "24h",
             &messages,
-        );
+        )
+        .await;
         assert!(
             result.is_err(),
             "corrupted state file must be a hard error, not silently replaced"
@@ -2052,8 +2114,8 @@ mod tests {
 
     /// `write_state_file_to` preserves `openbao_bind_addr` from an
     /// existing, valid state file.
-    #[test]
-    fn write_state_file_preserves_bind_addr() {
+    #[tokio::test]
+    async fn write_state_file_preserves_bind_addr() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -2084,6 +2146,7 @@ mod tests {
             "24h",
             &messages,
         )
+        .await
         .unwrap();
         let reloaded = crate::state::StateFile::load(&state_path).unwrap();
         assert_eq!(
@@ -2098,8 +2161,8 @@ mod tests {
     /// labels, the rotate roles' `secret_id` TTL (the dead-man
     /// threshold source), and preserves a previously recorded
     /// rotation-success timestamp across an init re-run.
-    #[test]
-    fn write_state_file_records_rotate_fields_and_preserves_timestamp() {
+    #[tokio::test]
+    async fn write_state_file_records_rotate_fields_and_preserves_timestamp() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -2120,6 +2183,7 @@ mod tests {
             "48h",
             &messages,
         )
+        .await
         .unwrap();
         let reloaded = crate::state::StateFile::load(&state_path).unwrap();
         for label in ["runtime_rotate", "infra_rotate"] {
@@ -2148,6 +2212,7 @@ mod tests {
             "24h",
             &messages,
         )
+        .await
         .unwrap();
         let reloaded = crate::state::StateFile::load(&state_path).unwrap();
         assert!(
@@ -2159,8 +2224,8 @@ mod tests {
     /// `write_state_file_to` preserves `stepca_bind_addr` /
     /// `stepca_advertise_addr` from an existing, valid state file so
     /// that an `init` re-run does not erase the step-ca exposure intent.
-    #[test]
-    fn write_state_file_preserves_stepca_bind_intent() {
+    #[tokio::test]
+    async fn write_state_file_preserves_stepca_bind_intent() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -2191,6 +2256,7 @@ mod tests {
             "24h",
             &messages,
         )
+        .await
         .unwrap();
         let reloaded = crate::state::StateFile::load(&state_path).unwrap();
         assert_eq!(
@@ -2479,5 +2545,380 @@ mod tests {
             .await
             .expect("rebuilt_admin_dsn_for_kv must succeed when KV path is absent");
         assert!(rebuilt.is_none(), "absent KV path must yield None");
+    }
+
+    /// The token arrives by rename from a staged temporary, so the
+    /// destination name never points at a partially written credential.
+    /// A changed inode is what separates that from the truncate-in-place
+    /// open this replaced.
+    #[tokio::test]
+    async fn write_root_token_file_publishes_a_new_inode_at_0600() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("root-token.txt");
+        write_root_token_file(&path, "hvs.first")
+            .await
+            .expect("first token write");
+        let first_inode = std::fs::metadata(&path).expect("stat").ino();
+
+        write_root_token_file(&path, "hvs.second")
+            .await
+            .expect("second token write");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "hvs.second");
+        assert_ne!(std::fs::metadata(&path).expect("stat").ino(), first_inode);
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("root-token.txt")],
+            "the staged temporary must not survive the publish"
+        );
+    }
+
+    /// The destination is created when the parent exists but the file
+    /// does not — the pre-write tightening must not trip over a missing
+    /// path.
+    #[tokio::test]
+    async fn write_root_token_file_creates_a_missing_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("root-token.txt");
+        write_root_token_file(&path, "hvs.only")
+            .await
+            .expect("token write into a fresh directory");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "hvs.only");
+    }
+
+    /// A destination an earlier run left world-readable is replaced at
+    /// `0600`, both halves of the write pulling their weight: the
+    /// tightening narrows the old token sitting there, and the staged
+    /// publish gives the new one a fresh inode that was never wider
+    /// than `0600`. `init` reaches this writer with no preflight, so
+    /// the wide destination is not a case only `reinit` can rule out.
+    #[tokio::test]
+    async fn write_root_token_file_replaces_a_world_readable_destination() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("root-token.txt");
+        std::fs::write(&path, "hvs.stale").expect("seed the destination");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let stale_inode = std::fs::metadata(&path).expect("stat").ino();
+
+        write_root_token_file(&path, "hvs.fresh")
+            .await
+            .expect("token write over a world-readable destination");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "hvs.fresh");
+        let meta = std::fs::metadata(&path).expect("stat");
+        assert_eq!(meta.permissions().mode() & 0o777, SECRET_OUTPUT_FILE_MODE);
+        assert_ne!(meta.ino(), stale_inode, "the publish must be a rename");
+    }
+
+    /// A symlinked destination delivers the token to the link's target,
+    /// which is what `validate_root_token_output_path` accepts a link to
+    /// a regular file *for*. Renaming over the link would leave the
+    /// operator without their link and the target holding the previous
+    /// run's token — a silent loss, since the write reports success.
+    #[tokio::test]
+    async fn write_root_token_file_writes_through_a_symlinked_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir");
+        let target = real_dir.join("token.txt");
+        std::fs::write(&target, "hvs.stale").expect("seed the target");
+        let link = dir.path().join("root-token.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_root_token_file(&link, "hvs.fresh")
+            .await
+            .expect("token write through a symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "hvs.fresh",
+            "the token must reach the link's target"
+        );
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
+
+    /// A link whose target does not exist yet is still where the
+    /// operator wants the token: the truncating write this replaced
+    /// created the target through the link, so the staged write creates
+    /// it too. Publishing at the link's own name instead would destroy
+    /// the link and leave a root token in a directory nobody chose.
+    #[tokio::test]
+    async fn write_root_token_file_creates_a_dangling_symlink_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("secure").join("token.txt");
+        std::fs::create_dir(dir.path().join("secure")).expect("mkdir");
+        let link = dir.path().join("root-token.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_root_token_file(&link, "hvs.dangling")
+            .await
+            .expect("token write over a dangling link");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "hvs.dangling"
+        );
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
+
+    /// A destination whose links form a cycle has no target to deliver
+    /// to, and every name in the loop is a link. The truncating write
+    /// this replaced failed with `ELOOP`; the staged write fails too,
+    /// rather than renaming the token over the operator's link and
+    /// reporting success.
+    #[tokio::test]
+    async fn write_root_token_file_refuses_a_symlink_cycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("root-token.txt");
+        let b = dir.path().join("other.txt");
+        std::os::unix::fs::symlink(&b, &a).expect("symlink");
+        std::os::unix::fs::symlink(&a, &b).expect("symlink");
+
+        let err = write_root_token_file(&a, "hvs.looped")
+            .await
+            .expect_err("a cyclic destination must not be published");
+        assert!(
+            format!("{err:#}").contains("Too many levels of symbolic links"),
+            "unexpected error: {err:#}"
+        );
+        for link in [&a, &b] {
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .expect("stat")
+                    .file_type()
+                    .is_symlink(),
+                "{} was replaced by the write",
+                link.display()
+            );
+        }
+    }
+
+    /// The summary JSON carries the same credentials, and refuses the
+    /// same destination for the same reason.
+    #[tokio::test]
+    async fn write_init_summary_json_refuses_a_symlink_cycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("summary.json");
+        let b = dir.path().join("other.json");
+        std::os::unix::fs::symlink(&b, &a).expect("symlink");
+        std::os::unix::fs::symlink(&a, &b).expect("symlink");
+
+        let err = write_init_summary_json(&a, &summary_with_token("hvs.looped"))
+            .await
+            .expect_err("a cyclic destination must not be published");
+        assert!(
+            format!("{err:#}").contains("Too many levels of symbolic links"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&a)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link was replaced by the write"
+        );
+    }
+
+    /// An older summary or token file left world-readable is narrowed
+    /// before the replacement is produced. The rename cannot do this:
+    /// it publishes a fresh inode and leaves the old one readable for
+    /// as long as it takes to write the new one.
+    #[test]
+    fn tighten_existing_secret_file_narrows_a_world_readable_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("summary.json");
+        std::fs::write(&path, "{}").expect("seed the destination");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        tighten_existing_secret_file(&path).expect("tighten");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
+
+    #[test]
+    fn tighten_existing_secret_file_ignores_a_missing_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tighten_existing_secret_file(&dir.path().join("absent.json"))
+            .expect("a missing destination is not an error");
+    }
+
+    /// The other secret-bearing `init` output. It shares
+    /// `write_root_token_file`'s staging, tightening and symlink
+    /// resolution, and carries the same credentials plus the unseal
+    /// keys, so it is pinned in its own right rather than by
+    /// resemblance to the token writer.
+    fn summary_with_token(root_token: &str) -> InitSummary {
+        use super::super::super::types::{ResponderCheck, StepCaInitResult};
+
+        InitSummary {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: std::path::PathBuf::from("secrets"),
+            show_secrets: false,
+            init_response: true,
+            root_token: root_token.to_string(),
+            unseal_keys: vec!["unseal-one".to_string()],
+            approles: Vec::new(),
+            stepca_password: "pw".to_string(),
+            db_dsn: String::new(),
+            db_dsn_host_original: String::new(),
+            db_dsn_host_effective: String::new(),
+            http_hmac: "hmac".to_string(),
+            eab: None,
+            step_ca_result: StepCaInitResult::Skipped,
+            responder_check: ResponderCheck::Skipped,
+            responder_url: None,
+            responder_template_path: std::path::PathBuf::from("responder.tmpl"),
+            responder_config_path: std::path::PathBuf::from("responder.toml"),
+            openbao_agent_stepca_config_path: std::path::PathBuf::from("agent-stepca.hcl"),
+            openbao_agent_responder_config_path: std::path::PathBuf::from("agent-responder.hcl"),
+            openbao_agent_override_path: None,
+            db_check: DbCheckStatus::Skipped,
+        }
+    }
+
+    /// The summary is published by rename at `0600` over a destination
+    /// an earlier run left world-readable: the tightening narrows the
+    /// old credentials sitting there, and the fresh inode the rename
+    /// installs was never wider than `0600`.
+    #[tokio::test]
+    async fn write_init_summary_json_replaces_a_world_readable_destination_at_0600() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("summary.json");
+        std::fs::write(&path, "{\"stale\":true}").expect("seed the destination");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let stale_inode = std::fs::metadata(&path).expect("stat").ino();
+
+        write_init_summary_json(&path, &summary_with_token("hvs.fresh"))
+            .await
+            .expect("summary write over a world-readable destination");
+
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert!(written.contains("hvs.fresh"), "got: {written}");
+        let meta = std::fs::metadata(&path).expect("stat");
+        assert_eq!(meta.permissions().mode() & 0o777, SECRET_OUTPUT_FILE_MODE);
+        assert_ne!(meta.ino(), stale_inode, "the publish must be a rename");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("summary.json")],
+            "the staged temporary must not survive the publish"
+        );
+    }
+
+    /// As for the token: the summary reaches the link's target and the
+    /// operator's link survives. Renaming over the link would leave the
+    /// target holding the previous run's credentials while the write
+    /// reported success.
+    #[tokio::test]
+    async fn write_init_summary_json_writes_through_a_symlinked_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir");
+        let target = real_dir.join("summary.json");
+        std::fs::write(&target, "{\"stale\":true}").expect("seed the target");
+        let link = dir.path().join("summary.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_init_summary_json(&link, &summary_with_token("hvs.through-link"))
+            .await
+            .expect("summary write through a symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the write"
+        );
+        let written = std::fs::read_to_string(&target).expect("read");
+        assert!(written.contains("hvs.through-link"), "got: {written}");
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
+
+    /// A link whose target does not exist yet is still where the
+    /// operator wants the summary, exactly as for the token file.
+    #[tokio::test]
+    async fn write_init_summary_json_creates_a_dangling_symlink_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("secure")).expect("mkdir");
+        let target = dir.path().join("secure").join("summary.json");
+        let link = dir.path().join("summary.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_init_summary_json(&link, &summary_with_token("hvs.dangling"))
+            .await
+            .expect("summary write over a dangling link");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the operator's link must survive the write"
+        );
+        let written = std::fs::read_to_string(&target).expect("read");
+        assert!(written.contains("hvs.dangling"), "got: {written}");
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
     }
 }
