@@ -612,9 +612,16 @@ executable_lines() {
 }
 
 # True when `chunk` invokes the function `name`.
+#
+# The stripped chunk is materialised rather than piped into `grep -q`:
+# the `-q` exits on the first match, SIGPIPEs whatever is still writing,
+# and `set -o pipefail` reports the pipeline as failed — so a match
+# would sometimes read as no call at all, and the reachability walk
+# below would stop at exactly the function it was following.
 calls_function() {
-  executable_lines "$1" \
-    | grep -qE "(^|[^[:alnum:]_./\"-])${2}([[:space:]]|\)|;|\"|$)"
+  local lines
+  lines="$(executable_lines "$1")"
+  grep -qE "(^|[^[:alnum:]_./\"-])${2}([[:space:]]|\)|;|\"|$)" <<<"$lines"
 }
 
 # Prints every function of `file` that `chunk` can reach, transitively.
@@ -647,6 +654,16 @@ reachable_functions() {
   printf '%s\n' "$seen"
 }
 
+# True when `chunk` runs anything that can remove a container.  Not a
+# pipe, for the reason `calls_function` is not one either: a SIGPIPEd
+# upstream would read here as a chunk that removes nothing, which is the
+# answer that lets a violation through.
+removes_a_container() {
+  local lines
+  lines="$(executable_lines "$1")"
+  grep -qE "$DESTRUCTIVE_RE" <<<"$lines"
+}
+
 check_startup_ordering() {
   local script path main_body assert_line mark_line down_line prefix name
   for script in "${DEFAULT_IDENTITY_SCRIPTS[@]}"; do
@@ -672,12 +689,11 @@ check_startup_ordering() {
       || die "${script}: the start-of-run teardown runs unowned"
 
     prefix="$(head -n "$((assert_line - 1))" <<<"$main_body")"
-    if executable_lines "$prefix" | grep -qE "$DESTRUCTIVE_RE"; then
+    if removes_a_container "$prefix"; then
       die "${script}: main removes a container before the startup check"
     fi
     for name in $(reachable_functions "$path" "$prefix"); do
-      if executable_lines "$(function_body "$name" "$path")" \
-        | grep -qE "$DESTRUCTIVE_RE"; then
+      if removes_a_container "$(function_body "$name" "$path")"; then
         die "${script}: ${name}, reached before the startup check, removes a container"
       fi
     done
@@ -698,12 +714,16 @@ check_startup_ordering() {
 # makes impossible to land quietly.
 
 check_explicit_instance_wiring() {
-  local script path call normalized checked=0
+  local script path call normalized uncommented checked=0
   for script in "${DEFAULT_IDENTITY_SCRIPTS[@]}"; do
     path="$IMPL_DIR/$script"
     # Comments stripped first: one of these scripts discusses
-    # `--instance-name` without passing one.
-    grep -vE '^[[:space:]]*#' "$path" | grep -q -- '--instance-name' || continue
+    # `--instance-name` without passing one.  Not through a pipe: a
+    # `grep -q` downstream exits on the first match and SIGPIPEs the
+    # upstream `grep`, which `set -o pipefail` then reads as a failed
+    # search — a match would silently skip the script it matched.
+    uncommented="$(grep -vE '^[[:space:]]*#' "$path" || true)"
+    grep -q -- '--instance-name' <<<"$uncommented" || continue
     checked=1
     while IFS= read -r call; do
       # `<check> <compose-file> <label> [<instance-name>]`, with quoted
