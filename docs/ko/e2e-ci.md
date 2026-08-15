@@ -111,10 +111,15 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
   아티팩트 basename이 같은 두 실행도 서로 다른 이름을 얻습니다.
 - 그 이름을 `infra install --instance-name`에 넘기고 `BOOTROOT_INSTANCE`로
   내보내므로, Compose와 바이너리가 모든 컨테이너를 같은 이름으로 부릅니다.
-  `--instance-name`은 Compose 프로젝트도 함께 결정합니다. 이름이 명시된
-  설치는 프로젝트를 인스턴스 이름 *그 자체*로 해석하므로 둘은 하나의
-  문자열입니다. 실행은 그것을 가정하지 않고 실제 컨테이너의
-  `com.docker.compose.project` 레이블에서 다시 읽어 확인합니다.
+- Compose 프로젝트는 같은 식별자에서 별도로, 자기 규칙에 따라 만듭니다. 앞에는
+  `bootroot-e2e-local-` 또는 `bootroot-e2e-remote-`가 붙고, 잘리지 않습니다.
+  프로젝트는 DNS 레이블 안에 들어갈 필요가 없기 때문입니다. 그래서 CI 길이의
+  `GITHUB_RUN_ID` 아래에서는 인스턴스 이름에 허용되는 길이를 넘어섭니다.
+  프로젝트는 `COMPOSE_PROJECT_NAME`으로 내보내져 바이너리에 전달되며, 이
+  변수는 프로젝트에 한해서만 `--instance-name`보다 우선합니다. 따라서 실행
+  안의 모든 `bootroot` 호출이 스크립트 자신의 `docker compose` 호출과 같은
+  프로젝트를 대상으로 삼습니다. 실행은 그 프로젝트를 가정하지 않고 실제
+  컨테이너의 `com.docker.compose.project` 레이블에서 다시 읽어 확인합니다.
 - 비어 있는 `127.0.0.1` 포트 네 개를 고르고 `--postgres-host-port`,
   `--openbao-host-port`, `--stepca-host-port`, `--http01-admin-host-port`로
   `infra install`에 넘깁니다. 그래야 설치가 쓰는 `.env`에 기록되어, 같은

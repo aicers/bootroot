@@ -16,12 +16,14 @@ cd "$ROOT_DIR"
 
 # Ambient environment sanitisation.
 #
-# `COMPOSE_PROJECT_NAME` outranks the `BOOTROOT_INSTANCE` this run
-# records, so a value inherited from the invoking shell would send every
-# `bootroot` invocation after `infra install` at a different Compose
-# project than the one the install created: the containers named after
-# this run's instance, labelled with someone else's project, and a
-# teardown that removes neither.  The four host-port variables are
+# `COMPOSE_PROJECT_NAME` is what this run hands the binary its own
+# Compose project in, and it is exported with that value in
+# `derive_run_scope`.  It is cleared first because everything before that
+# point would otherwise run against an inherited one: a value from the
+# invoking shell would send those calls at a different project than the
+# one this run creates, and it must not survive as far as `infra
+# install`, which would then record containers named after this run's
+# instance in someone else's project.  The four host-port variables are
 # cleared for the same reason — they outrank the `.env` the install
 # writes, and an inherited value would republish this run's stack on a
 # port another run already holds.  `POSTGRES_HOST`/`POSTGRES_PORT` are
@@ -111,6 +113,10 @@ TRUST_SYNC_EXTRA_FINGERPRINT=""
 # token, whose tail is the only part distinguishing two runs started in
 # the same second.
 RUN_INSTANCE_PREFIX="e2e-remote-"
+# Prefix every derived Compose project starts with.  Long on purpose,
+# and nothing like the instance prefix: the project has no length budget
+# to spend, so it says in full what the truncated instance name cannot.
+RUN_PROJECT_PREFIX="bootroot-e2e-remote-"
 # This run's install identity, the Compose project every `docker compose`
 # call is scoped to, and the four ports it publishes on `127.0.0.1`.  All
 # derived in `derive_run_scope`, which `main` runs before anything reads
@@ -200,12 +206,21 @@ derive_run_scope() {
   token="$(run_scope_token "$ARTIFACT_DIR")"
   RUN_INSTANCE="$(run_scope_instance "$RUN_INSTANCE_PREFIX" "$token")"
   run_scope_assert_valid_instance "$RUN_INSTANCE"
-  COMPOSE_PROJECT="$(run_scope_project_for_instance "$RUN_INSTANCE")"
+  COMPOSE_PROJECT="$(run_scope_project "$RUN_PROJECT_PREFIX" "$token")"
+  run_scope_assert_valid_project "$COMPOSE_PROJECT"
   # Compose reads the invoking process's environment ahead of the project
   # directory's `.env`, so this is what names the containers of the raw
   # `docker compose` calls below — including the ones made before `infra
   # install` has written anything.
   export BOOTROOT_INSTANCE="$RUN_INSTANCE"
+  # And this is how the derived project reaches the binary.  It outranks
+  # the `--instance-name` the install declares for the project and for
+  # nothing else, so `bootroot` scopes itself to the same project as the
+  # raw `docker compose` calls here while still naming every container
+  # after the instance.  Exported rather than recorded because that is
+  # what the variable is: a per-invocation Compose override, deliberately
+  # never written to `.env`.
+  export COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT"
   # `service add` resolves its identity from the directory this script
   # runs `bootroot` from rather than from the compose file's, so that
   # directory has to record the instance too.
@@ -234,10 +249,12 @@ collect_dead_runs() {
 # Asserts that the project `bootroot` resolved is the one this script
 # scopes its own `docker compose` calls to.
 #
-# Read off a container the install created rather than assumed: the two
-# are the same string only because `--instance-name` makes them so, and a
-# run whose binary resolved some other project would tear down a project
-# holding none of its containers and leave the whole stack behind.
+# Read off a container the install created rather than assumed.  The
+# instance and the project are separately derived and deliberately
+# different strings, so nothing about the container names proves the
+# binary agreed with this script about the project — and a run whose
+# binary resolved some other project would tear down a project holding
+# none of its containers and leave the whole stack behind.
 assert_resolved_compose_project() {
   local container="${RUN_INSTANCE}-openbao" resolved
   resolved="$(docker inspect \
@@ -411,6 +428,13 @@ install_infra() {
   # reason — a flag is recorded in the `.env` the install writes, so
   # every later `bootroot` invocation in this run resolves the same
   # ports whether or not it inherited the exports.
+  #
+  # The Compose project is the one value that travels the other way, as
+  # the exported `COMPOSE_PROJECT_NAME` `derive_run_scope` set.  There is
+  # no flag for it and there is deliberately no `.env` key either: it is
+  # Compose's own per-invocation override, and what makes it reliable
+  # here is that this script exports it for every `bootroot` invocation
+  # it makes, not that anything recorded it.
   run_bootroot_control infra install \
     --compose-file "$COMPOSE_FILE" \
     --instance-name "$RUN_INSTANCE" \

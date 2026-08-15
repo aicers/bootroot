@@ -2086,14 +2086,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `reinit` no longer derive the project from the `bootroot-openbao`
   container's `com.docker.compose.project` label or from the compose
   directory's basename — both fold onto the shared resolver, whose order
-  is `--instance-name`, then `COMPOSE_PROJECT_NAME` from the
-  environment, then `BOOTROOT_INSTANCE` from `.env`, then the literal
-  `bootroot`. `reinit` still reads the live container's project label as
-  the "what is" side of its mismatch check, so that check stays a real
-  comparison. An exported `COMPOSE_PROJECT_NAME` still overrides the
+  is `COMPOSE_PROJECT_NAME` from the environment, then
+  `--instance-name`, then `BOOTROOT_INSTANCE` from `.env`, then the
+  literal `bootroot`. `reinit` still reads the live container's project
+  label as the "what is" side of its mismatch check, so that check stays
+  a real comparison. An exported `COMPOSE_PROJECT_NAME` still overrides the
   project for a single invocation, is used verbatim without
   instance-name validation, and is never recorded — the E2E harness
-  keeps isolating scenarios exactly as before. Only an *exported*
+  keeps isolating scenarios exactly as before. It outranks
+  `--instance-name`, which decides the recorded identity every container
+  is named after rather than the project, so an install and every
+  command run against it afterwards resolve one project in any given
+  environment, and a run may declare a length-bounded identity while
+  scoping itself to a project of another name. Only an *exported*
   variable counts: `init` loads the compose directory's `.env` into its
   process environment part-way through, and that load now skips
   `COMPOSE_PROJECT_NAME` so a `.env`-authored value cannot become an

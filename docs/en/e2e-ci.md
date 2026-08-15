@@ -113,10 +113,17 @@ to finish. Each run:
   keeps, so two runs whose artifact basenames agree still get different names.
 - hands that name to `infra install --instance-name` and exports it as
   `BOOTROOT_INSTANCE`, so Compose and the binary name every container
-  identically. `--instance-name` also fixes the Compose project: an explicitly
-  named install resolves its project *to* the instance name, so the two are one
-  string. The run reads that back off a real container's
-  `com.docker.compose.project` label rather than assuming it.
+  identically.
+- derives its Compose project from the same identifier, separately and under
+  its own rule: prefixed `bootroot-e2e-local-` or `bootroot-e2e-remote-`, and
+  never truncated, because a project has no DNS label to fit inside. Under a
+  CI-length `GITHUB_RUN_ID` it is therefore longer than an instance name is
+  allowed to be. The project reaches the binary as an exported
+  `COMPOSE_PROJECT_NAME`, which outranks `--instance-name` for the project and
+  for nothing else, so every `bootroot` invocation in the run is scoped to the
+  same project as the script's own raw `docker compose` calls. The run reads
+  that project back off a real container's `com.docker.compose.project` label
+  rather than assuming it.
 - picks four free `127.0.0.1` ports and passes them to `infra install` as
   `--postgres-host-port`, `--openbao-host-port`, `--stepca-host-port` and
   `--http01-admin-host-port`, so the `.env` the install writes records them for

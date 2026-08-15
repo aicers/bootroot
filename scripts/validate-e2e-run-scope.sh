@@ -141,23 +141,92 @@ instance_name_is_valid() {
   return 0
 }
 
+# Compose's own rule for a project name: a lowercase letter or a digit
+# first, then lowercase letters, digits, `-` and `_`. No length limit —
+# that is the whole difference from an instance name.
+compose_project_is_valid() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  case "$name" in
+    ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
+    *) return 1 ;;
+  esac
+  case "$name" in
+    *[!"$RUN_SCOPE_PROJECT_ALPHABET"]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Reads the prefix a harness declares for one half of its identity.
+harness_prefix() {
+  local script="$1" var="$2" value
+  value="$(sed -n "s/^${var}=\"\(.*\)\"\$/\1/p" "$IMPL_DIR/$script")"
+  [ -n "$value" ] || die "${script} declares no ${var}"
+  printf '%s' "$value"
+}
+
 check_derived_instances_are_installable() {
-  local script prefix basename token instance project
+  local script prefix basename token instance
   for script in "${LIFECYCLE_SCRIPTS[@]}"; do
-    prefix="$(sed -n 's/^RUN_INSTANCE_PREFIX="\(.*\)"$/\1/p' "$IMPL_DIR/$script")"
-    [ -n "$prefix" ] || die "${script} declares no RUN_INSTANCE_PREFIX"
+    prefix="$(harness_prefix "$script" RUN_INSTANCE_PREFIX)"
     for basename in "${ARTIFACT_BASENAMES[@]}"; do
       token="$(run_scope_token "/tmp/e2e/$basename")"
       instance="$(run_scope_instance "$prefix" "$token")"
       instance_name_is_valid "$instance" \
         || die "${script} derives '${instance}' from ${basename}, which infra install would reject"
-      project="$(run_scope_project_for_instance "$instance")"
-      [ "$project" = "$instance" ] \
-        || die "${script} derives project '${project}' for instance '${instance}'; --instance-name makes them one string"
     done
   done
   ok "every matrix step's derived instance is one infra install accepts, under a CI-length run id"
-  ok "the derived project is the project --instance-name makes the install resolve"
+}
+
+# The instance and the project are two values, derived separately from
+# one token under two different rules. Deriving one from the other is
+# what the issue rules out, and the visible consequence is length: an
+# instance name is cut to 39 characters, and for a CI-length
+# `GITHUB_RUN_ID` the project the same run derives is longer than an
+# instance name is ever allowed to be.
+check_instance_and_project_are_derived_separately() {
+  local script instance_prefix project_prefix basename token instance project
+  for script in "${LIFECYCLE_SCRIPTS[@]}"; do
+    instance_prefix="$(harness_prefix "$script" RUN_INSTANCE_PREFIX)"
+    project_prefix="$(harness_prefix "$script" RUN_PROJECT_PREFIX)"
+    for basename in "${ARTIFACT_BASENAMES[@]}"; do
+      token="$(run_scope_token "/tmp/e2e/$basename")"
+      instance="$(run_scope_instance "$instance_prefix" "$token")"
+      project="$(run_scope_project "$project_prefix" "$token")"
+      compose_project_is_valid "$project" \
+        || die "${script} derives the project '${project}' from ${basename}, which Compose would reject"
+      [ "$project" != "$instance" ] \
+        || die "${script} derives one string for both halves of its identity from ${basename}: '${instance}'"
+      case "$basename" in
+        ci-*)
+          [ "${#project}" -gt "$BOOTROOT_MAX_INSTANCE_NAME_LEN" ] \
+            || die "${script} derives the project '${project}' (${#project} characters) from ${basename}; under a CI-length run id it must outgrow the ${BOOTROOT_MAX_INSTANCE_NAME_LEN}-character instance limit that proves the two are derived apart"
+          ;;
+      esac
+    done
+  done
+  ok "the instance and the project are separate derivations, and the project outgrows the instance limit under a CI-length run id"
+}
+
+check_project_derivation_rejects_what_compose_would() {
+  local status=0
+  ( run_scope_project "bootroot-e2e-local-" "..." ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] || die "an identifier holding nothing a project may use derived a project instead of failing"
+  status=0
+  ( run_scope_assert_valid_project "-leading-dash" ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] || die "the guard accepted a project name starting with a dash"
+  status=0
+  ( run_scope_assert_valid_project "Bootroot-E2E" ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] || die "the guard accepted a project name carrying uppercase"
+  status=0
+  ( run_scope_assert_valid_project "bootroot e2e" ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] || die "the guard accepted a project name carrying a space"
+  # An over-long project is the case the instance guard rejects and this
+  # one must not: the absence of a length limit is the difference.
+  run_scope_assert_valid_project "$(printf 'a%.0s' $(seq 1 120))" \
+    || die "the guard rejected a long project name; only instance names are length-bounded"
+  ok "the project guard rejects what Compose would, and imposes no instance-name length limit"
 }
 
 # The pid sits at the end of the token, so it is the part truncation must
@@ -177,6 +246,26 @@ check_truncation_keeps_the_discriminating_tail() {
     *) die "truncation dropped the tail: '${first}' does not end in the pid" ;;
   esac
   ok "a truncated identifier keeps its tail, so runs differing only there stay distinct"
+}
+
+# The separation only holds because the binary ranks the exported
+# project above the declared instance, and applies it to the project
+# alone. That ranking lives in `src/commands/compose_project.rs`, is
+# pinned there by a unit test, and is invisible from here — a harness run
+# under a reordered resolver would install into one project while
+# scoping its own `docker compose` calls to another, and only a
+# concurrent run would notice.
+#
+# So this asserts the pin is still in place rather than re-deriving the
+# behaviour: the test named below is what fails if the ranking moves, and
+# a rename that leaves this check unadjusted is a deliberate act rather
+# than an oversight.
+RANKING_TEST="compose_project_name_wins_over_the_flag_for_the_project_only"
+
+check_the_binary_ranks_the_override_above_the_flag() {
+  grep -q "fn ${RANKING_TEST}(" src/commands/compose_project.rs \
+    || die "src/commands/compose_project.rs no longer pins the ranking this harness depends on (${RANKING_TEST}); the derived project reaches the binary as COMPOSE_PROJECT_NAME, which must outrank --instance-name for the project and nothing else"
+  ok "the ranking the derived project depends on is pinned by the binary's own tests"
 }
 
 check_derivation_rejects_what_it_cannot_derive() {
@@ -436,9 +525,13 @@ seed_daemon() {
   : >"$WORK_DIR/sweep.log"
 }
 
+# The project is a separate argument because it is a separate value: a
+# run's project is derived apart from its instance and is a different
+# string, so a sweep that reconstructed it from the marker's filename
+# would query a label no volume of that run carries.
 seed_marker() {
-  local instance="$1" pid="$2"
-  printf 'pid=%s\nproject=%s\n' "$pid" "$instance" \
+  local instance="$1" pid="$2" project="$3"
+  printf 'pid=%s\nproject=%s\n' "$pid" "$project" \
     >"$BOOTROOT_E2E_RUN_MARKER_DIR/$instance"
 }
 
@@ -456,16 +549,18 @@ instance_containers() {
 }
 
 DEAD="e2e-local-dead"
+DEAD_PROJECT="bootroot-e2e-local-dead-run-1770000000-4242"
 LIVE="e2e-local-live"
+LIVE_PROJECT="bootroot-e2e-local-live-run-1770000000-4243"
 
 check_sweep_collects_only_dead_runs() {
   local status=0
   seed_daemon \
     "$(instance_containers "$DEAD") $(instance_containers "$LIVE") bootroot-openbao bootroot-ca" \
-    "$(printf '%s vol-dead\n%s vol-live\n' "$DEAD" "$LIVE")" \
-    "$(printf '%s net-dead\n%s net-live\n' "$DEAD" "$LIVE")"
-  seed_marker "$DEAD" 4194305
-  seed_marker "$LIVE" "$$"
+    "$(printf '%s vol-dead\n%s vol-live\n' "$DEAD_PROJECT" "$LIVE_PROJECT")" \
+    "$(printf '%s net-dead\n%s net-live\n' "$DEAD_PROJECT" "$LIVE_PROJECT")"
+  seed_marker "$DEAD" 4194305 "$DEAD_PROJECT"
+  seed_marker "$LIVE" "$$" "$LIVE_PROJECT"
 
   sweep_dead_run_instances "a-label" "$WORK_DIR/sweep.log" || status=$?
   [ "$status" -eq 0 ] || die "the sweep returned ${status} on a daemon it could fully collect"
@@ -483,11 +578,11 @@ check_sweep_collects_only_dead_runs() {
   ok "a dead run's nine containers are removed, and a live run's are not"
   ok "a co-located default-identity install is untouched"
 
-  [ "$(awk -v p="$DEAD" '$1 == p' "$STUB_STATE/volumes")" = "" ] \
+  [ "$(awk -v p="$DEAD_PROJECT" '$1 == p' "$STUB_STATE/volumes")" = "" ] \
     || die "the dead run's volume survived"
-  [ "$(awk -v p="$LIVE" '$1 == p { print $2 }' "$STUB_STATE/volumes")" = "vol-live" ] \
+  [ "$(awk -v p="$LIVE_PROJECT" '$1 == p { print $2 }' "$STUB_STATE/volumes")" = "vol-live" ] \
     || die "the live run's volume did not survive"
-  [ "$(awk -v p="$LIVE" '$1 == p { print $2 }' "$STUB_STATE/networks")" = "net-live" ] \
+  [ "$(awk -v p="$LIVE_PROJECT" '$1 == p { print $2 }' "$STUB_STATE/networks")" = "net-live" ] \
     || die "the live run's network did not survive"
   ok "the dead run's volumes and networks go with it, and the live run's stay"
 
@@ -500,7 +595,7 @@ check_sweep_collects_only_dead_runs() {
   [ "$removed" = "$(printf '%s\n' $(instance_containers "$DEAD") | LC_ALL=C sort)" ] \
     || die "the sweep removed ${removed//$'\n'/ }"
   asked="$(awk '$1 ~ /-ls$/ { print $2 }' "$WORK_DIR/query.log" | LC_ALL=C sort -u)"
-  [ "$asked" = "label=com.docker.compose.project=${DEAD}" ] \
+  [ "$asked" = "label=com.docker.compose.project=${DEAD_PROJECT}" ] \
     || die "the sweep's label queries were: ${asked//$'\n'/; }"
   ok "the sweep removes exact names and queries one exact project label, never a wildcard"
 }
@@ -508,7 +603,7 @@ check_sweep_collects_only_dead_runs() {
 check_sweep_keeps_a_marker_it_could_not_clear() {
   local status=0
   seed_daemon "$(instance_containers "$DEAD")" "" ""
-  seed_marker "$DEAD" 4194305
+  seed_marker "$DEAD" 4194305 "$DEAD_PROJECT"
   FAILING_QUERIES="rm" sweep_dead_run_instances "a-label" "$WORK_DIR/sweep.log" 2>/dev/null || status=$?
   [ "$status" -ne 0 ] || die "a sweep that removed nothing returned 0"
   [ -f "$BOOTROOT_E2E_RUN_MARKER_DIR/$DEAD" ] \
@@ -517,7 +612,7 @@ check_sweep_keeps_a_marker_it_could_not_clear() {
 
   status=0
   seed_daemon "$(instance_containers "$DEAD")" "" ""
-  seed_marker "$DEAD" 4194305
+  seed_marker "$DEAD" 4194305 "$DEAD_PROJECT"
   FAILING_QUERIES="list" sweep_dead_run_instances "a-label" "$WORK_DIR/sweep.log" 2>/dev/null || status=$?
   [ "$status" -ne 0 ] || die "a sweep whose container listing failed returned 0"
   [ -f "$BOOTROOT_E2E_RUN_MARKER_DIR/$DEAD" ] \
@@ -529,7 +624,7 @@ check_sweep_keeps_a_marker_it_could_not_clear() {
   # that must not read as a collection that failed.
   status=0
   seed_daemon "" "" ""
-  seed_marker "$DEAD" 4194305
+  seed_marker "$DEAD" 4194305 "$DEAD_PROJECT"
   sweep_dead_run_instances "a-label" "$WORK_DIR/sweep.log" || status=$?
   [ "$status" -eq 0 ] || die "a sweep of an already-collected dead run returned ${status}"
   [ ! -f "$BOOTROOT_E2E_RUN_MARKER_DIR/$DEAD" ] \
@@ -565,6 +660,14 @@ check_harness_wiring() {
       || die "${script} does not assert the project its install resolved"
     grep -qF -- '--instance-name "$RUN_INSTANCE"' "$path" \
       || die "${script} does not install at the derived instance"
+    # The instance reaches the binary as a flag; the project reaches it
+    # as Compose's own override, which outranks that flag for the
+    # project and for nothing else.  Without the export the binary would
+    # resolve the instance name as its project and this script's own
+    # `docker compose -p` calls would address a project holding none of
+    # its containers.
+    grep -q '^  export COMPOSE_PROJECT_NAME="\$COMPOSE_PROJECT"$' "$path" \
+      || die "${script} does not hand the binary the project it derived"
     # `service add` resolves its identity from the working directory
     # rather than from the compose file's, and skips the DNS-alias
     # rewiring with a warning — not a failure — when it resolves an
@@ -633,8 +736,11 @@ check_no_hardcoded_identity() {
 
 check_limit_matches_the_rust_derivation
 check_derived_instances_are_installable
+check_instance_and_project_are_derived_separately
+check_project_derivation_rejects_what_compose_would
 check_truncation_keeps_the_discriminating_tail
 check_derivation_rejects_what_it_cannot_derive
+check_the_binary_ranks_the_override_above_the_flag
 check_markers
 check_marker_dir_refuses_a_symlink
 check_default_marker_dir_is_per_user

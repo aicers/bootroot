@@ -357,8 +357,8 @@ volumes.
 
 The project a command acts on is resolved in this order:
 
-1. `--instance-name`, on `infra install` only;
-2. `COMPOSE_PROJECT_NAME` from the invoking environment, when non-empty;
+1. `COMPOSE_PROJECT_NAME` from the invoking environment, when non-empty;
+2. `--instance-name`, on `infra install` only;
 3. `BOOTROOT_INSTANCE` from the `.env` beside the compose file the
    command was handed;
 4. the literal `bootroot`.
@@ -372,6 +372,17 @@ it would have had without it, so every later command against that stack
 needs the same variable exported. Use it for throwaway stacks (this
 repository's E2E harness does); use `--instance-name` for anything
 durable.
+
+It outranks `--instance-name` because every other command resolves the
+project from it too: an install that ignored it would create the stack in
+one project while the shell that ran it addressed another, leaving a
+`clean` that removes nothing and a `status` that reports on nothing. The
+two together are therefore a legitimate combination rather than a
+conflict — the exported variable decides the project, the flag decides
+the recorded identity every container is named after, and the two may be
+different strings. That is what lets the E2E harness give each run a
+39-character instance name and a longer project derived separately from
+the same run identifier.
 
 Co-locating two bootroot instances on one host requires giving each a
 distinct `--instance-name`. Two installs that both take the default

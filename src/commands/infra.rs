@@ -584,11 +584,14 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         .map(|(key, value)| (*key, value.as_str()))
         .collect();
 
-    // The identity this install acts on.  For the project the declared
-    // identity wins, then an exported `COMPOSE_PROJECT_NAME`, then the
+    // The identity this install acts on.  For the project an exported
+    // `COMPOSE_PROJECT_NAME` wins, then the declared identity, then the
     // identity just recorded in `.env` — so a harness that exports the
-    // variable still gets its own throwaway project while `.env` keeps
-    // the durable identity every container is named after.
+    // variable gets its own throwaway project while `.env` keeps the
+    // durable identity every container is named after, and the two are
+    // free to be different strings.  That is what lets a run declare a
+    // length-bounded `--instance-name` and still scope itself to a
+    // project derived separately, past the instance-name limit.
     let identity = ComposeIdentity::resolve(
         &args.compose_file.compose_file,
         args.instance_name.as_deref(),

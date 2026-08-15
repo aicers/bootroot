@@ -118,26 +118,36 @@ pub(crate) fn compose_project_name_override() -> Option<String> {
 /// Resolves the Compose project every command must operate on, given the
 /// directory of the compose file it was handed.
 ///
-/// 1. `instance_name` — the `--instance-name` value, which only
-///    `infra install` can supply;
-/// 2. `project_override` — what the invoking environment's
+/// 1. `project_override` — what the invoking environment's
 ///    `COMPOSE_PROJECT_NAME` held, per
 ///    [`compose_project_name_override`].  Used verbatim and deliberately
 ///    not validated: the E2E harness's per-run project names are longer
 ///    than an instance name may be, and they must keep working;
+/// 2. `instance_name` — the `--instance-name` value, which only
+///    `infra install` can supply;
 /// 3. `BOOTROOT_INSTANCE` from `<compose dir>/.env`;
 /// 4. the literal [`DEFAULT_INSTANCE_NAME`].
+///
+/// The override outranks the declared identity because it is the only
+/// rank that leaves an install and the commands run against it
+/// afterwards in agreement.  Every later command resolves the project
+/// from that same variable, so an install that ignored it created the
+/// stack in one project while the whole shell it was run from addressed
+/// another — a `clean` that removed nothing and a `status` that reported
+/// on nothing.  The identity itself is untouched by it: the name every
+/// container is called after comes from
+/// [`resolve_recorded_instance_name`], which takes no override at all.
 pub(crate) fn resolve_compose_project_for_dir(
     compose_dir: &Path,
     instance_name: Option<&str>,
     project_override: Option<&str>,
     messages: &Messages,
 ) -> Result<String> {
-    if let Some(name) = instance_name {
-        return Ok(name.to_string());
-    }
     if let Some(project) = project_override.filter(|value| !value.is_empty()) {
         return Ok(project.to_string());
+    }
+    if let Some(name) = instance_name {
+        return Ok(name.to_string());
     }
     if let Some(recorded) = recorded_instance_name(compose_dir, messages)? {
         return Ok(recorded);
@@ -184,13 +194,17 @@ pub(crate) struct ComposeIdentity {
 }
 
 impl ComposeIdentity {
-    /// The identity an explicitly named install takes.
+    /// The identity a named install takes with no project override in
+    /// play.
     ///
-    /// `--instance-name` outranks everything either resolver consults,
-    /// so both halves are that name and nothing is read from disk or
-    /// from the environment.  Infallible for the same reason, which is
-    /// what lets the best-effort `init` rollback fall back to the
-    /// default identity without a `Result` to handle.
+    /// Both halves are that name: `--instance-name` outranks everything
+    /// left once `COMPOSE_PROJECT_NAME` is out of the picture, so
+    /// nothing is read from disk.  Infallible for the same reason, which
+    /// is what lets the best-effort `init` rollback fall back to the
+    /// default identity without a `Result` to handle.  A caller that may
+    /// see an override wants
+    /// [`ComposeIdentity::resolve_for_dir`] instead, which keeps the two
+    /// halves apart.
     pub(crate) fn for_instance(name: &str) -> Self {
         Self {
             project: name.to_string(),
@@ -224,17 +238,14 @@ impl ComposeIdentity {
         project_override: Option<&str>,
         messages: &Messages,
     ) -> Result<Self> {
-        if let Some(name) = instance_name {
-            return Ok(Self::for_instance(name));
-        }
         Ok(Self {
             project: resolve_compose_project_for_dir(
                 compose_dir,
-                None,
+                instance_name,
                 project_override,
                 messages,
             )?,
-            instance_name: resolve_recorded_instance_name(compose_dir, None, messages)?,
+            instance_name: resolve_recorded_instance_name(compose_dir, instance_name, messages)?,
         })
     }
 
@@ -466,18 +477,94 @@ mod tests {
         }
     }
 
+    /// The override outranks the declared identity for the project, and
+    /// reaches the recorded identity not at all.  Ranking them the other
+    /// way round is what used to leave an install in a project the shell
+    /// that ran it never addressed again.
+    ///
+    /// The E2E lifecycle harness depends on this ranking: it declares a
+    /// length-bounded `--instance-name` and exports a separately derived
+    /// project, and a resolver that put the flag first would install
+    /// into one project while the harness scoped its own `docker
+    /// compose` calls to another.  `scripts/validate-e2e-run-scope.sh`
+    /// asserts this test still exists for that reason.
     #[test]
-    fn flag_wins_over_compose_project_name() {
+    fn compose_project_name_wins_over_the_flag_for_the_project_only() {
         let dir = tempfile::tempdir().unwrap();
         write_dotenv_with_instance(dir.path(), "recorded");
-        let project = resolve_compose_project_for_dir(
+        let identity = ComposeIdentity::resolve_for_dir_with_override(
             dir.path(),
             Some("flag"),
             Some("env-project"),
             &test_messages(),
         )
         .unwrap();
-        assert_eq!(project, "flag");
+        assert_eq!(identity.project(), "env-project");
+        assert_eq!(
+            identity.container(BootrootContainer::OpenBao),
+            "flag-openbao"
+        );
+    }
+
+    /// Without an override the declared identity is both halves, which
+    /// is [`ComposeIdentity::for_instance`] — and the two paths must not
+    /// drift apart.
+    #[test]
+    fn the_flag_alone_is_both_halves() {
+        let dir = tempfile::tempdir().unwrap();
+        write_dotenv_with_instance(dir.path(), "recorded");
+        for project_override in [None, Some("")] {
+            let identity = ComposeIdentity::resolve_for_dir_with_override(
+                dir.path(),
+                Some("flag"),
+                project_override,
+                &test_messages(),
+            )
+            .unwrap();
+            assert_eq!(identity.project(), "flag");
+            assert_eq!(
+                identity.container(BootrootContainer::OpenBao),
+                ComposeIdentity::for_instance("flag").container(BootrootContainer::OpenBao)
+            );
+        }
+    }
+
+    /// The E2E harness's shape: an install declares a length-bounded
+    /// instance and exports a project derived separately from the same
+    /// run identifier, longer than an instance name may legally be.
+    /// Both must survive the install intact.
+    #[test]
+    fn a_declared_instance_and_a_longer_exported_project_stay_separate() {
+        const RUN_PROJECT: &str = "bootroot-e2e-local-no-hosts-18446744073709551615-99999";
+        const RUN_INSTANCE: &str = "e2e-local-nohosts18446744073709551615";
+        let messages = test_messages();
+        assert!(RUN_PROJECT.len() > MAX_INSTANCE_NAME_LEN);
+        validate_instance_name(RUN_INSTANCE, &messages)
+            .expect("the derived instance must be legal");
+        let dir = tempfile::tempdir().unwrap();
+        let identity = ComposeIdentity::resolve_for_dir_with_override(
+            dir.path(),
+            Some(RUN_INSTANCE),
+            Some(RUN_PROJECT),
+            &messages,
+        )
+        .unwrap();
+        assert_eq!(identity.project(), RUN_PROJECT);
+        assert_eq!(
+            identity.container(BootrootContainer::OpenBaoAgentResponder),
+            format!("{RUN_INSTANCE}-openbao-agent-responder")
+        );
+        let command = identity
+            .compose(&["docker-compose.yml"], None, &["up", "-d"])
+            .command(&[]);
+        assert!(command_args(&command).contains(&RUN_PROJECT.to_string()));
+        assert_eq!(
+            command_envs(&command),
+            vec![(
+                INSTANCE_NAME_ENV_KEY.to_string(),
+                Some(RUN_INSTANCE.to_string())
+            )]
+        );
     }
 
     #[test]

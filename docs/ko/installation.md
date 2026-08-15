@@ -297,7 +297,8 @@ bootroot는 `state.json`을 프로세스 작업 디렉터리 기준으로 해석
 실행하면 서비스가 다른 인스턴스에 등록됩니다.
 
 마지막으로, 내보낸 `COMPOSE_PROJECT_NAME`은 기록된
-`BOOTROOT_INSTANCE`보다 우선합니다(전체 우선순위는 [CLI](cli.md)의
+`BOOTROOT_INSTANCE`와 명령줄의 `--instance-name` 모두보다
+우선합니다(전체 우선순위는 [CLI](cli.md)의
 "인스턴스 정체성과 Compose 프로젝트" 절 참고). 셸에 값이 남아 있으면
 현재 서 있는 디렉터리의 인스턴스가 아니라 그 프로젝트를 조용히
 대상으로 삼으므로, 같은 호스트의 여러 인스턴스를 다루기 전에 해제하세요.

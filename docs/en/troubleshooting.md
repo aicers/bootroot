@@ -38,9 +38,11 @@ There are two ways to get there:
 
 - both installs share one compose directory, so both read the same `.env` and
   the same recorded `BOOTROOT_INSTANCE`;
-- a `COMPOSE_PROJECT_NAME` is exported in the shell. It outranks the recorded
-  `BOOTROOT_INSTANCE`, so both installs land in that one project no matter what
-  each `.env` says.
+- a `COMPOSE_PROJECT_NAME` is exported in the shell. It outranks both the
+  recorded `BOOTROOT_INSTANCE` and `--instance-name`, so both installs land in
+  that one project no matter what each `.env` says and no matter what identity
+  each declared. Distinct `--instance-name` values do not rescue you here: the
+  containers get distinct names, and the project they share is still one.
 
 Fix:
 

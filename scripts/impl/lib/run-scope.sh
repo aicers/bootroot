@@ -14,18 +14,27 @@
 # the run identifier its artifact directory is already named after, plus
 # the liveness bookkeeping that unique naming makes necessary.
 #
-# The identity and the Compose project are one string, and necessarily
-# so.  `infra install --instance-name X` resolves through
-# `ComposeIdentity::for_instance` (`src/commands/compose_project.rs`),
-# whose project *is* the instance name, and every later `bootroot`
-# invocation resolves its project from the `BOOTROOT_INSTANCE` the
-# install recorded in `.env`.  A harness that used some other project for
-# its own raw `docker compose` calls would tear down a project holding
-# none of its containers.  The two values are therefore derived through
-# separate functions with separate rules — the instance is validated and
-# length-bounded, the project is not — and `assert_resolved_compose_
-# project` in each harness reads the resolved project back off a real
-# container rather than assuming it.
+# The instance and the Compose project are derived separately, from the
+# same run identifier, under different rules — and they have to be.  An
+# instance name is a prefix on container names, which are DNS labels and
+# certificate SANs, so it is validated and capped at 39 characters; a
+# CI-length `GITHUB_RUN_ID` carries the identifier past that on its own.
+# A Compose project carries no such limit, so it keeps the identifier
+# whole and stays legible in `docker ps` when the truncated instance no
+# longer is.
+#
+# Both then have to be made effective, by different routes.  The instance
+# reaches `infra install` as `--instance-name`, which is what records it
+# in `.env` and names every container the binary later creates — the
+# `-openbao-agent-stepca` and `-openbao-agent-responder` sidecars
+# included.  The project reaches it as an exported `COMPOSE_PROJECT_NAME`,
+# which outranks the declared identity for the project and nothing else
+# (`resolve_compose_project_for_dir`, `src/commands/compose_project.rs`),
+# and which every later `bootroot` invocation in the run resolves the
+# same way.  `assert_resolved_compose_project` in each harness then reads
+# the project the install actually resolved back off a real container,
+# because a run whose binary resolved some other project would tear down
+# a project holding none of its containers.
 #
 # Requires `lib/leftovers.sh` for `BOOTROOT_CONTAINER_SUFFIXES` and
 # `bootroot_leftover_containers`, and a caller-defined `fail`.
@@ -60,6 +69,13 @@ BOOTROOT_E2E_RUN_MARKER_DIR="${BOOTROOT_E2E_RUN_MARKER_DIR:-${TMPDIR:-/tmp}/boot
 # have `infra install` reject it several minutes into a run.
 RUN_SCOPE_INSTANCE_ALPHABET="abcdefghijklmnopqrstuvwxyz0123456789"
 
+# What a Compose project name may hold after its first character, per
+# Compose's own rule.  Wider than the instance alphabet on purpose: the
+# project is not truncated, so it can afford to keep the `-` separators
+# that make the run identifier readable in `docker ps` and in a label
+# filter.  Spelled out for the same collation reason as above.
+RUN_SCOPE_PROJECT_ALPHABET="abcdefghijklmnopqrstuvwxyz0123456789-_"
+
 # Reduces a free-form run identifier to the alphabet an instance name may
 # use, dropping every other character rather than mapping it to `-`: the
 # result is a token to be appended to a prefix, and a mapped separator
@@ -68,6 +84,15 @@ run_scope_sanitize() {
   printf '%s' "$1" \
     | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' \
     | LC_ALL=C tr -cd "$RUN_SCOPE_INSTANCE_ALPHABET"
+}
+
+# Reduces a free-form run identifier to what a Compose project name may
+# hold, keeping the separators `run_scope_sanitize` drops.  Nothing here
+# is truncated, so there is no length budget for a separator to spend.
+run_scope_project_sanitize() {
+  printf '%s' "$1" \
+    | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' \
+    | LC_ALL=C tr -cd "$RUN_SCOPE_PROJECT_ALPHABET"
 }
 
 # Prints the identifier this run's instance and project are both derived
@@ -126,16 +151,43 @@ run_scope_assert_valid_instance() {
   esac
 }
 
-# Prints the Compose project a run's own `docker compose` calls must be
-# scoped to, given the instance name it installs at.
+# Prints the Compose project a run scopes every `docker compose` call to
+# — its own and the ones `bootroot` makes — derived from the same token
+# as the instance name and under its own rule.
 #
-# The same string, for the reason the header states: `--instance-name`
-# makes the project the instance name, and a harness that used any other
-# would be talking about a project its own install never created.  It is
-# a function rather than an assignment so the reason lives in one place
-# and both harnesses read it.
-run_scope_project_for_instance() {
-  printf '%s\n' "$1"
+# Nothing is truncated here.  A Compose project has no DNS label to fit
+# inside and no certificate SAN to appear in, so it keeps the whole run
+# identifier: that is what makes it unique without relying on the pid
+# alone, and what keeps a `com.docker.compose.project` filter legible
+# after the instance name has been cut to 39 characters.  For a
+# CI-length `GITHUB_RUN_ID` the two therefore differ in length as well as
+# in content, which is the point of deriving them separately.
+run_scope_project() {
+  local prefix="$1" token
+  token="$(run_scope_project_sanitize "$2")"
+  [ -n "$token" ] \
+    || fail "the run identifier '$2' holds no character a Compose project name may use"
+  printf '%s%s\n' "$prefix" "$token"
+}
+
+# Aborts unless `name` is one Compose will accept as a project.
+#
+# Checked for the same reason the instance name is: a prefix edited later
+# would otherwise surface as a rejected `docker compose` call several
+# minutes into a run.  Compose requires a lowercase letter or a digit
+# first, then lowercase letters, digits, `-` and `_`.
+run_scope_assert_valid_project() {
+  local name="$1"
+  [ -n "$name" ] || fail "the derived Compose project name is empty"
+  case "$name" in
+    ["$RUN_SCOPE_INSTANCE_ALPHABET"]*) ;;
+    *) fail "derived Compose project '${name}' does not start with a lowercase letter or a digit" ;;
+  esac
+  case "$name" in
+    *[!"$RUN_SCOPE_PROJECT_ALPHABET"]*)
+      fail "derived Compose project '${name}' holds a character outside [a-z0-9_-]"
+      ;;
+  esac
 }
 
 # Records the instance in a `.env` beside the directory a harness runs
@@ -332,9 +384,13 @@ collect_dead_run_instance() {
     status=1
   fi
   # Volumes and networks are reached by the project label the marker
-  # recorded, which is as exact as the container names: a run's project
-  # is its instance name, so a default-identity install's `bootroot`
-  # project is out of reach here for the same reason its containers are.
+  # recorded, which is as exact as the container names: the label filter
+  # matches that one project and no other, so a default-identity
+  # install's `bootroot` project is out of reach here for the same
+  # reason its containers are.  The project is read from the marker
+  # rather than derived from the instance, because the two are separate
+  # values and only the marker knows which project went with which
+  # instance.
   [ -n "$project" ] || return "$status"
   if ids="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" 2>>"$log")"; then
     for id in $ids; do

@@ -287,8 +287,8 @@ written, which Compose project is rewired, and which OpenBao is contacted: the
 URL comes from that directory's `state.json`. Running `bootroot service add`
 from the wrong directory registers the service against the wrong instance.
 
-Finally, an exported `COMPOSE_PROJECT_NAME` outranks the recorded
-`BOOTROOT_INSTANCE` (see
+Finally, an exported `COMPOSE_PROJECT_NAME` outranks both the recorded
+`BOOTROOT_INSTANCE` and an `--instance-name` given on the command line (see
 [Instance identity and the Compose project](cli.md#instance-identity-and-the-compose-project)
 for the full order). Leaving one set in a shell silently targets that project
 instead of the instance whose directory you are standing in; unset it before

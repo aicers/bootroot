@@ -39,8 +39,11 @@
 - 두 설치본이 하나의 compose 디렉터리를 공유해 같은 `.env`와 같은
   `BOOTROOT_INSTANCE`를 읽는 경우
 - 셸에 `COMPOSE_PROJECT_NAME`이 내보내져 있는 경우. 이 값은 기록된
-  `BOOTROOT_INSTANCE`보다 우선하므로, 각 `.env`에 무엇이 적혀 있든 두
-  설치본이 모두 그 하나의 프로젝트에 놓입니다.
+  `BOOTROOT_INSTANCE`와 `--instance-name` 모두보다 우선하므로, 각 `.env`에
+  무엇이 적혀 있든 어떤 정체성을 선언했든 두 설치본이 모두 그 하나의
+  프로젝트에 놓입니다. 서로 다른 `--instance-name` 값을 준다고 해결되지
+  않습니다. 컨테이너 이름만 달라질 뿐 공유하는 프로젝트는 여전히
+  하나입니다.
 
 해결:
 

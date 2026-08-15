@@ -82,10 +82,10 @@ cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 # retries are sized to cover a full poll interval on slow runners.
 # The lifecycle scripts take no project name.  They derive their own
 # per-run instance, Compose project and published ports so two runs can
-# share a host, which a caller-supplied project would only half-override:
-# `infra install --instance-name` fixes the project to the instance name,
-# and a `-p` disagreeing with it would name a project the install never
-# created.  See `scripts/impl/lib/run-scope.sh`.
+# share a host, and they clear an inherited `COMPOSE_PROJECT_NAME` before
+# exporting their own — so a caller-supplied project would be discarded
+# rather than honoured, and passing one would only suggest otherwise.
+# See `scripts/impl/lib/run-scope.sh`.
 echo "[ci-local-e2e] run local lifecycle (no-hosts)"
 ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}" \
 RESOLUTION_MODE="no-hosts" \
