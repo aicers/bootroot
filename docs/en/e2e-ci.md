@@ -137,7 +137,7 @@ them down on the way in, and they would otherwise accumulate for as long as
 the machine runs.
 
 Each run records its liveness explicitly instead. On start it writes
-`${TMPDIR:-/tmp}/bootroot-e2e-runs/<instance>` holding its own pid and its
+`${TMPDIR:-/tmp}/bootroot-e2e-runs-<uid>/<instance>` holding its own pid and its
 Compose project, and on the way out it removes that file — only ever the one
 recording its own pid, and only once its own teardown has left nothing
 behind. Before doing any work it reads every marker in that
@@ -152,6 +152,13 @@ acceptable: the next run collects them and nothing is removed wrongly. The
 sweep never matches a prefix or a wildcard — `bootroot-*` would reach into a
 real default-identity install on the same host — so it can only touch
 instances a run recorded.
+
+The directory is per-user and created `0700`, and a run refuses one it does not
+own: a marker's filename is an instance the sweep tears down by exact container
+name, so anyone who could write there would be choosing what a later run
+destroys. The uid in the path is what gives Linux the separation `$TMPDIR`
+already gives macOS, so two users can run the harness on one host instead of
+the second being refused.
 
 `scripts/validate-e2e-run-scope.sh` covers the derivation, the markers and the
 sweep without Docker, and runs in the `check` CI job.

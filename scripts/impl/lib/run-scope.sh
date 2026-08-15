@@ -42,7 +42,16 @@ BOOTROOT_MAX_INSTANCE_NAME_LEN=39
 # Under `${TMPDIR:-/tmp}` because that is where the harness already keeps
 # run state (`scripts/preflight/ci/e2e-matrix.sh`), and because on macOS
 # it is per-user, which keeps one user's markers out of another's sweep.
-BOOTROOT_E2E_RUN_MARKER_DIR="${BOOTROOT_E2E_RUN_MARKER_DIR:-${TMPDIR:-/tmp}/bootroot-e2e-runs}"
+#
+# The uid is in the name so Linux gets that separation too, where
+# `TMPDIR` is usually unset and `/tmp` is the whole machine's.  Without
+# it two users cannot both run the harness on one host: the first
+# creates the directory 0700, and `ensure_run_marker_dir` then refuses
+# it for the second — which is the same serialisation this issue exists
+# to remove, arriving as a hard failure instead of a collision.  The
+# ownership check below stays regardless, because a predictable path is
+# still one somebody else can get to first.
+BOOTROOT_E2E_RUN_MARKER_DIR="${BOOTROOT_E2E_RUN_MARKER_DIR:-${TMPDIR:-/tmp}/bootroot-e2e-runs-$(id -u)}"
 
 # The characters `validate_instance_name` accepts after the prefix,
 # spelled out rather than written as `a-z0-9`.  A bracket range is

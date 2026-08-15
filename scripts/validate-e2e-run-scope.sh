@@ -247,6 +247,33 @@ check_markers() {
   ok "a marker survives a teardown that did not finish, and goes with one that did"
 }
 
+# The default marker directory has to be per-user, and this is the only
+# check that can see it: everything else here runs under an override so
+# the sweep cannot reach a developer's live run.
+#
+# `ensure_run_marker_dir` refuses a directory this user does not own, so
+# a path shared by the whole machine would let the first user to run the
+# harness lock every other one out of it — the same serialisation the
+# per-run identity exists to remove, arriving as a hard failure.
+check_default_marker_dir_is_per_user() {
+  local resolved
+  resolved="$(
+    unset BOOTROOT_E2E_RUN_MARKER_DIR
+    # shellcheck source=impl/lib/run-scope.sh
+    . "$IMPL_DIR/lib/run-scope.sh"
+    printf '%s' "$BOOTROOT_E2E_RUN_MARKER_DIR"
+  )"
+  case "$resolved" in
+    "${TMPDIR:-/tmp}"/*) ;;
+    *) die "the default marker directory '${resolved}' is not under \${TMPDIR:-/tmp}" ;;
+  esac
+  case "$resolved" in
+    *"-$(id -u)") ;;
+    *) die "the default marker directory '${resolved}' is not per-user; two users on one host would contend for it" ;;
+  esac
+  ok "the default marker directory is per-user, so two users can run the harness on one host"
+}
+
 check_liveness() {
   run_pid_is_alive "$$" || die "this process reads as dead"
   # A pid past the kernel's maximum can never name a live process.
@@ -565,6 +592,7 @@ check_derived_instances_are_installable
 check_truncation_keeps_the_discriminating_tail
 check_derivation_rejects_what_it_cannot_derive
 check_markers
+check_default_marker_dir_is_per_user
 check_liveness
 install_docker_stub
 check_sweep_collects_only_dead_runs
