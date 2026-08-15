@@ -222,18 +222,33 @@ write_run_marker() {
   mv "$tmp" "$path" || fail "cannot publish the E2E run marker ${path}"
 }
 
-# Removes this run's own marker, and only this run's.
+# Removes this run's own marker, and only this run's, once its teardown
+# has left nothing behind.
 #
 # The recorded pid is compared rather than assumed: a marker naming
 # another pid belongs to a run still using that instance, and removing it
 # would hide that run's containers from every later sweep.
+#
+# The second argument is the teardown's status, and a non-zero one keeps
+# the marker — the same rule `sweep_dead_run_instances` applies to a
+# collection that did not finish, for the same reason.  A teardown that
+# failed, or that left a container the end-of-run check reported, is the
+# one case where this run's instance still holds resources after this
+# run is gone.  Dropping the marker there would strand them under a name
+# no later sweep knows to ask about, which is the accumulation the
+# marker exists to stop; keeping it costs one retry by the next run,
+# which finds this pid dead and collects what is left.
 remove_run_marker() {
-  local instance="${1:-}" path recorded
+  local instance="${1:-}" teardown_status="${2:-0}" path recorded
   [ -n "$instance" ] || return 0
   path="$(run_marker_path "$instance")"
   [ -f "$path" ] || return 0
   recorded="$(run_marker_field "$path" pid)"
   [ "$recorded" = "$$" ] || return 0
+  if [ "$teardown_status" -ne 0 ]; then
+    echo "the teardown of ${instance} did not finish, so its run marker is kept for the next run to collect: ${path}" >&2
+    return 0
+  fi
   rm -f "$path"
 }
 

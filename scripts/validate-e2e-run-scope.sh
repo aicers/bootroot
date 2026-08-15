@@ -209,6 +209,19 @@ check_markers() {
   remove_run_marker ""
   remove_run_marker "$instance"
   ok "a run removes its own marker, and removing an absent one is not an error"
+
+  # A teardown that failed, or that left a container the end-of-run check
+  # reported, is the one case where this run's instance still holds
+  # resources once the run is gone.  Dropping the marker there strands
+  # them under a name no later sweep knows to ask about — precisely the
+  # accumulation the marker exists to stop.
+  write_run_marker "$instance" "$instance"
+  remove_run_marker "$instance" 1 2>/dev/null
+  [ -f "$path" ] \
+    || die "remove_run_marker dropped the marker of a run whose teardown left containers behind"
+  remove_run_marker "$instance" 0
+  [ ! -f "$path" ] || die "remove_run_marker kept the marker of a clean teardown"
+  ok "a marker survives a teardown that did not finish, and goes with one that did"
 }
 
 check_liveness() {
@@ -450,8 +463,10 @@ check_harness_wiring() {
       || die "${script}'s main does not sweep the instances of dead runs"
     grep -q '^  write_run_marker "\$RUN_INSTANCE" "\$COMPOSE_PROJECT"$' "$path" \
       || die "${script}'s main records no liveness marker"
-    grep -q '^  remove_run_marker "\$RUN_INSTANCE"$' "$path" \
-      || die "${script}'s cleanup does not remove its own marker"
+    # With the teardown's status, so a teardown that left something
+    # behind keeps the marker the next run collects it by.
+    grep -q '^  remove_run_marker "\$RUN_INSTANCE" "\$cleanup_status"$' "$path" \
+      || die "${script}'s cleanup does not remove its own marker against the teardown's status"
     grep -q '^  assert_resolved_compose_project$' "$path" \
       || die "${script} does not assert the project its install resolved"
     grep -qF -- '--instance-name "$RUN_INSTANCE"' "$path" \

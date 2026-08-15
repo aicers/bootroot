@@ -395,8 +395,10 @@ cleanup() {
   # Last, and outside the ownership guard: the marker says this run is
   # still using its instance, and it has to outlive everything that could
   # leave a container behind.  It removes only a marker recording this
-  # process's own pid, so a run that never wrote one removes nothing.
-  remove_run_marker "$RUN_INSTANCE"
+  # process's own pid, so a run that never wrote one removes nothing, and
+  # only when the teardown above left nothing for the next run to
+  # collect.
+  remove_run_marker "$RUN_INSTANCE" "$cleanup_status"
   exit_with_cleanup_status "$status" "$cleanup_status"
 }
 
