@@ -320,8 +320,13 @@ check_harness_wiring() {
       || die "${script} does not end its cleanup with the run's own status"
     grep -q '^  compose_down || true$' "$IMPL_DIR/$script" \
       || die "${script} has no start-of-run teardown"
+    grep -q 'down -v --remove-orphans >>"\$RUN\(NER\)\?_LOG" 2>&1' "$IMPL_DIR/$script" \
+      || die "${script}'s teardown does not send its output to the run log"
+    grep -q '^  if ! compose_down; then$' "$IMPL_DIR/$script" \
+      || die "${script}'s cleanup does not fail the run on a failed teardown"
   done
   ok "every default-identity harness tears down and checks at the start, and reports at the end"
+  ok "every teardown reaches the run log, and a failed one at the end fails the run"
 
   grep -q 'assert_no_project_leftovers ' "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
     || die "${RUN_SCOPED_SCRIPT} does not use the shared label-scoped check"
@@ -331,6 +336,13 @@ check_harness_wiring() {
   # container-name check would be both wrong and redundant there.
   ! grep -q 'assert_no_leftover_containers' "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
     || die "${RUN_SCOPED_SCRIPT} must not run the default-identity container check"
+  grep -q 'exit_with_cleanup_status ' "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
+    || die "${RUN_SCOPED_SCRIPT} does not end its cleanup with the run's own status"
+  # Its teardown is `teardown_instance` rather than a `compose_down`, so
+  # the `/dev/null` sweep below does not reach it.
+  ! grep -q 'docker \(rm -f\|volume rm -f\|network rm\) "\$id" >/dev/null' \
+    "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
+    || die "${RUN_SCOPED_SCRIPT}'s teardown still discards its output"
   ok "the run-scoped harness uses the label-scoped check and only that one"
 
   # A teardown that removed nothing has to be distinguishable from one
