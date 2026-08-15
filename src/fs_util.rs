@@ -728,15 +728,24 @@ pub enum StagedDurability {
 /// directory, applying `mode` and `owner` to it there, and `rename`ing
 /// it over the destination.
 ///
-/// This is the one staging implementation in the crate. Every
-/// production file bootroot publishes reaches disk through it —
-/// `state.json`, `rotation-state.json`, `agent.toml`, the fast-poll
-/// state, the two `init` outputs, the issued certificate, key and CA
-/// bundle, and the configuration `init` and the rotation commands
-/// generate (`.env`, `ca.json` and its template, `openbao.hcl`, the
-/// responder config, the `OpenBao` Agent configs and credentials, the
-/// compose overrides). The destination name is only ever observed as
-/// the previous file or the complete new one.
+/// This is the one staging implementation in the crate. Every staged
+/// production file reaches disk through it — `state.json`,
+/// `rotation-state.json`, `agent.toml`, the fast-poll state, the two
+/// `init` outputs, the issued certificate, key and CA bundle, and the
+/// configuration `init` and the rotation commands generate (`.env`,
+/// `ca.json` and its template, `openbao.hcl`, the responder config,
+/// the `OpenBao` Agent configs and credentials, the compose
+/// overrides). For those the destination name is only ever observed as
+/// the previous file or the complete new one, and the final mode holds
+/// from the moment the name appears.
+///
+/// Two production writers are not staged yet and have neither
+/// property: `save_unseal_keys`, for `secrets/openbao/unseal-keys.txt`,
+/// and [`crate::eab`]'s `write_key_file`, for the `eab.json` beside
+/// each service's `secret_id`. Both still write over the destination in
+/// place and set `0600` once the bytes are down. Converting them is a
+/// separate change; do not read the guarantees above as covering the
+/// crate's writes exhaustively until it lands.
 ///
 /// Callers reach it through one of the four wrappers rather than
 /// directly: [`atomic_write`]/[`atomic_write_blocking`] for a file read
