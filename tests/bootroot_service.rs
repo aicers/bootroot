@@ -1054,6 +1054,13 @@ async fn test_app_add_print_only_shows_snippets_without_writes() {
     assert!(stdout.contains("preview mode: no files or state were changed"));
     assert!(stdout.contains("trust preview unavailable"));
     assert!(!stdout.contains("auto-applied"));
+    // The preview registers no aliases, so it reports none: reporting
+    // zero here would read as a registration that attached nothing, and
+    // any count at all would claim work the preview did not do.
+    assert!(
+        !stdout.contains("HTTP-01 DNS aliases registered"),
+        "the preview must not report an alias outcome: {stdout}"
+    );
 
     let state_contents =
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state.json");

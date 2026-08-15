@@ -100,7 +100,7 @@ pub(crate) fn print_service_add_summary(
     // Fixed position, ahead of the optional blocks, so the line an
     // operator or a script looks for does not move with them.
     if let Some(outcome) = options.dns_alias {
-        print_dns_alias_outcome(outcome, messages);
+        println!("{}", dns_alias_summary_line(outcome, messages));
     }
     if let Some(paths) = options.applied {
         print_local_apply_summary(&paths, messages);
@@ -115,10 +115,6 @@ pub(crate) fn print_service_add_summary(
         return;
     }
     print_service_add_snippets(entry, secret_id_path, options.trusted_ca_sha256, messages);
-}
-
-fn print_dns_alias_outcome(outcome: DnsAliasOutcome, messages: &Messages) {
-    println!("{}", dns_alias_summary_line(outcome, messages));
 }
 
 /// Renders the DNS alias registration as one summary line.
