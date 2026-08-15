@@ -1070,6 +1070,69 @@ pub async fn write_ca_bundle(
     cert_group::write_bundle_file(bundle_path, bundle_pem, policy).await
 }
 
+/// Marker that tells a re-executed test binary it is the isolated child
+/// rather than the parent that spawned it.
+const UMASK_CHILD_MARKER: &str = "BOOTROOT_UMASK_TEST_CHILD";
+
+/// Runs `test_name` — one test of the *calling* test executable — in a
+/// child process of its own, and answers whether it did.
+///
+/// `umask` is a property of the process, not of a thread, so a test that
+/// sets one sets it for every test the harness happens to be running
+/// beside it: the window covers every file those tests create, and no
+/// lock held by the setter can close it, since the tests it would race
+/// take no such lock. Making the umask-dependent test its own process is
+/// the only isolation that actually holds. Both bootroot test
+/// executables have exactly one such test, and each opens with
+///
+/// ```ignore
+/// if fs_util::umask_test_ran_in_child("module::tests::the_test_name") {
+///     return;
+/// }
+/// ```
+///
+/// which is `true` in the parent — the child has run the body and its
+/// result has already been asserted — and `false` in the child, which
+/// goes on to run it with the process to itself.
+///
+/// The child is asked for exactly one test and is held to it: a name
+/// that has drifted from the function it was copied from matches
+/// nothing, and libtest reports *success* for a run of zero tests, so
+/// the count is asserted rather than the exit status alone.
+///
+/// # Panics
+///
+/// Panics if this executable's path cannot be read, if it cannot be
+/// re-executed, if the child fails, or if the child did not run exactly
+/// the one test it was given.
+#[must_use]
+pub fn umask_test_ran_in_child(test_name: &str) -> bool {
+    if std::env::var_os(UMASK_CHILD_MARKER).is_some() {
+        return false;
+    }
+    let exe = std::env::current_exe().expect("a running test binary has a path");
+    let output = std::process::Command::new(&exe)
+        .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
+        .env(UMASK_CHILD_MARKER, "1")
+        .output()
+        .unwrap_or_else(|err| panic!("{} must be re-executable: {err}", exe.display()));
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "{test_name} failed in its own process:\n{report}"
+    );
+    assert!(
+        report.contains("test result: ok. 1 passed"),
+        "`--exact {test_name}` must name exactly one test of this binary, \
+         and libtest calls a run of none of them a success:\n{report}"
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -1627,7 +1690,10 @@ mod tests {
         umask: libc::mode_t,
     ) -> u32 {
         // SAFETY: `umask` is a libc call with no memory effects, and
-        // the previous value is restored before this returns.
+        // the previous value is restored before this returns. The
+        // process it changes is the child `umask_test_ran_in_child`
+        // spawned for the one test calling this, so no other test is
+        // running beside it to observe the change.
         let prev = unsafe { libc::umask(umask) };
         let result = publish_staged_blocking(
             path,
@@ -1643,12 +1709,12 @@ mod tests {
 
     /// All three [`StagedMode`] arms, on a create and on a rewrite.
     ///
-    /// One test rather than three, deliberately: `umask` is a property
-    /// of the *process*, so two tests changing it run as one race when
-    /// the harness schedules them on different threads. Sequencing every
-    /// umask-dependent publish in this crate through a single test is
-    /// what makes each window exclusive without a lock shared between
-    /// tests.
+    /// Runs in a process of its own (see [`umask_test_ran_in_child`]),
+    /// because it sets the umask and the umask belongs to the process:
+    /// left in this one it would reach every file every test scheduled
+    /// beside it creates. One test rather than three for the same
+    /// reason — one isolated process, every umask-dependent publish in
+    /// this crate sequenced through it.
     ///
     /// [`StagedMode::PreserveOrUmask`]'s create arm gets its mode from
     /// `open(2)` rather than from a `chmod` afterwards — the only way a
@@ -1657,6 +1723,12 @@ mod tests {
     /// chmod on that arm to leave a wider transient behind.
     #[test]
     fn staged_mode_arms_answer_the_create_and_the_rewrite() {
+        if umask_test_ran_in_child(
+            "fs_util::tests::staged_mode_arms_answer_the_create_and_the_rewrite",
+        ) {
+            return;
+        }
+
         let dir = tempdir().unwrap();
         let umask_restrictive = dir.path().join("umask-077.json");
         let umask_permissive = dir.path().join("umask-022.json");
