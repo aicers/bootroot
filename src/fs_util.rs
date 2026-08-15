@@ -488,10 +488,11 @@ pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()>
 /// and the directory flushed. Callers in an async context use
 /// [`atomic_write`] instead, which runs this on a blocking thread.
 ///
-/// One spelling of [`publish_staged_blocking`], which every staged
-/// publish in the crate goes through — see there for the two decisions
+/// One spelling of [`publish_staged_blocking`], the crate's
+/// general-purpose staging publisher — see there for the two decisions
 /// this one makes ([`StagedOwner::Destination`] and
-/// [`StagedDurability::FlushDirectory`]) and why.
+/// [`StagedDurability::FlushDirectory`]) and why, and for the staged
+/// writers that publish outside it.
 ///
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_write`].
