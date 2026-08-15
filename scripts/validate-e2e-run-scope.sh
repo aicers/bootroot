@@ -58,7 +58,7 @@ ok() {
   echo "[$LABEL] ok: $1"
 }
 
-# The marker directory's permission bits, in octal. The harness runs on
+# A path's permission bits, in octal. The harness runs on
 # both stats, and GNU has to be tried first — the order is the whole
 # point rather than a preference.
 #
@@ -69,7 +69,7 @@ ok() {
 # `||` never fires, and the mode comparison is left holding a multi-line
 # filesystem dump that is never going to equal `700`. GNU-first has no
 # such trap: BSD `stat` rejects `-c` outright, so the fallback runs.
-marker_dir_mode() {
+path_mode() {
   local dir="${1:-$BOOTROOT_E2E_RUN_MARKER_DIR}"
   stat -c '%a' "$dir" 2>/dev/null \
     || stat -f '%OLp' "$dir"
@@ -313,12 +313,12 @@ check_markers() {
   # runs before any marker is written.
   chmod 777 "$BOOTROOT_E2E_RUN_MARKER_DIR"
   write_run_marker "$instance" "$instance"
-  [ "$(marker_dir_mode)" = "700" ] \
-    || die "write_run_marker left the marker directory at mode $(marker_dir_mode)"
+  [ "$(path_mode)" = "700" ] \
+    || die "write_run_marker left the marker directory at mode $(path_mode)"
   chmod 777 "$BOOTROOT_E2E_RUN_MARKER_DIR"
   sweep_dead_run_instances "$LABEL" /dev/null >/dev/null 2>&1 || true
-  [ "$(marker_dir_mode)" = "700" ] \
-    || die "the sweep read a marker directory at mode $(marker_dir_mode)"
+  [ "$(path_mode)" = "700" ] \
+    || die "the sweep read a marker directory at mode $(path_mode)"
   rm -f "$path"
   ok "a pre-existing marker directory is restricted to its owner before it is read or written"
 
@@ -378,8 +378,8 @@ check_marker_dir_refuses_a_symlink() {
 
   [ -f "$bystander" ] \
     || die "the refused symbolic link's target had a file removed from it"
-  [ "$(marker_dir_mode "$victim")" = "755" ] \
-    || die "the refused symbolic link's target was re-moded to $(marker_dir_mode "$victim")"
+  [ "$(path_mode "$victim")" = "755" ] \
+    || die "the refused symbolic link's target was re-moded to $(path_mode "$victim")"
   rm -rf "$victim" "$link"
   ok "a marker directory reached through a symbolic link is refused, not followed"
 }
@@ -435,6 +435,17 @@ check_hosts_lock() {
     || die "the hosts lock does not record this process's pid"
   ok "a hosts-mode run takes a lock recording its own pid"
 
+  # The lock is machine-wide, so the run that reads it next is regularly
+  # another user's, and the pid in here is what tells that run whether
+  # this one is still alive. A lock it cannot read is one it must refuse
+  # rather than clear, so a run started under a restrictive umask would
+  # otherwise deny hosts mode to every other user on the host.
+  case "$(path_mode "$lock")" in
+    *[4567]) ;;
+    *) die "the hosts lock is at mode $(path_mode "$lock"), which another user's run cannot read the holding pid out of" ;;
+  esac
+  ok "the lock a run takes is readable by the other users whose runs have to judge it"
+
   # The second run is refused, and leaves the holder's lock untouched:
   # the whole point is that it stops before it can edit the file.
   status=0
@@ -474,6 +485,118 @@ check_hosts_lock() {
   rm -f "$lock"
   BOOTROOT_HOSTS_LOCK_HELD=0
   ok "a lock recording another pid survives this run's release"
+}
+
+# The lock is machine-wide and lives in `/tmp`, which is sticky: only a
+# file's owner may unlink it there. So the run that finds a killed run's
+# lock stale is regularly one that may not remove it — the file belongs
+# to the user who was killed — and a plain `rm` would leave hosts mode
+# refused on that host for everybody else until that user or root deleted
+# a file by hand, which is the per-user serialisation the machine-wide
+# lock exists to avoid.
+#
+# That case cannot be reproduced under one uid, since this process owns
+# everything it creates here. What is reproduced instead is the refusal
+# itself, with a directory this user may not write, and the privileged
+# path is a `sudo` stub standing in for the `sudo -n` hosts mode already
+# requires before it reaches the lock at all.
+check_hosts_lock_reclaims_a_lock_this_user_cannot_unlink() {
+  local dir="$WORK_DIR/foreign-lock" stub_dir="$WORK_DIR/foreign-lock-bin"
+  local stub_log="$WORK_DIR/foreign-lock-sudo.log" lock status=0
+  if [ "$(id -u)" -eq 0 ]; then
+    ok "skipped as root, which unlinks a file whoever owns it and never reaches the privileged fallback"
+    return 0
+  fi
+  mkdir -p "$dir" "$stub_dir"
+  lock="$dir/hosts.lock"
+
+  # A `sudo` that refuses, which is every sudo-less host and every
+  # sudoers that does not cover this: the run is refused rather than
+  # proceeding as though it held the file, and the lock survives.
+  cat >"$stub_dir/sudo" <<'STUB'
+#!/bin/sh
+echo "$@" >>"$SUDO_STUB_LOG"
+exit 1
+STUB
+  chmod 755 "$stub_dir/sudo"
+  : >"$stub_log"
+  printf 'pid=%s\nholder=%s\n' 4194305 "a killed run of another user" >"$lock"
+  chmod 555 "$dir"
+  status=0
+  (
+    export SUDO_STUB_LOG="$stub_log"
+    PATH="$stub_dir:$PATH"
+    BOOTROOT_E2E_HOSTS_LOCK="$lock"
+    BOOTROOT_HOSTS_LOCK_HELD=0
+    acquire_hosts_lock "the next user's run"
+  ) >/dev/null 2>&1 || status=$?
+  chmod 755 "$dir"
+  [ "$status" -eq 9 ] \
+    || die "a stale lock this user cannot unlink was not refused when the privileged path refused too"
+  grep -q 'rm' "$stub_log" \
+    || die "the stale-lock removal never tried the privileged path this user needs to clear another user's lock"
+  [ -f "$lock" ] \
+    || die "a run that could not clear the stale lock removed it anyway"
+
+  # And a `sudo` that does what root does. The stub leaves the directory
+  # writable afterwards because the real `/tmp` never stopped being: what
+  # the run may not do there is unlink one file, not create its own.
+  cat >"$stub_dir/sudo" <<'STUB'
+#!/bin/sh
+echo "$@" >>"$SUDO_STUB_LOG"
+[ "$1" = "-n" ] || exit 1
+shift
+[ "$1" = "rm" ] || exit 1
+for arg in "$@"; do
+  target="$arg"
+done
+chmod u+rwx "$(dirname "$target")" || exit 1
+exec rm -f -- "$target"
+STUB
+  chmod 755 "$stub_dir/sudo"
+  : >"$stub_log"
+  chmod 555 "$dir"
+  (
+    export SUDO_STUB_LOG="$stub_log"
+    PATH="$stub_dir:$PATH"
+    BOOTROOT_E2E_HOSTS_LOCK="$lock"
+    BOOTROOT_HOSTS_LOCK_HELD=0
+    acquire_hosts_lock "the next user's run"
+    hosts_lock_held || exit 1
+    [ "$(run_marker_field "$lock" pid)" = "$$" ] || exit 1
+  ) || die "a stale lock this user cannot unlink was not reclaimed through the privileged path"
+  chmod 755 "$dir"
+  [ "$(run_marker_field "$lock" pid)" = "$$" ] \
+    || die "the reclaimed hosts lock does not record the run that took it"
+  rm -f "$lock"
+  rm -f "$stub_dir/sudo"
+  ok "a stale lock this user may not unlink is reclaimed through the privileged path hosts mode already requires"
+}
+
+# Liveness is the only thing that licenses a removal here, and it is read
+# out of the file. A pid that cannot be read is not a pid that is dead:
+# clearing on one would hand `/etc/hosts` to two runs at once, and the
+# privileged fallback above is what would make that succeed.
+check_hosts_lock_refuses_an_unreadable_lock() {
+  local lock="$WORK_DIR/unreadable-hosts.lock" status=0
+  if [ "$(id -u)" -eq 0 ]; then
+    ok "skipped as root, which reads a file at any mode"
+    return 0
+  fi
+  printf 'pid=%s\nholder=%s\n' "$$" "a run whose lock cannot be read" >"$lock"
+  chmod 000 "$lock"
+  (
+    BOOTROOT_E2E_HOSTS_LOCK="$lock"
+    BOOTROOT_HOSTS_LOCK_HELD=0
+    acquire_hosts_lock "the run that cannot read it"
+  ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] \
+    || die "a hosts lock whose holding pid cannot be read was not treated as held"
+  chmod 644 "$lock"
+  [ -f "$lock" ] \
+    || die "a hosts lock whose holding pid cannot be read was cleared as though it were stale"
+  rm -f "$lock"
+  ok "a hosts lock that cannot be read is treated as held, never as stale"
 }
 
 # `noclobber` refuses an existing file but happily creates the target of
@@ -995,6 +1118,8 @@ check_markers
 check_marker_dir_refuses_a_symlink
 check_default_marker_dir_is_per_user
 check_hosts_lock
+check_hosts_lock_reclaims_a_lock_this_user_cannot_unlink
+check_hosts_lock_refuses_an_unreadable_lock
 check_hosts_lock_refuses_a_symlink
 check_default_hosts_lock_is_machine_wide
 check_liveness

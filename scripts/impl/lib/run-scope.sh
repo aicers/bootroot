@@ -550,6 +550,13 @@ sweep_dead_run_instances() {
 # a lock somebody else planted denies `hosts` runs — loudly, naming the
 # path — where a marker directory somebody else planted would have aimed
 # a teardown.
+#
+# What a machine-wide path in `/tmp` does cost is the recovery of a
+# killed run's lock, and that has to be paid rather than accepted:
+# `/tmp` is sticky, so the next user's run cannot unlink the file the
+# killed user's run left behind, and `hosts` mode would stay refused for
+# everyone but its owner.  `hosts_lock_clear_stale` below therefore falls
+# back to the `sudo -n` the mode already requires.
 BOOTROOT_E2E_HOSTS_LOCK="${BOOTROOT_E2E_HOSTS_LOCK:-/tmp/bootroot-e2e-hosts.lock}"
 
 # Whether this process is the run holding the lock.  Consulted by
@@ -570,12 +577,59 @@ hosts_lock_held() {
 # mechanism: two runs racing here — at the first attempt, or at the retry
 # after one of them cleared a stale lock — cannot both succeed, where a
 # test-then-write would let both through.
+#
+# World-readable on purpose, whatever the umask that created it.  The
+# next run to arrive here is regularly another user's, and the pid this
+# file holds is what tells it whether the run holding the lock is still
+# alive.  A lock it cannot read is one it must refuse rather than clear —
+# an unreadable pid is not a dead one — so a run started under `umask
+# 077` would otherwise deny `hosts` mode to every other user on the
+# machine for as long as it lasted, and past its death.  Nothing in here
+# is a secret: a pid and a one-line description of the run.
 hosts_lock_create() {
   local holder="$1"
   (
     set -o noclobber
     printf 'pid=%s\nholder=%s\n' "$$" "$holder" >"$BOOTROOT_E2E_HOSTS_LOCK"
-  ) 2>/dev/null
+  ) 2>/dev/null || return 1
+  chmod 644 "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null || true
+}
+
+# Removes a lock whose recorded pid is dead, through the privileged path
+# when this user's own unlink is refused.
+#
+# The refusal is the normal case across users rather than an unusual one.
+# `/tmp` is sticky on every system this harness runs on, so only a file's
+# owner may unlink it there, and the lock is deliberately machine-wide:
+# the run that finds it stale is exactly the run that did not write it.
+# A plain `rm` therefore recovers a killed run's lock only for the user
+# who was killed, which leaves `hosts` mode refused on that host for
+# everybody else until that user or root removes a file by hand — the
+# per-user serialisation this issue exists to remove, arriving as a hard
+# failure.
+#
+# `sudo -n` is already a precondition of the mode, checked by the caller
+# before it gets here: a run that cannot edit `/etc/hosts` unprompted
+# never reaches the lock at all.  So the privileged unlink asks for
+# nothing the run does not already have.
+#
+# It is also a safe thing to hand root.  `rm` unlinks a symbolic link
+# rather than following it, so the link the path is checked for above
+# cannot aim this at a file of somebody else's choosing even if one is
+# planted between the check and here, and a hard link planted at this
+# path costs the file it points at one of its names and none of its
+# contents.  What decides whether this runs at all is the pid read out of
+# the lock, and that decision is made before anything is removed.
+hosts_lock_clear_stale() {
+  rm -f -- "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null && return 0
+  # A holder that released it in between: gone is gone, whoever won.
+  [ -e "$BOOTROOT_E2E_HOSTS_LOCK" ] || return 0
+  # root's unlink has already been tried, and there is nothing above it.
+  if [ "$(id -u)" -eq 0 ]; then
+    return 1
+  fi
+  command -v sudo >/dev/null 2>&1 || return 1
+  sudo -n rm -f -- "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null
 }
 
 # Takes the `/etc/hosts` lock for this run, or aborts.
@@ -593,6 +647,14 @@ hosts_lock_create() {
 # by hand.  Its `/etc/hosts` entries survive that too, and are collected
 # by the next run's own `add_hosts_entry`/`cleanup_hosts` pair, which
 # match on the host name and the marker rather than on who wrote them.
+# The clearing goes through `hosts_lock_clear_stale`, because the run
+# that finds a lock stale is regularly not the user who wrote it and
+# `/tmp` lets nobody but that user unlink it.
+#
+# A lock that exists and cannot be read is refused instead of cleared.
+# Liveness is the only thing that licenses a removal here, and it is read
+# out of the file: a pid that cannot be read is not a pid that is dead,
+# and clearing on it would hand `/etc/hosts` to two runs at once.
 acquire_hosts_lock() {
   local holder="$1" owner_pid owner_holder
   # Checked before anything acts on the path, and for the reason
@@ -610,13 +672,16 @@ acquire_hosts_lock() {
       BOOTROOT_HOSTS_LOCK_HELD=1
       return 0
     fi
+    if [ -e "$BOOTROOT_E2E_HOSTS_LOCK" ] && [ ! -r "$BOOTROOT_E2E_HOSTS_LOCK" ]; then
+      fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} cannot be read, so whether the run holding it is still alive cannot be told; it is treated as held — wait for that run to finish, or use RESOLUTION_MODE=no-hosts, which has no such limit"
+    fi
     owner_pid="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" pid 2>/dev/null || true)"
     owner_holder="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" holder 2>/dev/null || true)"
     if run_pid_is_alive "$owner_pid"; then
       fail "another E2E run is already resolving through /etc/hosts (pid ${owner_pid}, ${owner_holder:-unknown}); hosts mode edits one file the whole machine shares under a fixed marker, so it runs one at a time — wait for that run to finish, or use RESOLUTION_MODE=no-hosts, which has no such limit"
     fi
-    rm -f "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null \
-      || fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} names the dead pid ${owner_pid:-unknown} and could not be removed; remove it once you are certain no run is resolving through /etc/hosts"
+    hosts_lock_clear_stale \
+      || fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} names the dead pid ${owner_pid:-unknown} and could not be removed, by this user or through sudo -n; remove it once you are certain no run is resolving through /etc/hosts"
   done
   fail "could not take the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK}; another run took it while this one was clearing a dead run's"
 }

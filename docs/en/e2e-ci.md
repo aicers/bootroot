@@ -172,6 +172,19 @@ message — so a file planted at that path denies `hosts` runs loudly rather tha
 aiming a teardown, which is why it needs none of the ownership machinery the
 marker directory has.
 
+Reclaiming a lock left behind by *another user's* killed run does need one
+thing that path costs, and takes it: `/tmp` is sticky, so only a file's owner
+may unlink it there, and a plain `rm` would recover a killed run's lock for
+that user alone — leaving `hosts` mode refused on the host for everybody else
+until they or root removed a file by hand, which is the per-user serialisation
+a machine-wide lock exists to avoid. The stale-lock removal therefore falls
+back to `sudo -n rm`, which asks for nothing the mode has not already required
+of the run before it reaches the lock. What licenses that removal is the pid
+read out of the file, so a lock whose pid cannot be read is treated as held
+rather than stale — an unreadable pid is not a dead one — and the lock is
+written world-readable whatever the umask that created it, since the run that
+has to judge it next is regularly not the one that wrote it.
+
 `no-hosts` runs take no lock and are unaffected. Use that mode when you need
 two lifecycle runs at once.
 
