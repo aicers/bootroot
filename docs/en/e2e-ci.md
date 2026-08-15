@@ -89,14 +89,16 @@ Primary scripts:
 - `scripts/impl/run-openbao-tls-reown.sh`
 - `scripts/impl/run-two-instance-isolation.sh`
 
-`run-two-instance-isolation.sh` is the one matrix scenario that is **not**
-handed a `COMPOSE_PROJECT_NAME`: it installs two instances into two compose
-directories that share a basename and must resolve each instance's Compose
-project from that instance's own `.env`, so a caller-supplied project name
-would collapse both into one. It derives run-scoped `--instance-name` values
-and picks free host ports itself, and every teardown and leftover check is
-scoped to those exact names — it is safe to run on a host that already has a
-default `bootroot` install.
+Three of those scripts are handed no project name at all, and derive their
+own instead. `run-two-instance-isolation.sh` installs two instances into two
+compose directories that share a basename and must resolve each instance's
+Compose project from that instance's own `.env`, so a caller-supplied
+`COMPOSE_PROJECT_NAME` would collapse both into one. The two lifecycle
+scripts derive one identity per run for the reason the next section gives.
+All three pick run-scoped `--instance-name` values and free host ports
+themselves, and every teardown and leftover check is scoped to those exact
+names — they are safe to run on a host that already has a default `bootroot`
+install.
 
 ### Two lifecycle runs can share a host
 
@@ -137,7 +139,8 @@ the machine runs.
 Each run records its liveness explicitly instead. On start it writes
 `${TMPDIR:-/tmp}/bootroot-e2e-runs/<instance>` holding its own pid and its
 Compose project, and on the way out it removes that file — only ever the one
-recording its own pid. Before doing any work it reads every marker in that
+recording its own pid, and only once its own teardown has left nothing
+behind. Before doing any work it reads every marker in that
 directory, skips the ones whose pid is still alive, and for each dead one
 removes that instance's nine container names along with the volumes and
 networks carrying its project label, then drops the marker. A marker it could
