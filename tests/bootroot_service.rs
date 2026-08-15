@@ -184,7 +184,7 @@ async fn test_app_add_writes_state_and_secret() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_summary_reports_registered_dns_aliases() {
-    let run = service_add_with_fake_docker(Some(FAKE_RESPONDER_ID)).await;
+    let run = service_add_with_fake_docker(FakeDocker::ResponderUp).await;
 
     assert!(
         run.output.status.success(),
@@ -226,7 +226,7 @@ async fn test_app_add_summary_reports_registered_dns_aliases() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_app_add_summary_reports_skipped_dns_aliases() {
-    let run = service_add_with_fake_docker(None).await;
+    let run = service_add_with_fake_docker(FakeDocker::ResponderDown).await;
 
     assert!(
         run.output.status.success(),
@@ -254,6 +254,52 @@ async fn test_app_add_summary_reports_skipped_dns_aliases() {
     assert!(
         !run.docker_log.contains("network connect"),
         "a missing responder must not be reconnected: {}",
+        run.docker_log
+    );
+}
+
+/// Issue #830 — the second way nothing gets attached: the responder is
+/// running, but the reconnect carrying the aliases fails and only the
+/// rollback that restores plain connectivity succeeds.  The summary must
+/// report it exactly as it reports a responder that was never there —
+/// what an operator has to act on is that no alias was attached, and the
+/// stderr warning is where the reason lives.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_summary_reports_a_recovered_connect_as_skipped() {
+    let run = service_add_with_fake_docker(FakeDocker::AliasedConnectFails).await;
+
+    assert!(
+        run.output.status.success(),
+        "a recovered reconnect must not fail the add: stdout:\n{}\nstderr:\n{}",
+        run.stdout(),
+        run.stderr()
+    );
+    let stdout = run.stdout();
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("DNS alias registration failed but network connectivity was restored"),
+        "the existing recovery warning must still be printed: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "- HTTP-01 DNS aliases registered: 0 (registration skipped; see the warning above)"
+        ),
+        "the summary must state that nothing was registered: {stdout}"
+    );
+    assert!(
+        !stdout.contains("registered HTTP-01 DNS alias"),
+        "nothing was attached, so no per-alias line may be printed: {stdout}"
+    );
+    assert_alias_line_position(&stdout);
+    // The rollback is what makes this outcome `Skipped` rather than an
+    // error: the responder is back on its network, just without aliases.
+    assert!(
+        run.docker_log.lines().any(|line| line
+            == format!(
+                "network connect --alias bootroot-http01 {FAKE_RESPONDER_NETWORK} {FAKE_RESPONDER_ID}"
+            )),
+        "the responder must be reconnected without aliases: {}",
         run.docker_log
     );
 }
@@ -2654,13 +2700,42 @@ impl FakeDockerAddRun {
     }
 }
 
+/// What the fake `docker` decides for one run, so each test names the
+/// branch of the registration it is about rather than a container ID.
+#[derive(Clone, Copy)]
+enum FakeDocker {
+    /// No responder container is running.
+    ResponderDown,
+    /// A responder is running and every reconnect succeeds.
+    ResponderUp,
+    /// A responder is running, but the reconnect carrying the aliases
+    /// fails; the rollback that restores plain connectivity succeeds.
+    AliasedConnectFails,
+}
+
+impl FakeDocker {
+    /// The container ID the fake reports for the responder — empty when
+    /// none is running, which is what the `ps` lookup finds nothing on.
+    fn responder_id(self) -> &'static str {
+        match self {
+            Self::ResponderDown => "",
+            Self::ResponderUp | Self::AliasedConnectFails => FAKE_RESPONDER_ID,
+        }
+    }
+
+    /// Non-empty when the fake must refuse the aliased reconnect.
+    fn aliased_connect_fails(self) -> &'static str {
+        match self {
+            Self::ResponderDown | Self::ResponderUp => "",
+            Self::AliasedConnectFails => "1",
+        }
+    }
+}
+
 /// Runs `service add` with a `docker` stand-in first on the child's
 /// `PATH`, so the alias registration takes a decided branch rather than
 /// whatever this host happens to have running.
-///
-/// `responder` is the container ID the fake reports for the HTTP-01
-/// responder; `None` reports none running, which is the skipped path.
-async fn service_add_with_fake_docker(responder: Option<&str>) -> FakeDockerAddRun {
+async fn service_add_with_fake_docker(docker: FakeDocker) -> FakeDockerAddRun {
     use support::ROOT_TOKEN;
 
     let temp_dir = tempdir().expect("create temp dir");
@@ -2690,8 +2765,9 @@ async fn service_add_with_fake_docker(responder: Option<&str>) -> FakeDockerAddR
         // than inheriting whatever this host sets.
         .env("BOOTROOT_LANG", "en")
         .env("FAKE_DOCKER_LOG", &docker_log)
-        .env("FAKE_RESPONDER_ID", responder.unwrap_or_default())
+        .env("FAKE_RESPONDER_ID", docker.responder_id())
         .env("FAKE_RESPONDER_NETWORK", FAKE_RESPONDER_NETWORK)
+        .env("FAKE_ALIASED_CONNECT_FAILS", docker.aliased_connect_fails())
         .args([
             "service",
             "add",
@@ -2750,6 +2826,23 @@ case "${1:-}" in
         printf '%s\n' "${FAKE_RESPONDER_NETWORK:-}"
       fi
     done
+    ;;
+  network)
+    if [ -n "${FAKE_ALIASED_CONNECT_FAILS:-}" ] && [ "${2:-}" = "connect" ]; then
+      aliases=0
+      for arg in "$@"; do
+        if [ "$arg" = "--alias" ]; then
+          aliases=$((aliases + 1))
+        fi
+      done
+      # The rollback reconnect carries the responder's own service alias
+      # and nothing else, so it must still succeed; anything beyond that
+      # one is the aliased reconnect this run refuses.
+      if [ "$aliases" -gt 1 ]; then
+        printf 'fake docker: refusing the aliased connect\n' >&2
+        exit 1
+      fi
+    fi
     ;;
 esac
 
