@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+
+# shellcheck source=lib/leftovers.sh
+. "$SCRIPT_DIR/lib/leftovers.sh"
 
 # docker-compose.yml interpolates the entire file regardless of which
 # services are targeted or which profiles are active, so required vars
@@ -58,6 +62,12 @@ fail_with_context() {
   exit 1
 }
 
+# `lib/leftovers.sh` aborts through `fail`; here that is the
+# context-carrying report above.
+fail() {
+  fail_with_context "$1"
+}
+
 ensure_prerequisites() {
   command -v docker >/dev/null 2>&1 || fail_with_context "docker is required"
   docker compose version >/dev/null 2>&1 || fail_with_context "docker compose is required"
@@ -74,8 +84,12 @@ compose_up() {
   docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" up -d $COMPOSE_SERVICES
 }
 
+# Teardown output goes to the run log rather than to `/dev/null`: a
+# teardown that removed nothing has to be distinguishable from one that
+# removed everything.  The status is the caller's to decide — the
+# start-of-run call tolerates a failure, `cleanup` does not.
 compose_down() {
-  docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" down -v --remove-orphans >>"$RUNNER_LOG" 2>&1
 }
 
 capture_artifacts() {
@@ -344,6 +358,8 @@ run_verify_all() {
 }
 
 cleanup() {
+  local status=$?
+  local cleanup_status=0
   if [ -n "$MOCK_OPENBAO_PID" ]; then
     kill "$MOCK_OPENBAO_PID" >/dev/null 2>&1 || true
     wait "$MOCK_OPENBAO_PID" 2>/dev/null || true
@@ -354,7 +370,17 @@ cleanup() {
   done <"$SERVICES_TSV" 2>/dev/null || true
 
   capture_artifacts
-  compose_down
+  # Nothing is torn down before the startup assertion passed: what is on
+  # this host then belongs to whoever put it there, and removing it is
+  # exactly what the assertion refused to do.
+  if stack_owned; then
+    if ! compose_down; then
+      echo "run-baseline: teardown failed; see ${RUNNER_LOG}" >&2
+      cleanup_status=1
+    fi
+    report_leftover_containers "$COMPOSE_FILE" "run-baseline cleanup" || cleanup_status=1
+  fi
+  exit_with_cleanup_status "$status" "$cleanup_status"
 }
 
 main() {
@@ -365,6 +391,23 @@ main() {
   trap cleanup EXIT
 
   ensure_prerequisites
+  # The assertion comes first, before the teardown and before anything
+  # else that could remove a container.  A `down -v` at this project
+  # would take a real install on this host with it, volumes and all, and
+  # leave the check reading a daemon it had just cleaned — and a killed
+  # run's leftovers, which the check exists to report, are
+  # indistinguishable from that install to everything but an operator.
+  assert_no_leftover_containers "$COMPOSE_FILE" "run-baseline startup"
+  # Past the assertion nothing here is anyone else's, so the stack
+  # becomes this run's to remove.  Nothing used to tear it down at the
+  # start of a run at all, so a previous run killed before its own
+  # teardown was found only when `up` collided with the containers it
+  # had left.  The teardown takes the volumes, networks and orphans the
+  # assertion does not look at, and may legitimately find nothing to do,
+  # so its status is not fatal.
+  mark_stack_owned
+  compose_down || true
+
   generate_workspace
 
   compose_up

@@ -45,7 +45,16 @@ set -euo pipefail
 # root is written or removed.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+
+# The leftover checks this script used to carry its own copies of.  Its
+# instances are named after a per-run token rather than after the
+# default identity, so it uses the label-scoped half of that library and
+# is deliberately not subject to the container-name check the harnesses
+# installing at the default identity run.
+# shellcheck source=lib/leftovers.sh
+. "$SCRIPT_DIR/lib/leftovers.sh"
 
 # ---------------------------------------------------------------------------
 # Ambient environment sanitisation
@@ -894,29 +903,51 @@ capture_artifacts() {
 # Every teardown action is scoped to the run's own instance names and
 # their `com.docker.compose.project` labels — never a `bootroot-*`
 # wildcard — so a co-located default install is untouched.
+#
+# Each step is a sweep over resources that may or may not exist, so no
+# one failure may stop the ones after it: a Compose `down` that errored
+# is exactly when the per-resource removals below are worth running.
+# Each failure is recorded instead and the sweep carries on, and the
+# accumulated status is returned once every resource kind has been
+# attempted.
+#
+# Returning it is what keeps a failed daemon call from passing for a
+# clean teardown.  The leftover assertions that follow each call site
+# cannot stand in for it: they report what the label query returns, and
+# a `docker rm` that failed — or a query that could not reach the daemon
+# at all — reads there as nothing left behind.
+#
+# What the steps no longer do is discard their output.  It goes to the
+# run log, so a sweep that removed nothing can be told from one that
+# removed everything, and the error behind a non-zero return is there to
+# read.
 teardown_instance() {
-  local project="$1" dir="$2" id
+  local project="$1" dir="$2" id ids status=0
   if [ -n "$dir" ] && [ -f "$dir/$COMPOSE_FILE_NAME" ]; then
-    instance_compose "$project" "$dir" down -v --remove-orphans >/dev/null 2>&1 || true
+    instance_compose "$project" "$dir" down -v --remove-orphans >>"$RUN_LOG" 2>&1 || status=1
   fi
-  for id in $(docker ps -aq --filter "label=com.docker.compose.project=${project}" 2>/dev/null); do
-    docker rm -f "$id" >/dev/null 2>&1 || true
-  done
-  for id in $(docker volume ls -q --filter "label=com.docker.compose.project=${project}" 2>/dev/null); do
-    docker volume rm -f "$id" >/dev/null 2>&1 || true
-  done
-  for id in $(docker network ls -q --filter "label=com.docker.compose.project=${project}" 2>/dev/null); do
-    docker network rm "$id" >/dev/null 2>&1 || true
-  done
-}
-
-assert_no_leftovers() {
-  local project="$1" label="$2" leftovers
-  leftovers="$(docker ps -aq --filter "label=com.docker.compose.project=${project}" 2>/dev/null || true)"
-  [ -z "$leftovers" ] || fail "containers of project ${project} survived ${label}"
-  leftovers="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" 2>/dev/null || true)"
-  [ -z "$leftovers" ] || fail "volumes of project ${project} survived ${label}"
-  pass "no container or volume of project ${project} survived ${label}"
+  if ids="$(docker ps -aq --filter "label=com.docker.compose.project=${project}" 2>>"$RUN_LOG")"; then
+    for id in $ids; do
+      docker rm -f "$id" >>"$RUN_LOG" 2>&1 || status=1
+    done
+  else
+    status=1
+  fi
+  if ids="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" 2>>"$RUN_LOG")"; then
+    for id in $ids; do
+      docker volume rm -f "$id" >>"$RUN_LOG" 2>&1 || status=1
+    done
+  else
+    status=1
+  fi
+  if ids="$(docker network ls -q --filter "label=com.docker.compose.project=${project}" 2>>"$RUN_LOG")"; then
+    for id in $ids; do
+      docker network rm "$id" >>"$RUN_LOG" 2>&1 || status=1
+    done
+  else
+    status=1
+  fi
+  return "$status"
 }
 
 remove_run_root() {
@@ -937,26 +968,31 @@ remove_run_root() {
 
 cleanup() {
   local status=$?
+  local cleanup_status=0
   log_phase "cleanup"
   capture_artifacts
-  teardown_instance "$INSTANCE_A" "$DIR_A"
-  teardown_instance "$INSTANCE_B" "$DIR_B"
-  docker image rm -f "$HTTP01_IMAGE" >/dev/null 2>&1 || true
+  # A failed teardown fails the run on its own account.  The leftover
+  # reports below cannot cover for it: they read what the label query
+  # returns, which is nothing at all when that query is what failed.
+  teardown_instance "$INSTANCE_A" "$DIR_A" || {
+    echo "[two-instance][cleanup] teardown of ${INSTANCE_A} failed; see ${RUN_LOG}" >&2
+    cleanup_status=1
+  }
+  teardown_instance "$INSTANCE_B" "$DIR_B" || {
+    echo "[two-instance][cleanup] teardown of ${INSTANCE_B} failed; see ${RUN_LOG}" >&2
+    cleanup_status=1
+  }
+  docker image rm -f "$HTTP01_IMAGE" >>"$RUN_LOG" 2>&1 || true
   remove_run_root
-  local project leftovers
+  local project
   for project in "$INSTANCE_A" "$INSTANCE_B"; do
-    leftovers="$(docker ps -aq --filter "label=com.docker.compose.project=${project}" 2>/dev/null || true)"
-    leftovers="${leftovers}$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" 2>/dev/null || true)"
-    if [ -n "$leftovers" ]; then
-      echo "[two-instance][cleanup] leftovers survived for project ${project}" >&2
-      status=1
-    fi
+    report_project_leftovers "$project" "two-instance cleanup" || cleanup_status=1
   done
   if [ -d "$RUN_ROOT" ]; then
     echo "[two-instance][cleanup] run root survived: ${RUN_ROOT}" >&2
-    status=1
+    cleanup_status=1
   fi
-  exit "$status"
+  exit_with_cleanup_status "$status" "$cleanup_status"
 }
 
 # ---------------------------------------------------------------------------
@@ -1034,8 +1070,13 @@ main() {
   run_alias_containment
 
   log_phase "teardown-b"
-  teardown_instance "$INSTANCE_B" "$DIR_B"
-  assert_no_leftovers "$INSTANCE_B" "instance B teardown"
+  # Mid-run this teardown is the thing under test rather than a sweep on
+  # the way out, so a failed step ends the run here with the reason,
+  # instead of leaving the assertion below to report whatever the same
+  # daemon happens to answer next.
+  teardown_instance "$INSTANCE_B" "$DIR_B" \
+    || fail "tearing instance B down failed; see ${RUN_LOG}"
+  assert_no_project_leftovers "$INSTANCE_B" "instance B teardown"
 
   log_phase "assert-a-survived-b-teardown"
   assert_containers_unchanged "$INSTANCE_A" \

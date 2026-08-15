@@ -38,7 +38,11 @@ set -euo pipefail
 #     the chown is a no-op when ownership is already correct
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+
+# shellcheck source=lib/leftovers.sh
+. "$SCRIPT_DIR/lib/leftovers.sh"
 
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-openbao-tls-reown-$(date +%s)}"
 mkdir -p "$ARTIFACT_DIR"
@@ -149,8 +153,12 @@ compose() {
   docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" "$@"
 }
 
+# Teardown output goes to the run log rather than to `/dev/null`: a
+# teardown that removed nothing has to be distinguishable from one that
+# removed everything.  The status is the caller's to decide — the
+# start-of-run call tolerates a failure, `cleanup` does not.
 compose_down() {
-  compose down -v --remove-orphans >/dev/null 2>&1 || true
+  compose down -v --remove-orphans >>"$RUN_LOG" 2>&1
 }
 
 run_bootroot() {
@@ -252,11 +260,23 @@ capture_artifacts() {
 }
 
 cleanup() {
+  local status=$?
+  local cleanup_status=0
   log_phase "cleanup"
   capture_artifacts
   restore_ownership
-  compose_down
+  # Nothing is torn down before the startup assertion passed: what is on
+  # this host then belongs to whoever put it there, and removing it is
+  # exactly what the assertion refused to do.
+  if stack_owned; then
+    if ! compose_down; then
+      echo "run-openbao-tls-reown: teardown failed; see ${RUN_LOG}" >&2
+      cleanup_status=1
+    fi
+    report_leftover_containers "$COMPOSE_FILE" "run-openbao-tls-reown cleanup" || cleanup_status=1
+  fi
   restore_repo_openbao_config
+  exit_with_cleanup_status "$status" "$cleanup_status"
 }
 
 # The rotation runs as root over a secrets tree owned by a foreign uid,
@@ -637,7 +657,19 @@ main() {
 
   ensure_prerequisites
   ensure_bind_host_available "$OPENBAO_BIND_HOST" OPENBAO_BIND_HOST
-  compose_down
+  # The assertion comes first, before the teardown and before anything
+  # else that could remove a container.  A `down -v` at this project
+  # would take a real install on this host with it, volumes and all, and
+  # leave the check reading a daemon it had just cleaned — and a killed
+  # run's leftovers, which the check exists to report, are
+  # indistinguishable from that install to everything but an operator.
+  assert_no_leftover_containers "$COMPOSE_FILE" "run-openbao-tls-reown startup"
+  # Past the assertion nothing here is anyone else's, so the stack
+  # becomes this run's to remove.  The teardown takes the volumes,
+  # networks and orphans the assertion does not look at, and may
+  # legitimately find nothing to do, so its status is not fatal.
+  mark_stack_owned
+  compose_down || true
   snapshot_repo_openbao_config
 
   log_phase "install"
