@@ -533,25 +533,38 @@ STUB
   chmod 755 "$dir"
   [ "$status" -eq 9 ] \
     || die "a stale lock this user cannot unlink was not refused when the privileged path refused too"
-  grep -q 'rm' "$stub_log" \
-    || die "the stale-lock removal never tried the privileged path this user needs to clear another user's lock"
+  grep -qE '(^|[[:space:]])(mv|rm)([[:space:]]|$)' "$stub_log" \
+    || die "the stale-lock recovery never tried the privileged path this user needs to clear another user's lock"
   [ -f "$lock" ] \
     || die "a run that could not clear the stale lock removed it anyway"
+  [ "$(run_marker_field "$lock" pid)" = 4194305 ] \
+    || die "a run that could not clear the stale lock left it holding something else"
 
   # And a `sudo` that does what root does. The stub leaves the directory
   # writable afterwards because the real `/tmp` never stopped being: what
-  # the run may not do there is unlink one file, not create its own.
+  # the run may not do there is unlink or rename one file, not create its
+  # own.
   cat >"$stub_dir/sudo" <<'STUB'
 #!/bin/sh
 echo "$@" >>"$SUDO_STUB_LOG"
 [ "$1" = "-n" ] || exit 1
 shift
-[ "$1" = "rm" ] || exit 1
+cmd="$1"
+case "$cmd" in
+  rm | mv) ;;
+  *) exit 1 ;;
+esac
+shift
+# Root renames and unlinks in a sticky directory whoever owns the file.
+# What stands in for that here is making the directory writable, which
+# is the one privilege the stub has to lend.
 for arg in "$@"; do
-  target="$arg"
+  case "$arg" in
+    -*) continue ;;
+  esac
+  chmod u+rwx "$(dirname "$arg")" || exit 1
 done
-chmod u+rwx "$(dirname "$target")" || exit 1
-exec rm -f -- "$target"
+exec "$cmd" "$@"
 STUB
   chmod 755 "$stub_dir/sudo"
   : >"$stub_log"
@@ -568,9 +581,85 @@ STUB
   chmod 755 "$dir"
   [ "$(run_marker_field "$lock" pid)" = "$$" ] \
     || die "the reclaimed hosts lock does not record the run that took it"
+  [ -z "$(find "$dir" -name 'hosts.lock.stale.*' -print -quit)" ] \
+    || die "the reclaim left behind the lock it moved aside"
   rm -f "$lock"
   rm -f "$stub_dir/sudo"
   ok "a stale lock this user may not unlink is reclaimed through the privileged path hosts mode already requires"
+}
+
+# Two runs arriving at the same stale lock.
+#
+# The pid a contender reads at the lock path says nothing about the file
+# that is there an instant later: a second contender can clear the stale
+# lock and take it in between. A recovery that removes the *path* on the
+# strength of that read then destroys a live run's lock and creates its
+# own over it, and both runs go on to edit `/etc/hosts` believing they
+# hold the mutex — which is the one outcome this lock exists to prevent,
+# and it is silent.
+#
+# So the recovery moves the lock aside under a private name first and
+# judges the object it got hold of, and what these drive is that the
+# judgement and the removal are of the same object however the two runs
+# interleave. The interleaving is deterministic here rather than raced
+# for: the replacement is planted from inside the liveness check, at each
+# of the two points a second contender could reach the path.
+hosts_lock_race_contender() {
+  local lock="$1" plant_at="$2" live_pid="$3"
+  (
+    BOOTROOT_E2E_HOSTS_LOCK="$lock"
+    BOOTROOT_HOSTS_LOCK_HELD=0
+    race_calls=0
+    # The real check, kept under another name: everything but the
+    # planted call has to answer exactly as it does in a run.
+    eval "race_real_pid_is_alive() $(declare -f run_pid_is_alive | sed 1d)"
+    run_pid_is_alive() {
+      race_calls=$((race_calls + 1))
+      if [ "$race_calls" -eq "$plant_at" ]; then
+        # The second contender, doing what this one is about to try:
+        # it clears the stale lock and takes it.
+        rm -f -- "$lock"
+        printf 'pid=%s\nholder=%s\n' "$live_pid" "the run that got there first" >"$lock"
+      fi
+      race_real_pid_is_alive "$1"
+    }
+    acquire_hosts_lock "the losing contender"
+  )
+}
+
+check_hosts_lock_stale_recovery_spares_a_replacement() {
+  local lock="$WORK_DIR/race-hosts.lock" err="$WORK_DIR/race-hosts.err"
+  local live_pid status plant_at
+  # A pid that is genuinely alive and is not this process's, so the
+  # replacement lock reads as a live holder's exactly as a real one does.
+  # This process's parent rather than a child of its own: a check that
+  # aborts mid-way would leave a child running, and holding this script's
+  # stdout open with it.
+  live_pid="$PPID"
+
+  # 1: the replacement is planted between the read of the stale pid and
+  #    the recovery — the window a `rm` of the path would act in.
+  # 2: it is planted while the stale lock is moved aside, when the path
+  #    is briefly free — the window the recovery itself opens.
+  for plant_at in 1 2; do
+    printf 'pid=%s\nholder=%s\n' 4194305 "a killed run" >"$lock"
+    status=0
+    hosts_lock_race_contender "$lock" "$plant_at" "$live_pid" >/dev/null 2>"$err" \
+      || status=$?
+    [ "$status" -eq 9 ] \
+      || die "the contender losing the stale-lock race at point ${plant_at} was not refused (status ${status})"
+    grep -q 'already resolving through /etc/hosts' "$err" \
+      || die "the contender losing the stale-lock race at point ${plant_at} was refused for some other reason: $(cat "$err")"
+    [ "$(run_marker_field "$lock" pid)" = "$live_pid" ] \
+      || die "the replacement lock did not survive the stale recovery at point ${plant_at}; the losing contender took a lock the live run holds"
+    [ "$(run_marker_field "$lock" holder)" = "the run that got there first" ] \
+      || die "the replacement lock was rewritten by the stale recovery at point ${plant_at}"
+    [ -z "$(find "$WORK_DIR" -name 'race-hosts.lock.stale.*' -print -quit)" ] \
+      || die "the stale recovery at point ${plant_at} left the lock it moved aside behind"
+  done
+
+  rm -f "$lock" "$err"
+  ok "a lock taken by a second contender survives the first contender's stale recovery, which judges and removes one object rather than a path"
 }
 
 # Liveness is the only thing that licenses a removal here, and it is read
@@ -1119,6 +1208,7 @@ check_marker_dir_refuses_a_symlink
 check_default_marker_dir_is_per_user
 check_hosts_lock
 check_hosts_lock_reclaims_a_lock_this_user_cannot_unlink
+check_hosts_lock_stale_recovery_spares_a_replacement
 check_hosts_lock_refuses_an_unreadable_lock
 check_hosts_lock_refuses_a_symlink
 check_default_hosts_lock_is_machine_wide

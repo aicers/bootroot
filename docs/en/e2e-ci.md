@@ -162,6 +162,16 @@ failed before taking the lock, leaves `/etc/hosts` alone on the way out: the
 cleanup rewrite drops every line carrying the script's marker, so it cannot
 tell one run's entries from another's.
 
+Clearing a stale lock moves it aside under a name private to the run doing the
+clearing, and judges the file that move got hold of — it never removes the
+lock path on the strength of a pid read from it a moment earlier. The two are
+not the same thing when two runs arrive at the same stale lock: the second can
+clear it and take it in between, and a removal aimed at the path would then
+destroy a live run's lock and create its own over it, leaving both runs editing
+`/etc/hosts` believing they hold the mutex. A rename is atomic, so the file
+that is judged and the file that is removed are one file; a run that finds it
+has moved aside a live run's lock puts it straight back and is refused.
+
 One lock covers both harnesses, because both add the same two host names — a
 local run and a remote run overwrite each other exactly as two local runs
 would. Its path is machine-wide rather than per-user like the run-marker
@@ -177,9 +187,10 @@ thing that path costs, and takes it: `/tmp` is sticky, so only a file's owner
 may unlink it there, and a plain `rm` would recover a killed run's lock for
 that user alone — leaving `hosts` mode refused on the host for everybody else
 until they or root removed a file by hand, which is the per-user serialisation
-a machine-wide lock exists to avoid. The stale-lock removal therefore falls
-back to `sudo -n rm`, which asks for nothing the mode has not already required
-of the run before it reaches the lock. What licenses that removal is the pid
+a machine-wide lock exists to avoid. The stale-lock recovery therefore falls
+back to `sudo -n`, for the rename that moves the lock aside as for the unlink
+that follows, and asks for nothing the mode has not already required of the run
+before it reaches the lock. What licenses that recovery is the pid
 read out of the file, so a lock whose pid cannot be read is treated as held
 rather than stale — an unreadable pid is not a dead one — and the lock is
 written world-readable whatever the umask that created it, since the run that

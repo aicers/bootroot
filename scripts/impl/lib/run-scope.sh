@@ -553,10 +553,10 @@ sweep_dead_run_instances() {
 #
 # What a machine-wide path in `/tmp` does cost is the recovery of a
 # killed run's lock, and that has to be paid rather than accepted:
-# `/tmp` is sticky, so the next user's run cannot unlink the file the
-# killed user's run left behind, and `hosts` mode would stay refused for
-# everyone but its owner.  `hosts_lock_clear_stale` below therefore falls
-# back to the `sudo -n` the mode already requires.
+# `/tmp` is sticky, so the next user's run cannot unlink or rename the
+# file the killed user's run left behind, and `hosts` mode would stay
+# refused for everyone but its owner.  The stale-lock recovery below
+# therefore falls back to the `sudo -n` the mode already requires.
 BOOTROOT_E2E_HOSTS_LOCK="${BOOTROOT_E2E_HOSTS_LOCK:-/tmp/bootroot-e2e-hosts.lock}"
 
 # Whether this process is the run holding the lock.  Consulted by
@@ -595,8 +595,8 @@ hosts_lock_create() {
   chmod 644 "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null || true
 }
 
-# Removes a lock whose recorded pid is dead, through the privileged path
-# when this user's own unlink is refused.
+# Unlinks a path, through the privileged path when this user's own
+# unlink is refused.
 #
 # The refusal is the normal case across users rather than an unusual one.
 # `/tmp` is sticky on every system this harness runs on, so only a file's
@@ -618,18 +618,112 @@ hosts_lock_create() {
 # cannot aim this at a file of somebody else's choosing even if one is
 # planted between the check and here, and a hard link planted at this
 # path costs the file it points at one of its names and none of its
-# contents.  What decides whether this runs at all is the pid read out of
-# the lock, and that decision is made before anything is removed.
-hosts_lock_clear_stale() {
-  rm -f -- "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null && return 0
-  # A holder that released it in between: gone is gone, whoever won.
-  [ -e "$BOOTROOT_E2E_HOSTS_LOCK" ] || return 0
+# contents.
+hosts_lock_priv_rm() {
+  local path="$1"
+  rm -f -- "$path" 2>/dev/null && return 0
+  # Somebody else got there first: gone is gone, whoever won.
+  [ -e "$path" ] || return 0
   # root's unlink has already been tried, and there is nothing above it.
   if [ "$(id -u)" -eq 0 ]; then
     return 1
   fi
   command -v sudo >/dev/null 2>&1 || return 1
-  sudo -n rm -f -- "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null
+  sudo -n rm -f -- "$path" 2>/dev/null
+}
+
+# Renames a path, through the privileged path for the same reason
+# `hosts_lock_priv_rm` unlinks through it: a sticky `/tmp` refuses a
+# rename of another user's file exactly as it refuses the unlink, and the
+# lock this moves aside is regularly another user's.
+#
+# `rename` never follows a symbolic link at either end, so neither a link
+# planted at the source — already refused above — nor one planted at the
+# destination in between can aim this, privileged or not: the link itself
+# is what gets replaced.
+hosts_lock_priv_mv() {
+  local from="$1" to="$2"
+  mv -f -- "$from" "$to" 2>/dev/null && return 0
+  # Nothing there to move: the caller decides what that means.
+  [ -e "$from" ] || return 1
+  if [ "$(id -u)" -eq 0 ]; then
+    return 1
+  fi
+  command -v sudo >/dev/null 2>&1 || return 1
+  sudo -n mv -f -- "$from" "$to" 2>/dev/null
+}
+
+# The pid and holder read out of the object `hosts_lock_steal_stale`
+# moved aside, for the caller's refusal message.
+HOSTS_LOCK_STOLEN_PID=""
+HOSTS_LOCK_STOLEN_HOLDER=""
+
+# Moves the lock aside under a name only this process knows, then decides
+# what to do with the object it actually got.  Returns 0 when the path is
+# clear for another attempt at the create, 2 when what it moved aside
+# turned out to be a live run's lock and has been put back, and 1 when
+# the move was refused outright.
+#
+# The ordering is the whole point, and it is the opposite of the obvious
+# one.  Reading a pid at the path and then removing the path acts on
+# whatever is there at the moment of the removal, which need not be what
+# was read: a second run arriving at the same stale lock can clear it and
+# take it in between, and the removal then destroys a live run's lock and
+# hands `/etc/hosts` to two runs at once — the very thing this lock
+# exists to prevent.  No amount of re-reading closes that, because every
+# check is of a name and every name can be re-pointed before the next
+# call opens it.
+#
+# `rename` is the one operation here that is atomic and that yields an
+# object rather than a name.  After it, the file this judges and the file
+# it removes are the same file, whatever else happens at the path: a
+# second run that gets there first finds nothing to move and takes the
+# lock cleanly, and this one loses its retry and is refused, which is the
+# correct answer.
+#
+# A lock that turns out to be live goes straight back.  That is the
+# losing side of the same race — the pid was dead when the caller read it
+# and the file was replaced before this ran — and the run that owns it is
+# editing `/etc/hosts` right now.  `ln` puts it back only while the path
+# is free, so a third run's lock is not overwritten by the restore; if
+# one did get in through the gap this opened, the live holder's own
+# record is what belongs at the path and replaces it.
+#
+# An object whose pid cannot be read is treated as live for the reason
+# the caller treats an unreadable lock as held: an unreadable pid is not
+# a dead one.
+hosts_lock_steal_stale() {
+  local stash="${BOOTROOT_E2E_HOSTS_LOCK}.stale.$$"
+  HOSTS_LOCK_STOLEN_PID=""
+  HOSTS_LOCK_STOLEN_HOLDER=""
+  # A stash of this pid's own, left by an attempt that did not finish,
+  # would otherwise be read as what this one moved aside.
+  hosts_lock_priv_rm "$stash" || return 1
+  if ! hosts_lock_priv_mv "$BOOTROOT_E2E_HOSTS_LOCK" "$stash"; then
+    # Either the holder released it in between, in which case the retry
+    # takes it, or the move was refused.
+    [ -e "$BOOTROOT_E2E_HOSTS_LOCK" ] || return 0
+    return 1
+  fi
+  if [ -r "$stash" ]; then
+    HOSTS_LOCK_STOLEN_PID="$(run_marker_field "$stash" pid 2>/dev/null || true)"
+    HOSTS_LOCK_STOLEN_HOLDER="$(run_marker_field "$stash" holder 2>/dev/null || true)"
+    if ! run_pid_is_alive "$HOSTS_LOCK_STOLEN_PID"; then
+      hosts_lock_priv_rm "$stash" || return 1
+      return 0
+    fi
+  fi
+  if ln -- "$stash" "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null; then
+    hosts_lock_priv_rm "$stash" >/dev/null 2>&1 || true
+  elif ! hosts_lock_priv_mv "$stash" "$BOOTROOT_E2E_HOSTS_LOCK"; then
+    fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} was moved aside to ${stash} while a live run held it, and could not be put back; move that file back once you are certain of it"
+  fi
+  return 2
+}
+
+# Aborts, naming the run that holds the lock.
+hosts_lock_refuse() {
+  fail "another E2E run is already resolving through /etc/hosts (pid ${1:-unknown}, ${2:-unknown}); hosts mode edits one file the whole machine shares under a fixed marker, so it runs one at a time — wait for that run to finish, or use RESOLUTION_MODE=no-hosts, which has no such limit"
 }
 
 # Takes the `/etc/hosts` lock for this run, or aborts.
@@ -647,16 +741,17 @@ hosts_lock_clear_stale() {
 # by hand.  Its `/etc/hosts` entries survive that too, and are collected
 # by the next run's own `add_hosts_entry`/`cleanup_hosts` pair, which
 # match on the host name and the marker rather than on who wrote them.
-# The clearing goes through `hosts_lock_clear_stale`, because the run
-# that finds a lock stale is regularly not the user who wrote it and
-# `/tmp` lets nobody but that user unlink it.
+# The clearing goes through `hosts_lock_steal_stale`, which moves the
+# lock aside before judging it — the pid read here licenses nothing on
+# its own, since the file it was read from can be replaced by a second
+# run doing exactly this before the removal lands.
 #
 # A lock that exists and cannot be read is refused instead of cleared.
 # Liveness is the only thing that licenses a removal here, and it is read
 # out of the file: a pid that cannot be read is not a pid that is dead,
 # and clearing on it would hand `/etc/hosts` to two runs at once.
 acquire_hosts_lock() {
-  local holder="$1" owner_pid owner_holder
+  local holder="$1" owner_pid owner_holder steal_status
   # Checked before anything acts on the path, and for the reason
   # `ensure_run_marker_dir` checks it: `-e` and the rest follow a link,
   # so a link planted here aims the create and the `rm` below at a file
@@ -678,10 +773,22 @@ acquire_hosts_lock() {
     owner_pid="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" pid 2>/dev/null || true)"
     owner_holder="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" holder 2>/dev/null || true)"
     if run_pid_is_alive "$owner_pid"; then
-      fail "another E2E run is already resolving through /etc/hosts (pid ${owner_pid}, ${owner_holder:-unknown}); hosts mode edits one file the whole machine shares under a fixed marker, so it runs one at a time — wait for that run to finish, or use RESOLUTION_MODE=no-hosts, which has no such limit"
+      hosts_lock_refuse "$owner_pid" "$owner_holder"
     fi
-    hosts_lock_clear_stale \
-      || fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} names the dead pid ${owner_pid:-unknown} and could not be removed, by this user or through sudo -n; remove it once you are certain no run is resolving through /etc/hosts"
+    # This pid is what says the lock may be stale, and nothing more: what
+    # decides is what the move aside actually gets hold of.
+    steal_status=0
+    hosts_lock_steal_stale || steal_status=$?
+    case "$steal_status" in
+      # The path is clear, or was cleared by whoever else was here; the
+      # retry's exclusive create is what settles it.
+      0) ;;
+      # A live run's lock, put back where it was.
+      2) hosts_lock_refuse "$HOSTS_LOCK_STOLEN_PID" "$HOSTS_LOCK_STOLEN_HOLDER" ;;
+      *)
+        fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} names the dead pid ${owner_pid:-unknown} and could not be moved aside, by this user or through sudo -n; remove it once you are certain no run is resolving through /etc/hosts"
+        ;;
+    esac
   done
   fail "could not take the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK}; another run took it while this one was clearing a dead run's"
 }
